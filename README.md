@@ -9,10 +9,10 @@
 ## 📌 ÖZET / SUMMARY
 
 ### TR: Bu Proje Nedir?
-VDB (VeriTabanı), masaüstü ve gömülü uygulamalar için tasarlanmış, yüksek performanslı, tek dosyada çalışan bir ilişkisel veritabanı motorudur. SQLite'a alternatif olarak geliştirilmiş; JSONB, Spatial, Range, Trigger, View, Stored Procedure, Partitioning, Parallel Query, Cost-Based Optimizer gibi ileri özellikleri destekler.
+VDB (VeriTabanı), masaüstü ve gömülü uygulamalar için tasarlanmış, yüksek performanslı, tek dosyada çalışan bir ilişkisel veritabanı motorudur. SQLite'a alternatif olarak geliştirilmiş; JSONB, Spatial, Range, Trigger, View, Stored Procedure, Partitioning, Parallel Query, Cost-Based Optimizer, PK Lazy Index (BETWEEN için Index Scan) ve Group Commit (`SyncWriteInterval`) gibi ileri özellikleri destekler.
 
 ### EN: What Is This Project?
-VDB is a high-performance, single-file relational database engine designed for desktop and embedded applications. Developed as an alternative to SQLite, it supports advanced features like JSONB, Spatial, Range types, Triggers, Views, Stored Procedures, Partitioning, Parallel Query, and a Cost-Based Optimizer.
+VDB is a high-performance, single-file relational database engine designed for desktop and embedded applications. Developed as an alternative to SQLite, it supports advanced features like JSONB, Spatial, Range types, Triggers, Views, Stored Procedures, Partitioning, Parallel Query, a Cost-Based Optimizer, PK Lazy Index (Index Scan for BETWEEN), and Group Commit (`SyncWriteInterval`).
 
 ---
 
