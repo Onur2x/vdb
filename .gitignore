@@ -1,0 +1,68 @@
+# ============================================
+# VDB - Git Ignore
+# ============================================
+
+# Derleme artıkları / Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+*.ppu
+*.a
+*.compiled
+*.res
+*.or
+*.rsj
+
+# Lazarus / FPC
+lib/
+backup/
+*.lps
+*.lpi.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# İşletim sistemi / OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Loglar / Logs
+*.log
+build_*.log
+
+# Test verileri / Test data
+*.odb
+*.wal
+*.key
+*.bak
+*_onceki
+
+# Geçici / Temp
+*.tmp
+*.temp
+*.cache
+
+# Yedek klasörü / Backup folder (dahil etme)
+yedek2/
+
+# mtakip projesi (farklı proje / different project)
+mtakip/
+
+# Sadece kaynak kodları tut / Keep only source
+!*.pas
+!*.lpr
+!*.lpi
+!*.md
+!*.h
+!*.sh
+!*.bat
+!*.cmd
+!LICENSE
+!README*

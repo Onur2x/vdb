@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VDb Web Admin</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, sans-serif; }
+        body { background: #f5f5f5; min-height: 100vh; }
+        header { background: #2c3e50; color: white; padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; }
+        header h1 { font-size: 1.5rem; }
+        header .actions { display: flex; gap: .5rem; flex-wrap: wrap; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 2rem; }
+        .card { background: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,.1); margin-bottom: 1rem; overflow: hidden; }
+        .card-header { background: #f8f9fa; padding: 1rem; border-bottom: 1px solid #eee; font-weight: 600; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: .5rem; }
+        .card-body { padding: 1rem; }
+        .btn { padding: .5rem 1rem; border: none; border-radius: 4px; cursor: pointer; font-weight: 500; transition: all .2s; }
+        .btn:hover { opacity: .9; }
+        .btn:disabled { opacity: .5; cursor: not-allowed; }
+        .btn-primary { background: #3498db; color: white; }
+        .btn-danger { background: #e74c3c; color: white; }
+        .btn-success { background: #27ae60; color: white; }
+        .btn-secondary { background: #6c757d; color: white; }
+        .btn-sm { padding: .25rem .5rem; font-size: .875rem; }
+        input, select { padding: .5rem; border: 1px solid #ddd; border-radius: 4px; }
+        input[type="text"] { max-width: 300px; }
+        .form-group { margin-bottom: 1rem; }
+        label { display: block; margin-bottom: .25rem; font-weight: 500; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: .75rem; text-align: left; border-bottom: 1px solid #eee; }
+        th { background: #f8f9fa; font-weight: 600; white-space: nowrap; }
+        tr:hover { background: #f8f9fa; }
+        .badge { padding: .25rem .5rem; border-radius: 9999px; font-size: .75rem; font-weight: 600; }
+        .badge-success { background: #d4edda; color: #155724; }
+        .badge-warning { background: #fff3cd; color: #856404; }
+        .badge-danger { background: #f8d7da; color: #721c24; }
+        .pagination { display: flex; gap: .5rem; justify-content: center; margin-top: 1rem; flex-wrap: wrap; }
+        .pagination .btn { min-width: 36px; }
+        .pagination .btn.active { background: #3498db; color: white; }
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,.5); align-items: center; justify-content: center; z-index: 1000; }
+        .modal.show { display: flex; }
+        .modal-content { background: white; padding: 2rem; border-radius: 8px; width: 100%; max-width: 400px; margin: 1rem; }
+        .modal-content h3 { margin-bottom: 1rem; }
+        .text-muted { color: #6c757d; font-size: .875rem; }
+        .alert { padding: 1rem; border-radius: 4px; margin-bottom: 1rem; }
+        .alert-success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .alert-error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .alert-info { background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
+        .loading { display: inline-block; width: 20px; height: 20px; border: 2px solid #f3f3f3; border-top: 2px solid #3498db; border-radius: 50%; animation: spin 1s linear infinite; margin-right: .5rem; vertical-align: middle; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .empty-state { text-align: center; padding: 3rem; color: #6c757d; }
+        .empty-state svg { width: 64px; height: 64px; margin-bottom: 1rem; opacity: .5; }
+        .toolbar { display: flex; gap: .5rem; margin-bottom: 1rem; flex-wrap: wrap; align-items: center; }
+        .toolbar .search-box { flex: 1; min-width: 200px; }
+        .table-responsive { overflow-x: auto; }
+        .db-stats { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
+        .stat-card { background: #f8f9fa; padding: 1rem; border-radius: 4px; min-width: 150px; }
+        .stat-card .value { font-size: 1.5rem; font-weight: bold; color: #2c3e50; }
+        .stat-card .label { font-size: .875rem; color: #6c757d; }
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>🗄️ VDb Web Admin</h1>
+        <div class="actions">
+            <button class="btn btn-primary" onclick="refreshDatabases()" id="btnRefresh">
+                <span class="loading hidden" id="refreshLoader"></span> 🔄 Yenile
+            </button>
+            <button class="btn btn-success" onclick="showCreateDbModal()">➕ Yeni DB</button>
+        </div>
+    </header>
+    
+    <div class="container">
+        <!-- Alert Container -->
+        <div id="alertContainer"></div>
+        
+        <!-- Database List Card -->
+        <div class="card">
+            <div class="card-header">
+                <span>Veritabanları</span>
+                <span class="badge badge-success" id="dbCount">0</span>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table id="dbTable">
+                        <thead>
+                            <tr>
+                                <th>Veritabanı Adı</th>
+                                <th>Dosya Boyutu</th>
+                                <th>Tablo Sayısı</th>
+                                <th>İşlemler</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <div class="empty-state hidden" id="dbEmpty">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>
+                    </svg>
+                    <p>Henüz veritabanı yok. "Yeni DB" butonuyla oluşturun.</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Table List Card (for selected DB) -->
+        <div class="card hidden" id="tableCard">
+            <div class="card-header">
+                <span>Tablolar: <span id="currentDbName"></span></span>
+                <button class="btn btn-secondary btn-sm" onclick="backToDatabases()">← Geri</button>
+            </div>
+            <div class="card-body">
+                <div class="toolbar">
+                    <div class="search-box">
+                        <input type="text" id="tableSearch" placeholder="Tablo ara..." onkeyup="filterTables()">
+                    </div>
+                </div>
+                <div class="table-responsive">
+                    <table id="tableTable">
+                        <thead>
+                            <tr>
+                                <th>Tablo Adı</th>
+                                <th>Kayıt Sayısı</th>
+                                <th>Sütun Sayısı</th>
+                                <th>İşlemler</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Data Grid Card -->
+        <div class="card hidden" id="dataCard">
+            <div class="card-header">
+                <div>
+                    <span>📄 Veri: </span>
+                    <strong id="currentTableName"></strong>
+                    <span class="badge badge-success" id="recordCount">0 kayıt</span>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="toolbar">
+                    <div class="search-box">
+                        <input type="text" id="dataSearch" placeholder="Verilerde ara..." onkeyup="searchTableData()">
+                    </div>
+                    <select id="pageSize" onchange="loadTableData()">
+                        <option value="25">25/sayfa</option>
+                        <option value="50" selected>50/sayfa</option>
+                        <option value="100">100/sayfa</option>
+                        <option value="200">200/sayfa</option>
+                    </select>
+                    <button class="btn btn-secondary btn-sm" onclick="exportTableCSV()">📥 CSV İndir</button>
+                    <button class="btn btn-secondary btn-sm" onclick="backToTables()">← Tablolar</button>
+                </div>
+                <div class="table-responsive">
+                    <table id="dataTable">
+                        <thead><tr></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <div class="pagination" id="pagination"></div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Create DB Modal -->
+    <div class="modal" id="createDbModal">
+        <div class="modal-content">
+            <h3>➕ Yeni Veritabanı Oluştur</h3>
+            <div class="form-group">
+                <label for="newDbName">Veritabanı Adı</label>
+                <input type="text" id="newDbName" placeholder="my_database" autocomplete="off">
+                <small class="text-muted">Sadece harf, rakam ve alt çizgi kullanın</small>
+            </div>
+            <div class="form-group">
+                <button class="btn btn-success" onclick="createDatabase()" id="btnCreateDb">Oluştur</button>
+                <button class="btn btn-secondary" style="margin-left:.5rem" onclick="hideModal('createDbModal')">İptal</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Confirm Delete Modal -->
+    <div class="modal" id="confirmModal">
+        <div class="modal-content">
+            <h3>⚠️ Onay</h3>
+            <p id="confirmMessage"></p>
+            <div class="form-group">
+                <button class="btn btn-danger" onclick="executeConfirmedAction()" id="btnConfirm">Evet, Sil</button>
+                <button class="btn btn-secondary" style="margin-left:.5rem" onclick="hideModal('confirmModal')">İptal</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API = '/api';
+        let currentDb = '';
+        let currentTable = '';
+        let currentPage = 1;
+        let currentPageSize = 50;
+        let allTables = [];
+        let confirmAction = null;
+
+        // Utility functions
+        function showAlert(message, type = 'info') {
+            const container = document.getElementById('alertContainer');
+            const alert = document.createElement('div');
+            alert.className = `alert alert-${type}`;
+            alert.textContent = message;
+            container.appendChild(alert);
+            setTimeout(() => alert.remove(), 5000);
+        }
+
+        function setLoading(btnId, loading) {
+            const btn = document.getElementById(btnId);
+            const loader = btn?.querySelector('.loading');
+            if (loading) {
+                btn.disabled = true;
+                loader?.classList.remove('hidden');
+            } else {
+                btn.disabled = false;
+                loader?.classList.add('hidden');
+            }
+        }
+
+        function showModal(id) {
+            document.getElementById(id).classList.add('show');
+            const input = document.getElementById(id).querySelector('input');
+            if (input) setTimeout(() => input.focus(), 100);
+        }
+
+        function hideModal(id) {
+            document.getElementById(id).classList.remove('show');
+            const input = document.getElementById(id).querySelector('input');
+            if (input) input.value = '';
+        }
+
+        // Database operations
+        async function refreshDatabases() {
+            setLoading('btnRefresh', true);
+            try {
+                const res = await fetch(`${API}/databases`);
+                const data = await res.json();
+                renderDatabaseList(data);
+            } catch (e) {
+                console.error(e);
+                showAlert('Veritabanları yüklenemedi: ' + e.message, 'error');
+            } finally {
+                setLoading('btnRefresh', false);
+            }
+        }
+
+        function renderDatabaseList(data) {
+            const tbody = document.querySelector('#dbTable tbody');
+            const empty = document.getElementById('dbEmpty');
+            const countEl = document.getElementById('dbCount');
+            
+            tbody.innerHTML = '';
+            
+            if (data.success && data.data && data.data.length > 0) {
+                empty.classList.add('hidden');
+                data.data.forEach(db => {
+                    const tr = document.createElement('tr');
+                    // Get file size if possible
+                    const size = db.size ? formatBytes(db.size) : '-';
+                    const tableCount = db.tables ? db.tables.length : '-';
+                    tr.innerHTML = `
+                        <td><strong>${escapeHtml(db.name)}</strong></td>
+                        <td>${size}</td>
+                        <td>${tableCount}</td>
+                        <td>
+                            <button class="btn btn-primary btn-sm" onclick="loadTables('${escapeHtml(db.name)}')">Tablolar</button>
+                            <button class="btn btn-danger btn-sm" onclick="confirmDeleteDb('${escapeHtml(db.name)}')">Sil</button>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+                countEl.textContent = data.data.length;
+            } else {
+                empty.classList.remove('hidden');
+                countEl.textContent = '0';
+            }
+        }
+
+        async function createDatabase() {
+            const name = document.getElementById('newDbName').value.trim();
+            if (!name) return showAlert('Veritabanı adı girin', 'error');
+            if (!/^[a-zA-Z][a-zA-Z0-9_]*$/.test(name)) {
+                return showAlert('Geçersiz isim. Harf ile başlamalı, sadece harf/rakam/_ içermeli', 'error');
+            }
+
+            setLoading('btnCreateDb', true);
+            try {
+                const res = await fetch(`${API}/databases`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name})
+                });
+                const data = await res.json();
+                if (data.success) {
+                    showAlert('Veritabanı oluşturuldu: ' + name, 'success');
+                    hideModal('createDbModal');
+                    refreshDatabases();
+                } else {
+                    showAlert('Hata: ' + data.error, 'error');
+                }
+            } catch (e) {
+                console.error(e);
+                showAlert('Oluşturulamadı: ' + e.message, 'error');
+            } finally {
+                setLoading('btnCreateDb', false);
+            }
+        }
+
+        function confirmDeleteDb(dbName) {
+            currentDb = dbName;
+            document.getElementById('confirmMessage').textContent = `"${dbName}" veritabanını silmek istediğinizden emin misiniz? Bu işlem geri alınamaz!`;
+            confirmAction = 'deleteDb';
+            showModal('confirmModal');
+        }
+
+        async function executeConfirmedAction() {
+            if (confirmAction === 'deleteDb') {
+                await deleteDatabase(currentDb);
+            }
+            hideModal('confirmModal');
+            confirmAction = null;
+        }
+
+        async function deleteDatabase(dbName) {
+            // Note: VDB doesn't have DELETE DATABASE in this API yet
+            // We'll show a message
+            showAlert('Veritabanı silme henüz desteklenmiyor. Dosyayı manuel silebilirsiniz.', 'warning');
+        }
+
+        // Table operations
+        async function loadTables(dbName) {
+            currentDb = dbName;
+            document.getElementById('currentDbName').textContent = dbName;
+            document.getElementById('tableCard').classList.remove('hidden');
+            document.getElementById('dataCard').classList.add('hidden');
+            
+            try {
+                const res = await fetch(`${API}/tables/${dbName}`);
+                const data = await res.json();
+                if (data.success) {
+                    allTables = data.tables || [];
+                    renderTableList(allTables);
+                } else {
+                    showAlert('Hata: ' + data.error, 'error');
+                }
+            } catch (e) {
+                console.error(e);
+                showAlert('Tablolar yüklenemedi: ' + e.message, 'error');
+            }
+        }
+
+        function renderTableList(tables) {
+            const tbody = document.querySelector('#tableTable tbody');
+            tbody.innerHTML = '';
+            
+            tables.forEach(t => {
+                const tr = document.createElement('tr');
+                const rowCount = t.row_count || t.count || '-';
+                const colCount = t.column_count || t.columns || '-';
+                tr.innerHTML = `
+                    <td><strong>${escapeHtml(t.name)}</strong></td>
+                    <td>${rowCount}</td>
+                    <td>${colCount}</td>
+                    <td>
+                        <button class="btn btn-primary btn-sm" onclick="loadTableData('${escapeHtml(t.name)}')">Veri Gör</button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function filterTables() {
+            const term = document.getElementById('tableSearch').value.toLowerCase();
+            const filtered = allTables.filter(t => t.name.toLowerCase().includes(term));
+            renderTableList(filtered);
+        }
+
+        function backToDatabases() {
+            document.getElementById('tableCard').classList.add('hidden');
+            document.getElementById('dataCard').classList.add('hidden');
+            currentDb = '';
+            currentTable = '';
+        }
+
+        function backToTables() {
+            document.getElementById('dataCard').classList.add('hidden');
+            currentTable = '';
+        }
+
+        // Data operations
+        async function loadTableData(tableName, page = 1) {
+            if (tableName) currentTable = tableName;
+            currentPage = page;
+            currentPageSize = parseInt(document.getElementById('pageSize').value);
+            
+            document.getElementById('currentTableName').textContent = currentTable;
+            document.getElementById('dataCard').classList.remove('hidden');
+            
+            try {
+                const res = await fetch(`${API}/tables/${currentDb}/${currentTable}/data?page=${page}&size=${currentPageSize}`);
+                const data = await res.json();
+                
+                if (!data.success) throw new Error(data.error);
+                
+                renderDataTable(data.data, data.meta);
+            } catch (e) {
+                console.error(e);
+                showAlert('Veri yüklenemedi: ' + e.message, 'error');
+            }
+        }
+
+        function renderDataTable(rows, meta) {
+            const thead = document.querySelector('#dataTable thead tr');
+            const tbody = document.querySelector('#dataTable tbody');
+            const pagination = document.getElementById('pagination');
+            const countEl = document.getElementById('recordCount');
+            
+            countEl.textContent = `${meta.total} kayıt`;
+            
+            // Headers
+            thead.innerHTML = '';
+            if (rows.length > 0) {
+                Object.keys(rows[0]).forEach(key => {
+                    const th = document.createElement('th');
+                    th.textContent = key;
+                    thead.appendChild(th);
+                });
+            }
+            
+            // Rows
+            tbody.innerHTML = '';
+            rows.forEach(row => {
+                const tr = document.createElement('tr');
+                Object.values(row).forEach(val => {
+                    const td = document.createElement('td');
+                    td.textContent = val !== null && val !== undefined ? val : '';
+                    tr.appendChild(td);
+                });
+                tbody.appendChild(tr);
+            });
+            
+            // Pagination
+            pagination.innerHTML = '';
+            if (meta.pages <= 1) return;
+            
+            const maxPages = 10;
+            let start = Math.max(1, meta.page - Math.floor(maxPages / 2));
+            let end = Math.min(meta.pages, start + maxPages - 1);
+            
+            if (end - start < maxPages - 1) {
+                start = Math.max(1, end - maxPages + 1);
+            }
+            
+            if (start > 1) {
+                addPageBtn(pagination, 1, meta.page);
+                if (start > 2) addEllipsis(pagination);
+            }
+            
+            for (let i = start; i <= end; i++) {
+                addPageBtn(pagination, i, meta.page);
+            }
+            
+            if (end < meta.pages) {
+                if (end < meta.pages - 1) addEllipsis(pagination);
+                addPageBtn(pagination, meta.pages, meta.page);
+            }
+        }
+
+        function addPageBtn(container, page, currentPage) {
+            const btn = document.createElement('button');
+            btn.className = `btn btn-sm ${page === currentPage ? 'btn-primary active' : 'btn-secondary'}`;
+            btn.textContent = page;
+            btn.onclick = () => loadTableData(null, page);
+            container.appendChild(btn);
+        }
+
+        function addEllipsis(container) {
+            const span = document.createElement('span');
+            span.style.padding = '0 .5rem';
+            span.textContent = '...';
+            container.appendChild(span);
+        }
+
+        function searchTableData() {
+            const term = document.getElementById('dataSearch').value.toLowerCase();
+            document.querySelectorAll('#dataTable tbody tr').forEach(tr => {
+                const text = tr.textContent.toLowerCase();
+                tr.style.display = text.includes(term) ? '' : 'none';
+            });
+        }
+
+        function exportTableCSV() {
+            if (!currentDb || !currentTable) return;
+            window.open(`${API}/tables/${currentDb}/${currentTable}/data?page=1&size=10000&format=csv`, '_blank');
+        }
+
+        // Format bytes
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                document.querySelectorAll('.modal.show').forEach(m => m.classList.remove('show'));
+            }
+        });
+
+        // Initial load
+        refreshDatabases();
+    </script>
+</body>
+</html>

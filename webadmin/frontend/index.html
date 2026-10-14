@@ -1,0 +1,1063 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VDb Web Admin</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+
+        :root {
+            --primary: #3b82f6;
+            --primary-dark: #1e40af;
+            --secondary: #64748b;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --surface: #ffffff;
+            --surface-alt: #f8fafc;
+            --surface-dark: #1e293b;
+            --text: #1e293b;
+            --text-muted: #64748b;
+            --border: #e2e8f0;
+            --radius: 8px;
+            --sidebar-width: 300px;
+        }
+
+        [data-theme="dark"] {
+            --primary: #3b82f6;
+            --primary-dark: #60a5fa;
+            --secondary: #94a3b8;
+            --success: #34d399;
+            --warning: #fbbf24;
+            --danger: #f87171;
+            --surface: #0f172a;
+            --surface-alt: #1e293b;
+            --surface-dark: #334155;
+            --text: #f1f5f9;
+            --text-muted: #94a3b8;
+            --border: #334155;
+        }
+
+        body {
+            background-color: var(--surface-alt);
+            color: var(--text);
+            transition: background-color 0.3s, color 0.3s;
+            overflow: hidden;
+        }
+
+        /* Header */
+        .header {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 56px;
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            padding: 0 16px;
+            z-index: 1000;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+
+        .header-brand {
+            font-size: 20px;
+            font-weight: bold;
+            color: var(--primary);
+            text-decoration: none;
+            margin-right: 24px;
+        }
+
+        .header-nav {
+            display: flex;
+            gap: 8px;
+        }
+
+        .header-btn {
+            padding: 8px 16px;
+            border: none;
+            background: transparent;
+            color: var(--text-muted);
+            border-radius: var(--radius);
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 14px;
+        }
+
+        .header-btn:hover {
+            background: var(--surface-alt);
+            color: var(--text);
+        }
+
+        .header-btn.active {
+            background: var(--primary);
+            color: white;
+        }
+
+        .header-right {
+            margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .theme-toggle {
+            width: 32px;
+            height: 32px;
+            border: 1px solid var(--border);
+            border-radius: 50%;
+            background: var(--surface);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            position: fixed;
+            top: 56px;
+            left: 0;
+            width: var(--sidebar-width);
+            height: calc(100vh - 56px);
+            background: var(--surface);
+            border-right: 1px solid var(--border);
+            padding: 16px;
+            overflow-y: auto;
+            z-index: 999;
+        }
+
+        .sidebar-header {
+            margin-bottom: 16px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .sidebar-title {
+            font-size: 12px;
+            font-weight: bold;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .search-box {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            background: var(--surface-alt);
+            color: var(--text);
+            font-size: 14px;
+        }
+
+        .search-box:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+
+        .database-tree {
+            list-style: none;
+        }
+
+        .tree-node {
+            margin-bottom: 2px;
+        }
+
+        .tree-node-header {
+            display: flex;
+            align-items: center;
+            padding: 6px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .tree-node-header:hover {
+            background: var(--surface-alt);
+        }
+
+        .tree-node-header.selected {
+            background: var(--primary);
+            color: white;
+        }
+
+        .tree-icon {
+            width: 16px;
+            height: 16px;
+            margin-right: 8px;
+            text-align: center;
+        }
+
+        /* Main Content */
+        .main {
+            margin-left: var(--sidebar-width);
+            margin-top: 56px;
+            padding: 24px;
+            height: calc(100vh - 56px);
+            overflow-y: auto;
+        }
+
+        .content-header {
+            margin-bottom: 24px;
+        }
+
+        .content-title {
+            font-size: 24px;
+            font-weight: bold;
+            color: var(--text);
+            margin-bottom: 8px;
+        }
+
+        .content-subtitle {
+            font-size: 14px;
+            color: var(--text-muted);
+        }
+
+        /* Cards */
+        .card-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 16px;
+            transition: all 0.2s;
+        }
+
+        .card:hover {
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            transform: translateY(-2px);
+        }
+
+        .card-title {
+            font-size: 14px;
+            font-weight: bold;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+        }
+
+        .card-value {
+            font-size: 32px;
+            font-weight: bold;
+            color: var(--primary);
+        }
+
+        .card-footer {
+            margin-top: 12px;
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        /* Tables */
+        .table-container {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            overflow: hidden;
+        }
+
+        .table-header {
+            padding: 16px;
+            border-bottom: 1px solid var(--border);
+            background: var(--surface-alt);
+        }
+
+        .table-title {
+            font-size: 16px;
+            font-weight: bold;
+            color: var(--text);
+        }
+
+        .table-actions {
+            margin-top: 16px;
+            display: flex;
+            gap: 8px;
+        }
+
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: var(--radius);
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background: var(--primary);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: var(--primary-dark);
+        }
+
+        .btn-secondary {
+            background: var(--surface);
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+
+        .btn-secondary:hover {
+            background: var(--surface-alt);
+        }
+
+        .btn-danger {
+            background: var(--danger);
+            color: white;
+        }
+
+        /* Form elements */
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            color: var(--text);
+        }
+
+        .form-control {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            background: var(--surface);
+            color: var(--text);
+            font-size: 14px;
+        }
+
+        .form-control:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+
+        /* Status indicators */
+        .status {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .status-healthy {
+            background: rgba(16, 185, 129, 0.1);
+            color: var(--success);
+        }
+
+        .status-warning {
+            background: rgba(245, 158, 11, 0.1);
+            color: var(--warning);
+        }
+
+        .status-danger {
+            background: rgba(239, 68, 68, 0.1);
+            color: var(--danger);
+        }
+
+        /* Loading */
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 40px;
+        }
+
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 4px solid var(--border);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Notifications */
+        .notification {
+            position: fixed;
+            top: 72px;
+            right: 16px;
+            padding: 12px 16px;
+            border-radius: var(--radius);
+            background: var(--surface);
+            border: 1px solid var(--border);
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            z-index: 2000;
+            transform: translateX(400px);
+            transition: transform 0.3s;
+        }
+
+        .notification.show {
+            transform: translateX(0);
+        }
+
+        .notification.success {
+            border-color: var(--success);
+        }
+
+        .notification.error {
+            border-color: var(--danger);
+        }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            border-bottom: 2px solid var(--border);
+            margin-bottom: 16px;
+        }
+
+        .tab {
+            padding: 12px 20px;
+            border: none;
+            background: transparent;
+            color: var(--text-muted);
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+
+        .tab:hover {
+            color: var(--text);
+            background: var(--surface-alt);
+        }
+
+        .tab.active {
+            color: var(--primary);
+            border-bottom-color: var(--primary);
+        }
+
+        /* Empty state */
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-muted);
+        }
+
+        .empty-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+            opacity: 0.5;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .sidebar {
+                transform: translateX(-100%);
+            }
+
+            .main {
+                margin-left: 0;
+            }
+
+            .header-nav {
+                display: none;
+            }
+        }
+    </style>
+</head>
+<body>\n    <!-- Header -->
+    <div class="header">
+        <a href="#" class="header-brand">VDb Web Admin</a>
+        
+        <div class="header-nav">
+            <button class="header-btn active" onclick="showTab('databases')">Veritabanalar</button>
+            <button class="header-btn" onclick="showTab('tables')">Tablolar</button>
+            <button class="header-btn" onclick="showTab('sql')">SQL</button>
+            <button class="header-btn" onclick="showTab('tools')">Araçlar</button>
+        </div>
+        
+        <div class="header-right">
+            <button class="theme-toggle" onclick="toggleTheme()" title="Tema değiştir">☀️</button>
+        </div>
+    </div>
+
+    <!-- Sidebar -->
+    <div class="sidebar">
+        <div class="sidebar-header">
+            <div class="sidebar-title">Veritabanalar</div>
+        </div>
+        
+        <input type="text" class="search-box" id="dbSearch" placeholder="Veritabana ara..." onkeyup="filterDatabases()">
+        
+        <ul class="database-tree" id="databaseTree">
+            <!-- JavaScript ile doldurulacak -->
+        </ul>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main">
+        <!-- Databases Tab -->
+        <div id="databases-tab" class="tab-content">
+            <div class="content-header">
+                <div class="content-title">Veritabanalari Yönet</div>
+                <div class="content-subtitle">VDb veritabanlarini görüntüle, olustur veya sil</div>
+            </div>
+            
+            <div class="card-grid" id="databasesGrid">
+                <!-- JavaScript ile doldurulacak -->
+            </div>
+            
+            <div class="table-container">
+                <div class="table-header">
+                    <div class="table-title">Hizli Islemler</div>
+                </div>
+                <div style="padding: 16px;">
+                    <div class="table-actions">
+                        <button class="btn btn-primary" onclick="newDatabase()">Yeni Veritabana</button>
+                        <button class="btn btn-secondary" onclick="refreshDatabases()">Yenile</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tables Tab -->
+        <div id="tables-tab" class="tab-content" style="display: none;">
+            <div class="content-header">
+                <div class="content-title">Tablolar</div>
+                <div class="content-subtitle" id="currentTableInfo">Veritabani secin</div>
+            </div>
+            
+            <div class="card-grid" id="tablesGrid">
+                <!-- JavaScript ile doldurulacak -->
+            </div>
+            
+            <div class="table-container">
+                <div class="table-header">
+                    <div class="table-title">Tablo Islemleri</div>
+                </div>
+                <div style="padding: 16px;">
+                    <div class="table-actions">
+                        <button class="btn btn-primary" onclick="newTable()">Yeni Tablo</button>
+                        <button class="btn btn-secondary" onclick="refreshTables()">Yenile</button>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Data Grid -->
+            <div class="table-container" style="margin-top: 16px; display: none;" id="dataTableContainer">
+                <div class="table-header">
+                    <div class="table-title">Veri Görüntuleme</div>
+                    <div style="margin-top: 8px; font-size: 12px; color: var(--text-muted);">
+                        Sayfa <span id="paginationInfo">1/1</span> - <span id="rowCount">0</span> satır
+                    </div>
+                </div>
+                <div style="padding: 16px;">
+                    <div style="overflow-x: auto;">
+                        <table style="width: 100%; border-collapse: collapse;">
+                            <thead>
+                                <tr style="border-bottom: 1px solid var(--border);">
+                                    <th style="padding: 12px; text-align: left; color: var(--text-muted);">PK</th>
+                                    <th style="padding: 12px; text-align: left; color: var(--text-muted);">Kolonu 1</th>
+                                    <th style="padding: 12px; text-align: left; color: var(--text-muted);">Kolonu 2</th>
+                                </tr>
+                            </thead>
+                            <tbody id="dataTableBody">
+                                <!-- JavaScript ile doldurulacak -->
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <div style="margin-top: 16px; display: flex; justify-content: space-between; align-items: center;">
+                        <div>
+                            <button class="btn btn-secondary" onclick="prevPage()">← Önceki</button>
+                            <button class="btn btn-secondary" onclick="nextPage()">Sonraki →</button>
+                        </div>
+                        <div style="font-size: 12px; color: var(--text-muted);">
+                            Sayfa boyutu: <select id="pageSize" onchange="changePageSize()">
+                                <option value="10">10</option>
+                                <option value="50">50</option>
+                                <option value="100">100</option>
+                                <option value="500">500</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- SQL Tab -->
+        <div id="sql-tab" class="tab-content" style="display: none;">
+            <div class="content-header">
+                <div class="content-title">SQL Editörü</div>
+                <div class="content-subtitle">SQL sorgulari çalıştır ve sonuclari görüntule</div>
+            </div>
+            
+            <div class="table-container">
+                <div class="table-header">
+                    <div class="table-title">SQL Çalıştırıcı</div>
+                </div>
+                <div style="padding: 16px;">
+                    <textarea id="sqlEditor" style="width: 100%; height: 200px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--text); font-family: monospace; font-size: 14px;"></textarea>
+                    
+                    <div style="margin-top: 16px; display: flex; gap: 8px;">
+                        <button class="btn btn-primary" onclick="executeSQL()">Çalıştır</button>
+                        <button class="btn btn-secondary" onclick="clearSQLEditor()">Temizle</button>
+                        <button class="btn btn-secondary" onclick="saveSQL()">Kaydet</button>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="table-container" style="margin-top: 16px; display: none;" id="sqlResultContainer">
+                <div class="table-header">
+                    <div class="table-title">Sonuç</div>
+                </div>
+                <div style="padding: 16px;">
+                    <div id="sqlResult">Sonuç burada goruncecek</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tools Tab -->
+        <div id="tools-tab" class="tab-content" style="display: none;">
+            <div class="content-header">
+                <div class="content-title">Araçlar</div>
+                <div class="content-subtitle">Veritabani yedekleme, repair, optimize işlemleri</div>
+            </div>
+            
+            <div class="card-grid">
+                <div class="card" onclick="backupDatabase()">
+                    <div class="card-title">Yedek Al</div>
+                    <div class="card-value">.odb</div>
+                    <div class="card-footer">Veritabanini yedekle</div>
+                </div>
+                
+                <div class="card" onclick="verifyDatabase()">
+                    <div class="card-title">Butunluk Dogrula</div>
+                    <div class="card-value">✓</div>
+                    <div class="card-footer">Veritabanini kontrol et</div>
+                </div>
+                
+                <div class="card" onclick="compactDatabase()">
+                    <div class="card-title">VACUUM</div>
+                    <div class="card-value">○</div>
+                    <div class="card-footer">Ölü verileri temizle</div>
+                </div>
+                
+                <div class="card" onclick="reindexTables()">
+                    <div class="card-title">REINDEX</div>
+                    <div class="card-value">🔍</div>
+                    <div class="card-footer">Indeksleri yeniden inşa et</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div id="loadingOverlay" class="loading" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 3000;">
+        <div class="spinner"></div>
+    </div>
+
+    <!-- Notifications -->
+    <div id="notificationContainer"></div>
+
+    <!-- JavaScript -->
+    <script>
+        // Global state
+        let currentTheme = localStorage.getItem('theme') || 'light';
+        let currentDb = null;
+        let currentTable = null;
+        let currentPage = 1;
+        let pageSize = 50;
+        let dataRows = [];
+        let totalRows = 0;
+        
+        // Initialize the application
+        document.addEventListener('DOMContentLoaded', function() {
+            applyTheme();
+            loadDatabases();
+            setupEventListeners();
+        });
+        
+        // Theme management
+        function applyTheme() {
+            document.body.setAttribute('data-theme', currentTheme);
+            localStorage.setItem('theme', currentTheme);
+            
+            // Update theme toggle icon
+            const themeToggle = document.querySelector('.theme-toggle');
+            themeToggle.textContent = currentTheme === 'dark' ? '☀️' : '🌙';
+        }
+        
+        function toggleTheme() {
+            currentTheme = currentTheme === 'dark' ? 'light' : 'dark';
+            applyTheme();
+            showNotification('Tema ' + (currentTheme === 'dark' ? 'Koyu' : 'Açık') + ' olarak değiştirildi');
+        }
+        
+        // Tab switching
+        function showTab(tabName) {
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.style.display = 'none';
+            });
+            
+            // Remove active class from all buttons
+            document.querySelectorAll('.header-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            
+            // Show selected tab
+            document.getElementById(tabName + '-tab').style.display = 'block';
+            
+            // Add active class to clicked button
+            event.target.classList.add('active');
+            
+            // Load content based on tab
+            switch(tabName) {
+                case 'databases':
+                    loadDatabases();
+                    break;
+                case 'tables':
+                    if (currentDb) loadTables();
+                    break;
+                case 'sql':
+                    // SQL tab content loaded when needed
+                    break;
+                case 'tools':
+                    loadTools();
+                    break;
+            }
+        }
+        
+        // Database operations
+        async function loadDatabases() {
+            showLoading(true);
+            
+            try {
+                const response = await apiRequest('/api/databases');
+                displayDatabases(response.data);
+            } catch (error) {
+                showNotification('Veritabanalar yuklenemedi: ' + error.message, 'error');
+            } finally {
+                showLoading(false);
+            }
+        }
+        
+        function displayDatabases(dbs) {
+            const grid = document.getElementById('databasesGrid');
+            grid.innerHTML = '';
+            
+            dbs.forEach(db => {
+                const card = document.createElement('div');
+                card.className = 'card';
+                card.onclick = () => selectDatabase(db.name);
+                
+                card.innerHTML = `
+                    <div class="card-title">${db.name}</div>
+                    <div class="card-value">${db.size}</div>
+                    <div class="card-footer">Veritabani boyutu: ${db.rows} satir</div>
+                `;
+                
+                grid.appendChild(card);
+            });
+        }
+        
+        async function newDatabase() {
+            const name = prompt('Yeni veritabani adi:');
+            if (!name) return;
+            
+            try {
+                const response = await apiRequest('/api/databases', 'POST', JSON.stringify({ name: name }));
+                showNotification('Veritabani olusturuldu: ' + name);
+                loadDatabases();
+            } catch (error) {
+                showNotification('Verit,abani olusturma hatasi: ' + error.message, 'error');
+            }
+        }
+        
+        function selectDatabase(dbName) {
+            currentDb = { name: dbName };
+            showTab('tables');
+            loadTables();
+        }
+        
+        // Table operations
+        async function loadTables() {
+            showLoading(true);
+            
+            try {
+                const response = await apiRequest('/api/tables/' + currentDb.name + '/list');
+                displayTables(response.data);
+                document.getElementById('currentTableInfo').textContent = 'Veritabani: ' + currentDb.name;
+            } catch (error) {
+                showNotification('Tablolar yuklenemedi: ' + error.message, 'error');
+            } finally {
+                showLoading(false);
+            }
+        }
+        
+        function displayTables(tables) {
+            const grid = document.getElementById('tablesGrid');
+            grid.innerHTML = '';
+            
+            tables.forEach(table => {
+                const card = document.createElement('div');
+                card.className = 'card';
+                card.onclick = () => selectTable(table.name);
+                
+                card.innerHTML = `
+                    <div class="card-title">${table.name}</div>
+                    <div class="card-value">${table.rows}</div>
+                    <div class="card-footer">Sutunlar: ${table.columns} | Indeksler: ${table.indexes}</div>
+                `;
+                
+                grid.appendChild(card);
+            });
+        }
+        
+        function selectTable(tableName) {
+            currentTable = { name: tableName, db: currentDb.name };
+            loadTableData();
+            document.getElementById('dataTableContainer').style.display = 'block';
+        }
+        
+        async function loadTableData() {
+            showLoading(true);
+            
+            try {
+                const response = await apiRequest('/api/tables/' + currentTable.db + '/' + currentTable.name + '/data?page=' + currentPage + '&size=' + pageSize);
+                displayTableData(response.data);
+                updatePagination(response.meta);
+            } catch (error) {
+                showNotification('Tablo verileri yuklenemedi: ' + error.message, 'error');
+            } finally {
+                showLoading(false);
+            }
+        }
+        
+        function displayTableData(data) {
+            const tbody = document.getElementById('dataTableBody');
+            tbody.innerHTML = '';
+            
+            data.rows.forEach(row => {
+                const tr = document.createElement('tr');
+                tr.style.borderBottom = '1px solid var(--border)';
+                tr.style.padding = '12px';
+                
+                // PK column
+                const tdPk = document.createElement('td');
+                tdPk.style.padding = '12px';
+                tdPk.style.textAlign = 'left';
+                tdPk.textContent = row.pk;
+                tr.appendChild(tdPk);
+                
+                // Data columns
+                row.values.forEach((value, index) => {
+                    const td = document.createElement('td');
+                    td.style.padding = '12px';
+                    td.style.textAlign = 'left';
+                    td.textContent = value;
+                    tr.appendChild(td);
+                });
+                
+                tbody.appendChild(tr);
+            });
+            
+            data.total && (totalRows = data.total);
+        }
+        
+        function updatePagination(meta) {
+            document.getElementById('paginationInfo').textContent = meta.page + '/' + meta.pages;
+            document.getElementById('rowCount').textContent = meta.total;
+        }
+        
+        function prevPage() {
+            if (currentPage > 1) {
+                currentPage--;
+                loadTableData();
+            }
+        }
+        
+        function nextPage() {
+            if (currentPage < Math.ceil(totalRows / pageSize)) {
+                currentPage++;
+                loadTableData();
+            }
+        }
+        
+        function changePageSize() {
+            pageSize = parseInt(document.getElementById('pageSize').value);
+            currentPage = 1;
+            loadTableData();
+        }
+        
+        // API helper
+        async function apiRequest(endpoint, method = 'GET', body = null) {
+            const url = 'http://localhost:8080' + endpoint;
+            const options = {
+                method: method,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                }
+            };
+            
+            if (body) {
+                options.body = body;
+            }
+            
+            const response = await fetch(url, options);
+            
+            if (!response.ok) {
+                throw new Error(await response.text());
+            }
+            
+            return await response.json();
+        }
+        
+        // Utility functions
+        function showLoading(show) {
+            const overlay = document.getElementById('loadingOverlay');
+            overlay.style.display = show ? 'flex' : 'none';
+        }
+        
+        function showNotification(message, type = 'success') {
+            const container = document.getElementById('notificationContainer');
+            const notification = document.createElement('div');
+            notification.className = 'notification ' + type;
+            notification.textContent = message;
+            
+            container.appendChild(notification);
+            
+            setTimeout(() => {
+                notification.classList.add('show');
+            }, 10);
+            
+            setTimeout(() => {
+                notification.classList.remove('show');
+                setTimeout(() => {
+                    container.removeChild(notification);
+                }, 300);
+            }, 3000);
+        }
+        
+        function setupEventListeners() {
+            // Search functionality
+            const dbSearch = document.getElementById('dbSearch');
+            if (dbSearch) {
+                dbSearch.addEventListener('input', filterDatabases);
+            }
+            
+            // Window resize
+            window.addEventListener('resize', function() {
+                if (window.innerWidth > 768) {
+                    document.querySelector('.sidebar').style.transform = 'translateX(0)';
+                } else {
+                    document.querySelector('.sidebar').style.transform = 'translateX(-100%)';
+                }
+            });
+        }
+        
+        function filterDatabases() {
+            const searchTerm = document.getElementById('dbSearch').value.toLowerCase();
+            const treeNodes = document.querySelectorAll('.tree-node-header');
+            
+            treeNodes.forEach(node => {
+                const text = node.textContent.toLowerCase();
+                if (text.includes(searchTerm)) {
+                    node.style.display = 'flex';
+                } else {
+                    node.style.display = 'none';
+                }
+            });
+        }
+        
+        // Placeholder functions for tools
+        function backupDatabase() {
+            showNotification('Yedekleme baslatiliyor...');
+        }
+        
+        function verifyDatabase() {
+            showNotification('Veritabani kontrol ediliyor...');
+        }
+        
+        function compactDatabase() {
+            showNotification('VACUUM baslatiliyor...');
+        }
+        
+        function reindexTables() {
+            showNotification('REINDEX baslatiliyor...');
+        }
+        
+        // SQL Editor functions
+        function executeSQL() {
+            const sql = document.getElementById('sqlEditor').value;
+            if (!sql.trim()) {
+                showNotification('SQL girin', 'error');
+                return;
+            }
+            
+            showLoading(true);
+            document.getElementById('sqlResultContainer').style.display = 'block';
+            document.getElementById('sqlResult').innerHTML = 'SQL çalistiriliyor...';
+            
+            apiRequest('/api/sql/execute', 'POST', JSON.stringify({ sql: sql }))
+                .then(response => {
+                    document.getElementById('sqlResult').innerHTML = JSON.stringify(response, null, 2);
+                    showNotification('SQL basariyla calistirildi');
+                })
+                .catch(error => {
+                    document.getElementById('sqlResult').innerHTML = 'Hata: ' + error.message;
+                    showNotification('SQL hatasi: ' + error.message, 'error');
+                })
+                .finally(() => {
+                    showLoading(false);
+                });
+        }
+        
+        function clearSQLEditor() {
+            document.getElementById('sqlEditor').value = '';
+            document.getElementById('sqlResultContainer').style.display = 'none';
+        }
+        
+        function saveSQL() {
+            showNotification('SQL kaydetme baslatiliyor...');
+        }
+        
+        // Make functions globally accessible
+        window.showTab = showTab;
+        window.toggleTheme = toggleTheme;
+        window.loadDatabases = loadDatabases;
+        window.newDatabase = newDatabase;
+        window.selectDatabase = selectDatabase;
+        window.loadTables = loadTables;
+        window.selectTable = selectTable;
+        window.loadTableData = loadTableData;
+        window.prevPage = prevPage;
+        window.nextPage = nextPage;
+        window.changePageSize = changePageSize;
+        window.executeSQL = executeSQL;
+        window.clearSQLEditor = clearSQLEditor;
+        window.saveSQL = saveSQL;
+        
+        // Initialize with databases tab
+        showTab('databases');
+    </script>
+</body>
+</html>

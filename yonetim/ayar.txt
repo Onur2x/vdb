@@ -1,0 +1,2 @@
+db=D:\veritabani\mtakip\data\mtakip.odb
+auto=0
