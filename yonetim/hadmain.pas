@@ -11,7 +11,8 @@ interface
 uses
   Classes, SysUtils, Forms, Controls, Graphics, Dialogs, StdCtrls, Grids,
   ComCtrls, Menus, ExtCtrls, FileUtil, Clipbrd, LCLType,
-  VDbCore, VDbTable, VDbSql, VDbJson, VDbTypes, haddlg, hadtools;
+  VDbCore, VDbTable, VDbSql, VDbJson, VDbTypes, haddlg, hadtools,
+  uLang, TypInfo;
 
 type
   { 2026-10-04 (M10): TEK TASARIM SISTEMI.
@@ -101,6 +102,10 @@ type
     cbPageSize: TComboBox;
     cbHist: TComboBox;
     cbSaved: TComboBox;
+    // dil secici / language selector (2026-10-14)
+    FUILang: TComboBox;
+    pnlLang: TPanel;
+    lblLang: TLabel;
     cbSqlTemplates: TComboBox;
     pmRes: TPopupMenu;
     cbSortCol: TComboBox;
@@ -143,6 +148,9 @@ type
     FHist: TStringList;
     procedure CreateUI;
     procedure BuildMenu;
+    // dil / language (2026-10-14)
+    procedure TranslateUI;
+    procedure LangChange(Sender: TObject);
     procedure cbSqlTemplatesChange(Sender: TObject);
     procedure btnSqlCopyTSVClick(Sender: TObject);
     procedure btnSqlSaveCSVClick(Sender: TObject);
@@ -373,6 +381,9 @@ begin
     if FileExists(FCurrentDBDir + '\veritabani.odb') then
       OpenDB(FCurrentDBDir + '\veritabani.odb');
   end;
+
+  // 2026-10-14: Arayuzu aktif dile cevir (varsayilan: Ingilizce).
+  TranslateUI;
 end;
 
 destructor TfrmMain.Destroy;
@@ -517,6 +528,30 @@ begin
   lblBannerSub.Caption := 'kapali - bir veritabani acin';
   lblBannerSub.Font.Color := UIStyle.TextMuted;
   lblBannerSub.Layout := tlCenter;
+
+  // Dil secici (sag ust) / Language selector (top-right)
+  pnlLang := TPanel.Create(Self);
+  pnlLang.Parent := banner;
+  pnlLang.Align := alRight;
+  pnlLang.Width := 158;
+  pnlLang.BevelOuter := bvNone;
+  pnlLang.Color := UIStyle.SurfaceSun;
+  lblLang := TLabel.Create(Self);
+  lblLang.Parent := pnlLang;
+  lblLang.Left := 12;
+  lblLang.Top := 21;
+  lblLang.Caption := 'Dil:';
+  lblLang.Font.Color := UIStyle.TextMuted;
+  FUILang := TComboBox.Create(Self);
+  FUILang.Parent := pnlLang;
+  FUILang.SetBounds(52, 15, 96, 24);
+  FUILang.Style := csDropDownList;
+  FUILang.Items.Add('English');
+  FUILang.Items.Add('Türkçe');
+  FUILang.ItemIndex := 0;
+  FUILang.OnChange := LangChange;
+  FUILang.ShowHint := True;
+  FUILang.Hint := 'Dil secimi / Language';
 
   // Health indicator (right side of banner)
   pnlHR := TPanel.Create(Self);
@@ -1304,15 +1339,16 @@ var
   walTxt: string;
 begin
   if (not Assigned(FKv)) or (FDBPath = '') then
-    Exit('Veritabani acik degil');
+    Exit(L('Veritabani acik degil', 'No database open'));
   walTxt := '';
   if FKv.HasWAL then
-    walTxt := sLineBreak + '!! WAL BEKLIYOR: ' + DbSizeStr(FKv.WalPath) +
-      ' (Araclar > WAL Replay)';
-  Result := 'Dosya: ' + FDBPath + sLineBreak +
-    'Boyut: ' + DbSizeStr(FDBPath) + sLineBreak +
-    'Kayit (canli): ' + IntToStr(FTb.DataKeyCount) + sLineBreak +
-    'Olu bayt: ' + IntToStr(FKv.DeadBytes) + walTxt;
+    walTxt := sLineBreak + L('!! WAL BEKLIYOR: ', '!! WAL PENDING: ') +
+      DbSizeStr(FKv.WalPath) +
+      L(' (Araclar > WAL Replay)', ' (Tools > WAL Replay)');
+  Result := L('Dosya: ', 'File: ') + FDBPath + sLineBreak +
+    L('Boyut: ', 'Size: ') + DbSizeStr(FDBPath) + sLineBreak +
+    L('Kayit (canli): ', 'Records (live): ') + IntToStr(FTb.DataKeyCount) + sLineBreak +
+    L('Olu bayt: ', 'Dead bytes: ') + IntToStr(FKv.DeadBytes) + walTxt;
 end;
 
 procedure TfrmMain.OpenDB(const FilePath: string);
@@ -1405,7 +1441,7 @@ begin
   tvList.Items.BeginUpdate;
   try
     tvList.Items.Clear;
-    root := tvList.Items.Add(nil, 'Veritabanlari');
+    root := tvList.Items.Add(nil, L('Veritabanlari', 'Databases'));
     if FindFirst(FCurrentDBDir + '\*.odb', faAnyFile, sr) = 0 then
     begin
       repeat
@@ -2612,7 +2648,8 @@ end;
 procedure TfrmMain.mnuAboutClick(Sender: TObject);
 begin
   ShowMessage('VDb Manager v2' + sLineBreak +
-    'Saf FPC veritabani yonetim programi.');
+    L('Saf FPC veritabani yonetim programi.',
+      'Pure FPC database management program.'));
 end;
 
 procedure TfrmMain.btnNewTableClick(Sender: TObject);
@@ -3533,7 +3570,14 @@ begin
       if Copy(sl[i], 1, 3) = 'db=' then
         db := Copy(sl[i], 4, MaxInt)
       else if sl[i] = 'auto=1' then
-        chkAutoBak.Checked := True;
+        chkAutoBak.Checked := True
+      else if Copy(sl[i], 1, 5) = 'lang=' then
+      begin
+        if Copy(sl[i], 6, MaxInt) = 'tr' then
+          CurrentLang := langTR
+        else
+          CurrentLang := langEN;
+      end;
     end;
     if (db <> '') and FileExists(db) then
       OpenDB(db);
@@ -3553,6 +3597,10 @@ begin
       sl.Add('auto=1')
     else
       sl.Add('auto=0');
+    if CurrentLang = langTR then
+      sl.Add('lang=tr')
+    else
+      sl.Add('lang=en');
     sl.SaveToFile(ExtractFilePath(Application.ExeName) + 'ayar.txt');
   finally
     sl.Free;
@@ -3869,6 +3917,68 @@ begin
   FDark := not FDark;
   SaveTheme;
   ApplyTheme;
+end;
+
+{ ---------------- dil / language (2026-10-14) ---------------- }
+
+procedure TfrmMain.TranslateUI;
+var
+  i: Integer;
+  c: TComponent;
+begin
+  // Pencere basligi (Self, kendi bileşen listesinde olmadigi icin ayrica).
+  Self.Caption := TranslateText(Self.Caption);
+
+  // RTTI ile tum bileşenlerin Caption/Hint/TextHint degerlerini cevir.
+  // Kurulum kodu Turkce birakildigi icin bu gecis tum arayuzu aktif dile
+  // cevirir; metin sozlukte yoksa aynen kalir (veri/metin guvenli).
+  for i := 0 to ComponentCount - 1 do
+  begin
+    c := Components[i];
+    if c = FUILang then Continue;   // dil kutusunun kendi metni cevrilmez
+    if IsPublishedProp(c, 'Caption') then
+      SetStrProp(c, 'Caption', TranslateText(GetStrProp(c, 'Caption')));
+    if IsPublishedProp(c, 'Hint') then
+      SetStrProp(c, 'Hint', TranslateText(GetStrProp(c, 'Hint')));
+    if IsPublishedProp(c, 'TextHint') then
+      SetStrProp(c, 'TextHint', TranslateText(GetStrProp(c, 'TextHint')));
+  end;
+
+  // Sol agac: sadece kok dugum ("Veritabanlari") cevrilir; tablo adlari
+  // gercek veri oldugu icin karistirilmaz.
+  if Assigned(tvList) then
+    for i := 0 to tvList.Items.Count - 1 do
+      if tvList.Items[i].Level = 0 then
+        tvList.Items[i].Text := TranslateText(tvList.Items[i].Text);
+
+  // Durum cubugu panelleri (koleksiyon).
+  if Assigned(sb) then
+    for i := 0 to sb.Panels.Count - 1 do
+      sb.Panels[i].Text := TranslateText(sb.Panels[i].Text);
+
+  // Dinamik uretilen DB bilgi metni aktif dile gore tazelenir.
+  if Assigned(lblDBInfo) then
+    lblDBInfo.Caption := DBInfoText;
+
+  // Dil kutusu aktif dili gostersin.
+  if Assigned(FUILang) then
+  begin
+    if CurrentLang = langEN then
+      FUILang.ItemIndex := 0
+    else
+      FUILang.ItemIndex := 1;
+  end;
+end;
+
+procedure TfrmMain.LangChange(Sender: TObject);
+begin
+  if not Assigned(FUILang) then Exit;
+  if FUILang.ItemIndex = 0 then
+    CurrentLang := langEN
+  else
+    CurrentLang := langTR;
+  TranslateUI;
+  SaveSettings;
 end;
 
 { ---------------- filtre ---------------- }

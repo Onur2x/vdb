@@ -4,9 +4,13 @@
     <Version Value="12"/>
     <PathDelim Value="\"/>
     <General>
+      <Flags>
+        <MainUnitHasCreateFormStatements Value="False"/>
+        <MainUnitHasTitleStatement Value="False"/>
+        <MainUnitHasScaledStatement Value="False"/>
+      </Flags>
       <SessionStorage Value="InProjectDir"/>
       <Title Value="vdbapi"/>
-      <Scaled Value="True"/>
       <ResourceType Value="res"/>
     </General>
     <BuildModes>
@@ -82,8 +86,13 @@
       <OtherUnitFiles Value="vdbapi.h"/>
       <UnitOutputDirectory Value="lib\vdbapi"/>
     </SearchPaths>
+    <CodeGeneration>
+      <SmallerCode Value="True"/>
+    </CodeGeneration>
     <Linking>
       <Debugging>
+        <GenerateDebugInfo Value="False"/>
+        <RunWithoutDebug Value="True"/>
         <DebugInfoType Value="dsDwarf3"/>
       </Debugging>
       <Options>

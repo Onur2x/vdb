@@ -40,7 +40,7 @@ unit VDbDataSet;
 interface
 
 uses
-  Classes, SysUtils, DB, VDbTable, VDbSql, VDbAst, VDbParser, VDbErr;
+  Classes, SysUtils, DB, VDbTypes, VDbTable, VDbSql, VDbAst, VDbParser, VDbErr;
 
 type
   TVDbRecInfo = record

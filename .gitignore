@@ -55,6 +55,17 @@ yedek2/
 # mtakip projesi (farklı proje / different project)
 mtakip/
 
+# webadmin projesi (farklı proje / different project)
+webadmin/
+
+db/
+.agents/
+.claude/
+data/
+
+
+
+
 # Sadece kaynak kodları tut / Keep only source
 !*.pas
 !*.lpr
@@ -66,3 +77,11 @@ mtakip/
 !*.cmd
 !LICENSE
 !README*
+
+# Calisma zamani / runtime (yonetim uygulamasi + test artiklari)
+ayar.txt
+tema.txt
+*.out
+err.txt
+trace.txt
+startup_error.txt

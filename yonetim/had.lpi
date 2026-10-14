@@ -47,6 +47,10 @@
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
+        <Filename Value="uLang.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
         <Filename Value="..\VDbCore.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
