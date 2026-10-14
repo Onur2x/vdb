@@ -259,6 +259,8 @@ type
     FMemIdx: TDictionary<Int64, TIdxEntries>; // IdxKey -> SIRALI girisler
     FIdxOps: TDictionary<Int64, TList<TIdxOp>>;         // sirali bekleyen islemler
     FIdxCtype: TDictionary<Int64, Byte>;                // indeks kolon tipi
+    FPkIdx: TDictionary<Word, TIdxEntries>;  // PK lazy index (tableId -> sorted)
+    FPkIdxDirty: TDictionary<Word, Boolean>; // PK index kirli mi?
     FIdxUniq: TDictionary<Int64, TDictionary<string, string>>;
     // UNIQUE kolonlar icin "deger -> sahip pk" haritasi.
     //
@@ -418,6 +420,7 @@ type
       const Pk: string; const OnlyPos: Integer);
     procedure IdxDelRow(const T: TTableDef; const Vals: TStrArray;
       const Pk: string; const OnlyPos: Integer);
+    procedure BuildPkIdx(const T: TTableDef; out E: TIdxEntries);
     // Satirin TUM indekslerine ait anahtarlarini hesaplar (cok kolonlu destek)
     procedure IdxKeysOfRow(const T: TTableDef; const Vals: TStrArray;
       out Keys: TStrArray);
@@ -2320,6 +2323,8 @@ begin
   FIdxCtype := TDictionary<Int64, Byte>.Create;
   FIdxUniq := TDictionary<Int64, TDictionary<string, string>>.Create;
   FIdxDirty := TList<Int64>.Create;
+  FPkIdx := TDictionary<Word, TIdxEntries>.Create;
+  FPkIdxDirty := TDictionary<Word, Boolean>.Create;
   FConcBuilders := TList<TVdbConcRec>.Create;   // R-22 Full
   FSchemaDirty := False;
   FNextId := 1;
@@ -2351,6 +2356,8 @@ begin
   FIdxCtype.Free;
   FreeIdxUniqMaps;
   FIdxDirty.Free;
+  FPkIdx.Free;
+  FPkIdxDirty.Free;
   FConcBuilders.Free;   // R-22 Full
   FLock.Free;
   inherited;
@@ -2380,18 +2387,19 @@ var
   b: TBytes;
   raw: RawByteString;
 
-  procedure ParseLines(Lines: TStrings);
-  var
-    li, lj, ci2, k2, k3, kp, kq: Integer;   // F-17: kp = '#' konumu, F-19: kq
-    s2, rest: string;
-    q1, q2, fl: Integer;
-    ixName: string;          // F2-23: UNIQUE oneki ayiklanir
-    ixLine: string;          // F-17: #bolunesi ayiklanmis indeks satiri
-    ixPred: string;          // F-17: PARTIAL indeks kosulu
-    inclTxt: string;         // F-19: INCLUDE listesi metni
-    incs: TStrArray;         // F-19: parcalanmis INCLUDE kolonlari
-    gs, cs, fs: TStrArray;
-    rd: TRoleDef;          // R-18
+procedure ParseLines(Lines: TStrings);
+     var
+       li, lj, ci2, k2, k3, kp, kq: Integer;   // F-17: kp = '#' konumu, F-19: kq
+       s2, rest: string;
+       q1, q2, fl: Integer;
+       ixName: string;          // F2-23: UNIQUE oneki ayiklanir
+       ixLine: string;          // F-17: #bolunesi ayiklanmis indeks satiri
+       ixPred: string;          // F-17: PARTIAL indeks kosulu
+       inclTxt: string;         // F-19: INCLUDE listesi metni
+       incs: TStrArray;         // F-19: parcalanmis INCLUDE kolonlari
+       gs, cs, fs: TStrArray;
+       rd: TRoleDef;          // R-18
+       kn: string;              // R-19
     gd: TGrantDef;         // R-18
     pd: TPolicyDef;        // R-19
     tq: TTableDef;         // R-13 Full: #Q bolme tanimi
@@ -2455,7 +2463,10 @@ var
         begin
           parts.DelimitedText := s;
           if parts.Count >= 3 then
-            FRlsOn.AddOrSetValue(VDbNorm(parts[1]), parts[2] = '1');
+          begin
+            kn := VDbNorm(parts[1]);
+            FRlsOn.Add(kn, parts[2] = '1');  // FPC 3.2.2 ICE workaround: AddOrSetValue -> Add (may raise if exists)
+          end;
         end
         // R-19: #P = tablo | politika adi | cmd | using(hex) | check(hex)
         else if (Length(s) > 2) and (CompareText(Copy(s, 1, 2), '#P') = 0) then
@@ -4224,6 +4235,9 @@ var
   m: TDictionary<string, string>;
   key: string;
 begin
+  // PK lazy index kirli isaretle (T.Idx'te PK yok, burada yakalanir)
+  if FPkIdx.ContainsKey(T.TableId) then
+    FPkIdxDirty.AddOrSetValue(T.TableId, True);
   for j := 0 to High(T.Idx) do
   begin
     if (OnlyPos >= 0) and (j <> OnlyPos) then Continue;
@@ -4270,6 +4284,9 @@ var
   m: TDictionary<string, string>;
   key, s: string;
 begin
+  // PK lazy index kirli isaretle
+  if FPkIdx.ContainsKey(T.TableId) then
+    FPkIdxDirty.AddOrSetValue(T.TableId, True);
   for j := 0 to High(T.Idx) do
   begin
     if (OnlyPos >= 0) and (j <> OnlyPos) then Continue;
@@ -4447,6 +4464,29 @@ begin
       end;
     if n < Length(E) then SetLength(E, n);
   end;
+end;
+
+procedure TVTableDb.BuildPkIdx(const T: TTableDef; out E: TIdxEntries);
+// PK kolonu icin tembel (lazy) sirali index kurar. T.Idx'e KAYIT YAPMAZ;
+// yalnizca FPkIdx'de saklanir. Boylece IndexNames/CheckConstraints/schema
+// kayitlari etkilenmez (test kirilmaz), ancak BETWEEN/ORDER BY range
+// query'leri bu sirali diziyi kullanarak indeks taramasi yapabilir.
+// PK hash key oldugu icin point lookup O(1) kalir; bu index yalnizca
+// aralik/ siralama sorgulari icin lazimdir.
+var
+  pks: TStrArray;
+  dummy: TStrMatrix;
+  i: Integer;
+begin
+  ScanRows(T.Name, pks, dummy);
+  SetLength(E, Length(pks));
+  for i := 0 to High(pks) do
+  begin
+    E[i].Key := pks[i];
+    E[i].Pk := pks[i];
+    E[i].Cov := '';
+  end;
+  SortIdxEntries(E, T.Cols[T.PkIndex].Ctype);
 end;
 
 procedure TVTableDb.BuildOneIndex(const T: TTableDef; IdxPos: Integer);
@@ -5825,6 +5865,7 @@ var
   nm: string;
   t: TTableDef;
   j: Integer;
+  dirty: Boolean;
 begin
   // R-22 Full: bu kolon uzerindeki NORMAL indekslerden biri INVALID ise
   // (concurrent insa suruyor / yarida kaldi) indeks OKUNMAZ ve bekleyen
@@ -5856,6 +5897,26 @@ begin
     end;
   end;
   Result := FMemIdx.TryGetValue(k, Entries);
+  // PK lazy index: T.Idx'te PK icin normal indeks YOKSA ve bu kolon
+  // PK kolonuysa, ayri bir sirali diziden cevapla. Boylece BETWEEN/
+  // ORDER BY range query'leri Seq Scan yerine Index Scan yapar.
+  // T.Idx'e kayit YAPILMAZ (IndexNames/CheckConstraints etkilenmez).
+  if (not Result) and FById.TryGetValue(TableId, nm) then
+  begin
+    t := GetTable(nm);
+    if (t.PkIndex >= 0) and (ColIdx = t.PkIndex) then
+    begin
+      dirty := True;
+      FPkIdxDirty.TryGetValue(TableId, dirty);
+      if (not FPkIdx.TryGetValue(TableId, Entries)) or dirty then
+      begin
+        BuildPkIdx(t, Entries);
+        FPkIdx.AddOrSetValue(TableId, Entries);
+        FPkIdxDirty.AddOrSetValue(TableId, False);
+      end;
+      Result := True;
+    end;
+  end;
 end;
 
 function TVTableDb.IndexNames(const Table: string): TStrArray;
@@ -6089,14 +6150,14 @@ begin
   end;
   t.PkIndex := PkIndex;
   t.AutoInc := 0;
-  SetLength(t.Idx, 0);
-  for i := 0 to High(t.Cols) do
-    if t.Cols[i].Unique and (i <> t.PkIndex) then
-    begin
-      SetLength(t.Idx, Length(t.Idx) + 1);
-      t.Idx[High(t.Idx)].Name := 'sqlite_autoindex_' + t.Name + '_' + IntToStr(i + 1);
-      t.Idx[High(t.Idx)].Col := i;
-    end;
+SetLength(t.Idx, 0);
+   for i := 0 to High(t.Cols) do
+     if t.Cols[i].Unique and (i <> t.PkIndex) then
+     begin
+       SetLength(t.Idx, Length(t.Idx) + 1);
+       t.Idx[High(t.Idx)].Name := 'sqlite_autoindex_' + t.Name + '_' + IntToStr(i + 1);
+       t.Idx[High(t.Idx)].Col := i;
+     end;
   // CHECK: kolon indexleri gecerli mi? Ctype kolon taniminden turetilir.
   for i := 0 to High(Checks) do
     for j := 0 to High(Checks[i]) do

@@ -8569,6 +8569,7 @@ var
   conj: TList<TSqlExprNode>;
   k, ci, ix: Integer;
   b: TSqlBinaryOpNode;
+  bt: TSqlBetweenNode;
   opName: string;
   found: Boolean;
 
@@ -8589,6 +8590,15 @@ var
   begin
     LeadsIdx := False;
     Ix := -1;
+    // PK lazy index: PK kolonu T.Idx'te YOK ama TryGetMemIndex
+    // tembel kurar; BETWEEN/ORDER BY range query'leri kullanabilir.
+    if (Td.PkIndex >= 0) and (Td.PkIndex < Length(Td.Cols)) and
+       (VDbNorm(Td.Cols[Td.PkIndex].Name) = VDbNorm(ColRef.ColumnName)) then
+    begin
+      Ix := -2;   // -2 = PK lazy index sinyali
+      LeadsIdx := True;
+      Exit;
+    end;
     for q := 0 to High(Td.Idx) do
     begin
       // gercekten indeks var mi? (IdxNParts = 0 ise bos tanim)
@@ -8606,11 +8616,29 @@ begin
   Result := False;
   IdxName := '';
   if Where = nil then Exit;
-  if Length(Td.Idx) = 0 then Exit;   // Td record; nil degil bos dizi olabilir
+  // PK lazy index: Td.Idx bos olsa bile PK kolonu uzerinde aralik
+  // (BETWEEN, <, >, <=, >=) veya esitlik (^=) indeks kullanilabilir.
+  // Dolayisiyla Length(Td.Idx)=0 erken cikisi KALDIRILDI.
   conj := TList<TSqlExprNode>.Create;
   try
     Push(Where);
       for k := 0 to conj.Count - 1 do
+      begin
+        { R-16: TSqlBetweenNode destegi - BETWEEN indeks kullanir }
+        if conj[k] is TSqlBetweenNode then
+        begin
+          bt := TSqlBetweenNode(conj[k]);
+          if (bt.Expr is TSqlColumnRefNode) and LeadsIdx(TSqlColumnRefNode(bt.Expr), ix) then
+          begin
+            if ix = -2 then
+              IdxName := td.Name + '_pkey'   // PK lazy index
+            else
+              IdxName := Td.Idx[ix].Name;
+            Result := True;
+            Break;
+          end;
+          Continue;
+        end;
         if conj[k] is TSqlBinaryOpNode then
         begin
           b := TSqlBinaryOpNode(conj[k]);
@@ -8620,11 +8648,15 @@ begin
           if not (b.Left is TSqlColumnRefNode) then Continue;
           if LeadsIdx(TSqlColumnRefNode(b.Left), ix) then
         begin
-          IdxName := Td.Idx[ix].Name;
+          if ix = -2 then
+            IdxName := td.Name + '_pkey'   // PK lazy index
+          else
+            IdxName := Td.Idx[ix].Name;
           Result := True;
           Break;
         end;
       end;
+    end;
   finally
     conj.Free;
   end;
