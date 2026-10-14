@@ -112,12 +112,18 @@ type
   TVDb = class
   private
     FDir: string;
-    FPath: string;
+FPath: string;
     FS: TFileStream;
     FLock: TCriticalSection;
     FIndex: TDictionary<QWord, TDbLoc>;
     FSeq: QWord;
     FSyncWrite: Boolean;
+    // GROUP COMMIT: SyncWrite=True iken bile, fsync'ler bu sure (ms)
+    // icinde toplanir. 0 = her yazmada fsync (eski davranis). Varsayilan
+    // 0; uygulama isterse 1..10 gibi degerler vererek 10-100x hizlanma
+    // saglayabilir (PostgreSQL commit_delay benzeri).
+    FSyncWriteInterval: Integer;
+    FSyncWriteLast: QWord;   // son fsync zaman damgasi (GetTickCount64)
     FInBatch: Boolean;
     // MVCC / Snapshot Isolation (R-01):
     // FSnapshotSeq: transaction-level snapshot sequence (BeginBatch'ta FSeq+1).
@@ -389,8 +395,12 @@ property CurrentSeq: QWord read FSeq;
   // F2-2: dizin fsync basarisiz (Unix). True ise veri dosyada duruyor
   // ama dosya adi kalici degil; isletme bir uyari vermelidir.
   property DirSyncFailed: Boolean read FDirSyncFailed;
-    property DeadBytes: Int64 read FDeadBytes;
+property DeadBytes: Int64 read FDeadBytes;
     property SyncWrite: Boolean read FSyncWrite write FSyncWrite;
+    // GROUP COMMIT: SyncWrite=True iken fsync'ler bu sure (ms) icinde
+    // toplanir. 0 = her yazmada fsync (varsayilan, eski davranis).
+    // 10 = en fazla 10ms gecikme, ama ~10-100x hizlanma.
+    property SyncWriteInterval: Integer read FSyncWriteInterval write FSyncWriteInterval;
     property InBatch: Boolean read FInBatch;
     // R-11: COMMIT oncesi geri-cagirim (deferrable kisit denetimi).
     // Metot adresi tutuldugu icin `procedure of object` tipindedir.
@@ -492,8 +502,10 @@ begin
   FPendingDels := TDictionary<QWord, Byte>.Create;
   FPendingIdx := TDictionary<QWord, Integer>.Create;
   FPutSeen := TDictionary<QWord, Byte>.Create;
-  FSavepoints := TList<TSavepoint>.Create;
+FSavepoints := TList<TSavepoint>.Create;
   FSyncWrite := True;
+  FSyncWriteInterval := 0;   // varsayilan: her yazmada fsync (eski davranis)
+  FSyncWriteLast := 0;
   FDirty := False;
   FClosed := True;
   FLcked := False;
@@ -1359,13 +1371,24 @@ begin
       PendingAdd(op);
       FPendingPuts.AddOrSetValue(Key, 0);
       FPendingDels.Remove(Key);
-    end
+end
     else
     begin
       // Batch disi tek yazim: kayit + BATCHEND. Boylece recovery,
       // yarim kalan tek yazimi da "gorulmemis" sayip geri sarabilir.
+      //
+      // GROUP COMMIT: SyncWrite=True olsa bile, SyncWriteInterval > 0 ise
+      // fsync bu sure icinde toplanir. Boylece tekil yazimlar ~10-100x
+      // hizlanir; en fazla SyncWriteInterval ms gecikme olur.
       AppendRec(Key, Value, False, False);
-      AppendBatchEnd(FSyncWrite);
+      if FSyncWrite and ((FSyncWriteInterval <= 0) or
+         (GetTickCount64 - FSyncWriteLast >= QWord(FSyncWriteInterval))) then
+      begin
+        AppendBatchEnd(True);
+        FSyncWriteLast := GetTickCount64;
+      end
+      else
+        AppendBatchEnd(False);   // fsync ertelendi (group commit)
     end;
   finally
     FLock.Leave;
@@ -1699,11 +1722,21 @@ begin
       PendingAdd(op);
       Exit(True);
     end;
-    if not FIndex.ContainsKey(Key) then
+if not FIndex.ContainsKey(Key) then
       Exit(False);
     // Batch disi tek silme: kayit + BATCHEND (bkz. Put).
+    //
+    // GROUP COMMIT: Put ile ayni mantik - fsync SyncWriteInterval
+    // icinde toplanir.
     AppendRec(Key, nil, True, False);
-    AppendBatchEnd(FSyncWrite);
+    if FSyncWrite and ((FSyncWriteInterval <= 0) or
+       (GetTickCount64 - FSyncWriteLast >= QWord(FSyncWriteInterval))) then
+    begin
+      AppendBatchEnd(True);
+      FSyncWriteLast := GetTickCount64;
+    end
+    else
+      AppendBatchEnd(False);   // fsync ertelendi (group commit)
     Result := True;
   finally
     FLock.Leave;
@@ -1765,13 +1798,22 @@ begin
           SkipWAL=True birakilirsa batch kayitlari hicbir zaman
           .wal'a girmez; crash sonrasi ReplayWAL onlari kurtaramaz
           (T73 bu boslugu yakaladi). }
-        for i := 0 to FPending.Count - 1 do
+for i := 0 to FPending.Count - 1 do
           AppendRec(FPending[i].Key, FPending[i].Value, FPending[i].IsDel,
             False, False);
         if PendingCount > 0 then
           AppendBatchEnd(False);
-        VDbFlushStream(FS);
-        FDirty := False;
+        // GROUP COMMIT: SyncWriteInterval > 0 ise ve yeterli sure gecmediyse
+        // fsync ertelenir. Boylece SQL katmaninin her UPDATE/DELETE icin
+        // kullandigi BeginBatch/CommitBatch de group commit ile calisir.
+        // FDirty False birakilmaz (siradaki Flush/CommitBatch'te tekrar denenecek).
+        if (FSyncWriteInterval <= 0) or
+           (GetTickCount64 - FSyncWriteLast >= QWord(FSyncWriteInterval)) then
+        begin
+          VDbFlushStream(FS);
+          FDirty := False;
+          FSyncWriteLast := GetTickCount64;
+        end;
       except
         on E: Exception do
         begin
@@ -1963,8 +2005,16 @@ begin
   FLock.Enter;
   try
     CheckOpen;
+    // GROUP COMMIT: SyncWriteInterval > 0 ise ve yeterli sure gecmediyse
+    // fsync ertelenir. Boylece SQL katmaninin her Exec sonrasi cagirdigi
+    // Flush bile group commit ile calisir. FDirty False birakilmaz
+    // (siradaki Flush'te tekrar denenecek).
+    if (FSyncWriteInterval > 0) and
+       (GetTickCount64 - FSyncWriteLast < QWord(FSyncWriteInterval)) then
+      Exit;   // fsync ertelendi; FDirty hala True
     VDbFlushStream(FS);
     FDirty := False;
+    FSyncWriteLast := GetTickCount64;
   finally
     FLock.Leave;
   end;

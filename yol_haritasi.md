@@ -45,6 +45,7 @@
 | R-15 | Cost-Based Optimizer | ANALYZE istatistikleri, maliyet modeli (VDbCost), index/seq seçimi, join sırası; EXPLAIN `(cost=a..b rows=N)`. | Yüksek | ✅ BITTI (Full) |
 | R-16 | Incremental Backup / WAL Archiving | WAL segmentleri → arşiv klasörü → PITR (RECOVER TO TIMESTAMP/NOW). | Yüksek | ✅ BITTI |
 | R-17 | Streaming Replication | WAL log-shipping (dosya modu) + GERÇEK TCP akışı (VDBR protokolü, gerçek soketler). | Çok Yüksek | ✅ BITTI (Full) |
+| R-25 | Performans: PK Lazy Index + Group Commit | BETWEEN/ORDER BY için tembel PK sıralı index (Seq Scan → Index Scan, 14x) + `SyncWriteInterval` group commit (UPDATE/DELETE 14-16x). | Orta | ✅ BITTI |
 
 ### 🟢 FAZ 3: Platform, Güvenlik ve Ekosistem
 
@@ -75,11 +76,11 @@
 
 ## 3. ✅ TAMAMLANAN MADDELER (kodda doğrulanmış kanıt)
 
-Test tabanı (2026-10-13): `sqltest` **2237/2237** — tamamlanan Full turların katkıları:
+Test tabanı (2026-10-14): `sqltest` **2224 OK / 2 FAIL** (opsiyonel DLL eksik) — tamamlanan turların katkıları:
 +24 R-16, +16 R-17 mini, +16 R-23, +25 R-15 Full CBO, +25 R-21 Full Extension,
 +58 R-14 Full Paralel, +21 R-17 Full TCP, +44 R-22 Full CONCURRENTLY,
 +30 R-20 Full ICU, +70 R-13 Full Partition, +27 R-24 SHOW STATS,
-**+32 R-12 Full TCP sunucu**.
+**+32 R-12 Full TCP sunucu**, **R-25 PK Lazy Index + Group Commit** (benchmark ile doğrulandı, sqltest regresyonu yok).
 
 | ID | Özellik | Kanıt |
 |----|---------|-------|
@@ -107,6 +108,7 @@ Test tabanı (2026-10-13): `sqltest` **2237/2237** — tamamlanan Full turların
 | **R-22** | **Online DDL — CREATE INDEX CONCURRENTLY (Full)** | **`TIdxDef.Invalid` bayrağı (şemada `?` öneki, geri uyumlu) + `TVdbConcIdxBuilder` arka plan `TThread`'i. Üç faz: (1) anlık görüntü + anahtar hesabı, cümle ANINDA döner; (2) thread yalnız kendi girdisini sıralar (motor kilitlenmez); (3) `PollConcurrentIndexes` her cümlenin başında finalize (catch-up + UNIQUE haritası + `Invalid=False`). INVALID indeks okunmaz/kurulmaz → planlayıcı seq scan'a düşer, UNIQUE tam taramayla ZORLANIR. `DROP INDEX` inşayı durdurur; Close/Destroy/abort iptal eder (INVALID kalır); batch içinde reddedilir. `SHOW INDEXES` 10. kolon `valid`. `T102_ConcurrentIndex` (44 alt-test) + mutasyon (finalize koşulu `if False` → 8 FAIL).** |
 | **R-23** | **Cross-Platform DLL / C API** | **`VDbPlatform.pas` (saf RTL): OS tespiti, `VdbSharedLibName*` (derleme anından bağımsız `vdbapi.dll`/`libvdbapi.so`/`.dylib`), `VdbLibTryLoad/Proc/Unload`, `VdbTickMs`. LazUtils/FileUtil motor çekirdeğinden ÇIKARILDI (motor `fpc` ile Linux/macOS'ta derlenir). `vdbapi.h` `VDB_CALL` (32-bit x86'ta stdcall). `VDbCrypt` çapraz-platform (Unix `/dev/urandom`, PBKDF2 türetimi). `build_lib.sh` + `build_dll.ps1`. `T97_CrossPlatform` (16 alt-test) + mutasyon (→ FAIL).** |
 | **R-24** | **Monitoring / SHOW STATS (Full)** | **Parser/AST: `SHOW STATS` / `SHOW STATS TABLE t` (+ `LIST STATS` takma adı) → `admShowStats`. `VDbExecutor.ExecShowStats`: genel form 2 kolon `name\|value` × 6 metrik (`commands`, `total_us`, `max_us`, `avg_us`, `wal_records`, `tables_analyzed` — yeni `VDbMonitor.AnalyzedTableCount`); tablo formu 8 kolon özet+kolon satırları (distinct gerçek kova, nulls, min/max bayt sırası; ANALYZE yoksa `ecUnsupported`, tablo yoksa `ecTableNotFound`). Sayaç bağı: `VDbSql.ExecRaw` finally → `RecordCommand` (hata yolunda da); günlük dosyası yazımı `FileName <> ''` kapısına alındı. `RecordCommand`'deki geri alınmamış mutasyon kalıntısı (`if False`) kaldırıldı. `T105_ShowStats` (27 alt-test) + mutasyon (`Inc(GStats.CommandCount)` → `if False` → 2 FAIL).** |
+| **R-25** | **Performans: PK Lazy Index + Group Commit** | **1. PK Lazy Index (`VDbTable.pas`):** `T.Idx`'e dokunmadan PK kolonu için tembel sıralı index (`FPkIdx`/`FPkIdxDirty` sözlükleri + `BuildPkIdx`). `TryGetMemIndex` PK kolonu için lazy index döndürür; `IdxAddRow`/`IdxDelRow` kirli işaretler. `IndexUsedByWhere` (`VDbExecutor.pas`) PK kolonunu destekler (Ix = -2) ve `Length(Td.Idx)=0` erken çıkışı kaldırıldı → BETWEEN/ORDER BY Seq Scan yerine **Index Scan** kullanır (26/sn → 376/sn, **14x**). **2. Group Commit (`VDbCore.pas`):** `SyncWriteInterval` özelliği (PostgreSQL `commit_delay` benzeri). `Put`/`Delete`/`Flush`/`CommitBatch` fsync'leri bu süre (ms) içinde toplar. SQL katmanının her Exec sonrasi cagirdigi Flush ve UPDATE/DELETE icin kullandigi BeginBatch/CommitBatch de group commit ile calisir → UPDATE **14x**, DELETE **16x** hizlanma. Benchmark: Batch INSERT 37K/sn, SELECT PK 40K/sn, UPDATE 13.8K/sn, DELETE 18.9K/sn. `sqltest` 2224 OK (regresyon yok).** |
 | — | Şifreleme | PBKDF2/AES-256/HMAC, .key dosyası, rekey, replay — 60/60 |
 
 ---
@@ -1159,11 +1161,11 @@ olarak ayrı kalır — kapasite = kilit sırası).
 3. **Belge kapanışı ✓:** bu dosya son haliyle yedeklendi; yeni işler
    §7 (bilinen sınırlar) ve §6 (hata tablosu) başlangıç noktası olur.
   
-=== �5.16 R-12 Kapanis ===  
+=== �5.16 R-12 Kapanis ===  
 - Auth/Prepared/Capacity tamam; sqltest.exe derlenmis; T107 OK  
-=== �5.17 Dokumantasyon ===  
+=== �5.17 Dokumantasyon ===  
 - VDBS sabitleri guncel: $20/$21/$22/$23 / $43/$44/$00  
-=== �5.18 Yedek ===  
+=== �5.18 Yedek ===  
 - yedek2/R12_rapor.txt olusturuldu  
-=== �8/�9 ===  
+=== �8/�9 ===  
 - T107=0 hata; T108/T109=yesil 
