@@ -5817,7 +5817,7 @@ var
   lastOp: TDictionary<string, TIdxOp>;    // pk -> son durum
   added: TDictionary<string, Boolean>;     // eklenen pk'ler
   ct: Byte;
-  i: Integer;
+  i, nKeep: Integer;
 begin
   if not FIdxOps.TryGetValue(k, ops) then Exit;
   if ops.Count = 0 then
@@ -5835,12 +5835,15 @@ begin
     lastOp.AddOrSetValue(ops[i].Pk, ops[i]);
 
   // 2) commitlenmis girdilerden bu toplantida dokunulan satirlari cikar
-  SetLength(keep, 0);
+  // En fazla eski girdiler + bekleyen islemler kadar sonuc olabilir.
+  // Dinamik diziyi her girdide buyutmek yerine bir kez kapasite ayir.
+  SetLength(keep, Length(e) + ops.Count);
+  nKeep := 0;
   for i := 0 to High(e) do
   begin
     if lastOp.ContainsKey(e[i].Pk) then Continue;
-    SetLength(keep, Length(keep) + 1);
-    keep[High(keep)] := e[i];
+    keep[nKeep] := e[i];
+    Inc(nKeep);
   end;
   // 3) hala var olan satirlar icin TAM OLARAK birer girdi koy
   added := TDictionary<string, Boolean>.Create;
@@ -5851,13 +5854,16 @@ begin
       // bu satirin SON durumu silme mi? (daha sonraki bir op geci kalmis olabilir)
       if lastOp[ops[i].Pk].IsDel then Continue;
       added.AddOrSetValue(ops[i].Pk, True);
-      SetLength(keep, Length(keep) + 1);
-      keep[High(keep)].Key := ops[i].Key;
-      keep[High(keep)].Pk := ops[i].Pk;
-      keep[High(keep)].Cov := ops[i].Cov;   // F-19
+      keep[nKeep].Key := ops[i].Key;
+      keep[nKeep].Pk := ops[i].Pk;
+      keep[nKeep].Cov := ops[i].Cov;   // F-19
+      Inc(nKeep);
     end;
   added.Free;
   lastOp.Free;
+
+  // Kullanilmayan kapasiteyi at; siralama yalnizca gercek girdiler uzerinde.
+  SetLength(keep, nKeep);
 
   // 4) sirala ve yayinla
   // COK KOLONLU indekslerde her parca kendi tipine gore karsilastirilir
@@ -6882,7 +6888,12 @@ begin
     for i := 0 to High(t.Cols) do
       if t.Cols[i].Name = t.PartCol then begin pci := i; Break; end;
     FKv.ScanAll(keys, raw, t.TableId);   // R-26: diger tablolar okunmaz
-    SetLength(Pks, 0); SetLength(Rows, 0); n := 0;
+  // keys/raw zaten aday satir sayisi kadar ayrildi. Sonuc dizilerini de
+  // basta bir kez ayir; her satirda SetLength yapmak O(N^2) kopyalamaya
+  // yol aciyordu.
+  SetLength(Pks, Length(keys));
+  SetLength(Rows, Length(keys));
+  n := 0;
   for i := 0 to High(keys) do
   begin
     k := keys[i];
@@ -6919,9 +6930,10 @@ begin
         if not hit then Continue;
       end;
     end;
-    SetLength(Pks, n + 1); SetLength(Rows, n + 1);
     Pks[n] := pk; Rows[n] := vals; Inc(n);
   end;
+  SetLength(Pks, n);
+  SetLength(Rows, n);
   Result := n;
 end;
 
