@@ -1,8 +1,8 @@
 # VDB — İlişkisel Veritabanı Motoru / Relational Database Engine
 
-> **TR:** Free Pascal ile yazılmış, harici DLL gerektirmeyen, tek dosyali (`.odb`) ilişkisel veritabanı motoru. SQL desteği, TCP SQL sunucusu, şifreleme, CDC, Time Travel, ve daha fazlası.
+> **TR:** Free Pascal ile yazılmış, harici DLL gerektirmeyen, tek dosyali (`.odb`) ilişkisel veritabanı motoru. SQL desteği, TCP SQL sunucusu, şifreleme, CDC, Time Travel, ve daha fazlası. **v2.1 performans sürümü:** 1M satırda `COUNT(*)` 800 ms, PK araması 0 ms, `SUM` 2,3 sn — veri kaybı yok (ölçümler aşağıda).
 >
-> **EN:** A relational database engine written in pure Free Pascal. No external DLL required. Single-file (`.odb`) storage. SQL support, TCP SQL server, encryption, CDC, Time Travel, and more.
+> **EN:** A relational database engine written in pure Free Pascal. No external DLL required. Single-file (`.odb`) storage. SQL support, TCP SQL server, encryption, CDC, Time Travel, and more. **v2.1 performance release:** `COUNT(*)` in 800 ms, PK lookups at 0 ms, `SUM` in 2.3 s at 1M rows — zero data loss (measurements below).
 
 ---
 
@@ -313,13 +313,72 @@ Same types as above. See `SQL.md` for detailed syntax and examples.
 
 ---
 
+## ⚡ PERFORMANS (v2.1) / PERFORMANCE (v2.1)
+
+### TR: 1.000.000 Satır Ölçümleri (2026-10-15)
+
+> v2.1, motorun iç okuma/yazma yollarını yeniden yazan performans sürümüdür. Ölçümler 1M satırlık tabloda (`id, ad, yas, bakiye, notu`) alınmıştır. **Dayanıklılık sözleşmesi değişmedi:** `SyncWriteInterval` varsayılanı 0 (grup commit isteğe bağlı); çökme testleri veri kaybı olmadan geçiyor.
+
+| Sorgu / işlem (1M satır) | Önce | v2.1 | Kazanç |
+|---|---|---|---|
+| `SELECT COUNT(*) FROM musteri` | 3.200 ms | **800 ms** | **4x** — decode'suz ham sayım |
+| `SELECT * FROM musteri` | 2.859 ms | **1.579 ms** | **1,8x** — ASCII hızlı yol + ham hash + ön-tahsis |
+| `SELECT SUM(id) FROM musteri` | 8.766 ms | **2.265 ms** | **3,9x** — aggregate gating + sabit float ayarları |
+| `WHERE id = -30792` (negatif PK) | 12.400 ms | **0 ms** | negatif-literal hat düzeltmesi |
+| `WHERE id > 100` (999.900 satır) | 13.000 ms | **~5.000 ms** | **2,6x** — CBO istatistik-yok düzeltmesi |
+| İlk indeks kullanımı (tembel kurulum) | 9–13 sn | **~4,3 sn** | **2–3x** — ön-parse quicksort |
+| `ScanAll` (ham KV taraması) | 7.016 ms | **437 ms** | **16x** — offset-sıralı blok okuma (8 MB pencere) |
+| `ScanRows` (çözümlü tarama) | 9.703 ms | **2.625 ms** | **3,7x** |
+| `WHERE id = 524288` (PK noktası) | 0 ms | 0 ms | — |
+| `WHERE id BETWEEN 100 AND 200` | 125 ms | 125 ms | PK tembel indeksi |
+| 1M INSERT (BEGIN/COMMIT) | — | 55,84 sn (17.907/sn) | 118,9 MB ≈ 119 B/satır |
+
+**Mikro ölçüler (v2.1):** `VDbParseInt` 78 ns/çağrı · `VDbParseFloat` 515 ns · `VDbFloatToStr` ~450 ns (önce ~800 ns) · STR kolon çözümleme 109 ns/kolon (önce ~300 ns).
+
+**v2.1 içinde ne var:**
+- ✅ `ScanSnapshot` yeniden yazımı — offset-sıralı blok okuma
+- ✅ COUNT(*) ham yolu — satır çözmeden, yalnızca yapı+hash doğrulamasıyla sayım (bozuk satır tespiti birebir korunur)
+- ✅ Aggregate gating — SUM artık MIN/MAX ve fazla parse yapmıyor
+- ✅ `SortIdxEntries` ön-parse quicksort — indeks kurulumu ~10 sn → ~1 sn
+- ✅ CBO düzeltmesi — istatistik yoksa satır sayısı yerine indeks uzunluğu (EXPLAIN metni aynı, karar noktası tek)
+- ✅ Negatif-literal düzeltmesi — `id = -1` gibi sorgular 12,4 sn sürüyordu
+- ✅ `DecodeRow` ASCII hızlı yolu + ham-bayt hash doğrulaması + ön-tahsis
+- ✅ `VDbParseInt`/`VDbParseFloat`/`VDbCmpVal`/`VDbFloatToStr` tahsis azaltmaları
+- ✅ Çökme dayanıklılığı test paketi (kill noktaları + transaction atomikliği)
+- ✅ `bench1m.dpr` faz 2 Int64 taşma düzeltmesi
+
+### EN: 1,000,000-Row Measurements (2026-10-15)
+
+> v2.1 is a performance release that rewrites the engine's internal read/write paths. Numbers measured on a 1M-row table (`id, ad, yas, bakiye, notu`). **Durability contract unchanged:** `SyncWriteInterval` defaults to 0 (group commit optional); crash tests pass with zero data loss.
+
+| Query / operation (1M rows) | Before | v2.1 | Gain |
+|---|---|---|---|
+| `SELECT COUNT(*) FROM musteri` | 3,200 ms | **800 ms** | **4x** — decode-free raw counting |
+| `SELECT * FROM musteri` | 2,859 ms | **1,579 ms** | **1.8x** — ASCII fast path + raw hash + prealloc |
+| `SELECT SUM(id) FROM musteri` | 8,766 ms | **2,265 ms** | **3.9x** — aggregate gating + static float settings |
+| `WHERE id = -30792` (negative PK) | 12,400 ms | **0 ms** | negative-literal bug fix |
+| `WHERE id > 100` (999,900 rows) | 13,000 ms | **~5,000 ms** | **2.6x** — CBO no-stats fix |
+| First index use (lazy build) | 9–13 s | **~4.3 s** | **2–3x** — pre-parse quicksort |
+| `ScanAll` (raw KV scan) | 7,016 ms | **437 ms** | **16x** — offset-ordered block reads (8 MB window) |
+| `ScanRows` (decoded scan) | 9,703 ms | **2,625 ms** | **3.7x** |
+| `WHERE id = 524288` (PK point) | 0 ms | 0 ms | — |
+| `WHERE id BETWEEN 100 AND 200` | 125 ms | 125 ms | PK lazy index |
+| 1M INSERT (BEGIN/COMMIT) | — | 55.84 s (17,907/s) | 118.9 MB ≈ 119 B/row |
+
+**Micro (v2.1):** `VDbParseInt` 78 ns/call · `VDbParseFloat` 515 ns · `VDbFloatToStr` ~450 ns (was ~800 ns) · STR column decoding 109 ns/column (was ~300 ns).
+
+Every v2.1 change preserves behavior — the SQL suite (2251/2251) and the crash-durability suite (kill at arbitrary points, single-commit and mid-batch transactions) pass.
+
+---
+
 ## 🧪 TEST SONUÇLARI / TEST RESULTS
 
-### TR: Mevcut Durum (2026-10-14)
+### TR: Mevcut Durum (2026-10-15)
 ```
-sqltest:     2224/2  (T107 Login/Exec/Logout OK, T108 Prepare OK, T109 Pool OK)
-vdbcrypttest:  60/60
-vdbapitest:   170/170
+sqltest:      2251/2251  (tümü yeşil)
+crashtest:    8/8        (çökme dayanıklılığı — veri kaybı YOK)
+vdbcrypttest:   60/60
+vdbapitest:    170/170
 vdbclienttest: 101/101
 ```
 
@@ -329,8 +388,8 @@ vdbclienttest: 101/101
 - ✅ Havuz-Kapasite (`FMaxConns=4`)
 - ✅ Mutasyon: 3 kapı (FAIL→geri al→yeşil)
 
-### EN: Current Status (2026-10-14)
-Test suite is green (2224/2, with 2 pre-existing unrelated failures). All R-12 features (Auth, Prepared Statements, Pool Capacity) are complete and mutation-tested.
+### EN: Current Status (2026-10-15)
+sqltest **2251/2251 (all green)**, crash-durability suite **8/8** (kill at arbitrary points, zero data loss), plus crypt (60/60), DLL API (170/170) and client (101/101) suites green. All R-12 features (Auth, Prepared Statements, Pool Capacity) are complete and mutation-tested.
 
 ---
 
@@ -385,6 +444,24 @@ See above. 57 exported functions for C/Delphi/FPC interop. Full list in `docs/03
 ---
 
 ## 📋 YAPILAN İŞLER (CHANGELOG) / WORK COMPLETED
+
+### TR: v2.1 — Performans Sürümü (2026-10-15)
+- ✅ 1M satırda COUNT(*) **4x**, SUM **3,9x**, ScanAll **16x** hızlandırma (ölçümler yukarıda)
+- ✅ Negatif-literal hat düzeltmesi — `WHERE id = -1` 12,4 sn → **0 ms**
+- ✅ CBO istatistik-yok daraltma düzeltmesi — `WHERE id > 100` 13 sn → **~5 sn**
+- ✅ Çökme dayanıklılığı test paketi eklendi (8/8 — veri kaybı yok, transaction atomikliği korunuyor)
+- ✅ Dayanıklılık sözleşmesi korundu (`SyncWriteInterval` varsayılanı 0)
+- ✅ `bench1m.dpr` faz 2 Int64 taşma düzeltmesi
+- ✅ Tüm testler yeşil: sqltest **2251/2251**
+
+### EN: v2.1 — Performance Release (2026-10-15)
+- ✅ At 1M rows: COUNT(*) **4x**, SUM **3.9x**, ScanAll **16x** faster (measurements above)
+- ✅ Negative-literal fix — `WHERE id = -1`: 12.4 s → **0 ms**
+- ✅ CBO no-stats narrowing fix — `WHERE id > 100`: 13 s → **~5 s**
+- ✅ Crash-durability suite added (8/8 — zero data loss, transaction atomicity preserved)
+- ✅ Durability contract preserved (`SyncWriteInterval` default 0)
+- ✅ `bench1m.dpr` phase 2 Int64 overflow fix
+- ✅ All tests green: sqltest **2251/2251**
 
 ### TR: Tüm Yol Haritası Tamamlandı (R-01 → R-24)
 
@@ -510,5 +587,5 @@ This project is open source. See `LICENSE` file for details.
 
 ---
 
-**Son güncelleme / Last updated:** 2026-10-14
-**Sürüm / Version:** 2.0 (R-12 Full + 24 yol haritası maddesi tamamlandı)
+**Son güncelleme / Last updated:** 2026-10-15
+**Sürüm / Version:** 2.1 — Performans Sürümü / Performance Release (COUNT(*) 4x, SUM 3,9x, ScanAll 16x @ 1M satır; veri kaybı yok / zero data loss)

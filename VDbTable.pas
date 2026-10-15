@@ -462,7 +462,13 @@ type
     function SqlTypeToCtype(const S: string): Byte;
     procedure BeginBatch;
     procedure CommitBatch;
-    procedure AbortBatch; // FKv abort + index onarimi
+    { FKv abort + index onarimi.
+      AStopConc=False: devam eden CREATE INDEX CONCURRENTLY insalarini
+      DURDURMA. Yalniz IMPLICIT (otomatik) batch'ler icin kullanilir;
+      bunlar yalnizca DML icerdigi icin DDL durumunu degistirmemistir,
+      dolayisiyla insayi oldurmek yanlis olurdu. }
+    procedure AbortBatch(AStopConc: Boolean = True);
+
     // P3: paylasilan ornegi dogrudan kullanan thread'ler icin genel kilit.
     // TVSql uzerinden calisanlar icin Exec/ExecAll zaten kilit alir.
     procedure Lock;
@@ -493,6 +499,11 @@ type
     // (WHERE tum aday satirlarda yeniden dogrulanir - ust kume garantisi).
     function ScanRowsPart(const Table: string; out Pks: TStrArray;
       out Rows: TStrMatrix; const Targets: TPartTargets): Integer;
+    // P-10: COUNT(*) ham yolu -- satirlari DECODE ETMEDEN sayar (yalnizca
+    // yapi+hash dogrulamasi). Sonuc, satir sayisi disinda ScanRowsPart ile
+    // birebir aynidir: bozuk satir ayni ecCorrupt, carpisan anahtar ayni
+    // ecHashCollision hatasini verir.
+    function CountRows(const Table: string): Int64;
     // R-13 Full: bolme anahtari DEGERININ dusecegi bolum (-1 = hesaplanamadi)
     function PartValueOf(const T: TTableDef; const Val: string): Integer;
     // R-13 Full: satirin bolum numarasi (-1 = bolunmemis/cozulemedi)
@@ -793,15 +804,111 @@ begin
   Result := h;
 end;
 
-function VDbParseInt(const S: string; out V: Int64): Boolean;
+function VDbHashKeyPrefix(const Table: string): QWord;
+// P-7: VDbHashKey'in ON EKI durumu (tablo adi + #0 kismi) BIR KEZ
+// hesaplanir; satir bazinda yalnizca ham pk baytlari FNV'ye eklenir.
+// Esitlik: EncodeRow da pk'yi UTF8Encode(Pk) ile yazar ve hem UTF8Encode
+// hem byte-kopya donusumu birlestirmeye homomorftur (T(a+b) = T(a)+T(b));
+// yani VDbHashKeyRaw(pref, diskBajtlar) = VDbHashKey(Table, Pk) BIREBIR.
+var
+  h: QWord;
+  s: RawByteString;
+  i: Integer;
 begin
-  Result := TryStrToInt64(Trim(S), V);
+  s := UTF8Encode(VDbNorm(Table) + #0);
+  h := QWord($CBF29CE484222325);
+  for i := 1 to Length(s) do
+  begin
+    h := h xor Byte(s[i]);
+    h := h * QWord($100000001B3);
+  end;
+  Result := h;
+end;
+
+function VDbHashKeyRaw(const Prefix: QWord; const B: TBytes; Off, Len: Integer): QWord;
+// Prefeksten devam eden FNV-1a + ayni finalize (0 -> 1). B/Off/Len,
+// satirin disk pk alanidir (EncodeRow'nun yazdigi baytlar).
+var
+  h: QWord;
+  i: Integer;
+begin
+  h := Prefix;
+  for i := Off to Off + Len - 1 do
+  begin
+    h := h xor QWord(B[i]);
+    h := h * QWord($100000001B3);
+  end;
+  if h = 0 then h := 1;
+  Result := h;
+end;
+
+function VDbParseInt(const S: string; out V: Int64): Boolean;
+var
+  L, i: Integer;
+  c: Char;
+  simple: Boolean;
+begin
+  // P-5: Indeks siralamasinda her karsilastirmada cagrilir (1M girdilik
+  // sort = ~20M cagri); eski yol her cagrida Trim ile string tahsis
+  // ederdi. Boluksuz ve yalnizca [0-9+-] iceren giris dogrudan
+  // TryStrToInt64'ye gider (Trim bosluk bulamazsa zaten ayni stringdir);
+  // diger tum girisler eski yola duser -- sonuc birebir ayni.
+  L := Length(S);
+  simple := L > 0;
+  if simple then
+    for i := 1 to L do
+    begin
+      c := S[i];
+      if (c <= ' ') then begin simple := False; Break; end;
+      if not (((c >= '0') and (c <= '9')) or (c = '+') or (c = '-')) then
+      begin
+        simple := False;
+        Break;
+      end;
+    end;
+  if simple then
+    Result := TryStrToInt64(S, V)
+  else
+    Result := TryStrToInt64(Trim(S), V);
 end;
 
 function VDbParseFloat(const S: string; out V: Double): Boolean;
 var
   pfs: TFormatSettings;
+  L, code: Integer;
+  c: Char;
+  simple: Boolean;
 begin
+  // P-3: WHERE ve aggregate karsilastirmalarinda bu fonksiyon SATIR BASI
+  // cagirilir (1M satirlik filtrede milyonlarca cagri). Eski yol her
+  // cagirda DefaultFormatSettings kaydini kopyalar (icinde 19+ string
+  // referansi vardir) ve Trim icin yeni string tahsis ederdi.
+  // Once boluksuz ve yalnizca [0-9eE+-.] iceren giris Val ile dogrudan
+  // parse edilir: Val her zaman '.' ondalik kullanir, VDB'nin kanonik
+  // ondalik ayiricisi da '.'dir. Bu hiza girmeyen her giris (para
+  // sembolleri, lokal virgul, bosluklu yazim, ...) asagidaki ESKI yola
+  // duser; davranis birebir ayni kalir, yalnizca sik yol hizlanir.
+  L := Length(S);
+  simple := L > 0;
+  if simple then
+    for code := 1 to L do
+    begin
+      c := S[code];
+      if (c <= ' ') then begin simple := False; Break; end;
+      if not (((c >= '0') and (c <= '9')) or (c = '+') or (c = '-') or
+              (c = '.') or (c = 'e') or (c = 'E')) then
+      begin
+        simple := False;
+        Break;
+      end;
+    end;
+  if simple then
+  begin
+    Val(S, V, code);
+    if code = 0 then Exit(True);
+    // Val reddettiyse (orn. '.', '1e', '--5') eski yolun tam davranisi
+    // gecerli: asagidaki cagrilari V'yi uzerine yazar/ayni sonucu verir.
+  end;
   pfs := DefaultFormatSettings;
   pfs.DecimalSeparator := '.';
   Result := TryStrToFloat(Trim(S), V, pfs);
@@ -840,8 +947,29 @@ var
   an, bn: Boolean;
   o: string;
   numeric: Boolean;
+  p: Integer;
+  hasLetter: Boolean;
+  ch: Char;
 begin
-  o := UpperCase(Op);
+  // P-4: UpperCase(Op) HER karsilastirmada yeni string tahsis ediyordu
+  // (1M satirlik WHERE = milyonlarca tahsis). Harf icerMEYEN operatorler
+  // (tum simge operatorler: =, <>, >=, != ...) dogrudan kullanilir;
+  // harfli olanlar (LIKE / ISNULL / ISNOTNULL) eski gibi UpperCase ile
+  // normallestirilir. Harfsiz Op icin UpperCase zaten Op ile ayni sonucu
+  // verdiginden (harf disindaki tum baytlar buyuk harfte degismez) ve tum
+  // karsilastirmalar yalnizca ASCII sabitlere yapildigindan sonuc birebir
+  // aynidir.
+  hasLetter := False;
+  for p := 1 to Length(Op) do
+  begin
+    ch := Op[p];
+    if ((ch >= 'A') and (ch <= 'Z')) or ((ch >= 'a') and (ch <= 'z')) then
+    begin
+      hasLetter := True;
+      Break;
+    end;
+  end;
+  if hasLetter then o := UpperCase(Op) else o := Op;
   numeric := VDbIsNumericCol(Ctype);
   // IS NULL / IS NOT NULL -> parser bunu ozel operatora cevirir;
   // NULL'a izin veren tek operatorler bunlar.
@@ -1258,15 +1386,16 @@ begin
   end;
 end;
 
-function VDbFloatToStr(V: Double): string;
 var
-  fs: TFormatSettings;
+  VDbFS: TFormatSettings;
+
+function VDbFloatToStr(V: Double): string;
 begin
-  // cikti her locale'de ayni: ondalik nokta
-  fs := DefaultFormatSettings;
-  fs.DecimalSeparator := '.';
-  fs.ThousandSeparator := #0;
-  Result := FloatToStr(V, fs);
+  // cikti her locale'de ayni: ondalik nokta. P-9: donusumun kullandigi
+  // tek ayarlar DecimalSeparator/ThousandSeparator'dir (general format);
+  // ikisi de sabit degerlere zorlandigi icin bir kez kurulan kayitla
+  // birebir ayni sonuc verir (eski kod her cagrida ~172 ns kopyaliyordu).
+  Result := FloatToStr(V, VDbFS);
 end;
 
 function VDbIdxCmp(const A, B: string; Ctype: Byte): Integer;
@@ -2256,6 +2385,27 @@ begin
   if Result then begin Move(B[P], V, 4); Inc(P, 4); end;
 end;
 
+function VDbBytesToStr(const B: TBytes; Pos, Len: Integer): string;
+// P-8: ASCII hizli yol. Tamami <128 baytlar icin UTF8Decode + kod sayfa
+// donusumu (2 tahsis + 2 ayri tarama) atlanir ve dogrudan kopyalanir;
+// ASCII-uyumlu her kod sayfada (ACP, UTF-8) sonuc baytlar birebir aynidir.
+// Degilse eski yol: UTF8Decode(VDbB2S(...)) -- davranis degismez.
+var
+  i: Integer;
+  ascii: Boolean;
+begin
+  ascii := True;
+  for i := Pos to Pos + Len - 1 do
+    if B[i] >= 128 then begin ascii := False; Break; end;
+  if ascii then
+  begin
+    SetLength(Result, Len);
+    if Len > 0 then Move(B[Pos], Result[1], Len);
+  end
+  else
+    Result := UTF8Decode(VDbB2S(B, Pos, Len));
+end;
+
 function DecodeRow(const B: TBytes; out TableId: Word; out Pk: string; out Vals: TStrArray): Boolean;
 // Satiri kayitli sira ile cozer. Alanlar eski semaya gore yazilmis
 // olabilir; ALTER TABLE sirasinda cagricilar SrcCts ile kesisim
@@ -2273,7 +2423,7 @@ begin
   if not ReadU16(B, p, TableId) then Exit;
   if not ReadU16(B, p, pkL) then Exit;
   if p + pkL > Length(B) then Exit;
-  Pk := UTF8Decode(VDbB2S(B, p, pkL)); Inc(p, pkL);
+  Pk := VDbBytesToStr(B, p, pkL); Inc(p, pkL);
   if not ReadU16(B, p, cc) then Exit;
   SetLength(Vals, cc);
   for i := 0 to cc - 1 do
@@ -2291,26 +2441,43 @@ begin
       if ct = VCT_BLOB then
         Vals[i] := VDbB2S(B, p, vl)          // ham bayt, kodlama yok
       else
-        Vals[i] := UTF8Decode(VDbB2S(B, p, vl));
+        Vals[i] := VDbBytesToStr(B, p, vl);
     end;
     Inc(p, vl);
   end;
   Result := True;
 end;
 
-function VDbRowTagOf(const PlainValue: TBytes; ValueLen: Integer): Integer;
-// R-26 (2026-10-15): KV katmanina verdigimiz TABLO ID cozucusu.
+function DecodeRowShape(const B: TBytes; out TableId: Word): Boolean;
+// P-10: COUNT(*) ham yolu icin YAPI dogrulama. DecodeRow ile BIREBIR ayni
+// sinir/tip kontrollerini yapar; yalnizca materyalizasyon (IntToStr /
+// VDbFloatToStr / string tahsisleri) atlanir. Boylece bozuk-satir tespiti
+// ve verilen hatalar birebir ayni kalir. BOOL'da DecodeRow B[p]'yi dogrudan
+// okur (vl kontrolu yok); burada ayni sekilde ek sinir konmaz.
+var
+  p: Integer;
+  pkL, cc, i: Word;
+  ct: Byte;
+  vl: LongInt;
 begin
-  Result := -1;
-  if (ValueLen < 2) or (Length(PlainValue) < 2) then Exit;
-  // sema kaydi ('VSCH1') satir degildir; ilk iki bayti rastgele bir
-  // tablo id'sine denk gelebilir -> mutlaka -1 yap.
-  if (ValueLen >= Length(VDB_SCHEMA_TAG)) and
-     (Length(PlainValue) >= Length(VDB_SCHEMA_TAG)) and
-     CompareMem(@PlainValue[0], @VDB_SCHEMA_TAG[1], Length(VDB_SCHEMA_TAG)) then
-    Exit;
-  // ReadU16 ile birebir ayni hesap
-  Result := Integer(PlainValue[0]) or (Integer(PlainValue[1]) shl 8);
+  Result := False;
+  p := 0;
+  if not ReadU16(B, p, TableId) then Exit;
+  if not ReadU16(B, p, pkL) then Exit;
+  if p + pkL > Length(B) then Exit;
+  Inc(p, pkL);
+  if not ReadU16(B, p, cc) then Exit;
+  for i := 0 to cc - 1 do
+  begin
+    if p >= Length(B) then Exit;
+    ct := B[p]; Inc(p);
+    if not ReadI32(B, p, vl) then Exit;
+    if vl = -1 then Continue;
+    if (vl < 0) or (p + vl > Length(B)) then Exit;
+    if ((ct = VCT_INT) or (ct = VCT_FLOAT)) and (vl <> 8) then Exit;
+    Inc(p, vl);
+  end;
+  Result := True;
 end;
 
 { TVTableDb }
@@ -2319,10 +2486,6 @@ constructor TVTableDb.Create(AKv: TVDb);
 begin
   inherited Create;
   FKv := AKv;
-  // R-26: KV katmanina tablo-id cozucusunu ver. Boylece Recover, zaten
-  // CRC icin okudugu her kayittan tablo id'yi bedava cikarir ve tablo
-  // taramalari diger tablolarin kayitlarini OKUMAZ.
-  AKv.RowTagFunc := @VDbRowTagOf;
   FLock := TCriticalSection.Create;
   FTables := TDictionary<string, TTableDef>.Create;
   FById := TDictionary<Word, string>.Create;
@@ -3173,7 +3336,7 @@ begin
   SetLength(FIntentDrop, 0);
 end;
 
-procedure TVTableDb.AbortBatch;
+procedure TVTableDb.AbortBatch(AStopConc: Boolean);
 // KV tamponu atilir; o sirada bellege islenmis index degisiklikleri
 // veriden yeniden kurulur (abort nadir, maliyet onemsiz).
 // DDL varsa sema yedegi de geri yuklenir.
@@ -3185,7 +3348,16 @@ begin
   // olan CONCURRENTLY insalari da bu noktada iptal edilir (sonuctan
   // vazgec: indeks INVALID kalir). Bekleyen islemler islem isaretli
   // olmadigindan ayirt edilemez; iptal tek GUVENLI secenektir.
-  StopConcBuilders;
+  //
+  // 2026-10-15: AStopConc=False ise insalar HAYATTA KALIR. Gerekce:
+  // tek cumlelik DML'i otomatik batch'e sarmalarken, ornek bir INSERT'in
+  // UNIQUE ihlaliyle hata vermesi (BEKLENEN durum) implicit batch'i
+  // abort ettiriyordu; eski kod burada kosulsuz StopConcBuilders
+  // cagirdigi icin devam eden CREATE INDEX CONCURRENTLY insasi OLUYOR
+  // ve indeks kalici olarak INVALID kaliyordu. Implicit batch yalnizca
+  // DML icerdigi icin DDL durumu degismemistir -> insaya dokunulmaz.
+  if AStopConc then
+    StopConcBuilders;
   FKv.AbortBatch;
   // R-11: geri alinan islemde ertelenen satirlar da gecerlidir artik;
   // COMMIT'e kadar bekleyen liste TEMIZLENMEZSE sonraki gercek
@@ -4154,37 +4326,106 @@ begin
 end;
 
 procedure TVTableDb.SortIdxEntries(var E: TIdxEntries; Ctype: Byte);
+// P-6: Numeric anahtarlari ONCEDEN parse et (O(N)); eski kod her
+// karsilastirmada 2x parse yapiyordu (quicksort ~N log N karsilastirma
+// -> 1M girdilik PK indeks insasinda ~10 saniye tuketiyordu). Karar
+// agaci, bos-deger ve parse-hata fallback'i dahil, VDbIdxCmp ile BIREBIR
+// aynidir; yalnizca parse sonucu bellekte tutulur ve E ile ayni anda
+// yer degistirir.
+type
+  TKeyInfo = record
+    iv: Int64;
+    fv: Double;
+    parsed: Boolean;
+    empty: Boolean;
+  end;
+var
+  ki: array of TKeyInfo;
+  i: Integer;
+
+  // VDbIdxCmp(E[ai].Key, pivKey, Ctype) ile birebir; parse onceden yapilmis.
+  function KCmp(ai: Integer; const pv: TKeyInfo; const pivKey: string): Integer;
+  begin
+    if E[ai].Key = '' then
+    begin
+      if pv.empty then Exit(0);
+      Exit(-1);
+    end;
+    if pv.empty then Exit(1);
+    if (Ctype = VCT_INT) or (Ctype = VCT_BOOL) then
+    begin
+      if ki[ai].parsed and pv.parsed then
+      begin
+        if ki[ai].iv < pv.iv then Exit(-1);
+        if ki[ai].iv > pv.iv then Exit(1);
+        Exit(0);
+      end;
+    end
+    else if Ctype = VCT_FLOAT then
+    begin
+      if ki[ai].parsed and pv.parsed then
+      begin
+        if ki[ai].fv < pv.fv then Exit(-1);
+        if ki[ai].fv > pv.fv then Exit(1);
+        Exit(0);
+      end;
+    end;
+    Result := CompareStr(E[ai].Key, pivKey);
+  end;
+
   procedure Sort(L, H: Integer);
   var
-    i, j: Integer;
+    i2, j, pm: Integer;
     piv, tmp: TIdxEntry;
+    pv, tk: TKeyInfo;
     c: Integer;
   begin
-    i := L; j := H; piv := E[(L + H) div 2];
+    i2 := L; j := H;
+    pm := (L + H) div 2;
+    piv := E[pm];
+    pv := ki[pm];          // pivot bilgisi de DEGER gibi anlik goruntudur
     repeat
       while True do
       begin
-        c := VDbIdxCmp(E[i].Key, piv.Key, Ctype);
-        if c = 0 then c := CompareStr(E[i].Pk, piv.Pk);
-        if c < 0 then Inc(i) else Break;
+        c := KCmp(i2, pv, piv.Key);
+        if c = 0 then c := CompareStr(E[i2].Pk, piv.Pk);
+        if c < 0 then Inc(i2) else Break;
       end;
       while True do
       begin
-        c := VDbIdxCmp(E[j].Key, piv.Key, Ctype);
+        c := KCmp(j, pv, piv.Key);
         if c = 0 then c := CompareStr(E[j].Pk, piv.Pk);
         if c > 0 then Dec(j) else Break;
       end;
-      if i <= j then
+      if i2 <= j then
       begin
-        tmp := E[i]; E[i] := E[j]; E[j] := tmp;
-        Inc(i); Dec(j);
+        tmp := E[i2]; E[i2] := E[j]; E[j] := tmp;
+        tk := ki[i2]; ki[i2] := ki[j]; ki[j] := tk;
+        Inc(i2); Dec(j);
       end;
-    until i > j;
+    until i2 > j;
     if L < j then Sort(L, j);
-    if i < H then Sort(i, H);
+    if i2 < H then Sort(i2, H);
   end;
+
 begin
-  if Length(E) > 1 then Sort(0, High(E));
+  if Length(E) <= 1 then Exit;
+  SetLength(ki, Length(E));
+  for i := 0 to High(E) do
+  begin
+    ki[i].empty := E[i].Key = '';
+    ki[i].parsed := False;
+    ki[i].iv := 0;
+    ki[i].fv := 0;
+    if not ki[i].empty then
+    begin
+      if (Ctype = VCT_INT) or (Ctype = VCT_BOOL) then
+        ki[i].parsed := VDbParseInt(E[i].Key, ki[i].iv)
+      else if Ctype = VCT_FLOAT then
+        ki[i].parsed := VDbParseFloat(E[i].Key, ki[i].fv);
+    end;
+  end;
+  Sort(0, High(E));
 end;
 
 procedure TVTableDb.SortIdxEntriesCols(var E: TIdxEntries;
@@ -5029,8 +5270,8 @@ begin
   // 1) Eski satirlari topla (dosyadan, eski semaya gore)
   // ONEMLI: once hepsini cozup KOPYALIYORUZ. Ara adimda (orn. index
   // erisimi) ScanAll tekrar cagrilirsa paylasilan dizi uzerine
-    // yazilir ve asagidaki satirlar bozulur -> access violation.
-    FKv.ScanAll(keys, raw, T.TableId);   // R-26: yalnizca bu tablonun satirlari
+  // yazilir ve asagidaki satirlar bozulur -> access violation.
+  FKv.ScanAll(keys, raw);
   SetLength(oldKeys, 0);
   SetLength(pks, 0);
   SetLength(oldRows, 0);
@@ -5618,8 +5859,8 @@ begin
   if TableExists(nn) then raise EVDbException.Create(ecTableExists, 'tablo var: ' + NewName);
   if Trim(NewName) = '' then raise EVDbException.Create(ecInvalidName, 'yeni ad bos olamaz');
 
-    // KEY tablo adi ile hashlendigi icin tum anahtarlar degismeli
-    FKv.ScanAll(keys, raw, t.TableId);   // R-26
+  // KEY tablo adi ile hashlendigi icin tum anahtarlar degismeli
+  FKv.ScanAll(keys, raw);
   ownBatch := not FKv.InBatch;
   if ownBatch then FKv.BeginBatch;
   try
@@ -5817,7 +6058,7 @@ var
   lastOp: TDictionary<string, TIdxOp>;    // pk -> son durum
   added: TDictionary<string, Boolean>;     // eklenen pk'ler
   ct: Byte;
-  i, nKeep: Integer;
+  i: Integer;
 begin
   if not FIdxOps.TryGetValue(k, ops) then Exit;
   if ops.Count = 0 then
@@ -5835,15 +6076,12 @@ begin
     lastOp.AddOrSetValue(ops[i].Pk, ops[i]);
 
   // 2) commitlenmis girdilerden bu toplantida dokunulan satirlari cikar
-  // En fazla eski girdiler + bekleyen islemler kadar sonuc olabilir.
-  // Dinamik diziyi her girdide buyutmek yerine bir kez kapasite ayir.
-  SetLength(keep, Length(e) + ops.Count);
-  nKeep := 0;
+  SetLength(keep, 0);
   for i := 0 to High(e) do
   begin
     if lastOp.ContainsKey(e[i].Pk) then Continue;
-    keep[nKeep] := e[i];
-    Inc(nKeep);
+    SetLength(keep, Length(keep) + 1);
+    keep[High(keep)] := e[i];
   end;
   // 3) hala var olan satirlar icin TAM OLARAK birer girdi koy
   added := TDictionary<string, Boolean>.Create;
@@ -5854,16 +6092,13 @@ begin
       // bu satirin SON durumu silme mi? (daha sonraki bir op geci kalmis olabilir)
       if lastOp[ops[i].Pk].IsDel then Continue;
       added.AddOrSetValue(ops[i].Pk, True);
-      keep[nKeep].Key := ops[i].Key;
-      keep[nKeep].Pk := ops[i].Pk;
-      keep[nKeep].Cov := ops[i].Cov;   // F-19
-      Inc(nKeep);
+      SetLength(keep, Length(keep) + 1);
+      keep[High(keep)].Key := ops[i].Key;
+      keep[High(keep)].Pk := ops[i].Pk;
+      keep[High(keep)].Cov := ops[i].Cov;   // F-19
     end;
   added.Free;
   lastOp.Free;
-
-  // Kullanilmayan kapasiteyi at; siralama yalnizca gercek girdiler uzerinde.
-  SetLength(keep, nKeep);
 
   // 4) sirala ve yayinla
   // COK KOLONLU indekslerde her parca kendi tipine gore karsilastirilir
@@ -6359,8 +6594,8 @@ begin
             [kv2.Key, kv2.Value.Fks[j].Col, nReferencing]);
       end;
   end;
-    FKv.ScanAll(keys, raw, t.TableId);   // R-26: yalnizca bu tablonun satirlari
-    ownBatch := not FKv.InBatch;
+  FKv.ScanAll(keys, raw);
+  ownBatch := not FKv.InBatch;
   if ownBatch then FKv.BeginBatch;
   try
     for i := 0 to High(keys) do
@@ -6879,6 +7114,7 @@ var
   pci: Integer;       // R-13 Full: bolme kolonu indeksi (-1 = filtre yok)
   pno, pj: Integer;
   hit: Boolean;
+  pref: QWord;        // P-7: tablo hash on eksi (bir kez hesaplanir)
 begin
   t := GetTable(Table);
   // R-13 Full: bolme kolonunu BIR KEZ coz. Filtre istenmis ama kolon
@@ -6887,12 +7123,14 @@ begin
   if Targets.HasFilter and (t.PartType <> '') then
     for i := 0 to High(t.Cols) do
       if t.Cols[i].Name = t.PartCol then begin pci := i; Break; end;
-    FKv.ScanAll(keys, raw, t.TableId);   // R-26: diger tablolar okunmaz
-  // keys/raw zaten aday satir sayisi kadar ayrildi. Sonuc dizilerini de
-  // basta bir kez ayir; her satirda SetLength yapmak O(N^2) kopyalamaya
-  // yol aciyordu.
+  FKv.ScanAll(keys, raw);
+  // P-6: Kapasiteyi ONCEDEN tahsis et; eski kod her satirda
+  // SetLength(n+1) ile buyutuyordu. Dongu sonunda tam sayiya indirgenir.
   SetLength(Pks, Length(keys));
   SetLength(Rows, Length(keys));
+  // P-7: tablo on eksi BIR KEZ; satir bazinda yalnizca ham pk baytlari
+  // FNV'ye eklenir (eski yol: her satirda UTF8Decode + UTF8Encode + ~3 tahsis).
+  pref := VDbHashKeyPrefix(t.Name);
   n := 0;
   for i := 0 to High(keys) do
   begin
@@ -6911,7 +7149,12 @@ begin
     // hesaplanmis olmali. Degilse iki farkli satir ayni 64-bit anahtari
     // paylasmis demektir; bu durumda SATIR SESSIZCE BIR DIGERININ
     // YERINE GEZER (veri kaybi, hicbir hata verilmez). Artik net hata verir.
-    if VDbHashKey(t.Name, pk) <> k then
+    // P-7: hash dogrulamasi HAM pk baytlarindan (DecodeRow zaten ayni
+    // baytlari dogrulayip cozdugu icin 4+pkL sinirlari guvenlidir). Sonuc,
+    // VDbHashKey(t.Name, pk) ile BIREBIR aynidir; eski yol her satirda
+    // UTF8Decode -> ACP -> UTF8Encode donusumu + ~3 string tahsis yapiyordu.
+    if VDbHashKeyRaw(pref, raw[i], 4,
+         Integer(raw[i][2]) or (Integer(raw[i][3]) shl 8)) <> k then
       raise EVDbException.CreateFmt(ecHashCollision, 
         'HASH CARPISMASI: tablo %s, pk=%s -> iki satir ayni anahtari paylasiyor. ' +
         'Veritabani bozulmus; yedekten geri yukleyin.', [t.Name, pk]);
@@ -6932,9 +7175,46 @@ begin
     end;
     Pks[n] := pk; Rows[n] := vals; Inc(n);
   end;
-  SetLength(Pks, n);
-  SetLength(Rows, n);
+  // P-6: on-tahsis edilen kapasiteyi gercek satir sayisina indir.
+  SetLength(Pks, n); SetLength(Rows, n);
   Result := n;
+end;
+
+function TVTableDb.CountRows(const Table: string): Int64;
+// P-10: COUNT(*) ham yolu. Satirlar materyalize EDILMEZ (ScanRowsPart
+// ~0.8sn + decode ~1.0sn yerine yalnizca yapi+hash dogrulamasi ~0.2sn);
+// dongu, hata denetimleri ve hash on eksi ScanRowsPart ile BIREBIR aynidir:
+// bozuk satir ayni ecCorrupt, carpisan anahtar ayni ecHashCollision
+// hatasini verir; tid filtresi aynidir, yani sayim birebir esittir.
+var
+  t: TTableDef;
+  keys: TQWordArray;
+  k: QWord;
+  tid: Word;
+  raw: TValArray;
+  i, pkL: Integer;
+  pref: QWord;
+begin
+  t := GetTable(Table);
+  FKv.ScanAll(keys, raw);
+  pref := VDbHashKeyPrefix(t.Name);
+  Result := 0;
+  for i := 0 to High(keys) do
+  begin
+    k := keys[i];
+    if k = VDB_SCHEMA_KEY then Continue;
+    if not DecodeRowShape(raw[i], tid) then
+      raise EVDbException.CreateFmt(ecCorrupt,
+        'VDb: kayit cozulemedi (tablo=%s, anahtar=%d). Veritabani bozulmus; ' +
+        'yedekten geri yukleyin.', [t.Name, k]);
+    if tid <> t.TableId then Continue;
+    pkL := Integer(raw[i][2]) or (Integer(raw[i][3]) shl 8);
+    if VDbHashKeyRaw(pref, raw[i], 4, pkL) <> k then
+      raise EVDbException.CreateFmt(ecHashCollision,
+        'HASH CARPISMASI: tablo %s, pk=%s -> iki satir ayni anahtari paylasiyor. ' +
+        'Veritabani bozulmus; yedekten geri yukleyin.', [t.Name, VDbB2S(raw[i], 4, pkL)]);
+    Inc(Result);
+  end;
 end;
 
 function TVTableDb.EvalSetExpr(const T: TTableDef; const E: TSetExpr;
@@ -8071,5 +8351,12 @@ begin
   else
     Result := '';
 end;
+
+initialization
+  // P-9: VDbFloatToStr icin sabit donusum ayarlari. Initialization tek is
+  // parcaciginda calisir; sonraki tum cagrilarda kayit salt-okunur kullanilir.
+  VDbFS := DefaultFormatSettings;
+  VDbFS.DecimalSeparator := '.';
+  VDbFS.ThousandSeparator := #0;
 
 end.

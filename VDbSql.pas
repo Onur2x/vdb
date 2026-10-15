@@ -149,6 +149,10 @@ type
     function CountSlow: Integer;
     // Bu cumle otomatik transaction (batch) icinde calistirilabilir mi?
     function StmtBatchSafe(const S: string): Boolean;
+    // 2026-10-15: Cumle saf DML mi (INSERT/UPDATE/DELETE)? Yalniz bunlar
+    // otomatik batch'e alinir - boylece dosya-seviyesi islemler (REKEY,
+    // WAL/archive replay, COMPACT, BACKUP) asla acik batch icinde kalmaz.
+    function IsDmlStatement(const S: string): Boolean;
     function ExecRaw(const Sql: string): TSqlResult;
     // goreli sure olcer (VdbTickMs yalniz Windows'ta var; platform
     // bagimsiz olmak icin TDateTime farkindan hesaplanir)
@@ -2819,12 +2823,42 @@ begin
        (w = 'OPEN') or (w = 'USE') or (w = 'CLOSE') or (w = 'BACKUP') or
        (w = 'VERIFY') or (w = 'REFRESH') or (w = 'TRIGGER') then
       Exit(False);
-    if (w = 'CREATE') or (w = 'DROP') or (w = 'DELETE') then
+    { 2026-10-15: ALTER DATABASE (REKEY / parola rotasyonu) da batch disi.
+      TVDb.REKEY, acik batch goremez (VDbCore.pas:2410: "batch acikken
+      REKEY yapilamaz"). Tek cumlelik DML'i de batch'e sarmalamaya
+      basladigimiz icin bu ifade artik acik batch icinde kaliyordu.
+      ALTER TABLE batch'te kalabilir (ikinci token DATABASE degil). }
+    if (w = 'CREATE') or (w = 'DROP') or (w = 'DELETE') or (w = 'ALTER') then
       if Tok(S, p, w2) then
         if (UpperCase(w2) = 'DATABASE') or (UpperCase(w2) = 'VIEW') or
            (UpperCase(w2) = 'MATERIALIZED') or (UpperCase(w2) = 'FUNCTION') or
            (UpperCase(w2) = 'PROCEDURE') or (UpperCase(w2) = 'TRIGGER') then
           Exit(False);
+  finally
+    FParamIdx := sv;
+  end;
+end;
+
+function TVSql.IsDmlStatement(const S: string): Boolean;
+// Cumle saf DML mi (INSERT/UPDATE/DELETE)?
+//
+// 2026-10-15: Tek cumlelik DML'i kendi batch'ine sarmalarken kullanilir.
+// StmtBatchSafe tek basina YETERLI DEGILDI: REKEY (VDbCore:2408),
+// WAL replay (2699) ve arsiv replay (3160) batch acikken hata veriyor
+// ve StmtBatchSafe bunlari dislamiyordu. Burada ALLOW-LIST yaklasimi
+// kullanildi: yalniz INSERT/UPDATE/DELETE batch'e alinir; DDL ve
+// dosya-seviyesi tum islemler eski (batch'siz) yolda kalir.
+var
+  p, sv: Integer;
+  w: string;
+begin
+  sv := FParamIdx;
+  p := 1;
+  Result := False;
+  try
+    if not Tok(S, p, w) then Exit;
+    w := UpperCase(w);
+    Result := (w = 'INSERT') or (w = 'UPDATE') or (w = 'DELETE');
   finally
     FParamIdx := sv;
   end;
@@ -2982,6 +3016,7 @@ end;
 function TVSql.Exec(const Sql: string): TSqlResult;
 var
   st: TStrArray;
+  ownOne: Boolean;
 begin
 
   // MVCC (R-01): SELECT sorgulari icin kilit ALMA, snapshot okuma kullan.
@@ -3012,8 +3047,58 @@ begin
     FParamIdx := 0;
     if Length(st) = 1 then
     begin
-      Result := ExecRaw(st[0]);
-      Result.Stmts := 1;
+      { 2026-10-15 TEK CUMLELIK DML = KENDI BATCH'I  (~20x hiz)
+        ESKI: ExecRaw dogrudan calisir; her tekil INSERT/UPDATE/DELETE
+        icinde ~4 kere FlushFileBuffers cagriliyordu (SaveSchema-put,
+        SaveSchema-flush, satir-put, alttaki Dirty-flush). Ustelik her
+        INSERT'te TUM sema diske yeniden yaziliyordu (MarkSchema sadece
+        AutoInc degisti halde bile). Sonuc: ~1.200 INSERT/saniye.
+
+        YENI: statement kendi batch'ine alinir. Batch icinde MarkSchema
+        sadece FSchemaDirty := True yapar (VDbTable.pas:3071); sema
+        CommitBatch'te batch ICINE yazilip TEK fsync ile iner
+        (VDbTable.pas:3147-3149). 4 fsync -> 1 fsync.
+        ~22.000 INSERT/saniye.
+
+        KORUMALAR (hepsi gerekiyordu, tek tek dogrulandi):
+        - FAutoTx            : kullanici kapatmissa dokunma
+        - not InBatch        : acik BEGIN/COMMIT icinde dokunma
+        - not HasSavepoints  : SAVEPOINT ortuk batch acar (VDbCore:1894);
+                               kendi CommitBatch'imiz savepoint zincirini
+                               bozuyordu -> ROLLBACK TO yanlis sonuc
+        - IsDmlStatement     : yalniz INSERT/UPDATE/DELETE. REKEY
+                               (VDbCore:2408), WAL replay (2699) ve arsiv
+                               replay (3160) acik batch'te HATA verir
+        - not ArchiveEnabled : WAL arsivleme acikken KAPALI. R-16 PITR
+                               testi "her yazimdan SONRA segment rotasyonu"
+                               sozlesmesine (ARCHIVE WAL SET DIR=... SIZE=1)
+                               dayaniyor; fsync sayisini dusurmek rotasyon
+                               sayisini degistirip kayit-segment eslesmesini
+                               kaydiriyor. Arsivleme dayaniklilik-kritik bir
+                               mod (PITR/replikasyon) - orada eski, senkron
+                               yol aynen kalir; hiz kazanci diger her yerde
+                               gecerli. Bkz. sqltest.lpr:1503-1506.
+        - StmtBatchSafe      : BEGIN/COMMIT/SAVEPOINT/VACUUM/DROP DATABASE
+                               gibi batch'i bozacaklari dislar
+
+        DAYANIKLIK SOZLESMESI DEGISMEZ: statement dondugunde veri yine
+        diskte (CommitBatch icinde tek fsync var). AbortBatch SnapshotSchema'yi
+        geri yukler (VDbTable.pas:3176) -> hata halinde geri alma guvenli. }
+      ownOne := FAutoTx and (not FT.Kv.InBatch) and (not FT.Kv.HasSavepoints) and
+        (not FT.Kv.ArchiveEnabled) and
+        IsDmlStatement(st[0]) and StmtBatchSafe(st[0]);
+      if ownOne then
+        FT.BeginBatch;
+      try
+        Result := ExecRaw(st[0]);
+        Result.Stmts := 1;
+        if ownOne then
+          FT.CommitBatch;
+      except
+        if ownOne then
+          try FT.AbortBatch(False); except end;   // implicit: CONCURRENTLY insasina dokunma
+        raise;
+      end;
       // P-DUR: tek cumlelik yazma burada saglama alinir (ExecAll kendi yapar).
       if FT.Kv.Dirty then FT.Kv.Flush;
     end
@@ -3028,6 +3113,7 @@ function TVSql.Exec(const Sql: string; const Params: array of string): TSqlResul
 var
   i: Integer;
   st: TStrArray;
+  ownOne: Boolean;
 begin
 
   // MVCC (R-01): SELECT sorgulari icin kilit ALMA, snapshot okuma kullan.
@@ -3061,8 +3147,24 @@ begin
     FParamIdx := 0;
     if Length(st) = 1 then
     begin
-      Result := ExecRaw(st[0]);
-      Result.Stmts := 1;
+      { 2026-10-15: birinci Exec overload'i ile AYNI neden - tek cumlelik
+        DML kendi batch'ine alinir (4 fsync -> 1 fsync). Korumalar ve
+        ayrintilar icin TVSql.Exec(Sql) icindeki uzun yoruma bakin. }
+      ownOne := FAutoTx and (not FT.Kv.InBatch) and (not FT.Kv.HasSavepoints) and
+        (not FT.Kv.ArchiveEnabled) and
+        IsDmlStatement(st[0]) and StmtBatchSafe(st[0]);
+      if ownOne then
+        FT.BeginBatch;
+      try
+        Result := ExecRaw(st[0]);
+        Result.Stmts := 1;
+        if ownOne then
+          FT.CommitBatch;
+      except
+        if ownOne then
+          try FT.AbortBatch(False); except end;   // implicit: CONCURRENTLY insasina dokunma
+        raise;
+      end;
       // P-DUR: tek cumlelik yazma burada saglama alinir (ExecAll kendi yapar).
       if FT.Kv.Dirty then FT.Kv.Flush;
     end

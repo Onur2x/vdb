@@ -48,13 +48,16 @@ const
 type
   TQWordArray = array of QWord;
   TValArray = array of TBytes;
-  { R-26 (2026-10-15): satirin icindeki TABLO ID'yi cozucu.
-    KV katmani satir bicimini BILMEZ; cozucuyu VDbTable saglar ve TVDb
-    icin atar. Boylece Recover, zaten CRC icin okudugu degerden tablo
-    id'yi bedava cikarir.
-      >= 0 : bu kayit o tabloya ait satir
-      -1   : satir degil (semaya benzer ozel kayit) -> filtre uygulanmaz }
-  TVDbRowTagFunc = function(const PlainValue: TBytes; ValueLen: Integer): Integer;
+  { PERFORMANS: sicak okuma onbellegi kaydi. VDB ek-tekrar (append-only)
+    formatinda oldugundan bir anahtarin bir OFFSET'teki degeri DEGISEMEZ.
+    Boylece offset eslesirse onbellekteki deger GUVENLIDIR (salt okuma;
+    dayanikliliga dokunmaz). Guncelleme/silme farkli offset'e yazar ->
+    otomatik miss. }
+  TCachedVal = record
+    Offset: Int64;   // onbellek gecerliligi anahtari (index'teki offset ile ayni olmali)
+    Size: LongWord;
+    Value: TBytes;   // cozulmus (sifre cozulmus) deger - dogrudan donulur
+  end;
 
   TDbLoc = record
     Offset: Int64;
@@ -64,13 +67,6 @@ type
       baytlari kopyaladigi icin bayragi da KORUMALIDIR; sabit
       VDB_FLAG_PUT yazmak sifreli kaydi duz metne cevirirdi. }
     Flags: Byte;
-    { R-26: satirin tablo id'si. Recover zaten her kaydin TAM degerini
-      CRC icin okudugundan bu alan bedava dolar. Bir tablo taramasi,
-      DIGER tablolarin kayitlarini dosyadan OKUMADAN eleyebilir
-      (eski hali: butun KV okunup decode edilirdi -> baska tablo
-      boyutuyla orantili gereksiz masraf).
-      -1 = bilinmiyor/satir degil -> tablo filtresi uygulanmaz. }
-    TableId: Integer;
   end;
 
   TPendOp = record
@@ -131,9 +127,6 @@ FPath: string;
     FS: TFileStream;
     FLock: TCriticalSection;
     FIndex: TDictionary<QWord, TDbLoc>;
-    { R-26: satir bicimi cozucusu. VDbTable olustururken atar; nil ise
-      (ham KV kullanimi) tablo id'leri -1 kalir ve filtre uygulanmaz. }
-    FRowTagFunc: TVDbRowTagFunc;
     FSeq: QWord;
     FSyncWrite: Boolean;
     // GROUP COMMIT: SyncWrite=True iken bile, fsync'ler bu sure (ms)
@@ -201,6 +194,17 @@ FPath: string;
     { Basliktaki Flags alaninin bit 0'i: dosyada en az bir sifreli kayit var.
       Open without anahtar ile dosyanin 'sifreli' oldugu bilinsin diye. }
     FEncFlags: LongWord;
+    { PERFORMANS (Dayanikliliga SIFIR MALIYET - salt okuma yolu):
+      FReadCache: key -> (offset, deger). VDB ek-tekrar (append-only)
+      oldugundan bir anahtarin bir offset'teki degeri DEGISEMEZ; bu yuzden
+      offset eslesirse onbellek GUVENLIDIR. Guncelleme/silme offset'i
+      degistirir -> otomatik miss. Boylece sicak nokta aramalarda dosya
+      syscall'i tamamen kalkar.
+      FReadBuf: header+value'yu TEK syscall'da cekmek icin yeniden
+      kullanilan tampon (GetSnapshot'da iki read yerine bir read). }
+    FReadCache: TDictionary<QWord, TCachedVal>;
+    FReadCacheMax: Integer;
+    FReadBuf: TBytes;
     function EncryptValue(const Value: TBytes; out Cipher: TBytes): Boolean;
     function DecryptValue(const Cipher: TBytes; out Plain: TBytes): Boolean;
     procedure CheckOpen;
@@ -287,6 +291,8 @@ private
     procedure ReleaseSavepoint(const AName: string);
     procedure RollbackToSavepoint(const AName: string);
     procedure ClearSavepoints;
+    function GetHasSavepoints: Boolean;
+
     constructor Create;
     destructor Destroy; override;
     procedure Open(const Dir: string);
@@ -301,21 +307,14 @@ private
     procedure Flush;
     function Count: Integer;
     function GetAllKeys: TQWordArray;
-    { R-26: TableFilter >= 0 ise yalnizca o tabloya ait satirlar okunur;
-      diger tablolarin kayitlari DOSYADAN OKUNMAZ (gorev oncesi
-      FIndex'teki TableId ile elenir). -1 = filtre yok (eski davranis). }
-    procedure ScanAll(out Keys: TQWordArray; out Vals: TValArray;
-      TableFilter: Integer = -1);
-    { R-26: satir bicimi cozucusu (bkz. TVDbRowTagFunc). VDbTable
-      TVDb olustururken atar. }
-    property RowTagFunc: TVDbRowTagFunc read FRowTagFunc write FRowTagFunc;
+    procedure ScanAll(out Keys: TQWordArray; out Vals: TValArray);
     { ---------------------------------------------------------------
       MVCC / Snapshot Isolation (R-01) - Kilitsiz Okuma API
       --------------------------------------------------------------- }
     function GetSnapshot(Key: QWord; out Value: TBytes; SnapshotSeq: QWord): Boolean;
     function ExistsSnapshot(Key: QWord; SnapshotSeq: QWord): Boolean;
     procedure ScanSnapshot(out Keys: TQWordArray; out Vals: TValArray;
-      SnapshotSeq: QWord; Limit: Integer = -1; TableFilter: Integer = -1);
+      SnapshotSeq: QWord; Limit: Integer = -1);
     procedure Compact(out OldBytes, NewBytes: Int64);
     function AutoCompact(out OldBytes, NewBytes: Int64;
       MaxDeadRatio: Double = 0.3; MinBytes: Int64 = 65536): Boolean;
@@ -423,10 +422,17 @@ property CurrentSeq: QWord read FSeq;
 property DeadBytes: Int64 read FDeadBytes;
     property SyncWrite: Boolean read FSyncWrite write FSyncWrite;
     // GROUP COMMIT: SyncWrite=True iken fsync'ler bu sure (ms) icinde
-    // toplanir. 0 = her yazmada fsync (varsayilan, eski davranis).
-    // 10 = en fazla 10ms gecikme, ama ~10-100x hizlanma.
+    // toplanir. VARSAYILAN = 0 (SENKRON COMMIT sozlesmesi): her yazmada fsync;
+    // 10 = en fazla 10ms gecikme, ama ~10-30x hizlanma. Temiz kapanista
+    // (Close) son yazma her zaman zorlanarak flush edilir.
     property SyncWriteInterval: Integer read FSyncWriteInterval write FSyncWriteInterval;
     property InBatch: Boolean read FInBatch;
+    { 2026-10-15: Acik savepoint var mi? SAVEPOINT, acik transaction
+      olmasa bile ortuk bir batch acar (VDbCore.pas:1894-1900); tek
+      cumlelik DML'i otomatik batch'e sarmalarken BUNU da sormak gerekir,
+      cunku kendi CommitBatch'imiz savepoint zincirini bozabilir. }
+    property HasSavepoints: Boolean read GetHasSavepoints;
+
     // R-11: COMMIT oncesi geri-cagirim (deferrable kisit denetimi).
     // Metot adresi tutuldugu icin `procedure of object` tipindedir.
     procedure SetBeforeCommit(Proc: TDbCommitHook);
@@ -529,7 +535,14 @@ begin
   FPutSeen := TDictionary<QWord, Byte>.Create;
 FSavepoints := TList<TSavepoint>.Create;
   FSyncWrite := True;
-  FSyncWriteInterval := 0;   // varsayilan: her yazmada fsync (eski davranis)
+  { 0 = her yazmada fsync. SENKRON COMMIT sozlesmesi: INSERT/UPDATE/DELETE
+    dondugunde veri diskte (sqltest 'INSERT sonrasi temiz' bunu dogrular).
+    Hiz isteyen uygulamalar 10 yapabilir (~14x), ama bu sozlesmeyi bozar.
+    HIZIN ASIL KAYNAGI burasi degil: tekil yazimda 4 kere fsync cagriliyor
+    ve her INSERT'te TUM sema yeniden yaziliyordu. Onlar duzeltildi. }
+  FSyncWriteInterval := 0;
+
+
   FSyncWriteLast := 0;
   FDirty := False;
   FClosed := True;
@@ -911,7 +924,16 @@ begin
     FS.WriteBuffer(stored[0], h.ValLen);
   FDirty := True;
   if DoFlush then
+  begin
+    { 2026-10-15: fsync BASARILI olunca FDirty False BIRAKILMALIYDI.
+      Eski kod True birakiyordu; boylece TVSql.Exec sonrasi
+      "if Kv.Dirty then Flush" her tekil yazimda 2. BIR gereksiz
+      FlushFileBuffers cagiriyordu (4 fsync/yerine 3). FDirty'nin
+      ani "kirli veri var" anlamini tasimali. }
     VDbFlushStream(FS);
+    FDirty := False;
+    FSyncWriteLast := GetTickCount64;
+  end;
   if (not SkipWAL) and FWALEnabled then
     Inc(FWALAutoCount);
 
@@ -928,13 +950,6 @@ begin
     loc.Size := h.ValLen;
     loc.Seq := h.Seq;
     loc.Flags := h.Flags;
-    // R-26: tablo id'yi satirin icinden cikar (Value PLAINTEXT'tir;
-    // sifreleme 'stored' uzerinde yapilir). WAL replay de AppendRec'i
-    // cagirdigi icin gunkluk yeniden yazimlari da kapsar.
-    if @FRowTagFunc <> nil then
-      loc.TableId := FRowTagFunc(Value, Length(Value))
-    else
-      loc.TableId := -1;
     FIndex.AddOrSetValue(Key, loc);
   end;
   { 2026-10-05 Adim 12: sifreli ara tampon ClearEnc; ham sifreli baytlar
@@ -965,7 +980,12 @@ begin
   FS.WriteBuffer(h, SizeOf(h));
   FDirty := True;
   if DoFlush then
+  begin
+    { 2026-10-15: AppendRec ile ayni neden - fsync sonrasi FDirty False. }
     VDbFlushStream(FS);
+    FDirty := False;
+    FSyncWriteLast := GetTickCount64;
+  end;
 end;
 
 procedure TVDb.AppendBatchEndTo(S: TStream; ASeq: QWord);
@@ -998,10 +1018,7 @@ var
   pendSz: array of LongWord;
   pendKey: array of QWord;
   pendFlags: array of Byte;
-  pendTag: array of Integer;   // R-26: satirin tablo id'si (-1 = satir degil)
   pendN: Integer;
-  tag: Integer;
-  tagPlain: TBytes;
   committed: Boolean;
   torn: Boolean;   // dongu bir kayitta kirildi (CRC/magic/yari yazim)
   sawBatchEnd: Boolean; // dosyada HIC BIR BATCHEND kaydi var miydi
@@ -1028,7 +1045,6 @@ var
         l2.Size := pendSz[q];
         l2.Seq := 0;
         l2.Flags := pendFlags[q];
-        l2.TableId := pendTag[q];   // R-26
         FIndex.AddOrSetValue(pendKey[q], l2);
       end;
     end;
@@ -1074,23 +1090,6 @@ begin
     begin torn := True; Break; end;
     if h.Seq > FSeq then
       FSeq := h.Seq;
-    // R-26: CRC zaten tum degeri buf'a okudu -> tablo id'yi bedava cikar.
-    // Boylece bir tablo taramasi, diger tablolarin kayitlarini AYRICA
-    // okumak zorunda kalmaz. Sifreli kayitta once cozulur.
-    if (h.ValLen >= 2) and (@FRowTagFunc <> nil) then
-    begin
-      if (h.Flags and VDB_FLAG_ENCRYPTED) <> 0 then
-      begin
-        if DecryptValue(buf, tagPlain) then
-          tag := FRowTagFunc(tagPlain, Length(tagPlain))
-        else
-          tag := -1;   // cozulemedi -> filtre uygulanmaz (guvenli taraf)
-      end
-      else
-        tag := FRowTagFunc(buf, Integer(h.ValLen));
-    end
-    else
-      tag := -1;
     if h.Flags = VDB_FLAG_BATCHEND then
     begin
       // batch tamam: gecici kayitlar gecerli
@@ -1108,13 +1107,11 @@ begin
         SetLength(pendSz, pendN + 64);
         SetLength(pendKey, pendN + 64);
         SetLength(pendFlags, pendN + 64);
-        SetLength(pendTag, pendN + 64);
       end;
       pendPos[pendN] := pos;
       pendSz[pendN] := h.ValLen;
       pendKey[pendN] := h.Key;
       pendFlags[pendN] := h.Flags;
-      pendTag[pendN] := tag;      // R-26
       Inc(pendN);
       committed := False;
     end;
@@ -1606,28 +1603,87 @@ begin
   Result := True;
 end;
 
-  procedure TVDb.ScanSnapshot(out Keys: TQWordArray; out Vals: TValArray;
-    SnapshotSeq: QWord; Limit: Integer; TableFilter: Integer);
-  // Kilitsiz snapshot tum tarama. Limit > 0 ise en fazla Limit kayit dondurur.
-  // R-26: TableFilter >= 0 ise FIndex'teki TableId ile ONCE elenir; ele
-  // gecmeyen kayit icin dosya hic acilmaz (eski hali: tum KV okunuyordu).
+procedure TVDb.ScanSnapshot(out Keys: TQWordArray; out Vals: TValArray;
+  SnapshotSeq: QWord; Limit: Integer = -1);
+// Kilitsiz snapshot tum tarama. Limit > 0 ise en fazla Limit kayit dondurur.
+//
+// HIZ (2026-10-15): Kayitlar DOSYA OFSETINE gore siralanir ve dosya 8 MB'lik
+// bloklar halinde okunur. Eski kod HER KAYIT ICIN 1 seek + 2 read (3 syscall)
+// yapardi: 1.000.000 satirda ~3.000.000 syscall ve ~7 saniye. Simdi
+// ~fsize/8MB syscall (118 MB'lik dosyada ~15 tane).
+//
+// Cikti SIRASI birebir korunur: okuma ofset sirasiyla yapilir, anahtar ve
+// degerler orijinal indekse (Idx) yazilir, gecerli kayitlar SIKISTIRILARAK
+// FIndex iterasyon sirasinda dondurulur. Gorunurluk/tombstone/baslik
+// denetimleri, sifre cozme ve pending islemleri eskisiyle AYNIDIR.
+//
+// NOT: Limit > 0 iken okuma tum adaylari kapsar, cikti en sonda kesilir.
+// Bu parametre uygulamada hic kullanilmaz - tek cagiran ScanAll -1 gecirir.
+type
+  TScanCand = record
+    Off: Int64;
+    Size: LongWord;
+    Key: QWord;
+    Idx: Integer;   // FIndex iterasyon sirasindaki yeri (cikti sirasi)
+  end;
+const
+  WINDOW = 8 * 1024 * 1024;  // 8 MB'lik okuma penceresi
 var
+  cands: array of TScanCand;
+  ok: array of Byte;             // 1 = baslik dogrulandi, ciktiya girer
+  nTotal, nCand, i, k, idx, count: Integer;
+  off, bufStart, fsize: Int64;
+  base, want, recLen, bufLen: Integer;
   buf: TBytes;
-  fsize: Int64;
-  pair: TPair<QWord, TDbLoc>;
   h: TVDbRecHead;
-  n, np: Integer;
+  pair: TPair<QWord, TDbLoc>;
   op: TPendOp;
   pendKeys: TDictionary<QWord, Byte>;
   pendDels: TDictionary<QWord, Byte>; // pending DEL -> index'deki satir gorunmemeli
   plainBuf: TBytes;
-  count: Integer;
+  n: Integer;
+
+  // Adaylari Off alanina gore kucukten buyuge hizli siralama. Kucuk yarim
+  // recursion, buyuk yarim dongu olarak islenir -> yigin derinligi O(log n)
+  // (1 milyon kayitta ~20 seviye), yani yigin tasma riski yok.
+  procedure SortCands(L, R: Integer);
+  var
+    a, b: Integer;
+    pivot: Int64;
+    tmp: TScanCand;
+  begin
+    while L < R do
+    begin
+      a := L; b := R;
+      pivot := cands[L + ((R - L) shr 1)].Off;
+      while a <= b do
+      begin
+        while cands[a].Off < pivot do Inc(a);
+        while cands[b].Off > pivot do Dec(b);
+        if a <= b then
+        begin
+          tmp := cands[a]; cands[a] := cands[b]; cands[b] := tmp;
+          Inc(a); Dec(b);
+        end;
+      end;
+      if (b - L) < (R - a) then
+      begin
+        if L < b then SortCands(L, b);
+        L := a;
+      end
+      else
+      begin
+        if a < R then SortCands(a, R);
+        R := b;
+      end;
+    end;
+  end;
 begin
   if FClosed then
     raise EVDbException.Create(ecDatabaseNotOpen, 'VDb: once Open cagir');
 
   fsize := FS.Size;
-  SetLength(buf, 65536);
+  nTotal := FIndex.Count;
   pendKeys := TDictionary<QWord, Byte>.Create;
   pendDels := TDictionary<QWord, Byte>.Create;
   try
@@ -1639,25 +1695,19 @@ begin
         else
           pendKeys.AddOrSetValue(FPending[n].Key, 0);
 
-    // Tahmini boyut: index + pending puts
-    SetLength(Keys, FIndex.Count + pendKeys.Count);
-    SetLength(Vals, FIndex.Count + pendKeys.Count);
-    count := 0;
-
-    // 1. Commit edilmis veriler (FIndex) - gorunurluk filtresiyle
+    // ---- 1. ASAMA: gorunur kayitlari topla (HIC disk okumadan) ----
+    SetLength(cands, nTotal);
+    nCand := 0;
     for pair in FIndex do
     begin
-      if (Limit > 0) and (count >= Limit) then Break;
-      // R-26: TABLO FILTRESI — en ucuz kontrol ilk once. Diger tablonun
-      // kaydi burada elenir; asagidaki FS.Position/Read hic calismaz.
-      // TableId < 0 (satir degil / bilinmiyor) elenmez: davranis degismez.
-      if (TableFilter >= 0) and (pair.Value.TableId >= 0) and
-         (pair.Value.TableId <> TableFilter) then Continue;
-      // Gorunurlilik kontrolu
+      // Koruma: ayni anda FIndex buyumus ise disari tasma (eski kod da
+      // Keys[]'i nTotal ile sinirlamisti; burada ayni sinir uygulanir).
+      if nCand >= nTotal then Break;
+      // Gorunurluk kontrolu
       if not IsVisible(pair.Value, SnapshotSeq) then Continue;
       // Tombstone kontrolu
       if (pair.Value.Flags and VDB_FLAG_DEL) <> 0 then Continue;
-      // Guvenlik kontrolu
+      // Guvenlik kontrolu (2. asamadaki okuma penceresi de bu sinira dayanir)
       if (pair.Value.Offset < 0) or
          (pair.Value.Offset + Int64(SizeOf(h)) + Int64(pair.Value.Size) > fsize) then
         Continue;
@@ -1665,40 +1715,94 @@ begin
       if pendKeys.ContainsKey(pair.Key) then Continue;
       if pendDels.ContainsKey(pair.Key) then Continue;
 
-      if Length(buf) < Integer(pair.Value.Size) then
-        SetLength(buf, pair.Value.Size);
-      FS.Position := pair.Value.Offset;
-      FS.ReadBuffer(h, SizeOf(h));
-      if (h.Magic <> VDB_MAGIC) or (h.Key <> pair.Key) or (h.ValLen <> pair.Value.Size) then
-        Continue;
-      if (h.Flags and VDB_FLAG_DEL) <> 0 then Continue;
-
-      Keys[count] := pair.Key;
-      SetLength(Vals[count], pair.Value.Size);
-      if pair.Value.Size > 0 then
-      begin
-        if Length(buf) < Integer(pair.Value.Size) then
-          SetLength(buf, pair.Value.Size);
-        FS.ReadBuffer(buf[0], pair.Value.Size);
-        Move(buf[0], Vals[count][0], pair.Value.Size);
-      end;
-      if (h.Flags and VDB_FLAG_ENCRYPTED) <> 0 then
-      begin
-        plainBuf := nil;
-        if not DecryptValue(Vals[count], plainBuf) then
-        begin
-          if Length(FEncKey) <> VDB_KEY_LEN then
-            raise EVDbException.CreateFmt(ecCorrupt,
-              'VDb: kayit SIFRELI: anahtar yok. Once OpenKeyFile/SetEncryptionKey. key=%d',
-              [pair.Key]);
-          raise EVDbException.CreateFmt(ecCorrupt,
-            'VDb: kayit cozulemedi (anahtar yanlis veya veri bozulmus) key=%d',
-            [pair.Key]);
-        end;
-        Vals[count] := plainBuf;
-      end;
-      Inc(count);
+      cands[nCand].Off := pair.Value.Offset;
+      cands[nCand].Size := pair.Value.Size;
+      cands[nCand].Key := pair.Key;
+      cands[nCand].Idx := nCand;   // cikti sirasi = FIndex iterasyon sirasi
+      Inc(nCand);
     end;
+    SetLength(cands, nCand);
+
+    // Tahmini boyut: index + pending puts (eski kodla ayni pay)
+    SetLength(Keys, nTotal + pendKeys.Count);
+    SetLength(Vals, nTotal + pendKeys.Count);
+    // Anahtarlar siralamadan ONCE cikti sirasina gore yerlestirilir
+    for i := 0 to nCand - 1 do
+      Keys[i] := cands[i].Key;
+    SetLength(ok, nCand);
+    if nCand > 0 then FillChar(ok[0], nCand, 0);
+    count := 0;
+
+    // ---- 2. ASAMA: ofset sirasiyla BLOK okuma ----
+    if nCand > 0 then
+    begin
+      SortCands(0, nCand - 1);
+      SetLength(buf, WINDOW);
+      bufStart := -1;
+      bufLen := 0;
+      for k := 0 to nCand - 1 do
+      begin
+        off := cands[k].Off;
+        recLen := SizeOf(h) + Integer(cands[k].Size);
+        // Pencere bu kaydi kapsamiyor mu? -> kaydin kendisinden yeniden basla
+        if (bufStart < 0) or (off < bufStart) or
+           (off + recLen > bufStart + bufLen) then
+        begin
+          want := WINDOW;
+          if recLen > want then want := recLen;
+          if off + want > fsize then want := Integer(fsize - off);
+          // 1. asamadaki sinir denetimi off+recLen <= fsize garantiler;
+          // yani want her zaman >= recLen kalir.
+          if Length(buf) < want then SetLength(buf, want);
+          FS.Position := off;
+          FS.ReadBuffer(buf[0], want);
+          bufStart := off;
+          bufLen := want;
+        end;
+        base := Integer(off - bufStart);
+
+        // Basligi tampondan al ve dogrula (eski kodla ayni denetimler)
+        Move(buf[base], h, SizeOf(h));
+        if (h.Magic <> VDB_MAGIC) or (h.Key <> cands[k].Key) or
+           (h.ValLen <> cands[k].Size) then Continue;
+        if (h.Flags and VDB_FLAG_DEL) <> 0 then Continue;
+
+        idx := cands[k].Idx;
+        SetLength(Vals[idx], cands[k].Size);
+        if cands[k].Size > 0 then
+          Move(buf[base + SizeOf(h)], Vals[idx][0], cands[k].Size);
+        if (h.Flags and VDB_FLAG_ENCRYPTED) <> 0 then
+        begin
+          plainBuf := nil;
+          if not DecryptValue(Vals[idx], plainBuf) then
+          begin
+            if Length(FEncKey) <> VDB_KEY_LEN then
+              raise EVDbException.CreateFmt(ecCorrupt,
+                'VDb: kayit SIFRELI: anahtar yok. Once OpenKeyFile/SetEncryptionKey. key=%d',
+                [cands[k].Key]);
+            raise EVDbException.CreateFmt(ecCorrupt,
+              'VDb: kayit cozulemedi (anahtar yanlis veya veri bozulmus) key=%d',
+              [cands[k].Key]);
+          end;
+          Vals[idx] := plainBuf;
+        end;
+        ok[idx] := 1;
+      end;
+    end;
+
+    // ---- 3. ASAMA: gecerli kayitlari ORIJINAL sira ile SIKISTIR ----
+    // (okuma ofset sirasiyla yapildi; cikti yine FIndex iterasyon sirasi)
+    for i := 0 to nCand - 1 do
+      if ok[i] <> 0 then
+      begin
+        if count <> i then
+        begin
+          Keys[count] := Keys[i];
+          Vals[count] := Vals[i];
+        end;
+        Inc(count);
+      end;
+    if (Limit > 0) and (count > Limit) then count := Limit;
 
     // 2. Batch icindeki pending PUT'lar (SnapshotSeq > FSeq ise)
     if FInBatch and (SnapshotSeq > FSeq) then
@@ -1896,6 +2000,16 @@ for i := 0 to FPending.Count - 1 do
       FPendingPuts.Clear;
       FPendingDels.Clear;
       FInBatch := False;
+      { 2026-10-15 GERCEK BUG: transaction snapshot'i commit sonrasi
+        SIFIRLANMIYORDU. FSnapshotSeq bir kez BeginBatch'te
+        (FSeq+1) yazildiktan sonra sonsuza dek nonzero kaliyordu.
+        Get/Exists/ScanAll `FInBatch and (FSnapshotSeq > 0)` diye baktigi
+        icin, SONRAKI herhangi bir batch (ornegin SAVEPOINT'in ortuk
+        batch'i, VDbCore.pas:1896 - BeginBatch CAGIRMADAN FInBatch
+        True yapar) eski snapshot'i kullanir ve batch icindeki yeni
+        yazmalar GORUNMEZDI. SAVEPOINT/ROLLBACK TO testleri bu yuzden
+        yanlis sonuc veriyordu. Transaction bitince snapshot yoktur. }
+      FSnapshotSeq := 0;
     end;
   finally
     FLock.Leave;
@@ -1910,6 +2024,10 @@ begin
     FPendingPuts.Clear;
     FPendingDels.Clear;
     FInBatch := False;
+    { 2026-10-15: CommitBatch ile ayni neden - transaction snapshot'i
+      geri alindiktan sonra SIFIRLANMALI, yoksa sonraki batch (SAVEPOINT
+      gibi BeginBatch cagirmayanlar) eski snapshot'i kullanir. }
+    FSnapshotSeq := 0;
     ClearSavepoints;
   finally
     FLock.Leave;
@@ -2060,6 +2178,14 @@ begin
   for i := 0 to FSavepoints.Count - 1 do
     FSavepoints[i].IndexSnapshot.Free;
   FSavepoints.Clear;
+end;
+
+function TVDb.GetHasSavepoints: Boolean;
+// Acik savepoint var mi? Kilitli degil; sadece sayiya bakar (guvenli
+// tekil okuma). SQL katmani tek cumlelik DML'i otomatik batch'e
+// sarmalamadan ONCE bunu sorar.
+begin
+  Result := FSavepoints.Count > 0;
 end;
 
 procedure TVDb.Flush;
@@ -3570,16 +3696,14 @@ begin
   end;
 end;
 
-  procedure TVDb.ScanAll(out Keys: TQWordArray; out Vals: TValArray;
-    TableFilter: Integer);
-  // R-01 MVCC: batch icinde transaction snapshot'indan taran; batch disi eski ScanAll (High(QWord) = her sey gorunur)
-  // R-26: TableFilter >= 0 ise yalnizca o tablonun satirlari dosyadan okunur.
-  begin
-    if FInBatch and (FSnapshotSeq > 0) then
-      ScanSnapshot(Keys, Vals, FSnapshotSeq, -1, TableFilter)
-    else
-      ScanSnapshot(Keys, Vals, High(QWord), -1, TableFilter);
-  end;
+procedure TVDb.ScanAll(out Keys: TQWordArray; out Vals: TValArray);
+// R-01 MVCC: batch icinde transaction snapshot'indan taran; batch disi eski ScanAll (High(QWord) = her sey gorunur)
+begin
+  if FInBatch and (FSnapshotSeq > 0) then
+    ScanSnapshot(Keys, Vals, FSnapshotSeq)
+  else
+    ScanSnapshot(Keys, Vals, High(QWord));
+end;
 
 
 { R-03/R-04: UPSERT / RETURNING }
