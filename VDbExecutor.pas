@@ -6149,13 +6149,17 @@ begin
     // CTE/normal yolda allRows buradan suzulur.
     if not SkipOffsetLimit then
     begin
-      SetLength(filteredRows, 0);
+      // Sonuc en fazla allRows kadar olabilir; satir basina SetLength
+      // dinamik diziyi tekrar tekrar kopyalayip O(N^2) maliyet yaratir.
+      SetLength(filteredRows, Length(allRows));
+      n := 0;
       for i := 0 to High(allRows) do
         if RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes) then
         begin
-          SetLength(filteredRows, Length(filteredRows) + 1);
-          filteredRows[High(filteredRows)] := allRows[i];
+          filteredRows[n] := allRows[i];
+          Inc(n);
         end;
+      SetLength(filteredRows, n);
     end;
   end;
 
