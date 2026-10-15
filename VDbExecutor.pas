@@ -6009,13 +6009,18 @@ begin
       FinishGroup;
       Exit;
     end;
-    SetLength(filteredRows, 0);
+    // Sonuc en fazla allRows kadar olabilir: bir kez ayir, eslesenleri
+    // sirayla doldur ve sonunda kisalt. Satir basina SetLength O(N^2)
+    // kopyalama maliyeti olusturuyordu.
+    SetLength(filteredRows, Length(allRows));
+    n := 0;
     for i := 0 to High(allRows) do
       if RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes) then
       begin
-        SetLength(filteredRows, Length(filteredRows) + 1);
-        filteredRows[High(filteredRows)] := allRows[i];
+        filteredRows[n] := allRows[i];
+        Inc(n);
       end;
+    SetLength(filteredRows, n);
   end
   else
   begin
@@ -6107,13 +6112,17 @@ begin
       // kumesi uzerinde calissin. WHERE filtresi asagida ayrica uygulanir.
       if FT.RlsApplies(Stmt.FromTable) then
       begin
-        SetLength(rlRows, 0);
+        // RLS sonucunun ust siniri allRows uzunlugudur; her gorunen
+        // satirda diziyi yeniden buyutme.
+        SetLength(rlRows, Length(allRows));
+        n := 0;
         for i := 0 to High(allRows) do
           if RlsRowVisible(Stmt.FromTable, 1, allRows[i], colNames, colTypes) then
           begin
-            SetLength(rlRows, Length(rlRows) + 1);
-            rlRows[High(rlRows)] := allRows[i];
+            rlRows[n] := allRows[i];
+            Inc(n);
           end;
+        SetLength(rlRows, n);
         allRows := rlRows;
         SetLength(pks, 0);
         SkipOffsetLimit := False;
