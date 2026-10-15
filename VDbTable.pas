@@ -2298,12 +2298,31 @@ begin
   Result := True;
 end;
 
+function VDbRowTagOf(const PlainValue: TBytes; ValueLen: Integer): Integer;
+// R-26 (2026-10-15): KV katmanina verdigimiz TABLO ID cozucusu.
+begin
+  Result := -1;
+  if (ValueLen < 2) or (Length(PlainValue) < 2) then Exit;
+  // sema kaydi ('VSCH1') satir degildir; ilk iki bayti rastgele bir
+  // tablo id'sine denk gelebilir -> mutlaka -1 yap.
+  if (ValueLen >= Length(VDB_SCHEMA_TAG)) and
+     (Length(PlainValue) >= Length(VDB_SCHEMA_TAG)) and
+     CompareMem(@PlainValue[0], @VDB_SCHEMA_TAG[1], Length(VDB_SCHEMA_TAG)) then
+    Exit;
+  // ReadU16 ile birebir ayni hesap
+  Result := Integer(PlainValue[0]) or (Integer(PlainValue[1]) shl 8);
+end;
+
 { TVTableDb }
 
 constructor TVTableDb.Create(AKv: TVDb);
 begin
   inherited Create;
   FKv := AKv;
+  // R-26: KV katmanina tablo-id cozucusunu ver. Boylece Recover, zaten
+  // CRC icin okudugu her kayittan tablo id'yi bedava cikarir ve tablo
+  // taramalari diger tablolarin kayitlarini OKUMAZ.
+  AKv.RowTagFunc := @VDbRowTagOf;
   FLock := TCriticalSection.Create;
   FTables := TDictionary<string, TTableDef>.Create;
   FById := TDictionary<Word, string>.Create;
@@ -5010,8 +5029,8 @@ begin
   // 1) Eski satirlari topla (dosyadan, eski semaya gore)
   // ONEMLI: once hepsini cozup KOPYALIYORUZ. Ara adimda (orn. index
   // erisimi) ScanAll tekrar cagrilirsa paylasilan dizi uzerine
-  // yazilir ve asagidaki satirlar bozulur -> access violation.
-  FKv.ScanAll(keys, raw);
+    // yazilir ve asagidaki satirlar bozulur -> access violation.
+    FKv.ScanAll(keys, raw, T.TableId);   // R-26: yalnizca bu tablonun satirlari
   SetLength(oldKeys, 0);
   SetLength(pks, 0);
   SetLength(oldRows, 0);
@@ -5599,8 +5618,8 @@ begin
   if TableExists(nn) then raise EVDbException.Create(ecTableExists, 'tablo var: ' + NewName);
   if Trim(NewName) = '' then raise EVDbException.Create(ecInvalidName, 'yeni ad bos olamaz');
 
-  // KEY tablo adi ile hashlendigi icin tum anahtarlar degismeli
-  FKv.ScanAll(keys, raw);
+    // KEY tablo adi ile hashlendigi icin tum anahtarlar degismeli
+    FKv.ScanAll(keys, raw, t.TableId);   // R-26
   ownBatch := not FKv.InBatch;
   if ownBatch then FKv.BeginBatch;
   try
@@ -6334,8 +6353,8 @@ begin
             [kv2.Key, kv2.Value.Fks[j].Col, nReferencing]);
       end;
   end;
-  FKv.ScanAll(keys, raw);
-  ownBatch := not FKv.InBatch;
+    FKv.ScanAll(keys, raw, t.TableId);   // R-26: yalnizca bu tablonun satirlari
+    ownBatch := not FKv.InBatch;
   if ownBatch then FKv.BeginBatch;
   try
     for i := 0 to High(keys) do
@@ -6862,8 +6881,8 @@ begin
   if Targets.HasFilter and (t.PartType <> '') then
     for i := 0 to High(t.Cols) do
       if t.Cols[i].Name = t.PartCol then begin pci := i; Break; end;
-  FKv.ScanAll(keys, raw);
-  SetLength(Pks, 0); SetLength(Rows, 0); n := 0;
+    FKv.ScanAll(keys, raw, t.TableId);   // R-26: diger tablolar okunmaz
+    SetLength(Pks, 0); SetLength(Rows, 0); n := 0;
   for i := 0 to High(keys) do
   begin
     k := keys[i];

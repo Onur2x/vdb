@@ -48,6 +48,14 @@ const
 type
   TQWordArray = array of QWord;
   TValArray = array of TBytes;
+  { R-26 (2026-10-15): satirin icindeki TABLO ID'yi cozucu.
+    KV katmani satir bicimini BILMEZ; cozucuyu VDbTable saglar ve TVDb
+    icin atar. Boylece Recover, zaten CRC icin okudugu degerden tablo
+    id'yi bedava cikarir.
+      >= 0 : bu kayit o tabloya ait satir
+      -1   : satir degil (semaya benzer ozel kayit) -> filtre uygulanmaz }
+  TVDbRowTagFunc = function(const PlainValue: TBytes; ValueLen: Integer): Integer;
+
   TDbLoc = record
     Offset: Int64;
     Size: LongWord;
@@ -56,6 +64,13 @@ type
       baytlari kopyaladigi icin bayragi da KORUMALIDIR; sabit
       VDB_FLAG_PUT yazmak sifreli kaydi duz metne cevirirdi. }
     Flags: Byte;
+    { R-26: satirin tablo id'si. Recover zaten her kaydin TAM degerini
+      CRC icin okudugundan bu alan bedava dolar. Bir tablo taramasi,
+      DIGER tablolarin kayitlarini dosyadan OKUMADAN eleyebilir
+      (eski hali: butun KV okunup decode edilirdi -> baska tablo
+      boyutuyla orantili gereksiz masraf).
+      -1 = bilinmiyor/satir degil -> tablo filtresi uygulanmaz. }
+    TableId: Integer;
   end;
 
   TPendOp = record
@@ -116,6 +131,9 @@ FPath: string;
     FS: TFileStream;
     FLock: TCriticalSection;
     FIndex: TDictionary<QWord, TDbLoc>;
+    { R-26: satir bicimi cozucusu. VDbTable olustururken atar; nil ise
+      (ham KV kullanimi) tablo id'leri -1 kalir ve filtre uygulanmaz. }
+    FRowTagFunc: TVDbRowTagFunc;
     FSeq: QWord;
     FSyncWrite: Boolean;
     // GROUP COMMIT: SyncWrite=True iken bile, fsync'ler bu sure (ms)
@@ -283,14 +301,21 @@ private
     procedure Flush;
     function Count: Integer;
     function GetAllKeys: TQWordArray;
-    procedure ScanAll(out Keys: TQWordArray; out Vals: TValArray);
+    { R-26: TableFilter >= 0 ise yalnizca o tabloya ait satirlar okunur;
+      diger tablolarin kayitlari DOSYADAN OKUNMAZ (gorev oncesi
+      FIndex'teki TableId ile elenir). -1 = filtre yok (eski davranis). }
+    procedure ScanAll(out Keys: TQWordArray; out Vals: TValArray;
+      TableFilter: Integer = -1);
+    { R-26: satir bicimi cozucusu (bkz. TVDbRowTagFunc). VDbTable
+      TVDb olustururken atar. }
+    property RowTagFunc: TVDbRowTagFunc read FRowTagFunc write FRowTagFunc;
     { ---------------------------------------------------------------
       MVCC / Snapshot Isolation (R-01) - Kilitsiz Okuma API
       --------------------------------------------------------------- }
     function GetSnapshot(Key: QWord; out Value: TBytes; SnapshotSeq: QWord): Boolean;
     function ExistsSnapshot(Key: QWord; SnapshotSeq: QWord): Boolean;
     procedure ScanSnapshot(out Keys: TQWordArray; out Vals: TValArray;
-      SnapshotSeq: QWord; Limit: Integer = -1);
+      SnapshotSeq: QWord; Limit: Integer = -1; TableFilter: Integer = -1);
     procedure Compact(out OldBytes, NewBytes: Int64);
     function AutoCompact(out OldBytes, NewBytes: Int64;
       MaxDeadRatio: Double = 0.3; MinBytes: Int64 = 65536): Boolean;
@@ -903,6 +928,13 @@ begin
     loc.Size := h.ValLen;
     loc.Seq := h.Seq;
     loc.Flags := h.Flags;
+    // R-26: tablo id'yi satirin icinden cikar (Value PLAINTEXT'tir;
+    // sifreleme 'stored' uzerinde yapilir). WAL replay de AppendRec'i
+    // cagirdigi icin gunkluk yeniden yazimlari da kapsar.
+    if @FRowTagFunc <> nil then
+      loc.TableId := FRowTagFunc(Value, Length(Value))
+    else
+      loc.TableId := -1;
     FIndex.AddOrSetValue(Key, loc);
   end;
   { 2026-10-05 Adim 12: sifreli ara tampon ClearEnc; ham sifreli baytlar
@@ -966,7 +998,10 @@ var
   pendSz: array of LongWord;
   pendKey: array of QWord;
   pendFlags: array of Byte;
+  pendTag: array of Integer;   // R-26: satirin tablo id'si (-1 = satir degil)
   pendN: Integer;
+  tag: Integer;
+  tagPlain: TBytes;
   committed: Boolean;
   torn: Boolean;   // dongu bir kayitta kirildi (CRC/magic/yari yazim)
   sawBatchEnd: Boolean; // dosyada HIC BIR BATCHEND kaydi var miydi
@@ -993,6 +1028,7 @@ var
         l2.Size := pendSz[q];
         l2.Seq := 0;
         l2.Flags := pendFlags[q];
+        l2.TableId := pendTag[q];   // R-26
         FIndex.AddOrSetValue(pendKey[q], l2);
       end;
     end;
@@ -1038,6 +1074,23 @@ begin
     begin torn := True; Break; end;
     if h.Seq > FSeq then
       FSeq := h.Seq;
+    // R-26: CRC zaten tum degeri buf'a okudu -> tablo id'yi bedava cikar.
+    // Boylece bir tablo taramasi, diger tablolarin kayitlarini AYRICA
+    // okumak zorunda kalmaz. Sifreli kayitta once cozulur.
+    if (h.ValLen >= 2) and (@FRowTagFunc <> nil) then
+    begin
+      if (h.Flags and VDB_FLAG_ENCRYPTED) <> 0 then
+      begin
+        if DecryptValue(buf, tagPlain) then
+          tag := FRowTagFunc(tagPlain, Length(tagPlain))
+        else
+          tag := -1;   // cozulemedi -> filtre uygulanmaz (guvenli taraf)
+      end
+      else
+        tag := FRowTagFunc(buf, Integer(h.ValLen));
+    end
+    else
+      tag := -1;
     if h.Flags = VDB_FLAG_BATCHEND then
     begin
       // batch tamam: gecici kayitlar gecerli
@@ -1055,11 +1108,13 @@ begin
         SetLength(pendSz, pendN + 64);
         SetLength(pendKey, pendN + 64);
         SetLength(pendFlags, pendN + 64);
+        SetLength(pendTag, pendN + 64);
       end;
       pendPos[pendN] := pos;
       pendSz[pendN] := h.ValLen;
       pendKey[pendN] := h.Key;
       pendFlags[pendN] := h.Flags;
+      pendTag[pendN] := tag;      // R-26
       Inc(pendN);
       committed := False;
     end;
@@ -1551,9 +1606,11 @@ begin
   Result := True;
 end;
 
-procedure TVDb.ScanSnapshot(out Keys: TQWordArray; out Vals: TValArray;
-  SnapshotSeq: QWord; Limit: Integer = -1);
-// Kilitsiz snapshot tum tarama. Limit > 0 ise en fazla Limit kayit dondurur.
+  procedure TVDb.ScanSnapshot(out Keys: TQWordArray; out Vals: TValArray;
+    SnapshotSeq: QWord; Limit: Integer; TableFilter: Integer);
+  // Kilitsiz snapshot tum tarama. Limit > 0 ise en fazla Limit kayit dondurur.
+  // R-26: TableFilter >= 0 ise FIndex'teki TableId ile ONCE elenir; ele
+  // gecmeyen kayit icin dosya hic acilmaz (eski hali: tum KV okunuyordu).
 var
   buf: TBytes;
   fsize: Int64;
@@ -1591,7 +1648,12 @@ begin
     for pair in FIndex do
     begin
       if (Limit > 0) and (count >= Limit) then Break;
-      // Gorunurluk kontrolu
+      // R-26: TABLO FILTRESI — en ucuz kontrol ilk once. Diger tablonun
+      // kaydi burada elenir; asagidaki FS.Position/Read hic calismaz.
+      // TableId < 0 (satir degil / bilinmiyor) elenmez: davranis degismez.
+      if (TableFilter >= 0) and (pair.Value.TableId >= 0) and
+         (pair.Value.TableId <> TableFilter) then Continue;
+      // Gorunurlilik kontrolu
       if not IsVisible(pair.Value, SnapshotSeq) then Continue;
       // Tombstone kontrolu
       if (pair.Value.Flags and VDB_FLAG_DEL) <> 0 then Continue;
@@ -3508,14 +3570,16 @@ begin
   end;
 end;
 
-procedure TVDb.ScanAll(out Keys: TQWordArray; out Vals: TValArray);
-// R-01 MVCC: batch icinde transaction snapshot'indan taran; batch disi eski ScanAll (High(QWord) = her sey gorunur)
-begin
-  if FInBatch and (FSnapshotSeq > 0) then
-    ScanSnapshot(Keys, Vals, FSnapshotSeq)
-  else
-    ScanSnapshot(Keys, Vals, High(QWord));
-end;
+  procedure TVDb.ScanAll(out Keys: TQWordArray; out Vals: TValArray;
+    TableFilter: Integer);
+  // R-01 MVCC: batch icinde transaction snapshot'indan taran; batch disi eski ScanAll (High(QWord) = her sey gorunur)
+  // R-26: TableFilter >= 0 ise yalnizca o tablonun satirlari dosyadan okunur.
+  begin
+    if FInBatch and (FSnapshotSeq > 0) then
+      ScanSnapshot(Keys, Vals, FSnapshotSeq, -1, TableFilter)
+    else
+      ScanSnapshot(Keys, Vals, High(QWord), -1, TableFilter);
+  end;
 
 
 { R-03/R-04: UPSERT / RETURNING }
