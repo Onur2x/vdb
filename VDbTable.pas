@@ -659,6 +659,13 @@ function VDbNormValue(Ctype: Byte; const S: string): string; }
 
 function VDbHashKey(const Table, Pk: string): QWord;
 function VDbNorm(const S: string): string;
+{ P-18a (2026-10-16): VDbPeekRawRow'un PByte+Len surumu. ScanRawIter
+  geri-cagrisinda kayit tamponu TBytes DEGIL, chunk icinde bir araliktir;
+  yeni TBytes ayirmadan ayni sinir kontrolleriyle onizlenir. Semantigi
+  VDbPeekRawRow ile birebir ayni (eski sema/kesik kayit -> False). }
+function VDbPeekRawRowP(B: PByte; Len, ColCount: Integer;
+  out TableId: Word; out Pk: string;
+  var FType: array of Byte; var FOff, FLen: array of Integer): Boolean;
 { P-12 (2026-10-16): Ham satir onizlemesi (aggregate stream taramasi).
   DecodeRow'un tam string materializasyonu yerine yalnizca tablo id + PK
   cozulur; alanlar ham OFSET/UZUNLUK/TIP olarak raporlanir (cozulmez).
@@ -2462,6 +2469,60 @@ begin
       Continue;
     end;
     if (vl < 0) or (p + vl > Length(B)) then Exit;
+    FOff[i] := p; FLen[i] := vl;
+    Inc(p, vl);
+  end;
+  Result := True;
+end;
+
+function VDbPeekRawRowP(B: PByte; Len, ColCount: Integer;
+  out TableId: Word; out Pk: string;
+  var FType: array of Byte; var FOff, FLen: array of Integer): Boolean;
+{ P-18a: bkz. interface. VDbPeekRawRow ile AYNI sinir kontrolleri; tek
+  fark: kaynak (B, Len) ikilisi chunk icinden gosterilir, kopyalanmaz.
+  Not: pk yalnizca KISA bir stringe cevrilir (VDbHashKey denetimi icin
+  sart) — 120 baytlik deger govdesi hicbir yere kopyalanmaz. }
+var
+  p: Integer;
+  pkL, cc, i: Word;
+  vl: LongInt;
+  s: AnsiString;
+
+  function RdU16(out V: Word): Boolean;
+  begin
+    Result := p + 2 <= Len;
+    if Result then begin V := B[p] or (Word(B[p + 1]) shl 8); Inc(p, 2); end;
+  end;
+
+  function RdI32(out V: LongInt): Boolean;
+  begin
+    Result := p + 4 <= Len;
+    if Result then begin Move(B[p], V, 4); Inc(p, 4); end;
+  end;
+
+begin
+  Result := False;
+  if (B = nil) or (Length(FType) < ColCount) then Exit;
+  p := 0;
+  if not RdU16(TableId) then Exit;
+  if not RdU16(pkL) then Exit;
+  if p + pkL > Len then Exit;
+  SetString(s, PAnsiChar(NativeUInt(B) + NativeUInt(p)), pkL);
+  Pk := UTF8Decode(s);
+  Inc(p, pkL);
+  if not RdU16(cc) then Exit;
+  if Integer(cc) <> ColCount then Exit;
+  for i := 0 to cc - 1 do
+  begin
+    if p >= Len then Exit;
+    FType[i] := B[p]; Inc(p);
+    if not RdI32(vl) then Exit;
+    if vl = -1 then
+    begin
+      FOff[i] := -1; FLen[i] := 0;   // NULL: DecodeRow gibi ilerlemez
+      Continue;
+    end;
+    if (vl < 0) or (p + vl > Len) then Exit;
     FOff[i] := p; FLen[i] := vl;
     Inc(p, vl);
   end;

@@ -9,6 +9,66 @@ akışını izler.
 
 ---
 
+## v0.007 — 2026-10-16 — Hız turu: P-18a sıfır-kopya agreg taraması (ScanRawIter)
+
+### Ne eklendi / değişti
+
+- **P-18a — `ScanRawIter` (VDbCore/VDbTable/VDbExecutor)**: `TryStreamAgg`
+  (COUNT/SUM/AVG/MIN/MAX akışı) artık `ScanAll` ile satır başına TBytes +
+  Keys/Vals dizisi MALZELLEŞTİRMİYOR. `TVDb.ScanRawIter` ScanSnapshot'ın üç
+  fazını (görünürlük + tombstone + R-26 filtresi + bucket toplu okuma +
+  bozuk-kayıt sessiz atlama + şifre çözme) BİREBİR kopyalar; tek fark: değer,
+  2 MB'lık chunk tamponunun içindeki aralıktan geri çağrıya `(PByte, Len)`
+  olarak verilir. `VDbPeekRawRowP` aynı sınır kontrollerini kopyasız uygular.
+  Şifreli kayıtlar nadir yol olarak çözülüp verilir (doğal gereklilik).
+  Semantik birebir: eski-sema/bozuk kayıt veya hash çakışmasında aynı
+  "genel yola düş" davranışı; sıralama bucket sırasıdır (agrega sıradan
+  bağımsız). `Limit` desteklenmez (agregalar kullanmaz).
+- `bench26` mini A/B: COUNT x5 140.8→**135.2 ms** (−%4), SUM x3
+  144.9→**136.1 ms** (−%6) @200K. 200K ölçeğinde malzelleştirme büyük
+  ölçüde cache-isabetli; asıl kazanç 1M'de (vsbench run5'te ölçülecek).
+  Aynı koşuda INSERT/UPDATE yan aşamaları ±%5 gürültü gösterdi — mini-bench
+  gürültülü makinede okuma fazları için alt sınırdır.
+
+### Doğrulama (sıfırdan)
+
+- `fpc -B` temiz (sqltest 55.856; crashtest 44.837 satır).
+- `sqltest` **2251/2251**, kalan=0 (`sqltest_p18.log`).
+- crashtest 8'li çarpma zinciri **8/8** (`c8_p18.log`) — dayanıklılık
+  sözleşmesi (`SyncWriteInterval=0`) değişmedi.
+
+---
+
+## v0.007 — 2026-10-16 — Speed round: P-18a zero-copy aggregate scan (ScanRawIter) (ENGLISH)
+
+### Added / changed
+
+- **P-18a — `ScanRawIter` (VDbCore/VDbTable/VDbExecutor)**: `TryStreamAgg`
+  (the COUNT/SUM/AVG/MIN/MAX stream) no longer materializes per-row TBytes +
+  Keys/Vals arrays through `ScanAll`. `TVDb.ScanRawIter` copies ScanSnapshot's
+  three phases BIT-FOR-BIT (visibility + tombstones + R-26 filter + bucketed
+  bulk reads + silent skip of corrupt records + decryption); the only change:
+  the value is handed to the callback as `(PByte, Len)` pointing INSIDE the
+  2 MB chunk buffer. `VDbPeekRawRowP` applies the same bounds checks without
+  copying. Encrypted records decrypt into a scratch buffer (rare path,
+  inherent). Semantics preserved: old-schema/corrupt record or hash collision
+  still falls back to the general path; iteration order is bucket order
+  (aggregates are order-insensitive). `Limit` unsupported (aggregates don't).
+- `bench26` mini A/B: COUNT x5 140.8→**135.2 ms** (−4%), SUM x3
+  144.9→**136.1 ms** (−6%) @200K. At 200K the materialization mostly hits
+  cache; the real win shows at 1M (to be measured in vsbench run5). Same run
+  showed ±5% noise on unrelated phases — on a noisy machine the mini-bench is
+  a lower bound for read phases.
+
+### Verification (from scratch)
+
+- Clean `fpc -B` builds (sqltest 55,856; crashtest 44,837 lines).
+- `sqltest` **2251/2251**, remaining=0 (`sqltest_p18.log`).
+- crashtest 8-way crash chain **8/8** (`c8_p18.log`) — the
+  `SyncWriteInterval=0` durability contract is unchanged.
+
+---
+
 ## v0.006 — 2026-10-16 — Hız turu: P-17 yazma-yolü tahsis diyeti (AutoInc, EncodeRow, Exists)
 
 *Not: v0.005'te "P-16" reddedilen BETWEEN nokta-okuma adayıydı; karışmaması

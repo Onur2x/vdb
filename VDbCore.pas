@@ -55,6 +55,13 @@ type
       >= 0 : bu kayit o tabloya ait satir
       -1   : satir degil (semaya benzer ozel kayit) -> filtre uygulanmaz }
   TVDbRowTagFunc = function(const PlainValue: TBytes; ValueLen: Integer): Integer;
+  { P-18a (2026-10-16): ScanRawIter geri cagrisi. Buf, motorun ic tamponuna
+    (bucket chunk'i) isaret eder — YALNIZ cagri sirasinda gecerlidir,
+    saklanmamali/kopyalamadan kullanilmalidir. Return False => tarama
+    derhal durdurulur (ScanRawIter False doner). EN: zero-copy raw scan
+    callback; buffer valid only during the call. }
+  TVDbRawCb = function(Key: QWord; Buf: PByte; Len: Integer;
+    User: Pointer): Boolean;
 
   TDbLoc = record
     Offset: Int64;
@@ -306,6 +313,19 @@ private
       FIndex'teki TableId ile elenir). -1 = filtre yok (eski davranis). }
     procedure ScanAll(out Keys: TQWordArray; out Vals: TValArray;
       TableFilter: Integer = -1);
+    { P-18a (2026-10-16): ScanSnapshot'in SIFIR-KOPYA surumu. Faz A/B/C
+      ScanSnapshot ile birebir (gorunurluk, tombstone, R-26 filtresi,
+      bucket toplu okuma, bozuk-kayit sessiz atlama, sifre cozme); tek
+      fark: kayit basina TBytes/Keys/Vals ayirilmaz, chunk icindeki
+      tampon Cb'ye (PByte+Len) olarak verilir. Limit desteklenmez
+      (agregalar kullanmaz); siralama bucket sirasidir — agregada
+      siparis bagimsizdir. SnapshotSeq secimini cagiran yapar (bkz.
+      ScanRawIterAll). Kilitsizdir; ScanSnapshot ile ayni kosullarda. }
+    function ScanRawIter(SnapshotSeq: QWord; TableFilter: Integer;
+      Cb: TVDbRawCb; User: Pointer): Boolean;
+    function ScanRawIterAll(TableFilter: Integer;
+      Cb: TVDbRawCb; User: Pointer): Boolean;
+    { ScanAll'in secim kuraliyla birebir ayni snapshot secimi. }
     { R-26: satir bicimi cozucusu (bkz. TVDbRowTagFunc). VDbTable
       TVDb olustururken atar. }
     property RowTagFunc: TVDbRowTagFunc read FRowTagFunc write FRowTagFunc;
@@ -1844,6 +1864,229 @@ begin
     pendKeys.Free;
     pendDels.Free;
   end;
+end;
+
+function TVDb.ScanRawIter(SnapshotSeq: QWord; TableFilter: Integer;
+  Cb: TVDbRawCb; User: Pointer): Boolean;
+// P-18a (2026-10-16): bkz. interface. Fazlar ScanSnapshot'tan kopyadir ve
+// ELEME/SINIFLANDIRMA kurallari birebirdir; yalniz CIKTI biyimi degisir:
+// adayin deger tamponu Cb'ye gosterilir, kopyalanmaz. DecryptNeededIf
+// ScanSnapshot icindeki ile aynidir (kucuk yordam; paylasim yerine
+// kopya — ScanSnapshot gauntlet'ten gecmis haliyle kalmasi icin).
+const
+  VDB_SCAN_BUCKET = 21;
+  VDB_SCAN_CHUNK_CAP = 4 * 1024 * 1024;
+type
+  TIterCand = record
+    Off: Int64;
+    Size: LongWord;
+    Key: QWord;
+  end;
+var
+  fsize: Int64;
+  pair: TPair<QWord, TDbLoc>;
+  h: TVDbRecHead;
+  n: Integer;
+  op: TPendOp;
+  pendKeys, pendDels: TDictionary<QWord, Byte>;
+  cands: array of TIterCand;
+  bBeg, bCur: array of Integer;
+  bLo, bHi: array of Int64;
+  order: array of Integer;
+  chunk, decB, recBuf: TBytes;
+  candCnt, bucket, m, n2, bCount: Integer;
+  lo, hi, span, endOff, bucket64: Int64;
+  got, p: Integer;
+
+  procedure DecryptIfNeeded(var V: TBytes; Flags: Byte; RecKey: QWord);
+  var
+    plain: TBytes;
+  begin
+    if (Flags and VDB_FLAG_ENCRYPTED) = 0 then Exit;
+    plain := nil;
+    if not DecryptValue(V, plain) then
+    begin
+      if Length(FEncKey) <> VDB_KEY_LEN then
+        raise EVDbException.CreateFmt(ecCorrupt,
+          'VDb: kayit SIFRELI: anahtar yok. Once OpenKeyFile/SetEncryptionKey. key=%d',
+          [RecKey]);
+      raise EVDbException.CreateFmt(ecCorrupt,
+        'VDb: kayit cozulemedi (anahtar yanlis veya veri bozulmus) key=%d',
+        [RecKey]);
+    end;
+    V := plain;
+  end;
+
+begin
+  Result := True;
+  if FClosed then
+    raise EVDbException.Create(ecDatabaseNotOpen, 'VDb: once Open cagir');
+
+  fsize := FS.Size;
+  pendKeys := TDictionary<QWord, Byte>.Create;
+  pendDels := TDictionary<QWord, Byte>.Create;
+  try
+    // Batch icindeki pending ops: SnapshotSeq > FSeq ise gorunur
+    if FInBatch and (SnapshotSeq > FSeq) then
+      for n := 0 to FPending.Count - 1 do
+        if FPending[n].IsDel then
+          pendDels.AddOrSetValue(FPending[n].Key, 0)
+        else
+          pendKeys.AddOrSetValue(FPending[n].Key, 0);
+
+    // ---- PAS A: gorunur adaylari topla (dosyaya hic dokunmaz) ----
+    SetLength(cands, FIndex.Count);
+    candCnt := 0;
+    for pair in FIndex do
+    begin
+      if (TableFilter >= 0) and (pair.Value.TableId >= 0) and
+         (pair.Value.TableId <> TableFilter) then Continue;
+      if not IsVisible(pair.Value, SnapshotSeq) then Continue;
+      if (pair.Value.Flags and VDB_FLAG_DEL) <> 0 then Continue;
+      if (pair.Value.Offset < 0) or
+         (pair.Value.Offset + Int64(SizeOf(h)) + Int64(pair.Value.Size) > fsize) then
+        Continue;
+      if pendKeys.ContainsKey(pair.Key) then Continue;
+      if pendDels.ContainsKey(pair.Key) then Continue;
+      cands[candCnt].Off := pair.Value.Offset;
+      cands[candCnt].Size := pair.Value.Size;
+      cands[candCnt].Key := pair.Key;
+      Inc(candCnt);
+    end;
+
+    // ---- PAS B: bucket sayim-donusturmesi (ScanSnapshot ile birebir) ----
+    if candCnt > 0 then
+    begin
+      bCount := Integer((fsize shr VDB_SCAN_BUCKET) + 1);
+      if bCount > 8192 then bCount := 8192;
+      SetLength(bLo, bCount); SetLength(bHi, bCount);
+      for n := 0 to bCount - 1 do begin bLo[n] := High(Int64); bHi[n] := 0; end;
+      SetLength(bBeg, bCount + 1);
+      for n := 0 to bCount do bBeg[n] := 0;
+      for n := 0 to candCnt - 1 do
+      begin
+        bucket64 := cands[n].Off shr VDB_SCAN_BUCKET;
+        if bucket64 >= bCount then bucket := bCount - 1
+        else bucket := Integer(bucket64);
+        Inc(bBeg[bucket + 1]);
+        endOff := cands[n].Off + Int64(SizeOf(h)) + Int64(cands[n].Size);
+        if cands[n].Off < bLo[bucket] then bLo[bucket] := cands[n].Off;
+        if endOff > bHi[bucket] then bHi[bucket] := endOff;
+      end;
+      for n := 1 to bCount do Inc(bBeg[n], bBeg[n - 1]);
+      bCur := Copy(bBeg);
+      SetLength(order, candCnt);
+      for n := 0 to candCnt - 1 do
+      begin
+        bucket64 := cands[n].Off shr VDB_SCAN_BUCKET;
+        if bucket64 >= bCount then bucket := bCount - 1
+        else bucket := Integer(bucket64);
+        order[bCur[bucket]] := n;
+        Inc(bCur[bucket]);
+      end;
+
+      // ---- PAS C: bucket basina TEK dosya okuması; deger KOPYALANMAZ ----
+      for bucket := 0 to bCount - 1 do
+      begin
+        if bCur[bucket] <= bBeg[bucket] then Continue;
+        lo := bLo[bucket]; hi := bHi[bucket]; span := hi - lo;
+        got := -1;
+        if span <= VDB_SCAN_CHUNK_CAP then
+        begin
+          if Length(chunk) < Integer(span) then SetLength(chunk, Integer(span));
+          FS.Position := lo;
+          if FS.Read(chunk[0], span) = span then got := Integer(span);
+        end;
+        for m := bBeg[bucket] to bCur[bucket] - 1 do
+        begin
+          n2 := order[m];
+          if got >= 0 then
+            Move(chunk[Integer(cands[n2].Off - lo)], h, SizeOf(h))
+          else
+          begin
+            FS.Position := cands[n2].Off;
+            FS.ReadBuffer(h, SizeOf(h));
+          end;
+          if (h.Magic <> VDB_MAGIC) or (h.Key <> cands[n2].Key) or
+             (h.ValLen <> cands[n2].Size) or
+             ((h.Flags and VDB_FLAG_DEL) <> 0) then
+            Continue;
+          if (h.Flags and VDB_FLAG_ENCRYPTED) <> 0 then
+          begin
+            // Sifreli kayit: cozum yeni tampon gerektirir (nadir yol).
+            SetLength(decB, cands[n2].Size);
+            if cands[n2].Size > 0 then
+            begin
+              if got >= 0 then
+                Move(chunk[Integer(cands[n2].Off - lo) + SizeOf(h)], decB[0], cands[n2].Size)
+              else
+              begin
+                FS.Position := cands[n2].Off + SizeOf(h);
+                FS.ReadBuffer(decB[0], cands[n2].Size);
+              end;
+            end;
+            DecryptIfNeeded(decB, h.Flags, cands[n2].Key);
+            if Length(decB) > 0 then
+            begin
+              if not Cb(cands[n2].Key, @decB[0], Length(decB), User) then Exit(False);
+            end
+            else if not Cb(cands[n2].Key, nil, 0, User) then Exit(False);
+          end
+          else if got >= 0 then
+          begin
+            // HIZLI YOL: chunk icindeki baytlar oldugu gibi verilir.
+            p := Integer(cands[n2].Off - lo) + SizeOf(h);
+            if cands[n2].Size > 0 then
+            begin
+              if not Cb(cands[n2].Key, @chunk[p], Integer(cands[n2].Size), User) then
+                Exit(False);
+            end
+            else if not Cb(cands[n2].Key, @chunk[p], 0, User) then Exit(False);
+          end
+          else
+          begin
+            // Asiri buyuk bucket / kismi okuma: kayit-bazi eski yol.
+            SetLength(recBuf, cands[n2].Size);
+            if cands[n2].Size > 0 then
+            begin
+              FS.Position := cands[n2].Off + SizeOf(h);
+              FS.ReadBuffer(recBuf[0], cands[n2].Size);
+              if not Cb(cands[n2].Key, @recBuf[0], cands[n2].Size, User) then Exit(False);
+            end
+            else if not Cb(cands[n2].Key, nil, 0, User) then Exit(False);
+          end;
+        end;
+      end;
+    end;
+
+    // 2. Batch icindeki pending PUT'lar (ScanSnapshot ile ayni kume:
+    //    pendKeys her pending put'i icerdiginden eski ContainsKey denetimi
+    //    daima dogruydu — burada dogal olarak dusuruldu.)
+    if FInBatch and (SnapshotSeq > FSeq) then
+      for n := 0 to FPending.Count - 1 do
+      begin
+        op := FPending[n];
+        if op.IsDel then Continue;
+        if Length(op.Value) > 0 then
+        begin
+          if not Cb(op.Key, @op.Value[0], Length(op.Value), User) then Exit(False);
+        end
+        else if not Cb(op.Key, nil, 0, User) then Exit(False);
+      end;
+  finally
+    pendKeys.Free;
+    pendDels.Free;
+  end;
+end;
+
+function TVDb.ScanRawIterAll(TableFilter: Integer;
+  Cb: TVDbRawCb; User: Pointer): Boolean;
+// ScanAll'in snapshot secim kuraliyla birebir ayni.
+begin
+  if FInBatch and (FSnapshotSeq > 0) then
+    Result := ScanRawIter(FSnapshotSeq, TableFilter, Cb, User)
+  else
+    Result := ScanRawIter(High(QWord), TableFilter, Cb, User);
 end;
 
 function TVDb.Delete(Key: QWord): Boolean;

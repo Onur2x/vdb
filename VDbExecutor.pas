@@ -5484,9 +5484,12 @@ end;
 
 { ------------------------------------------------------------
   P-12 (2026-10-16) - TryStreamAgg (bkz. sinif bildirimi)
+  P-18a (2026-10-16): ham akis artik ScanRawIter GERI CAGRISIYLA akar;
+  satir basina TBytes malzellestirmesi kaldirildi (COUNT/SUM boslugu).
+  TAggPlan birim duzeyine cikarildi — VdbAggRawCb unit duzeyinde bir
+  prosedurdur ve TVDbRawCb imzasina uyar; dolasim durumu TAggIterCtx
+  uzerinden (stack, cagri boyunca gecerli) gecer.
   //---------------------------------------------------------- }
-function TVSqlExecutor.TryStreamAgg(Stmt: TSqlSelectStmt; const td: TTableDef;
-  out Res: TSqlResult): Boolean;
 type
   TAggPlan = record
     Fn: TSqlFuncCallNode;
@@ -5497,18 +5500,114 @@ type
     MinF, MaxF: Double;      // VCT_FLOAT icin
     HasMin, HasMax: Boolean;
   end;
+
+  TAggIterCtx = record
+    Plans: array of TAggPlan;   // cagiranin plans dizisiyle ayni gonderme
+    Ct, FType: TByteArray;
+    FOff, FLen: TIntArray;
+    ColCnt: Integer;
+    TableId: Word;
+    TableName: string;
+  end;
+
+function VdbAggRawCb(Key: QWord; Buf: PByte; Len: Integer; User: Pointer): Boolean;
+// P-18a: TryStreamAgg'in satir-dongusu govdesi BIREBIR (P-12 semantigi);
+// tek fark veri kaynagi (Buf, Len) — kopyalanmis TBytes degil, motorun
+// chunk tamponu. False => taramayi kes (genel yola dus; hata orada).
 var
-  j, i, c, colCnt: Integer;
+  ctx: ^TAggIterCtx;
+  tid: Word;
+  pk: string;
+  j, c: Integer;
+  iv: Int64;
+  fv: Double;
+  fn: TSqlFuncCallNode;
+begin
+  ctx := User;
+  if Key = VDB_SCHEMA_KEY then Exit(True);
+  if not VDbPeekRawRowP(Buf, Len, ctx.ColCnt, tid, pk, ctx.FType, ctx.FOff, ctx.FLen) then
+    Exit(False);   // eski sema / bozuk kayit -> genel yol (hata onda uretilir)
+  if tid <> ctx.TableId then Exit(True);          // ScanRowsPart ile ayni kural
+  if VDbHashKey(ctx.TableName, pk) <> Key then
+    Exit(False);   // hash carpismasi: genel yol ayni kayitta NET HATA verir
+  for j := 0 to High(ctx.Plans) do
+  begin
+    if ctx.Plans[j].Col < 0 then                  // COUNT(*)
+    begin
+      Inc(ctx.Plans[j].Cnt);
+      Continue;
+    end;
+    c := ctx.Plans[j].Col;
+    // EvalAggregateValue bos metni NULL sayar: vl=-1 VE vl=0 ayni kapar
+    if (ctx.FOff[c] < 0) or (ctx.FLen[c] = 0) then Continue;
+    fn := ctx.Plans[j].Fn;
+    if fn.FuncName = 'COUNT' then                 // her tur kolonda sayilir
+    begin
+      Inc(ctx.Plans[j].Cnt);
+      Continue;
+    end;
+    // SUM/AVG/MIN/MAX: kolon tipi planda sinirlandi (INT/FLOAT/BOOL).
+    case ctx.Ct[c] of
+      VCT_INT:
+        begin
+          if ctx.FLen[c] <> 8 then Exit(False);   // DecodeRow gibi: 8 bayt sart
+          Move(Buf[ctx.FOff[c]], iv, 8);
+          // DIKKAT: Double(iv) mode-delphi'de BIT CAST'tir (denormal
+          // cantan); deger donusumu atama/carpmayla olur (P-12 sqltest).
+          fv := iv * 1.0;   // StrToFloat(IntToStr(iv)) ile birebir ayni
+        end;
+      VCT_FLOAT:
+        begin
+          if ctx.FLen[c] <> 8 then Exit(False);
+          Move(Buf[ctx.FOff[c]], fv, 8);
+          // NaN/Inf: VDbFloatToStr/Parse turu belirsiz -> genel yol
+          if not ((fv = fv) and (fv < 1e308) and (fv > -1e308)) then Exit(False);
+        end;
+    else  // VCT_BOOL: BoolToStr(x, True) = '-1' / '0'
+      begin
+        if ctx.FLen[c] <> 1 then Exit(False);
+        if Buf[ctx.FOff[c]] <> 0 then fv := -1 else fv := 0;
+      end;
+    end;
+    // Kanonik bicimler VDbParseFloat'ta her zaman cozulur (NaN/Inf elendi)
+    Inc(ctx.Plans[j].Cnt);
+    Inc(ctx.Plans[j].AvgCnt);
+    ctx.Plans[j].SumF := ctx.Plans[j].SumF + fv;
+    if fn.FuncName = 'MIN' then
+    begin
+      if not ctx.Plans[j].HasMin then
+      begin
+        ctx.Plans[j].HasMin := True;
+        if ctx.Ct[c] = VCT_INT then ctx.Plans[j].MinI := iv else ctx.Plans[j].MinF := fv;
+      end
+      else if ctx.Ct[c] = VCT_INT then
+      begin if iv < ctx.Plans[j].MinI then ctx.Plans[j].MinI := iv end
+      else if fv < ctx.Plans[j].MinF then ctx.Plans[j].MinF := fv;
+    end
+    else if fn.FuncName = 'MAX' then
+    begin
+      if not ctx.Plans[j].HasMax then
+      begin
+        ctx.Plans[j].HasMax := True;
+        if ctx.Ct[c] = VCT_INT then ctx.Plans[j].MaxI := iv else ctx.Plans[j].MaxF := fv;
+      end
+      else if ctx.Ct[c] = VCT_INT then
+      begin if iv > ctx.Plans[j].MaxI then ctx.Plans[j].MaxI := iv end
+      else if fv > ctx.Plans[j].MaxF then ctx.Plans[j].MaxF := fv;
+    end;
+  end;
+  Result := True;
+end;
+
+function TVSqlExecutor.TryStreamAgg(Stmt: TSqlSelectStmt; const td: TTableDef;
+  out Res: TSqlResult): Boolean;
+var
+  j, c, colCnt: Integer;
   cn: TStrArray;
   ct, ftype: TByteArray;
   foff, flen: TIntArray;
   plans: array of TAggPlan;
-  keys: TQWordArray;
-  raws: TValArray;
-  tid: Word;
-  pk: string;
-  iv: Int64;
-  fv: Double;
+  ctx: TAggIterCtx;
   fn: TSqlFuncCallNode;
   cr: TSqlColumnRefNode;
 begin
@@ -5565,82 +5664,18 @@ begin
         cozulmez, ofset/uzunluk uzerinden okunur (string alloc YOK). --- }
   colCnt := Length(td.Cols);
   SetLength(ftype, colCnt); SetLength(foff, colCnt); SetLength(flen, colCnt);
-  FT.Kv.ScanAll(keys, raws, td.TableId);      // R-26: yalniz bu tablo
-  for i := 0 to High(keys) do
-  begin
-    if keys[i] = VDB_SCHEMA_KEY then Continue;
-    if not VDbPeekRawRow(raws[i], colCnt, tid, pk, ftype, foff, flen) then
-      Exit;      // eski sema / bozuk kayit -> genel yol (hata onda uretilir)
-    if tid <> td.TableId then Continue;       // ScanRowsPart ile ayni kural
-    if VDbHashKey(td.Name, pk) <> keys[i] then
-      Exit;      // hash carpismasi: genel yol ayni kayitta NET HATA verir
-    for j := 0 to High(plans) do
-    begin
-      if plans[j].Col < 0 then                // COUNT(*)
-      begin
-        Inc(plans[j].Cnt);
-        Continue;
-      end;
-      c := plans[j].Col;
-      // EvalAggregateValue bos metni NULL sayar: vl=-1 VE vl=0 ayni kapar
-      if (foff[c] < 0) or (flen[c] = 0) then Continue;
-      fn := plans[j].Fn;
-      if fn.FuncName = 'COUNT' then           // her tur kolonda sayilir
-      begin
-        Inc(plans[j].Cnt);
-        Continue;
-      end;
-      // SUM/AVG/MIN/MAX: kolon tipi planda sinirlandi (INT/FLOAT/BOOL).
-      case ct[c] of
-        VCT_INT:
-          begin
-            if flen[c] <> 8 then Exit;        // DecodeRow gibi: 8 bayt sart
-            Move(raws[i][foff[c]], iv, 8);
-            // DIKKAT: Double(iv) mode-delphi'de BIT CAST'tir (denormal
-            // cantan); deger donusumu atama/carpmayla olur (P-12 sqltest).
-            fv := iv * 1.0;   // StrToFloat(IntToStr(iv)) ile birebir ayni
-          end;
-        VCT_FLOAT:
-          begin
-            if flen[c] <> 8 then Exit;
-            Move(raws[i][foff[c]], fv, 8);
-            // NaN/Inf: VDbFloatToStr/Parse turu belirsiz -> genel yol
-            if not ((fv = fv) and (fv < 1e308) and (fv > -1e308)) then Exit;
-          end;
-      else  // VCT_BOOL: BoolToStr(x, True) = '-1' / '0'
-        begin
-          if flen[c] <> 1 then Exit;
-          if raws[i][foff[c]] <> 0 then fv := -1 else fv := 0;
-        end;
-      end;
-      // Kanonik bicimler VDbParseFloat'ta her zaman cozulur (NaN/Inf elendi)
-      Inc(plans[j].Cnt);
-      Inc(plans[j].AvgCnt);
-      plans[j].SumF := plans[j].SumF + fv;
-      if fn.FuncName = 'MIN' then
-      begin
-        if not plans[j].HasMin then
-        begin
-          plans[j].HasMin := True;
-          if ct[c] = VCT_INT then plans[j].MinI := iv else plans[j].MinF := fv;
-        end
-        else if ct[c] = VCT_INT then
-        begin if iv < plans[j].MinI then plans[j].MinI := iv end
-        else if fv < plans[j].MinF then plans[j].MinF := fv;
-      end
-      else if fn.FuncName = 'MAX' then
-      begin
-        if not plans[j].HasMax then
-        begin
-          plans[j].HasMax := True;
-          if ct[c] = VCT_INT then plans[j].MaxI := iv else plans[j].MaxF := fv;
-        end
-        else if ct[c] = VCT_INT then
-        begin if iv > plans[j].MaxI then plans[j].MaxI := iv end
-        else if fv > plans[j].MaxF then plans[j].MaxF := fv;
-      end;
-    end;
-  end;
+  // P-18a: sifir-kopya akis (ScanRawIter). plans/ftype/foff/flen/ct
+  // dizileri ctx uzerinden ayni gondermeyi paylasir; sayac guncellemeleri
+  // geri cagrisinda YERINDE yapilir (bkz. VdbAggRawCb — govde P-12 ile
+  // birebir, veri kaynagi (Buf, Len)). False => genel yola dus.
+  ctx.ColCnt := colCnt;
+  ctx.TableId := td.TableId;
+  ctx.TableName := td.Name;
+  ctx.Ct := ct;
+  ctx.FType := ftype; ctx.FOff := foff; ctx.FLen := flen;
+  ctx.Plans := plans;
+  if not FT.Kv.ScanRawIterAll(td.TableId, VdbAggRawCb, @ctx) then
+    Exit;
 
   { --- 3) Sonuc: ExecGroupBy'nin alan adi / deger bicimi kurallari BIREBIR --- }
   SetLength(Res.Fields, Stmt.Columns.Count);

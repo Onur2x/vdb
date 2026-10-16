@@ -1835,6 +1835,38 @@ hâlâ ertelendi: SQLite tarafı da prepared statement kullanmıyor
 
 ---
 
+### 5.19 HIZ TURU: P-18a sıfır-kopya agreg taraması — ScanRawIter (2026-10-16)
+
+`TryStreamAgg` (P-12) agregları tek geçişte sayıyordu ama her satırı
+`ScanAll` üzerinden **TBytes + Keys/Vals dizisine malzelleştiriyordu**.
+P-18a bu malzelleştirmeyi kaldırır:
+
+- `TVDb.ScanRawIter(SnapshotSeq, TableFilter, Cb, User)` — Faz A/B/C
+  `ScanSnapshot` ile birebir (görünürlük, tombstone, R-26 filtresi, 2 MB
+  bucket toplu okuma, bozuk kayıt sessiz atlama, şifre çözme); değer chunk
+  tamponundaki aralıktan `(PByte, Len)` olarak geri çağrıya verilir.
+  Callback `False` dönerse tarama derhal durur. Kilitsizlik sözleşmesi aynı.
+- `VDbPeekRawRowP(B, Len, ...)` — peek'in kopyasız ikizi; aynı sınır
+  kontrolleri, aynı "eski sema/kesik → False" sınıflandırması.
+- `VdbAggRawCb` (VDbExecutor, birim düzeyi) — P-12 döngü gövdesi birebir;
+  `TAggPlan` birim düzeyine çıktı, dolaşım durumu `TAggIterCtx` (stack).
+- Semantik korunur: peek-fail / hash-çakışması → genel yola düş (hata aynı
+  yerde üretilir); sıralama bucket sırası (agrega sıradan bağımsız).
+
+**Ölçülen (bench26 @200K):** COUNT x5 −%4, SUM x3 −%6 — 200K'te
+malzelleştirme cache'te yaşıyor; ceza 1M ölçeğinde (vsbench run5 beklenen
+kazanç). Okuma fazları gürültülü makinede ±%5 dalgalanıyor; mini-bench alt
+sınırdır.
+
+**Kabul edilmeyen aday:** COUNT(*)'ı Faz C doğrulaması olmadan salt-indeks
+saymak ~%45 ek kazanç sağlardı AMA bozuk dosyada "sessiz atlama / NET HATA"
+davranışını değiştirirdi — dayanıklılık sözleşmesi öncelikli, reddedildi.
+
+**Doğrulama:** `fpc -B` hatasız; `sqltest` **2251/2251**; crashtest **8/8**
+(`sqltest_p18.log`, `c8_p18.log`).
+
+---
+
 ### 5.17 ⚡ SPEED ROUND: R-26 + P-12..P-15 + FAIR COMPARISON (2026-10-15..16)
 
 **R-26 — Table-scan filter** (`VDbCore.pas`, `VDbTable.pas`): the per-row TableId
@@ -1943,6 +1975,42 @@ prepared statements either), so raw pipeline diet takes priority.
 
 **Verification:** clean `fpc -B` builds; `sqltest` **2251/2251**; crashtest
 **8/8** (`sqltest_p16.log`, `c8_p16.log`).
+
+---
+
+### 5.19 SPEED ROUND: P-18a zero-copy aggregate scan — ScanRawIter (2026-10-16)
+
+`TryStreamAgg` (P-12) already counted aggregates in a single pass, but every
+row was MATERIALIZED through `ScanAll` into TBytes + Keys/Vals arrays. P-18a
+removes that materialization:
+
+- `TVDb.ScanRawIter(SnapshotSeq, TableFilter, Cb, User)` — phases A/B/C are
+  bit-for-bit `ScanSnapshot` (visibility, tombstones, R-26 filter, 2 MB
+  bucketed bulk reads, silent skip of corrupt records, decryption); the value
+  is handed to the callback as `(PByte, Len)` pointing inside the chunk
+  buffer. Callback returning `False` aborts the scan immediately. Same
+  lock-free contract.
+- `VDbPeekRawRowP(B, Len, ...)` — the copy-free twin of the peek; identical
+  bounds checks, identical "old schema/truncated → False" classification.
+- `VdbAggRawCb` (VDbExecutor, unit level) — the P-12 loop body verbatim;
+  `TAggPlan` moved to unit level, iteration state flows via `TAggIterCtx`
+  (stack).
+- Semantics preserved: peek-fail / hash-collision still fall back to the
+  general path (error raised at the same place); order is bucket order
+  (aggregates are order-insensitive).
+
+**Measured (bench26 @200K):** COUNT x5 −4%, SUM x3 −6% — at 200K the
+materialization lives in cache; the penalty shows at 1M scale (expected win
+in vsbench run5). Read phases fluctuate ±5% on a noisy machine; the
+mini-bench is a lower bound.
+
+**Rejected candidate:** counting COUNT(*) from the index alone (skipping the
+phase-C record validation) would add ~45% — BUT it would change the
+"silent-skip / hard-error" behavior on corrupt files; the durability
+contract wins, rejected.
+
+**Verification:** clean `fpc -B` builds; `sqltest` **2251/2251**; crashtest
+**8/8** (`sqltest_p18.log`, `c8_p18.log`).
 
 ---
 
