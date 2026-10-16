@@ -9,6 +9,95 @@ akışını izler.
 
 ---
 
+## v0.009 — 2026-10-16 — Hız turu: P-15b PK tembel indeksinin sıfır-kopya kurucusu
+
+### Ne eklendi / değişti
+
+- **P-15b — `BuildPkIdx` peek-rebuild (VDbTable):** BETWEEN/ORDER BY için
+  tembel (lazy) kurulan PK sıralı indeksi eskiden `ScanRows` ile **tüm
+  tabloyu 5 kolonluk string matrisine decode edip matrisi çöpe atıyor**,
+  yalnız PK sütununu alıyordu (1M'de ~1–3 sn + yüzlerce MB geçici). Artık
+  `ScanRawIterAll` (P-18a) geri çağrısında `VDbPeekRawRowP` ile PK'lar
+  kopyalanmadan toplanıyor. Görünür satır kümesi `ScanAll` ile **birebir**:
+  aynı fazlar, aynı snapshot seçim kuralı, aynı pending görünürlüğü, aynı
+  bucket sırası; girişler yine aynı `SortIdxEntries` ile sıralanır
+  (PK'lar benzersiz olduğundan çıktı dizisi birebir aynıdır).
+- **Anomali = tam teslim:** peek False (eski sema — `ALTER` sonrası eski
+  satırlar — veya kesik kayıt) ya da hash çakışması görülürse hızlı kurucu
+  BAIL eder ve **eski yol AYNEN** yeniden çalışır: F2-16
+  `ecCorrupt` / `ecHashCollision` mesajları, sema-evrimli tabloların
+  davranışı birebir korunur. Hızlı kurucu hiçbir motor hatası üretmez.
+- Aynı kurucu `TryGetMemIndex` üzerinden ORDER-BY-indeks ve JOIN yollarının
+  ilk kurulumunu da besler; üçü de yararlanır.
+
+### Ölçülmüş sonuç — adil kıyas run5 → run6 (1M satır, C:\temp, sessiz makine)
+
+| Aşama | run5 VDB | run6 VDB | SQLite | VDB/SQLite (run6) |
+|---|---|---|---|---|
+| RANGE 2.000×100 | 6,63 sn | **4,19 sn** | 217 ms | 28,3x → **19,3x** |
+| INSERT 1M (tx) | 34,2 sn | 34,0 sn | 3,64 sn | 9,4x (değişmedi — yol dışı) |
+| COUNT x10 | 695 ms | 721 ms | 41 ms | 17,6x (gürültü bandı) |
+| UPDATE 100k | 6,97 sn | 6,97 sn | 388 ms | 18,0x (SQLite yanındaki dalgalanma) |
+
+RANGE dışındaki aşamalar bilinçli olarak değişmedi; run5→run6 farkları
+okuma/gürültü bandındadır (`vsbench_run5.log`, `vsbench_run6.log`).
+Kampanya başına (run4) göre: INSERT 16,1x→9,4x; COUNT 26,8x→17,6x;
+RANGE ~35x→19,3x; PK nokta araması 0,59x (VDB 1,7x ÖNDE).
+
+### Doğrulama (sıfırdan)
+
+- `fpc -B` temiz (sqltest 56.248; crashtest 45.229 satır).
+- `sqltest` **2251/2251**, kalan=0 (`sqltest_p15b.log`).
+- crashtest 8'li çarpma zinciri **8/8** (`c8_p15b.log`) —
+  `SyncWriteInterval=0` dayanıklılık sözleşmesi değişmedi.
+
+---
+
+## v0.009 — 2026-10-16 — Speed round: P-15b zero-copy builder for the lazy PK index (ENGLISH)
+
+### Added / changed
+
+- **P-15b — `BuildPkIdx` peek-rebuild (VDbTable):** the lazy sorted PK
+  index (for BETWEEN/ORDER BY) used to be built through `ScanRows`, which
+  decoded the WHOLE table into a 5-column string matrix and threw the
+  matrix away, keeping only the PK column (~1–3 s plus hundreds of MB of
+  garbage at 1M rows). The builder now collects PK strings copy-free via
+  `VDbPeekRawRowP` inside a `ScanRawIterAll` (P-18a) callback. The visible
+  row set is BIT-IDENTICAL to `ScanAll`: same phases, same snapshot
+  selection rule, same pending visibility, same bucket order; entries are
+  sorted by the same `SortIdxEntries` (PKs are unique, so the resulting
+  array is identical).
+- **Anomaly = full handback:** on peek-False (old schema — pre-`ALTER`
+  rows — or truncated record) or a hash collision the fast builder BAILs
+  and the OLD path re-runs VERBATIM: F2-16 `ecCorrupt` / `ecHashCollision`
+  messages and schema-evolution behavior are preserved exactly. The fast
+  builder itself never raises engine errors.
+- The same builder feeds `TryGetMemIndex`, so the ORDER-BY-index and JOIN
+  first-build paths benefit too.
+
+### Measured — fair comparison run5 → run6 (1M rows, C:\temp, quiet machine)
+
+| Phase | run5 VDB | run6 VDB | SQLite | VDB/SQLite (run6) |
+|---|---|---|---|---|
+| RANGE 2,000×100 | 6.63 s | **4.19 s** | 217 ms | 28.3x → **19.3x** |
+| INSERT 1M (tx) | 34.2 s | 34.0 s | 3.64 s | 9.4x (unchanged — off-lane) |
+| COUNT x10 | 695 ms | 721 ms | 41 ms | 17.6x (noise band) |
+| UPDATE 100k | 6.97 s | 6.97 s | 388 ms | 18.0x (SQLite-side wobble) |
+
+Phases other than RANGE deliberately unchanged; run5→run6 deltas sit in
+the read/noise band (`vsbench_run5.log`, `vsbench_run6.log`). vs campaign
+start (run4): INSERT 16.1x→9.4x; COUNT 26.8x→17.6x; RANGE ~35x→19.3x;
+PK point lookup 0.59x (VDB 1.7x AHEAD).
+
+### Verification (from scratch)
+
+- Clean `fpc -B` builds (sqltest 56,248; crashtest 45,229 lines).
+- `sqltest` **2251/2251**, remaining=0 (`sqltest_p15b.log`).
+- crashtest 8-way crash chain **8/8** (`c8_p15b.log`) — the
+  `SyncWriteInterval=0` durability contract is unchanged.
+
+---
+
 ## v0.008 — 2026-10-16 — Hız turu: P-18c literal INSERT hızlı şeridi (AST'siz yazım)
 
 ### Ne eklendi / değişti

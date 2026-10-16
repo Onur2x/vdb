@@ -1900,6 +1900,38 @@ tabanla eşit); crashtest **8/8** (`sqltest_p18d.log`, `c8_p18d.log`).
 
 ---
 
+### 5.21 HIZ TURU: P-15b PK tembel indeksinin sıfır-kopya kurucusu (2026-10-16)
+
+`BuildPkIdx` (BETWEEN/ORDER BY tembel PK indeksi) `ScanRows` ile tüm tabloyu
+string matrisine decode edip matrisi atıyordu — 1M'de ~1–3 sn + yüzlerce MB.
+Artık `ScanRawIterAll` (P-18a) callback'i içinde `VDbPeekRawRowP` ile PK'lar
+kopyalanmadan toplanır (`PkBuildPeekCb` + `TPkBuildCtx`, VDbTable):
+
+- Görünür satır kümesi `ScanAll` ile birebir (aynı fazlar, aynı snapshot
+  seçimi, aynı pending görünürlüğü, aynı bucket sırası); `SortIdxEntries`
+  çıktısı benzersiz PK'larla deterministik → girdi dizisi birebir aynı.
+- **Anomali = tam teslim:** peek False (eski sema/kesik) veya hash çakışması
+  → `Bail` → eski yol AYNEN yeniden çalışır (F2-16 `ecCorrupt` /
+  `ecHashCollision` mesajları ve ALTER sonrası eski-satır davranışı dahil).
+  Hızlı kurucu motor hatası üretmez; semantiğin tek sahibi eski yoldur.
+- Aynı kurucu `TryGetMemIndex` üzerinden ORDER-BY-indeks ve JOIN ilk
+  kurulumlarını da besler.
+
+**Ölçülen (adil kıyas run5→run6 @1M):** RANGE 6,63→**4,19 sn** (−%37),
+28,3x→**19,3x**. Kampanya toplamı (run4→run6): INSERT 16,1x→9,4x,
+COUNT 26,8x→17,6x, RANGE ~35x→19,3x, PK nokta 0,59x (VDB önde).
+
+**Kabul edilmeyen aday (P-15c olarak etiketli):** ikincil indeks
+`BuildIdxEntries` de tam decode kullanıyor ama indeks ANAHTARLARI kolon
+değerlerinden üretildiği için peek-only yeniden yazım anlamsız; en fazla
+decode edilmeyen kolonlar atılarak (FOff/FLen dilim decode) daraltılabilir
+— ayrı iş, ayrı gauntlet.
+
+**Doğrulama:** `fpc -B` hatasız; `sqltest` **2251/2251**; crashtest **8/8**
+(`sqltest_p15b.log`, `c8_p15b.log`).
+
+---
+
 ### 5.17 ⚡ SPEED ROUND: R-26 + P-12..P-15 + FAIR COMPARISON (2026-10-15..16)
 
 **R-26 — Table-scan filter** (`VDbCore.pas`, `VDbTable.pas`): the per-row TableId
@@ -2083,6 +2115,40 @@ INSERT ratio 16.1x→~10x.
 **Verification:** clean `fpc -B` builds; `sqltest` **2251/2251** (SHOW
 STATS total equal to baseline); crashtest **8/8** (`sqltest_p18d.log`,
 `c8_p18d.log`).
+
+---
+
+### 5.21 SPEED ROUND: P-15b zero-copy builder for the lazy PK index (2026-10-16)
+
+`BuildPkIdx` (the lazy PK index behind BETWEEN/ORDER BY) decoded the whole
+table into a string matrix via `ScanRows` and threw the matrix away —
+~1–3 s plus hundreds of MB at 1M rows. It now collects PK strings copy-free
+via `VDbPeekRawRowP` inside a `ScanRawIterAll` (P-18a) callback
+(`PkBuildPeekCb` + `TPkBuildCtx`, VDbTable):
+
+- Visible row set bit-identical to `ScanAll` (same phases, same snapshot
+  selection, same pending visibility, same bucket order); with unique PKs
+  `SortIdxEntries` output is deterministic → the entry array is identical.
+- **Anomaly = full handback:** peek-False (old schema / truncated) or a
+  hash collision sets `Bail` and the OLD path re-runs VERBATIM — including
+  F2-16 `ecCorrupt` / `ecHashCollision` messages and pre-ALTER old-schema
+  row behavior. The fast builder never raises; the old path remains the
+  single owner of semantics.
+- The same builder feeds `TryGetMemIndex`, so ORDER-BY-index and JOIN
+  first builds benefit too.
+
+**Measured (fair comparison run5→run6 @1M):** RANGE 6.63→**4.19 s** (−37%),
+28.3x→**19.3x**. Campaign totals (run4→run6): INSERT 16.1x→9.4x,
+COUNT 26.8x→17.6x, RANGE ~35x→19.3x, PK point 0.59x (VDB ahead).
+
+**Rejected candidate (tagged P-15c):** the secondary-index
+`BuildIdxEntries` also uses full decode, but index KEYS are built from
+column values, so a peek-only rewrite is meaningless; at most un-indexed
+columns could be skipped via FOff/FLen slice decoding — separate work,
+separate gauntlet.
+
+**Verification:** clean `fpc -B` builds; `sqltest` **2251/2251**; crashtest
+**8/8** (`sqltest_p15b.log`, `c8_p15b.log`).
 
 ---
 

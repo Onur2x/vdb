@@ -369,6 +369,33 @@ Same types as above. See `SQL.md` for detailed syntax and examples.
 
 Every v2.1 change preserves behavior — the SQL suite (2251/2251) and the crash-durability suite (kill at arbitrary points, single-commit and mid-batch transactions) pass.
 
+### ⚖️ Adil kıyas: SQLite ile aynı makinede / Fair comparison vs SQLite (v2.1 final)
+
+> **TR:** Aynı SQL metni, aynı veri üretimi, aynı disk (C:\temp), tek süreç,
+> iki motor da **stok varsayılanlarla**: VDB `SyncWriteInterval=0` (senkron
+> commit), SQLite `synchronous=FULL` + journal DELETE (resmî sqlite.org
+> 3.54.0 32-bit DLL). Ölçüm QueryPerformanceCounter.
+> **EN:** Same SQL text, same data, same disk, one process, both engines on
+> **stock defaults**: VDB synchronous commits, SQLite FULL + journal DELETE.
+
+| Aşama / Phase (1M satır) | VDB | SQLite | VDB/SQLite |
+|---|---|---|---|
+| `INSERT` 1M (BEGIN/COMMIT) | 34,0 s | 3,64 s | 9,4x |
+| `SELECT COUNT(*)` x10 ort. | 721 ms | 41 ms | 17,6x |
+| `SELECT SUM(bakiye)` x5 ort. | 802 ms | 84 ms | 9,5x |
+| PK nokta araması 50.000x | **1,95 s** | 3,33 s | **0,59x — VDB önde** |
+| `BETWEEN` 2.000×100 satır | 4,19 s | 217 ms | 19,3x |
+| `UPDATE` 100k (tx) | 6,97 s | 388 ms | 18,0x |
+| `DELETE` 100k (tx) | 4,85 s | 205 ms | 23,6x |
+
+Hız kampanyası (P-12…P-18c + P-15b) başlangıcına göre: INSERT 16,1x→9,4x,
+COUNT 26,8x→17,6x, BETWEEN ~35x→19,3x — **veri kaybı yok**: sqltest
+2251/2251 ve 8'li çökme zinciri 8/8 her adımda yeşil kaldı. Kampanya
+öncesi tablo: INSERT 16,1x, COUNT 26,8x.
+Campaign start → final: INSERT 16.1x→9.4x, COUNT 26.8x→17.6x,
+BETWEEN ~35x→19.3x — with zero data loss (2251/2251 SQL tests + 8/8 crash
+chain green at every step). (`vsbench_run6.log`)
+
 ---
 
 ## 🧪 TEST SONUÇLARI / TEST RESULTS

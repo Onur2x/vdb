@@ -4849,6 +4849,55 @@ begin
   end;
 end;
 
+type
+  { P-15b (2026-10-16): BuildPkIdx sifir-kopya kurucu baglami. }
+  TPkBuildCtx = record
+    TableName: string;
+    TableId: Word;
+    ColCnt: Integer;
+    FType: TByteArray;      // peek yazi tamponlari — BIR KEZ ayrilir
+    FOff, FLen: TIntArray;  // (TryStreamAgg deseniyle ayni)
+    Pks: TStrArray;         // toplanan PK metinleri (buyuyen)
+    Cap, N: Integer;
+    Bail: Boolean;          // True => hizli kurucu birakir, eski yol aynen
+  end;
+
+function PkBuildPeekCb(Key: QWord; Buf: PByte; Len: Integer;
+  User: Pointer): Boolean;
+// ScanRawIter geri cagrisi: kaydi KOPYALAMADAN onizler, PK metnini toplar.
+// ESKI SEMA/KESIK (peek False) ve HASH CARPISMASI burada HATA uretmez:
+// Bail kurulur, tarama durur ve BuildPkIdx eski yolu (ScanRows) AYNEN
+// yeniden calistirir — F2-16 'kayit cozulemedi' / ecHashCollision
+// mesajlari ve sema-evrimli tablolarin davranisi BIREBIR korunur.
+var
+  ctx: ^TPkBuildCtx;
+  tid: Word;
+  pk: string;
+begin
+  if Key = VDB_SCHEMA_KEY then Exit(True);   // sema kaydi satir degildir
+  ctx := User;
+  Result := True;
+  if not VDbPeekRawRowP(Buf, Len, ctx.ColCnt, tid, pk,
+                        ctx.FType, ctx.FOff, ctx.FLen) then
+  begin
+    ctx.Bail := True;
+    Exit(False);
+  end;
+  if tid <> ctx.TableId then Exit;           // diger tablo / etiketsiz
+  if VDbHashKey(ctx.TableName, pk) <> Key then
+  begin
+    ctx.Bail := True;                        // carpisma: eski yol raise eder
+    Exit(False);
+  end;
+  if ctx.N >= ctx.Cap then
+  begin
+    if ctx.Cap = 0 then ctx.Cap := 64 else ctx.Cap := ctx.Cap * 2;
+    SetLength(ctx.Pks, ctx.Cap);
+  end;
+  ctx.Pks[ctx.N] := pk;
+  Inc(ctx.N);
+end;
+
 procedure TVTableDb.BuildPkIdx(const T: TTableDef; out E: TIdxEntries);
 // PK kolonu icin tembel (lazy) sirali index kurar. T.Idx'e KAYIT YAPMAZ;
 // yalnizca FPkIdx'de saklanir. Boylece IndexNames/CheckConstraints/schema
@@ -4856,11 +4905,42 @@ procedure TVTableDb.BuildPkIdx(const T: TTableDef; out E: TIdxEntries);
 // query'leri bu sirali diziyi kullanarak indeks taramasi yapabilir.
 // PK hash key oldugu icin point lookup O(1) kalir; bu index yalnizca
 // aralik/ siralama sorgulari icin lazimdir.
+// P-15b (2026-10-16): Kurucunun ham hali ScanRows ile 1M satiri TAM
+// matrise decode edip yalniz PK sütununu aliyor, matrix'i atiyordu
+// (~1-3 sn + yuzlerce MB gecici). Artik ScanRawIterAll (P-18a) uzerinden
+// peek ile PK'lar toplanir — gorunur satir kumesi ScanAll ile birebir
+// (ayni fazlar, ayni snapshot secimi, ayni pending gorunurlugu, ayni
+// bucket sirasi). Anomalide (eski sema/kesik/carpisma) hizli kurucu
+// BAIL eder ve eski yol AYNEN tekrar calisir — davranis degismez.
 var
+  ctx: TPkBuildCtx;
   pks: TStrArray;
   dummy: TStrMatrix;
   i: Integer;
 begin
+  ctx.TableName := T.Name;
+  ctx.TableId := T.TableId;
+  ctx.ColCnt := Length(T.Cols);
+  SetLength(ctx.FType, ctx.ColCnt);
+  SetLength(ctx.FOff, ctx.ColCnt);
+  SetLength(ctx.FLen, ctx.ColCnt);
+  ctx.Pks := nil;
+  ctx.Cap := 0;
+  ctx.N := 0;
+  ctx.Bail := False;
+  if FKv.ScanRawIterAll(T.TableId, PkBuildPeekCb, @ctx) and (not ctx.Bail) then
+  begin
+    SetLength(E, ctx.N);
+    for i := 0 to ctx.N - 1 do
+    begin
+      E[i].Key := ctx.Pks[i];
+      E[i].Pk := ctx.Pks[i];
+      E[i].Cov := '';
+    end;
+    SortIdxEntries(E, T.Cols[T.PkIndex].Ctype);
+    Exit;
+  end;
+  // ---- BAIL: eski yol, birebir (F2-16 raise / carpisma raise / eski sema) ----
   ScanRows(T.Name, pks, dummy);
   SetLength(E, Length(pks));
   for i := 0 to High(pks) do
