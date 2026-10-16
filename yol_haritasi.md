@@ -1798,6 +1798,43 @@ pazarlık dışı kaldı.
 
 ---
 
+### 5.18 HIZ TURU: P-17 yazma-yolu tahsis diyeti (2026-10-16)
+
+**P-17a — AutoInc ayrı sözlüğü** (`VDbTable.pas`): sayacı ilerleten her INSERT
+tüm `TTableDef` kaydını (Cols/Idx/Fks/Checks dizileriyle) `FTables`'a geri
+yazıyordu; sayaç artık `TableId`-anahtarlı O(1) sözlükte ve sema kaydı sıcak
+yolda dokunulmaz. `SaveSchema` aynı alana `max(kayıt, sözlük)` yazar (wire
+format değişmedi); sözlük transaction snapshot'ına dahil (ROLLBACK güvenli),
+DROP TABLE'da temizlenir.
+
+**P-17b — `EncodeRow` tek tampon:** satır başına ~10-13 tahsis kaldırıldı;
+saf-ASCII metin kaynak diziden doğrudan taşınır (UTF8Encode çıktısı bayt bayt
+aynı olurdu); BLOB/ASCII-üstü yolları birebir korundu — **wire format bayt bayt
+aynı**.
+
+**P-17c — `Exists` kesmesi:** çakışma denetimi `Get` ile TBytes ayırıp atıyordu;
+`ExistsSnapshot` (pending+index+tombstone) saf araması geçerli, değer ancak
+gerçek çakışmada okunur — "duplicate vs hash çakışması" sınıflandırması aynı.
+
+**Ölçülen (bench26 mini A/B, 200K satır):** INSERT 52.4→**50.1 µs** (−%4.5),
+DELETE 47.5→**45.0 µs** (−%5), UPDATE −%1.5; okuma aşamaları değişmedi (yol
+üzerinde değiller). Dürüst özet: diyet ~%5 verdi — INSERT'in kalan ağırlığı
+**parser (~12 µs)** ve **KV/commit (~16 µs)** katmanında. `bench26.dpr` A/B
+aracı olarak depoya girdi.
+
+**Sonraki adaylar:** (1) sıfır-kopya tarama geri çağırması — `ScanAll` yerine
+`ScanRawIter`, COUNT/SUM'ın TBytes malzelleştirmesi biter (~4-6x beklenen);
+(2) P-15b `BuildPkIdx` peek-rebuild (RANGE tek-seferlik maliyeti); (3) INSERT
+literal hızlı şeridi — `INSERT INTO t(cols) VALUES(<literaller>)` biçimini
+parser+AST olmadan tanı, en ufak sapmada genel ayrıştırıcıya düş. Plan cache
+hâlâ ertelendi: SQLite tarafı da prepared statement kullanmıyor
+(`sqlite3_exec`), ham pipeline diyeti öne geçti.
+
+**Doğrulama:** `fpc -B` hatasız; `sqltest` **2251/2251**; crashtest **8/8**
+(`sqltest_p16.log`, `c8_p16.log`).
+
+---
+
 ### 5.17 ⚡ SPEED ROUND: R-26 + P-12..P-15 + FAIR COMPARISON (2026-10-15..16)
 
 **R-26 — Table-scan filter** (`VDbCore.pas`, `VDbTable.pas`): the per-row TableId
@@ -1868,6 +1905,44 @@ ownership transfer) — next-round candidate. Second candidate: peek-rebuild in
 `sqltest` **2251/2251** (0 remaining, no abort); 8-crash crashtest chain **8/8**
 "no data loss/corruption" — the durability contract (`SyncWriteInterval=0`)
 remained non-negotiable.
+
+---
+
+### 5.18 SPEED ROUND: P-17 write-path allocation diet (2026-10-16)
+
+**P-17a — AutoInc side dictionary** (`VDbTable.pas`): every counter-advancing
+INSERT rewrote the whole `TTableDef` record (Cols/Idx/Fks/Checks arrays) back
+into `FTables`; the counter now lives in an O(1) dictionary keyed by `TableId`
+and the schema record is untouched on the hot path. `SaveSchema` writes
+`max(record, dict)` into the same field (wire format unchanged); the dictionary
+is part of the transaction snapshot (ROLLBACK-safe) and cleaned on DROP TABLE.
+
+**P-17b — `EncodeRow` single buffer:** ~10-13 allocations per row removed; pure
+ASCII text is moved straight from the source string (UTF8Encode output would be
+byte-identical); BLOB/non-ASCII paths preserved bit-for-bit — **wire format is
+byte-identical**.
+
+**P-17c — `Exists` short-circuit:** the duplicate check used to allocate a
+TBytes via `Get` and throw it away; the pure `ExistsSnapshot` lookup
+(pending+index+tombstone) now gates it and the value is read only on a real hit
+— the "duplicate vs hash collision" classification is unchanged.
+
+**Measured (bench26 mini A/B, 200K rows):** INSERT 52.4→**50.1 µs** (−4.5%),
+DELETE 47.5→**45.0 µs** (−5%), UPDATE −1.5%; read phases unchanged (not on the
+path). Honest summary: the diet paid ~5% — the remaining INSERT weight sits in
+the **parser (~12 µs)** and **KV/commit (~16 µs)** layers. `bench26.dpr` is
+committed as the A/B harness.
+
+**Next candidates:** (1) zero-copy scan callback — `ScanRawIter` instead of
+`ScanAll`, ending the TBytes materialization in COUNT/SUM (~4-6x expected);
+(2) P-15b peek-rebuild in `BuildPkIdx` (one-time RANGE cost); (3) INSERT literal
+fast lane — recognize `INSERT INTO t(cols) VALUES(<literals>)` without
+parser+AST, falling back to the general parser on the slightest deviation. The
+plan cache stays deferred: the SQLite side turns out to use `sqlite3_exec` (no
+prepared statements either), so raw pipeline diet takes priority.
+
+**Verification:** clean `fpc -B` builds; `sqltest` **2251/2251**; crashtest
+**8/8** (`sqltest_p16.log`, `c8_p16.log`).
 
 ---
 

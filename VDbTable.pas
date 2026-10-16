@@ -261,6 +261,14 @@ type
     FIdxCtype: TDictionary<Int64, Byte>;                // indeks kolon tipi
     FPkIdx: TDictionary<Word, TIdxEntries>;  // PK lazy index (tableId -> sorted)
     FPkIdxDirty: TDictionary<Word, Boolean>; // PK index kirli mi?
+    // P-17a (2026-10-16): AutoInc sayaci SICAK yolda ayri sozlukte tutulur.
+    // ONCEDEN sayaci ilerleyen her INSERT (acik artan PK dahil) tum TTableDef
+    // kaydini (Cols/Idx/Fks/Checks dizileriyle) FTables'a geri yaziyordu:
+    // kayit kopyalama + sozluk yazmasi satir basina ~1-2 us. KAYIT ALANI
+    // ARTIK DOKUNULMAZ; SaveSchema semaya max(kayit, sozluk) yazar. Sozlukte
+    // kayit yoksa alan degeri gecerlidir (view'lar, eski semalar, CREATE).
+    // Anahtar TableId; DROP TABLE temizler; transaction snapshot'a dahildir.
+    FAutoInc: TDictionary<Word, Int64>;
     FIdxUniq: TDictionary<Int64, TDictionary<string, string>>;
     // UNIQUE kolonlar icin "deger -> sahip pk" haritasi.
     //
@@ -283,6 +291,7 @@ type
     FSnapById: TDictionary<Word, string>;
     FSnapNextId: Word;
     FSnapDirty: Boolean;
+    FSnapAutoInc: TDictionary<Word, Int64>; // P-17a: sayac sozlugunun batch yedegi
     // F-35: kullanici tanimli fonksiyon/prosedur kataloglari.
     // DIKKAT: sema ile birlikte diske yazilmaz; oturum ici kayit.
     FFunctions: TDictionary<string, TFunctionDef>;
@@ -320,6 +329,12 @@ type
     procedure LoadSchema;
     procedure SaveSchema;
     procedure MarkSchema; // batchte isaretle, disiinda hemen yaz
+    function AutoIncOf(const T: TTableDef): Int64;
+    // P-17a: sicak sayac okuma; sozlukte yoksa sema kaydi alani (view/eski sema).
+    procedure BumpAutoInc(const T: TTableDef; NewVal: Int64);
+    // P-17a: sema kaydina DOKUNMADAN sayaci yukselt + semayi kirle.
+    function AutoIncPersistOf(const T: TTableDef): Int64;
+    // P-17a: SaveSchema'ya yazilacak deger = max(kayit alani, sozluk).
     procedure SnapshotSchema;
     procedure RestoreSchemaSnapshot;
     procedure ClearSchemaSnapshot;
@@ -2216,63 +2231,146 @@ begin
 end;
 
 function EncodeRow(TableId: Word; const Pk: string; const T: TTableDef; const Vals: TStrArray): TBytes;
+// P-17b (2026-10-16): WIRE FORMAT BIREBIR ayni (DecodeRow/PeekRawRow/CRC
+// yeni durumu bilmiyor); tahsis baskisi azaltildi. ONCE: INT/FLOAT alan
+// basina SetLength(sv,8), BOOL'da TBytes.Create, metin alaninda
+// UTF8Encode+VDbS2B CIFT kopya -> satir basina ~10-13 dinamik dizi tahsisi.
+// Simdi: tek buyuyen tampon; saf-ASCII metin (ezici cogunluk) kaynak
+// diziden DOĞRUDAN tasinir — UTF8Encode cikisi bayt bayt ayni olurdu.
 var
   b: TBytes;
   p: Integer;
-  pkB: TBytes;
   i: Integer;
   sv: TBytes;
   iv: Int64;
   fv: Double;
   bv: Byte;
+
+  procedure Grow(Need: Integer);
+  var n: Integer;
+  begin
+    if p + Need > Length(b) then
+    begin
+      n := Length(b);
+      if n < 64 then n := 64;
+      while p + Need > n do n := n * 2;
+      SetLength(b, n);
+    end;
+  end;
+
+  procedure PutU16(V: Word);
+  begin
+    Grow(2);
+    b[p] := Byte(V); b[p + 1] := Byte(V shr 8); Inc(p, 2);
+  end;
+
+  procedure PutI32(V: LongInt);
+  begin
+    Grow(4);
+    Move(V, b[p], 4); Inc(p, 4);
+  end;
+
+  function IsPureAscii(const S: string): Boolean;
+  var j: Integer;
+  begin
+    for j := 1 to Length(S) do
+      if S[j] >= #128 then Exit(False);
+    Result := True;
+  end;
+
+  procedure PutPkU8(const S: string);
+  // u16 uzunluk + UTF-8 baytlar (pk). Eski: VDbS2B(UTF8Encode(S)).
+  var sb: TBytes;
+  begin
+    if IsPureAscii(S) then
+    begin
+      PutU16(Word(Length(S)));
+      Grow(Length(S));
+      if Length(S) > 0 then Move(S[1], b[p], Length(S));
+      Inc(p, Length(S));
+    end
+    else
+    begin
+      sb := VDbS2B(UTF8Encode(S));
+      PutU16(Word(Length(sb)));
+      Grow(Length(sb));
+      if Length(sb) > 0 then Move(sb[0], b[p], Length(sb));
+      Inc(p, Length(sb));
+    end;
+  end;
+
+  procedure PutTextU8(const S: string);
+  // i32 uzunluk + UTF-8 baytlar (metin kolonu). Eski: VDbS2B(UTF8Encode(S)).
+  var sb: TBytes;
+  begin
+    if IsPureAscii(S) then
+    begin
+      PutI32(Length(S));
+      Grow(Length(S));
+      if Length(S) > 0 then Move(S[1], b[p], Length(S));
+      Inc(p, Length(S));
+    end
+    else
+    begin
+      sb := VDbS2B(UTF8Encode(S));
+      PutI32(Length(sb));
+      Grow(Length(sb));
+      if Length(sb) > 0 then Move(sb[0], b[p], Length(sb));
+      Inc(p, Length(sb));
+    end;
+  end;
+
 begin
-  SetLength(b, 128); p := 0;
-  WriteU16(b, p, TableId);
-  pkB := VDbS2B(UTF8Encode(Pk));
-  WriteU16(b, p, Word(Length(pkB)));
-  WriteBytes(b, p, pkB);
-  WriteU16(b, p, Word(Length(T.Cols)));
+  SetLength(b, 256); p := 0;
+  PutU16(TableId);
+  PutPkU8(Pk);
+  PutU16(Word(Length(T.Cols)));
   for i := 0 to High(T.Cols) do
   begin
-    if p + 2 > Length(b) then SetLength(b, p + 64);
+    Grow(2);
     b[p] := T.Cols[i].Ctype; Inc(p);
     case T.Cols[i].Ctype of
       VCT_INT:
         if (i < Length(Vals)) and (Vals[i] <> '') and VDbParseInt(Vals[i], iv) then
-        begin SetLength(sv, 8); Move(iv, sv[0], 8); WriteI32(b, p, 8); WriteBytes(b, p, sv); end
-        else begin WriteI32(b, p, -1); end;
+        begin PutI32(8); Grow(8); Move(iv, b[p], 8); Inc(p, 8); end
+        else PutI32(-1);
       VCT_FLOAT:
         if (i < Length(Vals)) and (Vals[i] <> '') and VDbParseFloat(Vals[i], fv) then
-        begin SetLength(sv, 8); Move(fv, sv[0], 8); WriteI32(b, p, 8); WriteBytes(b, p, sv); end
-        else WriteI32(b, p, -1);
+        begin PutI32(8); Grow(8); Move(fv, b[p], 8); Inc(p, 8); end
+        else PutI32(-1);
       VCT_BOOL:
         begin
           // BOS DEGER = NULL (vlen = -1). Once kontrol etmek gerekiyor:
           // aksi halde NULL satiri 'False' olarak kalici yazilirdi.
           if (i >= Length(Vals)) or (Vals[i] = '') then
-            WriteI32(b, p, -1)
+            PutI32(-1)
           else
           begin
             if SameText(Trim(Vals[i]), 'true') or (Trim(Vals[i]) = '1') then bv := 1
             else bv := 0;
-            WriteI32(b, p, 1);
-            WriteBytes(b, p, TBytes.Create(bv));
+            PutI32(1);
+            Grow(1); b[p] := bv; Inc(p);
           end;
         end;
     else
       if (i < Length(Vals)) and (Vals[i] <> '') then
       begin
-        // VCT_BLOB = ham bayt: kodlama/temizleme YAPILMAZ.
-        // Metin kolonlari UTF-8'e normalize edilir; BLOB kolonunda bu
-        // gecersiz UTF-8 baytlarini U+FFFD'ye cevirerek JPEG/PNG/exe
-        // gibi ikili veriyi bozardi.
+        // VCT_BLOB = ham bayt: kodlama/temizleme YAPILMAZ (eski bayt-yolu
+        // birebir korundu). Metin kolonlari PutTextU8 ile UTF-8'e normalize
+        // edilir; BLOB'da bu gecersiz UTF-8 baytlarini U+FFFD'ye cevirerek
+        // JPEG/PNG/exe gibi ikili veriyi bozardi.
         if T.Cols[i].Ctype = VCT_BLOB then
-          sv := VDbS2B(Vals[i])
+        begin
+          sv := VDbS2B(Vals[i]);
+          PutI32(Length(sv));
+          Grow(Length(sv));
+          if Length(sv) > 0 then Move(sv[0], b[p], Length(sv));
+          Inc(p, Length(sv));
+        end
         else
-          sv := VDbS2B(UTF8Encode(Vals[i]));
-        WriteI32(b, p, Length(sv)); WriteBytes(b, p, sv);
+          PutTextU8(Vals[i]);
       end
-      else WriteI32(b, p, -1);
+      else PutI32(-1);
     end;
   end;
   SetLength(b, p);
@@ -2416,12 +2514,14 @@ begin
   FIdxDirty := TList<Int64>.Create;
   FPkIdx := TDictionary<Word, TIdxEntries>.Create;
   FPkIdxDirty := TDictionary<Word, Boolean>.Create;
+  FAutoInc := TDictionary<Word, Int64>.Create;   // P-17a
   FConcBuilders := TList<TVdbConcRec>.Create;   // R-22 Full
   FSchemaDirty := False;
   FNextId := 1;
   FSnapActive := False;
   FSnapTables := nil;
   FSnapById := nil;
+  FSnapAutoInc := nil;   // P-17a
   FSnapNextId := 1;
   FSnapDirty := False;
 end;
@@ -2449,6 +2549,7 @@ begin
   FIdxDirty.Free;
   FPkIdx.Free;
   FPkIdxDirty.Free;
+  FAutoInc.Free;   // P-17a
   FConcBuilders.Free;   // R-22 Full
   FLock.Free;
   inherited;
@@ -3010,7 +3111,9 @@ begin
           FkAct(kv.Value.Fks[i].OnDelete) + ':' + FkAct(kv.Value.Fks[i].OnUpdate) +
           ':' + IntToStr(kv.Value.Fks[i].Deferrable);
       end;
-      sl.Add(Format('%d|%s|%d|%d|%s|%s|%s|%s', [kv.Value.TableId, kv.Value.Name, kv.Value.PkIndex, kv.Value.AutoInc, s, si, sc, sf]));
+      // P-17a: semaya yazilan sayac = max(kayit alani, sicak sozluk);
+      // kaydin kendisi INSERT sicak yolunda artik guncellenmiyor.
+      sl.Add(Format('%d|%s|%d|%d|%s|%s|%s|%s', [kv.Value.TableId, kv.Value.Name, kv.Value.PkIndex, AutoIncPersistOf(kv.Value), s, si, sc, sf]));
       // R-13 Full: bolme tanimi ayri '#Q' satirinda (R-18/R-19 deseni;
       // eski semalar bu satiri icermedigi icin geriye uyumludur).
       // Degerler hex kodlanir (bosluk/ayrac guvenligi).
@@ -3164,12 +3267,43 @@ begin
     SaveSchema;
 end;
 
+function TVTableDb.AutoIncOf(const T: TTableDef): Int64;
+// P-17a: sicak sayac okuma. Sozlukte kayit yoksa sema kaydi alanindan
+// gelir (CREATE/LOAD sonrasi ilk yazim, view'lar, eski semalar).
+begin
+  if not FAutoInc.TryGetValue(T.TableId, Result) then
+    Result := T.AutoInc;
+end;
+
+procedure TVTableDb.BumpAutoInc(const T: TTableDef; NewVal: Int64);
+// P-17a: sayaci sema KAYDINA DOKUNMADAN yukselt. Eski yol her adimda
+// FTables.AddOrSetValue(t.Name, t) ile TTableDef kayidini bastan yaziyordu;
+// SaveSchema semayi zaten ayrica kirli sayiyordu. Sozluk yazmasi O(1) ve
+// kopyalanacak dizi yok.
+begin
+  FAutoInc.AddOrSetValue(T.TableId, NewVal);
+  MarkSchema;
+end;
+
+function TVTableDb.AutoIncPersistOf(const T: TTableDef): Int64;
+// P-17a: semaya yazilacak sayac = max(kayit alani, sozluk). Kayit alani
+// yalnizca yuklenir/okunur; sicak yolda sozluk buyur. View yollari eski
+// gibi kayit alanini kullandigi icin max() iki kaynagi da dogru temsil eder.
+var
+  v: Int64;
+begin
+  Result := T.AutoInc;
+  if FAutoInc.TryGetValue(T.TableId, v) then
+    if v > Result then Result := v;
+end;
+
 procedure TVTableDb.SnapshotSchema;
 // Batch basinda sema yedegi al. AbortBatch bunu geri yukleyecek,
 // boylece ROLLBACK DDL'yi de geri alir.
 var
   kvT: TPair<string, TTableDef>;
   kvI: TPair<Word, string>;
+  kvA: TPair<Word, Int64>;   // P-17a
 begin
   ClearSchemaSnapshot;
   FSnapActive := True;
@@ -3181,6 +3315,10 @@ begin
     FSnapTables.AddOrSetValue(kvT.Key, kvT.Value);
   for kvI in FById do
     FSnapById.AddOrSetValue(kvI.Key, kvI.Value);
+  // P-17a: AutoInc sozlugi de sema parcasidir; ROLLBACK'ta geri gelmeli.
+  FSnapAutoInc := TDictionary<Word, Int64>.Create;
+  for kvA in FAutoInc do
+    FSnapAutoInc.AddOrSetValue(kvA.Key, kvA.Value);
 end;
 
 procedure TVTableDb.RestoreSchemaSnapshot;
@@ -3188,6 +3326,7 @@ procedure TVTableDb.RestoreSchemaSnapshot;
 var
   kvT: TPair<string, TTableDef>;
   kvI: TPair<Word, string>;
+  kvA: TPair<Word, Int64>;   // P-17a
 begin
   if not FSnapActive then Exit;
   FTables.Clear;
@@ -3196,6 +3335,12 @@ begin
     FTables.AddOrSetValue(kvT.Key, kvT.Value);
   for kvI in FSnapById do
     FById.AddOrSetValue(kvI.Key, kvI.Value);
+  // P-17a: sayac sozlugunu de geri al (sayilar geri alinmaz; sozluk
+  // snapshot'u tam durumudur).
+  FAutoInc.Clear;
+  if FSnapAutoInc <> nil then
+    for kvA in FSnapAutoInc do
+      FAutoInc.AddOrSetValue(kvA.Key, kvA.Value);
   FNextId := FSnapNextId;
   FSchemaDirty := FSnapDirty;
   // ROLLBACK: tablo geri geliyor, o yuzden intent listesini temizle
@@ -3209,6 +3354,7 @@ begin
   FSnapActive := False;
   FreeAndNil(FSnapTables);
   FreeAndNil(FSnapById);
+  FreeAndNil(FSnapAutoInc);   // P-17a
 end;
 
 procedure TVTableDb.Open(const Dir: string);
@@ -6534,6 +6680,7 @@ begin
   end;
   IntentDrop(Name);   // sema korumasi: bu kaybolma kasitli
   FTables.Remove(VDbNorm(Name));
+  FAutoInc.Remove(t.TableId);   // P-17a: dusen tablonun sicak sayaci temizle
   FById.Remove(t.TableId);
   for j := 0 to High(t.Idx) do
     FMemIdx.Remove(IdxKey(t.TableId, t.Idx[j].Col));
@@ -6671,10 +6818,10 @@ begin
   // kalici olarak saklanir, yeniden acilista carpisma olusmaz.
   if t.PkIndex < 0 then
   begin
-    Inc(t.AutoInc);
-    pk := '@' + IntToStr(t.AutoInc);
-    FTables.AddOrSetValue(t.Name, t);
-    MarkSchema;
+    // P-17a: sayac ayri sozlukte; sema kaydi (TTableDef) bastan yazilmaz.
+    iv := AutoIncOf(t) + 1;
+    pk := '@' + IntToStr(iv);
+    BumpAutoInc(t, iv);
   end
   else
   begin
@@ -6684,22 +6831,16 @@ begin
       if pk = '' then
       begin
         // oto-sayac; eski DB'de sayac geride kalmissa veriyle uzlastir
-        iv := t.AutoInc + 1;
+        iv := AutoIncOf(t) + 1;
         if ReadRow(t.Name, IntToStr(iv), dummyVals) then
           iv := MaxPkInt(t) + 1;
-        t.AutoInc := iv;
         vals[t.PkIndex] := IntToStr(iv);
         pk := vals[t.PkIndex];
-        FTables.AddOrSetValue(t.Name, t);
-        MarkSchema;
+        BumpAutoInc(t, iv);
       end
-      else if VDbParseInt(pk, iv) and (iv > t.AutoInc) then
-      begin
+      else if VDbParseInt(pk, iv) and (iv > AutoIncOf(t)) then
         // acik PK verildiyse sayaci ilerlet ki sonraki oto deger cakismasin
-        t.AutoInc := iv;
-        FTables.AddOrSetValue(t.Name, t);
-        MarkSchema;
-      end;
+        BumpAutoInc(t, iv);
     end;
     if pk = '' then raise EVDbException.Create(ecInvalidName, 'PK bos olamaz');
   end;
@@ -6710,7 +6851,11 @@ begin
     raise EVDbException.Create(ecCheckViolation, 'CHECK ihlali: ' + t.Name);
   CheckFk(t, vals);
   key := VDbHashKey(t.Name, pk);
-  if FKv.Get(key, b) then
+  // P-17c: cakisma denetimi icin Get degeri (TBytes) ayirip cok atiyordu.
+  // Exists saf aramadir (pending+index+tombstone); yalniz anahtar GERCEKTEN
+  // varsa deger okunur ve "duplicate vs hash carpismasi" siniflandirmasi
+  // aynen korunur.
+  if FKv.Exists(key) and FKv.Get(key, b) then
   begin
     if DecodeRow(b, exTid, exPk, exVals) and (exTid = t.TableId) and (exPk = pk) then
       raise EVDbException.Create(ecDuplicatePrimaryKey, 'duplicate PK: ' + pk)
@@ -7695,10 +7840,10 @@ begin
   // PK belirleme
   if t.PkIndex < 0 then
   begin
-    Inc(t.AutoInc);
-    pk := '@' + IntToStr(t.AutoInc);
-    FTables.AddOrSetValue(t.Name, t);
-    MarkSchema;
+    // P-17a: bkz. Insert — sema kaydi yerine ayri sayac sozlugü.
+    iv := AutoIncOf(t) + 1;
+    pk := '@' + IntToStr(iv);
+    BumpAutoInc(t, iv);
   end
   else
   begin
@@ -7707,21 +7852,15 @@ begin
     begin
       if pk = '' then
       begin
-        iv := t.AutoInc + 1;
+        iv := AutoIncOf(t) + 1;
         if ReadRow(t.Name, IntToStr(iv), dummyVals) then
           iv := MaxPkInt(t) + 1;
-        t.AutoInc := iv;
         vals[t.PkIndex] := IntToStr(iv);
         pk := vals[t.PkIndex];
-        FTables.AddOrSetValue(t.Name, t);
-        MarkSchema;
+        BumpAutoInc(t, iv);
       end
-      else if VDbParseInt(pk, iv) and (iv > t.AutoInc) then
-      begin
-        t.AutoInc := iv;
-        FTables.AddOrSetValue(t.Name, t);
-        MarkSchema;
-      end;
+      else if VDbParseInt(pk, iv) and (iv > AutoIncOf(t)) then
+        BumpAutoInc(t, iv);
     end;
     if pk = '' then raise EVDbException.Create(ecInvalidName, 'PK bos olamaz');
   end;
@@ -7802,10 +7941,10 @@ begin
   // PK belirleme
   if t.PkIndex < 0 then
   begin
-    Inc(t.AutoInc);
-    pk := '@' + IntToStr(t.AutoInc);
-    FTables.AddOrSetValue(t.Name, t);
-    MarkSchema;
+    // P-17a: bkz. Insert — sema kaydi yerine ayri sayac sozlugü.
+    iv := AutoIncOf(t) + 1;
+    pk := '@' + IntToStr(iv);
+    BumpAutoInc(t, iv);
   end
   else
   begin
@@ -7814,21 +7953,15 @@ begin
     begin
       if pk = '' then
       begin
-        iv := t.AutoInc + 1;
+        iv := AutoIncOf(t) + 1;
         if ReadRow(t.Name, IntToStr(iv), dummyVals) then
           iv := MaxPkInt(t) + 1;
-        t.AutoInc := iv;
         vals[t.PkIndex] := IntToStr(iv);
         pk := vals[t.PkIndex];
-        FTables.AddOrSetValue(t.Name, t);
-        MarkSchema;
+        BumpAutoInc(t, iv);
       end
-      else if VDbParseInt(pk, iv) and (iv > t.AutoInc) then
-      begin
-        t.AutoInc := iv;
-        FTables.AddOrSetValue(t.Name, t);
-        MarkSchema;
-      end;
+      else if VDbParseInt(pk, iv) and (iv > AutoIncOf(t)) then
+        BumpAutoInc(t, iv);
     end;
     if pk = '' then raise EVDbException.Create(ecInvalidName, 'PK bos olamaz');
   end;
@@ -7840,7 +7973,8 @@ begin
   CheckFk(t, vals);
   
   key := VDbHashKey(t.Name, pk);
-  conflict := FKv.Get(key, b);
+  // P-17c: conflict YOKKEN deger ayirmaya gerek yok; Once saf arama.
+  conflict := FKv.Exists(key) and FKv.Get(key, b);
   
   if conflict then
   begin

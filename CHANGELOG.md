@@ -9,6 +9,120 @@ akışını izler.
 
 ---
 
+## v0.006 — 2026-10-16 — Hız turu: P-17 yazma-yolü tahsis diyeti (AutoInc, EncodeRow, Exists)
+
+*Not: v0.005'te "P-16" reddedilen BETWEEN nokta-okuma adayıydı; karışmaması
+için bu üçlü **P-17** olarak adlandırıldı.*
+
+### Ne eklendi / değişti
+
+- **P-17a — AutoInc sayacı ayri sözlük** (`VDbTable.pas`): sayaci ilerleten her
+  INSERT (acik artan PK dahil) tum `TTableDef` kaydini `FTables`'a geri yaziyordu.
+  Artik sayaç `TableId`-anahtarli O(1) sozlukte; sema kaydi sicak yolda DOKUNULMAZ.
+  `SaveSchema` ayni alana `max(kayit, sozluk)` yazar (wire format degismedi);
+  sozluk transaction snapshot'ina dahildir (ROLLBACK guvenli) ve DROP TABLE'da
+  temizlenir. View yollari eski gibi kayit alanini kullanir (max() iki kaynagi da
+  dogru temsil eder).
+- **P-17b — `EncodeRow` tek tampon + ASCII hizli yolu** (`VDbTable.pas`): satir
+  basina ~10-13 dinamik dizi tahsisi kaldirildi; alanlar tek buyuyen tampona
+  yazilir. Saf-ASCII metin kaynak diziden dogrudan tasinir (UTF8Encode cikisi
+  bayt bayt ayni olurdu); ASCII-ustu ve BLOB yollari birebir korundu.
+  **Wire format bayt bayt ayni** — DecodeRow/CRC/reopen testleri yeni hali bilmiyor.
+- **P-17c — cakisma denetiminde `Exists` devre-kesmesi** (`Insert`/
+  `InsertReturning`/`UpsertRowReturning`): `Get` degeri (TBytes) ayirip cok
+  atiyordu; `ExistsSnapshot` saf aramadir (pending+index+tombstone, O(1)).
+  Anahtar gercekten varsa deger okunur ve "duplicate vs hash carpismasi"
+  siniflandirmasi aynen korunur.
+
+### Ölçülmüş sonuç — bench26 mini A/B (200K satir, C:\temp, ayni makine, ardişik)
+
+| Asama | HEAD (once) | +P-17a/c | +P-17b (final) | Toplam |
+|---|---|---|---|---|
+| INSERT /satir | 52.4 µs | 51.4 | **50.1** | **−%4.5** |
+| UPDATE /islem | 66.6 µs | 65.8 | **65.6** | −%1.5 |
+| DELETE /islem | 47.5 µs | 45.0 | **45.0** | **−%5** |
+| COUNT / SUM / PK / RANGE | — | — | — | degismedi (okuma yolu) |
+
+Dürüst yorum: toplam kazanç ~%5 — tahsis diyeti beklenenden küçüktü. INSERT'in
+kalan agirligi **parser (~12 µs)** ve **KV/commit katmaninda (~16 µs)**; sonraki
+turlar oraya hedefleniyor. `bench26.dpr` (yeni) bu A/B'yi ~1 dakikada tekrarlama
+araci olarak depoya girdi.
+
+### Bilinçli olarak YAPILMAYANLAR
+
+- **Plan cache — hâlâ ERTELENDİ** (v0.005 kararı): SQLite'in da prepared
+  statement kullanmadığı görüldü (vsbench `sqlite3_exec` kullanıyor); plan
+  cache'in önceliği düştü, önce ham pipeline diyeti.
+- AutoInc sözlüğü DROP sonrası Temizlenir ama id yeniden kullanımına karsı
+  FNextId zaten koruyor; ek denetim eklenmedi.
+
+### Doğrulama (sıfırdan)
+
+- `fpc -B` derlemeleri hatasız (sqltest 55.517 satır; crashtest 44.498 satır).
+- `sqltest` **2251/2251**, kalan=0 (`sqltest_p16.log`).
+- crashtest 8'li çarpma zinciri **8/8** "copme sonrasi veri kaybi/bozulma YOK"
+  (`c8_p16.log`) — `SyncWriteInterval=0` dayanıklılık sözleşmesi değişmedi.
+
+---
+
+## v0.006 — 2026-10-16 — Speed round: P-17 write-path allocation diet (AutoInc, EncodeRow, Exists) (ENGLISH)
+
+*Note: in v0.005 "P-16" was the REJECTED BETWEEN point-read candidate; to avoid
+confusion this trio is named **P-17**.*
+
+### Added / changed
+
+- **P-17a — AutoInc counter in a side dictionary** (`VDbTable.pas`): every INSERT
+  advancing the counter (including explicit ascending PKs) rewrote the whole
+  `TTableDef` record back into `FTables`. The counter now lives in an O(1)
+  dictionary keyed by `TableId`; the schema record is untouched on the hot path.
+  `SaveSchema` writes `max(record, dict)` into the same field (wire format
+  unchanged); the dictionary is part of the transaction snapshot (ROLLBACK-safe)
+  and is cleaned on DROP TABLE. View paths keep using the record field — max()
+  represents both sources correctly.
+- **P-17b — `EncodeRow` single buffer + ASCII fast path** (`VDbTable.pas`): the
+  ~10-13 dynamic-array allocations per row are gone; fields are written into one
+  growing buffer. Pure-ASCII text is moved straight from the source string (the
+  UTF8Encode output would be byte-identical); non-ASCII and BLOB paths preserved
+  bit-for-bit. **Wire format byte-identical** — DecodeRow/CRC/reopen tests are
+  unaware of the change.
+- **P-17c — `Exists` short-circuit in the duplicate check** (`Insert` /
+  `InsertReturning` / `UpsertRowReturning`): `Get` used to allocate the value
+  (TBytes) just to throw it away; `ExistsSnapshot` is a pure lookup
+  (pending+index+tombstone, O(1)). The value is read only when the key actually
+  exists, preserving the "duplicate vs hash collision" classification exactly.
+
+### Measured — bench26 mini A/B (200K rows, C:\temp, same machine, sequential)
+
+| Phase | HEAD (before) | +P-17a/c | +P-17b (final) | Total |
+|---|---|---|---|---|
+| INSERT /row | 52.4 µs | 51.4 | **50.1** | **−4.5%** |
+| UPDATE /op | 66.6 µs | 65.8 | **65.6** | −1.5% |
+| DELETE /op | 47.5 µs | 45.0 | **45.0** | **−5%** |
+| COUNT / SUM / PK / RANGE | — | — | — | unchanged (read path) |
+
+Honest reading: the allocation diet paid ~5% in total — less than hoped. The
+remaining INSERT weight sits in the **parser (~12 µs)** and the
+**KV/commit layer (~16 µs)**; that is where the next rounds aim. `bench26.dpr`
+(new) is committed as the ~1-minute A/B harness.
+
+### Deliberately NOT done
+
+- **Plan cache — still DEFERRED** (v0.005 decision): the SQLite side of vsbench
+  turned out to use `sqlite3_exec` (no prepared statements either), lowering the
+  priority of a plan cache vs raw pipeline diet.
+- The AutoInc dictionary is cleaned on DROP; no extra guard against TableId reuse
+  was added since FNextId already prevents it.
+
+### Verification (from scratch)
+
+- `fpc -B` builds clean (sqltest 55,517 lines; crashtest 44,498 lines).
+- `sqltest` **2251/2251**, remaining=0 (`sqltest_p16.log`).
+- crashtest 8-way crash chain **8/8** "no data loss/corruption after crash"
+  (`c8_p16.log`) — the `SyncWriteInterval=0` durability contract is unchanged.
+
+---
+
 ## v0.005 — 2026-10-16 — Hız turu: P-14/P-15 + adil kıyas (vsbench) + ölü kod temizliği
 
 ### Ne eklendi / değişti
