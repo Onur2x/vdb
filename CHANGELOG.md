@@ -9,6 +9,116 @@ akışını izler.
 
 ---
 
+## v0.008 — 2026-10-16 — Hız turu: P-18c literal INSERT hızlı şeridi (AST'siz yazım)
+
+### Ne eklendi / değişti
+
+- **P-18c — `ExecFastLiteralInsert` (VDbExecutor) + `ExecRaw` kancası
+  (VDbSql):** `INSERT INTO t (kolonlar) VALUES (<literaller>)` biçimindeki
+  cumleler artik lexer/AST/ExprEval zincirinden GECMIYOR — 31.9 µs/satır.
+  Biçim tarayıcı yalnız şunları KABUL eder: ASCII tanımlayıcılar, kanonik
+  tamsayı, '.'-lı float (`VDbFloatToStr(VDbParseFloat)` kanonik sonucu —
+  genel yolla birebir), tek tırnaklı string (`''` kaçışı NextToken ile
+  birebir), NULL (→ `''`, `EvalExpr` ile aynı), TRUE/FALSE (→ 'True'/'False',
+  `CreateBool` ile aynı). Kolon listesi opsiyonel (yoksa genel yol gibi tüm
+  tablo kolonları).
+  **En ufak sapmada genel yol AYNEN devralır:** yorum, `?` param, fonksiyon,
+  `+` işaret, `05`, bilimsel-basamaksız, BLOB, tırnaklı tanımlayıcı,
+  `RETURNING`, `ON CONFLICT`, ikinci VALUES satırı, `;`, tablo yok, VIEW,
+  INSERT tetikleyicisi olan tablo (STATEMENT+ROW, BEFORE+AFTER —
+  `TriggersFor` propları), kolon/değer sayısı farkı.
+  **Kabul yolunda genel yolun sarmalama dizisi birebir:** `RequirePriv`
+  (R-18) → `RlsRequireInsert` (R-19) → `FT.Insert` (PK/UNIQUE/NOT NULL/
+  CHECK/FK/AutoInc tablo katmanı — aynı yordam, aynı istisnalar, aynı sıra).
+  F-21 sure ve R-24 sayaç kayıtları AST yoluyla kopyalandı; RET yolunda
+  kayıt YAPILMAZ (genel yol kendi kaydeder — bkz. aşağıdaki düzeltme).
+- **Düzeltme (A/B sırasında bulundu):** kanca ilk halinde `finally`
+  içinde kayıt yaptığı için şeridin REDDETTİĞİ INSERT'ler `SHOW STATS`
+  sayaçlarına iki kez yazılıyordu (sqltest logunda komut toplamı
+  6811→6984). Kayıt artık yalnız kabul ve istisna yollarında; sayaç
+  toplamı tekrar tabanla eşit (`sqltest_p18d.log` 6811 = `sqltest_p18.log`).
+- **Bilinçli dokunulmayan:** `TriggersFor` içindeki debug `WriteLn`
+  izleri (F-36 döneminden kalma, HEAD'de mevcut) — şerit başına 2 ekstra
+  print üretmesi yalnız stdout gürültüsüdür; başka oturumun aktif hata
+  ayıklama izine dokunulmadı.
+
+### Ölçülmüş sonuç — bench26 mini A/B (200K satır, C:\temp, sıralı)
+
+| Aşama | v0.007 (önce) | P-18c | Değişim |
+|---|---|---|---|
+| INSERT /satır | 51.4 µs | **31.9 µs** | **−%38** |
+| INSERT toplam (tx) | 10.29 sn | **6.38 sn** | −38% |
+| UPDATE / DELETE / okuma | — | — | değişmedi (yol dışı) |
+
+v0.005 HEAD'e göre kümülatif INSERT: 52.4 → **31.9 µs** (−%39).
+vsbench 1M ölçeğinde tahmini INSERT oranı 16.1x → ~10x (run5'te doğrulanacak).
+
+### Doğrulama (sıfırdan)
+
+- `fpc -B` temiz (sqltest 56.168; crashtest 45.149 satır).
+- `sqltest` **2251/2251**, kalan=0 (`sqltest_p18d.log`); SHOW STATS
+  komut toplamı tabanla birebir.
+- crashtest 8'li çarpma zinciri **8/8** (`c8_p18d.log`) —
+  `SyncWriteInterval=0` dayanıklılık sözleşmesi değişmedi.
+
+---
+
+## v0.008 — 2026-10-16 — Speed round: P-18c literal INSERT fast lane (AST-free writes) (ENGLISH)
+
+### Added / changed
+
+- **P-18c — `ExecFastLiteralInsert` (VDbExecutor) + `ExecRaw` hook
+  (VDbSql):** statements shaped exactly like
+  `INSERT INTO t (cols) VALUES (<literals>)` no longer pass through the
+  lexer/AST/ExprEval chain — 31.9 µs/row. The format scanner ONLY accepts:
+  ASCII identifiers, canonical integers, '.'-floats (canonicalized via the
+  same `VDbFloatToStr(VDbParseFloat)` the parser uses), single-quoted
+  strings (`''` escape identical to NextToken), NULL (→ `''`, same as
+  `EvalExpr`), TRUE/FALSE (→ 'True'/'False', same as `CreateBool`). The
+  column list is optional (missing = all table columns, like the general
+  path).
+  **Any deviation falls back to the untouched general path:** comments,
+  `?` parameters, functions, `+` sign, `05`, exponent-without-dot, BLOB,
+  quoted identifiers, `RETURNING`, `ON CONFLICT`, second VALUES row, `;`,
+  missing table, VIEW, tables with INSERT triggers (STATEMENT+ROW,
+  BEFORE+AFTER via `TriggersFor` probes), column/value count mismatch.
+  **On the accepted path the general path's wrapper sequence is
+  reproduced exactly:** `RequirePriv` (R-18) → `RlsRequireInsert` (R-19) →
+  `FT.Insert` (PK/UNIQUE/NOT NULL/CHECK/FK/AutoInc live in the table layer
+  — same routine, same exceptions, same order). F-21 timing and R-24
+  command counters are replicated from the AST path; on REJECT nothing is
+  recorded (the general path records its own run — see the fix below).
+- **Fix (found during A/B):** the hook first recorded counters in a
+  `finally` block, so lane-REJECTED INSERTs were counted TWICE in
+  `SHOW STATS` (command total 6811→6984 in the sqltest log). Recording now
+  happens only on accept and exception paths; the total again matches the
+  baseline (`sqltest_p18d.log` 6811 = `sqltest_p18.log`).
+- **Deliberately untouched:** debug `WriteLn` traces inside
+  `TriggersFor` (left over from the F-36 era, present in HEAD) — the
+  lane's two extra probes only add stdout noise; another session's active
+  debugging trace was not removed.
+
+### Measured — bench26 mini A/B (200K rows, C:\temp, sequential)
+
+| Phase | v0.007 (before) | P-18c | Change |
+|---|---|---|---|
+| INSERT /row | 51.4 µs | **31.9 µs** | **−38%** |
+| INSERT total (tx) | 10.29 s | **6.38 s** | −38% |
+| UPDATE / DELETE / reads | — | — | unchanged (off-lane) |
+
+Cumulative vs v0.005 HEAD: INSERT 52.4 → **31.9 µs** (−39%).
+Expected 1M-scale vsbench INSERT ratio 16.1x → ~10x (to be confirmed by run5).
+
+### Verification (from scratch)
+
+- Clean `fpc -B` builds (sqltest 56,168; crashtest 45,149 lines).
+- `sqltest` **2251/2251**, remaining=0 (`sqltest_p18d.log`); SHOW STATS
+  command total matches the baseline exactly.
+- crashtest 8-way crash chain **8/8** (`c8_p18d.log`) — the
+  `SyncWriteInterval=0` durability contract is unchanged.
+
+---
+
 ## v0.007 — 2026-10-16 — Hız turu: P-18a sıfır-kopya agreg taraması (ScanRawIter)
 
 ### Ne eklendi / değişti

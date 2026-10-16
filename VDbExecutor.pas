@@ -430,6 +430,19 @@ type
     { F-36: trigger WHEN kosulu bu metotla degerlendirilir
       (EvalExpr private; VDbTable'dan cagrilamaz). }
     function EvalExprFor(Expr: TSqlExprNode; const Row: TStrArray): string;
+    { P-18c (2026-10-16): LITERAL INSERT hizli seridi. Yalniz birebir
+      `INSERT INTO t (a,b,...) VALUES (<literal>,...)` bicimini tanir
+      (literaller: kanonik tamsayi, tek tirnakli string, NULL, TRUE,
+      FALSE; kolon listesi opsiyonel). En ufak sapmada (yorum, param,
+      fonksiyon, float, ON CONFLICT, RETURNING, cok satir, tirnakli
+      tanimlayici, tablo yok, VIEW, INSERT tetikleyicisi, kolon/deger
+      sayi farki) False doner ve GENEL YOL AYNEN calisir — davranis
+      garantisi buradan gelir. Kabul yolunda genel yolun sarmalama
+      dizisi birebir uygulanir: RequirePriv -> RlsRequireInsert ->
+      FT.Insert (PK/UNIQUE/NOT NULL/CHECK/AutoInc tablo katmaninda);
+      hata istisnalari ayni sirada ayni noktalardan firlar. }
+    function ExecFastLiteralInsert(const Sql: string;
+      out Res: TSqlResult): Boolean;
   end;
 
 implementation
@@ -7282,6 +7295,264 @@ begin
   Res.Affected := rCount;
   Res.LastTable := Stmt.Table;
   Res.Msg := 'OK';
+end;
+
+{ ------------------------------------------------------------
+  P-18c (2026-10-16) - ExecFastLiteralInsert (bkz. sinif bildirimi)
+  Lexer/AST/parse-maliyeti (~12 µs) + AST dugüm tahsislerini atlar.
+  Literallerin STRING sonucu genel yolla birebir olmak ZORUNDADIR
+  (VDbAst TSqlLiteralNode karsiligi):
+    kanonik tamsayi  -> metin ayni (IntToStr tur-donum kimligi)
+    'abc' / 'a''b'   -> tirnaksiz/kaçışsız ham metin (NextToken kuralı)
+    NULL             -> ''  (EvalExpr de sltNull icin '' doner)
+    TRUE / FALSE     -> 'True' / 'False' (CreateBool StrVal'i)
+  Sayi bictimindeki HER turlu sapma (0 basamak, float, karsilikli,
+  +isaret, tasma) False => genel yol ayni metni ayni sekilde
+  uretir. Tarayici YANLIZ kabul/ret karar verir; motor hatasi
+  uretmez — tek istisna kaynagi RequirePriv/RLS/FT.Insert.
+  //---------------------------------------------------------- }
+function TVSqlExecutor.ExecFastLiteralInsert(const Sql: string;
+  out Res: TSqlResult): Boolean;
+var
+  n, p, nc, nv, cap: Integer;
+  s, tbl: string;
+  cnames, vals: TStrArray;
+  td: TTableDef;
+  fv: Double;   // P-18c: float literal kanoniklestirme (VDbParseFloat)
+
+  procedure SkipWs;
+  begin
+    while (p <= n) and (Sql[p] in [' ', #9, #10, #13]) do Inc(p);
+  end;
+
+  function WordChar(c: Char): Boolean;
+  begin
+    Result := (c in ['A'..'Z', 'a'..'z', '0'..'9', '_', '$']);
+  end;
+
+  { Kw BÜYÜK harf olmali; eslesme sonrasi kelime-karakteri gelmemeli
+    ('INSERTION' INSERT ile baslamaz sayilir). }
+  function MatchKw(const Kw: string): Boolean;
+  var
+    k: Integer;
+  begin
+    Result := False;
+    SkipWs;
+    if p + Length(Kw) - 1 > n then Exit;
+    for k := 1 to Length(Kw) do
+      if UpCase(Sql[p + k - 1]) <> Kw[k] then Exit;
+    if (p + Length(Kw) <= n) and WordChar(Sql[p + Length(Kw)]) then Exit;
+    Inc(p, Length(Kw));
+    Result := True;
+  end;
+
+  { Ham tanimlayici (buyuk/kucuk harf KORUNUR — genel yol da ham token
+    saklar, normalizasyonu tablo katmani yapar). Tirnakh/tivitli/dot'lu
+    tanimlayici TANI MAZ: ret -> genel yol. }
+  function ReadIdent(out S: string): Boolean;
+  var
+    st: Integer;
+  begin
+    Result := False;
+    SkipWs;
+    if p > n then Exit;
+    if not (Sql[p] in ['A'..'Z', 'a'..'z', '_']) then Exit;
+    st := p;
+    while (p <= n) and WordChar(Sql[p]) do Inc(p);
+    S := Copy(Sql, st, p - st);
+    Result := True;
+  end;
+
+  function ReadLiteral(out S: string): Boolean;
+  var
+    st: Integer;
+    w: string;
+  begin
+    Result := False;
+    S := '';
+    SkipWs;
+    if p > n then Exit;
+
+    if Sql[p] = '''' then
+    begin
+      // String literali: NextToken ile BIREBIR ('' -> tek tirnak).
+      Inc(p);
+      st := p;
+      while p <= n do
+      begin
+        if Sql[p] = '''' then
+        begin
+          if (p < n) and (Sql[p + 1] = '''') then
+          begin
+            S := S + Copy(Sql, st, p - st) + '''';
+            Inc(p, 2);
+            st := p;
+            Continue;
+          end;
+          S := S + Copy(Sql, st, p - st);
+          Inc(p);
+          Result := True;
+          Exit;
+        end;
+        Inc(p);
+      end;
+      Exit;   // kapanmamis string -> genel yol AYNI hatayi uretir
+    end;
+
+    // Sayi: kanonik tamsayi VEYA '.'-lic FLOAT. Float'ta genel yolun
+    // YAPTIGI BIREBIR yapilir: token metni VDbParseFloat -> StrVal =
+    // VDbFloatToStr(fv) (TSqlLiteralNode.CreateFloat). '-' genel yolda
+    // ayri token + CreateFloat(-fv) idi; burada işaret metne dahil —
+    // VDbParseFloat('-5.5') == -VDbParseFloat('5.5) oldugundan StrVal
+    // ayni. Karsilikli (e/E) kabul; +isaret, 0-basamak ('05'),
+    // '5.'-virgulSOnu, tasma: RET -> genel yol ayni sonucu uretir.
+    st := p;
+    if (Sql[p] = '-') and (p < n) and (Sql[p + 1] in ['1'..'9']) then Inc(p)
+    else if not (Sql[p] in ['0'..'9']) then Exit;
+    if Sql[p] = '0' then
+    begin
+      Inc(p);
+      if (p <= n) and (Sql[p] in ['0'..'9']) then Exit;  // 05 -> genel yol
+    end
+    else
+      while (p <= n) and (Sql[p] in ['0'..'9']) do Inc(p);
+    if (p < n) and (Sql[p] = '.') and (Sql[p + 1] in ['0'..'9']) then
+    begin
+      Inc(p);
+      while (p <= n) and (Sql[p] in ['0'..'9']) do Inc(p);
+      if (p <= n) and ((Sql[p] = 'E') or (Sql[p] = 'e')) then
+      begin
+        Inc(p);
+        if (p <= n) and ((Sql[p] = '+') or (Sql[p] = '-')) then Inc(p);
+        if (p > n) or not (Sql[p] in ['0'..'9']) then Exit;
+        while (p <= n) and (Sql[p] in ['0'..'9']) do Inc(p);
+      end;
+      if (p <= n) and WordChar(Sql[p]) then Exit;
+      if not VDbParseFloat(Copy(Sql, st, p - st), fv) then Exit;
+      S := VDbFloatToStr(fv);
+      Result := True;
+      Exit;
+    end;
+    if (p <= n) and ((Sql[p] = '.') or WordChar(Sql[p]) or
+       (Sql[p] = 'E') or (Sql[p] = 'e')) then Exit;      // float/us/tasma...
+    S := Copy(Sql, st, p - st);
+    Result := True;
+    Exit;
+  end;
+
+  { Kelime literalleri: NULL/TRUE/FALSE; baska her kelime ret.
+    Karsilastirma genel yolla ayni UstCase (UpperCase) uzerinden. }
+  function ReadWordLit(out S: string): Boolean;
+  var
+    st: Integer;
+    w: string;
+  begin
+    Result := False;
+    S := '';
+    SkipWs;
+    if p > n then Exit;
+    if not (Sql[p] in ['A'..'Z', 'a'..'z']) then Exit;
+    st := p;
+    while (p <= n) and WordChar(Sql[p]) do Inc(p);
+    w := UpperCase(Copy(Sql, st, p - st));
+    if w = 'NULL'  then begin S := '';      Result := True end
+    else if w = 'TRUE'  then begin S := 'True';  Result := True end
+    else if w = 'FALSE' then begin S := 'False'; Result := True end;
+  end;
+
+  function ReadValue(out S: string): Boolean;
+  var
+    save: Integer;
+  begin
+    // ReadLiteral sayi kuyrugunda ret ile ayrilirken p'yi ilerletmis
+    // olabilir ('12TRUE' tek lexer token'idir ve genel yol onu STRING
+    // sayar): basarisizlikta konum GERI alinir, seri ret edilir.
+    save := p;
+    if ReadLiteral(S) then Exit(True);
+    p := save;
+    Result := ReadWordLit(S);
+    if not Result then p := save;
+  end;
+
+begin
+  Result := False;
+  n := Length(Sql);
+  p := 1;
+
+  // ---- Bicim tanima (hiçbir motor durumuna dokunmaz) ----
+  if not MatchKw('INSERT') then Exit;
+  if not MatchKw('INTO') then Exit;
+  if not ReadIdent(tbl) then Exit;
+  SetLength(cnames, 0);
+  nc := 0;
+  SkipWs;
+  if (p <= n) and (Sql[p] = '(') then
+  begin
+    Inc(p);
+    repeat
+      if not ReadIdent(s) then Exit;
+      SetLength(cnames, nc + 1);
+      cnames[nc] := s;
+      Inc(nc);
+      SkipWs;
+      if (p <= n) and (Sql[p] = ',') then begin Inc(p); Continue; end;
+      Break;
+    until False;
+    if (p > n) or (Sql[p] <> ')') then Exit;
+    Inc(p);
+  end;
+  if not MatchKw('VALUES') then Exit;
+  SkipWs;
+  if (p > n) or (Sql[p] <> '(') then Exit;
+  Inc(p);
+  SetLength(vals, 8);
+  cap := 8;
+  nv := 0;
+  repeat
+    if not ReadValue(s) then Exit;
+    if nv >= cap then begin cap := cap * 2; SetLength(vals, cap); end;
+    vals[nv] := s;
+    Inc(nv);
+    SkipWs;
+    if (p <= n) and (Sql[p] = ',') then begin Inc(p); Continue; end;
+    Break;
+  until False;
+  if (p > n) or (Sql[p] <> ')') then Exit;
+  Inc(p);
+  SkipWs;
+  if p <= n then Exit;      // RETURNING / ON CONFLICT / ';' / ikinci satir
+  if nv = 0 then Exit;      // VALUES()
+
+  // ---- Semantik kapilar: gecilirse genel yolun ayni sirasi ayni hata ----
+  if not FT.TableExists(tbl) then Exit;   // genel: 'tablo bulunamadi'
+  if FT.IsView(tbl) then Exit;            // view kurallari genel yolda
+  // INSERT tetikleyicileri (STATEMENT + ROW, BEFORE + AFTER) genel yolun
+  // FireTriggers cagri noktalaridir; biri bile varsa serit kapanir.
+  if Length(FT.TriggersFor(tbl, Byte(ttBefore), Byte(teInsert))) > 0 then Exit;
+  if Length(FT.TriggersFor(tbl, Byte(ttAfter),  Byte(teInsert))) > 0 then Exit;
+  if nc = 0 then
+  begin
+    // Kolon listesi yok: genel yoldaki gibi tum tablo kolonlari.
+    td := FT.GetTable(tbl);
+    if nv <> Length(td.Cols) then Exit;   // sayi farki: genel hata
+    SetLength(cnames, Length(td.Cols));
+    for nc := 0 to High(td.Cols) do cnames[nc] := td.Cols[nc].Name;
+  end
+  else if nc <> nv then Exit;             // (kolon listesi + deger sayisi)
+  SetLength(vals, nv);
+  // R-18 izin + R-19 RLS: genel yolun cagirdigi AYNI metotlar, AYNI sira.
+  FT.RequirePriv(tbl, Ord(pkInsert));
+  RlsRequireInsert(tbl, cnames, vals);
+  // PK/UNIQUE/NOT NULL/CHECK/AutoInc/FK denetimleri FT.Insert icerisinde
+  // (genel yolun cagirdigi ile birebir ayni yordam, ayni istisnalar).
+  FT.Insert(tbl, cnames, vals);
+
+  Res.Affected := 1;
+  Res.LastTable := tbl;
+  Res.Msg := 'OK';
+  SetLength(Res.Fields, 0);
+  SetLength(Res.Rows, 0);
+  Result := True;
 end;
 
 { ------------------------------------------------------------

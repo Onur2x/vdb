@@ -3436,6 +3436,8 @@ var
   pSet: Integer;   // R-11: "SET" anahtar kelimesinden SONRAKI konum
                     // (SET CONSTRAINTS ayriminda geri sarmak icin)
   w1, w2, w3: string;
+  fastEx: TVSqlExecutor;   // P-18c: literal INSERT hizli seridi
+  fastOk: Boolean;
   // P6 (2026-10-02): eski monolitik yolun ~60 degiskeni silindi. Canli kod
   // (asagidaki DB-oncesi blok + AST pipeline) yalnizca ustteki 6'sini
   // kullaniyor. Silinenlerin listesi icin git surumu / arsiv yedegi bakilabilir;
@@ -3443,6 +3445,45 @@ var
 begin
   Result.Affected := 0; Result.Msg := ''; SetLength(Result.Fields, 0); SetLength(Result.Rows, 0);
   Result.LastTable := ''; Result.Stmts := 1;
+
+  // P-18c (2026-10-16): literal INSERT hizli seridi. Ucuz on kontrol
+  // ('I'/'i' ile baslamayan hICbir cumleye executor bile dokunmaz);
+  // biicim taninirsa ExecFastLiteralInsert genel yolun sarmalama
+  // dizisini (RequirePriv -> RLS -> FT.Insert) AST'siz uygular. Ret
+  // edilirse asagidaki genel yol AYNEN devam eder. F-21 sure olcumu ve
+  // R-24 komut sayaclari (SHOW STATS) AST yoluyla birebir kopyalanir;
+  // serit iceride hata verirse istisna aynen yukselir (AST yolu da
+  // hatada sayaci kaydettikten sonra yukseltiyordu).
+  if (Length(Sql) > 13) and ((Sql[1] = 'I') or (Sql[1] = 'i')) then
+  begin
+    fastEx := TVSqlExecutor.Create(FT);
+    try
+      SlowMarkStart;
+      try
+        fastOk := fastEx.ExecFastLiteralInsert(Sql, Result);
+        // Kabul: F-21/R-24 kayitlari tek sefer, burada. RET: hicbir sey
+        // kaydedilmez — asagidaki genel yol AYNI cumleyi kendi olcum
+        // bloguyla yeniden calistiracagi icin ici kayit CIFT sayilir
+        // (SHOW SLOW/SHOW STATS sabunu — sqltest p18c log farki).
+        if fastOk then
+        begin
+          FLastMs := ElapsedMs;
+          NoteSlow(Sql, FLastMs, Length(Result.Rows));
+          RecordCommand(Sql, Integer(FLastMs * 1000), 0);
+        end;
+      except
+        // R-24 paritesi: genel yol hatada da sayaci kaydettikten sonra
+        // yukseltiyordu (finally); serit hatasi da ayni sekilde sayilir.
+        FLastMs := ElapsedMs;
+        NoteSlow(Sql, FLastMs, Length(Result.Rows));
+        RecordCommand(Sql, Integer(FLastMs * 1000), 0);
+        raise;
+      end;
+      if fastOk then Exit;
+    finally
+      fastEx.Free;
+    end;
+  end;
 
   // DB yonetim komutlari TVSql uzerinde ozel dosya yonetimi gerektirir
   pTest := 1;

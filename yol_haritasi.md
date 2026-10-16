@@ -1867,6 +1867,39 @@ davranışını değiştirirdi — dayanıklılık sözleşmesi öncelikli, redd
 
 ---
 
+### 5.20 HIZ TURU: P-18c literal INSERT hızlı şeridi (2026-10-16)
+
+`TVSql.Exec` yazma yolunda `ExecRaw` başına literal-INSERT tanıyıcı eklendi:
+`INSERT INTO t (kolonlar) VALUES (<literaller>)` biçimi lexer/AST/ExprEval
+ZİNCİRİ ATLANARAK yürütülür (`TVSqlExecutor.ExecFastLiteralInsert`).
+
+- **Kabul kümesi daraltılmıştır (bilinçli):** ASCII tanımlayıcı; kanonik
+  tamsayı; '.'-lı float (`VDbFloatToStr(VDbParseFloat)` kanonik sonucu);
+  `''`-kaçışlı tek tırnak string (NextToken kurallarıyla birebir); NULL→`''`
+  (`EvalExpr`'in sltNull üretimiyle aynı); TRUE/FALSE→'True'/'False'
+  (`CreateBool` ile aynı). Kolon listesi opsiyoneldir.
+- **Sapma = ret = genel yol aynen:** yorum/param/fonksiyon/float-biçim
+  sapmaları/BLOB/tırnaklı tanımlayıcı/RETURNING/ON CONFLICT/çok satır/`;`,
+  tablo yok, VIEW, INSERT tetikleyicisi (STATEMENT+ROW, BEFORE+AFTER),
+  kolon≠değer sayısı. Tarayıcı yalnız kabul/ret karar verir; motor hatası
+  üretmez — tek istisna kaynağı kabul sonrası `RequirePriv`/RLS/`FT.Insert`,
+  yani genel yolun aynı noktaları, aynı sıra.
+- **Sayaç paritesi:** F-21 `FLastMs` + R-24 `RecordCommand`/`NoteSlow` AST
+  yoluyla kopyalandı; şerit REDDİNDE kayıt yok (genel yol kendi kaydeder).
+  İlk sürüm `finally` kaydı yüzünden reddedilen INSERT'leri iki kez
+  sayıyordu (6811→6984); düzeltme sonrası tabanla birebir (`sqltest_p18d`).
+- `TriggersFor` içi debug WriteLn izleri (F-36 döneminden, HEAD'de mevcut)
+  bilinçli olarak yerinde bırakıldı — başka oturumun ayıklama izi.
+
+**Ölçülen (bench26 @200K):** INSERT 51.4→**31.9 µs/satır** (−%38; v0.005
+HEAD'e göre −%39); okuma/yazma diğer aşamalar yol dışı, değişmedi. vsbench
+run5 beklentisi: INSERT 16.1x→~10x.
+
+**Doğrulama:** `fpc -B` hatasız; `sqltest` **2251/2251** (SHOW STATS toplamı
+tabanla eşit); crashtest **8/8** (`sqltest_p18d.log`, `c8_p18d.log`).
+
+---
+
 ### 5.17 ⚡ SPEED ROUND: R-26 + P-12..P-15 + FAIR COMPARISON (2026-10-15..16)
 
 **R-26 — Table-scan filter** (`VDbCore.pas`, `VDbTable.pas`): the per-row TableId
@@ -2011,6 +2044,45 @@ contract wins, rejected.
 
 **Verification:** clean `fpc -B` builds; `sqltest` **2251/2251**; crashtest
 **8/8** (`sqltest_p18.log`, `c8_p18.log`).
+
+---
+
+### 5.20 SPEED ROUND: P-18c literal INSERT fast lane (2026-10-16)
+
+A literal-INSERT recognizer was added at the top of `ExecRaw` on the
+`TVSql.Exec` write path: statements shaped exactly like
+`INSERT INTO t (cols) VALUES (<literals>)` execute WITHOUT the
+lexer/AST/ExprEval chain (`TVSqlExecutor.ExecFastLiteralInsert`).
+
+- **Deliberately narrow accept set:** ASCII identifiers; canonical
+  integers; '.'-floats canonicalized through the same
+  `VDbFloatToStr(VDbParseFloat)` the parser uses; single-quoted strings
+  with `''` escaping (bit-identical to NextToken); NULL→`''` (exactly what
+  `EvalExpr` yields for sltNull); TRUE/FALSE→'True'/'False' (same as
+  `CreateBool`). The column list is optional.
+- **Deviation = reject = general path untouched:** comments, `?` params,
+  functions, float-format deviations, BLOB, quoted identifiers, RETURNING,
+  ON CONFLICT, multi-row, `;`, missing table, VIEW, tables with INSERT
+  triggers (STATEMENT+ROW, BEFORE+AFTER), column≠value counts. The scanner
+  only decides accept/reject; it never raises engine errors — after
+  acceptance the ONLY raise sources are `RequirePriv`/RLS/`FT.Insert`, the
+  same points, the same order as the general path.
+- **Counter parity:** F-21 `FLastMs` + R-24 `RecordCommand`/`NoteSlow`
+  replicated from the AST path; on lane REJECT nothing is recorded (the
+  general path records its own run). The first revision recorded in a
+  `finally`, double-counting rejected INSERTs (6811→6984); after the fix
+  the total matches the baseline again (`sqltest_p18d`).
+- Debug WriteLn traces inside `TriggersFor` (from the F-36 era, present in
+  HEAD) were deliberately left in place — another session's live
+  debugging trace.
+
+**Measured (bench26 @200K):** INSERT 51.4→**31.9 µs/row** (−38%; −39% vs
+v0.005 HEAD); all other phases off-lane, unchanged. Expected vsbench run5:
+INSERT ratio 16.1x→~10x.
+
+**Verification:** clean `fpc -B` builds; `sqltest` **2251/2251** (SHOW
+STATS total equal to baseline); crashtest **8/8** (`sqltest_p18d.log`,
+`c8_p18d.log`).
 
 ---
 
