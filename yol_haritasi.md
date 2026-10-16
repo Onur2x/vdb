@@ -1971,6 +1971,36 @@ RANGE 19,3→**14,4x**, DELETE 23,6→**17,4x**.
 
 ---
 
+### 5.23 HIZ TURU: P-21 COMMIT toplu yazım tamponu (2026-10-16)
+
+**Ölçüm-önce:** bench31 K aşaması (`kv.Put` + commit) 7,04 µs/kayıt; commit
+kayıt başına `FS.Seek` + `WriteBuffer` yapıyordu.
+
+**P-21:** `CommitBatch` bekleyen kayıtların baytlarını (başlık+değer) bellek
+tamponuna biriktirir; 1 MB eşiğinde `FlushWriteBuf` ile **tek `WriteBuffer`**
+yapar. Diskteki bayt akışı **birebir aynı** (aynı baytlar, aynı sıra, aynı
+offset = `FWrBufBase` + tampondaki konum); `AppendRec`'in başlık/CRC/indeks/
+ölü-bayt mantığı değişmedi, yalnız son yazım yönlendirildi.
+
+**Güvenlik (pazarlık dışı):** `FlushWriteBuf` dosya sonu `FWrBufBase` ile
+uyuşmazsa **yazmaz**, görünür `ecIOError` verir — sessiz bozulma imkânsız.
+Tampon yalnız `FLock` altında ve `CommitBatch` süresince aktif; başka her
+yolda `FWrBufActive = False` → eski yol birebir. Hata yolunda yazılmamış
+tampon baytları diske hiç gitmez; mevcut truncate+`Recover` yolu aynen çalışır.
+
+**Ölçülen (aynı-koşu):** `kv.Put` 7,04→**2,00 µs** (−%72); bench27 INSERT
+32,80→**23,67**, UPDATE 48,75→**39,72**, DELETE 34,12→**27,72**; `sink`
+birebir **569999**.
+
+**Ölçülen (adil kıyas run8→run9 @1M):** INSERT 29,0→**24,1 sn**; UPDATE
+4,68→**4,25 sn**; DELETE 3,36→**2,92 sn**. run9'da SQLite sabit (INSERT
+3,14→3,12; PK 3,06→3,04) → kazanç gerçek kod etkisi.
+
+**Doğrulama:** `fpc -B` hatasız; `sqltest` **2251/2251**; crashtest **8/8**
+(`sqltest_p21.log`, `c8_p21.log`).
+
+---
+
 ### 5.17 ⚡ SPEED ROUND: R-26 + P-12..P-15 + FAIR COMPARISON (2026-10-15..16)
 
 **R-26 — Table-scan filter** (`VDbCore.pas`, `VDbTable.pas`): the per-row TableId
@@ -2227,6 +2257,38 @@ ahead), RANGE 19.3→**14.4x**, DELETE 23.6→**17.4x**.
 
 **Verification:** clean `fpc -B` builds; `sqltest` **2251/2251**; crashtest
 **8/8** (`sqltest_p20.log`, `c8_p20.log`).
+
+---
+
+### 5.23 SPEED ROUND: P-21 batched COMMIT write buffer (2026-10-16)
+
+**Measure first:** bench31 phase K (`kv.Put` + commit) = 7.04 µs/record; the
+commit did `FS.Seek` + `WriteBuffer` per record.
+
+**P-21:** `CommitBatch` accumulates the pending records' bytes (header+value)
+in an in-memory buffer and, at the 1 MB threshold, flushes them with a
+**single `WriteBuffer`**. The on-disk byte stream is **bit-identical** (same
+bytes, same order, same offset = `FWrBufBase` + position in the buffer);
+`AppendRec`'s header/CRC/index/dead-byte logic is unchanged — only the final
+write is redirected.
+
+**Safety (non-negotiable):** if the file end does not match `FWrBufBase`,
+`FlushWriteBuf` **writes nothing** and raises a visible `ecIOError` — silent
+corruption is impossible. The buffer is active only under `FLock` and only
+during `CommitBatch`; on every other path `FWrBufActive = False` → old path
+verbatim. On the error path the unwritten buffer bytes never touch disk; the
+existing truncate+`Recover` path runs unchanged.
+
+**Measured (same-run):** `kv.Put` 7.04→**2.00 µs** (−72%); bench27 INSERT
+32.80→**23.67**, UPDATE 48.75→**39.72**, DELETE 34.12→**27.72**; `sink`
+bit-identical **569999**.
+
+**Measured (fair comparison run8→run9 @1M):** INSERT 29.0→**24.1 s**; UPDATE
+4.68→**4.25 s**; DELETE 3.36→**2.92 s**. SQLite is flat in run9 (INSERT
+3.14→3.12; PK 3.06→3.04) → the gain is a real code effect.
+
+**Verification:** clean `fpc -B` builds; `sqltest` **2251/2251**; crashtest
+**8/8** (`sqltest_p21.log`, `c8_p21.log`).
 
 ---
 

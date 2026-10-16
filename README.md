@@ -380,19 +380,19 @@ Every v2.1 change preserves behavior — the SQL suite (2251/2251) and the crash
 
 | Aşama / Phase (1M satır) | VDB | SQLite | VDB/SQLite |
 |---|---|---|---|
-| `INSERT` 1M (BEGIN/COMMIT) | 29,0 s | 3,14 s | 9,2x |
-| `SELECT COUNT(*)` x10 ort. | 698 ms | 35 ms | 19,7x |
-| `SELECT SUM(bakiye)` x5 ort. | 733 ms | 82 ms | 9,0x |
-| PK nokta araması 50.000x | **1,41 s** | 3,06 s | **0,46x — VDB 2,2x önde** |
-| `BETWEEN` 2.000×100 satır | 3,11 s | 216 ms | 14,4x |
-| `UPDATE` 100k (tx) | 4,68 s | 267 ms | 17,5x |
-| `DELETE` 100k (tx) | 3,36 s | 194 ms | 17,4x |
+| `INSERT` 1M (BEGIN/COMMIT) | 24,1 s | 3,12 s | 7,7x |
+| `SELECT COUNT(*)` x10 ort. | 713 ms | 37 ms | 19,5x |
+| `SELECT SUM(bakiye)` x5 ort. | 722 ms | 82 ms | 8,8x |
+| PK nokta araması 50.000x | **1,42 s** | 3,04 s | **0,47x — VDB 2,1x önde** |
+| `BETWEEN` 2.000×100 satır | 3,12 s | 211 ms | 14,8x |
+| `UPDATE` 100k (tx) | 4,25 s | 270 ms | 15,8x |
+| `DELETE` 100k (tx) | 2,92 s | 196 ms | 14,9x |
 
-Hız kampanyası (P-12…P-20) başlangıcına göre İYİLEŞME — **veri kaybı yok**:
+Hız kampanyası (P-12…P-21) başlangıcına göre İYİLEŞME — **veri kaybı yok**:
 sqltest 2251/2251 ve 8'li çökme zinciri 8/8 her adımda yeşil kaldı.
-Kampanya başı: INSERT 16,1x, COUNT 26,8x, BETWEEN ~35x. (`vsbench_run8.log`)
-Campaign start → final: INSERT 16.1x→9.2x, COUNT 26.8x→19.7x,
-BETWEEN ~35x→14.4x, PK point 0.59x→**0.46x (VDB ahead)** — with zero data
+Kampanya başı: INSERT 16,1x, COUNT 26,8x, BETWEEN ~35x. (`vsbench_run9.log`)
+Campaign start → final: INSERT 16.1x→7.7x, COUNT 26.8x→19.5x,
+BETWEEN ~35x→14.8x, PK point 0.59x→**0.47x (VDB ahead)** — with zero data
 loss (2251/2251 SQL tests + 8/8 crash chain green at every step).
 
 ---

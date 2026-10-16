@@ -9,6 +9,108 @@ akışını izler.
 
 ---
 
+## v0.011 — 2026-10-16 — Hız turu: P-21 COMMIT toplu yazım tamponu
+
+### Ne eklendi / değişti
+
+- **P-21 — COMMIT toplu yazım (VDbCore):** `CommitBatch`, bekleyen kayıtları
+  **tek tek** `AppendRec` ile dosyaya yazıyordu (kayıt başına `FS.Seek` +
+  `WriteBuffer`). Artık kayıt baytları (başlık+değer) bellekte **1 MB'lık
+  tampona** biriktirilir ve eşik aşılınca `FlushWriteBuf` ile **tek
+  `WriteBuffer`** olarak dosyaya boşaltılır. Diskteki bayt akışı **birebir
+  aynıdır**: aynı baytlar, aynı sıra, aynı offset (`FWrBufBase` + tampondaki
+  konum). Yalnız syscall sayısı düşer (kayıt başına ≈2 → ≈blok başına 2).
+  `AppendRec`'in başlık/CRC/indeks/ölü-bayt mantığı **hiç değişmedi**;
+  yalnızca son dosya yazımı yönlendirilir.
+- **Güvenlik (pazarlık dışı):** `FlushWriteBuf`, dosya sonu `FWrBufBase` ile
+  **uyuşmazsa yazmaz**, görünür `ecIOError` verir — sessiz veri bozulması
+  imkânsız. Tampon **yalnızca `FLock` altında ve `CommitBatch` süresince**
+  aktiftir; başka her yolda (`Put`/`Delete`/`Recover`/replay/Compact)
+  `FWrBufActive = False` → **eski yol birebir**. Hata yolunda yazılmamış
+  tampon baytları diske **hiç gitmez**; mevcut `FS.Size := savedSize` +
+  `Recover` geri sarma yolu aynen çalışır (bkz. v0.006–v0.009).
+- **Çoklu platform:** yalnız bellek içi + mevcut `TFileStream` yazımı
+  kullanılır; platforma özel kod **yok**.
+
+### Ölçülmüş sonuç (aynı-koşu A/B, 200K)
+
+| Ölçüm | Önce | Sonra | Fark |
+|---|---|---|---|
+| `kv.Put` + commit (bench31 K) | 7,04 µs | **2,00 µs** | −%72 |
+| bench27 `INSERT` hızlı şerit | 32,80 µs | **23,67 µs** | −%28 |
+| bench27 `UPDATE` | 48,75 µs | **39,72 µs** | −%19 |
+| bench27 `DELETE` | 34,12 µs | **27,72 µs** | −%19 |
+| bench27 `sink` / `dokunma` | 569999 / 99995 | **569999 / 99995** | **birebir** ✓ |
+
+### Ölçülmüş sonuç — adil kıyas run8 → run9 (1M satır, tek süreç)
+
+| Aşama | run8 VDB | run9 VDB | SQLite (run9) | run9 oranı |
+|---|---|---|---|---|
+| INSERT 1M (tx) | 29,0 sn | **24,1 sn** | 3,12 sn | 7,73x |
+| UPDATE 100k | 4,68 sn | **4,25 sn** | 269,7 ms | 15,75x |
+| DELETE 100k | 3,36 sn | **2,92 sn** | 195,9 ms | 14,89x |
+| SELECT PK 50.000x | 1,41 sn | 1,42 sn | 3,04 sn | **0,47x** (VDB 2,1x önde) |
+| RANGE 2.000×100 | 3,11 sn | 3,12 sn | 211,1 ms | 14,77x |
+| COUNT x10 | 698 ms | 713 ms | 36,5 ms | 19,53x |
+| SUM x5 | 733 ms | 722 ms | 82,2 ms | 8,79x |
+
+run9'da SQLite'ın kendi sayıları run8'e göre **sabit** (INSERT 3,14→3,12;
+PK 3,06→3,04; RANGE 215,7→211,1) → makine sakin, kazanç **gerçek kod
+etkisidir**. Kampanya başına (run6) göre: INSERT 34,0→**24,1** (−%29),
+UPDATE 6,97→**4,25** (−%39), DELETE 4,85→**2,92** (−%40).
+
+### Doğrulama (sıfırdan)
+
+- `fpc -B` temiz (sqltest 56.488; crashtest 45.469 satır).
+- `sqltest` **2251/2251**, kalan=0 (`sqltest_p21.log`).
+- crashtest 8'li çarpma zinciri **8/8** (`c8_p21.log`) — çok-bloklu (33 MB)
+  commit dahil veri kaybı/bozulma yok, `SyncWriteInterval=0` değişmedi.
+- run9 doğrulaması: COUNT 1M ✓, DELETE sonrası 900k ✓,
+  SUM=5000000000 ✓.
+
+---
+
+## v0.011 — 2026-10-16 — Speed round: P-21 batched COMMIT write buffer (ENGLISH)
+
+### Added / changed
+
+- **P-21 — batched COMMIT write (VDbCore):** `CommitBatch` wrote the pending
+  records **one by one** via `AppendRec` (`FS.Seek` + `WriteBuffer` per
+  record). Record bytes (header+value) now accumulate in a **1 MB in-memory
+  buffer** and are flushed with a **single `WriteBuffer`** when the threshold
+  is crossed (`FlushWriteBuf`). The on-disk byte stream is **bit-identical**:
+  same bytes, same order, same offset (`FWrBufBase` + position in the
+  buffer). Only the syscall count drops (≈2 per record → ≈2 per block).
+  `AppendRec`'s header/CRC/index/dead-byte logic is **unchanged**; only the
+  final file write is redirected.
+- **Safety (non-negotiable):** if the file end does not match `FWrBufBase`,
+  `FlushWriteBuf` **writes nothing** and raises a visible `ecIOError` —
+  silent corruption is impossible. The buffer is active **only under `FLock`
+  and only during `CommitBatch`**; on every other path (`Put`/`Delete`/
+  `Recover`/replay/Compact) `FWrBufActive = False` → the **old path runs
+  verbatim**. On the error path the unwritten buffer bytes **never touch
+  disk**; the existing `FS.Size := savedSize` + `Recover` rollback path runs
+  unchanged.
+- **Cross-platform:** only in-memory work plus the existing `TFileStream`
+  write; **no** platform-specific code.
+
+### Measured — fair comparison run8 → run9 (1M rows, single process)
+
+See the Turkish table above. SQLite's own numbers are **flat** from run8 to
+run9 (INSERT 3.14→3.12, PK 3.06→3.04, RANGE 215.7→211.1), so the machine is
+quiet and the gain is a **real code effect**. Versus the campaign baseline
+(run6): INSERT 34.0→**24.1** (−29%), UPDATE 6.97→**4.25** (−39%),
+DELETE 4.85→**2.92** (−40%).
+
+### Verification (from scratch)
+
+- Clean `fpc -B` builds; `sqltest` **2251/2251** (`sqltest_p21.log`);
+  crashtest **8/8** (`c8_p21.log`) — including the multi-block (33 MB)
+  commit; `SyncWriteInterval=0` unchanged. run9: COUNT 1M ✓, 900k after
+  DELETE ✓, SUM=5000000000 ✓.
+
+---
+
 ## v0.010 — 2026-10-16 — Hız turu: P-19 konumsal okuma + P-19w birleşik ekleme + P-20 ayırıcı hızlı yolu
 
 ### Ne eklendi / değişti

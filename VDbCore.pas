@@ -35,6 +35,10 @@ const
   // (3 syscall -> 2). Uzerinde ESKI yol birebir calisir (buyuk bloblar
   // icin gecici birlesik kopya ayirmamak icin).
   VDB_COMBINE_MAX = 64 * 1024;
+  // P-21: COMMIT toplu yazim tamponu esigi. CommitBatch bekleyen kayitlari
+  // bu boyuta kadar biriktirip TEK WriteBuffer ile bosaltir (kayit basina
+  // syscall yerine ~blok basina). Diskteki bayt akisi birebir aynidir.
+  VDB_WRBUF_MAX = 1024 * 1024;
 
   // Dosya kimligi: her .odb 'VODB'(LE) + surum + bayrak + baslik CRC ile baslar.
   // Kayitlar hep VDB_HDR_SIZE sonrasinda. Ham kayit akisiyla karismaz.
@@ -164,6 +168,19 @@ FPath: string;
     // kirliyse Flush cagirir -> SQL katmaninda SyncWrite ayarindan bagimsiz
     // commit garantisi (salt-okunur sorgularda syscall yok).
     FDirty: Boolean;
+    { P-21 (2026-10-16): COMMIT TOPLU YAZIM TAMPONU. CommitBatch icinde
+      AppendRec kayit baytlarini (baslik+deger) dogrudan dosyaya yazmak
+      yerine bu tampona biriktirir; esik asilinca TEK WriteBuffer ile
+      dosyaya bosaltilir. Diskteki bayt akisi BIREBIR aynidir: ayni
+      baytlar, ayni sira, ayni offset (FWrBufBase + tampondaki konum).
+      Yalniz syscall sayisi duser. Tampon YALNIZCA FLock altinda ve
+      CommitBatch suresince aktiftir; baska her yerde FWrBufActive=False
+      -> ESKI yol birebir. FlushWriteBuf dosya sonu ile FWrBufBase
+      uyusmazsa yazar DEGIL, GORUNUR hata verir (sessiz bozulma yok). }
+    FWrBuf: TBytes;
+    FWrBufLen: Integer;
+    FWrBufBase: Int64;
+    FWrBufActive: Boolean;
     // Bekleyen (batch ici) yazmalar.
     //
     // FPending   : yazma sirasiyla islenen op listesi
@@ -230,6 +247,9 @@ FPath: string;
       kayitlarini .wal'a yazmasin (yoksa dongu). }
     procedure AppendRec(Key: QWord; const Value: TBytes; IsDel: Boolean;
       DoFlush: Boolean; SkipWAL: Boolean = False);
+    { P-21: aktif toplu yazim tamponunu (varsa) dosyaya bosaltir ve
+      tamponu sifirlar. FWrBufActive=False veya tampon bos ise no-op. }
+    procedure FlushWriteBuf;
     { WriteAheadWAL'in kilit ALMAYAN cekirdegi. AppendRec bunu cagirir;
       kilit zaten AppendRec'de tutuluyor, yeniden almak deadlock yapar. }
     function WriteAheadWALCore(Key: QWord; const Value: TBytes;
@@ -839,6 +859,27 @@ begin
   end;
 end;
 
+procedure TVDb.FlushWriteBuf;
+{ P-21 (2026-10-16): aktif toplu yazim tamponunu dosyaya bosaltir.
+  Diskteki bayt akisi birebir aynidir (tampon = sirayla yazilacak
+  baytlar). GUVENLIK: dosya sonu FWrBufBase ile UYUSMAZSA yazmaz,
+  GORUNUR hata verir — sessiz veri bozulmasi imkansiz. }
+var
+  off: Int64;
+begin
+  if not FWrBufActive then Exit;
+  if FWrBufLen <= 0 then Exit;
+  off := FS.Seek(0, soEnd);
+  if off <> FWrBufBase then
+    raise EVDbException.CreateFmt(ecIOError,
+      'VDb: toplu yazim tamponu dosya sonuyla uyusmuyor (beklenen=%d gercek=%d)',
+      [FWrBufBase, off]);
+  FS.WriteBuffer(FWrBuf[0], FWrBufLen);
+  Inc(FWrBufBase, Int64(FWrBufLen));
+  FWrBufLen := 0;
+  FDirty := True;
+end;
+
 procedure TVDb.AppendRec(Key: QWord; const Value: TBytes; IsDel: Boolean;
   DoFlush: Boolean; SkipWAL: Boolean);
 { Tum KALICI yazma yollarinin tek kavsi. Put, Delete, CommitBatch ve
@@ -867,6 +908,7 @@ var
   pv: PByte;
   stored: TBytes;      // dosyaya yazilacak deger (sifreli olabilir)
   wbuf: TBytes;        // P-19w: header+deger birlesik yazim tamponu
+  need, newCap: Integer;   // P-21: toplu yazim tamponu boyut yonetimi
   walFlags: Byte;
 begin
   stored := nil;
@@ -930,29 +972,57 @@ begin
           'VDb: WAL yazilamadi, islem durduruldu (ana dosyaya yazilmadi): %s',
           [FPath]);
 
-  off := FS.Seek(0, soEnd);
-  { P-19w: header + deger TEK WriteBuffer ile yazilir (3 syscall -> 2).
-    FS.Seek(0, soEnd) KORUNUR: dosya sonunun tek yetkili kaynagi budur.
-    Offset'i bellekte tutmak (in-place guncelleme FS.Position, rollback
-    FS.Size:=, Compact, truncate yollarinda) bir kez invalide
-    edilmediginde sessiz veri bozulmasi riski tasirdi; guvenlik > mikro
-    kazanc. Birlesik yazim veri sozlesmesini DEGISTIRMEZ: ayni baytlar
-    ayni sirayla ayni offset'e yazilir.
-    BUYUK DEGER (blob): birlesik tampon ayirmamak icin ESKI yol birebir
-    (16 MB'a kadar gecici kopya olmasin). }
-  if h.ValLen <= VDB_COMBINE_MAX then
+  { P-21 (2026-10-16): CommitBatch toplu yazim. Tampon AKTIFSE kayit
+    baytlari (baslik+deger) dosyaya degil tampona eklenir; offset
+    FWrBufBase + tampondaki konumdur (kayit CommitBatch sonunda TAM o
+    offset'e gidecek). Esikte FlushWriteBuf tek WriteBuffer yapar.
+    Diskteki bayt akisi BIREBIR aynidir: ayni baytlar, ayni sira.
+    Tampon PASIFSE (CommitBatch disi HER yol) asagidaki ESKI yol
+    birebir calisir. }
+  if FWrBufActive then
   begin
-    SetLength(wbuf, Integer(SizeOf(h)) + Integer(h.ValLen));
-    Move(h, wbuf[0], SizeOf(h));
+    off := FWrBufBase + Int64(FWrBufLen);
+    need := Integer(SizeOf(h)) + Integer(h.ValLen);
+    if FWrBufLen + need > Length(FWrBuf) then
+    begin
+      newCap := Length(FWrBuf);
+      while newCap < FWrBufLen + need do
+        Inc(newCap, VDB_WRBUF_MAX);
+      SetLength(FWrBuf, newCap);
+    end;
+    Move(h, FWrBuf[FWrBufLen], SizeOf(h));
     if h.ValLen > 0 then
-      Move(stored[0], wbuf[SizeOf(h)], h.ValLen);
-    FS.WriteBuffer(wbuf[0], Integer(SizeOf(h)) + Integer(h.ValLen));
+      Move(stored[0], FWrBuf[FWrBufLen + SizeOf(h)], h.ValLen);
+    Inc(FWrBufLen, need);
+    if FWrBufLen >= VDB_WRBUF_MAX then
+      FlushWriteBuf;
   end
   else
   begin
-    FS.WriteBuffer(h, SizeOf(h));
-    if h.ValLen > 0 then
-      FS.WriteBuffer(stored[0], h.ValLen);
+    off := FS.Seek(0, soEnd);
+    { P-19w: header + deger TEK WriteBuffer ile yazilir (3 syscall -> 2).
+      FS.Seek(0, soEnd) KORUNUR: dosya sonunun tek yetkili kaynagi budur.
+      Offset'i bellekte tutmak (in-place guncelleme FS.Position, rollback
+      FS.Size:=, Compact, truncate yollarinda) bir kez invalide
+      edilmediginde sessiz veri bozulmasi riski tasirdi; guvenlik > mikro
+      kazanc. Birlesik yazim veri sozlesmesini DEGISTIRMEZ: ayni baytlar
+      ayni sirayla ayni offset'e yazilir.
+      BUYUK DEGER (blob): birlesik tampon ayirmamak icin ESKI yol birebir
+      (16 MB'a kadar gecici kopya olmasin). }
+    if h.ValLen <= VDB_COMBINE_MAX then
+    begin
+      SetLength(wbuf, Integer(SizeOf(h)) + Integer(h.ValLen));
+      Move(h, wbuf[0], SizeOf(h));
+      if h.ValLen > 0 then
+        Move(stored[0], wbuf[SizeOf(h)], h.ValLen);
+      FS.WriteBuffer(wbuf[0], Integer(SizeOf(h)) + Integer(h.ValLen));
+    end
+    else
+    begin
+      FS.WriteBuffer(h, SizeOf(h));
+      if h.ValLen > 0 then
+        FS.WriteBuffer(stored[0], h.ValLen);
+    end;
   end;
   FDirty := True;
   if DoFlush then
@@ -2362,9 +2432,22 @@ begin
           SkipWAL=True birakilirsa batch kayitlari hicbir zaman
           .wal'a girmez; crash sonrasi ReplayWAL onlari kurtaramaz
           (T73 bu boslugu yakaladi). }
-for i := 0 to FPending.Count - 1 do
-          AppendRec(FPending[i].Key, FPending[i].Value, FPending[i].IsDel,
-            False, False);
+        { P-21: TOPLU YAZIM. Kayitlar bellekte biriktirilir, esikte tek
+          WriteBuffer ile dosyaya bosaltilir; diskteki bayt akisi BIREBIR
+          ayni (ayni baytlar, ayni sira, ayni offset). Tampon YALNIZCA
+          burada, FLock altinda ve bu blok suresince aktiftir. }
+        FWrBufLen := 0;
+        FWrBufBase := FS.Seek(0, soEnd);
+        FWrBufActive := True;
+        try
+          for i := 0 to FPending.Count - 1 do
+            AppendRec(FPending[i].Key, FPending[i].Value, FPending[i].IsDel,
+              False, False);
+          FlushWriteBuf;
+        finally
+          FWrBufActive := False;
+          FWrBufLen := 0;
+        end;
         if PendingCount > 0 then
           AppendBatchEnd(False);
         // GROUP COMMIT: SyncWriteInterval > 0 ise ve yeterli sure gecmediyse
