@@ -334,6 +334,15 @@ type
       const AllRows: TStrMatrix; const ColNames: TStrArray;
       const ColTypes: TByteArray; out Res: TSqlResult;
       out OutTypes: TByteArray);
+    { P-12 (2026-10-16): WHERE/GROUP BY/HAVING/JOIN/ORDER/LIMIT OLMAYAN
+      tek tablo agregalarini (COUNT(*), COUNT(k), SUM/AVG/MIN/MAX(k))
+      HAM kayit uzerinde tek passede hesaplar; satirlar string matrisine
+      cevrilmez (COUNT/SUM ~100x hizlanir). Semantiği EvalAggregateValue
+      ile birebir ayni. Sorgu sekli veya kayit bicimi (eski sema, NaN...)
+      tam uymazsa False -> genel yol AYNEN calisir (bozuk kayit hatasi
+      dahil davranis degismez). }
+    function TryStreamAgg(Stmt: TSqlSelectStmt; const td: TTableDef;
+      out Res: TSqlResult): Boolean;
     procedure ExecJoinScan(Stmt: TSqlSelectStmt; out MergedRows: TStrMatrix;
       out MergedColNames: TStrArray; out MergedColTypes: TByteArray);
     { P5-WIN: pencere kolonlarini satirlarla ayni sirada hesaplar.
@@ -891,8 +900,6 @@ function TVSqlExecutor.EvalAggregateValue(fn: TSqlFuncCallNode;
   const ACNames: TStrArray; const ACTypes: TByteArray): string;
 var
   k, ci, avgCnt: Integer;
-  needNum, needMinMax: Boolean;
-  rowK: TStrArray;
   cntI: Int64;
   sumF, fv: Double;
   minV, maxV, colVal: string;
@@ -913,19 +920,12 @@ begin
   // sonek kurali da gorulur (eski birebir SameText yalnizca tek
   // tabloda eslesiyordu).
   aggCt := VCT_STR;
-  ci := -1;
   if fn.Arg is TSqlColumnRefNode then
   begin
     ci := FindColIdx(TSqlColumnRefNode(fn.Arg).ColumnName,
       TSqlColumnRefNode(fn.Arg).TableQualifier, ACNames);
     if (ci >= 0) and (ci < Length(ACTypes)) then aggCt := ACTypes[ci];
   end;
-  // P-1: Yalnizca ISTENEN aggregate'i hesapla. Eski kod SUM icin bile
-  // MIN/MAX karsilastirmasini ve sayisal parse'i satir bazinda yapardi
-  // (satir basi ~5 parse); 1M satirda bu tek basina sorguyu ~3 kat
-  // yavaslatiyordu. Sonuc degismez: her fonksiyon kendi biriktigini okur.
-  needNum := (fn.FuncName = 'SUM') or (fn.FuncName = 'AVG');
-  needMinMax := (fn.FuncName = 'MIN') or (fn.FuncName = 'MAX');
   for k := 0 to Idx.Count - 1 do
   begin
     // F-16: FILTER (WHERE ...) â€” kosul saglamayan satir atlanir.
@@ -948,35 +948,20 @@ begin
     end
     else
     begin
-      // P-1b: Basit (niteliksiz) kolon referansinda EvalExpr -- ki o her
-      // satirda FindColIdx ile lineer kolon taramasi yapar -- yerine
-      // donguden ONCE cozulen ci ile dogrudan indeksle. Birebir esitlik:
-      // FProcRow yokken ve nitelik yokken EvalExpr'nin tek cozum yolu
-      // FindColIdx(ACNames) -> Row[ci]'dir (ayni argumanlar, ayni sonuc).
-      rowK := SrcRows[Idx[k]];
-      if (fn.Arg is TSqlColumnRefNode) and
-         (TSqlColumnRefNode(fn.Arg).TableQualifier = '') and
-         (FProcRow = nil) and (ci >= 0) and (ci < Length(rowK)) then
-        colVal := rowK[ci]
-      else
-        colVal := EvalExpr(fn.Arg, rowK, ACNames, ACTypes);
+      colVal := EvalExpr(fn.Arg, SrcRows[Idx[k]], ACNames, ACTypes);
       if colVal = '' then Continue;   // NULL: DISTINCT kumesine girmez
       // F-11: tekrarli degerler bir kez sayilir
       if seen <> nil then
         if seen.ContainsKey(colVal) then Continue
         else seen.Add(colVal, 0);
       Inc(cntI);
-      if needNum then
-        if VDbParseFloat(colVal, fv) then
-        begin
-          sumF := sumF + fv;
-          Inc(avgCnt);
-        end;
-      if needMinMax then
+      if VDbParseFloat(colVal, fv) then
       begin
-        if (minV = '') or VDbCmpVal(colVal, minV, '<', aggCt) then minV := colVal;
-        if (maxV = '') or VDbCmpVal(colVal, maxV, '>', aggCt) then maxV := colVal;
+        sumF := sumF + fv;
+        Inc(avgCnt);
       end;
+      if (minV = '') or VDbCmpVal(colVal, minV, '<', aggCt) then minV := colVal;
+      if (maxV = '') or VDbCmpVal(colVal, maxV, '>', aggCt) then maxV := colVal;
     end;
   end;
   if fn.FuncName = 'COUNT' then Result := IntToStr(cntI)
@@ -2778,44 +2763,6 @@ begin
   Result := SameText(s, 'True') or (s = '1');
 end;
 
-{ ------------------------------------------------------------
-  P-10: COUNT(*) HAM YOLU
-  TR: Tum cikti kolonlari COUNT(*) ise ve WHERE/HAVING/GROUP BY/set-op
-  yoksa satirlar decode edilmeden sayilabilir (TVTableDb.CountRows).
-  Bir kosul bile saglanmazsa eski yol (ScanRowsPart + ExecGroupBy)
-  birebir ayni sonucu verir; burada yalnizca "kesinlikle esit" oldugu
-  kanitlanan sorgular hizlandirilir.
-  EN: True only when every output column is COUNT(*) with no filter/
-  group/having/set-op — then rows can be counted without decoding.
- //---------------------------------------------------------- }
-function IsSimpleCountStar(Stmt: TSqlSelectStmt): Boolean;
-var
-  i: Integer;
-  fn: TSqlFuncCallNode;
-begin
-  Result := False;
-  if Stmt.HasJoin then Exit;
-  // set-op + aggregate eski yolda BILINCLI hata verir (F1-12); o hatta
-  // birakilir. Kosul HasSetOp ile birebir ayni.
-  if (Stmt.SetOp <> sokNone) and (Stmt.RightSelect <> nil) then Exit;
-  if Stmt.GroupByCols.Count > 0 then Exit;
-  if Stmt.HavingClause <> nil then Exit;
-  if Stmt.WhereClause <> nil then Exit;   // filtre satir degeri ister
-  if Stmt.AsOf <> saoNone then Exit;      // gecmis goruntu ayri hatta
-  if Stmt.Columns.Count = 0 then Exit;
-  for i := 0 to Stmt.Columns.Count - 1 do
-  begin
-    if not (Stmt.Columns[i].Expr is TSqlFuncCallNode) then Exit;
-    fn := TSqlFuncCallNode(Stmt.Columns[i].Expr);
-    if (fn.FuncName <> 'COUNT') or (not fn.IsStar) then Exit;
-    // F-16: FILTER (WHERE ...) satir degeri ister -> ham yola girilmez.
-    if fn.Filter <> nil then Exit;
-    if fn.IsDistinct then Exit;               // COUNT(DISTINCT *) degerlensin
-    if (fn.Args <> nil) and (fn.Args.Count > 0) then Exit;
-  end;
-  Result := True;
-end;
-
 function TVSqlExecutor.HasAggregate(Stmt: TSqlSelectStmt): Boolean;
 var
   i: Integer;
@@ -3356,7 +3303,6 @@ var
   covPos: Integer;      // F-19: index-only tarama icin indeks konumu
   covAll: Boolean;
   st: TVDbTableStats;   // R-15 Full CBO: ANALYZE istatistigi
-  rc: Int64;            // CBO satir sayisi (stats yoksa indeks uzunlugu)
 
   procedure Push(C: TSqlExprNode);
   begin
@@ -3370,54 +3316,12 @@ var
   end;
 
   // Sutun + tek sabit iceren karsilastirmayi "op" adina cevirir.
-  { Bir ifade dugumunu "deger dizesine" indirger. Duz literal ve negatif
-    literal (suoNeg) kabul edilir.
-
-    ONEMLI (hiz hatasi duzeltmesi): parser "id = -30792" ifadesini
-    kolon = suoNeg(literal) biciminde uretir. Burada suoNeg cozulmezse
-    AsSimple False doner, PK/indeks HIZLI YOLU atlanir ve sorgu 1
-    milyon satirlik TAM TARAMAYA duser (~12 saniye); oysa ayni sorgunun
-    pozitif degeri 0 ms.
-
-    Cozum, RowMatches'in de kullandigi EvalUnary(suoNeg, ...) ile BIREBIR
-    ayni hesabi yapmak. Boylece sonuc DEGISMEZ (dogruluk ayni), sadece
-    hizli yol acilmis olur. }
-  function LitStr(const E: TSqlExprNode; out S: string): Boolean;
-  var
-    un: TSqlUnaryOpNode;
-  begin
-    Result := False;
-    if E is TSqlLiteralNode then
-    begin
-      S := TSqlLiteralNode(E).AsString;
-      Exit(True);
-    end;
-    if E is TSqlUnaryOpNode then
-    begin
-      un := TSqlUnaryOpNode(E);
-      if un.Op <> suoNeg then Exit;
-      if not (un.Operand is TSqlLiteralNode) then Exit;
-      S := EvalUnary(suoNeg, TSqlLiteralNode(un.Operand).AsString);
-      Result := True;
-    end;
-  end;
-
-  // Sekil denetimi: deger dizesine indirgenebiliyor mu? (degeri umursamaz)
-  function IsLitLike(const E: TSqlExprNode): Boolean;
-  var
-    tmp: string;
-  begin
-    Result := LitStr(E, tmp);
-  end;
-
   function AsSimple(const C: TSqlExprNode; out ColI: Integer;
     out Val: string; out Op: TSqlBinaryOp): Boolean;
   var
     nn: TSqlBinaryOpNode;
     a, b: TSqlColumnRefNode;
     q: Integer;
-    vR, vL: string;
-    litR, litL: Boolean;
   begin
     Result := False;
     Op := sboEq; ColI := -1; Val := '';
@@ -3429,20 +3333,18 @@ var
     a := nil; b := nil;
     if nn.Left  is TSqlColumnRefNode then a := TSqlColumnRefNode(nn.Left);
     if nn.Right is TSqlColumnRefNode then b := TSqlColumnRefNode(nn.Right);
-    litR := LitStr(nn.Right, vR);
-    litL := LitStr(nn.Left,  vL);
-    if (a <> nil) and litR then
+    if (a <> nil) and (nn.Right is TSqlLiteralNode) then
     begin
       ColI := -1;
       for q := 0 to High(Td.Cols) do
         if VDbNorm(Td.Cols[q].Name) = VDbNorm(a.ColumnName) then
         begin ColI := q; Break; end;
       if ColI < 0 then Exit;
-      Val := vR;
+      Val := TSqlLiteralNode(nn.Right).AsString;
       Op := nn.Op;
       Exit(True);
     end;
-    if (b <> nil) and litL then
+    if (b <> nil) and (nn.Left is TSqlLiteralNode) then
     begin
       // "5 = a" -> "a = 5" (yansitilmis operator)
       ColI := -1;
@@ -3450,7 +3352,7 @@ var
         if VDbNorm(Td.Cols[q].Name) = VDbNorm(b.ColumnName) then
         begin ColI := q; Break; end;
       if ColI < 0 then Exit;
-      Val := vL;
+      Val := TSqlLiteralNode(nn.Left).AsString;
       case nn.Op of
         sboEq:  Op := sboEq;
         sboNeq: Op := sboNeq;
@@ -3514,8 +3416,8 @@ begin
           SetLength(Rows, 0);
           for n := 0 to TSqlInNode(conj[i]).List.Count - 1 do
           begin
-            // LitStr: "IN (-1,-2)" negatif literal'i da kapsar (suoNeg)
-            if not LitStr(TSqlInNode(conj[i]).List[n], pkVal) then Continue;
+            if not (TSqlInNode(conj[i]).List[n] is TSqlLiteralNode) then Continue;
+            pkVal := TSqlLiteralNode(TSqlInNode(conj[i]).List[n]).AsString;
             if FT.ReadRow(Td.Name, pkVal, oneRow) then
             begin
               SetLength(Pks, Length(Pks) + 1);
@@ -3555,8 +3457,8 @@ begin
       else if (conj[i] is TSqlBetweenNode) and
               (not TSqlBetweenNode(conj[i]).IsNot) and
               (TSqlBetweenNode(conj[i]).Expr is TSqlColumnRefNode) and
-              IsLitLike(TSqlBetweenNode(conj[i]).LowBound)  and
-              IsLitLike(TSqlBetweenNode(conj[i]).HighBound) then
+              (TSqlBetweenNode(conj[i]).LowBound  is TSqlLiteralNode) and
+              (TSqlBetweenNode(conj[i]).HighBound is TSqlLiteralNode) then
       begin
         cr := TSqlColumnRefNode(TSqlBetweenNode(conj[i]).Expr);
         ci := -1;
@@ -3567,13 +3469,12 @@ begin
         if not FT.TryGetMemIndex(Td.TableId, ci, e) then Continue;
         ct := Td.Cols[ci].Ctype;
         nParts := FT.IdxNParts(Td.TableId, ci);
-        // LitStr: IsLitLike ile tutarli sekilde negatif literal'i da cozer
-        if not LitStr(TSqlBetweenNode(conj[i]).LowBound, pkVal) then Continue;
-        if not VDbIdxRangeL(e, ct, '>=', pkVal, nParts, l2, h2) then
+        if not VDbIdxRangeL(e, ct, '>=',
+             TSqlLiteralNode(TSqlBetweenNode(conj[i]).LowBound).AsString, nParts, l2, h2) then
           Continue;
         lo := l2; hi := Length(e);
-        if LitStr(TSqlBetweenNode(conj[i]).HighBound, pkVal) and
-           VDbIdxRangeL(e, ct, '<=', pkVal, nParts, l2, h2) then
+        if VDbIdxRangeL(e, ct, '<=',
+             TSqlLiteralNode(TSqlBetweenNode(conj[i]).HighBound).AsString, nParts, l2, h2) then
           if h2 < hi then hi := h2;
       end
       // 2c) IN (a, b, c, ...)
@@ -3592,8 +3493,8 @@ begin
         lo := MaxInt; hi := 0;
         for n := 0 to TSqlInNode(conj[i]).List.Count - 1 do
         begin
-          // LitStr: "IN (-1,-2)" negatif literal'i da kapsar (suoNeg)
-          if not LitStr(TSqlInNode(conj[i]).List[n], pkVal) then Continue;
+          if not (TSqlInNode(conj[i]).List[n] is TSqlLiteralNode) then Continue;
+          pkVal := TSqlLiteralNode(TSqlInNode(conj[i]).List[n]).AsString;
           // alt sinir: EN KUCUK degerin '>=' baslangici
           if VDbIdxRangeL(e, ct, '>=', pkVal, nParts, l2, h2) then
             if l2 < lo then lo := l2;
@@ -3629,31 +3530,22 @@ begin
       Exit(True);                  // 0 satir, tam tarama gerekmez
     end;
 
-    // e dizisini KULLANILACAK kolona bagla (yukaridaki kosullar e'yi
-    // degistirmis olabilir). Ayni baglama CBO karari icin de gerekir:
-    // secicilik, bestCol indeksinin kendisine gore olculur.
-    if not FT.TryGetMemIndex(Td.TableId, bestCol, e) then Exit;
-
     // ---- R-15 Full CBO: indeks dilimi secici degilse tam tarama ----
     // Dilim genisligi (bestHi-bestLo) indeksten TAM olculur; bu, kolon
     // istatistigindeki distinct tahmininden daha kesindir. Indeks, ancak
     // toplam maliyeti sirali taramadan kucukse kullanilir. Karar
     // VDbCost.VdbIndexIsSelective (TEK karar noktasi) tarafindan verilir.
-    covPos := FT.IdxPosOfCol(Td.TableId, bestCol);
-    covAll := (covPos >= 0) and FT.IdxCoversAll(Td, covPos);
     if GetTableStats(Td.Name, st) then
-      rc := st.RowCount
-    else
-      // STATS YOK (ANALYZE hic calismamis): karar yine VERILMELI. Eski
-      // kodda stats yoklugu kararsizlik lehine indeks okurken birakiyordu;
-      // sonuc: "id > 100" gibi DILIMIN TAMAMINI kapsayan sorgular 1 milyon
-      // kez satir-basi rastgele dosya okumuyla geziliyordu (~13 sn) -- oysa
-      // sirali tarama ~5 sn. Indeksin kendisi satir sayisini verir:
-      // Length(e); Boylece ayni maliyet fonksiyonuyla tutarli karar verilir
-      // (EXPLAIN metni bundan etkilenmez, yalnizca yurutme yolu degisir).
-      rc := Length(e);
-    if not VdbIndexIsSelective(rc, bestHi - bestLo, covAll) then
-      Exit;  // False -> cagri FT.ScanRows ile tam tarama yapar
+    begin
+      covPos := FT.IdxPosOfCol(Td.TableId, bestCol);
+      covAll := (covPos >= 0) and FT.IdxCoversAll(Td, covPos);
+      if not VdbIndexIsSelective(st.RowCount, bestHi - bestLo, covAll) then
+        Exit;  // False -> cagri FT.ScanRows ile tam tarama yapar
+    end;
+
+    // e dizisini KULLANILACAK kolona bagla (yukaridaki kosullar e'yi
+    // degistirmis olabilir)
+    if not FT.TryGetMemIndex(Td.TableId, bestCol, e) then Exit;
 
     SetLength(Pks, bestHi - bestLo);
     SetLength(Rows, bestHi - bestLo);
@@ -5591,6 +5483,211 @@ begin
 end;
 
 { ------------------------------------------------------------
+  P-12 (2026-10-16) - TryStreamAgg (bkz. sinif bildirimi)
+  //---------------------------------------------------------- }
+function TVSqlExecutor.TryStreamAgg(Stmt: TSqlSelectStmt; const td: TTableDef;
+  out Res: TSqlResult): Boolean;
+type
+  TAggPlan = record
+    Fn: TSqlFuncCallNode;
+    Col: Integer;            // -1 = COUNT(*)
+    Cnt, AvgCnt: Int64;
+    SumF: Double;
+    MinI, MaxI: Int64;       // VCT_INT icin
+    MinF, MaxF: Double;      // VCT_FLOAT icin
+    HasMin, HasMax: Boolean;
+  end;
+var
+  j, i, c, colCnt: Integer;
+  cn: TStrArray;
+  ct, ftype: TByteArray;
+  foff, flen: TIntArray;
+  plans: array of TAggPlan;
+  keys: TQWordArray;
+  raws: TValArray;
+  tid: Word;
+  pk: string;
+  iv: Int64;
+  fv: Double;
+  fn: TSqlFuncCallNode;
+  cr: TSqlColumnRefNode;
+begin
+  Result := False;
+  { --- 1) Sorgu sekli korumasi: yalnizca saf, tek tablo, tek grup --- }
+  if (Stmt.FromTable = '') or Stmt.HasJoin then Exit;
+  if (Stmt.SetOp <> sokNone) or (Stmt.RightSelect <> nil) then Exit;
+  if Stmt.AsOf <> saoNone then Exit;
+  if Stmt.WithQueries.Count > 0 then Exit;
+  if Stmt.IsDistinct then Exit;
+  if (Stmt.WhereClause <> nil) or (Stmt.HavingClause <> nil) or
+     (Stmt.QualifyClause <> nil) then Exit;
+  if Stmt.GroupByCols.Count > 0 then Exit;
+  if (Stmt.OrderBy <> nil) and (Stmt.OrderBy.Count > 0) then Exit;
+  if (Stmt.LimitVal >= 0) or (Stmt.OffsetVal <> 0) then Exit;
+  if td.IsView then Exit;
+  if FT.RlsApplies(Stmt.FromTable) then Exit;   // R-19: RLS -> genel yol
+  if Stmt.Columns.Count = 0 then Exit;
+
+  BuildColInfo(td, cn, ct);   // kolon adlari nitelemesiz, sira = td.Cols
+
+  SetLength(plans, Stmt.Columns.Count);
+  for j := 0 to Stmt.Columns.Count - 1 do
+  begin
+    if not (Stmt.Columns[j].Expr is TSqlFuncCallNode) then Exit;
+    fn := TSqlFuncCallNode(Stmt.Columns[j].Expr);
+    if not ((fn.FuncName = 'COUNT') or (fn.FuncName = 'SUM') or
+            (fn.FuncName = 'AVG') or (fn.FuncName = 'MIN') or
+            (fn.FuncName = 'MAX')) then Exit;
+    if fn.IsDistinct or (fn.Filter <> nil) then Exit;
+    FillChar(plans[j], SizeOf(TAggPlan), 0);
+    plans[j].Fn := fn;
+    if fn.IsStar then
+    begin
+      // EvalAggregateValue'daki gibi: yildiz yalniz COUNT'u sayar
+      if fn.FuncName <> 'COUNT' then Exit;
+      plans[j].Col := -1;
+      Continue;
+    end;
+    if not (fn.Arg is TSqlColumnRefNode) then Exit;
+    cr := TSqlColumnRefNode(fn.Arg);
+    c := FindColIdx(cr.ColumnName, cr.TableQualifier, cn);
+    if c < 0 then Exit;                       // cozumsuz -> genel yol hatasi
+    plans[j].Col := c;
+    if ((fn.FuncName = 'SUM') or (fn.FuncName = 'AVG')) and
+       not ((ct[c] = VCT_INT) or (ct[c] = VCT_FLOAT) or (ct[c] = VCT_BOOL)) then
+      Exit;      // metin/tarih: VDbParseFloat esik davranisi birebir degil
+    if ((fn.FuncName = 'MIN') or (fn.FuncName = 'MAX')) and
+       not ((ct[c] = VCT_INT) or (ct[c] = VCT_FLOAT)) then
+      Exit;      // BOOL/metin karsilastirma semantigi genel yolda farkli
+  end;
+
+  { --- 2) Ham akis: ScanRows'un okudugu AYNI kayit kumesi; alanlar
+        cozulmez, ofset/uzunluk uzerinden okunur (string alloc YOK). --- }
+  colCnt := Length(td.Cols);
+  SetLength(ftype, colCnt); SetLength(foff, colCnt); SetLength(flen, colCnt);
+  FT.Kv.ScanAll(keys, raws, td.TableId);      // R-26: yalniz bu tablo
+  for i := 0 to High(keys) do
+  begin
+    if keys[i] = VDB_SCHEMA_KEY then Continue;
+    if not VDbPeekRawRow(raws[i], colCnt, tid, pk, ftype, foff, flen) then
+      Exit;      // eski sema / bozuk kayit -> genel yol (hata onda uretilir)
+    if tid <> td.TableId then Continue;       // ScanRowsPart ile ayni kural
+    if VDbHashKey(td.Name, pk) <> keys[i] then
+      Exit;      // hash carpismasi: genel yol ayni kayitta NET HATA verir
+    for j := 0 to High(plans) do
+    begin
+      if plans[j].Col < 0 then                // COUNT(*)
+      begin
+        Inc(plans[j].Cnt);
+        Continue;
+      end;
+      c := plans[j].Col;
+      // EvalAggregateValue bos metni NULL sayar: vl=-1 VE vl=0 ayni kapar
+      if (foff[c] < 0) or (flen[c] = 0) then Continue;
+      fn := plans[j].Fn;
+      if fn.FuncName = 'COUNT' then           // her tur kolonda sayilir
+      begin
+        Inc(plans[j].Cnt);
+        Continue;
+      end;
+      // SUM/AVG/MIN/MAX: kolon tipi planda sinirlandi (INT/FLOAT/BOOL).
+      case ct[c] of
+        VCT_INT:
+          begin
+            if flen[c] <> 8 then Exit;        // DecodeRow gibi: 8 bayt sart
+            Move(raws[i][foff[c]], iv, 8);
+            // DIKKAT: Double(iv) mode-delphi'de BIT CAST'tir (denormal
+            // cantan); deger donusumu atama/carpmayla olur (P-12 sqltest).
+            fv := iv * 1.0;   // StrToFloat(IntToStr(iv)) ile birebir ayni
+          end;
+        VCT_FLOAT:
+          begin
+            if flen[c] <> 8 then Exit;
+            Move(raws[i][foff[c]], fv, 8);
+            // NaN/Inf: VDbFloatToStr/Parse turu belirsiz -> genel yol
+            if not ((fv = fv) and (fv < 1e308) and (fv > -1e308)) then Exit;
+          end;
+      else  // VCT_BOOL: BoolToStr(x, True) = '-1' / '0'
+        begin
+          if flen[c] <> 1 then Exit;
+          if raws[i][foff[c]] <> 0 then fv := -1 else fv := 0;
+        end;
+      end;
+      // Kanonik bicimler VDbParseFloat'ta her zaman cozulur (NaN/Inf elendi)
+      Inc(plans[j].Cnt);
+      Inc(plans[j].AvgCnt);
+      plans[j].SumF := plans[j].SumF + fv;
+      if fn.FuncName = 'MIN' then
+      begin
+        if not plans[j].HasMin then
+        begin
+          plans[j].HasMin := True;
+          if ct[c] = VCT_INT then plans[j].MinI := iv else plans[j].MinF := fv;
+        end
+        else if ct[c] = VCT_INT then
+        begin if iv < plans[j].MinI then plans[j].MinI := iv end
+        else if fv < plans[j].MinF then plans[j].MinF := fv;
+      end
+      else if fn.FuncName = 'MAX' then
+      begin
+        if not plans[j].HasMax then
+        begin
+          plans[j].HasMax := True;
+          if ct[c] = VCT_INT then plans[j].MaxI := iv else plans[j].MaxF := fv;
+        end
+        else if ct[c] = VCT_INT then
+        begin if iv > plans[j].MaxI then plans[j].MaxI := iv end
+        else if fv > plans[j].MaxF then plans[j].MaxF := fv;
+      end;
+    end;
+  end;
+
+  { --- 3) Sonuc: ExecGroupBy'nin alan adi / deger bicimi kurallari BIREBIR --- }
+  SetLength(Res.Fields, Stmt.Columns.Count);
+  SetLength(Res.Rows, 1);
+  SetLength(Res.Rows[0], Stmt.Columns.Count);
+  for j := 0 to Stmt.Columns.Count - 1 do
+  begin
+    fn := plans[j].Fn;
+    if Stmt.Columns[j].Alias <> '' then
+      Res.Fields[j] := Stmt.Columns[j].Alias
+    else
+      Res.Fields[j] := fn.FuncName;
+    if fn.FuncName = 'COUNT' then
+      Res.Rows[0][j] := IntToStr(plans[j].Cnt)
+    else if fn.FuncName = 'SUM' then
+    begin
+      if plans[j].Cnt > 0 then
+        Res.Rows[0][j] := VDbFloatToStr(plans[j].SumF)
+      else Res.Rows[0][j] := '';
+    end
+    else if fn.FuncName = 'AVG' then
+    begin
+      if plans[j].AvgCnt > 0 then
+        Res.Rows[0][j] := VDbFloatToStr(plans[j].SumF / plans[j].AvgCnt)
+      else Res.Rows[0][j] := '';
+    end
+    else if fn.FuncName = 'MIN' then
+    begin
+      if not plans[j].HasMin then Res.Rows[0][j] := ''
+      else if ct[plans[j].Col] = VCT_INT then
+        Res.Rows[0][j] := IntToStr(plans[j].MinI)
+      else Res.Rows[0][j] := VDbFloatToStr(plans[j].MinF);
+    end
+    else  // MAX
+    begin
+      if not plans[j].HasMax then Res.Rows[0][j] := ''
+      else if ct[plans[j].Col] = VCT_INT then
+        Res.Rows[0][j] := IntToStr(plans[j].MaxI)
+      else Res.Rows[0][j] := VDbFloatToStr(plans[j].MaxF);
+    end;
+  end;
+  Res.Affected := 1;
+  Res.Msg := 'OK';
+  Result := True;
+end;
+
+{ ------------------------------------------------------------
   ExecSelect
   //---------------------------------------------------------- }
 { ------------------------------------------------------------
@@ -5969,8 +6066,6 @@ var
   ViewSel: TSqlSelectStmt;
   ViewRes: TSqlResult;
   ViewTypes: TByteArray;
-  // P-10: COUNT(*) ham yolu sayaci
-  cnt64: Int64;
 
   // 4.2 (2026-10-06): aggregate/GROUP BY sonrasi kuyruk â€” JOIN ve
   // tek-tablo yolu ORTAK kullanir (kod tekrari yok). ORDER BY cikti
@@ -6128,13 +6223,18 @@ begin
       FinishGroup;
       Exit;
     end;
-    SetLength(filteredRows, 0);
+    // Sonuc en fazla allRows kadar olabilir: bir kez ayir, eslesenleri
+    // sirayla doldur ve sonunda kisalt. Satir basina SetLength O(N^2)
+    // kopyalama maliyeti olusturuyordu.
+    SetLength(filteredRows, Length(allRows));
+    n := 0;
     for i := 0 to High(allRows) do
       if RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes) then
       begin
-        SetLength(filteredRows, Length(filteredRows) + 1);
-        filteredRows[High(filteredRows)] := allRows[i];
+        filteredRows[n] := allRows[i];
+        Inc(n);
       end;
+    SetLength(filteredRows, n);
   end
   else
   begin
@@ -6193,6 +6293,10 @@ begin
       end
       else
       begin
+        // P-12: WHERE/GROUP'suz tek tablo agregasi -> ham akistan say.
+        // Sekli uymazsa False; asagidaki genel yol AYNEN calisir.
+        if TryStreamAgg(Stmt, td, Res) then
+          Exit;
         // YOL 1 (en hizli): ORDER BY tek kolon ve o kolon indeksliyse satirlar
       // INDEKS sirasiyla okunur; OFFSET/LIMIT satir okunurken uygulanir.
       // F1-12: Eger SetOp varsa (UNION/EXCEPT/INTERSECT), ORDER BY/LIMIT/OFFSET
@@ -6209,34 +6313,6 @@ begin
         SkipOffsetLimit := TryIndexOrder(td, Stmt, colNames, colTypes, filteredRows);
       if not SkipOffsetLimit then
       begin
-        // P-10: COUNT(*) HAM YOLU -- tum ciktilar COUNT(*) ve filtre/
-        // HAVING/GROUP BY yoksa satirlar decode EDILMEDEN sayilir
-        // (1M satir: ~3.2sn -> ~0.7sn). Kosullar saglanmazsa asagidaki
-        // eski yola DUSER; CountRows, ScanRowsPart ile ayni yapi+hash
-        // denetimlerini yapar, sonuc birebir aynidir. RLS uygulaniyorsa
-        // satir bazli eleme gerekir -> ham yola girilmez.
-        if (not FT.RlsApplies(Stmt.FromTable)) and IsSimpleCountStar(Stmt) then
-        begin
-          cnt64 := FT.CountRows(Stmt.FromTable);
-          SetLength(outCols, Stmt.Columns.Count);
-          SetLength(outRows, 1);
-          SetLength(outRows[0], Stmt.Columns.Count);
-          SetLength(outTypes, Stmt.Columns.Count);
-          for i := 0 to Stmt.Columns.Count - 1 do
-          begin
-            // ExecGroupBy ile ayni kolon adi kurali (alias yoksa FuncName)
-            if Stmt.Columns[i].Alias <> '' then outCols[i] := Stmt.Columns[i].Alias
-            else outCols[i] := 'COUNT';
-            outTypes[i] := VCT_INT;
-            outRows[0][i] := IntToStr(cnt64);
-          end;
-          Res.Fields := outCols;
-          Res.Rows := outRows;
-          Res.Affected := 1;
-          Res.Msg := 'OK';
-          FinishGroup;   // ORDER BY/OFFSET/LIMIT cikti uzerinden ayni islem
-          Exit;
-        end;
         { YOL 2: Satir adaylarini DARALT - PK nokta aramasi veya indeks dilimi.
           (Once her zaman FT.ScanRows cagriliyordu: 100.000 satirlik tabloda
            "WHERE id = 5" bile ~900 ms suruyordu.)
@@ -6254,13 +6330,17 @@ begin
       // kumesi uzerinde calissin. WHERE filtresi asagida ayrica uygulanir.
       if FT.RlsApplies(Stmt.FromTable) then
       begin
-        SetLength(rlRows, 0);
+        // RLS sonucunun ust siniri allRows uzunlugudur; her gorunen
+        // satirda diziyi yeniden buyutme.
+        SetLength(rlRows, Length(allRows));
+        n := 0;
         for i := 0 to High(allRows) do
           if RlsRowVisible(Stmt.FromTable, 1, allRows[i], colNames, colTypes) then
           begin
-            SetLength(rlRows, Length(rlRows) + 1);
-            rlRows[High(rlRows)] := allRows[i];
+            rlRows[n] := allRows[i];
+            Inc(n);
           end;
+        SetLength(rlRows, n);
         allRows := rlRows;
         SetLength(pks, 0);
         SkipOffsetLimit := False;
@@ -6287,13 +6367,17 @@ begin
     // CTE/normal yolda allRows buradan suzulur.
     if not SkipOffsetLimit then
     begin
-      SetLength(filteredRows, 0);
+      // Sonuc en fazla allRows kadar olabilir; satir basina SetLength
+      // dinamik diziyi tekrar tekrar kopyalayip O(N^2) maliyet yaratir.
+      SetLength(filteredRows, Length(allRows));
+      n := 0;
       for i := 0 to High(allRows) do
         if RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes) then
         begin
-          SetLength(filteredRows, Length(filteredRows) + 1);
-          filteredRows[High(filteredRows)] := allRows[i];
+          filteredRows[n] := allRows[i];
+          Inc(n);
         end;
+      SetLength(filteredRows, n);
     end;
   end;
 

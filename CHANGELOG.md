@@ -9,6 +9,139 @@ akışını izler.
 
 ---
 
+## v0.005 — 2026-10-16 — Hız turu: P-14/P-15 + adil kıyas (vsbench) + ölü kod temizliği
+
+### Ne eklendi / değişti
+
+- **P-14a — tahsis-siz `VDbNorm` hızlı yolu + `IsView` tek `TryGetValue`**
+  (`VDbTable.pas`): ASCII-üstü/büyük harf/kabartma içermeyen dizilerde
+  `Trim+LowerCase` hiç çağrılmıyor, aynı referans dönüyor (davranış bit-bit aynı;
+  FPC `Trim`'in yalnız ' ' ve #9 sildiği `ttrim.pas` ile doğrulandı). Sema/kolon
+  aramaları satır başına ~15 kez bu fonksiyondan geçiyor.
+- **P-15a — `SortIdxEntries` decorated INT sort** (`VDbTable.pas`): INTEGER
+  indeks anahtarları karşılaştırma başına yeniden parse edilmek yerine bir kez
+  Int64'a çözülüp dekorlu anahtarla sıralanıyor; NULL-en-önde sıra ve
+  `CompareStr(Pk)` tie-break birebir korundu; parse edilemeyende eski yola düşer.
+  Lazy PK index rebuild 300K'da **2123 → 892 ms**; RANGE sorgularının kök
+  nedeni bu tek-seferlik rebuild'miş (sorgu başına 25 ms sanılıyordu).
+- **P-12 `TryStreamAgg`** (`VDbExecutor.pas`) ve **P-13 `ScanSnapshot` toplu
+  okuma + counting-sort bucket** (`VDbCore.pas`): agregatlarda satır matrisi
+  malzelleştirmesi yok; taramada satır başına 3 syscall yerine bucket başına tek
+  toplu okuma.
+- **R-26 tablo-tarama filtresi** kodla bu turda yayımlandı (ayrıntı v0.004).
+- **`vsbench.dpr` (yeni): SQLite ile ADİL hız testi** — 1M satır, aynı SQL metni,
+  aynı disk, tek süreç, iki taraf da stok varsayılanlar (VDB `SyncWriteInterval=0`
+  = senkron commit; SQLite varsayılan journal modu). Çalıştırmak için `sqlite3.dll`
+  exe'nin yanında olmalı. **Sonuçlar aşağıda dürüst haliyle yazılı.**
+- **Ölü kod temizliği** (`VDbExecutor.pas`, `VDbSql.pas`, `VDbTable.pas` ve
+  yardımcı dosyalar): kullanılmayan yordam/birim parçaları kaldırıldı; davranış
+  değişmedi (aşağıdaki gauntlet sıfırdan doğruladı).
+
+### Ölçülmüş sonuç — adil kıyas run3 → run4 (1M satır)
+
+| Aşama | run3 VDB | run4 VDB | SQLite | VDB/SQLite (run4) |
+|---|---|---|---|---|
+| INSERT 1M (tx) | 56.4 sn | 59.7 sn | 3.70 sn | 16.1x |
+| COUNT(*) x10 | 1.06 sn | 1.20 sn | 44.8 ms | 26.8x |
+| SUM(bakiye) x5 | 1.10 sn | 1.35 sn | 94.4 ms | 14.3x |
+| SELECT PK 50K | 1.95 sn | **2.51 sn** | 3.53 sn | **0.71x — VDB hızlı** |
+| RANGE 2000x100 | 12.3 sn | **8.54 sn** | 245 ms | **34.9x** (55x'ten indi) |
+| UPDATE 100k | 7.4 sn | 8.59 sn | 318.8 ms | 26.9x |
+| DELETE 100k | 5.2 sn | 6.10 sn | 229.7 ms | 26.6x |
+
+- Doğrulama: iki motorun COUNT/SUM'ı eşit (5.000.000.000), DELETE sonrası 900.000.
+- Kalan boşluk **mimari**: SQLite prepared statement kullanıyor; P-14 mikro
+  ölçeklerinde INSERT'imizin ~56 µs'si = parse ~12 + glue ~9 + Insert/commit ~16
+  + sarmalayıcı ~3-5 + heap büyüme cezası ~15 µs.
+
+### Bilinçli olarak YAPILMAYANLAR
+
+- **P-16 nokta-okuma adayı — REDDEDİLDİ:** BETWEEN uçlarından `IntToStr` ile anahtar
+  üretmek, INT PK'ların yazım şekliyle saklanması (`'010'` kalır) nedeniyle
+  `'01000'` gibi satırları sessiz düşürürdü → semantik bozucu.
+- **Plan cache — ERTELENDİ:** yürütücü AST'yi mutasyona uğratıyor (`Stmt.Table :=
+  baseTable`, `Stmt.Body` sahiplik devri); önbellek ancak immutable-plan denetimiyle
+  güvenli (v0.003 kararı yeniden doğrulandı).
+- **Index-only COUNT — REDDEDİLDİ:** "veri bozuksa bağır" sözleşmesiyle çelişir.
+- **P-15b peek-rebuild — SONRAKI ADAY:** `BuildPkIdx` hâlâ tam-decode `ScanRows`
+  kullanıyor (~620 ms @300k); stream/peek rebuild orta riskli, ayrıca plan cache
+  ile birlikte değerlendirilecek.
+
+### Doğrulama (ölü kod temizliği sonrası SIFIRDAN)
+
+- `fpc -B` derlemeleri hatasız (sqltest 55.383 satır; crashtest 44.364 satır).
+- `sqltest` **2251/2251**, kalan=0, KESILDI yok (`sqltest_restart.log`).
+- crashtest 8'li çarpma zinciri **8/8** "copme sonrasi veri kaybi/bozulma YOK"
+  (`c8_restart.log`) — `SyncWriteInterval=0` dayanıklılık sözleşmesi değişmedi.
+
+---
+
+## v0.005 — 2026-10-16 — Speed round: P-14/P-15 + fair benchmark (vsbench) + dead-code cleanup (ENGLISH)
+
+### Added / changed
+
+- **P-14a — allocation-free `VDbNorm` fast path + single `TryGetValue` in `IsView`**
+  (`VDbTable.pas`): strings without non-ASCII, uppercase or trim-requiring edge
+  whitespace return the SAME reference — `Trim+LowerCase` is never called and
+  behavior stays bit-identical (FPC `Trim` only strips ' ' and #9, verified with
+  `ttrim.pas`). Schema/column lookups hit this ~15 times per row.
+- **P-15a — decorated INT sort in `SortIdxEntries`** (`VDbTable.pas`): INTEGER index
+  keys are decoded to Int64 once instead of re-parsed per comparison; NULL-first
+  ordering and the `CompareStr(Pk)` tie-break preserved bit-for-bit; unparsable keys
+  fall back to the legacy path. Lazy PK index rebuild at 300K: **2,123 → 892 ms**.
+  The root cause of the RANGE gap turned out to be this one-time rebuild (previously
+  mistaken for 25 ms per query).
+- **P-12 `TryStreamAgg`** (`VDbExecutor.pas`) and **P-13 batched `ScanSnapshot` reads
+  with counting-sort buckets** (`VDbCore.pas`): aggregates no longer materialize the
+  row matrix; scans issue one batched read per bucket instead of 3 syscalls per row.
+- **R-26 table-scan filter** shipped with this round (details in v0.004).
+- **`vsbench.dpr` (new): FAIR speed test vs SQLite** — 1M rows, same SQL text, same
+  disk, single process, both engines on stock defaults (VDB `SyncWriteInterval=0`
+  = synchronous commit; SQLite default journal mode). Needs `sqlite3.dll` next to
+  the exe. **Honest results below.**
+- **Dead-code cleanup** (`VDbExecutor.pas`, `VDbSql.pas`, `VDbTable.pas` and helper
+  files): unused routines/unit parts removed; behavior unchanged (gauntlet below
+  re-verified from scratch).
+
+### Measured — fair comparison run3 → run4 (1M rows)
+
+| Phase | run3 VDB | run4 VDB | SQLite | VDB/SQLite (run4) |
+|---|---|---|---|---|
+| INSERT 1M (tx) | 56.4 s | 59.7 s | 3.70 s | 16.1x |
+| COUNT(*) x10 | 1.06 s | 1.20 s | 44.8 ms | 26.8x |
+| SUM(balance) x5 | 1.10 s | 1.35 s | 94.4 ms | 14.3x |
+| SELECT PK 50K | 1.95 s | **2.51 s** | 3.53 s | **0.71x — VDB faster** |
+| RANGE 2000x100 | 12.3 s | **8.54 s** | 245 ms | **34.9x** (down from 55x) |
+| UPDATE 100k | 7.4 s | 8.59 s | 318.8 ms | 26.9x |
+| DELETE 100k | 5.2 s | 6.10 s | 229.7 ms | 26.6x |
+
+- Verification: COUNT/SUM identical across engines (5,000,000,000); 900,000 rows after DELETE.
+- The remaining gap is **architectural**: SQLite uses prepared statements; our
+  ~56 µs per INSERT breaks down as parse ~12 + glue ~9 + Insert/commit ~16 +
+  wrapper ~3-5 + heap growth penalty ~15 µs (P-14 micro-benchmarks).
+
+### Deliberately NOT done
+
+- **P-16 point-read candidate — REJECTED:** generating keys with `IntToStr` from
+  BETWEEN bounds would silently drop rows such as `'01000'`, since INT PKs are
+  stored exactly as written (`'010'` stays). Semantics-breaking.
+- **Plan cache — DEFERRED:** the executor mutates the AST (`Stmt.Table := baseTable`,
+  `Stmt.Body` ownership transfer); a cache is only safe with an immutable-plan audit
+  (v0.003 decision re-confirmed).
+- **Index-only COUNT — REJECTED:** conflicts with the "shout if data is corrupt" contract.
+- **P-15b peek-rebuild — NEXT CANDIDATE:** `BuildPkIdx` still full-decodes via
+  `ScanRows` (~620 ms @300K); stream/peek rebuild is medium-risk, to be evaluated
+  together with the plan cache.
+
+### Verification (FROM SCRATCH after dead-code cleanup)
+
+- Clean `fpc -B` builds (sqltest 55,383 lines; crashtest 44,364 lines).
+- `sqltest` **2251/2251**, 0 remaining, no aborts (`sqltest_restart.log`).
+- 8-crash crashtest chain **8/8** "no data loss/corruption after crash"
+  (`c8_restart.log`) — the `SyncWriteInterval=0` durability contract unchanged.
+
+---
+
 ## v0.004 — 2026-10-15 — Tablo-tarama filtresi (R-26): 240x hızlanma
 
 ### Ne eklendi

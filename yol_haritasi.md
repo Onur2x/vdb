@@ -1727,6 +1727,150 @@ yeşil.
 
 ---
 
+### 5.17 ⚡ HIZ TURU: R-26 + P-12..P-15 + ADİL KIYAS (2026-10-15..16)
+
+**R-26 — Tablo-tarama filtresi** (`VDbCore.pas`, `VDbTable.pas`): satır başındaki
+TableId (CRC baytları, `Recover`'da bedava) `TDbLoc.TableId`'ye yazılır;
+`ScanSnapshot/ScanAll` artık `TableFilter` ile diğer tablonun satırını dosyadan
+bile okumuyor. A=150K satır varken `B LIMIT 10`: 1.782 ms → **7.4 ms (240x)**.
+
+**P-12 — `TryStreamAgg`** (`VDbExecutor.pas`): `COUNT/SUM/MIN/MAX/AVG` tek-tablo
+sorgularında satır matrisi hiç malzelleştirilmez; agregat planı satır akışı üstünde
+ilerler (`TAggPlan`).
+
+**P-13 — `ScanSnapshot` toplu okuma** (`VDbCore.pas`): satır başına 3 syscall yerine
+üç faz: A) görünür adaylar toplanır (dosyaya dokunulmaz), B) bucket sayım-dönüşümü
+(O(N) counting sort), C) bucket başına TEK dosya okuması.
+
+**P-14 — INSERT boşluğunun tam teşhisi** (bench14..bench23 mikro-ölçümleri): SQLite
+karşısındaki 16x farkın dökümü (300K satır, tek INSERT 56.6 µs): parse ~12 µs +
+execütör glue ~9 µs + Insert/commit ~16.3 µs + API sarmalayıcı ~3-5 µs + kalan
+~15 µs heap tahsis/büyüme cezası. "Sarmalayıcı 25 µs" yanıltmacası çürütüldü:
+C−G farkı süreç/heap bağlamıydı (36 MB hazır string pre-alloc'u 58.6→44.1 µs).
+Kalan boşluk **mimari**: SQLite prepared statement kullanıyor; metin-başına-parse
+kaçınılmaz maliyet.
+
+**P-14a — tahsis-siz `VDbNorm` hızlı yolu** (`VDbTable.pas`): ASCII-üstü (≥#128),
+büyük harf veya kabartma gerektiren kenar boşluk yoksa `Trim+LowerCase` hiç
+çağrılmadan AYNI referans döner (FPC `Trim` yalnız ' ' ve #9 siler — `ttrim.pas`
+ile doğrulandı); davranış bit-bit aynı. `IsView` da `ContainsKey+indexer` yerine
+tek `TryGetValue`. Sema/kolon aramaları satır başına ~15 kez buradan geçiyordu.
+
+**P-15a — `SortIdxEntries` decorated INT sort** (`VDbTable.pas`): INTEGER
+anahtarlarda karşılaştırma başına 2× `VDbParseInt` yerine anahtarlar bir kez
+Int64'a çıkarılıp ( dekorlu ) aynı Hoare partition ile sıralanır; NULL-en-önde +
+`CompareStr(Pk)` tie-break birebir korunur; parse edilemeyen anahtarda eski yola
+düşer. Lazy PK index rebuild 300K'da **2123 ms → 892 ms** (tüm indeks
+kurulumlarına kazanç). RANGE kök nedeni buydu: sorgu başına 25 ms sanılan şey
+tek-seferlik tembel rebuild'miş.
+
+**P-16 (YAPILMADI, gerekçeli):** `BETWEEN` uçlarından `IntToStr` ile aday anahtar
+üretip nokta-okuma yapılabilirdi ama INT PK'lar YAZIM ŞEKLİYLE saklanır
+(`'010'` olduğu gibi kalır); `BETWEEN 1000 AND 1000` için `'1000'` okumak
+`'01000'` satırını sessizce düşürürdü → semantiği bozacağı için reddedildi.
+Aday üretimi yalnız literalin kendisiyle (`=`, `IN`) güvenlidir — 1/1b yolları
+zaten öyle yapıyor.
+
+**Adil kıyas — `vsbench.dpr` (yeni):** 1M satır, AYNI SQL metni, AYNI disk, tek
+süreç, stok varsayılanlar (`SyncWriteInterval=0`, senkron commit — SQLite tarafı
+da varsayılan journal modunda). run4 (P-14a+P-15a sonrası):
+
+| Aşama | VDB | SQLite | VDB/SQLite |
+|---|---|---|---|
+| INSERT 1M (BEGIN/COMMIT) | 59.7 sn | 3.70 sn | 16.1x |
+| COUNT(*) x10 | 1.20 sn | 44.8 ms | 26.8x |
+| SUM(bakiye) x5 | 1.35 sn | 94.4 ms | 14.3x |
+| SELECT PK 50.000x | **2.51 sn** | 3.53 sn | **0.71x — VDB hızlı** |
+| RANGE 2.000x100 satır | 8.54 sn | 245 ms | 34.9x (run3: 55x) |
+| UPDATE 100k | 8.59 sn | 318.8 ms | 26.9x |
+| DELETE 100k | 6.10 sn | 229.7 ms | 26.6x |
+
+Doğrulama: COUNT/SUM her iki motorun çıktıları eşit (SUM=5000000000), DELETE
+sonrası 900.000. Kalan boşluk (INSERT/UPDATE/COUNT) = prepared statement
+mimarisidir; plan-cache `Stmt` mutasyonu (VIEW DML `Stmt.Table := baseTable`,
+`Stmt.Body` sahiplik devri) nedeniyle ancak immutable-plan denetimiyle gelir —
+sonraki tur adayı. İkinci aday: `BuildPkIdx` peek-rebuild (P-15b).
+
+**Doğrulama (ölü kod temizliği sonrası sıfırdan):** `fpc -B` derlemeleri hatasız;
+`sqltest` **2251/2251** (kalan=0, KESILDI yok); crashtest 8'li çarpma zinciri
+**8/8** "veri kaybı/bozulma YOK" — dayanıklılık sözleşmesi (`SyncWriteInterval=0`)
+pazarlık dışı kaldı.
+
+---
+
+### 5.17 ⚡ SPEED ROUND: R-26 + P-12..P-15 + FAIR COMPARISON (2026-10-15..16)
+
+**R-26 — Table-scan filter** (`VDbCore.pas`, `VDbTable.pas`): the per-row TableId
+(already read for CRC in `Recover`) is stored in `TDbLoc.TableId`;
+`ScanSnapshot/ScanAll` take a `TableFilter` and do not even read other tables'
+rows from disk. `B LIMIT 10` while A holds 150K rows: 1,782 ms → **7.4 ms (240x)**.
+
+**P-12 — `TryStreamAgg`** (`VDbExecutor.pas`): single-table `COUNT/SUM/MIN/MAX/AVG`
+never materializes the row matrix; the aggregate plan (`TAggPlan`) advances over a
+row stream.
+
+**P-13 — `ScanSnapshot` batched reads** (`VDbCore.pas`): instead of 3 syscalls per
+row, three phases: A) collect visible candidates (no file access), B) O(N) bucket
+counting sort, C) one batched file read per bucket.
+
+**P-14 — full diagnosis of the INSERT gap** (bench14..bench23 micro-benchmarks):
+breakdown of the 16x gap vs SQLite (single INSERT 56.6 µs at 300K rows): parse
+~12 µs + executor glue ~9 µs + Insert/commit ~16.3 µs + API wrapper ~3-5 µs +
+~15 µs heap allocation/growth penalty. The "wrapper costs 25 µs" red herring was
+disproved: the C−G delta was the process/heap context (pre-allocating 36 MB of
+ready strings: 58.6→44.1 µs). The remaining gap is **architectural**: SQLite uses
+prepared statements; per-text parsing is an unavoidable cost.
+
+**P-14a — allocation-free `VDbNorm` fast path** (`VDbTable.pas`): when the string
+has no non-ASCII (≥#128), no uppercase and no trim-requiring edge whitespace,
+the SAME reference is returned without calling `Trim+LowerCase` (FPC `Trim` only
+strips ' ' and #9 — verified with `ttrim.pas`); behavior is bit-identical.
+`IsView` now uses a single `TryGetValue` instead of `ContainsKey`+indexer. Schema
+and column lookups passed through here ~15 times per row.
+
+**P-15a — decorated INT sort in `SortIdxEntries`** (`VDbTable.pas`): for INTEGER
+keys, instead of 2× `VDbParseInt` per comparison, keys are decoded to Int64 once
+and sorted with the same Hoare partition; NULL-first ordering and the
+`CompareStr(Pk)` tie-break are preserved bit-for-bit; unparsable keys fall back to
+the old path. Lazy PK index rebuild at 300K: **2,123 ms → 892 ms** (benefits every
+index build). This was the true root cause of RANGE: what looked like 25 ms per
+query was a one-time lazy rebuild.
+
+**P-16 (NOT DONE, deliberate):** generating point-read candidate keys via
+`IntToStr` from BETWEEN bounds was possible, but INT PKs are stored EXACTLY as
+written (`'010'` stays `'010'`); reading `'1000'` for `BETWEEN 1000 AND 1000`
+would silently drop `'01000'` — rejected as semantics-breaking. Candidate
+generation is only safe with the literal itself (`=`, `IN`) — paths 1/1b already
+do exactly that.
+
+**Fair comparison — `vsbench.dpr` (new):** 1M rows, SAME SQL text, SAME disk, one
+process, stock defaults (`SyncWriteInterval=0`, synchronous commit — SQLite side
+also runs its default journal mode). run4 (after P-14a+P-15a):
+
+| Phase | VDB | SQLite | VDB/SQLite |
+|---|---|---|---|
+| INSERT 1M (BEGIN/COMMIT) | 59.7 s | 3.70 s | 16.1x |
+| COUNT(*) x10 | 1.20 s | 44.8 ms | 26.8x |
+| SUM(balance) x5 | 1.35 s | 94.4 ms | 14.3x |
+| SELECT PK 50,000x | **2.51 s** | 3.53 s | **0.71x — VDB faster** |
+| RANGE 2,000x100 rows | 8.54 s | 245 ms | 34.9x (run3: 55x) |
+| UPDATE 100k | 8.59 s | 318.8 ms | 26.9x |
+| DELETE 100k | 6.10 s | 229.7 ms | 26.6x |
+
+Verification: COUNT/SUM identical across engines (SUM=5000000000); 900,000 rows
+after DELETE. The remaining gap (INSERT/UPDATE/COUNT) is the prepared-statement
+architecture; a plan cache requires an immutable-plan audit first because the
+executor mutates `Stmt` (VIEW DML `Stmt.Table := baseTable`, `Stmt.Body`
+ownership transfer) — next-round candidate. Second candidate: peek-rebuild in
+`BuildPkIdx` (P-15b).
+
+**Verification (from scratch after dead-code cleanup):** clean `fpc -B` builds;
+`sqltest` **2251/2251** (0 remaining, no abort); 8-crash crashtest chain **8/8**
+"no data loss/corruption" — the durability contract (`SyncWriteInterval=0`)
+remained non-negotiable.
+
+---
+
 ## 6. 🐛 DÜZELTİLEN GERÇEK HATALAR (tüm turlar)
 
 | Yer | Hata | Etki |
