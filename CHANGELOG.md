@@ -9,6 +9,126 @@ akışını izler.
 
 ---
 
+## v0.010 — 2026-10-16 — Hız turu: P-19 konumsal okuma + P-19w birleşik ekleme + P-20 ayırıcı hızlı yolu
+
+### Ne eklendi / değişti
+
+- **P-19 — konumsal tek okuma (`VDbPosRead`, VDbCore):** `GetSnapshot`
+  (nokta PK/KV okuma yolu) eskiden `FS.Size` + `FS.Position` + `FS.Read` +
+  `FS.Read` ile **4 syscall** yapıyordu (dosya sonu, konum, başlık, değer).
+  Artık offsetli **tek** okuma: Windows'ta `ReadFile` + `OVERLAPPED`
+  (`kernel32.dll`'den `external` bağlanır — `Windows` birimi `uses`'a
+  EKLENMEZ; `TCriticalSection` gölgelenirdi), diğer platformlarda
+  `System.FileSeek` + `FileRead` (FPC'nin kendi `THandleStream` ilkelleri,
+  4→2). Başarısızlık veya aralık sapmasında **eski yol birebir** çalışır;
+  hata sınıflandırma sırası ve mesajları korunur (dosya dışı → başlık
+  eksik → index/data uyuşmazlığı → DEL → değer eksik). `loc.Size >
+  VDB_POSREAD_MAX (16 MB)` → eski yol.
+- **P-19w — birleşik ekleme yazımı (`AppendRec`, VDbCore):** `FS.Seek(0,
+  soEnd)` + başlık + değer = **3 syscall** idi; artık başlık+değer **tek**
+  `WriteBuffer` (2 syscall). `FS.Seek(0, soEnd)` **korunur**: dosya sonunun
+  tek yetkili kaynağı budur; offset'i bellekte tutmak (in-place
+  `FS.Position`, rollback `FS.Size:=`, `Compact`, truncate yollarında) bir
+  kez invalide edilmediğinde **sessiz veri bozulması** riski taşırdı —
+  güvenlik > mikro kazanç. Yazılan baytlar/sıra/offset birebir aynıdır.
+  `ValLen > VDB_COMBINE_MAX (64 KB)` → geçici kopya ayırmamak için eski yol.
+- **P-20 — `SplitStatements` hızlı yolu (VDbSql):** ayırıcı her kelimeyi
+  karakter karakter `w := w + S[i]` ile kuruyordu (100 karakterlik bir
+  INSERT'te ~15 kelime, her biri yeniden ayrılıyor). **Hiç `;` yoksa**
+  sonuç kanıtlanabilir biçimde `[Trim(S)]` (ya da boş) olduğundan `Pos(';',
+  S) = 0` hızlı yolu eklendi; tirnak/yorum içindeki `;` durumları genel
+  yola düşer. Çok-ifadeli betikler aynen genel yolu kullanır.
+
+### Ölçülmüş sonuç (aynı-koşu A/B, 200K)
+
+| Ölçüm | Önce | Sonra | Fark |
+|---|---|---|---|
+| `kv.Get` (aynı anahtar, bench28) | 6,71 µs | **1,83 µs** | −%73 |
+| `kv.Get` (rastgele) | 7,57 µs | **2,57 µs** | −%66 |
+| `tb.ReadRow` (bench27) | 10,07 µs | **5,73 µs** | −%43 |
+| SQL BETWEEN (satır başı) | 19,62 µs | **14,52 µs** | −%26 |
+| Ham ekleme yolu (bench32) | 6,04 µs | **3,98 µs** | −%34 |
+| `SplitStatements(INSERT)` (bench35) | 2,87 µs | **1,02 µs** | −%64 |
+
+### Ölçülmüş sonuç — adil kıyas run6 → run8 (1M satır, C:\temp, tek süreç)
+
+| Aşama | run6 VDB | run8 VDB | SQLite (run8) | run8 oranı |
+|---|---|---|---|---|
+| INSERT 1M (tx) | 34,0 sn | **29,0 sn** | 3,14 sn | 9,24x |
+| SELECT PK 50.000x | 1,95 sn | **1,41 sn** | 3,06 sn | **0,46x** (VDB 2,2x önde) |
+| RANGE 2.000×100 | 4,19 sn | **3,11 sn** | 215,7 ms | 14,43x |
+| UPDATE 100k | 6,97 sn | **4,68 sn** | 267,1 ms | 17,52x |
+| DELETE 100k | 4,85 sn | **3,36 sn** | 193,7 ms | 17,36x |
+| COUNT x10 | 721 ms | 698 ms | 35,4 ms | 19,69x |
+| SUM x5 | 802 ms | 733 ms | 81,9 ms | 8,95x |
+
+Makine durumu run8'de SQLite'ı da hızlandırdığından (INSERT 3,64→3,14 sn),
+makineden bağımsız **oran** belirleyicidir: PK 0,59→**0,46x**, RANGE
+19,3→**14,4x**, DELETE 23,6→**17,4x**. Doğrulama: COUNT 1M ✓, DELETE
+sonrası 900k ✓, SUM=5000000000 ✓ (`vsbench_run8.log`).
+
+### Doğrulama (sıfırdan)
+
+- `fpc -B` temiz (sqltest 56.405; crashtest 45.386 satır).
+- `sqltest` **2251/2251**, kalan=0 (`sqltest_p20.log`).
+- crashtest 8'li çarpma zinciri **8/8** (`c8_p20.log`) —
+  `SyncWriteInterval=0` dayanıklılık sözleşmesi değişmedi.
+
+---
+
+## v0.010 — 2026-10-16 — Speed round: P-19 positional read + P-19w combined append + P-20 splitter fast path (ENGLISH)
+
+### Added / changed
+
+- **P-19 — single positional read (`VDbPosRead`, VDbCore):** `GetSnapshot`
+  (point PK/KV read path) used `FS.Size` + `FS.Position` + `FS.Read` +
+  `FS.Read` — **4 syscalls** (file size, position, header, value). It is now
+  a single offset read: `ReadFile` + `OVERLAPPED` on Windows (`external`
+  from `kernel32.dll` — the `Windows` unit is NOT added to `uses`, it would
+  shadow `TCriticalSection`), `System.FileSeek` + `FileRead` elsewhere
+  (FPC's own `THandleStream` primitives, 4→2). On any failure or range
+  mismatch the **old path runs verbatim**; error classification order and
+  messages are preserved. `loc.Size > VDB_POSREAD_MAX (16 MB)` → old path.
+- **P-19w — combined append write (`AppendRec`, VDbCore):** `FS.Seek(0,
+  soEnd)` + header + value was **3 syscalls**; now header+value go out in a
+  single `WriteBuffer` (2 syscalls). `FS.Seek(0, soEnd)` is **kept**: it is
+  the single authority for the end of file; tracking the offset in memory
+  (in-place `FS.Position`, rollback `FS.Size:=`, `Compact`, truncate paths)
+  would risk silent corruption if invalidated even once — safety over
+  micro-gain. Bytes, order and offset are bit-identical. `ValLen >
+  VDB_COMBINE_MAX (64 KB)` → old path, to avoid a temp copy.
+- **P-20 — `SplitStatements` fast path (VDbSql):** the splitter built every
+  word char-by-char (`w := w + S[i]`). When there is **no `;` at all** the
+  result is provably `[Trim(S)]` (or empty), so a `Pos(';', S) = 0` fast
+  path was added; `;` inside quotes/comments still falls to the general
+  path. Multi-statement scripts are untouched.
+
+### Measured (same-run A/B, 200K)
+
+| Measurement | Before | After | Delta |
+|---|---|---|---|
+| `kv.Get` (same key, bench28) | 6.71 µs | **1.83 µs** | −73% |
+| `kv.Get` (random) | 7.57 µs | **2.57 µs** | −66% |
+| `tb.ReadRow` (bench27) | 10.07 µs | **5.73 µs** | −43% |
+| SQL BETWEEN (per row) | 19.62 µs | **14.52 µs** | −26% |
+| Raw append path (bench32) | 6.04 µs | **3.98 µs** | −34% |
+| `SplitStatements(INSERT)` (bench35) | 2.87 µs | **1.02 µs** | −64% |
+
+### Measured — fair comparison run6 → run8 (1M rows, C:\temp, single process)
+
+See the Turkish table above; the machine-independent **ratio** is the
+decider: PK 0.59→**0.46x**, RANGE 19.3→**14.4x**, DELETE 23.6→**17.4x**.
+Verification: COUNT 1M ✓, 900k after DELETE ✓, SUM=5000000000 ✓
+(`vsbench_run8.log`).
+
+### Verification (from scratch)
+
+- Clean `fpc -B` builds; `sqltest` **2251/2251** (`sqltest_p20.log`);
+  crashtest **8/8** (`c8_p20.log`) — the `SyncWriteInterval=0` durability
+  contract is unchanged.
+
+---
+
 ## v0.009 — 2026-10-16 — Hız turu: P-15b PK tembel indeksinin sıfır-kopya kurucusu
 
 ### Ne eklendi / değişti

@@ -31,6 +31,10 @@ const
   VDB_FLAG_ENCRYPTED = 4;   // Faz D: Encryption (AES)
   VDB_FLAG_COMPRESSED = 8;  // Faz D: Compression (ZLIB)
   VDB_MAX_VALUE = 16 * 1024 * 1024;
+  // P-19w: bu boyuta kadar header+deger TEK WriteBuffer ile yazilir
+  // (3 syscall -> 2). Uzerinde ESKI yol birebir calisir (buyuk bloblar
+  // icin gecici birlesik kopya ayirmamak icin).
+  VDB_COMBINE_MAX = 64 * 1024;
 
   // Dosya kimligi: her .odb 'VODB'(LE) + surum + bayrak + baslik CRC ile baslar.
   // Kayitlar hep VDB_HDR_SIZE sonrasinda. Ham kayit akisiyla karismaz.
@@ -862,6 +866,7 @@ var
   off: Int64;
   pv: PByte;
   stored: TBytes;      // dosyaya yazilacak deger (sifreli olabilir)
+  wbuf: TBytes;        // P-19w: header+deger birlesik yazim tamponu
   walFlags: Byte;
 begin
   stored := nil;
@@ -926,9 +931,29 @@ begin
           [FPath]);
 
   off := FS.Seek(0, soEnd);
-  FS.WriteBuffer(h, SizeOf(h));
-  if h.ValLen > 0 then
-    FS.WriteBuffer(stored[0], h.ValLen);
+  { P-19w: header + deger TEK WriteBuffer ile yazilir (3 syscall -> 2).
+    FS.Seek(0, soEnd) KORUNUR: dosya sonunun tek yetkili kaynagi budur.
+    Offset'i bellekte tutmak (in-place guncelleme FS.Position, rollback
+    FS.Size:=, Compact, truncate yollarinda) bir kez invalide
+    edilmediginde sessiz veri bozulmasi riski tasirdi; guvenlik > mikro
+    kazanc. Birlesik yazim veri sozlesmesini DEGISTIRMEZ: ayni baytlar
+    ayni sirayla ayni offset'e yazilir.
+    BUYUK DEGER (blob): birlesik tampon ayirmamak icin ESKI yol birebir
+    (16 MB'a kadar gecici kopya olmasin). }
+  if h.ValLen <= VDB_COMBINE_MAX then
+  begin
+    SetLength(wbuf, Integer(SizeOf(h)) + Integer(h.ValLen));
+    Move(h, wbuf[0], SizeOf(h));
+    if h.ValLen > 0 then
+      Move(stored[0], wbuf[SizeOf(h)], h.ValLen);
+    FS.WriteBuffer(wbuf[0], Integer(SizeOf(h)) + Integer(h.ValLen));
+  end
+  else
+  begin
+    FS.WriteBuffer(h, SizeOf(h));
+    if h.ValLen > 0 then
+      FS.WriteBuffer(stored[0], h.ValLen);
+  end;
   FDirty := True;
   if DoFlush then
     VDbFlushStream(FS);
@@ -1470,6 +1495,69 @@ end
   end;
 end;
 
+const
+  { P-19: konumsal hizli okumanin ust siniri. Bu boyuttan buyuk degerler
+    (bozuk loc.Size) ESKI yola birakilir: orada once dosya-siniri kontrolu
+    yapilir, asiri ayirma olmaz. Yalnizca HIZI etkiler, davranisi degil. }
+  VDB_POSREAD_MAX = 16 * 1024 * 1024;
+
+{$IFDEF MSWINDOWS}
+type
+  { Windows birimini KULLANMIYORUZ (kendi TCriticalSection'i SyncObjs'inkini
+    golgeliyor); ReadFile'i dogrudan kernel32'den baglariz. Yerlesim
+    Win32 OVERLAPPED ile aynidir (yalniz offset alanlari kullanilir). }
+  TVDbOverlapped = record
+    Internal: LongWord;
+    InternalHigh: LongWord;
+    Offset: LongWord;
+    OffsetHigh: LongWord;
+    hEvent: THandle;
+  end;
+
+function VDbReadFileRaw(hFile: THandle; lpBuffer: Pointer;
+  nNumberOfBytesToRead: LongWord; lpNumberOfBytesRead: PLongWord;
+  lpOverlapped: Pointer): LongBool; stdcall;
+  external 'kernel32.dll' name 'ReadFile';
+
+function VDbPosRead(H: THandle; Offset: Int64; var Buf; Count: Integer): Integer;
+// P-19 (2026-10-16): KONUMSAL TEK OKUMA. Eski okuma yolu kayit basina
+//   FS.Size (1 syscall) + FS.Position (1) + FS.Read (1) + FS.Read (1)
+// = 4 syscall yapiyordu; olcumde 6,65 us/kayit (Defender/filtre surucusu
+// dahil). Burada OVERLAPPED offset ile TEK ReadFile: senkron handle'da
+// offset OVERLAPPED'tan alinir, dosya konum belirteci kullanilmaz
+// (yazim yollari zaten FS.Seek(0, soEnd) ile acik konumlanir).
+// Basarisizsa -1 doner; cagiran ESKI yola duser (davranis degismez).
+var
+  ov: TVDbOverlapped;
+  n: LongWord;
+begin
+  if Count <= 0 then Exit(0);
+  FillChar(ov, SizeOf(ov), 0);
+  ov.Offset := LongWord(Offset and $FFFFFFFF);
+  ov.OffsetHigh := LongWord((Offset shr 32) and $FFFFFFFF);
+  n := 0;
+  if not VDbReadFileRaw(H, @Buf, LongWord(Count), @n, @ov) then
+    Exit(-1);
+  Result := Integer(n);
+end;
+{$ELSE}
+function VDbPosRead(H: THandle; Offset: Int64; var Buf; Count: Integer): Integer;
+// Tasinabilir yol (Linux/macOS/BSD): System.FileSeek + FileRead. Bunlar
+// FPC'nin KENDI THandleStream'inin kullandigi ilkellerdir (Classes),
+// yani ayni ilkel uzerinde calisir; TFileStream'in Position+Read+Read
+// zincirinden (3 syscall) daha az is yapar. Windows'ta OVERLAPPED yolu
+// (1 syscall) secilir. Basarisizsa -1 -> cagiran ESKI yola duser.
+var
+  n: Integer;
+begin
+  if Count <= 0 then Exit(0);
+  if FileSeek(H, Offset, 0) < 0 then Exit(-1);
+  n := FileRead(H, Buf, Count);
+  if n < 0 then Exit(-1);
+  Result := n;
+end;
+{$ENDIF}
+
 function TVDb.Get(Key: QWord; out Value: TBytes): Boolean;
 begin
   // R-01 MVCC: batch icinde transaction snapshot'indan oku; batch disi eski Get davranisi (High(QWord) = her sey gorunur)
@@ -1509,6 +1597,8 @@ var
   op: TPendOp;
   fsize: Int64;
   nRead: Integer;
+  need: Integer;
+  scratch: TBytes;
   plainBuf: TBytes;
   inBatchVisible: Boolean;
 begin
@@ -1546,35 +1636,86 @@ begin
   if not FIndex.TryGetValue(Key, loc) then Exit;
   if not IsVisible(loc, SnapshotSeq) then Exit;
 
-  // 3. Guvenlik kontrolu (Get ile ayni)
-  fsize := FS.Size;
-  if (loc.Offset < 0) or
-     (loc.Offset + Int64(SizeOf(h)) + Int64(loc.Size) > fsize) then
-    raise EVDbException.CreateFmt(ecCorrupt,
-      'VDb: index kaydi dosya disinda (key=%d offset=%d size=%d dosya=%d)',
-      [Key, loc.Offset, loc.Size, fsize]);
-
-  // 4. Kayit basligini oku ve dogrula
-  FS.Position := loc.Offset;
-  nRead := FS.Read(h, SizeOf(h));
-  if nRead <> SizeOf(h) then
-    raise EVDbException.CreateFmt(ecCorrupt,
-      'VDb: kayit basligi eksik (key=%d, okunan=%d)', [Key, nRead]);
-  if (h.Magic <> VDB_MAGIC) or (h.Key <> Key) or (h.ValLen <> loc.Size) then
-    raise EVDbException.Create(ecCorrupt, 'VDb: index/data uyusmazligi');
-
-  // 5. DELETED kayit kontrolu (tombstone)
-  if (h.Flags and VDB_FLAG_DEL) <> 0 then Exit(False);
-
-  // 6. Degeri oku
-  SetLength(Value, loc.Size);
-  if loc.Size > 0 then
+  // 3/4/5/6. Okuma — P-19 (2026-10-16): HIZLI YOL tek konumsal ReadFile,
+  //   yedek ESKI yol birebir. Siniflandirma SIRASI ve mesajlari eski ile
+  //   ayni: (dosya disinda) -> (baslik eksik) -> (index/data uyusmazligi)
+  //   -> (DEL) -> (deger eksik). Hizli yol yalnizca okuma basariliysa
+  //   kullanilir; platform/aralik sapmasinda ESKI yol aynen calisir.
+  need := -1;
+  if (loc.Offset >= 0) and (loc.Size >= 0) and (loc.Size <= VDB_POSREAD_MAX) then
   begin
-    nRead := FS.Read(Value[0], loc.Size);
-    if nRead <> loc.Size then
+    need := SizeOf(h) + loc.Size;
+    SetLength(scratch, need);
+    nRead := VDbPosRead(FS.Handle, loc.Offset, scratch[0], need);
+    if nRead < 0 then
+      need := -1;   // basarisiz -> ESKI yol
+  end;
+
+  if need >= 0 then
+  begin
+    // ---- HIZLI YOL ----
+    if nRead < SizeOf(h) then
+    begin
+      fsize := FS.Size;
+      if loc.Offset + Int64(SizeOf(h)) + Int64(loc.Size) > fsize then
+        raise EVDbException.CreateFmt(ecCorrupt,
+          'VDb: index kaydi dosya disinda (key=%d offset=%d size=%d dosya=%d)',
+          [Key, loc.Offset, loc.Size, fsize]);
+      raise EVDbException.CreateFmt(ecCorrupt,
+        'VDb: kayit basligi eksik (key=%d, okunan=%d)', [Key, nRead]);
+    end;
+    Move(scratch[0], h, SizeOf(h));
+    if (h.Magic <> VDB_MAGIC) or (h.Key <> Key) or (h.ValLen <> loc.Size) then
+      raise EVDbException.Create(ecCorrupt, 'VDb: index/data uyusmazligi');
+    if (h.Flags and VDB_FLAG_DEL) <> 0 then Exit(False);
+    if nRead < need then
+    begin
+      fsize := FS.Size;
+      if loc.Offset + Int64(SizeOf(h)) + Int64(loc.Size) > fsize then
+        raise EVDbException.CreateFmt(ecCorrupt,
+          'VDb: index kaydi dosya disinda (key=%d offset=%d size=%d dosya=%d)',
+          [Key, loc.Offset, loc.Size, fsize]);
       raise EVDbException.CreateFmt(ecCorrupt,
         'VDb: kayit degeri eksik (key=%d, okunan=%d beklenen=%d)',
-        [Key, nRead, loc.Size]);
+        [Key, nRead - SizeOf(h), loc.Size]);
+    end;
+    SetLength(Value, loc.Size);
+    if loc.Size > 0 then
+      Move(scratch[SizeOf(h)], Value[0], loc.Size);
+  end
+  else
+  begin
+    // ---- ESKI YOL (birebir; davranis referansi) ----
+    // 3. Guvenlik kontrolu (Get ile ayni)
+    fsize := FS.Size;
+    if (loc.Offset < 0) or
+       (loc.Offset + Int64(SizeOf(h)) + Int64(loc.Size) > fsize) then
+      raise EVDbException.CreateFmt(ecCorrupt,
+        'VDb: index kaydi dosya disinda (key=%d offset=%d size=%d dosya=%d)',
+        [Key, loc.Offset, loc.Size, fsize]);
+
+    // 4. Kayit basligini oku ve dogrula
+    FS.Position := loc.Offset;
+    nRead := FS.Read(h, SizeOf(h));
+    if nRead <> SizeOf(h) then
+      raise EVDbException.CreateFmt(ecCorrupt,
+        'VDb: kayit basligi eksik (key=%d, okunan=%d)', [Key, nRead]);
+    if (h.Magic <> VDB_MAGIC) or (h.Key <> Key) or (h.ValLen <> loc.Size) then
+      raise EVDbException.Create(ecCorrupt, 'VDb: index/data uyusmazligi');
+
+    // 5. DELETED kayit kontrolu (tombstone)
+    if (h.Flags and VDB_FLAG_DEL) <> 0 then Exit(False);
+
+    // 6. Degeri oku
+    SetLength(Value, loc.Size);
+    if loc.Size > 0 then
+    begin
+      nRead := FS.Read(Value[0], loc.Size);
+      if nRead <> loc.Size then
+        raise EVDbException.CreateFmt(ecCorrupt,
+          'VDb: kayit degeri eksik (key=%d, okunan=%d beklenen=%d)',
+          [Key, nRead, loc.Size]);
+    end;
   end;
 
   // 7. Sifreleme cozme (Get ile ayni mantik)

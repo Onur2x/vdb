@@ -2675,6 +2675,22 @@ var
 begin
   SetLength(Result, 0);
   n := Length(S);
+  { P-20: HIZLI YOL. Hic ';' yoksa bolme de, BEGIN/END govde sayaci da
+    is yapmaz; sonuc TAM OLARAK [Trim(S)] (ya da S tamamen bosluk ise []).
+    Genel yolun son blogu da bunu uretir: dongu ';' dali HIC calismaz,
+    bu yuzden start=1 kalir ve tek parca Trim(S) eklenir. Bu, tirnak/
+    yorum icindeki ';' durumlarini da kapsar (Pos yalnizca VARLIGA bakar;
+    varsa genel yol aynen calisir). Karakter-karakter string birleştiren
+    genel yol her ifadede ~2.4 us yiyordu; tek-ifadeli cagrilar baskin. }
+  if Pos(';', S) = 0 then
+  begin
+    if Trim(S) <> '' then
+    begin
+      SetLength(Result, 1);
+      Result[0] := Trim(S);
+    end;
+    Exit;
+  end;
   inStr := False;
   inDq := False;
   inLine := False;

@@ -1932,6 +1932,45 @@ decode edilmeyen kolonlar atılarak (FOff/FLen dilim decode) daraltılabilir
 
 ---
 
+### 5.22 HIZ TURU: P-19 konumsal okuma + P-19w birleşik ekleme + P-20 ayırıcı (2026-10-16)
+
+**Ölçüm-önce:** bench27/28/29/30/31/32/33/34/35/36 ile katman katman prof.
+Kanıtlananlar (200K): `GetSnapshot` okuma yolu **4 syscall** (`FS.Size` +
+`FS.Position` + 2×`FS.Read`); ekleme yolu **3 syscall** (`FS.Seek` + başlık +
+değer); `SplitStatements` her kelimeyi karakter karakter kuruyor.
+
+**P-19 — konumsal tek okuma:** `VDbPosRead` offsetli **tek** `ReadFile`
+(Windows `OVERLAPPED`, `kernel32.dll`'den `external`; diğer platformlar
+`System.FileSeek`+`FileRead`). Hızlı yol koşulu `loc.Size <= VDB_POSREAD_MAX`;
+her sapmada **eski yol birebir** — hata sınıflandırma sırası/metinleri
+korunur. `kv.Get` 6,71→**1,83 µs**; `ReadRow` 10,07→**5,73 µs**.
+
+**P-19w — birleşik ekleme:** başlık+değer tek `WriteBuffer` (3→2 syscall).
+`FS.Seek(0, soEnd)` **korunur** (dosya sonunun tek yetkili kaynağı; offset'i
+bellekte tutmak in-place/rollback/Compact/truncate yollarında riskli). Ham
+ekleme 6,04→**3,98 µs**. `ValLen > 64 KB` → eski yol.
+
+**P-20 — ayırıcı hızlı yolu:** `Pos(';', S) = 0` iken sonuç kanıtlanabilir
+biçimde `[Trim(S)]`; `SplitStatements(INSERT)` 2,87→**1,02 µs**.
+
+**Reddedilen aday — konumsal YAZMA (offset takipli, bench32 varyant C):**
+2,16 µs (A'ya göre −3,88 µs) ama dosya sonu offset'ini bellekte tutmayı
+gerektirir; `FS`'e dokunan **57 nokta** (in-place `FS.Position`, rollback
+`FS.Size := savedSize`, truncate, `Compact`) tek tek invalide edilmezse
+**sessiz veri bozulması**. Güvenlik gereği alınmadı; varyant B (seek + tek
+write) seçildi. Konumsal okuma (P-19) truncate'e duyarsızdır ve yaşam-süresi
+riski taşımaz — bu yüzden okuma alındı, yazma alınmadı.
+
+**Ölçülen (adil kıyas run6→run8 @1M):** INSERT 34,0→**29,0 sn**; SELECT PK
+1,95→**1,41 sn**; RANGE 4,19→**3,11 sn**; UPDATE 6,97→**4,68 sn**; DELETE
+4,85→**3,36 sn**. Makineden bağımsız oran: PK 0,59→**0,46x** (VDB 2,2x önde),
+RANGE 19,3→**14,4x**, DELETE 23,6→**17,4x**.
+
+**Doğrulama:** `fpc -B` hatasız; `sqltest` **2251/2251**; crashtest **8/8**
+(`sqltest_p20.log`, `c8_p20.log`).
+
+---
+
 ### 5.17 ⚡ SPEED ROUND: R-26 + P-12..P-15 + FAIR COMPARISON (2026-10-15..16)
 
 **R-26 — Table-scan filter** (`VDbCore.pas`, `VDbTable.pas`): the per-row TableId
@@ -2149,6 +2188,45 @@ separate gauntlet.
 
 **Verification:** clean `fpc -B` builds; `sqltest` **2251/2251**; crashtest
 **8/8** (`sqltest_p15b.log`, `c8_p15b.log`).
+
+---
+
+### 5.22 SPEED ROUND: P-19 positional read + P-19w combined append + P-20 splitter (2026-10-16)
+
+**Measure first:** bench27/28/29/30/31/32/33/34/35/36 layer-by-layer profiles.
+Proven at 200K: the `GetSnapshot` read path used **4 syscalls** (`FS.Size` +
+`FS.Position` + 2×`FS.Read`); the append path used **3** (`FS.Seek` + header +
+value); `SplitStatements` built every word char-by-char.
+
+**P-19 — single positional read:** `VDbPosRead` performs one offset `ReadFile`
+(Windows `OVERLAPPED`, `external` from `kernel32.dll`; `System.FileSeek` +
+`FileRead` elsewhere). Fast-path condition `loc.Size <= VDB_POSREAD_MAX`; on
+any mismatch the **old path runs verbatim** — error classification order and
+messages preserved. `kv.Get` 6.71→**1.83 µs**; `ReadRow` 10.07→**5.73 µs**.
+
+**P-19w — combined append:** header+value in one `WriteBuffer` (3→2 syscalls).
+`FS.Seek(0, soEnd)` is **kept** (single authority for end of file; tracking the
+offset in memory across in-place/rollback/Compact/truncate paths is unsafe).
+Raw append 6.04→**3.98 µs**. `ValLen > 64 KB` → old path.
+
+**P-20 — splitter fast path:** when `Pos(';', S) = 0` the result is provably
+`[Trim(S)]`; `SplitStatements(INSERT)` 2.87→**1.02 µs**.
+
+**Rejected candidate — positional WRITE (tracked offset, bench32 variant C):**
+2.16 µs (−3.88 µs vs A) but it requires keeping the end-of-file offset in
+memory; with **57 `FS` touch points** (in-place `FS.Position`, rollback
+`FS.Size := savedSize`, truncate, `Compact`) a single missed invalidation
+means **silent data corruption**. Rejected on safety grounds; variant B (seek
++ single write) chosen. Positional READ (P-19) is insensitive to truncation and
+carries no lifetime risk — hence read taken, write not.
+
+**Measured (fair comparison run6→run8 @1M):** INSERT 34.0→**29.0 s**; SELECT
+PK 1.95→**1.41 s**; RANGE 4.19→**3.11 s**; UPDATE 6.97→**4.68 s**; DELETE
+4.85→**3.36 s**. Machine-independent ratio: PK 0.59→**0.46x** (VDB 2.2x
+ahead), RANGE 19.3→**14.4x**, DELETE 23.6→**17.4x**.
+
+**Verification:** clean `fpc -B` builds; `sqltest` **2251/2251**; crashtest
+**8/8** (`sqltest_p20.log`, `c8_p20.log`).
 
 ---
 
