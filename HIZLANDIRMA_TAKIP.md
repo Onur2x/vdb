@@ -70,6 +70,13 @@ Bu doküman, VDB'nin SQLite hızına yaklaştırılması için yürütülen perf
   - *Gevşeme (kullanıcı onaylı, KR-1B COUNT ile aynı kategori):* agrega'nın OKUMADIĞI kuyruk kolonlarındaki dahili bozulma bu yolda yakalanmaz → satır genel yola düşüp hata vermek yerine sessizce toplanır; dönen **değer doğruluğu değişmez**.
   - *Sonuç:* `MaxCol`'ün peek'a ulaştığı `-1`'e sabitleyip SUM'ın NULL dönmesiyle doğrulandı. 3 kolonlu tabloda `SUM(id)` 285→273 ms (~%4); yalıtık probe kuyruk-yürüyüşünü ~40 ms ölçse de PAS C kaydı L1/L2'ye taşıdığı için uçtan-uca ~12 ms'e iner. Kazanç atlanan kolonla ~doğrusal (~6 ms/kolon/1M satır) → geniş şemalarda (30+ kolon, erken ölçüde SUM) anlam kazanır. `sqltest` 2251/2251, `crashtest` 8/8. *(Tamamlandı)*
 
+- [ ] **Öneri KR-9 (FORMAT v2 / SIKIŞTIRMA): değerlendirildi → REDDEDİLDİ (2026-10-17, kullanıcı kararı)**
+  - *İddia:* satır kodlamasını sıkıştırmak (`[1 tip + 4 uzunluk + N değer]` düzenindeki 4B uzunluk önekini sabit-genişlik tiplerde kaldırmak; sabit-8B integer'ı varint/delta'ya; NULL'u bitmap'e; pk iki-kopyasını azaltmak) boyutu ~%25–55 küçültür.
+  - *Ölçüme karşı karar:* 1M/77MB bench'te **RAW I/O = 11–22 ms, `SUM` ≈ 273 ms** → I/O toplamın **%4–8**'i; DB fiilen **RAM-ikametli**, darboğaz **CPU** (tarama makinesi + peek + FNV). Kullanıcı profili: **DB genelde RAM'e sığıyor.** Bu rejimde sıkıştırma **net negatif**: I/O'dan kâr yok (zaten ucuz), decode CPU'su (varint döngüsü/sözlük) artar — tam KR-8/8c ile incelttiğimiz peek yolunu yavaşlatır. Blast radius devasa (EncodeRow/DecodeRow/peek/pk-indeks/**crash-recovery**/WAL/TCP replikasyon/snapshot/şifreleme + çift decoder/migrasyon) ve 1. öncelik "ASLA veri kaybı" ile doğrudan çelişen bir risk yüzeyi açar.
+  - *Karar:* **0 — dokunma.** Ne v2-lite ne v2-full yapılmaz.
+  - *Yeniden açma koşulu:* yalnız kalıcı olarak **DB ≫ RAM** (10M+ satır, soğuk/I/O-bağlı tarama yaygın) bir iş yükü **gerçekten** ortaya çıkarsa; ve o zaman önce **v2-lite** (varint yok → decode nötr/hafif hızlı), en son v2-full.
+  - *(Karar, profil sorusu yanıtlanınca verildi; kayıt tekrardan tartışmayı önlemek için.)*
+
 ---
 
 ## Tamamlanan Aşama ve Güncel Süre Kayıtları
