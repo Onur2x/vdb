@@ -1,4 +1,4 @@
-﻿program SpeedTest;
+program SpeedTest;
 
 {$mode delphi}
 {$APPTYPE CONSOLE}
@@ -221,6 +221,7 @@ begin
     kv.SyncWriteInterval := interval;
 
     t0 := NowTick;
+    sq.Exec('DROP TABLE IF EXISTS b');
     sq.Exec('CREATE TABLE b(id INTEGER PRIMARY KEY, val INTEGER, txt TEXT)');
     t1 := NowTick;
     Line('CREATE TABLE', 1, Sec(t0, t1));

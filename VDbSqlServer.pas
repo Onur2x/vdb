@@ -43,16 +43,22 @@ uses
 type
   TVdbSqlServer = class;
 
-  { Her istemci baglantisi icin bir thread. Sira disi tek is yok:
-    tum SQL FLock altinda SERI calisir. }
+  { Her istemci baglantisi icin bir thread.
+    KR-7: Her baglanti kendi TVSql ornegiyle calisir (FSql); ayni Ftb
+    paylasilir. Okuma sorgulari paralel, yazma serilestirme Ftb.Lock
+    (TMultiReadExclusiveWriteSynchronizer) ile saglanir. }
   TVdbServerConn = class(TThread)
   private
     FServer: TVdbSqlServer;
     FSock: TVdbSocket;
+    FSql: TVSql;    // KR-7: baglantiya ozel SQL motoru (ayni Ftb paylasilir)
+    FSessionActive: Boolean; // KR-7: baglanti bazli oturum durumu
+    FPreparedSql: string;   // KR-7: baglantiya ozel hazirlanmis SQL
   protected
     procedure Execute; override;
   public
     constructor Create(AServer: TVdbSqlServer; ASock: TVdbSocket);
+    destructor Destroy; override;
     { Stop sirasinda engellenmis recv'yi uyandirir (kapanis Execute'ta). }
     procedure Wake;
     property Sock: TVdbSocket read FSock;
@@ -75,8 +81,8 @@ type
     FListen: TVdbSocket;
     Fkv: TVDb;
     Ftb: TVTableDb;
-    Fsq: TVSql;
-    FLock: TCriticalSection;     // motor serilestirmesi
+    // KR-7: Fsq ve FLock kaldirildi. Her baglanti kendi TVSql ornegini
+    // kullanir (TVdbServerConn.FSql). Ftb'nin MREW kilidi serilestirir.
     FConnsLock: TCriticalSection; // baglanti listesi
     FConns: TList;                // TVdbServerConn
     FAccept: TVdbServerAccept;
@@ -84,11 +90,10 @@ type
     FStopping: Boolean;
     FLastErr: string;
     FServed: Integer;             // islenen QUERY cercevesi (hata dahil)
-    FSessionId: Integer;        // oturum kimligi (1: aktif, 0: kapali)
+    FSessionId: Integer;        // genel oturum durumu (login/logout icin)
     FUser: string;              // R-12 devam: auth
     FPass: string;              // R-12 devam
-    FPreparedSql: string;     // R-12 devam: hazirlanmis SQL
-    FMaxConns: Integer;      // R-12 devam: maksimum TCP baglanti (kapasite = FSize)
+    FMaxConns: Integer;      // R-12 devam: maksimum TCP baglanti
     procedure AddConn(AConn: TVdbServerConn);
     procedure CloseEngine;
   public
@@ -100,8 +105,6 @@ type
     { Kabul thread'ini bitirir, tum baglantilari uyandirir ve bekler,
       motoru kapatir. Cagrilmasi guvenlidir (idempotent). }
     procedure Stop;
-    { Bir istemciden gelen QUERY cercevesini calistirip yaniti yazar. }
-    function ExecCmd(const ASql: string; ASock: TVdbSocket): Boolean;
     property Ready: Boolean read FReady;
     property Port: Word read FPort;
     property LastError: string read FLastErr;
@@ -156,8 +159,21 @@ begin
   FreeOnTerminate := False;
   FServer := AServer;
   FSock := ASock;
+  FSql := TVSql.Create(AServer.Ftb); // KR-7: baglantiya ozel SQL moturu
+  FSessionActive := (AServer.SessionId <> 0); // varsayilan aktif oturum
+  FPreparedSql := '';
   AServer.AddConn(Self);
   Start;
+end;
+
+destructor TVdbServerConn.Destroy;
+begin
+  if FSql <> nil then
+  begin
+    FSql.Free;
+    FSql := nil;
+  end;
+  inherited Destroy;
 end;
 
 procedure TVdbServerConn.Wake;
@@ -167,10 +183,14 @@ begin
 end;
 
 procedure TVdbServerConn.Execute;
+// KR-7: FSql bu baglantiyin TVSql ornegi. Okuma sorguları Ftb MREW kilidiyle
+// paralel calisir; yazma serilestirme Ftb.Lock ile saglanir.
 var
   typ: Byte;
   sql, user, pass, sqlP: string;
   mag: array[0..3] of AnsiChar;
+  Res: TSqlResult;
+  err: string;
 begin
   try
     { 1) El sikisma: SUNUCU ilk mesaji gonderir. }
@@ -187,24 +207,50 @@ begin
         VDBS_CMD_QUERY:
           begin
             if not VdbRecvStr(FSock, sql) then Break;
-            if not FServer.ExecCmd(sql, FSock) then Break;
+            if not FSessionActive then
+            begin
+              if not VdbSendU8(FSock, VDBS_RSP_ERROR) then Break;
+              if not VdbSendStr(FSock, 'oturum yok') then Break;
+              if not VdbSendU8(FSock, VDBS_TERM) then Break;
+            end
+            else
+            begin
+              err := '';
+              Res := Default(TSqlResult);
+              try
+                Res := FSql.Exec(sql);
+              except
+                on E: Exception do
+                  err := E.Message;
+              end;
+              InterlockedIncrement(FServer.FServed);
+              if err <> '' then
+              begin
+                if not SendErrorFrame(FSock, err) then Break;
+              end
+              else
+              begin
+                if not SendResultFrame(FSock, Res) then Break;
+              end;
+            end;
           end;
         VDBS_CMD_LOGIN:
           begin
             user := ''; pass := '';
             if not VdbRecvStr(FSock, user) then Break;
             if not VdbRecvStr(FSock, pass) then Break;
-            // auth kontrolü
+            // auth kontrolu
             if (user = FServer.FUser) and (pass = FServer.FPass) then
             begin
-              FServer.FSessionId := 1;
+              FSessionActive := True;
+              FServer.FSessionId := 1;  // genel gozlem icin
               if not VdbSendU8(FSock, VDBS_RSP_AUTH) then Break;
               if not VdbSendU8(FSock, 0) then Break;   // status: OK
               if not VdbSendU8(FSock, VDBS_TERM) then Break;
             end
             else
             begin
-              FServer.FSessionId := 0;
+              FSessionActive := False;
               if not VdbSendU8(FSock, VDBS_RSP_AUTH) then Break;
               if not VdbSendU8(FSock, 1) then Break;   // status: FAIL
               if not VdbSendU8(FSock, VDBS_TERM) then Break;
@@ -212,25 +258,40 @@ begin
           end;
         VDBS_CMD_LOGOUT:
           begin
-            FServer.FSessionId := 0;
+            FSessionActive := False;
             Break;
           end;
         VDBS_CMD_PREPARE:
           begin
             if not VdbRecvStr(FSock, sqlP) then Break;
-            // Hazirlik kapisi: dogrulama (mutasyon hedefi burada)
             if False and (sqlP = '') then Break; // mutasyon: etki test
-            FServer.FPreparedSql := sqlP;
+            FPreparedSql := sqlP;
             if not VdbSendU8(FSock, $44) then Break; // RSP_PREPARE
             if not VdbSendU8(FSock, 0) then Break;   // OK
             if not VdbSendU8(FSock, VDBS_TERM) then Break;
           end;
         VDBS_CMD_EXECUTE:
           begin
-            // Hazirlanmis SQL'i params ile calistir;
-            // basit calisma: FPreparedSql veya varsa parametreli degisiklik yok
-            if FServer.FPreparedSql <> '' then
-              if not FServer.ExecCmd(FServer.FPreparedSql, FSock) then Break
+            if FPreparedSql <> '' then
+            begin
+              err := '';
+              Res := Default(TSqlResult);
+              try
+                Res := FSql.Exec(FPreparedSql);
+              except
+                on E: Exception do
+                  err := E.Message;
+              end;
+              InterlockedIncrement(FServer.FServed);
+              if err <> '' then
+              begin
+                if not SendErrorFrame(FSock, err) then Break;
+              end
+              else
+              begin
+                if not SendResultFrame(FSock, Res) then Break;
+              end;
+            end
             else
             begin
               if not VdbSendU8(FSock, VDBS_RSP_ERROR) then Break;
@@ -302,7 +363,6 @@ begin
   FDir := ADir;
   FPort := APort;
   FListen := VDB_SOCK_INVALID;
-  FLock := TCriticalSection.Create;
   FConnsLock := TCriticalSection.Create;
   FConns := TList.Create;
 end;
@@ -312,13 +372,11 @@ begin
   Stop;
   FConns.Free;
   FConnsLock.Free;
-  FLock.Free;
   inherited;
 end;
 
 procedure TVdbSqlServer.CloseEngine;
 begin
-  if Fsq <> nil then begin Fsq.Free; Fsq := nil; end;
   if Ftb <> nil then begin Ftb.Close; Ftb.Free; Ftb := nil; end;
   if Fkv <> nil then begin Fkv.Close; Fkv.Free; Fkv := nil; end;
 end;
@@ -338,7 +396,6 @@ begin
     Fkv.Open(FDir);
     Ftb := TVTableDb.Create(Fkv);
     Ftb.Open(FDir);
-    Fsq := TVSql.Create(Ftb);
   except
     on E: Exception do
     begin
@@ -363,9 +420,8 @@ begin
   FSessionId := 1;     // varsayilan aktif oturum
   FUser := 'admin';    // varsayilan oturum bilgileri
   FPass := 'admin123';
-  FPreparedSql := '';  // R-12 devam: hazirlanmis SQL yok
-    FMaxConns := 4;  // R-12 devam: kapasite (havuz-slot sayisi)
-    FAccept := TVdbServerAccept.Create(Self);
+  FMaxConns := 4;  // R-12 devam: kapasite (havuz-slot sayisi)
+  FAccept := TVdbServerAccept.Create(Self);
   Result := True;
 end;
 
@@ -443,49 +499,6 @@ begin
   finally
     FConnsLock.Leave;
   end;
-end;
-
-function TVdbSqlServer.ExecCmd(const ASql: string;
-  ASock: TVdbSocket): Boolean;
-var
-  Res: TSqlResult;
-  err: string;
-begin
-  if FSessionId = 0 then
-  begin
-    // oturum yok - ERROR body
-    if not VdbSendU8(ASock, VDBS_RSP_ERROR) then
-      Result := False
-    else
-    begin
-      if not VdbSendStr(ASock, 'oturum yok') then
-        Result := False
-      else
-        Result := False;
-    end;
-    Exit;
-  end;
-
-  err := '';
-  Res := Default(TSqlResult);
-  FLock.Enter;
-  try
-    try
-      Res := Fsq.Exec(ASql);
-    except
-      on E: Exception do
-        err := E.Message;
-    end;
-    Inc(FServed);   // QUERY sayaci: hatalar da islenen komuttur
-  finally
-    FLock.Leave;
-  end;
-  { Yanit yazimi motor kilidi DISINDA: ag gecikmesi diger istemcileri
-    bekletmesin (serializasyon zaten EXEC sirasinda saglandi). }
-  if err <> '' then
-    Result := SendErrorFrame(ASock, err)
-  else
-    Result := SendResultFrame(ASock, Res);
 end;
 
 end.

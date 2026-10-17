@@ -309,7 +309,11 @@ type
       UST KUMEDIR, bu yuzden sonuc hicbir kosulda degismez. }
     function NarrowRows(const Td: TTableDef; WhereClause: TSqlExprNode;
       const ColNames: TStrArray; const ColTypes: TByteArray;
-      out Pks: TStrArray; out Rows: TStrMatrix): Boolean;
+      out Pks: TStrArray; out Rows: TStrMatrix;
+      out IsExact: Boolean): Boolean; overload;
+    function NarrowRows(const Td: TTableDef; WhereClause: TSqlExprNode;
+      const ColNames: TStrArray; const ColTypes: TByteArray;
+      out Pks: TStrArray; out Rows: TStrMatrix): Boolean; overload;
     { R-13 Full: WHERE'den bolme hedef kumesini cikarir (partition
       pruning). Guvenlik: yalniz AND'lenen ve anlasilabilen kosullar
       (bolme kolonunda '=' ya da IN, literal degerlerle) katki verir;
@@ -442,6 +446,10 @@ type
       FT.Insert (PK/UNIQUE/NOT NULL/CHECK/AutoInc tablo katmaninda);
       hata istisnalari ayni sirada ayni noktalardan firlar. }
     function ExecFastLiteralInsert(const Sql: string;
+      out Res: TSqlResult): Boolean;
+    { P-23 (2026-10-17): Tekil PK nokta sorgusu icin hizli serit (SELECT <cols> FROM <table> WHERE <pk> = <val>).
+      AST Parser/Executor olusturma yukunu atlayarak dogrudan TVTableDb.ReadRow uzerinden calisir. }
+    function ExecFastPointSelect(const Sql: string;
       out Res: TSqlResult): Boolean;
   end;
 
@@ -3298,7 +3306,7 @@ end;
 
 function TVSqlExecutor.NarrowRows(const Td: TTableDef; WhereClause: TSqlExprNode;
   const ColNames: TStrArray; const ColTypes: TByteArray;
-  out Pks: TStrArray; out Rows: TStrMatrix): Boolean;
+  out Pks: TStrArray; out Rows: TStrMatrix; out IsExact: Boolean): Boolean;
 var
   conj: TList<TSqlExprNode>;
   i, ci, lo, hi, l2, h2, n: Integer;
@@ -3308,6 +3316,7 @@ var
   bestCol: Integer;
   bestLo, bestHi: Integer;
   foundRange: Boolean;
+  exactRange: Boolean;
   op: TSqlBinaryOp;
   cr: TSqlColumnRefNode;
   opName: string;
@@ -3383,6 +3392,7 @@ begin
   SetLength(Pks, 0);
   SetLength(Rows, 0);
   Result := False;
+  IsExact := False;
   if WhereClause = nil then Exit;
 
   conj := TList<TSqlExprNode>.Create;
@@ -3405,6 +3415,7 @@ begin
           Rows[0] := oneRow;
         end;
         // eslesme yoksa da bos sonuc DONDURULUR: tam tarama gerekmez
+        IsExact := True;
         Exit(True);
       end;
 
@@ -3422,28 +3433,32 @@ begin
           ci := -1;
           for n := 0 to High(Td.Cols) do
             if VDbNorm(Td.Cols[n].Name) =
-               VDbNorm(TSqlColumnRefNode(TSqlInNode(conj[i]).Expr).ColumnName) then
+                VDbNorm(TSqlColumnRefNode(TSqlInNode(conj[i]).Expr).ColumnName) then
             begin ci := n; Break; end;
           if ci <> Td.PkIndex then Continue;
-          SetLength(Pks, 0);
-          SetLength(Rows, 0);
+          // KR-2: on-tahsis (List.Count ust sinir), sonunda budama.
+          SetLength(Pks, TSqlInNode(conj[i]).List.Count);
+          SetLength(Rows, TSqlInNode(conj[i]).List.Count);
+          ci := 0;  // ci'yi sayac olarak yeniden kullan (PkIndex artik gerekmez)
           for n := 0 to TSqlInNode(conj[i]).List.Count - 1 do
           begin
             if not (TSqlInNode(conj[i]).List[n] is TSqlLiteralNode) then Continue;
             pkVal := TSqlLiteralNode(TSqlInNode(conj[i]).List[n]).AsString;
             if FT.ReadRow(Td.Name, pkVal, oneRow) then
             begin
-              SetLength(Pks, Length(Pks) + 1);
-              SetLength(Rows, Length(Rows) + 1);
-              Pks[High(Pks)] := pkVal;
-              Rows[High(Rows)] := oneRow;
+              Pks[ci] := pkVal;
+              Rows[ci] := oneRow;
+              Inc(ci);
             end;
           end;
-          Exit(True);   // filtre RowMatches ile asagida uygulanir
+          SetLength(Pks, ci);
+          SetLength(Rows, ci);
+          IsExact := (conj.Count = 1);
+          Exit(True);   // filtre RowMatches ile asagida uygulanir (IsExact degilse)
         end;
 
     // --- 2) indeks dilimi ---
-    bestCol := -1; bestLo := 0; bestHi := 0; foundRange := False;
+    bestCol := -1; bestLo := 0; bestHi := 0; foundRange := False; exactRange := False;
     for i := 0 to conj.Count - 1 do
     begin
       lo := 0; hi := 0;
@@ -3529,25 +3544,24 @@ begin
       if not foundRange then
       begin
         foundRange := True; bestCol := ci; bestLo := lo; bestHi := hi;
+        exactRange := (conj.Count = 1);
       end
       else
       begin
         if lo > bestLo then bestLo := lo;
         if hi < bestHi then bestHi := hi;
+        exactRange := False; // birden fazla kosul kesisiyorsa RowMatches dogrulamasi gerekir
       end;
     end;
 
     if not foundRange then Exit;   // -> tam tarama
     if bestHi <= bestLo then       // kesim bos
     begin
+      IsExact := True;
       Exit(True);                  // 0 satir, tam tarama gerekmez
     end;
 
     // ---- R-15 Full CBO: indeks dilimi secici degilse tam tarama ----
-    // Dilim genisligi (bestHi-bestLo) indeksten TAM olculur; bu, kolon
-    // istatistigindeki distinct tahmininden daha kesindir. Indeks, ancak
-    // toplam maliyeti sirali taramadan kucukse kullanilir. Karar
-    // VDbCost.VdbIndexIsSelective (TEK karar noktasi) tarafindan verilir.
     if GetTableStats(Td.Name, st) then
     begin
       covPos := FT.IdxPosOfCol(Td.TableId, bestCol);
@@ -3556,15 +3570,12 @@ begin
         Exit;  // False -> cagri FT.ScanRows ile tam tarama yapar
     end;
 
-    // e dizisini KULLANILACAK kolona bagla (yukaridaki kosullar e'yi
-    // degistirmis olabilir)
+    // e dizisini KULLANILACAK kolona bagla
     if not FT.TryGetMemIndex(Td.TableId, bestCol, e) then Exit;
 
     SetLength(Pks, bestHi - bestLo);
     SetLength(Rows, bestHi - bestLo);
     n := 0;
-    // F-19: indeks tablonun TUM kolonlarini kapsiyorsa satirlar tabloya
-    // OKUNMAKDAN (index-only scan) uretilebilir; kapsamiyorsa normal yol.
     covPos := FT.IdxPosOfCol(Td.TableId, bestCol);
     covAll := (covPos >= 0) and FT.IdxCoversAll(Td, covPos);
     for i := bestLo to bestHi - 1 do
@@ -3582,10 +3593,20 @@ begin
       end;
     SetLength(Pks, n);
     SetLength(Rows, n);
+    IsExact := exactRange;
     Result := True;
   finally
     conj.Free;
   end;
+end;
+
+function TVSqlExecutor.NarrowRows(const Td: TTableDef; WhereClause: TSqlExprNode;
+  const ColNames: TStrArray; const ColTypes: TByteArray;
+  out Pks: TStrArray; out Rows: TStrMatrix): Boolean;
+var
+  dummyExact: Boolean;
+begin
+  Result := NarrowRows(Td, WhereClause, ColNames, ColTypes, Pks, Rows, dummyExact);
 end;
 
 function TVSqlExecutor.TryIndexOrder(const Td: TTableDef; Stmt: TSqlSelectStmt;
@@ -3609,6 +3630,7 @@ var
   icols: TIntArray;      // indeksin kolonlari
   nIdxCols: Integer;     // indeksin kac kolonu
   leadingMatch: Integer; // ORDER BY'nin indeks on ekiyle eslesen kolon sayisi
+  cap: Integer;          // KR-2: geometrik kapasite
 
   procedure Push(C: TSqlExprNode);
   begin
@@ -3713,7 +3735,14 @@ begin
   lim := Stmt.LimitVal;
   need := lim;
   if need < 0 then need := -1;
-  SetLength(Rows, 0);
+  // KR-2: geometrik kapasite buyumesi — SetLength(+1) kopyalamasi engellenir.
+  // LIMIT varsa cap'i ilk tahsis olarak LIMIT degerine esitle (cok buyuk
+  // LIMIT icin (hi-lo) ile sinirla); yoksa 64'ten basla ve 2x buyut.
+  if (need > 0) and (need <= hi - lo) then cap := need
+  else if hi - lo < 64 then cap := hi - lo
+  else cap := 64;
+  if cap < 1 then cap := 1;
+  SetLength(Rows, cap);
   n := 0;
   if desc then
   begin
@@ -3726,9 +3755,9 @@ begin
         if off > 0 then Dec(off)
         else
         begin
-          SetLength(Rows, Length(Rows) + 1);
-          Rows[High(Rows)] := rv;
-          if (need >= 0) and (Length(Rows) >= need) then Break;
+          if n >= cap then begin cap := cap * 2; SetLength(Rows, cap); end;
+          Rows[n] := rv; Inc(n);
+          if (need >= 0) and (n >= need) then Break;
         end;
       end;
       Dec(i);
@@ -3745,14 +3774,15 @@ begin
         if off > 0 then Dec(off)
         else
         begin
-          SetLength(Rows, Length(Rows) + 1);
-          Rows[High(Rows)] := rv;
-          if (need >= 0) and (Length(Rows) >= need) then Break;
+          if n >= cap then begin cap := cap * 2; SetLength(Rows, cap); end;
+          Rows[n] := rv; Inc(n);
+          if (need >= 0) and (n >= need) then Break;
         end;
       end;
       Inc(i);
     end;
   end;
+  SetLength(Rows, n);
   Result := True;
 end;
 
@@ -5311,6 +5341,7 @@ var
   outRows: TStrMatrix;
   fn: TSqlFuncCallNode;
   ci: Integer;
+  n: Integer;            // KR-2: outRows satir sayaci
   tmpRow: TStrArray;
   havingOk: Boolean;
   gb: string;             // 4.2: GROUP BY cozumleme (EvalExpr ile ayni kural)
@@ -5413,8 +5444,9 @@ begin
       end;
     end;
 
-    // 3. Her grup icin hesapla
-    SetLength(outRows, 0);
+    // KR-2: on-tahsis (her grup 1 cikti satiri uretir).
+    SetLength(outRows, GroupKeys.Count);
+    n := 0;
     for gi := 0 to GroupKeys.Count - 1 do
     begin
       rowIdx := GroupRowSets[gi];
@@ -5479,11 +5511,12 @@ begin
         havingOk := True;
       if havingOk then
       begin
-        SetLength(outRows, Length(outRows) + 1);
-        outRows[High(outRows)] := tmpRow;
+        outRows[n] := tmpRow;
+        Inc(n);
       end;
     end;
 
+  SetLength(outRows, n);  // KR-2: on-tahsis sonrasi budama
   Res.Fields := outCols;
     Res.Rows := outRows;
     Res.Affected := Length(outRows);
@@ -6100,7 +6133,7 @@ var
   seenSet, rightSet: TDictionary<string, Integer>;
   distinctOut: TStrMatrix;
   rowKey: string;
-  isDup, found, SkipOffsetLimit, HasSetOp, deferOrder: Boolean;
+  isDup, found, SkipOffsetLimit, HasSetOp, deferOrder, isExactNarrow: Boolean;
   baseIdx, tmpSlot, origCols: Integer;
   // P5-WIN: pencere onbellek (projeksiyonda tuketilir).
   WinVals: TStrMatrix;
@@ -6157,6 +6190,11 @@ begin
   // FT.BeginSnapshotRead;
   try
     SkipOffsetLimit := False;
+    isExactNarrow := False;
+    // R-20: aktif tablo — kolon varsayilan collation'i (WHERE / GROUP BY / ORDER BY icin)
+    FCurTable := Stmt.FromTable;
+    FCurCollation := '';
+    FExplicitColl := False;
     // F1-12: set-op'ta kuyruk (ORDER BY / OFFSET / LIMIT) birlestirme
     // SONRASINA uygulanir; ONCESI uygulanirsa sol taraf kirpilir.
     HasSetOp := (Stmt.SetOp <> sokNone) and (Stmt.RightSelect <> nil);
@@ -6367,7 +6405,7 @@ begin
           Aggregate/GROUP BY de dogrudan sunu kullanir: ExecGroupBy satirlari
           KENDISI RowMatches ile filtreler, yani onceden daraltmak sonucu
           degistirmez. }
-        if not NarrowRows(td, Stmt.WhereClause, colNames, colTypes, pks, allRows) then
+        if not NarrowRows(td, Stmt.WhereClause, colNames, colTypes, pks, allRows, isExactNarrow) then
           // R-13 Full: tam taramaya dustuk -> bolme hedef kumesiyle
           // tara (partition pruning). Sonuc ayni, okunan satir azalir.
           FT.ScanRowsPart(Stmt.FromTable, pks, allRows, PartTargetsOf(td, Stmt.WhereClause));
@@ -6392,6 +6430,7 @@ begin
         allRows := rlRows;
         SetLength(pks, 0);
         SkipOffsetLimit := False;
+        isExactNarrow := False;
       end;
     end;
   end;  // end of else (not view)
@@ -6415,17 +6454,25 @@ begin
     // CTE/normal yolda allRows buradan suzulur.
     if not SkipOffsetLimit then
     begin
-      // Sonuc en fazla allRows kadar olabilir; satir basina SetLength
-      // dinamik diziyi tekrar tekrar kopyalayip O(N^2) maliyet yaratir.
-      SetLength(filteredRows, Length(allRows));
-      n := 0;
-      for i := 0 to High(allRows) do
-        if RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes) then
-        begin
-          filteredRows[n] := allRows[i];
-          Inc(n);
-        end;
-      SetLength(filteredRows, n);
+      // P-22: Eger NarrowRows araligi zaten WHERE kosulunu TAM olarak
+      // karsiliyorsa (tek BETWEEN / = / IN), satirlari tekrar tekrar
+      // RowMatches ile AST evaluate etmekten kurtul (84x farkin cozumu).
+      if isExactNarrow then
+        filteredRows := allRows
+      else
+      begin
+        // Sonuc en fazla allRows kadar olabilir; satir basina SetLength
+        // dinamik diziyi tekrar tekrar kopyalayip O(N^2) maliyet yaratir.
+        SetLength(filteredRows, Length(allRows));
+        n := 0;
+        for i := 0 to High(allRows) do
+          if RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes) then
+          begin
+            filteredRows[n] := allRows[i];
+            Inc(n);
+          end;
+        SetLength(filteredRows, n);
+      end;
     end;
   end;
 
@@ -6722,6 +6769,9 @@ begin
   Res.Affected := Length(outRows);
   Res.Msg := 'OK';
   finally
+    FCurTable := '';
+    FCurCollation := '';
+    FExplicitColl := False;
     // FT.EndSnapshotRead;
   end;
 end;
@@ -7552,6 +7602,204 @@ begin
   Res.Msg := 'OK';
   SetLength(Res.Fields, 0);
   SetLength(Res.Rows, 0);
+  Result := True;
+end;
+
+function TVSqlExecutor.ExecFastPointSelect(const Sql: string;
+  out Res: TSqlResult): Boolean;
+var
+  n, p, nc, i, ci: Integer;
+  s, tbl, pkCol, pkVal: string;
+  cnames: TStrArray;
+  colMap: TIntArray;
+  td: TTableDef;
+  rowVals: TStrArray;
+
+  procedure SkipWs;
+  begin
+    while (p <= n) and (Sql[p] in [' ', #9, #10, #13]) do Inc(p);
+  end;
+
+  function WordChar(c: Char): Boolean;
+  begin
+    Result := (c in ['A'..'Z', 'a'..'z', '0'..'9', '_', '$']);
+  end;
+
+  function MatchKw(const Kw: string): Boolean;
+  var
+    k: Integer;
+  begin
+    Result := False;
+    SkipWs;
+    if p + Length(Kw) - 1 > n then Exit;
+    for k := 1 to Length(Kw) do
+      if UpCase(Sql[p + k - 1]) <> Kw[k] then Exit;
+    if (p + Length(Kw) <= n) and WordChar(Sql[p + Length(Kw)]) then Exit;
+    Inc(p, Length(Kw));
+    Result := True;
+  end;
+
+  function ReadIdent(out S: string): Boolean;
+  var
+    st: Integer;
+  begin
+    Result := False;
+    SkipWs;
+    if p > n then Exit;
+    if not (Sql[p] in ['A'..'Z', 'a'..'z', '_']) then Exit;
+    st := p;
+    while (p <= n) and WordChar(Sql[p]) do Inc(p);
+    S := Copy(Sql, st, p - st);
+    Result := True;
+  end;
+
+  function ReadLit(out S: string): Boolean;
+  var
+    st: Integer;
+  begin
+    Result := False;
+    S := '';
+    SkipWs;
+    if p > n then Exit;
+    if Sql[p] = '''' then
+    begin
+      Inc(p);
+      st := p;
+      while p <= n do
+      begin
+        if Sql[p] = '''' then
+        begin
+          if (p < n) and (Sql[p + 1] = '''') then
+          begin
+            S := S + Copy(Sql, st, p - st) + '''';
+            Inc(p, 2);
+            st := p;
+          end
+          else
+          begin
+            S := S + Copy(Sql, st, p - st);
+            Inc(p);
+            Result := True;
+            Exit;
+          end;
+        end
+        else
+          Inc(p);
+      end;
+      Exit;
+    end;
+    if Sql[p] in ['0'..'9', '-', '+'] then
+    begin
+      st := p;
+      if Sql[p] in ['-', '+'] then Inc(p);
+      while (p <= n) and (Sql[p] in ['0'..'9']) do Inc(p);
+      if (p <= n) and WordChar(Sql[p]) then Exit;
+      S := Copy(Sql, st, p - st);
+      Result := True;
+    end;
+  end;
+
+begin
+  Result := False;
+  n := Length(Sql);
+  p := 1;
+
+  // 1. SELECT ile baslamali
+  if not MatchKw('SELECT') then Exit;
+
+  // 2. Kolon listesi
+  SetLength(cnames, 0);
+  nc := 0;
+  SkipWs;
+  if (p <= n) and (Sql[p] = '*') then
+  begin
+    Inc(p);
+    // '*' tum kolonlar demek; cnames bos kalacak
+  end
+  else
+  begin
+    repeat
+      if not ReadIdent(s) then Exit;
+      SetLength(cnames, nc + 1);
+      cnames[nc] := s;
+      Inc(nc);
+      SkipWs;
+      if (p <= n) and (Sql[p] = ',') then begin Inc(p); Continue; end;
+      Break;
+    until False;
+  end;
+
+  // 3. FROM <table>
+  if not MatchKw('FROM') then Exit;
+  if not ReadIdent(tbl) then Exit;
+
+  // 4. WHERE <pk_col> = <pk_val>
+  if not MatchKw('WHERE') then Exit;
+  if not ReadIdent(pkCol) then Exit;
+  SkipWs;
+  if (p > n) or (Sql[p] <> '=') then Exit;
+  Inc(p);
+  if not ReadLit(pkVal) then Exit;
+
+  SkipWs;
+  // Fazladan sozcuk (ORDER, LIMIT, GROUP, AND vb.) varsa serit ret eder
+  if p <= n then Exit;
+
+  // Semantik kontroller
+  if not FT.TableExists(tbl) then Exit;
+  if FT.IsView(tbl) then Exit;
+  if FT.RlsApplies(tbl) then Exit; // RLS varsa genel yol filtrelesin
+
+  td := FT.GetTable(tbl);
+  if td.PkIndex < 0 then Exit; // PK'si olmayan tablo
+  if VDbNorm(td.Cols[td.PkIndex].Name) <> VDbNorm(pkCol) then Exit; // kosul PK kolonu uzerinde degil
+
+  // Kolon haritasi
+  if Length(cnames) = 0 then
+  begin
+    // '*' durumu
+    SetLength(colMap, Length(td.Cols));
+    SetLength(Res.Fields, Length(td.Cols));
+    for i := 0 to High(td.Cols) do
+    begin
+      colMap[i] := i;
+      Res.Fields[i] := td.Cols[i].Name;
+    end;
+  end
+  else
+  begin
+    SetLength(colMap, Length(cnames));
+    SetLength(Res.Fields, Length(cnames));
+    for i := 0 to High(cnames) do
+    begin
+      ci := -1;
+      for n := 0 to High(td.Cols) do
+        if VDbNorm(td.Cols[n].Name) = VDbNorm(cnames[i]) then
+        begin ci := n; Break; end;
+      if ci < 0 then Exit; // kolon bulunamadiysa genel yol hata uretsin
+      colMap[i] := ci;
+      Res.Fields[i] := td.Cols[ci].Name;
+    end;
+  end;
+
+  // Dogrudan tekil okuma (AST yok, Parser yok, Executor yok)
+  if FT.ReadRow(td.Name, pkVal, rowVals) then
+  begin
+    SetLength(Res.Rows, 1);
+    SetLength(Res.Rows[0], Length(colMap));
+    for i := 0 to High(colMap) do
+      Res.Rows[0][i] := rowVals[colMap[i]];
+    Res.Affected := 1;
+  end
+  else
+  begin
+    SetLength(Res.Rows, 0);
+    Res.Affected := 0;
+  end;
+
+  Res.LastTable := td.Name;
+  Res.Msg := 'OK';
+  Res.Stmts := 1;
   Result := True;
 end;
 

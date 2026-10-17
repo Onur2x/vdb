@@ -63,6 +63,8 @@ type
     FSlowNext: Integer;    // halka yazma imleci
     FSlowT0: TDateTime;    // olcum baslangic ani (MSWINDOWS disi)
     FSlowT0Tick: QWord;    // olcum baslangic tik (MSWINDOWS)
+    FParser: TVDbParser;   // P-25 (2026-10-17): her sorguda Create/Free yapmamak icin yeniden kullanilan parser
+    FExecutor: TVSqlExecutor; // P-25: yeniden kullanilan yurutucu
     function Tok(const S: string; var P: Integer; out T: string): Boolean;
     function PeekWord(const S: string; P: Integer): string;
     function TokAt(const S: string; var P: Integer; out T: string;
@@ -154,6 +156,8 @@ type
     // bagimsiz olmak icin TDateTime farkindan hesaplanir)
     procedure SlowMarkStart;
     function ElapsedMs: Int64;
+    // KR-7: lock alinmis yazma yolu icin ic yardimci (recursive write lock yok)
+    function ExecAllInner(const Stmts: TStrArray): TSqlResult;
     // F-35: check if statement is a read-only SELECT
     function IsSelectStatement(const S: string): Boolean;
   public
@@ -212,10 +216,14 @@ begin
   FLastMs := 0;
   FSlow := TList<TFSlowRec>.Create;
   FSlowNext := 0;
+  FParser := TVDbParser.Create;
+  FExecutor := TVSqlExecutor.Create(FT);
 end;
 
 destructor TVSql.Destroy;
 begin
+  FExecutor.Free;
+  FParser.Free;
   FSlow.Free;   // F-21: TList<T> ogeleri sahiplendigi icin hepsi serbest
   inherited;
 end;
@@ -1475,6 +1483,7 @@ var
   rowOf: TDictionary<string, Integer>;
   sidx: array of Integer;
   ord: array of Integer;
+  mCap, mCount, outCap, outCount: Integer;
 begin
   Result := False;
   Res.Affected := 0; Res.Msg := '';
@@ -1740,23 +1749,51 @@ begin
     rowOf.Free;
   end
   else if useOrder and desc then
+  begin
+    mCap := hi - lo;
+    if mCap < 16 then mCap := 16;
+    SetLength(mPks, mCap);
+    SetLength(mRows, mCap);
+    mCount := 0;
     for k := hi - 1 downto lo do
     begin
       if not FT.ReadRow(Td.Name, e[k].Pk, rv) then Continue;
       if not VDbMatchGroups(rv, Groups) then Continue;
-      SetLength(mPks, Length(mPks) + 1); SetLength(mRows, Length(mRows) + 1);
-      mPks[High(mPks)] := e[k].Pk; mRows[High(mRows)] := rv;
-      if (not takeAll) and (Length(mPks) >= need) then Break;
-    end
+      if mCount >= Length(mPks) then
+      begin
+        SetLength(mPks, Length(mPks) * 2);
+        SetLength(mRows, Length(mRows) * 2);
+      end;
+      mPks[mCount] := e[k].Pk; mRows[mCount] := rv;
+      Inc(mCount);
+      if (not takeAll) and (mCount >= need) then Break;
+    end;
+    SetLength(mPks, mCount);
+    SetLength(mRows, mCount);
+  end
   else
+  begin
+    mCap := hi - lo;
+    if mCap < 16 then mCap := 16;
+    SetLength(mPks, mCap);
+    SetLength(mRows, mCap);
+    mCount := 0;
     for k := lo to hi - 1 do
     begin
       if not FT.ReadRow(Td.Name, e[k].Pk, rv) then Continue;
       if not VDbMatchGroups(rv, Groups) then Continue;
-      SetLength(mPks, Length(mPks) + 1); SetLength(mRows, Length(mRows) + 1);
-      mPks[High(mPks)] := e[k].Pk; mRows[High(mRows)] := rv;
-      if (not takeAll) and (Length(mPks) >= need) then Break;
+      if mCount >= Length(mPks) then
+      begin
+        SetLength(mPks, Length(mPks) * 2);
+        SetLength(mRows, Length(mRows) * 2);
+      end;
+      mPks[mCount] := e[k].Pk; mRows[mCount] := rv;
+      Inc(mCount);
+      if (not takeAll) and (mCount >= need) then Break;
     end;
+    SetLength(mPks, mCount);
+    SetLength(mRows, mCount);
+  end;
   // --- Siralama --------------------------------------------------------
   if (not useOrder) and (Length(OCols) > 0) then
   begin
@@ -1772,21 +1809,28 @@ begin
     for k := 0 to High(sidx) do sidx[k] := k;
   end;
   // --- OFFSET / LIMIT + projeksiyon -----------------------------------
+  outCap := Length(sidx);
+  if (Lim >= 0) and (Lim < outCap) then outCap := Lim;
+  SetLength(outR, outCap);
+  outCount := 0;
   for k := 0 to High(sidx) do
   begin
     if Off > 0 then begin Dec(Off); Continue; end;
-    if (Lim >= 0) and (Length(outR) >= Lim) then Break;
+    if (Lim >= 0) and (outCount >= Lim) then Break;
     m := sidx[k];
-    SetLength(outR, Length(outR) + 1);
+    if outCount >= Length(outR) then
+      SetLength(outR, Length(outR) * 2 + 8);
     if Length(SCols) = 0 then
-      outR[High(outR)] := Copy(mRows[m], 0, Length(mRows[m]))
+      outR[outCount] := Copy(mRows[m], 0, Length(mRows[m]))
     else
     begin
-      SetLength(outR[High(outR)], Length(proj));
+      SetLength(outR[outCount], Length(proj));
       for q := 0 to High(proj) do
-        outR[High(outR)][q] := mRows[m][proj[q]];
+        outR[outCount][q] := mRows[m][proj[q]];
     end;
+    Inc(outCount);
   end;
+  SetLength(outR, outCount);
   Res.Rows := outR;
   Result := True;
 end;
@@ -2872,24 +2916,13 @@ function TVSql.ExecAll(const Stmts: TStrArray): TSqlResult;
 // Cumle listesini sirayla isler. Affected TOPLAM, Fields/Rows ise SATIR
 // DONDUREN SON cumlenin sonucu (yoksa son cumlenin sonucu).
 //
-// ONEMLI: her cumle TAM OLARAK BIR KEZ calistirilir. Sonucu "tazelemek"
-// icin son cumleyi tekrar islemek INSERT/UPDATE/DELETE'i IKINCI KEZ
-// calistirir ve veriyi bozardi.
-//
-// OTOMATIK TRANSACTION (AutoTransaction, varsayilan acik):
-//   Birden fazla cumle ve hepsi batch uyumluysa TEK BeginBatch/CommitBatch
-//   icinde calistirilir. Boylece:
-//     * TEK fsync (cumle basina fsync yerine)      -> belirgin hizli
-//     * HATA OLURSA HICBIR CUMLE UYGULANMAZ        -> daha guvenli
-//   Kullanici zaten BEGIN...COMMIT yazdiysa dokunulmaz.
-//
-// MVCC (R-01): Eger TUM cumleler SELECT ise kilit ALMA, snapshot okuma kullan.
-//   Her SELECT ayri snapshot ile calisir (statement-level snapshot isolation).
-//   Eger herhangi bir cumle yazma islemi ise kilitli transaction yoluna gecer.
+// KR-7 (MREW): Tum cumleler SELECT ise LockRead (paralel calisir),
+//   aksi halde Lock (yazma kilidi). Yazma yolu ExecAllInner'a delege
+//   edilir -- bu sayede Exec -> ExecAll zincirinde recursive BeginWrite yok.
 var
   i: Integer;
   one: TSqlResult;
-  ownBatch, okAll, allSelect: Boolean;
+  allSelect: Boolean;
 begin
   // Once tum cumleler SELECT mi kontrol et
   allSelect := True;
@@ -2902,13 +2935,8 @@ begin
 
   if allSelect then
   begin
-    // Tum cumleler SELECT: kilitli okuma yolu.
-    // NOT: Kilit KARSILANILIR sekilde alinir. Salt-okunur batch icin kilit
-    // almamak performans kazandirir ama ExecRaw ic ice FT erisimi varsayilir
-    // (kirli bayrak, WAL, sema yazimi) ve bunlar kilit altinda tanimli.
-    // Ileride dogru bir MVCC okuma yolu ayri bir bayrakla devreye alinacak
-    // (FReadSnapshot sayaci hazir; sadece ReadOnlyCommit tanimlanmali).
-    FT.Lock;
+    // Tum cumleler SELECT: okuma kilidi (paralel calisabilir)
+    FT.LockRead;
     try
       Result.Affected := 0;
       Result.Msg := '';
@@ -2917,34 +2945,40 @@ begin
       Result.LastTable := '';
       Result.Stmts := Length(Stmts);
       if Length(Stmts) = 0 then Exit;
-
-   //   FT.BeginSnapshotRead;
-      try
-        for i := 0 to High(Stmts) do
-        begin
-          one := ExecRaw(Stmts[i]);
-          Result.Affected := Result.Affected + one.Affected;
-          if one.LastTable <> '' then Result.LastTable := one.LastTable;
-          Result.Fields := one.Fields;
-          Result.Rows := one.Rows;
-          Result.Msg := one.Msg;
-        end;
-      finally
-     //   FT.EndSnapshotRead;
+      for i := 0 to High(Stmts) do
+      begin
+        one := ExecRaw(Stmts[i]);
+        Result.Affected := Result.Affected + one.Affected;
+        if one.LastTable <> '' then Result.LastTable := one.LastTable;
+        Result.Fields := one.Fields;
+        Result.Rows := one.Rows;
+        Result.Msg := one.Msg;
       end;
       Result.Msg := 'OK';
     finally
-      FT.Unlock;
+      FT.UnlockRead;
     end;
     Exit;
   end;
 
-  // En az bir yazma cumlesi var: Kilitli transaction yolu
-  // P3: cagrinin TAMAMI tablo kilidi altinda. Ayni TVTableDb'yi paylasan
-  // tum thread'ler (tek veya cok TVSql ornegi) burada siralanir.
-  // Kilit recursive'tir: Exec -> ExecAll -> ExecRaw ic ice alabilir.
+  // En az bir yazma cumlesi var: yazma kilidi + ExecAllInner
   FT.Lock;
   try
+    Result := ExecAllInner(Stmts);
+  finally
+    FT.Unlock;
+  end;
+end;
+
+function TVSql.ExecAllInner(const Stmts: TStrArray): TSqlResult;
+// KR-7: Lock ALINMADAN calistirilir. Cagiranin FT.Lock (yazma kilidi)
+// almis olmasi beklenir. Exec/ExecWithParams write path'i bu yardimciyi
+// kullanarak recursive BeginWrite sorununu onler.
+var
+  i: Integer;
+  one: TSqlResult;
+  ownBatch, okAll: Boolean;
+begin
   Result.Affected := 0;
   Result.Msg := '';
   SetLength(Result.Fields, 0);
@@ -2983,16 +3017,9 @@ begin
       try FT.AbortBatch; except end;
     raise;
   end;
-  // INSERT/UPDATE/DELETE/DDL satIR DONDURMEZ -> Fields bos kalir; arayuz
-  // LastTable ile tabloyu yeniden cizer.
   Result.Msg := 'OK';
-  // P-DUR: basarili yazma sonrasi kirliyse flush'la. Batch zaten
-  // CommitBatch'te fsync yapti (bayrak temiz); tekil yazimlar burada
-  // saglama alinir. Salt-okunur cagrilarda syscall YOK.
+  // P-DUR: basarili yazma sonrasi kirliyse flush'la.
   if FT.Kv.Dirty then FT.Kv.Flush;
-  finally
-    FT.Unlock;
-  end;
 end;
 
 function TVSql.Exec(const Sql: string): TSqlResult;
@@ -3000,8 +3027,7 @@ var
   st: TStrArray;
 begin
 
-  // MVCC (R-01): SELECT sorgulari icin kilit ALMA, snapshot okuma kullan.
-  // Yazma islemleri (INSERT/UPDATE/DELETE/DDL) icin kilit al.
+  // KR-7 (MREW): SELECT sorgulari LockRead (paralel), yazma Lock (seri).
   st := SplitStatements(Sql);
   if Length(st) = 0 then
   begin
@@ -3013,15 +3039,20 @@ begin
 
   if (Length(st) = 1) and IsSelectStatement(st[0]) then
   begin
-    // Tek SELECT: Kilitsiz snapshot okuma
+    // Tek SELECT: okuma kilidi (paralel calisabilir)
     SetLength(FParams, 0);
     FParamIdx := 0;
-    Result := ExecRaw(st[0]);
-    Result.Stmts := 1;
+    FT.LockRead;
+    try
+      Result := ExecRaw(st[0]);
+      Result.Stmts := 1;
+    finally
+      FT.UnlockRead;
+    end;
     Exit;
   end;
 
-  // Coklu cumle veya yazma islemi: Kilitli yol
+  // Coklu cumle veya yazma islemi: yazma kilidi
   FT.Lock;
   try
     SetLength(FParams, 0);
@@ -3030,11 +3061,11 @@ begin
     begin
       Result := ExecRaw(st[0]);
       Result.Stmts := 1;
-      // P-DUR: tek cumlelik yazma burada saglama alinir (ExecAll kendi yapar).
+      // P-DUR: tek cumlelik yazma burada saglama alinir (ExecAllInner kendi yapar).
       if FT.Kv.Dirty then FT.Kv.Flush;
     end
     else
-      Result := ExecAll(st);
+      Result := ExecAllInner(st);  // KR-7: recursive Lock yok
   finally
     FT.Unlock;
   end;
@@ -3046,7 +3077,7 @@ var
   st: TStrArray;
 begin
 
-  // MVCC (R-01): SELECT sorgulari icin kilit ALMA, snapshot okuma kullan.
+  // KR-7 (MREW): SELECT sorgulari LockRead (paralel), yazma Lock (seri).
   st := SplitStatements(Sql);
   if Length(st) = 0 then
   begin
@@ -3058,17 +3089,22 @@ begin
 
   if (Length(st) = 1) and IsSelectStatement(st[0]) then
   begin
-    // Tek SELECT: Kilitsiz snapshot okuma
+    // Tek SELECT: okuma kilidi (paralel calisabilir)
     SetLength(FParams, Length(Params));
     for i := 0 to High(Params) do
       FParams[i] := Params[i];
     FParamIdx := 0;
-    Result := ExecRaw(st[0]);
-    Result.Stmts := 1;
+    FT.LockRead;
+    try
+      Result := ExecRaw(st[0]);
+      Result.Stmts := 1;
+    finally
+      FT.UnlockRead;
+    end;
     Exit;
   end;
 
-  // Coklu cumle veya yazma islemi: Kilitli yol
+  // Coklu cumle veya yazma islemi: yazma kilidi
   FT.Lock;
   try
     SetLength(FParams, Length(Params));
@@ -3079,11 +3115,11 @@ begin
     begin
       Result := ExecRaw(st[0]);
       Result.Stmts := 1;
-      // P-DUR: tek cumlelik yazma burada saglama alinir (ExecAll kendi yapar).
+      // P-DUR: tek cumlelik yazma burada saglama alinir (ExecAllInner kendi yapar).
       if FT.Kv.Dirty then FT.Kv.Flush;
     end
     else
-      Result := ExecAll(st);
+      Result := ExecAllInner(st);  // KR-7: recursive Lock yok
   // fazla parametre sessizce yoksayilir; eksik Tok'ta patlar
   finally
     FT.Unlock;
@@ -3445,59 +3481,56 @@ end;
 
 function TVSql.ExecRaw(const Sql: string): TSqlResult;
 var
-  astParser: TVDbParser;
   astStmt: TSqlStmtNode;
-  astExecutor: TVSqlExecutor;
   pTest: Integer;
   pSet: Integer;   // R-11: "SET" anahtar kelimesinden SONRAKI konum
                     // (SET CONSTRAINTS ayriminda geri sarmak icin)
   w1, w2, w3: string;
-  fastEx: TVSqlExecutor;   // P-18c: literal INSERT hizli seridi
   fastOk: Boolean;
-  // P6 (2026-10-02): eski monolitik yolun ~60 degiskeni silindi. Canli kod
-  // (asagidaki DB-oncesi blok + AST pipeline) yalnizca ustteki 6'sini
-  // kullaniyor. Silinenlerin listesi icin git surumu / arsiv yedegi bakilabilir;
-  // F3-1 sonrasi bu dosyada arsiv KALMADI (bkz. dosya sonundaki not).
 begin
   Result.Affected := 0; Result.Msg := ''; SetLength(Result.Fields, 0); SetLength(Result.Rows, 0);
   Result.LastTable := ''; Result.Stmts := 1;
 
-  // P-18c (2026-10-16): literal INSERT hizli seridi. Ucuz on kontrol
-  // ('I'/'i' ile baslamayan hICbir cumleye executor bile dokunmaz);
-  // biicim taninirsa ExecFastLiteralInsert genel yolun sarmalama
-  // dizisini (RequirePriv -> RLS -> FT.Insert) AST'siz uygular. Ret
-  // edilirse asagidaki genel yol AYNEN devam eder. F-21 sure olcumu ve
-  // R-24 komut sayaclari (SHOW STATS) AST yoluyla birebir kopyalanir;
-  // serit iceride hata verirse istisna aynen yukselir (AST yolu da
-  // hatada sayaci kaydettikten sonra yukseltiyordu).
+  // P-18c (2026-10-16): literal INSERT hizli seridi.
   if (Length(Sql) > 13) and ((Sql[1] = 'I') or (Sql[1] = 'i')) then
   begin
-    fastEx := TVSqlExecutor.Create(FT);
+    SlowMarkStart;
     try
-      SlowMarkStart;
-      try
-        fastOk := fastEx.ExecFastLiteralInsert(Sql, Result);
-        // Kabul: F-21/R-24 kayitlari tek sefer, burada. RET: hicbir sey
-        // kaydedilmez — asagidaki genel yol AYNI cumleyi kendi olcum
-        // bloguyla yeniden calistiracagi icin ici kayit CIFT sayilir
-        // (SHOW SLOW/SHOW STATS sabunu — sqltest p18c log farki).
-        if fastOk then
-        begin
-          FLastMs := ElapsedMs;
-          NoteSlow(Sql, FLastMs, Length(Result.Rows));
-          RecordCommand(Sql, Integer(FLastMs * 1000), 0);
-        end;
-      except
-        // R-24 paritesi: genel yol hatada da sayaci kaydettikten sonra
-        // yukseltiyordu (finally); serit hatasi da ayni sekilde sayilir.
+      fastOk := FExecutor.ExecFastLiteralInsert(Sql, Result);
+      if fastOk then
+      begin
         FLastMs := ElapsedMs;
         NoteSlow(Sql, FLastMs, Length(Result.Rows));
         RecordCommand(Sql, Integer(FLastMs * 1000), 0);
-        raise;
+        Exit;
       end;
-      if fastOk then Exit;
-    finally
-      fastEx.Free;
+    except
+      FLastMs := ElapsedMs;
+      NoteSlow(Sql, FLastMs, Length(Result.Rows));
+      RecordCommand(Sql, Integer(FLastMs * 1000), 0);
+      raise;
+    end;
+  end;
+
+  // P-23 (2026-10-17): tekil PK nokta SELECT hizli seridi
+  // ('S'/'s' ile baslayan, WHERE pk = val iceren basit sorgular)
+  if (Length(Sql) > 15) and ((Sql[1] = 'S') or (Sql[1] = 's')) then
+  begin
+    SlowMarkStart;
+    try
+      fastOk := FExecutor.ExecFastPointSelect(Sql, Result);
+      if fastOk then
+      begin
+        FLastMs := ElapsedMs;
+        NoteSlow(Sql, FLastMs, Length(Result.Rows));
+        RecordCommand(Sql, Integer(FLastMs * 1000), 0);
+        Exit;
+      end;
+    except
+      FLastMs := ElapsedMs;
+      NoteSlow(Sql, FLastMs, Length(Result.Rows));
+      RecordCommand(Sql, Integer(FLastMs * 1000), 0);
+      raise;
     end;
   end;
 
@@ -3636,34 +3669,27 @@ begin
     end;
   end;
 
-  // Diger tum komutlar icin AST Pipeline
-  astParser := TVDbParser.Create;
+  // Diger tum komutlar icin AST Pipeline (P-25: FParser ve FExecutor yeniden kullanilir)
+  astStmt := FParser.Parse(Sql, FParams);
   try
-    astStmt := astParser.Parse(Sql, FParams);
+    if astStmt = nil then Exit;
+    // F-21: yavas sorgu olcumu. Parse DAHIL edilir (kullanicinin
+    // bekledigi sure = ayristirma + yurutme).
+    SlowMarkStart;
     try
-      if astStmt = nil then Exit;
-      astExecutor := TVSqlExecutor.Create(FT);
-      // F-21: yavas sorgu olcumu. Parse DAHIL edilir (kullanicinin
-      // bekledigi sure = ayristirma + yurutme).
-      SlowMarkStart;
-      try
-        Result := astExecutor.Execute(astStmt);
-      finally
-        FLastMs := ElapsedMs;
-        NoteSlow(Sql, FLastMs, Length(Result.Rows));
-        // R-24 (2026-10-13): ast gecen her cumle sure ile birlikte
-        // global sayaclara yazilir (SHOW STATS bunlari okur). Hata
-        // yolunda da kaydedilir (pg_stat benzeri: basarisiz cumleler
-        // de sayilir). Sure F-21 ile AYNI olcumden turetilir (ms -> us).
-        RecordCommand(Sql, Integer(FLastMs * 1000), 0);
-        astExecutor.Free;    // F-21: yol degisti, serbest birakma buraya
-      end;
-      Exit;
+      Result := FExecutor.Execute(astStmt);
     finally
-      astStmt.Free;
+      FLastMs := ElapsedMs;
+      NoteSlow(Sql, FLastMs, Length(Result.Rows));
+      // R-24 (2026-10-13): ast gecen her cumle sure ile birlikte
+      // global sayaclara yazilir (SHOW STATS bunlari okur). Hata
+      // yolunda da kaydedilir (pg_stat benzeri: basarisiz cumleler
+      // de sayilir). Sure F-21 ile AYNI olcumden turetilir (ms -> us).
+      RecordCommand(Sql, Integer(FLastMs * 1000), 0);
     end;
+    Exit;
   finally
-    astParser.Free;
+    astStmt.Free;
   end;
   // ------------------------------------------------------------
   // NOT (2026-10-02): Eski monolitik yol dosya altina tasindi.

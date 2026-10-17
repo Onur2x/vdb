@@ -247,12 +247,13 @@ type
   TVTableDb = class
   private
     FKv: TVDb;
-    // P3: kaba taneli kilit. TVSql.Exec/ExecAll cagrinin TAMAMI bu kilit
-    // altinda calisir; ayni TVTableDb'yi paylasan tum thread'ler siralanir.
-    // TCriticalSection recursive'tir: Exec -> ExecAll -> ExecRaw zinciri
-    // ayni thread'de ic ice kilit alabilir (VDbCore'daki modelle ayni).
-    // Dogrudan TVTableDb kullanan cok-thread'li kod Lock/Unlock ile sarmalimali.
-    FLock: TCriticalSection;
+    // KR-7: Coklu Okuma Kilidi (TMultiReadExclusiveWriteSynchronizer).
+    // SELECT sorgulari LockRead/UnlockRead ile paralel calisir;
+    // INSERT/UPDATE/DELETE/DDL Lock/Unlock (yazma kilidi) ile serialize edilir.
+    // DIKKAT: MREW non-recursive'tir. Yazma path'i ic ice Lock cagirmamalidir;
+    // ExecAll icin disarida lock alinmissa ExecAllLocked (lock'siz ic yardimci)
+    // kullanilmalidir.
+    FLock: TMultiReadExclusiveWriteSynchronizer;
     FDir: string;
     FTables: TDictionary<string, TTableDef>; // name -> def
     FById: TDictionary<Word, string>;
@@ -283,6 +284,11 @@ type
     // Yalniz ANA thread erisir; is parcaciklari kendi dizileriyle ugrasir.
     FConcBuilders: TList<TVdbConcRec>;
     FSchemaDirty: Boolean;
+    // P-24: Batch yazim sirasinda tablo semasini ve kolon siralamasini onbellekleme
+    FBatchTableCached: Boolean;
+    FBatchTableDef: TTableDef;
+    FBatchColMapValid: Boolean;
+    FBatchColMap: TIntArray;
   // F2-12: aktif FK kaskad zinciri derinligi (koruma sayaci)
   FCascadeDepth: Integer;
     FNextId: Word;
@@ -322,6 +328,7 @@ type
     // (kisi + t tablolari "siparisler" ile ezildi). Yazma ONCESI diskteki
     // sema ile bellekteki tablo listesi karsilastirilir.
     FIntentDrop: TStrArray;    // DROP TABLE / RENAME ile kaldirilanlar
+    procedure ResetBatchTableCache;
     procedure IntentDrop(const Name: string);
     function IntentHas(const Name: string): Boolean;
     procedure GuardSchemaLoss;
@@ -478,10 +485,14 @@ type
     procedure BeginBatch;
     procedure CommitBatch;
     procedure AbortBatch; // FKv abort + index onarimi
-    // P3: paylasilan ornegi dogrudan kullanan thread'ler icin genel kilit.
-    // TVSql uzerinden calisanlar icin Exec/ExecAll zaten kilit alir.
+    // KR-7: Kilit API.
+    // TVSql uzerinden calisanlar Exec/ExecAll/ExecAll zaten kilit alir.
+    // Lock/Unlock = yazma kilidi (INSERT/UPDATE/DELETE/DDL).
+    // LockRead/UnlockRead = okuma kilidi (SELECT, paralel calisabilir).
     procedure Lock;
     procedure Unlock;
+    procedure LockRead;
+    procedure UnlockRead;
     function TableExists(const Name: string): Boolean;
     function GetTable(const Name: string): TTableDef;
     function TableNames: TStrArray;
@@ -851,8 +862,36 @@ begin
 end;
 
 function VDbParseInt(const S: string; out V: Int64): Boolean;
+var
+  i, n, sign: Integer;
+  res: Int64;
+  c: Char;
 begin
-  Result := TryStrToInt64(Trim(S), V);
+  n := Length(S);
+  if n = 0 then Exit(False);
+  // Hizli yol: boluksuz tam sayi (en yaygin id durumu)
+  i := 1;
+  while (i <= n) and (S[i] = ' ') do Inc(i);
+  if i > n then Exit(False);
+  sign := 1;
+  if S[i] = '-' then
+  begin
+    sign := -1;
+    Inc(i);
+  end
+  else if S[i] = '+' then
+    Inc(i);
+  if (i > n) or not (S[i] in ['0'..'9']) then Exit(False);
+  res := 0;
+  while (i <= n) and (S[i] in ['0'..'9']) do
+  begin
+    res := res * 10 + (Ord(S[i]) - Ord('0'));
+    Inc(i);
+  end;
+  while (i <= n) and (S[i] = ' ') do Inc(i);
+  if i <= n then Exit(False);
+  V := res * sign;
+  Result := True;
 end;
 
 function VDbParseFloat(const S: string; out V: Double): Boolean;
@@ -1986,8 +2025,27 @@ function IdxKeyLo(const E: TIdxEntries; Ctype: Byte; const Key: string): Integer
 // Key'e gore alt sinir (pk goz ardi)
 var
   lo, hi, m: Integer;
+  kInt, mInt: Int64;
 begin
   lo := 0; hi := Length(E);
+  // P-24: INTEGER ve BOOLEAN icin hedef Key tek sefer parse edilir
+  if ((Ctype = VCT_INT) or (Ctype = VCT_BOOL)) and VDbParseInt(Key, kInt) then
+  begin
+    while lo < hi do
+    begin
+      m := (lo + hi) div 2;
+      if (E[m].Key <> '') and VDbParseInt(E[m].Key, mInt) then
+      begin
+        if mInt < kInt then lo := m + 1 else hi := m;
+      end
+      else
+      begin
+        if VDbIdxCmp(E[m].Key, Key, Ctype) < 0 then lo := m + 1 else hi := m;
+      end;
+    end;
+    Exit(lo);
+  end;
+
   while lo < hi do
   begin
     m := (lo + hi) div 2;
@@ -2003,8 +2061,27 @@ function IdxKeyHi(const E: TIdxEntries; Ctype: Byte; const Key: string): Integer
 // Key'e gore ust sinir (Key>X olan ilk konum)
 var
   lo, hi, m: Integer;
+  kInt, mInt: Int64;
 begin
   lo := 0; hi := Length(E);
+  // P-24: INTEGER ve BOOLEAN icin hedef Key tek sefer parse edilir
+  if ((Ctype = VCT_INT) or (Ctype = VCT_BOOL)) and VDbParseInt(Key, kInt) then
+  begin
+    while lo < hi do
+    begin
+      m := (lo + hi) div 2;
+      if (E[m].Key <> '') and VDbParseInt(E[m].Key, mInt) then
+      begin
+        if mInt <= kInt then lo := m + 1 else hi := m;
+      end
+      else
+      begin
+        if VDbIdxCmp(E[m].Key, Key, Ctype) <= 0 then lo := m + 1 else hi := m;
+      end;
+    end;
+    Exit(lo);
+  end;
+
   while lo < hi do
   begin
     m := (lo + hi) div 2;
@@ -2327,8 +2404,12 @@ var
     end;
   end;
 
+var
+  initCap: Integer;
 begin
-  SetLength(b, 256); p := 0;
+  initCap := 16 + Length(Pk) * 2 + Length(T.Cols) * 24;
+  if initCap < 128 then initCap := 128;
+  SetLength(b, initCap); p := 0;
   PutU16(TableId);
   PutPkU8(Pk);
   PutU16(Word(Length(T.Cols)));
@@ -2554,7 +2635,7 @@ begin
   // CRC icin okudugu her kayittan tablo id'yi bedava cikarir ve tablo
   // taramalari diger tablolarin kayitlarini OKUMAZ.
   AKv.RowTagFunc := @VDbRowTagOf;
-  FLock := TCriticalSection.Create;
+  FLock := TMultiReadExclusiveWriteSynchronizer.Create;
   FTables := TDictionary<string, TTableDef>.Create;
   FById := TDictionary<Word, string>.Create;
   FMemIdx := TDictionary<Int64, TIdxEntries>.Create;
@@ -2585,6 +2666,7 @@ begin
   FSnapAutoInc := nil;   // P-17a
   FSnapNextId := 1;
   FSnapDirty := False;
+  ResetBatchTableCache;
 end;
 
 destructor TVTableDb.Destroy;
@@ -2618,12 +2700,22 @@ end;
 
 procedure TVTableDb.Lock;
 begin
-  FLock.Enter;
+  FLock.BeginWrite;
 end;
 
 procedure TVTableDb.Unlock;
 begin
-  FLock.Leave;
+  FLock.EndWrite;
+end;
+
+procedure TVTableDb.LockRead;
+begin
+  FLock.BeginRead;
+end;
+
+procedure TVTableDb.UnlockRead;
+begin
+  FLock.EndRead;
 end;
 
 function TVTableDb.SchemaPath: string;
@@ -3431,17 +3523,26 @@ begin
   // veriden kurar. 95.000 satirlik tabloda dosya acilisi 4,5 sn -> ~0 ms.
 end;
 
+procedure TVTableDb.ResetBatchTableCache;
+begin
+  FBatchTableCached := False;
+  FBatchColMapValid := False;
+  SetLength(FBatchColMap, 0);
+end;
+
 procedure TVTableDb.BeginBatch;
 begin
   // DDL (CREATE/DROP TABLE, INDEX) batch icinde yapilabilsin diye sema
   // yedegi alinir; AbortBatch bunu geri yukler. Aksi halde ROLLBACK
   // sonrasi tablo hem diskte hem bellekte kalirdi.
   SnapshotSchema;
+  ResetBatchTableCache;
   FKv.BeginBatch;
 end;
 
 procedure TVTableDb.CommitBatch;
 begin
+  ResetBatchTableCache;
   if FSchemaDirty then
     SaveSchema; // batch icine yazilir, tek fsync commit'te
   FKv.CommitBatch;
@@ -3460,6 +3561,7 @@ var
   kv: TPair<string, TTableDef>;
   j: Integer;
 begin
+  ResetBatchTableCache;
   // R-22 Full: geri alma tum indeksleri VERIDEN yeniden kurar; surmekte
   // olan CONCURRENTLY insalari da bu noktada iptal edilir (sonuctan
   // vazgec: indeks INVALID kalir). Bekleyen islemler islem isaretli
@@ -3480,6 +3582,7 @@ end;
 
 procedure TVTableDb.Close;
 begin
+  ResetBatchTableCache;
   // sayaclari kalici yap; Close asla patlamaz
   try
     if FSchemaDirty then
@@ -5475,22 +5578,25 @@ begin
   // erisimi) ScanAll tekrar cagrilirsa paylasilan dizi uzerine
     // yazilir ve asagidaki satirlar bozulur -> access violation.
     FKv.ScanAll(keys, raw, T.TableId);   // R-26: yalnizca bu tablonun satirlari
-  SetLength(oldKeys, 0);
-  SetLength(pks, 0);
-  SetLength(oldRows, 0);
+  // KR-2: on-tahsis (max keys boyutu), sonunda budama.
+  SetLength(oldKeys, Length(keys));
+  SetLength(pks, Length(keys));
+  SetLength(oldRows, Length(keys));
+  j := 0;
   for i := 0 to High(keys) do
   begin
     if keys[i] = VDB_SCHEMA_KEY then Continue;
     if not DecodeRow(raw[i], tid, pk, nv) then Continue;
     if tid <> T.TableId then Continue;
-    SetLength(oldKeys, Length(oldKeys) + 1);
-    SetLength(pks, Length(pks) + 1);
-    SetLength(oldRows, Length(oldRows) + 1);
-    oldKeys[High(oldKeys)] := keys[i];
-    pks[High(pks)] := pk;
+    oldKeys[j] := keys[i];
+    pks[j] := pk;
     // kopyala: nv yeniden kullanilacak
-    oldRows[High(oldRows)] := Copy(nv, 0, Length(nv));
+    oldRows[j] := Copy(nv, 0, Length(nv));
+    Inc(j);
   end;
+  SetLength(oldKeys, j);
+  SetLength(pks, j);
+  SetLength(oldRows, j);
   // cozum bittikten sonra paylasilan arabellek artik gerekmez
   SetLength(raw, 0);
   SetLength(keys, 0);
@@ -6257,11 +6363,13 @@ procedure TVTableDb.FlushIdxPending(const k: Int64);
 // bagimsiz olarak kendini tutarli tutar (mukerrer/eksik girdi imkansiz).
 var
   ops: TList<TIdxOp>;
-  e, keep: TIdxEntries;
+  e, keep, delta, merged: TIdxEntries;
   lastOp: TDictionary<string, TIdxOp>;    // pk -> son durum
   added: TDictionary<string, Boolean>;     // eklenen pk'ler
   ct: Byte;
-  i, nKeep: Integer;
+  ctMulti: TByteArray;
+  isMulti: Boolean;
+  i, nKeep, nDelta, iKeep, iDelta, iMerged, cmp: Integer;
 begin
   if not FIdxOps.TryGetValue(k, ops) then Exit;
   if ops.Count = 0 then
@@ -6279,9 +6387,8 @@ begin
     lastOp.AddOrSetValue(ops[i].Pk, ops[i]);
 
   // 2) commitlenmis girdilerden bu toplantida dokunulan satirlari cikar
-  // En fazla eski girdiler + bekleyen islemler kadar sonuc olabilir.
-  // Dinamik diziyi her girdide buyutmek yerine bir kez kapasite ayir.
-  SetLength(keep, Length(e) + ops.Count);
+  // En fazla eski girdiler kadar sonuc kalabilir.
+  SetLength(keep, Length(e));
   nKeep := 0;
   for i := 0 to High(e) do
   begin
@@ -6289,7 +6396,11 @@ begin
     keep[nKeep] := e[i];
     Inc(nKeep);
   end;
-  // 3) hala var olan satirlar icin TAM OLARAK birer girdi koy
+  SetLength(keep, nKeep);
+
+  // 3) hala var olan satirlar icin YENI delta girdilerini topla
+  SetLength(delta, ops.Count);
+  nDelta := 0;
   added := TDictionary<string, Boolean>.Create;
   for i := 0 to ops.Count - 1 do
     if not ops[i].IsDel then
@@ -6298,24 +6409,67 @@ begin
       // bu satirin SON durumu silme mi? (daha sonraki bir op geci kalmis olabilir)
       if lastOp[ops[i].Pk].IsDel then Continue;
       added.AddOrSetValue(ops[i].Pk, True);
-      keep[nKeep].Key := ops[i].Key;
-      keep[nKeep].Pk := ops[i].Pk;
-      keep[nKeep].Cov := ops[i].Cov;   // F-19
-      Inc(nKeep);
+      delta[nDelta].Key := ops[i].Key;
+      delta[nDelta].Pk := ops[i].Pk;
+      delta[nDelta].Cov := ops[i].Cov;   // F-19
+      Inc(nDelta);
     end;
   added.Free;
   lastOp.Free;
+  SetLength(delta, nDelta);
 
-  // Kullanilmayan kapasiteyi at; siralama yalnizca gercek girdiler uzerinde.
-  SetLength(keep, nKeep);
-
-  // 4) sirala ve yayinla
-  // COK KOLONLU indekslerde her parca kendi tipine gore karsilastirilir
-  if IdxNPartsByKey(k) > 1 then
-    SortIdxEntriesCols(keep, IdxCtypesByKey(k))
+  // 4) KR-5 Delta Merge: Delta'yi tek basina sirala, sonra sirali keep ile O(N+M) birlestir
+  isMulti := IdxNPartsByKey(k) > 1;
+  if isMulti then
+  begin
+    ctMulti := IdxCtypesByKey(k);
+    SortIdxEntriesCols(delta, ctMulti);
+  end
   else
-    SortIdxEntries(keep, ct);
-  FMemIdx.AddOrSetValue(k, keep);
+    SortIdxEntries(delta, ct);
+
+  if nKeep = 0 then
+    merged := delta
+  else if nDelta = 0 then
+    merged := keep
+  else
+  begin
+    SetLength(merged, nKeep + nDelta);
+    iKeep := 0; iDelta := 0; iMerged := 0;
+    while (iKeep < nKeep) and (iDelta < nDelta) do
+    begin
+      if isMulti then
+        cmp := VDbIdxMultiCmp(keep[iKeep].Key, delta[iDelta].Key, ctMulti)
+      else
+        cmp := VDbIdxCmp(keep[iKeep].Key, delta[iDelta].Key, ct);
+      if cmp = 0 then
+        cmp := CompareStr(keep[iKeep].Pk, delta[iDelta].Pk);
+
+      if cmp <= 0 then
+      begin
+        merged[iMerged] := keep[iKeep];
+        Inc(iKeep);
+      end
+      else
+      begin
+        merged[iMerged] := delta[iDelta];
+        Inc(iDelta);
+      end;
+      Inc(iMerged);
+    end;
+    while iKeep < nKeep do
+    begin
+      merged[iMerged] := keep[iKeep];
+      Inc(iKeep); Inc(iMerged);
+    end;
+    while iDelta < nDelta do
+    begin
+      merged[iMerged] := delta[iDelta];
+      Inc(iDelta); Inc(iMerged);
+    end;
+  end;
+
+  FMemIdx.AddOrSetValue(k, merged);
   ops.Free;
   FIdxOps.Remove(k);
   FIdxDirty.Delete(FIdxDirty.IndexOf(k));
@@ -6927,30 +7081,60 @@ var
   key: QWord;
   b: TBytes;
   exTid: Word;
+  inBatch: Boolean;
+  matchCachedCols: Boolean;
 begin
-  t := GetTable(Table);
+  inBatch := FKv.InBatch;
+  if inBatch and FBatchTableCached and (FBatchTableDef.Name = Table) then
+    t := FBatchTableDef
+  else
+  begin
+    t := GetTable(Table);
+    if inBatch then
+    begin
+      FBatchTableDef := t;
+      FBatchTableCached := True;
+      FBatchColMapValid := False;
+    end;
+  end;
+
   // Sutun sayisi ile deger sayisi ESIT olmali. Esit degilse sessizce
   // yutmak veri kaybina yol acar: eksik deger NULL olur, fazla deger
   // atilir. Kullanim hatasi erken bildirilir.
   if Length(ColNames) <> Length(StrVals) then
     raise EVDbException.CreateFmt(ecInvalidArgument, '%s: sutun sayisi (%d) deger sayisiyla (%d) esit degil',
       [Table, Length(ColNames), Length(StrVals)]);
+
   SetLength(vals, Length(t.Cols));
-  SetLength(provided, Length(t.Cols));
-  for i := 0 to High(vals) do begin vals[i] := ''; provided[i] := False; end;
-  for i := 0 to High(ColNames) do
+
+  if inBatch and FBatchColMapValid and (Length(FBatchColMap) = Length(ColNames)) then
   begin
-    ci := FindCol(t, ColNames[i]);
-    if ci < 0 then raise EVDbException.Create(ecColumnNotFound, 'kolon yok: ' + ColNames[i]);
-    if provided[ci] then
-      raise EVDbException.Create(ecColumnExists, 'kolon iki kez verildi: ' + ColNames[i]);
-    vals[ci] := StrVals[i];
-    provided[ci] := True;
+    for i := 0 to High(t.Cols) do
+      if t.Cols[i].HasDef then vals[i] := t.Cols[i].Def else vals[i] := '';
+    for i := 0 to High(ColNames) do
+      vals[FBatchColMap[i]] := StrVals[i];
+  end
+  else
+  begin
+    SetLength(provided, Length(t.Cols));
+    for i := 0 to High(vals) do begin vals[i] := ''; provided[i] := False; end;
+    if inBatch then SetLength(FBatchColMap, Length(ColNames));
+    for i := 0 to High(ColNames) do
+    begin
+      ci := FindCol(t, ColNames[i]);
+      if ci < 0 then raise EVDbException.Create(ecColumnNotFound, 'kolon yok: ' + ColNames[i]);
+      if provided[ci] then
+        raise EVDbException.Create(ecColumnExists, 'kolon iki kez verildi: ' + ColNames[i]);
+      vals[ci] := StrVals[i];
+      provided[ci] := True;
+      if inBatch then FBatchColMap[i] := ci;
+    end;
+    if inBatch then FBatchColMapValid := True;
+    // verilmemis kolonlara DEFAULT
+    for i := 0 to High(vals) do
+      if not provided[i] and t.Cols[i].HasDef then
+        vals[i] := t.Cols[i].Def;
   end;
-  // verilmemis kolonlara DEFAULT
-  for i := 0 to High(vals) do
-    if not provided[i] and t.Cols[i].HasDef then
-      vals[i] := t.Cols[i].Def;
   // F2-22: PK TANIMLANMAMISSA sentetik satir anahtari uretilir.
   // ONCEDEN PkIndex 0'a zorlandigi icin ilk kolon hem anahtar hem de
   // ortuk UNIQUE idi: `CREATE TABLE t(a,b)` + ayni a ile ikinci satir
@@ -7102,17 +7286,20 @@ begin
       Continue;
     if lo > hi then lo := hi;
     // dilimdeki PKlari topla; satirlari SADECE onlar icin oku
-    SetLength(Pks, 0);
-    SetLength(Rows, 0);
-    for n := lo to hi - 1 do
+    // KR-2: on-tahsis ile O(N^2) SetLength(+1) kopyalamasi engellenir.
+    SetLength(Pks, hi - lo);
+    SetLength(Rows, hi - lo);
+    n := 0;
+    for m := lo to hi - 1 do
     begin
-      if not ReadRow(T.Name, e[n].Pk, rv) then Continue;
+      if not ReadRow(T.Name, e[m].Pk, rv) then Continue;
       if not VDbMatchGroups(rv, Groups) then Continue;
-      SetLength(Pks, Length(Pks) + 1);
-      SetLength(Rows, Length(Rows) + 1);
-      Pks[High(Pks)] := e[n].Pk;
-      Rows[High(Rows)] := rv;
+      Pks[n] := e[m].Pk;
+      Rows[n] := rv;
+      Inc(n);
     end;
+    SetLength(Pks, n);
+    SetLength(Rows, n);
     Exit(True);
   end;
   Result := False;
@@ -7895,15 +8082,17 @@ var
   vals: TStrArray;
   pk: string;
 begin
-  SetLength(Pks, 0); SetLength(Rows, 0); n := 0;
-  if not FTables.TryGetValue(VDbNorm(ViewName), v) then Exit(0);
+  // KR-2: on-tahsis (AutoInc ust sinir), sonunda budama.
+  if not FTables.TryGetValue(VDbNorm(ViewName), v) then
+  begin SetLength(Pks, 0); SetLength(Rows, 0); Exit(0); end;
+  SetLength(Pks, v.AutoInc); SetLength(Rows, v.AutoInc); n := 0;
   for i := 0 to v.AutoInc - 1 do
   begin
     pk := '@mv' + IntToStr(i);
     if not ReadRow(VDbNorm(ViewName), pk, vals) then Continue;
-    SetLength(Pks, n + 1); SetLength(Rows, n + 1);
     Pks[n] := pk; Rows[n] := vals; Inc(n);
   end;
+  SetLength(Pks, n); SetLength(Rows, n);
   Result := n;
 end;
 

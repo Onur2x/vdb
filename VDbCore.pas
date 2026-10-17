@@ -146,6 +146,16 @@ FPath: string;
     FS: TFileStream;
     FLock: TCriticalSection;
     FIndex: TDictionary<QWord, TDbLoc>;
+    { KR-1: tablo basina ANAHTAR DIZINI (turev onbellek). Yalnizca tarama
+      hizlandirmasi icindir; TEK kaynagi FIndex'tir ve asla bagimsiz
+      guncellenmez. FIndex her degistiginde FTableKeysDirty kurulur;
+      filtreli bir tarama once bu dizini FIndex'ten yeniden kurar (O(N)),
+      sonra YALNIZCA hedef tablonun anahtarlarini dolasir. Boylece karisik
+      veritabanlarinda her tarama icin tum tablolarin anahtarlari
+      dolasilmaz. Anahtar -1 = "etiketsiz" kayitlar (sema kaydi); R-26
+      davranisi geregi her tablo taramasinda elenmez. }
+    FTableKeys: TDictionary<Integer, TList<QWord>>;
+    FTableKeysDirty: Boolean;
     { R-26: satir bicimi cozucusu. VDbTable olustururken atar; nil ise
       (ham KV kullanimi) tablo id'leri -1 kalir ve filtre uygulanmaz. }
     FRowTagFunc: TVDbRowTagFunc;
@@ -258,6 +268,10 @@ FPath: string;
     procedure AppendBatchEnd(DoFlush: Boolean);
     procedure AppendBatchEndTo(S: TStream; ASeq: QWord);
     procedure Recover;
+    { KR-1: tablo anahtar dizinini temizler / FIndex'ten yeniden kurar. }
+    procedure ClearTableKeys;
+    procedure RebuildTableKeys;
+    procedure SetRowTagFunc(AValue: TVDbRowTagFunc);
     function FindPending(Key: QWord; out Op: TPendOp): Boolean;
     procedure PendingAdd(const Op: TPendOp);
     procedure PendingRemove(const Idx: Integer);
@@ -352,7 +366,7 @@ private
     { ScanAll'in secim kuraliyla birebir ayni snapshot secimi. }
     { R-26: satir bicimi cozucusu (bkz. TVDbRowTagFunc). VDbTable
       TVDb olustururken atar. }
-    property RowTagFunc: TVDbRowTagFunc read FRowTagFunc write FRowTagFunc;
+    property RowTagFunc: TVDbRowTagFunc read FRowTagFunc write SetRowTagFunc;
     { ---------------------------------------------------------------
       MVCC / Snapshot Isolation (R-01) - Kilitsiz Okuma API
       --------------------------------------------------------------- }
@@ -566,6 +580,8 @@ begin
   inherited Create;
   FLock := TCriticalSection.Create;
   FIndex := TDictionary<QWord, TDbLoc>.Create;
+  FTableKeys := TDictionary<Integer, TList<QWord>>.Create;
+  FTableKeysDirty := True;
   FPending := TList<TPendOp>.Create;
   FPendingPuts := TDictionary<QWord, Byte>.Create;
   FPendingDels := TDictionary<QWord, Byte>.Create;
@@ -600,6 +616,8 @@ begin
   ClearSavepoints;
   FSavepoints.Free;
   FIndex.Free;
+  ClearTableKeys;
+  FTableKeys.Free;
   FLock.Free;
   { 2026-10-05 Adim 12: anahtar kalintisi birakma }
   if FEncKey <> nil then
@@ -1052,6 +1070,9 @@ begin
       loc.TableId := -1;
     FIndex.AddOrSetValue(Key, loc);
   end;
+  // KR-1: FIndex degisti -> tablo anahtar dizini bir sonraki filtreli
+  // taramada FIndex'ten yeniden kurulacak (yazma yoluna ek maliyet yok).
+  FTableKeysDirty := True;
   { 2026-10-05 Adim 12: sifreli ara tampon ClearEnc; ham sifreli baytlar
     bellekte kalmasin. Try-finally ile dosyalara dokunmadan temizlenir. }
   if (stored <> nil) and (Length(stored) > 0) and (Length(FEncKey) = VDB_KEY_LEN) then
@@ -1147,11 +1168,13 @@ var
         FIndex.AddOrSetValue(pendKey[q], l2);
       end;
     end;
+    FTableKeysDirty := True;   // KR-1: kurtarma sirasinda FIndex degisti
     pendN := 0;
   end;
 
 begin
   FIndex.Clear;
+  FTableKeysDirty := True;   // KR-1: index tamamen sifirlandi
   FSeq := 0;
   FDeadBytes := 0;
   fsize := FS.Size;
@@ -1837,11 +1860,55 @@ begin
   Result := True;
 end;
 
+  procedure TVDb.ClearTableKeys;
+  // KR-1: tablo anahtar dizinindeki tum listeleri serbest birakir.
+  var
+    lst: TList<QWord>;
+  begin
+    for lst in FTableKeys.Values do
+      lst.Free;
+    FTableKeys.Clear;
+    FTableKeysDirty := False;
+  end;
+
+  procedure TVDb.RebuildTableKeys;
+  // KR-1: FIndex'i BIR KEZ dolasarak tablo id -> anahtar listesi kurar.
+  // Etiketsiz kayitlar (TableId < 0; sema kaydi) -1 anahtari altinda
+  // toplanir ve her tablo taramasinda (R-26 gibi) elenmez.
+  var
+    pair: TPair<QWord, TDbLoc>;
+    lst: TList<QWord>;
+    tid: Integer;
+  begin
+    ClearTableKeys;
+    FTableKeysDirty := False;
+    if @FRowTagFunc = nil then Exit;   // ham KV: filtre yok, dizin gerekmez
+    for pair in FIndex do
+    begin
+      tid := pair.Value.TableId;
+      if tid < 0 then tid := -1;
+      if not FTableKeys.TryGetValue(tid, lst) then
+      begin
+        lst := TList<QWord>.Create;
+        FTableKeys.Add(tid, lst);
+      end;
+      lst.Add(pair.Key);
+    end;
+  end;
+
+  procedure TVDb.SetRowTagFunc(AValue: TVDbRowTagFunc);
+  begin
+    FRowTagFunc := AValue;
+    FTableKeysDirty := True;   // dizin yeni etiketleyiciyle yeniden kurulmali
+  end;
+
   procedure TVDb.ScanSnapshot(out Keys: TQWordArray; out Vals: TValArray;
     SnapshotSeq: QWord; Limit: Integer; TableFilter: Integer);
   // Kilitsiz snapshot tum tarama. Limit > 0 ise en fazla Limit kayit dondurur.
   // R-26: TableFilter >= 0 ise FIndex'teki TableId ile ONCE elenir; ele
   // gecmeyen kayit icin dosya hic acilmaz (eski hali: tum KV okunuyordu).
+  // KR-1: TableFilter >= 0 ise ayrica FIndex YERINE yalnizca hedef tablonun
+  // anahtar dizini dolanilir (karisik DB'de O(toplam) -> O(tablo)).
   // P-13 (2026-10-16): kayit basina 3 syscall (Position+Read+Read) yerine
   // gorunur adaylar once toplanir, dosya 2 MB'lik bucket araliklarinda
   // TEK okumayla taranir. Cikti sirasi eski枚举 ile BIREBIR aynidir:
@@ -1876,6 +1943,10 @@ var
   candCnt, keptCnt, bucket, m, n2, bCount: Integer;
   lo, hi, span, endOff, bucket64: Int64;
   got, p: Integer;
+  // KR-1: hedef-tablo anahtar dizini dolasim durumu
+  stop: Boolean;
+  tloc: TDbLoc;
+  tl: TList<QWord>;
 
   procedure DecryptIfNeeded(var V: TBytes; Flags: Byte; RecKey: QWord);
   var
@@ -1894,6 +1965,37 @@ var
         [RecKey]);
     end;
     V := plain;
+  end;
+
+  // KR-1/R-26: aday eleme govdesi. Filtre karari cagiran tarafta verilir:
+  // filtresiz yol tum FIndex'i gezer, filtreli yol YALNIZCA hedef tablonun
+  // anahtar dizinini (ve etiketsiz kayitlari) gezer.
+  procedure Consider(const K: QWord; const L: TDbLoc);
+  begin
+    if stop then Exit;
+    if (Limit > 0) and (count >= Limit) then
+    begin
+      stop := True;
+      Exit;
+    end;
+    // Gorunurlilik kontrolu
+    if not IsVisible(L, SnapshotSeq) then Exit;
+    // Tombstone kontrolu
+    if (L.Flags and VDB_FLAG_DEL) <> 0 then Exit;
+    // Guvenlik kontrolu
+    if (L.Offset < 0) or
+       (L.Offset + Int64(SizeOf(h)) + Int64(L.Size) > fsize) then
+      Exit;
+    // Pending ile cakisma kontrolu
+    if pendKeys.ContainsKey(K) then Exit;
+    if pendDels.ContainsKey(K) then Exit;
+
+    Keys[count] := K;
+    cands[candCnt].Off := L.Offset;
+    cands[candCnt].Size := L.Size;
+    cands[candCnt].Slot := count;
+    Inc(count);
+    Inc(candCnt);
   end;
 begin
   if FClosed then
@@ -1925,33 +2027,28 @@ begin
     SetLength(cands, FIndex.Count);
     SetLength(kept, FIndex.Count);   // 0 = basarisiz slot (sonra sikistirilir)
     candCnt := 0;
-    for pair in FIndex do
+    stop := False;
+    if TableFilter >= 0 then
     begin
-      if (Limit > 0) and (count >= Limit) then Break;
-      // R-26: TABLO FILTRESI — en ucuz kontrol ilk once. Diger tablonun
-      // kaydi burada elenir; asagidaki okuma hic calismaz.
-      // TableId < 0 (satir degil / bilinmiyor) elenmez: davranis degismez.
-      if (TableFilter >= 0) and (pair.Value.TableId >= 0) and
-         (pair.Value.TableId <> TableFilter) then Continue;
-      // Gorunurlilik kontrolu
-      if not IsVisible(pair.Value, SnapshotSeq) then Continue;
-      // Tombstone kontrolu
-      if (pair.Value.Flags and VDB_FLAG_DEL) <> 0 then Continue;
-      // Guvenlik kontrolu
-      if (pair.Value.Offset < 0) or
-         (pair.Value.Offset + Int64(SizeOf(h)) + Int64(pair.Value.Size) > fsize) then
-        Continue;
-      // Pending ile cakisma kontrolu
-      if pendKeys.ContainsKey(pair.Key) then Continue;
-      if pendDels.ContainsKey(pair.Key) then Continue;
-
-      Keys[count] := pair.Key;
-      cands[candCnt].Off := pair.Value.Offset;
-      cands[candCnt].Size := pair.Value.Size;
-      cands[candCnt].Slot := count;
-      Inc(count);
-      Inc(candCnt);
-    end;
+      // KR-1: YALNIZCA hedef tablonun anahtarlari (O(tablo), O(toplam) degil).
+      if FTableKeysDirty then RebuildTableKeys;
+      if FTableKeys.TryGetValue(TableFilter, tl) then
+        for n := 0 to tl.Count - 1 do
+        begin
+          if stop then Break;
+          if FIndex.TryGetValue(tl[n], tloc) then Consider(tl[n], tloc);
+        end;
+      // R-26: TableId < 0 (sema kaydi) hicbir filtrede elenmez.
+      if (not stop) and FTableKeys.TryGetValue(-1, tl) then
+        for n := 0 to tl.Count - 1 do
+        begin
+          if stop then Break;
+          if FIndex.TryGetValue(tl[n], tloc) then Consider(tl[n], tloc);
+        end;
+    end
+    else
+      for pair in FIndex do
+        Consider(pair.Key, pair.Value);
 
     // ---- P-13 PAS B: bucket sayim-donusturmesi (counting sort, O(N)) ----
     // Kayitlar dosya offset'ine gore gruplanir; her bucket bir KEZ
@@ -2108,6 +2205,9 @@ var
   candCnt, bucket, m, n2, bCount: Integer;
   lo, hi, span, endOff, bucket64: Int64;
   got, p: Integer;
+  // KR-1: hedef-tablo anahtar dizini dolasim durumu
+  tloc: TDbLoc;
+  tl: TList<QWord>;
 
   procedure DecryptIfNeeded(var V: TBytes; Flags: Byte; RecKey: QWord);
   var
@@ -2126,6 +2226,23 @@ var
         [RecKey]);
     end;
     V := plain;
+  end;
+
+  // KR-1/R-26: aday eleme govdesi (ScanSnapshot.Consider ile ayni kurallar;
+  // tek fark cikti bicimi — deger kopyalanmaz, aday listesine yazilir).
+  procedure Consider(const K: QWord; const L: TDbLoc);
+  begin
+    if not IsVisible(L, SnapshotSeq) then Exit;
+    if (L.Flags and VDB_FLAG_DEL) <> 0 then Exit;
+    if (L.Offset < 0) or
+       (L.Offset + Int64(SizeOf(h)) + Int64(L.Size) > fsize) then
+      Exit;
+    if pendKeys.ContainsKey(K) then Exit;
+    if pendDels.ContainsKey(K) then Exit;
+    cands[candCnt].Off := L.Offset;
+    cands[candCnt].Size := L.Size;
+    cands[candCnt].Key := K;
+    Inc(candCnt);
   end;
 
 begin
@@ -2148,22 +2265,21 @@ begin
     // ---- PAS A: gorunur adaylari topla (dosyaya hic dokunmaz) ----
     SetLength(cands, FIndex.Count);
     candCnt := 0;
-    for pair in FIndex do
+    if TableFilter >= 0 then
     begin
-      if (TableFilter >= 0) and (pair.Value.TableId >= 0) and
-         (pair.Value.TableId <> TableFilter) then Continue;
-      if not IsVisible(pair.Value, SnapshotSeq) then Continue;
-      if (pair.Value.Flags and VDB_FLAG_DEL) <> 0 then Continue;
-      if (pair.Value.Offset < 0) or
-         (pair.Value.Offset + Int64(SizeOf(h)) + Int64(pair.Value.Size) > fsize) then
-        Continue;
-      if pendKeys.ContainsKey(pair.Key) then Continue;
-      if pendDels.ContainsKey(pair.Key) then Continue;
-      cands[candCnt].Off := pair.Value.Offset;
-      cands[candCnt].Size := pair.Value.Size;
-      cands[candCnt].Key := pair.Key;
-      Inc(candCnt);
-    end;
+      // KR-1: YALNIZCA hedef tablonun anahtarlari (O(tablo), O(toplam) degil).
+      if FTableKeysDirty then RebuildTableKeys;
+      if FTableKeys.TryGetValue(TableFilter, tl) then
+        for n := 0 to tl.Count - 1 do
+          if FIndex.TryGetValue(tl[n], tloc) then Consider(tl[n], tloc);
+      // R-26: TableId < 0 (sema kaydi) hicbir filtrede elenmez.
+      if FTableKeys.TryGetValue(-1, tl) then
+        for n := 0 to tl.Count - 1 do
+          if FIndex.TryGetValue(tl[n], tloc) then Consider(tl[n], tloc);
+    end
+    else
+      for pair in FIndex do
+        Consider(pair.Key, pair.Value);
 
     // ---- PAS B: bucket sayim-donusturmesi (ScanSnapshot ile birebir) ----
     if candCnt > 0 then
@@ -2617,6 +2733,7 @@ begin
     FIndex.Clear;
     for pair in sp.IndexSnapshot do
       FIndex.Add(pair.Key, pair.Value);
+    FTableKeysDirty := True;   // KR-1: index restore edildi
     // 3. State restore
     FSeq := sp.Seq;
     FDirty := sp.Dirty;
