@@ -5555,6 +5555,7 @@ type
     TableId: Word;
     TableName: string;
     PrefixSeed: QWord;   // KR-8: VDbHashKeyPrefix(td.Name) -- sorgu basi bir kez
+    MaxCol: Integer;     // KR-8c: planlarin referans verdigi en buyuk kolon (-1 = hic)
   end;
 
 function VdbAggRawCb(Key: QWord; Buf: PByte; Len: Integer; User: Pointer): Boolean;
@@ -5572,8 +5573,8 @@ var
 begin
   ctx := User;
   if Key = VDB_SCHEMA_KEY then Exit(True);
-  if not VDbPeekRawRowKeyHash(Buf, Len, ctx.ColCnt, tid, ctx.PrefixSeed, kh,
-                              ctx.FType, ctx.FOff, ctx.FLen) then
+  if not VDbPeekRawRowKeyHashTo(Buf, Len, ctx.ColCnt, tid, ctx.PrefixSeed, kh,
+                                ctx.MaxCol, ctx.FType, ctx.FOff, ctx.FLen) then
     Exit(False);   // eski sema / bozuk kayit -> genel yol (hata onda uretilir)
   if tid <> ctx.TableId then Exit(True);          // ScanRowsPart ile ayni kural
   if kh <> Key then
@@ -5651,6 +5652,7 @@ function TVSqlExecutor.TryStreamAgg(Stmt: TSqlSelectStmt; const td: TTableDef;
   out Res: TSqlResult): Boolean;
 var
   j, c, colCnt: Integer;
+  mc: Integer;                     // KR-8c: planlarin max referans kolonu
   cn: TStrArray;
   ct, ftype: TByteArray;
   foff, flen: TIntArray;
@@ -5752,6 +5754,13 @@ begin
   ctx.Ct := ct;
   ctx.FType := ftype; ctx.FOff := foff; ctx.FLen := flen;
   ctx.Plans := plans;
+  // KR-8c: planlarin referans verdigi en buyuk kolon indeksi. Erken kolon-
+  // durmasi bu noktada durur; sonrasindaki kolonlar (aggregate'in OKUMADIGI)
+  // cozulmez. COUNT(*) Col=-1 oldugundan hic kolon cozulmez (mc=-1).
+  mc := -1;
+  for j := 0 to High(plans) do
+    if plans[j].Col > mc then mc := plans[j].Col;
+  ctx.MaxCol := mc;
   if not FT.Kv.ScanRawIterAll(td.TableId, VdbAggRawCb, @ctx) then
     Exit;
   { KR-1B: saf COUNT(*) (allStar => autocommit) dogrulamali tarayarak sayildi;

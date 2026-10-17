@@ -9,6 +9,115 @@ akışını izler.
 
 ---
 
+## v0.014 — 2026-10-17 — KR-8c: Agrega peek'inde erken kolon-durması (yalnız okunan kolon)
+
+### Ne eklendi / değişti
+
+- **KR-8c — `VDbPeekRawRowKeyHashTo` (VDbTable) + `TAggIterCtx.MaxCol`
+  (VDbExecutor):** v0.013'teki agrega peek'i (`VDbPeekRawRowKeyHash`) her
+  satırda **tüm** kolon dizinini çözüyordu (her kolon için tip-baytı + i32
+  uzunluk oku + ilerle), oysa `VdbAggRawCb` yalnız planların referans verdiği
+  kolonları kullanır. Yeni `...To` çekirdeği `MaxCol` parametresi alır ve
+  kolon dizinini **yalnızca `0..MaxCol`** için çözer; `TryStreamAgg`
+  `MaxCol = max(plans[j].Col)`'ü sorgu başına bir kez hesaplar. `COUNT(*)`
+  (`Col = -1`) için `MaxCol = -1` → **hiç kolon çözülmez** (yalnız başlık +
+  pk-hash + `cc` kontrolü). Eski `VDbPeekRawRowKeyHash` ince bir sarmalayıcı
+  olarak (`MaxCol = ColCount-1`) kaldı.
+- **Korunan:** `cc == ColCount` **sema kontrolü** aynen durur (eski sema
+  satırı yine `False` → genel yol); FNV pk↔anahtar çarpışma denetimi ve
+  **okunan** kolonların (0..MaxCol) tam sinir doğrulaması **atlanmaz**.
+- **Bilinçli gevşetme (kullanıcı onaylı, KR-1B COUNT ile aynı kategori):**
+  agrega'nın **OKUMADIĞI** kuyruk kolonlarındaki (MaxCol+1..) dahili bir
+  bozulma bu yoldan yakalanmaz; böyle bir satır genel yola düşüp hata vermek
+  yerine sessizce toplanır. Dönen **değer doğruluğu değişmez** (agrega o
+  kolonları zaten okumaz). Bu, v0.012'de `COUNT` için kabul edilen "okunmayan
+  veriyi doğrulama" ödününün `SUM/AVG/MIN/MAX`'e yayılmış hâlidir. Çoklu
+  platform; platforma özel kod yok.
+
+### Kanıt ve ölçüm
+
+- **Doğrulama:** `MaxCol`'ün peek'a ulaştığı, onu `-1`'e sabitleyip SUM'ın
+  NULL dönmesinin gözlenmesiyle doğrulandı (kolon çözülmezse cb her değeri
+  NULL sayar). Erken-durma devrede.
+- **Hız (1M satır, 3 kolonlu tablo, sıcak + iç içe + 7 tur, `bench_profile`):**
+
+| Ölçüm | Tam yürüyüş (col2, `SUM(val)`) | Erken-dur (col0, `SUM(id)`) | Fark |
+|---|---|---|---|
+| `SUM` | 285 ms | **273 ms** | −~12 ms (≈%4) |
+| İlk `COUNT(*)` (`MaxCol=-1`, hiç kolon) | ~317 ms | ~294 ms | −~23 ms |
+
+- **Dürüst not:** 3 kolonlu tabloda atlanacak kolon az olduğundan uçtan-uca
+  kazanç mütevazdır. Yalıtık peek-probe kuyruk-yürüyüşünü ~40 ms ölçmüştü;
+  uçtan-uca yalnız ~12 ms'e iner, çünkü PAS C kaydı zaten L1/L2'ye sıralı
+  taşır ve 2 kolonu L1'de yürümek neredeyse bedavadır. Kazanç **atlanan
+  kolon sayısıyla ~doğrusal** ölçeklenir (~6 ms/atlanan-kolon/1M satır):
+  geniş şemalarda (30+ kolonlu tabloda erken bir ölçüde `SUM`) anlam kazanır,
+  2-3 kolonlu tabloda ~0'dır. Dönen değer semantiği her durumda değişmez.
+
+### Doğrulama kapıları
+
+- `sqltest`: **2251/2251** (0 hata; SUM/AVG/MIN/MAX + çarpışma/genel-yol
+  testleri dahil).
+- `crashtest`: **8/8 `SONUC: GECTI`** (çökme sonrası veri kaybı/bozulma yok).
+
+---
+
+## v0.014 — 2026-10-17 — KR-8c: early column-stop in the aggregate peek (read-only columns) (ENGLISH)
+
+### Added / changed
+
+- **KR-8c — `VDbPeekRawRowKeyHashTo` (VDbTable) + `TAggIterCtx.MaxCol`
+  (VDbExecutor):** v0.013's aggregate peek (`VDbPeekRawRowKeyHash`) resolved
+  the **entire** column directory on every row (per column: type byte + i32
+  length + advance), yet `VdbAggRawCb` only uses columns the plans reference.
+  The new `...To` core takes a `MaxCol` parameter and resolves the column
+  directory only for **`0..MaxCol`**; `TryStreamAgg` computes
+  `MaxCol = max(plans[j].Col)` once per query. For `COUNT(*)` (`Col = -1`)
+  `MaxCol = -1` → **no column is resolved** (header + pk-hash + `cc` check
+  only). The old `VDbPeekRawRowKeyHash` stays as a thin wrapper
+  (`MaxCol = ColCount-1`).
+- **Preserved:** the `cc == ColCount` **schema check** stays (an old-schema
+  row still returns `False` → general path); the FNV pk↔key collision check
+  and the full bounds validation of the **read** columns (0..MaxCol) are
+  **not** skipped.
+- **Deliberate relaxation (user-approved, same category as KR-1B COUNT):**
+  an internal corruption in a **trailing column the aggregate does NOT read**
+  (MaxCol+1..) is no longer caught on this path; such a row is silently
+  aggregated instead of falling back to the general path and raising. The
+  returned **value is unchanged** (the aggregate never reads those columns).
+  This extends the "don't validate unread data" trade-off accepted for
+  `COUNT` in v0.012 to `SUM/AVG/MIN/MAX`. Cross-platform; no
+  platform-specific code.
+
+### Proof and measurement
+
+- **Validation:** confirmed `MaxCol` reaches the peek by pinning it to `-1`
+  and observing SUM return NULL (with no column resolved, cb treats every
+  value as NULL). Early-stop is live.
+- **Speed (1M rows, 3-column table, warm + interleaved + 7 iters,
+  `bench_profile`):**
+
+| Measurement | Full walk (col2, `SUM(val)`) | Early-stop (col0, `SUM(id)`) | Delta |
+|---|---|---|---|
+| `SUM` | 285 ms | **273 ms** | −~12 ms (≈4%) |
+| First `COUNT(*)` (`MaxCol=-1`, no column) | ~317 ms | ~294 ms | −~23 ms |
+
+- **Honest note:** with only 3 columns there is little to skip, so the
+  end-to-end win is modest. The isolated peek-probe measured the tail-walk at
+  ~40 ms but end-to-end it shrinks to ~12 ms, because PAS C already streams
+  the record into L1/L2 and walking 2 columns in L1 is nearly free. The gain
+  scales ~linearly with the number of skipped columns (~6 ms/skipped
+  column/1M rows): meaningful on wide schemas (e.g. `SUM` over an early
+  measure in a 30+ column table), ~0 on a 2-3 column table. The returned
+  value's semantics are unchanged in every case.
+
+### Verification gates
+
+- `sqltest`: **2251/2251** (0 errors; SUM/AVG/MIN/MAX + collision/general-path tests).
+- `crashtest`: **8/8 `SONUC: GECTI`** (no data loss/corruption after crash).
+
+---
+
 ## v0.013 — 2026-10-17 — KR-8: Agrega taramasında allocation-free pk-hash (decode-on-demand)
 
 ### Ne eklendi / değişti

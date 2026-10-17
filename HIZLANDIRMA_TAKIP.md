@@ -64,6 +64,12 @@ Bu doküman, VDB'nin SQLite hızına yaklaştırılması için yürütülen perf
   - *Yapılan (v0.013):* `VDbHashKey`'in FNV girdisi `UTF8(Norm(Table)+#0+Pk)`; `#0` ayırıcısı öneki Pk'dan ayırdığı için önek tohumu (`VDbHashKeyPrefix`) sorgu başına BİR KEZ hesaplanır, her satırda ham UTF-8 pk baytları tohuma katlanır (`VDbHashKeyBytes`). Yeni `VDbPeekRawRowKeyHash` pk stringi hiç kurmaz; `VdbAggRawCb` bunu kullanır. Sonuç `VDbHashKey` ile **bayt-bayt aynı** (`hashchk`: 80/80) → "bozukta bağır" sözleşmesi aynen korunur (KR-1B'nin cache-isabet ödününden farklı; hiçbir denetim atlanmaz). pk metni gereken yerde (`PkBuildPeekCb`) eski `VDbPeekRawRowP` durur.
   - *Sonuç:* `SUM(id)` 805→280 ms (~%65); aynı cb'yi paylaşan `COUNT(*)` doğrulama taraması 757→317 ms. `sqltest` 2251/2251, `crashtest` 8/8. *(Tamamlandı)*
 
+- [x] **Öneri KR-8c (HIZ): Agrega Peek'inde Erken Kolon-Durması (yalnız okunan kolon)**
+  - v0.013 sonrası peek alt-profili: SUM'un ~%40'ı peek; peek'in bir kısmı **okunmayan kuyruk kolonlarının dizin yürüyüşü**. `VdbAggRawCb` yalnız planların referans verdiği kolonları kullanır, ama `VDbPeekRawRowKeyHash` her satırda TÜM kolon dizinini çözüyordu.
+  - *Yapılan (v0.014):* `VDbPeekRawRowKeyHashTo(..., MaxCol, ...)` kolon dizinini yalnız `0..MaxCol` için çözer; `TryStreamAgg` `MaxCol = max(plans[j].Col)`'ü sorgu başına hesaplar (`COUNT(*)` → `MaxCol=-1`, hiç kolon çözülmez). `cc==ColCount` sema kontrolü + FNV pk↔anahtar denetimi + okunan kolonların (0..MaxCol) tam sinir doğrulaması **korunur**. Eski `VDbPeekRawRowKeyHash` (`MaxCol=ColCount-1`) sarmalayıcı olarak durur.
+  - *Gevşeme (kullanıcı onaylı, KR-1B COUNT ile aynı kategori):* agrega'nın OKUMADIĞI kuyruk kolonlarındaki dahili bozulma bu yolda yakalanmaz → satır genel yola düşüp hata vermek yerine sessizce toplanır; dönen **değer doğruluğu değişmez**.
+  - *Sonuç:* `MaxCol`'ün peek'a ulaştığı `-1`'e sabitleyip SUM'ın NULL dönmesiyle doğrulandı. 3 kolonlu tabloda `SUM(id)` 285→273 ms (~%4); yalıtık probe kuyruk-yürüyüşünü ~40 ms ölçse de PAS C kaydı L1/L2'ye taşıdığı için uçtan-uca ~12 ms'e iner. Kazanç atlanan kolonla ~doğrusal (~6 ms/kolon/1M satır) → geniş şemalarda (30+ kolon, erken ölçüde SUM) anlam kazanır. `sqltest` 2251/2251, `crashtest` 8/8. *(Tamamlandı)*
+
 ---
 
 ## Tamamlanan Aşama ve Güncel Süre Kayıtları
@@ -138,6 +144,18 @@ Bu doküman, VDB'nin SQLite hızına yaklaştırılması için yürütülen perf
   * Sonraki `COUNT(*)` (KR-1B cache isabeti): 0,01 ms (değişmedi, O(1)).
   * RAW I/O (77 MB): 11 ms (taban). Kalan ~269 ms = satır-başı kolon-dizini yürüyüşü + `Move` + ScanRawIter chunk makinesi (tahsis artık yok).
 * **Regresyon kapısı:** `sqltest` **2251/2251** (0 hata; SUM/AVG/MIN/MAX + çarpışma/genel-yol dahil); `crashtest` **8/8** `SONUC: GECTI`.
+
+### Adım KR-8c Sonrası Ölçümler (17.10.2026 - agrega peek'inde erken kolon-durması):
+* **Bağlam:** v0.013 sonrası peek alt-profili: SUM ~285 ms = FLOOR 131 (PAS A+B+C makinesi) + peek ~109 (kolon-dizini yürüyüşü + zorunlu FNV) + agreg aritmetiği. Peek'in `VdbAggRawCb`'nin OKUMADIĞI kuyruk kolonlarına giden kısmı atlanabilir mi?
+* **Yöntem:** `VDbPeekRawRowKeyHashTo(..., MaxCol, ...)`; `TryStreamAgg` `MaxCol = max(plans[j].Col)`. `cc==ColCount` + FNV + okunan kolon doğrulaması durur; yalnız `MaxCol+1..` yürünmez.
+* **Doğrulama:** `MaxCol := -1` sabitlendi → SUM NULL döndü (cb her değeri NULL sayar) → param peek'a ulaşıyor, erken-durma devrede.
+* **Hız (1M satır, 3 kolonlu tablo, sıcak + iç içe + 7 tur, `bench_profile.exe`):**
+  * `SUM(val)` (col2 → tam yürüyüş, `MaxCol=2`): 285 ms.
+  * `SUM(id)` (col0 → erken-dur, `MaxCol=0`): **273 ms** (−~12 ms, ≈%4).
+  * İlk `COUNT(*)` (`MaxCol=-1`, hiç kolon çözülmez): ~317 → ~294 ms.
+* **Dürüst not:** yalıtık peek-probe kuyruk-yürüyüşünü ~40 ms ölçtü; uçtan-uca ~12 ms'e iner (PAS C kaydı L1/L2'ye sıralı taşır, 2 kolonu L1'de yürümek bedava). Kazanç atlanan kolonla ~doğrusal (~6 ms/kolon/1M satır) → **geniş şemalarda** anlam kazanır, 2-3 kolonda ~0. Dönen değer semantiği her durumda aynı.
+* **Gevşeme (kullanıcı onaylı):** okunmayan kuyruk kolonundaki dahili bozulma bu yolda yakalanmaz (KR-1B COUNT ödününün SUM/AVG/MIN/MAX'e yayılmışı); **veri kaybı yok**, değer aynı.
+* **Regresyon kapısı:** `sqltest` **2251/2251**; `crashtest` **8/8** `SONUC: GECTI`.
 
 
 

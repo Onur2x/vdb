@@ -697,6 +697,17 @@ function VDbPeekRawRowP(B: PByte; Len, ColCount: Integer;
 function VDbPeekRawRowKeyHash(B: PByte; Len, ColCount: Integer;
   out TableId: Word; HashPrefix: QWord; out KeyHash: QWord;
   var FType: array of Byte; var FOff, FLen: array of Integer): Boolean;
+{ KR-8c (2026-10-17): VDbPeekRawRowKeyHash'in ERKEN KOLON-DURMALI hali.
+  Kolon dizini yalnizca 0..MaxCol icin cozulur; sonraki kolonlar yurunmez.
+  Cagri, FOff/FLen'in > MaxCol indekslerini kullanmamayi taahhut eder.
+  cc==ColCount sema kontrolu korunur. Aggregate'in OKUMADIGI kuyruk
+  kolonlarindaki dahili bozulma bu yoldan yakalanmaz (KR-1B COUNT ile ayni
+  kategoride, kullanici onayli gevseme); deger dogrulugu degismez. MaxCol<0
+  => hic kolon cozulmez (COUNT(*) tumu). }
+function VDbPeekRawRowKeyHashTo(B: PByte; Len, ColCount: Integer;
+  out TableId: Word; HashPrefix: QWord; out KeyHash: QWord;
+  MaxCol: Integer; var FType: array of Byte;
+  var FOff, FLen: array of Integer): Boolean;
 { P-12 (2026-10-16): Ham satir onizlemesi (aggregate stream taramasi).
   DecodeRow'un tam string materializasyonu yerine yalnizca tablo id + PK
   cozulur; alanlar ham OFSET/UZUNLUK/TIP olarak raporlanir (cozulmez).
@@ -2665,19 +2676,30 @@ begin
   Result := True;
 end;
 
-function VDbPeekRawRowKeyHash(B: PByte; Len, ColCount: Integer;
+function VDbPeekRawRowKeyHashTo(B: PByte; Len, ColCount: Integer;
   out TableId: Word; HashPrefix: QWord; out KeyHash: QWord;
-  var FType: array of Byte; var FOff, FLen: array of Integer): Boolean;
+  MaxCol: Integer; var FType: array of Byte;
+  var FOff, FLen: array of Integer): Boolean;
 { KR-8 (2026-10-17): VDbPeekRawRowP ile AYNI sinir kontrolleri; tek fark:
   pk string'ini (SetString + UTF8Decode) KURMAZ. pk UTF-8 baytlarinin
   chunk icindeki konumunu hatirlar; butun dogrulamalar gectiginde
   HashPrefix tohumunun uzerine o baytlari katip KeyHash'i uretir. Bu deger
   VDbHashKey(Table, Utf8Decode(pk)) ile gecerli UTF-8 icin birebir aynidir,
   cunku satirdaki pk baytlari = UTF8Encode(Pk). Dogrulama basarisizsa
-  (eski sema/kesik) Result=False ve KeyHash gecersizdir (cagri yok sayar). }
+  (eski sema/kesik) Result=False ve KeyHash gecersizdir (cagri yok sayar).
+  KR-8c (ERKEN KOLON-DURMASI): kolon dizini yalnizca 0..MaxCol icin cozulur;
+  MaxCol+1..ColCount-1 KOLONLARI YURUNMEZ. Cagri, bu indekslerdeki FOff/FLen
+  degerlerini KULLANMAMAYI taahhut eder (aggregate yalniz planlarinin
+  referans verdigi kolonlara bakar, hepsi <= MaxCol). cc==ColCount sema
+  kontrolu KORUNUR (eski sema yine False -> genel yol). Bu, KR-1B COUNT'un
+  kabul ettigi "okunmayan veriyi dogrulama" gevsemesinin ayni kategorisidir:
+  aggregate'in OKUMADIGI kuyruk kolonlarindaki dahili bir bozulma bu yoldan
+  yakalanmaz. Deger dogrulugu ETKILENMEZ. MaxCol<0 => hic kolon cozulmez
+  (COUNT(*) tumu: yalniz baslik + pk + cc kontrolu). }
 var
   p: Integer;
-  pkL, cc, i: Word;
+  pkL, cc: Word;
+  k: Integer;
   vl: LongInt;
   pkPtr: PByte;
 
@@ -2705,22 +2727,33 @@ begin
   Inc(p, pkL);
   if not RdU16(cc) then Exit;
   if Integer(cc) <> ColCount then Exit;
-  for i := 0 to cc - 1 do
+  if MaxCol > ColCount - 1 then MaxCol := ColCount - 1;
+  for k := 0 to MaxCol do          // erken dur: MaxCol son cozulen kolon
   begin
     if p >= Len then Exit;
-    FType[i] := B[p]; Inc(p);
+    FType[k] := B[p]; Inc(p);
     if not RdI32(vl) then Exit;
     if vl = -1 then
     begin
-      FOff[i] := -1; FLen[i] := 0;   // NULL: DecodeRow gibi ilerlemez
+      FOff[k] := -1; FLen[k] := 0;  // NULL: DecodeRow gibi ilerlemez
       Continue;
     end;
     if (vl < 0) or (p + vl > Len) then Exit;
-    FOff[i] := p; FLen[i] := vl;
+    FOff[k] := p; FLen[k] := vl;
     Inc(p, vl);
   end;
   KeyHash := VDbHashKeyBytes(HashPrefix, pkPtr, pkL);
   Result := True;
+end;
+
+function VDbPeekRawRowKeyHash(B: PByte; Len, ColCount: Integer;
+  out TableId: Word; HashPrefix: QWord; out KeyHash: QWord;
+  var FType: array of Byte; var FOff, FLen: array of Integer): Boolean;
+// Tum kolon dizinini cozer (MaxCol = ColCount-1). pk yalnizca carpisma
+// denetimi icin gereken hash'tir; metin lazimsa VDbPeekRawRowP kullanilir.
+begin
+  Result := VDbPeekRawRowKeyHashTo(B, Len, ColCount, TableId, HashPrefix,
+    KeyHash, ColCount - 1, FType, FOff, FLen);
 end;
 
 function VDbRowTagOf(const PlainValue: TBytes; ValueLen: Integer): Integer;
