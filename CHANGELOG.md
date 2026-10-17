@@ -9,6 +9,109 @@ akışını izler.
 
 ---
 
+## v0.013 — 2026-10-17 — KR-8: Agrega taramasında allocation-free pk-hash (decode-on-demand)
+
+### Ne eklendi / değişti
+
+- **KR-8 — `VDbPeekRawRowKeyHash` (VDbTable) + `VdbAggRawCb` (VDbExecutor):**
+  WHERE/GROUP BY'siz agregalarda (`SUM/AVG/MIN/MAX/COUNT`) satır-döngüsü
+  geri-cagrisi, doğrulanmış kaydı okurken pk'nın **metnini kurmuyordu ama
+  yine de çarpışma denetimi için kurmak zorundaydı**: `VDbPeekRawRowP` satır
+  başına `SetString` + `UTF8Decode` (2 heap tahsisi) yapıyor, ardından
+  `VDbHashKey(name, pk)` bir string birleştirme + `UTF8Encode` tahsisi daha
+  ekliyordu. 1M satırda bu ~3 tahsis + 2 UTF dönüşümü + `VDbNorm` çağrısı
+  satır başınaydı.
+- **Çözüm (birebir ayni sonuç, gevşetme YOK):** `VDbHashKey` UTF-8 baytları
+  üzerinde FNV çalıştırır: `UTF8Encode(Norm(Table)+#0+Pk)`. `#0` ayırıcısı
+  surrogat çifti sınırını kestiği için **önek, pk'dan bağımsızdır**:
+  `UTF8(Norm(Table)+#0+Pk) == UTF8(Norm(Table)+#0) ++ UTF8(Pk)`. Bu yüzden
+  tablo-önek tohumu `VDbHashKeyPrefix(Table)` **sorgu başına bir kez**
+  hesaplanır; her satırda satırdaki ham UTF-8 pk baytları (zaten
+  `UTF8Encode(Pk)`) tohumun üstüne `VDbHashKeyBytes` ile katlanır. Sonuç
+  `VDbHashKey(Table, Pk)` ile **bayt-bayt aynı QWord** — hiçbir string
+  kurulmaz. `pk` yalnızca çarpışma denetimi içindi; değeri gereken yerde
+  (`PkBuildPeekCb`, pk-indeks kurucusu) eski `VDbPeekRawRowP` aynen kullanılır.
+- **Aynı callback'i paylaşan yol da hızlandı:** KR-1B'nin (v0.012) doğrulamalı
+  `COUNT(*)` taraması aynı `VdbAggRawCb`'yi kullandığı için onun tek seferlik
+  doğrulaması da ~2,4× hızlandı (taramasız cache isabeti zaten O(1), değişmedi).
+- **Güvenlik:** hash DEĞERİ değişmediği için "veri bozuksa bağır" sözleşmesi
+  aynen korunur (v0.012'nin cache-isabet ödününden farklı — burada hiçbir
+  denetim atlanmaz). Yalnız geçersiz UTF-8 / eşlenmemiş surrogat gibi motorun
+  üretemeyeceği girdilerde davranış teorik olarak ayrışabilir; motor yoluyla
+  yazılan her pk geçerli UTF-8 round-trip yaptığından birebir aynıdır.
+  Çoklu platform; platforma özel kod yok.
+
+### Kanıt ve ölçüm
+
+- **Eşdeğerlik:** `hashchk` — 8 tablo adı × 10 pk (boş, gömülü `#0`, Unicode,
+  boşluklu, karışık büyük/küçük) = **80/80 birebir eşit**.
+- **Hız (1M satır, aynı DB, tek süreç, soğuk, `bench_profile.exe`):**
+
+| Ölçüm | Önce | Sonra | Fark |
+|---|---|---|---|
+| `SUM(id)` | 805 ms | **280 ms** | −%65 (~2,9×) |
+| İlk `COUNT(*)` (doğrulamalı tarama) | 757 ms | **317 ms** | −%58 (aynı cb) |
+| Sonraki `COUNT(*)` (cache, v0.012) | 0,01 ms | 0,01 ms | O(1) (değişmedi) |
+| RAW I/O (77 MB) | 11 ms | 11 ms | taban |
+
+### Doğrulama kapıları
+
+- `sqltest`: **2251/2251** (0 hata; SUM/AVG/MIN/MAX + çarpışma/genel-yol
+  testleri dahil).
+- `crashtest`: **8/8 `SONUC: GECTI`** (çökme sonrası veri kaybı/bozulma yok).
+
+---
+
+## v0.013 — 2026-10-17 — KR-8: allocation-free pk-hash in the aggregate scan (decode-on-demand) (ENGLISH)
+
+### Added / changed
+
+- **KR-8 — `VDbPeekRawRowKeyHash` (VDbTable) + `VdbAggRawCb` (VDbExecutor):** the
+  row-loop callback for WHERE/GROUP-BY-free aggregates (`SUM/AVG/MIN/MAX/COUNT`)
+  did not materialize the pk **value**, but still had to build it for the
+  collision check: `VDbPeekRawRowP` did a `SetString` + `UTF8Decode` (2 heap
+  allocations) per row, and `VDbHashKey(name, pk)` added one more string-concat +
+  `UTF8Encode` allocation. Over 1M rows that was ~3 allocations + 2 UTF
+  conversions + a `VDbNorm` call per row.
+- **Fix (byte-identical result, NO relaxation):** `VDbHashKey` runs FNV over
+  UTF-8 bytes `UTF8Encode(Norm(Table)+#0+Pk)`. The `#0` separator breaks any
+  surrogate-pair boundary, so the **prefix is independent of Pk**:
+  `UTF8(Norm(Table)+#0+Pk) == UTF8(Norm(Table)+#0) ++ UTF8(Pk)`. So the table
+  prefix seed `VDbHashKeyPrefix(Table)` is computed **once per query**; per row
+  the raw UTF-8 pk bytes (already `UTF8Encode(Pk)`) are folded onto the seed by
+  `VDbHashKeyBytes`. The result is the **byte-for-byte same QWord** as
+  `VDbHashKey(Table, Pk)` — no string is built. pk was only needed for the
+  collision check; where the pk text is genuinely needed (`PkBuildPeekCb`, the
+  pk-index builder) the old `VDbPeekRawRowP` is still used unchanged.
+- **Shared-callback path also sped up:** KR-1B's (v0.012) verified `COUNT(*)`
+  scan uses the same `VdbAggRawCb`, so its one-time verification also got ~2.4×
+  faster (the cache-hit O(1) path was already free and unchanged).
+- **Safety:** the hash VALUE is unchanged, so the "shout if data is corrupt"
+  contract is fully preserved (unlike v0.012's cache-hit trade-off — no check is
+  skipped here). Only inputs the engine cannot produce (invalid UTF-8 / lone
+  surrogates) could theoretically diverge; every engine-written pk round-trips
+  as valid UTF-8, so it is identical. Cross-platform; no platform-specific code.
+
+### Proof and measurement
+
+- **Equivalence:** `hashchk` — 8 table names × 10 pk values (empty, embedded
+  `#0`, Unicode, spaces, mixed case) = **80/80 byte-identical**.
+- **Speed (1M rows, same DB, single process, cold, `bench_profile.exe`):**
+
+| Measurement | Before | After | Delta |
+|---|---|---|---|
+| `SUM(id)` | 805 ms | **280 ms** | −65% (~2.9×) |
+| First `COUNT(*)` (verified scan) | 757 ms | **317 ms** | −58% (same callback) |
+| Subsequent `COUNT(*)` (cache, v0.012) | 0.01 ms | 0.01 ms | O(1) (unchanged) |
+| RAW I/O (77 MB) | 11 ms | 11 ms | floor |
+
+### Verification gates
+
+- `sqltest`: **2251/2251** (0 errors; SUM/AVG/MIN/MAX + collision/general-path tests).
+- `crashtest`: **8/8 `SONUC: GECTI`** (no data loss/corruption after crash).
+
+---
+
 ## v0.012 — 2026-10-17 — KR-1B: COUNT(*) doğrulanmış-sonuç önbelleği (COUNT O(1))
 
 ### Ne eklendi / değişti

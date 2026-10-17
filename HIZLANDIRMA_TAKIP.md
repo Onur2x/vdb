@@ -59,6 +59,11 @@ Bu doküman, VDB'nin SQLite hızına yaklaştırılması için yürütülen perf
   - Sunucu havuzunda ve çok iş parçacıklı okumalarda tek kilit (`TCriticalSection`) tüm okuyucuları tek sıraya sokuyordu.
   - *Yapılan:* `TVTableDb.FLock` nesnesi `TMultiReadExclusiveWriteSynchronizer` (MREW) mekanizmasına geçirildi; `BeginRead/EndRead` ve `BeginWrite/EndWrite` eklendi. `TVdbSqlServer` üzerindeki global `FLock` ve tek `Fsq` nesnesi kaldırılarak `TVdbServerConn` başına bağımsız `FSql: TVSql` tahsis edildi. Böylece paralel SELECT sorguları birbirini engellemeden eşzamanlı çalışabilmektedir. 2251/2251 test tam başarıyla geçti. *(Tamamlandı)*
 
+- [x] **Öneri KR-8 (HIZ): Agrega Taramasında Allocation-Free pk-Hash (decode-on-demand)**
+  - v0.012 KR-1B sonrası profil: `SELECT SUM` hâlâ ~720–800 ms. Değer zaten 8B binary'den `Move` ile okunuyordu (string yoktu); kalan maliyet, satır-döngüsü geri-cagrisinin **çarpışma denetimi için pk metnini kurması** idi: `VDbPeekRawRowP` satır başına `SetString` + `UTF8Decode` (2 tahsis), üstüne `VDbHashKey` bir string birleştirme + `UTF8Encode` daha ekliyordu.
+  - *Yapılan (v0.013):* `VDbHashKey`'in FNV girdisi `UTF8(Norm(Table)+#0+Pk)`; `#0` ayırıcısı öneki Pk'dan ayırdığı için önek tohumu (`VDbHashKeyPrefix`) sorgu başına BİR KEZ hesaplanır, her satırda ham UTF-8 pk baytları tohuma katlanır (`VDbHashKeyBytes`). Yeni `VDbPeekRawRowKeyHash` pk stringi hiç kurmaz; `VdbAggRawCb` bunu kullanır. Sonuç `VDbHashKey` ile **bayt-bayt aynı** (`hashchk`: 80/80) → "bozukta bağır" sözleşmesi aynen korunur (KR-1B'nin cache-isabet ödününden farklı; hiçbir denetim atlanmaz). pk metni gereken yerde (`PkBuildPeekCb`) eski `VDbPeekRawRowP` durur.
+  - *Sonuç:* `SUM(id)` 805→280 ms (~%65); aynı cb'yi paylaşan `COUNT(*)` doğrulama taraması 757→317 ms. `sqltest` 2251/2251, `crashtest` 8/8. *(Tamamlandı)*
+
 ---
 
 ## Tamamlanan Aşama ve Güncel Süre Kayıtları
@@ -123,6 +128,16 @@ Bu doküman, VDB'nin SQLite hızına yaklaştırılması için yürütülen perf
   * Sayı doğrulaması: cache isabetinde dahi `deger=1000000` (birebir).
 * **Tasarım notu:** sayı `FIndex`'ten türetilmez, doğrulamalı taramanın çıktısı önbelleğe alınır. Böylece reopen sonrası `FRowTagFunc` atanmadan önce FIndex etiketlerinin -1 kalması (`VDbCore.pas:1238`) sayımı yanlışlamaz — ilk COUNT dosyayı doğrulamalı tarayıp doğru sayıyı üretir.
 * **Regresyon kapısı:** `sqltest` **2251/2251** (0 hata; yeniden-başlatma sonrası `COUNT=3` dahil); `crashtest` **8/8** `SONUC: GECTI`.
+
+### Adım KR-8 Sonrası Ölçümler (17.10.2026 - allocation-free pk-hash, decode-on-demand):
+* **Bağlam:** KR-1B sonrası profil, agregalarda darboğazın değer değil, çarpışma denetimi için kurulan **pk string'i** olduğunu gösterdi (`VDbPeekRawRowP`: satır başına `SetString`+`UTF8Decode`, üstüne `VDbHashKey`'in string birleştirme + `UTF8Encode`'u).
+* **Eşdeğerlik kanıtı (`hashchk`):** `VDbHashKeyBytes(VDbHashKeyPrefix(T), pkUtf8, n)` == `VDbHashKey(T, Pk)` — 8 tablo × 10 pk (boş, gömülü `#0`, Unicode, boşluklu, karışık büyük/küçük) = **80/80 birebir**. Semantik gevşetme YOK (hash değeri aynı).
+* **Hız (1M satır, aynı DB, tek süreç, soğuk, `bench_profile.exe`):**
+  * `SUM(id)`: **805 ms → 280 ms** (~2,9×, −%65).
+  * İlk `COUNT(*)` (doğrulamalı tarama; aynı cb'yi paylaşır): **757 ms → 317 ms** (−%58).
+  * Sonraki `COUNT(*)` (KR-1B cache isabeti): 0,01 ms (değişmedi, O(1)).
+  * RAW I/O (77 MB): 11 ms (taban). Kalan ~269 ms = satır-başı kolon-dizini yürüyüşü + `Move` + ScanRawIter chunk makinesi (tahsis artık yok).
+* **Regresyon kapısı:** `sqltest` **2251/2251** (0 hata; SUM/AVG/MIN/MAX + çarpışma/genel-yol dahil); `crashtest` **8/8** `SONUC: GECTI`.
 
 
 

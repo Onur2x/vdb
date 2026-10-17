@@ -5554,6 +5554,7 @@ type
     ColCnt: Integer;
     TableId: Word;
     TableName: string;
+    PrefixSeed: QWord;   // KR-8: VDbHashKeyPrefix(td.Name) -- sorgu basi bir kez
   end;
 
 function VdbAggRawCb(Key: QWord; Buf: PByte; Len: Integer; User: Pointer): Boolean;
@@ -5563,7 +5564,7 @@ function VdbAggRawCb(Key: QWord; Buf: PByte; Len: Integer; User: Pointer): Boole
 var
   ctx: ^TAggIterCtx;
   tid: Word;
-  pk: string;
+  kh: QWord;               // KR-8: pk stringi KURULMAZ; yalniz hash hesaplanir
   j, c: Integer;
   iv: Int64;
   fv: Double;
@@ -5571,10 +5572,11 @@ var
 begin
   ctx := User;
   if Key = VDB_SCHEMA_KEY then Exit(True);
-  if not VDbPeekRawRowP(Buf, Len, ctx.ColCnt, tid, pk, ctx.FType, ctx.FOff, ctx.FLen) then
+  if not VDbPeekRawRowKeyHash(Buf, Len, ctx.ColCnt, tid, ctx.PrefixSeed, kh,
+                              ctx.FType, ctx.FOff, ctx.FLen) then
     Exit(False);   // eski sema / bozuk kayit -> genel yol (hata onda uretilir)
   if tid <> ctx.TableId then Exit(True);          // ScanRowsPart ile ayni kural
-  if VDbHashKey(ctx.TableName, pk) <> Key then
+  if kh <> Key then
     Exit(False);   // hash carpismasi: genel yol ayni kayitta NET HATA verir
   for j := 0 to High(ctx.Plans) do
   begin
@@ -5746,6 +5748,7 @@ begin
   ctx.ColCnt := colCnt;
   ctx.TableId := td.TableId;
   ctx.TableName := td.Name;
+  ctx.PrefixSeed := VDbHashKeyPrefix(td.Name);   // KR-8: satir basi pk stringi yerine tek tohum
   ctx.Ct := ct;
   ctx.FType := ftype; ctx.FOff := foff; ctx.FLen := flen;
   ctx.Plans := plans;

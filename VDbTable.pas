@@ -670,12 +670,32 @@ function VDbNormValue(Ctype: Byte; const S: string): string; }
 
 function VDbHashKey(const Table, Pk: string): QWord;
 function VDbNorm(const S: string): string;
+{ KR-8 (2026-10-17): VDbHashKey'in BOLUNEBILIR hali. VDbHashKey
+  UTF8Encode(Norm(Table)+#0+Pk) baytlari uzerinde FNV kosar. #0 ayirici
+  surrogat cifti sinirini kestigi icin on-ek, Pk baytlarindan bagimsizdir:
+    UTF8(Norm(Table)+#0+Pk) == UTF8(Norm(Table)+#0) ++ UTF8(Pk)
+  DOLAYISIYLA:
+    VDbHashKeyBytes(VDbHashKeyPrefix(T), pkUtf8, n)
+      == VDbHashKey(T, Utf8Decode(pkUtf8))   (gecerli UTF-8 icin birebir)
+  Amac: aggregate taramasinda pk string'ini (SetString + UTF8Decode) HIC
+  kurmadan, satirdaki ham UTF-8 pk baytlari uzerinde ayni hash'i uretmek. }
+function VDbHashKeyPrefix(const Table: string): QWord;
+function VDbHashKeyBytes(h: QWord; PkUtf8: PByte; PkLen: Integer): QWord;
 { P-18a (2026-10-16): VDbPeekRawRow'un PByte+Len surumu. ScanRawIter
   geri-cagrisinda kayit tamponu TBytes DEGIL, chunk icinde bir araliktir;
   yeni TBytes ayirmadan ayni sinir kontrolleriyle onizlenir. Semantigi
   VDbPeekRawRow ile birebir ayni (eski sema/kesik kayit -> False). }
 function VDbPeekRawRowP(B: PByte; Len, ColCount: Integer;
   out TableId: Word; out Pk: string;
+  var FType: array of Byte; var FOff, FLen: array of Integer): Boolean;
+{ KR-8 (2026-10-17): VDbPeekRawRowP ile AYNI sinir kontrolleri, ama pk
+  string'ini KURMAZ; bunun yerine oncelikle VDbHashKeyPrefix(Table) ile
+  hesaplanmis HashPrefix tohumunun uzerine satirdaki ham pk baytlarini
+  katip KeyHash'i dondurur. Birebir VDbHashKey(Table, Pk) degeri. pk
+  yalnizca carpisma denetimi icin gereken hash'tir; metin lazimsa
+  VDbPeekRawRowP kullanilmaya devam edilir (bkz. PkBuildPeekCb). }
+function VDbPeekRawRowKeyHash(B: PByte; Len, ColCount: Integer;
+  out TableId: Word; HashPrefix: QWord; out KeyHash: QWord;
   var FType: array of Byte; var FOff, FLen: array of Integer): Boolean;
 { P-12 (2026-10-16): Ham satir onizlemesi (aggregate stream taramasi).
   DecodeRow'un tam string materializasyonu yerine yalnizca tablo id + PK
@@ -855,6 +875,41 @@ begin
   for i := 1 to Length(s) do
   begin
     h := h xor Byte(s[i]);
+    h := h * QWord($100000001B3);
+  end;
+  if h = 0 then h := 1;
+  Result := h;
+end;
+
+function VDbHashKeyPrefix(const Table: string): QWord;
+// VDbHashKey'in tablo+ayirici kisimini katlamis tohum (Pk'siz). Cagri
+// sorgu kurulumunda BIR KEZ; ardindan her satirin pk baytlari ustune
+// VDbHashKeyBytes ile katlanir. Sabitler VDbHashKey ile birebir aynidir.
+var
+  pre: RawByteString;
+  h: QWord;
+  i: Integer;
+begin
+  pre := UTF8Encode(VDbNorm(Table) + #0);
+  h := QWord($CBF29CE484222325);
+  for i := 1 to Length(pre) do
+  begin
+    h := h xor Byte(pre[i]);
+    h := h * QWord($100000001B3);
+  end;
+  Result := h;   // h=0 -> 1 duzeltmesi PK katilmadan once YAPILMAZ
+end;
+
+function VDbHashKeyBytes(h: QWord; PkUtf8: PByte; PkLen: Integer): QWord;
+// VDbHashKeyPrefix tohumunun uzerine pk'nin UTF-8 baytlarini katlar ve
+// sifir kontrolunu uygular. Sonuc VDbHashKey(Table, Utf8Decode(pk)) ile
+// gecerli UTF-8 icin BIREBIR esittir (bkz. arayuz notu).
+var
+  i: Integer;
+begin
+  for i := 0 to PkLen - 1 do
+  begin
+    h := h xor PkUtf8[i];
     h := h * QWord($100000001B3);
   end;
   if h = 0 then h := 1;
@@ -2607,6 +2662,64 @@ begin
     FOff[i] := p; FLen[i] := vl;
     Inc(p, vl);
   end;
+  Result := True;
+end;
+
+function VDbPeekRawRowKeyHash(B: PByte; Len, ColCount: Integer;
+  out TableId: Word; HashPrefix: QWord; out KeyHash: QWord;
+  var FType: array of Byte; var FOff, FLen: array of Integer): Boolean;
+{ KR-8 (2026-10-17): VDbPeekRawRowP ile AYNI sinir kontrolleri; tek fark:
+  pk string'ini (SetString + UTF8Decode) KURMAZ. pk UTF-8 baytlarinin
+  chunk icindeki konumunu hatirlar; butun dogrulamalar gectiginde
+  HashPrefix tohumunun uzerine o baytlari katip KeyHash'i uretir. Bu deger
+  VDbHashKey(Table, Utf8Decode(pk)) ile gecerli UTF-8 icin birebir aynidir,
+  cunku satirdaki pk baytlari = UTF8Encode(Pk). Dogrulama basarisizsa
+  (eski sema/kesik) Result=False ve KeyHash gecersizdir (cagri yok sayar). }
+var
+  p: Integer;
+  pkL, cc, i: Word;
+  vl: LongInt;
+  pkPtr: PByte;
+
+  function RdU16(out V: Word): Boolean;
+  begin
+    Result := p + 2 <= Len;
+    if Result then begin V := B[p] or (Word(B[p + 1]) shl 8); Inc(p, 2); end;
+  end;
+
+  function RdI32(out V: LongInt): Boolean;
+  begin
+    Result := p + 4 <= Len;
+    if Result then begin Move(B[p], V, 4); Inc(p, 4); end;
+  end;
+
+begin
+  Result := False;
+  KeyHash := 0;
+  if (B = nil) or (Length(FType) < ColCount) then Exit;
+  p := 0;
+  if not RdU16(TableId) then Exit;
+  if not RdU16(pkL) then Exit;
+  if p + pkL > Len then Exit;
+  pkPtr := B + p;                 // pk UTF-8 baytlari: kopya YOK, string YOK
+  Inc(p, pkL);
+  if not RdU16(cc) then Exit;
+  if Integer(cc) <> ColCount then Exit;
+  for i := 0 to cc - 1 do
+  begin
+    if p >= Len then Exit;
+    FType[i] := B[p]; Inc(p);
+    if not RdI32(vl) then Exit;
+    if vl = -1 then
+    begin
+      FOff[i] := -1; FLen[i] := 0;   // NULL: DecodeRow gibi ilerlemez
+      Continue;
+    end;
+    if (vl < 0) or (p + vl > Len) then Exit;
+    FOff[i] := p; FLen[i] := vl;
+    Inc(p, vl);
+  end;
+  KeyHash := VDbHashKeyBytes(HashPrefix, pkPtr, pkL);
   Result := True;
 end;
 
