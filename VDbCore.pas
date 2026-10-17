@@ -156,6 +156,14 @@ FPath: string;
       davranisi geregi her tablo taramasinda elenmez. }
     FTableKeys: TDictionary<Integer, TList<QWord>>;
     FTableKeysDirty: Boolean;
+    { KR-1B: COUNT(*) O(1) sonucu ONEMLI: bu sozluk FIndex'ten DEGIL, dogrulanmis
+      bir COUNT taramasinin (stream-agg) sonucundan beslenir -- boylece recover/
+      reopen sonrasi FIndex kayitlarinin etiketsiz (-1) kalmasi sayimi etkilemez.
+      Herhangi bir yazma (AppendRec/recover/restore) TUM cache'i gecerli kilmadiyi
+      siler (Clear). Okuma-agirlikli ise tablo-bazinda O(1); yazma sonrasi ilk
+      COUNT yeniden sayar. Yalniz autocommit'te kullanilir (acik batch gorunurlugu
+      cache'e yansimaz). }
+    FTableRowCount: TDictionary<Integer, Int64>;
     { R-26: satir bicimi cozucusu. VDbTable olustururken atar; nil ise
       (ham KV kullanimi) tablo id'leri -1 kalir ve filtre uygulanmaz. }
     FRowTagFunc: TVDbRowTagFunc;
@@ -345,6 +353,16 @@ private
     procedure AbortBatch; // NOT: tablo indexleri onarilmaz, TVTableDb.AbortBatch kullan
     procedure Flush;
     function Count: Integer;
+    { KR-1B: COUNT(*) O(1). Tablonun daha once DOGRULANMIS canli satir sayisi
+      cache'te duruyorsa True+deger dondurur; cache yoksa/gecersizse False
+      (cagiran dogrulamali taramayi yapip SetTableRowCount ile doldurur).
+      CAGIRAN SARTI: autocommit olmali (acik batch gorunurlugu cache'e
+      yansimaz). Cache her yazmada Clear edilir; boylece tek bir gecersiz
+      deger bile kalmaz. }
+    function TryGetTableRowCount(TableId: Integer; out Value: Int64): Boolean;
+    { KR-1B: dogrulanmis COUNT degerini cache'e yazar (autocommit'ten emin
+      cagiran tarafi). Coksayili COUNT(*) ayni degeri yazar -- zararsiz. }
+    procedure SetTableRowCount(TableId: Integer; Value: Int64);
     function GetAllKeys: TQWordArray;
     { R-26: TableFilter >= 0 ise yalnizca o tabloya ait satirlar okunur;
       diger tablolarin kayitlari DOSYADAN OKUNMAZ (gorev oncesi
@@ -582,6 +600,7 @@ begin
   FIndex := TDictionary<QWord, TDbLoc>.Create;
   FTableKeys := TDictionary<Integer, TList<QWord>>.Create;
   FTableKeysDirty := True;
+  FTableRowCount := TDictionary<Integer, Int64>.Create;
   FPending := TList<TPendOp>.Create;
   FPendingPuts := TDictionary<QWord, Byte>.Create;
   FPendingDels := TDictionary<QWord, Byte>.Create;
@@ -618,6 +637,7 @@ begin
   FIndex.Free;
   ClearTableKeys;
   FTableKeys.Free;
+  FTableRowCount.Free;
   FLock.Free;
   { 2026-10-05 Adim 12: anahtar kalintisi birakma }
   if FEncKey <> nil then
@@ -1073,6 +1093,7 @@ begin
   // KR-1: FIndex degisti -> tablo anahtar dizini bir sonraki filtreli
   // taramada FIndex'ten yeniden kurulacak (yazma yoluna ek maliyet yok).
   FTableKeysDirty := True;
+  FTableRowCount.Clear;   // KR-1B: her yazma COUNT cache'ini gecersiz kilar
   { 2026-10-05 Adim 12: sifreli ara tampon ClearEnc; ham sifreli baytlar
     bellekte kalmasin. Try-finally ile dosyalara dokunmadan temizlenir. }
   if (stored <> nil) and (Length(stored) > 0) and (Length(FEncKey) = VDB_KEY_LEN) then
@@ -1169,12 +1190,14 @@ var
       end;
     end;
     FTableKeysDirty := True;   // KR-1: kurtarma sirasinda FIndex degisti
+    FTableRowCount.Clear;
     pendN := 0;
   end;
 
 begin
   FIndex.Clear;
   FTableKeysDirty := True;   // KR-1: index tamamen sifirlandi
+  FTableRowCount.Clear;
   FSeq := 0;
   FDeadBytes := 0;
   fsize := FS.Size;
@@ -1896,10 +1919,36 @@ end;
     end;
   end;
 
+  function TVDb.TryGetTableRowCount(TableId: Integer; out Value: Int64): Boolean;
+  // KR-1B: dogrulanmis COUNT cache'ini oku. Kilit altinda (yazicilarla tutarli).
+  // Cache yoksa False -> cagiran dogrulamali taramayi yapar, sonra doldurur.
+  begin
+    FLock.Enter;
+    try
+      Result := FTableRowCount.TryGetValue(TableId, Value);
+    finally
+      FLock.Leave;
+    end;
+  end;
+
+  procedure TVDb.SetTableRowCount(TableId: Integer; Value: Int64);
+  // KR-1B: dogrulanmis COUNT degerini cache'e yazar. Cagiran yurutucu autocommit
+  // oldugundan emindir; Value bir onceki DOGRULAMALI taramanin (stream-agg)
+  // sonucudur -- bu yuzden etiket/reopen kaynakli -1 sorunu sayimi etkilemez.
+  begin
+    FLock.Enter;
+    try
+      FTableRowCount.AddOrSetValue(TableId, Value);
+    finally
+      FLock.Leave;
+    end;
+  end;
+
   procedure TVDb.SetRowTagFunc(AValue: TVDbRowTagFunc);
   begin
     FRowTagFunc := AValue;
     FTableKeysDirty := True;   // dizin yeni etiketleyiciyle yeniden kurulmali
+    FTableRowCount.Clear;
   end;
 
   procedure TVDb.ScanSnapshot(out Keys: TQWordArray; out Vals: TValArray;
@@ -2734,6 +2783,7 @@ begin
     for pair in sp.IndexSnapshot do
       FIndex.Add(pair.Key, pair.Value);
     FTableKeysDirty := True;   // KR-1: index restore edildi
+    FTableRowCount.Clear;
     // 3. State restore
     FSeq := sp.Seq;
     FDirty := sp.Dirty;

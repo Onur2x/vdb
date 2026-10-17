@@ -38,6 +38,12 @@ Bu doküman, VDB'nin SQLite hızına yaklaştırılması için yürütülen perf
   - `VDbTable.pas` içindeki `ScanRowsPart` tüm veritabanındaki tüm anahtarları tarayıp tablo id'sini sonradan eliyordu (R-26 yalnızca diğer tabloların KAYITLARINI okumayı önlüyordu; anahtar dolasimi hâlâ O(toplam) idi).
   - *Yapılan:* KV çekirdeğine (`VDbCore.pas`) tablo başına anahtar dizini eklendi: `FTableKeys: TDictionary<Integer, TList<QWord>>` (anahtar `-1` = etiketsiz kayıtlar/sema kaydı; R-26 gibi hiçbir filtrede elenmez). Dizin **türev önbellektir**: tek kaynağı `FIndex`'tir, asla bağımsız güncellenmez; `FIndex` her değiştiğinde (Put/Delete/CommitBatch/Kurtarma/Savepoint geri alma) yalnızca bir `Dirty` bayrağı kurulur. Filtreli bir tarama (`ScanSnapshot` ve `ScanRawIterAll`) bayrak kirliyse dizini `FIndex`'ten BİR KEZ (O(N)) yeniden kurar ve ardından **yalnızca hedef tablonun** anahtarlarını dolasir. Böylece **yazma yoluna sıfır ek maliyet** eklenir (bkz. mikro-ölçüm).
 
+- [x] **Öneri KR-1B (HIZ): `SELECT COUNT(*)` O(1) — Doğrulanmış-Sonuç Önbelleği**
+  - KR-1 ile hedef tablo anahtarları daralmıştı, ama `SELECT COUNT(*)` hâlâ o tablonun **tüm** kayıtlarını akışla (stream-agg) tarayıp sayıyordu (1M'de ~683 ms). Amaç: WHERE/JOIN/GROUP BY olmadan tekrarlı `COUNT(*)`'ı taramasız, O(1) yapmak.
+  - *Yapılan (v0.012):* `VDbCore`'a doğrulanmış COUNT sonuçlarını tutan `FTableRowCount: TDictionary<Integer,Int64>` eklendi. `TVSqlExecutor.TryStreamAgg`, **tüm** seçme kolonları `COUNT(*)` olan tek-tablo sorgusunda ve **autocommit**'te önce bu cache'i dener; isabetse O(1) döner, isabetsse doğrulamalı stream-agg ile sayar ve sonucu cache'ler. Sayı **indeksten türetilmez**, doğrulamalı taramadan gelir → v0.005'te reddedilen "index-only COUNT" tuzağına düşmez. Her yazma (`AppendRec`/`Recover`/savepoint/etiket-değişimi) cache'i tamamen `Clear` eder; açık transaction'da (MVCC görünürlüğü cache'e yansımadığı için) cache kullanılmaz.
+  - *Bilinçli ödün (kullanıcı onaylı):* dışarıdan bozulmuş/hash-çarpışmalı (desteklenmeyen) DB'de isabet, "bozukta bağır" yerine önbelleği döndürebilir; sağlam DB'de her yazmada sıfırlandığı için birebir doğrudur.
+  - *Sonuç:* ilk COUNT ~757 ms (aynı doğrulama), sonraki COUNT **~0,01 ms**. `sqltest` 2251/2251, `crashtest` 8/8 yeşil. *(Tamamlandı)*
+
 - [x] **Öneri KR-2 (KRİTİK): Geometrik Bellek Büyümesi (O(N²) SetLength Diyetine Son)**
   - FPC dinamik dizilerinde `SetLength(arr, n+1)` her seferinde tüm diziyi baştan kopyaladığı için `O(N²)` maliyet üretir.
   - *Yapılan:* `ScanSnapshot`, `ScanRowsPart`, `ScanViewRows`, `NarrowRows` ve `ExecGroupBy` içerisinde ön-tahsis ve toplu budama uygulandı. 2251/2251 test tam başarıyla geçti. *(Tamamlandı)*
@@ -107,6 +113,16 @@ Bu doküman, VDB'nin SQLite hızına yaklaştırılması için yürütülen perf
   * **Doğruluk:** her iki sürümde de aynı sonuç (`chk=16000800000`, satır=20.000). Fark yok.
 * **Tek tablolu kıyas (speedtest.exe):** KR-1 öncesi/sonrası ile aynı mertebede (ör. Range BETWEEN 0,355 sn / SELECT PK 0,057 sn); **tek tablolu iş yükünde regresyon yok.**
 * **Regresyon kapısı:** `sqltest` 2251/2251 geçti; `crashtest` 8/8 `SONUC: GECTI` (veri kaybı/bozulma yok).
+
+### Adım KR-1B Sonrası Ölçümler (17.10.2026 - `SELECT COUNT(*)` O(1) önbelleği):
+* **Ayrıştırmalı profil (1M satır, tek süreç, aynı DB, `bench_profile.exe`):**
+  * İlk `COUNT(*)` (cache boş): **757 ms** — doğrulamalı stream-agg; cache'i doldurur (tarama maliyeti KR-1B öncesiyle aynı).
+  * Sonraki `COUNT(*)` (arada yazma yok): **0,01 ms** — O(1) cache isabeti.
+  * `COUNT(*) x10` toplam: **758 ms** (757 doğrulama + 9 × ~0). v0.011 tabanı (önbelleksiz) x10 ≈ 698–713 ms; kazanç **tekrar başına** tam taramanın kalkması.
+  * `SUM(id)`: 805 ms — cache kullanmaz, değişmedi (beklenen).
+  * Sayı doğrulaması: cache isabetinde dahi `deger=1000000` (birebir).
+* **Tasarım notu:** sayı `FIndex`'ten türetilmez, doğrulamalı taramanın çıktısı önbelleğe alınır. Böylece reopen sonrası `FRowTagFunc` atanmadan önce FIndex etiketlerinin -1 kalması (`VDbCore.pas:1238`) sayımı yanlışlamaz — ilk COUNT dosyayı doğrulamalı tarayıp doğru sayıyı üretir.
+* **Regresyon kapısı:** `sqltest` **2251/2251** (0 hata; yeniden-başlatma sonrası `COUNT=3` dahil); `crashtest` **8/8** `SONUC: GECTI`.
 
 
 

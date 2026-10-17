@@ -9,6 +9,125 @@ akışını izler.
 
 ---
 
+## v0.012 — 2026-10-17 — KR-1B: COUNT(*) doğrulanmış-sonuç önbelleği (COUNT O(1))
+
+### Ne eklendi / değişti
+
+- **KR-1B — `SELECT COUNT(*)` O(1) (VDbCore + VDbExecutor):** WHERE / JOIN /
+  GROUP BY / HAVING / DISTINCT / ORDER / LIMIT / AS OF / RLS / view **olmayan**
+  ve **tüm** seçme kolonları `COUNT(*)` olan tek-tablo sorgusunda artık tarama
+  YAPILMAZ. Motor, o tablo için daha önce **doğrulanmış** bir COUNT sonucunu
+  bellek-içi sözlükte (`FTableRowCount`: tablo id → satır sayısı) tutar ve o
+  zamandan beri **hiç yazma olmadıysa** onu O(1) döndürür.
+- **v0.005'teki reddedenle FARK (bilinçli, kullanıcı onaylı):** v0.005'te
+  "yalnız indeks sayacı" reddedilmişti — bozuk veride sessizce sayar, "veri
+  bozuksa bağır" sözleşmesini bozardı. KR-1B sayıyı indeksten **türetmez**:
+  ilk COUNT mevcut **doğrulamalı** akışla (stream-agg; satır satır pk-hash /
+  görünürlük / dosya-başı denetimi) hesaplanır ve **yalnız ondan sonra**
+  cache'e yazılır. Cache isabeti, o doğrulamadan beri yazma olmadığında
+  geçerlidir.
+- **Geçerlilik (pazarlık dışı):** her yazma yolu — `AppendRec` (Put / Delete /
+  CommitBatch), `Recover` (reopen), savepoint geri alma, satır-etiketi değişimi
+  — cache'i **tamamen** `Clear` eder; tek bir bayat değer kalmaz. Önbellek
+  **yalnız autocommit**'te kullanılır: açık transaction'da bekleyen
+  INSERT/DELETE görünürlüğü cache'e yansımadığı için sorgu doğrulamalı taramaya
+  düşer.
+- **Kilit / concurrency:** `TryGetTableRowCount` ve `SetTableRowCount` mevcut
+  `FLock` altındadır. Cache'i **değiştiren** noktalar `FIndex`'in değiştiği
+  noktalarla birebir aynı olduğundan, önbellek `FIndex`'in kilit korumasını
+  aynen devralır (yeni bir yarış sınıfı eklenmez). Çoklu platform; platforma
+  özel kod yok.
+
+### Ölçülmüş sonuç (1M satır, tek süreç, aynı DB)
+
+| Durum | Önce (COUNT her çağrıda doğrulamalı tarar) | Sonra (KR-1B) |
+|---|---|---|
+| İlk `COUNT(*)` (cache boş) | ~683–757 ms (doğrulama) | ~757 ms — **aynı doğrulama** + cache'i doldurur |
+| Sonraki `COUNT(*)` (arada yazma yok) | tam yeniden-tarama | **~0,01 ms (O(1))** |
+| `COUNT(*) x10` toplam | 698–713 ms (v0.011 tabanı) | **758 ms** (757 doğrulama + 9 × ~0) |
+| `SUM(id)` | ~720 ms | ~720 ms (değişmedi — cache kullanmaz) |
+
+Kazanç **tekrar başınadır**: doğrulanmış durumdayken sorulan her ek `COUNT(*)`
+bir tam taramadan (~70 ms sıcak) ~0'a iner; tek seferlik soğuk COUNT aynı
+doğrulamayı bir kez yapar. Sayı cache isabetinde de birebir: `deger=1000000`.
+
+### Doğrulama kapıları
+
+- `sqltest`: **2251/2251** (0 hata) — yeniden-başlatma sonrası `COUNT=3` testi
+  dahil (açılışta `FRowTagFunc` henüz atanmadığı için FIndex etiketleri -1
+  kalır; cache-model bu -1 kaynaklı sayım tuzağına düşmez çünkü sayı
+  doğrulamalı taramadan gelir).
+- `crashtest`: **8/8 `SONUC: GECTI`** (çökme sonrası veri kaybı/bozulma yok).
+
+### Bilinçli ödün (kullanıcı onaylı)
+
+Motor-dışı (dışarıdan) bozulmuş ya da hash-çarpışmalı bir DB'de, cache isabeti
+taramayı atladığı için "bozukta bağır" yerine önbellekteki değeri döndürebilir.
+Bu yalnız **desteklenmeyen** bozuk-DB durumunda mümkündür; motorun kendi
+yazdığı sağlam DB'de cache her yazmada sıfırlandığından birebir doğrudur ve
+ilk COUNT daima doğrulamalıdır.
+
+---
+
+## v0.012 — 2026-10-17 — KR-1B: verified-result cache for COUNT(*) (COUNT O(1)) (ENGLISH)
+
+### Added / changed
+
+- **KR-1B — `SELECT COUNT(*)` O(1) (VDbCore + VDbExecutor):** for a single-table
+  query with **no** WHERE / JOIN / GROUP BY / HAVING / DISTINCT / ORDER / LIMIT /
+  AS OF / RLS / view and where **every** select column is `COUNT(*)`, no scan is
+  performed. The engine keeps the last **verified** COUNT for that table in an
+  in-memory map (`FTableRowCount`: table id → row count) and returns it in O(1)
+  when **no write has happened since**.
+- **Difference from the v0.005 rejection (deliberate, user-approved):** v0.005
+  rejected an "index-only counter" because it silently counts on corrupt data,
+  breaking the "shout if data is corrupt" contract. KR-1B does **not** derive the
+  number from the index: the first COUNT is computed by the existing **verified**
+  path (stream-agg with per-row pk-hash / visibility / header checks) and is
+  cached **only then**. A cache hit is valid only while nothing has been written
+  since that verification.
+- **Validity (non-negotiable):** every write path — `AppendRec` (Put / Delete /
+  CommitBatch), `Recover` (reopen), savepoint restore, row-tag change — fully
+  `Clear`s the cache, so not a single stale value can survive. The cache is used
+  **only under autocommit**: pending INSERT/DELETE visibility inside an open
+  transaction is not reflected in the cache, so the query falls back to the
+  verified scan.
+- **Locking / concurrency:** `TryGetTableRowCount` and `SetTableRowCount` run
+  under the existing `FLock`. The points that **mutate** the cache are exactly the
+  points where `FIndex` changes, so the cache inherits `FIndex`'s lock protection
+  (no new race class is introduced). Cross-platform; no platform-specific code.
+
+### Measured result (1M rows, single process, same DB)
+
+| Case | Before (COUNT re-scans each call) | After (KR-1B) |
+|---|---|---|
+| First `COUNT(*)` (cold cache) | ~683–757 ms (verification) | ~757 ms — **same verification** + fills the cache |
+| Subsequent `COUNT(*)` (no write between) | full re-scan | **~0.01 ms (O(1))** |
+| `COUNT(*) x10` total | 698–713 ms (v0.011 baseline) | **758 ms** (757 verification + 9 × ~0) |
+| `SUM(id)` | ~720 ms | ~720 ms (unchanged — does not use the cache) |
+
+The win is **per repeated query**: while in a verified state, each extra
+`COUNT(*)` drops from a full scan (~70 ms warm) to ~0; a single cold COUNT still
+pays the one-time verification. The value on a cache hit is identical: `deger=1000000`.
+
+### Verification gates
+
+- `sqltest`: **2251/2251** (0 errors) — including the "COUNT=3 after restart" test
+  (on open, `FRowTagFunc` is not yet assigned so FIndex tags stay -1; the
+  cache-model avoids this -1 counting trap because the number comes from the
+  verified scan).
+- `crashtest`: **8/8 `SONUC: GECTI`** (no data loss/corruption after crash).
+
+### Deliberate trade-off (user-approved)
+
+On an out-of-band (external) corrupted or hash-collided DB, a cache hit skips the
+scan and may return the cached value instead of "shouting on corruption". This is
+only possible in the **unsupported** corrupt-DB case; for a healthy DB the engine
+writes through, the cache is cleared on every write so it is always exact, and the
+first COUNT is always verified.
+
+---
+
 ## v0.011 — 2026-10-16 — Hız turu: P-21 COMMIT toplu yazım tamponu
 
 ### Ne eklendi / değişti

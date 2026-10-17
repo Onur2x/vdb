@@ -5656,6 +5656,8 @@ var
   ctx: TAggIterCtx;
   fn: TSqlFuncCallNode;
   cr: TSqlColumnRefNode;
+  useCounter, allStar: Boolean;   // KR-1B
+  ncnt: Int64;                     // KR-1B
 begin
   Result := False;
   { --- 1) Sorgu sekli korumasi: yalnizca saf, tek tablo, tek grup --- }
@@ -5706,6 +5708,33 @@ begin
       Exit;      // BOOL/metin karsilastirma semantigi genel yolda farkli
   end;
 
+  { --- KR-1B: Saf COUNT(*) (TUM secim kolonlari yildiz) + autocommit ise
+        taramayi HIC yapmadan motorun bellek-ici canli satir sayacindan O(1)
+        yanit ver. Acik batch'te bekleyen INSERT/DELETE gorunurlugu sayaca
+        yansimadigi icin akiskan taramaya dus; karisik agregada (COUNT(k),
+        SUM...) da akiskan tarama gerekir. Sonuc kurulumu asagida BIREBIR
+        ayni kod oldugu icin alan adi/deger bicimi degismez. --- }
+  useCounter := False;
+  allStar := False;
+  if not FT.Kv.InBatch then
+  begin
+    allStar := True;
+    for j := 0 to High(plans) do
+      if plans[j].Col <> -1 then
+      begin
+        allStar := False;
+        Break;
+      end;
+    if allStar and FT.Kv.TryGetTableRowCount(td.TableId, ncnt) then
+    begin
+      for j := 0 to High(plans) do
+        plans[j].Cnt := ncnt;
+      useCounter := True;
+    end;
+  end;
+
+  if not useCounter then
+  begin
   { --- 2) Ham akis: ScanRows'un okudugu AYNI kayit kumesi; alanlar
         cozulmez, ofset/uzunluk uzerinden okunur (string alloc YOK). --- }
   colCnt := Length(td.Cols);
@@ -5722,6 +5751,11 @@ begin
   ctx.Plans := plans;
   if not FT.Kv.ScanRawIterAll(td.TableId, VdbAggRawCb, @ctx) then
     Exit;
+  { KR-1B: saf COUNT(*) (allStar => autocommit) dogrulamali tarayarak sayildi;
+    sonucu cache'e yaz -> sonraki ayni COUNT taramasiz O(1) doner. }
+  if allStar then
+    FT.Kv.SetTableRowCount(td.TableId, plans[0].Cnt);
+  end;
 
   { --- 3) Sonuc: ExecGroupBy'nin alan adi / deger bicimi kurallari BIREBIR --- }
   SetLength(Res.Fields, Stmt.Columns.Count);
