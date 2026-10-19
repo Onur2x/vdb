@@ -10821,6 +10821,83 @@ var
       end;
   end;
 
+  function CopyDataText: string;
+  var
+    k: Integer;
+  begin
+    Result := '';
+    if msgs = nil then Exit;
+    for k := 0 to msgs.Count - 1 do
+      if (msgs[k] <> '') and (msgs[k][1] = 'd') then
+        Result := Result + TPgBody(msgs[k]);
+  end;
+
+  function CopyIn(const Sql, Data: string): Boolean;
+  var
+    st: AnsiString;
+    t: AnsiChar;
+    bb: AnsiString;
+    tmp: TStringList;
+  begin
+    Result := False;
+    FreeAndNil(msgs);
+    st := 'Q' + TPgI32(Length(Sql) + 1 + 4) + Sql + #0;
+    if not TPgSend(s, st) then Exit;
+    while True do
+    begin
+      if not TPgRecvMsg(s, t, bb) then Exit;
+      if t = 'E' then
+      begin
+        msgs := TStringList.Create;
+        msgs.Add(t + '|' + bb);
+        while TPgRecvMsg(s, t, bb) do
+        begin
+          msgs.Add(t + '|' + bb);
+          if t = 'Z' then Break;
+        end;
+        Exit(False);
+      end;
+      if t = 'G' then Break;
+    end;
+    if Data <> '' then
+      if not TPgSend(s, 'd' + TPgI32(Length(Data) + 4) + Data) then Exit;
+    if not TPgSend(s, 'c' + TPgI32(4)) then Exit;
+    Result := TPgReadUntilReady(s, tmp);
+    msgs := tmp;
+  end;
+
+  function CopyFail(const Sql, Msg: string): Boolean;
+  var
+    st: AnsiString;
+    t: AnsiChar;
+    bb: AnsiString;
+    tmp: TStringList;
+  begin
+    Result := False;
+    FreeAndNil(msgs);
+    st := 'Q' + TPgI32(Length(Sql) + 1 + 4) + Sql + #0;
+    if not TPgSend(s, st) then Exit;
+    while True do
+    begin
+      if not TPgRecvMsg(s, t, bb) then Exit;
+      if t = 'E' then
+      begin
+        msgs := TStringList.Create;
+        msgs.Add(t + '|' + bb);
+        while TPgRecvMsg(s, t, bb) do
+        begin
+          msgs.Add(t + '|' + bb);
+          if t = 'Z' then Break;
+        end;
+        Exit(False);
+      end;
+      if t = 'G' then Break;
+    end;
+    if not TPgSend(s, 'f' + TPgI32(Length(Msg) + 1 + 4) + Msg + #0) then Exit;
+    Result := TPgReadUntilReady(s, tmp);
+    msgs := tmp;
+  end;
+
 begin
   Grp('M1 PostgreSQL wire protocol (basit sorgu)');
   ForceDirectories(D + '\pgsrv');
@@ -10866,6 +10943,58 @@ begin
     Dogrula('pg UPDATE tag UPDATE 1', FindTag('UPDATE 1'), '');
     Dogrula('pg DELETE calisti', Query('DELETE FROM pg_t WHERE id=1'), '');
     Dogrula('pg DELETE tag DELETE 1', FindTag('DELETE 1'), '');
+
+    // ---- COPY FROM STDIN / TO STDOUT (basit sorgu) ----
+    Dogrula('pg COPY tablo DDL', Query(
+      'CREATE TABLE pg_copy(id INTEGER PRIMARY KEY, s TEXT)'), '');
+    Dogrula('pg COPY FROM STDIN',
+      CopyIn('COPY pg_copy FROM STDIN WITH (FORMAT csv)',
+        '1,aa'#10'2,bb'#10), '');
+    Dogrula('pg COPY FROM tag COPY 2', FindTag('COPY 2'), '');
+    Dogrula('pg COPY FROM sonrasi SELECT',
+      Query('SELECT id,s FROM pg_copy ORDER BY id'), '');
+    row := RowAt(0);
+    Dogrula('pg COPY ilk satir 1/aa',
+      (Length(row) = 2) and (row[0] = '1') and (row[1] = 'aa'), '');
+    row := RowAt(1);
+    Dogrula('pg COPY ikinci satir 2/bb',
+      (Length(row) = 2) and (row[0] = '2') and (row[1] = 'bb'), '');
+
+    Dogrula('pg COPY HEADER + DELIMITER',
+      CopyIn('COPY pg_copy (id, s) FROM STDIN WITH ' +
+        '(FORMAT csv, HEADER, DELIMITER '';'')',
+        'id;s'#10'3;cc'#10'4;dd'#10), '');
+    Dogrula('pg COPY HEADER tag COPY 2', FindTag('COPY 2'), '');
+
+    Dogrula('pg COPY Fail yanitladi',
+      CopyFail('COPY pg_copy FROM STDIN WITH (FORMAT csv)', 'istemci iptali'),
+      '');
+    Dogrula('pg COPY Fail ErrorResponse dolu', ErrText <> '',
+      Copy(ErrText, 1, 40));
+    Dogrula('pg COPY Fail sonrasi SELECT',
+      Query('SELECT COUNT(*) FROM pg_copy'), '');
+    row := RowAt(0);
+    Dogrula('pg COPY Fail atomik (4 satir)',
+      (Length(row) = 1) and (row[0] = '4'), '');
+
+    Dogrula('pg COPY TO STDOUT',
+      Query('COPY pg_copy TO STDOUT WITH (FORMAT csv, HEADER)'), '');
+    Dogrula('pg COPY TO akis tipi H',
+      Pos('H', TypeSeq) > 0, TypeSeq);
+    Dogrula('pg COPY TO tag COPY 4', FindTag('COPY 4'), '');
+    Dogrula('pg COPY TO CSV icerik',
+      (Pos('id,s'#10, CopyDataText) = 1) and
+      (Pos('1,aa'#10, CopyDataText) > 0) and
+      (Pos('2,bb'#10, CopyDataText) > 0) and
+      (Pos('3,cc'#10, CopyDataText) > 0) and
+      (Pos('4,dd'#10, CopyDataText) > 0),
+      StringReplace(CopyDataText, #10, '\n', [rfReplaceAll]));
+
+    Dogrula('pg COPY TO text varsayilan',
+      Query('COPY pg_copy (id, s) TO STDOUT'), '');
+    Dogrula('pg COPY TO text icerik',
+      Pos('1'#9'aa'#10, CopyDataText) > 0,
+      StringReplace(CopyDataText, #10, '\n', [rfReplaceAll]));
 
     // ---- Extended query protocol (parametresiz) ----
     FreeAndNil(msgs);

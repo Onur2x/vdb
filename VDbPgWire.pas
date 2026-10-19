@@ -23,9 +23,13 @@ unit VDbPgWire;
     - ErrorResponse + ReadyForQuery; hata sonrasi Sync'e kadar mesajlar
       yutulur (PostgreSQL semantigi).
     - 'X' Terminate
+    - COPY ... FROM STDIN / COPY ... TO STDOUT (basit sorgu; CSV/TEXT).
+      FROM akisi gecici dosyaya yazilip mevcut COPY motoruna devredilir;
+      TO akisi SELECT sonucundan CSV/TEXT satirlari olarak uretilir.
 
   DESTEKLENMEYEN (bilincli sinir):
-    - COPY, SSL/TLS, gercek sonuc tip OID'leri (tum alanlar TEXT/OID 25).
+    - Extended protocol uzerinden COPY; SSL/TLS; gercek sonuc tip OID'leri
+      (tum alanlar TEXT/OID 25).
     - Binary sonuc formati istenirse hata dondurulur; sonuclar metindir.
     - NULL ile bos metin ayrimi: motor ikisini de '' olarak tutar;
       DataRow'da her ikisi de uzunluk 0 olarak gonderilir.
@@ -114,6 +118,20 @@ type
   TPgStmt = record
     Sql: string;
     ParamOids: array of LongInt;
+  end;
+
+  { M1: COPY ... FROM STDIN / TO STDOUT (yalniz basit sorgu). }
+  TPgCopySpec = record
+    TableName: string;
+    Cols: TStrArray;
+    Options: string;
+    FromStdin: Boolean;
+    ToStdout: Boolean;
+    Format: string;       // csv | text
+    Delimiter: string;
+    NullStr: string;
+    Quote: string;
+    Header: Boolean;
   end;
 
 { ---------------------------------------------------- ag bayt duzeni (BE) }
@@ -406,17 +424,536 @@ begin
   end;
 end;
 
+procedure PgSkipWs(const S: string; var P: Integer);
+begin
+  while (P <= Length(S)) and (S[P] in [' ', #9, #10, #13]) do Inc(P);
+end;
+
+function PgWordChar(C: Char): Boolean;
+begin
+  Result := C in ['A'..'Z', 'a'..'z', '0'..'9', '_', '$'];
+end;
+
+function PgMatchWord(const S: string; var P: Integer; const W: string): Boolean;
+var
+  q, k: Integer;
+begin
+  Result := False;
+  PgSkipWs(S, P);
+  if P + Length(W) - 1 > Length(S) then Exit;
+  for k := 1 to Length(W) do
+    if UpCase(S[P + k - 1]) <> UpCase(W[k]) then Exit;
+  q := P + Length(W);
+  if (q <= Length(S)) and PgWordChar(S[q]) then Exit;
+  P := q;
+  Result := True;
+end;
+
+function PgReadIdent(const S: string; var P: Integer; out V: string): Boolean;
+var
+  st: Integer;
+begin
+  Result := False;
+  V := '';
+  PgSkipWs(S, P);
+  if P > Length(S) then Exit;
+  if not (S[P] in ['A'..'Z', 'a'..'z', '_']) then Exit;
+  st := P;
+  while (P <= Length(S)) and PgWordChar(S[P]) do Inc(P);
+  V := Copy(S, st, P - st);
+  Result := True;
+end;
+
+procedure PgParseCopyOptions(const Opt: string; var Spec: TPgCopySpec);
+var
+  s, w, v, q: string;
+  p, n, st: Integer;
+
+  procedure Skip;
+  begin
+    while (p <= n) and (s[p] in [' ', #9, #10, #13]) do Inc(p);
+  end;
+
+  function ReadWord: string;
+  begin
+    Skip;
+    st := p;
+    while (p <= n) and not (s[p] in [' ', #9, #10, #13, ',', ')', '=']) do
+      Inc(p);
+    Result := Copy(s, st, p - st);
+  end;
+
+  function ReadVal: string;
+  begin
+    Skip;
+    Result := '';
+    if p > n then Exit;
+    if s[p] in ['''', '"'] then
+    begin
+      q := s[p];
+      Inc(p);
+      while p <= n do
+        if s[p] = q then
+        begin
+          if (p < n) and (s[p + 1] = q) then
+          begin
+            Result := Result + q;
+            Inc(p, 2);
+          end
+          else
+          begin
+            Inc(p);
+            Break;
+          end;
+        end
+        else
+        begin
+          Result := Result + s[p];
+          Inc(p);
+        end;
+    end
+    else
+    begin
+      st := p;
+      while (p <= n) and not (s[p] in [',', ')']) do Inc(p);
+      Result := Trim(Copy(s, st, p - st));
+    end;
+  end;
+
+begin
+  Spec.Format := 'text';
+  Spec.Delimiter := #9;
+  Spec.NullStr := '\N';
+  Spec.Quote := '"';
+  Spec.Header := False;
+
+  s := Trim(Opt);
+  if s = '' then Exit;
+  if UpperCase(Copy(s, 1, 4)) = 'WITH' then
+  begin
+    Delete(s, 1, 4);
+    s := Trim(s);
+  end;
+  if (s <> '') and (s[1] = '(') then
+  begin
+    Delete(s, 1, 1);
+    if (s <> '') and (s[Length(s)] = ')') then
+      Delete(s, Length(s), 1);
+  end;
+
+  p := 1;
+  n := Length(s);
+  while p <= n do
+  begin
+    Skip;
+    if p > n then Break;
+    w := UpperCase(ReadWord);
+    if w = '' then Break;
+    Skip;
+    if (p <= n) and (s[p] = '=') then
+    begin
+      Inc(p);
+      Skip;
+    end;
+    if w = 'HEADER' then
+    begin
+      if (p > n) or (s[p] in [',', ')']) then
+        Spec.Header := True
+      else
+      begin
+        v := UpperCase(ReadVal);
+        Spec.Header := (v = 'TRUE') or (v = 'ON') or (v = '1') or (v = 'YES');
+      end;
+    end
+    else
+    begin
+      v := ReadVal;
+      if w = 'FORMAT' then
+      begin
+        Spec.Format := LowerCase(v);
+        if Spec.Format = 'csv' then
+        begin
+          Spec.Delimiter := ',';
+          Spec.NullStr := '';
+        end
+        else if Spec.Format = 'text' then
+        begin
+          Spec.Delimiter := #9;
+          Spec.NullStr := '\N';
+        end;
+      end
+      else if w = 'DELIMITER' then
+        Spec.Delimiter := v
+      else if w = 'NULL' then
+        Spec.NullStr := v
+      else if w = 'QUOTE' then
+        Spec.Quote := v
+      else if w = 'ESCAPE' then
+        ; // kabul edilir, yok sayilir
+    end;
+    Skip;
+    if (p <= n) and (s[p] = ',') then Inc(p)
+    else Break;
+  end;
+end;
+
+function TryParsePgCopy(const Sql: string; out Spec: TPgCopySpec;
+  out AErr: string): Boolean;
+var
+  p, n: Integer;
+  tbl: string;
+begin
+  Result := False;
+  AErr := '';
+  Spec := Default(TPgCopySpec);
+
+  p := 1;
+  n := Length(Sql);
+  PgSkipWs(Sql, p);
+  if not PgMatchWord(Sql, p, 'COPY') then Exit;
+  if not PgReadIdent(Sql, p, tbl) then
+  begin
+    AErr := 'COPY: tablo adi bekleniyordu';
+    Exit;
+  end;
+  Spec.TableName := tbl;
+
+  PgSkipWs(Sql, p);
+  if (p <= n) and (Sql[p] = '(') then
+  begin
+    Inc(p);
+    while True do
+    begin
+      PgSkipWs(Sql, p);
+      if not PgReadIdent(Sql, p, tbl) then
+      begin
+        AErr := 'COPY: kolon adi bekleniyordu';
+        Exit;
+      end;
+      SetLength(Spec.Cols, Length(Spec.Cols) + 1);
+      Spec.Cols[High(Spec.Cols)] := tbl;
+      PgSkipWs(Sql, p);
+      if (p <= n) and (Sql[p] = ',') then Inc(p)
+      else if (p <= n) and (Sql[p] = ')') then
+      begin
+        Inc(p);
+        Break;
+      end
+      else
+      begin
+        AErr := 'COPY: kolon listesi kapatilmadi';
+        Exit;
+      end;
+    end;
+  end;
+
+  PgSkipWs(Sql, p);
+  if PgMatchWord(Sql, p, 'FROM') then
+  begin
+    PgSkipWs(Sql, p);
+    if not PgMatchWord(Sql, p, 'STDIN') then Exit;  // dosya COPY motoruna kalsin
+    Spec.FromStdin := True;
+  end
+  else if PgMatchWord(Sql, p, 'TO') then
+  begin
+    PgSkipWs(Sql, p);
+    if not PgMatchWord(Sql, p, 'STDOUT') then Exit;
+    Spec.ToStdout := True;
+  end
+  else
+    Exit;
+
+  PgSkipWs(Sql, p);
+  Spec.Options := Trim(Copy(Sql, p, MaxInt));
+  if (Spec.Options <> '') and
+     (Spec.Options[Length(Spec.Options)] = ';') then
+    Spec.Options := Trim(Copy(Spec.Options, 1, Length(Spec.Options) - 1));
+  if Spec.Options <> '' then
+    if (UpperCase(Copy(Spec.Options, 1, 4)) <> 'WITH') and
+       (Spec.Options[1] <> '(') then
+    begin
+      AErr := 'COPY: secenekler WITH veya ( ile baslamali';
+      Exit;
+    end;
+
+  if Spec.ToStdout then
+    PgParseCopyOptions(Spec.Options, Spec);
+  Result := True;
+end;
+
+function PgCopyResponse(const T: AnsiChar; NCols: Integer): AnsiString;
+var
+  i: Integer;
+begin
+  Result := #0 + NetI16(NCols);
+  for i := 1 to NCols do
+    Result := Result + NetI16(0);
+  Result := PgMsg(T, Result);
+end;
+
+function PgCsvField(const V, D, Q: string): string;
+var
+  qq: string;
+begin
+  qq := Q;
+  if qq = '' then qq := '"';
+  if (Pos(D, V) > 0) or (Pos(qq, V) > 0) or
+     (Pos(#10, V) > 0) or (Pos(#13, V) > 0) then
+    Result := qq + StringReplace(V, qq, qq + qq, [rfReplaceAll]) + qq
+  else
+    Result := V;
+end;
+
+function PgTextField(const V: string): string;
+begin
+  Result := StringReplace(V, '\', '\\', [rfReplaceAll]);
+  Result := StringReplace(Result, #9, '\t', [rfReplaceAll]);
+  Result := StringReplace(Result, #10, '\n', [rfReplaceAll]);
+  Result := StringReplace(Result, #13, '\r', [rfReplaceAll]);
+end;
+
+function PgCopyLine(const Fields: TStrArray; const Spec: TPgCopySpec): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 0 to High(Fields) do
+  begin
+    if i > 0 then Result := Result + Spec.Delimiter;
+    if Spec.Format = 'csv' then
+      Result := Result + PgCsvField(Fields[i], Spec.Delimiter, Spec.Quote)
+    else
+      Result := Result + PgTextField(Fields[i]);
+  end;
+end;
+
+function PgTempCopyPath: string;
+var
+  i: Integer;
+begin
+  i := 0;
+  repeat
+    Result := IncludeTrailingPathDelimiter(GetTempDir) + 'vdb_pgcopy_' +
+      IntToStr(GetTickCount64) + '_' + IntToStr(i) + '.tmp';
+    Inc(i);
+  until not FileExists(Result);
+end;
+
+function HandlePgCopyIn(S: TVdbSocket; FSql: TVSql;
+  const Spec: TPgCopySpec): Boolean;
+var
+  td: TTableDef;
+  ncols, i, len, plen: Integer;
+  fs: TFileStream;
+  path, sql, cols, msg: string;
+  b: Byte;
+  buf: TBytes;
+  Res: TSqlResult;
+begin
+  Result := False;
+  try
+    td := FSql.TableDb.GetTable(Spec.TableName);
+  except
+    on E: Exception do
+    begin
+      SendPg(S, ErrorMsg(E.Message));
+      Exit(SendPg(S, ReadyMsg));
+    end;
+  end;
+  if Length(Spec.Cols) > 0 then ncols := Length(Spec.Cols)
+  else ncols := Length(td.Cols);
+  if ncols <= 0 then
+  begin
+    SendPg(S, ErrorMsg('COPY: tabloda kolon yok'));
+    Exit(SendPg(S, ReadyMsg));
+  end;
+
+  if not SendPg(S, PgCopyResponse('G', ncols)) then Exit;
+
+  path := PgTempCopyPath;
+  fs := nil;
+  try
+    try
+      fs := TFileStream.Create(path, fmCreate);
+      while True do
+      begin
+        if not VdbRecvU8(S, b) then Exit;
+        if not RecvI32(S, len) then Exit;
+        plen := len - 4;
+        if (plen < 0) or (plen > 64 * 1024 * 1024) then
+        begin
+          SendPg(S, ErrorMsg('COPY: gecersiz veri parcasi'));
+          Exit(SendPg(S, ReadyMsg));
+        end;
+        SetLength(buf, plen);
+        if (plen > 0) and not VdbRecvAll(S, buf[1], plen) then Exit;
+        case AnsiChar(b) of
+          'd':
+            if plen > 0 then fs.WriteBuffer(buf[1], plen);
+          'c':
+            Break;
+          'H':
+            ; // Flush
+          'f':
+            begin
+              msg := '';
+              if plen > 0 then
+              begin
+                SetLength(msg, plen);
+                Move(buf[0], msg[1], plen);
+                if (msg <> '') and (msg[Length(msg)] = #0) then
+                  Delete(msg, Length(msg), 1);
+              end;
+              SendPg(S, ErrorMsg('COPY: ' + msg));
+              Exit(SendPg(S, ReadyMsg));
+            end;
+          else
+            begin
+              SendPg(S, ErrorMsg('COPY: beklenmeyen istemci mesaji'));
+              Exit(SendPg(S, ReadyMsg));
+            end;
+        end;
+      end;
+    finally
+      if fs <> nil then fs.Free;
+    end;
+
+    sql := 'COPY ' + Spec.TableName;
+    if Length(Spec.Cols) > 0 then
+    begin
+      cols := '';
+      for i := 0 to High(Spec.Cols) do
+      begin
+        if i > 0 then cols := cols + ', ';
+        cols := cols + Spec.Cols[i];
+      end;
+      sql := sql + ' (' + cols + ')';
+    end;
+    sql := sql + ' FROM ''' +
+      StringReplace(path, '''', '''''', [rfReplaceAll]) + '''';
+    if Spec.Options <> '' then
+      sql := sql + ' ' + Spec.Options;
+
+    Res := Default(TSqlResult);
+    try
+      Res := FSql.Exec(sql);
+      Result := SendPg(S, CommandMsg('COPY ' + IntToStr(Res.Affected))) and
+        SendPg(S, ReadyMsg);
+    except
+      on E: Exception do
+        Result := SendPg(S, ErrorMsg(E.Message)) and SendPg(S, ReadyMsg);
+    end;
+  finally
+    if FileExists(path) then DeleteFile(path);
+  end;
+end;
+
+function HandlePgCopyOut(S: TVdbSocket; FSql: TVSql;
+  var Spec: TPgCopySpec): Boolean;
+var
+  td: TTableDef;
+  names, row: TStrArray;
+  i, j, n: Integer;
+  sql, line: string;
+  Res: TSqlResult;
+begin
+  Result := False;
+  if (Spec.Format <> 'csv') and (Spec.Format <> 'text') then
+  begin
+    SendPg(S, ErrorMsg('COPY: yalniz FORMAT CSV veya TEXT destekleniyor'));
+    Exit(SendPg(S, ReadyMsg));
+  end;
+  if Spec.Delimiter = '' then
+  begin
+    if Spec.Format = 'csv' then Spec.Delimiter := ',' else Spec.Delimiter := #9;
+  end;
+
+  try
+    td := FSql.TableDb.GetTable(Spec.TableName);
+  except
+    on E: Exception do
+    begin
+      SendPg(S, ErrorMsg(E.Message));
+      Exit(SendPg(S, ReadyMsg));
+    end;
+  end;
+  if Length(Spec.Cols) = 0 then
+  begin
+    SetLength(names, Length(td.Cols));
+    for i := 0 to High(td.Cols) do names[i] := td.Cols[i].Name;
+  end
+  else
+    names := Spec.Cols;
+  if Length(names) = 0 then
+  begin
+    SendPg(S, ErrorMsg('COPY: tabloda kolon yok'));
+    Exit(SendPg(S, ReadyMsg));
+  end;
+
+  sql := 'SELECT ';
+  for i := 0 to High(names) do
+  begin
+    if i > 0 then sql := sql + ', ';
+    sql := sql + names[i];
+  end;
+  sql := sql + ' FROM ' + Spec.TableName;
+
+  Res := Default(TSqlResult);
+  try
+    Res := FSql.Exec(sql);
+  except
+    on E: Exception do
+    begin
+      SendPg(S, ErrorMsg(E.Message));
+      Exit(SendPg(S, ReadyMsg));
+    end;
+  end;
+
+  if not SendPg(S, PgCopyResponse('H', Length(names))) then Exit;
+  if Spec.Header then
+  begin
+    line := PgCopyLine(names, Spec);
+    if not SendPg(S, PgMsg('d', line + #10)) then Exit;
+  end;
+  n := 0;
+  for i := 0 to High(Res.Rows) do
+  begin
+    SetLength(row, Length(names));
+    for j := 0 to High(row) do
+      if j <= High(Res.Rows[i]) then row[j] := Res.Rows[i][j]
+      else row[j] := '';
+    line := PgCopyLine(row, Spec);
+    if not SendPg(S, PgMsg('d', line + #10)) then Exit;
+    Inc(n);
+  end;
+  if not SendPg(S, PgMsg('c', '')) then Exit;
+  if not SendPg(S, CommandMsg('COPY ' + IntToStr(n))) then Exit;
+  Result := SendPg(S, ReadyMsg);
+end;
+
 function HandleQuery(S: TVdbSocket; FSql: TVSql; const Sql: string;
   out AServed: Boolean): Boolean;
 var
   Res: TSqlResult;
-  err: string;
+  err, cpErr: string;
   i: Integer;
+  CopySpec: TPgCopySpec;
 begin
   Result := False;
   AServed := True;
   err := '';
   Res := Default(TSqlResult);
+  // M1: COPY ... FROM STDIN / TO STDOUT basit sorgu akisi.
+  if TryParsePgCopy(Sql, CopySpec, cpErr) then
+  begin
+    if CopySpec.FromStdin then Exit(HandlePgCopyIn(S, FSql, CopySpec));
+    if CopySpec.ToStdout then Exit(HandlePgCopyOut(S, FSql, CopySpec));
+  end
+  else if cpErr <> '' then
+  begin
+    if not SendPg(S, ErrorMsg(cpErr)) then Exit;
+    Exit(SendPg(S, ReadyMsg));
+  end;
   try
     Res := FSql.Exec(Sql);
   except
