@@ -11358,6 +11358,25 @@ begin
     ', ' + Q + '$.items[?(@.fiyat > 10)]' + Q + ')', 0, 0, 'True');
   ChkVal('JP EXISTS filtre yok', 'SELECT JSON_EXISTS(' + Q + J2 + Q +
     ', ' + Q + '$.items[?(@.fiyat > 100)]' + Q + ')', 0, 0, 'False');
+  // M10 genisletme: union seciciler [0,2] / ['a','c'] / ["a","c"].
+  ChkVal('JP union indeks', 'SELECT JSON_EXTRACT(' + Q + '[10,20,30]' + Q +
+    ', ' + Q + '$[0,2]' + Q + ')', 0, 0, '[10,30]');
+  ChkVal('JP union negatif indeks', 'SELECT JSON_EXTRACT(' + Q + '[10,20,30]' + Q +
+    ', ' + Q + '$[0,-1]' + Q + ')', 0, 0, '[10,30]');
+  ChkVal('JP union tek tirnak anahtar', 'SELECT JSON_EXTRACT(' + Q +
+    '{"a":1,"b":2,"c":3}' + Q + ', ' + Q + '$[' + Q+Q + 'a' + Q+Q +
+    ',' + Q+Q + 'c' + Q+Q + ']' + Q + ')', 0, 0, '[1,3]');
+  ChkVal('JP union cift tirnak anahtar', 'SELECT JSON_EXTRACT(' + Q +
+    '{"a":1,"b":2,"c":3}' + Q + ', ' + Q + '$["a","c"]' + Q + ')',
+    0, 0, '[1,3]');
+  ChkVal('JP tek tirnak anahtar', 'SELECT JSON_EXTRACT(' + Q + J + Q +
+    ', ' + Q + '$[' + Q+Q + 's' + Q+Q + ']' + Q + ')', 0, 0, '"hi"');
+  ChkVal('JP union ic ice', 'SELECT JSON_EXTRACT(' + Q + J2 + Q +
+    ', ' + Q + '$.items[0,2].ad' + Q + ')', 0, 0, '["a","c"]');
+  ChkVal('JP union JSON_VALUE bos', 'SELECT JSON_VALUE(' + Q + '[10,20,30]' + Q +
+    ', ' + Q + '$[0,2]' + Q + ')', 0, 0, '');
+  ChkVal('JP union EXISTS', 'SELECT JSON_EXISTS(' + Q + '[10,20,30]' + Q +
+    ', ' + Q + '$[0,2]' + Q + ')', 0, 0, 'True');
 end;
 
 procedure T111_RasgeleDiferansiyel;

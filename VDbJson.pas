@@ -690,6 +690,12 @@ type
     Bool: Boolean;
     Str: string;
   end;
+  { M10 (2026-10-19): JSONPath union secici ogesi: [0,2] veya ['a','b']. }
+  TJsonUnionItem = record
+    IsKey: Boolean;
+    Key: string;
+    Index: Integer;
+  end;
 
 procedure JsonAddNode(var L: TJsonNodeList; V: TJsonVal);
 begin
@@ -922,6 +928,108 @@ begin
   if P.Op = '>=' then Exit(cmp >= 0);
 end;
 
+function JsonParseQuotedItem(const S: string; out V: string): Boolean;
+var
+  i, n: Integer;
+  q: Char;
+begin
+  Result := False;
+  V := '';
+  n := Length(S);
+  if n < 2 then Exit;
+  q := S[1];
+  if (q <> '''') and (q <> '"') then Exit;
+  if S[n] <> q then Exit;
+  i := 2;
+  while i < n do
+  begin
+    if S[i] = '\' then
+    begin
+      Inc(i);
+      if i >= n then Exit;
+      case S[i] of
+        'n': V := V + #10;
+        't': V := V + #9;
+        'r': V := V + #13;
+        'b': V := V + #8;
+        'f': V := V + #12;
+      else
+        V := V + S[i];
+      end;
+      Inc(i);
+    end
+    else
+    begin
+      V := V + S[i];
+      Inc(i);
+    end;
+  end;
+  Result := True;
+end;
+
+function JsonParseUnionItem(const S: string; out Item: TJsonUnionItem): Boolean;
+var
+  t: string;
+begin
+  Result := False;
+  Item := Default(TJsonUnionItem);
+  t := Trim(S);
+  if t = '' then Exit;
+  if t[1] in ['''', '"'] then
+  begin
+    if not JsonParseQuotedItem(t, Item.Key) then Exit;
+    Item.IsKey := True;
+  end
+  else
+  begin
+    if not TryStrToInt(t, Item.Index) then Exit;
+    Item.IsKey := False;
+  end;
+  Result := True;
+end;
+
+function JsonSplitUnion(const S: string; out Parts: TStrArray): Boolean;
+var
+  p, n, st: Integer;
+  q: Char;
+begin
+  Result := False;
+  SetLength(Parts, 0);
+  p := 1;
+  n := Length(S);
+  while p <= n do
+  begin
+    while (p <= n) and (S[p] = ' ') do Inc(p);
+    if p > n then Exit;
+    st := p;
+    if S[p] in ['''', '"'] then
+    begin
+      q := S[p];
+      Inc(p);
+      while (p <= n) and (S[p] <> q) do
+      begin
+        if S[p] = '\' then Inc(p);
+        if p <= n then Inc(p);
+      end;
+      if p > n then Exit;
+      Inc(p);
+      while (p <= n) and (S[p] = ' ') do Inc(p);
+    end
+    else
+      while (p <= n) and (S[p] <> ',') do Inc(p);
+    SetLength(Parts, Length(Parts) + 1);
+    Parts[High(Parts)] := Trim(Copy(S, st, p - st));
+    if (p <= n) and (S[p] = ',') then
+    begin
+      Inc(p);
+      if p > n then Exit;
+    end
+    else if p <= n then
+      Exit;
+  end;
+  Result := Length(Parts) > 0;
+end;
+
 function JsonNodesText(const N: TJsonNodeList): string;
 var
   i: Integer;
@@ -938,10 +1046,12 @@ end;
 function JsonPathSelect(Root: TJsonVal; const Path: string;
   out Nodes: TJsonNodeList; out Multi: Boolean): Boolean;
 var
-  p, n, i, j, st, idx, aa, bb, cnt: Integer;
+  p, n, i, j, k, st, idx, aa, bb, cnt: Integer;
   cur, nxt: TJsonNodeList;
   name, pred: string;
   pr: TJsonPred;
+  parts: TStrArray;
+  ui: TJsonUnionItem;
 begin
   Result := False;
   SetLength(Nodes, 0);
@@ -997,29 +1107,7 @@ begin
     else if Path[p] = '[' then
     begin
       Inc(p);
-      if (p <= n) and (Path[p] = '"') then
-      begin
-        Inc(p);
-        name := '';
-        while (p <= n) and (Path[p] <> '"') do
-        begin
-          if (Path[p] = '\') and (p < n) then
-          begin
-            Inc(p);
-            name := name + Path[p];
-          end
-          else
-            name := name + Path[p];
-          Inc(p);
-        end;
-        if p > n then Exit;
-        Inc(p);
-        if (p > n) or (Path[p] <> ']') then Exit;
-        Inc(p);
-        for i := 0 to High(cur) do
-          JsonAddNode(nxt, JsonFieldOf(cur[i], name));
-      end
-      else if (p <= n) and (Path[p] = '*') then
+      if (p <= n) and (Path[p] = '*') then
       begin
         Inc(p);
         if (p > n) or (Path[p] <> ']') then Exit;
@@ -1052,7 +1140,41 @@ begin
         if p > n then Exit;
         name := Copy(Path, st, p - st);
         Inc(p);
-        if Pos(':', name) > 0 then
+        if Pos(',', name) > 0 then
+        begin
+          Multi := True;
+          if not JsonSplitUnion(name, parts) then Exit;
+          for k := 0 to High(parts) do
+          begin
+            if not JsonParseUnionItem(parts[k], ui) then Exit;
+            for i := 0 to High(cur) do
+            begin
+              if cur[i] = nil then Continue;
+              if ui.IsKey then
+              begin
+                if cur[i].Kind = jkObj then
+                  JsonAddNode(nxt, JsonFieldOf(cur[i], ui.Key));
+              end
+              else if cur[i].Kind = jkArr then
+              begin
+                j := ui.Index;
+                if j < 0 then Inc(j, Length(cur[i].Items));
+                if (j >= 0) and (j <= High(cur[i].Items)) then
+                  JsonAddNode(nxt, cur[i].Items[j]);
+              end;
+            end;
+          end;
+        end
+        else if (Length(name) >= 2) and
+                (name[1] in ['''', '"']) and
+                (name[Length(name)] = name[1]) then
+        begin
+          if not JsonParseUnionItem(name, ui) then Exit;
+          for i := 0 to High(cur) do
+            if (cur[i] <> nil) and (cur[i].Kind = jkObj) then
+              JsonAddNode(nxt, JsonFieldOf(cur[i], ui.Key));
+        end
+        else if Pos(':', name) > 0 then
         begin
           Multi := True;
           j := Pos(':', name);
@@ -1115,6 +1237,8 @@ begin
   if Pos('..', Path) > 0 then Exit;
   if Pos('[?', Path) > 0 then Exit;
   if Pos(':', Path) > 0 then Exit;
+  if Pos(',', Path) > 0 then Exit;
+  if Pos('''', Path) > 0 then Exit;
   i := Pos('.*', Path);
   if (i > 0) and (i + 2 <= Length(Path)) then Exit;
   i := Pos('[*]', Path);
