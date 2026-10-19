@@ -216,7 +216,7 @@ type
 implementation
 
 uses
-  VDbCore, VDbJson, VDbPlatform, VDbMonitor;   // VDbCore: CREATE/DROP DATABASE icin TVDb
+  VDbCore, VDbJson, VDbPlatform, VDbMonitor, VDbTrace;   // VDbCore: CREATE/DROP DATABASE icin TVDb
 
 constructor TVSql.Create(AT: TVTableDb);
 begin
@@ -3606,10 +3606,14 @@ var
                     // (SET CONSTRAINTS ayriminda geri sarmak icin)
   w1, w2, w3: string;
   fastOk: Boolean;
+  spanRoot, spanChild: TVDbTraceSpan;
 begin
   Result.Affected := 0; Result.Msg := ''; SetLength(Result.Fields, 0); SetLength(Result.Rows, 0);
   Result.LastTable := ''; Result.Stmts := 1;
 
+  spanRoot := VDbTraceBegin('sql.query', nil);
+  VDbTraceSetAttr(spanRoot, 'db.statement', Sql);
+  try
   // P-18c (2026-10-16): literal INSERT hizli seridi.
   if (Length(Sql) > 13) and ((Sql[1] = 'I') or (Sql[1] = 'i')) then
   begin
@@ -3819,7 +3823,12 @@ begin
     Inc(FPlanHits);
     SlowMarkStart;
     try
-      Result := FExecutor.Execute(astStmt);
+      spanChild := VDbTraceBegin('sql.execute', spanRoot);
+      try
+        Result := FExecutor.Execute(astStmt);
+      finally
+        VDbTraceEnd(spanChild);
+      end;
     finally
       FLastMs := ElapsedMs;
       NoteSlow(Sql, FLastMs, Length(Result.Rows));
@@ -3830,14 +3839,24 @@ begin
 
   // Diger tum komutlar icin AST Pipeline (P-25: FParser ve FExecutor yeniden kullanilir)
   if (Length(FParams) = 0) and IsSelectStatement(Sql) then Inc(FPlanMiss);
-  astStmt := FParser.Parse(Sql, FParams);
+  spanChild := VDbTraceBegin('sql.parse', spanRoot);
+  try
+    astStmt := FParser.Parse(Sql, FParams);
+  finally
+    VDbTraceEnd(spanChild);
+  end;
   try
     if astStmt = nil then Exit;
     // F-21: yavas sorgu olcumu. Parse DAHIL edilir (kullanicinin
     // bekledigi sure = ayristirma + yurutme).
     SlowMarkStart;
     try
-      Result := FExecutor.Execute(astStmt);
+      spanChild := VDbTraceBegin('sql.execute', spanRoot);
+      try
+        Result := FExecutor.Execute(astStmt);
+      finally
+        VDbTraceEnd(spanChild);
+      end;
     finally
       FLastMs := ElapsedMs;
       NoteSlow(Sql, FLastMs, Length(Result.Rows));
@@ -3879,6 +3898,9 @@ begin
   // AST Pipeline (ustteki blok) tum komutlari karsiliyor; asagidaki
   // VDB_LEGACY_OLDESECRAW_ARSIV blogu F3-1 ile SILINDI (bkz. asagida).
   // ------------------------------------------------------------
+  finally
+    VDbTraceEnd(spanRoot);
+  end;
 end;
 
   // F3-1: VDB_LEGACY_OLDESECRAW_ARSIV (1267 satir, `{$IF 0}` blogu) SILINDI.

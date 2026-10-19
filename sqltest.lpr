@@ -14,7 +14,7 @@ uses
   SysUtils, Classes, Math, VDbCore, VDbTypes, VDbTable, VDbSql, VDbSync, VDbCrc32,
   VDbCrypt, VDbKdf, VDbSpatial, VDbRange, VDbMonitor, VDbPlatform, VDbCost,
   VDbExtension, VDbText, VDbParallel, VDbReplication, VDbNet, VDbSqlServer,
-  VDbClientNet, VDbMetricsHttp, VDbPgWire, dynlibs;
+  VDbClientNet, VDbMetricsHttp, VDbPgWire, VDbTrace, dynlibs;
 { VDbTypes: TStrArray / TStrMatrix gibi paylasilan tipler artik tek
   kaynaktan geliyor (ayri birimde ikinci tanim FPC'de sessizce
   FARKLI tip uretip derleme hatasi veriyordu). }
@@ -10523,6 +10523,31 @@ begin
     HxOf(h));
 end;
 
+procedure T119_Trace;
+var
+  j: string;
+begin
+  Grp('M9 OpenTelemetry span kaydi');
+  VDbTraceClear;
+  VDbTraceSetEnabled(True);
+  try
+    try
+      sq.Exec('SELECT 119 AS trace_probe');
+    except
+      on E: Exception do No('trace sorgu', E.Message);
+    end;
+  finally
+    VDbTraceSetEnabled(False);
+  end;
+  j := VDbTraceGetJSON;
+  Dogrula('sql.query span', Pos('"name":"sql.query"', j) > 0, '');
+  Dogrula('sql.parse span', Pos('"name":"sql.parse"', j) > 0, '');
+  Dogrula('sql.execute span', Pos('"name":"sql.execute"', j) > 0, '');
+  Dogrula('db.statement attr',
+    Pos('"db.statement":"SELECT 119 AS trace_probe"', j) > 0, '');
+  VDbTraceClear;
+end;
+
 procedure T117_Generated;
 var
   kv2: TVDb;
@@ -11868,6 +11893,7 @@ T92_MVCC_Isoaltion;
        T116_PgWire;
        T117_Generated;
        T118_AeadKdf;
+       T119_Trace;
   
       except
         on E: Exception do
