@@ -7441,7 +7441,7 @@ function TVSqlExecutor.TryStreamSelect(Stmt: TSqlSelectStmt; const td: TTableDef
 var
   ctx: TStreamSelCtx;
   cn, outCols: TStrArray;
-  ct: TByteArray;
+  ct, outTypes: TByteArray;
   j, ci, nConds: Integer;
   pkName: string;
   conj: TList<TSqlExprNode>;
@@ -7896,7 +7896,17 @@ begin
   end;
   if ctx.Failed then Exit(False);
 
+  // M1: cikti tipleri (pgwire OID'leri icin)
+  SetLength(outTypes, Length(outCols));
+  for j := 0 to High(outTypes) do
+  begin
+    if j < Stmt.Columns.Count then
+      outTypes[j] := ExprResultCtype(Stmt.Columns[j].Expr, cn, ct)
+    else
+      outTypes[j] := VCT_STR;
+  end;
   Res.Fields := outCols;
+  Res.FieldTypes := outTypes;
   Res.Rows := ctx.OutRows;
   Res.Affected := Length(Res.Rows);
   Res.Msg := 'OK';
@@ -8538,17 +8548,13 @@ begin
   end;
 
   // F1-20: projeksiyon cikti tipleri (UNION sonrasi ORDER BY icin gerekir)
+  // M1: yalniz kolon referansi degil, tum ifadeler icin tip cikarilir.
   SetLength(outTypes, Length(outCols));
   for j := 0 to High(outCols) do outTypes[j] := VCT_STR;
   for j := 0 to Stmt.Columns.Count - 1 do
   begin
-    if not (Stmt.Columns[j].Expr is TSqlColumnRefNode) then Continue;
-    for i := 0 to High(colNames) do
-      if SameText(colNames[i], TSqlColumnRefNode(Stmt.Columns[j].Expr).ColumnName) then
-      begin
-        if i < Length(colTypes) then outTypes[j] := colTypes[i];
-        Break;
-      end;
+    if j > High(outTypes) then Break;
+    outTypes[j] := ExprResultCtype(Stmt.Columns[j].Expr, colNames, colTypes);
   end;
 
   // LIMIT  (TryIndexOrder yolu LIMIT'i SATIR OKURKEN uyguladi)
@@ -8591,6 +8597,7 @@ begin
   if Stmt.ForUpdate then LockSelectRows(Stmt);
 
   Res.Fields := outCols;
+  Res.FieldTypes := outTypes;   // M1: gercek sonuc tipleri
   Res.Rows := outRows;
   Res.Affected := Length(outRows);
   Res.Msg := 'OK';
@@ -13202,6 +13209,7 @@ begin
 
   Result.Affected := 0;
   SetLength(Result.Fields, 0);
+  SetLength(Result.FieldTypes, 0);
   SetLength(Result.Rows, 0);
   if Stmt = nil then Exit;
 

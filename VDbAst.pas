@@ -880,6 +880,9 @@ type
   { SQL sorgu sonucu (VDbSql.pas ile paylasilan ortak tip) }
   TSqlResult = record
     Fields: TStrArray;
+    // M1: her alanin motor tipi (VCT_*). Bos ise tum alanlar metin sayilir.
+    // pgwire bunu gercek PostgreSQL OID'lerine cevirir.
+    FieldTypes: TByteArray;
     Rows: TStrMatrix;
     Affected: Integer;
     Msg: string;

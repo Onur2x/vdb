@@ -215,15 +215,35 @@ begin
   Result := PgMsg('Z', 'I');
 end;
 
-function RowDescMsg(const Fields: TStrArray): AnsiString;
+function PgOidOf(Ct: Byte): LongInt;
+// M1: motor kolon tipi -> PostgreSQL OID. Tum degerler metin olarak
+// gonderilir; OID istemcinin dogru tip cozumlemesi icin bildirilir.
+begin
+  case Ct of
+    VCT_INT:      Result := 20;    // int8
+    VCT_FLOAT:    Result := 701;   // float8
+    VCT_BOOL:     Result := 16;    // bool
+    VCT_DATE:     Result := 1082;  // date
+    VCT_DATETIME: Result := 1114;  // timestamp
+  else
+    Result := 25;                  // text
+  end;
+end;
+
+function RowDescMsg(const Fields: TStrArray;
+  const Types: TByteArray): AnsiString;
 var
   body: AnsiString;
   i: Integer;
+  oid: LongInt;
 begin
   body := NetI16(Length(Fields));
   for i := 0 to High(Fields) do
-    body := body + Fields[i] + #0 + NetI32(0) + NetI16(0) + NetI32(25) +
+  begin
+    if i < Length(Types) then oid := PgOidOf(Types[i]) else oid := 25;
+    body := body + Fields[i] + #0 + NetI32(0) + NetI16(0) + NetI32(oid) +
       NetI16(-1) + NetI32(-1) + NetI16(0);
+  end;
   Result := PgMsg('T', body);
 end;
 
@@ -1160,7 +1180,7 @@ begin
       end;
       if Length(Res.Fields) > 0 then
       begin
-        if not SendPg(S, RowDescMsg(Res.Fields)) then Exit;
+        if not SendPg(S, RowDescMsg(Res.Fields, Res.FieldTypes)) then Exit;
         for i := 0 to High(Res.Rows) do
           if not SendPg(S, DataRowMsg(Res.Rows[i])) then Exit;
       end;
@@ -1185,7 +1205,7 @@ begin
   end;
   if Length(Res.Fields) > 0 then
   begin
-    if not SendPg(S, RowDescMsg(Res.Fields)) then Exit;
+    if not SendPg(S, RowDescMsg(Res.Fields, Res.FieldTypes)) then Exit;
     for i := 0 to High(Res.Rows) do
       if not SendPg(S, DataRowMsg(Res.Rows[i])) then Exit;
   end;
@@ -1486,7 +1506,7 @@ begin
                 ExtFail(pt.Err)
               else if Length(pt.Res.Fields) > 0 then
               begin
-                if not SendPg(FSock, RowDescMsg(pt.Res.Fields)) then Break;
+                if not SendPg(FSock, RowDescMsg(pt.Res.Fields, pt.Res.FieldTypes)) then Break;
               end
               else if not SendPg(FSock, PgMsg('n', '')) then Break;
             end;

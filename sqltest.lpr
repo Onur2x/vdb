@@ -10551,6 +10551,32 @@ begin
   end;
 end;
 
+function TPgFieldOidAt(const Body: AnsiString; Index: Integer): LongInt;
+// M1: RowDescription icindeki alan tip OID'sini okur.
+var
+  n, i, p: Integer;
+begin
+  Result := -1;
+  if Length(Body) < 2 then Exit;
+  n := (Ord(Body[1]) shl 8) or Ord(Body[2]);
+  p := 3;
+  for i := 0 to n - 1 do
+  begin
+    while (p <= Length(Body)) and (Body[p] <> #0) do Inc(p);
+    Inc(p);    // ad sonu
+    if i = Index then
+    begin
+      if p + 9 > Length(Body) then Exit;
+      Result := (LongInt(Ord(Body[p + 6])) shl 24) or
+                (LongInt(Ord(Body[p + 7])) shl 16) or
+                (LongInt(Ord(Body[p + 8])) shl 8) or
+                 LongInt(Ord(Body[p + 9]));
+      Exit;
+    end;
+    Inc(p, 18);  // tableOid+attnum+typeOid+typlen+typmod+format
+  end;
+end;
+
 function TPgRow(const Body: AnsiString): TStrArray;
 var
   n, i, p, l: Integer;
@@ -10864,6 +10890,7 @@ var
   body, tag: string;
   row: TStrArray;
   ok: Boolean;
+  oidId, oidS: LongInt;
   b: Byte;
   startup, param: AnsiString;
 
@@ -11176,9 +11203,13 @@ begin
       if (msgs[i] <> '') and (msgs[i][1] = 'T') then
       begin
         row := TPgFieldNames(TPgBody(msgs[i]));
+        oidId := TPgFieldOidAt(TPgBody(msgs[i]), 0);
+        oidS := TPgFieldOidAt(TPgBody(msgs[i]), 1);
         ok := (Length(row) = 2) and (row[0] = 'id') and (row[1] = 's');
       end;
     Dogrula('pg RowDescription alanlari', ok, '');
+    Dogrula('pg OID id=int8', oidId = 20, IntToStr(oidId));
+    Dogrula('pg OID s=text', oidS = 25, IntToStr(oidS));
     row := RowAt(0);
     Dogrula('pg ilk satir 1/a',
       (Length(row) = 2) and (row[0] = '1') and (row[1] = 'a'), '');

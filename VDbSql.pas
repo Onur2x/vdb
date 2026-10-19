@@ -3069,6 +3069,7 @@ begin
       Result.Affected := 0;
       Result.Msg := '';
       SetLength(Result.Fields, 0);
+      SetLength(Result.FieldTypes, 0);
       SetLength(Result.Rows, 0);
       Result.LastTable := '';
       Result.Stmts := Length(Stmts);
@@ -3079,6 +3080,7 @@ begin
         Result.Affected := Result.Affected + one.Affected;
         if one.LastTable <> '' then Result.LastTable := one.LastTable;
         Result.Fields := one.Fields;
+        Result.FieldTypes := one.FieldTypes;
         Result.Rows := one.Rows;
         Result.Msg := one.Msg;
       end;
@@ -3110,6 +3112,7 @@ begin
   Result.Affected := 0;
   Result.Msg := '';
   SetLength(Result.Fields, 0);
+  SetLength(Result.FieldTypes, 0);
   SetLength(Result.Rows, 0);
   Result.LastTable := '';
   Result.Stmts := Length(Stmts);
@@ -3136,6 +3139,7 @@ begin
       Result.Affected := Result.Affected + one.Affected;
       if one.LastTable <> '' then Result.LastTable := one.LastTable;
       Result.Fields := one.Fields;
+      Result.FieldTypes := one.FieldTypes;
       Result.Rows := one.Rows;
       Result.Msg := one.Msg;
     end;
@@ -3617,7 +3621,8 @@ var
   fastOk: Boolean;
   spanRoot, spanChild: TVDbTraceSpan;
 begin
-  Result.Affected := 0; Result.Msg := ''; SetLength(Result.Fields, 0); SetLength(Result.Rows, 0);
+  Result.Affected := 0; Result.Msg := ''; SetLength(Result.Fields, 0);
+  SetLength(Result.FieldTypes, 0); SetLength(Result.Rows, 0);
   Result.LastTable := ''; Result.Stmts := 1;
 
   // F-40: READ COMMITTED / READ UNCOMMITTED -> her cumle yeni snapshot.
