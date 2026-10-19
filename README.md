@@ -399,10 +399,14 @@ loss (2251/2251 SQL tests + 8/8 crash chain green at every step).
 
 ## 🧪 TEST SONUÇLARI / TEST RESULTS
 
-### TR: Mevcut Durum (2026-10-15)
+### TR: Mevcut Durum (2026-10-19)
 ```
-sqltest:      2251/2251  (tümü yeşil)
+sqltest:      2426/2426  (tümü yeşil)
 crashtest:    8/8        (çökme dayanıklılığı — veri kaybı YOK)
+rawchk:       29/29      (akışlı ↔ genel diferansiyel)
+mrowchk:      0 hata     (çok-satırlı VALUES + atomiklik)
+fuzzchk:      3000/3000  (bağımsız 3VL WHERE fuzz, 3×1000)
+sqlite_diff:  4000/4000  (SQLite WHERE diferansiyeli, 4×1000)
 vdbcrypttest:   60/60
 vdbapitest:    170/170
 vdbclienttest: 101/101

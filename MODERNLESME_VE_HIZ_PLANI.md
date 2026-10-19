@@ -21,7 +21,7 @@ Zaten kazanılmış (dokunma, koru):
 - `COUNT(*)` O(1) (KR-1B doğrulanmış-sonuç önbelleği).
 - WHERE'siz agrega (`SUM/AVG/MIN/MAX`) allocation-free raw-peek (`ScanRawIter`, KR-8/8c).
 - Yazma yolunda tahsis diyeti, batch COMMIT tamponu (P-21), konumsal okuma (P-19).
-- Çökme dayanıklılığı: `sqltest 2417/2417`, `crashtest 8/8`.
+- Çökme dayanıklılığı: `sqltest 2426/2426`, `crashtest 8/8`.
 
 Hâlâ yavaş (bu belgenin hedefi):
 
@@ -145,7 +145,7 @@ yazılır, string matrisi yalnız **sonuç** aşamasında kurulur.
 > kolon değilken** uygulanıyor (metin kolonunun sayısal literalle kıyası
 > değişmez). `BETWEEN` ifade yolu da aynı şekilde düzeltildi. Regresyon: `T07`
 > içine `(v+0) > 9`, `(v*1) < 10`, ifade-BETWEEN, birim eksi testleri → `sqltest`
-> **2417/2417**, `crashtest 8/8`, `rawchk 29/29` (ifade ile düz kolon birebir),
+> **2426/2426**, `crashtest 8/8`, `rawchk 29/29` (ifade ile düz kolon birebir),
 > `hashchk 80/80`, `mrowchk` ve `cbochk` 0 hata.
 
 > Join yolundaki `MrPush` kopyalama/tampon yeniden kullanımı korunuyor (tek başına nötr ölçüldü).
@@ -166,7 +166,7 @@ yazılır, string matrisi yalnız **sonuç** aşamasında kurulur.
 > (`ExecJoinScan`). Kural: yalnız INNER/LEFT, NULL anahtar eşleşmez, iki kolon aynı ctype,
 > USING/NATURAL ve AND'li koşullar klasik yolda kalır; `JoinOnOk` nihai eleyici olarak korunur
 > (satır sırası birebir). Ölçüm (`joinbench`, 3000×3000 indekssiz eşitlik, 30.000 eşleşme):
-> **24.020 ms → 98 ms (~245x)**. Kapılar: `sqltest 2417/2417`, `crashtest 8/8`.
+> **24.020 ms → 98 ms (~245x)**. Kapılar: `sqltest 2426/2426`, `crashtest 8/8`.
 
 ### H3 — Aralık sorguları için modern indeks (ART / B+tree / skiplist)
 **Sorun:** KR-C. `BETWEEN`/`RANGE` ~15x; tembel tam rebuild + O(n) ekleme.
@@ -214,7 +214,7 @@ sorgu tarafında ART/B+tree kazanımı bu profilde küçük. ART/B+tree hâlâ t
 >   dolaşımıdır (zone map yalnız C fazını keser). `<>` ve dağınık kolon
 >   budanmaz (beklenen). Doğruluk: tüm şekiller `COUNT(*)` ile birebir;
 >   INSERT/UPDATE/DELETE/Compact sonrası sonuçlar doğru (bayat harita
->   kullanılmıyor). **Kapılar:** `sqltest 2417/2417`, `crashtest 8/8`,
+>   kullanılmıyor). **Kapılar:** `sqltest 2426/2426`, `crashtest 8/8`,
 >   `rawchk 29/29`, `hashchk 80/80`, `cachechk`/`mmapchk`/`aggchk` birebir.
 > **Kalan:** ART/B+tree prototipi (indekssiz taramada A/B fazının O(n)
 > dolaşımını da kaldırmak için offset→bucket indeksi veya ART).
@@ -246,7 +246,7 @@ Dosya büyümesi/Compact için **güvenli remap** şart; başarısızlıkta mevc
 > olduğundan mmap kazancı yok. **Karar:** doğru ve güvenli (fallback'li) deneysel yol
 > olarak **varsayılan KAPALI** bırakıldı; kalıcı (tek sefer kurulup büyümeyle yeniden
 > eşlenen) bir harita + `PrefetchVirtualMemory` ileride değerlendirilebilir.
-> **Kapılar:** `sqltest 2417/2417`, `crashtest 8/8`, `mmapchk` birebir, `cachechk` birebir.
+> **Kapılar:** `sqltest 2426/2426`, `crashtest 8/8`, `mmapchk` birebir, `cachechk` birebir.
 
 ### H5 — Blok-grup CRC
 **Sorun:** Kayıt başına CRC, tarama/verify CPU'sunda pay sahibi.
@@ -327,7 +327,7 @@ indeks build'ini paralel merge-sort'a çevir (`SortIdxEntries` 1M'de belirgin).
 > `CREATE INDEX` **708,7 → 515,2 ms (~1,38x)**; indeks içeriği/checksum'lar
 > seri ile birebir, `EXPLAIN` indeksi kullanıyor. Kalan süre satır
 > okuma/anahtar çıkarma + fsync'tir; sıralamanın payı büyüdükçe (daha büyük
-> `n`) oran artar. **Kapılar:** `sqltest 2417/2417`, `crashtest 8/8`.
+> `n`) oran artar. **Kapılar:** `sqltest 2426/2426`, `crashtest 8/8`.
 
 ### H7 — Plan/AST önbelleği (yeniden değerlendir)
 **Sorun:** `TVSql.ExecRaw` her çağrıda parse + executor kuruyor (`yol_haritasi_hiz.md §6`).
@@ -344,7 +344,7 @@ DDL/rol/policy/collation değişiminde invalidate; parametre değerleri AST'de d
 > `PlanCacheHits` / `PlanCacheMisses` / `PlanCacheSize` / `ClearPlanCache`.
 > **Ölçüm (`selbench`):** parse-baskın `SELECT 1+2` ×50.000: **0,0075 → 0,0030 ms/sorgu (~2,5x)**;
 > filtre+sort ×60: **816,9 → 742,1 ms (~%9)** — kalan maliyet tarama/sıralama. Kapılar:
-> `sqltest 2417/2417`, `crashtest 8/8`.
+> `sqltest 2426/2426`, `crashtest 8/8`.
 
 ### H8 — CBO kalibrasyonu
 **Sorun:** `VdbEstimateEqRows` distinct istatistiği yoksa `RowCount div 4` sezgisine düşüyor
@@ -367,7 +367,7 @@ gerçek satır/byte + cache hit/miss ile `VDbCost` katsayılarını kalibre et.
 > plan metni ile gerçek plan çelişebiliyordu. `ExecExplain.RangeColEst` eklendi: ANALYZE **min/max**
 > istatistiğinden uniform kesir `([lo,hi]∩[min,max])/(max-min)` ile tahmin; yalnız sayısal kolon
 > (PK ya da indeks öneki) + sayısal sınır; `BETWEEN` dahil. `ince-aral` (`a>=40 AND a<42`, 200
-> satır) artık `est=202 / Index` (önceden `est=10000 / Seq`). Kapılar: `sqltest 2417/2417`,
+> satır) artık `est=202 / Index` (önceden `est=10000 / Seq`). Kapılar: `sqltest 2426/2426`,
 > `crashtest 8/8`.
 
 ### H9 — Mikro temizlik
@@ -393,7 +393,7 @@ eksik olan **satır-içi** iş (mevcut yol `VDbTable.pas` Insert/EncodeRow + `VD
 > `FBatchHashPrefix` eklendi; `Insert` artık saf-ASCII pk'da `VDbHashKeyBytes(prefix, ...)`
 > kullanıyor, ASCII dışında genel `VDbHashKey` yolu korunuyor (hash birebir, format değişmedi).
 > Ölçüm (`insbench`, 1M INSERT tek tx): **8836 ms → 8199 ms (~%7,2)**. Kapılar:
-> `hashchk` 80/80 eşit, `sqltest 2417/2417`, `crashtest 8/8`. Adım 2 (`EncodeRow` tampon
+> `hashchk` 80/80 eşit, `sqltest 2426/2426`, `crashtest 8/8`. Adım 2 (`EncodeRow` tampon
 > yeniden kullanımı) ve adım 3 (`FPending` duplicate-PK) henüz yapılmadı; asıl kazanç orada.
 
 
@@ -459,7 +459,7 @@ tüm batch'i **tek tampona** kodla, tek `COMMIT` ile bitir. Satır-satır genel 
 > görülürse şerit kapanır ve genel yol **birebir** çalışır (aynı hatalar).
 > **Ölçüm (`insplit`, 200.000 satır, tek tx):** satır-satır `sq.Exec` **1665 ms** → çok-satırlı
 > VALUES **~1074 ms (~1,55x)**; parça=1000/5000 en iyi. Doğrudan `tb.Insert` (parse yok) 749 ms —
-> yani SQL katmanı farkı ~2,8x'ten ~1,4x'e indi. Kapılar: `sqltest 2417/2417`, `crashtest 8/8`,
+> yani SQL katmanı farkı ~2,8x'ten ~1,4x'e indi. Kapılar: `sqltest 2426/2426`, `crashtest 8/8`,
 > `mrowchk` (diferansiyel içerik + atomik rollback + BEGIN/ROLLBACK/COMMIT + Affected) **0 hata**.
 >
 > **`COPY FROM` (2026-10-19, tamamlandı):** `VDbSql.ExecRaw` içinde `ExecFastCopy` hızlı şeridi
@@ -479,7 +479,7 @@ tüm batch'i **tek tampona** kodla, tek `COMMIT` ile bitir. Satır-satır genel 
 > `COPY FROM` **531 ms (~1,95x)**; 300.000 satır / 10,9 MB: **3553 ms → 1613 ms (~2,20x)**,
 > dosya boyutuyla doğrusal, batch belleği tek tx ile sınırlı. **`copychk` 17/17**: CSV/`""`/
 > tırnak içi LF/boş alan NULL, TEXT `\N`+`\t`, HEADER, kolon listesi, atomik PK ihlali, yol ve
-> seçenek hataları, yeniden açılış kalıcılığı. Kapılar: **`sqltest 2417/2417 (kalan=0)`**,
+> seçenek hataları, yeniden açılış kalıcılığı. Kapılar: **`sqltest 2426/2426 (kalan=0)`**,
 > **`crashtest 8/8`**.
 
 ### H10 — ek not (adım 2/3 yeniden değerlendirme)
@@ -553,7 +553,7 @@ kolon-seviyesi şifreleme, envelope/key-rotation.
 >   v2'de 0'dır; REKEY yeni anahtarı yeniden türetir.
 > - **Kalan:** kolon-seviyesi şifreleme; Argon2 `p>1` paralelliği (RFC
 >   vektörü p=4 ile doğrulandı, üretimde p=1).
-> **Kapılar:** `sqltest 2417/2417`, `crashtest 8/8`, `gcmchk` 13/13,
+> **Kapılar:** `sqltest 2426/2426`, `crashtest 8/8`, `gcmchk` 13/13,
 > `argonchk` 3/3, `keychk` 12/12.
 
 ### M7 — Async sunucu + HTTP/JSON streaming + gRPC
@@ -569,17 +569,27 @@ her commit'te regresyon kapısı yap. Ek olarak:
   parse+yürüt; çökme/yanlış-sonuç/bellek sızıntısı ara. `VDbSql.pas` + `VDbParser.pas`
   projenin **en riskli** birimi (`vdb_analiz_raporu.md §2.5`); buradaki en yüksek getirili güvenlik ağı.
 
-> **Durum (2026-10-19):** Bağımsız 3VL fuzz yapıldı. `fuzzchk.dpr`, 400 satırlık
-> INT/FLOAT/TEXT/BOOL/NULL karışık tabloda rastgele WHERE yüklemleri üretir; aynı
-> yüklemi VDB'de ve Pascal'daki **bağımsız üç-değerli** değerlendiricide çalıştırıp
-> kimlik kümelerini karşılaştırır. `3 seed × 1000 = 3000/3000` birebir.
+> **Durum (2026-10-19):** İki bağımsız oracle ile diferansiyel doğrulama yapıldı.
+>
+> 1. **Bağımsız 3VL fuzz:** `fuzzchk.dpr`, 400 satırlık INT/FLOAT/TEXT/BOOL/NULL
+>    karışık tabloda rastgele WHERE yüklemleri üretir; aynı yüklemi VDB'de ve
+>    Pascal'daki bağımsız üç-değerli değerlendiricide çalıştırıp kimlik kümelerini
+>    karşılaştırır. `3 seed × 1000 = 3000/3000` birebir.
+> 2. **SQLite diferansiyeli:** `sqlite_diff.py` + `vdbbatch.dpr`, aynı şema/satırları
+>    ve aynı rastgele WHERE üretimini (NOT'lu bileşik ifadeler dahil) VDB ile
+>    Python `sqlite3` üzerinde çalıştırır; `SELECT id ... ORDER BY id` kümeleri
+>    karşılaştırılır. `4 seed × 1000 = 4000/4000` birebir. SQLite tarafında
+>    `PRAGMA case_sensitive_like=ON` ile LIKE duyarlılığı eşitlenir; boş metin
+>    kullanılmaz (VDB'de NULL/boş ayrımı yok).
+>
 > Bulunan/düzeltilen hatalar: AST `NOT` altında `IN/NOT IN` ve
 > `BETWEEN/NOT BETWEEN` ile NULL karşılaştırmalarının UNKNOWN'ı FALSE'a
 > indirmesi; `AND/OR`'da 3VL eksikliği; JOIN DNF yolunda `NOT (A AND B)`'nin
 > yalnız ilk koşulu değiştirmesi ve `NOT IN`/`NOT BETWEEN` terslerinin eksikliği.
 > Regresyon: `T09d` (8 test). Derleme: `fpc -Mdelphi -O2 -Fu. -Fu.\dcpcrypt
-> -Fu.\dcpcrypt\Ciphers -Fu.\dcpcrypt\Hashes fuzzchk.dpr`; çalıştırma:
-> `fuzzchk.exe [sorgu] [seed]`. SQLite'a karşı diferansiyel hâlâ yok.
+> -Fu.\dcpcrypt\Ciphers -Fu.\dcpcrypt\Hashes fuzzchk.dpr` ve aynı bayraklarla
+> `vdbbatch.dpr`; çalıştırma: `fuzzchk.exe [sorgu] [seed]` ve
+> `python sqlite_diff.py [sorgu] [seed]`. SQLancer tarzı tam SQL üretimi hâlâ yok.
 
 ### M9 — Gözlemlenebilirlik: Prometheus metrikleri + OpenTelemetry trace
 `SHOW STATS` ve `SHOW SLOW QUERIES` iyi bir başlangıç, ama yapısal değiller.
@@ -723,7 +733,7 @@ Test çalıştırılamadıysa başarılıymış gibi yazılmaz.
 > Bu bölümdeki **tüm sayılar mühendislik tahminidir, ölçüm değildir.** Dayanak: mevcut profil
 > ayrıştırmaları (örn. `SUM 285 ms ≈ FLOOR 131 + peek ~109 + aritmetik`), `vsbench run9`
 > mutlak süreleri ve koddan çıkan maliyet payları. Kesin değer yalnız §6 protokolüyle
-> (`bench1m` / `vsbench` / `speedtest` + `sqltest 2417/2417` + `crashtest 8/8`) doğrulanır.
+> (`bench1m` / `vsbench` / `speedtest` + `sqltest 2426/2426` + `crashtest 8/8`) doğrulanır.
 > Faktörler **konservatif → optimist** aralık olarak verilmiştir.
 
 ### 8.1 İş yükü-bazlı projeksiyon
@@ -780,7 +790,7 @@ Kabul edilirse §2/§3'e `H15+` / `M13+` olarak katlanır. §2/§3 maddeleriyle 
 ### 8.4 Belirsizlik / dürüstlük notları
 
 1. **Bunlar tahmin.** Gerçek sayı için her madde ayrı commit + öncesi/sonrası `bench1m`/`vsbench`/
-   `speedtest` + `sqltest 2417/2417` + `crashtest 8/8`.
+   `speedtest` + `sqltest 2426/2426` + `crashtest 8/8`.
 2. **Örtüşme:** E3/E4/E5 çekirdeği birlikte değiştirir; faktörleri çarpmak üst sınır verir, gerçek
    daha düşük çıkar → ölçüm şart.
 3. **Adil kıyas:** E1 (64-bit) VDB'ye kazandırırken SQLite da 64-bit derlenirse kazanır →
@@ -805,7 +815,7 @@ maddelerin "eksik" sanılıp tekrar uygulanmasını önlemektir.
 | **H2** hash join | ✅ Yapıldı | indekssiz tek-eşitlik INNER/LEFT; JOIN 24.020→98 ms (~245x) |
 | **H7** plan önbelleği | ✅ Yapıldı | parametresiz SELECT AST cache; parse ×0,0075→0,0030 ms (~2,5x), API+DDL invalidation |
 | **H1** filtreli SELECT + ham yüklem | ✅ Yapıldı | Adım 1 `capSel` erken-çıkış (~5,3x); Adım 2 `TryStreamSelect` ham akış (LIMIT ~58x); Adım 3 ham-yüklem batch motoru (INT/FLOAT, ~4x); Adım 3b TEXT `=`/`<>` (~2,5x); Adım 3c sayısal BETWEEN/IN (~3,1x, IN vs ifade); `rawchk` diferansiyel 29/29 birebir |
-| **EK** ifade tip hatası | ✅ Düzeltildi | `ExprResultCtype`: iki taraf da kolon değilken ifade (aritmetik) sayısal kıyaslanır; `(a+0) > 198` 77.800→60.200; `T07` 5 yeni test; `sqltest 2417/2417` |
+| **EK** ifade tip hatası | ✅ Düzeltildi | `ExprResultCtype`: iki taraf da kolon değilken ifade (aritmetik) sayısal kıyaslanır; `(a+0) > 198` 77.800→60.200; `T07` 5 yeni test; `sqltest 2426/2426` |
 | **M12** dizin fsync | ✅ **Zaten vardı** | `VDbFlushDir` (`VDbSync.pas:66`) + `VDbCore.pas:854,1441,1456,1505,2969,3039,3779` |
 | **H14** konumsal I/O | ✅ **Büyük ölçüde vardı** | `VDbPosRead` (OVERLAPPED/pread) `GetSnapshot`'ta (`VDbCore.pas:1765`, P-19) |
 
@@ -831,7 +841,7 @@ maddelerin "eksik" sanılıp tekrar uygulanmasını önlemektir.
 | M5 FTS/BM25 | 🟡 Kısmi | `VDbText.pas` (ifade/analiz) + **`TO_TSVECTOR`/`TS_MATCH` (AND)/`TS_RANK`** (tokenizasyon + Türkçe küçük harf; `T114` 6 test) var; inverted index/BM25 ve phrase/negation yok |
 | M6 AEAD/Argon2 | 🟡 Kısmi (AEAD + Argon2 ✅) | **AES-256-GCM** zarfı (`VDBAEAD1`, 96-bit nonce, 128-bit tag; NIST vektörleri `gcmchk`), eski CTR+HMAC okunur; **Argon2id v1.3** (`VDbKdf.pas`, RFC 9106 vektörü `argonchk`) + `.key` v2 (t=3, 64 MiB, p=1; v1 PBKDF2 okunur, `keychk`). Kolon-seviyesi şifreleme yok |
 | M7 async sunucu | 🟡 Kısmi | `VDbSqlServer.pas` thread-per-connection; event-loop yok |
-| M8 fuzz + diferansiyel | 🟡 Kısmi | geniş `sqltest` (2417) + `crashtest` (8/8) + `rawchk` (akışlı↔genel diferansiyel 29/29) + `mrowchk` (H13 diferansiyel+atomiklik 8/8) + `copychk` (COPY 17/17) + **`T111` rasgele 120 WHERE yüklemi** (INT/FLOAT/TEXT/BOOL/NULL; ham vs genel birebir) + **`fuzzchk` bağımsız 3VL fuzz (3×1000, 0 fark)**. SQLite diferansiyel ve SQLancer tarzı tam SQL üretimi yok |
+| M8 fuzz + diferansiyel | 🟢 Büyük ölçüde | geniş `sqltest` (2426) + `crashtest` (8/8) + `rawchk` (akışlı↔genel diferansiyel 29/29) + `mrowchk` (H13 diferansiyel+atomiklik 8/8) + `copychk` (COPY 17/17) + **`T111` rasgele 120 WHERE yüklemi** (INT/FLOAT/TEXT/BOOL/NULL; ham vs genel birebir) + **`fuzzchk` bağımsız 3VL fuzz (3×1000, 0 fark)** + **`sqlite_diff.py` SQLite diferansiyeli (4×1000, 0 fark)**. SQLancer tarzı tam SQL üretimi yok |
 | M9 gözlemlenebilirlik | 🟡 Kısmi | `SHOW STATS` (6→13 metrik: dosya/bellek/blok önbelleği) + `SHOW SLOW QUERIES` + **`TVSql.GetMetricsText` Prometheus exposition** + **`VDbMetricsHttp` ayrı portta `GET /metrics` HTTP ucu** (404 diğer yollar, `Content-Type: text/plain; version=0.0.4`, `T115` canlı soket testi) var; **OpenTelemetry trace yok** |
 | M10 GENERATED + JSONPath | 🟡 Kısmi | JSON operatörleri + **JSONPath alt kümesi** (`JSON_EXTRACT`/`JSON_VALUE`/`JSON_EXISTS`; `$ .ad ["ad"] [n] [a:b] [*] .* ..ad ..*` ve `[?(@.alan op literal)]` filtresi; ara segment joker; `T112` 28 test) + locale-bağımsız JSON sayı ayrıştırma + **GENERATED ALWAYS AS (STORED)** (`T117` 12 test; semada 6. alan, INSERT/BatchInsert/RETURNING/UPDATE ve ALTER ADD'de hesaplanır; mevcut satırlar geriye dönük doldurulur; IDENTITY yok); tam JSONPath (union/script/fonksiyon) yok |
 | M11 depolama soyutlaması | ❌ Yok | `VDbCore` somut KV; arayüz dikişi yok |
@@ -842,13 +852,14 @@ M9 `SHOW STATS` 6→13 metrik + `TVSql.GetMetricsText` (Prometheus metni) + `VDb
 kümesi (`JSON_EXTRACT`/`JSON_VALUE`/`JSON_EXISTS`) + locale-bağımsız JSON sayı ayrıştırma;
 M4 `VECTOR_DIM`/`VECTOR_NORM`/`VECTOR_DISTANCE` (cosine/l2/l1/dot); M5 `TO_TSVECTOR`/
 `TS_MATCH`/`TS_RANK` (index'siz); M8 rasgele 120 WHERE yüklemi diferansiyeli (`T111`) +
-bağımsız 3VL fuzz (`fuzzchk`, 3×1000 sorgu, 0 fark; NOT/NULL/IN/BETWEEN düzeltmeleri);
+bağımsız 3VL fuzz (`fuzzchk`, 3×1000 sorgu, 0 fark; NOT/NULL/IN/BETWEEN düzeltmeleri) +
+SQLite diferansiyeli (`sqlite_diff.py`, 4×1000 sorgu, 0 fark);
 M1 pgwire v3 + extended query + `$1…` parametreleri (`VDbPgWire.pas`, `T116` 59 test);
 M10 `GENERATED ALWAYS AS (…) STORED`
 + JSONPath filtre/recursive/slice (`T117` 12 test, `T112` 28 test); **M6 AES-256-GCM AEAD +
 Argon2id + `.key` v2** (`gcmchk` 13/13, `argonchk` 3/3, `keychk` 12/12; eski CTR+HMAC ve
-PBKDF2 uyumlu). Kapılar: **`sqltest 2417/2417 (kalan=0)`**, **`crashtest 8/8`**,
-**`copychk` 17/17**, **`rawchk` 29/29**, **`fuzzchk` 3000/3000**. Kalan büyük işler: H3 ART/B+tree, H5 blok-grup CRC,
+PBKDF2 uyumlu). Kapılar: **`sqltest 2426/2426 (kalan=0)`**, **`crashtest 8/8`**,
+**`copychk` 17/17**, **`rawchk` 29/29**, **`fuzzchk` 3000/3000**, **`sqlite_diff` 4000/4000**. Kalan büyük işler: H3 ART/B+tree, H5 blok-grup CRC,
 H11 free-list, M1 TLS/COPY, M2 Arrow/Parquet, M3 WASM,
 M6 kolon-seviyesi şifreleme, M7 async, M10 tam JSONPath + IDENTITY, M11 depolama soyutlaması.
 
