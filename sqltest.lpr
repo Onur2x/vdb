@@ -11688,6 +11688,36 @@ begin
   ChkVal('JP alan-alan mantik', 'SELECT JSON_EXTRACT(' + Q +
     '[{"a":5,"b":2},{"a":1,"b":3},{"a":2,"b":2}]' + Q + ', ' + Q +
     '$[?(@.a >= @.b && @.a < 5)].a' + Q + ')', 0, 0, '[2]');
+  // M10 genisletme: script indeks ifadeleri [(@.length-1)].
+  ChkVal('JP script son eleman', 'SELECT JSON_EXTRACT(' + Q + '[1,2,3]' + Q +
+    ', ' + Q + '$[(@.length-1)]' + Q + ')', 0, 0, '3');
+  ChkVal('JP script offset', 'SELECT JSON_EXTRACT(' + Q + '[1,2,3]' + Q +
+    ', ' + Q + '$[(@.length-2)]' + Q + ')', 0, 0, '2');
+  ChkVal('JP script alan icinde', 'SELECT JSON_EXTRACT(' + Q + J + Q +
+    ', ' + Q + '$.a.b[(@.length-1)].c' + Q + ')', 0, 0, '"x"');
+  ChkVal('JP script aritmetik', 'SELECT JSON_EXTRACT(' + Q + '[10,20,30,40]' + Q +
+    ', ' + Q + '$[(@.length/2)]' + Q + ')', 0, 0, '30');
+  ChkVal('JP script gecersiz', 'SELECT JSON_EXTRACT(' + Q + '[1,2,3]' + Q +
+    ', ' + Q + '$[(@.yok)]' + Q + ')', 0, 0, '');
+  // M10 genisletme: slice adimi [a:b:c] ve negatif adim.
+  ChkVal('JP slice adim 2', 'SELECT JSON_EXTRACT(' + Q + '[1,2,3,4,5]' + Q +
+    ', ' + Q + '$[0:5:2]' + Q + ')', 0, 0, '[1,3,5]');
+  ChkVal('JP slice negatif adim', 'SELECT JSON_EXTRACT(' + Q + '[1,2,3]' + Q +
+    ', ' + Q + '$[::-1]' + Q + ')', 0, 0, '[3,2,1]');
+  ChkVal('JP slice negatif sinir', 'SELECT JSON_EXTRACT(' + Q + '[1,2,3,4]' + Q +
+    ', ' + Q + '$[3:0:-1]' + Q + ')', 0, 0, '[4,3,2]');
+  ChkVal('JP slice sifir adim', 'SELECT JSON_EXTRACT(' + Q + '[1,2,3]' + Q +
+    ', ' + Q + '$[0:3:0]' + Q + ')', 0, 0, '');
+  // M10 genisletme: filtrede @.length ozelligi.
+  ChkVal('JP filtre @.length dizi', 'SELECT JSON_EXTRACT(' + Q +
+    '[[1,2,3],[4]]' + Q + ', ' + Q + '$[?(@.length > 2)]' + Q + ')',
+    0, 0, '[[1,2,3]]');
+  ChkVal('JP filtre @.length metin', 'SELECT JSON_EXTRACT(' + Q +
+    '[{"s":"abc"},{"s":"de"}]' + Q + ', ' + Q + '$[?(@.s.length > 2)].s' + Q + ')',
+    0, 0, '["abc"]');
+  ChkVal('JP filtre @.length nesne', 'SELECT JSON_EXTRACT(' + Q +
+    '[{"a":1,"b":2},{"c":3}]' + Q + ', ' + Q + '$[?(@.length > 1)]' + Q + ')',
+    0, 0, '[{"a":1,"b":2}]');
 end;
 
 procedure T111_RasgeleDiferansiyel;

@@ -914,18 +914,33 @@ function JsonPredMatch(V: TJsonVal; const P: TJsonPred): Boolean;
 var
   t, r: TJsonVal;
   i, cmp: Integer;
-  fnNum: Double;
+  fnNum, lenNum: Double;
   fnStr: string;
-  isFnNum, isFnStr: Boolean;
+  isFnNum, isFnStr, hasLen: Boolean;
 begin
   Result := False;
   t := V;
+  hasLen := False;
+  lenNum := 0;
   for i := 0 to High(P.Fields) do
   begin
+    if (P.FuncName = '') and (P.Fields[i] = 'length') and
+       (i = High(P.Fields)) and (t <> nil) then
+    begin
+      case t.Kind of
+        jkArr, jkObj: lenNum := Length(t.Items);
+        jkStr: lenNum := Length(t.Str);
+      else
+        Exit;
+      end;
+      hasLen := True;
+      t := nil;
+      Break;
+    end;
     t := JsonFieldOf(t, P.Fields[i]);
     if t = nil then Exit;
   end;
-  if t = nil then Exit;
+  if (t = nil) and (not hasLen) then Exit;
   r := nil;
   if P.HasRight then
   begin
@@ -968,6 +983,11 @@ begin
   end
   else if P.FuncName <> '' then
     Exit(False);
+  if hasLen then
+  begin
+    fnNum := lenNum;
+    isFnNum := True;
+  end;
   if P.Op = '' then
   begin
     if isFnNum then Exit(fnNum <> 0);
@@ -1401,10 +1421,257 @@ begin
   Result := Result + ']';
 end;
 
+{ M10 (2026-10-19): slice belirtimi [a:b:c]. Bos parcalar varsayilan
+  degeri alir; adim 0 gecersizdir. }
+function JsonParseSliceSpec(const S: string; out A, B, Step: Integer;
+  out HasA, HasB, HasStep: Boolean): Boolean;
+var
+  p, n, k: Integer;
+  cur: string;
+  parts: array[0..2] of string;
+begin
+  Result := False;
+  HasA := False;
+  HasB := False;
+  HasStep := False;
+  A := 0;
+  B := 0;
+  Step := 1;
+  n := Length(S);
+  if n = 0 then Exit;
+  k := 0;
+  cur := '';
+  p := 1;
+  while p <= n do
+  begin
+    if S[p] = ':' then
+    begin
+      if k > 2 then Exit;
+      parts[k] := cur;
+      Inc(k);
+      cur := '';
+    end
+    else
+      cur := cur + S[p];
+    Inc(p);
+  end;
+  if k > 2 then Exit;
+  parts[k] := cur;
+  Inc(k);
+  if (k < 2) or (k > 3) then Exit;
+  if Trim(parts[0]) <> '' then
+  begin
+    if not TryStrToInt(Trim(parts[0]), A) then Exit;
+    HasA := True;
+  end;
+  if Trim(parts[1]) <> '' then
+  begin
+    if not TryStrToInt(Trim(parts[1]), B) then Exit;
+    HasB := True;
+  end;
+  if k = 3 then
+  begin
+    if Trim(parts[2]) <> '' then
+    begin
+      if not TryStrToInt(Trim(parts[2]), Step) then Exit;
+      HasStep := True;
+    end;
+  end;
+  Result := True;
+end;
+
+{ M10 (2026-10-19): [(@.length-1)] gibi script indeks ifadeleri.
+  Destek: tam sayi, @, @.alan, @.length, + - * / ve parantez. }
+function JsonEvalScriptIndex(V: TJsonVal; const Expr: string;
+  out Idx: Integer): Boolean;
+var
+  S: string;
+  p, n: Integer;
+  ok: Boolean;
+  val: Double;
+
+  procedure SkipWs;
+  begin
+    while (p <= n) and (S[p] in [' ', #9, #13, #10]) do Inc(p);
+  end;
+
+  function ParseExpr: Double; forward;
+
+  function ParsePrimary: Double;
+  var
+    st, i: Integer;
+    name: string;
+    path: TStrArray;
+    t: TJsonVal;
+    len: Double;
+  begin
+    Result := 0;
+    SkipWs;
+    if p > n then
+    begin
+      ok := False;
+      Exit;
+    end;
+    if S[p] = '(' then
+    begin
+      Inc(p);
+      Result := ParseExpr;
+      SkipWs;
+      if (p > n) or (S[p] <> ')') then
+      begin
+        ok := False;
+        Exit;
+      end;
+      Inc(p);
+      Exit;
+    end;
+    if S[p] = '+' then
+    begin
+      Inc(p);
+      Result := ParsePrimary;
+      Exit;
+    end;
+    if S[p] = '-' then
+    begin
+      Inc(p);
+      Result := -ParsePrimary;
+      Exit;
+    end;
+    if S[p] = '@' then
+    begin
+      Inc(p);
+      SetLength(path, 0);
+      while (p <= n) and (S[p] = '.') do
+      begin
+        Inc(p);
+        st := p;
+        while (p <= n) and (S[p] in ['a'..'z', 'A'..'Z', '0'..'9', '_']) do
+          Inc(p);
+        if p = st then
+        begin
+          ok := False;
+          Exit;
+        end;
+        SetLength(path, Length(path) + 1);
+        path[High(path)] := Copy(S, st, p - st);
+      end;
+      t := V;
+      len := 0;
+      for i := 0 to High(path) do
+      begin
+        if (path[i] = 'length') and (i = High(path)) and (t <> nil) then
+        begin
+          case t.Kind of
+            jkArr, jkObj: len := Length(t.Items);
+            jkStr: len := Length(t.Str);
+          else
+            ok := False;
+            Exit;
+          end;
+          t := nil;
+          Break;
+        end;
+        t := JsonFieldOf(t, path[i]);
+        if t = nil then
+        begin
+          ok := False;
+          Exit;
+        end;
+      end;
+      if t = nil then
+        Result := len
+      else
+      begin
+        if t.Kind <> jkNum then
+        begin
+          ok := False;
+          Exit;
+        end;
+        Result := t.Num;
+      end;
+      Exit;
+    end;
+    if S[p] in ['0'..'9', '.'] then
+    begin
+      st := p;
+      while (p <= n) and (S[p] in ['0'..'9', '.', 'e', 'E', '+', '-']) do
+        Inc(p);
+      if not VDbParseFloat(Copy(S, st, p - st), Result) then
+        ok := False;
+      Exit;
+    end;
+    ok := False;
+  end;
+
+  function ParseMul: Double;
+  var
+    r: Double;
+    op: Char;
+  begin
+    Result := ParsePrimary;
+    while ok do
+    begin
+      SkipWs;
+      if p > n then Break;
+      op := S[p];
+      if not (op in ['*', '/']) then Break;
+      Inc(p);
+      r := ParsePrimary;
+      if not ok then Break;
+      if op = '*' then
+        Result := Result * r
+      else
+      begin
+        if r = 0 then
+        begin
+          ok := False;
+          Break;
+        end;
+        Result := Result / r;
+      end;
+    end;
+  end;
+
+  function ParseExpr: Double;
+  var
+    r: Double;
+    op: Char;
+  begin
+    Result := ParseMul;
+    while ok do
+    begin
+      SkipWs;
+      if p > n then Break;
+      op := S[p];
+      if not (op in ['+', '-']) then Break;
+      Inc(p);
+      r := ParseMul;
+      if not ok then Break;
+      if op = '+' then Result := Result + r else Result := Result - r;
+    end;
+  end;
+
+begin
+  Result := False;
+  Idx := 0;
+  S := Expr;
+  n := Length(S);
+  p := 1;
+  ok := n > 0;
+  if not ok then Exit;
+  val := ParseExpr;
+  if not ok then Exit;
+  SkipWs;
+  if p <= n then Exit;
+  Idx := Trunc(val);
+  Result := True;
+end;
+
 function JsonPathSelect(Root: TJsonVal; const Path: string;
   out Nodes: TJsonNodeList; out Multi: Boolean): Boolean;
 var
-  p, n, i, j, k, st, idx, aa, bb, cnt, depth: Integer;
+  p, n, i, j, k, st, idx, aa, bb, stepv, cnt, depth: Integer;
+  hasA, hasB, hasStep: Boolean;
   q: Char;
   esc: Boolean;
   cur, nxt: TJsonNodeList;
@@ -1519,6 +1786,55 @@ begin
               if JsonFilterMatch(cur[i].Items[j], pl) then
                 JsonAddNode(nxt, cur[i].Items[j]);
       end
+      else if (p <= n) and (Path[p] = '(') then
+      begin
+        st := p;
+        depth := 1;
+        Inc(p);
+        q := #0;
+        esc := False;
+        while p <= n do
+        begin
+          if q <> #0 then
+          begin
+            if esc then esc := False
+            else if Path[p] = '\' then esc := True
+            else if Path[p] = q then q := #0;
+            Inc(p);
+            Continue;
+          end;
+          if Path[p] in ['''', '"'] then
+          begin
+            q := Path[p];
+            Inc(p);
+            Continue;
+          end;
+          if Path[p] = '(' then Inc(depth)
+          else if Path[p] = ')' then
+          begin
+            Dec(depth);
+            if depth = 0 then Break;
+          end;
+          Inc(p);
+        end;
+        if p > n then Exit;
+        pred := Copy(Path, st + 1, p - st - 1);
+        Inc(p);
+        if (p > n) or (Path[p] <> ']') then Exit;
+        Inc(p);
+        if Length(cur) > 1 then Multi := True;
+        for i := 0 to High(cur) do
+        begin
+          if not JsonEvalScriptIndex(cur[i], pred, idx) then Exit;
+          if (cur[i] <> nil) and (cur[i].Kind = jkArr) then
+          begin
+            j := idx;
+            if j < 0 then Inc(j, Length(cur[i].Items));
+            if (j >= 0) and (j <= High(cur[i].Items)) then
+              JsonAddNode(nxt, cur[i].Items[j]);
+          end;
+        end;
+      end
       else
       begin
         st := p;
@@ -1562,34 +1878,65 @@ begin
         end
         else if Pos(':', name) > 0 then
         begin
+          if not JsonParseSliceSpec(name, aa, bb, stepv, hasA, hasB, hasStep) then Exit;
+          if stepv = 0 then Exit;
           Multi := True;
-          j := Pos(':', name);
-          if j > 1 then
-          begin
-            if not TryStrToInt(Copy(name, 1, j - 1), aa) then Exit;
-          end
-          else
-            aa := 0;
-          if j < Length(name) then
-          begin
-            if not TryStrToInt(Copy(name, j + 1, MaxInt), bb) then Exit;
-          end
-          else
-            bb := MaxInt;
           for i := 0 to High(cur) do
             if (cur[i] <> nil) and (cur[i].Kind = jkArr) then
             begin
               cnt := Length(cur[i].Items);
-              j := aa;
-              if j < 0 then Inc(j, cnt);
-              if j < 0 then j := 0;
-              st := bb;
-              if st < 0 then Inc(st, cnt);
-              if st > cnt then st := cnt;
-              while (j < st) and (j <= High(cur[i].Items)) do
+              if stepv > 0 then
               begin
-                if j >= 0 then JsonAddNode(nxt, cur[i].Items[j]);
-                Inc(j);
+                if hasA then
+                begin
+                  j := aa;
+                  if j < 0 then Inc(j, cnt);
+                  if j < 0 then j := 0;
+                  if j > cnt then j := cnt;
+                end
+                else
+                  j := 0;
+                if hasB then
+                begin
+                  st := bb;
+                  if st < 0 then Inc(st, cnt);
+                  if st < 0 then st := 0;
+                  if st > cnt then st := cnt;
+                end
+                else
+                  st := cnt;
+                while j < st do
+                begin
+                  JsonAddNode(nxt, cur[i].Items[j]);
+                  Inc(j, stepv);
+                end;
+              end
+              else
+              begin
+                if hasA then
+                begin
+                  j := aa;
+                  if j < 0 then Inc(j, cnt);
+                  if j >= cnt then j := cnt - 1;
+                  if j < 0 then j := -1;
+                end
+                else
+                  j := cnt - 1;
+                if hasB then
+                begin
+                  st := bb;
+                  if st < 0 then Inc(st, cnt);
+                  if st >= cnt then st := cnt - 1;
+                  if st < -1 then st := -1;
+                end
+                else
+                  st := -1;
+                while j > st do
+                begin
+                  if (j >= 0) and (j < cnt) then
+                    JsonAddNode(nxt, cur[i].Items[j]);
+                  Inc(j, stepv);
+                end;
               end;
             end;
         end
@@ -1624,6 +1971,7 @@ begin
   if Pos('[?', Path) > 0 then Exit;
   if Pos(':', Path) > 0 then Exit;
   if Pos(',', Path) > 0 then Exit;
+  if Pos('(', Path) > 0 then Exit;
   if Pos('''', Path) > 0 then Exit;
   i := Pos('.*', Path);
   if (i > 0) and (i + 2 <= Length(Path)) then Exit;
