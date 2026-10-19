@@ -48,6 +48,7 @@ type
   TVSql = class
   private
     FT: TVTableDb;
+    FSessionId: Cardinal;   // F-41: satir kilidi sahipligi
     FParams: TStrArray;
     FParamIdx: Integer;
     FSetDepth: Boolean;  // ic ice UNION taramasini engeller
@@ -222,6 +223,10 @@ constructor TVSql.Create(AT: TVTableDb);
 begin
   inherited Create;
   FT := AT;
+  // F-41: oturum kimligi. Ayni anda yasayan TVSql nesneleri icin nesne
+  // adresi yeterince benzersizdir; kilitler nesne yok edilirken birakilir.
+  FSessionId := Cardinal(PtrUInt(Self));
+  if FSessionId = 0 then FSessionId := 1;
   // Boolean alanlar Pascal'da OTOMATIK sifirlanmaz. FSetDepth yanlislikla
   // True kalirsa UNION ayristirmasi tamamen atlanir ve sorgu
   // "anlasilamayan ek: SELECT" ile bozulur. AYNI sebEPLE FAutoTx de
@@ -238,6 +243,7 @@ begin
   FSlowNext := 0;
   FParser := TVDbParser.Create;
   FExecutor := TVSqlExecutor.Create(FT);
+  FExecutor.SessionId := FSessionId;
   FPlanCache := TDictionary<string, TSqlStmtNode>.Create;   // H7
   FPlanHits := 0;
   FPlanMiss := 0;
@@ -247,6 +253,9 @@ destructor TVSql.Destroy;
 var
   pn: TSqlStmtNode;
 begin
+  // F-41: kapanan oturum kendi satir kilitlerini birakir. Acik batch'e
+  // DOKUNULMAZ: batch TVDb basina globaldir ve baska bir TVSql'e ait olabilir.
+  FT.UnlockRows(FSessionId);
   // H7: onbellekteki AST'ler sahiplenilir
   for pn in FPlanCache.Values do pn.Free;
   FPlanCache.Free;
@@ -3611,6 +3620,11 @@ begin
   Result.Affected := 0; Result.Msg := ''; SetLength(Result.Fields, 0); SetLength(Result.Rows, 0);
   Result.LastTable := ''; Result.Stmts := 1;
 
+  // F-40: READ COMMITTED / READ UNCOMMITTED -> her cumle yeni snapshot.
+  if FT.Kv.InBatch and
+     (FExecutor.Isolation in [ilReadUncommitted, ilReadCommitted]) then
+    FT.Kv.RefreshBatchSnapshot;
+
   spanRoot := VDbTraceBegin('sql.query', nil);
   VDbTraceSetAttr(spanRoot, 'db.statement', Sql);
   try
@@ -3730,6 +3744,19 @@ begin
           Result.Rows[0][0] := w2;
           Result.Affected := 0;
           Result.Msg := 'OK';
+          Exit;
+        end;
+        { F-40: SET [SESSION CHARACTERISTICS AS] TRANSACTION ISOLATION
+          LEVEL ... bir ayar degil, SQL cumlesidir; AST'ye devredilir. }
+        if (UpperCase(w3) = 'TRANSACTION') or
+           (UpperCase(w3) = 'SESSION') then
+        begin
+          astStmt := FParser.Parse(Sql, FParams);
+          try
+            Result := FExecutor.Execute(astStmt);
+          finally
+            astStmt.Free;
+          end;
           Exit;
         end;
         { R-11: SET CONSTRAINTS ... }

@@ -65,7 +65,9 @@ type
     // --- yetki (R-18 RBAC) ---
     ecPermissionDenied,    // rol tablo/izin uzerinde yetkili degil
     ecObjectExists,        // CREATE ROLE: rol zaten var
-    ecNotFound             // DROP ROLE / GRANT: nesne yok
+    ecNotFound,            // DROP ROLE / GRANT: nesne yok
+    // --- F-41 satir kilidi ---
+    ecLockConflict          // baska oturumun tuttugu satir kilidi
   );
 
   EVDbException = class(Exception)
@@ -136,6 +138,7 @@ begin
     ecPermissionDenied:   Result := 'ecPermissionDenied';
     ecObjectExists:       Result := 'ecObjectExists';
     ecNotFound:           Result := 'ecNotFound';
+    ecLockConflict:       Result := 'ecLockConflict';
   else
     Result := 'ecGeneral';
   end;

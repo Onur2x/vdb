@@ -420,6 +420,10 @@ private
     function Exists(Key: QWord): Boolean;
     function Delete(Key: QWord): Boolean;
     procedure BeginBatch;
+    { F-40: READ COMMITTED icin her cumle basinda gorunurluk penceresini
+      ilerletir. Yalnizca acik batch icinde etkilidir; bekleyen yazmalar
+      (bu oturumun) gorunmeye devam eder. }
+    procedure RefreshBatchSnapshot;
     procedure CommitBatch;
     procedure AbortBatch; // NOT: tablo indexleri onarilmaz, TVTableDb.AbortBatch kullan
     procedure Flush;
@@ -3450,6 +3454,18 @@ begin
     PendingClear;
     FPendingPuts.Clear;
     FPendingDels.Clear;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TVDb.RefreshBatchSnapshot;
+begin
+  FLock.Enter;
+  try
+    CheckOpen;
+    if FInBatch then
+      FSnapshotSeq := FSeq + 1;
   finally
     FLock.Leave;
   end;

@@ -147,6 +147,7 @@ type
     // R-11: SET CONSTRAINTS [ALL] DEFERRED | IMMEDIATE
     // (CONSTRAINTS anahtar kelimesi cagiranda YUTULMUS olur)
     function ParseSetConstraints: TSqlSetConstraintsStmt;
+    function ParseSetIsolation: TSqlSetIsolationStmt;
     // R-18: CREATE/DROP ROLE ve GRANT/REVOKE. Anahtar kelimeler
     // (CREATE/DROP/GRANT/REVOKE) cagiranda yutulmus olur.
     function ParseRole: TRoleStmt;
@@ -2347,6 +2348,29 @@ begin
       else if PeekToken = 'ROWS' then NextToken(T);
     end;
   end;
+
+  // F-41: SELECT ... FOR UPDATE [NOWAIT]
+  if PeekToken = 'FOR' then
+  begin
+    NextToken(T);
+    if PeekToken = 'UPDATE' then
+    begin
+      NextToken(T);
+      Stmt.ForUpdate := True;
+      // NOWAIT/SKIP LOCKED: motor beklemedigi icin NOWAIT kabul edilir;
+      // SKIP LOCKED su an desteklenmez (acikca reddedilir).
+      if PeekToken = 'NOWAIT' then NextToken(T)
+      else if PeekToken = 'SKIP' then
+      begin
+        NextToken(T); Expect('LOCKED');
+        raise EVDbException.Create(ecUnsupported,
+          'SKIP LOCKED desteklenmiyor; NOWAIT kullanin');
+      end;
+    end
+    else
+      raise EVDbException.CreateFmt(ecSyntaxError,
+        'FOR sonrasi UPDATE bekleniyor, "%s" bulundu (%s)', [PeekToken, CurPos]);
+  end;
 end;
 
 { ============================================================
@@ -3357,6 +3381,47 @@ begin
     Result.Free;
     raise;
   end;
+end;
+
+function TVDbParser.ParseSetIsolation: TSqlSetIsolationStmt;
+// F-40: `SET TRANSACTION ISOLATION LEVEL ...`
+// veya `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ...`.
+var
+  T, U: string;
+  lvl: TIsolationLevel;
+begin
+  if PeekToken = 'SESSION' then
+  begin
+    NextToken(T);
+    Expect('CHARACTERISTICS');
+    Expect('AS');
+  end;
+  Expect('TRANSACTION');
+  Expect('ISOLATION');
+  Expect('LEVEL');
+  ExpectToken(T);
+  U := UpperCase(T);
+  if U = 'READ' then
+  begin
+    ExpectToken(T);
+    if UpperCase(T) = 'COMMITTED' then lvl := ilReadCommitted
+    else if UpperCase(T) = 'UNCOMMITTED' then lvl := ilReadUncommitted
+    else
+      raise EVDbException.CreateFmt(ecSyntaxError,
+        'READ COMMITTED veya READ UNCOMMITTED bekleniyor, "%s" geldi (%s)',
+        [T, CurPos]);
+  end
+  else if U = 'REPEATABLE' then
+  begin
+    Expect('READ');
+    lvl := ilRepeatableRead;
+  end
+  else if U = 'SERIALIZABLE' then
+    lvl := ilSerializable
+  else
+    raise EVDbException.CreateFmt(ecSyntaxError,
+      'gecersiz isolation level: "%s" (%s)', [T, CurPos]);
+  Result := TSqlSetIsolationStmt.Create(lvl);
 end;
 
 function TVDbParser.ParseReturn: TSqlReturnStmt;
@@ -4885,11 +4950,19 @@ begin
   else if U = 'SET' then
   begin
     // R-11: SET CONSTRAINTS [ALL] DEFERRED | IMMEDIATE
-    NextToken(T); U2 := UpperCase(T);
-    if U2 <> 'CONSTRAINTS' then
+    // F-40: SET [SESSION CHARACTERISTICS AS] TRANSACTION ISOLATION LEVEL ...
+    U2 := UpperCase(PeekToken);
+    if (U2 = 'TRANSACTION') or (U2 = 'SESSION') then
+      Result := ParseSetIsolation
+    else if U2 = 'CONSTRAINTS' then
+    begin
+      NextToken(T);   // CONSTRAINTS
+      Result := ParseSetConstraints;
+    end
+    else
       raise EVDbException.CreateFmt(ecSyntaxError,
-        'SET sonrasi CONSTRAINTS bekleniyor, "%s" geldi (%s)', [U2, CurPos]);
-    Result := ParseSetConstraints;
+        'SET sonrasi CONSTRAINTS veya TRANSACTION bekleniyor, "%s" geldi (%s)',
+        [U2, CurPos]);
   end
   // ---- R-18: RBAC ----
   else if U = 'GRANT' then begin FLastMainToken := U; Result := ParseGrant; end

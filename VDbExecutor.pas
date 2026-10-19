@@ -95,6 +95,10 @@ type
   TVSqlExecutor = class
   private
     FT: TVTableDb;
+    // F-40: oturum yalitim seviyesi (varsayilan REPEATABLE READ).
+    FIsolation: TIsolationLevel;
+    // F-41: bu yurutucunun bagli oldugu SQL oturumu (0 = kimliksiz).
+    FSessionId: Cardinal;
     // R-20: aktif tablo adi. Kolon varsayilan collation'i (ad:tip:bayrak:
     // hexdef:collate) metin karsilastirmasinda kullanilir; eski sema
     // dosyalarinda bu alan yoktur, o durumda bos string = motor varsayilani.
@@ -454,6 +458,10 @@ type
       const Cols: TStrArray);
     // R-11: SET CONSTRAINTS [ALL] DEFERRED | IMMEDIATE
     procedure ExecSetConstraints(Stmt: TSqlSetConstraintsStmt; out Res: TSqlResult);
+    // F-40: SET TRANSACTION ISOLATION LEVEL ...
+    procedure ExecSetIsolation(Stmt: TSqlSetIsolationStmt; out Res: TSqlResult);
+    // F-41: SELECT ... FOR UPDATE satirlarini kilitler.
+    procedure LockSelectRows(Stmt: TSqlSelectStmt);
     // R-18: RBAC
     procedure ExecRole(Stmt: TRoleStmt; out Res: TSqlResult);
     procedure ExecGrant(Stmt: TGrantStmt; out Res: TSqlResult);
@@ -484,6 +492,9 @@ type
     destructor Destroy; override;
     function Execute(Stmt: TSqlStmtNode): TSqlResult;
     property TableDb: TVTableDb read FT;
+    // F-40/F-41: TVSql tarafindan atanan oturum kimligi ve yalitim.
+    property SessionId: Cardinal read FSessionId write FSessionId;
+    property Isolation: TIsolationLevel read FIsolation write FIsolation;
     { F-35: FUNCTION/PROCEDURE govdesi bu executor ile calistirilir.
       Parametre degerleri FOuterRow/FOuterColNames uzerinden gecer.
       VDbTable'daki ExecuteFunctionFor/CallProcedureFor bunlari
@@ -593,6 +604,8 @@ constructor TVSqlExecutor.Create(ATableDb: TVTableDb);
 begin
   inherited Create;
   FT := ATableDb;
+  FIsolation := ilRepeatableRead;   // F-40: mevcut snapshot davranisi
+  FSessionId := 0;
   FZoneMaps := TDictionary<Integer, TVDbZoneMap>.Create;
 end;
 
@@ -6882,6 +6895,58 @@ begin
   Res.Msg := 'OK';
 end;
 
+procedure TVSqlExecutor.ExecSetIsolation(Stmt: TSqlSetIsolationStmt;
+  out Res: TSqlResult);
+// F-40: oturum yalitim seviyesi. READ COMMITTED her cumle basinda
+// gorunurluk penceresini ilerletir; digerleri batch-basi snapshot kullanir.
+begin
+  FIsolation := Stmt.Level;
+  SetLength(Res.Fields, 1);
+  Res.Fields[0] := 'isolation';
+  SetLength(Res.Rows, 1);
+  SetLength(Res.Rows[0], 1);
+  case Stmt.Level of
+    ilReadUncommitted: Res.Rows[0][0] := 'READ UNCOMMITTED';
+    ilReadCommitted:   Res.Rows[0][0] := 'READ COMMITTED';
+    ilRepeatableRead:  Res.Rows[0][0] := 'REPEATABLE READ';
+    ilSerializable:    Res.Rows[0][0] := 'SERIALIZABLE';
+  end;
+  Res.Affected := 0;
+  Res.Msg := 'OK';
+end;
+
+procedure TVSqlExecutor.LockSelectRows(Stmt: TSqlSelectStmt);
+// F-41: basit tek-tablo SELECT'te WHERE'e uyan satirlari FOR UPDATE ile
+// kilitler. JOIN/VIEW/SET OP/CTE kapsam disidir. Kilitler tx sonunda
+// (COMMIT/ROLLBACK) birakilir. LIMIT'ten ONCE kilitlenir: ust kume
+// kilitlenmesi guvenlidir, eksik kilitlenmeden daha iyidir.
+var
+  td: TTableDef;
+  pks: TStrArray;
+  rows: TStrMatrix;
+  cn: TStrArray;
+  ct: TByteArray;
+  i: Integer;
+begin
+  if not FT.Kv.InBatch then
+    raise EVDbException.Create(ecTransactionState,
+      'SELECT ... FOR UPDATE yalniz acik islem (BEGIN) icinde kullanilabilir');
+  if (Stmt.FromTable = '') or Stmt.HasJoin or
+     ((Stmt.SetOp <> sokNone) and (Stmt.RightSelect <> nil)) or
+     (Stmt.WithQueries.Count > 0) then
+    raise EVDbException.Create(ecUnsupported,
+      'SELECT ... FOR UPDATE yalniz tek tablo, JOIN/CTE/SET OP olmadan desteklenir');
+  if not FT.TableExists(Stmt.FromTable) then
+    raise EVDbException.Create(ecUnsupported,
+      'SELECT ... FOR UPDATE yalniz temel tablo uzerinde desteklenir: ' + Stmt.FromTable);
+  td := FT.GetTable(Stmt.FromTable);
+  BuildColInfo(td, cn, ct);
+  FT.ScanRows(td.Name, pks, rows);
+  for i := 0 to High(rows) do
+    if RowMatches(Stmt.WhereClause, rows[i], cn, ct) then
+      FT.LockRow(FSessionId, td.Name, pks[i]);
+end;
+
 procedure TVSqlExecutor.MergeSetOpRows(Stmt: TSqlSelectStmt; var Rows: TStrMatrix;
   const Cols: TStrArray);
 { UNION [ALL] / EXCEPT / INTERSECT birlestirmesi.
@@ -8522,6 +8587,8 @@ begin
     if (Stmt.LimitVal >= 0) and (Length(outRows) > Stmt.LimitVal) then
       SetLength(outRows, Stmt.LimitVal);
   end;
+
+  if Stmt.ForUpdate then LockSelectRows(Stmt);
 
   Res.Fields := outCols;
   Res.Rows := outRows;
@@ -11308,8 +11375,8 @@ begin
     // geri alinir. Dogrudan Kv.BeginBatch cagrilirsa sema yedegi alinmadigi
     // icin "ROLLBACK sonrasi tablo yok" testi basarisiz olur.
     txBegin:           FT.BeginBatch;
-    txCommit:          FT.CommitBatch;
-    txRollback:        FT.AbortBatch;
+    txCommit:          begin FT.CommitBatch; FT.UnlockRows(FSessionId); end;
+    txRollback:        begin FT.AbortBatch; FT.UnlockRows(FSessionId); end;
     txSavepoint:       FT.Kv.Savepoint(Stmt.SavepointName);
     txRollbackTo:      FT.Kv.RollbackToSavepoint(Stmt.SavepointName);
     txReleaseSavepoint: FT.Kv.ReleaseSavepoint(Stmt.SavepointName);
@@ -13130,12 +13197,17 @@ var
   st: TSqlStmtNode;
   i: Integer;
   o1, o2: string;
+  prevSess: Cardinal;
 begin
 
   Result.Affected := 0;
   SetLength(Result.Fields, 0);
   SetLength(Result.Rows, 0);
   if Stmt = nil then Exit;
+
+  // F-41: bu cumleyi calistiran oturumu yazma yoluna bildir.
+  prevSess := VDbGetWriteSession;
+  VDbSetWriteSession(FSessionId);
 
   // R-17 Full: TCP akisindaki standby motoru alici THREAD'E aittir.
   // STOP REPLICATION ve SHOW REPLICATION STATUS disindaki her cumle
@@ -13231,6 +13303,8 @@ begin
   // R-11: SET CONSTRAINTS ALL DEFERRED | IMMEDIATE
   else if Stmt is TSqlSetConstraintsStmt then
     ExecSetConstraints(TSqlSetConstraintsStmt(Stmt), Result)
+  else if Stmt is TSqlSetIsolationStmt then
+    ExecSetIsolation(TSqlSetIsolationStmt(Stmt), Result)
   else if Stmt is TRoleStmt then
     ExecRole(TRoleStmt(Stmt), Result)
   else if Stmt is TGrantStmt then
@@ -13243,6 +13317,7 @@ begin
   //   ExecCompoundStmt(TSqlCompoundStmt(Stmt), Result)
   else raise EVDbException.Create(ecUnsupported, 'Desteklenmeyen AST cumlesi: ' + Stmt.ClassName);
   finally
+    VDbSetWriteSession(prevSess);
     FSubCache.Free;
     FSubCache := nil;
     if FInSetCache <> nil then

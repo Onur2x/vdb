@@ -876,6 +876,118 @@ begin
   Ok('SAVEPOINT temel islemler', '');
 end;
 
+procedure T79b_IsolationForUpdate;
+{ F-40 / F-41: SET TRANSACTION ISOLATION LEVEL ve SELECT ... FOR UPDATE
+  - REPEATABLE READ: batch basi snapshot (varsayilan)
+  - READ COMMITTED: her cumle yeni snapshot
+  - FOR UPDATE: tx icinde satir kilidi; ayni satiri yazan baska oturum
+    ecLockConflict alir; kilit COMMIT/ROLLBACK ile birakilir.
+
+  NOT: motorun batch'i TVDb basina GLOBALDIR; ayni TVTableDb uzerinde iki
+  TVSql ayni anda bagimsiz transaction acamaz. Bu yuzden "baska oturum"
+  davranisi kilit yoneticisi API'si + yazma yolu denetimi ile dogrulanir. }
+var
+  rr: TSqlResult;
+  blocked: Boolean;
+  owner: Cardinal;
+begin
+  Grp('ISOLATION + SELECT FOR UPDATE (F-40/F-41)');
+  UseDir('iso_fu');
+  sq.Exec('CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)');
+  sq.Exec('INSERT INTO t(id,v) VALUES(1,10)');
+  sq.Exec('INSERT INTO t(id,v) VALUES(2,20)');
+
+  // --- SET TRANSACTION ISOLATION LEVEL: dort seviye de ayristirilir ---
+  R := sq.Exec('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+  Dogrula('SET READ COMMITTED', (Length(R.Rows) = 1) and
+    (R.Rows[0][0] = 'READ COMMITTED'), '');
+  R := sq.Exec('SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED');
+  Dogrula('SET READ UNCOMMITTED', (Length(R.Rows) = 1) and
+    (R.Rows[0][0] = 'READ UNCOMMITTED'), '');
+  R := sq.Exec('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+  Dogrula('SET REPEATABLE READ', (Length(R.Rows) = 1) and
+    (R.Rows[0][0] = 'REPEATABLE READ'), '');
+  R := sq.Exec('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+  Dogrula('SET SERIALIZABLE', (Length(R.Rows) = 1) and
+    (R.Rows[0][0] = 'SERIALIZABLE'), '');
+  ChkErr('gecersiz isolation level reddedilir',
+    'SET TRANSACTION ISOLATION LEVEL BOGUS');
+
+  // --- READ COMMITTED kendi bekleyen yazisini gizlemez ---
+  sq.Exec('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+  sq.Exec('BEGIN');
+  sq.Exec('INSERT INTO t(id,v) VALUES(3,30)');
+  ChkVal('RC kendi yazisi gorunur', 'SELECT COUNT(*) FROM t', 0, 0, '3');
+  sq.Exec('ROLLBACK');
+  ChkVal('RC rollback sonrasi 2 satir', 'SELECT COUNT(*) FROM t', 0, 0, '2');
+  sq.Exec('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+
+  // --- FOR UPDATE yalniz acik islem icinde ---
+  try
+    sq.Exec('SELECT * FROM t WHERE id=1 FOR UPDATE');
+    No('FOR UPDATE tx disinda reddedildi', 'kabul edildi');
+  except
+    on E: Exception do Ok('FOR UPDATE tx disinda reddedildi', E.Message);
+  end;
+
+  // --- tx icinde satir kilidi alinir ---
+  sq.Exec('BEGIN');
+  rr := sq.Exec('SELECT * FROM t WHERE id=1 FOR UPDATE');
+  ChkInt('FOR UPDATE 1 satir', Length(rr.Rows), 1);
+  owner := tb.RowLockOwner('t', '1');
+  Dogrula('satir kilidi kaydedildi', owner <> 0, IntToStr(owner));
+
+  // --- ayni satiri yazan farkli oturum engellenir ---
+  blocked := False;
+  VdbSetWriteSession(owner + 1);
+  try
+    try
+      tb.Delete('t', '1');
+    except
+      on E: Exception do blocked := True;
+    end;
+  finally
+    VdbSetWriteSession(0);
+  end;
+  Dogrula('baska oturumun yazmasi kilitlendi', blocked, '');
+  ChkVal('kilitli satir degismedi', 'SELECT v FROM t WHERE id=1', 0, 0, '10');
+
+  // --- kendi kilidi kendi yazmasini engellemez ---
+  sq.Exec('UPDATE t SET v=13 WHERE id=1');
+  ChkVal('kendi kilidiyle UPDATE', 'SELECT v FROM t WHERE id=1', 0, 0, '13');
+
+  // --- COMMIT kilidi birakir ---
+  sq.Exec('COMMIT');
+  Dogrula('COMMIT satir kilidini birakti',
+    tb.RowLockOwner('t', '1') = 0, '');
+
+  // --- kilit yoneticisi: reentrant / cakisma / birakma ---
+  tb.LockRow(101, 't', '1');
+  tb.LockRow(101, 't', '1');   // ayni sahip tekrar alabilir
+  blocked := False;
+  try
+    tb.LockRow(102, 't', '1');
+  except
+    on E: Exception do blocked := True;
+  end;
+  Dogrula('ikinci sahip kilit alamadi', blocked, '');
+  tb.UnlockRows(101);
+  tb.LockRow(102, 't', '1');
+  Dogrula('kilit birakildi, yeni sahip aldi',
+    tb.RowLockOwner('t', '1') = 102, '');
+  tb.UnlockRows(102);
+
+  // --- desteklenmeyen JOIN + FOR UPDATE acikca reddedilir ---
+  sq.Exec('BEGIN');
+  try
+    sq.Exec('SELECT * FROM t a JOIN t b ON a.id=b.id FOR UPDATE');
+    No('JOIN + FOR UPDATE reddedildi', 'kabul edildi');
+  except
+    on E: Exception do Ok('JOIN + FOR UPDATE reddedildi', E.Message);
+  end;
+  sq.Exec('ROLLBACK');
+end;
+
 procedure T93_RBAC;
 { R-18: ROLE / GRANT / REVOKE / SET ROLE
   Kod tarafi (TRoleDef, TGrantDef, ParseRole, ParseGrant, ExecGrant,
@@ -12031,6 +12143,7 @@ begin
       T77_AlterDatabaseKey;
       T78_AsofGecmis;
       T79_Savepoint;
+      T79b_IsolationForUpdate;
       T90_MVCC_Snapshot;
       T91_MVCC_Nested;
 T92_MVCC_Isoaltion;

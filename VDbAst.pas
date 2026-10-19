@@ -407,6 +407,8 @@ type
     AsOf: TSqlAsOfKind;
     AsOfValue: QWord;   // SEQUENCE n
     AsOfText: string;   // TIMESTAMP/VERSION ham metni (executor rededer)
+    // F-41: SELECT ... FOR UPDATE
+    ForUpdate: Boolean;
     constructor Create;
     destructor Destroy; override;
   end;
@@ -728,6 +730,13 @@ type
     destructor Destroy; override;
   end;
 
+  { F-40: islem yalitim seviyeleri. Motorda varsayilan REPEATABLE READ
+    (batch basi snapshot). READ COMMITTED her cumle basinda gorunurluk
+    penceresini ilerletir. SERIALIZABLE su an REPEATABLE READ ile ayni
+    snapshot davranisini kullanir (tek global yazma kilidi ek koruma). }
+  TIsolationLevel = (ilReadUncommitted, ilReadCommitted,
+    ilRepeatableRead, ilSerializable);
+
   { Transaction Cumlesi (BEGIN / COMMIT / ROLLBACK / SAVEPOINT) }
   TTxKind = (txBegin, txCommit, txRollback, txSavepoint, txRollbackTo, txReleaseSavepoint);
 
@@ -736,6 +745,13 @@ type
     Kind: TTxKind;
     SavepointName: string;
     constructor Create(AKind: TTxKind);
+  end;
+
+  { F-40: SET TRANSACTION ISOLATION LEVEL ... }
+  TSqlSetIsolationStmt = class(TSqlStmtNode)
+  public
+    Level: TIsolationLevel;
+    constructor Create(ALevel: TIsolationLevel);
   end;
 
   { Yonetim ve Bakim Cumlesi }
@@ -1383,6 +1399,7 @@ begin
   AsOf := saoNone;
   AsOfValue := 0;
   AsOfText := '';
+  ForUpdate := False;
 end;
 
 destructor TSqlSelectStmt.Destroy;
@@ -1853,6 +1870,12 @@ begin
   inherited Create;
   Kind := AKind;
   SavepointName := '';
+end;
+
+constructor TSqlSetIsolationStmt.Create(ALevel: TIsolationLevel);
+begin
+  inherited Create;
+  Level := ALevel;
 end;
 
 { TSqlAdminStmt }

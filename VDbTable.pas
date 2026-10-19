@@ -356,6 +356,10 @@ type
     // ertelenir; FDeferredRows ertelenen (tablo, satir) ciftlerini tutar.
     FDeferred: Boolean;
     FDeferredRows: TList<string>;
+    // F-41: SELECT ... FOR UPDATE satir kilitleri. Anahtar = lower(tablo)#1+pk;
+    // deger = kilidi tutan oturum kimligi. Kilitler tx sonunda birakilir.
+    FRowLocks: TDictionary<string, Cardinal>;
+    FRowLockCs: TCriticalSection;
     // ---- R-18: RBAC katalogu ----
     FRoles: TDictionary<string, TRoleDef>;   // rol adi -> tanim
     FGrants: TList<TGrantDef>;               // izin kayitlari
@@ -445,6 +449,12 @@ type
     procedure SetDeferred(AOn: Boolean);
     property Deferred: Boolean read FDeferred;
     function DeferrableFk(const T: TTableDef): Boolean;
+    // ---- F-41: satir kilidi (SELECT ... FOR UPDATE) ----
+    // ASession = 0 ise kilit alinmaz. Baska oturum ayni satiri tutuyorsa
+    // ecLockConflict firlatilir. Ayni oturum kilidi yeniden alabilir.
+    procedure LockRow(ASession: Cardinal; const Table, Pk: string);
+    procedure UnlockRows(ASession: Cardinal);
+    function RowLockOwner(const Table, Pk: string): Cardinal;
   private
     procedure DoCheckDeferred;
     procedure CheckRestrict(const T: TTableDef; const ParentVals: TStrArray;
@@ -452,6 +462,8 @@ type
     // FK CASCADE/SET NULL icin: satiri dogrudan yazar (kisit denetimi
     // uygulanmaz -- zaten gecerli bir deger).
     procedure PutRow(const T: TTableDef; const Pk: string; const Vals: TStrArray);
+    // F-41: baska oturumun satir kilidi bu yazmayi engelliyor mu?
+    procedure CheckRowWritable(const Table, Pk: string);
     // ON DELETE/ON UPDATE degistirilebilir mi? (ALTER ile degismez)
     procedure SetFkAction(const Table, Column, RefTable: string;
       const OnEvent, Action: string);
@@ -866,10 +878,102 @@ function VdbConcIdxGateClosed: Boolean;
 procedure VdbSetSortParallel(AEnabled: Boolean);
 function VdbSortParallelEnabled: Boolean;
 
+{ F-41: etkin SQL oturumu (thread yerel). TVSqlExecutor her cumle basinda
+  ayarlar; TVTableDb yazma yolu baska oturumun satir kilidini denetlemek
+  icin okur. 0 = oturum yok (denetim yapilmaz). }
+procedure VdbSetWriteSession(AId: Cardinal);
+function VdbGetWriteSession: Cardinal;
+
 implementation
 
 uses
   VDbSync, VDbParallel;
+
+threadvar
+  GVdbWriteSession: Cardinal;
+
+procedure VdbSetWriteSession(AId: Cardinal);
+begin
+  GVdbWriteSession := AId;
+end;
+
+function VdbGetWriteSession: Cardinal;
+begin
+  Result := GVdbWriteSession;
+end;
+
+{ ------------------------- F-41: satir kilidi ------------------------- }
+
+function RowLockKeyOf(const Table, Pk: string): string;
+begin
+  Result := LowerCase(Table) + #1 + Pk;
+end;
+
+procedure TVTableDb.LockRow(ASession: Cardinal; const Table, Pk: string);
+var
+  k: string;
+  owner: Cardinal;
+begin
+  if ASession = 0 then Exit;
+  k := RowLockKeyOf(Table, Pk);
+  FRowLockCs.Enter;
+  try
+    if FRowLocks.TryGetValue(k, owner) and (owner <> ASession) then
+      raise EVDbException.CreateFmt(ecLockConflict,
+        'satir kilitli: %s/%s (kilidi tutan oturum: %u)', [Table, Pk, owner]);
+    FRowLocks.AddOrSetValue(k, ASession);
+  finally
+    FRowLockCs.Leave;
+  end;
+end;
+
+procedure TVTableDb.UnlockRows(ASession: Cardinal);
+var
+  k: string;
+  keys: TList<string>;
+begin
+  if ASession = 0 then Exit;
+  keys := TList<string>.Create;
+  try
+    FRowLockCs.Enter;
+    try
+      for k in FRowLocks.Keys do
+        if FRowLocks[k] = ASession then keys.Add(k);
+      for k in keys do FRowLocks.Remove(k);
+    finally
+      FRowLockCs.Leave;
+    end;
+  finally
+    keys.Free;
+  end;
+end;
+
+function TVTableDb.RowLockOwner(const Table, Pk: string): Cardinal;
+var
+  k: string;
+begin
+  Result := 0;
+  k := RowLockKeyOf(Table, Pk);
+  FRowLockCs.Enter;
+  try
+    if not FRowLocks.TryGetValue(k, Result) then Result := 0;
+  finally
+    FRowLockCs.Leave;
+  end;
+end;
+
+procedure TVTableDb.CheckRowWritable(const Table, Pk: string);
+var
+  sid, owner: Cardinal;
+begin
+  sid := VdbGetWriteSession;
+  if sid = 0 then Exit;
+  owner := RowLockOwner(Table, Pk);
+  if (owner <> 0) and (owner <> sid) then
+    raise EVDbException.CreateFmt(ecLockConflict,
+      'satir kilitli, yazma reddedildi: %s/%s (kilidi tutan oturum: %u)',
+      [Table, Pk, owner]);
+end;
 
 { ==================== R-22 Full: CONCURRENTLY insa altyapisi ==================== }
 
@@ -3374,6 +3478,8 @@ begin
   FTriggers := TDictionary<string, TTriggerDef>.Create;
   FDeferredRows := TList<string>.Create;
   FDeferred := False;
+  FRowLocks := TDictionary<string, Cardinal>.Create;   // F-41
+  FRowLockCs := TCriticalSection.Create;
   // R-18: rol/izin kataloglari semada tasinir
   FRoles := TDictionary<string, TRoleDef>.Create;
   FGrants := TList<TGrantDef>.Create;
@@ -3405,6 +3511,8 @@ begin
   ClearSchemaSnapshot;
   FreeAllTriggers;   // F-36: govde AST'leri serbest birakilir
   FDeferredRows.Free;   // R-11
+  FRowLocks.Free;       // F-41
+  FRowLockCs.Free;
   FRoles.Free;          // R-18
   FGrants.Free;
   FRlsOn.Free;          // R-19
@@ -4984,6 +5092,7 @@ var
   exPk: string;
   exVals: TStrArray;
 begin
+  CheckRowWritable(T.Name, Pk);
   // R-13 Full: bolme anahtari NULL olamaz (hangi bolume dusecegi
   // hesaplanamazdi). PostgreSQL uyumlu kural; INSERT ve UPDATE yollarinin
   // ikisi de PutRow'dan gectigi icin tek noktada denetlenir.
@@ -8311,6 +8420,7 @@ var
   j: Integer;
 begin
   t := GetTable(Table);
+  CheckRowWritable(t.Name, Pk);
   if not ReadRow(t.Name, Pk, vals) then Exit(False);
   CheckRestrict(t, vals, 'DELETE', '');
   IdxDelRow(t, vals, Pk, -1);
@@ -8771,6 +8881,7 @@ var
   n: Integer;
 begin
   t := GetTable(Table);
+  CheckRowWritable(t.Name, Pk);
   if not ReadRow(t.Name, Pk, oldVals) then Exit(False);
   if Length(SrcVals) <> Length(t.Cols) then
     raise EVDbException.Create(ecColumnNotFound,
