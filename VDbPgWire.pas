@@ -22,7 +22,8 @@ unit VDbPgWire;
       ('t') gercek parametre sayisini/OID'lerini bildirir.
       `?` yer tutuculari da SQL API'siyle ayni sekilde desteklenir.
     - ErrorResponse + ReadyForQuery; hata sonrasi Sync'e kadar mesajlar
-      yutulur (PostgreSQL semantigi).
+      yutulur (PostgreSQL semantigi). SQLSTATE ('C') alani
+      EVDbException.ErrorCode'dan eslenir (23505, 42P01, 42601, ...).
     - 'X' Terminate
     - COPY ... FROM STDIN / COPY ... TO STDOUT / COPY (SELECT ...) TO STDOUT
       (basit sorgu; CSV/TEXT). FROM akisi gecici dosyaya yazilip mevcut COPY
@@ -48,7 +49,7 @@ interface
 
 uses
   SysUtils, Classes, SyncObjs, Generics.Collections, VDbTypes, VDbCore, VDbTable, VDbSql, VDbAst,
-  VDbParser, VDbNet;
+  VDbParser, VDbNet, VDbErr;
 
 type
   TVdbPgServer = class;
@@ -331,13 +332,75 @@ begin
   Result := PgMsg('C', Tag + #0);
 end;
 
-function ErrorMsg(const Msg: string): AnsiString;
+function PgSqlStateOf(ACode: TVDbErrorCode): string;
+begin
+  // PostgreSQL SQLSTATE eslemesi; bilinmeyenler genel 42000.
+  case ACode of
+    ecSyntaxError:         Result := '42601';
+    ecTableNotFound:       Result := '42P01';
+    ecColumnNotFound:      Result := '42703';
+    ecTableExists:         Result := '42P07';
+    ecColumnExists:        Result := '42701';
+    ecIndexNotFound:       Result := '42704';
+    ecIndexExists:         Result := '42P07';
+    ecInvalidName:         Result := '42602';
+    ecDuplicatePrimaryKey,
+    ecUniqueViolation:     Result := '23505';
+    ecNotNullViolation:    Result := '23502';
+    ecCheckViolation:      Result := '23514';
+    ecForeignKeyViolation: Result := '23503';
+    ecTypeMismatch:        Result := '42804';
+    ecMathError:           Result := '22012';
+    ecInvalidArgument:     Result := '42601';
+    ecUnsupported:         Result := '0A000';
+    ecTransactionState:    Result := '25000';
+    ecDuplicateSavepoint:  Result := '3B001';
+    ecSavepointNotFound:   Result := '3B000';
+    ecPoolTimeout:         Result := '53300';
+    ecPoolClosed:          Result := '08003';
+    ecJsonError:           Result := '22P02';
+    ecPermissionDenied:    Result := '42501';
+    ecObjectExists:        Result := '42710';
+    ecNotFound:            Result := '42704';
+    ecDatabaseNotOpen:     Result := '08003';
+    ecDatabaseNotFound:    Result := '3D000';
+    ecDatabaseExists:      Result := '42P04';
+    ecDatabaseLocked:      Result := '55006';
+    ecIOError:             Result := '58030';
+    ecCorrupt, ecHashCollision, ecSchemaCorrupt: Result := 'XX001';
+    ecInvalidState:        Result := '55000';
+    ecLimit:               Result := '54000';
+    ecNone, ecGeneral:     Result := '42000';
+  else
+    Result := '42000';
+  end;
+end;
+
+function PgSqlStateOfException(E: Exception): string;
+begin
+  if E is EVDbException then
+    Result := PgSqlStateOf(EVDbException(E).ErrorCode)
+  else
+    Result := '42000';
+end;
+
+function ErrorMsg(const Msg: string; const Code: string): AnsiString; overload;
 var
   body: AnsiString;
 begin
-  body := 'S' + 'ERROR' + #0 + 'V' + 'ERROR' + #0 + 'C' + '42000' +
+  body := 'S' + 'ERROR' + #0 + 'V' + 'ERROR' + #0 + 'C' + Code +
     #0 + 'M' + Msg + #0 + #0;
   Result := PgMsg('E', body);
+end;
+
+function ErrorMsg(const Msg: string): AnsiString; overload;
+begin
+  Result := ErrorMsg(Msg, '42000');
+end;
+
+function ErrorMsgEx(const Msg: string; E: Exception): AnsiString;
+begin
+  Result := ErrorMsg(Msg, PgSqlStateOfException(E));
 end;
 
 function CommandTag(const Sql: string; const Res: TSqlResult): string;
@@ -839,7 +902,7 @@ begin
   except
     on E: Exception do
     begin
-      SendPg(S, ErrorMsg(E.Message));
+      SendPg(S, ErrorMsgEx(E.Message, E));
       Exit(SendPg(S, ReadyMsg));
     end;
   end;
@@ -924,7 +987,7 @@ begin
         SendPg(S, ReadyMsg);
     except
       on E: Exception do
-        Result := SendPg(S, ErrorMsg(E.Message)) and SendPg(S, ReadyMsg);
+        Result := SendPg(S, ErrorMsgEx(E.Message, E)) and SendPg(S, ReadyMsg);
     end;
   finally
     if FileExists(path) then DeleteFile(path);
@@ -959,7 +1022,7 @@ begin
     except
       on E: Exception do
       begin
-        SendPg(S, ErrorMsg(E.Message));
+        SendPg(S, ErrorMsgEx(E.Message, E));
         Exit(SendPg(S, ReadyMsg));
       end;
     end;
@@ -977,7 +1040,7 @@ begin
     except
       on E: Exception do
       begin
-        SendPg(S, ErrorMsg(E.Message));
+        SendPg(S, ErrorMsgEx(E.Message, E));
         Exit(SendPg(S, ReadyMsg));
       end;
     end;
@@ -1007,7 +1070,7 @@ begin
     except
       on E: Exception do
       begin
-        SendPg(S, ErrorMsg(E.Message));
+        SendPg(S, ErrorMsgEx(E.Message, E));
         Exit(SendPg(S, ReadyMsg));
       end;
     end;
@@ -1039,7 +1102,7 @@ function HandleQuery(S: TVdbSocket; FSql: TVSql; const Sql: string;
   out AServed: Boolean): Boolean;
 var
   Res: TSqlResult;
-  err, cpErr: string;
+  err, errState, cpErr: string;
   i, k: Integer;
   CopySpec: TPgCopySpec;
   stmts: TStrArray;
@@ -1047,6 +1110,7 @@ begin
   Result := False;
   AServed := True;
   err := '';
+  errState := '42000';
   Res := Default(TSqlResult);
   // M1: COPY ... FROM STDIN / TO STDOUT basit sorgu akisi.
   if TryParsePgCopy(Sql, CopySpec, cpErr) then
@@ -1056,7 +1120,7 @@ begin
   end
   else if cpErr <> '' then
   begin
-    if not SendPg(S, ErrorMsg(cpErr)) then Exit;
+    if not SendPg(S, ErrorMsg(cpErr, '42601')) then Exit;
     Exit(SendPg(S, ReadyMsg));
   end;
 
@@ -1071,15 +1135,19 @@ begin
       if Trim(stmts[k]) = '' then Continue;
       Res := Default(TSqlResult);
       err := '';
+      errState := '42000';
       try
         Res := FSql.Exec(stmts[k]);
       except
         on E: Exception do
+        begin
           err := E.Message;
+          errState := PgSqlStateOfException(E);
+        end;
       end;
       if err <> '' then
       begin
-        if not SendPg(S, ErrorMsg(err)) then Exit;
+        if not SendPg(S, ErrorMsg(err, errState)) then Exit;
         Exit(SendPg(S, ReadyMsg));
       end;
       if Length(Res.Fields) > 0 then
@@ -1097,11 +1165,14 @@ begin
     Res := FSql.Exec(Sql);
   except
     on E: Exception do
+    begin
       err := E.Message;
+      errState := PgSqlStateOfException(E);
+    end;
   end;
   if err <> '' then
   begin
-    if not SendPg(S, ErrorMsg(err)) then Exit;
+    if not SendPg(S, ErrorMsg(err, errState)) then Exit;
     Exit(SendPg(S, ReadyMsg));
   end;
   if Length(Res.Fields) > 0 then

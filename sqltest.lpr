@@ -10806,6 +10806,28 @@ var
         Exit(TPgBody(msgs[k]));
   end;
 
+  // ErrorResponse govdesindeki 'C' (SQLSTATE) alanini dondurur.
+  function ErrState: string;
+  var
+    b: AnsiString;
+    p, st: Integer;
+    c: AnsiChar;
+  begin
+    Result := '';
+    b := ErrText;
+    p := 1;
+    while p <= Length(b) do
+    begin
+      c := b[p];
+      Inc(p);
+      if c = #0 then Break;
+      st := p;
+      while (p <= Length(b)) and (b[p] <> #0) do Inc(p);
+      if c = 'C' then Exit(Copy(b, st, p - st));
+      if p <= Length(b) then Inc(p);
+    end;
+  end;
+
   function RowAt(Idx: Integer): TStrArray;
   var
     k, seen: Integer;
@@ -10938,11 +10960,17 @@ begin
 
     Dogrula('pg hata sorgusu yanitladi', Query('SELECT * FROM yok'), '');
     Dogrula('pg ErrorResponse dolu', ErrText <> '', Copy(ErrText, 1, 40));
+    Dogrula('pg SQLSTATE tablo yok 42P01', ErrState = '42P01', ErrState);
     Dogrula('pg hata sonrasi devam',
       Query('UPDATE pg_t SET s=''z'' WHERE id=2'), '');
     Dogrula('pg UPDATE tag UPDATE 1', FindTag('UPDATE 1'), '');
     Dogrula('pg DELETE calisti', Query('DELETE FROM pg_t WHERE id=1'), '');
     Dogrula('pg DELETE tag DELETE 1', FindTag('DELETE 1'), '');
+    Dogrula('pg SQLSTATE duplicate PK',
+      Query('INSERT INTO pg_t VALUES (2,''dup'')'), '');
+    Dogrula('pg SQLSTATE 23505', ErrState = '23505', ErrState);
+    Dogrula('pg SQLSTATE sozdizimi', Query('SELEC 1'), '');
+    Dogrula('pg SQLSTATE 42601', ErrState = '42601', ErrState);
 
     // ---- Basit sorguda coklu cumle ----
     Dogrula('pg multi SELECT', Query('SELECT 1 AS a; SELECT 2 AS b'), '');
