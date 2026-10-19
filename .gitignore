@@ -68,6 +68,7 @@ data/
 
 # Yerel dokumanlar / Local docs (Git'e eklenmez / not tracked)
 dokuman/
+MDLER/
 
 # Sadece kaynak kodları tut / Keep only source
 !*.pas
