@@ -11334,6 +11334,22 @@ begin
     'SELECT TS_RANK(' + SQLIT('a b a b') + ',' + SQLIT('a b') + ')', 0, 0, '4');
   ChkVal('FTS bos sorgu',
     'SELECT TS_MATCH(' + SQLIT('x') + ',' + SQLIT('') + ')', 0, 0, 'False');
+  // M5 genisletme: phrase ve negation.
+  ChkVal('FTS phrase eslesme',
+    'SELECT TS_MATCH(' + SQLIT('kirmizi araba hizli') + ',' +
+    SQLIT('"kirmizi araba"') + ')', 0, 0, 'True');
+  ChkVal('FTS phrase sira',
+    'SELECT TS_MATCH(' + SQLIT('kirmizi araba hizli') + ',' +
+    SQLIT('"araba kirmizi"') + ')', 0, 0, 'False');
+  ChkVal('FTS negation yok',
+    'SELECT TS_MATCH(' + SQLIT('kirmizi araba') + ',' +
+    SQLIT('kirmizi -hizli') + ')', 0, 0, 'True');
+  ChkVal('FTS negation var',
+    'SELECT TS_MATCH(' + SQLIT('kirmizi araba') + ',' +
+    SQLIT('kirmizi -araba') + ')', 0, 0, 'False');
+  ChkVal('FTS RANK phrase',
+    'SELECT TS_RANK(' + SQLIT('a b a b') + ',' + SQLIT('"a b"') + ')',
+    0, 0, '2');
 end;
 
 procedure T113_Vector;

@@ -1237,21 +1237,158 @@ begin
   end;
 end;
 
+{ M5 (2026-10-19): sorgu sozdizimi.
+  Terimler AND ile birlesir; -terim negasyon; "iki kelime" phrase.
+  Donen liste kodlanmis oge tutar: P/N:tek terim, Q/R:phrase. }
+function VDbFtsParseQuery(const Query: string): TStringList;
+var
+  i, n: Integer;
+  c: Char;
+  cur: string;
+  inQuote, neg: Boolean;
+
+  procedure AddWords(const Prefix, Payload: string);
+  var
+    W: TStringList;
+    k: Integer;
+  begin
+    W := TStringList.Create;
+    try
+      VDbFtsSplit(Payload, W);
+      for k := 0 to W.Count - 1 do
+        Result.Add(Prefix + ':' + W[k]);
+    finally
+      W.Free;
+    end;
+  end;
+
+  procedure FlushTerm;
+  var
+    norm: string;
+  begin
+    norm := VDbFtsNormalize(cur);
+    if norm <> '' then
+    begin
+      if inQuote then
+      begin
+        if neg then Result.Add('R:' + norm)
+        else Result.Add('Q:' + norm);
+      end
+      else
+      begin
+        if neg then AddWords('N', norm)
+        else AddWords('P', norm);
+      end;
+    end;
+    cur := '';
+    inQuote := False;
+    neg := False;
+  end;
+
+begin
+  Result := TStringList.Create;
+  n := Length(Query);
+  cur := '';
+  inQuote := False;
+  neg := False;
+  i := 1;
+  while i <= n do
+  begin
+    c := Query[i];
+    if inQuote then
+    begin
+      if c = '"' then
+      begin
+        FlushTerm;
+        Inc(i);
+        Continue;
+      end;
+      cur := cur + c;
+      Inc(i);
+      Continue;
+    end;
+    if c = '"' then
+    begin
+      if cur <> '' then FlushTerm;
+      inQuote := True;
+      Inc(i);
+      Continue;
+    end;
+    if (c = '-') and (cur = '') then
+    begin
+      neg := True;
+      Inc(i);
+      Continue;
+    end;
+    if (c = ' ') or (c = #9) or (c = #10) or (c = #13) then
+    begin
+      if cur <> '' then FlushTerm;
+      Inc(i);
+      Continue;
+    end;
+    cur := cur + c;
+    Inc(i);
+  end;
+  if (cur <> '') or inQuote then FlushTerm;
+end;
+
+function VDbFtsPhraseAt(T: TStringList; Start: Integer;
+  const Phrase: string): Boolean;
+var
+  W: TStringList;
+  j: Integer;
+begin
+  Result := False;
+  if (Start < 0) or (Start >= T.Count) then Exit;
+  W := TStringList.Create;
+  try
+    VDbFtsSplit(Phrase, W);
+    if (W.Count = 0) or (Start + W.Count > T.Count) then Exit;
+    for j := 0 to W.Count - 1 do
+      if T[Start + j] <> W[j] then Exit;
+    Result := True;
+  finally
+    W.Free;
+  end;
+end;
+
 function VDbFtsMatch(const Text, Query: string): Boolean;
 var
   T, Q: TStringList;
-  i: Integer;
+  i, j: Integer;
+  item, prefix, payload: string;
+  neg, phrase, hit: Boolean;
 begin
   Result := False;
   if (Text = '') or (Query = '') then Exit;
   T := TStringList.Create;
-  Q := TStringList.Create;
+  Q := VDbFtsParseQuery(Query);
   try
-    VDbFtsSplit(Text, T);
-    VDbFtsSplit(Query, Q);
     if Q.Count = 0 then Exit;
+    VDbFtsSplit(Text, T);
     for i := 0 to Q.Count - 1 do
-      if T.IndexOf(Q[i]) < 0 then Exit;
+    begin
+      item := Q[i];
+      prefix := Copy(item, 1, 1);
+      payload := Copy(item, 3, Length(item) - 2);
+      neg := (prefix = 'N') or (prefix = 'R');
+      phrase := (prefix = 'Q') or (prefix = 'R');
+      if phrase then
+      begin
+        hit := False;
+        if T.Count > 0 then
+          for j := 0 to T.Count - 1 do
+            if VDbFtsPhraseAt(T, j, payload) then
+            begin
+              hit := True;
+              Break;
+            end;
+      end
+      else
+        hit := T.IndexOf(payload) >= 0;
+      if neg and hit then Exit(False);
+      if (not neg) and (not hit) then Exit(False);
+    end;
     Result := True;
   finally
     Q.Free;
@@ -1263,17 +1400,31 @@ function VDbFtsRank(const Text, Query: string): Integer;
 var
   T, Q: TStringList;
   i, j: Integer;
+  item, prefix, payload: string;
+  phrase: Boolean;
 begin
   Result := 0;
   if (Text = '') or (Query = '') then Exit;
   T := TStringList.Create;
-  Q := TStringList.Create;
+  Q := VDbFtsParseQuery(Query);
   try
     VDbFtsSplit(Text, T);
-    VDbFtsSplit(Query, Q);
     for i := 0 to Q.Count - 1 do
-      for j := 0 to T.Count - 1 do
-        if T[j] = Q[i] then Inc(Result);
+    begin
+      item := Q[i];
+      prefix := Copy(item, 1, 1);
+      if (prefix = 'N') or (prefix = 'R') then Continue;
+      payload := Copy(item, 3, Length(item) - 2);
+      phrase := prefix = 'Q';
+      if phrase then
+      begin
+        for j := 0 to T.Count - 1 do
+          if VDbFtsPhraseAt(T, j, payload) then Inc(Result);
+      end
+      else
+        for j := 0 to T.Count - 1 do
+          if T[j] = payload then Inc(Result);
+    end;
   finally
     Q.Free;
     T.Free;
