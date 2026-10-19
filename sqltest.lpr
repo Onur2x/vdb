@@ -11660,6 +11660,50 @@ begin
   ChkVal('FTS RANK phrase',
     'SELECT TS_RANK(' + SQLIT('a b a b') + ',' + SQLIT('"a b"') + ')',
     0, 0, '2');
+
+  // M5: tablo uzerinde inverted index yolu (TS_MATCH -> aday daraltma).
+  // Sonuc kumesi WHERE ile aynen dogrulanir.
+  Chk('FTS index tablo olustur',
+    'CREATE TABLE fts_idx_t(id INTEGER PRIMARY KEY, body TEXT)', 0);
+  Chk('FTS index satirlari',
+    'INSERT INTO fts_idx_t VALUES (1, ' + SQLIT('kirmizi araba hizli') + '),' +
+    '(2, ' + SQLIT('mavi araba yavas') + '),' +
+    '(3, ' + SQLIT('kirmizi bisiklet') + '),' +
+    '(4, ' + SQLIT('yesil araba hizli') + ')', 0);
+  Chk('FTS index tek terim',
+    'SELECT id FROM fts_idx_t WHERE TS_MATCH(body, ' + SQLIT('hizli') +
+    ') ORDER BY id', 2);
+  Chk('FTS index phrase',
+    'SELECT id FROM fts_idx_t WHERE TS_MATCH(body, ' + SQLIT('"kirmizi araba"') +
+    ') ORDER BY id', 1);
+  Chk('FTS index negation',
+    'SELECT id FROM fts_idx_t WHERE TS_MATCH(body, ' + SQLIT('araba -hizli') +
+    ') ORDER BY id', 1);
+  Chk('FTS index AND ek kosul',
+    'SELECT id FROM fts_idx_t WHERE TS_MATCH(body, ' + SQLIT('araba') +
+    ') AND id > 1 ORDER BY id', 2);
+  Chk('FTS index yalniz negatif (tarama yolu)',
+    'SELECT id FROM fts_idx_t WHERE TS_MATCH(body, ' + SQLIT('-hizli') +
+    ') ORDER BY id', 2);
+  Chk('FTS index eslesmeyen terim',
+    'SELECT id FROM fts_idx_t WHERE TS_MATCH(body, ' + SQLIT('yokboyle') +
+    ')', 0);
+  // Cache invalidation: yazma sonrasi index yeniden kurulmali.
+  Chk('FTS index yeni satir',
+    'INSERT INTO fts_idx_t VALUES (5, ' + SQLIT('kirmizi araba hizli') + ')', 0);
+  Chk('FTS index yeni satir gorunur',
+    'SELECT id FROM fts_idx_t WHERE TS_MATCH(body, ' + SQLIT('hizli') +
+    ') ORDER BY id', 3);
+  Chk('FTS index update',
+    'UPDATE fts_idx_t SET body = ' + SQLIT('mavi araba hizli') +
+    ' WHERE id = 2', -1);
+  Chk('FTS index update sonrasi',
+    'SELECT id FROM fts_idx_t WHERE TS_MATCH(body, ' + SQLIT('hizli') +
+    ') ORDER BY id', 4);
+  Chk('FTS index delete', 'DELETE FROM fts_idx_t WHERE id = 1', -1);
+  Chk('FTS index delete sonrasi',
+    'SELECT id FROM fts_idx_t WHERE TS_MATCH(body, ' + SQLIT('hizli') +
+    ') ORDER BY id', 3);
 end;
 
 procedure T113_Vector;

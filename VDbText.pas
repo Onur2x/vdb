@@ -46,7 +46,7 @@ unit VDbText;
 
 interface
 
-uses SysUtils, Classes;
+uses SysUtils, Classes, Generics.Collections;
 
 // ---- temel islemler (geriye uyum) ----
 function VDbTrUpper(const S: string): string;
@@ -132,6 +132,35 @@ function VDbAlphaForLang(const LangIn: string): TVDbAlpha;
 function VDbFtsNormalize(const S: string): string;
 function VDbFtsMatch(const Text, Query: string): Boolean;   // tum terimler (AND)
 function VDbFtsRank(const Text, Query: string): Integer;    // terim gecis sayisi
+
+{ M5 (2026-10-20): bellek-ici inverted index + BM25.
+  Bir tablo/kolon icin satirlar bir kez taranip dokuman bazli posting
+  listeleri kurulur. Aday kumesi yalnizca POZITIF terimlerin kesisimiyle
+  daraltilir; WHERE kosulu sonradan aynen dogrulanir (phrase/negation
+  semantigi VDbFtsMatch tarafindan korunur). }
+type
+  TVdbFtsIndex = class
+  private
+    FPostings: TDictionary<string, TStringList>;  // token -> "pk#9tf"
+    FDocLen: TDictionary<string, Integer>;        // pk -> token sayisi
+    FDocCount: Integer;
+    FTotalLen: Int64;
+    function TermFreq(const Token, Pk: string): Integer;
+    function DocLenOf(const Pk: string): Integer;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Clear;
+    procedure AddDoc(const Pk, Text: string);
+    { Pozitif terimleri toplar. Hic pozitif terim yoksa False doner. }
+    function PositiveTerms(const Query: string; Terms: TStringList): Boolean;
+    { Query icin aday PK listesi. Pks cagiran tarafindan olusturulur ve
+      doldurulur. Donus False ise index bu sorgu icin kullanilamaz
+      (ornegin yalniz negatif terim). }
+    function Candidates(const Query: string; Pks: TStringList): Boolean;
+    function Bm25(const Pk, Query: string): Double;
+    property DocCount: Integer read FDocCount;
+  end;
 
 implementation
 
@@ -1428,6 +1457,215 @@ begin
   finally
     Q.Free;
     T.Free;
+  end;
+end;
+
+// ---- M5: inverted index + BM25 ----
+
+constructor TVdbFtsIndex.Create;
+begin
+  inherited Create;
+  FPostings := TDictionary<string, TStringList>.Create;
+  FDocLen := TDictionary<string, Integer>.Create;
+  FDocCount := 0;
+  FTotalLen := 0;
+end;
+
+destructor TVdbFtsIndex.Destroy;
+var
+  L: TStringList;
+begin
+  if FPostings <> nil then
+  begin
+    for L in FPostings.Values do L.Free;
+    FreeAndNil(FPostings);
+  end;
+  FreeAndNil(FDocLen);
+  inherited Destroy;
+end;
+
+procedure TVdbFtsIndex.Clear;
+var
+  L: TStringList;
+begin
+  for L in FPostings.Values do L.Free;
+  FPostings.Clear;
+  FDocLen.Clear;
+  FDocCount := 0;
+  FTotalLen := 0;
+end;
+
+procedure TVdbFtsIndex.AddDoc(const Pk, Text: string);
+var
+  Toks, W: TStringList;
+  TF: TDictionary<string, Integer>;
+  i, c: Integer;
+  tok, item: string;
+  Pair: TPair<string, Integer>;
+  PL: TStringList;
+begin
+  if Pk = '' then Exit;
+  if FDocLen.ContainsKey(Pk) then Exit;   // ayni dokuman iki kez eklenmez
+  Toks := TStringList.Create;
+  TF := TDictionary<string, Integer>.Create;
+  try
+    VDbFtsSplit(Text, Toks);
+    for i := 0 to Toks.Count - 1 do
+    begin
+      tok := Toks[i];
+      if tok = '' then Continue;
+      if TF.TryGetValue(tok, c) then TF[tok] := c + 1
+      else TF.Add(tok, 1);
+    end;
+    for Pair in TF do
+    begin
+      if not FPostings.TryGetValue(Pair.Key, PL) then
+      begin
+        PL := TStringList.Create;
+        PL.Sorted := False;
+        FPostings.Add(Pair.Key, PL);
+      end;
+      item := Pk + #9 + IntToStr(Pair.Value);
+      PL.Add(item);
+    end;
+    FDocLen.Add(Pk, Toks.Count);
+    Inc(FDocCount);
+    Inc(FTotalLen, Toks.Count);
+  finally
+    TF.Free;
+    Toks.Free;
+  end;
+end;
+
+function TVdbFtsIndex.TermFreq(const Token, Pk: string): Integer;
+var
+  PL: TStringList;
+  i, p: Integer;
+  item: string;
+begin
+  Result := 0;
+  if not FPostings.TryGetValue(Token, PL) then Exit;
+  for i := 0 to PL.Count - 1 do
+  begin
+    item := PL[i];
+    p := Pos(#9, item);
+    if (p > 0) and (Copy(item, 1, p - 1) = Pk) then
+    begin
+      Result := StrToIntDef(Copy(item, p + 1, MaxInt), 0);
+      Exit;
+    end;
+  end;
+end;
+
+function TVdbFtsIndex.DocLenOf(const Pk: string): Integer;
+begin
+  if not FDocLen.TryGetValue(Pk, Result) then Result := 0;
+end;
+
+function TVdbFtsIndex.PositiveTerms(const Query: string;
+  Terms: TStringList): Boolean;
+var
+  Q, W: TStringList;
+  i, j: Integer;
+  item, prefix, payload, word: string;
+begin
+  Result := False;
+  Terms.Clear;
+  if Query = '' then Exit;
+  Q := VDbFtsParseQuery(Query);
+  W := TStringList.Create;
+  try
+    for i := 0 to Q.Count - 1 do
+    begin
+      item := Q[i];
+      if Length(item) < 3 then Continue;
+      prefix := Copy(item, 1, 1);
+      if (prefix <> 'P') and (prefix <> 'Q') then Continue;  // negatifler atlanir
+      payload := Copy(item, 3, Length(item) - 2);
+      VDbFtsSplit(payload, W);
+      for j := 0 to W.Count - 1 do
+      begin
+        word := W[j];
+        if (word <> '') and (Terms.IndexOf(word) < 0) then Terms.Add(word);
+      end;
+    end;
+    Result := Terms.Count > 0;
+  finally
+    W.Free;
+    Q.Free;
+  end;
+end;
+
+function TVdbFtsIndex.Candidates(const Query: string;
+  Pks: TStringList): Boolean;
+var
+  Terms, PL: TStringList;
+  Counts: TDictionary<string, Integer>;
+  i, j, p, c: Integer;
+  item, pk: string;
+  Pair: TPair<string, Integer>;
+begin
+  Pks.Clear;
+  Terms := TStringList.Create;
+  if not PositiveTerms(Query, Terms) then
+  begin
+    Terms.Free;
+    Exit(False);
+  end;
+  Counts := TDictionary<string, Integer>.Create;
+  try
+    for i := 0 to Terms.Count - 1 do
+    begin
+      if not FPostings.TryGetValue(Terms[i], PL) then Continue;
+      for j := 0 to PL.Count - 1 do
+      begin
+        item := PL[j];
+        p := Pos(#9, item);
+        if p <= 0 then Continue;
+        pk := Copy(item, 1, p - 1);
+        if Counts.TryGetValue(pk, c) then Counts[pk] := c + 1
+        else Counts.Add(pk, 1);
+      end;
+    end;
+    for Pair in Counts do
+      if Pair.Value = Terms.Count then Pks.Add(Pair.Key);
+    Result := True;
+  finally
+    Counts.Free;
+    Terms.Free;
+  end;
+end;
+
+function TVdbFtsIndex.Bm25(const Pk, Query: string): Double;
+const
+  K1 = 1.2;
+  B = 0.75;
+var
+  Terms, PL: TStringList;
+  i, df, tf, dl: Integer;
+  avgdl, idf, denom: Double;
+begin
+  Result := 0;
+  if (Pk = '') or (Query = '') or (FDocCount = 0) then Exit;
+  Terms := TStringList.Create;
+  try
+    if not PositiveTerms(Query, Terms) then Exit;
+    if FTotalLen > 0 then avgdl := FTotalLen / FDocCount
+    else avgdl := 0;
+    if avgdl <= 0 then avgdl := 1;
+    dl := DocLenOf(Pk);
+    for i := 0 to Terms.Count - 1 do
+    begin
+      if not FPostings.TryGetValue(Terms[i], PL) then Continue;
+      df := PL.Count;
+      tf := TermFreq(Terms[i], Pk);
+      if tf <= 0 then Continue;
+      idf := Ln(1 + (FDocCount - df + 0.5) / (df + 0.5));
+      denom := tf + K1 * (1 - B + B * dl / avgdl);
+      if denom > 0 then Result := Result + idf * (tf * (K1 + 1)) / denom;
+    end;
+  finally
+    Terms.Free;
   end;
 end;
 

@@ -120,6 +120,9 @@ type
     FCteTables: TDictionary<string, TCteTable>;
     { H3: tablo id -> zone map (VERI DEGISINCE (Seq/Epoch) gecersiz). }
     FZoneMaps: TDictionary<Integer, TVDbZoneMap>;
+    { M5: tablo id + kolon -> inverted FTS index; Seq degisince yeniden kurulur. }
+    FFtsIndexes: TDictionary<string, TVdbFtsIndex>;
+    FFtsSeqs: TDictionary<string, QWord>;
     // H3: COUNT(*) + indekslenebilir WHERE icin yalnizca indeks girdilerini
     // sayan yol. FCountOnly yalnizca TryIndexCount cagrisi boyunca aciktir;
     // NarrowRows bu modda satir OKUMAZ, FCountResult'a sayiyi yazar.
@@ -411,6 +414,11 @@ type
       Sekil/guvenlik uymazsa False -> genel yol AYNEN calisir. }
     function TryStreamSelect(Stmt: TSqlSelectStmt; const td: TTableDef;
       out Res: TSqlResult): Boolean;
+    { M5: WHERE icindeki TS_MATCH(col, 'sorgu') conjunct'larini inverted
+      index ile daraltir. Semantik degismez: WHERE sonradan aynen uygulanir. }
+    function TryFtsNarrow(Stmt: TSqlSelectStmt; const td: TTableDef;
+      const ColNames: TStrArray; const ColTypes: TByteArray;
+      out Pks: TStrArray; out Rows: TStrMatrix): Boolean;
     procedure ExecJoinScan(Stmt: TSqlSelectStmt; out MergedRows: TStrMatrix;
       out MergedColNames: TStrArray; out MergedColTypes: TByteArray);
     { P5-WIN: pencere kolonlarini satirlarla ayni sirada hesaplar.
@@ -607,17 +615,26 @@ begin
   FIsolation := ilRepeatableRead;   // F-40: mevcut snapshot davranisi
   FSessionId := 0;
   FZoneMaps := TDictionary<Integer, TVDbZoneMap>.Create;
+  FFtsIndexes := TDictionary<string, TVdbFtsIndex>.Create;
+  FFtsSeqs := TDictionary<string, QWord>.Create;
 end;
 
 destructor TVSqlExecutor.Destroy;
 var
   m: TVDbZoneMap;
+  f: TVdbFtsIndex;
 begin
   if FZoneMaps <> nil then
   begin
     for m in FZoneMaps.Values do m.Free;
     FreeAndNil(FZoneMaps);
   end;
+  if FFtsIndexes <> nil then
+  begin
+    for f in FFtsIndexes.Values do f.Free;
+    FreeAndNil(FFtsIndexes);
+  end;
+  FreeAndNil(FFtsSeqs);
   inherited Destroy;
 end;
 
@@ -7913,6 +7930,143 @@ begin
   Result := True;
 end;
 
+function TVSqlExecutor.TryFtsNarrow(Stmt: TSqlSelectStmt;
+  const td: TTableDef; const ColNames: TStrArray;
+  const ColTypes: TByteArray; out Pks: TStrArray;
+  out Rows: TStrMatrix): Boolean;
+var
+  QList, Cand: TStringList;
+  fts: TVdbFtsIndex;
+  Counts: TDictionary<string, Integer>;
+  allPks, loadedPks: TStrArray;
+  allRows, loadedRows: TStrMatrix;
+  i, j, ci, p, n: Integer;
+  seq: QWord;
+  col, q, key, pk, item: string;
+  Pair: TPair<string, Integer>;
+  storedSeq, curSeq: QWord;
+  ftsRow: TStrArray;
+
+  function Collect(E: TSqlExprNode): Boolean;
+  var
+    b: TSqlBinaryOpNode;
+    fn: TSqlFuncCallNode;
+    lit: TSqlLiteralNode;
+    cref: TSqlColumnRefNode;
+    l, r: Boolean;
+  begin
+    Result := False;
+    if E = nil then Exit;
+    if (E is TSqlBinaryOpNode) and
+       (TSqlBinaryOpNode(E).Op = sboAnd) then
+    begin
+      b := TSqlBinaryOpNode(E);
+      l := Collect(b.Left);
+      r := Collect(b.Right);
+      Exit(l or r);
+    end;
+    if not (E is TSqlFuncCallNode) then Exit;
+    fn := TSqlFuncCallNode(E);
+    if (not SameText(fn.FuncName, 'TS_MATCH')) or
+       (fn.Args = nil) or (fn.Args.Count < 2) then Exit;
+    if not (fn.Args[0] is TSqlColumnRefNode) then Exit;
+    if not (fn.Args[1] is TSqlLiteralNode) then Exit;
+    cref := TSqlColumnRefNode(fn.Args[0]);
+    lit := TSqlLiteralNode(fn.Args[1]);
+    if lit.LitType <> sltString then Exit;
+    QList.Add(cref.ColumnName + #9 + lit.StrVal);
+    Result := True;
+  end;
+
+begin
+  Result := False;
+  Pks := nil;
+  Rows := nil;
+  if (Stmt = nil) or (Stmt.WhereClause = nil) then Exit;
+  QList := TStringList.Create;
+  Cand := TStringList.Create;
+  Counts := TDictionary<string, Integer>.Create;
+  try
+    if not Collect(Stmt.WhereClause) then Exit;
+    if QList.Count = 0 then Exit;
+
+    for i := 0 to QList.Count - 1 do
+    begin
+      item := QList[i];
+      p := Pos(#9, item);
+      if p <= 0 then Exit;
+      col := Copy(item, 1, p - 1);
+      q := Copy(item, p + 1, MaxInt);
+      ci := FindColIdx(col, '', ColNames);
+      if (ci < 0) or (ci > High(ColTypes)) or (ColTypes[ci] <> VCT_STR) then Exit;
+
+      key := IntToStr(td.TableId) + ':' + LowerCase(col);
+      if not FFtsIndexes.TryGetValue(key, fts) then
+      begin
+        fts := TVdbFtsIndex.Create;
+        FFtsIndexes.Add(key, fts);
+        FFtsSeqs.Add(key, High(QWord));
+      end;
+      curSeq := QWord(FT.Kv.DataSeqValue);
+      if (not FFtsSeqs.TryGetValue(key, storedSeq)) or (storedSeq <> curSeq) then
+      begin
+        fts.Clear;
+        FT.ScanRows(Stmt.FromTable, allPks, allRows);
+        for j := 0 to High(allPks) do
+          if (j <= High(allRows)) and (ci <= High(allRows[j])) then
+            fts.AddDoc(allPks[j], allRows[j][ci]);
+        allPks := nil;
+        allRows := nil;
+        FFtsSeqs[key] := curSeq;
+      end;
+
+      Cand.Clear;
+      if not fts.Candidates(q, Cand) then Exit;   // yalniz negatif terim
+      for j := 0 to Cand.Count - 1 do
+      begin
+        pk := Cand[j];
+        if Counts.TryGetValue(pk, n) then Counts[pk] := n + 1
+        else Counts.Add(pk, 1);
+      end;
+    end;
+
+    // Tum TS_MATCH conjunct'lari ayni PK'yi isaret etmeli.
+    loadedPks := nil;
+    for Pair in Counts do
+      if Pair.Value = QList.Count then
+      begin
+        SetLength(loadedPks, Length(loadedPks) + 1);
+        loadedPks[High(loadedPks)] := Pair.Key;
+      end;
+
+    if Length(loadedPks) = 0 then
+    begin
+      SetLength(Pks, 0);
+      SetLength(Rows, 0);
+      Exit(True);
+    end;
+
+    SetLength(loadedRows, Length(loadedPks));
+    n := 0;
+    for i := 0 to High(loadedPks) do
+      if FT.ReadRow(Stmt.FromTable, loadedPks[i], ftsRow) then
+      begin
+        loadedPks[n] := loadedPks[i];
+        loadedRows[n] := ftsRow;
+        Inc(n);
+      end;
+    SetLength(loadedPks, n);
+    SetLength(loadedRows, n);
+    Pks := loadedPks;
+    Rows := loadedRows;
+    Result := True;
+  finally
+    Counts.Free;
+    Cand.Free;
+    QList.Free;
+  end;
+end;
+
 procedure TVSqlExecutor.ExecSelect(Stmt: TSqlSelectStmt; out Res: TSqlResult);
 var
   td: TTableDef;
@@ -8181,6 +8335,15 @@ begin
       end
       else
       begin
+        { M5: TS_MATCH conjunct'lari varsa once inverted index ile daralt.
+          WHERE yine asagida aynen uygulanir; sonuc kumesi degismez. }
+        if TryFtsNarrow(Stmt, td, colNames, colTypes, pks, allRows) then
+        begin
+          SkipOffsetLimit := False;
+          isExactNarrow := False;
+        end
+        else
+        begin
         // H1 (2026-10-18): indekssiz, LIMIT'li, ORDER BY'siz tek tablo
         // SELECT'i ham akistan okuyup LIMIT dolunca durur. Uymazsa False.
         if TryStreamSelect(Stmt, td, Res) then
@@ -8231,6 +8394,7 @@ begin
           // tara (partition pruning). Sonuc ayni, okunan satir azalir.
           FT.ScanRowsPart(Stmt.FromTable, pks, allRows, PartTargetsOf(td, Stmt.WhereClause));
       end;
+        end;
       // R-19: satirlar okundu; simdi RLS ile GORUNMEZ olanlari ele.
       // BURADA yapilir (WHERE filtresinden ONCE) ki aggregate/GROUP BY,
       // ORDER BY, LIMIT/LIST ve set-op birlestirmesi de dogru satir
