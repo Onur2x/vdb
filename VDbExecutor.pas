@@ -852,6 +852,15 @@ var
   RA, RB: TRangeBound;
   cl: TVDbLang;
   cc: Integer;
+  la, lb: Integer;
+
+  { SQL uc-degerli mantik: -1 = FALSE, 0 = UNKNOWN (NULL), +1 = TRUE. }
+  function BoolTri(const V: string): Integer;
+  begin
+    if V = '' then Exit(0);
+    if SameText(V, 'True') or (V = '1') then Exit(1);
+    Result := -1;
+  end;
 
   { R-20: metin karsilastirmasinda kolonun varsayilan collation'i
     uygulanir. Acik COLLATE yoksa VDbCmpVal'in varsayilan (bayt/duyarli)
@@ -922,15 +931,23 @@ begin
       end;
     sboAnd:
       begin
-        bRes := (SameText(LeftVal, 'True') or (LeftVal = '1')) and
-                (SameText(RightVal, 'True') or (RightVal = '1'));
-        if bRes then Exit('True') else Exit('False');
+        // SQL 3VL: FALSE AND UNKNOWN = FALSE, TRUE AND UNKNOWN = UNKNOWN.
+        // UNKNOWN'i burada 'False'e indirgersek NOT (unknown AND ...) yanlis
+        // True olur ve NULL satirlari filtreye girer.
+        la := BoolTri(LeftVal);
+        lb := BoolTri(RightVal);
+        if (la = -1) or (lb = -1) then Exit('False');
+        if (la = 0) or (lb = 0) then Exit('');
+        Exit('True');
       end;
     sboOr:
       begin
-        bRes := (SameText(LeftVal, 'True') or (LeftVal = '1')) or
-                (SameText(RightVal, 'True') or (RightVal = '1'));
-        if bRes then Exit('True') else Exit('False');
+        // SQL 3VL: TRUE OR UNKNOWN = TRUE, FALSE OR UNKNOWN = UNKNOWN.
+        la := BoolTri(LeftVal);
+        lb := BoolTri(RightVal);
+        if (la = 1) or (lb = 1) then Exit('True');
+        if (la = 0) or (lb = 0) then Exit('');
+        Exit('False');
       end;
     sboConcat:
       // || string birlestirme (SQL standardi)
@@ -1591,7 +1608,9 @@ begin
   begin
     inN := TSqlInNode(Expr);
     lv := EvalExpr(inN.Expr, Row, ColNames, ColTypes);
-    if lv = '' then Exit('False');
+    // NULL IN (...) / NULL NOT IN (...) -> UNKNOWN. Once 'False' donuyordu;
+    // dis NOT bunu True'ya cevirip NULL satirlarini yanlislikla seciyordu.
+    if lv = '' then Exit('');
     matched := False;
     // F1-13: NOT IN ... NULL handling (three-valued logic)
     hasNull := False;
@@ -1641,12 +1660,15 @@ begin
       end;
     if inN.IsNot then
     begin
-      // F1-13: NOT IN ... NULL => UNKNOWN (satir gelmez)
-      // Liste icinde NULL varsa sonuc UNKNOWN -> eslesmez.
-      if hasNull then matched := False
-      else matched := not matched;
+      // SQL: x NOT IN (liste) = NOT (x IN (liste)).
+      // Eslesme varsa FALSE; eslesme yok ama listede NULL varsa UNKNOWN.
+      if matched then Exit('False');
+      if hasNull then Exit('');
+      Exit('True');
     end;
-    if matched then Exit('True') else Exit('False');
+    if matched then Exit('True');
+    if hasNull then Exit('');
+    Exit('False');
   end;
 
   if Expr is TSqlQuantNode then
@@ -1730,7 +1752,9 @@ begin
   begin
     bt := TSqlBetweenNode(Expr);
     lv := EvalExpr(bt.Expr, Row, ColNames, ColTypes);
-    if lv = '' then Exit('False');
+    // NULL BETWEEN ... / NULL NOT BETWEEN ... -> UNKNOWN. Once 'False'
+    // donuyordu; dis NOT bunu True'ya cevirip NULL satirlarini seciyordu.
+    if lv = '' then Exit('');
     ct := VCT_STR;
     if bt.Expr is TSqlColumnRefNode then
     begin
@@ -1742,8 +1766,12 @@ begin
     // H-ek: ifade tarafi (kolon degil) sayisal ise metin sirasi yerine sayisal.
     else
       ct := ExprResultCtype(bt.Expr, ColNames, ColTypes);
-    matched := VDbCmpVal(lv, EvalExpr(bt.LowBound, Row, ColNames, ColTypes), '>=', ct) and
-               VDbCmpVal(lv, EvalExpr(bt.HighBound, Row, ColNames, ColTypes), '<=', ct);
+    lv2 := EvalExpr(bt.LowBound, Row, ColNames, ColTypes);
+    if lv2 = '' then Exit('');
+    rv := EvalExpr(bt.HighBound, Row, ColNames, ColTypes);
+    if rv = '' then Exit('');
+    matched := VDbCmpVal(lv, lv2, '>=', ct) and
+               VDbCmpVal(lv, rv, '<=', ct);
     if bt.IsNot then matched := not matched;
     if matched then Exit('True') else Exit('False');
   end;
