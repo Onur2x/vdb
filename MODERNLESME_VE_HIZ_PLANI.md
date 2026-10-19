@@ -21,7 +21,7 @@ Zaten kazanılmış (dokunma, koru):
 - `COUNT(*)` O(1) (KR-1B doğrulanmış-sonuç önbelleği).
 - WHERE'siz agrega (`SUM/AVG/MIN/MAX`) allocation-free raw-peek (`ScanRawIter`, KR-8/8c).
 - Yazma yolunda tahsis diyeti, batch COMMIT tamponu (P-21), konumsal okuma (P-19).
-- Çökme dayanıklılığı: `sqltest 2508/2508`, `crashtest 8/8`.
+- Çökme dayanıklılığı: `sqltest 2527/2527`, `crashtest 8/8`.
 
 Hâlâ yavaş (bu belgenin hedefi):
 
@@ -233,6 +233,44 @@ sorgu tarafında ART/B+tree kazanımı bu profilde küçük. ART/B+tree hâlâ t
 > dizi yerine aralık iterasyonuna taşınması ve güncelleme yolunun O(N)
 > birleştirmeden kurtarılması. Bu dilim tamamlanana kadar mevcut dizi yolu
 > varsayılan ve tek doğruluk kaynağıdır.
+
+> **Uygulama durumu — 3. adım: küçük-delta güncelleme + indeksli COUNT (2026-10-19, TAMAM):**
+> `FlushIdxPending` en fazla **8 farklı PK** için tam O(N+M) birleştirme yerine
+> hızlı yol kullanır: eski girdiyi çıkarıp yenisini aynı sıralı dizide **tek
+> kaydırmayla** yerleştirir (silme/ekleme ayrı ayrı tam kaydırma yapmaz).
+> `TIdxEntry` string alanları için ham `Move` + `FillChar` + yönetilen atama
+> kullanılır; refcount'lar dengede kalır. Anahtar değişmediyse (örn. yalnız
+> INCLUDE kolonu) yalnız `Cov` yerinde güncellenir. 8'den büyük deltalarda
+> mevcut O(N+M) birleştirme aynen yedek yoldur.
+>
+> `NarrowRows` artık aynı kolondaki **bitişik** aralıkların (`>`, `>=`, `<`,
+> `<=`, `=`, `BETWEEN`) kesişimini "tam" kabul eder; `IN` ayrık küme olduğu
+> için `RowMatches` korunur. Nullable kolonda yalnız üst sınır içeren
+> (`<`, `<=`) dilim NULL/boş anahtarları da kapsayabildiğinden tam sayılmaz.
+> `a = NULL` indeks aralığı üretmez (SQL UNKNOWN). `ExecGroupBy`, dilim
+> WHERE'in tamamını temsil ediyorsa `RowMatches`'i ikinci kez çalıştırmaz.
+>
+> **Yeni `TryIndexCount`:** saf `COUNT(*)` + indekslenebilir WHERE için
+> satırları okumadan yalnız indeks girdilerini sayar; şekil uymazsa genel
+> yola döner (JOIN, GROUP BY/HAVING/QUALIFY, DISTINCT, ORDER BY, LIMIT/OFFSET,
+> view, RLS, ifade/IN vb.).
+>
+> **Ölçüm (`idxbench`, 100.000 satır, 200 × 1000 satırlık aralık, 100 döngü):**
+> A) 200 UPDATE (pending) **76,8 ms**; ilk indeksli sorgu (flush) **20,3 ms**;
+> B) 100 × (UPDATE + indeksli `COUNT(*)`) **2499,0 → 40,6 ms**
+> (**24,99 → 0,41 ms/döngü, ~61x**); B0) indeksli COUNT (pending yok)
+> **0,01 ms**; C) indekssiz COUNT **737,7 ms/döngü** (değişmedi).
+>
+> **Kapılar:** `sqltest 2527/2527`, `crashtest 8/8`, `rawchk 29/29`,
+> `mrowchk 0 hata`, `fuzzchk 3000/3000`, `sqlite_diff 4000/4000`,
+> `hashchk 80/80`, `copychk 17/17`, `zonechk 0 hata`, `skipchk 0 hata`,
+> yeni `countchk` **120/120**. `countchk`, indeksli tabloyu indekssiz oracle
+> ile `COUNT(*)` + `SUM(id)` üzerinden karşılaştırır (range/IN/NULL/partial/
+> çok kolonlu indeks, pending UPDATE/DELETE ve ROLLBACK dahil).
+>
+> **Kalan:** tam skiplist entegrasyonu (O(log N) güncelleme) ve çok büyük
+> deltalarda O(N+M) birleştirmenin kaldırılması; mevcut dizi yolu varsayılan
+> ve tek doğruluk kaynağıdır.
 
 ### H4 — mmap read yolu (sıfır-kopya)
 **Sorun:** KR-D okuma tarafı. Kayıt başına okuma/kopya.
@@ -880,7 +918,7 @@ maddelerin "eksik" sanılıp tekrar uygulanmasını önlemektir.
 |---|---|---|
 | H1 vektörleştirilmiş filtre | ✅ Yapıldı | `TryStreamSelect`: ham akış + LIMIT erken durma + AND-tabanlı ham-yüklem batch eleme (INT/FLOAT + TEXT `=`/`<>`); `rawchk` birebir. (Projeksiyon/`EvalExpr` hâlâ string döndürür — çıktı aşaması; planın "tip-tabanlı ara diziler" optimizasyonu opsiyonel kaldı, sonucu değiştirmez.) |
 | H2 hash join | ✅ Yapıldı | indekssiz tek-eşitlik INNER/LEFT (`ExecJoinScan`); indeksli/PK hızlı yolu korunuyor |
-| H3 ART/B+tree + zone map | 🟡 Kısmi (zone map ✅, skiplist prototipi ✅) | **Bucket zone map**: INT/FLOAT min/max, 2 MB bucket, disk formatı değişmez, `(FIdxVer,DataEpoch)` invalidation + batch'te kapalı; `a=77777` 163,5→31,6 ms (**5,2x**), float aralık 185,4→35,4 ms (**5,2x**); `zonechk` birebir + INSERT/UPDATE/DELETE/ROLLBACK/Compact güvenliği. `FMemIdx` hash + sıralı dizi (KR-C) indeks dilimi ~1300x. **`VDbSkipList.pas`** prototipi: O(log N) insert/delete + LowerBound/Range; `skipchk` 200k oracle + 1M ölçüm (ekleme 1091,1 ms, LB 393,8 ms, 10k range 289,6 ms, 100k delete 257,2 ms). Motora entegrasyon henüz yok; sıralı dizi varsayılan |
+| H3 ART/B+tree + zone map | 🟡 Kısmi (zone map ✅, skiplist prototipi ✅, küçük-delta ✅) | **Bucket zone map**: INT/FLOAT min/max, 2 MB bucket, disk formatı değişmez, `(FIdxVer,DataEpoch)` invalidation + batch'te kapalı; `a=77777` 163,5→31,6 ms (**5,2x**), float aralık 185,4→35,4 ms (**5,2x**); `zonechk` birebir + INSERT/UPDATE/DELETE/ROLLBACK/Compact güvenliği. `FMemIdx` hash + sıralı dizi (KR-C) indeks dilimi ~1300x. **Küçük-delta güncelleme + indeksli COUNT:** `idxbench` 100k satırda 100 × (UPDATE + indeksli COUNT) **24,99 → 0,41 ms/döngü (~61x)**; indeksli COUNT **0,01 ms**; `NarrowRows` bitişik aralıkları tam sayar, IN/NULL için `RowMatches` korunur. **`VDbSkipList.pas`** prototipi: O(log N) insert/delete + LowerBound/Range; `skipchk` 200k oracle + 1M ölçüm (ekleme ~1025 ms, LB ~390 ms, 10k range ~276 ms, 100k delete ~251 ms). Tam skiplist entegrasyonu henüz yok; sıralı dizi varsayılan |
 | H4 mmap okuma | 🟡 Deneysel (varsayılan KAPALI) | `ScanRawIter` salt-okunur eşleme (`VDbMapFileHandle`/`SetReadMapEnabled`); sıcak-cache'te mmap **yavaş** (11,3→17,3 ms; yumuşak sayfa hatası); `mmapchk` düz+şifreli+Compact birebir; POSIX kapalı |
 | H5 blok-grup CRC | ❌ Yok | per-record CRC (aynı zamanda format girdisi) |
 | H6 tek-sorgu paralel | ✅ Yapıldı (agrega + indeks sıralaması) | `PrepareRawScan`/`ScanRawPrepared` (offset bucket, aday bir kez); `TryStreamAgg` işçi başına biriktirici + deterministik birleşim; 150k'da 53,0→13,0 ms (8 işçi, **4,08x**); SUM/AVG FLOAT'ta seri (bit-ayni); havuzun auto-reset `RTLEvent` hatası sayma semaforuyla düzeltildi. **H6-sort:** `SortIdxEntries`/`SortIdxEntriesCols` parçalı hızlı sıralama + k-yönlü heap birleştirme; 300k `CREATE INDEX` 708,7→515,2 ms (~1,38x), seri ile birebir |

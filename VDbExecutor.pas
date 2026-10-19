@@ -116,6 +116,11 @@ type
     FCteTables: TDictionary<string, TCteTable>;
     { H3: tablo id -> zone map (VERI DEGISINCE (Seq/Epoch) gecersiz). }
     FZoneMaps: TDictionary<Integer, TVDbZoneMap>;
+    // H3: COUNT(*) + indekslenebilir WHERE icin yalnizca indeks girdilerini
+    // sayan yol. FCountOnly yalnizca TryIndexCount cagrisi boyunca aciktir;
+    // NarrowRows bu modda satir OKUMAZ, FCountResult'a sayiyi yazar.
+    FCountOnly: Boolean;
+    FCountResult: Int64;
     // 4.3: HAVING icinde dogrudan aggregate. EvalBool sirasinda aktif
     // grup baglami: FAggIdx <> nil iken EvalExpr'de aggregate cagrilari
     // grup satirlari uzerinden hesaplanir (alias zorunlu degil). yalnizca
@@ -358,6 +363,12 @@ type
     function NarrowRows(const Td: TTableDef; WhereClause: TSqlExprNode;
       const ColNames: TStrArray; const ColTypes: TByteArray;
       out Pks: TStrArray; out Rows: TStrMatrix): Boolean; overload;
+    { H3: Saf COUNT(*) + indekslenebilir WHERE. Satirlari okumadan, indeks
+      dilimindeki girdi sayisini dondurur. WHERE'in tamami dilimle
+      temsil edilemiyorsa False -> genel yol. }
+    function TryIndexCount(const Td: TTableDef; Stmt: TSqlSelectStmt;
+      const ColNames: TStrArray; const ColTypes: TByteArray;
+      out Cnt: Int64): Boolean;
     { R-13 Full: WHERE'den bolme hedef kumesini cikarir (partition
       pruning). Guvenlik: yalniz AND'lenen ve anlasilabilen kosullar
       (bolme kolonunda '=' ya da IN, literal degerlerle) katki verir;
@@ -381,7 +392,7 @@ type
     procedure ExecGroupBy(Stmt: TSqlSelectStmt; const AllPks: TStrArray;
       const AllRows: TStrMatrix; const ColNames: TStrArray;
       const ColTypes: TByteArray; out Res: TSqlResult;
-      out OutTypes: TByteArray);
+      out OutTypes: TByteArray; AlreadyFiltered: Boolean = False);
     { P-12 (2026-10-16): WHERE/GROUP BY/HAVING/JOIN/ORDER/LIMIT OLMAYAN
       tek tablo agregalarini (COUNT(*), COUNT(k), SUM/AVG/MIN/MAX(k))
       HAM kayit uzerinde tek passede hesaplar; satirlar string matrisine
@@ -3646,6 +3657,10 @@ var
   bestLo, bestHi: Integer;
   foundRange: Boolean;
   exactRange: Boolean;
+  nUsed: Integer;          // dilime katkida bulunan conjunct sayisi
+  hasIn: Boolean;          // katkida bulunan IN var mi (aralik tam degil)
+  hasLower: Boolean;       // alt sinir var mi (NULL'lari disarida tutar)
+  isIn: Boolean;
   op: TSqlBinaryOp;
   cr: TSqlColumnRefNode;
   opName: string;
@@ -3686,6 +3701,9 @@ var
     if nn.Right is TSqlColumnRefNode then b := TSqlColumnRefNode(nn.Right);
     if (a <> nil) and (nn.Right is TSqlLiteralNode) then
     begin
+      // `a = NULL` SQL'de UNKNOWN'dir; indeks araligi uretme, RowMatches
+      // (veya tam tarama) dogru sonucu versin.
+      if TSqlLiteralNode(nn.Right).LitType = sltNull then Exit;
       ColI := -1;
       for q := 0 to High(Td.Cols) do
         if VDbNorm(Td.Cols[q].Name) = VDbNorm(a.ColumnName) then
@@ -3698,6 +3716,7 @@ var
     if (b <> nil) and (nn.Left is TSqlLiteralNode) then
     begin
       // "5 = a" -> "a = 5" (yansitilmis operator)
+      if TSqlLiteralNode(nn.Left).LitType = sltNull then Exit;
       ColI := -1;
       for q := 0 to High(Td.Cols) do
         if VDbNorm(Td.Cols[q].Name) = VDbNorm(b.ColumnName) then
@@ -3745,6 +3764,7 @@ begin
         end;
         // eslesme yoksa da bos sonuc DONDURULUR: tam tarama gerekmez
         IsExact := True;
+        if FCountOnly then FCountResult := Length(Pks);
         Exit(True);
       end;
 
@@ -3783,14 +3803,17 @@ begin
           SetLength(Pks, ci);
           SetLength(Rows, ci);
           IsExact := (conj.Count = 1);
+          if FCountOnly then FCountResult := Length(Pks);
           Exit(True);   // filtre RowMatches ile asagida uygulanir (IsExact degilse)
         end;
 
     // --- 2) indeks dilimi ---
     bestCol := -1; bestLo := 0; bestHi := 0; foundRange := False; exactRange := False;
+    nUsed := 0; hasIn := False; hasLower := False;
     for i := 0 to conj.Count - 1 do
     begin
       lo := 0; hi := 0;
+      isIn := False;
       // 2a) basit karsilastirma
       if AsSimple(conj[i], ci, pkVal, op) then
       begin
@@ -3807,6 +3830,10 @@ begin
           if not FT.TryGetMemIndex(Td.TableId, ci, e) then Continue;
           if not VDbIdxRangeL(e, Td.Cols[ci].Ctype, opName, pkVal, FT.IdxNParts(Td.TableId, ci), lo, hi) then
             Continue;
+          // >, >=, = bir ALT SINIR getirir; indekste NULL/bos anahtar
+          // (en basta) boylece dilim disinda kalir.
+          if (op = sboGt) or (op = sboGte) or (op = sboEq) then
+            hasLower := True;
         end
         else Continue;
       end
@@ -3826,6 +3853,7 @@ begin
         if not FT.TryGetMemIndex(Td.TableId, ci, e) then Continue;
         ct := Td.Cols[ci].Ctype;
         nParts := FT.IdxNParts(Td.TableId, ci);
+        hasLower := True;
         if not VDbIdxRangeL(e, ct, '>=',
              TSqlLiteralNode(TSqlBetweenNode(conj[i]).LowBound).AsString, nParts, l2, h2) then
           Continue;
@@ -3838,6 +3866,7 @@ begin
       else if (conj[i] is TSqlInNode) and (not TSqlInNode(conj[i]).IsNot) and
               (TSqlInNode(conj[i]).Expr is TSqlColumnRefNode) then
       begin
+        isIn := True;
         cr := TSqlColumnRefNode(TSqlInNode(conj[i]).Expr);
         ci := -1;
         for n := 0 to High(Td.Cols) do
@@ -3870,16 +3899,16 @@ begin
       // sonuctaki satirlar yine RowMatches ile dogrulanir.
       if foundRange and (ci <> bestCol) then Continue;
 
+      Inc(nUsed);
+      if isIn then hasIn := True;
       if not foundRange then
       begin
         foundRange := True; bestCol := ci; bestLo := lo; bestHi := hi;
-        exactRange := (conj.Count = 1);
       end
       else
       begin
         if lo > bestLo then bestLo := lo;
         if hi < bestHi then bestHi := hi;
-        exactRange := False; // birden fazla kosul kesisiyorsa RowMatches dogrulamasi gerekir
       end;
     end;
 
@@ -3887,7 +3916,34 @@ begin
     if bestHi <= bestLo then       // kesim bos
     begin
       IsExact := True;
+      if FCountOnly then FCountResult := 0;
       Exit(True);                  // 0 satir, tam tarama gerekmez
+    end;
+    // Ayni kolondaki BITISIK araliklarin (>, >=, <, <=, =, BETWEEN) kesisimi
+    // WHERE'in tamamini temsil eder. IN AYRIK bir kumedir: [min,max]
+    // dilimi aradaki degerleri de kapsar, bu yuzden RowMatches her zaman
+    // gerekir. Baska kolondaki/cozulmeyen kosullar da dilime girmez.
+    // NULL/BOS anahtar indeksin EN BASINDA durur; yalniz ust sinirli
+    // (<, <=) bir dilim onu da kapsar. SQL'de NULL < x bilinmez oldugundan
+    // nullable kolonda alt sinir yoksa tam sayim yapilamaz.
+    exactRange := (nUsed = conj.Count) and (not hasIn) and
+      (hasLower or Td.Cols[bestCol].NotNull);
+
+    // H3 COUNT(*): yalnizca dilimdeki girdileri say. exactRange degilse
+    // RowMatches gerektigi icin genel yola don (satir okumadan sayamayiz).
+    if FCountOnly then
+    begin
+      if not exactRange then
+      begin
+        SetLength(Pks, 0);
+        SetLength(Rows, 0);
+        Exit;
+      end;
+      FCountResult := bestHi - bestLo;
+      SetLength(Pks, 0);
+      SetLength(Rows, 0);
+      IsExact := True;
+      Exit(True);
     end;
 
     // ---- R-15 Full CBO: indeks dilimi secici degilse tam tarama ----
@@ -3936,6 +3992,47 @@ var
   dummyExact: Boolean;
 begin
   Result := NarrowRows(Td, WhereClause, ColNames, ColTypes, Pks, Rows, dummyExact);
+end;
+
+function TVSqlExecutor.TryIndexCount(const Td: TTableDef; Stmt: TSqlSelectStmt;
+  const ColNames: TStrArray; const ColTypes: TByteArray; out Cnt: Int64): Boolean;
+var
+  fn: TSqlFuncCallNode;
+  pks: TStrArray;
+  rows: TStrMatrix;
+  exact: Boolean;
+begin
+  Result := False;
+  Cnt := 0;
+  if Stmt.WhereClause = nil then Exit;
+  if Stmt.Columns.Count <> 1 then Exit;
+  if not (Stmt.Columns[0].Expr is TSqlFuncCallNode) then Exit;
+  fn := TSqlFuncCallNode(Stmt.Columns[0].Expr);
+  if (fn.FuncName <> 'COUNT') or (not fn.IsStar) or
+     fn.IsDistinct or (fn.Filter <> nil) then Exit;
+  if Stmt.FromTable = '' then Exit;
+  if Stmt.HasJoin or (Stmt.SetOp <> sokNone) or (Stmt.RightSelect <> nil) then Exit;
+  if Stmt.AsOf <> saoNone then Exit;
+  if Stmt.WithQueries.Count > 0 then Exit;
+  if Stmt.IsDistinct then Exit;
+  if Stmt.GroupByCols.Count > 0 then Exit;
+  if Stmt.HavingClause <> nil then Exit;
+  if Stmt.QualifyClause <> nil then Exit;
+  if HasWindow(Stmt) then Exit;
+  if (Stmt.OrderBy <> nil) and (Stmt.OrderBy.Count > 0) then Exit;
+  if (Stmt.LimitVal >= 0) or (Stmt.OffsetVal <> 0) then Exit;
+  if Td.IsView then Exit;
+  if FT.RlsApplies(Stmt.FromTable) then Exit;
+  FCountOnly := True;
+  try
+    if not NarrowRows(Td, Stmt.WhereClause, ColNames, ColTypes,
+      pks, rows, exact) then Exit;
+    if not exact then Exit;
+    Cnt := FCountResult;
+    Result := True;
+  finally
+    FCountOnly := False;
+  end;
 end;
 
 function TVSqlExecutor.TryIndexOrder(const Td: TTableDef; Stmt: TSqlSelectStmt;
@@ -5749,7 +5846,7 @@ end;
 procedure TVSqlExecutor.ExecGroupBy(Stmt: TSqlSelectStmt;
   const AllPks: TStrArray; const AllRows: TStrMatrix;
   const ColNames: TStrArray; const ColTypes: TByteArray;
-  out Res: TSqlResult; out OutTypes: TByteArray);
+  out Res: TSqlResult; out OutTypes: TByteArray; AlreadyFiltered: Boolean);
 var
   GroupKeys: TList<TStrArray>;
   GroupRowSets: TIntListList;
@@ -5778,7 +5875,11 @@ begin
     // 1. Grupla
     for i := 0 to High(AllRows) do
     begin
-      if not RowMatches(Stmt.WhereClause, AllRows[i], ColNames, ColTypes) then Continue;
+      // Indeks dilimi WHERE'in tamamini temsil ediyorsa satirlar zaten
+      // filtrelenmistir; ayni AST'yi ikinci kez degerlendirmeyiz.
+      if (not AlreadyFiltered) and
+         (not RowMatches(Stmt.WhereClause, AllRows[i], ColNames, ColTypes)) then
+        Continue;
       SetLength(key, Stmt.GroupByCols.Count);
       for j := 0 to Stmt.GroupByCols.Count - 1 do
       begin
@@ -7688,6 +7789,7 @@ var
   ViewSel: TSqlSelectStmt;
   ViewRes: TSqlResult;
   ViewTypes: TByteArray;
+  cnt64: Int64;
 
   // 4.2 (2026-10-06): aggregate/GROUP BY sonrasi kuyruk â€” JOIN ve
   // tek-tablo yolu ORTAK kullanir (kod tekrari yok). ORDER BY cikti
@@ -7928,6 +8030,21 @@ begin
         // Sekli uymazsa False; asagidaki genel yol AYNEN calisir.
         if TryStreamAgg(Stmt, td, Res) then
           Exit;
+        // H3: WHERE'li saf COUNT(*) -> indeks dilimini satir okumadan say.
+        if TryIndexCount(td, Stmt, colNames, colTypes, cnt64) then
+        begin
+          SetLength(Res.Fields, 1);
+          if Stmt.Columns[0].Alias <> '' then
+            Res.Fields[0] := Stmt.Columns[0].Alias
+          else
+            Res.Fields[0] := 'COUNT';
+          SetLength(Res.Rows, 1);
+          SetLength(Res.Rows[0], 1);
+          Res.Rows[0][0] := IntToStr(cnt64);
+          Res.Affected := 1;
+          Res.Msg := 'OK';
+          Exit;
+        end;
         // YOL 1 (en hizli): ORDER BY tek kolon ve o kolon indeksliyse satirlar
       // INDEKS sirasiyla okunur; OFFSET/LIMIT satir okunurken uygulanir.
       // F1-12: Eger SetOp varsa (UNION/EXCEPT/INTERSECT), ORDER BY/LIMIT/OFFSET
@@ -7988,7 +8105,8 @@ begin
       if HasSetOp then
         raise EVDbException.Create(ecUnsupported,
           'UNION/EXCEPT/INTERSECT ile aggregate/GROUP BY birlestirilemiyor');
-      ExecGroupBy(Stmt, pks, allRows, colNames, colTypes, Res, outTypes);
+      ExecGroupBy(Stmt, pks, allRows, colNames, colTypes, Res, outTypes,
+        isExactNarrow and (not SkipOffsetLimit));
       // 4.2: kuyruk ortak FinishGroup'a tasinildi (JOIN yolu da aynisini
       // cagirir; F1-20 ORDER BY tip haritasi + OFFSET/LIMIT + Affected).
       FinishGroup;

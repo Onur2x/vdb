@@ -6923,11 +6923,38 @@ var
   ops: TList<TIdxOp>;
   e, keep, delta, merged: TIdxEntries;
   lastOp: TDictionary<string, TIdxOp>;    // pk -> son durum
+  oldKeys: TDictionary<string, string>;   // pk -> committed eski anahtar
   added: TDictionary<string, Boolean>;     // eklenen pk'ler
   ct: Byte;
   ctMulti: TByteArray;
   isMulti: Boolean;
   i, nKeep, nDelta, iKeep, iDelta, iMerged, cmp: Integer;
+  oldLen, pos, pNew, target: Integer;
+  oldKey: string;
+  op: TIdxOp;
+  p: TPair<string, TIdxOp>;
+  tmpEntry: TIdxEntry;
+
+  function EntryLB(const Arr: TIdxEntries; const Key, Pk: string): Integer;
+  var
+    lo, hi, m, c: Integer;
+  begin
+    lo := 0;
+    hi := Length(Arr);
+    while lo < hi do
+    begin
+      m := (lo + hi) div 2;
+      if isMulti then
+        c := VDbIdxMultiCmp(Arr[m].Key, Key, ctMulti)
+      else
+        c := VDbIdxCmp(Arr[m].Key, Key, ct);
+      if c = 0 then
+        c := CompareStr(Arr[m].Pk, Pk);
+      if c < 0 then lo := m + 1 else hi := m;
+    end;
+    Result := lo;
+  end;
+
 begin
   if not FIdxOps.TryGetValue(k, ops) then Exit;
   if ops.Count = 0 then
@@ -6938,11 +6965,111 @@ begin
   end;
   if not FIdxCtype.TryGetValue(k, ct) then ct := VCT_STR;
   if not FMemIdx.TryGetValue(k, e) then SetLength(e, 0);
+  isMulti := IdxNPartsByKey(k) > 1;
+  if isMulti then
+    ctMulti := IdxCtypesByKey(k);
 
   // 1) her satir icin son durumu belirle
   lastOp := TDictionary<string, TIdxOp>.Create;
+  oldKeys := TDictionary<string, string>.Create;
   for i := 0 to ops.Count - 1 do
+  begin
     lastOp.AddOrSetValue(ops[i].Pk, ops[i]);
+    // Ilk silme isleminin anahtari COMMITLENMIS girdinin anahtaridir.
+    // Ayni batch icinde ikinci bir update gelse bile eski anahtar budur.
+    if ops[i].IsDel and (not oldKeys.ContainsKey(ops[i].Pk)) then
+      oldKeys.Add(ops[i].Pk, ops[i].Key);
+  end;
+
+  // 1b) KUCUK DELTA HIZLI YOLU: tek satir update/delete + sorgu dongusunde
+  // tum N girdiyi yeniden birlestirmek yerine yalniz eski girdiyi cikar,
+  // yenisini sirali konuma ekle. Her islem O(N) kaydirma yapar ama sabit
+  // katsayi dusuktur; N buyuk, delta kucukken merge'den cok daha hizli.
+  if (lastOp.Count <= 8) and FMemIdx.ContainsKey(k) then
+  begin
+    for p in lastOp do
+    begin
+      op := p.Value;
+      if oldKeys.TryGetValue(op.Pk, oldKey) then
+      begin
+        pos := EntryLB(e, oldKey, op.Pk);
+        if (pos < Length(e)) and (e[pos].Pk = op.Pk) and
+           (e[pos].Key = oldKey) then
+        begin
+          // Anahtar degismedi (ornegin yalniz INCLUDE kolonu): yerinde guncelle.
+          if (not op.IsDel) and (op.Key = oldKey) then
+          begin
+            e[pos].Cov := op.Cov;
+            Continue;
+          end;
+          if op.IsDel then
+          begin
+            // Silme: cikarilacak degeri geciciye al, kuyrugu ham Move ile
+            // sola kaydir, son yuva kopyasini FillChar ile sifirla.
+            tmpEntry := e[pos];
+            e[pos] := Default(TIdxEntry);
+            oldLen := Length(e);
+            if pos < oldLen - 1 then
+            begin
+              Move(e[pos + 1], e[pos],
+                (oldLen - pos - 1) * SizeOf(TIdxEntry));
+              FillChar(e[oldLen - 1], SizeOf(TIdxEntry), 0);
+            end;
+            SetLength(e, oldLen - 1);
+            tmpEntry := Default(TIdxEntry);
+            Continue;
+          end;
+          // Anahtar degisti: eski girdiyi cikarip yenisini AYNI dizide,
+          // yalniz iki konum arasindaki dilimi kaydirarak yerlestir.
+          // SetLength buyut/kucult yok; tek Move + tek FillChar.
+          pNew := EntryLB(e, op.Key, op.Pk);
+          if pNew > pos then target := pNew - 1 else target := pNew;
+          tmpEntry := e[pos];
+          e[pos] := Default(TIdxEntry);
+          if target > pos then
+          begin
+            Move(e[pos + 1], e[pos],
+              (target - pos) * SizeOf(TIdxEntry));
+            FillChar(e[target], SizeOf(TIdxEntry), 0);
+          end
+          else if target < pos then
+          begin
+            Move(e[target], e[target + 1],
+              (pos - target) * SizeOf(TIdxEntry));
+            FillChar(e[target], SizeOf(TIdxEntry), 0);
+          end;
+          e[target].Key := op.Key;
+          e[target].Pk := op.Pk;
+          e[target].Cov := op.Cov;
+          tmpEntry := Default(TIdxEntry);
+          Continue;
+        end;
+      end;
+      if not op.IsDel then
+      begin
+        pos := EntryLB(e, op.Key, op.Pk);
+        oldLen := Length(e);
+        SetLength(e, oldLen + 1);
+        if pos < oldLen then
+        begin
+          Move(e[pos], e[pos + 1],
+            (oldLen - pos) * SizeOf(TIdxEntry));
+          FillChar(e[pos], SizeOf(TIdxEntry), 0);
+        end;
+        e[pos].Key := op.Key;
+        e[pos].Pk := op.Pk;
+        e[pos].Cov := op.Cov;
+      end;
+    end;
+    oldKeys.Free;
+    lastOp.Free;
+    FMemIdx.AddOrSetValue(k, e);
+    ops.Free;
+    FIdxOps.Remove(k);
+    FIdxDirty.Delete(FIdxDirty.IndexOf(k));
+    Exit;
+  end;
+  oldKeys.Free;
 
   // 2) commitlenmis girdilerden bu toplantida dokunulan satirlari cikar
   // En fazla eski girdiler kadar sonuc kalabilir.
@@ -6977,12 +7104,8 @@ begin
   SetLength(delta, nDelta);
 
   // 4) KR-5 Delta Merge: Delta'yi tek basina sirala, sonra sirali keep ile O(N+M) birlestir
-  isMulti := IdxNPartsByKey(k) > 1;
   if isMulti then
-  begin
-    ctMulti := IdxCtypesByKey(k);
-    SortIdxEntriesCols(delta, ctMulti);
-  end
+    SortIdxEntriesCols(delta, ctMulti)
   else
     SortIdxEntries(delta, ct);
 
