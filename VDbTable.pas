@@ -344,6 +344,9 @@ type
     procedure BumpAutoInc(const T: TTableDef; NewVal: Int64);
     // P-17a: sema kaydina DOKUNMADAN sayaci yukselt + semayi kirle.
     function AutoIncPersistOf(const T: TTableDef): Int64;
+    // M10: IDENTITY kolonlarini doldurur; ALWAYS acik degeri reddeder,
+    // BY DEFAULT acik degeri kabul edip sayaci ilerletir.
+    procedure ApplyIdentity(const T: TTableDef; var Vals: TStrArray);
     // P-17a: SaveSchema'ya yazilacak deger = max(kayit alani, sozluk).
     procedure SnapshotSchema;
     procedure RestoreSchemaSnapshot;
@@ -2090,6 +2093,20 @@ begin
     end;
 end;
 
+procedure VDbCheckIdentityUnchanged(const T: TTableDef;
+  const OldVals, NewVals: TStrArray);
+// M10: IDENTITY degeri UPDATE ile degistirilemez.
+var
+  i: Integer;
+begin
+  for i := 0 to High(T.Cols) do
+    if (T.Cols[i].Identity <> 0) and (i <= High(OldVals)) and
+       (i <= High(NewVals)) and (OldVals[i] <> NewVals[i]) then
+      raise EVDbException.CreateFmt(ecInvalidArgument,
+        'IDENTITY kolonu guncellenemez: %s.%s',
+        [T.Name, T.Cols[i].Name]);
+end;
+
 function VDbIdxJoin(const Vals: TStrArray; const Cols: TIntArray): string;
 // Satir degerlerinden indeks anahtari olusturur.
 // F2-15: Birden fazla kolon varsa UZUNLUK-ONEKI kodlama kullanilir
@@ -3195,6 +3212,7 @@ procedure ParseLines(Lines: TStrings);
         t.Cols[lj].Collate := '';   // R-20
         t.Cols[lj].Generated := False;   // M10
         t.Cols[lj].GenExpr := '';
+        t.Cols[lj].Identity := 0;        // M10: IDENTITY
         if Pos(':', cp[lj]) > 0 then
         begin
           s2 := cp[lj];
@@ -3245,6 +3263,10 @@ procedure ParseLines(Lines: TStrings);
               fl := StrToIntDef(rest, 0);
             t.Cols[lj].NotNull := (fl and 1) <> 0;
             t.Cols[lj].Unique := (fl and 2) <> 0;
+            // M10: IDENTITY bayraklari (eski semalarda bitler 0 -> normal).
+            if (fl and 4) <> 0 then t.Cols[lj].Identity := 1
+            else if (fl and 8) <> 0 then t.Cols[lj].Identity := 2
+            else t.Cols[lj].Identity := 0;
           end
           else
             t.Cols[lj].Ctype := Byte(StrToIntDef(rest, 2));
@@ -3501,6 +3523,9 @@ begin
         fl := 0;
         if kv.Value.Cols[i].NotNull then fl := fl or 1;
         if kv.Value.Cols[i].Unique then fl := fl or 2;
+        // M10: IDENTITY modu bayrak bitlerinde (4=ALWAYS, 8=BY DEFAULT).
+        if kv.Value.Cols[i].Identity = 1 then fl := fl or 4
+        else if kv.Value.Cols[i].Identity = 2 then fl := fl or 8;
         s := s + kv.Value.Cols[i].Name + ':' + IntToStr(kv.Value.Cols[i].Ctype) +
           ':' + IntToStr(fl);
         { R-20: collation 5. alan (ad:tip:bayrak:hexdef:collation).
@@ -3761,6 +3786,42 @@ procedure TVTableDb.BumpAutoInc(const T: TTableDef; NewVal: Int64);
 begin
   FAutoInc.AddOrSetValue(T.TableId, NewVal);
   MarkSchema;
+end;
+
+procedure TVTableDb.ApplyIdentity(const T: TTableDef; var Vals: TStrArray);
+var
+  i: Integer;
+  iv: Int64;
+  dummy: TStrArray;
+begin
+  for i := 0 to High(T.Cols) do
+    if T.Cols[i].Identity <> 0 then
+    begin
+      if i > High(Vals) then Continue;
+      if Vals[i] <> '' then
+      begin
+        // ALWAYS: acik deger yasak (PostgreSQL ile ayni netlik).
+        if T.Cols[i].Identity = 1 then
+          raise EVDbException.CreateFmt(ecInvalidArgument,
+            'IDENTITY ALWAYS kolonuna deger verilemez: %s.%s',
+            [T.Name, T.Cols[i].Name]);
+        if not VDbParseInt(Vals[i], iv) then
+          raise EVDbException.CreateFmt(ecInvalidArgument,
+            'IDENTITY degeri tamsayi degil: %s.%s',
+            [T.Name, T.Cols[i].Name]);
+        if iv > AutoIncOf(T) then BumpAutoInc(T, iv);
+      end
+      else
+      begin
+        iv := AutoIncOf(T) + 1;
+        // Identity PK ise eski dosyadaki yuksek degerlerle cakismayi engelle.
+        if (T.PkIndex = i) and
+           ReadRow(T.Name, IntToStr(iv), dummy) then
+          iv := MaxPkInt(T) + 1;
+        Vals[i] := IntToStr(iv);
+        BumpAutoInc(T, iv);
+      end;
+    end;
 end;
 
 function TVTableDb.AutoIncPersistOf(const T: TTableDef): Int64;
@@ -6291,6 +6352,9 @@ begin
   if FindCol(t, Col.Name) >= 0 then
     raise EVDbException.Create(ecColumnExists, 'kolon var: ' + Col.Name);
   if Trim(Col.Name) = '' then raise EVDbException.Create(ecInvalidName, 'kolon adi bos olamaz');
+  if Col.Identity <> 0 then
+    raise EVDbException.Create(ecUnsupported,
+      'mevcut tabloya IDENTITY kolonu eklenmesi desteklenmiyor: ' + Col.Name);
   c2 := Col;
   c2.Name := VDbNorm(Col.Name);
   // DEFAULT tip dogrulugu
@@ -7266,7 +7330,36 @@ begin
     t.Cols[i].Collate := Cols[i].Collate;   // R-20
     t.Cols[i].Generated := Cols[i].Generated;   // M10
     t.Cols[i].GenExpr := Cols[i].GenExpr;
+    t.Cols[i].Identity := Cols[i].Identity;     // M10: IDENTITY
   end;
+  // M10: IDENTITY dogrulamalari. Tek kolon, tamsayi tipi, DEFAULT/GENERATED
+  // ile ayni anda kullanilamaz; ALWAYS/BY DEFAULT NOT NULL anlamina gelir.
+  j := 0;
+  n := -1;
+  for i := 0 to High(t.Cols) do
+    if t.Cols[i].Identity <> 0 then
+    begin
+      Inc(j);
+      n := i;
+      if j > 1 then
+        raise EVDbException.Create(ecInvalidArgument,
+          'tabloda en fazla bir IDENTITY kolonu olabilir: ' + t.Name);
+      if t.Cols[i].Ctype <> VCT_INT then
+        raise EVDbException.Create(ecInvalidArgument,
+          'IDENTITY kolonu tamsayi olmali: ' + t.Cols[i].Name);
+      if t.Cols[i].HasDef then
+        raise EVDbException.Create(ecInvalidArgument,
+          'IDENTITY kolonu DEFAULT ile birlikte kullanilamaz: ' +
+          t.Cols[i].Name);
+      if t.Cols[i].Generated then
+        raise EVDbException.Create(ecInvalidArgument,
+          'IDENTITY kolonu GENERATED ifadesiyle birlikte kullanilamaz: ' +
+          t.Cols[i].Name);
+      t.Cols[i].NotNull := True;
+    end;
+  // PK tanimlanmamis bir tabloda IDENTITY kolonu satir anahtari olur;
+  // boylece sentetik PK sayaci ile identity sayaci ayni anda tuketilmez.
+  if (PkIndex < 0) and (n >= 0) then PkIndex := n;
   t.PkIndex := PkIndex;
   t.AutoInc := 0;
 SetLength(t.Idx, 0);
@@ -7637,6 +7730,9 @@ begin
       if not provided[i] and t.Cols[i].HasDef then
         vals[i] := t.Cols[i].Def;
   end;
+  // M10: IDENTITY kolonlarini doldur (GENERATED'den once; generated
+  // ifadeler identity degerine bagli olabilir).
+  ApplyIdentity(t, vals);
   // M10: GENERATED kolonlari hesapla (tum INSERT yollari buradan gecer).
   VDbApplyGenerated(t, vals);
   // F2-22: PK TANIMLANMAMISSA sentetik satir anahtari uretilir.
@@ -8178,6 +8274,8 @@ begin
   newVals := Copy(SrcVals, 0, Length(SrcVals));
   // M10: SET'ten bagimsiz olarak GENERATED kolonlari yeniden hesapla.
   VDbApplyGenerated(t, newVals);
+  // M10: IDENTITY degeri UPDATE ile degistirilemez.
+  VDbCheckIdentityUnchanged(t, oldVals, newVals);
 
   // Yalnizca GERCEKTEN degisen kolonlar. (Once SET edilen tum kolonlar
   // listeleniyordu; degismeyenleri indeks bakiminda gezmek gereksizdi.)
@@ -8681,7 +8779,8 @@ begin
   for i := 0 to High(vals) do
     if not provided[i] and t.Cols[i].HasDef then
       vals[i] := t.Cols[i].Def;
-  // M10: GENERATED kolonlari hesapla.
+  // M10: IDENTITY + GENERATED kolonlari hesapla.
+  ApplyIdentity(t, vals);
   VDbApplyGenerated(t, vals);
 
   // PK belirleme
@@ -8784,7 +8883,8 @@ begin
   for i := 0 to High(vals) do
     if not provided[i] and t.Cols[i].HasDef then
       vals[i] := t.Cols[i].Def;
-  // M10: GENERATED kolonlari hesapla.
+  // M10: IDENTITY + GENERATED kolonlari hesapla.
+  ApplyIdentity(t, vals);
   VDbApplyGenerated(t, vals);
 
   // PK belirleme
@@ -8871,6 +8971,8 @@ begin
         // PK degistirilemez
         if t.PkIndex >= 0 then dummyVals[t.PkIndex] := pk;
         vals := dummyVals;
+        // M10: IDENTITY degeri ON CONFLICT DO UPDATE ile degistirilemez.
+        VDbCheckIdentityUnchanged(t, existingVals, vals);
 
         // Eski satir indekslerinden sil
         IdxDelRow(t, existingVals, pk, -1);

@@ -110,6 +110,11 @@ type
     // ama ayni sekilde saklanir (okuma aninda yeniden hesaplanmaz).
     Generated: Boolean;
     GenExpr: string;   // ExprToText ile kanoniklestirilmis ifade
+    // M10: GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY.
+    // 0 = normal kolon, 1 = ALWAYS, 2 = BY DEFAULT.
+    // Sema uyumu icin kolon bayrak alaninda (bit2/bit3) saklanir; boylece
+    // sema satirinin alan sayisi degismez ve eski DB'ler aynen okunur.
+    Identity: Byte;
   end;
 
   // --- yabanci anahtar ---
