@@ -174,8 +174,9 @@ type
     // F-21: yavas sorgu kayitlari burada serbest birakilir
     destructor Destroy; override;
     function Exec(const Sql: string): TSqlResult; overload;
-    // Parametreli SQL: metindeki her '?' sirayla Params[i] olur.
-    // Tirnak/escape derdi yok (or. soyad O'Brien guvenli gecer).
+    // Parametreli SQL: '?' sirayla, `$1`/`$2` ... konumsal olarak
+    // Params[i] ile doldurulur. Tirnak/escape derdi yok
+    // (or. soyad O'Brien guvenli gecer).
     function Exec(const Sql: string; const Params: array of string): TSqlResult; overload;
     // SQL betigini ';' ile ayrilmis cumlelere boler (tirnak disinda).
     // 'a;b' gibi bir deger icindeki ';' bolunmez, '' kacisli tirnak sayilir.

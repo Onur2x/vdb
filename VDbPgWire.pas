@@ -13,20 +13,24 @@ unit VDbPgWire;
     - BackendKeyData, ReadyForQuery
     - 'Q' simple query: RowDescription + DataRow* + CommandComplete
     - Extended query protocol: Parse ('P'), Bind ('B'), Describe ('D'),
-      Execute ('E'), Close ('C'), Flush ('H'), Sync ('S') — ancak
-      YALNIZCA PARAMETRESIZ sorgular (0 parametre). Prepared statement
-      adlari ve portal adlari desteklenir; Describe Portal sorguyu
-      calistirip sonucu onbellege alir.
+      Execute ('E'), Close ('C'), Flush ('H'), Sync ('S').
+      Prepared statement ve portal adlari desteklenir; Describe Portal
+      sorguyu calistirip sonucu onbellege alir.
+    - Sorgu parametreleri: PostgreSQL uyumlu $1, $2 ... (metin veya
+      int2/int4/int8/float4/float8/bool binary). ParameterDescription
+      ('t') gercek parametre sayisini/OID'lerini bildirir.
+      `?` yer tutuculari da SQL API'siyle ayni sekilde desteklenir.
     - ErrorResponse + ReadyForQuery; hata sonrasi Sync'e kadar mesajlar
       yutulur (PostgreSQL semantigi).
     - 'X' Terminate
 
   DESTEKLENMEYEN (bilincli sinir):
-    - Sorgu parametreleri ($1, $2 ...), COPY, SSL/TLS, gercek tip OID'leri.
-      Parametreli Parse/Bind hata dondurur (baglanti Sync ile devam eder).
+    - COPY, SSL/TLS, gercek sonuc tip OID'leri (tum alanlar TEXT/OID 25).
+    - Binary sonuc formati istenirse hata dondurulur; sonuclar metindir.
     - NULL ile bos metin ayrimi: motor ikisini de '' olarak tutar;
       DataRow'da her ikisi de uzunluk 0 olarak gonderilir.
-    - Tum alanlar TEXT (OID 25) olarak bildirilir.
+    - Numeric/date/time/timestamp gibi karmasik binary parametreler
+      reddedilir; bu tipler metin formatinda gonderilmelidir.
 
   Eszamanlilik: VDbSqlServer ile ayni model — baglanti basina TVSql,
   paylasilan TVTableDb; yazmalar Ftb kilidiyle serilesir.
@@ -38,7 +42,7 @@ interface
 
 uses
   SysUtils, Classes, SyncObjs, Generics.Collections, VDbTypes, VDbCore, VDbTable, VDbSql, VDbAst,
-  VDbNet;
+  VDbParser, VDbNet;
 
 type
   TVdbPgServer = class;
@@ -100,9 +104,16 @@ implementation
 type
   TPgPortal = record
     Sql: string;
+    Params: TStrArray;
     Done: Boolean;
     Res: TSqlResult;
     Err: string;
+  end;
+
+  { M1: prepared statement; ParamOids uzunlugu parametre sayisidir. }
+  TPgStmt = record
+    Sql: string;
+    ParamOids: array of LongInt;
   end;
 
 { ---------------------------------------------------- ag bayt duzeni (BE) }
@@ -205,6 +216,92 @@ begin
     body := body + NetI32(Length(v)) + v;
   end;
   Result := PgMsg('D', body);
+end;
+
+function ParamDescMsg(const Oids: array of LongInt): AnsiString;
+var
+  body: AnsiString;
+  i: Integer;
+begin
+  body := NetI16(Length(Oids));
+  for i := 0 to High(Oids) do
+    body := body + NetI32(Oids[i]);
+  Result := PgMsg('t', body);
+end;
+
+{ M1: PostgreSQL binary parametre -> VDB metin degeri. }
+function PgParamText(const Raw: AnsiString; Fmt: Integer;
+  Oid: LongInt): string;
+var
+  b1, b2, b3, b4: Byte;
+  u32: Cardinal;
+  u64: QWord;
+  i64: Int64;
+  f32: Single;
+  f64: Double;
+  k: Integer;
+begin
+  if Fmt = 0 then Exit(Raw);          // metin formati
+  if Fmt <> 1 then
+    raise Exception.CreateFmt('gecersiz parametre formati: %d', [Fmt]);
+  if Oid = 0 then Oid := 25;          // tur belirtilmemis -> metin
+
+  case Oid of
+    16: begin                         // bool
+      if Length(Raw) <> 1 then
+        raise Exception.Create('bool parametre uzunlugu 1 olmali');
+      if Raw[1] <> #0 then Result := 'True' else Result := 'False';
+    end;
+    21: begin                         // int2
+      if Length(Raw) <> 2 then
+        raise Exception.Create('int2 parametre uzunlugu 2 olmali');
+      b1 := Ord(Raw[1]); b2 := Ord(Raw[2]);
+      Result := IntToStr(SmallInt((Word(b1) shl 8) or b2));
+    end;
+    23: begin                         // int4
+      if Length(Raw) <> 4 then
+        raise Exception.Create('int4 parametre uzunlugu 4 olmali');
+      b1 := Ord(Raw[1]); b2 := Ord(Raw[2]);
+      b3 := Ord(Raw[3]); b4 := Ord(Raw[4]);
+      u32 := (Cardinal(b1) shl 24) or (Cardinal(b2) shl 16) or
+        (Cardinal(b3) shl 8) or Cardinal(b4);
+      Result := IntToStr(LongInt(u32));
+    end;
+    20: begin                         // int8
+      if Length(Raw) <> 8 then
+        raise Exception.Create('int8 parametre uzunlugu 8 olmali');
+      u64 := 0;
+      for k := 1 to 8 do
+        u64 := (u64 shl 8) or Ord(Raw[k]);
+      Move(u64, i64, SizeOf(i64));
+      Result := IntToStr(i64);
+    end;
+    700: begin                        // float4
+      if Length(Raw) <> 4 then
+        raise Exception.Create('float4 parametre uzunlugu 4 olmali');
+      b1 := Ord(Raw[1]); b2 := Ord(Raw[2]);
+      b3 := Ord(Raw[3]); b4 := Ord(Raw[4]);
+      u32 := (Cardinal(b1) shl 24) or (Cardinal(b2) shl 16) or
+        (Cardinal(b3) shl 8) or Cardinal(b4);
+      Move(u32, f32, SizeOf(f32));
+      Result := VDbFloatToStr(f32);
+    end;
+    701: begin                        // float8
+      if Length(Raw) <> 8 then
+        raise Exception.Create('float8 parametre uzunlugu 8 olmali');
+      u64 := 0;
+      for k := 1 to 8 do
+        u64 := (u64 shl 8) or Ord(Raw[k]);
+      Move(u64, f64, SizeOf(f64));
+      Result := VDbFloatToStr(f64);
+    end;
+    18, 19, 25, 1042, 1043:           // char/name/text/varchar
+      Result := Raw;
+  else
+    raise Exception.CreateFmt(
+      'binary parametre tipi desteklenmiyor (OID %d); metin formatinda gonderin',
+      [Oid]);
+  end;
 end;
 
 function CommandMsg(const Tag: string): AnsiString;
@@ -377,12 +474,18 @@ var
   payload: AnsiString;
   sql, user: string;
   served: Boolean;
-  Stmts: TDictionary<string, string>;
+  Stmts: TDictionary<string, TPgStmt>;
   Portals: TDictionary<string, TPgPortal>;
   skipUntilSync: Boolean;
   p, np, nf, i2, nParams, nFmt, maxRows: Integer;
+  declared, inferred, oid, fmt, plen, nResFmt: Integer;
   nm, q, kind: string;
   pt: TPgPortal;
+  st: TPgStmt;
+  fmts: array of Integer;
+  params: TStrArray;
+  raw: AnsiString;
+  bad: Boolean;
 
   function TakeI16: Integer;
   begin
@@ -391,6 +494,19 @@ var
     begin
       Result := (Ord(payload[p]) shl 8) or Ord(payload[p + 1]);
       Inc(p, 2);
+    end;
+  end;
+
+  function TakeI32: LongInt;
+  begin
+    Result := 0;
+    if p + 3 <= Length(payload) then
+    begin
+      Result := LongInt((Cardinal(Ord(payload[p])) shl 24) or
+        (Cardinal(Ord(payload[p + 1])) shl 16) or
+        (Cardinal(Ord(payload[p + 2])) shl 8) or
+        Cardinal(Ord(payload[p + 3])));
+      Inc(p, 4);
     end;
   end;
 
@@ -406,7 +522,7 @@ var
     P.Err := '';
     P.Res := Default(TSqlResult);
     try
-      P.Res := FSql.Exec(P.Sql);
+      P.Res := FSql.Exec(P.Sql, P.Params);
       Result := True;
     except
       on E: Exception do P.Err := E.Message;
@@ -419,7 +535,7 @@ begin
   Portals := nil;
   try
     if not ReadStartup(FSock, user) then Exit;
-    Stmts := TDictionary<string, string>.Create;
+    Stmts := TDictionary<string, TPgStmt>.Create;
     Portals := TDictionary<string, TPgPortal>.Create;
     if not SendPg(FSock, AuthOkMsg) then Exit;
     if not SendPg(FSock, ParamMsg('server_version', '14.0 (VDB)')) then Exit;
@@ -458,50 +574,121 @@ begin
         p := 1;
         nm := ReadCStr(payload, p);
         q := ReadCStr(payload, p);
-        nParams := TakeI16;
-        if nParams > 0 then
-          ExtFail('parametreli prepared statement desteklenmiyor (' +
-            IntToStr(nParams) + ' parametre)')
-        else
+        declared := TakeI16;
+        inferred := VDbCountSqlParams(q);
+        if inferred < declared then inferred := declared;
+        if (declared > 0) and (p + declared * 4 - 1 > Length(payload)) then
         begin
-          Stmts.AddOrSetValue(nm, q);
-          if not SendPg(FSock, PgMsg('1', '')) then Break;
+          ExtFail('Parse mesaji eksik parametre OID listesi');
+          Continue;
         end;
+        st := Default(TPgStmt);
+        st.Sql := q;
+        SetLength(st.ParamOids, inferred);
+        for i2 := 0 to inferred - 1 do st.ParamOids[i2] := 25;  // text
+        for i2 := 0 to declared - 1 do
+        begin
+          oid := TakeI32;
+          if oid = 0 then oid := 25;
+          st.ParamOids[i2] := oid;
+        end;
+        Stmts.AddOrSetValue(nm, st);
+        if not SendPg(FSock, PgMsg('1', '')) then Break;
       end
       else if typ = Ord('B') then            // Bind
       begin
         p := 1;
         nm := ReadCStr(payload, p);          // portal
         q := ReadCStr(payload, p);           // statement
-        nFmt := TakeI16;
-        Inc(p, nFmt * 2);
-        nParams := TakeI16;
-        for i2 := 1 to nParams do
+        if not Stmts.TryGetValue(q, st) then
         begin
-          maxRows := 0;
-          if p + 3 <= Length(payload) then
+          ExtFail('prepared statement yok: ' + q);
+          Continue;
+        end;
+        nFmt := TakeI16;
+        if (nFmt < 0) or (p + nFmt * 2 - 1 > Length(payload)) then
+        begin
+          ExtFail('Bind mesaji eksik parametre formati');
+          Continue;
+        end;
+        SetLength(fmts, nFmt);
+        for i2 := 0 to nFmt - 1 do fmts[i2] := TakeI16;
+        nParams := TakeI16;
+        // `?` yer tutuculari icin: Parse'te OID verilmediyse Bind sayisini
+        // esas al (standart istemciler $n kullanir; bu yalnizca uyumluluk).
+        if (Length(st.ParamOids) = 0) and (nParams > 0) then
+        begin
+          SetLength(st.ParamOids, nParams);
+          for i2 := 0 to nParams - 1 do st.ParamOids[i2] := 25;
+        end;
+        if nParams <> Length(st.ParamOids) then
+        begin
+          ExtFail(Format('parametre sayisi uyusmuyor: beklenen %d, gelen %d',
+            [Length(st.ParamOids), nParams]));
+          Continue;
+        end;
+        if (nFmt <> 0) and (nFmt <> 1) and (nFmt <> nParams) then
+        begin
+          ExtFail('parametre format sayisi gecersiz');
+          Continue;
+        end;
+        SetLength(params, nParams);
+        bad := False;
+        for i2 := 0 to nParams - 1 do
+        begin
+          if p + 3 > Length(payload) then
           begin
-            maxRows := LongInt((Cardinal(Ord(payload[p])) shl 24) or
-              (Cardinal(Ord(payload[p + 1])) shl 16) or
-              (Cardinal(Ord(payload[p + 2])) shl 8) or
-              Cardinal(Ord(payload[p + 3])));
-            Inc(p, 4);
-            if maxRows > 0 then Inc(p, maxRows);
+            bad := True;
+            Break;
+          end;
+          plen := TakeI32;
+          if plen = -1 then
+          begin
+            params[i2] := '';               // motor NULL/bos ayrimi yapmaz
+            Continue;
+          end;
+          if (plen < 0) or (p + plen - 1 > Length(payload)) then
+          begin
+            bad := True;
+            Break;
+          end;
+          raw := Copy(payload, p, plen);
+          Inc(p, plen);
+          if nFmt = 0 then fmt := 0
+          else if nFmt = 1 then fmt := fmts[0]
+          else fmt := fmts[i2];
+          try
+            params[i2] := PgParamText(raw, fmt, st.ParamOids[i2]);
+          except
+            on E: Exception do
+            begin
+              bad := True;
+              ExtFail(E.Message);
+              Break;
+            end;
           end;
         end;
-        nFmt := TakeI16;
-        if nParams > 0 then
-          ExtFail('sorgu parametreleri desteklenmiyor')
-        else if not Stmts.TryGetValue(q, sql) then
-          ExtFail('prepared statement yok: ' + q)
-        else
+        if bad then Continue;
+        nResFmt := TakeI16;
+        if (nResFmt < 0) or (p + nResFmt * 2 - 1 > Length(payload)) then
         begin
-          pt := Default(TPgPortal);
-          pt.Sql := sql;
-          pt.Done := False;
-          Portals.AddOrSetValue(nm, pt);
-          if not SendPg(FSock, PgMsg('2', '')) then Break;
+          ExtFail('Bind mesaji eksik sonuc formati');
+          Continue;
         end;
+        bad := False;
+        for i2 := 0 to nResFmt - 1 do
+          if TakeI16 <> 0 then bad := True;
+        if bad then
+        begin
+          ExtFail('binary sonuc formati desteklenmiyor');
+          Continue;
+        end;
+        pt := Default(TPgPortal);
+        pt.Sql := st.Sql;
+        pt.Params := params;
+        pt.Done := False;
+        Portals.AddOrSetValue(nm, pt);
+        if not SendPg(FSock, PgMsg('2', '')) then Break;
       end
       else if typ = Ord('D') then            // Describe
       begin
@@ -512,7 +699,12 @@ begin
           nm := ReadCStr(payload, p);
           if kind = 'S' then
           begin
-            if not SendPg(FSock, PgMsg('t', NetI16(0))) then Break;  // 0 parametre
+            if not Stmts.TryGetValue(nm, st) then
+            begin
+              ExtFail('prepared statement yok: ' + nm);
+              Continue;
+            end;
+            if not SendPg(FSock, ParamDescMsg(st.ParamOids)) then Break;
             if not SendPg(FSock, PgMsg('n', '')) then Break;          // NoData
           end
           else if Portals.TryGetValue(nm, pt) then
