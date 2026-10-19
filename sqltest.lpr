@@ -12,7 +12,7 @@
 
 uses
   SysUtils, Classes, Math, VDbCore, VDbTypes, VDbTable, VDbSql, VDbSync, VDbCrc32,
-  VDbCrypt, VDbSpatial, VDbRange, VDbMonitor, VDbPlatform, VDbCost,
+  VDbCrypt, VDbKdf, VDbSpatial, VDbRange, VDbMonitor, VDbPlatform, VDbCost,
   VDbExtension, VDbText, VDbParallel, VDbReplication, VDbNet, VDbSqlServer,
   VDbClientNet, VDbMetricsHttp, VDbPgWire, dynlibs;
 { VDbTypes: TStrArray / TStrMatrix gibi paylasilan tipler artik tek
@@ -312,13 +312,13 @@ procedure T74_KayitSifreleme;
 }
 var
   myKv: TVDb;
-  v: TBytes;
+  v, ct, tag, back: TBytes;
   k: TBytes;
   kp, dbp: string;
   sK: TQWordArray;
   sV: TValArray;
   i: Integer;
-  bulundu: Boolean;
+  bulundu, aeadHata: Boolean;
 
   procedure Dogrula(const Ad: string; Cond: Boolean; const E: string = '');
   begin
@@ -541,6 +541,39 @@ begin
   finally
     myKv.Free;
   end;
+
+  // ---- l) M6: AEAD (AES-256-GCM) zarf bicimi ----
+  k := TestKey(5);
+  ct := nil;
+  Dogrula('l) AEAD sifreleme basarili',
+    VDbCryptEncrypt(k, VDbStrToBytes('aead-gizli-metin'), ct));
+  Dogrula('l) zarf VDB magic ile basliyor',
+    VDbCryptIsAead(ct) and
+    (VDbCryptBytesToStr(Copy(ct, 0, 8)) = 'VDBAEAD1'));
+  back := nil;
+  Dogrula('l) AEAD cozme dogru',
+    VDbCryptDecrypt(k, ct, back) and
+    (VDbBytesToStr(back) = 'aead-gizli-metin'));
+  if Length(ct) > 0 then
+    ct[High(ct)] := ct[High(ct)] xor $01;
+  aeadHata := False;
+  try
+    VDbCryptDecrypt(k, ct, back);
+  except
+    on E: EVdbCryptError do
+      aeadHata := True;
+  end;
+  Dogrula('l) bozulmus AEAD etiketi REDDEDILDI', aeadHata);
+
+  // ---- m) eski CTR+HMAC zarfi hala okunuyor (geriye donuk uyum) ----
+  ct := nil;
+  Dogrula('m) eski zarf uretildi',
+    VDbCryptEncryptLegacy(k, VDbStrToBytes('eski-zarf-metni'), ct));
+  Dogrula('m) eski zarf AEAD magic TASIMIYOR', not VDbCryptIsAead(ct));
+  back := nil;
+  Dogrula('m) eski zarf yeni kodla cozuldu',
+    VDbCryptDecrypt(k, ct, back) and
+    (VDbBytesToStr(back) = 'eski-zarf-metni'));
 end;
 
 procedure T75_SifrelemeDayaniklilik;
@@ -10368,6 +10401,69 @@ begin
 end;
 
 { M10: GENERATED ALWAYS AS (...) STORED }
+procedure T118_AeadKdf;
+var
+  key, nonce, pt, aad, ct, tag, tag2, outb: TBytes;
+  pwd, salt, secret, ad, h: TBytes;
+  ok: Boolean;
+
+  function Hx(const S: string): TBytes;
+  var
+    i: Integer;
+  begin
+    SetLength(Result, Length(S) div 2);
+    for i := 1 to Length(Result) do
+      Result[i - 1] := StrToInt('$' + Copy(S, (i - 1) * 2 + 1, 2));
+  end;
+
+  function HxOf(const B: TBytes): string;
+  var
+    i: Integer;
+  begin
+    Result := '';
+    for i := 0 to High(B) do
+      Result := Result + IntToHex(B[i], 2);
+  end;
+
+  function RepeatByte(B: Byte; N: Integer): TBytes;
+  begin
+    SetLength(Result, N);
+    if N > 0 then FillChar(Result[0], N, B);
+  end;
+
+begin
+  Grp('M6 AES-256-GCM + Argon2id vektorleri');
+
+  // NIST SP 800-38D: sifir anahtar/nonce, 16 bayt sifir duz metin.
+  key := Hx('0000000000000000000000000000000000000000000000000000000000000000');
+  nonce := Hx('000000000000000000000000');
+  pt := Hx('00000000000000000000000000000000');
+  aad := nil;
+  ok := VDbCryptGcmSeal(key, nonce, pt, aad, ct, tag);
+  Dogrula('GCM NIST sifreli metin', ok and
+    (LowerCase(HxOf(ct)) = 'cea7403d4d606b6e074ec5d3baf39d18'), HxOf(ct));
+  Dogrula('GCM NIST etiket', ok and
+    (LowerCase(HxOf(tag)) = 'd0d1c8a799996bf0265b98b5d48ab919'), HxOf(tag));
+
+  tag2 := Copy(tag, 0, Length(tag));
+  if Length(tag2) > 0 then
+    tag2[0] := tag2[0] xor $01;
+  outb := nil;
+  Dogrula('GCM bozulmus etiket reddedildi',
+    not VDbCryptGcmOpen(key, nonce, ct, tag2, aad, outb));
+
+  // RFC 9106 Argon2id test vektoru: p=4, T=32, m=32 KiB, t=3.
+  pwd := RepeatByte($01, 32);
+  salt := RepeatByte($02, 16);
+  secret := RepeatByte($03, 8);
+  ad := RepeatByte($04, 12);
+  h := nil;
+  ok := VDbArgon2id(pwd, salt, secret, ad, 3, 32, 4, 32, h);
+  Dogrula('Argon2id RFC 9106', ok and
+    (LowerCase(HxOf(h)) = '0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659'),
+    HxOf(h));
+end;
+
 procedure T117_Generated;
 var
   kv2: TVDb;
@@ -11301,6 +11397,7 @@ T92_MVCC_Isoaltion;
        T115_MetricsHttp;
        T116_PgWire;
        T117_Generated;
+       T118_AeadKdf;
   
       except
         on E: Exception do
