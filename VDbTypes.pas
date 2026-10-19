@@ -105,6 +105,11 @@ type
     // R-20: kolon varsayilan collation'i (`ad TEXT COLLATE "tr-TR"`).
     // Bos = motor varsayilani (bayt sirasi / duyarli karsilastirma).
     Collate: string;
+    // M10: GENERATED ALWAYS AS (ifade). STORED gibi davranir: deger
+    // INSERT/UPDATE sirasinda hesaplanip saklanir. VIRTUAL kabul edilir
+    // ama ayni sekilde saklanir (okuma aninda yeniden hesaplanmaz).
+    Generated: Boolean;
+    GenExpr: string;   // ExprToText ile kanoniklestirilmis ifade
   end;
 
   // --- yabanci anahtar ---

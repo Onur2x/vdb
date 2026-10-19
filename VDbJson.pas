@@ -61,6 +61,20 @@ function VDbJsonHasKeyStr(const L, Key: string): Boolean;
 function VDbJsonAnyKeyStr(const L: string; const Keys: array of string): Boolean;
 function VDbJsonAllKeysStr(const L: string; const Keys: array of string): Boolean;
 
+{ M10 (2026-10-19): JSONPath alt kumesi.
+  Desteklenen: $ , .ad , ["ad"] , [n] (negatif sondan) , son segmentte .*
+  veya [*] (dizi/nesne degerleri -> JSON dizi).
+  Yol gecersizse veya deger yoksa False doner; hata yukseltmez. }
+function VDbJsonPathGet(const Json, Path: string; out OutText: string): Boolean;
+function VDbJsonPathScalar(const Json, Path: string; out OutText: string): Boolean;
+function VDbJsonPathExists(const Json, Path: string): Boolean;
+
+{ M4 (2026-10-19): JSON sayi dizisi -> Double vektoru. Tum ogeler sayi
+  olmali; aksi halde False. Vektor SQL fonksiyonlari icin. }
+type
+  TDoubleArray = array of Double;
+function VDbJsonNumArray(const S: string; out Vals: TDoubleArray): Boolean;
+
 implementation
 
 uses
@@ -296,7 +310,9 @@ var
         numTxt := numTxt + S[P];
         Inc(P);
       end;
-      if not TryStrToFloat(numTxt, X.Num) then
+      // M10: JSON sayilari HER ZAMAN '.' ondalik ayiricisidir; locale'e
+      // bagli TryStrToFloat TR gibi virgullu locale'lerde "1.5"u reddediyordu.
+      if not VDbParseFloat(numTxt, X.Num) then
       begin
         VDbJsonFree(X);
         Exit(False);
@@ -574,6 +590,762 @@ begin
     Result := True;
   finally
     VDbJsonFree(a);
+  end;
+end;
+
+// ---- M10: JSONPath alt kumesi ----
+
+procedure JsonAppendEscaped(const S: string; var O: string);
+var
+  i: Integer;
+  c: Char;
+begin
+  O := O + '"';
+  for i := 1 to Length(S) do
+  begin
+    c := S[i];
+    case c of
+      '"': O := O + '\"';
+      '\': O := O + '\\';
+      #8: O := O + '\b';
+      #9: O := O + '\t';
+      #10: O := O + '\n';
+      #12: O := O + '\f';
+      #13: O := O + '\r';
+    else
+      if Ord(c) < 32 then
+        O := O + '\u' + IntToHex(Ord(c), 4)
+      else
+        O := O + c;
+    end;
+  end;
+  O := O + '"';
+end;
+
+function JsonNodeText(V: TJsonVal): string;
+var
+  i: Integer;
+begin
+  if V = nil then Exit('null');
+  case V.Kind of
+    jkNull: Result := 'null';
+    jkBool: if V.B then Result := 'true' else Result := 'false';
+    jkNum: Result := VDbFloatToStr(V.Num);
+    jkStr:
+      begin
+        Result := '';
+        JsonAppendEscaped(V.Str, Result);
+      end;
+    jkArr:
+      begin
+        Result := '[';
+        for i := 0 to High(V.Items) do
+        begin
+          if i > 0 then Result := Result + ',';
+          Result := Result + JsonNodeText(V.Items[i]);
+        end;
+        Result := Result + ']';
+      end;
+    jkObj:
+      begin
+        Result := '{';
+        for i := 0 to High(V.Items) do
+        begin
+          if i > 0 then Result := Result + ',';
+          JsonAppendEscaped(V.Keys[i], Result);
+          Result := Result + ':' + JsonNodeText(V.Items[i]);
+        end;
+        Result := Result + '}';
+      end;
+  end;
+end;
+
+function JsonWildcardText(V: TJsonVal): string;
+var
+  i: Integer;
+begin
+  Result := '[';
+  for i := 0 to High(V.Items) do
+  begin
+    if i > 0 then Result := Result + ',';
+    Result := Result + JsonNodeText(V.Items[i]);
+  end;
+  Result := Result + ']';
+end;
+
+{ M10 genisletme (2026-10-19): coklu dugum JSONPath degerlendiricisi.
+  Destek: $ .ad ["ad"] [n] [a:b] [*] .* ..ad ..* [?(@.alan op literal)]
+  op: = == != < <= > >= ; literal: sayi, 'metin', "metin", true/false/null.
+  Joker/filtre/recursive/slice adimlari coklu sonuc uretir; Get bunlari
+  JSON dizi olarak dondurur. }
+
+type
+  TJsonNodeList = array of TJsonVal;
+  TJsonLitKind = (jlNone, jlNum, jlStr, jlBool, jlNull);
+  TJsonPred = record
+    Fields: TStrArray;
+    Op: string;
+    LitKind: TJsonLitKind;
+    Num: Double;
+    Bool: Boolean;
+    Str: string;
+  end;
+
+procedure JsonAddNode(var L: TJsonNodeList; V: TJsonVal);
+begin
+  if V = nil then Exit;
+  SetLength(L, Length(L) + 1);
+  L[High(L)] := V;
+end;
+
+function JsonFieldOf(V: TJsonVal; const K: string): TJsonVal;
+var
+  i: Integer;
+begin
+  Result := nil;
+  if (V = nil) or (V.Kind <> jkObj) then Exit;
+  for i := 0 to High(V.Keys) do
+    if V.Keys[i] = K then Exit(V.Items[i]);
+end;
+
+procedure JsonChildrenOf(V: TJsonVal; var L: TJsonNodeList);
+var
+  i: Integer;
+begin
+  if V = nil then Exit;
+  if V.Kind = jkObj then
+  begin
+    for i := 0 to High(V.Items) do JsonAddNode(L, V.Items[i]);
+  end
+  else if V.Kind = jkArr then
+    for i := 0 to High(V.Items) do JsonAddNode(L, V.Items[i]);
+end;
+
+procedure JsonCollectKey(V: TJsonVal; const K: string; var L: TJsonNodeList);
+var
+  i: Integer;
+begin
+  if V = nil then Exit;
+  if V.Kind = jkObj then
+  begin
+    for i := 0 to High(V.Keys) do
+    begin
+      if V.Keys[i] = K then JsonAddNode(L, V.Items[i]);
+      JsonCollectKey(V.Items[i], K, L);
+    end;
+  end
+  else if V.Kind = jkArr then
+    for i := 0 to High(V.Items) do
+      JsonCollectKey(V.Items[i], K, L);
+end;
+
+procedure JsonCollectAll(V: TJsonVal; var L: TJsonNodeList);
+var
+  i: Integer;
+begin
+  if V = nil then Exit;
+  if V.Kind = jkObj then
+  begin
+    for i := 0 to High(V.Items) do
+    begin
+      JsonAddNode(L, V.Items[i]);
+      JsonCollectAll(V.Items[i], L);
+    end;
+  end
+  else if V.Kind = jkArr then
+    for i := 0 to High(V.Items) do
+    begin
+      JsonAddNode(L, V.Items[i]);
+      JsonCollectAll(V.Items[i], L);
+    end;
+end;
+
+function JsonParsePred(const S: string; out Pred: TJsonPred): Boolean;
+var
+  p, n, st: Integer;
+  qch: Char;
+
+  procedure SkipWs;
+  begin
+    while (p <= n) and (S[p] = ' ') do Inc(p);
+  end;
+
+  function ReadWord: string;
+  begin
+    Result := '';
+    while (p <= n) and (S[p] in ['a'..'z', 'A'..'Z', '0'..'9', '_', '-']) do
+    begin
+      Result := Result + S[p];
+      Inc(p);
+    end;
+  end;
+begin
+  Result := False;
+  Pred := Default(TJsonPred);
+  SetLength(Pred.Fields, 0);
+  p := 1;
+  n := Length(S);
+  if n = 0 then Exit;
+  SkipWs;
+  if (p > n) or (S[p] <> '@') then Exit;
+  Inc(p);
+  while (p <= n) and (S[p] = '.') do
+  begin
+    Inc(p);
+    st := p;
+    while (p <= n) and (S[p] in ['a'..'z', 'A'..'Z', '0'..'9', '_', '-']) do
+      Inc(p);
+    if p = st then Exit;
+    SetLength(Pred.Fields, Length(Pred.Fields) + 1);
+    Pred.Fields[High(Pred.Fields)] := Copy(S, st, p - st);
+  end;
+  SkipWs;
+  if p > n then Exit(True);   // yalniz @... -> dogruluk testi
+  // operator
+  if Copy(S, p, 2) = '==' then begin Pred.Op := '='; Inc(p, 2); end
+  else if Copy(S, p, 2) = '!=' then begin Pred.Op := '!='; Inc(p, 2); end
+  else if Copy(S, p, 2) = '<=' then begin Pred.Op := '<='; Inc(p, 2); end
+  else if Copy(S, p, 2) = '>=' then begin Pred.Op := '>='; Inc(p, 2); end
+  else if (p <= n) and (S[p] = '=') then begin Pred.Op := '='; Inc(p); end
+  else if (p <= n) and (S[p] = '<') then begin Pred.Op := '<'; Inc(p); end
+  else if (p <= n) and (S[p] = '>') then begin Pred.Op := '>'; Inc(p); end
+  else Exit;
+  SkipWs;
+  if p > n then Exit;
+  // literal
+  if S[p] in ['''', '"'] then
+  begin
+    Pred.LitKind := jlStr;
+    qch := S[p];
+    Inc(p);
+    Pred.Str := '';
+    while (p <= n) and (S[p] <> qch) do
+    begin
+      if (S[p] = '\') and (p < n) then
+      begin
+        Inc(p);
+        case S[p] of
+          'n': Pred.Str := Pred.Str + #10;
+          't': Pred.Str := Pred.Str + #9;
+          'r': Pred.Str := Pred.Str + #13;
+        else
+          Pred.Str := Pred.Str + S[p];
+        end;
+      end
+      else
+        Pred.Str := Pred.Str + S[p];
+      Inc(p);
+    end;
+    if p > n then Exit;
+    Inc(p);
+  end
+  else if (S[p] = '-') or (S[p] in ['0'..'9']) then
+  begin
+    st := p;
+    if S[p] = '-' then Inc(p);
+    while (p <= n) and (S[p] in ['0'..'9', '.', 'e', 'E', '+', '-']) do
+      Inc(p);
+    if not VDbParseFloat(Copy(S, st, p - st), Pred.Num) then Exit;
+    Pred.LitKind := jlNum;
+  end
+  else
+  begin
+    st := p;
+    Pred.Str := UpperCase(ReadWord);
+    if st = p then Exit;
+    if Pred.Str = 'TRUE' then begin Pred.LitKind := jlBool; Pred.Bool := True; end
+    else if Pred.Str = 'FALSE' then begin Pred.LitKind := jlBool; Pred.Bool := False; end
+    else if Pred.Str = 'NULL' then Pred.LitKind := jlNull
+    else Exit;
+  end;
+  SkipWs;
+  Result := p > n;
+end;
+
+function JsonPredMatch(V: TJsonVal; const P: TJsonPred): Boolean;
+var
+  t: TJsonVal;
+  i, cmp: Integer;
+begin
+  Result := False;
+  t := V;
+  for i := 0 to High(P.Fields) do
+  begin
+    t := JsonFieldOf(t, P.Fields[i]);
+    if t = nil then Exit;
+  end;
+  if t = nil then Exit;
+  if P.Op = '' then
+  begin
+    case t.Kind of
+      jkNull: Exit(False);
+      jkBool: Exit(t.B);
+      jkNum: Exit(t.Num <> 0);
+      jkStr: Exit(t.Str <> '');
+    else
+      Exit(True);
+    end;
+  end;
+  cmp := 0;
+  case P.LitKind of
+    jlNull:
+      begin
+        if t.Kind <> jkNull then Exit(P.Op = '!=');
+        cmp := 0;
+      end;
+    jlBool:
+      begin
+        if t.Kind <> jkBool then Exit(False);
+        if t.B <> P.Bool then cmp := 1 else cmp := 0;
+      end;
+    jlNum:
+      begin
+        if t.Kind <> jkNum then Exit(False);
+        if t.Num < P.Num then cmp := -1
+        else if t.Num > P.Num then cmp := 1
+        else cmp := 0;
+      end;
+    jlStr:
+      begin
+        if t.Kind <> jkStr then Exit(False);
+        cmp := CompareStr(t.Str, P.Str);
+        if cmp < 0 then cmp := -1 else if cmp > 0 then cmp := 1;
+      end;
+  else
+    Exit(False);
+  end;
+  if P.Op = '=' then Exit(cmp = 0);
+  if P.Op = '!=' then Exit(cmp <> 0);
+  if P.Op = '<' then Exit(cmp < 0);
+  if P.Op = '<=' then Exit(cmp <= 0);
+  if P.Op = '>' then Exit(cmp > 0);
+  if P.Op = '>=' then Exit(cmp >= 0);
+end;
+
+function JsonNodesText(const N: TJsonNodeList): string;
+var
+  i: Integer;
+begin
+  Result := '[';
+  for i := 0 to High(N) do
+  begin
+    if i > 0 then Result := Result + ',';
+    Result := Result + JsonNodeText(N[i]);
+  end;
+  Result := Result + ']';
+end;
+
+function JsonPathSelect(Root: TJsonVal; const Path: string;
+  out Nodes: TJsonNodeList; out Multi: Boolean): Boolean;
+var
+  p, n, i, j, st, idx, aa, bb, cnt: Integer;
+  cur, nxt: TJsonNodeList;
+  name, pred: string;
+  pr: TJsonPred;
+begin
+  Result := False;
+  SetLength(Nodes, 0);
+  Multi := False;
+  n := Length(Path);
+  if (n < 1) or (Path[1] <> '$') then Exit;
+  SetLength(cur, 1);
+  cur[0] := Root;
+  p := 2;
+  while p <= n do
+  begin
+    SetLength(nxt, 0);
+    if Path[p] = '.' then
+    begin
+      if (p < n) and (Path[p + 1] = '.') then
+      begin
+        Multi := True;
+        Inc(p, 2);
+        if (p <= n) and (Path[p] = '*') then
+        begin
+          Inc(p);
+          for i := 0 to High(cur) do JsonCollectAll(cur[i], nxt);
+        end
+        else
+        begin
+          st := p;
+          while (p <= n) and (Path[p] <> '.') and (Path[p] <> '[') do Inc(p);
+          if p = st then Exit;
+          name := Copy(Path, st, p - st);
+          for i := 0 to High(cur) do JsonCollectKey(cur[i], name, nxt);
+        end;
+      end
+      else
+      begin
+        Inc(p);
+        if (p <= n) and (Path[p] = '*') then
+        begin
+          Inc(p);
+          Multi := True;
+          for i := 0 to High(cur) do JsonChildrenOf(cur[i], nxt);
+        end
+        else
+        begin
+          st := p;
+          while (p <= n) and (Path[p] <> '.') and (Path[p] <> '[') do Inc(p);
+          if p = st then Exit;
+          name := Copy(Path, st, p - st);
+          for i := 0 to High(cur) do
+            JsonAddNode(nxt, JsonFieldOf(cur[i], name));
+        end;
+      end;
+    end
+    else if Path[p] = '[' then
+    begin
+      Inc(p);
+      if (p <= n) and (Path[p] = '"') then
+      begin
+        Inc(p);
+        name := '';
+        while (p <= n) and (Path[p] <> '"') do
+        begin
+          if (Path[p] = '\') and (p < n) then
+          begin
+            Inc(p);
+            name := name + Path[p];
+          end
+          else
+            name := name + Path[p];
+          Inc(p);
+        end;
+        if p > n then Exit;
+        Inc(p);
+        if (p > n) or (Path[p] <> ']') then Exit;
+        Inc(p);
+        for i := 0 to High(cur) do
+          JsonAddNode(nxt, JsonFieldOf(cur[i], name));
+      end
+      else if (p <= n) and (Path[p] = '*') then
+      begin
+        Inc(p);
+        if (p > n) or (Path[p] <> ']') then Exit;
+        Inc(p);
+        Multi := True;
+        for i := 0 to High(cur) do JsonChildrenOf(cur[i], nxt);
+      end
+      else if (p < n) and (Path[p] = '?') and (Path[p + 1] = '(') then
+      begin
+        Inc(p, 2);
+        st := p;
+        while (p <= n) and (Path[p] <> ')') do Inc(p);
+        if p > n then Exit;
+        pred := Copy(Path, st, p - st);
+        Inc(p);
+        if (p > n) or (Path[p] <> ']') then Exit;
+        Inc(p);
+        if not JsonParsePred(pred, pr) then Exit;
+        Multi := True;
+        for i := 0 to High(cur) do
+          if (cur[i] <> nil) and (cur[i].Kind = jkArr) then
+            for j := 0 to High(cur[i].Items) do
+              if JsonPredMatch(cur[i].Items[j], pr) then
+                JsonAddNode(nxt, cur[i].Items[j]);
+      end
+      else
+      begin
+        st := p;
+        while (p <= n) and (Path[p] <> ']') do Inc(p);
+        if p > n then Exit;
+        name := Copy(Path, st, p - st);
+        Inc(p);
+        if Pos(':', name) > 0 then
+        begin
+          Multi := True;
+          j := Pos(':', name);
+          if j > 1 then
+          begin
+            if not TryStrToInt(Copy(name, 1, j - 1), aa) then Exit;
+          end
+          else
+            aa := 0;
+          if j < Length(name) then
+          begin
+            if not TryStrToInt(Copy(name, j + 1, MaxInt), bb) then Exit;
+          end
+          else
+            bb := MaxInt;
+          for i := 0 to High(cur) do
+            if (cur[i] <> nil) and (cur[i].Kind = jkArr) then
+            begin
+              cnt := Length(cur[i].Items);
+              j := aa;
+              if j < 0 then Inc(j, cnt);
+              if j < 0 then j := 0;
+              st := bb;
+              if st < 0 then Inc(st, cnt);
+              if st > cnt then st := cnt;
+              while (j < st) and (j <= High(cur[i].Items)) do
+              begin
+                if j >= 0 then JsonAddNode(nxt, cur[i].Items[j]);
+                Inc(j);
+              end;
+            end;
+        end
+        else
+        begin
+          if not TryStrToInt(name, idx) then Exit;
+          for i := 0 to High(cur) do
+            if (cur[i] <> nil) and (cur[i].Kind = jkArr) then
+            begin
+              j := idx;
+              if j < 0 then Inc(j, Length(cur[i].Items));
+              if (j >= 0) and (j <= High(cur[i].Items)) then
+                JsonAddNode(nxt, cur[i].Items[j]);
+            end;
+        end;
+      end;
+    end
+    else
+      Exit;
+    cur := nxt;
+  end;
+  Nodes := cur;
+  Result := True;
+end;
+
+function JsonPathNeedsAdvanced(const Path: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := True;
+  if Pos('..', Path) > 0 then Exit;
+  if Pos('[?', Path) > 0 then Exit;
+  if Pos(':', Path) > 0 then Exit;
+  i := Pos('.*', Path);
+  if (i > 0) and (i + 2 <= Length(Path)) then Exit;
+  i := Pos('[*]', Path);
+  if (i > 0) and (i + 3 <= Length(Path)) then Exit;
+  Result := False;
+end;
+
+function JsonPathNavigate(Root: TJsonVal; const Path: string;
+  out Node: TJsonVal; out Wildcard: Boolean): Boolean;
+
+  function FindKey(V: TJsonVal; const K: string): TJsonVal;
+  var
+    i: Integer;
+  begin
+    Result := nil;
+    if (V = nil) or (V.Kind <> jkObj) then Exit;
+    for i := 0 to High(V.Keys) do
+      if V.Keys[i] = K then Exit(V.Items[i]);
+  end;
+
+var
+  p, n, st, idx: Integer;
+  name: string;
+  cur: TJsonVal;
+begin
+  Result := False;
+  Node := nil;
+  Wildcard := False;
+  n := Length(Path);
+  if (n < 1) or (Path[1] <> '$') then Exit;
+  cur := Root;
+  p := 2;
+  while p <= n do
+  begin
+    if Path[p] = '.' then
+    begin
+      Inc(p);
+      if (p <= n) and (Path[p] = '*') then
+      begin
+        Inc(p);
+        if p <= n then Exit;   // joker yalniz son segment
+        if (cur = nil) or
+           ((cur.Kind <> jkArr) and (cur.Kind <> jkObj)) then Exit;
+        Node := cur;
+        Wildcard := True;
+        Exit(True);
+      end;
+      st := p;
+      while (p <= n) and (Path[p] <> '.') and (Path[p] <> '[') do Inc(p);
+      if p = st then Exit;
+      name := Copy(Path, st, p - st);
+      cur := FindKey(cur, name);
+      if cur = nil then Exit;
+    end
+    else if Path[p] = '[' then
+    begin
+      Inc(p);
+      if (p <= n) and (Path[p] = '"') then
+      begin
+        Inc(p);
+        name := '';
+        while (p <= n) and (Path[p] <> '"') do
+        begin
+          if (Path[p] = '\') and (p < n) then
+          begin
+            Inc(p);
+            name := name + Path[p];
+          end
+          else
+            name := name + Path[p];
+          Inc(p);
+        end;
+        if p > n then Exit;
+        Inc(p);  // kapanis tirnagi
+        if (p > n) or (Path[p] <> ']') then Exit;
+        Inc(p);
+        cur := FindKey(cur, name);
+        if cur = nil then Exit;
+      end
+      else
+      begin
+        st := p;
+        if (p <= n) and (Path[p] = '-') then Inc(p);
+        while (p <= n) and (Path[p] in ['0'..'9']) do Inc(p);
+        if (p <= n) and (Path[p] = '*') then
+        begin
+          Inc(p);
+          if (p > n) or (Path[p] <> ']') then Exit;
+          Inc(p);
+          if p <= n then Exit;
+          if (cur = nil) or (cur.Kind <> jkArr) then Exit;
+          Node := cur;
+          Wildcard := True;
+          Exit(True);
+        end;
+        if (p > n) or (Path[p] <> ']') then Exit;
+        if not TryStrToInt(Copy(Path, st, p - st), idx) then Exit;
+        Inc(p);
+        if (cur = nil) or (cur.Kind <> jkArr) then Exit;
+        if idx < 0 then idx := Length(cur.Items) + idx;
+        if (idx < 0) or (idx > High(cur.Items)) then Exit;
+        cur := cur.Items[idx];
+      end;
+    end
+    else
+      Exit;
+  end;
+  Node := cur;
+  Result := Node <> nil;
+end;
+
+function VDbJsonPathGet(const Json, Path: string; out OutText: string): Boolean;
+var
+  root, node: TJsonVal;
+  wild: Boolean;
+  nodes: TJsonNodeList;
+  multi: Boolean;
+begin
+  Result := False;
+  OutText := '';
+  if not VDbJsonParse(Json, root) then Exit;
+  try
+    if JsonPathNeedsAdvanced(Path) then
+    begin
+      if not JsonPathSelect(root, Path, nodes, multi) then Exit;
+      if Length(nodes) = 0 then Exit;
+      if multi then OutText := JsonNodesText(nodes)
+      else OutText := JsonNodeText(nodes[0]);
+      Result := True;
+      Exit;
+    end;
+    if not JsonPathNavigate(root, Path, node, wild) then Exit;
+    if wild then
+      OutText := JsonWildcardText(node)
+    else
+      OutText := JsonNodeText(node);
+    Result := True;
+  finally
+    VDbJsonFree(root);
+  end;
+end;
+
+function VDbJsonPathScalar(const Json, Path: string; out OutText: string): Boolean;
+var
+  root, node: TJsonVal;
+  wild: Boolean;
+  nodes: TJsonNodeList;
+  multi: Boolean;
+begin
+  Result := False;
+  OutText := '';
+  if not VDbJsonParse(Json, root) then Exit;
+  try
+    if JsonPathNeedsAdvanced(Path) then
+    begin
+      if not JsonPathSelect(root, Path, nodes, multi) then Exit;
+      if multi or (Length(nodes) <> 1) then Exit;
+      node := nodes[0];
+      if node = nil then Exit;
+      case node.Kind of
+        jkNull: OutText := '';
+        jkBool: OutText := BoolToStr(node.B, True);
+        jkNum: OutText := VDbFloatToStr(node.Num);
+        jkStr: OutText := node.Str;
+      else
+        Exit;
+      end;
+      Result := True;
+      Exit;
+    end;
+    if not JsonPathNavigate(root, Path, node, wild) then Exit;
+    if wild or (node = nil) then Exit;
+    case node.Kind of
+      jkNull: OutText := '';
+      jkBool: OutText := BoolToStr(node.B, True);
+      jkNum: OutText := VDbFloatToStr(node.Num);
+      jkStr: OutText := node.Str;
+    else
+      Exit;   // nesne/dizi skaler degildir
+    end;
+    Result := True;
+  finally
+    VDbJsonFree(root);
+  end;
+end;
+
+function VDbJsonPathExists(const Json, Path: string): Boolean;
+var
+  root, node: TJsonVal;
+  wild: Boolean;
+  nodes: TJsonNodeList;
+  multi: Boolean;
+begin
+  Result := False;
+  if not VDbJsonParse(Json, root) then Exit;
+  try
+    if JsonPathNeedsAdvanced(Path) then
+    begin
+      Result := JsonPathSelect(root, Path, nodes, multi) and
+        (Length(nodes) > 0);
+      Exit;
+    end;
+    Result := JsonPathNavigate(root, Path, node, wild);
+  finally
+    VDbJsonFree(root);
+  end;
+end;
+
+function VDbJsonNumArray(const S: string; out Vals: TDoubleArray): Boolean;
+var
+  V: TJsonVal;
+  i: Integer;
+begin
+  Result := False;
+  SetLength(Vals, 0);
+  if not VDbJsonParse(S, V) then Exit;
+  try
+    if (V = nil) or (V.Kind <> jkArr) then Exit;
+    SetLength(Vals, Length(V.Items));
+    for i := 0 to High(V.Items) do
+    begin
+      if V.Items[i].Kind <> jkNum then
+      begin
+        SetLength(Vals, 0);
+        Exit;
+      end;
+      Vals[i] := V.Items[i].Num;
+    end;
+    Result := True;
+  finally
+    VDbJsonFree(V);
   end;
 end;
 

@@ -287,6 +287,9 @@ type
     // P-24: Batch yazim sirasinda tablo semasini ve kolon siralamasini onbellekleme
     FBatchTableCached: Boolean;
     FBatchTableDef: TTableDef;
+    // H10 (2026-10-18): batch basina BIR KEZ hesaplanan VDbHashKeyPrefix tohumu.
+    // FBatchTableCached ile ayni gecerlilikte (ad eslesmesi kontrol edilir).
+    FBatchHashPrefix: QWord;
     FBatchColMapValid: Boolean;
     FBatchColMap: TIntArray;
   // F2-12: aktif FK kaskad zinciri derinligi (koruma sayaci)
@@ -681,6 +684,17 @@ function VDbNorm(const S: string): string;
   kurmadan, satirdaki ham UTF-8 pk baytlari uzerinde ayni hash'i uretmek. }
 function VDbHashKeyPrefix(const Table: string): QWord;
 function VDbHashKeyBytes(h: QWord; PkUtf8: PByte; PkLen: Integer): QWord;
+{ H1 (2026-10-18): DecodeRow'un PByte+Len surumu (TBytes ayirmaz).
+  Filtered SELECT'in AKISLI taramasinda kaydi TStrArray'e cozmek icin;
+  DecodeRow ile BIREBIR ayni deger bicimlerini uretir. }
+function VDbDecodeRawRowP(B: PByte; Len: Integer;
+  out TableId: Word; out Pk: string; out Vals: TStrArray): Boolean;
+{ H1 (2026-10-18): VDbPeekRawRowP'nin verdigi ofset/tip dizilerinden
+  TStrArray kurar (yeniden cozmeden). Deger bicimi DecodeRow ile BIREBIR
+  aynidir; filtreli SELECT'in ham-yuklem yolunda kullanilir. }
+procedure VDbRowFromOffsetsP(B: PByte; ColCount: Integer;
+  const FType: array of Byte; const FOff, FLen: array of Integer;
+  out Vals: TStrArray);
 { P-18a (2026-10-16): VDbPeekRawRow'un PByte+Len surumu. ScanRawIter
   geri-cagrisinda kayit tamponu TBytes DEGIL, chunk icinde bir araliktir;
   yeni TBytes ayirmadan ayni sinir kontrolleriyle onizlenir. Semantigi
@@ -783,16 +797,33 @@ function VDbFkActionToStr(const A: string): string;
 procedure VdbSetConcIdxGate(AClosed: Boolean);
 function VdbConcIdxGateClosed: Boolean;
 
+{ H6-sort: TEST/OLCUM KANCASI — paralel indeks siralamasi. Kapatilinca
+  eski seri (tek parca) yol calisir; sonuc BIREBIR aynidir. Varsayilan acik. }
+procedure VdbSetSortParallel(AEnabled: Boolean);
+function VdbSortParallelEnabled: Boolean;
+
 implementation
 
 uses
-  VDbSync;
+  VDbSync, VDbParallel;
 
 { ==================== R-22 Full: CONCURRENTLY insa altyapisi ==================== }
 
 var
   // R-22: insa kapisi (test kancasi; varsayilan ACIK).
   GVdbConcGateClosed: Boolean = False;
+  // H6-sort: paralel siralama (test kancasi; varsayilan ACIK).
+  GSortParallelEnabled: Boolean = True;
+
+procedure VdbSetSortParallel(AEnabled: Boolean);
+begin
+  GSortParallelEnabled := AEnabled;
+end;
+
+function VdbSortParallelEnabled: Boolean;
+begin
+  Result := GSortParallelEnabled;
+end;
 
 procedure VdbSetConcIdxGate(AClosed: Boolean);
 begin
@@ -890,6 +921,19 @@ begin
   end;
   if h = 0 then h := 1;
   Result := h;
+end;
+
+function VDbIsPureAscii(const S: string): Boolean;
+// H10 (2026-10-18): saf-ASCII (tum baytlar < #128) metin icin string'in
+// kendi baytlari UTF8Encode(S) ile BIREBIR aynidir (kod sayfasi ne olursa
+// olsun ASCII kimliktir). Bu yuzden pk'nin ham baytlari VDbHashKeyBytes'a
+// dogrudan verilebilir; sonuc VDbHashKey(Table, Pk) ile esit kalir.
+var
+  i: Integer;
+begin
+  for i := 1 to Length(S) do
+    if S[i] >= #128 then Exit(False);
+  Result := True;
 end;
 
 function VDbHashKeyPrefix(const Table: string): QWord;
@@ -2021,6 +2065,31 @@ begin
   Result := True;
 end;
 
+procedure VDbApplyGenerated(const T: TTableDef; var Vals: TStrArray);
+// M10: GENERATED ALWAYS AS (...) STORED kolonlarini sirayla hesaplar.
+// Kolonlar tanim sirasinda islenir; bir generated kolon yalnizca KENDINDEN
+// ONCEKI kolonlara bagimli olmalidir (aksi halde bos deger gorur).
+var
+  i: Integer;
+  v: string;
+  ct: Byte;
+begin
+  for i := 0 to High(T.Cols) do
+    if T.Cols[i].Generated then
+    begin
+      if T.Cols[i].GenExpr = '' then
+        raise EVDbException.Create(ecSchemaCorrupt,
+          'GENERATED ifadesi bos: ' + T.Cols[i].Name);
+      if i < Length(Vals) then Vals[i] := '';
+      if not VDbExprVal(T.Cols[i].GenExpr, Vals, T.Cols, v, ct) then
+        raise EVDbException.CreateFmt(ecInvalidArgument,
+          'GENERATED ifadesi degerlendirilemedi (%s): %s',
+          [T.Cols[i].Name, T.Cols[i].GenExpr]);
+      if i < Length(Vals) then
+        Vals[i] := VDbNormValue(T.Cols[i].Ctype, v);
+    end;
+end;
+
 function VDbIdxJoin(const Vals: TStrArray; const Cols: TIntArray): string;
 // Satir degerlerinden indeks anahtari olusturur.
 // F2-15: Birden fazla kolon varsa UZUNLUK-ONEKI kodlama kullanilir
@@ -2676,6 +2745,99 @@ begin
   Result := True;
 end;
 
+procedure VDbRowFromOffsetsP(B: PByte; ColCount: Integer;
+  const FType: array of Byte; const FOff, FLen: array of Integer;
+  out Vals: TStrArray);
+// H1: VDbPeekRawRowP ofsetlerinden TStrArray kurar (DecodeRow ile ayni bicim).
+var
+  i: Integer;
+  iv: Int64;
+  fv: Double;
+  s: RawByteString;
+begin
+  SetLength(Vals, ColCount);
+  for i := 0 to ColCount - 1 do
+  begin
+    if (FOff[i] < 0) or (FLen[i] = 0) then begin Vals[i] := ''; Continue; end;
+    case FType[i] of
+      VCT_INT:
+        begin Move(B[FOff[i]], iv, 8); Vals[i] := IntToStr(iv); end;
+      VCT_FLOAT:
+        begin Move(B[FOff[i]], fv, 8); Vals[i] := VDbFloatToStr(fv); end;
+      VCT_BOOL:
+        begin Vals[i] := BoolToStr(B[FOff[i]] <> 0, True); end;
+    else
+      begin
+        SetString(s, PAnsiChar(NativeUInt(B) + NativeUInt(FOff[i])), FLen[i]);
+        if FType[i] = VCT_BLOB then Vals[i] := s else Vals[i] := UTF8Decode(s);
+      end;
+    end;
+  end;
+end;
+
+function VDbDecodeRawRowP(B: PByte; Len: Integer;
+  out TableId: Word; out Pk: string; out Vals: TStrArray): Boolean;
+// H1: DecodeRow'un PByte+Len surumu; chunktan TStrArray'e dogrudan cozer.
+var
+  p: Integer;
+  pkL, cc, i: Word;
+  ct: Byte;
+  vl: LongInt;
+  iv: Int64;
+  fv: Double;
+  s: AnsiString;
+
+  function RdU16(out V: Word): Boolean;
+  begin
+    Result := p + 2 <= Len;
+    if Result then begin V := B[p] or (Word(B[p + 1]) shl 8); Inc(p, 2); end;
+  end;
+
+  function RdI32(out V: LongInt): Boolean;
+  begin
+    Result := p + 4 <= Len;
+    if Result then begin Move(B[p], V, 4); Inc(p, 4); end;
+  end;
+
+  function SliceStr(Off, L: Integer): RawByteString;
+  begin
+    SetString(Result, PAnsiChar(NativeUInt(B) + NativeUInt(Off)), L);
+  end;
+
+begin
+  Result := False;
+  if B = nil then Exit;
+  p := 0;
+  if not RdU16(TableId) then Exit;
+  if not RdU16(pkL) then Exit;
+  if p + pkL > Len then Exit;
+  s := SliceStr(p, pkL);
+  Pk := UTF8Decode(s);
+  Inc(p, pkL);
+  if not RdU16(cc) then Exit;
+  SetLength(Vals, cc);
+  for i := 0 to cc - 1 do
+  begin
+    if p >= Len then Exit;
+    ct := B[p]; Inc(p);
+    if not RdI32(vl) then Exit;
+    if vl = -1 then begin Vals[i] := ''; Continue; end;
+    if (vl < 0) or (p + vl > Len) then Exit;
+    case ct of
+      VCT_INT: begin if vl <> 8 then Exit; Move(B[p], iv, 8); Vals[i] := IntToStr(iv); end;
+      VCT_FLOAT: begin if vl <> 8 then Exit; Move(B[p], fv, 8); Vals[i] := VDbFloatToStr(fv); end;
+      VCT_BOOL: begin Vals[i] := BoolToStr(B[p] <> 0, True); end;
+    else
+      if ct = VCT_BLOB then
+        Vals[i] := SliceStr(p, vl)
+      else
+        Vals[i] := UTF8Decode(SliceStr(p, vl));
+    end;
+    Inc(p, vl);
+  end;
+  Result := True;
+end;
+
 function VDbPeekRawRowKeyHashTo(B: PByte; Len, ColCount: Integer;
   out TableId: Word; HashPrefix: QWord; out KeyHash: QWord;
   MaxCol: Integer; var FType: array of Byte;
@@ -3031,6 +3193,8 @@ procedure ParseLines(Lines: TStrings);
         t.Cols[lj].HasDef := False;
         t.Cols[lj].Def := '';
         t.Cols[lj].Collate := '';   // R-20
+        t.Cols[lj].Generated := False;   // M10
+        t.Cols[lj].GenExpr := '';
         if Pos(':', cp[lj]) > 0 then
         begin
           s2 := cp[lj];
@@ -3057,7 +3221,18 @@ procedure ParseLines(Lines: TStrings);
                   t.Cols[lj].HasDef := True;
                   t.Cols[lj].Def := string(VDbUnhex(Copy(rest, 1, q1 - 1)));
                 end;
-                t.Cols[lj].Collate := Copy(rest, q1 + 1, 999);
+                // M10: 5. alan collation, 6. alan hex(GENERATED ifadesi).
+                s2 := Copy(rest, q1 + 1, 999);
+                q2 := Pos(':', s2);
+                if q2 > 0 then
+                begin
+                  t.Cols[lj].Collate := Copy(s2, 1, q2 - 1);
+                  if q2 < Length(s2) then
+                    t.Cols[lj].GenExpr := string(VDbUnhex(Copy(s2, q2 + 1, 999)));
+                end
+                else
+                  t.Cols[lj].Collate := s2;
+                t.Cols[lj].Generated := t.Cols[lj].GenExpr <> '';
               end
               else
               begin
@@ -3332,13 +3507,17 @@ begin
           DIKKAT: 4. alan (hexdef) dolu olmasa bile BOS AYIRAC yazilir;
           aksi halde okuma tarafi 5. alani hexdef sanar ve "hex bozuk"
           hatasi verir. Eski 3 alanli bicim geriye uyumlu kalir. }
-        if kv.Value.Cols[i].Collate <> '' then
+        if (kv.Value.Cols[i].Collate <> '') or
+           (kv.Value.Cols[i].GenExpr <> '') then
         begin
           if kv.Value.Cols[i].HasDef then
             s := s + ':' + VDbHex(kv.Value.Cols[i].Def)
           else
             s := s + '::';
           s := s + kv.Value.Cols[i].Collate;
+          // M10: 6. alan hex(GENERATED ifadesi).
+          if kv.Value.Cols[i].GenExpr <> '' then
+            s := s + ':' + VDbHex(kv.Value.Cols[i].GenExpr);
         end
         else if kv.Value.Cols[i].HasDef then
           s := s + ':' + VDbHex(kv.Value.Cols[i].Def);
@@ -4681,6 +4860,259 @@ begin
   Result := ct;
 end;
 
+type
+  { H6-sort (2026-10-19): paralel indeks siralamasi. Parcalar bagimsiz
+    araliklar uzerinde siralanir (her isci yalniz KENDI araligina yazar),
+    sonra tek gecisli k-yonlu birlestirme ile birlestirilir. Karsilastirma
+    kurallari eski Hoare yoluyla BIREBIR aynidir; sonuc deterministiktir. }
+  TIdxSortMode = (ismGen, ismNum, ismMulti);
+  TIdxSortCtx = record
+    E: TIdxEntries;
+    Keys: array of Int64;
+    IsNull: array of Boolean;
+    Ctype: Byte;
+    Ctypes: TByteArray;
+    Mode: TIdxSortMode;
+  end;
+  PIdxSortCtx = ^TIdxSortCtx;
+
+const
+  VDB_SORT_PAR_MIN = 50000;        // altinda paralel kurulum maliyeti anlamsiz
+  VDB_SORT_PAR_MAX = 4000000;      // ustunde birlesme icin bellek ikiye katlanmasin
+
+function IdxSortCmpIdx(const S: TIdxSortCtx; i, j: Integer): Integer;
+begin
+  case S.Mode of
+    ismNum:
+      begin
+        if S.IsNull[i] then
+        begin
+          if S.IsNull[j] then Result := 0 else Result := -1;
+        end
+        else if S.IsNull[j] then Result := 1
+        else if S.Keys[i] < S.Keys[j] then Result := -1
+        else if S.Keys[i] > S.Keys[j] then Result := 1
+        else Result := 0;
+      end;
+    ismMulti: Result := VDbIdxMultiCmp(S.E[i].Key, S.E[j].Key, S.Ctypes);
+  else
+    Result := VDbIdxCmp(S.E[i].Key, S.E[j].Key, S.Ctype);
+  end;
+  if Result = 0 then Result := CompareStr(S.E[i].Pk, S.E[j].Pk);
+end;
+
+{ Tek araligi (in-place) sirala. VdbParallelFor is parcayi bu yordama verir. }
+procedure IdxSortRange(ACtx: Pointer; AChunkIx, ALo, AHi: Integer);
+var
+  S: PIdxSortCtx;
+
+  procedure QS(L, H: Integer);
+  var
+    i, j, c: Integer;
+    tmp: TIdxEntry;
+    tmpK: Int64;
+    tmpN: Boolean;
+    pivKey, pivPk: string;
+    pivK: Int64;
+    pivNull: Boolean;
+    mid: Integer;
+  begin
+    i := L; j := H;
+    mid := (L + H) div 2;
+    pivKey := S^.E[mid].Key;
+    pivPk := S^.E[mid].Pk;
+    if S^.Mode = ismNum then
+    begin
+      pivK := S^.Keys[mid];
+      pivNull := S^.IsNull[mid];
+    end
+    else
+    begin
+      pivK := 0; pivNull := False;
+    end;
+    repeat
+      while True do
+      begin
+        case S^.Mode of
+          ismNum:
+            begin
+              if S^.IsNull[i] then
+              begin
+                if pivNull then c := 0 else c := -1;
+              end
+              else if pivNull then c := 1
+              else if S^.Keys[i] < pivK then c := -1
+              else if S^.Keys[i] > pivK then c := 1
+              else c := 0;
+            end;
+          ismMulti: c := VDbIdxMultiCmp(S^.E[i].Key, pivKey, S^.Ctypes);
+        else
+          c := VDbIdxCmp(S^.E[i].Key, pivKey, S^.Ctype);
+        end;
+        if c = 0 then c := CompareStr(S^.E[i].Pk, pivPk);
+        if c < 0 then Inc(i) else Break;
+      end;
+      while True do
+      begin
+        case S^.Mode of
+          ismNum:
+            begin
+              if S^.IsNull[j] then
+              begin
+                if pivNull then c := 0 else c := -1;
+              end
+              else if pivNull then c := 1
+              else if S^.Keys[j] < pivK then c := -1
+              else if S^.Keys[j] > pivK then c := 1
+              else c := 0;
+            end;
+          ismMulti: c := VDbIdxMultiCmp(S^.E[j].Key, pivKey, S^.Ctypes);
+        else
+          c := VDbIdxCmp(S^.E[j].Key, pivKey, S^.Ctype);
+        end;
+        if c = 0 then c := CompareStr(S^.E[j].Pk, pivPk);
+        if c > 0 then Dec(j) else Break;
+      end;
+      if i <= j then
+      begin
+        tmp := S^.E[i]; S^.E[i] := S^.E[j]; S^.E[j] := tmp;
+        if S^.Mode = ismNum then
+        begin
+          tmpK := S^.Keys[i]; S^.Keys[i] := S^.Keys[j]; S^.Keys[j] := tmpK;
+          tmpN := S^.IsNull[i]; S^.IsNull[i] := S^.IsNull[j]; S^.IsNull[j] := tmpN;
+        end;
+        Inc(i); Dec(j);
+      end;
+    until i > j;
+    if L < j then QS(L, j);
+    if i < H then QS(i, H);
+  end;
+
+begin
+  S := PIdxSortCtx(ACtx);
+  if ALo < AHi then QS(ALo, AHi);
+end;
+
+{ Sirali parcalari TEK gecisli k-yonlu (min-heap) birlestirme. Parcalar
+  Bounds[0..w] ile tanimlidir ve her biri zaten sirali olmalidir. }
+procedure IdxSortMerge(S: PIdxSortCtx; const Bounds: array of Integer);
+var
+  w, i, hpN, outN, ch: Integer;
+  resE: TIdxEntries;
+  resK: array of Int64;
+  resN: array of Boolean;
+  heap, pos, cnt: array of Integer;
+
+  function Less(a, b: Integer): Boolean;
+  begin
+    Result := IdxSortCmpIdx(S^, pos[a], pos[b]) < 0;
+  end;
+
+  procedure SiftDown(idx: Integer);
+  var
+    a, b, sel, t: Integer;
+  begin
+    while True do
+    begin
+      a := idx * 2 + 1;
+      if a >= hpN then Break;
+      b := a + 1;
+      sel := a;
+      if (b < hpN) and Less(heap[b], heap[a]) then sel := b;
+      if Less(heap[sel], heap[idx]) then
+      begin
+        t := heap[idx]; heap[idx] := heap[sel]; heap[sel] := t;
+        idx := sel;
+      end
+      else
+        Break;
+    end;
+  end;
+
+begin
+  w := Length(Bounds) - 1;
+  if w <= 1 then Exit;
+  SetLength(resE, Length(S^.E));
+  if S^.Mode = ismNum then
+  begin
+    SetLength(resK, Length(S^.Keys));
+    SetLength(resN, Length(S^.IsNull));
+  end;
+  SetLength(heap, w); SetLength(pos, w); SetLength(cnt, w);
+  for i := 0 to w - 1 do
+  begin
+    pos[i] := Bounds[i];
+    cnt[i] := Bounds[i + 1] - Bounds[i];
+    heap[i] := i;
+  end;
+  hpN := w;
+  for i := (w div 2) - 1 downto 0 do SiftDown(i);
+  outN := 0;
+  while hpN > 0 do
+  begin
+    ch := heap[0];
+    resE[outN] := S^.E[pos[ch]];
+    if S^.Mode = ismNum then
+    begin
+      resK[outN] := S^.Keys[pos[ch]];
+      resN[outN] := S^.IsNull[pos[ch]];
+    end;
+    Inc(outN);
+    Inc(pos[ch]);
+    Dec(cnt[ch]);
+    if cnt[ch] <= 0 then
+    begin
+      heap[0] := heap[hpN - 1];
+      Dec(hpN);
+    end;
+    if hpN > 0 then SiftDown(0);
+  end;
+  S^.E := resE;
+  if S^.Mode = ismNum then
+  begin
+    S^.Keys := resK;
+    S^.IsNull := resN;
+  end;
+end;
+
+{ Baglamdaki diziyi (gerekirse paralel) siralar; sonuc S^.E'dedir. }
+procedure IdxSortExecute(var S: TIdxSortCtx; n: Integer);
+var
+  usePar: Boolean;
+  chunks, sz, extra, lo, i, c2: Integer;
+  bounds: array of Integer;
+begin
+  usePar := GSortParallelEnabled and (n >= VDB_SORT_PAR_MIN) and
+    (n <= VDB_SORT_PAR_MAX);
+  if usePar and (not ThreadPoolReady) then usePar := InitThreadPool(0);
+  if usePar and (ParallelWorkerCount < 2) then usePar := False;
+  if usePar then
+  begin
+    chunks := ParallelWorkerCount * 2;
+    if chunks > n then chunks := n;
+    if chunks < 2 then
+      usePar := False;
+  end;
+  if usePar then
+  begin
+    SetLength(bounds, chunks + 1);
+    sz := n div chunks;
+    extra := n mod chunks;
+    lo := 0;
+    for i := 0 to chunks - 1 do
+    begin
+      bounds[i] := lo;
+      c2 := sz + Ord(i < extra);
+      Inc(lo, c2);
+    end;
+    bounds[chunks] := n;
+    VdbParallelForChunked(0, n - 1, chunks, IdxSortRange, @S);
+    IdxSortMerge(@S, bounds);
+  end
+  else
+    IdxSortRange(@S, 0, 0, n - 1);
+end;
+
 procedure TVTableDb.SortIdxEntries(var E: TIdxEntries; Ctype: Byte);
 { P-15a: INTEGER anahtarlarda onden-cikarilmis (decorated) anahtarla siralama.
   VDbIdxCmp her karsilastirmada 2x VDbParseInt (metin->Int64) ayistirir;
@@ -4692,149 +5124,61 @@ procedure TVTableDb.SortIdxEntries(var E: TIdxEntries; Ctype: Byte);
   esit sayilir, tie Pk'ya duser - eskisi gibi). Parse edilemeyen anahtar
   (INT kolonda beklenmez) ya da bos dizi -> eski yol aynen calisir. }
 var
-  keys: array of Int64;
-  isnull: array of Boolean;
-  fi: Integer;
-  fv: Int64;
-  fast: Boolean;
-
-  procedure Sort(L, H: Integer);
-  var
-    i, j: Integer;
-    piv, tmp: TIdxEntry;
-    c: Integer;
-  begin
-    i := L; j := H; piv := E[(L + H) div 2];
-    repeat
-      while True do
-      begin
-        c := VDbIdxCmp(E[i].Key, piv.Key, Ctype);
-        if c = 0 then c := CompareStr(E[i].Pk, piv.Pk);
-        if c < 0 then Inc(i) else Break;
-      end;
-      while True do
-      begin
-        c := VDbIdxCmp(E[j].Key, piv.Key, Ctype);
-        if c = 0 then c := CompareStr(E[j].Pk, piv.Pk);
-        if c > 0 then Dec(j) else Break;
-      end;
-      if i <= j then
-      begin
-        tmp := E[i]; E[i] := E[j]; E[j] := tmp;
-        Inc(i); Dec(j);
-      end;
-    until i > j;
-    if L < j then Sort(L, j);
-    if i < H then Sort(i, H);
-  end;
-
-  procedure SortNum(L, H: Integer);
-  var
-    i, j, c: Integer;
-    tmpE: TIdxEntry;
-    tmpK: Int64;
-    tmpN: Boolean;
-    pivK: Int64;
-    pivNull: Boolean;
-    pivPk: string;
-  begin
-    i := L; j := H;
-    pivK := keys[(L + H) div 2];
-    pivNull := isnull[(L + H) div 2];
-    pivPk := E[(L + H) div 2].Pk;
-    repeat
-      while True do
-      begin
-        if isnull[i] then
-        begin
-          if pivNull then c := 0 else c := -1;
-        end
-        else if pivNull then c := 1
-        else if keys[i] < pivK then c := -1
-        else if keys[i] > pivK then c := 1
-        else c := 0;
-        if c = 0 then c := CompareStr(E[i].Pk, pivPk);
-        if c < 0 then Inc(i) else Break;
-      end;
-      while True do
-      begin
-        if isnull[j] then
-        begin
-          if pivNull then c := 0 else c := -1;
-        end
-        else if pivNull then c := 1
-        else if keys[j] < pivK then c := -1
-        else if keys[j] > pivK then c := 1
-        else c := 0;
-        if c = 0 then c := CompareStr(E[j].Pk, pivPk);
-        if c > 0 then Dec(j) else Break;
-      end;
-      if i <= j then
-      begin
-        tmpE := E[i]; E[i] := E[j]; E[j] := tmpE;
-        tmpK := keys[i]; keys[i] := keys[j]; keys[j] := tmpK;
-        tmpN := isnull[i]; isnull[i] := isnull[j]; isnull[j] := tmpN;
-        Inc(i); Dec(j);
-      end;
-    until i > j;
-    if L < j then SortNum(L, j);
-    if i < H then SortNum(i, H);
-  end;
-
+  S: TIdxSortCtx;
+  fi, n: Integer;
 begin
-  if Length(E) <= 1 then Exit;
-  fast := False;
+  n := Length(E);
+  if n <= 1 then Exit;
+  S.E := E;
+  S.Ctype := Ctype;
+  SetLength(S.Ctypes, 0);
+  S.Mode := ismGen;
   if Ctype = VCT_INT then
   begin
-    SetLength(keys, Length(E));
-    SetLength(isnull, Length(E));
-    fast := True;
-    for fi := 0 to High(E) do
+    SetLength(S.Keys, n);
+    SetLength(S.IsNull, n);
+    S.Mode := ismNum;
+    for fi := 0 to n - 1 do
     begin
       if E[fi].Key = '' then
-      begin isnull[fi] := True; keys[fi] := 0; end
-      else if VDbParseInt(E[fi].Key, fv) then keys[fi] := fv
-      else begin fast := False; Break; end;
+      begin
+        S.IsNull[fi] := True;
+        S.Keys[fi] := 0;
+      end
+      else if not VDbParseInt(E[fi].Key, S.Keys[fi]) then
+      begin
+        S.Mode := ismGen;   // beklenmeyen metin: genel yol (eskisi gibi)
+        Break;
+      end;
+    end;
+    if S.Mode <> ismNum then
+    begin
+      SetLength(S.Keys, 0);
+      SetLength(S.IsNull, 0);
     end;
   end;
-  if fast then SortNum(0, High(E)) else Sort(0, High(E));
+  IdxSortExecute(S, n);
+  E := S.E;
 end;
 
 procedure TVTableDb.SortIdxEntriesCols(var E: TIdxEntries;
   const Ctypes: TByteArray);
 // COK KOLONLU indeks siralamasi: anahtarlar #1 ile birlestirilmis,
 // her parca kendi tipine gore karsilastirilir.
-  procedure Sort(L, H: Integer);
-  var
-    i, j: Integer;
-    piv, tmp: TIdxEntry;
-    c: Integer;
-  begin
-    i := L; j := H; piv := E[(L + H) div 2];
-    repeat
-      while True do
-      begin
-        c := VDbIdxMultiCmp(E[i].Key, piv.Key, Ctypes);
-        if c = 0 then c := CompareStr(E[i].Pk, piv.Pk);
-        if c < 0 then Inc(i) else Break;
-      end;
-      while True do
-      begin
-        c := VDbIdxMultiCmp(E[j].Key, piv.Key, Ctypes);
-        if c = 0 then c := CompareStr(E[j].Pk, piv.Pk);
-        if c > 0 then Dec(j) else Break;
-      end;
-      if i <= j then
-      begin
-        tmp := E[i]; E[i] := E[j]; E[j] := tmp;
-        Inc(i); Dec(j);
-      end;
-    until i > j;
-    if L < j then Sort(L, j);
-    if i < H then Sort(i, H);
-  end;
+var
+  S: TIdxSortCtx;
+  n: Integer;
 begin
-  if Length(E) > 1 then Sort(0, High(E));
+  n := Length(E);
+  if n <= 1 then Exit;
+  S.E := E;
+  S.Ctype := 0;
+  S.Ctypes := Ctypes;
+  SetLength(S.Keys, 0);
+  SetLength(S.IsNull, 0);
+  S.Mode := ismMulti;
+  IdxSortExecute(S, n);
+  E := S.E;
 end;
 
 function TVTableDb.IdxLowerBound(const E: TIdxEntries; Ctype: Byte; const Key, Pk: string): Integer;
@@ -5759,6 +6103,8 @@ begin
       if (sj >= 0) and (sj < Length(oldRows[i])) then
         newRows[i][j] := oldRows[i][sj];
     end;
+    // M10: ALTER TABLE ADD COLUMN GENERATED icin mevcut satiri hesapla.
+    VDbApplyGenerated(T, newRows[i]);
   end;
 
   ownBatch := not FKv.InBatch;
@@ -5821,6 +6167,8 @@ begin
       if (sj >= 0) and (sj < Length(Rows[i])) then
         newRows[i][j] := Rows[i][sj];
     end;
+    // M10: mevcut satirlarda GENERATED degerlerini yeniden hesapla.
+    VDbApplyGenerated(T, newRows[i]);
   end;
   ownBatch := not FKv.InBatch;
   if ownBatch then FKv.BeginBatch;
@@ -6916,6 +7264,8 @@ begin
     t.Cols[i].HasDef := Cols[i].HasDef;
     t.Cols[i].Def := Cols[i].Def;
     t.Cols[i].Collate := Cols[i].Collate;   // R-20
+    t.Cols[i].Generated := Cols[i].Generated;   // M10
+    t.Cols[i].GenExpr := Cols[i].GenExpr;
   end;
   t.PkIndex := PkIndex;
   t.AutoInc := 0;
@@ -7225,6 +7575,7 @@ var
   pk, exPk: string;
   iv: Int64;
   key: QWord;
+  prefix: QWord;   // H10: batch tohumu
   b: TBytes;
   exTid: Word;
   inBatch: Boolean;
@@ -7232,15 +7583,20 @@ var
 begin
   inBatch := FKv.InBatch;
   if inBatch and FBatchTableCached and (FBatchTableDef.Name = Table) then
-    t := FBatchTableDef
+  begin
+    t := FBatchTableDef;
+    prefix := FBatchHashPrefix;
+  end
   else
   begin
     t := GetTable(Table);
+    prefix := VDbHashKeyPrefix(t.Name);
     if inBatch then
     begin
       FBatchTableDef := t;
       FBatchTableCached := True;
       FBatchColMapValid := False;
+      FBatchHashPrefix := prefix;
     end;
   end;
 
@@ -7281,6 +7637,8 @@ begin
       if not provided[i] and t.Cols[i].HasDef then
         vals[i] := t.Cols[i].Def;
   end;
+  // M10: GENERATED kolonlari hesapla (tum INSERT yollari buradan gecer).
+  VDbApplyGenerated(t, vals);
   // F2-22: PK TANIMLANMAMISSA sentetik satir anahtari uretilir.
   // ONCEDEN PkIndex 0'a zorlandigi icin ilk kolon hem anahtar hem de
   // ortuk UNIQUE idi: `CREATE TABLE t(a,b)` + ayni a ile ikinci satir
@@ -7321,7 +7679,14 @@ begin
   if not VDbCheckOK(vals, t.Checks) then
     raise EVDbException.Create(ecCheckViolation, 'CHECK ihlali: ' + t.Name);
   CheckFk(t, vals);
-  key := VDbHashKey(t.Name, pk);
+  // H10 (2026-10-18): batch tohumu bir kez hesaplandigindan pk'nin ham
+  // baytlari dogrudan katilir. Saf-ASCII pk'da string baytlari =
+  // UTF8Encode(pk) oldugu icin sonuc VDbHashKey ile BIREBIR (hashchk).
+  // ASCII disi pk'da (nadir) genel yol korunur.
+  if (Length(pk) > 0) and VDbIsPureAscii(pk) then
+    key := VDbHashKeyBytes(prefix, PByte(@pk[1]), Length(pk))
+  else
+    key := VDbHashKey(t.Name, pk);
   // P-17c: cakisma denetimi icin Get degeri (TBytes) ayirip cok atiyordu.
   // Exists saf aramadir (pending+index+tombstone); yalniz anahtar GERCEKTEN
   // varsa deger okunur ve "duplicate vs hash carpismasi" siniflandirmasi
@@ -7808,20 +8173,24 @@ begin
     raise EVDbException.Create(ecColumnNotFound,
       'UPDATE: sutun sayisi uymuyor (' + t.Name + ')');
 
+  // CheckConstraints Vals'i YERINDE normalize eder (var parametre), bu
+  // yuzden const NewVals'i dogrudan veremeyiz; calisma kopyasi kullanilir.
+  newVals := Copy(SrcVals, 0, Length(SrcVals));
+  // M10: SET'ten bagimsiz olarak GENERATED kolonlari yeniden hesapla.
+  VDbApplyGenerated(t, newVals);
+
   // Yalnizca GERCEKTEN degisen kolonlar. (Once SET edilen tum kolonlar
   // listeleniyordu; degismeyenleri indeks bakiminda gezmek gereksizdi.)
+  // M10: generated kolonlar da burada yakalanir.
   SetLength(setIdx, 0);
   for i := 0 to High(t.Cols) do
-    if oldVals[i] <> SrcVals[i] then
+    if oldVals[i] <> newVals[i] then
     begin
       SetLength(setIdx, Length(setIdx) + 1);
       setIdx[High(setIdx)] := i;
     end;
   if Length(setIdx) = 0 then Exit(True);   // hicbir sey degismemis
 
-  // CheckConstraints Vals'i YERINDE normalize eder (var parametre), bu
-  // yuzden const NewVals'i dogrudan veremeyiz; calisma kopyasi kullanilir.
-  newVals := Copy(SrcVals, 0, Length(SrcVals));
   CheckConstraints(t, newVals, Pk);
   if not VDbCheckOK(newVals, t.Checks) then
     raise EVDbException.Create(ecCheckViolation, 'CHECK ihlali: ' + t.Name);
@@ -8312,7 +8681,9 @@ begin
   for i := 0 to High(vals) do
     if not provided[i] and t.Cols[i].HasDef then
       vals[i] := t.Cols[i].Def;
-  
+  // M10: GENERATED kolonlari hesapla.
+  VDbApplyGenerated(t, vals);
+
   // PK belirleme
   if t.PkIndex < 0 then
   begin
@@ -8413,7 +8784,9 @@ begin
   for i := 0 to High(vals) do
     if not provided[i] and t.Cols[i].HasDef then
       vals[i] := t.Cols[i].Def;
-  
+  // M10: GENERATED kolonlari hesapla.
+  VDbApplyGenerated(t, vals);
+
   // PK belirleme
   if t.PkIndex < 0 then
   begin
@@ -8781,35 +9154,22 @@ var
   k: string;
   i: Integer;
   found: Boolean;
-  evlist: string;
-  evstr: string;
 begin
 
   if FTriggers = nil then Exit;
   for k in FTriggers.Keys do
   begin
     if not FTriggers.TryGetValue(k, td) then Continue;
-    evstr := '';
-    for i := 0 to High(td.Events) do evstr := evstr + IntToStr(td.Events[i]) + ',';
     if td.TableName <> VDbNorm(TableName) then
-    begin
-      WriteLn('  check ' + k + ': TableName mismatch ' + td.TableName + ' vs ' + VDbNorm(TableName));
       Continue;
-    end;
     if td.Timing <> Timing then
-    begin
-      WriteLn('  check ' + k + ': Timing mismatch ' + IntToStr(td.Timing) + ' vs ' + IntToStr(Timing));
       Continue;
-    end;
     found := False;
     for i := 0 to High(td.Events) do
       if td.Events[i] = Ev then found := True;
-    WriteLn('  detail ' + k + ': TblOK=' + BoolToStr(td.TableName = VDbNorm(TableName), True) +
-      ' TimOK=' + BoolToStr(td.Timing = Timing, True) + ' Events=[' + evstr + '] EvOK=' + BoolToStr(found, True));
     if not found then Continue;
     SetLength(Result, Length(Result) + 1);
     Result[High(Result)] := td.Name;
-    WriteLn('  ADD ' + k + ' -> Result now len=' + IntToStr(Length(Result)));
   end;
 end;
 

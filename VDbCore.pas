@@ -52,6 +52,10 @@ const
   VDB_FILE_VER_OLD = 1;
   VDB_HDR_SIZE = 16;
   VDB_HFLAG_HAS_ENCRYPTED = 1;
+  { H3 (2026-10-18): zone map / atlanabilir offset bolumu geometrisi.
+    ScanRawIter PAS B/C ile BIREBIR ayni olmali. }
+  VDB_RAW_SCAN_SHIFT = 21;         // 2 MB
+  VDB_RAW_SCAN_MAX_BUCKET = 8192;
 
 type
   TQWordArray = array of QWord;
@@ -70,6 +74,28 @@ type
     callback; buffer valid only during the call. }
   TVDbRawCb = function(Key: QWord; Buf: PByte; Len: Integer;
     User: Pointer): Boolean;
+
+  { H6 (2026-10-18): PARALEL TARAMA icin ONCEDEN HAZIRLANMIS aday kumesi.
+    PrepareRawScan adaylari BIR KEZ toplar ve offset bucket'larina gore
+    gruplar; isci basina yalnizca kendi aday araligi [CandLo, CandHi)
+    taranir. Boylece isci basina FIndex dolasimi (O(n)) YAPILMAZ — paralel
+    hizin sarti budur. Kayitlar bucket-major dizilir; ayni bucket icinde
+    sira onemsizdir (tarama bucket basina min/max span okur). }
+  TVDbRawPrepared = record
+    FSize: Int64;
+    BucketShift: Integer;
+    BCount: Integer;
+    BucketStart: array of Integer;   // BCount+1 (kumulatif)
+    CandOff: array of Int64;
+    CandSize: array of LongWord;
+    CandKey: array of QWord;
+    { H6: istege bagli SALT-OKUNUR esleme. Dolu ise isciler kayitlari
+      haritadan OKUR (paylasimli, syscall yok); bos ise konumsal okuma. }
+    MapBase: PByte;
+    MapLen: Int64;
+    MapHandle: THandle;
+    MapView: Pointer;
+  end;
 
   TDbLoc = record
     Offset: Int64;
@@ -101,6 +127,15 @@ type
     Key: QWord;
     ValLen: LongWord;
     Flags: Byte;
+  end;
+
+  { H12 (2026-10-18): sinirli blok onbellegi icin slot. Blk = -1 -> bos.
+    Data, dosyadaki FCacheBlock baytin BIREBIR kopyasidir (ham baytlar;
+    sifre cozumu/CRC bu katmanda yapilmaz -> bayt-icerikten bagimsiz). }
+  TVDbCacheSlot = record
+    Blk: Int64;      // blok numarasi (offset div FCacheBlock)
+    Ref: Boolean;    // CLOCK referans biti
+    Data: TBytes;    // FCacheBlock bayt (dosyadan birebir)
   end;
 
   { 2026-10-05: WAL kayit basligi ARTIK INTERFACE'TE.
@@ -168,6 +203,13 @@ FPath: string;
       (ham KV kullanimi) tablo id'leri -1 kalir ve filtre uygulanmaz. }
     FRowTagFunc: TVDbRowTagFunc;
     FSeq: QWord;
+    { H3: FIndex TAM guncellendikten SONRA artan surum. Zone map anahtari
+      bunu kullanir; yarim kalmis (FSeq artmis ama FIndex'e yazilmamis)
+      bir yazma yuzunden bayat haritanin "gecerli" sanilmasi imkansizdir. }
+    FIdxVer: QWord;
+    { H3: dosya fiziksel olarak yeniden yazildiginda (Compact/Restore/Rekey)
+      artar; zone map gecerliligi (FDataEpoch, FSeq) ciftiyle denetlenir. }
+    FDataEpoch: QWord;
     FSyncWrite: Boolean;
     // GROUP COMMIT: SyncWrite=True iken bile, fsync'ler bu sure (ms)
     // icinde toplanir. 0 = her yazmada fsync (eski davranis). Varsayilan
@@ -222,6 +264,31 @@ FPath: string;
   FDirSyncFailed: Boolean;
     FNewFile: Boolean;
     FDeadBytes: Int64;
+    { H12 (2026-10-18): SUNUCU TARAFLI SINIRLI BLOK ONBELLEGI. GetSnapshot
+      noktasal okumalari kayit basina bir ReadFile yapiyordu; ayni 8 KB
+      bloga dusen TEKRARLI okumalar (indeks probe / JOIN) icin blok bazinda
+      onbellek. Salt-okunur yol; diskt/formati DEGISTIRMEZ. Guvenlik: yalnizca
+      dosyadan TAM bir blok (FCacheBlock bayt) okunabildiyse onbelleklenir;
+      dosya append-only oldugundan bu blok bir daha DEGISMEZ (kismi son blok
+      onbelleklenmez). Recover/Compact/yerinde baslik yazimi veya commit
+      hata-sarma (truncate) onbellegi temizler. FCacheMaxBlocks = 0 -> kapali. }
+    FCacheLock: TCriticalSection;
+    FCacheSlots: array of TVDbCacheSlot;
+    FCacheMap: TDictionary<Int64, Integer>;   // blok no -> slot indeksi (O(1))
+    FCacheHand: Integer;          // CLOCK eli
+    FCacheBlock: Integer;         // blok boyutu (bayt)
+    FCacheHits: Int64;
+    FCacheMisses: Int64;
+    FCacheMaxBlocks: Integer;     // kapasite (blok sayisi); 0 = kapali
+    { H4 (2026-10-18): mmap okuma yolu anahtari. OLCUM: sicak onbellekte
+      tarama basina esleme kurma + yumusak sayfa hatasi (4 KB'da bir)
+      maliyeti, ReadFile'in tek syscall + yeniden kullanilan tampon
+      kopyasindan DAHA YAVAS (6,5 MB tarama: 11,3 -> 17,3 ms). Taramalar
+      kayit-basi CPU'ya bagli oldugundan mmap varsayilan KAPALI; istege
+      bagli deneysel yol olarak durur. }
+    FReadMapEnabled: Boolean;
+    { H4: basariyla acilan okuma-eslemesi sayisi (tanilama/olcum). }
+    FMmapOpens: Int64;
     { 2026-10-04: OTOMATIK WAL. True iken her kalici yazma once .wal'a
       yazilir, sonra ana dosyaya. Eski davranis (yalniz elle
       WriteAheadWAL) varsayilandir; bu yuzden mevcut kullanicilarin
@@ -285,6 +352,10 @@ FPath: string;
     procedure PendingRemove(const Idx: Integer);
     procedure PendingClear;
     function PendingCount: Integer;
+    { H12: blok onbellegi ic yardimcilari (bkz. FCache* alanlari). }
+    function CacheGetBlock(Blk: Int64; out Data: TBytes): Boolean;
+    function CacheFill(Offset: Int64; Need: Integer; Dest: PByte): Boolean;
+    procedure CacheInvalidateAt(Offset: Int64; Len: Integer);
     { ---------------------------------------------------------------
       SAVEPOINT / Nested Transaction (R-02)
       Her savepoint: Seq, PendingCount, FIndex kopyasi (referans sayacli).
@@ -378,9 +449,55 @@ private
       siparis bagimsizdir. SnapshotSeq secimini cagiran yapar (bkz.
       ScanRawIterAll). Kilitsizdir; ScanSnapshot ile ayni kosullarda. }
     function ScanRawIter(SnapshotSeq: QWord; TableFilter: Integer;
-      Cb: TVDbRawCb; User: Pointer): Boolean;
+      Cb: TVDbRawCb; User: Pointer;
+      OffLo: Int64 = 0; OffHi: Int64 = High(Int64);
+      SkipBuckets: PByte = nil; SkipLen: Integer = 0;
+      CurBucket: PInteger = nil): Boolean;
     function ScanRawIterAll(TableFilter: Integer;
       Cb: TVDbRawCb; User: Pointer): Boolean;
+    { H6 (2026-10-18): ScanRawIterAll'in [OffLo, OffHi) offset araligina
+      kirpilmis hali. Aday KAYIT BASLANGICI bu aralikta olanlar islenir;
+      boylece [0, DataFileSize) N parcaya bolunup N isciye dagitilabilir
+      (her kayit TAM BIR kez). Sonuc offset parcalarina gore degismez. }
+    function ScanRawIterAllRange(TableFilter: Integer; OffLo, OffHi: Int64;
+      Cb: TVDbRawCb; User: Pointer): Boolean;
+    { H6: veri dosyasinin o anki boyutu (paralel bolumleme siniri icin). }
+    function DataFileSize: Int64;
+    { H3 (2026-10-18): ZONE MAP icin tarama bolumleme sabiti. Bolum (bucket)
+      indeksi = offset shr VDB_RAW_SCAN_SHIFT; ust sinir VDB_RAW_SCAN_MAX_BUCKET.
+      Cagiran (VDbExecutor) ayni geometriyi kullanarak bayt-dizi atlama
+      haritasi uretir; boylece motor zone map mantigini BILMEZ. }
+    function DataSeqValue: QWord;
+    { H3: zone map bolum sayisi (ScanRawIter PAS B ile birebir ayni). }
+    class function RawScanBucketCount(FileSize: Int64): Integer; static;
+    { H3: dosya YENIDEN yazildiginda (Compact/Restore/Rekey) artan damga.
+      Offset'ler degistigi icin zone map gecersizdir; (Seq, Epoch) cifti
+      birlikte karsilastirilir. }
+    function DataEpochValue: QWord;
+    { H3: SkipBuckets[b] <> 0 ise o offset bolumu HIC OKUNMAZ. SkipLen,
+      SkipBuckets uzunlugudur (dosya buyurse tasma olmaz). CurBucket nil
+      degilse her bolum basinda oraya bolum indeksi yazilir (zone map
+      insa eden cagiran icin). }
+    function ScanRawIterAllZoned(TableFilter: Integer;
+      SkipBuckets: PByte; SkipLen: Integer; CurBucket: PInteger;
+      Cb: TVDbRawCb; User: Pointer): Boolean;
+    { H6: tablo anahtar dizini kirliyse TEK KEZ yeniden kurar. Paralel
+      tarama oncesi cagrilir; boylece N isci RebuildTableKeys'i yaris
+      halinde cagirmaz. }
+    procedure EnsureTableKeys;
+    { H6: tablonun anahtar sayisi (paralel esik karari icin). Dizini
+      gerekirse kurar; tablo yoksa 0 doner. }
+    function TableKeyCount(TableId: Integer): Integer;
+    { H6: aday kumesini BIR KEZ toplar (bkz. TVDbRawPrepared). Acik
+      batch'te (pending op) False doner; cagiran seri yola duser. }
+    function PrepareRawScan(TableFilter: Integer;
+      out P: TVDbRawPrepared): Boolean;
+    { H6: hazir aday kumesinin [CandLo, CandHi) araligini tarar.
+      ScanRawIterAll ile ayni gorunurluk/baslik/sifre kurallari. }
+    function ScanRawPrepared(const P: TVDbRawPrepared;
+      CandLo, CandHi: Integer; Cb: TVDbRawCb; User: Pointer): Boolean;
+    { H6: PrepareRawScan'in actigi eslemeyi birakir (esleme yoksa no-op). }
+    procedure ReleasePreparedScan(var P: TVDbRawPrepared);
     { ScanAll'in secim kuraliyla birebir ayni snapshot secimi. }
     { R-26: satir bicimi cozucusu (bkz. TVDbRowTagFunc). VDbTable
       TVDb olustururken atar. }
@@ -397,6 +514,19 @@ private
       MaxDeadRatio: Double = 0.3; MinBytes: Int64 = 65536): Boolean;
     function Verify(out Report: string): Boolean;
     function GetIsOpen: Boolean;
+    { H12 (2026-10-18): sinirli blok onbellegi denetimi. BlockCount=0 kapatir.
+      Varsayilan: ReadCacheDefaultBlocks (bkz. implementation). }
+    procedure SetReadCacheBlocks(BlockCount: Integer);
+    function ReadCacheBlocks: Integer;
+    { H4 (2026-10-18): mmap okuma yolu anahtari (varsayilan KAPALI;
+      olcumle kazanc gorulmedi, deneysel). }
+    procedure SetReadMapEnabled(AValue: Boolean);
+    function ReadMapEnabled: Boolean;
+    { H4: simdiye kadar basariyla acilan okuma-eslemesi sayisi. }
+    function ReadMapOpens: Int64;
+    procedure ClearReadCache;
+    procedure GetReadCacheStats(out Hits, Misses: Int64;
+      out UsedBlocks, MaxBlocks: Integer);
     procedure BackupTo(const DestPath: string);
     { R-16: yedekten geri yukler. Mevcut .odb once
       <db>.pre-restore.bak olarak saklanir, boylece hatali bir
@@ -594,9 +724,23 @@ end;
 { TVDb }
 
 constructor TVDb.Create;
+var
+  i: Integer;
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
+  { H12: sinirli blok onbellegi. Varsayilan 1024 blok x 8 KB = 8 MB (sinirli,
+    salt-okunur). Uygulama SetReadCacheBlocks ile degistirebilir/kapatabilir. }
+  FCacheLock := TCriticalSection.Create;
+  FCacheMap := TDictionary<Int64, Integer>.Create;
+  FCacheBlock := 8 * 1024;
+  FCacheHand := 0;
+  FCacheHits := 0;
+  FCacheMisses := 0;
+  FCacheMaxBlocks := 1024;
+  SetLength(FCacheSlots, FCacheMaxBlocks);
+  for i := 0 to FCacheMaxBlocks - 1 do
+    FCacheSlots[i].Blk := -1;
   FIndex := TDictionary<QWord, TDbLoc>.Create;
   FTableKeys := TDictionary<Integer, TList<QWord>>.Create;
   FTableKeysDirty := True;
@@ -619,6 +763,7 @@ FSavepoints := TList<TSavepoint>.Create;
   FDeadBytes := 0;
   FDataStart := VDB_HDR_SIZE;
   FEncFlags := 0;
+  FReadMapEnabled := False;  // H4: olcumle net kazanc yok -> varsayilan kapali
 end;
 
 destructor TVDb.Destroy;
@@ -639,6 +784,9 @@ begin
   FTableKeys.Free;
   FTableRowCount.Free;
   FLock.Free;
+  SetLength(FCacheSlots, 0);
+  FCacheMap.Free;
+  FCacheLock.Free;
   { 2026-10-05 Adim 12: anahtar kalintisi birakma }
   if FEncKey <> nil then
   begin
@@ -832,6 +980,8 @@ var
     FPendingPuts.Clear;
     FPendingDels.Clear;
     Recover;
+    // H3: offsetler fiziksel olarak degisti -> zone map gecersiz.
+    Inc(FDataEpoch);
   end;
 
 begin
@@ -982,6 +1132,8 @@ begin
     WriteHeaderTo(FS);
     FS.Seek(0, soEnd);
     VDbFlushStream(FS);
+    // H12: baslik YERINDE degisti -> 0. blogu gecersiz kil.
+    CacheInvalidateAt(0, VDB_HDR_SIZE);
   end;
   if h.ValLen > VDB_MAX_VALUE then
     raise EVDbException.Create(ecLimit, 'VDb: value cok buyuk');
@@ -1094,6 +1246,8 @@ begin
   // taramada FIndex'ten yeniden kurulacak (yazma yoluna ek maliyet yok).
   FTableKeysDirty := True;
   FTableRowCount.Clear;   // KR-1B: her yazma COUNT cache'ini gecersiz kilar
+  // H3: FIndex artik TAM guncel -> zone map surumu.
+  Inc(FIdxVer);
   { 2026-10-05 Adim 12: sifreli ara tampon ClearEnc; ham sifreli baytlar
     bellekte kalmasin. Try-finally ile dosyalara dokunmadan temizlenir. }
   if (stored <> nil) and (Length(stored) > 0) and (Length(FEncKey) = VDB_KEY_LEN) then
@@ -1195,6 +1349,9 @@ var
   end;
 
 begin
+  // H12: kurtarma offset'leri yeniden kurar (ve gerekirse dosyayi kirpar)
+  // -> blok onbellegi gecersiz.
+  ClearReadCache;
   FIndex.Clear;
   FTableKeysDirty := True;   // KR-1: index tamamen sifirlandi
   FTableRowCount.Clear;
@@ -1539,6 +1696,8 @@ begin
     FWALAutoCount := 0;
     FWALWasEnabled := False;
     FClosed := True;
+    // H12: kapanista blok onbellegi bosaltilir (dosya tanitici degisir).
+    ClearReadCache;
     { 2026-10-05 Adim 12: kapanista master anahtar bellekte kalmasin }
     if FEncKey <> nil then
     begin
@@ -1617,6 +1776,11 @@ const
     yapilir, asiri ayirma olmaz. Yalnizca HIZI etkiler, davranisi degil. }
   VDB_POSREAD_MAX = 16 * 1024 * 1024;
 
+  { H4 (2026-10-18): mmap read yolu esikleri. Bu araligin disindaki
+    taramalar mevcut konumsal/parca okuma yolunu birebir kullanir. }
+  VDB_MMAP_MIN = 1 * 1024 * 1024;              // kucuk taramalar icin degmez
+  VDB_MMAP_MAX = Int64(2) * 1024 * 1024 * 1024; // adres alani tavani (i386)
+
 {$IFDEF MSWINDOWS}
 type
   { Windows birimini KULLANMIYORUZ (kendi TCriticalSection'i SyncObjs'inkini
@@ -1673,6 +1837,293 @@ begin
   Result := n;
 end;
 {$ENDIF}
+
+{ ---------------------------------------------------------------
+  H4 (2026-10-18): SALT-OKUNUR DOSYA ESLEMESI (mmap read yolu)
+  ---------------------------------------------------------------
+  ACIK veritabani handle'i (FS.Handle) uzerinden tum dosyayi salt-okunur
+  esler; bucket araligi harita icindeyse kayitlar DOGRUDAN haritadan
+  verilir (kopya/syscall yok). Ayri handle ACMAYIZ: TFileStream dosyayi
+  paylasimsiz actigindan ikinci bir CreateFile basarisiz olur; mevcut
+  handle uzerinden mapping yeterlidir ve esleme dosya yeniden adlansa
+  (Compact) bile gecerli kalir.
+  Herhangi bir hata / aralik-disi / kucuk-buyuk dosyada cagiran mevcut
+  konumsal okuma yoluna BIREBIR duser. POSIX'te simdilik kapali
+  (Valid=False -> fallback). }
+
+type
+  TVDbFileMap = record
+    Base: PByte;
+    Len: Int64;
+    MapHandle: THandle;   // Win: mapping; 0 = yok
+    View: Pointer;
+    Valid: Boolean;
+  end;
+
+{$IFDEF MSWINDOWS}
+const
+  VDB_PAGE_READONLY  = $02;
+  VDB_FILE_MAP_READ  = $0004;
+
+function VDbGetFileSize(hFile: THandle; lpFileSizeHigh: PLongWord): LongWord;
+  stdcall; external 'kernel32.dll' name 'GetFileSize';
+function VDbCreateFileMappingA(hFile: THandle; lpFileMappingAttributes: Pointer;
+  flProtect, dwMaximumSizeHigh, dwMaximumSizeLow: LongWord; lpName: PChar): THandle;
+  stdcall; external 'kernel32.dll' name 'CreateFileMappingA';
+function VDbMapViewOfFile(hFileMappingObject: THandle; dwDesiredAccess: LongWord;
+  dwFileOffsetHigh, dwFileOffsetLow, dwNumberOfBytesToMap: LongWord): Pointer;
+  stdcall; external 'kernel32.dll' name 'MapViewOfFile';
+function VDbUnmapViewOfFile(lpBaseAddress: Pointer): LongBool;
+  stdcall; external 'kernel32.dll' name 'UnmapViewOfFile';
+function VDbCloseHandle(hObject: THandle): LongBool;
+  stdcall; external 'kernel32.dll' name 'CloseHandle';
+{$ENDIF}
+
+function VDbMapFileHandle(hFile: THandle; MaxBytes: Int64): TVDbFileMap;
+{$IFDEF MSWINDOWS}
+var
+  szLo, szHi: LongWord;
+  ml: Int64;
+{$ENDIF}
+begin
+  Result.Base := nil; Result.Len := 0; Result.MapHandle := 0;
+  Result.View := nil; Result.Valid := False;
+  {$IFDEF MSWINDOWS}
+  if (hFile = 0) or (hFile = THandle(-1)) then Exit;
+  szLo := VDbGetFileSize(hFile, @szHi);
+  ml := (Int64(szHi) shl 32) or Int64(szLo);
+  if (ml <= 0) or ((MaxBytes > 0) and (ml > MaxBytes)) then Exit;
+  Result.MapHandle := VDbCreateFileMappingA(hFile, nil, VDB_PAGE_READONLY, 0, 0, nil);
+  if Result.MapHandle = 0 then Exit;
+  Result.View := VDbMapViewOfFile(Result.MapHandle, VDB_FILE_MAP_READ, 0, 0, 0);
+  if Result.View = nil then
+  begin
+    VDbCloseHandle(Result.MapHandle);
+    Result.MapHandle := 0;
+    Exit;
+  end;
+  Result.Base := PByte(Result.View);
+  Result.Len := ml;
+  Result.Valid := True;
+  {$ENDIF}
+end;
+
+procedure VDbCloseFileMap(var M: TVDbFileMap);
+begin
+  {$IFDEF MSWINDOWS}
+  if M.View <> nil then VDbUnmapViewOfFile(M.View);
+  if M.MapHandle <> 0 then VDbCloseHandle(M.MapHandle);
+  {$ENDIF}
+  M.View := nil; M.Base := nil; M.MapHandle := 0; M.Len := 0; M.Valid := False;
+end;
+
+{ ---------------------------------------------------------------
+  H12 (2026-10-18): SINIRLI BLOK ONBELLEGI (CLOCK)
+  --------------------------------------------------------------- }
+
+procedure TVDb.SetReadCacheBlocks(BlockCount: Integer);
+var
+  i: Integer;
+begin
+  if BlockCount < 0 then BlockCount := 0;
+  FCacheLock.Enter;
+  try
+    FCacheMaxBlocks := BlockCount;
+    FCacheHand := 0;
+    FCacheHits := 0;
+    FCacheMisses := 0;
+    FCacheMap.Clear;
+    SetLength(FCacheSlots, BlockCount);
+    for i := 0 to BlockCount - 1 do
+      FCacheSlots[i].Blk := -1;
+  finally
+    FCacheLock.Leave;
+  end;
+end;
+
+function TVDb.ReadCacheBlocks: Integer;
+begin
+  FCacheLock.Enter;
+  try
+    Result := FCacheMaxBlocks;
+  finally
+    FCacheLock.Leave;
+  end;
+end;
+
+procedure TVDb.SetReadMapEnabled(AValue: Boolean);
+begin
+  FReadMapEnabled := AValue;
+end;
+
+function TVDb.ReadMapEnabled: Boolean;
+begin
+  Result := FReadMapEnabled;
+end;
+
+function TVDb.ReadMapOpens: Int64;
+begin
+  Result := FMmapOpens;
+end;
+
+procedure TVDb.ClearReadCache;
+var
+  i: Integer;
+begin
+  FCacheLock.Enter;
+  try
+    for i := 0 to Length(FCacheSlots) - 1 do
+    begin
+      FCacheSlots[i].Blk := -1;
+      FCacheSlots[i].Ref := False;
+      FCacheSlots[i].Data := nil;
+    end;
+    FCacheMap.Clear;
+    FCacheHand := 0;
+  finally
+    FCacheLock.Leave;
+  end;
+end;
+
+procedure TVDb.GetReadCacheStats(out Hits, Misses: Int64;
+  out UsedBlocks, MaxBlocks: Integer);
+begin
+  FCacheLock.Enter;
+  try
+    Hits := FCacheHits;
+    Misses := FCacheMisses;
+    MaxBlocks := FCacheMaxBlocks;
+    UsedBlocks := FCacheMap.Count;
+  finally
+    FCacheLock.Leave;
+  end;
+end;
+
+procedure TVDb.CacheInvalidateAt(Offset: Int64; Len: Integer);
+var
+  b0, b1: Int64;
+  i: Integer;
+begin
+  if (FCacheMaxBlocks <= 0) or (Len <= 0) then Exit;
+  b0 := Offset div FCacheBlock;
+  b1 := (Offset + Len - 1) div FCacheBlock;
+  FCacheLock.Enter;
+  try
+    for i := 0 to Length(FCacheSlots) - 1 do
+      if (FCacheSlots[i].Blk >= b0) and (FCacheSlots[i].Blk <= b1) then
+      begin
+        FCacheMap.Remove(FCacheSlots[i].Blk);
+        FCacheSlots[i].Blk := -1;
+        FCacheSlots[i].Ref := False;
+        FCacheSlots[i].Data := nil;
+      end;
+  finally
+    FCacheLock.Leave;
+  end;
+end;
+
+function TVDb.CacheGetBlock(Blk: Int64; out Data: TBytes): Boolean;
+// Bir TAM blogu (FCacheBlock bayt) dondurur; yoksa dosyadan okuyup
+// onbellege alir. Kismi blok (dosya sonu) veya kapali onbellek -> False.
+// Onbellek tutamaclari TBytes oldugundan, tahliye edilse bile donen
+// referans cagiran boyunca GECERLI kalir (referans sayimi).
+var
+  i, n, victim, scanned: Integer;
+  tmp: TBytes;
+begin
+  Data := nil;
+  Result := False;
+  if (FCacheMaxBlocks <= 0) or (Blk < 0) then Exit;
+
+  // 1. Arama (kilit altinda; O(1) hash; hit'te syscall YOK)
+  FCacheLock.Enter;
+  try
+    if FCacheMap.TryGetValue(Blk, i) then
+    begin
+      FCacheSlots[i].Ref := True;
+      Inc(FCacheHits);
+      Data := FCacheSlots[i].Data;
+      Exit(True);
+    end;
+    Inc(FCacheMisses);
+  finally
+    FCacheLock.Leave;
+  end;
+
+  // 2. Miss: blogu KILIT DISINDA oku (paralel okuyuculari serilestirmemek icin)
+  SetLength(tmp, FCacheBlock);
+  if VDbPosRead(FS.Handle, Blk * FCacheBlock, tmp[0], FCacheBlock)
+       <> FCacheBlock then
+    Exit(False);   // kismi blok / okuma hatasi -> onbelleklenmez
+
+  // 3. Yerlestir (tekrar kontrol + CLOCK tahliyesi)
+  FCacheLock.Enter;
+  try
+    if FCacheMap.TryGetValue(Blk, i) then
+    begin   // arada baska is parcacigi doldurdu -> onunki kullan
+      FCacheSlots[i].Ref := True;
+      Data := FCacheSlots[i].Data;
+      Exit(True);
+    end;
+    n := Length(FCacheSlots);
+    if n <= 0 then Exit(False);
+    victim := -1;
+    scanned := 0;
+    while (victim < 0) and (scanned < 2 * n) do
+    begin
+      if FCacheHand >= n then FCacheHand := 0;
+      if FCacheSlots[FCacheHand].Blk < 0 then
+        victim := FCacheHand
+      else if FCacheSlots[FCacheHand].Ref then
+      begin
+        FCacheSlots[FCacheHand].Ref := False;
+        FCacheHand := (FCacheHand + 1) mod n;
+        Inc(scanned);
+      end
+      else
+        victim := FCacheHand;
+    end;
+    if victim < 0 then
+      victim := FCacheHand mod n;
+    if FCacheSlots[victim].Blk >= 0 then
+      FCacheMap.Remove(FCacheSlots[victim].Blk);
+    FCacheSlots[victim].Blk := Blk;
+    FCacheSlots[victim].Data := tmp;
+    FCacheSlots[victim].Ref := True;
+    FCacheMap.AddOrSetValue(Blk, victim);
+    FCacheHand := (victim + 1) mod n;
+    Data := tmp;
+    Result := True;
+  finally
+    FCacheLock.Leave;
+  end;
+end;
+
+function TVDb.CacheFill(Offset: Int64; Need: Integer; Dest: PByte): Boolean;
+// [Offset, Offset+Need) araligini onbellekten doldurur. Need <= FCacheBlock
+// olmali (kayit en fazla bir bloga sigar; bu yuzden en fazla 2 blok gerekir).
+// Herhangi bir blok onbellekte yoksa False doner ve cagiran ESKI yola duser.
+var
+  done, take: Integer;
+  absOff, blk, off: Int64;
+  pb: TBytes;
+begin
+  Result := False;
+  if (FCacheMaxBlocks <= 0) or (Need <= 0) or (Need > FCacheBlock) then Exit;
+  done := 0;
+  while done < Need do
+  begin
+    absOff := Offset + done;
+    blk := absOff div FCacheBlock;
+    off := absOff - blk * FCacheBlock;
+    take := FCacheBlock - Integer(off);
+    if take > Need - done then take := Need - done;
+    if not CacheGetBlock(blk, pb) then Exit;
+    Move(pb[off], Dest[done], take);
+    Inc(done, take);
+  end;
+  Result := True;
+end;
 
 function TVDb.Get(Key: QWord; out Value: TBytes): Boolean;
 begin
@@ -1762,9 +2213,17 @@ begin
   begin
     need := SizeOf(h) + loc.Size;
     SetLength(scratch, need);
-    nRead := VDbPosRead(FS.Handle, loc.Offset, scratch[0], need);
-    if nRead < 0 then
-      need := -1;   // basarisiz -> ESKI yol
+    // H12: once sinirli blok onbellegi. Onbellek HIT'i syscall yapmaz.
+    // Kayit en fazla FCacheBlock ise denenir (en fazla 2 blok). Onbellekte
+    // yoksa/kismi bloksa CacheFill False doner -> ESKI konumsal yol birebir.
+    if CacheFill(loc.Offset, need, PByte(@scratch[0])) then
+      nRead := need
+    else
+    begin
+      nRead := VDbPosRead(FS.Handle, loc.Offset, scratch[0], need);
+      if nRead < 0 then
+        need := -1;   // basarisiz -> ESKI yol
+    end;
   end;
 
   if need >= 0 then
@@ -2224,14 +2683,15 @@ begin
 end;
 
 function TVDb.ScanRawIter(SnapshotSeq: QWord; TableFilter: Integer;
-  Cb: TVDbRawCb; User: Pointer): Boolean;
+  Cb: TVDbRawCb; User: Pointer; OffLo: Int64; OffHi: Int64;
+  SkipBuckets: PByte; SkipLen: Integer; CurBucket: PInteger): Boolean;
 // P-18a (2026-10-16): bkz. interface. Fazlar ScanSnapshot'tan kopyadir ve
 // ELEME/SINIFLANDIRMA kurallari birebirdir; yalniz CIKTI biyimi degisir:
 // adayin deger tamponu Cb'ye gosterilir, kopyalanmaz. DecryptNeededIf
 // ScanSnapshot icindeki ile aynidir (kucuk yordam; paylasim yerine
 // kopya — ScanSnapshot gauntlet'ten gecmis haliyle kalmasi icin).
 const
-  VDB_SCAN_BUCKET = 21;
+  VDB_SCAN_BUCKET = VDB_RAW_SCAN_SHIFT;
   VDB_SCAN_CHUNK_CAP = 4 * 1024 * 1024;
 type
   TIterCand = record
@@ -2251,6 +2711,9 @@ var
   bLo, bHi: array of Int64;
   order: array of Integer;
   chunk, decB, recBuf: TBytes;
+  fmap: TVDbFileMap;            // H4: salt-okunur esleme (opsiyonel)
+  useMap: Boolean;
+  spanBase: PByte;              // H4: bucket araliginin okuma tabani
   candCnt, bucket, m, n2, bCount: Integer;
   lo, hi, span, endOff, bucket64: Int64;
   got, p: Integer;
@@ -2281,6 +2744,11 @@ var
   // tek fark cikti bicimi — deger kopyalanmaz, aday listesine yazilir).
   procedure Consider(const K: QWord; const L: TDbLoc);
   begin
+    // H6: offset aralik filtresi. [OffLo, OffHi) disindaki adaylar bu
+    // isciye ait degildir; boylece [0, DataFileSize) N parcaya bolununce
+    // her kayit TAM BIR kez islenir. Varsayilan (0, High(Int64)) hepsini
+    // gecirir; seri yol degismez.
+    if (L.Offset < OffLo) or (L.Offset >= OffHi) then Exit;
     if not IsVisible(L, SnapshotSeq) then Exit;
     if (L.Flags and VDB_FLAG_DEL) <> 0 then Exit;
     if (L.Offset < 0) or
@@ -2300,6 +2768,17 @@ begin
     raise EVDbException.Create(ecDatabaseNotOpen, 'VDb: once Open cagir');
 
   fsize := FS.Size;
+  // H4 (2026-10-18): taranan dosyayi salt-okunur esle. Esleme YALNIZCA bu
+  // tarama icin (yerel) ve VDB_MMAP_MIN..VDB_MMAP_MAX arasinda denenir;
+  // herhangi bir hata/kucuk-buyuk dosyada mevcut okuma yolu birebir kalir.
+  FillChar(fmap, SizeOf(fmap), 0);
+  useMap := FReadMapEnabled and (fsize >= VDB_MMAP_MIN) and (fsize <= VDB_MMAP_MAX);
+  if useMap then
+  begin
+    fmap := VDbMapFileHandle(FS.Handle, VDB_MMAP_MAX);
+    useMap := fmap.Valid;
+    if useMap then Inc(FMmapOpens);
+  end;
   pendKeys := TDictionary<QWord, Byte>.Create;
   pendDels := TDictionary<QWord, Byte>.Create;
   try
@@ -2333,8 +2812,7 @@ begin
     // ---- PAS B: bucket sayim-donusturmesi (ScanSnapshot ile birebir) ----
     if candCnt > 0 then
     begin
-      bCount := Integer((fsize shr VDB_SCAN_BUCKET) + 1);
-      if bCount > 8192 then bCount := 8192;
+      bCount := RawScanBucketCount(fsize);
       SetLength(bLo, bCount); SetLength(bHi, bCount);
       for n := 0 to bCount - 1 do begin bLo[n] := High(Int64); bHi[n] := 0; end;
       SetLength(bBeg, bCount + 1);
@@ -2361,27 +2839,47 @@ begin
         Inc(bCur[bucket]);
       end;
 
-      // ---- PAS C: bucket basina TEK dosya okuması; deger KOPYALANMAZ ----
+      // ---- PAS C: bucket basina TEK okuma; deger KOPYALANMAZ ----
+      // H4: dosya eslenebildiyse bucket araligi DOGRUDAN haritadan verilir
+      // (syscall/kopya yok). Aralik harita disinda ya da esleme yoksa
+      // birebir eski konumsal okuma kullanilir.
       for bucket := 0 to bCount - 1 do
       begin
         if bCur[bucket] <= bBeg[bucket] then Continue;
+        // H3: zone map "bu bolumde eslesen satir olamaz" dediyse bolumu
+        // HIC OKUMA (ne ReadFile ne Cb). SkipLen disi = guvenli taraf.
+        if (SkipBuckets <> nil) and (bucket < SkipLen) and
+           (SkipBuckets[bucket] <> 0) then Continue;
+        if CurBucket <> nil then CurBucket^ := bucket;
         lo := bLo[bucket]; hi := bHi[bucket]; span := hi - lo;
         got := -1;
-        if span <= VDB_SCAN_CHUNK_CAP then
+        spanBase := nil;
+        if useMap and (hi <= fmap.Len) then
+        begin
+          spanBase := fmap.Base + lo;
+          got := Integer(span);
+        end
+        else if span <= VDB_SCAN_CHUNK_CAP then
         begin
           if Length(chunk) < Integer(span) then SetLength(chunk, Integer(span));
-          FS.Position := lo;
-          if FS.Read(chunk[0], span) = span then got := Integer(span);
+          // H6: konumsal okuma (OVERLAPPED) — paralel taramalarda FS.Position
+          // paylasimli durumdur; VDbPosRead dosya konum belirtecine dokunmaz.
+          if VDbPosRead(FS.Handle, lo, chunk[0], Integer(span)) = Integer(span) then
+          begin
+            got := Integer(span);
+            spanBase := @chunk[0];
+          end;
         end;
         for m := bBeg[bucket] to bCur[bucket] - 1 do
         begin
           n2 := order[m];
           if got >= 0 then
-            Move(chunk[Integer(cands[n2].Off - lo)], h, SizeOf(h))
+            Move(spanBase[Integer(cands[n2].Off - lo)], h, SizeOf(h))
           else
           begin
-            FS.Position := cands[n2].Off;
-            FS.ReadBuffer(h, SizeOf(h));
+            // H6: konumsal (paylasimsiz) okuma.
+            if VDbPosRead(FS.Handle, cands[n2].Off, h, SizeOf(h)) <> SizeOf(h) then
+              Continue;
           end;
           if (h.Magic <> VDB_MAGIC) or (h.Key <> cands[n2].Key) or
              (h.ValLen <> cands[n2].Size) or
@@ -2394,11 +2892,11 @@ begin
             if cands[n2].Size > 0 then
             begin
               if got >= 0 then
-                Move(chunk[Integer(cands[n2].Off - lo) + SizeOf(h)], decB[0], cands[n2].Size)
+                Move(spanBase[Integer(cands[n2].Off - lo) + SizeOf(h)], decB[0], cands[n2].Size)
               else
               begin
-                FS.Position := cands[n2].Off + SizeOf(h);
-                FS.ReadBuffer(decB[0], cands[n2].Size);
+                // H6: konumsal (paylasimsiz) okuma.
+                VDbPosRead(FS.Handle, cands[n2].Off + SizeOf(h), decB[0], cands[n2].Size);
               end;
             end;
             DecryptIfNeeded(decB, h.Flags, cands[n2].Key);
@@ -2414,10 +2912,10 @@ begin
             p := Integer(cands[n2].Off - lo) + SizeOf(h);
             if cands[n2].Size > 0 then
             begin
-              if not Cb(cands[n2].Key, @chunk[p], Integer(cands[n2].Size), User) then
+              if not Cb(cands[n2].Key, spanBase + p, Integer(cands[n2].Size), User) then
                 Exit(False);
             end
-            else if not Cb(cands[n2].Key, @chunk[p], 0, User) then Exit(False);
+            else if not Cb(cands[n2].Key, spanBase + p, 0, User) then Exit(False);
           end
           else
           begin
@@ -2425,8 +2923,10 @@ begin
             SetLength(recBuf, cands[n2].Size);
             if cands[n2].Size > 0 then
             begin
-              FS.Position := cands[n2].Off + SizeOf(h);
-              FS.ReadBuffer(recBuf[0], cands[n2].Size);
+              // H6: konumsal (paylasimsiz) okuma.
+              if VDbPosRead(FS.Handle, cands[n2].Off + SizeOf(h),
+                recBuf[0], cands[n2].Size) <> cands[n2].Size then
+                Continue;
               if not Cb(cands[n2].Key, @recBuf[0], cands[n2].Size, User) then Exit(False);
             end
             else if not Cb(cands[n2].Key, nil, 0, User) then Exit(False);
@@ -2438,7 +2938,9 @@ begin
     // 2. Batch icindeki pending PUT'lar (ScanSnapshot ile ayni kume:
     //    pendKeys her pending put'i icerdiginden eski ContainsKey denetimi
     //    daima dogruydu — burada dogal olarak dusuruldu.)
-    if FInBatch and (SnapshotSeq > FSeq) then
+    //    H6: offset parcasi YOKTUR; yalnizca ilk parcada (OffLo = 0) verilir,
+    //    aksi halde N isci ayni pending satiri N kez sayardi.
+    if FInBatch and (SnapshotSeq > FSeq) and (OffLo = 0) then
       for n := 0 to FPending.Count - 1 do
       begin
         op := FPending[n];
@@ -2452,6 +2954,7 @@ begin
   finally
     pendKeys.Free;
     pendDels.Free;
+    VDbCloseFileMap(fmap);   // H4: eslemeyi birak (acilmadiysa no-op)
   end;
 end;
 
@@ -2463,6 +2966,393 @@ begin
     Result := ScanRawIter(FSnapshotSeq, TableFilter, Cb, User)
   else
     Result := ScanRawIter(High(QWord), TableFilter, Cb, User);
+end;
+
+class function TVDb.RawScanBucketCount(FileSize: Int64): Integer;
+var
+  n: Int64;
+begin
+  n := (FileSize shr VDB_RAW_SCAN_SHIFT) + 1;
+  if n < 1 then n := 1;
+  if n > VDB_RAW_SCAN_MAX_BUCKET then n := VDB_RAW_SCAN_MAX_BUCKET;
+  Result := Integer(n);
+end;
+
+function TVDb.DataSeqValue: QWord;
+begin
+  // H3: zone map surumu — yarim yazmalari degil, TAMAMLANMIS dizin
+  // guncellemelerini yansitir.
+  Result := FIdxVer;
+end;
+
+function TVDb.DataEpochValue: QWord;
+begin
+  Result := FDataEpoch;
+end;
+
+function TVDb.ScanRawIterAllZoned(TableFilter: Integer;
+  SkipBuckets: PByte; SkipLen: Integer; CurBucket: PInteger;
+  Cb: TVDbRawCb; User: Pointer): Boolean;
+// H3: ScanRawIterAll ile ayni snapshot kurali; yalnizca zone map'in
+// atlanabilir buldugu offset bolumleri okunmaz.
+begin
+  if FInBatch and (FSnapshotSeq > 0) then
+    Result := ScanRawIter(FSnapshotSeq, TableFilter, Cb, User,
+      0, High(Int64), SkipBuckets, SkipLen, CurBucket)
+  else
+    Result := ScanRawIter(High(QWord), TableFilter, Cb, User,
+      0, High(Int64), SkipBuckets, SkipLen, CurBucket);
+end;
+
+function TVDb.ScanRawIterAllRange(TableFilter: Integer; OffLo, OffHi: Int64;
+  Cb: TVDbRawCb; User: Pointer): Boolean;
+// H6: ScanRawIterAll ile ayni snapshot kurali; yalnizca [OffLo, OffHi)
+// offset araligindaki kayit baslangiclari islenir.
+begin
+  if FInBatch and (FSnapshotSeq > 0) then
+    Result := ScanRawIter(FSnapshotSeq, TableFilter, Cb, User, OffLo, OffHi)
+  else
+    Result := ScanRawIter(High(QWord), TableFilter, Cb, User, OffLo, OffHi);
+end;
+
+function TVDb.DataFileSize: Int64;
+begin
+  if FClosed or (FS = nil) then Exit(0);
+  Result := FS.Size;
+end;
+
+procedure TVDb.EnsureTableKeys;
+begin
+  if FClosed then Exit;
+  if not FTableKeysDirty then Exit;
+  FLock.Enter;
+  try
+    if FTableKeysDirty then RebuildTableKeys;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TVDb.TableKeyCount(TableId: Integer): Integer;
+var
+  tl: TList<QWord>;
+begin
+  Result := 0;
+  if FClosed then Exit;
+  EnsureTableKeys;
+  if FTableKeys.TryGetValue(TableId, tl) then Result := tl.Count;
+end;
+
+function TVDb.PrepareRawScan(TableFilter: Integer;
+  out P: TVDbRawPrepared): Boolean;
+// H6: bkz. interface. Iki gecisli sayim-yerlestirme (counting sort):
+//   1) bucket basina aday sayisi, 2) bucket-major yerlestirme.
+// Gorunurluk/eleme kurallari ScanRawIter.Consider ile BIREBIR.
+const
+  VDB_PREP_SHIFT = 18;   // 256 KB: paralel bolumleme icin yeterince ince
+  { H6: hazir taramada dosya eslemesi. Olcumle karar verilir; buyuk
+    dosyada i386 adres alanini tuketmemek icin ust sinir vardir. }
+  VDB_PREP_USE_MAP = False;
+  VDB_PREP_MAP_MAX = Int64(256) * 1024 * 1024;
+var
+  fsize: Int64;
+  bCount, n, b, total, candCnt, cap: Integer;
+  cur: array of Integer;
+  tmpOff: array of Int64;
+  tmpSize: array of LongWord;
+  tmpKey: array of QWord;
+  tl: TList<QWord>;
+  loc: TDbLoc;
+  pair: TPair<QWord, TDbLoc>;
+  fmap: TVDbFileMap;
+  direct: Boolean;      // FIndex'i dogrudan dolas (tablo yogunsa hizli)
+
+  procedure Visit(const K: QWord; const L: TDbLoc);
+  var
+    bucket64: Int64;
+    bucket: Integer;
+  begin
+    if not IsVisible(L, High(QWord)) then Exit;
+    if (L.Flags and VDB_FLAG_DEL) <> 0 then Exit;
+    if (L.Offset < 0) or
+       (L.Offset + Int64(SizeOf(TVDbRecHead)) + Int64(L.Size) > fsize) then
+      Exit;
+    bucket64 := L.Offset shr VDB_PREP_SHIFT;
+    if bucket64 >= bCount then bucket := bCount - 1
+    else bucket := Integer(bucket64);
+    // TEK gecis: adayi gecici duz diziye yaz + bucket say.
+    if candCnt < cap then
+    begin
+      tmpOff[candCnt] := L.Offset;
+      tmpSize[candCnt] := L.Size;
+      tmpKey[candCnt] := K;
+    end;
+    Inc(candCnt);
+    Inc(P.BucketStart[bucket + 1]);
+  end;
+
+  procedure VisitSource;
+  var
+    i, tid: Integer;
+  begin
+    if direct then
+    begin
+      // Tek gecis, HASH YOK: FIndex kayitlarinda TableId/offset zaten
+      // yan yana. Yogun tabloda FTableKeys+TryGetValue'den ~5-10x hizli.
+      for pair in FIndex do
+      begin
+        if TableFilter >= 0 then
+        begin
+          tid := pair.Value.TableId;
+          // R-26: TableId < 0 (sema) hicbir filtrede elenmez.
+          if (tid >= 0) and (tid <> TableFilter) then Continue;
+        end;
+        Visit(pair.Key, pair.Value);
+      end;
+    end
+    else if TableFilter >= 0 then
+    begin
+      if FTableKeys.TryGetValue(TableFilter, tl) then
+        for i := 0 to tl.Count - 1 do
+          if FIndex.TryGetValue(tl[i], loc) then Visit(tl[i], loc);
+      if FTableKeys.TryGetValue(-1, tl) then
+        for i := 0 to tl.Count - 1 do
+          if FIndex.TryGetValue(tl[i], loc) then Visit(tl[i], loc);
+    end
+    else
+      for pair in FIndex do Visit(pair.Key, pair.Value);
+  end;
+
+begin
+  Result := False;
+  FillChar(P, SizeOf(P), 0);
+  if FClosed then Exit;
+  // Pending op'larin offset'i yoktur; paralel/parcali toplama onlari
+  // yanlis sayar. Acik batch'te seri yol kullanilir.
+  if FInBatch then Exit;
+  EnsureTableKeys;
+  // Kaynak secimi: tablo FIndex'e KOMSU ise dogrudan dolas (hash lookup
+  // yok); seyrekse tablo anahtar listesi (O(tablo), O(toplam) degil).
+  if TableFilter < 0 then
+    direct := True
+  else if not FTableKeys.TryGetValue(TableFilter, tl) then
+    direct := True
+  else
+    direct := (Int64(tl.Count) * 3 >= FIndex.Count);
+  P.BucketShift := VDB_PREP_SHIFT;
+  fsize := FS.Size;
+  P.FSize := fsize;
+  // H6: SALT-OKUNUR esleme (istege bagli; asagidaki sabitle acilir).
+  // Kucuk/orta dosyada ReadFile yolu da yeterli; esleme buyuk dosyada
+  // i386 adres alanini tuketmemek icin ust sinirlidir.
+  if VDB_PREP_USE_MAP and (fsize > 0) and (fsize <= VDB_PREP_MAP_MAX) then
+  begin
+    fmap := VDbMapFileHandle(FS.Handle, VDB_PREP_MAP_MAX);
+    if fmap.Valid then
+    begin
+      P.MapBase := fmap.Base;
+      P.MapLen := fmap.Len;
+      P.MapHandle := fmap.MapHandle;
+      P.MapView := fmap.View;
+    end;
+  end;
+  bCount := Integer((fsize shr VDB_PREP_SHIFT) + 1);
+  if bCount < 1 then bCount := 1;
+  if bCount > 4096 then bCount := 4096;
+  P.BCount := bCount;
+  SetLength(P.BucketStart, bCount + 1);
+  for n := 0 to bCount do P.BucketStart[n] := 0;
+
+  // Gecici dizi kapasitesi = kaynak ust siniri (gorunurluk/eleme azaltir).
+  if direct then
+    cap := FIndex.Count
+  else
+  begin
+    cap := 0;
+    if FTableKeys.TryGetValue(TableFilter, tl) then Inc(cap, tl.Count);
+    if FTableKeys.TryGetValue(-1, tl) then Inc(cap, tl.Count);
+  end;
+  if cap < 0 then cap := 0;
+  SetLength(tmpOff, cap);
+  SetLength(tmpSize, cap);
+  SetLength(tmpKey, cap);
+  candCnt := 0;
+
+  // ---- TEK gecis: adaylari gecici diziye topla + bucket say ----
+  VisitSource;
+  total := candCnt;
+  if total <= 0 then Exit(True);   // bos: aday yok (gecerli sonuc)
+
+  // bucket kumulatif baslangiclari
+  for n := 1 to bCount do
+    Inc(P.BucketStart[n], P.BucketStart[n - 1]);
+  SetLength(P.CandOff, total);
+  SetLength(P.CandSize, total);
+  SetLength(P.CandKey, total);
+  SetLength(cur, bCount);
+  for n := 0 to bCount - 1 do cur[n] := P.BucketStart[n];
+
+  // ---- counting sort: bucket-major yerlestir (hash/IO yok) ----
+  for n := 0 to total - 1 do
+  begin
+    b := Integer(tmpOff[n] shr VDB_PREP_SHIFT);
+    if b >= bCount then b := bCount - 1;
+    candCnt := cur[b];
+    P.CandOff[candCnt] := tmpOff[n];
+    P.CandSize[candCnt] := tmpSize[n];
+    P.CandKey[candCnt] := tmpKey[n];
+    Inc(cur[b]);
+  end;
+  Result := True;
+end;
+
+function TVDb.ScanRawPrepared(const P: TVDbRawPrepared;
+  CandLo, CandHi: Integer; Cb: TVDbRawCb; User: Pointer): Boolean;
+// H6: bkz. interface. Pass C'nin onceden toplanmis adaylarla ayni isi;
+// seri ScanRawIter'dan farki: aday toplama/bucket sayimi YOK, isci yalniz
+// kendi araligini isler ve konumsal VDbPosRead kullanir (paylasimsiz).
+const
+  VDB_PREP_CHUNK_CAP = 4 * 1024 * 1024;
+var
+  h: TVDbRecHead;
+  chunk, decB, recBuf: TBytes;
+  k, e, m, bucket, got, pp: Integer;
+  lo, hi, span, off, endOff: Int64;
+  spanBase: PByte;
+
+  procedure DecryptIfNeeded(var V: TBytes; Flags: Byte; RecKey: QWord);
+  var
+    plain: TBytes;
+  begin
+    if (Flags and VDB_FLAG_ENCRYPTED) = 0 then Exit;
+    plain := nil;
+    if not DecryptValue(V, plain) then
+    begin
+      if Length(FEncKey) <> VDB_KEY_LEN then
+        raise EVDbException.CreateFmt(ecCorrupt,
+          'VDb: kayit SIFRELI: anahtar yok. Once OpenKeyFile/SetEncryptionKey. key=%d',
+          [RecKey]);
+      raise EVDbException.CreateFmt(ecCorrupt,
+        'VDb: kayit cozulemedi (anahtar yanlis veya veri bozulmus) key=%d',
+        [RecKey]);
+    end;
+    V := plain;
+  end;
+
+begin
+  Result := True;
+  if (CandLo < 0) or (CandHi > Length(P.CandOff)) or (CandLo >= CandHi) then Exit;
+  k := CandLo;
+  while k < CandHi do
+  begin
+    bucket := Integer(P.CandOff[k] shr P.BucketShift);
+    if bucket >= P.BCount then bucket := P.BCount - 1;
+    e := k + 1;
+    while e < CandHi do
+    begin
+      m := Integer(P.CandOff[e] shr P.BucketShift);
+      if m >= P.BCount then m := P.BCount - 1;
+      if m <> bucket then Break;
+      Inc(e);
+    end;
+    // Bucket grubunun okuma araligi
+    lo := P.CandOff[k];
+    hi := 0;
+    for m := k to e - 1 do
+    begin
+      off := P.CandOff[m];
+      endOff := off + Int64(SizeOf(h)) + Int64(P.CandSize[m]);
+      if off < lo then lo := off;
+      if endOff > hi then hi := endOff;
+    end;
+    span := hi - lo;
+    got := -1;
+    spanBase := nil;
+    if (P.MapBase <> nil) and (hi <= P.MapLen) then
+    begin
+      // H6: paylasimli salt-okunur esleme -> syscall yok.
+      spanBase := P.MapBase + PtrInt(lo);
+      got := Integer(span);
+    end
+    else if (span > 0) and (span <= VDB_PREP_CHUNK_CAP) then
+    begin
+      if Length(chunk) < Integer(span) then SetLength(chunk, Integer(span));
+      if VDbPosRead(FS.Handle, lo, chunk[0], Integer(span)) = Integer(span) then
+      begin
+        got := Integer(span);
+        spanBase := @chunk[0];
+      end;
+    end;
+    for m := k to e - 1 do
+    begin
+      if got >= 0 then
+        Move(spanBase[Integer(P.CandOff[m] - lo)], h, SizeOf(h))
+      else if VDbPosRead(FS.Handle, P.CandOff[m], h, SizeOf(h)) <> SizeOf(h) then
+        Continue;
+      if (h.Magic <> VDB_MAGIC) or (h.Key <> P.CandKey[m]) or
+         (h.ValLen <> P.CandSize[m]) or
+         ((h.Flags and VDB_FLAG_DEL) <> 0) then
+        Continue;
+      if (h.Flags and VDB_FLAG_ENCRYPTED) <> 0 then
+      begin
+        SetLength(decB, P.CandSize[m]);
+        if P.CandSize[m] > 0 then
+        begin
+          if got >= 0 then
+            Move(spanBase[Integer(P.CandOff[m] - lo) + SizeOf(h)], decB[0], P.CandSize[m])
+          else
+            VDbPosRead(FS.Handle, P.CandOff[m] + SizeOf(h), decB[0], P.CandSize[m]);
+        end;
+        DecryptIfNeeded(decB, h.Flags, P.CandKey[m]);
+        if Length(decB) > 0 then
+        begin
+          if not Cb(P.CandKey[m], @decB[0], Length(decB), User) then Exit(False);
+        end
+        else if not Cb(P.CandKey[m], nil, 0, User) then Exit(False);
+      end
+      else if got >= 0 then
+      begin
+        pp := Integer(P.CandOff[m] - lo) + SizeOf(h);
+        if P.CandSize[m] > 0 then
+        begin
+          if not Cb(P.CandKey[m], spanBase + pp, Integer(P.CandSize[m]), User) then
+            Exit(False);
+        end
+        else if not Cb(P.CandKey[m], spanBase + pp, 0, User) then Exit(False);
+      end
+      else
+      begin
+        SetLength(recBuf, P.CandSize[m]);
+        if P.CandSize[m] > 0 then
+        begin
+          if VDbPosRead(FS.Handle, P.CandOff[m] + SizeOf(h),
+            recBuf[0], P.CandSize[m]) <> P.CandSize[m] then
+            Continue;
+          if not Cb(P.CandKey[m], @recBuf[0], P.CandSize[m], User) then Exit(False);
+        end
+        else if not Cb(P.CandKey[m], nil, 0, User) then Exit(False);
+      end;
+    end;
+    k := e;
+  end;
+end;
+
+procedure TVDb.ReleasePreparedScan(var P: TVDbRawPrepared);
+var
+  m: TVDbFileMap;
+begin
+  if P.MapBase = nil then Exit;
+  FillChar(m, SizeOf(m), 0);
+  m.Base := P.MapBase;
+  m.Len := P.MapLen;
+  m.MapHandle := P.MapHandle;
+  m.View := P.MapView;
+  m.Valid := True;
+  VDbCloseFileMap(m);
+  P.MapBase := nil;
+  P.MapLen := 0;
+  P.MapHandle := 0;
+  P.MapView := nil;
 end;
 
 function TVDb.Delete(Key: QWord): Boolean;
@@ -2632,6 +3522,9 @@ begin
           try
             FS.Size := savedSize;
             VDbFlushStream(FS);
+            // H12: kuyruk kirpildi -> bu bolgedeki olasi onbellek bloklari
+            // artik gecersiz (Recover zaten temizler; yine de burada da temizle).
+            ClearReadCache;
           except
           end;
           try

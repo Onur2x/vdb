@@ -54,6 +54,42 @@ type
     Rows: TStrMatrix;
   end;
 
+  { H3 (2026-10-18): ZONE MAP — offset bolumu basina min/max.
+    Yalnizca INT(8)/FLOAT(8) kolonlar icin kurulur. Amac: aralik/esitlik
+    yukleminde "bu bolumde eslesen satir OLAMAZ" kanitlanirsa bolum HIC
+    okunmaz. Guvenlik: min/max ASLA daraltilmaz; bir satirin tipi
+    beklenenden farkliysa ilgili kolon "kullanilamaz" isaretlenir ve o
+    kolon icin budama YAPILMAZ (sessiz satir kaybi imkansiz). }
+  TVDbZoneOp = (zopEq, zopNe, zopLt, zopLe, zopGt, zopGe, zopIn);
+
+  TVDbZoneCond = record
+    Col: Integer;
+    Op: TVDbZoneOp;
+    IsFloat: Boolean;
+    I: Int64;
+    F: Double;
+    InIsFloat: Boolean;
+    InInts: array of Int64;
+    InFloats: array of Double;
+  end;
+
+  TVDbZoneMap = class
+  public
+    GenSeq: QWord;
+    GenEpoch: QWord;
+    BucketCount: Integer;
+    ColIds: array of Integer;
+    ColFloat: array of Boolean;
+    ColUsable: array of Boolean;
+    MinI, MaxI: array of Int64;     // BucketCount * NCol
+    MinF, MaxF: array of Double;    // BucketCount * NCol
+    HasVal: array of Byte;          // BucketCount * NCol
+    Complete: array of Byte;        // BucketCount
+    constructor Create(ASeq, AEpoch: QWord; ABucketCount: Integer;
+      const ACols: array of Integer; const AIsFloat: array of Boolean);
+    function FindCol(ACol: Integer): Integer;
+  end;
+
   { TVSqlExecutor }
 
   TVSqlExecutor = class
@@ -78,6 +114,8 @@ type
     // P5-CTE: WITH adlari (cumle basi kapsam; sirayla doldurulur,
     // sonrakiler oncekileri gorur).
     FCteTables: TDictionary<string, TCteTable>;
+    { H3: tablo id -> zone map (VERI DEGISINCE (Seq/Epoch) gecersiz). }
+    FZoneMaps: TDictionary<Integer, TVDbZoneMap>;
     // 4.3: HAVING icinde dogrudan aggregate. EvalBool sirasinda aktif
     // grup baglami: FAggIdx <> nil iken EvalExpr'de aggregate cagrilari
     // grup satirlari uzerinden hesaplanir (alias zorunlu degil). yalnizca
@@ -152,6 +190,12 @@ type
     // SUM/AVG->FLOAT, MIN/MAX->kolon tipi). Yoksa metin sirasi kiyasi
     // ('10' > '9' => false) yanlis HAVING sonucu dogurur.
     function AggFuncCtype(fn: TSqlFuncCallNode): Byte;
+    // H-ek: ifade sonuc tipi (aritmetik -> INT/FLOAT). Aksi halde WHERE/ON'da
+    // `(a+0) > 198` gibi ifadeler yanlislikla METIN sirasiyla kiyaslanir
+    // ('1990' < '198' yanlis sonuc). Yalnizca sayisal sonuc kanitlanabiliyorsa
+    // VCT_INT/VCT_FLOAT doner; aksi halde VCT_STR (mevcut davranis korunur).
+    function ExprResultCtype(E: TSqlExprNode;
+      const ColNames: TStrArray; const ColTypes: TByteArray): Byte;
     procedure ExecCall(Stmt: TSqlCallStmt; out Res: TSqlResult);
     { F-35: CREATE/DROP FUNCTION + PROCEDURE. Bu metotlar vardi ama
       SINIF TANIMINDA yoktu -> "method identifier expected" hatasi. }
@@ -347,6 +391,11 @@ type
       dahil davranis degismez). }
     function TryStreamAgg(Stmt: TSqlSelectStmt; const td: TTableDef;
       out Res: TSqlResult): Boolean;
+    { H1 (2026-10-18): Indekssiz tek-tablo LIMIT'li SELECT'te satirlari HAM
+      akistan okuyup LIMIT kadar eslesen bulunca DURUR (tum tabloyu cozmez).
+      Sekil/guvenlik uymazsa False -> genel yol AYNEN calisir. }
+    function TryStreamSelect(Stmt: TSqlSelectStmt; const td: TTableDef;
+      out Res: TSqlResult): Boolean;
     procedure ExecJoinScan(Stmt: TSqlSelectStmt; out MergedRows: TStrMatrix;
       out MergedColNames: TStrArray; out MergedColTypes: TByteArray);
     { P5-WIN: pencere kolonlarini satirlarla ayni sirada hesaplar.
@@ -421,6 +470,7 @@ type
       out Ret: TStrArray): Boolean;
   public
     constructor Create(ATableDb: TVTableDb);
+    destructor Destroy; override;
     function Execute(Stmt: TSqlStmtNode): TSqlResult;
     property TableDb: TVTableDb read FT;
     { F-35: FUNCTION/PROCEDURE govdesi bu executor ile calistirilir.
@@ -446,6 +496,18 @@ type
       FT.Insert (PK/UNIQUE/NOT NULL/CHECK/AutoInc tablo katmaninda);
       hata istisnalari ayni sirada ayni noktalardan firlar. }
     function ExecFastLiteralInsert(const Sql: string;
+      out Res: TSqlResult): Boolean;
+    { H13 (2026-10-19): COPY FROM dosya akisi.
+        COPY <tablo> [(kolon,...)] FROM '<yol>'
+          [WITH] [(] [FORMAT CSV|TEXT] [, HEADER] [, DELIMITER 'x']
+                      [, NULL 'x'] [, QUOTE 'x'] [)]
+      Tum satirlar TEK batch icinde yazilir (atomik); batch zaten aciksa
+      (BEGIN / cok cumleli otomatik batch) ona eklenir, kapatilmaz.
+      CSV: RFC4180 tirnaklari ("") ve tirnak icinde satir sonu desteklenir.
+      TEXT: PostgreSQL benzeri; varsayilan ayirici TAB, NULL '\\N'.
+      Kok neden: her satir icin INSERT cumlesi ayristirmak/calistirmak
+      yerine tek gecisli dosya okuma + FT.Insert batch yolu. }
+    function ExecFastCopy(const Sql: string;
       out Res: TSqlResult): Boolean;
     { P-23 (2026-10-17): Tekil PK nokta sorgusu icin hizli serit (SELECT <cols> FROM <table> WHERE <pk> = <val>).
       AST Parser/Executor olusturma yukunu atlayarak dogrudan TVTableDb.ReadRow uzerinden calisir. }
@@ -520,6 +582,62 @@ constructor TVSqlExecutor.Create(ATableDb: TVTableDb);
 begin
   inherited Create;
   FT := ATableDb;
+  FZoneMaps := TDictionary<Integer, TVDbZoneMap>.Create;
+end;
+
+destructor TVSqlExecutor.Destroy;
+var
+  m: TVDbZoneMap;
+begin
+  if FZoneMaps <> nil then
+  begin
+    for m in FZoneMaps.Values do m.Free;
+    FreeAndNil(FZoneMaps);
+  end;
+  inherited Destroy;
+end;
+
+{ ---------------- H3: zone map ---------------- }
+
+constructor TVDbZoneMap.Create(ASeq, AEpoch: QWord; ABucketCount: Integer;
+  const ACols: array of Integer; const AIsFloat: array of Boolean);
+var
+  i, n: Integer;
+begin
+  inherited Create;
+  GenSeq := ASeq;
+  GenEpoch := AEpoch;
+  BucketCount := ABucketCount;
+  if BucketCount < 1 then BucketCount := 1;
+  SetLength(ColIds, Length(ACols));
+  SetLength(ColFloat, Length(ACols));
+  SetLength(ColUsable, Length(ACols));
+  for i := 0 to High(ACols) do
+  begin
+    ColIds[i] := ACols[i];
+    ColFloat[i] := AIsFloat[i];
+    ColUsable[i] := True;
+  end;
+  n := BucketCount * Length(ColIds);
+  SetLength(MinI, n); SetLength(MaxI, n);
+  SetLength(MinF, n); SetLength(MaxF, n);
+  SetLength(HasVal, n);
+  for i := 0 to n - 1 do
+  begin
+    MinI[i] := High(Int64); MaxI[i] := Low(Int64);
+    MinF[i] := 0; MaxF[i] := 0;
+    HasVal[i] := 0;
+  end;
+  SetLength(Complete, BucketCount);
+  for i := 0 to BucketCount - 1 do Complete[i] := 0;
+end;
+
+function TVDbZoneMap.FindCol(ACol: Integer): Integer;
+var i: Integer;
+begin
+  for i := 0 to High(ColIds) do
+    if ColIds[i] = ACol then Exit(i);
+  Result := -1;
 end;
 
 function TVSqlExecutor.CurColCollation(ColIx: Integer): string;
@@ -900,6 +1018,67 @@ begin
   end;
 end;
 
+{ H-ek: Bir ifadenin sonuc tipini (kaba) cikarir. EvalBinary'nin aritmetik
+  dallari (sboAdd..sboMod) HER ZAMAN sayisal sonuc uretir ( || ayri op).
+  Bu yuzden aritmetik bir ifade karsilastirmada VCT_STR ile metin sirasi
+  yerine sayisal kiyaslanmalidir. Yalnizca kanitlanabilir durumda sayisal
+  doner; belirsizlikte VCT_STR. }
+function TVSqlExecutor.ExprResultCtype(E: TSqlExprNode;
+  const ColNames: TStrArray; const ColTypes: TByteArray): Byte;
+var
+  ci: Integer;
+  bin: TSqlBinaryOpNode;
+  un: TSqlUnaryOpNode;
+  lit: TSqlLiteralNode;
+  lt, rt: Byte;
+begin
+  Result := VCT_STR;
+  if E = nil then Exit;
+  if E is TSqlColumnRefNode then
+  begin
+    ci := FindColIdx(TSqlColumnRefNode(E).ColumnName,
+                     TSqlColumnRefNode(E).TableQualifier, ColNames);
+    if (ci >= 0) and (ci < Length(ColTypes)) then Result := ColTypes[ci];
+    Exit;
+  end;
+  if E is TSqlLiteralNode then
+  begin
+    lit := TSqlLiteralNode(E);
+    case lit.LitType of
+      sltInt:   Result := VCT_INT;
+      sltFloat: Result := VCT_FLOAT;
+    else
+      Result := VCT_STR;
+    end;
+    Exit;
+  end;
+  if E is TSqlUnaryOpNode then
+  begin
+    un := TSqlUnaryOpNode(E);
+    if un.Op = suoNeg then Exit(ExprResultCtype(un.Operand, ColNames, ColTypes));
+    Exit(VCT_STR);
+  end;
+  if E is TSqlBinaryOpNode then
+  begin
+    bin := TSqlBinaryOpNode(E);
+    case bin.Op of
+      sboAdd, sboSub, sboMul, sboDiv, sboMod:
+        begin
+          lt := ExprResultCtype(bin.Left, ColNames, ColTypes);
+          rt := ExprResultCtype(bin.Right, ColNames, ColTypes);
+          if (lt = VCT_FLOAT) or (rt = VCT_FLOAT) then Result := VCT_FLOAT
+          else if (lt = VCT_INT) and (rt = VCT_INT) then Result := VCT_INT
+          else Result := VCT_STR;
+        end;
+    else
+      Result := VCT_STR;   // karsilastirma/mantik/concat -> metin/bool
+    end;
+    Exit;
+  end;
+  if E is TSqlFuncCallNode then
+    Exit(ScalarFuncCtype(TSqlFuncCallNode(E)));
+end;
+
 { ------------------------------------------------------------
   4.3: Aggregate yardimcilari
   IsAggFuncName: fonksiyon adi aggregate mi?
@@ -1185,6 +1364,13 @@ var
   xpart: string;
   xroot: TXmlNode;
   xn: TXmlNode;
+  // M10: JSONPath fonksiyon argumanlari
+  jargs: TStrArray;
+  jout: string;
+  // M4: vektor fonksiyonlari
+  va, vb: TDoubleArray;
+  vna, vnb, vdot, vsum: Double;
+  vmetric: string;
   // F-25: RANGE
   rargs: TStrArray;
   br: string;
@@ -1349,6 +1535,18 @@ begin
         ct := ScalarFuncCtype(TSqlFuncCallNode(bin.Left));
       if (ct = VCT_STR) and (bin.Right is TSqlFuncCallNode) then
         ct := ScalarFuncCtype(TSqlFuncCallNode(bin.Right));
+    end;
+    // H-ek: IKI taraf da kolon referansi DEGILSE (yani tip hicbir kolondan
+    // gelmiyorsa) ifade sonuc tipini cikar. `(a+0) > 198` aksi halde metin
+    // sirasiyla kiyaslanip '1990' < '198' gibi yanlis sonuc veriyordu.
+    // Bir taraf kolon ise kolon tipi (ustteki mantik) korunur — metin
+    // kolonunun sayisal literalle kiyasi DEGISMEZ.
+    if (ct = VCT_STR) and (not (bin.Left is TSqlColumnRefNode)) and
+       (not (bin.Right is TSqlColumnRefNode)) then
+    begin
+      ct := ExprResultCtype(bin.Left, ColNames, ColTypes);
+      if ct = VCT_STR then
+        ct := ExprResultCtype(bin.Right, ColNames, ColTypes);
     end;
     // R-20: metin kolonu ve karsilastirma tarafi bir kolon referansi ise
     // o kolonun varsayilan collation'i uygulanir. ACIK COLLATE yazilmissa
@@ -1540,7 +1738,10 @@ begin
       for i := 0 to High(ColNames) do
         if SameText(colRef.ColumnName, ColNames[i]) and (i < Length(ColTypes)) then
         begin ct := ColTypes[i]; Break; end;
-    end;
+    end
+    // H-ek: ifade tarafi (kolon degil) sayisal ise metin sirasi yerine sayisal.
+    else
+      ct := ExprResultCtype(bt.Expr, ColNames, ColTypes);
     matched := VDbCmpVal(lv, EvalExpr(bt.LowBound, Row, ColNames, ColTypes), '>=', ct) and
                VDbCmpVal(lv, EvalExpr(bt.HighBound, Row, ColNames, ColTypes), '<=', ct);
     if bt.IsNot then matched := not matched;
@@ -1651,6 +1852,106 @@ begin
     else if fn.FuncName = 'COALESCE' then
     begin
       if lv <> '' then Exit(lv) else Exit('');
+    end
+    // ---- M10: JSONPath (JSON_EXTRACT / JSON_VALUE / JSON_EXISTS) ----
+    else if (fn.FuncName = 'JSON_EXTRACT') or (fn.FuncName = 'JSON_VALUE') or
+            (fn.FuncName = 'JSON_EXISTS') then
+    begin
+      SetLength(jargs, 0);
+      if fn.Args <> nil then
+      begin
+        SetLength(jargs, fn.Args.Count);
+        for i := 0 to fn.Args.Count - 1 do
+          jargs[i] := EvalExpr(fn.Args[i], Row, ColNames, ColTypes);
+      end
+      else if fn.Arg <> nil then
+        jargs := [EvalExpr(fn.Arg, Row, ColNames, ColTypes)];
+      if Length(jargs) < 2 then Exit('');
+      if fn.FuncName = 'JSON_EXISTS' then
+        Exit(BoolToStr(VDbJsonPathExists(jargs[0], jargs[1]), True));
+      if fn.FuncName = 'JSON_VALUE' then
+      begin
+        if not VDbJsonPathScalar(jargs[0], jargs[1], jout) then Exit('');
+        Exit(jout);
+      end;
+      if not VDbJsonPathGet(jargs[0], jargs[1], jout) then Exit('');
+      Exit(jout);
+    end
+    // ---- M4: vektor fonksiyonlari (JSON sayi dizisi uzerinde) ----
+    else if (fn.FuncName = 'VECTOR_DIM') or (fn.FuncName = 'VECTOR_NORM') or
+            (fn.FuncName = 'VECTOR_DISTANCE') then
+    begin
+      SetLength(jargs, 0);
+      if fn.Args <> nil then
+      begin
+        SetLength(jargs, fn.Args.Count);
+        for i := 0 to fn.Args.Count - 1 do
+          jargs[i] := EvalExpr(fn.Args[i], Row, ColNames, ColTypes);
+      end
+      else if fn.Arg <> nil then
+        jargs := [EvalExpr(fn.Arg, Row, ColNames, ColTypes)];
+      if Length(jargs) < 1 then Exit('');
+      if not VDbJsonNumArray(jargs[0], va) then Exit('');
+      if fn.FuncName = 'VECTOR_DIM' then Exit(IntToStr(Length(va)));
+      if fn.FuncName = 'VECTOR_NORM' then
+      begin
+        vsum := 0;
+        for i := 0 to High(va) do vsum := vsum + va[i] * va[i];
+        Exit(VDbFloatToStr(Sqrt(vsum)));
+      end;
+      if Length(jargs) < 2 then Exit('');
+      if not VDbJsonNumArray(jargs[1], vb) then Exit('');
+      if Length(va) <> Length(vb) then Exit('');
+      vmetric := 'l2';
+      if Length(jargs) >= 3 then vmetric := LowerCase(jargs[2]);
+      vdot := 0;
+      vna := 0;
+      vnb := 0;
+      vsum := 0;
+      for i := 0 to High(va) do
+      begin
+        vdot := vdot + va[i] * vb[i];
+        vna := vna + va[i] * va[i];
+        vnb := vnb + vb[i] * vb[i];
+        vsum := vsum + Sqr(va[i] - vb[i]);
+      end;
+      if (vmetric = 'cosine') or (vmetric = 'cos') then
+      begin
+        if (vna = 0) or (vnb = 0) then Exit('');
+        Exit(VDbFloatToStr(1 - vdot / (Sqrt(vna) * Sqrt(vnb))));
+      end;
+      if (vmetric = 'dot') or (vmetric = 'ip') then
+        Exit(VDbFloatToStr(vdot));
+      if (vmetric = 'l1') or (vmetric = 'manhattan') then
+      begin
+        vsum := 0;
+        for i := 0 to High(va) do
+          vsum := vsum + Abs(va[i] - vb[i]);
+        Exit(VDbFloatToStr(vsum));
+      end;
+      if (vmetric = 'l2') or (vmetric = 'euclidean') then
+        Exit(VDbFloatToStr(Sqrt(vsum)));
+      Exit('');
+    end
+    // ---- M5: temel tam metin arama (index yok; satir uzerinde) ----
+    else if (fn.FuncName = 'TO_TSVECTOR') or (fn.FuncName = 'TS_MATCH') or
+            (fn.FuncName = 'TS_RANK') then
+    begin
+      SetLength(jargs, 0);
+      if fn.Args <> nil then
+      begin
+        SetLength(jargs, fn.Args.Count);
+        for i := 0 to fn.Args.Count - 1 do
+          jargs[i] := EvalExpr(fn.Args[i], Row, ColNames, ColTypes);
+      end
+      else if fn.Arg <> nil then
+        jargs := [EvalExpr(fn.Arg, Row, ColNames, ColTypes)];
+      if Length(jargs) < 1 then Exit('');
+      if fn.FuncName = 'TO_TSVECTOR' then Exit(VDbFtsNormalize(jargs[0]));
+      if Length(jargs) < 2 then Exit('');
+      if fn.FuncName = 'TS_MATCH' then
+        Exit(BoolToStr(VDbFtsMatch(jargs[0], jargs[1]), True));
+      Exit(IntToStr(VDbFtsRank(jargs[0], jargs[1])));
     end
     // ---- F-23: XML fonksiyonlari ----
     else if (fn.FuncName = 'DISTANCE') or (fn.FuncName = 'HAVERSINE') or
@@ -4446,6 +4747,14 @@ var
     // F-27/F-28: NATURAL/USING ortak kolon hesabi
     np, li, ri: Integer;
     bare: string;
+    // H2 (2026-10-18): indekssiz tek-esitlik join icin hash join.
+    // HashL: sol kolonun birlesik satirdaki 0-tabanli indeksi;
+    // HashRrel: sag kolonun rRows icindeki 0-tabanli indeksi.
+    HashL, HashRrel, x: Integer;
+    HashOK: Boolean;
+    bk: TDictionary<string, TList<Integer>>;
+    lst: TList<Integer>;
+    kj: string;
 
     // LN ogesindeki nitelemeyi ('alias.kolon' -> 'kolon') atar.
     function AfterDot(const S: string): string;
@@ -4513,6 +4822,14 @@ var
     end;
 
     procedure MrPush(const Row: TStrArray);
+    { H1 (2026-10-18): satiri KOPYALAYARAK saklar. Onceden `mr[mrN] := Row`
+      diziyi PAYLASIYORDU; bu yuzden cagiran her (i,j) icin yeni bir
+      `merged` ayirmak zorundaydi (eslesmeyen ciftlerde bosa tahsis).
+      Kopya ile artik cagiran TEK bir `merged` tamponunu yeniden
+      kullanabilir; eslesmeyen ciftlerde hic tahsis yapilmaz. Cikti ve
+      sirasi BIREBIR aynidir. }
+    var
+      z: Integer;
     begin
       if mrN >= 2000000 then
         raise EVDbException.Create(ecLimit, 'JOIN sonucu cok buyuk (2M sinir)');
@@ -4522,7 +4839,9 @@ var
         else mrCap := mrCap * 2;
         SetLength(mr, mrCap);
       end;
-      mr[mrN] := Row;
+      SetLength(mr[mrN], Length(Row));
+      for z := 0 to High(Row) do
+        mr[mrN][z] := Row[z];
       Inc(mrN);
     end;
 
@@ -4775,6 +5094,7 @@ var
     end;
 
     JoinIdxCol1 := -1; JoinIdxCol2 := -1; JoinUsePk := False;
+    HashL := -1; HashRrel := -1;
     if (JC.OnCondition is TSqlBinaryOpNode) and
        (TSqlBinaryOpNode(JC.OnCondition).Op = sboEq) and
        (TSqlBinaryOpNode(JC.OnCondition).Left  is TSqlColumnRefNode) and
@@ -4791,6 +5111,11 @@ var
       begin
         JoinIdxCol1 := q; JoinIdxCol2 := i;
       end;
+      if (JoinIdxCol1 >= 0) and (JoinIdxCol2 >= 0) then
+      begin
+        HashL := JoinIdxCol1;
+        HashRrel := JoinIdxCol2 - n1;
+      end;
     end;
     if JoinIdxCol2 >= 0 then
     begin
@@ -4803,6 +5128,17 @@ var
       else if not FT.TryGetMemIndex(rDef.TableId, JoinIdxCol2 - n1, JoinEntries) then
         JoinIdxCol2 := -1;   // indeks yok -> klasik yol
     end;
+    // H2 (2026-10-18): indeks hizli yolu UYGULANMIYORSA ve ON tek esitlikse
+    // sag tarafi hash tablosuna koyup O(N+M) yap. Kurallar:
+    //   - yalniz INNER/LEFT (RIGHT/FULL sag surucu semantigini bozmamak icin),
+    //   - NULL anahtar eslesmez (SQL uc-degerli mantik),
+    //   - iki kolon ayni ctype olmali (norm anahtari tutarli olsun),
+    //   - USING/NATURAL (OnCondition yok) klasik yolda kalir.
+    HashOK := (HashL >= 0) and (HashRrel >= 0) and (JoinIdxCol2 < 0) and
+              ((JC.JoinType = jtInner) or (JC.JoinType = jtLeft)) and
+              (not FJoinUsing) and
+              (HashRrel <= High(rDef.Cols)) and (HashL <= High(LT)) and
+              (rDef.Cols[HashRrel].Ctype = LT[HashL]);
 
     // Sag isimler (nitelikli, alias oncelikli)
     SetLength(LN, n1 + n2);
@@ -4872,7 +5208,60 @@ var
       if not rIsCte then
         FT.ScanRows(JC.Table, rPks, rRows);
       mrN := 0;
-      if (JC.JoinType = jtRight) or (JC.JoinType = jtFull) then
+      if HashOK then
+      begin
+        // H2 (2026-10-18): sag tarafi hash tablosuna koy, sol satir basina
+        // O(1) bak. Sonuc ve SATIR SIRASI klasik ic ice donguyle BIREBIR
+        // (kuyruk listeleri artan j ile kurulur; JoinOnOk nihai eleyicidir).
+        bk := TDictionary<string, TList<Integer>>.Create;
+        try
+          for j := 0 to High(rRows) do
+          begin
+            if rRows[j][HashRrel] = '' then Continue;   // NULL eslesmez
+            kj := VDbNormValue(rDef.Cols[HashRrel].Ctype, rRows[j][HashRrel]);
+            if not bk.TryGetValue(kj, lst) then
+            begin
+              lst := TList<Integer>.Create;
+              bk.Add(kj, lst);
+            end;
+            lst.Add(j);
+          end;
+          SetLength(merged, n1 + n2);
+          for i := 0 to High(LR) do
+          begin
+            matchFound := False;
+            if LR[i][HashL] <> '' then
+            begin
+              kj := VDbNormValue(LT[HashL], LR[i][HashL]);
+              if bk.TryGetValue(kj, lst) then
+                for x := 0 to lst.Count - 1 do
+                begin
+                  j := lst[x];
+                  for k := 0 to n1 - 1 do merged[k] := LR[i][k];
+                  for k := 0 to n2 - 1 do merged[n1 + k] := rRows[j][k];
+                  if JoinOnOk(merged, LN, LT) then
+                  begin
+                    MrPush(merged);
+                    matchFound := True;
+                  end;
+                end;
+            end;
+            if (not matchFound) and (JC.JoinType = jtLeft) then
+            begin
+              for k := 0 to n1 - 1 do merged[k] := LR[i][k];
+              for k := 0 to n2 - 1 do merged[n1 + k] := '';
+              MrPush(merged);
+            end;
+          end;
+        finally
+          if bk <> nil then
+          begin
+            for lst in bk.Values do lst.Free;
+            bk.Free;
+          end;
+        end;
+      end
+      else if (JC.JoinType = jtRight) or (JC.JoinType = jtFull) then
       begin
         // P5-RF: sag surucu. Eslesmeyen sag satirlar NULL-solla korunur;
         // FULL'da ayrica eslesmeyen sol satirlar da korunur. Cikti sirasi
@@ -4884,12 +5273,12 @@ var
           for i := 0 to High(lMatched) do
             lMatched[i] := False;
         end;
+        SetLength(merged, n1 + n2);   // H1: tek tampon
         for j := 0 to High(rRows) do
         begin
           matchFound := False;
           for i := 0 to High(LR) do
           begin
-            SetLength(merged, n1 + n2);
             for k := 0 to n1 - 1 do merged[k] := LR[i][k];
             for k := 0 to n2 - 1 do merged[n1 + k] := rRows[j][k];
             onOk := JoinOnOk(merged, LN, LT);
@@ -4903,7 +5292,6 @@ var
           end;
           if not matchFound then
           begin
-            SetLength(merged, n1 + n2);
             for k := 0 to n1 - 1 do merged[k] := '';
             for k := 0 to n2 - 1 do merged[n1 + k] := rRows[j][k];
             MrPush(merged);
@@ -4920,27 +5308,30 @@ var
             end;
       end
       else
-      for i := 0 to High(LR) do
       begin
-        matchFound := False;
-        for j := 0 to High(rRows) do
+        // H1: tek `merged` tamponu dongu boyunca yeniden kullanilir;
+        // MrPush kopyaladigi icin guvenli ve eslesmeyen ciftte tahsis YOK.
+        SetLength(merged, n1 + n2);
+        for i := 0 to High(LR) do
         begin
-          SetLength(merged, n1 + n2);
-          for k := 0 to n1 - 1 do merged[k] := LR[i][k];
-          for k := 0 to n2 - 1 do merged[n1 + k] := rRows[j][k];
-          onOk := JoinOnOk(merged, LN, LT);
-          if onOk then
+          matchFound := False;
+          for j := 0 to High(rRows) do
           begin
-            MrPush(merged);
-            matchFound := True;
+            for k := 0 to n1 - 1 do merged[k] := LR[i][k];
+            for k := 0 to n2 - 1 do merged[n1 + k] := rRows[j][k];
+            onOk := JoinOnOk(merged, LN, LT);
+            if onOk then
+            begin
+              MrPush(merged);
+              matchFound := True;
+            end;
           end;
-        end;
-        if (not matchFound) and (JC.JoinType = jtLeft) then
-        begin
-          SetLength(merged, n1 + n2);
-          for k := 0 to n1 - 1 do merged[k] := LR[i][k];
-          for k := 0 to n2 - 1 do merged[n1 + k] := '';
-          MrPush(merged);
+          if (not matchFound) and (JC.JoinType = jtLeft) then
+          begin
+            for k := 0 to n1 - 1 do merged[k] := LR[i][k];
+            for k := 0 to n2 - 1 do merged[n1 + k] := '';
+            MrPush(merged);
+          end;
         end;
       end;
       SetLength(mr, mrN);
@@ -5648,6 +6039,80 @@ begin
   Result := True;
 end;
 
+{ ------------------------------------------------------------
+  H6 (2026-10-18) — Tek sorgu paralel agrega.
+  TryStreamAgg'in seri taramasini [0, DataFileSize) offset araliklarina
+  bolup isci havuzuna dagitir. Her isci KENDI TAggIterCtx kopyasina
+  biriktirir; sonra planlar birlestirilir. COUNT/SUM/AVG/MIN/MAX
+  birlesmeli (associative) oldugundan sonuc offset bolunmesinden
+  bagimsizdir.
+
+  Determinizm siniri: SUM/AVG bir VCT_FLOAT kolonundaysa kayan nokta
+  toplama sirasi sonucun son bitini degistirebilir; bu durumda paralel
+  yol KAPATILIR (seri sonuc bit-ayni kalir). VCT_INT toplamlari
+  |toplam| < 2^53 icin tamdir, bu yuzden birlestirme bit-ayni sonuc verir.
+  ------------------------------------------------------------ }
+const
+  { H6: altinda seri yol (kucuk tabloda regresyon yok). Ust sinir: aday
+    kumesi isci sayisindan bagimsiz TEK kez ~24 B/satir tutar; i386 adres
+    alanini korumak icin cok buyuk tabloda seri kalinir. }
+  VDB_PAR_AGG_MIN_ROWS = 20000;
+  VDB_PAR_AGG_MAX_ROWS = 2000000;
+
+type
+  TAggParCtx = record
+    Kv: TVDb;
+    TableId: Word;
+    Base: TAggIterCtx;              // salt-okunur sablon (paylasilan diziler)
+    Ctxs: array of TAggIterCtx;     // isci basina ayri biriktirici
+    Prep: TVDbRawPrepared;          // ADAY KUMESI bir kez toplandi
+    CLo, CHi: array of Integer;     // isci basina aday araligi
+    Fails: array of Byte;           // isci basina basarisizlik bayragi
+  end;
+
+procedure VdbAggParTask(ACtx: Pointer; AChunkIx, ALo, AHi: Integer);
+var
+  pc: ^TAggParCtx;
+  i, j: Integer;
+begin
+  pc := ACtx;
+  for i := ALo to AHi do
+  begin
+    pc.Ctxs[i].Ct := pc.Base.Ct;
+    // DIKKAT (H6): FType/FOff/FLen VdbAggRawCb tarafindan HER SATIRDA
+    // YENIDEN YAZILIR (VDbPeekRawRowKeyHashTo). Paylasilirsa isciler
+    // birbirinin kolon ofsetini ezer -> yanlis deger (8 iscide goruldu).
+    // Bu yuzden her isciye AYRI dizi verilir; Ct salt-okunur oldugundan
+    // paylasilabilir.
+    SetLength(pc.Ctxs[i].FType, Length(pc.Base.FType));
+    SetLength(pc.Ctxs[i].FOff, Length(pc.Base.FOff));
+    SetLength(pc.Ctxs[i].FLen, Length(pc.Base.FLen));
+    pc.Ctxs[i].ColCnt := pc.Base.ColCnt;
+    pc.Ctxs[i].TableId := pc.Base.TableId;
+    pc.Ctxs[i].TableName := pc.Base.TableName;
+    pc.Ctxs[i].PrefixSeed := pc.Base.PrefixSeed;
+    pc.Ctxs[i].MaxCol := pc.Base.MaxCol;
+    SetLength(pc.Ctxs[i].Plans, Length(pc.Base.Plans));
+    for j := 0 to High(pc.Ctxs[i].Plans) do
+    begin
+      // Sablon planlar (Fn/Col) kopyalanir; SAYACLAR sifirdan baslar.
+      pc.Ctxs[i].Plans[j] := pc.Base.Plans[j];
+      pc.Ctxs[i].Plans[j].Cnt := 0;
+      pc.Ctxs[i].Plans[j].AvgCnt := 0;
+      pc.Ctxs[i].Plans[j].SumF := 0;
+      pc.Ctxs[i].Plans[j].MinI := 0;
+      pc.Ctxs[i].Plans[j].MaxI := 0;
+      pc.Ctxs[i].Plans[j].MinF := 0;
+      pc.Ctxs[i].Plans[j].MaxF := 0;
+      pc.Ctxs[i].Plans[j].HasMin := False;
+      pc.Ctxs[i].Plans[j].HasMax := False;
+    end;
+    if not pc.Kv.ScanRawPrepared(pc.Prep, pc.CLo[i], pc.CHi[i],
+      VdbAggRawCb, @pc.Ctxs[i]) then
+      pc.Fails[i] := 1;
+  end;
+end;
+
 function TVSqlExecutor.TryStreamAgg(Stmt: TSqlSelectStmt; const td: TTableDef;
   out Res: TSqlResult): Boolean;
 var
@@ -5662,6 +6127,12 @@ var
   cr: TSqlColumnRefNode;
   useCounter, allStar: Boolean;   // KR-1B
   ncnt: Int64;                     // KR-1B
+  // H6: paralel yol
+  usePar: Boolean;
+  parN, i, w, total, kc: Integer;
+  prep: TVDbRawPrepared;
+  prepared: Boolean;
+  pc: TAggParCtx;
 begin
   Result := False;
   { --- 1) Sorgu sekli korumasi: yalnizca saf, tek tablo, tek grup --- }
@@ -5761,8 +6232,124 @@ begin
   for j := 0 to High(plans) do
     if plans[j].Col > mc then mc := plans[j].Col;
   ctx.MaxCol := mc;
-  if not FT.Kv.ScanRawIterAll(td.TableId, VdbAggRawCb, @ctx) then
-    Exit;
+
+  { H6: paralel uygunluk. Kucuk tabloda ve SUM/AVG VCT_FLOAT'ta seri yol
+    korunur (bit-ayni sonuc). Aday kumesi BIR KEZ hazirlanir; isciler
+    yalnizca kendi dilimini tarar (isci basina O(n) FIndex dolasimi YOK). }
+  kc := FT.Kv.TableKeyCount(td.TableId);
+  usePar := (kc >= VDB_PAR_AGG_MIN_ROWS) and (kc <= VDB_PAR_AGG_MAX_ROWS);
+  if usePar then
+    for j := 0 to High(plans) do
+      if (plans[j].Col >= 0) and
+         ((plans[j].Fn.FuncName = 'SUM') or (plans[j].Fn.FuncName = 'AVG')) and
+         (ct[plans[j].Col] = VCT_FLOAT) then
+      begin
+        usePar := False;
+        Break;
+      end;
+  total := 0;
+  prepared := False;
+  if usePar then
+  begin
+    if not FT.Kv.PrepareRawScan(td.TableId, prep) then
+      usePar := False
+    else
+    begin
+      prepared := True;
+      total := Length(prep.CandOff);
+      if total < VDB_PAR_AGG_MIN_ROWS then usePar := False;
+    end;
+  end;
+  if usePar and (not ThreadPoolReady) then
+    usePar := InitThreadPool(0);
+  if usePar and (ParallelWorkerCount < 2) then
+    usePar := False;
+
+  if usePar then
+  begin
+    parN := ParallelWorkerCount;
+    if parN > VDB_PAR_MAX_WORKERS then parN := VDB_PAR_MAX_WORKERS;
+    if parN < 2 then parN := 2;
+    SetLength(pc.Ctxs, parN);
+    SetLength(pc.Fails, parN);
+    SetLength(pc.CLo, parN);
+    SetLength(pc.CHi, parN);
+    pc.Kv := FT.Kv;
+    pc.TableId := td.TableId;
+    pc.Base := ctx;
+    pc.Prep := prep;
+    for i := 0 to parN - 1 do
+    begin
+      // ADAY SAYISINA gore denge (bucket sinirlari degil): her isci
+      // hemen hemen ayni sayida satir isler.
+      pc.CLo[i] := Integer((Int64(total) * i) div parN);
+      pc.CHi[i] := Integer((Int64(total) * (i + 1)) div parN);
+      pc.Fails[i] := 0;
+    end;
+    VdbParallelForChunked(0, parN - 1, parN, VdbAggParTask, @pc);
+    // Isci taramalari bitti: eslemeyi birak (pc.Ctxs sonuclari kalir).
+    if prepared then
+    begin
+      FT.Kv.ReleasePreparedScan(prep);
+      prepared := False;
+    end;
+    for i := 0 to parN - 1 do
+      if pc.Fails[i] <> 0 then Exit;   // -> genel yol (hata orada uretilir)
+    // Birlesim: isci sirasi sabit -> deterministik.
+    for j := 0 to High(plans) do
+    begin
+      c := plans[j].Col;
+      for w := 0 to parN - 1 do
+      begin
+        Inc(plans[j].Cnt, pc.Ctxs[w].Plans[j].Cnt);
+        Inc(plans[j].AvgCnt, pc.Ctxs[w].Plans[j].AvgCnt);
+        plans[j].SumF := plans[j].SumF + pc.Ctxs[w].Plans[j].SumF;
+        if pc.Ctxs[w].Plans[j].HasMin then
+        begin
+          if not plans[j].HasMin then
+          begin
+            plans[j].HasMin := True;
+            plans[j].MinI := pc.Ctxs[w].Plans[j].MinI;
+            plans[j].MinF := pc.Ctxs[w].Plans[j].MinF;
+          end
+          else if (c >= 0) and (ct[c] = VCT_INT) then
+          begin
+            if pc.Ctxs[w].Plans[j].MinI < plans[j].MinI then
+              plans[j].MinI := pc.Ctxs[w].Plans[j].MinI;
+          end
+          else if pc.Ctxs[w].Plans[j].MinF < plans[j].MinF then
+            plans[j].MinF := pc.Ctxs[w].Plans[j].MinF;
+        end;
+        if pc.Ctxs[w].Plans[j].HasMax then
+        begin
+          if not plans[j].HasMax then
+          begin
+            plans[j].HasMax := True;
+            plans[j].MaxI := pc.Ctxs[w].Plans[j].MaxI;
+            plans[j].MaxF := pc.Ctxs[w].Plans[j].MaxF;
+          end
+          else if (c >= 0) and (ct[c] = VCT_INT) then
+          begin
+            if pc.Ctxs[w].Plans[j].MaxI > plans[j].MaxI then
+              plans[j].MaxI := pc.Ctxs[w].Plans[j].MaxI;
+          end
+          else if pc.Ctxs[w].Plans[j].MaxF > plans[j].MaxF then
+            plans[j].MaxF := pc.Ctxs[w].Plans[j].MaxF;
+        end;
+      end;
+    end;
+  end
+  else
+  begin
+    // Hazirlik yapildi ama paralel yol secilmedi (kucuk kume / havuz yok).
+    if prepared then
+    begin
+      FT.Kv.ReleasePreparedScan(prep);
+      prepared := False;
+    end;
+    if not FT.Kv.ScanRawIterAll(td.TableId, VdbAggRawCb, @ctx) then
+      Exit;
+  end;
   { KR-1B: saf COUNT(*) (allStar => autocommit) dogrulamali tarayarak sayildi;
     sonucu cache'e yaz -> sonraki ayni COUNT taramasiz O(1) doner. }
   if allStar then
@@ -6161,6 +6748,883 @@ begin
   end;
 end;
 
+{ ------------------------------------------------------------
+  H1 (2026-10-18): TryStreamSelect — akisli filtered SELECT
+  ------------------------------------------------------------
+  Indekssiz tek-tablo, ORDER BY'siz, LIMIT'li SELECT'te kayitlar ham
+  akistan okunur; LIMIT kadar eslesen satir bulununca tarama DURUR.
+  Genel yol TUM satirlari cozup (string matrisi) sonra LIMIT uyguluyordu;
+  "SELECT ... LIMIT 50" 100.000 satirlik tabloda ~580 ms yerine ~1 ms.
+  Sekil/guvenlik uymazsa False doner ve genel yol AYNEN calisir. }
+
+type
+  { H1 ham-yuklem: tek kolon kiyasi (col op literal). Raw kiyas YALNIZ
+    "kesinlikle UYMUYOR" satiri elemek icin kullanilir; uyan aday yine
+    RowMatches ile dogrulanir. Boylece yanlis eleme (sessiz satir kaybi)
+    imkansizdir: yalnizca INT/FLOAT kolon + sayisal literal, NULL -> elenir. }
+  TRawCond = record
+    Col: Integer;          // taban tablo kolon indeksi
+    Op: TSqlBinaryOp;      // sboEq..sboGte
+    IsFloat: Boolean;
+    IsText: Boolean;       // H1b: TEXT esitlik/esitsizlik (bayt kiyasi)
+    IsIn: Boolean;         // H1c: sayisal IN (liste)
+    InIsFloat: Boolean;    // IN listesi float mi (kolon tipine gore)
+    InInts: array of Int64;
+    InFloats: array of Double;
+    I: Int64;
+    F: Double;
+    S: string;             // IsText: saf-ASCII literal baytlari
+  end;
+
+  TStreamSelCtx = record
+    Exec: TVSqlExecutor;
+    TableId: Word;
+    TableName: string;
+    ColCnt: Integer;
+    FType: TByteArray;
+    FOff, FLen: TIntArray;
+    ColNames: TStrArray;
+    ColTypes: TByteArray;
+    Where: TSqlExprNode;
+    Columns: TList<TSelectColumnItem>;
+    Offset, Limit: Integer;   // Limit = -1 ise sinir yok
+    Seen, Emitted: Integer;
+    HasRaw: Boolean;
+    RawConds: array of TRawCond;
+    // H3: zone map insasi (yalnizca gecersiz harita varken acilir)
+    ZoneOn: Boolean;
+    ZoneMap: TVDbZoneMap;
+    ZoneCols: array of Integer;
+    ZoneIsFloat: array of Boolean;
+    CurBucket: Integer;
+    ZoneLastBucket: Integer;
+    OutRows: TStrMatrix;
+    Failed: Boolean;
+  end;
+  PStreamSelCtx = ^TStreamSelCtx;
+
+{ H1b: kayittaki ham baytlar saf-ASCII mi? (>=128 varsa ham bayt kiyasi
+  ile cozulmus-string kiyasi farkli olabilir; o durumda filtreleme yapmayiz.) }
+function VdbBytesAscii(P: PByte; L: Integer): Boolean;
+var i: Integer;
+begin
+  for i := 0 to L - 1 do
+    if P[i] >= 128 then Exit(False);
+  Result := True;
+end;
+
+{ H1b: literal saf-ASCII mi? (yalniz bu durumda ham bayt kiyasi guvenli) }
+function VdbStrPureAscii(const S: string): Boolean;
+var i: Integer;
+begin
+  for i := 1 to Length(S) do
+    if S[i] >= #128 then Exit(False);
+  Result := True;
+end;
+
+{ Ham baytlar ile saf-ASCII literal birebir mi? }
+function VdbBytesEqP(P: PByte; L: Integer; const S: string): Boolean;
+var i: Integer;
+begin
+  if L <> Length(S) then Exit(False);
+  for i := 1 to L do
+    if P[i - 1] <> Byte(S[i]) then Exit(False);
+  Result := True;
+end;
+
+{ Ham kosullari degerlendirir: True = "uyabilir" (elem yok),
+  False = "kesinlikle uymaz" (satiri cozmeden ele). Yalniz AND zincirinden
+  cikan kosullar cagrilir; bu yuzden tek bir kosunun False'u yeterlidir. }
+function VdbStreamSelRawPass(const Conds: array of TRawCond;
+  Buf: PByte; const FType: TByteArray; const FOff, FLen: TIntArray): Boolean;
+var
+  k: Integer;
+  c: TRawCond;
+  iv: Int64;
+  fv: Double;
+  ok: Boolean;
+  iv2: Integer;
+begin
+  Result := True;
+  for k := 0 to High(Conds) do
+  begin
+    c := Conds[k];
+    if FOff[c.Col] < 0 then Exit(False);        // NULL: kiyas FALSE (3-degerli)
+    if c.IsIn then
+    begin
+      // H1c: sayisal IN. NULL yukarida elendi. Kolon tipi beklenenden farkli
+      // ise HIC filtreleme (Continue -> genel RowMatches dogru sonucu verir).
+      if c.InIsFloat then
+      begin
+        if (FType[c.Col] <> VCT_FLOAT) or (FLen[c.Col] <> 8) then Continue;
+        Move((Buf + FOff[c.Col])^, fv, 8);
+        ok := False;
+        for iv2 := 0 to High(c.InFloats) do
+          if fv = c.InFloats[iv2] then begin ok := True; Break; end;
+      end
+      else
+      begin
+        if (FType[c.Col] <> VCT_INT) or (FLen[c.Col] <> 8) then Continue;
+        Move((Buf + FOff[c.Col])^, iv, 8);
+        ok := False;
+        for iv2 := 0 to High(c.InInts) do
+          if iv = c.InInts[iv2] then begin ok := True; Break; end;
+      end;
+      if not ok then Exit(False);
+      Continue;
+    end;
+    if c.IsText then
+    begin
+      // H1b: TEXT esitlik/esitsizlik. VDbCmpVal metin yolunda NULL ('')
+      // hicbir operatorle eslesmez; kiyas BAYT duzenidir. Yalniz saf-ASCII
+      // kayit+literal icin filtrelenir (codepage farki riskini onler);
+      // aksi halde Continue -> genel yol dogru sonucu verir.
+      if FType[c.Col] <> VCT_STR then Continue;
+      if FLen[c.Col] = 0 then Exit(False);      // '' hicbir kiyasta eslesmez
+      if not VdbBytesAscii(Buf + FOff[c.Col], FLen[c.Col]) then Continue;
+      if c.Op = sboEq then
+      begin
+        if not VdbBytesEqP(Buf + FOff[c.Col], FLen[c.Col], c.S) then Exit(False);
+      end
+      else
+      begin
+        if VdbBytesEqP(Buf + FOff[c.Col], FLen[c.Col], c.S) then Exit(False);
+      end;
+      Continue;
+    end;
+    if c.IsFloat then
+    begin
+      // Kayittaki GERCEK alan tipi beklenen tip degilse HIC filtreleme
+      // (dinamik tip olabilir; genel yol dogru sonucu verir).
+      if (FType[c.Col] <> VCT_FLOAT) or (FLen[c.Col] <> 8) then Continue;
+      Move(Buf[FOff[c.Col]], fv, 8);
+      case c.Op of
+        sboEq: ok := fv = c.F;
+        sboNeq: ok := fv <> c.F;
+        sboLt: ok := fv < c.F;
+        sboLte: ok := fv <= c.F;
+        sboGt: ok := fv > c.F;
+        sboGte: ok := fv >= c.F;
+      else ok := True;
+      end;
+      if not ok then Exit(False);
+    end
+    else
+    begin
+      if (FType[c.Col] <> VCT_INT) or (FLen[c.Col] <> 8) then Continue;
+      Move(Buf[FOff[c.Col]], iv, 8);
+      case c.Op of
+        sboEq: ok := iv = c.I;
+        sboNeq: ok := iv <> c.I;
+        sboLt: ok := iv < c.I;
+        sboLte: ok := iv <= c.I;
+        sboGt: ok := iv > c.I;
+        sboGte: ok := iv >= c.I;
+      else ok := True;
+      end;
+      if not ok then Exit(False);
+    end;
+  end;
+end;
+
+{ H3: zone kosulu bu bolumde ASLA eslesemez mi? (yalnizca kanit varsa
+  True; suphede False -> bolum okunur, satir kaybi olmaz.) }
+function VdbZoneCondFalse(const C: TVDbZoneCond; Has: Boolean;
+  MnI, MxI: Int64; MnF, MxF: Double): Boolean;
+var
+  q: Integer;
+begin
+  if not Has then Exit(True);   // bolumde non-NULL deger yok: kiyas FALSE
+  if C.IsFloat then
+  begin
+    case C.Op of
+      zopEq: Result := (C.F < MnF) or (C.F > MxF);
+      zopNe: Result := (MnF = MxF) and (MnF = C.F);
+      zopLt: Result := MnF >= C.F;
+      zopLe: Result := MnF > C.F;
+      zopGt: Result := MxF <= C.F;
+      zopGe: Result := MxF < C.F;
+      zopIn:
+        begin
+          Result := True;
+          for q := 0 to High(C.InFloats) do
+            if (C.InFloats[q] >= MnF) and (C.InFloats[q] <= MxF) then Exit(False);
+        end;
+    else
+      Result := False;
+    end;
+  end
+  else
+  begin
+    case C.Op of
+      zopEq: Result := (C.I < MnI) or (C.I > MxI);
+      zopNe: Result := (MnI = MxI) and (MnI = C.I);
+      zopLt: Result := MnI >= C.I;
+      zopLe: Result := MnI > C.I;
+      zopGt: Result := MxI <= C.I;
+      zopGe: Result := MxI < C.I;
+      zopIn:
+        begin
+          Result := True;
+          for q := 0 to High(C.InInts) do
+            if (C.InInts[q] >= MnI) and (C.InInts[q] <= MxI) then Exit(False);
+        end;
+    else
+      Result := False;
+    end;
+  end;
+end;
+
+{ H3: bir satiri (o an cozulmus FType/FOff/FLen ile) zone map'e isler.
+  Tip beklenenden farkliysa veya NaN gorulurse kolon KULLANILAMAZ olur;
+  o kolon icin budama yapilmaz. }
+procedure VdbStreamSelZoneAdd(ctx: PStreamSelCtx; Buf: PByte; Len: Integer);
+var
+  b, k, c, idx: Integer;
+  iv: Int64;
+  fv: Double;
+begin
+  b := ctx^.CurBucket;
+  if (ctx^.ZoneMap = nil) or (b < 0) or (b >= ctx^.ZoneMap.BucketCount) then Exit;
+  if b > ctx^.ZoneLastBucket then
+  begin
+    for idx := ctx^.ZoneLastBucket to b - 1 do
+      ctx^.ZoneMap.Complete[idx] := 1;
+    ctx^.ZoneLastBucket := b;
+  end;
+  for k := 0 to High(ctx^.ZoneCols) do
+  begin
+    if not ctx^.ZoneMap.ColUsable[k] then Continue;
+    c := ctx^.ZoneCols[k];
+    if (c < 0) or (c > High(ctx^.FType)) then Continue;
+    if ctx^.FOff[c] < 0 then Continue;                    // NULL: kiyas FALSE
+    if ctx^.FOff[c] + 8 > Len then
+    begin
+      ctx^.ZoneMap.ColUsable[k] := False; Continue;       // bozuk satir: budama yok
+    end;
+    idx := b * Length(ctx^.ZoneMap.ColIds) + k;
+    if ctx^.ZoneIsFloat[k] then
+    begin
+      if (ctx^.FType[c] <> VCT_FLOAT) or (ctx^.FLen[c] <> 8) then
+      begin ctx^.ZoneMap.ColUsable[k] := False; Continue; end;
+      Move(Buf[ctx^.FOff[c]], fv, 8);
+      if fv <> fv then                                  // NaN: karsilastirma belirsiz
+      begin ctx^.ZoneMap.ColUsable[k] := False; Continue; end;
+      if ctx^.ZoneMap.HasVal[idx] = 0 then
+      begin
+        ctx^.ZoneMap.MinF[idx] := fv;
+        ctx^.ZoneMap.MaxF[idx] := fv;
+        ctx^.ZoneMap.HasVal[idx] := 1;
+      end
+      else
+      begin
+        if fv < ctx^.ZoneMap.MinF[idx] then ctx^.ZoneMap.MinF[idx] := fv;
+        if fv > ctx^.ZoneMap.MaxF[idx] then ctx^.ZoneMap.MaxF[idx] := fv;
+      end;
+    end
+    else
+    begin
+      if (ctx^.FType[c] <> VCT_INT) or (ctx^.FLen[c] <> 8) then
+      begin ctx^.ZoneMap.ColUsable[k] := False; Continue; end;
+      Move(Buf[ctx^.FOff[c]], iv, 8);
+      if ctx^.ZoneMap.HasVal[idx] = 0 then
+      begin
+        ctx^.ZoneMap.MinI[idx] := iv;
+        ctx^.ZoneMap.MaxI[idx] := iv;
+        ctx^.ZoneMap.HasVal[idx] := 1;
+      end
+      else
+      begin
+        if iv < ctx^.ZoneMap.MinI[idx] then ctx^.ZoneMap.MinI[idx] := iv;
+        if iv > ctx^.ZoneMap.MaxI[idx] then ctx^.ZoneMap.MaxI[idx] := iv;
+      end;
+    end;
+  end;
+end;
+
+
+function VdbStreamSelRefersCol(E: TSqlExprNode; const Name: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  if E = nil then Exit;
+  if E is TSqlLiteralNode then Exit(False);
+  if E is TSqlColumnRefNode then
+    Exit(VDbNorm(TSqlColumnRefNode(E).ColumnName) = VDbNorm(Name));
+  if E is TSqlBinaryOpNode then
+    Exit(VdbStreamSelRefersCol(TSqlBinaryOpNode(E).Left, Name) or
+         VdbStreamSelRefersCol(TSqlBinaryOpNode(E).Right, Name));
+  if E is TSqlUnaryOpNode then
+    Exit(VdbStreamSelRefersCol(TSqlUnaryOpNode(E).Operand, Name));
+  if E is TSqlCastNode then
+    Exit(VdbStreamSelRefersCol(TSqlCastNode(E).Expr, Name));
+  if E is TSqlCollateNode then
+    Exit(VdbStreamSelRefersCol(TSqlCollateNode(E).Inner, Name));
+  if E is TSqlNullIfNode then
+    Exit(VdbStreamSelRefersCol(TSqlNullIfNode(E).Arg1, Name) or
+         VdbStreamSelRefersCol(TSqlNullIfNode(E).Arg2, Name));
+  if E is TSqlCoalesceNode then
+  begin
+    for i := 0 to TSqlCoalesceNode(E).Args.Count - 1 do
+      if VdbStreamSelRefersCol(TSqlCoalesceNode(E).Args[i], Name) then Exit(True);
+    Exit(False);
+  end;
+  if E is TSqlFuncCallNode then
+  begin
+    if VdbStreamSelRefersCol(TSqlFuncCallNode(E).Arg, Name) then Exit(True);
+    if VdbStreamSelRefersCol(TSqlFuncCallNode(E).Filter, Name) then Exit(True);
+    if TSqlFuncCallNode(E).Args <> nil then
+      for i := 0 to TSqlFuncCallNode(E).Args.Count - 1 do
+        if VdbStreamSelRefersCol(TSqlFuncCallNode(E).Args[i], Name) then Exit(True);
+    Exit(False);
+  end;
+  if E is TSqlInNode then
+  begin
+    if VdbStreamSelRefersCol(TSqlInNode(E).Expr, Name) then Exit(True);
+    for i := 0 to TSqlInNode(E).List.Count - 1 do
+      if VdbStreamSelRefersCol(TSqlInNode(E).List[i], Name) then Exit(True);
+    if TSqlInNode(E).SubSelect <> nil then Exit(True);
+    Exit(False);
+  end;
+  if E is TSqlBetweenNode then
+    Exit(VdbStreamSelRefersCol(TSqlBetweenNode(E).Expr, Name) or
+         VdbStreamSelRefersCol(TSqlBetweenNode(E).LowBound, Name) or
+         VdbStreamSelRefersCol(TSqlBetweenNode(E).HighBound, Name));
+  if E is TSqlCaseNode then
+  begin
+    if VdbStreamSelRefersCol(TSqlCaseNode(E).Operand, Name) then Exit(True);
+    for i := 0 to TSqlCaseNode(E).Whens.Count - 1 do
+      if VdbStreamSelRefersCol(TSqlCaseNode(E).Whens[i].Cond, Name) or
+         VdbStreamSelRefersCol(TSqlCaseNode(E).Whens[i].Value, Name) then Exit(True);
+    if VdbStreamSelRefersCol(TSqlCaseNode(E).ElseExpr, Name) then Exit(True);
+    Exit(False);
+  end;
+  if E is TSqlJsonKeyNode then
+  begin
+    if VdbStreamSelRefersCol(TSqlJsonKeyNode(E).Left, Name) then Exit(True);
+    for i := 0 to TSqlJsonKeyNode(E).Keys.Count - 1 do
+      if VdbStreamSelRefersCol(TSqlJsonKeyNode(E).Keys[i], Name) then Exit(True);
+    Exit(False);
+  end;
+  Result := True;   // bilinmeyen / alt sorgu / pencere: guvenli taraf
+end;
+
+function VdbStreamSelCb(Key: QWord; Buf: PByte; Len: Integer;
+  User: Pointer): Boolean;
+var
+  ctx: ^TStreamSelCtx;
+  tid: Word;
+  pk: string;
+  vals, prow: TStrArray;
+  j: Integer;
+begin
+  ctx := User;
+  if Key = VDB_SCHEMA_KEY then Exit(True);
+  if not VDbPeekRawRowP(Buf, Len, ctx^.ColCnt, tid, pk,
+                        ctx^.FType, ctx^.FOff, ctx^.FLen) then
+  begin
+    ctx^.Failed := True;   // bozuk/eski sema: genel yol ayni hatayi uretir
+    Exit(False);
+  end;
+  if tid <> ctx^.TableId then Exit(True);   // baska tablo: ScanRowsPart gibi atla
+  if VDbHashKey(ctx^.TableName, pk) <> Key then
+  begin
+    ctx^.Failed := True;   // hash carpismasi: genel yol NET HATA verir
+    Exit(False);
+  end;
+  // H3: zone map insasi (yalnizca harita gecersizken; validasyondan gecen
+  // her canli satir katilir — ham yuklem elemesinden ONCE).
+  if ctx^.ZoneOn then VdbStreamSelZoneAdd(ctx, Buf, Len);
+  // H1 ham-yuklem: kesinlikle UYMAYAN satiri HIC string'e cozmeden ele.
+  if ctx^.HasRaw and
+     (not VdbStreamSelRawPass(ctx^.RawConds, Buf, ctx^.FType,
+                              ctx^.FOff, ctx^.FLen)) then
+    Exit(True);
+  VDbRowFromOffsetsP(Buf, ctx^.ColCnt, ctx^.FType, ctx^.FOff, ctx^.FLen, vals);
+  if (ctx^.Where <> nil) and
+     (not ctx^.Exec.RowMatches(ctx^.Where, vals, ctx^.ColNames, ctx^.ColTypes)) then
+    Exit(True);
+  Inc(ctx^.Seen);
+  if ctx^.Seen <= ctx^.Offset then Exit(True);
+  SetLength(prow, ctx^.Columns.Count);
+  for j := 0 to ctx^.Columns.Count - 1 do
+    prow[j] := ctx^.Exec.EvalExpr(ctx^.Columns[j].Expr, vals,
+                                  ctx^.ColNames, ctx^.ColTypes);
+  SetLength(ctx^.OutRows, Length(ctx^.OutRows) + 1);
+  ctx^.OutRows[High(ctx^.OutRows)] := prow;
+  Inc(ctx^.Emitted);
+  if (ctx^.Limit >= 0) and (ctx^.Emitted >= ctx^.Limit) then Exit(False);
+  Result := True;
+end;
+
+function TVSqlExecutor.TryStreamSelect(Stmt: TSqlSelectStmt; const td: TTableDef;
+  out Res: TSqlResult): Boolean;
+var
+  ctx: TStreamSelCtx;
+  cn, outCols: TStrArray;
+  ct: TByteArray;
+  j, ci, nConds: Integer;
+  pkName: string;
+  conj: TList<TSqlExprNode>;
+  b: TSqlBinaryOpNode;
+  cr: TSqlColumnRefNode;
+  lit: TSqlLiteralNode;
+  op: TSqlBinaryOp;
+  swap: Boolean;
+  cnd: TRawCond;
+  cnd2: TRawCond;
+  // H3: zone map
+  zConds: array of TVDbZoneCond;
+  zCols: array of Integer;
+  zFloat: array of Boolean;
+  zSkip: TBytes;
+  zSkipPtr: PByte;
+  zMap, zOld: TVDbZoneMap;
+  zN, zB, zIdx, zK, zBCount: Integer;
+  zGenSeq, zGenEpoch: QWord;
+  zUsable, zScanOk: Boolean;
+
+  procedure CollectAnd(E: TSqlExprNode);
+  begin
+    if E = nil then Exit;
+    if (E is TSqlBinaryOpNode) and (TSqlBinaryOpNode(E).Op = sboAnd) then
+    begin
+      CollectAnd(TSqlBinaryOpNode(E).Left);
+      CollectAnd(TSqlBinaryOpNode(E).Right);
+    end
+    else conj.Add(E);
+  end;
+
+  { AND'in tek kosunu ham kosuya cevrilebilir mi? Yalnizca INT/FLOAT kolon
+    ile SAYISAL literal; digerleri atlanir (guvenli: filtre uygulanmaz). }
+  function TryCond(E: TSqlExprNode; out C: TRawCond): Boolean;
+  begin
+    Result := False;
+    if not (E is TSqlBinaryOpNode) then Exit;
+    b := TSqlBinaryOpNode(E);
+    op := b.Op;
+    if not (op in [sboEq, sboNeq, sboLt, sboLte, sboGt, sboGte]) then Exit;
+    swap := False;
+    if b.Left is TSqlColumnRefNode then
+    begin
+      cr := TSqlColumnRefNode(b.Left);
+      if not (b.Right is TSqlLiteralNode) then Exit;
+      lit := TSqlLiteralNode(b.Right);
+    end
+    else if b.Right is TSqlColumnRefNode then
+    begin
+      cr := TSqlColumnRefNode(b.Right);
+      if not (b.Left is TSqlLiteralNode) then Exit;
+      lit := TSqlLiteralNode(b.Left);
+      swap := True;     // literal op kolon  ->  kolon ters-op literal
+    end
+    else Exit;
+    ci := FindColIdx(cr.ColumnName, cr.TableQualifier, cn);
+    if ci < 0 then Exit;
+    if swap then
+      case op of
+        sboLt: op := sboGt;
+        sboLte: op := sboGte;
+        sboGt: op := sboLt;
+        sboGte: op := sboLte;
+      end;
+    if ct[ci] = VCT_INT then
+    begin
+      if lit.LitType <> sltInt then Exit;
+      C.Col := ci; C.Op := op; C.IsFloat := False; C.IsText := False;
+      C.IsIn := False; C.InIsFloat := False;
+      C.I := lit.IntVal; C.F := 0;
+      Exit(True);
+    end;
+    if ct[ci] = VCT_FLOAT then
+    begin
+      if lit.LitType = sltInt then C.F := lit.IntVal
+      else if lit.LitType = sltFloat then C.F := lit.FloatVal
+      else Exit;
+      C.Col := ci; C.Op := op; C.IsFloat := True; C.IsText := False; C.I := 0;
+      C.IsIn := False; C.InIsFloat := False;
+      Exit(True);
+    end;
+    if ct[ci] = VCT_STR then
+    begin
+      // H1b: TEXT yalniz '=' / '<>' ve saf-ASCII string literal icin ham
+      // filtrelenir (VDbCmpVal metin yolu BAYT duzenidir). Diger operatorler
+      // ya da ASCII disi literal -> ham filtre yok (genel RowMatches).
+      if not (op in [sboEq, sboNeq]) then Exit;
+      if lit.LitType <> sltString then Exit;
+      if not VdbStrPureAscii(lit.StrVal) then Exit;
+      C.Col := ci; C.Op := op; C.IsFloat := False; C.IsText := True;
+      C.IsIn := False; C.InIsFloat := False;
+      C.I := 0; C.F := 0; C.S := lit.StrVal;
+      Exit(True);
+    end;
+  end;
+
+  { H1c: sayisal BETWEEN (NOT degil) -> iki ham kosu (>= lo ve <= hi).
+    Boylece mevcut degerlendirici yeniden kullanilir; RowMatches dogrulamasi
+    zaten son sozdur. }
+  function TryBetween(E: TSqlExprNode; out C1, C2: TRawCond): Boolean;
+  var
+    bt: TSqlBetweenNode;
+    cl: TSqlColumnRefNode;
+    loN, hiN: TSqlLiteralNode;
+    ci2: Integer;
+    loF, hiF: Double;
+  begin
+    Result := False;
+    if not (E is TSqlBetweenNode) then Exit;
+    bt := TSqlBetweenNode(E);
+    if bt.IsNot then Exit;
+    if not (bt.Expr is TSqlColumnRefNode) then Exit;
+    if not ((bt.LowBound is TSqlLiteralNode) and (bt.HighBound is TSqlLiteralNode)) then Exit;
+    cl := TSqlColumnRefNode(bt.Expr);
+    ci2 := FindColIdx(cl.ColumnName, cl.TableQualifier, cn);
+    if ci2 < 0 then Exit;
+    loN := TSqlLiteralNode(bt.LowBound);
+    hiN := TSqlLiteralNode(bt.HighBound);
+
+    C1.Col := ci2; C1.Op := sboGte; C1.IsText := False; C1.IsIn := False;
+    C2.Col := ci2; C2.Op := sboLte; C2.IsText := False; C2.IsIn := False;
+    C1.I := 0; C1.F := 0; C1.S := ''; C2.I := 0; C2.F := 0; C2.S := '';
+    if ct[ci2] = VCT_INT then
+    begin
+      if (loN.LitType <> sltInt) or (hiN.LitType <> sltInt) then Exit;
+      C1.IsFloat := False; C1.I := loN.IntVal;
+      C2.IsFloat := False; C2.I := hiN.IntVal;
+      Exit(True);
+    end;
+    if ct[ci2] = VCT_FLOAT then
+    begin
+      if loN.LitType = sltInt then loF := loN.IntVal
+      else if loN.LitType = sltFloat then loF := loN.FloatVal
+      else Exit;
+      if hiN.LitType = sltInt then hiF := hiN.IntVal
+      else if hiN.LitType = sltFloat then hiF := hiN.FloatVal
+      else Exit;
+      C1.IsFloat := True; C1.F := loF;
+      C2.IsFloat := True; C2.F := hiF;
+      Exit(True);
+    end;
+  end;
+
+  { H1c: sayisal IN (NOT IN degil, alt sorgu yok, tum literal sayisal). }
+  function TryIn(E: TSqlExprNode; out C: TRawCond): Boolean;
+  var
+    inN: TSqlInNode;
+    cl: TSqlColumnRefNode;
+    q, ci2: Integer;
+    ln: TSqlLiteralNode;
+  begin
+    Result := False;
+    if not (E is TSqlInNode) then Exit;
+    inN := TSqlInNode(E);
+    if inN.IsNot or (inN.SubSelect <> nil) then Exit;
+    if not (inN.Expr is TSqlColumnRefNode) then Exit;
+    if inN.List.Count = 0 then Exit;
+    cl := TSqlColumnRefNode(inN.Expr);
+    ci2 := FindColIdx(cl.ColumnName, cl.TableQualifier, cn);
+    if ci2 < 0 then Exit;
+    C.Col := ci2; C.Op := sboEq; C.IsText := False; C.IsIn := True;
+    C.I := 0; C.F := 0; C.S := '';
+    if ct[ci2] = VCT_INT then
+    begin
+      C.IsFloat := False; C.InIsFloat := False;
+      SetLength(C.InInts, inN.List.Count);
+      for q := 0 to inN.List.Count - 1 do
+      begin
+        if not (inN.List[q] is TSqlLiteralNode) then Exit;
+        ln := TSqlLiteralNode(inN.List[q]);
+        if ln.LitType <> sltInt then Exit;
+        C.InInts[q] := ln.IntVal;
+      end;
+      Exit(True);
+    end;
+    if ct[ci2] = VCT_FLOAT then
+    begin
+      C.IsFloat := False; C.InIsFloat := True;
+      SetLength(C.InFloats, inN.List.Count);
+      for q := 0 to inN.List.Count - 1 do
+      begin
+        if not (inN.List[q] is TSqlLiteralNode) then Exit;
+        ln := TSqlLiteralNode(inN.List[q]);
+        if ln.LitType = sltInt then C.InFloats[q] := ln.IntVal
+        else if ln.LitType = sltFloat then C.InFloats[q] := ln.FloatVal
+        else Exit;
+      end;
+      Exit(True);
+    end;
+  end;
+
+begin
+  Result := False;
+  { --- Sekil korumasi: genel yol ile AYNI sonucu garantileyen dar kume --- }
+  if Stmt.LimitVal = 0 then Exit;                 // LIMIT 0 -> genel (bos)
+  if Stmt.OffsetVal < 0 then Exit;
+  if (Stmt.FromTable = '') or Stmt.HasJoin then Exit;
+  if (Stmt.SetOp <> sokNone) or (Stmt.RightSelect <> nil) then Exit;
+  if Stmt.AsOf <> saoNone then Exit;
+  if Stmt.WithQueries.Count > 0 then Exit;
+  if Stmt.IsDistinct then Exit;
+  if (Stmt.GroupByCols.Count > 0) or HasAggregate(Stmt) then Exit;
+  if HasWindow(Stmt) then Exit;
+  if (Stmt.QualifyClause <> nil) or (Stmt.HavingClause <> nil) then Exit;
+  if (Stmt.OrderBy <> nil) and (Stmt.OrderBy.Count > 0) then Exit;
+  if td.IsView then Exit;
+  if FT.RlsApplies(Stmt.FromTable) then Exit;
+  if Stmt.Columns.Count = 0 then Exit;
+  // Ikincil indeks varsa ya da WHERE PK'ya basvuruyorsa genel yol
+  // (indeks/PK daraltmasi) daha iyi olabilir; streaming KULLANMA.
+  if Length(td.Idx) > 0 then Exit;
+  if td.PkIndex >= 0 then
+  begin
+    pkName := td.Cols[td.PkIndex].Name;
+    if VdbStreamSelRefersCol(Stmt.WhereClause, pkName) then Exit;
+  end;
+
+  BuildColInfo(td, cn, ct);
+  // Cikti kolon adlari: genel yol ile ayni kural.
+  SetLength(outCols, Stmt.Columns.Count);
+  for j := 0 to Stmt.Columns.Count - 1 do
+  begin
+    if Stmt.Columns[j].Alias <> '' then outCols[j] := Stmt.Columns[j].Alias
+    else if Stmt.Columns[j].Expr is TSqlColumnRefNode then
+      outCols[j] := TSqlColumnRefNode(Stmt.Columns[j].Expr).ColumnName
+    else outCols[j] := 'col' + IntToStr(j + 1);
+  end;
+
+  // Ham-yuklem kosulari: AND zincirindeki uygun kiyaslar.
+  conj := TList<TSqlExprNode>.Create;
+  try
+    CollectAnd(Stmt.WhereClause);
+    SetLength(ctx.RawConds, conj.Count * 2);   // BETWEEN iki kosu uretir
+    nConds := 0;
+    for j := 0 to conj.Count - 1 do
+    begin
+      if TryCond(conj[j], cnd) then
+      begin
+        ctx.RawConds[nConds] := cnd; Inc(nConds);
+        Continue;
+      end;
+      // H1c: sayisal BETWEEN -> iki kosu; RowMatches yine son soz.
+      if TryBetween(conj[j], cnd, cnd2) then
+      begin
+        ctx.RawConds[nConds] := cnd; Inc(nConds);
+        ctx.RawConds[nConds] := cnd2; Inc(nConds);
+        Continue;
+      end;
+      // H1c: sayisal IN listesi.
+      if TryIn(conj[j], cnd) then
+      begin
+        ctx.RawConds[nConds] := cnd; Inc(nConds);
+      end;
+    end;
+    SetLength(ctx.RawConds, nConds);
+  finally
+    conj.Free;
+  end;
+  ctx.HasRaw := nConds > 0;
+
+  // LIMIT yok ve ham yuklem de yoksa: ne erken durma ne eleme var -> genel.
+  if (Stmt.LimitVal < 0) and (not ctx.HasRaw) then Exit;
+
+  // ---- H3 (2026-10-18): aralik/esitlik icin zone map ----
+  // Kosullar yalnizca sayisal kolonlara uygulanir. Harita gecersizse
+  // (veri degismis / yok) BU tarama sirasinda insa edilip yayinlanir;
+  // gecerliyse bucket atlama bayraklari hesaplanir.
+  SetLength(zConds, 0);
+  SetLength(zCols, 0);
+  SetLength(zFloat, 0);
+  zN := 0;
+  SetLength(zConds, Length(ctx.RawConds));
+  for j := 0 to High(ctx.RawConds) do
+  begin
+    if ctx.RawConds[j].IsText then Continue;
+    if (ctx.RawConds[j].Col < 0) or (ctx.RawConds[j].Col > High(ct)) then Continue;
+    if (ct[ctx.RawConds[j].Col] <> VCT_INT) and
+       (ct[ctx.RawConds[j].Col] <> VCT_FLOAT) then Continue;
+    if ctx.RawConds[j].IsIn then
+    begin
+      if ctx.RawConds[j].InIsFloat and (ct[ctx.RawConds[j].Col] <> VCT_FLOAT) then Continue;
+      if (not ctx.RawConds[j].InIsFloat) and (ct[ctx.RawConds[j].Col] <> VCT_INT) then Continue;
+    end
+    else
+    begin
+      if ctx.RawConds[j].IsFloat and (ct[ctx.RawConds[j].Col] <> VCT_FLOAT) then Continue;
+      if (not ctx.RawConds[j].IsFloat) and (ct[ctx.RawConds[j].Col] <> VCT_INT) then Continue;
+    end;
+    zConds[zN].Col := ctx.RawConds[j].Col;
+    if ctx.RawConds[j].IsIn then
+    begin
+      zConds[zN].Op := zopIn;
+      zConds[zN].IsFloat := ctx.RawConds[j].InIsFloat;
+      zConds[zN].InIsFloat := ctx.RawConds[j].InIsFloat;
+      zConds[zN].InInts := ctx.RawConds[j].InInts;
+      zConds[zN].InFloats := ctx.RawConds[j].InFloats;
+    end
+    else
+    begin
+      case ctx.RawConds[j].Op of
+        sboEq: zConds[zN].Op := zopEq;
+        sboNeq: zConds[zN].Op := zopNe;
+        sboLt: zConds[zN].Op := zopLt;
+        sboLte: zConds[zN].Op := zopLe;
+        sboGt: zConds[zN].Op := zopGt;
+        sboGte: zConds[zN].Op := zopGe;
+      else
+        zConds[zN].Op := zopEq;
+      end;
+      zConds[zN].IsFloat := ctx.RawConds[j].IsFloat;
+      zConds[zN].I := ctx.RawConds[j].I;
+      zConds[zN].F := ctx.RawConds[j].F;
+    end;
+    Inc(zN);
+  end;
+  SetLength(zConds, zN);
+  // benzersiz (kolon, tip) listesi
+  for j := 0 to zN - 1 do
+  begin
+    zIdx := -1;
+    for zB := 0 to High(zCols) do
+      if zCols[zB] = zConds[j].Col then begin zIdx := zB; Break; end;
+    if zIdx < 0 then
+    begin
+      SetLength(zCols, Length(zCols) + 1);
+      SetLength(zFloat, Length(zFloat) + 1);
+      zCols[High(zCols)] := zConds[j].Col;
+      zFloat[High(zFloat)] := zConds[j].IsFloat;
+    end;
+  end;
+
+  zSkip := nil;
+  zSkipPtr := nil;
+  zMap := nil;
+  zOld := nil;
+  zScanOk := True;
+  // Batch icinde bekleyen PUT/DELETE'ler FIdxVer'i ARTIRMAZ (dosyaya da
+  // yazilmazlar). Harita pending degisimlerini kacirabilecegi icin batch
+  // sirasinda zone map NE kullanilir NE de insa edilir.
+  if FT.Kv.InBatch then
+  begin
+    SetLength(zCols, 0);
+    SetLength(zFloat, 0);
+    zN := 0;
+  end;
+  ctx.ZoneOn := False;
+  ctx.ZoneMap := nil;
+  ctx.CurBucket := -1;
+  ctx.ZoneLastBucket := 0;
+  SetLength(ctx.ZoneCols, 0);
+  SetLength(ctx.ZoneIsFloat, 0);
+  zBCount := 0;
+  if Length(zCols) > 0 then
+  begin
+    zGenSeq := FT.Kv.DataSeqValue;
+    zGenEpoch := FT.Kv.DataEpochValue;
+    zBCount := TVDb.RawScanBucketCount(FT.Kv.DataFileSize);
+    zUsable := FZoneMaps.TryGetValue(td.TableId, zMap) and
+      (zMap.GenSeq = zGenSeq) and (zMap.GenEpoch = zGenEpoch) and
+      (zMap.BucketCount = zBCount);
+    if zUsable then
+      for j := 0 to High(zCols) do
+      begin
+        zK := zMap.FindCol(zCols[j]);
+        if zK < 0 then begin zUsable := False; Break; end;
+        // Sema tipi degistiyse (INT<->FLOAT) eski min/max gecersizdir.
+        if zMap.ColFloat[zK] <> zFloat[j] then begin zUsable := False; Break; end;
+      end;
+    if zUsable then
+    begin
+      SetLength(zSkip, zBCount);
+      for zB := 0 to zBCount - 1 do
+      begin
+        if zMap.Complete[zB] = 0 then Continue;
+        for j := 0 to zN - 1 do
+        begin
+          zK := zMap.FindCol(zConds[j].Col);
+          if zK < 0 then Continue;
+          if not zMap.ColUsable[zK] then Continue;
+          zIdx := zB * Length(zMap.ColIds) + zK;
+          if VdbZoneCondFalse(zConds[j], zMap.HasVal[zIdx] <> 0,
+               zMap.MinI[zIdx], zMap.MaxI[zIdx],
+               zMap.MinF[zIdx], zMap.MaxF[zIdx]) then
+          begin
+            zSkip[zB] := 1;
+            Break;
+          end;
+        end;
+      end;
+      if Length(zSkip) > 0 then zSkipPtr := @zSkip[0];
+    end
+    else
+    begin
+      zMap := TVDbZoneMap.Create(zGenSeq, zGenEpoch, zBCount, zCols, zFloat);
+      ctx.ZoneOn := True;
+      ctx.ZoneMap := zMap;
+      ctx.ZoneCols := zCols;
+      ctx.ZoneIsFloat := zFloat;
+      ctx.ZoneLastBucket := 0;
+    end;
+  end;
+
+  FCurTable := Stmt.FromTable;
+  FCurCollation := '';
+  FExplicitColl := False;
+
+  ctx.Exec := Self;
+  ctx.TableId := td.TableId;
+  ctx.TableName := td.Name;
+  ctx.ColCnt := Length(td.Cols);
+  SetLength(ctx.FType, ctx.ColCnt);
+  SetLength(ctx.FOff, ctx.ColCnt);
+  SetLength(ctx.FLen, ctx.ColCnt);
+  ctx.ColNames := cn;
+  ctx.ColTypes := ct;
+  ctx.Where := Stmt.WhereClause;
+  ctx.Columns := Stmt.Columns;
+  ctx.Offset := Stmt.OffsetVal;
+  ctx.Limit := Stmt.LimitVal;
+  ctx.Seen := 0;
+  ctx.Emitted := 0;
+  SetLength(ctx.OutRows, 0);
+  ctx.Failed := False;
+
+  zScanOk := FT.Kv.ScanRawIterAllZoned(td.TableId, zSkipPtr, Length(zSkip),
+    @ctx.CurBucket, VdbStreamSelCb, @ctx);
+
+  // H3: insa edilen haritayi yayinla (yalnizca veri hala ayni surumdeyse).
+  // LIMIT ile erken durulduysa yalnizca TAM islenen on-ek bucket'lar
+  // "tamam" isaretlidir; kalanlar sonraki taramada okunur.
+  if ctx.ZoneOn and (ctx.ZoneMap <> nil) then
+  begin
+    if (not ctx.Failed) and zScanOk then
+      for zB := ctx.ZoneLastBucket to zBCount - 1 do
+        ctx.ZoneMap.Complete[zB] := 1;
+    if (not ctx.Failed) and
+       (FT.Kv.DataSeqValue = zGenSeq) and
+       (FT.Kv.DataEpochValue = zGenEpoch) then
+    begin
+      if FZoneMaps.TryGetValue(td.TableId, zOld) then
+      begin
+        FZoneMaps.AddOrSetValue(td.TableId, ctx.ZoneMap);
+        zOld.Free;
+      end
+      else
+        FZoneMaps.Add(td.TableId, ctx.ZoneMap);
+    end
+    else
+      ctx.ZoneMap.Free;
+    ctx.ZoneMap := nil;
+  end;
+  if ctx.Failed then Exit(False);
+
+  Res.Fields := outCols;
+  Res.Rows := ctx.OutRows;
+  Res.Affected := Length(Res.Rows);
+  Res.Msg := 'OK';
+  Result := True;
+end;
+
 procedure TVSqlExecutor.ExecSelect(Stmt: TSqlSelectStmt; out Res: TSqlResult);
 var
   td: TTableDef;
@@ -6181,6 +7645,9 @@ var
   rowKey: string;
   isDup, found, SkipOffsetLimit, HasSetOp, deferOrder, isExactNarrow: Boolean;
   baseIdx, tmpSlot, origCols: Integer;
+  // H1 (2026-10-18): LIMIT erken-cikis
+  capSel: Integer;
+  canEarly: Boolean;
   // P5-WIN: pencere onbellek (projeksiyonda tuketilir).
   WinVals: TStrMatrix;
   WinSlot: TIntArray;
@@ -6425,6 +7892,10 @@ begin
       end
       else
       begin
+        // H1 (2026-10-18): indekssiz, LIMIT'li, ORDER BY'siz tek tablo
+        // SELECT'i ham akistan okuyup LIMIT dolunca durur. Uymazsa False.
+        if TryStreamSelect(Stmt, td, Res) then
+          Exit;
         // P-12: WHERE/GROUP'suz tek tablo agregasi -> ham akistan say.
         // Sekli uymazsa False; asagidaki genel yol AYNEN calisir.
         if TryStreamAgg(Stmt, td, Res) then
@@ -6507,16 +7978,28 @@ begin
         filteredRows := allRows
       else
       begin
+        // H1 (2026-10-18): LIMIT ERKEN-CIKIS. ORDER BY / DISTINCT / pencere /
+        // QUALIFY / set-op YOKken ilk (OFFSET+LIMIT) eslesen satir nihai
+        // sonuctur; sonrasi degerlendirilmez. Sonuc BIREBIR ayni kalir.
+        canEarly := (Stmt.LimitVal >= 0) and (Stmt.OffsetVal >= 0) and
+                    (Stmt.OrderBy.Count = 0) and (not Stmt.IsDistinct) and
+                    (Stmt.SetOp = sokNone) and (Stmt.QualifyClause = nil) and
+                    (not HasWindow(Stmt));
+        if canEarly then capSel := Stmt.OffsetVal + Stmt.LimitVal
+        else capSel := -1;
         // Sonuc en fazla allRows kadar olabilir; satir basina SetLength
         // dinamik diziyi tekrar tekrar kopyalayip O(N^2) maliyet yaratir.
         SetLength(filteredRows, Length(allRows));
         n := 0;
         for i := 0 to High(allRows) do
+        begin
           if RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes) then
           begin
             filteredRows[n] := allRows[i];
             Inc(n);
+            if (capSel >= 0) and (n >= capSel) then Break;   // H1
           end;
+        end;
         SetLength(filteredRows, n);
       end;
     end;
@@ -7415,6 +8898,9 @@ var
   cnames, vals: TStrArray;
   td: TTableDef;
   fv: Double;   // P-18c: float literal kanoniklestirme (VDbParseFloat)
+  // H13 (2026-10-18): cok-satirli VALUES icin satirlar
+  rows: array of TStrArray;
+  nrows, expNv, bi, bi2: Integer;
 
   procedure SkipWs;
   begin
@@ -7598,26 +9084,41 @@ begin
     Inc(p);
   end;
   if not MatchKw('VALUES') then Exit;
-  SkipWs;
-  if (p > n) or (Sql[p] <> '(') then Exit;
-  Inc(p);
-  SetLength(vals, 8);
-  cap := 8;
-  nv := 0;
+  // H13: cok-satirli VALUES '(v,..),(v,..),..' — parse BIR KEZ, AST yok.
+  // Bos tuple '()' genel yola birakilir (ReadValue basarisiz -> Exit).
+  nrows := 0;
+  expNv := -1;
   repeat
-    if not ReadValue(s) then Exit;
-    if nv >= cap then begin cap := cap * 2; SetLength(vals, cap); end;
-    vals[nv] := s;
-    Inc(nv);
+    SkipWs;
+    if (p > n) or (Sql[p] <> '(') then Exit;
+    Inc(p);
+    SetLength(vals, 8);
+    cap := 8;
+    nv := 0;
+    repeat
+      if not ReadValue(s) then Exit;
+      if nv >= cap then begin cap := cap * 2; SetLength(vals, cap); end;
+      vals[nv] := s;
+      Inc(nv);
+      SkipWs;
+      if (p <= n) and (Sql[p] = ',') then begin Inc(p); Continue; end;
+      Break;
+    until False;
+    if (p > n) or (Sql[p] <> ')') then Exit;
+    Inc(p);
+    if nv = 0 then Exit;                  // '()' -> genel yol
+    SetLength(vals, nv);
+    if expNv < 0 then expNv := nv
+    else if nv <> expNv then Exit;        // satirlar arasi deger sayisi farkli -> genel
+    SetLength(rows, nrows + 1);
+    rows[nrows] := vals;
+    Inc(nrows);
     SkipWs;
     if (p <= n) and (Sql[p] = ',') then begin Inc(p); Continue; end;
     Break;
   until False;
-  if (p > n) or (Sql[p] <> ')') then Exit;
-  Inc(p);
-  SkipWs;
-  if p <= n then Exit;      // RETURNING / ON CONFLICT / ';' / ikinci satir
-  if nv = 0 then Exit;      // VALUES()
+  if p <= n then Exit;      // RETURNING / ON CONFLICT / ';' / kuyruk
+  nv := expNv;
 
   // ---- Semantik kapilar: gecilirse genel yolun ayni sirasi ayni hata ----
   if not FT.TableExists(tbl) then Exit;   // genel: 'tablo bulunamadi'
@@ -7635,20 +9136,616 @@ begin
     for nc := 0 to High(td.Cols) do cnames[nc] := td.Cols[nc].Name;
   end
   else if nc <> nv then Exit;             // (kolon listesi + deger sayisi)
-  SetLength(vals, nv);
-  // R-18 izin + R-19 RLS: genel yolun cagirdigi AYNI metotlar, AYNI sira.
+  // R-18 izin: genel yolun cagirdigi AYNI metot, AYNI sira (cumle basina bir kez).
   FT.RequirePriv(tbl, Ord(pkInsert));
-  RlsRequireInsert(tbl, cnames, vals);
-  // PK/UNIQUE/NOT NULL/CHECK/AutoInc/FK denetimleri FT.Insert icerisinde
-  // (genel yolun cagirdigi ile birebir ayni yordam, ayni istisnalar).
-  FT.Insert(tbl, cnames, vals);
 
-  Res.Affected := 1;
+  if nrows = 1 then
+  begin
+    // Tek satir: eski hizli serit davranisi (batch YOK).
+    // R-19 RLS: genel yolun cagirdigi AYNI metot.
+    RlsRequireInsert(tbl, cnames, rows[0]);
+    // PK/UNIQUE/NOT NULL/CHECK/AutoInc/FK denetimleri FT.Insert icerisinde.
+    FT.Insert(tbl, cnames, rows[0]);
+  end
+  else
+  begin
+    // Cok satir: genel yol ile ayni ATOMIKLIK (batch yoksa tumu icin ac).
+    bi := 0;
+    if not FT.Kv.InBatch then
+    begin
+      FT.Kv.BeginBatch;
+      bi := 1;
+    end;
+    try
+      for bi2 := 0 to nrows - 1 do
+      begin
+        RlsRequireInsert(tbl, cnames, rows[bi2]);   // R-19
+        FT.Insert(tbl, cnames, rows[bi2]);
+      end;
+      if bi = 1 then FT.Kv.CommitBatch;
+    except
+      if bi = 1 then FT.AbortBatch;
+      raise;
+    end;
+  end;
+
+  Res.Affected := nrows;
   Res.LastTable := tbl;
   Res.Msg := 'OK';
   SetLength(Res.Fields, 0);
   SetLength(Res.Rows, 0);
   Result := True;
+end;
+
+function TVSqlExecutor.ExecFastCopy(const Sql: string;
+  out Res: TSqlResult): Boolean;
+type
+  TCopyBoolArr = array of Boolean;
+var
+  n, p: Integer;
+  tbl, path, alt: string;
+  cnames: TStrArray;
+  td: TTableDef;
+  fmt, nullStr: string;
+  delim, quoteCh: Char;
+  delimSet, nullSet, header, inParen: Boolean;
+  fsh: TFileStream;
+  buf: array[0..131071] of Byte;
+  bPos, bLen: Integer;
+  atEof: Boolean;
+  pbBuf: array[0..7] of Char;
+  pbN: Integer;
+  row: TStrArray;
+  rowQ: TCopyBoolArr;
+  fbuf: string;
+  flen: Integer;
+  lineNo: Int64;
+  total: Int64;
+  i: Integer;
+  ownBatch: Boolean;
+  hasInsTrig: Boolean;
+  cn, opt, val: string;
+
+  procedure SkipWs;
+  begin
+    while (p <= n) and (Sql[p] in [' ', #9, #10, #13]) do Inc(p);
+  end;
+
+  function WordChar(c: Char): Boolean;
+  begin
+    Result := (c in ['A'..'Z', 'a'..'z', '0'..'9', '_', '$']);
+  end;
+
+  function MatchKw(const Kw: string): Boolean;
+  var
+    k: Integer;
+  begin
+    Result := False;
+    SkipWs;
+    if p + Length(Kw) - 1 > n then Exit;
+    for k := 1 to Length(Kw) do
+      if UpCase(Sql[p + k - 1]) <> Kw[k] then Exit;
+    if (p + Length(Kw) <= n) and WordChar(Sql[p + Length(Kw)]) then Exit;
+    Inc(p, Length(Kw));
+    Result := True;
+  end;
+
+  { Tanimlayici: duz kelime veya "cift tirnakli" ("" kacisi). }
+  function ReadIdent(out S: string): Boolean;
+  var
+    st: Integer;
+  begin
+    Result := False;
+    S := '';
+    SkipWs;
+    if p > n then Exit;
+    if Sql[p] = '"' then
+    begin
+      Inc(p);
+      st := p;
+      while p <= n do
+      begin
+        if Sql[p] = '"' then
+        begin
+          if (p < n) and (Sql[p + 1] = '"') then
+          begin
+            S := S + Copy(Sql, st, p - st) + '"';
+            Inc(p, 2);
+            st := p;
+          end
+          else
+          begin
+            S := S + Copy(Sql, st, p - st);
+            Inc(p);
+            Exit(True);
+          end;
+        end
+        else Inc(p);
+      end;
+      Exit;
+    end;
+    if not (Sql[p] in ['A'..'Z', 'a'..'z', '_']) then Exit;
+    st := p;
+    while (p <= n) and WordChar(Sql[p]) do Inc(p);
+    S := Copy(Sql, st, p - st);
+    Result := True;
+  end;
+
+  { Tek tirnakli string; '' -> ' kacisi. }
+  function ReadStr(out S: string): Boolean;
+  var
+    st: Integer;
+  begin
+    Result := False;
+    S := '';
+    SkipWs;
+    if (p > n) or (Sql[p] <> '''') then Exit;
+    Inc(p);
+    st := p;
+    while p <= n do
+    begin
+      if Sql[p] = '''' then
+      begin
+        if (p < n) and (Sql[p + 1] = '''') then
+        begin
+          S := S + Copy(Sql, st, p - st) + '''';
+          Inc(p, 2);
+          st := p;
+        end
+        else
+        begin
+          S := S + Copy(Sql, st, p - st);
+          Inc(p);
+          Exit(True);
+        end;
+      end
+      else Inc(p);
+    end;
+  end;
+
+  function ReadOptVal(out S: string): Boolean;
+  var
+    st: Integer;
+  begin
+    Result := False;
+    S := '';
+    SkipWs;
+    if p > n then Exit;
+    if Sql[p] = '''' then Exit(ReadStr(S));
+    if Sql[p] = '"' then Exit(ReadIdent(S));
+    if not (Sql[p] in ['A'..'Z', 'a'..'z', '0'..'9', '_', '\', '/', '.']) then Exit;
+    st := p;
+    while (p <= n) and
+          (Sql[p] in ['A'..'Z', 'a'..'z', '0'..'9', '_', '\', '/', '.']) do
+      Inc(p);
+    S := Copy(Sql, st, p - st);
+    Result := True;
+  end;
+
+  function ParseBoolVal(const S: string): Boolean;
+  begin
+    Result := SameText(S, 'TRUE') or SameText(S, 'YES') or
+              SameText(S, 'ON') or (S = '1');
+  end;
+
+  { --- dosya okuyucu (256 KB tampon, tek gecis) --- }
+  function NextCh(out c: Char): Boolean;
+  begin
+    if pbN > 0 then
+    begin
+      Dec(pbN);
+      c := pbBuf[pbN];
+      Exit(True);
+    end;
+    if bPos >= bLen then
+    begin
+      if atEof then Exit(False);
+      bLen := fsh.Read(buf, SizeOf(buf));
+      bPos := 0;
+      if bLen <= 0 then
+      begin
+        atEof := True;
+        Exit(False);
+      end;
+    end;
+    c := Char(buf[bPos]);
+    Inc(bPos);
+    Result := True;
+  end;
+
+  procedure PushCh(c: Char);
+  begin
+    if pbN <= High(pbBuf) then
+    begin
+      pbBuf[pbN] := c;
+      Inc(pbN);
+    end;
+  end;
+
+  procedure FieldAdd(c: Char);
+  begin
+    if flen >= Length(fbuf) then
+      SetLength(fbuf, flen * 2 + 256);
+    Inc(flen);
+    fbuf[flen] := c;
+  end;
+
+  { Tirnakli alan: kapanis tirnagini ve ardindan gelen sonlandiriciyi
+    okur. Bozuk girdide (kapanis sonrasi bitisik metin) kalan karakterler
+    alana eklenir; satir kaybi olmaz. }
+  function ReadQuotedTerm(var Term: Char): Boolean;
+  var
+    cc, nn: Char;
+  begin
+    while NextCh(cc) do
+    begin
+      if cc = quoteCh then
+      begin
+        if NextCh(nn) then
+        begin
+          if nn = quoteCh then
+          begin
+            FieldAdd(quoteCh);
+            Continue;
+          end;
+          if (nn = delim) or (nn = #10) or (nn = #13) then
+          begin
+            Term := nn;
+            Exit(True);
+          end;
+          FieldAdd(nn);
+          Continue;
+        end
+        else Exit(False);
+      end;
+      FieldAdd(cc);
+    end;
+    Result := False;
+  end;
+
+  function ReadRecord: Boolean;
+  var
+    c: Char;
+    q, hasC: Boolean;
+  begin
+    SetLength(row, 0);
+    SetLength(rowQ, 0);
+    // Tamamen bos satirlari atla (tek kolonlu tabloda bos satir = NULL
+    // satiri degil; belirsizligi onlemek icin atlanir).
+    repeat
+      if not NextCh(c) then Exit(False);
+    until (c <> #10) and (c <> #13);
+    hasC := True;
+    while True do
+    begin
+      flen := 0;
+      q := False;
+      if (fmt <> 'text') and hasC and (c = quoteCh) then
+      begin
+        q := True;
+        hasC := ReadQuotedTerm(c);
+      end
+      else
+      begin
+        while hasC and (c <> delim) and (c <> #10) and (c <> #13) do
+        begin
+          if (fmt = 'text') and (c = '\') then
+          begin
+            if NextCh(c) then
+            begin
+              case c of
+                't': FieldAdd(#9);
+                'n': FieldAdd(#10);
+                'r': FieldAdd(#13);
+                'b': FieldAdd(#8);
+                'f': FieldAdd(#12);
+                'v': FieldAdd(#11);
+                '\': FieldAdd('\');
+              else
+                FieldAdd('\');
+                FieldAdd(c);
+              end;
+              hasC := NextCh(c);
+            end
+            else hasC := False;
+          end
+          else
+          begin
+            FieldAdd(c);
+            hasC := NextCh(c);
+          end;
+        end;
+      end;
+      SetLength(row, Length(row) + 1);
+      row[High(row)] := Copy(fbuf, 1, flen);
+      SetLength(rowQ, Length(rowQ) + 1);
+      rowQ[High(rowQ)] := q;
+      if not hasC then Break;
+      if c = delim then
+      begin
+        hasC := NextCh(c);
+        if not hasC then
+        begin
+          SetLength(row, Length(row) + 1);
+          row[High(row)] := '';
+          SetLength(rowQ, Length(rowQ) + 1);
+          rowQ[High(rowQ)] := False;
+          Break;
+        end;
+        Continue;
+      end;
+      // Satir sonu (CRLF / LF / CR)
+      if c = #13 then
+        if NextCh(c) and (c <> #10) then PushCh(c);
+      Break;
+    end;
+    Inc(lineNo);
+    Result := True;
+  end;
+
+begin
+  Result := False;
+  p := 1;
+  n := Length(Sql);
+  if not MatchKw('COPY') then Exit;
+
+  // Buradan itibaren cumle bize ait: hatalar ecSyntaxError ile bildirilir.
+  Result := True;
+  Res.Affected := 0;
+  Res.Msg := '';
+  Res.LastTable := '';
+  Res.Stmts := 1;
+  SetLength(Res.Fields, 0);
+  SetLength(Res.Rows, 0);
+
+  fmt := 'csv';
+  delim := ',';
+  quoteCh := '"';
+  nullStr := '';
+  delimSet := False;
+  nullSet := False;
+  header := False;
+  SetLength(cnames, 0);
+
+  if not ReadIdent(tbl) then
+    raise EVDbException.Create(ecSyntaxError, 'COPY: tablo adi bekleniyordu');
+
+  SkipWs;
+  if (p <= n) and (Sql[p] = '(') then
+  begin
+    Inc(p);
+    while True do
+    begin
+      if not ReadIdent(cn) then
+        raise EVDbException.Create(ecSyntaxError, 'COPY: kolon adi bekleniyordu');
+      SetLength(cnames, Length(cnames) + 1);
+      cnames[High(cnames)] := cn;
+      SkipWs;
+      if (p <= n) and (Sql[p] = ',') then Inc(p)
+      else if (p <= n) and (Sql[p] = ')') then
+      begin
+        Inc(p);
+        Break;
+      end
+      else
+        raise EVDbException.Create(ecSyntaxError, 'COPY: kolon listesi kapatilmadi');
+    end;
+  end;
+
+  if not MatchKw('FROM') then
+    raise EVDbException.Create(ecSyntaxError, 'COPY: FROM bekleniyordu');
+  if not ReadStr(path) then
+    raise EVDbException.Create(ecSyntaxError, 'COPY: dosya yolu (string) bekleniyordu');
+
+  // --- Secenekler: [WITH] [(] ... [)] ---
+  SkipWs;
+  MatchKw('WITH');
+  SkipWs;
+  inParen := False;
+  if (p <= n) and (Sql[p] = '(') then
+  begin
+    Inc(p);
+    inParen := True;
+  end;
+  while True do
+  begin
+    SkipWs;
+    if p > n then Break;
+    if inParen and (Sql[p] = ')') then
+    begin
+      Inc(p);
+      Break;
+    end;
+    if not ReadIdent(opt) then
+      raise EVDbException.Create(ecSyntaxError, 'COPY: secenek adi bekleniyordu');
+    opt := UpperCase(opt);
+    SkipWs;
+    if (p <= n) and (Sql[p] = '=') then
+    begin
+      Inc(p);
+      SkipWs;
+    end;
+    if opt = 'HEADER' then
+    begin
+      if (p > n) or (Sql[p] in [',', ')']) then
+        header := True
+      else
+      begin
+        if not ReadOptVal(val) then
+          raise EVDbException.Create(ecSyntaxError, 'COPY: HEADER degeri bekleniyordu');
+        header := ParseBoolVal(val);
+      end;
+    end
+    else
+    begin
+      if not ReadOptVal(val) then
+        raise EVDbException.CreateFmt(ecSyntaxError,
+          'COPY: %s degeri bekleniyordu', [opt]);
+      if opt = 'FORMAT' then
+      begin
+        fmt := LowerCase(val);
+        if (fmt <> 'csv') and (fmt <> 'text') then
+          raise EVDbException.Create(ecUnsupported,
+            'COPY: yalniz FORMAT CSV veya TEXT destekleniyor: ' + val);
+      end
+      else if opt = 'DELIMITER' then
+      begin
+        if Length(val) <> 1 then
+          raise EVDbException.Create(ecInvalidArgument,
+            'COPY: DELIMITER tek karakter olmali');
+        delim := val[1];
+        delimSet := True;
+      end
+      else if opt = 'NULL' then
+      begin
+        nullStr := val;
+        nullSet := True;
+      end
+      else if opt = 'QUOTE' then
+      begin
+        if Length(val) <> 1 then
+          raise EVDbException.Create(ecInvalidArgument,
+            'COPY: QUOTE tek karakter olmali');
+        quoteCh := val[1];
+      end
+      else if opt = 'ESCAPE' then
+      begin
+        // CSV kacis karakteri desteklenmiyor; kabul edilip yok sayilir.
+      end
+      else
+        raise EVDbException.Create(ecUnsupported,
+          'COPY: bilinmeyen secenek: ' + opt);
+    end;
+    SkipWs;
+    if (p <= n) and (Sql[p] = ',') then Inc(p)
+    else if inParen then
+    begin
+      if (p <= n) and (Sql[p] = ')') then
+      begin
+        Inc(p);
+        Break;
+      end;
+      raise EVDbException.Create(ecSyntaxError, 'COPY: secenek listesi kapatilmadi');
+    end;
+  end;
+  SkipWs;
+  if p <= n then
+    raise EVDbException.Create(ecSyntaxError,
+      'COPY: beklenmeyen ifade: ' + Copy(Sql, p, 40));
+
+  if not delimSet then
+  begin
+    if fmt = 'text' then delim := #9 else delim := ',';
+  end;
+  if not nullSet then
+  begin
+    if fmt = 'text' then nullStr := '\N' else nullStr := '';
+  end;
+
+  // --- Dosya / tablo ---
+  if not FileExists(path) then
+  begin
+    alt := '';
+    if FT.Kv.FilePath <> '' then
+      alt := IncludeTrailingPathDelimiter(ExtractFileDir(FT.Kv.FilePath)) + path;
+    if (alt <> '') and FileExists(alt) then
+      path := alt
+    else
+      raise EVDbException.Create(ecNotFound, 'COPY: dosya bulunamadi: ' + path);
+  end;
+
+  if not FT.TableExists(tbl) then
+    raise EVDbException.Create(ecNotFound, 'COPY: tablo bulunamadi: ' + tbl);
+  if FT.IsView(tbl) then
+    raise EVDbException.Create(ecUnsupported,
+      'COPY: view uzerine toplu yukleme desteklenmiyor: ' + tbl);
+  td := FT.GetTable(tbl);
+  if Length(cnames) = 0 then
+  begin
+    SetLength(cnames, Length(td.Cols));
+    for i := 0 to High(td.Cols) do
+      cnames[i] := td.Cols[i].Name;
+  end;
+  FT.RequirePriv(tbl, Ord(pkInsert));
+
+  fsh := TFileStream.Create(path, fmOpenRead or fmShareDenyWrite);
+  try
+    // UTF-8 BOM varsa atla (yoksa basa don).
+    if fsh.Size >= 3 then
+    begin
+      fsh.Read(buf, 3);
+      if not ((buf[0] = $EF) and (buf[1] = $BB) and (buf[2] = $BF)) then
+        fsh.Position := 0;
+    end;
+    bPos := 0;
+    bLen := 0;
+    atEof := False;
+    pbN := 0;
+    flen := 0;
+    SetLength(fbuf, 256);
+    lineNo := 0;
+    total := 0;
+
+    if header then
+    begin
+      if ReadRecord and (Length(row) <> Length(cnames)) then
+        raise EVDbException.CreateFmt(ecInvalidArgument,
+          'COPY %s:%d: baslikta %d alan var, %d bekleniyordu',
+          [path, lineNo, Length(row), Length(cnames)]);
+    end;
+
+    // Tetikleyici meta verisi COPY boyunca degismez: bir kez bak, yoksa
+    // satir basina iki FireTriggers cagrisini tamamen atla (sicak yol).
+    hasInsTrig :=
+      (Length(FT.TriggersFor(tbl, Byte(ttBefore), Byte(teInsert))) > 0) or
+      (Length(FT.TriggersFor(tbl, Byte(ttAfter), Byte(teInsert))) > 0);
+    if hasInsTrig then
+      FireTriggers(tbl, Byte(ttBefore), Byte(teInsert), nil, nil, [], Res, False);
+    ownBatch := not FT.Kv.InBatch;
+    if ownBatch then FT.BeginBatch;
+    try
+      while ReadRecord do
+      begin
+        if Length(row) <> Length(cnames) then
+          raise EVDbException.CreateFmt(ecInvalidArgument,
+            'COPY %s:%d: %d alan bekleniyordu, %d bulundu',
+            [path, lineNo, Length(cnames), Length(row)]);
+        for i := 0 to High(row) do
+          if (not rowQ[i]) and (row[i] = nullStr) then
+            row[i] := '';
+        try
+          if hasInsTrig then
+            FireTriggers(tbl, Byte(ttBefore), Byte(teInsert),
+              nil, row, cnames, Res, True);
+          RlsRequireInsert(tbl, cnames, row);
+          FT.Insert(tbl, cnames, row);
+          Inc(total);
+          if hasInsTrig then
+            FireTriggers(tbl, Byte(ttAfter), Byte(teInsert),
+              nil, row, cnames, Res, True);
+        except
+          on e: EVDbException do
+            raise EVDbException.Create(e.ErrorCode,
+              Format('COPY %s satir %d: %s', [path, lineNo, e.Message]));
+        end;
+      end;
+      if ownBatch then FT.CommitBatch;
+    except
+      if ownBatch then
+        try FT.AbortBatch; except end;
+      raise;
+    end;
+    if hasInsTrig then
+      FireTriggers(tbl, Byte(ttAfter), Byte(teInsert), nil, nil, [], Res, False);
+  finally
+    fsh.Free;
+  end;
+
+  Res.Affected := total;
+  Res.LastTable := tbl;
+  Res.Msg := IntToStr(total) + ' satir';
+  SetLength(Res.Fields, 0);
+  SetLength(Res.Rows, 0);
 end;
 
 function TVSqlExecutor.ExecFastPointSelect(const Sql: string;
@@ -9645,6 +11742,134 @@ var
     end;
   end;
 
+  { H8: aralik (range) kosulu icin ANALYZE min/max istatistiginden secicilik
+    tahmini. Gercek yurutme (NarrowRows) dilim boyutunu (bestHi-bestLo) TAM
+    bilir; EXPLAIN ise sabit "RowCount div 3"e duserdi -> plan metni ile
+    gercek plan celisebiliyordu. Burada [min,max] uzerinde uniform varsayimla
+    kesir hesaplanir. Yalnizca sayisal kolon + sayisal sinir; aksi halde False
+    (eski "div 3" sezgisine duser). }
+  function RangeColEst(T: TTableDef; out EstRows: Int64): Boolean;
+  var
+    conj: TList<TSqlExprNode>;
+    k, ci: Integer;
+    b: TSqlBinaryOpNode;
+    btw: TSqlBetweenNode;
+    colName: string;
+    lo, hi, v, mn, mx, frac: Double;
+    tgt: Integer;
+
+    procedure Push(C: TSqlExprNode);
+    begin
+      if (C is TSqlBinaryOpNode) and (TSqlBinaryOpNode(C).Op = sboAnd) then
+      begin
+        Push(TSqlBinaryOpNode(C).Left);
+        Push(TSqlBinaryOpNode(C).Right);
+      end
+      else conj.Add(C);
+    end;
+
+    function ColIdxOf(const N: string): Integer;
+    var q: Integer;
+    begin
+      Result := -1;
+      for q := 0 to High(T.Cols) do
+        if VDbNorm(T.Cols[q].Name) = VDbNorm(N) then Exit(q);
+    end;
+
+    function StatsOf(ci2: Integer; out m1, m2: Double): Boolean;
+    var q: Integer;
+    begin
+      Result := False;
+      for q := 0 to High(tblStats.ColStats) do
+        if SameText(tblStats.ColStats[q].ColName, T.Cols[ci2].Name) then
+        begin
+          if VDbParseFloat(tblStats.ColStats[q].MinVal, m1) and
+             VDbParseFloat(tblStats.ColStats[q].MaxVal, m2) then Exit(True);
+          Exit(False);
+        end;
+    end;
+
+  begin
+    Result := False;
+    EstRows := 0;
+    if (sel = nil) or (sel.WhereClause = nil) then Exit;
+    conj := TList<TSqlExprNode>.Create;
+    try
+      Push(sel.WhereClause);
+      // 1) Hedef kolon: indeksli (PK ya da onek) + sayisal + istatistikli
+      //    ilk aralik kolonu.
+      tgt := -1;
+      for k := 0 to conj.Count - 1 do
+      begin
+        colName := '';
+        if conj[k] is TSqlBinaryOpNode then
+        begin
+          b := TSqlBinaryOpNode(conj[k]);
+          if not ((b.Op in [sboLt, sboLte, sboGt, sboGte]) and
+                  (b.Left is TSqlColumnRefNode) and
+                  (b.Right is TSqlLiteralNode)) then Continue;
+          colName := TSqlColumnRefNode(b.Left).ColumnName;
+        end
+        else if conj[k] is TSqlBetweenNode then
+        begin
+          btw := TSqlBetweenNode(conj[k]);
+          if not (btw.Expr is TSqlColumnRefNode) then Continue;
+          colName := TSqlColumnRefNode(btw.Expr).ColumnName;
+        end
+        else Continue;
+        ci := ColIdxOf(colName);
+        if ci < 0 then Continue;
+        if not VDbIsNumericCol(T.Cols[ci].Ctype) then Continue;
+        if not ((ci = T.PkIndex) or (FT.IdxPosOfCol(T.TableId, ci) >= 0)) then Continue;
+        if not StatsOf(ci, mn, mx) then Continue;
+        tgt := ci;
+        Break;
+      end;
+      if tgt < 0 then Exit;
+      if (not StatsOf(tgt, mn, mx)) or (mx <= mn) then Exit;
+
+      // 2) Ayni kolon icin alt/ust sinirlari topla
+      lo := mn; hi := mx;
+      for k := 0 to conj.Count - 1 do
+      begin
+        if conj[k] is TSqlBinaryOpNode then
+        begin
+          b := TSqlBinaryOpNode(conj[k]);
+          if not ((b.Left is TSqlColumnRefNode) and
+                  (b.Right is TSqlLiteralNode)) then Continue;
+          if ColIdxOf(TSqlColumnRefNode(b.Left).ColumnName) <> tgt then Continue;
+          if not VDbParseFloat(TSqlLiteralNode(b.Right).AsString, v) then Continue;
+          case b.Op of
+            sboGt, sboGte: lo := v;
+            sboLt, sboLte: hi := v;
+          end;
+        end
+        else if conj[k] is TSqlBetweenNode then
+        begin
+          btw := TSqlBetweenNode(conj[k]);
+          if not (btw.Expr is TSqlColumnRefNode) then Continue;
+          if ColIdxOf(TSqlColumnRefNode(btw.Expr).ColumnName) <> tgt then Continue;
+          if (btw.LowBound is TSqlLiteralNode) and
+             VDbParseFloat(TSqlLiteralNode(btw.LowBound).AsString, v) then lo := v;
+          if (btw.HighBound is TSqlLiteralNode) and
+             VDbParseFloat(TSqlLiteralNode(btw.HighBound).AsString, v) then hi := v;
+        end;
+      end;
+
+      // 3) [lo,hi] ∩ [mn,mx] kesiri (uniform)
+      if lo < mn then lo := mn;
+      if hi > mx then hi := mx;
+      if hi <= lo then begin EstRows := 1; Exit(True); end;
+      frac := (hi - lo) / (mx - mn);
+      EstRows := Round(tblStats.RowCount * frac);
+      if EstRows < 1 then EstRows := 1;
+      if EstRows > tblStats.RowCount then EstRows := tblStats.RowCount;
+      Result := True;
+    finally
+      conj.Free;
+    end;
+  end;
+
 begin
   SetLength(plan, 0);
   sel := nil;
@@ -9737,6 +11962,10 @@ begin
           // ve indeksin gercekten kazanip kazanmadigina karar ver.
           if EqColStats(td, eqDistinct, eqNulls) then
             est := VdbChooseScan(tblStats.RowCount, eqDistinct, eqNulls, True, covAll)
+          else if RangeColEst(td, rangeRows) then
+            // H8: aralik seçiciliği ANALYZE min/max'tan (uniform) -> gerçek
+            // yürütmenin dilim-temelli kararıyla tutarlı.
+            est := VdbChooseScanForRows(tblStats.RowCount, rangeRows, True, covAll)
           else
           begin
             rangeRows := tblStats.RowCount div 3;
@@ -10536,6 +12765,9 @@ var
   ts: TVDbTableStats;
   avg: UInt64;
   i: Integer;
+  hits, misses: Int64;
+  usedB, maxB: Integer;
+  ratio: Double;
 begin
   if Stmt.TableName <> '' then
   begin
@@ -10590,7 +12822,11 @@ begin
   SetLength(Res.Fields, 2);
   Res.Fields[0] := 'name';
   Res.Fields[1] := 'value';
-  SetLength(Res.Rows, 6);
+  FT.Kv.GetReadCacheStats(hits, misses, usedB, maxB);
+  ratio := 0;
+  if (hits + misses) > 0 then
+    ratio := hits * 100.0 / (hits + misses);
+  SetLength(Res.Rows, 13);
   SetLength(Res.Rows[0], 2);
   Res.Rows[0][0] := 'commands';
   Res.Rows[0][1] := IntToStr(ms.CommandCount);
@@ -10609,6 +12845,27 @@ begin
   SetLength(Res.Rows[5], 2);
   Res.Rows[5][0] := 'tables_analyzed';
   Res.Rows[5][1] := IntToStr(AnalyzedTableCount);
+  SetLength(Res.Rows[6], 2);
+  Res.Rows[6][0] := 'data_file_bytes';
+  Res.Rows[6][1] := IntToStr(FT.Kv.DataFileSize);
+  SetLength(Res.Rows[7], 2);
+  Res.Rows[7][0] := 'tables';
+  Res.Rows[7][1] := IntToStr(Length(FT.TableNames));
+  SetLength(Res.Rows[8], 2);
+  Res.Rows[8][0] := 'batch_active';
+  Res.Rows[8][1] := BoolToStr(FT.Kv.InBatch, True);
+  SetLength(Res.Rows[9], 2);
+  Res.Rows[9][0] := 'read_cache_blocks';
+  Res.Rows[9][1] := IntToStr(usedB) + '/' + IntToStr(maxB);
+  SetLength(Res.Rows[10], 2);
+  Res.Rows[10][0] := 'cache_hits';
+  Res.Rows[10][1] := IntToStr(hits);
+  SetLength(Res.Rows[11], 2);
+  Res.Rows[11][0] := 'cache_misses';
+  Res.Rows[11][1] := IntToStr(misses);
+  SetLength(Res.Rows[12], 2);
+  Res.Rows[12][0] := 'cache_hit_ratio_pct';
+  Res.Rows[12][1] := FormatFloat('0.0', ratio);
   Res.Affected := Length(Res.Rows);
   Res.Msg := IntToStr(ms.CommandCount) + ' komut';
 end;
