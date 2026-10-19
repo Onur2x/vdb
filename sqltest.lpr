@@ -6821,6 +6821,51 @@ begin
       'SELECT * FROM dnf WHERE NOT (a > 15 AND b > 25 OR id = 3)', 1);
 end;
 
+procedure T09d_NotNull3VL;
+// M8 fuzz bulgulari: NOT, NULL iceren BETWEEN/IN/karsilastirmalari
+// UNKNOWN olarak korumali; aksi halde NOT UNKNOWN -> TRUE olup NULL
+// satirlari WHERE sonucuna yanlislikla girer.
+begin
+  Grp('M8 NOT + NULL uc-degerli mantik');
+  UseDir('notnull3vl');
+  sq.Exec('CREATE TABLE nn(id INTEGER PRIMARY KEY, a INTEGER, f FLOAT, b BOOLEAN)');
+  sq.Exec('INSERT INTO nn VALUES (1,10,1.5,TRUE),(2,NULL,NULL,NULL),(3,30,3.5,FALSE),(4,50,5.5,TRUE)');
+
+  // a NULL olan id=2 disarida kalir; disaridakiler id=1 (10) ve id=4 (50).
+  Chk('NOT BETWEEN NULL satiri dislar',
+      'SELECT * FROM nn WHERE NOT (a BETWEEN 20 AND 40)', 2);
+  Chk('NOT NOT BETWEEN = BETWEEN',
+      'SELECT * FROM nn WHERE NOT (a NOT BETWEEN 20 AND 40)', 1);
+  // NOT (a NOT IN (...)) = a IN (...); a NULL yine disarida.
+  Chk('NOT NOT IN = IN',
+      'SELECT * FROM nn WHERE NOT (a NOT IN (10, 30))', 2);
+  // NULL ile karsilastirma UNKNOWN; NOT UNKNOWN satir getirmez.
+  Chk('NOT (f = NULL) bos',
+      'SELECT * FROM nn WHERE NOT (f = NULL)', 0);
+  // UNKNOWN AND FALSE = FALSE -> id=3,4 girer; UNKNOWN AND TRUE/UNKNOWN
+  // -> UNKNOWN -> id=1,2 girmez.
+  Chk('NOT (UNKNOWN AND FALSE) = TRUE',
+      'SELECT * FROM nn WHERE NOT (f = NULL AND a = 10)', 2);
+  // UNKNOWN OR FALSE = UNKNOWN -> NOT UNKNOWN; hicbir satir gelmez.
+  Chk('NOT (UNKNOWN OR FALSE) bos',
+      'SELECT * FROM nn WHERE NOT (f = NULL OR a = 10)', 0);
+
+  // JOIN yolu ParseWhereGroups (DNF) kullanir: NOT (A AND B) De Morgan
+  // ile NOT A OR NOT B olmali; yalniz ilk kosulu degistirmek yanlisti.
+  sq.Exec('CREATE TABLE j1(id INTEGER PRIMARY KEY, a INTEGER)');
+  sq.Exec('CREATE TABLE j2(id INTEGER PRIMARY KEY, x INTEGER)');
+  sq.Exec('INSERT INTO j1 VALUES (1,10),(2,20),(3,NULL)');
+  sq.Exec('INSERT INTO j2 VALUES (1,1),(2,1),(3,1)');
+  // id=1: NOT(TRUE AND TRUE) = FALSE -> disarida; id=2: NOT(FALSE AND TRUE)
+  // = TRUE -> girer; id=3: NOT(UNKNOWN AND TRUE) = UNKNOWN -> disarida.
+  Chk('JOIN NOT (A AND B) De Morgan',
+      'SELECT j1.id FROM j1 JOIN j2 ON j1.id = j2.id ' +
+      'WHERE NOT (j1.a = 10 AND j2.x = 1)', 1);
+  Chk('JOIN NOT (A NOT IN) = IN',
+      'SELECT j1.id FROM j1 JOIN j2 ON j1.id = j2.id ' +
+      'WHERE NOT (j1.a NOT IN (10))', 1);
+end;
+
 procedure T09e_NullIfCoalesce;
 begin
   Grp('NULLIF / COALESCE (F-02)');
@@ -11352,6 +11397,7 @@ begin
         T09_GroupAggregate;
         T09b_HavingAggregate;
         T09c_NotOrDNF;
+        T09d_NotNull3VL;
         T09e_NullIfCoalesce;
         T09f_ILike;
         T09g_AnySomeAll;

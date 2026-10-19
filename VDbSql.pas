@@ -729,7 +729,9 @@ var
     begin
       u := UpperCase(O);
       if u = 'IN' then Result := 'NOTIN'
+      else if u = 'NOTIN' then Result := 'IN'
       else if u = 'BETWEEN' then Result := 'NOTBETWEEN'
+      else if u = 'NOTBETWEEN' then Result := 'BETWEEN'
       else if u = 'NOTLIKE' then Result := 'LIKE'
       else if u = 'ISNULL' then Result := 'ISNOTNULL'
       else if u = 'ISNOTNULL' then Result := 'ISNULL'
@@ -757,7 +759,16 @@ var
       if Length(G) = 0 then Exit;
       if Length(G) = 1 then
       begin
-        G[0][0].Op := NegOp(G[0][0].Op);
+        // 4.4: NOT (A AND B) = NOT A OR NOT B. Tek AND grubunda her
+        // kosul icin bir OR dali uretilir; eskiden yalnizca ilk kosul
+        // degistirilip digerleri sessizce korunuyordu.
+        SetLength(Result, Length(G[0]));
+        for kk := 0 to High(G[0]) do
+        begin
+          SetLength(Result[kk], 1);
+          Result[kk][0] := G[0][kk];
+          Result[kk][0].Op := NegOp(Result[kk][0].Op);
+        end;
         Exit;
       end;
       // 4.4: NOT icinde OR: De Morgan ile acilir.
