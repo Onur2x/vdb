@@ -169,10 +169,16 @@ type
 
   public
     { Parse: SQL metnini ayrıştırır, AST dugumu dondurur.
-      Params: '?' yer tutucularini sirasıyla dolduran deger listesi. }
+      Params: '?' yer tutucularini sirasıyla doldurur; `$1`, `$2` ...
+      ise Params dizisinde 1-tabanli konumu secer. }
     function Parse(const ASql: string;
                    const AParams: array of string): TSqlStmtNode;
   end;
+
+{ M1: SQL metnindeki en buyuk konumsal parametre numarasini dondurur
+  ($1, $2 ...). Yalnizca tirnak/yorum disindaki $n sayilir; `?` JSONB
+  operatoru ile karismamasi icin `?` burada sayilmaz. }
+function VDbCountSqlParams(const Sql: string): Integer;
 
 implementation
 
@@ -188,6 +194,80 @@ begin Result := C in ['A'..'Z','a'..'z','0'..'9','_']; end;
 
 function IsDigit(C: Char): Boolean; inline;
 begin Result := C in ['0'..'9']; end;
+
+function VDbCountSqlParams(const Sql: string): Integer;
+var
+  i, j, n, maxN: Integer;
+  c: Char;
+begin
+  n := 0;
+  maxN := 0;
+  i := 1;
+  while i <= Length(Sql) do
+  begin
+    c := Sql[i];
+    // tek tirnakli metin ('' kacisi dahil)
+    if c = '''' then
+    begin
+      Inc(i);
+      while i <= Length(Sql) do
+      begin
+        if Sql[i] = '''' then
+        begin
+          if (i < Length(Sql)) and (Sql[i + 1] = '''') then Inc(i, 2)
+          else begin Inc(i); Break; end;
+        end
+        else Inc(i);
+      end;
+    end
+    // cift tirnakli tanimlayici
+    else if c = '"' then
+    begin
+      Inc(i);
+      while i <= Length(Sql) do
+      begin
+        if Sql[i] = '"' then
+        begin
+          if (i < Length(Sql)) and (Sql[i + 1] = '"') then Inc(i, 2)
+          else begin Inc(i); Break; end;
+        end
+        else Inc(i);
+      end;
+    end
+    // -- satir yorumu
+    else if (c = '-') and (i < Length(Sql)) and (Sql[i + 1] = '-') then
+    begin
+      Inc(i, 2);
+      while (i <= Length(Sql)) and (Sql[i] <> #10) do Inc(i);
+    end
+    // /* blok yorumu */
+    else if (c = '/') and (i < Length(Sql)) and (Sql[i + 1] = '*') then
+    begin
+      Inc(i, 2);
+      while i < Length(Sql) do
+      begin
+        if (Sql[i] = '*') and (Sql[i + 1] = '/') then
+        begin Inc(i, 2); Break; end;
+        Inc(i);
+      end;
+      if i > Length(Sql) then i := Length(Sql) + 1;
+    end
+    else if c = '$' then
+    begin
+      j := i + 1;
+      while (j <= Length(Sql)) and IsDigit(Sql[j]) do Inc(j);
+      if j > i + 1 then
+      begin
+        n := StrToIntDef(Copy(Sql, i + 1, j - i - 1), 0);
+        if n > maxN then maxN := n;
+        i := j;
+      end
+      else Inc(i);
+    end
+    else Inc(i);
+  end;
+  Result := maxN;
+end;
 
 // R-19: ParsePolicy (ustte) ExprToText'i kullanir; tanim asagida.
 function ExprToText(E: TSqlExprNode): string; forward;
@@ -240,7 +320,7 @@ end;
 
 function TVDbParser.NextToken(out T: string; out IsStringLit: Boolean): Boolean;
 var
-  Start, i: Integer;
+  Start, i, pidx: Integer;
   c: Char;
   rangeOk: Boolean;
 begin
@@ -281,6 +361,28 @@ begin
         Inc(FPos);
       end;
     end;
+    Result := True;
+    Exit;
+  end;
+
+  // M1: PostgreSQL uyumlu konumsal parametre: $1, $2 ...
+  if FSql[FPos] = '$' then
+  begin
+    Start := FPos + 1;
+    i := Start;
+    while (i <= FLen) and IsDigit(FSql[i]) do Inc(i);
+    if i = Start then
+      raise EVDbException.CreateFmt(ecSyntaxError,
+        'gecersiz parametre: "$" (konum=%d)', [FPos]);
+    if not TryStrToInt(Copy(FSql, Start, i - Start), pidx) then
+      raise EVDbException.CreateFmt(ecSyntaxError,
+        'gecersiz parametre numarasi: %s', [Copy(FSql, Start, i - Start)]);
+    if (pidx < 1) or (pidx > Length(FParams)) then
+      raise EVDbException.CreateFmt(ecSyntaxError,
+        'parametre $%d tanimli degil (toplam %d)', [pidx, Length(FParams)]);
+    FPos := i;
+    T := FParams[pidx - 1];
+    IsStringLit := True;
     Result := True;
     Exit;
   end;

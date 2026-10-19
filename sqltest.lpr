@@ -7205,6 +7205,20 @@ begin
   R := sq.Exec('SELECT yas FROM t WHERE ad = ?', ['Ali']);
   if (Length(R.Rows) = 1) and (R.Rows[0][0] = '30') then Ok('WHERE ?', R.Rows[0][0])
   else No('WHERE ?', 'sonuc ' + IntToStr(Length(R.Rows)));
+  // M1: PostgreSQL uyumlu konumsal parametreler
+  R := sq.Exec('SELECT yas FROM t WHERE ad = $1', ['Ali']);
+  if (Length(R.Rows) = 1) and (R.Rows[0][0] = '30') then Ok('WHERE $1', R.Rows[0][0])
+  else No('WHERE $1', 'sonuc ' + IntToStr(Length(R.Rows)));
+  R := sq.Exec('SELECT yas FROM t WHERE ad = $2 OR ad = $1 ORDER BY yas',
+    ['Veli', 'Ali']);
+  if (Length(R.Rows) = 2) and (R.Rows[0][0] = '20') and (R.Rows[1][0] = '30') then
+    Ok('WHERE $2/$1 sira', '20,30')
+  else No('WHERE $2/$1 sira', 'sonuc ' + IntToStr(Length(R.Rows)));
+  R := sq.Exec('INSERT INTO t(ad,yas) VALUES($1,$2)', ['Can', '40']);
+  if R.Affected = 1 then Ok('INSERT $1/$2', '') else No('INSERT $1/$2', '');
+  R := sq.Exec('DELETE FROM t WHERE ad = $1', ['Can']);
+  if R.Affected = 1 then Ok('DELETE $1', '') else No('DELETE $1', '');
+  ChkErr('eksik $2 parametresi (hata)', 'SELECT * FROM t WHERE ad = $2');
   R := sq.Exec('UPDATE t SET yas = ? WHERE ad = ?', ['31', 'Ali']);
   if R.Affected = 1 then Ok('UPDATE 2 parametre', '') else No('UPDATE 2 parametre', '');
   R := sq.Exec('DELETE FROM t WHERE ad = ?', ['Veli']);
@@ -10788,14 +10802,75 @@ begin
     Dogrula('pg ext INSERT satir sayisi 1',
       (Length(row) = 1) and (row[0] = '1'), '');
 
-    // Parametreli Parse reddedilir; hata sonrasi Sync'e kadar mesaj yutulur.
+    // ---- Parametreli extended protocol (M1) ----
+    // Parse'te OID verilmez; sunucu SQL'den 1 parametre cikarir.
     FreeAndNil(msgs);
-    SendExt('P', 'bad'#0 + 'SELECT 1'#0 + TPgI16(1) + TPgI32(25));
-    SendExt('B', ''#0 + 'bad'#0 + TPgI16(0) + TPgI16(0) + TPgI16(0));
+    SendExt('P', 'p1'#0 + 'SELECT $1'#0 + TPgI16(0));
+    SendExt('B', ''#0 + 'p1'#0 + TPgI16(0) + TPgI16(1) +
+      TPgI32(2) + '42' + TPgI16(0));
+    SendExt('D', 'S' + 'p1'#0);
+    SendExt('E', ''#0 + TPgI32(0));
     SyncRead;
-    Dogrula('pg ext parametre reddi (EZ)', TypeSeq = 'EZ', TypeSeq);
-    Dogrula('pg ext parametre hatasi dolu', ErrText <> '',
+    Dogrula('pg ext parametreli yanit dizisi 12tnDCZ',
+      TypeSeq = '12tnDCZ', TypeSeq);
+    row := RowAt(0);
+    Dogrula('pg ext metin parametre 42',
+      (Length(row) = 1) and (row[0] = '42'), '');
+    Dogrula('pg ext parametreli SELECT tag', FindTag('SELECT 1'), '');
+    ok := False;
+    for i := 0 to msgs.Count - 1 do
+      if (msgs[i] <> '') and (msgs[i][1] = 't') then
+      begin
+        body := TPgBody(msgs[i]);
+        ok := (Copy(body, 1, 2) = TPgI16(1)) and
+          (Copy(body, 3, 4) = TPgI32(25));
+      end;
+    Dogrula('pg ext ParameterDescription 1/OID 25', ok, '');
+
+    // Binary int4 parametre: 4 bayt buyuk-endian 7.
+    FreeAndNil(msgs);
+    SendExt('P', 'p2'#0 + 'SELECT $1'#0 + TPgI16(1) + TPgI32(23));
+    SendExt('B', ''#0 + 'p2'#0 + TPgI16(1) + TPgI16(1) + TPgI16(1) +
+      TPgI32(4) + TPgI32(7) + TPgI16(0));
+    SendExt('D', 'S' + 'p2'#0);
+    SendExt('E', ''#0 + TPgI32(0));
+    SyncRead;
+    Dogrula('pg ext binary int4 yanit 12tnDCZ',
+      TypeSeq = '12tnDCZ', TypeSeq);
+    row := RowAt(0);
+    Dogrula('pg ext binary int4 degeri 7',
+      (Length(row) = 1) and (row[0] = '7'), '');
+
+    // `?` yer tutucu: Parse'te OID yok; Bind sayisindan turetilir.
+    FreeAndNil(msgs);
+    SendExt('P', 'p5'#0 + 'SELECT ?'#0 + TPgI16(0));
+    SendExt('B', ''#0 + 'p5'#0 + TPgI16(0) + TPgI16(1) +
+      TPgI32(2) + '99' + TPgI16(0));
+    SendExt('D', 'S' + 'p5'#0);
+    SendExt('E', ''#0 + TPgI32(0));
+    SyncRead;
+    Dogrula('pg ext ? yer tutucu 12tnDCZ', TypeSeq = '12tnDCZ', TypeSeq);
+    row := RowAt(0);
+    Dogrula('pg ext ? yer tutucu 99',
+      (Length(row) = 1) and (row[0] = '99'), '');
+
+    // Eksik parameter: Parse/Bind hata verir, Sync'e kadar yutulur.
+    FreeAndNil(msgs);
+    SendExt('P', 'p3'#0 + 'SELECT $1'#0 + TPgI16(0));
+    SendExt('B', ''#0 + 'p3'#0 + TPgI16(0) + TPgI16(0) + TPgI16(0));
+    SyncRead;
+    Dogrula('pg ext eksik parametre (1EZ)', TypeSeq = '1EZ', TypeSeq);
+    Dogrula('pg ext eksik parametre hatasi dolu', ErrText <> '',
       Copy(ErrText, 1, 40));
+
+    // Binary sonuc formati reddedilir.
+    FreeAndNil(msgs);
+    SendExt('P', 'p4'#0 + 'SELECT 1'#0 + TPgI16(0));
+    SendExt('B', ''#0 + 'p4'#0 + TPgI16(0) + TPgI16(0) +
+      TPgI16(1) + TPgI16(1));
+    SyncRead;
+    Dogrula('pg ext binary sonuc reddi (1EZ)', TypeSeq = '1EZ', TypeSeq);
+
     Dogrula('pg ext hata sonrasi baglanti canli',
       Query('SELECT COUNT(*) FROM pg_ext'), '');
     row := RowAt(0);
