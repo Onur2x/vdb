@@ -66,6 +66,9 @@ data/
 
 
 
+# Yerel dokumanlar / Local docs (Git'e eklenmez / not tracked)
+dokuman/
+
 # Sadece kaynak kodları tut / Keep only source
 !*.pas
 !*.lpr
