@@ -268,9 +268,50 @@ sorgu tarafında ART/B+tree kazanımı bu profilde küçük. ART/B+tree hâlâ t
 > ile `COUNT(*)` + `SUM(id)` üzerinden karşılaştırır (range/IN/NULL/partial/
 > çok kolonlu indeks, pending UPDATE/DELETE ve ROLLBACK dahil).
 >
-> **Kalan:** tam skiplist entegrasyonu (O(log N) güncelleme) ve çok büyük
-> deltalarda O(N+M) birleştirmenin kaldırılması; mevcut dizi yolu varsayılan
-> ve tek doğruluk kaynağıdır.
+> **Kalan:** çok büyük deltalarda O(N+M) birleştirme kodu artık erişilemez
+> durumdadır ve temizlenmiştir; tüm indeks güncellemeleri skiplist üzerinden
+> O(log N) yürür.
+
+> **Uygulama durumu — 4. adım: skiplist tam entegrasyonu (2026-10-19, TAMAM):**
+> `FSkipIdx` artık **kanonik indeks**tir; `FMemIdx` sıralı dizisi yalnızca cold
+> okuma yolları için tembel malzeme cache'idir. `FlushIdxPending` bekleyen
+> ekleme/silme işlemlerini skiplist üzerinde O(log N) uygular ve `FMemIdx`
+> cache'ini geçersiz kılar. `TVDbSkipList` düğümlerine **rank/span** alanı
+> eklendi: `CountRange` ve `RankBefore` artık aralığı baştan sona yürümeden
+> O(log N) sayar; bu, indeksli `COUNT(*)` yolunun ana performans kaynağıdır.
+>
+> Yeni `TIdxSource` soyutlaması (`Skip` + yedek `Arr`) üzerinden şu sıcak
+> yollar skiplist'e taşındı: `NarrowRows` (aralık/BETWEEN/IN/COUNT/CBO),
+> `TryIndexOrder` (ORDER BY + LIMIT), JOIN iç indeks erişimi,
+> `RefValueExists`, FK `FindHits` ve `CandidatePks` (UPDATE/DELETE adayları).
+> PK lazy indeksi (`FPkIdx`) dizi olarak kaldı; `TryGetIdxSource` bu durumda
+> `TryGetMemIndex` fallback'ini kullanır. Çok kolonlu indekslerde aralık yine
+> yalnızca leading kolondan hesaplanır; kalan koşullar `RowMatches` ile
+> doğrulanır. `SetIdxSkipFromEntries` ctype'ı önce indeks tanımından
+> (`IdxCtypesByKey`) okur; bu, sayısal indekslerin yanlışlıkla metin olarak
+> sıralanmasını önler.
+>
+> **Ölçüm (`idxbench`, 100.000 satır, 200 × 1000 satırlık aralık, 100 döngü):**
+> A) 200 UPDATE (pending) **80,8 ms**; ilk indeksli sorgu (flush) **1,3 ms**;
+> B0) indeksli COUNT (pending yok) **1,1 ms (0,01 ms/döngü)**;
+> B) 100 × (UPDATE + indeksli `COUNT(*)`) **39,3–41,8 ms
+> (0,39–0,42 ms/döngü)**; B1) yalnız 100 UPDATE **35,6–38,8 ms**;
+> B2) aynı pending üzerinde 100 sorgu **1,7–2,1 ms**; C) indekssiz COUNT
+> **769–879 ms/döngü**. Önceki O(N) birleştirme tabanına göre B
+> **2499,0 → 39,3–41,8 ms (~60–64x)**; önceki küçük-delta sonucu 40,6 ms
+> idi. Güncelleme başına maliyet artık indeks boyutundan bağımsızdır.
+>
+> **`skipchk` (rank/span doğrulaması dahil):** 200.000 girdi oracle ile
+> birebir; `CountRange` dört sınır kombinasyonu ve `RankBefore` brute-force
+> sayımla karşılaştırılır. 1.000.000 girdilik ölçüm: ekleme **1110,3 ms**,
+> 200k LowerBound **423,8 ms**, 10k aralık **336,3 ms**, 100k silme
+> **271,7 ms**, 0 hata. Rank alanları prototipe göre ölçümlerde ~%10–30
+> ek yük getirir; karşılığında aralık sayımı O(K) → O(log N) olur.
+>
+> **Kapılar:** `sqltest 2527/2527`, `crashtest 8/8`, `rawchk 29/29`,
+> `mrowchk 0 hata`, `fuzzchk 3000/3000`, `sqlite_diff 4000/4000`,
+> `hashchk 80/80`, `copychk 17/17`, `zonechk 0 hata`, `skipchk 0 hata`,
+> `countchk 120/120`.
 
 ### H4 — mmap read yolu (sıfır-kopya)
 **Sorun:** KR-D okuma tarafı. Kayıt başına okuma/kopya.
@@ -918,7 +959,7 @@ maddelerin "eksik" sanılıp tekrar uygulanmasını önlemektir.
 |---|---|---|
 | H1 vektörleştirilmiş filtre | ✅ Yapıldı | `TryStreamSelect`: ham akış + LIMIT erken durma + AND-tabanlı ham-yüklem batch eleme (INT/FLOAT + TEXT `=`/`<>`); `rawchk` birebir. (Projeksiyon/`EvalExpr` hâlâ string döndürür — çıktı aşaması; planın "tip-tabanlı ara diziler" optimizasyonu opsiyonel kaldı, sonucu değiştirmez.) |
 | H2 hash join | ✅ Yapıldı | indekssiz tek-eşitlik INNER/LEFT (`ExecJoinScan`); indeksli/PK hızlı yolu korunuyor |
-| H3 ART/B+tree + zone map | 🟡 Kısmi (zone map ✅, skiplist prototipi ✅, küçük-delta ✅) | **Bucket zone map**: INT/FLOAT min/max, 2 MB bucket, disk formatı değişmez, `(FIdxVer,DataEpoch)` invalidation + batch'te kapalı; `a=77777` 163,5→31,6 ms (**5,2x**), float aralık 185,4→35,4 ms (**5,2x**); `zonechk` birebir + INSERT/UPDATE/DELETE/ROLLBACK/Compact güvenliği. `FMemIdx` hash + sıralı dizi (KR-C) indeks dilimi ~1300x. **Küçük-delta güncelleme + indeksli COUNT:** `idxbench` 100k satırda 100 × (UPDATE + indeksli COUNT) **24,99 → 0,41 ms/döngü (~61x)**; indeksli COUNT **0,01 ms**; `NarrowRows` bitişik aralıkları tam sayar, IN/NULL için `RowMatches` korunur. **`VDbSkipList.pas`** prototipi: O(log N) insert/delete + LowerBound/Range; `skipchk` 200k oracle + 1M ölçüm (ekleme ~1025 ms, LB ~390 ms, 10k range ~276 ms, 100k delete ~251 ms). Tam skiplist entegrasyonu henüz yok; sıralı dizi varsayılan |
+| H3 ART/B+tree + zone map | 🟡 Kısmi (zone map ✅, skiplist tam entegre ✅) | **Bucket zone map**: INT/FLOAT min/max, 2 MB bucket, disk formatı değişmez, `(FIdxVer,DataEpoch)` invalidation + batch'te kapalı; `a=77777` 163,5→31,6 ms (**5,2x**), float aralık 185,4→35,4 ms (**5,2x**); `zonechk` birebir + INSERT/UPDATE/DELETE/ROLLBACK/Compact güvenliği. **Kanonik indeks artık `VDbSkipList.pas`:** rank/span ile O(log N) ekleme/silme, `CountRange`/`RankBefore` O(log N); `FlushIdxPending` O(log N) uygular, `FMemIdx` yalnız cold cache. `TIdxSource` ile `NarrowRows`, `TryIndexOrder`, JOIN, FK `FindHits`, `RefValueExists` ve `CandidatePks` skiplist üzerinden okur. `idxbench` 100k satırda 100 × (UPDATE + indeksli COUNT) **24,99 → 0,39–0,42 ms/döngü (~60–64x)**; indeksli COUNT **0,01 ms**; ilk flush **1,3 ms**. `skipchk` 200k oracle + rank/span brute-force doğrulaması + 1M ölçüm (ekleme 1110,3 ms, LB 423,8 ms, 10k range 336,3 ms, 100k delete 271,7 ms), 0 hata. ART/B+tree kalanı opsiyonel |
 | H4 mmap okuma | 🟡 Deneysel (varsayılan KAPALI) | `ScanRawIter` salt-okunur eşleme (`VDbMapFileHandle`/`SetReadMapEnabled`); sıcak-cache'te mmap **yavaş** (11,3→17,3 ms; yumuşak sayfa hatası); `mmapchk` düz+şifreli+Compact birebir; POSIX kapalı |
 | H5 blok-grup CRC | ❌ Yok | per-record CRC (aynı zamanda format girdisi) |
 | H6 tek-sorgu paralel | ✅ Yapıldı (agrega + indeks sıralaması) | `PrepareRawScan`/`ScanRawPrepared` (offset bucket, aday bir kez); `TryStreamAgg` işçi başına biriktirici + deterministik birleşim; 150k'da 53,0→13,0 ms (8 işçi, **4,08x**); SUM/AVG FLOAT'ta seri (bit-ayni); havuzun auto-reset `RTLEvent` hatası sayma semaforuyla düzeltildi. **H6-sort:** `SortIdxEntries`/`SortIdxEntriesCols` parçalı hızlı sıralama + k-yönlü heap birleştirme; 300k `CREATE INDEX` 708,7→515,2 ms (~1,38x), seri ile birebir |

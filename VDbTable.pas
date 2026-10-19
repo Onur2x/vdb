@@ -12,7 +12,8 @@ unit VDbTable;
 interface
 
 uses
-  Classes, SysUtils, SyncObjs, Generics.Collections, VDbCore, VDbErr, VDbText, VDbTypes;
+  Classes, SysUtils, SyncObjs, Generics.Collections, VDbCore, VDbErr, VDbText,
+  VDbTypes, VDbSkipList;
 
 type
   // Use Pointer for TSqlSelectStmt parameters to avoid circular dependency with VDbAst
@@ -99,6 +100,48 @@ type
     Cov: string;      // F-19: INCLUDE kolon degerleri
   end;
   TIdxOps = array of TIdxOp;
+
+  { H3: indeksin kanonik hizi. Siralanmis dizi yerine skiplist tutulur;
+    dizi yalnizca eski (cold) okuma yollari icin tembel malzeme cache'idir. }
+  TIdxSkipCmp = class
+  public
+    Ctype: Byte;
+    Ctypes: TByteArray;
+    IsMulti: Boolean;
+    function FullCompare(const A, B: TVDbSkipEntry): Integer;
+    function LeadCompare(const AKey, BKey: string): Integer;
+    function ExactCompare(const AKey, BKey: string): Integer;
+  end;
+
+  TIdxSkip = class
+  public
+    List: TVDbSkipList;
+    Cmp: TIdxSkipCmp;
+    constructor Create(ACtype: Byte; const ACtypes: TByteArray);
+    destructor Destroy; override;
+    procedure LoadFromEntries(const E: TIdxEntries);
+    function Add(const Key, Pk, Cov: string): Boolean;
+    function Remove(const Key, Pk: string): Boolean;
+    function RangeByOp(const Op, Val: string; out Entries: TIdxEntries): Integer;
+    function CountByOp(const Op, Val: string): Int64;
+    function RangeBounds(const LoVal, HiVal: string;
+      HasLo, HasHi, LoInc, HiInc: Boolean; out Entries: TIdxEntries): Integer;
+    function CountBounds(const LoVal, HiVal: string;
+      HasLo, HasHi, LoInc, HiInc: Boolean): Int64;
+    function RangeExact(const Key: string; ExactString: Boolean;
+      out Entries: TIdxEntries): Integer;
+    function CountExact(const Key: string; ExactString: Boolean): Int64;
+    function CompareVal(const A, B: string): Integer;
+  end;
+
+  { Bir indeksin okuma kaynagi: yeni yol skiplist, eski/yedek yol dizi. }
+  TIdxSource = record
+    Skip: TIdxSkip;
+    Arr: TIdxEntries;
+    Ctype: Byte;
+    NParts: Integer;
+  end;
+
   // BIR IKINCI INDEKSIN BELLEK ICI TAMPONU
   //
   // TEMEL FIKIR: sirali diziye ARA DEGER eklemek O(n) kaydirma ister.
@@ -257,7 +300,8 @@ type
     FDir: string;
     FTables: TDictionary<string, TTableDef>; // name -> def
     FById: TDictionary<Word, string>;
-    FMemIdx: TDictionary<Int64, TIdxEntries>; // IdxKey -> SIRALI girisler
+    FMemIdx: TDictionary<Int64, TIdxEntries>; // IdxKey -> SIRALI girisler (cache)
+    FSkipIdx: TDictionary<Int64, TIdxSkip>;   // H3: kanonik skiplist indeksleri
     FIdxOps: TDictionary<Int64, TList<TIdxOp>>;         // sirali bekleyen islemler
     FIdxCtype: TDictionary<Int64, Byte>;                // indeks kolon tipi
     FPkIdx: TDictionary<Word, TIdxEntries>;  // PK lazy index (tableId -> sorted)
@@ -422,6 +466,8 @@ type
     procedure FreeIdxUniqMaps;
     procedure FreeIdxPend;
     procedure FlushIdxPending(const k: Int64);
+    procedure SetIdxSkipFromEntries(const k: Int64; const E: TIdxEntries);
+    procedure FreeIdxSkips;
     function IdxTDefByKey(const k: Int64; out ColIdx: Integer): TTableDef;
     function IdxNPartsByKey(const k: Int64): Integer;
     function IdxCtypesByKey(const k: Int64): TByteArray;
@@ -562,6 +608,7 @@ type
     function ConcIdxBuildersActive: Integer;
     function IndexNames(const Table: string): TStrArray;
     function TryGetMemIndex(TableId: Word; ColIdx: Integer; out Entries: TIdxEntries): Boolean;
+    function TryGetIdxSource(TableId: Word; ColIdx: Integer; out Src: TIdxSource): Boolean;
     function IdxNParts(TableId: Word; ColIdx: Integer): Integer;
     function IdxPosOfName(const Table, IdxName: string): Integer;      // F-19
 function IdxEntryCount(TableId: Word; IdxPos: Integer): Integer;      // F-17
@@ -757,6 +804,20 @@ function VDbMatchGroups(const Vals: TStrArray; const Groups: TWhereGroups): Bool
 // ---- COK KOLONLU INDEKS YARDIMCILARI ----
 // Anahtarlar VDB_IDX_SEP (#1) ile birlestirilir. Anahtar yalnizca bellekte
 // tutulur (diskte degil); parcalara ayirmak karsilastirma sirasinda olur.
+function IdxSourceRange(const S: TIdxSource; const Op, Val: string;
+  out Entries: TIdxEntries): Integer;
+function IdxSourceCount(const S: TIdxSource; const Op, Val: string): Int64;
+function IdxSourceRangeBounds(const S: TIdxSource; const LoVal, HiVal: string;
+  HasLo, HasHi, LoInc, HiInc: Boolean; out Entries: TIdxEntries): Integer;
+function IdxSourceCountBounds(const S: TIdxSource; const LoVal, HiVal: string;
+  HasLo, HasHi, LoInc, HiInc: Boolean): Int64;
+function IdxSourceRangeExact(const S: TIdxSource; const Key: string;
+  ExactString: Boolean; out Entries: TIdxEntries): Integer;
+function IdxSourceCountExact(const S: TIdxSource; const Key: string;
+  ExactString: Boolean): Int64;
+function IdxSourceCompareVal(const S: TIdxSource;
+  const A, B: string): Integer;
+function IdxSourceCountAll(const S: TIdxSource): Int64;
 function VDbIdxPartOf(const A: string; Part: Integer): string;
 function VDbIdxPartCmp(const A, B: string; Part: Integer; Ctype: Byte): Integer;
 function VDbIdxMultiCmp(const A, B: string; const Ctypes: TByteArray): Integer;
@@ -2445,6 +2506,349 @@ begin
   else begin Lo := 0; Hi := 0; Result := False; end;
 end;
 
+{ ================= H3: SKIPLIST INDEKS SARMALAYICISI ================= }
+
+function TIdxSkipCmp.FullCompare(const A, B: TVDbSkipEntry): Integer;
+begin
+  if IsMulti then
+    Result := VDbIdxMultiCmp(A.Key, B.Key, Ctypes)
+  else
+    Result := VDbIdxCmp(A.Key, B.Key, Ctype);
+  if Result = 0 then
+    Result := CompareStr(A.Value, B.Value);
+end;
+
+function TIdxSkipCmp.LeadCompare(const AKey, BKey: string): Integer;
+begin
+  if IsMulti then
+    Result := VDbIdxPartCmp(AKey, BKey, 0, Ctype)
+  else
+    Result := VDbIdxCmp(AKey, BKey, Ctype);
+end;
+
+function TIdxSkipCmp.ExactCompare(const AKey, BKey: string): Integer;
+begin
+  if IsMulti then
+    Result := VDbIdxMultiCmp(AKey, BKey, Ctypes)
+  else
+    Result := VDbIdxCmp(AKey, BKey, Ctype);
+end;
+
+constructor TIdxSkip.Create(ACtype: Byte; const ACtypes: TByteArray);
+begin
+  inherited Create;
+  Cmp := TIdxSkipCmp.Create;
+  Cmp.Ctype := ACtype;
+  Cmp.Ctypes := Copy(ACtypes, 0, Length(ACtypes));
+  Cmp.IsMulti := Length(ACtypes) > 1;
+  List := TVDbSkipList.Create(Cmp.FullCompare, 32, 1);
+end;
+
+destructor TIdxSkip.Destroy;
+begin
+  List.Free;
+  Cmp.Free;
+  inherited Destroy;
+end;
+
+procedure TIdxSkip.LoadFromEntries(const E: TIdxEntries);
+var
+  a: TVDbSkipEntryArray;
+  i: Integer;
+begin
+  SetLength(a, Length(E));
+  for i := 0 to High(E) do
+  begin
+    a[i].Key := E[i].Key;
+    a[i].Value := E[i].Pk;
+    a[i].Cov := E[i].Cov;
+  end;
+  List.LoadSorted(a);
+end;
+
+function TIdxSkip.Add(const Key, Pk, Cov: string): Boolean;
+begin
+  Result := List.Insert(Key, Pk, Cov);
+end;
+
+function TIdxSkip.Remove(const Key, Pk: string): Boolean;
+begin
+  Result := List.Delete(Key, Pk);
+end;
+
+function TIdxSkip.CompareVal(const A, B: string): Integer;
+begin
+  Result := VDbIdxCmp(A, B, Cmp.Ctype);
+end;
+
+function TIdxSkip.RangeBounds(const LoVal, HiVal: string;
+  HasLo, HasHi, LoInc, HiInc: Boolean; out Entries: TIdxEntries): Integer;
+var
+  a: TVDbSkipEntryArray;
+  loKey, hiKey: string;
+  i: Integer;
+begin
+  if not HasLo then LoInc := True;
+  if not HasHi then HiInc := True;
+  if Cmp.IsMulti then
+  begin
+    loKey := VDbIdxProbe1(LoVal);
+    hiKey := VDbIdxProbe1(HiVal);
+  end
+  else
+  begin
+    loKey := LoVal;
+    hiKey := HiVal;
+  end;
+  Result := List.CollectRange(loKey, hiKey, HasLo, HasHi, LoInc, HiInc,
+    Cmp.LeadCompare, a);
+  SetLength(Entries, Result);
+  for i := 0 to Result - 1 do
+  begin
+    Entries[i].Key := a[i].Key;
+    Entries[i].Pk := a[i].Value;
+    Entries[i].Cov := a[i].Cov;
+  end;
+end;
+
+function TIdxSkip.CountBounds(const LoVal, HiVal: string;
+  HasLo, HasHi, LoInc, HiInc: Boolean): Int64;
+var
+  loKey, hiKey: string;
+begin
+  if not HasLo then LoInc := True;
+  if not HasHi then HiInc := True;
+  if Cmp.IsMulti then
+  begin
+    loKey := VDbIdxProbe1(LoVal);
+    hiKey := VDbIdxProbe1(HiVal);
+  end
+  else
+  begin
+    loKey := LoVal;
+    hiKey := HiVal;
+  end;
+  Result := List.CountRange(loKey, hiKey, HasLo, HasHi, LoInc, HiInc,
+    Cmp.LeadCompare);
+end;
+
+function TIdxSkip.RangeByOp(const Op, Val: string;
+  out Entries: TIdxEntries): Integer;
+var
+  o: string;
+begin
+  o := UpperCase(Op);
+  if o = '=' then
+    Result := RangeBounds(Val, Val, True, True, True, True, Entries)
+  else if o = '>' then
+    Result := RangeBounds(Val, '', True, False, False, True, Entries)
+  else if o = '>=' then
+    Result := RangeBounds(Val, '', True, False, True, True, Entries)
+  else if o = '<' then
+    Result := RangeBounds('', Val, False, True, True, False, Entries)
+  else if o = '<=' then
+    Result := RangeBounds('', Val, False, True, True, True, Entries)
+  else
+  begin
+    SetLength(Entries, 0);
+    Result := 0;
+  end;
+end;
+
+function TIdxSkip.CountByOp(const Op, Val: string): Int64;
+var
+  o: string;
+begin
+  o := UpperCase(Op);
+  if o = '=' then
+    Result := CountBounds(Val, Val, True, True, True, True)
+  else if o = '>' then
+    Result := CountBounds(Val, '', True, False, False, True)
+  else if o = '>=' then
+    Result := CountBounds(Val, '', True, False, True, True)
+  else if o = '<' then
+    Result := CountBounds('', Val, False, True, True, False)
+  else if o = '<=' then
+    Result := CountBounds('', Val, False, True, True, True)
+  else
+    Result := 0;
+end;
+
+function TIdxSkip.RangeExact(const Key: string; ExactString: Boolean;
+  out Entries: TIdxEntries): Integer;
+var
+  a: TVDbSkipEntryArray;
+  i, n: Integer;
+begin
+  n := List.CollectRange(Key, Key, True, True, True, True,
+    Cmp.ExactCompare, a);
+  SetLength(Entries, n);
+  Result := 0;
+  for i := 0 to n - 1 do
+  begin
+    if ExactString and (a[i].Key <> Key) then Continue;
+    Entries[Result].Key := a[i].Key;
+    Entries[Result].Pk := a[i].Value;
+    Entries[Result].Cov := a[i].Cov;
+    Inc(Result);
+  end;
+  SetLength(Entries, Result);
+end;
+
+function TIdxSkip.CountExact(const Key: string; ExactString: Boolean): Int64;
+var
+  a: TVDbSkipEntryArray;
+  i: Integer;
+begin
+  Result := 0;
+  if not ExactString then
+    Exit(List.CountRange(Key, Key, True, True, True, True, Cmp.ExactCompare));
+  List.CollectRange(Key, Key, True, True, True, True, Cmp.ExactCompare, a);
+  for i := 0 to High(a) do
+    if a[i].Key = Key then Inc(Result);
+end;
+
+{ ================= H3: KAYNAK (SKIPLIST / DIZI) YARDIMCILARI ================= }
+
+function IdxSourceCountAll(const S: TIdxSource): Int64;
+begin
+  if S.Skip <> nil then
+    Result := S.Skip.List.Count
+  else
+    Result := Length(S.Arr);
+end;
+
+function IdxSourceCompareVal(const S: TIdxSource;
+  const A, B: string): Integer;
+begin
+  Result := VDbIdxCmp(A, B, S.Ctype);
+end;
+
+function IdxSourceRangeBounds(const S: TIdxSource; const LoVal, HiVal: string;
+  HasLo, HasHi, LoInc, HiInc: Boolean; out Entries: TIdxEntries): Integer;
+var
+  l2, h2, lo, hi: Integer;
+  op: string;
+begin
+  if S.Skip <> nil then
+    Exit(S.Skip.RangeBounds(LoVal, HiVal, HasLo, HasHi, LoInc, HiInc, Entries));
+  SetLength(Entries, 0);
+  Result := 0;
+  if Length(S.Arr) = 0 then Exit;
+  lo := 0;
+  hi := Length(S.Arr);
+  if HasLo then
+  begin
+    if LoInc then op := '>=' else op := '>';
+    if not VDbIdxRangeL(S.Arr, S.Ctype, op, LoVal, S.NParts, l2, h2) then Exit;
+    if l2 > lo then lo := l2;
+  end;
+  if HasHi then
+  begin
+    if HiInc then op := '<=' else op := '<';
+    if not VDbIdxRangeL(S.Arr, S.Ctype, op, HiVal, S.NParts, l2, h2) then Exit;
+    if h2 < hi then hi := h2;
+  end;
+  if hi <= lo then Exit;
+  SetLength(Entries, hi - lo);
+  for l2 := lo to hi - 1 do
+    Entries[l2 - lo] := S.Arr[l2];
+  Result := hi - lo;
+end;
+
+function IdxSourceCountBounds(const S: TIdxSource; const LoVal, HiVal: string;
+  HasLo, HasHi, LoInc, HiInc: Boolean): Int64;
+var
+  e: TIdxEntries;
+begin
+  if S.Skip <> nil then
+    Exit(S.Skip.CountBounds(LoVal, HiVal, HasLo, HasHi, LoInc, HiInc));
+  IdxSourceRangeBounds(S, LoVal, HiVal, HasLo, HasHi, LoInc, HiInc, e);
+  Result := Length(e);
+end;
+
+function IdxSourceRange(const S: TIdxSource; const Op, Val: string;
+  out Entries: TIdxEntries): Integer;
+var
+  o: string;
+begin
+  o := UpperCase(Op);
+  if o = '=' then
+    Result := IdxSourceRangeBounds(S, Val, Val, True, True, True, True, Entries)
+  else if o = '>' then
+    Result := IdxSourceRangeBounds(S, Val, '', True, False, False, True, Entries)
+  else if o = '>=' then
+    Result := IdxSourceRangeBounds(S, Val, '', True, False, True, True, Entries)
+  else if o = '<' then
+    Result := IdxSourceRangeBounds(S, '', Val, False, True, True, False, Entries)
+  else if o = '<=' then
+    Result := IdxSourceRangeBounds(S, '', Val, False, True, True, True, Entries)
+  else
+  begin
+    SetLength(Entries, 0);
+    Result := 0;
+  end;
+end;
+
+function IdxSourceCount(const S: TIdxSource; const Op, Val: string): Int64;
+var
+  o: string;
+begin
+  o := UpperCase(Op);
+  if o = '=' then
+    Result := IdxSourceCountBounds(S, Val, Val, True, True, True, True)
+  else if o = '>' then
+    Result := IdxSourceCountBounds(S, Val, '', True, False, False, True)
+  else if o = '>=' then
+    Result := IdxSourceCountBounds(S, Val, '', True, False, True, True)
+  else if o = '<' then
+    Result := IdxSourceCountBounds(S, '', Val, False, True, True, False)
+  else if o = '<=' then
+    Result := IdxSourceCountBounds(S, '', Val, False, True, True, True)
+  else
+    Result := 0;
+end;
+
+function IdxSourceRangeExact(const S: TIdxSource; const Key: string;
+  ExactString: Boolean; out Entries: TIdxEntries): Integer;
+var
+  l2, h2, i: Integer;
+begin
+  if S.Skip <> nil then
+    Exit(S.Skip.RangeExact(Key, ExactString, Entries));
+  SetLength(Entries, 0);
+  Result := 0;
+  if S.NParts > 1 then
+  begin
+    if not VDbIdxRangeLK(S.Arr, S.Ctype, '=', Key, S.NParts, l2, h2) then Exit;
+  end
+  else
+  begin
+    if not VDbIdxRange(S.Arr, S.Ctype, '=', Key, l2, h2) then Exit;
+  end;
+  SetLength(Entries, h2 - l2);
+  for i := l2 to h2 - 1 do
+  begin
+    if ExactString and (S.Arr[i].Key <> Key) then Continue;
+    Entries[Result] := S.Arr[i];
+    Inc(Result);
+  end;
+  SetLength(Entries, Result);
+end;
+
+function IdxSourceCountExact(const S: TIdxSource; const Key: string;
+  ExactString: Boolean): Int64;
+var
+  e: TIdxEntries;
+begin
+  if S.Skip <> nil then
+    Exit(S.Skip.CountExact(Key, ExactString));
+  IdxSourceRangeExact(S, Key, ExactString, e);
+  Result := Length(e);
+end;
+
+
+
 // ---- row encode/decode ----
 
 procedure WriteU16(var B: TBytes; var P: Integer; V: Word);
@@ -2964,6 +3368,7 @@ begin
   FTables := TDictionary<string, TTableDef>.Create;
   FById := TDictionary<Word, string>.Create;
   FMemIdx := TDictionary<Int64, TIdxEntries>.Create;
+  FSkipIdx := TDictionary<Int64, TIdxSkip>.Create;
   FFunctions := TDictionary<string, TFunctionDef>.Create;
   FProcedures := TDictionary<string, TFunctionDef>.Create;
   FTriggers := TDictionary<string, TTriggerDef>.Create;
@@ -3009,6 +3414,7 @@ begin
   FFunctions.Free;
   FProcedures.Free;
   FTriggers.Free;
+  FreeIdxSkips;
   FMemIdx.Free;
   FreeIdxPend;      // TList'leri serbest birakir
   FIdxOps.Free;
@@ -4170,8 +4576,8 @@ end;
 function TVTableDb.RefValueExists(const Rt: TTableDef; ColIdx: Integer; const V: string): Boolean;
 // Referans deger baska tabloda var mi? (PK ise O(1), indexli ise dilim, degilse tara)
 var
-  e: TIdxEntries;
-  lo, hi, k: Integer;
+  src: TIdxSource;
+  k: Integer;
   pks: TStrArray;
   rows: TStrMatrix;
 begin
@@ -4179,8 +4585,8 @@ begin
   // F2-22: PkIndex<0 ise PK tanimlanmamis; bu yol kullanilmaz.
   if (Rt.PkIndex >= 0) and (ColIdx = Rt.PkIndex) then
     Exit(ReadRow(Rt.Name, V, pks));
-  if TryGetMemIndex(Rt.TableId, ColIdx, e) then
-    Exit(VDbIdxRange(e, Rt.Cols[ColIdx].Ctype, '=', V, lo, hi) and (hi > lo));
+  if TryGetIdxSource(Rt.TableId, ColIdx, src) then
+    Exit(IdxSourceCount(src, '=', V) > 0);
   ScanRows(Rt.Name, pks, rows);
   for k := 0 to High(pks) do
     if rows[k][ColIdx] = V then Exit(True);
@@ -4685,6 +5091,7 @@ var
   // Bu FK icin ParentVals[rc]'e isaret eden cocuk satirlarinin PK'lari.
   var
     ii: Integer;
+    src: TIdxSource;
     ee: TIdxEntries;
     l2, h2: Integer;
     pp: TStrArray;
@@ -4692,11 +5099,10 @@ var
     res: TStrArray;
   begin
     SetLength(res, 0);
-    if TryGetMemIndex(Child2.TableId, Child2.Fks[FkIx].Col, ee) then
+    if TryGetIdxSource(Child2.TableId, Child2.Fks[FkIx].Col, src) then
     begin
-      if VDbIdxRange(ee, Child2.Cols[Child2.Fks[FkIx].Col].Ctype, '=',
-        ParentVals[rc], l2, h2) then
-        for ii := l2 to h2 - 1 do
+      if IdxSourceRange(src, '=', ParentVals[rc], ee) > 0 then
+        for ii := 0 to High(ee) do
         begin
           SetLength(res, Length(res) + 1);
           res[High(res)] := ee[ii].Pk;
@@ -5424,11 +5830,17 @@ var
   l: TList<TIdxOp>;
   m: Integer;
   um: TDictionary<string, string>;
+  sk: TIdxSkip;
 begin
   if FIdxOps.TryGetValue(k, l) then
   begin
     l.Free;
     FIdxOps.Remove(k);
+  end;
+  if FSkipIdx.TryGetValue(k, sk) then
+  begin
+    sk.Free;
+    FSkipIdx.Remove(k);
   end;
   FIdxCtype.Remove(k);
   if FIdxUniq.TryGetValue(k, um) then
@@ -5637,6 +6049,7 @@ begin
   else
     SortIdxEntries(e, T.Cols[ci].Ctype);
   FMemIdx.AddOrSetValue(k, e);
+  SetIdxSkipFromEntries(k, e);
   if expr <> '' then
     FIdxCtype.AddOrSetValue(k, keyCt)     // F-18
   else
@@ -5753,6 +6166,8 @@ var
   k: Int64;
   e: TIdxEntries;
   um: TDictionary<string, string>;
+  sk2: TIdxSkip;
+  a: TVDbSkipEntryArray;
 begin
   if (FConcBuilders = nil) or (FConcBuilders.Count = 0) then Exit;
   if AForce then GVdbConcGateClosed := False;   // kilitlenme yok
@@ -5774,6 +6189,7 @@ begin
         FIdxCtype.AddOrSetValue(k, IdxCtypeOfPos(t, pos))
       else
         FIdxCtype.AddOrSetValue(k, t.Cols[ci].Ctype);
+      SetIdxSkipFromEntries(k, rec.Builder.Entries);
       // 2) CATCH-UP: insa penceresindeki yazmalar
       if FIdxDirty.IndexOf(k) >= 0 then
         FlushIdxPending(k);
@@ -5783,7 +6199,14 @@ begin
           (t.Idx[pos].ExprText = '') and (ci >= 0) and t.Cols[ci].Unique) then
       begin
         um := TDictionary<string, string>.Create;
-        if FMemIdx.TryGetValue(k, e) then
+        if FSkipIdx.TryGetValue(k, sk2) then
+        begin
+          sk2.List.All(a);
+          for m := 0 to High(a) do
+            if a[m].Key <> '' then
+              um.AddOrSetValue(a[m].Key, a[m].Value);
+        end
+        else if FMemIdx.TryGetValue(k, e) then
           for m := 0 to High(e) do
             if e[m].Key <> '' then
               um.AddOrSetValue(e[m].Key, e[m].Pk);
@@ -5997,6 +6420,7 @@ var
   e: TIdxEntries;
   nm: string;
   t: TTableDef;
+  sk: TIdxSkip;
 begin
   Result := -1;   // -1 = indeks bellekte degil / yok
   if not FById.TryGetValue(TableId, nm) then Exit;
@@ -6008,6 +6432,11 @@ begin
   k := IdxKeyPos(t, IdxPos);
   if FIdxDirty.IndexOf(k) >= 0 then
     FlushIdxPending(k);
+  if FSkipIdx.TryGetValue(k, sk) then
+  begin
+    Result := sk.List.Count;
+    Exit;
+  end;
   // Indeksler TENBEL kurulur; "kac kayit var" sorusu bunu yine de
   // yanitlayabilmelidir, yoksa SHOW INDEXES ilk acikta -1 gosterirdi.
   if not FMemIdx.ContainsKey(k) then
@@ -6092,6 +6521,7 @@ begin
   // CONCURRENTLY insalari iptal edilir (INVALID kalirlar).
   StopConcBuilders;
   FMemIdx.Clear;
+  FreeIdxSkips;
   FreeIdxPend;
   for kv in FTables do
     for j := 0 to High(kv.Value.Idx) do
@@ -6481,6 +6911,11 @@ begin
       begin
         DropIdxPend(IdxKey(t.TableId, nt.Idx[i].Col));
         FMemIdx.Remove(IdxKey(t.TableId, nt.Idx[i].Col));
+        if FSkipIdx.ContainsKey(IdxKey(t.TableId, nt.Idx[i].Col)) then
+        begin
+          FSkipIdx[IdxKey(t.TableId, nt.Idx[i].Col)].Free;
+          FSkipIdx.Remove(IdxKey(t.TableId, nt.Idx[i].Col));
+        end;
       end;
     for i := j to High(nt.Idx) - 1 do nt.Idx[i] := nt.Idx[i + 1];
     SetLength(nt.Idx, Length(nt.Idx) - 1);
@@ -6921,39 +7356,14 @@ procedure TVTableDb.FlushIdxPending(const k: Int64);
 // bagimsiz olarak kendini tutarli tutar (mukerrer/eksik girdi imkansiz).
 var
   ops: TList<TIdxOp>;
-  e, keep, delta, merged: TIdxEntries;
+  e: TIdxEntries;
   lastOp: TDictionary<string, TIdxOp>;    // pk -> son durum
   oldKeys: TDictionary<string, string>;   // pk -> committed eski anahtar
-  added: TDictionary<string, Boolean>;     // eklenen pk'ler
-  ct: Byte;
-  ctMulti: TByteArray;
-  isMulti: Boolean;
-  i, nKeep, nDelta, iKeep, iDelta, iMerged, cmp: Integer;
-  oldLen, pos, pNew, target: Integer;
+  sk: TIdxSkip;
+  i: Integer;
   oldKey: string;
   op: TIdxOp;
   p: TPair<string, TIdxOp>;
-  tmpEntry: TIdxEntry;
-
-  function EntryLB(const Arr: TIdxEntries; const Key, Pk: string): Integer;
-  var
-    lo, hi, m, c: Integer;
-  begin
-    lo := 0;
-    hi := Length(Arr);
-    while lo < hi do
-    begin
-      m := (lo + hi) div 2;
-      if isMulti then
-        c := VDbIdxMultiCmp(Arr[m].Key, Key, ctMulti)
-      else
-        c := VDbIdxCmp(Arr[m].Key, Key, ct);
-      if c = 0 then
-        c := CompareStr(Arr[m].Pk, Pk);
-      if c < 0 then lo := m + 1 else hi := m;
-    end;
-    Result := lo;
-  end;
 
 begin
   if not FIdxOps.TryGetValue(k, ops) then Exit;
@@ -6963,11 +7373,6 @@ begin
     FIdxOps.Remove(k);
     Exit;
   end;
-  if not FIdxCtype.TryGetValue(k, ct) then ct := VCT_STR;
-  if not FMemIdx.TryGetValue(k, e) then SetLength(e, 0);
-  isMulti := IdxNPartsByKey(k) > 1;
-  if isMulti then
-    ctMulti := IdxCtypesByKey(k);
 
   // 1) her satir icin son durumu belirle
   lastOp := TDictionary<string, TIdxOp>.Create;
@@ -6981,179 +7386,129 @@ begin
       oldKeys.Add(ops[i].Pk, ops[i].Key);
   end;
 
-  // 1b) KUCUK DELTA HIZLI YOLU: tek satir update/delete + sorgu dongusunde
-  // tum N girdiyi yeniden birlestirmek yerine yalniz eski girdiyi cikar,
-  // yenisini sirali konuma ekle. Her islem O(N) kaydirma yapar ama sabit
-  // katsayi dusuktur; N buyuk, delta kucukken merge'den cok daha hizli.
-  if (lastOp.Count <= 8) and FMemIdx.ContainsKey(k) then
+  // H3: kanonik indeks skiplist ise bekleyen islemleri O(log N) uygula.
+  // Siralanmis dizi guncellenmez; FMemIdx yalnizca cold okuma cache'i olarak
+  // gecersiz kilinir.
+  if (not FSkipIdx.ContainsKey(k)) and FMemIdx.TryGetValue(k, e) then
+    SetIdxSkipFromEntries(k, e);
+  if FSkipIdx.TryGetValue(k, sk) then
   begin
     for p in lastOp do
     begin
       op := p.Value;
       if oldKeys.TryGetValue(op.Pk, oldKey) then
-      begin
-        pos := EntryLB(e, oldKey, op.Pk);
-        if (pos < Length(e)) and (e[pos].Pk = op.Pk) and
-           (e[pos].Key = oldKey) then
-        begin
-          // Anahtar degismedi (ornegin yalniz INCLUDE kolonu): yerinde guncelle.
-          if (not op.IsDel) and (op.Key = oldKey) then
-          begin
-            e[pos].Cov := op.Cov;
-            Continue;
-          end;
-          if op.IsDel then
-          begin
-            // Silme: cikarilacak degeri geciciye al, kuyrugu ham Move ile
-            // sola kaydir, son yuva kopyasini FillChar ile sifirla.
-            tmpEntry := e[pos];
-            e[pos] := Default(TIdxEntry);
-            oldLen := Length(e);
-            if pos < oldLen - 1 then
-            begin
-              Move(e[pos + 1], e[pos],
-                (oldLen - pos - 1) * SizeOf(TIdxEntry));
-              FillChar(e[oldLen - 1], SizeOf(TIdxEntry), 0);
-            end;
-            SetLength(e, oldLen - 1);
-            tmpEntry := Default(TIdxEntry);
-            Continue;
-          end;
-          // Anahtar degisti: eski girdiyi cikarip yenisini AYNI dizide,
-          // yalniz iki konum arasindaki dilimi kaydirarak yerlestir.
-          // SetLength buyut/kucult yok; tek Move + tek FillChar.
-          pNew := EntryLB(e, op.Key, op.Pk);
-          if pNew > pos then target := pNew - 1 else target := pNew;
-          tmpEntry := e[pos];
-          e[pos] := Default(TIdxEntry);
-          if target > pos then
-          begin
-            Move(e[pos + 1], e[pos],
-              (target - pos) * SizeOf(TIdxEntry));
-            FillChar(e[target], SizeOf(TIdxEntry), 0);
-          end
-          else if target < pos then
-          begin
-            Move(e[target], e[target + 1],
-              (pos - target) * SizeOf(TIdxEntry));
-            FillChar(e[target], SizeOf(TIdxEntry), 0);
-          end;
-          e[target].Key := op.Key;
-          e[target].Pk := op.Pk;
-          e[target].Cov := op.Cov;
-          tmpEntry := Default(TIdxEntry);
-          Continue;
-        end;
-      end;
+        sk.Remove(oldKey, op.Pk);
       if not op.IsDel then
-      begin
-        pos := EntryLB(e, op.Key, op.Pk);
-        oldLen := Length(e);
-        SetLength(e, oldLen + 1);
-        if pos < oldLen then
-        begin
-          Move(e[pos], e[pos + 1],
-            (oldLen - pos) * SizeOf(TIdxEntry));
-          FillChar(e[pos], SizeOf(TIdxEntry), 0);
-        end;
-        e[pos].Key := op.Key;
-        e[pos].Pk := op.Pk;
-        e[pos].Cov := op.Cov;
-      end;
+        sk.Add(op.Key, op.Pk, op.Cov);
     end;
-    oldKeys.Free;
+    FMemIdx.Remove(k);   // dizi cache'i bayat
     lastOp.Free;
-    FMemIdx.AddOrSetValue(k, e);
+    oldKeys.Free;
     ops.Free;
     FIdxOps.Remove(k);
-    FIdxDirty.Delete(FIdxDirty.IndexOf(k));
+    i := FIdxDirty.IndexOf(k);
+    if i >= 0 then FIdxDirty.Delete(i);
     Exit;
   end;
-  oldKeys.Free;
 
-  // 2) commitlenmis girdilerden bu toplantida dokunulan satirlari cikar
-  // En fazla eski girdiler kadar sonuc kalabilir.
-  SetLength(keep, Length(e));
-  nKeep := 0;
-  for i := 0 to High(e) do
-  begin
-    if lastOp.ContainsKey(e[i].Pk) then Continue;
-    keep[nKeep] := e[i];
-    Inc(nKeep);
-  end;
-  SetLength(keep, nKeep);
-
-  // 3) hala var olan satirlar icin YENI delta girdilerini topla
-  SetLength(delta, ops.Count);
-  nDelta := 0;
-  added := TDictionary<string, Boolean>.Create;
-  for i := 0 to ops.Count - 1 do
-    if not ops[i].IsDel then
-    begin
-      if added.ContainsKey(ops[i].Pk) then Continue;
-      // bu satirin SON durumu silme mi? (daha sonraki bir op geci kalmis olabilir)
-      if lastOp[ops[i].Pk].IsDel then Continue;
-      added.AddOrSetValue(ops[i].Pk, True);
-      delta[nDelta].Key := ops[i].Key;
-      delta[nDelta].Pk := ops[i].Pk;
-      delta[nDelta].Cov := ops[i].Cov;   // F-19
-      Inc(nDelta);
-    end;
-  added.Free;
+  // Indeks henuz kurulmadiysa bekleyenler atilir; ilk okuma BuildOneIndex
+  // ile TUM veriden dogru indeksi kurar.
   lastOp.Free;
-  SetLength(delta, nDelta);
-
-  // 4) KR-5 Delta Merge: Delta'yi tek basina sirala, sonra sirali keep ile O(N+M) birlestir
-  if isMulti then
-    SortIdxEntriesCols(delta, ctMulti)
-  else
-    SortIdxEntries(delta, ct);
-
-  if nKeep = 0 then
-    merged := delta
-  else if nDelta = 0 then
-    merged := keep
-  else
-  begin
-    SetLength(merged, nKeep + nDelta);
-    iKeep := 0; iDelta := 0; iMerged := 0;
-    while (iKeep < nKeep) and (iDelta < nDelta) do
-    begin
-      if isMulti then
-        cmp := VDbIdxMultiCmp(keep[iKeep].Key, delta[iDelta].Key, ctMulti)
-      else
-        cmp := VDbIdxCmp(keep[iKeep].Key, delta[iDelta].Key, ct);
-      if cmp = 0 then
-        cmp := CompareStr(keep[iKeep].Pk, delta[iDelta].Pk);
-
-      if cmp <= 0 then
-      begin
-        merged[iMerged] := keep[iKeep];
-        Inc(iKeep);
-      end
-      else
-      begin
-        merged[iMerged] := delta[iDelta];
-        Inc(iDelta);
-      end;
-      Inc(iMerged);
-    end;
-    while iKeep < nKeep do
-    begin
-      merged[iMerged] := keep[iKeep];
-      Inc(iKeep); Inc(iMerged);
-    end;
-    while iDelta < nDelta do
-    begin
-      merged[iMerged] := delta[iDelta];
-      Inc(iDelta); Inc(iMerged);
-    end;
-  end;
-
-  FMemIdx.AddOrSetValue(k, merged);
+  oldKeys.Free;
   ops.Free;
   FIdxOps.Remove(k);
-  FIdxDirty.Delete(FIdxDirty.IndexOf(k));
+  i := FIdxDirty.IndexOf(k);
+  if i >= 0 then FIdxDirty.Delete(i);
+  Exit;
+end;
+
+procedure TVTableDb.FreeIdxSkips;
+var
+  kv: TPair<Int64, TIdxSkip>;
+begin
+  if FSkipIdx = nil then Exit;
+  for kv in FSkipIdx do kv.Value.Free;
+  FSkipIdx.Clear;
+end;
+
+procedure TVTableDb.SetIdxSkipFromEntries(const k: Int64; const E: TIdxEntries);
+var
+  sk: TIdxSkip;
+  ct: Byte;
+  cts: TByteArray;
+begin
+  cts := IdxCtypesByKey(k);
+  if Length(cts) = 0 then
+  begin
+    if not FIdxCtype.TryGetValue(k, ct) then ct := VCT_STR;
+    SetLength(cts, 1);
+    cts[0] := ct;
+  end
+  else if not FIdxCtype.TryGetValue(k, ct) then
+    ct := cts[0];
+  if FSkipIdx.TryGetValue(k, sk) then sk.Free;
+  sk := TIdxSkip.Create(ct, cts);
+  sk.LoadFromEntries(E);
+  FSkipIdx.AddOrSetValue(k, sk);
+end;
+
+function TVTableDb.TryGetIdxSource(TableId: Word; ColIdx: Integer;
+  out Src: TIdxSource): Boolean;
+var
+  k: Int64;
+  nm: string;
+  t: TTableDef;
+  j: Integer;
+  e: TIdxEntries;
+  sk: TIdxSkip;
+begin
+  Result := False;
+  Src.Skip := nil;
+  SetLength(Src.Arr, 0);
+  k := IdxKey(TableId, ColIdx);
+  if FById.TryGetValue(TableId, nm) then
+  begin
+    t := GetTable(nm);
+    for j := 0 to High(t.Idx) do
+      if (t.Idx[j].Col = ColIdx) and (t.Idx[j].Predicate = '') and
+         (t.Idx[j].ExprText = '') and t.Idx[j].Invalid then
+        Exit(False);
+  end;
+  if FIdxDirty.IndexOf(k) >= 0 then
+    FlushIdxPending(k);
+  if not FSkipIdx.ContainsKey(k) then
+  begin
+    if FMemIdx.TryGetValue(k, e) then
+      SetIdxSkipFromEntries(k, e)
+    else if FById.TryGetValue(TableId, nm) then
+    begin
+      t := GetTable(nm);
+      for j := 0 to High(t.Idx) do
+        if (t.Idx[j].Col = ColIdx) and not t.Idx[j].Invalid then
+        begin
+          BuildOneIndex(t, j);
+          if FMemIdx.TryGetValue(k, e) then
+            SetIdxSkipFromEntries(k, e);
+          Break;
+        end;
+    end;
+  end;
+  if FSkipIdx.TryGetValue(k, sk) then
+  begin
+    Src.Skip := sk;
+    Src.Ctype := sk.Cmp.Ctype;
+    Src.NParts := IdxNPartsByKey(k);
+    Exit(True);
+  end;
+  // PK lazy index / dizi yedegi: eski yolu kullan.
+  if TryGetMemIndex(TableId, ColIdx, e) then
+  begin
+    Src.Arr := e;
+    if not FIdxCtype.TryGetValue(k, Src.Ctype) then
+      Src.Ctype := VCT_STR;
+    Src.NParts := IdxNPartsByKey(k);
+    Result := True;
+  end;
 end;
 
 function TVTableDb.TryGetMemIndex(TableId: Word; ColIdx: Integer; out Entries: TIdxEntries): Boolean;
@@ -7170,6 +7525,8 @@ var
   t: TTableDef;
   j: Integer;
   dirty: Boolean;
+  sk: TIdxSkip;
+  a: TVDbSkipEntryArray;
 begin
   // R-22 Full: bu kolon uzerindeki NORMAL indekslerden biri INVALID ise
   // (concurrent insa suruyor / yarida kaldi) indeks OKUNMAZ ve bekleyen
@@ -7189,7 +7546,20 @@ begin
     FlushIdxPending(k);
   if not FMemIdx.ContainsKey(k) then
   begin
-    if FById.TryGetValue(TableId, nm) then
+    if FSkipIdx.TryGetValue(k, sk) then
+    begin
+      // H3: dizi yalnizca cold okuma icin skiplist'ten malzeme edilir.
+      sk.List.All(a);
+      SetLength(Entries, Length(a));
+      for j := 0 to High(a) do
+      begin
+        Entries[j].Key := a[j].Key;
+        Entries[j].Pk := a[j].Value;
+        Entries[j].Cov := a[j].Cov;
+      end;
+      FMemIdx.AddOrSetValue(k, Entries);
+    end
+    else if FById.TryGetValue(TableId, nm) then
     begin
       t := GetTable(nm);
       for j := 0 to High(t.Idx) do
@@ -7390,6 +7760,11 @@ begin
         // indeks hem bellekten hem de tampondan KALDIRILIR
         DropIdxPend(IdxKeyPos(t, j));   // F-17: partial indeks anahtari
         FMemIdx.Remove(IdxKeyPos(t, j));
+        if FSkipIdx.ContainsKey(IdxKeyPos(t, j)) then
+        begin
+          FSkipIdx[IdxKeyPos(t, j)].Free;
+          FSkipIdx.Remove(IdxKeyPos(t, j));
+        end;
         FIdxCtype.Remove(IdxKeyPos(t, j));
         for m := j to High(t.Idx) - 1 do
           t.Idx[m] := t.Idx[m + 1];
@@ -7690,7 +8065,14 @@ begin
   FAutoInc.Remove(t.TableId);   // P-17a: dusen tablonun sicak sayaci temizle
   FById.Remove(t.TableId);
   for j := 0 to High(t.Idx) do
+  begin
     FMemIdx.Remove(IdxKey(t.TableId, t.Idx[j].Col));
+    if FSkipIdx.ContainsKey(IdxKey(t.TableId, t.Idx[j].Col)) then
+    begin
+      FSkipIdx[IdxKey(t.TableId, t.Idx[j].Col)].Free;
+      FSkipIdx.Remove(IdxKey(t.TableId, t.Idx[j].Col));
+    end;
+  end;
   // F2-6: Artik var olmayan tabloya isaret eden FK TANIMLARINI cocuk
   // tablolardan kaldir. Aksi halde cocukta sonraki INSERT'ler FK
   // denetiminde "tablo yok" ile kacar ve tablo kalici kullanilamaz
@@ -7954,8 +8336,9 @@ var
   i, lo, hi, n, m: Integer;
   l2, h2: Integer;
   e: TIdxEntries;
+  src: TIdxSource;
   rv: TStrArray;
-  w: string;
+  w, vmin, vmax: string;
   ct: Byte;
 begin
   SetLength(Pks, 0);
@@ -7981,46 +8364,47 @@ begin
   for i := 0 to High(Groups[0]) do
   begin
     if (Groups[0][i].Col < 0) or (Groups[0][i].Col >= Length(T.Cols)) then Continue;
-    if not TryGetMemIndex(T.TableId, Groups[0][i].Col, e) then Continue;
-    ct := T.Cols[Groups[0][i].Col].Ctype;
+    if not TryGetIdxSource(T.TableId, Groups[0][i].Col, src) then Continue;
     w := Groups[0][i].Op;
-    lo := 0;
-    hi := Length(e);
     if (w = '=') or (w = '>') or (w = '>=') or (w = '<') or (w = '<=') then
     begin
-      if not VDbIdxRange(e, ct, w, Groups[0][i].Val, lo, hi) then Continue;
+      if IdxSourceRange(src, w, Groups[0][i].Val, e) <= 0 then Continue;
     end
     else if w = 'BETWEEN' then
     begin
-      if not VDbIdxRange(e, ct, '>=', Groups[0][i].Val, lo, hi) then Continue;
-      if Length(Groups[0][i].Vals) > 0 then
-        VDbIdxRange(e, ct, '<=', Groups[0][i].Vals[0], lo, hi);
+      if Length(Groups[0][i].Vals) = 0 then Continue;
+      if IdxSourceRangeBounds(src, Groups[0][i].Val, Groups[0][i].Vals[0],
+        True, True, True, True, e) <= 0 then Continue;
     end
     else if w = 'IN' then
     begin
       // TUM degerleri kapsayan TEK aralik (UST KUME; sonra elenir).
-      // alt sinir = en kucuk degerin '>=' baslangici (min)
-      // ust sinir = en buyuk degerin '<=' bitisi     (max)
-      lo := MaxInt;
-      hi := 0;
+      vmin := ''; vmax := ''; n := 0;
       for m := 0 to High(Groups[0][i].Vals) do
       begin
-        if VDbIdxRange(e, ct, '>=', Groups[0][i].Vals[m], l2, h2) then
-          if l2 < lo then lo := l2;
-        if VDbIdxRange(e, ct, '<=', Groups[0][i].Vals[m], l2, h2) then
-          if h2 > hi then hi := h2;
+        if n = 0 then
+        begin vmin := Groups[0][i].Vals[m]; vmax := vmin; end
+        else
+        begin
+          if IdxSourceCompareVal(src, Groups[0][i].Vals[m], vmin) < 0 then
+            vmin := Groups[0][i].Vals[m];
+          if IdxSourceCompareVal(src, Groups[0][i].Vals[m], vmax) > 0 then
+            vmax := Groups[0][i].Vals[m];
+        end;
+        Inc(n);
       end;
-      if (lo = MaxInt) or (hi = 0) then Continue;
+      if n = 0 then Continue;
+      if IdxSourceRangeBounds(src, vmin, vmax, True, True, True, True, e) <= 0 then
+        Continue;
     end
     else
       Continue;
-    if lo > hi then lo := hi;
     // dilimdeki PKlari topla; satirlari SADECE onlar icin oku
     // KR-2: on-tahsis ile O(N^2) SetLength(+1) kopyalamasi engellenir.
-    SetLength(Pks, hi - lo);
-    SetLength(Rows, hi - lo);
+    SetLength(Pks, Length(e));
+    SetLength(Rows, Length(e));
     n := 0;
-    for m := lo to hi - 1 do
+    for m := 0 to High(e) do
     begin
       if not ReadRow(T.Name, e[m].Pk, rv) then Continue;
       if not VDbMatchGroups(rv, Groups) then Continue;

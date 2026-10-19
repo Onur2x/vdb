@@ -410,17 +410,21 @@ sqlite_diff:  4000/4000  (SQLite WHERE diferansiyeli, 4×1000)
 hashchk:      80/80      (hash birebir)
 copychk:      17/17      (COPY CSV/TEXT + atomiklik)
 zonechk:      0 hata     (zone map doğruluk/performans)
-skipchk:      0 hata     (H3 skiplist prototipi: 200k oracle + 1M ölçüm)
+skipchk:      0 hata     (H3 skiplist: 200k oracle + rank/span doğrulaması + 1M ölçüm)
 countchk:     120/120    (indeksli COUNT(*) + aralık kesinliği, indekssiz oracle)
 vdbcrypttest:   60/60
 vdbapitest:    170/170
 vdbclienttest: 101/101
 ```
 
-**H3 küçük-delta + indeksli COUNT (2026-10-19):** 100.000 satırda
-100 × (UPDATE + indeksli `COUNT(*)`) **24,99 → 0,41 ms/döngü (~61x)**;
-indeksli COUNT (pending yok) **0,01 ms**. `countchk` indeksli tabloyu
-indekssiz oracle ile karşılaştırır: **108/108**.
+**H3 skiplist tam entegrasyonu (2026-10-19):** `VDbSkipList` artık kanonik
+indeks; `FlushIdxPending` bekleyen değişiklikleri O(log N) uygular ve sıralı
+dizi yalnızca cold okuma cache'i olarak kalır. Rank/span sayesinde indeksli
+`COUNT(*)` aralığı O(log N) sayar. 100.000 satırda
+100 × (UPDATE + indeksli `COUNT(*)`) **24,99 → 0,39–0,42 ms/döngü
+(~60–64x)**; indeksli COUNT (pending yok) **0,01 ms**; ilk flush **1,3 ms**.
+`countchk`
+indeksli tabloyu indekssiz oracle ile karşılaştırır: **120/120**.
 
 **R-12 Tamamlandı:**
 - ✅ Auth/Oturum (`Login`/`Logout`)
@@ -429,7 +433,7 @@ indekssiz oracle ile karşılaştırır: **108/108**.
 - ✅ Mutasyon: 3 kapı (FAIL→geri al→yeşil)
 
 ### EN: Current Status (2026-10-15)
-sqltest **2527/2527 (all green, including M10 IDENTITY, JSONPath union/logical filters/filter functions/field comparison, M5 FTS phrase/negation, M9 in-process OTel spans, and pgwire COPY/multi-statement/SQLSTATE plus extended-protocol COPY)**, crash-durability suite **8/8** (kill at arbitrary points, zero data loss), H3 skiplist prototype gate **skipchk** green (200k oracle checks + 1M-entry benchmark), **countchk 120/120** (indexed COUNT(*) and range-exactness against an unindexed oracle), plus crypt (60/60), DLL API (170/170) and client (101/101) suites green. The new small-delta index update path plus index-only COUNT reduces 100 × (UPDATE + indexed COUNT) on a 100k-row table from **24.99 ms to 0.41 ms per cycle (~61x)** (`idxbench`). All R-12 features (Auth, Prepared Statements, Pool Capacity) are complete and mutation-tested.
+sqltest **2527/2527 (all green, including M10 IDENTITY, JSONPath union/logical filters/filter functions/field comparison, M5 FTS phrase/negation, M9 in-process OTel spans, and pgwire COPY/multi-statement/SQLSTATE plus extended-protocol COPY)**, crash-durability suite **8/8** (kill at arbitrary points, zero data loss), H3 skiplist gate **skipchk** green (200k oracle checks, rank/span brute-force validation, and a 1M-entry benchmark), **countchk 120/120** (indexed COUNT(*) and range-exactness against an unindexed oracle), plus crypt (60/60), DLL API (170/170) and client (101/101) suites green. The skiplist is now the canonical secondary index: pending changes are applied in O(log N), rank/span makes indexed COUNT O(log N), and the sorted array is only a cold cache. On a 100k-row table, 100 × (UPDATE + indexed COUNT) drops from **24.99 ms to 0.39–0.42 ms per cycle (~60–64x)** (`idxbench`). All R-12 features (Auth, Prepared Statements, Pool Capacity) are complete and mutation-tested.
 
 ---
 

@@ -20,6 +20,16 @@ const
   N_DEL = 50000;
   BENCH_N = 1000000;
 
+type
+  TCmp = class
+    function C(const A, B: string): Integer;
+  end;
+
+function TCmp.C(const A, B: string): Integer;
+begin
+  Result := CompareStr(A, B);
+end;
+
 var
   fails: Integer;
   GFreq: Int64;
@@ -124,8 +134,9 @@ var
   L: TVDbSkipList;
   SL: TStringList;
   arr: TVDbSkipEntryArray;
+  cmp: TCmp;
   Keys, Vals: array of string;
-  i, j, p, lo, hi, cnt: Integer;
+  i, j, p, lo, hi, cnt, allCnt, brute, rankLo, rankHi: Integer;
   rnd: Cardinal;
   key, val, s, oval: string;
   lb: TVDbSkipEntry;
@@ -134,6 +145,7 @@ var
 begin
   L := TVDbSkipList.Create(32, 20261019);
   SL := TStringList.Create;
+  cmp := TCmp.Create;
   try
     SL.Sorted := True;
     SL.Duplicates := dupAccept;
@@ -176,6 +188,40 @@ begin
       end;
     end;
     Check(ok, 'All sirasi');
+
+    allCnt := cnt;
+    // H3 rank/span: CountRange ve RankBefore, All uzerinden brute-force
+    // sayimla birebir ayni olmali (dahil/haric sinirlar dahil).
+    rnd := 2026;
+    for i := 0 to 199 do
+    begin
+      rnd := rnd * 1664525 + 1013904223;
+      lo := rnd mod 190000;
+      rnd := rnd * 1664525 + 1013904223;
+      hi := lo + (rnd mod 60);
+      for p := 0 to 3 do
+      begin
+        brute := 0;
+        for j := 0 to allCnt - 1 do
+          if (p = 0) and (arr[j].Key >= K(lo)) and (arr[j].Key <= K(hi)) then Inc(brute)
+          else if (p = 1) and (arr[j].Key > K(lo)) and (arr[j].Key < K(hi)) then Inc(brute)
+          else if (p = 2) and (arr[j].Key >= K(lo)) and (arr[j].Key < K(hi)) then Inc(brute)
+          else if (p = 3) and (arr[j].Key > K(lo)) and (arr[j].Key <= K(hi)) then Inc(brute);
+        cnt := L.CountRange(K(lo), K(hi), True, True,
+          (p = 0) or (p = 2), (p = 0) or (p = 3), cmp.C);
+        Check(cnt = brute, Format('CountRange p=%d [%d..%d]', [p, lo, hi]));
+      end;
+      rankLo := L.RankBefore(K(lo), cmp.C, False);
+      rankHi := L.RankBefore(K(lo), cmp.C, True);
+      brute := 0;
+      for j := 0 to allCnt - 1 do
+        if arr[j].Key < K(lo) then Inc(brute);
+      Check(rankLo = brute, 'RankBefore <');
+      brute := 0;
+      for j := 0 to allCnt - 1 do
+        if arr[j].Key <= K(lo) then Inc(brute);
+      Check(rankHi = brute, 'RankBefore <=');
+    end;
 
     rnd := 777;
     for i := 0 to N_FIND - 1 do
@@ -257,6 +303,7 @@ begin
   finally
     SL.Free;
     L.Free;
+    cmp.Free;
   end;
 end;
 

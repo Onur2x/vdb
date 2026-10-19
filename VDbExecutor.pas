@@ -3669,6 +3669,15 @@ var
   covPos: Integer;      // F-19: index-only tarama icin indeks konumu
   covAll: Boolean;
   st: TVDbTableStats;   // R-15 Full CBO: ANALYZE istatistigi
+  // H3: skiplist/dizi ortak aralik kaynagi
+  src, bestSrc: TIdxSource;
+  hasLo, hasHi: Boolean;
+  bestLoInc, bestHiInc: Boolean;
+  condHasLo, condHasHi: Boolean;
+  condLoInc, condHiInc: Boolean;
+  bestLoVal, bestHiVal: string;
+  condLoVal, condHiVal, minVal, maxVal: string;
+  cmpV: Integer;
 
   procedure Push(C: TSqlExprNode);
   begin
@@ -3808,34 +3817,47 @@ begin
         end;
 
     // --- 2) indeks dilimi ---
-    bestCol := -1; bestLo := 0; bestHi := 0; foundRange := False; exactRange := False;
+    bestCol := -1; foundRange := False; exactRange := False;
     nUsed := 0; hasIn := False; hasLower := False;
+    hasLo := False; hasHi := False;
+    bestLoVal := ''; bestHiVal := ''; bestLoInc := True; bestHiInc := True;
     for i := 0 to conj.Count - 1 do
     begin
-      lo := 0; hi := 0;
+      condHasLo := False; condHasHi := False;
+      condLoInc := True; condHiInc := True;
+      condLoVal := ''; condHiVal := '';
       isIn := False;
       // 2a) basit karsilastirma
       if AsSimple(conj[i], ci, pkVal, op) then
       begin
-        opName := '';
         case op of
-          sboEq:  opName := '=';
-          sboGt:  opName := '>';
-          sboGte: opName := '>=';
-          sboLt:  opName := '<';
-          sboLte: opName := '<=';
+          sboEq:
+            begin
+              condHasLo := True; condHasHi := True;
+              condLoInc := True; condHiInc := True;
+              condLoVal := pkVal; condHiVal := pkVal;
+              hasLower := True;
+            end;
+          sboGt:
+            begin
+              condHasLo := True; condLoInc := False; condLoVal := pkVal;
+              hasLower := True;
+            end;
+          sboGte:
+            begin
+              condHasLo := True; condLoInc := True; condLoVal := pkVal;
+              hasLower := True;
+            end;
+          sboLt:
+            begin
+              condHasHi := True; condHiInc := False; condHiVal := pkVal;
+            end;
+          sboLte:
+            begin
+              condHasHi := True; condHiInc := True; condHiVal := pkVal;
+            end;
         end;
-        if opName <> '' then
-        begin
-          if not FT.TryGetMemIndex(Td.TableId, ci, e) then Continue;
-          if not VDbIdxRangeL(e, Td.Cols[ci].Ctype, opName, pkVal, FT.IdxNParts(Td.TableId, ci), lo, hi) then
-            Continue;
-          // >, >=, = bir ALT SINIR getirir; indekste NULL/bos anahtar
-          // (en basta) boylece dilim disinda kalir.
-          if (op = sboGt) or (op = sboGte) or (op = sboEq) then
-            hasLower := True;
-        end
-        else Continue;
+        if (not condHasLo) and (not condHasHi) then Continue;
       end
       // 2b) BETWEEN a AND b
       else if (conj[i] is TSqlBetweenNode) and
@@ -3850,17 +3872,11 @@ begin
           if VDbNorm(Td.Cols[n].Name) = VDbNorm(cr.ColumnName) then
           begin ci := n; Break; end;
         if ci < 0 then Continue;
-        if not FT.TryGetMemIndex(Td.TableId, ci, e) then Continue;
-        ct := Td.Cols[ci].Ctype;
-        nParts := FT.IdxNParts(Td.TableId, ci);
+        condHasLo := True; condLoInc := True;
+        condLoVal := TSqlLiteralNode(TSqlBetweenNode(conj[i]).LowBound).AsString;
+        condHasHi := True; condHiInc := True;
+        condHiVal := TSqlLiteralNode(TSqlBetweenNode(conj[i]).HighBound).AsString;
         hasLower := True;
-        if not VDbIdxRangeL(e, ct, '>=',
-             TSqlLiteralNode(TSqlBetweenNode(conj[i]).LowBound).AsString, nParts, l2, h2) then
-          Continue;
-        lo := l2; hi := Length(e);
-        if VDbIdxRangeL(e, ct, '<=',
-             TSqlLiteralNode(TSqlBetweenNode(conj[i]).HighBound).AsString, nParts, l2, h2) then
-          if h2 < hi then hi := h2;
       end
       // 2c) IN (a, b, c, ...)
       else if (conj[i] is TSqlInNode) and (not TSqlInNode(conj[i]).IsNot) and
@@ -3873,51 +3889,73 @@ begin
           if VDbNorm(Td.Cols[n].Name) = VDbNorm(cr.ColumnName) then
           begin ci := n; Break; end;
         if (ci < 0) or (TSqlInNode(conj[i]).List.Count = 0) then Continue;
-        if not FT.TryGetMemIndex(Td.TableId, ci, e) then Continue;
-        ct := Td.Cols[ci].Ctype;
-        nParts := FT.IdxNParts(Td.TableId, ci);
-        lo := MaxInt; hi := 0;
-        for n := 0 to TSqlInNode(conj[i]).List.Count - 1 do
+        if (not FT.TryGetIdxSource(Td.TableId, ci, src)) then Continue;
+        minVal := ''; maxVal := ''; n := 0;
+        for lo := 0 to TSqlInNode(conj[i]).List.Count - 1 do
         begin
-          if not (TSqlInNode(conj[i]).List[n] is TSqlLiteralNode) then Continue;
-          pkVal := TSqlLiteralNode(TSqlInNode(conj[i]).List[n]).AsString;
-          // alt sinir: EN KUCUK degerin '>=' baslangici
-          if VDbIdxRangeL(e, ct, '>=', pkVal, nParts, l2, h2) then
-            if l2 < lo then lo := l2;
-          // ust sinir: EN BUYUK degerin '<=' bitisi
-          if VDbIdxRangeL(e, ct, '<=', pkVal, nParts, l2, h2) then
-            if h2 > hi then hi := h2;
+          if not (TSqlInNode(conj[i]).List[lo] is TSqlLiteralNode) then Continue;
+          pkVal := TSqlLiteralNode(TSqlInNode(conj[i]).List[lo]).AsString;
+          if n = 0 then
+          begin minVal := pkVal; maxVal := pkVal; end
+          else
+          begin
+            if IdxSourceCompareVal(src, pkVal, minVal) < 0 then minVal := pkVal;
+            if IdxSourceCompareVal(src, pkVal, maxVal) > 0 then maxVal := pkVal;
+          end;
+          Inc(n);
         end;
-        if (lo = MaxInt) or (hi = 0) then Continue;
+        if n = 0 then Continue;
+        condHasLo := True; condLoInc := True; condLoVal := minVal;
+        condHasHi := True; condHiInc := True; condHiVal := maxVal;
       end
       else Continue;
 
       // ONEMLI: birden fazla indeks kosulu ancak AYNI KOLONDA ise
-      // kesisilir. Farkli kolonlarda kesisim anlamsizdir (iki farkli
-      // indeks dizisinin konumlari birbirine denk gelmez) ve hatta
-      // dizi sonuna tasmaya yol acardi. Farkli kolonlu kosul yok sayilir;
-      // sonuctaki satirlar yine RowMatches ile dogrulanir.
+      // kesisilir. Farkli kolonlarda kesisim anlamsizdir.
       if foundRange and (ci <> bestCol) then Continue;
+      if (not isIn) and (not FT.TryGetIdxSource(Td.TableId, ci, src)) then
+        Continue;
 
-      Inc(nUsed);
-      if isIn then hasIn := True;
       if not foundRange then
       begin
-        foundRange := True; bestCol := ci; bestLo := lo; bestHi := hi;
-      end
-      else
+        foundRange := True;
+        bestCol := ci;
+        bestSrc := src;
+      end;
+      Inc(nUsed);
+      if isIn then hasIn := True;
+      if condHasLo then
       begin
-        if lo > bestLo then bestLo := lo;
-        if hi < bestHi then bestHi := hi;
+        if (not hasLo) or
+           (IdxSourceCompareVal(bestSrc, condLoVal, bestLoVal) > 0) or
+           ((IdxSourceCompareVal(bestSrc, condLoVal, bestLoVal) = 0) and
+            (not condLoInc) and bestLoInc) then
+        begin
+          hasLo := True; bestLoVal := condLoVal; bestLoInc := condLoInc;
+        end;
+      end;
+      if condHasHi then
+      begin
+        if (not hasHi) or
+           (IdxSourceCompareVal(bestSrc, condHiVal, bestHiVal) < 0) or
+           ((IdxSourceCompareVal(bestSrc, condHiVal, bestHiVal) = 0) and
+            (not condHiInc) and bestHiInc) then
+        begin
+          hasHi := True; bestHiVal := condHiVal; bestHiInc := condHiInc;
+        end;
       end;
     end;
 
     if not foundRange then Exit;   // -> tam tarama
-    if bestHi <= bestLo then       // kesim bos
+    if hasLo and hasHi then
     begin
-      IsExact := True;
-      if FCountOnly then FCountResult := 0;
-      Exit(True);                  // 0 satir, tam tarama gerekmez
+      cmpV := IdxSourceCompareVal(bestSrc, bestLoVal, bestHiVal);
+      if (cmpV > 0) or ((cmpV = 0) and ((not bestLoInc) or (not bestHiInc))) then
+      begin
+        IsExact := True;
+        if FCountOnly then FCountResult := 0;
+        Exit(True);                  // 0 satir, tam tarama gerekmez
+      end;
     end;
     // Ayni kolondaki BITISIK araliklarin (>, >=, <, <=, =, BETWEEN) kesisimi
     // WHERE'in tamamini temsil eder. IN AYRIK bir kumedir: [min,max]
@@ -3939,7 +3977,8 @@ begin
         SetLength(Rows, 0);
         Exit;
       end;
-      FCountResult := bestHi - bestLo;
+      FCountResult := IdxSourceCountBounds(bestSrc, bestLoVal, bestHiVal,
+        hasLo, hasHi, bestLoInc, bestHiInc);
       SetLength(Pks, 0);
       SetLength(Rows, 0);
       IsExact := True;
@@ -3951,19 +3990,29 @@ begin
     begin
       covPos := FT.IdxPosOfCol(Td.TableId, bestCol);
       covAll := (covPos >= 0) and FT.IdxCoversAll(Td, covPos);
-      if not VdbIndexIsSelective(st.RowCount, bestHi - bestLo, covAll) then
+      if not VdbIndexIsSelective(st.RowCount,
+        IdxSourceCountBounds(bestSrc, bestLoVal, bestHiVal,
+          hasLo, hasHi, bestLoInc, bestHiInc), covAll) then
         Exit;  // False -> cagri FT.ScanRows ile tam tarama yapar
     end;
 
-    // e dizisini KULLANILACAK kolona bagla
-    if not FT.TryGetMemIndex(Td.TableId, bestCol, e) then Exit;
+    // Kullanilacak kolonun dilimini skiplist'ten/diziden al.
+    if IdxSourceRangeBounds(bestSrc, bestLoVal, bestHiVal,
+      hasLo, hasHi, bestLoInc, bestHiInc, e) <= 0 then
+    begin
+      SetLength(Pks, 0);
+      SetLength(Rows, 0);
+      IsExact := exactRange;
+      Result := True;
+      Exit;
+    end;
 
-    SetLength(Pks, bestHi - bestLo);
-    SetLength(Rows, bestHi - bestLo);
+    SetLength(Pks, Length(e));
+    SetLength(Rows, Length(e));
     n := 0;
     covPos := FT.IdxPosOfCol(Td.TableId, bestCol);
     covAll := (covPos >= 0) and FT.IdxCoversAll(Td, covPos);
-    for i := bestLo to bestHi - 1 do
+    for i := 0 to High(e) do
       if covAll and FT.ReadRowCovered(Td, covPos, e[i], oneRow) then
       begin
         Pks[n] := e[i].Pk;
@@ -4043,6 +4092,10 @@ function TVSqlExecutor.TryIndexOrder(const Td: TTableDef; Stmt: TSqlSelectStmt;
 // hicbir siralama yapilmaz; satirlar indeks sirasiyla okunur.
 var
   e: TIdxEntries;
+  src: TIdxSource;
+  hasLo, hasHi, loInc, hiInc: Boolean;
+  loVal, hiVal: string;
+  cmpV: Integer;
   ci, lo, hi, l2, h2, i, j, n, off, lim, need: Integer;
   desc: Boolean;
   descAny: Boolean;
@@ -4108,7 +4161,7 @@ begin
   if descAny then Exit;
 
   ci := oCols[0];
-  if not FT.TryGetMemIndex(Td.TableId, ci, e) then Exit;
+  if not FT.TryGetIdxSource(Td.TableId, ci, src) then Exit;
   nIdxCols := FT.IdxNParts(Td.TableId, ci);
   if Stmt.OrderBy.Count > nIdxCols then Exit;
 
@@ -4124,7 +4177,8 @@ begin
 
   // WHERE ile dilim daralt (yalnizca ILK ORDER BY kolonu uzerinden; boylece
   // dilim icinde indeks sirasi ORDER BY sirasiyla ayni kalir)
-  lo := 0; hi := Length(e);
+  hasLo := False; hasHi := False; loInc := True; hiInc := True;
+  loVal := ''; hiVal := '';
   conj := TList<TSqlExprNode>.Create;
   try
     if Stmt.WhereClause <> nil then Push(Stmt.WhereClause);
@@ -4148,13 +4202,44 @@ begin
       if VDbNorm(TSqlColumnRefNode(TSqlBinaryOpNode(conj[i]).Left).ColumnName) <>
          VDbNorm(Td.Cols[ci].Name) then Continue;
       pkVal := TSqlLiteralNode(node.Right).AsString;
-      if not VDbIdxRangeL(e, Td.Cols[ci].Ctype, opName, pkVal,
-      FT.IdxNParts(Td.TableId, ci), l2, h2) then Continue;
-      if l2 > lo then lo := l2;
-      if h2 < hi then hi := h2;
+      case node.Op of
+        sboEq:
+          begin
+            if (not hasLo) or (IdxSourceCompareVal(src, pkVal, loVal) > 0) then
+            begin hasLo := True; loVal := pkVal; loInc := True; end
+            else if (IdxSourceCompareVal(src, pkVal, loVal) = 0) then
+              loInc := loInc and True;
+            if (not hasHi) or (IdxSourceCompareVal(src, pkVal, hiVal) < 0) then
+            begin hasHi := True; hiVal := pkVal; hiInc := True; end
+            else if (IdxSourceCompareVal(src, pkVal, hiVal) = 0) then
+              hiInc := hiInc and True;
+          end;
+        sboGt, sboGte:
+          begin
+            if (not hasLo) or (IdxSourceCompareVal(src, pkVal, loVal) > 0) or
+               ((IdxSourceCompareVal(src, pkVal, loVal) = 0) and
+                (node.Op = sboGt)) then
+            begin hasLo := True; loVal := pkVal; loInc := node.Op = sboGte; end;
+          end;
+        sboLt, sboLte:
+          begin
+            if (not hasHi) or (IdxSourceCompareVal(src, pkVal, hiVal) < 0) or
+               ((IdxSourceCompareVal(src, pkVal, hiVal) = 0) and
+                (node.Op = sboLt)) then
+            begin hasHi := True; hiVal := pkVal; hiInc := node.Op = sboLte; end;
+          end;
+      end;
     end;
   finally
     conj.Free;
+  end;
+  IdxSourceRangeBounds(src, loVal, hiVal, hasLo, hasHi, loInc, hiInc, e);
+  lo := 0; hi := Length(e);
+  if hi <= lo then
+  begin
+    // bos dilim: siralama yolu da dogru bos sonuc verir.
+    Result := True;
+    Exit;
   end;
 
   off := Stmt.OffsetVal;
@@ -4859,7 +4944,8 @@ var
     lMatched: array of Boolean;
     JoinIdxCol1, JoinIdxCol2: Integer;   // sol/sag JOIN kolonlari
     JoinUsePk: Boolean;
-    JoinEntries: TIdxEntries;
+    JoinSrc: TIdxSource;
+    JoinRange: TIdxEntries;
     lo2, hi2: Integer;
     rv2: TStrArray;
     jv: string;
@@ -5250,7 +5336,7 @@ var
         JoinIdxCol2 := -1   // P5-RF: sag surucu klasik dongu kullanir
       else if rDef.PkIndex = JoinIdxCol2 - n1 then
         JoinUsePk := True
-      else if not FT.TryGetMemIndex(rDef.TableId, JoinIdxCol2 - n1, JoinEntries) then
+      else if not FT.TryGetIdxSource(rDef.TableId, JoinIdxCol2 - n1, JoinSrc) then
         JoinIdxCol2 := -1;   // indeks yok -> klasik yol
     end;
     // H2 (2026-10-18): indeks hizli yolu UYGULANMIYORSA ve ON tek esitlikse
@@ -5300,11 +5386,9 @@ var
             matchFound := True;
           end;
         end
-        else if VDbIdxRangeL(JoinEntries, rDef.Cols[JoinIdxCol2 - n1].Ctype, '=', jv,
-                 FT.IdxNParts(rDef.TableId, JoinIdxCol2 - n1),
-                 lo2, hi2) then
-          for k := lo2 to hi2 - 1 do
-            if FT.ReadRow(JC.Table, JoinEntries[k].Pk, rv2) then
+        else if IdxSourceRange(JoinSrc, '=', jv, JoinRange) > 0 then
+          for k := 0 to High(JoinRange) do
+            if FT.ReadRow(JC.Table, JoinRange[k].Pk, rv2) then
             begin
               SetLength(merged, n1 + n2);
               for q := 0 to n1 - 1 do merged[q] := LR[i][q];
