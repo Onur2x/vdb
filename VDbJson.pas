@@ -676,7 +676,7 @@ end;
 { M10 genisletme (2026-10-19): coklu dugum JSONPath degerlendiricisi.
   Destek: $ .ad ["ad"] [n] [a:b] [*] .* ..ad ..* [?(@.alan op literal)]
   op: = == != < <= > >= ; literal: sayi, 'metin', "metin", true/false/null.
-  Filtre birlesimi: && (yuksek oncelik), ||, tek terim ! (parantez opsiyonel).
+  Filtre birlesimi: && (yuksek oncelik), ||, ! ve parantezli compound gruplar.
   Joker/filtre/recursive/slice adimlari coklu sonuc uretir; Get bunlari
   JSON dizi olarak dondurur. }
 
@@ -929,175 +929,217 @@ begin
   if P.Op = '>=' then Exit(cmp >= 0);
 end;
 
-{ M10 (2026-10-19): filtre mantiksal birlesimi.
-  Destek: terimler arasi && / || (&& daha yuksek oncelik) ve tek terim
-  negasyonu (!). Parantez yalnizca tek terimi sarabilir; compound grouping
-  henuz yok. }
+{ M10 (2026-10-19): filtre mantiksal ifade agaci.
+  Destek: && (yuksek oncelik), ||, ! ve parantezli compound gruplar.
+  Dugum sayisi JSON_FILTER_NODE_CAP ile sinirlidir. }
 type
-  TJsonPredTermRec = record
+  TJsonFilterKind = (jfTerm, jfAnd, jfOr, jfNot);
+  TJsonFilterNode = record
+    Kind: TJsonFilterKind;
     Pred: TJsonPred;
-    Negate: Boolean;
+    A, B: Integer;
   end;
-  TJsonPredList = record
-    Terms: array of TJsonPredTermRec;
-    Joins: array of Char;   // Terms-1 adet: '&' veya '|'
+  TJsonFilter = record
+    Nodes: array of TJsonFilterNode;
+    Root: Integer;
   end;
 
-function JsonStripOuterParens(const S: string; out Inner: string): Boolean;
-var
-  i, n, depth: Integer;
-  q: Char;
-  esc: Boolean;
+const
+  JSON_FILTER_NODE_CAP = 1024;
+
+function JsonFilterAdd(var F: TJsonFilter; K: TJsonFilterKind;
+  const P: TJsonPred; A, B: Integer): Integer;
 begin
-  Inner := S;
-  n := Length(S);
-  Result := True;
-  if (n < 2) or (S[1] <> '(') or (S[n] <> ')') then Exit;
-  depth := 0;
-  q := #0;
-  esc := False;
-  for i := 1 to n do
-  begin
-    if q <> #0 then
-    begin
-      if esc then esc := False
-      else if S[i] = '\' then esc := True
-      else if S[i] = q then q := #0;
-      Continue;
-    end;
-    if S[i] in ['''', '"'] then
-    begin
-      q := S[i];
-      Continue;
-    end;
-    if S[i] = '(' then Inc(depth)
-    else if S[i] = ')' then
-    begin
-      Dec(depth);
-      if depth = 0 then
-      begin
-        // Yalnizca tum ifadeyi saran tek cift ise soy.
-        if i <> n then Exit;
-        Inner := Copy(S, 2, n - 2);
-        Exit;
-      end;
-    end;
-  end;
+  Result := -1;
+  if Length(F.Nodes) >= JSON_FILTER_NODE_CAP then Exit;
+  SetLength(F.Nodes, Length(F.Nodes) + 1);
+  Result := High(F.Nodes);
+  F.Nodes[Result].Kind := K;
+  F.Nodes[Result].Pred := P;
+  F.Nodes[Result].A := A;
+  F.Nodes[Result].B := B;
 end;
 
-function JsonParsePredList(const S: string; out L: TJsonPredList): Boolean;
+function JsonParseFilter(const S: string; out F: TJsonFilter): Boolean;
 var
-  n, p, st, depth: Integer;
-  q, j: Char;
-  esc: Boolean;
+  n, p: Integer;
 
-  function AddPart(const Raw: string; J: Char): Boolean;
+  procedure SkipWs;
+  begin
+    while (p <= n) and (S[p] = ' ') do Inc(p);
+  end;
+
+  function ParseExpr: Integer; forward;
+
+  function ParsePrimary: Integer;
   var
-    t, inner: string;
-    neg: Boolean;
+    st, depth: Integer;
+    q: Char;
+    esc: Boolean;
+    term: string;
     pr: TJsonPred;
   begin
-    Result := False;
-    t := Trim(Raw);
-    if t = '' then Exit;
-    neg := False;
-    if t[1] = '!' then
+    Result := -1;
+    SkipWs;
+    if p > n then Exit;
+    if S[p] = '(' then
     begin
-      neg := True;
-      Delete(t, 1, 1);
-      t := Trim(t);
+      Inc(p);
+      Result := ParseExpr;
+      if Result < 0 then Exit;
+      SkipWs;
+      if (p > n) or (S[p] <> ')') then
+      begin
+        Result := -1;
+        Exit;
+      end;
+      Inc(p);
+      Exit;
     end;
-    if not JsonStripOuterParens(t, inner) then Exit;
-    t := inner;
-    if not JsonParsePred(t, pr) then Exit;
-    SetLength(L.Terms, Length(L.Terms) + 1);
-    L.Terms[High(L.Terms)].Pred := pr;
-    L.Terms[High(L.Terms)].Negate := neg;
-    if J <> #0 then
+    st := p;
+    depth := 0;
+    q := #0;
+    esc := False;
+    while p <= n do
     begin
-      SetLength(L.Joins, Length(L.Joins) + 1);
-      L.Joins[High(L.Joins)] := J;
+      if q <> #0 then
+      begin
+        if esc then esc := False
+        else if S[p] = '\' then esc := True
+        else if S[p] = q then q := #0;
+        Inc(p);
+        Continue;
+      end;
+      if S[p] in ['''', '"'] then
+      begin
+        q := S[p];
+        Inc(p);
+        Continue;
+      end;
+      if S[p] = '(' then
+      begin
+        Inc(depth);
+        Inc(p);
+        Continue;
+      end;
+      if S[p] = ')' then
+      begin
+        if depth = 0 then Break;
+        Dec(depth);
+        Inc(p);
+        Continue;
+      end;
+      if (depth = 0) and (p < n) and
+         ((Copy(S, p, 2) = '&&') or (Copy(S, p, 2) = '||')) then
+        Break;
+      Inc(p);
     end;
-    Result := True;
+    term := Trim(Copy(S, st, p - st));
+    if term = '' then Exit;
+    if not JsonParsePred(term, pr) then Exit;
+    Result := JsonFilterAdd(F, jfTerm, pr, -1, -1);
+  end;
+
+  function ParseUnary: Integer;
+  begin
+    SkipWs;
+    if (p <= n) and (S[p] = '!') then
+    begin
+      Inc(p);
+      Result := ParseUnary;
+      if Result < 0 then Exit;
+      Result := JsonFilterAdd(F, jfNot, Default(TJsonPred), Result, -1);
+      Exit;
+    end;
+    Result := ParsePrimary;
+  end;
+
+  function ParseAnd: Integer;
+  var
+    r: Integer;
+  begin
+    Result := ParseUnary;
+    if Result < 0 then Exit;
+    while True do
+    begin
+      SkipWs;
+      if (p < n) and (Copy(S, p, 2) = '&&') then
+      begin
+        Inc(p, 2);
+        r := ParseUnary;
+        if r < 0 then
+        begin
+          Result := -1;
+          Exit;
+        end;
+        Result := JsonFilterAdd(F, jfAnd, Default(TJsonPred), Result, r);
+        if Result < 0 then Exit;
+      end
+      else
+        Break;
+    end;
+  end;
+
+  function ParseExpr: Integer;
+  var
+    r: Integer;
+  begin
+    Result := ParseAnd;
+    if Result < 0 then Exit;
+    while True do
+    begin
+      SkipWs;
+      if (p < n) and (Copy(S, p, 2) = '||') then
+      begin
+        Inc(p, 2);
+        r := ParseAnd;
+        if r < 0 then
+        begin
+          Result := -1;
+          Exit;
+        end;
+        Result := JsonFilterAdd(F, jfOr, Default(TJsonPred), Result, r);
+        if Result < 0 then Exit;
+      end
+      else
+        Break;
+    end;
   end;
 
 begin
   Result := False;
-  L := Default(TJsonPredList);
+  F := Default(TJsonFilter);
+  F.Root := -1;
   n := Length(S);
   if n = 0 then Exit;
   p := 1;
-  st := 1;
-  depth := 0;
-  q := #0;
-  esc := False;
-  j := #0;
-  while p <= n do
-  begin
-    if q <> #0 then
-    begin
-      if esc then esc := False
-      else if S[p] = '\' then esc := True
-      else if S[p] = q then q := #0;
-      Inc(p);
-      Continue;
-    end;
-    if S[p] in ['''', '"'] then
-    begin
-      q := S[p];
-      Inc(p);
-      Continue;
-    end;
-    if S[p] = '(' then
-    begin
-      Inc(depth);
-      Inc(p);
-      Continue;
-    end;
-    if S[p] = ')' then
-    begin
-      if depth > 0 then Dec(depth);
-      Inc(p);
-      Continue;
-    end;
-    if (depth = 0) and (p < n) and
-       ((Copy(S, p, 2) = '&&') or (Copy(S, p, 2) = '||')) then
-    begin
-      if not AddPart(Copy(S, st, p - st), j) then Exit;
-      if Copy(S, p, 2) = '&&' then j := '&' else j := '|';
-      Inc(p, 2);
-      st := p;
-      Continue;
-    end;
-    Inc(p);
-  end;
-  if (q <> #0) or (depth <> 0) then Exit;
-  if not AddPart(Copy(S, st, n - st + 1), j) then Exit;
+  F.Root := ParseExpr;
+  if F.Root < 0 then Exit;
+  SkipWs;
+  if p <= n then Exit;
   Result := True;
 end;
 
-function JsonPredListMatch(V: TJsonVal; const L: TJsonPredList): Boolean;
+function JsonFilterEval(V: TJsonVal; const F: TJsonFilter; Idx: Integer): Boolean;
 var
-  i: Integer;
-  andRes, term: Boolean;
+  nd: TJsonFilterNode;
 begin
   Result := False;
-  if Length(L.Terms) = 0 then Exit;
-  andRes := JsonPredMatch(V, L.Terms[0].Pred);
-  if L.Terms[0].Negate then andRes := not andRes;
-  for i := 1 to High(L.Terms) do
-  begin
-    term := JsonPredMatch(V, L.Terms[i].Pred);
-    if L.Terms[i].Negate then term := not term;
-    if (i - 1 <= High(L.Joins)) and (L.Joins[i - 1] = '|') then
-    begin
-      Result := Result or andRes;
-      andRes := term;
-    end
-    else
-      andRes := andRes and term;
+  if (Idx < 0) or (Idx > High(F.Nodes)) then Exit;
+  nd := F.Nodes[Idx];
+  case nd.Kind of
+    jfTerm: Result := JsonPredMatch(V, nd.Pred);
+    jfNot:  Result := not JsonFilterEval(V, F, nd.A);
+    jfAnd:  Result := JsonFilterEval(V, F, nd.A) and
+                       JsonFilterEval(V, F, nd.B);
+    jfOr:   Result := JsonFilterEval(V, F, nd.A) or
+                       JsonFilterEval(V, F, nd.B);
   end;
-  Result := Result or andRes;
+end;
+
+function JsonFilterMatch(V: TJsonVal; const F: TJsonFilter): Boolean;
+begin
+  Result := JsonFilterEval(V, F, F.Root);
 end;
 
 function JsonParseQuotedItem(const S: string; out V: string): Boolean;
@@ -1223,7 +1265,7 @@ var
   esc: Boolean;
   cur, nxt: TJsonNodeList;
   name, pred: string;
-  pl: TJsonPredList;
+  pl: TJsonFilter;
   parts: TStrArray;
   ui: TJsonUnionItem;
 begin
@@ -1325,12 +1367,12 @@ begin
         Inc(p);
         if (p > n) or (Path[p] <> ']') then Exit;
         Inc(p);
-        if not JsonParsePredList(pred, pl) then Exit;
+        if not JsonParseFilter(pred, pl) then Exit;
         Multi := True;
         for i := 0 to High(cur) do
           if (cur[i] <> nil) and (cur[i].Kind = jkArr) then
             for j := 0 to High(cur[i].Items) do
-              if JsonPredListMatch(cur[i].Items[j], pl) then
+              if JsonFilterMatch(cur[i].Items[j], pl) then
                 JsonAddNode(nxt, cur[i].Items[j]);
       end
       else

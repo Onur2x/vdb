@@ -11466,6 +11466,19 @@ begin
   ChkVal('JP filtre skaler', 'SELECT JSON_EXTRACT(' + Q +
     '[1,2,3,4]' + Q + ', ' + Q + '$[?(@ > 2)]' + Q + ')',
     0, 0, '[3,4]');
+  // M10 genisletme: parantezli compound filtre gruplari.
+  ChkVal('JP filtre gruplu', 'SELECT JSON_EXTRACT(' + Q +
+    '[{"x":1,"y":9},{"x":2,"y":8},{"x":3,"y":9}]' + Q + ', ' + Q +
+    '$[?((@.x = 1 || @.x = 3) && @.y = 9)]' + Q + ')',
+    0, 0, '[{"x":1,"y":9},{"x":3,"y":9}]');
+  ChkVal('JP filtre ic ice grup', 'SELECT JSON_EXTRACT(' + Q +
+    '[{"x":1,"y":9},{"x":2,"y":8},{"x":3,"y":9}]' + Q + ', ' + Q +
+    '$[?(((@.x = 1) || (@.x = 2)) && @.y < 9)]' + Q + ')',
+    0, 0, '[{"x":2,"y":8}]');
+  ChkVal('JP filtre grup oncelik', 'SELECT JSON_EXTRACT(' + Q +
+    '[{"x":1,"y":9},{"x":2,"y":8},{"x":3,"y":9}]' + Q + ', ' + Q +
+    '$[?(@.x = 1 || (@.x = 2 && @.y = 8))]' + Q + ')',
+    0, 0, '[{"x":1,"y":9},{"x":2,"y":8}]');
 end;
 
 procedure T111_RasgeleDiferansiyel;
