@@ -11,7 +11,8 @@ unit VDbPgWire;
     - ParameterStatus (server_version, client_encoding, DateStyle,
       integer_datetimes)
     - BackendKeyData, ReadyForQuery
-    - 'Q' simple query: RowDescription + DataRow* + CommandComplete
+    - 'Q' simple query: RowDescription + DataRow* + CommandComplete;
+      ';' ile ayrilmis coklu cumleler her biri icin ayri sonuc uretir
     - Extended query protocol: Parse ('P'), Bind ('B'), Describe ('D'),
       Execute ('E'), Close ('C'), Flush ('H'), Sync ('S').
       Prepared statement ve portal adlari desteklenir; Describe Portal
@@ -1039,8 +1040,9 @@ function HandleQuery(S: TVdbSocket; FSql: TVSql; const Sql: string;
 var
   Res: TSqlResult;
   err, cpErr: string;
-  i: Integer;
+  i, k: Integer;
   CopySpec: TPgCopySpec;
+  stmts: TStrArray;
 begin
   Result := False;
   AServed := True;
@@ -1057,6 +1059,40 @@ begin
     if not SendPg(S, ErrorMsg(cpErr)) then Exit;
     Exit(SendPg(S, ReadyMsg));
   end;
+
+  // M1: PostgreSQL basit sorguda ';' ile ayrilmis birden fazla cumle
+  // gonderilebilir; her cumle icin ayri sonuc kumesi/CommandComplete.
+  // (COPY zaten yukarida ozel islenir; burada yalnizca normal cumleler.)
+  stmts := FSql.SplitStatements(Sql);
+  if Length(stmts) > 1 then
+  begin
+    for k := 0 to High(stmts) do
+    begin
+      if Trim(stmts[k]) = '' then Continue;
+      Res := Default(TSqlResult);
+      err := '';
+      try
+        Res := FSql.Exec(stmts[k]);
+      except
+        on E: Exception do
+          err := E.Message;
+      end;
+      if err <> '' then
+      begin
+        if not SendPg(S, ErrorMsg(err)) then Exit;
+        Exit(SendPg(S, ReadyMsg));
+      end;
+      if Length(Res.Fields) > 0 then
+      begin
+        if not SendPg(S, RowDescMsg(Res.Fields)) then Exit;
+        for i := 0 to High(Res.Rows) do
+          if not SendPg(S, DataRowMsg(Res.Rows[i])) then Exit;
+      end;
+      if not SendPg(S, CommandMsg(CommandTag(stmts[k], Res))) then Exit;
+    end;
+    Exit(SendPg(S, ReadyMsg));
+  end;
+
   try
     Res := FSql.Exec(Sql);
   except

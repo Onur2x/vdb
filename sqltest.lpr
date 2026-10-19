@@ -10944,6 +10944,37 @@ begin
     Dogrula('pg DELETE calisti', Query('DELETE FROM pg_t WHERE id=1'), '');
     Dogrula('pg DELETE tag DELETE 1', FindTag('DELETE 1'), '');
 
+    // ---- Basit sorguda coklu cumle ----
+    Dogrula('pg multi SELECT', Query('SELECT 1 AS a; SELECT 2 AS b'), '');
+    Dogrula('pg multi iki sonuc kumesi', TypeSeq = 'TDCTDCZ', TypeSeq);
+    Dogrula('pg multi SELECT tag', FindTag('SELECT 1'), '');
+    Dogrula('pg multi DDL+DML',
+      Query('CREATE TABLE pg_multi(id INTEGER PRIMARY KEY, v TEXT); ' +
+        'INSERT INTO pg_multi VALUES (1,''x''); ' +
+        'INSERT INTO pg_multi VALUES (2,''y'')'), '');
+    Dogrula('pg multi INSERT tag', FindTag('INSERT 0 1'), '');
+    Dogrula('pg multi satir sayisi',
+      Query('SELECT COUNT(*) FROM pg_multi'), '');
+    row := RowAt(0);
+    Dogrula('pg multi 2 satir', (Length(row) = 1) and (row[0] = '2'), '');
+    Dogrula('pg multi transaction',
+      Query('BEGIN; INSERT INTO pg_multi VALUES (3,''z''); COMMIT'), '');
+    Dogrula('pg multi BEGIN/COMMIT tag',
+      FindTag('BEGIN') and FindTag('COMMIT'), TypeSeq);
+    Dogrula('pg multi transaction satir',
+      Query('SELECT COUNT(*) FROM pg_multi'), '');
+    row := RowAt(0);
+    Dogrula('pg multi 3 satir', (Length(row) = 1) and (row[0] = '3'), '');
+    Dogrula('pg multi hata',
+      Query('SELECT 1 AS a; SELECT * FROM yok_boyle_tablo'), '');
+    Dogrula('pg multi hata ErrorResponse', ErrText <> '',
+      Copy(ErrText, 1, 40));
+    Dogrula('pg multi hata sonrasi devam',
+      Query('SELECT 42 AS c'), '');
+    row := RowAt(0);
+    Dogrula('pg multi hata sonrasi deger',
+      (Length(row) = 1) and (row[0] = '42'), '');
+
     // ---- COPY FROM STDIN / TO STDOUT (basit sorgu) ----
     Dogrula('pg COPY tablo DDL', Query(
       'CREATE TABLE pg_copy(id INTEGER PRIMARY KEY, s TEXT)'), '');
