@@ -676,6 +676,7 @@ end;
 { M10 genisletme (2026-10-19): coklu dugum JSONPath degerlendiricisi.
   Destek: $ .ad ["ad"] [n] [a:b] [*] .* ..ad ..* [?(@.alan op literal)]
   op: = == != < <= > >= ; literal: sayi, 'metin', "metin", true/false/null.
+  Filtre birlesimi: && (yuksek oncelik), ||, tek terim ! (parantez opsiyonel).
   Joker/filtre/recursive/slice adimlari coklu sonuc uretir; Get bunlari
   JSON dizi olarak dondurur. }
 
@@ -928,6 +929,177 @@ begin
   if P.Op = '>=' then Exit(cmp >= 0);
 end;
 
+{ M10 (2026-10-19): filtre mantiksal birlesimi.
+  Destek: terimler arasi && / || (&& daha yuksek oncelik) ve tek terim
+  negasyonu (!). Parantez yalnizca tek terimi sarabilir; compound grouping
+  henuz yok. }
+type
+  TJsonPredTermRec = record
+    Pred: TJsonPred;
+    Negate: Boolean;
+  end;
+  TJsonPredList = record
+    Terms: array of TJsonPredTermRec;
+    Joins: array of Char;   // Terms-1 adet: '&' veya '|'
+  end;
+
+function JsonStripOuterParens(const S: string; out Inner: string): Boolean;
+var
+  i, n, depth: Integer;
+  q: Char;
+  esc: Boolean;
+begin
+  Inner := S;
+  n := Length(S);
+  Result := True;
+  if (n < 2) or (S[1] <> '(') or (S[n] <> ')') then Exit;
+  depth := 0;
+  q := #0;
+  esc := False;
+  for i := 1 to n do
+  begin
+    if q <> #0 then
+    begin
+      if esc then esc := False
+      else if S[i] = '\' then esc := True
+      else if S[i] = q then q := #0;
+      Continue;
+    end;
+    if S[i] in ['''', '"'] then
+    begin
+      q := S[i];
+      Continue;
+    end;
+    if S[i] = '(' then Inc(depth)
+    else if S[i] = ')' then
+    begin
+      Dec(depth);
+      if depth = 0 then
+      begin
+        // Yalnizca tum ifadeyi saran tek cift ise soy.
+        if i <> n then Exit;
+        Inner := Copy(S, 2, n - 2);
+        Exit;
+      end;
+    end;
+  end;
+end;
+
+function JsonParsePredList(const S: string; out L: TJsonPredList): Boolean;
+var
+  n, p, st, depth: Integer;
+  q, j: Char;
+  esc: Boolean;
+
+  function AddPart(const Raw: string; J: Char): Boolean;
+  var
+    t, inner: string;
+    neg: Boolean;
+    pr: TJsonPred;
+  begin
+    Result := False;
+    t := Trim(Raw);
+    if t = '' then Exit;
+    neg := False;
+    if t[1] = '!' then
+    begin
+      neg := True;
+      Delete(t, 1, 1);
+      t := Trim(t);
+    end;
+    if not JsonStripOuterParens(t, inner) then Exit;
+    t := inner;
+    if not JsonParsePred(t, pr) then Exit;
+    SetLength(L.Terms, Length(L.Terms) + 1);
+    L.Terms[High(L.Terms)].Pred := pr;
+    L.Terms[High(L.Terms)].Negate := neg;
+    if J <> #0 then
+    begin
+      SetLength(L.Joins, Length(L.Joins) + 1);
+      L.Joins[High(L.Joins)] := J;
+    end;
+    Result := True;
+  end;
+
+begin
+  Result := False;
+  L := Default(TJsonPredList);
+  n := Length(S);
+  if n = 0 then Exit;
+  p := 1;
+  st := 1;
+  depth := 0;
+  q := #0;
+  esc := False;
+  j := #0;
+  while p <= n do
+  begin
+    if q <> #0 then
+    begin
+      if esc then esc := False
+      else if S[p] = '\' then esc := True
+      else if S[p] = q then q := #0;
+      Inc(p);
+      Continue;
+    end;
+    if S[p] in ['''', '"'] then
+    begin
+      q := S[p];
+      Inc(p);
+      Continue;
+    end;
+    if S[p] = '(' then
+    begin
+      Inc(depth);
+      Inc(p);
+      Continue;
+    end;
+    if S[p] = ')' then
+    begin
+      if depth > 0 then Dec(depth);
+      Inc(p);
+      Continue;
+    end;
+    if (depth = 0) and (p < n) and
+       ((Copy(S, p, 2) = '&&') or (Copy(S, p, 2) = '||')) then
+    begin
+      if not AddPart(Copy(S, st, p - st), j) then Exit;
+      if Copy(S, p, 2) = '&&' then j := '&' else j := '|';
+      Inc(p, 2);
+      st := p;
+      Continue;
+    end;
+    Inc(p);
+  end;
+  if (q <> #0) or (depth <> 0) then Exit;
+  if not AddPart(Copy(S, st, n - st + 1), j) then Exit;
+  Result := True;
+end;
+
+function JsonPredListMatch(V: TJsonVal; const L: TJsonPredList): Boolean;
+var
+  i: Integer;
+  andRes, term: Boolean;
+begin
+  Result := False;
+  if Length(L.Terms) = 0 then Exit;
+  andRes := JsonPredMatch(V, L.Terms[0].Pred);
+  if L.Terms[0].Negate then andRes := not andRes;
+  for i := 1 to High(L.Terms) do
+  begin
+    term := JsonPredMatch(V, L.Terms[i].Pred);
+    if L.Terms[i].Negate then term := not term;
+    if (i - 1 <= High(L.Joins)) and (L.Joins[i - 1] = '|') then
+    begin
+      Result := Result or andRes;
+      andRes := term;
+    end
+    else
+      andRes := andRes and term;
+  end;
+  Result := Result or andRes;
+end;
+
 function JsonParseQuotedItem(const S: string; out V: string): Boolean;
 var
   i, n: Integer;
@@ -1046,10 +1218,12 @@ end;
 function JsonPathSelect(Root: TJsonVal; const Path: string;
   out Nodes: TJsonNodeList; out Multi: Boolean): Boolean;
 var
-  p, n, i, j, k, st, idx, aa, bb, cnt: Integer;
+  p, n, i, j, k, st, idx, aa, bb, cnt, depth: Integer;
+  q: Char;
+  esc: Boolean;
   cur, nxt: TJsonNodeList;
   name, pred: string;
-  pr: TJsonPred;
+  pl: TJsonPredList;
   parts: TStrArray;
   ui: TJsonUnionItem;
 begin
@@ -1119,18 +1293,44 @@ begin
       begin
         Inc(p, 2);
         st := p;
-        while (p <= n) and (Path[p] <> ')') do Inc(p);
+        depth := 1;
+        q := #0;
+        esc := False;
+        while p <= n do
+        begin
+          if q <> #0 then
+          begin
+            if esc then esc := False
+            else if Path[p] = '\' then esc := True
+            else if Path[p] = q then q := #0;
+            Inc(p);
+            Continue;
+          end;
+          if Path[p] in ['''', '"'] then
+          begin
+            q := Path[p];
+            Inc(p);
+            Continue;
+          end;
+          if Path[p] = '(' then Inc(depth)
+          else if Path[p] = ')' then
+          begin
+            Dec(depth);
+            if depth = 0 then Break;
+          end;
+          Inc(p);
+        end;
         if p > n then Exit;
         pred := Copy(Path, st, p - st);
         Inc(p);
         if (p > n) or (Path[p] <> ']') then Exit;
         Inc(p);
-        if not JsonParsePred(pred, pr) then Exit;
+        if not JsonParsePredList(pred, pl) then Exit;
         Multi := True;
         for i := 0 to High(cur) do
           if (cur[i] <> nil) and (cur[i].Kind = jkArr) then
             for j := 0 to High(cur[i].Items) do
-              if JsonPredMatch(cur[i].Items[j], pr) then
+              if JsonPredListMatch(cur[i].Items[j], pl) then
                 JsonAddNode(nxt, cur[i].Items[j]);
       end
       else

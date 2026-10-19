@@ -11446,6 +11446,26 @@ begin
     ', ' + Q + '$[0,2]' + Q + ')', 0, 0, '');
   ChkVal('JP union EXISTS', 'SELECT JSON_EXISTS(' + Q + '[10,20,30]' + Q +
     ', ' + Q + '$[0,2]' + Q + ')', 0, 0, 'True');
+  // M10 genisletme: mantiksal filtre operatorleri && / || / !.
+  ChkVal('JP filtre &&', 'SELECT JSON_EXTRACT(' + Q +
+    '[{"x":1},{"x":2},{"x":3}]' + Q + ', ' + Q +
+    '$[?(@.x > 1 && @.x < 3)]' + Q + ')', 0, 0, '[{"x":2}]');
+  ChkVal('JP filtre ||', 'SELECT JSON_EXTRACT(' + Q +
+    '[{"x":1},{"x":2},{"x":3}]' + Q + ', ' + Q +
+    '$[?(@.x = 1 || @.x = 3)]' + Q + ')', 0, 0, '[{"x":1},{"x":3}]');
+  ChkVal('JP filtre && oncelik', 'SELECT JSON_EXTRACT(' + Q +
+    '[{"x":1},{"x":2,"y":9},{"x":2,"y":8}]' + Q + ', ' + Q +
+    '$[?(@.x = 1 || @.x = 2 && @.y = 9)]' + Q + ')',
+    0, 0, '[{"x":1},{"x":2,"y":9}]');
+  ChkVal('JP filtre !', 'SELECT JSON_EXTRACT(' + Q +
+    '[{"x":1},{"x":2}]' + Q + ', ' + Q + '$[?(!@.x = 1)]' + Q + ')',
+    0, 0, '[{"x":2}]');
+  ChkVal('JP filtre parantezli !', 'SELECT JSON_EXTRACT(' + Q +
+    '[{"x":1},{"x":2}]' + Q + ', ' + Q + '$[?(!(@.x = 1))]' + Q + ')',
+    0, 0, '[{"x":2}]');
+  ChkVal('JP filtre skaler', 'SELECT JSON_EXTRACT(' + Q +
+    '[1,2,3,4]' + Q + ', ' + Q + '$[?(@ > 2)]' + Q + ')',
+    0, 0, '[3,4]');
 end;
 
 procedure T111_RasgeleDiferansiyel;
