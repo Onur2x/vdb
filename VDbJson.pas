@@ -686,6 +686,8 @@ type
   TJsonPred = record
     FuncName: string;   // '', LENGTH, ABS, LOWER, UPPER
     Fields: TStrArray;
+    HasRight: Boolean;  // sag taraf @.alan ise True
+    RightFields: TStrArray;
     Op: string;
     LitKind: TJsonLitKind;
     Num: Double;
@@ -787,6 +789,27 @@ var
       Inc(p);
     end;
   end;
+
+  function ParsePath(out F: TStrArray): Boolean;
+  var
+    fst: Integer;
+  begin
+    Result := False;
+    SetLength(F, 0);
+    if (p > n) or (S[p] <> '@') then Exit;
+    Inc(p);
+    while (p <= n) and (S[p] = '.') do
+    begin
+      Inc(p);
+      fst := p;
+      while (p <= n) and (S[p] in ['a'..'z', 'A'..'Z', '0'..'9', '_', '-']) do
+        Inc(p);
+      if p = fst then Exit;
+      SetLength(F, Length(F) + 1);
+      F[High(F)] := Copy(S, fst, p - fst);
+    end;
+    Result := True;
+  end;
 begin
   Result := False;
   Pred := Default(TJsonPred);
@@ -809,18 +832,7 @@ begin
     Inc(p);
     SkipWs;
   end;
-  if (p > n) or (S[p] <> '@') then Exit;
-  Inc(p);
-  while (p <= n) and (S[p] = '.') do
-  begin
-    Inc(p);
-    st := p;
-    while (p <= n) and (S[p] in ['a'..'z', 'A'..'Z', '0'..'9', '_', '-']) do
-      Inc(p);
-    if p = st then Exit;
-    SetLength(Pred.Fields, Length(Pred.Fields) + 1);
-    Pred.Fields[High(Pred.Fields)] := Copy(S, st, p - st);
-  end;
+  if not ParsePath(Pred.Fields) then Exit;
   SkipWs;
   if Pred.FuncName <> '' then
   begin
@@ -840,6 +852,14 @@ begin
   else Exit;
   SkipWs;
   if p > n then Exit;
+  if S[p] = '@' then
+  begin
+    if not ParsePath(Pred.RightFields) then Exit;
+    Pred.HasRight := True;
+    SkipWs;
+    Result := p > n;
+    Exit;
+  end;
   // literal
   if S[p] in ['''', '"'] then
   begin
@@ -892,7 +912,7 @@ end;
 
 function JsonPredMatch(V: TJsonVal; const P: TJsonPred): Boolean;
 var
-  t: TJsonVal;
+  t, r: TJsonVal;
   i, cmp: Integer;
   fnNum: Double;
   fnStr: string;
@@ -906,6 +926,16 @@ begin
     if t = nil then Exit;
   end;
   if t = nil then Exit;
+  r := nil;
+  if P.HasRight then
+  begin
+    r := V;
+    for i := 0 to High(P.RightFields) do
+    begin
+      r := JsonFieldOf(r, P.RightFields[i]);
+      if r = nil then Exit;
+    end;
+  end;
   isFnNum := False;
   isFnStr := False;
   if P.FuncName = 'LENGTH' then
@@ -954,16 +984,56 @@ begin
   cmp := 0;
   if isFnNum then
   begin
-    if P.LitKind <> jlNum then Exit(False);
-    if fnNum < P.Num then cmp := -1
-    else if fnNum > P.Num then cmp := 1
-    else cmp := 0;
+    if P.HasRight then
+    begin
+      if r.Kind <> jkNum then Exit(False);
+      if fnNum < r.Num then cmp := -1
+      else if fnNum > r.Num then cmp := 1
+      else cmp := 0;
+    end
+    else
+    begin
+      if P.LitKind <> jlNum then Exit(False);
+      if fnNum < P.Num then cmp := -1
+      else if fnNum > P.Num then cmp := 1
+      else cmp := 0;
+    end;
   end
   else if isFnStr then
   begin
-    if P.LitKind <> jlStr then Exit(False);
-    cmp := CompareStr(fnStr, P.Str);
+    if P.HasRight then
+    begin
+      if r.Kind <> jkStr then Exit(False);
+      cmp := CompareStr(fnStr, r.Str);
+    end
+    else
+    begin
+      if P.LitKind <> jlStr then Exit(False);
+      cmp := CompareStr(fnStr, P.Str);
+    end;
     if cmp < 0 then cmp := -1 else if cmp > 0 then cmp := 1;
+  end
+  else if P.HasRight then
+  begin
+    if (t.Kind = jkNum) and (r.Kind = jkNum) then
+    begin
+      if t.Num < r.Num then cmp := -1
+      else if t.Num > r.Num then cmp := 1
+      else cmp := 0;
+    end
+    else if (t.Kind = jkStr) and (r.Kind = jkStr) then
+    begin
+      cmp := CompareStr(t.Str, r.Str);
+      if cmp < 0 then cmp := -1 else if cmp > 0 then cmp := 1;
+    end
+    else if (t.Kind = jkBool) and (r.Kind = jkBool) then
+    begin
+      if t.B <> r.B then cmp := 1 else cmp := 0;
+    end
+    else if (t.Kind = jkNull) and (r.Kind = jkNull) then
+      cmp := 0
+    else
+      Exit(False);
   end
   else
   begin

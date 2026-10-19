@@ -11511,6 +11511,16 @@ begin
   ChkVal('JP upper()', 'SELECT JSON_EXTRACT(' + Q +
     '["A","b"]' + Q + ', ' + Q +
     '$[?(upper(@) == "A")]' + Q + ')', 0, 0, '["A"]');
+  // M10 genisletme: iki alan karsilastirmasi (@.a > @.b).
+  ChkVal('JP alan-alan sayi', 'SELECT JSON_EXTRACT(' + Q +
+    '[{"a":5,"b":2},{"a":1,"b":3},{"a":2,"b":2}]' + Q + ', ' + Q +
+    '$[?(@.a > @.b)].a' + Q + ')', 0, 0, '[5]');
+  ChkVal('JP alan-alan metin', 'SELECT JSON_EXTRACT(' + Q +
+    '[{"name":"x","alias":"x"},{"name":"y","alias":"z"}]' + Q + ', ' + Q +
+    '$[?(@.name == @.alias)].name' + Q + ')', 0, 0, '["x"]');
+  ChkVal('JP alan-alan mantik', 'SELECT JSON_EXTRACT(' + Q +
+    '[{"a":5,"b":2},{"a":1,"b":3},{"a":2,"b":2}]' + Q + ', ' + Q +
+    '$[?(@.a >= @.b && @.a < 5)].a' + Q + ')', 0, 0, '[2]');
 end;
 
 procedure T111_RasgeleDiferansiyel;

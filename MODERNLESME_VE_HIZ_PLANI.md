@@ -21,7 +21,7 @@ Zaten kazanılmış (dokunma, koru):
 - `COUNT(*)` O(1) (KR-1B doğrulanmış-sonuç önbelleği).
 - WHERE'siz agrega (`SUM/AVG/MIN/MAX`) allocation-free raw-peek (`ScanRawIter`, KR-8/8c).
 - Yazma yolunda tahsis diyeti, batch COMMIT tamponu (P-21), konumsal okuma (P-19).
-- Çökme dayanıklılığı: `sqltest 2501/2501`, `crashtest 8/8`.
+- Çökme dayanıklılığı: `sqltest 2504/2504`, `crashtest 8/8`.
 
 Hâlâ yavaş (bu belgenin hedefi):
 
@@ -393,7 +393,7 @@ eksik olan **satır-içi** iş (mevcut yol `VDbTable.pas` Insert/EncodeRow + `VD
 > `FBatchHashPrefix` eklendi; `Insert` artık saf-ASCII pk'da `VDbHashKeyBytes(prefix, ...)`
 > kullanıyor, ASCII dışında genel `VDbHashKey` yolu korunuyor (hash birebir, format değişmedi).
 > Ölçüm (`insbench`, 1M INSERT tek tx): **8836 ms → 8199 ms (~%7,2)**. Kapılar:
-> `hashchk` 80/80 eşit, `sqltest 2501/2501`, `crashtest 8/8`. Adım 2 (`EncodeRow` tampon
+> `hashchk` 80/80 eşit, `sqltest 2504/2504`, `crashtest 8/8`. Adım 2 (`EncodeRow` tampon
 > yeniden kullanımı) **denendi ve geri alındı**: bekleyen `Put` tamponu referansla
 > tuttuğu için copy-on-write oluşuyor; 1M INSERT 7920→7934 ms (kazanç yok). Adım 3
 > (`FPending` duplicate-PK) zaten vardı.
@@ -618,13 +618,14 @@ tarzı tam JSONPath desteği. Mevcut expression/partial indeks altyapısıyla uy
 > **Durum (2026-10-19):** JSONPath alt kümesi **yapıldı** — `JSON_EXTRACT(json, path)`,
 > `JSON_VALUE(json, path)`, `JSON_EXISTS(json, path)`. Destek: `$`, `.ad`, `["ad"]`,
 > `[n]` (negatif sondan), `[a:b]` dilimi, `.*` / `[*]` (ara segment dahil),
-> `..ad` / `..*` recursive descent, `[?(@.alan op literal)]` filtresi
+> `..ad` / `..*` recursive descent, `[?(@.alan op literal)]` /
+> `[?(@.alan op @.diger)]` filtresi
 > (`= == != < <= > >=`; sayı/metin/bool/null) ve mantıksal birleşim
 > (`&&`, `||`, `!`; `&&` öncelikli, parantezli gruplar). Çoklu sonuç JSON dizi döner.
 > Geçersiz
 > JSON/yol hata yükseltmez, `''`/`False` döner. Ek olarak JSON sayı ayrıştırması
 > locale'den bağımsız hale getirildi (`1.5` TR locale'de reddediliyordu).
-> `T112` 50 test. Ek olarak **`GENERATED ALWAYS AS (expr) [STORED|VIRTUAL]`**
+> `T112` 53 test. Ek olarak **`GENERATED ALWAYS AS (expr) [STORED|VIRTUAL]`**
 > kolonları **yapıldı** (`T117` 19 test): ifade `ExprToText` ile semada hex olarak
 > saklanır (6. alan), `INSERT`/`BatchInsert`/`INSERT ... RETURNING`/`UPDATE`
 > yollarında `VDbExprVal` ile hesaplanır ve kolon tipine normalize edilir.
@@ -642,9 +643,10 @@ tarzı tam JSONPath desteği. Mevcut expression/partial indeks altyapısıyla uy
 > sayaç yeniden açılışta korunur. `ALTER TABLE ADD COLUMN ... IDENTITY` ve
 > `START WITH/INCREMENT BY` seçenekleri desteklenmez. **Union seçiciler**
 > (`[0,2]`, `['a','c']`, negatif indeks), tek/çift tırnaklı anahtarlar ve
-> `&&`/`||`/`!` filtre birleşimi, parantezli compound gruplar ve
-> `length`/`abs`/`lower`/`upper` filtre fonksiyonları desteklenir; tam JSONPath
-> (script ifadeleri) hâlâ yok.
+> `&&`/`||`/`!` filtre birleşimi, parantezli compound gruplar,
+> `length`/`abs`/`lower`/`upper` filtre fonksiyonları ve alan-alan
+> karşılaştırması (`@.a > @.b`) desteklenir; tam JSONPath (script ifadeleri)
+> hâlâ yok.
 
 ### M11 — Depolama motoru soyutlama dikişi (geleceğe hazırlık)
 §5, "WAL + B-tree'ye tam geçiş"i kapsam dışı bırakıyor — haklı olarak. Ancak bugün
@@ -840,7 +842,7 @@ maddelerin "eksik" sanılıp tekrar uygulanmasını önlemektir.
 | **H2** hash join | ✅ Yapıldı | indekssiz tek-eşitlik INNER/LEFT; JOIN 24.020→98 ms (~245x) |
 | **H7** plan önbelleği | ✅ Yapıldı | parametresiz SELECT AST cache; parse ×0,0075→0,0030 ms (~2,5x), API+DDL invalidation |
 | **H1** filtreli SELECT + ham yüklem | ✅ Yapıldı | Adım 1 `capSel` erken-çıkış (~5,3x); Adım 2 `TryStreamSelect` ham akış (LIMIT ~58x); Adım 3 ham-yüklem batch motoru (INT/FLOAT, ~4x); Adım 3b TEXT `=`/`<>` (~2,5x); Adım 3c sayısal BETWEEN/IN (~3,1x, IN vs ifade); `rawchk` diferansiyel 29/29 birebir |
-| **EK** ifade tip hatası | ✅ Düzeltildi | `ExprResultCtype`: iki taraf da kolon değilken ifade (aritmetik) sayısal kıyaslanır; `(a+0) > 198` 77.800→60.200; `T07` 5 yeni test; `sqltest 2501/2501` |
+| **EK** ifade tip hatası | ✅ Düzeltildi | `ExprResultCtype`: iki taraf da kolon değilken ifade (aritmetik) sayısal kıyaslanır; `(a+0) > 198` 77.800→60.200; `T07` 5 yeni test; `sqltest 2504/2504` |
 | **M10 IDENTITY** | ✅ Yapıldı | `GENERATED {ALWAYS\|BY DEFAULT} AS IDENTITY`; ALWAYS açık değeri reddeder, BY DEFAULT sayacı ilerletir; INSERT/BatchInsert/COPY/RETURNING; UPDATE/upsert değişimi reddeder; sema bayrağı bit2/bit3; `T117` 19 test |
 | **M12** dizin fsync | ✅ **Zaten vardı** | `VDbFlushDir` (`VDbSync.pas:66`) + `VDbCore.pas:854,1441,1456,1505,2969,3039,3779` |
 | **H14** konumsal I/O | ✅ Yapıldı | `VDbPosRead` (OVERLAPPED/pread) `GetSnapshot` (`VDbCore.pas:1765`, P-19), `ScanRawIter` ve **`ScanSnapshot`** (bucket + kayıt-bazı yollar; `FS.Position` paylaşımı kaldırıldı) |
@@ -867,9 +869,9 @@ maddelerin "eksik" sanılıp tekrar uygulanmasını önlemektir.
 | M5 FTS/BM25 | 🟡 Kısmi | `VDbText.pas` (ifade/analiz) + **`TO_TSVECTOR`/`TS_MATCH` (AND + `"phrase"` + `-negation`)/`TS_RANK`** (tokenizasyon + Türkçe küçük harf; `T114` 11 test) var; inverted index/BM25 yok |
 | M6 AEAD/Argon2 | 🟡 Kısmi (AEAD + Argon2 ✅) | **AES-256-GCM** zarfı (`VDBAEAD1`, 96-bit nonce, 128-bit tag; NIST vektörleri `gcmchk`), eski CTR+HMAC okunur; **Argon2id v1.3** (`VDbKdf.pas`, RFC 9106 vektörü `argonchk`) + `.key` v2 (t=3, 64 MiB, p=1; v1 PBKDF2 okunur, `keychk`). Kolon-seviyesi şifreleme yok |
 | M7 async sunucu | 🟡 Kısmi | `VDbSqlServer.pas` thread-per-connection; event-loop yok |
-| M8 fuzz + diferansiyel | 🟢 Büyük ölçüde | geniş `sqltest` (2501) + `crashtest` (8/8) + `rawchk` (akışlı↔genel diferansiyel 29/29) + `mrowchk` (H13 diferansiyel+atomiklik 8/8) + `copychk` (COPY 17/17) + **`T111` rasgele 120 WHERE yüklemi** (INT/FLOAT/TEXT/BOOL/NULL; ham vs genel birebir) + **`fuzzchk` bağımsız 3VL fuzz (3×1000, 0 fark)** + **`sqlite_diff.py` SQLite diferansiyeli (4×1000, 0 fark)**. SQLancer tarzı tam SQL üretimi yok |
+| M8 fuzz + diferansiyel | 🟢 Büyük ölçüde | geniş `sqltest` (2504) + `crashtest` (8/8) + `rawchk` (akışlı↔genel diferansiyel 29/29) + `mrowchk` (H13 diferansiyel+atomiklik 8/8) + `copychk` (COPY 17/17) + **`T111` rasgele 120 WHERE yüklemi** (INT/FLOAT/TEXT/BOOL/NULL; ham vs genel birebir) + **`fuzzchk` bağımsız 3VL fuzz (3×1000, 0 fark)** + **`sqlite_diff.py` SQLite diferansiyeli (4×1000, 0 fark)**. SQLancer tarzı tam SQL üretimi yok |
 | M9 gözlemlenebilirlik | 🟡 Kısmi | `SHOW STATS` (6→13 metrik: dosya/bellek/blok önbelleği) + `SHOW SLOW QUERIES` + **`TVSql.GetMetricsText` Prometheus exposition** + **`VDbMetricsHttp` ayrı portta `GET /metrics` HTTP ucu** (404 diğer yollar, `Content-Type: text/plain; version=0.0.4`, `T115` canlı soket testi) var; **OpenTelemetry trace yok** |
-| M10 GENERATED + JSONPath | 🟡 Kısmi | JSON operatörleri + **JSONPath alt kümesi** (`JSON_EXTRACT`/`JSON_VALUE`/`JSON_EXISTS`; `$ .ad ["ad"] ['ad'] [n] [a:b] [*] [0,2] ['a','b'] .* ..ad ..*` ve `[?(@.alan op literal)]` filtresi + `&&`/`||`/`!` birleşimi + parantezli gruplar + `length`/`abs`/`lower`/`upper` fonksiyonları; ara segment joker; `T112` 50 test) + locale-bağımsız JSON sayı ayrıştırma + **GENERATED ALWAYS AS (STORED)** (`T117` 19 test; semada 6. alan, INSERT/BatchInsert/RETURNING/UPDATE ve ALTER ADD'de hesaplanır; mevcut satırlar geriye dönük doldurulur) + **GENERATED {ALWAYS\|BY DEFAULT} AS IDENTITY** (ALWAYS açık değeri reddeder; BY DEFAULT sayacı ilerletir; UPDATE/upsert değişimi reddeder; sema bayrağı bit2/bit3, yeniden açılışta sayaç korunur); tam JSONPath (script ifadeleri) yok |
+| M10 GENERATED + JSONPath | 🟡 Kısmi | JSON operatörleri + **JSONPath alt kümesi** (`JSON_EXTRACT`/`JSON_VALUE`/`JSON_EXISTS`; `$ .ad ["ad"] ['ad'] [n] [a:b] [*] [0,2] ['a','b'] .* ..ad ..*` ve `[?(@.alan op literal)]` filtresi + `&&`/`||`/`!` birleşimi + parantezli gruplar + `length`/`abs`/`lower`/`upper` fonksiyonları + alan-alan karşılaştırma; ara segment joker; `T112` 53 test) + locale-bağımsız JSON sayı ayrıştırma + **GENERATED ALWAYS AS (STORED)** (`T117` 19 test; semada 6. alan, INSERT/BatchInsert/RETURNING/UPDATE ve ALTER ADD'de hesaplanır; mevcut satırlar geriye dönük doldurulur) + **GENERATED {ALWAYS\|BY DEFAULT} AS IDENTITY** (ALWAYS açık değeri reddeder; BY DEFAULT sayacı ilerletir; UPDATE/upsert değişimi reddeder; sema bayrağı bit2/bit3, yeniden açılışta sayaç korunur); tam JSONPath (script ifadeleri) yok |
 | M11 depolama soyutlaması | ❌ Yok | `VDbCore` somut KV; arayüz dikişi yok |
 
 **2026-10-19 ek turu:** H13 `COPY FROM` (CSV/TEXT, atomik, 100k ~1,95x / 300k ~2,20x);
@@ -886,13 +888,13 @@ M1 pgwire v3 + extended query + `$1…` parametreleri + **`COPY ... FROM STDIN` 
 `TO STDOUT` / `COPY (SELECT ...) TO STDOUT`** + **çoklu cümle basit sorgu**
 (CSV/TEXT, CopyIn/CopyOut/CopyFail; `VDbPgWire.pas`, `T116` 100 test);
 M10 `GENERATED ALWAYS AS (…) STORED`
-+ JSONPath filtre/recursive/slice/union (`T117` 19 test, `T112` 50 test);
++ JSONPath filtre/recursive/slice/union (`T117` 19 test, `T112` 53 test);
 **M10 `GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY`** (ALWAYS açık değeri reddeder,
 BY DEFAULT sayacı ilerletir; INSERT/BatchInsert/COPY/RETURNING; UPDATE/upsert
 değişimi reddeder; sema bayrağı bit2/bit3, yeniden açılışta sayaç korunur);
 **M6 AES-256-GCM AEAD + Argon2id + `.key` v2** (`gcmchk` 13/13, `argonchk` 3/3,
 `keychk` 12/12; eski CTR+HMAC ve PBKDF2 uyumlu). Kapılar:
-**`sqltest 2501/2501 (kalan=0)`**, **`crashtest 8/8`**, **`copychk` 17/17**,
+**`sqltest 2504/2504 (kalan=0)`**, **`crashtest 8/8`**, **`copychk` 17/17**,
 **`rawchk` 29/29**, **`mrowchk` 0 hata**, **`fuzzchk` 3000/3000**,
 **`sqlite_diff` 4000/4000**, `hashchk` 80/80, `zonechk` 0 hata. Kalan büyük işler:
 H3 ART/B+tree, H5 blok-grup CRC, H11 free-list, M1 TLS, M2 Arrow/Parquet,
