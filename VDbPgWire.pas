@@ -49,7 +49,7 @@ unit VDbPgWire;
 interface
 
 uses
-  SysUtils, Classes, SyncObjs, Generics.Collections, VDbTypes, VDbCore, VDbTable, VDbSql, VDbAst,
+  SysUtils, DateUtils, Classes, SyncObjs, Generics.Collections, VDbTypes, VDbCore, VDbTable, VDbSql, VDbAst,
   VDbParser, VDbNet, VDbErr;
 
 type
@@ -116,6 +116,7 @@ type
     Done: Boolean;
     Res: TSqlResult;
     Err: string;
+    ResFmts: array of Integer;   // M1: 0=metin, 1=binary
   end;
 
   { M1: prepared statement; ParamOids uzunlugu parametre sayisidir. }
@@ -157,6 +158,28 @@ begin
   u := Cardinal(V);
   Result := AnsiChar(u shr 24) + AnsiChar((u shr 16) and $FF) +
     AnsiChar((u shr 8) and $FF) + AnsiChar(u and $FF);
+end;
+
+function NetI64(V: Int64): AnsiString;
+var
+  u: QWord;
+  i: Integer;
+begin
+  u := QWord(V);
+  Result := '';
+  for i := 7 downto 0 do
+    Result := Result + AnsiChar((u shr (i * 8)) and $FF);
+end;
+
+function NetF64(D: Double): AnsiString;
+var
+  u: QWord;
+  i: Integer;
+begin
+  Move(D, u, 8);
+  Result := '';
+  for i := 7 downto 0 do
+    Result := Result + AnsiChar((u shr (i * 8)) and $FF);
 end;
 
 function PgMsg(const T: AnsiChar; const Body: AnsiString): AnsiString;
@@ -230,8 +253,16 @@ begin
   end;
 end;
 
-function RowDescMsg(const Fields: TStrArray;
-  const Types: TByteArray): AnsiString;
+function PgFmtAt(const Fmts: array of Integer; Ix: Integer): Integer;
+begin
+  if Length(Fmts) = 0 then Exit(0);
+  if Length(Fmts) = 1 then Exit(Fmts[0]);
+  if (Ix >= 0) and (Ix <= High(Fmts)) then Exit(Fmts[Ix]);
+  Result := 0;
+end;
+
+function RowDescMsgFmt(const Fields: TStrArray; const Types: TByteArray;
+  const Fmts: array of Integer): AnsiString;
 var
   body: AnsiString;
   i: Integer;
@@ -242,24 +273,116 @@ begin
   begin
     if i < Length(Types) then oid := PgOidOf(Types[i]) else oid := 25;
     body := body + Fields[i] + #0 + NetI32(0) + NetI16(0) + NetI32(oid) +
-      NetI16(-1) + NetI32(-1) + NetI16(0);
+      NetI16(-1) + NetI32(-1) + NetI16(PgFmtAt(Fmts, i));
   end;
   Result := PgMsg('T', body);
 end;
 
-function DataRowMsg(const Row: TStrArray): AnsiString;
+function RowDescMsg(const Fields: TStrArray;
+  const Types: TByteArray): AnsiString;
+begin
+  Result := RowDescMsgFmt(Fields, Types, []);
+end;
+
+{ M1: tek bir sonuc degerini istenen formatta kodlar. Donus uzunlugu
+  DataRow tarafindan yazilir. Bilinmeyen donusumde ham metin kullanilir. }
+function PgBinText(const V: string; Oid: LongInt): AnsiString;
+var
+  i64: Int64;
+  dt, ep: TDateTime;
+  y, mo, d, hh, mi, ss: Integer;
+  days: LongInt;
+  us: Int64;
+  dval: Double;
+  code: Integer;
+begin
+  case Oid of
+    16: begin
+      if (V = '1') or SameText(V, 'true') or SameText(V, 't') then
+        Result := #1 else Result := #0;
+    end;
+    20: Result := NetI64(StrToInt64Def(V, 0));
+    21: Result := NetI16(SmallInt(StrToInt64Def(V, 0)));
+    23: Result := NetI32(LongInt(StrToInt64Def(V, 0)));
+    700: begin
+      dval := 0;
+      Val(V, dval, code);
+      Result := NetF64(dval);
+    end;
+    701: begin
+      dval := 0;
+      Val(V, dval, code);
+      Result := NetF64(dval);
+    end;
+    1082: begin
+      // PostgreSQL date: 2000-01-01'den gun sayisi (int32).
+      Result := NetI32(0);
+      if Length(V) >= 10 then
+      begin
+        y := StrToIntDef(Copy(V, 1, 4), 0);
+        mo := StrToIntDef(Copy(V, 6, 2), 0);
+        d := StrToIntDef(Copy(V, 9, 2), 0);
+        if TryEncodeDate(y, mo, d, dt) then
+        begin
+          ep := EncodeDate(2000, 1, 1);
+          days := Trunc(dt - ep);
+          Result := NetI32(days);
+        end;
+      end;
+    end;
+    1114: begin
+      // PostgreSQL timestamp: 2000-01-01'den mikrosaniye (int64).
+      Result := NetI64(0);
+      if Length(V) >= 19 then
+      begin
+        y := StrToIntDef(Copy(V, 1, 4), 0);
+        mo := StrToIntDef(Copy(V, 6, 2), 0);
+        d := StrToIntDef(Copy(V, 9, 2), 0);
+        hh := StrToIntDef(Copy(V, 12, 2), 0);
+        mi := StrToIntDef(Copy(V, 15, 2), 0);
+        ss := StrToIntDef(Copy(V, 18, 2), 0);
+        if TryEncodeDate(y, mo, d, dt) and TryEncodeTime(hh, mi, ss, 0, ep) then
+        begin
+          dt := dt + ep;
+          us := Round((dt - EncodeDate(2000, 1, 1)) * 86400.0 * 1000000.0);
+          Result := NetI64(us);
+        end;
+      end;
+    end;
+  else
+    Result := V;
+  end;
+end;
+
+function DataRowMsgFmt(const Row: TStrArray; const Types: TByteArray;
+  const Fmts: array of Integer): AnsiString;
 var
   body: AnsiString;
   i: Integer;
-  v: string;
+  v: AnsiString;
+  oid: LongInt;
 begin
   body := NetI16(Length(Row));
   for i := 0 to High(Row) do
   begin
-    v := Row[i];
-    body := body + NetI32(Length(v)) + v;
+    if PgFmtAt(Fmts, i) = 1 then
+    begin
+      if i < Length(Types) then oid := PgOidOf(Types[i]) else oid := 25;
+      v := PgBinText(Row[i], oid);
+      body := body + NetI32(Length(v)) + v;
+    end
+    else
+    begin
+      v := Row[i];
+      body := body + NetI32(Length(v)) + v;
+    end;
   end;
   Result := PgMsg('D', body);
+end;
+
+function DataRowMsg(const Row: TStrArray): AnsiString;
+begin
+  Result := DataRowMsgFmt(Row, nil, []);
 end;
 
 function ParamDescMsg(const Oids: array of LongInt): AnsiString;
@@ -1258,6 +1381,7 @@ var
   pt: TPgPortal;
   st: TPgStmt;
   fmts: array of Integer;
+  rfmts: array of Integer;
   params: TStrArray;
   raw: AnsiString;
   bad: Boolean;
@@ -1454,16 +1578,28 @@ begin
           Continue;
         end;
         bad := False;
+        SetLength(rfmts, 0);
         for i2 := 0 to nResFmt - 1 do
-          if TakeI16 <> 0 then bad := True;
+        begin
+          if p + 1 > Length(payload) then
+          begin
+            bad := True;
+            Break;
+          end;
+          SetLength(rfmts, Length(rfmts) + 1);
+          rfmts[High(rfmts)] := TakeI16;
+          if (rfmts[High(rfmts)] <> 0) and (rfmts[High(rfmts)] <> 1) then
+            bad := True;
+        end;
         if bad then
         begin
-          ExtFail('binary sonuc formati desteklenmiyor');
+          ExtFail('gecersiz sonuc formati (0/1 beklenir)');
           Continue;
         end;
         pt := Default(TPgPortal);
         pt.Sql := st.Sql;
         pt.Params := params;
+        pt.ResFmts := rfmts;
         pt.Done := False;
         Portals.AddOrSetValue(nm, pt);
         if not SendPg(FSock, PgMsg('2', '')) then Break;
@@ -1506,7 +1642,7 @@ begin
                 ExtFail(pt.Err)
               else if Length(pt.Res.Fields) > 0 then
               begin
-                if not SendPg(FSock, RowDescMsg(pt.Res.Fields, pt.Res.FieldTypes)) then Break;
+                if not SendPg(FSock, RowDescMsgFmt(pt.Res.Fields, pt.Res.FieldTypes, pt.ResFmts)) then Break;
               end
               else if not SendPg(FSock, PgMsg('n', '')) then Break;
             end;
@@ -1555,7 +1691,7 @@ begin
             else
             begin
               for i2 := 0 to High(pt.Res.Rows) do
-                if not SendPg(FSock, DataRowMsg(pt.Res.Rows[i2])) then Break;
+                if not SendPg(FSock, DataRowMsgFmt(pt.Res.Rows[i2], pt.Res.FieldTypes, pt.ResFmts)) then Break;
               if not SendPg(FSock, CommandMsg(CommandTag(pt.Sql, pt.Res))) then Break;
               InterlockedIncrement(FServer.FServed);
             end;

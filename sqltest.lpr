@@ -10477,6 +10477,28 @@ begin
     AnsiChar((u shr 8) and $FF) + AnsiChar(u and $FF);
 end;
 
+function TPgI64(V: Int64): AnsiString;
+var
+  u: QWord;
+  i: Integer;
+begin
+  u := QWord(V);
+  Result := '';
+  for i := 7 downto 0 do
+    Result := Result + AnsiChar((u shr (i * 8)) and $FF);
+end;
+
+function TPgF64(V: Double): AnsiString;
+var
+  u: QWord;
+  i: Integer;
+begin
+  Move(V, u, 8);
+  Result := '';
+  for i := 7 downto 0 do
+    Result := Result + AnsiChar((u shr (i * 8)) and $FF);
+end;
+
 function TPgSend(S: TVdbSocket; const M: AnsiString): Boolean;
 begin
   Result := False;
@@ -11473,13 +11495,50 @@ begin
     Dogrula('pg ext eksik parametre hatasi dolu', ErrText <> '',
       Copy(ErrText, 1, 40));
 
-    // Binary sonuc formati reddedilir.
+    // Binary sonuc formati: int8 (a) 8 bayt buyuk-endian.
     FreeAndNil(msgs);
-    SendExt('P', 'p4'#0 + 'SELECT 1'#0 + TPgI16(0));
+    SendExt('P', 'p4'#0 + 'SELECT a FROM pg_ext'#0 + TPgI16(0));
     SendExt('B', ''#0 + 'p4'#0 + TPgI16(0) + TPgI16(0) +
       TPgI16(1) + TPgI16(1));
+    SendExt('D', 'P' + ''#0);
+    SendExt('E', ''#0 + TPgI32(0));
     SyncRead;
-    Dogrula('pg ext binary sonuc reddi (1EZ)', TypeSeq = '1EZ', TypeSeq);
+    Dogrula('pg ext binary sonuc kabul (12TDCZ)', TypeSeq = '12TDCZ', TypeSeq);
+    body := '';
+    for i := 0 to msgs.Count - 1 do
+      if (msgs[i] <> '') and (msgs[i][1] = 'D') then
+        body := TPgBody(msgs[i]);
+    Dogrula('pg ext binary int8 degeri 1',
+      body = TPgI16(1) + TPgI32(8) + TPgI64(1), '');
+
+    // Binary sonuc: float8/bool/date/timestamp/text birlikte.
+    Dogrula('pg bin DDL',
+      Query('CREATE TABLE pg_bin(id INTEGER PRIMARY KEY, f FLOAT, b BOOL, ' +
+        'd DATE, ts DATETIME, s TEXT)'), '');
+    Dogrula('pg bin INSERT',
+      Query('INSERT INTO pg_bin VALUES (1, 1.5, 1, ''2026-01-02'', ' +
+        '''2026-01-02 03:04:05'', ''abc'')'), '');
+    FreeAndNil(msgs);
+    SendExt('P', 'p6'#0 + 'SELECT id, f, b, d, ts, s FROM pg_bin'#0 + TPgI16(0));
+    SendExt('B', ''#0 + 'p6'#0 + TPgI16(0) + TPgI16(0) +
+      TPgI16(1) + TPgI16(1));
+    SendExt('D', 'P' + ''#0);
+    SendExt('E', ''#0 + TPgI32(0));
+    SyncRead;
+    Dogrula('pg bin binary yanit (12TDCZ)', TypeSeq = '12TDCZ', TypeSeq);
+    body := '';
+    for i := 0 to msgs.Count - 1 do
+      if (msgs[i] <> '') and (msgs[i][1] = 'D') then
+        body := TPgBody(msgs[i]);
+    Dogrula('pg bin binary degerler',
+      body = TPgI16(6) + TPgI32(8) + TPgI64(1) +
+        TPgI32(8) + TPgF64(1.5) + TPgI32(1) + #1 +
+        TPgI32(4) + TPgI32(Trunc(EncodeDate(2026, 1, 2) -
+          EncodeDate(2000, 1, 1))) +
+        TPgI32(8) + TPgI64(Round((EncodeDate(2026, 1, 2) +
+          EncodeTime(3, 4, 5, 0) - EncodeDate(2000, 1, 1)) *
+          86400.0 * 1000000.0)) +
+        TPgI32(3) + 'abc', '');
 
     Dogrula('pg ext hata sonrasi baglanti canli',
       Query('SELECT COUNT(*) FROM pg_ext'), '');
