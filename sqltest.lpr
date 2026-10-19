@@ -11479,6 +11479,22 @@ begin
     '[{"x":1,"y":9},{"x":2,"y":8},{"x":3,"y":9}]' + Q + ', ' + Q +
     '$[?(@.x = 1 || (@.x = 2 && @.y = 8))]' + Q + ')',
     0, 0, '[{"x":1,"y":9},{"x":2,"y":8}]');
+  // M10 genisletme: filtre fonksiyonlari length/abs/lower/upper.
+  ChkVal('JP length()', 'SELECT JSON_EXTRACT(' + Q +
+    '[{"s":"abc"},{"s":"de"}]' + Q + ', ' + Q +
+    '$[?(length(@.s) > 2)].s' + Q + ')', 0, 0, '["abc"]');
+  ChkVal('JP length() dizi', 'SELECT JSON_EXTRACT(' + Q +
+    '[[1,2,3],[4]]' + Q + ', ' + Q +
+    '$[?(length(@) > 2)]' + Q + ')', 0, 0, '[[1,2,3]]');
+  ChkVal('JP abs()', 'SELECT JSON_EXTRACT(' + Q +
+    '[-3,2,-1]' + Q + ', ' + Q +
+    '$[?(abs(@) > 2)]' + Q + ')', 0, 0, '[-3]');
+  ChkVal('JP lower()', 'SELECT JSON_EXTRACT(' + Q +
+    '["A","b"]' + Q + ', ' + Q +
+    '$[?(lower(@) == "a")]' + Q + ')', 0, 0, '["A"]');
+  ChkVal('JP upper()', 'SELECT JSON_EXTRACT(' + Q +
+    '["A","b"]' + Q + ', ' + Q +
+    '$[?(upper(@) == "A")]' + Q + ')', 0, 0, '["A"]');
 end;
 
 procedure T111_RasgeleDiferansiyel;

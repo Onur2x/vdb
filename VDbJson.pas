@@ -684,6 +684,7 @@ type
   TJsonNodeList = array of TJsonVal;
   TJsonLitKind = (jlNone, jlNum, jlStr, jlBool, jlNull);
   TJsonPred = record
+    FuncName: string;   // '', LENGTH, ABS, LOWER, UPPER
     Fields: TStrArray;
     Op: string;
     LitKind: TJsonLitKind;
@@ -794,6 +795,20 @@ begin
   n := Length(S);
   if n = 0 then Exit;
   SkipWs;
+  if (p <= n) and (S[p] in ['a'..'z', 'A'..'Z']) then
+  begin
+    st := p;
+    while (p <= n) and (S[p] in ['a'..'z', 'A'..'Z', '0'..'9', '_']) do
+      Inc(p);
+    Pred.FuncName := UpperCase(Copy(S, st, p - st));
+    if (Pred.FuncName <> 'LENGTH') and (Pred.FuncName <> 'ABS') and
+       (Pred.FuncName <> 'LOWER') and (Pred.FuncName <> 'UPPER') then
+      Exit;
+    SkipWs;
+    if (p > n) or (S[p] <> '(') then Exit;
+    Inc(p);
+    SkipWs;
+  end;
   if (p > n) or (S[p] <> '@') then Exit;
   Inc(p);
   while (p <= n) and (S[p] = '.') do
@@ -807,6 +822,12 @@ begin
     Pred.Fields[High(Pred.Fields)] := Copy(S, st, p - st);
   end;
   SkipWs;
+  if Pred.FuncName <> '' then
+  begin
+    if (p > n) or (S[p] <> ')') then Exit;
+    Inc(p);
+    SkipWs;
+  end;
   if p > n then Exit(True);   // yalniz @... -> dogruluk testi
   // operator
   if Copy(S, p, 2) = '==' then begin Pred.Op := '='; Inc(p, 2); end
@@ -873,6 +894,9 @@ function JsonPredMatch(V: TJsonVal; const P: TJsonPred): Boolean;
 var
   t: TJsonVal;
   i, cmp: Integer;
+  fnNum: Double;
+  fnStr: string;
+  isFnNum, isFnStr: Boolean;
 begin
   Result := False;
   t := V;
@@ -882,8 +906,42 @@ begin
     if t = nil then Exit;
   end;
   if t = nil then Exit;
+  isFnNum := False;
+  isFnStr := False;
+  if P.FuncName = 'LENGTH' then
+  begin
+    case t.Kind of
+      jkStr: fnNum := Length(t.Str);
+      jkArr, jkObj: fnNum := Length(t.Items);
+    else
+      Exit(False);
+    end;
+    isFnNum := True;
+  end
+  else if P.FuncName = 'ABS' then
+  begin
+    if t.Kind <> jkNum then Exit(False);
+    fnNum := Abs(t.Num);
+    isFnNum := True;
+  end
+  else if P.FuncName = 'LOWER' then
+  begin
+    if t.Kind <> jkStr then Exit(False);
+    fnStr := LowerCase(t.Str);
+    isFnStr := True;
+  end
+  else if P.FuncName = 'UPPER' then
+  begin
+    if t.Kind <> jkStr then Exit(False);
+    fnStr := UpperCase(t.Str);
+    isFnStr := True;
+  end
+  else if P.FuncName <> '' then
+    Exit(False);
   if P.Op = '' then
   begin
+    if isFnNum then Exit(fnNum <> 0);
+    if isFnStr then Exit(fnStr <> '');
     case t.Kind of
       jkNull: Exit(False);
       jkBool: Exit(t.B);
@@ -894,32 +952,48 @@ begin
     end;
   end;
   cmp := 0;
-  case P.LitKind of
-    jlNull:
-      begin
-        if t.Kind <> jkNull then Exit(P.Op = '!=');
-        cmp := 0;
-      end;
-    jlBool:
-      begin
-        if t.Kind <> jkBool then Exit(False);
-        if t.B <> P.Bool then cmp := 1 else cmp := 0;
-      end;
-    jlNum:
-      begin
-        if t.Kind <> jkNum then Exit(False);
-        if t.Num < P.Num then cmp := -1
-        else if t.Num > P.Num then cmp := 1
-        else cmp := 0;
-      end;
-    jlStr:
-      begin
-        if t.Kind <> jkStr then Exit(False);
-        cmp := CompareStr(t.Str, P.Str);
-        if cmp < 0 then cmp := -1 else if cmp > 0 then cmp := 1;
-      end;
+  if isFnNum then
+  begin
+    if P.LitKind <> jlNum then Exit(False);
+    if fnNum < P.Num then cmp := -1
+    else if fnNum > P.Num then cmp := 1
+    else cmp := 0;
+  end
+  else if isFnStr then
+  begin
+    if P.LitKind <> jlStr then Exit(False);
+    cmp := CompareStr(fnStr, P.Str);
+    if cmp < 0 then cmp := -1 else if cmp > 0 then cmp := 1;
+  end
   else
-    Exit(False);
+  begin
+    case P.LitKind of
+      jlNull:
+        begin
+          if t.Kind <> jkNull then Exit(P.Op = '!=');
+          cmp := 0;
+        end;
+      jlBool:
+        begin
+          if t.Kind <> jkBool then Exit(False);
+          if t.B <> P.Bool then cmp := 1 else cmp := 0;
+        end;
+      jlNum:
+        begin
+          if t.Kind <> jkNum then Exit(False);
+          if t.Num < P.Num then cmp := -1
+          else if t.Num > P.Num then cmp := 1
+          else cmp := 0;
+        end;
+      jlStr:
+        begin
+          if t.Kind <> jkStr then Exit(False);
+          cmp := CompareStr(t.Str, P.Str);
+          if cmp < 0 then cmp := -1 else if cmp > 0 then cmp := 1;
+        end;
+    else
+      Exit(False);
+    end;
   end;
   if P.Op = '=' then Exit(cmp = 0);
   if P.Op = '!=' then Exit(cmp <> 0);
