@@ -2602,8 +2602,11 @@ begin
         if span <= VDB_SCAN_CHUNK_CAP then
         begin
           if Length(chunk) < Integer(span) then SetLength(chunk, Integer(span));
-          FS.Position := lo;
-          if FS.Read(chunk[0], span) = span then got := Integer(span);
+          // H14: konumsal (paylasimsiz) okuma; FS.Position paralel
+          // taramalarda yaris durumudur.
+          if VDbPosRead(FS.Handle, lo, chunk[0], Integer(span)) =
+             Integer(span) then
+            got := Integer(span);
         end;
         for m := bBeg[bucket] to bCur[bucket] - 1 do
         begin
@@ -2612,9 +2615,10 @@ begin
             Move(chunk[Integer(cands[n2].Off - lo)], h, SizeOf(h))
           else
           begin
-            // Asiri buyuk bucket / kismi okuma: eski kayit-bazi yolu
-            FS.Position := cands[n2].Off;
-            FS.ReadBuffer(h, SizeOf(h));
+            // Asiri buyuk bucket / kismi okuma: kayit-bazi konumsal yol
+            if VDbPosRead(FS.Handle, cands[n2].Off, h, SizeOf(h)) <>
+               SizeOf(h) then
+              Continue;
           end;
           // Eski davranisla birebir: magic/anahtar/uzunluk/DEL uyumsuzsa
           // kayit SESSIZ atlanir (slot bos kalir, sonda sikistirilir).
@@ -2630,8 +2634,10 @@ begin
               p := Integer(cands[n2].Off - lo) + SizeOf(h);
               Move(chunk[p], Vals[cands[n2].Slot][0], cands[n2].Size);
             end
-            else
-              FS.ReadBuffer(Vals[cands[n2].Slot][0], cands[n2].Size);
+            else if VDbPosRead(FS.Handle,
+              cands[n2].Off + SizeOf(h), Vals[cands[n2].Slot][0],
+              cands[n2].Size) <> cands[n2].Size then
+              Continue;
           end;
           DecryptIfNeeded(Vals[cands[n2].Slot], h.Flags, Keys[cands[n2].Slot]);
           kept[cands[n2].Slot] := 1;

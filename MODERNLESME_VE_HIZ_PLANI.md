@@ -834,7 +834,7 @@ maddelerin "eksik" sanılıp tekrar uygulanmasını önlemektir.
 | **EK** ifade tip hatası | ✅ Düzeltildi | `ExprResultCtype`: iki taraf da kolon değilken ifade (aritmetik) sayısal kıyaslanır; `(a+0) > 198` 77.800→60.200; `T07` 5 yeni test; `sqltest 2462/2462` |
 | **M10 IDENTITY** | ✅ Yapıldı | `GENERATED {ALWAYS\|BY DEFAULT} AS IDENTITY`; ALWAYS açık değeri reddeder, BY DEFAULT sayacı ilerletir; INSERT/BatchInsert/COPY/RETURNING; UPDATE/upsert değişimi reddeder; sema bayrağı bit2/bit3; `T117` 19 test |
 | **M12** dizin fsync | ✅ **Zaten vardı** | `VDbFlushDir` (`VDbSync.pas:66`) + `VDbCore.pas:854,1441,1456,1505,2969,3039,3779` |
-| **H14** konumsal I/O | ✅ **Büyük ölçüde vardı** | `VDbPosRead` (OVERLAPPED/pread) `GetSnapshot`'ta (`VDbCore.pas:1765`, P-19) |
+| **H14** konumsal I/O | ✅ Yapıldı | `VDbPosRead` (OVERLAPPED/pread) `GetSnapshot` (`VDbCore.pas:1765`, P-19), `ScanRawIter` ve **`ScanSnapshot`** (bucket + kayıt-bazı yollar; `FS.Position` paylaşımı kaldırıldı) |
 
 **Kod denetimi sonucu diğer maddeler:**
 
@@ -864,6 +864,7 @@ maddelerin "eksik" sanılıp tekrar uygulanmasını önlemektir.
 | M11 depolama soyutlaması | ❌ Yok | `VDbCore` somut KV; arayüz dikişi yok |
 
 **2026-10-19 ek turu:** H13 `COPY FROM` (CSV/TEXT, atomik, 100k ~1,95x / 300k ~2,20x);
+H14 `ScanSnapshot` konumsal I/O (`VDbPosRead`; paylaşımlı `FS.Position` kaldırıldı);
 M9 `SHOW STATS` 6→13 metrik + `TVSql.GetMetricsText` (Prometheus metni) + `VDbMetricsHttp`
 (`GET /metrics`, ayrı port); M10 JSONPath alt
 kümesi (`JSON_EXTRACT`/`JSON_VALUE`/`JSON_EXISTS`) + **union seciciler**
