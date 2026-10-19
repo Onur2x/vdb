@@ -10945,6 +10945,98 @@ var
     msgs := tmp;
   end;
 
+  { Extended protocol: Parse/Bind/Execute + COPY FROM STDIN akisi.
+    Execute'tan sonra CopyInResponse ('G') beklenir; veri ve CopyDone
+    gonderilir; ReadyForQuery yalnizca Sync ile gelir. }
+  function ExtCopyIn(const Sql, Data: string): Boolean;
+  var
+    t: AnsiChar;
+    bb: AnsiString;
+    tmp: TStringList;
+    sawG: Boolean;
+  begin
+    Result := False;
+    FreeAndNil(msgs);
+    if not SendExt('P', ''#0 + Sql + #0 + TPgI16(0)) then Exit;
+    if not SendExt('B', ''#0 + ''#0 + TPgI16(0) + TPgI16(0) + TPgI16(0)) then Exit;
+    if not SendExt('E', ''#0 + TPgI32(0)) then Exit;
+    sawG := False;
+    while True do
+    begin
+      if not TPgRecvMsg(s, t, bb) then Exit;
+      if t = 'E' then
+      begin
+        // Hata: Sync gonderip Ready'ye kadar oku.
+        if not SendExt('S', '') then Exit;
+        Result := TPgReadUntilReady(s, tmp);
+        tmp.Insert(0, t + '|' + bb);   // E, Ready okumasindan once tuketildi
+        msgs := tmp;
+        Exit;
+      end;
+      if t = 'G' then
+      begin
+        sawG := True;
+        Break;
+      end;
+    end;
+    if not sawG then Exit;
+    if Data <> '' then
+      if not SendExt('d', Data) then Exit;
+    if not SendExt('c', '') then Exit;
+    if not SendExt('S', '') then Exit;
+    Result := TPgReadUntilReady(s, tmp);
+    if Result and sawG then
+      tmp.Insert(0, 'G|');   // G, veri gonderilmeden once tuketildi
+    msgs := tmp;
+  end;
+
+  { Extended protocol: Parse/Bind/Execute/Sync; COPY TO STDOUT yanitini
+    ReadyForQuery'ye kadar toplar. }
+  function ExtCopyOut(const Sql: string): Boolean;
+  var
+    tmp: TStringList;
+  begin
+    Result := False;
+    FreeAndNil(msgs);
+    if not SendExt('P', ''#0 + Sql + #0 + TPgI16(0)) then Exit;
+    if not SendExt('B', ''#0 + ''#0 + TPgI16(0) + TPgI16(0) + TPgI16(0)) then Exit;
+    if not SendExt('E', ''#0 + TPgI32(0)) then Exit;
+    if not SendExt('S', '') then Exit;
+    Result := TPgReadUntilReady(s, tmp);
+    msgs := tmp;
+  end;
+
+  { Extended COPY FROM: CopyFail gonder, Sync ile kapan. }
+  function ExtCopyFail(const Sql, Msg: string): Boolean;
+  var
+    t: AnsiChar;
+    bb: AnsiString;
+    tmp: TStringList;
+  begin
+    Result := False;
+    FreeAndNil(msgs);
+    if not SendExt('P', ''#0 + Sql + #0 + TPgI16(0)) then Exit;
+    if not SendExt('B', ''#0 + ''#0 + TPgI16(0) + TPgI16(0) + TPgI16(0)) then Exit;
+    if not SendExt('E', ''#0 + TPgI32(0)) then Exit;
+    while True do
+    begin
+      if not TPgRecvMsg(s, t, bb) then Exit;
+      if t = 'G' then Break;
+      if t = 'E' then
+      begin
+        if not SendExt('S', '') then Exit;
+        Result := TPgReadUntilReady(s, tmp);
+        tmp.Insert(0, t + '|' + bb);
+        msgs := tmp;
+        Exit;
+      end;
+    end;
+    if not SendExt('f', Msg + #0) then Exit;
+    if not SendExt('S', '') then Exit;
+    Result := TPgReadUntilReady(s, tmp);
+    msgs := tmp;
+  end;
+
 begin
   Grp('M1 PostgreSQL wire protocol (basit sorgu)');
   ForceDirectories(D + '\pgsrv');
@@ -11089,6 +11181,56 @@ begin
       (Pos('1,aa'#10, CopyDataText) > 0) and
       (Pos('4,dd'#10, CopyDataText) > 0),
       StringReplace(CopyDataText, #10, '\n', [rfReplaceAll]));
+
+    // ---- Extended protocol uzerinden COPY ----
+    Dogrula('pg ext COPY FROM',
+      ExtCopyIn('COPY pg_copy FROM STDIN WITH (FORMAT csv)',
+        '5,ee'#10'6,ff'#10), '');
+    Dogrula('pg ext COPY FROM tag COPY 2', FindTag('COPY 2'), TypeSeq);
+    Dogrula('pg ext COPY FROM akis tipi G',
+      Pos('G', TypeSeq) > 0, TypeSeq);
+    Dogrula('pg ext COPY FROM Ready yalniz Sync sonrasi',
+      (TypeSeq <> '') and (TypeSeq[Length(TypeSeq)] = 'Z'), TypeSeq);
+    Dogrula('pg ext COPY FROM sonrasi SELECT',
+      Query('SELECT COUNT(*) FROM pg_copy'), '');
+    row := RowAt(0);
+    Dogrula('pg ext COPY FROM 6 satir',
+      (Length(row) = 1) and (row[0] = '6'), '');
+
+    Dogrula('pg ext COPY TO',
+      ExtCopyOut('COPY (SELECT id, s FROM pg_copy WHERE id >= 5 ' +
+        'ORDER BY id) TO STDOUT WITH (FORMAT csv, HEADER)'), '');
+    Dogrula('pg ext COPY TO akis tipi H',
+      Pos('H', TypeSeq) > 0, TypeSeq);
+    Dogrula('pg ext COPY TO tag COPY 2', FindTag('COPY 2'), TypeSeq);
+    Dogrula('pg ext COPY TO CSV icerik',
+      (Pos('id,s'#10, CopyDataText) = 1) and
+      (Pos('5,ee'#10, CopyDataText) > 0) and
+      (Pos('6,ff'#10, CopyDataText) > 0),
+      StringReplace(CopyDataText, #10, '\n', [rfReplaceAll]));
+
+    Dogrula('pg ext COPY Fail',
+      ExtCopyFail('COPY pg_copy FROM STDIN WITH (FORMAT csv)',
+        'ext iptal'), '');
+    Dogrula('pg ext COPY Fail ErrorResponse', ErrText <> '',
+      Copy(ErrText, 1, 40));
+    Dogrula('pg ext COPY Fail atomik',
+      Query('SELECT COUNT(*) FROM pg_copy'), '');
+    row := RowAt(0);
+    Dogrula('pg ext COPY Fail 6 satir',
+      (Length(row) = 1) and (row[0] = '6'), '');
+
+    // Describe Portal COPY akisini BASLATMAMALI; NoData donmeli.
+    FreeAndNil(msgs);
+    Dogrula('pg ext COPY Describe Parse',
+      SendExt('P', 'cdesc'#0 + 'COPY pg_copy TO STDOUT'#0 + TPgI16(0)), '');
+    Dogrula('pg ext COPY Describe Bind',
+      SendExt('B', 'cdesc'#0 + 'cdesc'#0 + TPgI16(0) + TPgI16(0) + TPgI16(0)), '');
+    Dogrula('pg ext COPY Describe Portal',
+      SendExt('D', 'P' + 'cdesc'#0), '');
+    Dogrula('pg ext COPY Describe Sync', SyncRead, '');
+    Dogrula('pg ext COPY Describe NoData',
+      (TypeSeq = '12nZ') and (Pos('H', TypeSeq) = 0), TypeSeq);
 
     // ---- Extended query protocol (parametresiz) ----
     FreeAndNil(msgs);

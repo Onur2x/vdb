@@ -219,6 +219,21 @@ sorgu tarafında ART/B+tree kazanımı bu profilde küçük. ART/B+tree hâlâ t
 > **Kalan:** ART/B+tree prototipi (indekssiz taramada A/B fazının O(n)
 > dolaşımını da kaldırmak için offset→bucket indeksi veya ART).
 
+> **Uygulama durumu — 2. adım: skiplist prototipi (2026-10-19, TAMAM):**
+> `VDbSkipList.pas` eklendi: `Key + Value` (indeks anahtarı + PK/Cov) üzerinde
+> O(log N) beklenen ekleme/silme, `LowerBound`, tam eşleşme ve sıralı
+> `Range` iterasyonu. `TIdxEntry` sözleşmesi metin anahtar/PK olarak korunur;
+> tip-duyarlı karşılaştırma için `TVDbSkipCompare` enjekte edilebilir.
+> `skipchk.dpr` bağımsız oracle (`TStringList`) ile 200.000 girdide
+> ekleme/sıralama/LowerBound/Find/Range/Delete sonuçlarını birebir doğrular.
+> **Ölçüm (1.000.000 girdi):** ekleme **1091,1 ms**, 200.000 LowerBound
+> **393,8 ms**, 10.000 aralık **289,6 ms**, 100.000 silme **257,2 ms**.
+> **Kapı:** `skipchk` 0 hata.
+> **Sıradaki:** motora entegrasyon — `TryGetMemIndex` çağrılarının sıralı
+> dizi yerine aralık iterasyonuna taşınması ve güncelleme yolunun O(N)
+> birleştirmeden kurtarılması. Bu dilim tamamlanana kadar mevcut dizi yolu
+> varsayılan ve tek doğruluk kaynağıdır.
+
 ### H4 — mmap read yolu (sıfır-kopya)
 **Sorun:** KR-D okuma tarafı. Kayıt başına okuma/kopya.
 **Çözüm:** Append-only veri dosyasını `MapViewOfFile` (Windows) / `mmap` (POSIX) ile eşle;
@@ -528,9 +543,14 @@ Mevcut SQL çekirdeği hazır. `psql`, JDBC/ODBC, PgAdmin, BI araçları ve ORM'
 > RowDescription/DataRow/CommandComplete üretilir. **SQLSTATE (2026-10-19):**
 > ErrorResponse `C` alanı `EVDbException.ErrorCode` üzerinden eşlenir
 > (`23505`, `42P01`, `42601`, `42P07`, `0A000`, `XX001`, …); bilinmeyenler
-> `42000`. `T116` 100 test.
-> **Kalan:** SSL/TLS, extended protocol üzerinden COPY, gerçek sonuç tip OID'leri
-> (şu an hepsi TEXT) ve binary sonuç formatı.
+> `42000`. **Extended COPY (2026-10-19):** `Parse/Bind/Execute` üzerinden
+> `COPY ... FROM STDIN` ve `COPY ... TO STDOUT` / `COPY (SELECT ...) TO STDOUT`
+> desteklenir. COPY akışı Execute anında başlar; `CopyInResponse`/`CopyOutResponse`,
+> CopyData/CopyDone/CopyFail işlenir; `ReadyForQuery` yalnızca `Sync` ile
+> gönderilir. `Describe Portal` COPY akışını başlatmaz, `NoData` döner.
+> **T116** 119 test (19'u extended COPY).
+> **Kalan:** SSL/TLS, gerçek sonuç tip OID'leri (şu an hepsi TEXT) ve binary
+> sonuç formatı.
 
 ### M2 — Arrow/Parquet içe-dışa + DuckDB interop
 Kolonlu dosya formatı desteği; analitik pipeline'lara/Arrow'a sıfır-kopya aktarım.
@@ -860,7 +880,7 @@ maddelerin "eksik" sanılıp tekrar uygulanmasını önlemektir.
 |---|---|---|
 | H1 vektörleştirilmiş filtre | ✅ Yapıldı | `TryStreamSelect`: ham akış + LIMIT erken durma + AND-tabanlı ham-yüklem batch eleme (INT/FLOAT + TEXT `=`/`<>`); `rawchk` birebir. (Projeksiyon/`EvalExpr` hâlâ string döndürür — çıktı aşaması; planın "tip-tabanlı ara diziler" optimizasyonu opsiyonel kaldı, sonucu değiştirmez.) |
 | H2 hash join | ✅ Yapıldı | indekssiz tek-eşitlik INNER/LEFT (`ExecJoinScan`); indeksli/PK hızlı yolu korunuyor |
-| H3 ART/B+tree + zone map | 🟡 Kısmi (zone map ✅) | **Bucket zone map**: INT/FLOAT min/max, 2 MB bucket, disk formatı değişmez, `(FIdxVer,DataEpoch)` invalidation + batch'te kapalı; `a=77777` 163,5→31,6 ms (**5,2x**), float aralık 185,4→35,4 ms (**5,2x**); `zonechk` birebir + INSERT/UPDATE/DELETE/ROLLBACK/Compact güvenliği. `FMemIdx` hash + sıralı dizi (KR-C) indeks dilimi ~1300x. **ART/B+tree hâlâ yok** |
+| H3 ART/B+tree + zone map | 🟡 Kısmi (zone map ✅, skiplist prototipi ✅) | **Bucket zone map**: INT/FLOAT min/max, 2 MB bucket, disk formatı değişmez, `(FIdxVer,DataEpoch)` invalidation + batch'te kapalı; `a=77777` 163,5→31,6 ms (**5,2x**), float aralık 185,4→35,4 ms (**5,2x**); `zonechk` birebir + INSERT/UPDATE/DELETE/ROLLBACK/Compact güvenliği. `FMemIdx` hash + sıralı dizi (KR-C) indeks dilimi ~1300x. **`VDbSkipList.pas`** prototipi: O(log N) insert/delete + LowerBound/Range; `skipchk` 200k oracle + 1M ölçüm (ekleme 1091,1 ms, LB 393,8 ms, 10k range 289,6 ms, 100k delete 257,2 ms). Motora entegrasyon henüz yok; sıralı dizi varsayılan |
 | H4 mmap okuma | 🟡 Deneysel (varsayılan KAPALI) | `ScanRawIter` salt-okunur eşleme (`VDbMapFileHandle`/`SetReadMapEnabled`); sıcak-cache'te mmap **yavaş** (11,3→17,3 ms; yumuşak sayfa hatası); `mmapchk` düz+şifreli+Compact birebir; POSIX kapalı |
 | H5 blok-grup CRC | ❌ Yok | per-record CRC (aynı zamanda format girdisi) |
 | H6 tek-sorgu paralel | ✅ Yapıldı (agrega + indeks sıralaması) | `PrepareRawScan`/`ScanRawPrepared` (offset bucket, aday bir kez); `TryStreamAgg` işçi başına biriktirici + deterministik birleşim; 150k'da 53,0→13,0 ms (8 işçi, **4,08x**); SUM/AVG FLOAT'ta seri (bit-ayni); havuzun auto-reset `RTLEvent` hatası sayma semaforuyla düzeltildi. **H6-sort:** `SortIdxEntries`/`SortIdxEntriesCols` parçalı hızlı sıralama + k-yönlü heap birleştirme; 300k `CREATE INDEX` 708,7→515,2 ms (~1,38x), seri ile birebir |
@@ -869,14 +889,14 @@ maddelerin "eksik" sanılıp tekrar uygulanmasını önlemektir.
 | H11 free-list | ❌ Yok | `DeadBytes`/`AutoCompact` mekanizması var; yerinde geri kazanım yok |
 | H12 blok/sayfa önbelleği | ✅ Yapıldı | `VDbCore` blok önbelleği: 8 KB blok, CLOCK, O(1) hash, varsayılan 8 MB (`SetReadCacheBlocks`); `cachechk` sıcak ~1,8x + şifreli birebir; `sqltest` (kalan=0) / `crashtest` (8/8) yeşil. mmap (H4) isteğe bağlı/deneysel |
 | H13 toplu yükleme | ✅ Yapıldı | çok-satırlı `VALUES (..),(..)` (AST'siz, atomik; 200k ~1,55x) + `COPY FROM` CSV/TEXT dosya akışı (100k ~1,95x, 300k ~2,20x; `copychk` 17/17, atomik rollback) |
-| M1 pgwire | 🟡 Kısmi (parametre ✅) | **pgwire v3** (`VDbPgWire.pas`, ayrı port): startup v3 + SSL reddi, trust auth, ParameterStatus, `Q` basit sorgu, RowDescription/DataRow/CommandComplete, ErrorResponse, Terminate; **extended query** (Parse/Bind/Describe/Execute/Close/Flush/Sync); **`$1…` parametreleri** + `ParameterDescription` (gerçek sayı/OID), metin ve int2/int4/int8/float4/float8/bool binary parametre, `?` yer tutucu; **`COPY ... FROM STDIN` / `TO STDOUT` / `COPY (SELECT ...) TO STDOUT`** (CSV/TEXT, CopyIn/CopyOut/CopyFail, atomik `COPY FROM` motoru) + **çoklu cümle basit sorgu**; `T116` 100 test. SSL/TLS, extended protocol üzerinden COPY, gerçek sonuç tip OID'leri ve binary sonuç formatı yok |
+| M1 pgwire | 🟡 Kısmi (parametre ✅) | **pgwire v3** (`VDbPgWire.pas`, ayrı port): startup v3 + SSL reddi, trust auth, ParameterStatus, `Q` basit sorgu, RowDescription/DataRow/CommandComplete, ErrorResponse, Terminate; **extended query** (Parse/Bind/Describe/Execute/Close/Flush/Sync); **`$1…` parametreleri** + `ParameterDescription` (gerçek sayı/OID), metin ve int2/int4/int8/float4/float8/bool binary parametre, `?` yer tutucu; **`COPY ... FROM STDIN` / `TO STDOUT` / `COPY (SELECT ...) TO STDOUT`** (CSV/TEXT, CopyIn/CopyOut/CopyFail, atomik `COPY FROM` motoru) + **çoklu cümle basit sorgu** + **extended protocol COPY** (Parse/Bind/Execute; CopyIn/CopyOut/CopyDone/CopyFail, `ReadyForQuery` yalnız Sync'te, Describe Portal NoData); `T116` 119 test. SSL/TLS, gerçek sonuç tip OID'leri ve binary sonuç formatı yok |
 | M2 Arrow/Parquet | ❌ Yok | — |
 | M3 WASM | ❌ Yok | — |
 | M4 vektör arama | 🟡 Kısmi | `VDbSpatial.pas` + **`VECTOR_DIM`/`VECTOR_NORM`/`VECTOR_DISTANCE`** (JSON sayı dizisi; cosine/l2/l1/dot; `T113` 10 test) var; ANN (HNSW/IVF) ve `VECTOR(n)` tipi yok — tarama tabanlı |
 | M5 FTS/BM25 | 🟡 Kısmi | `VDbText.pas` (ifade/analiz) + **`TO_TSVECTOR`/`TS_MATCH` (AND + `"phrase"` + `-negation`)/`TS_RANK`** (tokenizasyon + Türkçe küçük harf; `T114` 11 test) var; inverted index/BM25 yok |
 | M6 AEAD/Argon2 | 🟡 Kısmi (AEAD + Argon2 ✅) | **AES-256-GCM** zarfı (`VDBAEAD1`, 96-bit nonce, 128-bit tag; NIST vektörleri `gcmchk`), eski CTR+HMAC okunur; **Argon2id v1.3** (`VDbKdf.pas`, RFC 9106 vektörü `argonchk`) + `.key` v2 (t=3, 64 MiB, p=1; v1 PBKDF2 okunur, `keychk`). Kolon-seviyesi şifreleme yok |
 | M7 async sunucu | 🟡 Kısmi | `VDbSqlServer.pas` thread-per-connection; event-loop yok |
-| M8 fuzz + diferansiyel | 🟢 Büyük ölçüde | geniş `sqltest` (2508) + `crashtest` (8/8) + `rawchk` (akışlı↔genel diferansiyel 29/29) + `mrowchk` (H13 diferansiyel+atomiklik 8/8) + `copychk` (COPY 17/17) + **`T111` rasgele 120 WHERE yüklemi** (INT/FLOAT/TEXT/BOOL/NULL; ham vs genel birebir) + **`fuzzchk` bağımsız 3VL fuzz (3×1000, 0 fark)** + **`sqlite_diff.py` SQLite diferansiyeli (4×1000, 0 fark)**. SQLancer tarzı tam SQL üretimi yok |
+| M8 fuzz + diferansiyel | 🟢 Büyük ölçüde | geniş `sqltest` (2527) + `crashtest` (8/8) + `rawchk` (akışlı↔genel diferansiyel 29/29) + `mrowchk` (H13 diferansiyel+atomiklik 8/8) + `copychk` (COPY 17/17) + **`T111` rasgele 120 WHERE yüklemi** (INT/FLOAT/TEXT/BOOL/NULL; ham vs genel birebir) + **`fuzzchk` bağımsız 3VL fuzz (3×1000, 0 fark)** + **`sqlite_diff.py` SQLite diferansiyeli (4×1000, 0 fark)**. SQLancer tarzı tam SQL üretimi yok |
 | M9 gözlemlenebilirlik | 🟡 Kısmi | `SHOW STATS` (6→13 metrik: dosya/bellek/blok önbelleği) + `SHOW SLOW QUERIES` + **`TVSql.GetMetricsText` Prometheus exposition** + **`VDbMetricsHttp` ayrı portta `GET /metrics` HTTP ucu** (404 diğer yollar, `Content-Type: text/plain; version=0.0.4`, `T115` canlı soket testi) var; ayrıca **`VDbTrace` in-process OpenTelemetry-uyumlu span kaydı** (`sql.query`/`sql.parse`/`sql.execute`, JSON export; OTLP ağ export'u yok) |
 | M10 GENERATED + JSONPath | 🟡 Kısmi | JSON operatörleri + **JSONPath alt kümesi** (`JSON_EXTRACT`/`JSON_VALUE`/`JSON_EXISTS`; `$ .ad ["ad"] ['ad'] [n] [a:b] [*] [0,2] ['a','b'] .* ..ad ..*` ve `[?(@.alan op literal)]` filtresi + `&&`/`||`/`!` birleşimi + parantezli gruplar + `length`/`abs`/`lower`/`upper` fonksiyonları + alan-alan karşılaştırma; ara segment joker; `T112` 53 test) + locale-bağımsız JSON sayı ayrıştırma + **GENERATED ALWAYS AS (STORED)** (`T117` 19 test; semada 6. alan, INSERT/BatchInsert/RETURNING/UPDATE ve ALTER ADD'de hesaplanır; mevcut satırlar geriye dönük doldurulur) + **GENERATED {ALWAYS\|BY DEFAULT} AS IDENTITY** (ALWAYS açık değeri reddeder; BY DEFAULT sayacı ilerletir; UPDATE/upsert değişimi reddeder; sema bayrağı bit2/bit3, yeniden açılışta sayaç korunur); tam JSONPath (script ifadeleri) yok |
 | M11 depolama soyutlaması | ❌ Yok | `VDbCore` somut KV; arayüz dikişi yok |
@@ -892,8 +912,9 @@ M4 `VECTOR_DIM`/`VECTOR_NORM`/`VECTOR_DISTANCE` (cosine/l2/l1/dot); M5 `TO_TSVEC
 bağımsız 3VL fuzz (`fuzzchk`, 3×1000 sorgu, 0 fark; NOT/NULL/IN/BETWEEN düzeltmeleri) +
 SQLite diferansiyeli (`sqlite_diff.py`, 4×1000 sorgu, 0 fark);
 M1 pgwire v3 + extended query + `$1…` parametreleri + **`COPY ... FROM STDIN` /
-`TO STDOUT` / `COPY (SELECT ...) TO STDOUT`** + **çoklu cümle basit sorgu**
-(CSV/TEXT, CopyIn/CopyOut/CopyFail; `VDbPgWire.pas`, `T116` 100 test);
+`TO STDOUT` / `COPY (SELECT ...) TO STDOUT`** + **çoklu cümle basit sorgu** +
+**extended protocol COPY** (CSV/TEXT, CopyIn/CopyOut/CopyFail; `VDbPgWire.pas`,
+`T116` 119 test);
 M10 `GENERATED ALWAYS AS (…) STORED`
 + JSONPath filtre/recursive/slice/union (`T117` 19 test, `T112` 53 test);
 **M10 `GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY`** (ALWAYS açık değeri reddeder,

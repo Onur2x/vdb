@@ -401,14 +401,16 @@ loss (2251/2251 SQL tests + 8/8 crash chain green at every step).
 
 ### TR: Mevcut Durum (2026-10-19)
 ```
-sqltest:      2508/2508  (tümü yeşil; M10 IDENTITY/JSONPath union+mantık+fonksiyon+alan karşılaştırma, M5 FTS phrase/negation, M9 OTel span kaydı, pgwire COPY/çoklu cümle/SQLSTATE dahil)
+sqltest:      2527/2527  (tümü yeşil; M10 IDENTITY/JSONPath union+mantık+fonksiyon+alan karşılaştırma, M5 FTS phrase/negation, M9 OTel span kaydı, pgwire COPY/çoklu cümle/SQLSTATE + extended COPY dahil)
 crashtest:    8/8        (çökme dayanıklılığı — veri kaybı YOK)
 rawchk:       29/29      (akışlı ↔ genel diferansiyel)
 mrowchk:      0 hata     (çok-satırlı VALUES + atomiklik)
 fuzzchk:      3000/3000  (bağımsız 3VL WHERE fuzz, 3×1000)
 sqlite_diff:  4000/4000  (SQLite WHERE diferansiyeli, 4×1000)
 hashchk:      80/80      (hash birebir)
+copychk:      17/17      (COPY CSV/TEXT + atomiklik)
 zonechk:      0 hata     (zone map doğruluk/performans)
+skipchk:      0 hata     (H3 skiplist prototipi: 200k oracle + 1M ölçüm)
 vdbcrypttest:   60/60
 vdbapitest:    170/170
 vdbclienttest: 101/101
@@ -421,7 +423,7 @@ vdbclienttest: 101/101
 - ✅ Mutasyon: 3 kapı (FAIL→geri al→yeşil)
 
 ### EN: Current Status (2026-10-15)
-sqltest **2508/2508 (all green, including M10 IDENTITY, JSONPath union/logical filters/filter functions/field comparison, M5 FTS phrase/negation, M9 in-process OTel spans, and pgwire COPY/multi-statement/SQLSTATE)**, crash-durability suite **8/8** (kill at arbitrary points, zero data loss), plus crypt (60/60), DLL API (170/170) and client (101/101) suites green. All R-12 features (Auth, Prepared Statements, Pool Capacity) are complete and mutation-tested.
+sqltest **2527/2527 (all green, including M10 IDENTITY, JSONPath union/logical filters/filter functions/field comparison, M5 FTS phrase/negation, M9 in-process OTel spans, and pgwire COPY/multi-statement/SQLSTATE plus extended-protocol COPY)**, crash-durability suite **8/8** (kill at arbitrary points, zero data loss), H3 skiplist prototype gate **skipchk** green (200k oracle checks + 1M-entry benchmark), plus crypt (60/60), DLL API (170/170) and client (101/101) suites green. All R-12 features (Auth, Prepared Statements, Pool Capacity) are complete and mutation-tested.
 
 ---
 

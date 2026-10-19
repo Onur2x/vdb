@@ -26,13 +26,14 @@ unit VDbPgWire;
       EVDbException.ErrorCode'dan eslenir (23505, 42P01, 42601, ...).
     - 'X' Terminate
     - COPY ... FROM STDIN / COPY ... TO STDOUT / COPY (SELECT ...) TO STDOUT
-      (basit sorgu; CSV/TEXT). FROM akisi gecici dosyaya yazilip mevcut COPY
-      motoruna devredilir; TO akisi SELECT sonucundan CSV/TEXT satirlari
-      olarak uretilir.
+      (CSV/TEXT), hem basit sorguda hem extended protocol Execute icinde.
+      FROM akisi gecici dosyaya yazilip mevcut COPY motoruna devredilir;
+      TO akisi SELECT sonucundan CSV/TEXT satirlari olarak uretilir.
+      Extended COPY'de ReadyForQuery yalnizca Sync ile gonderilir;
+      Describe Portal akisi baslatmaz, NoData doner.
 
   DESTEKLENMEYEN (bilincli sinir):
-    - Extended protocol uzerinden COPY; SSL/TLS; gercek sonuc tip OID'leri
-      (tum alanlar TEXT/OID 25).
+    - SSL/TLS; gercek sonuc tip OID'leri (tum alanlar TEXT/OID 25).
     - Binary sonuc formati istenirse hata dondurulur; sonuclar metindir.
     - NULL ile bos metin ayrimi: motor ikisini de '' olarak tutar;
       DataRow'da her ikisi de uzunluk 0 olarak gonderilir.
@@ -886,7 +887,11 @@ begin
 end;
 
 function HandlePgCopyIn(S: TVdbSocket; FSql: TVSql;
-  const Spec: TPgCopySpec): Boolean;
+  const Spec: TPgCopySpec; ATerminate: Boolean; out AErr: Boolean): Boolean;
+// ATerminate=True: basit sorgu -> hata/basari sonunda ReadyForQuery.
+// ATerminate=False: extended protocol -> ReadyForQuery yalnizca Sync'te
+// gonderilir; hata varsa AErr=True ile donulur ve cagiran Sync'e kadar
+// mesaj yutar.
 var
   td: TTableDef;
   ncols, i, len, plen: Integer;
@@ -895,24 +900,31 @@ var
   b: Byte;
   buf: TBytes;
   Res: TSqlResult;
+
+  function CopyErr(const Msg: string; E: Exception): Boolean;
+  begin
+    AErr := True;
+    if E <> nil then
+      Result := SendPg(S, ErrorMsgEx(Msg, E))
+    else
+      Result := SendPg(S, ErrorMsg(Msg));
+    if ATerminate then
+      Result := SendPg(S, ReadyMsg);
+  end;
+
 begin
   Result := False;
+  AErr := False;
   try
     td := FSql.TableDb.GetTable(Spec.TableName);
   except
     on E: Exception do
-    begin
-      SendPg(S, ErrorMsgEx(E.Message, E));
-      Exit(SendPg(S, ReadyMsg));
-    end;
+      Exit(CopyErr(E.Message, E));
   end;
   if Length(Spec.Cols) > 0 then ncols := Length(Spec.Cols)
   else ncols := Length(td.Cols);
   if ncols <= 0 then
-  begin
-    SendPg(S, ErrorMsg('COPY: tabloda kolon yok'));
-    Exit(SendPg(S, ReadyMsg));
-  end;
+    Exit(CopyErr('COPY: tabloda kolon yok', nil));
 
   if not SendPg(S, PgCopyResponse('G', ncols)) then Exit;
 
@@ -927,10 +939,7 @@ begin
         if not RecvI32(S, len) then Exit;
         plen := len - 4;
         if (plen < 0) or (plen > 64 * 1024 * 1024) then
-        begin
-          SendPg(S, ErrorMsg('COPY: gecersiz veri parcasi'));
-          Exit(SendPg(S, ReadyMsg));
-        end;
+          Exit(CopyErr('COPY: gecersiz veri parcasi', nil));
         SetLength(buf, plen);
         if (plen > 0) and not VdbRecvAll(S, buf[1], plen) then Exit;
         case AnsiChar(b) of
@@ -950,14 +959,10 @@ begin
                 if (msg <> '') and (msg[Length(msg)] = #0) then
                   Delete(msg, Length(msg), 1);
               end;
-              SendPg(S, ErrorMsg('COPY: ' + msg));
-              Exit(SendPg(S, ReadyMsg));
+              Exit(CopyErr('COPY: ' + msg, nil));
             end;
           else
-            begin
-              SendPg(S, ErrorMsg('COPY: beklenmeyen istemci mesaji'));
-              Exit(SendPg(S, ReadyMsg));
-            end;
+            Exit(CopyErr('COPY: beklenmeyen istemci mesaji', nil));
         end;
       end;
     finally
@@ -983,11 +988,12 @@ begin
     Res := Default(TSqlResult);
     try
       Res := FSql.Exec(sql);
-      Result := SendPg(S, CommandMsg('COPY ' + IntToStr(Res.Affected))) and
-        SendPg(S, ReadyMsg);
+      Result := SendPg(S, CommandMsg('COPY ' + IntToStr(Res.Affected)));
+      if Result and ATerminate then
+        Result := SendPg(S, ReadyMsg);
     except
       on E: Exception do
-        Result := SendPg(S, ErrorMsgEx(E.Message, E)) and SendPg(S, ReadyMsg);
+        Result := CopyErr(E.Message, E);
     end;
   finally
     if FileExists(path) then DeleteFile(path);
@@ -995,20 +1001,31 @@ begin
 end;
 
 function HandlePgCopyOut(S: TVdbSocket; FSql: TVSql;
-  var Spec: TPgCopySpec): Boolean;
+  var Spec: TPgCopySpec; ATerminate: Boolean; out AErr: Boolean): Boolean;
+// ATerminate=True: basit sorgu; False: extended protocol (Ready yok).
 var
   td: TTableDef;
   names, row: TStrArray;
   i, j, n: Integer;
   sql, line: string;
   Res: TSqlResult;
+
+  function CopyErr(const Msg: string; E: Exception): Boolean;
+  begin
+    AErr := True;
+    if E <> nil then
+      Result := SendPg(S, ErrorMsgEx(Msg, E))
+    else
+      Result := SendPg(S, ErrorMsg(Msg));
+    if ATerminate then
+      Result := SendPg(S, ReadyMsg);
+  end;
+
 begin
   Result := False;
+  AErr := False;
   if (Spec.Format <> 'csv') and (Spec.Format <> 'text') then
-  begin
-    SendPg(S, ErrorMsg('COPY: yalniz FORMAT CSV veya TEXT destekleniyor'));
-    Exit(SendPg(S, ReadyMsg));
-  end;
+    Exit(CopyErr('COPY: yalniz FORMAT CSV veya TEXT destekleniyor', nil));
   if Spec.Delimiter = '' then
   begin
     if Spec.Format = 'csv' then Spec.Delimiter := ',' else Spec.Delimiter := #9;
@@ -1021,16 +1038,10 @@ begin
       Res := FSql.Exec(Spec.Query);
     except
       on E: Exception do
-      begin
-        SendPg(S, ErrorMsgEx(E.Message, E));
-        Exit(SendPg(S, ReadyMsg));
-      end;
+        Exit(CopyErr(E.Message, E));
     end;
     if Length(Res.Fields) = 0 then
-    begin
-      SendPg(S, ErrorMsg('COPY: sorgu kolon dondurmedi'));
-      Exit(SendPg(S, ReadyMsg));
-    end;
+      Exit(CopyErr('COPY: sorgu kolon dondurmedi', nil));
     names := Res.Fields;
   end
   else
@@ -1039,10 +1050,7 @@ begin
       td := FSql.TableDb.GetTable(Spec.TableName);
     except
       on E: Exception do
-      begin
-        SendPg(S, ErrorMsgEx(E.Message, E));
-        Exit(SendPg(S, ReadyMsg));
-      end;
+        Exit(CopyErr(E.Message, E));
     end;
     if Length(Spec.Cols) = 0 then
     begin
@@ -1052,10 +1060,7 @@ begin
     else
       names := Spec.Cols;
     if Length(names) = 0 then
-    begin
-      SendPg(S, ErrorMsg('COPY: tabloda kolon yok'));
-      Exit(SendPg(S, ReadyMsg));
-    end;
+      Exit(CopyErr('COPY: tabloda kolon yok', nil));
 
     sql := 'SELECT ';
     for i := 0 to High(names) do
@@ -1069,10 +1074,7 @@ begin
       Res := FSql.Exec(sql);
     except
       on E: Exception do
-      begin
-        SendPg(S, ErrorMsgEx(E.Message, E));
-        Exit(SendPg(S, ReadyMsg));
-      end;
+        Exit(CopyErr(E.Message, E));
     end;
   end;
 
@@ -1095,7 +1097,10 @@ begin
   end;
   if not SendPg(S, PgMsg('c', '')) then Exit;
   if not SendPg(S, CommandMsg('COPY ' + IntToStr(n))) then Exit;
-  Result := SendPg(S, ReadyMsg);
+  if ATerminate then
+    Result := SendPg(S, ReadyMsg)
+  else
+    Result := True;
 end;
 
 function HandleQuery(S: TVdbSocket; FSql: TVSql; const Sql: string;
@@ -1106,6 +1111,7 @@ var
   i, k: Integer;
   CopySpec: TPgCopySpec;
   stmts: TStrArray;
+  dummyErr: Boolean;
 begin
   Result := False;
   AServed := True;
@@ -1115,8 +1121,10 @@ begin
   // M1: COPY ... FROM STDIN / TO STDOUT basit sorgu akisi.
   if TryParsePgCopy(Sql, CopySpec, cpErr) then
   begin
-    if CopySpec.FromStdin then Exit(HandlePgCopyIn(S, FSql, CopySpec));
-    if CopySpec.ToStdout then Exit(HandlePgCopyOut(S, FSql, CopySpec));
+    if CopySpec.FromStdin then
+      Exit(HandlePgCopyIn(S, FSql, CopySpec, True, dummyErr));
+    if CopySpec.ToStdout then
+      Exit(HandlePgCopyOut(S, FSql, CopySpec, True, dummyErr));
   end
   else if cpErr <> '' then
   begin
@@ -1233,6 +1241,9 @@ var
   params: TStrArray;
   raw: AnsiString;
   bad: Boolean;
+  CopySpec: TPgCopySpec;
+  cpErr: string;
+  copyOk, copyErr: Boolean;
 
   function TakeI16: Integer;
   begin
@@ -1456,18 +1467,29 @@ begin
           end
           else if Portals.TryGetValue(nm, pt) then
           begin
-            if not pt.Done then
+            // COPY FROM STDIN / TO STDOUT akisi Describe sirasinda
+            // BASLATILMAZ; PostgreSQL gibi NoData donulur. Aksi halde
+            // Describe, istemciden veri bekleyen bir kopya acardi.
+            if TryParsePgCopy(pt.Sql, CopySpec, cpErr) and
+               (CopySpec.FromStdin or CopySpec.ToStdout) then
             begin
-              ExecutePortal(pt);
-              Portals.AddOrSetValue(nm, pt);
-            end;
-            if pt.Err <> '' then
-              ExtFail(pt.Err)
-            else if Length(pt.Res.Fields) > 0 then
-            begin
-              if not SendPg(FSock, RowDescMsg(pt.Res.Fields)) then Break;
+              if not SendPg(FSock, PgMsg('n', '')) then Break;
             end
-            else if not SendPg(FSock, PgMsg('n', '')) then Break;
+            else
+            begin
+              if not pt.Done then
+              begin
+                ExecutePortal(pt);
+                Portals.AddOrSetValue(nm, pt);
+              end;
+              if pt.Err <> '' then
+                ExtFail(pt.Err)
+              else if Length(pt.Res.Fields) > 0 then
+              begin
+                if not SendPg(FSock, RowDescMsg(pt.Res.Fields)) then Break;
+              end
+              else if not SendPg(FSock, PgMsg('n', '')) then Break;
+            end;
           end
           else
             ExtFail('portal yok: ' + nm);
@@ -1479,19 +1501,44 @@ begin
         nm := ReadCStr(payload, p);
         if Portals.TryGetValue(nm, pt) then
         begin
-          if not pt.Done then
+          // M1: extended protocol uzerinden COPY. Akis Execute aninda
+          // baslar; CopyIn/CopyOut mesajlari burada tuketilir/uretilir.
+          // ReadyForQuery gonderilmez; istemci Sync gonderince gonderilir.
+          if TryParsePgCopy(pt.Sql, CopySpec, cpErr) and
+             (CopySpec.FromStdin or CopySpec.ToStdout) then
           begin
-            ExecutePortal(pt);
-            Portals.AddOrSetValue(nm, pt);
-          end;
-          if pt.Err <> '' then
-            ExtFail(pt.Err)
+            if pt.Done then
+              ExtFail('portal zaten calistirildi: ' + nm)
+            else
+            begin
+              pt.Done := True;
+              Portals.AddOrSetValue(nm, pt);
+              if CopySpec.FromStdin then
+                copyOk := HandlePgCopyIn(FSock, FSql, CopySpec, False, copyErr)
+              else
+                copyOk := HandlePgCopyOut(FSock, FSql, CopySpec, False, copyErr);
+              if copyErr then
+                skipUntilSync := True;
+              if not copyOk then Break;
+              InterlockedIncrement(FServer.FServed);
+            end;
+          end
           else
           begin
-            for i2 := 0 to High(pt.Res.Rows) do
-              if not SendPg(FSock, DataRowMsg(pt.Res.Rows[i2])) then Break;
-            if not SendPg(FSock, CommandMsg(CommandTag(pt.Sql, pt.Res))) then Break;
-            InterlockedIncrement(FServer.FServed);
+            if not pt.Done then
+            begin
+              ExecutePortal(pt);
+              Portals.AddOrSetValue(nm, pt);
+            end;
+            if pt.Err <> '' then
+              ExtFail(pt.Err)
+            else
+            begin
+              for i2 := 0 to High(pt.Res.Rows) do
+                if not SendPg(FSock, DataRowMsg(pt.Res.Rows[i2])) then Break;
+              if not SendPg(FSock, CommandMsg(CommandTag(pt.Sql, pt.Res))) then Break;
+              InterlockedIncrement(FServer.FServed);
+            end;
           end;
         end
         else
