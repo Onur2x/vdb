@@ -23,9 +23,10 @@ unit VDbPgWire;
     - ErrorResponse + ReadyForQuery; hata sonrasi Sync'e kadar mesajlar
       yutulur (PostgreSQL semantigi).
     - 'X' Terminate
-    - COPY ... FROM STDIN / COPY ... TO STDOUT (basit sorgu; CSV/TEXT).
-      FROM akisi gecici dosyaya yazilip mevcut COPY motoruna devredilir;
-      TO akisi SELECT sonucundan CSV/TEXT satirlari olarak uretilir.
+    - COPY ... FROM STDIN / COPY ... TO STDOUT / COPY (SELECT ...) TO STDOUT
+      (basit sorgu; CSV/TEXT). FROM akisi gecici dosyaya yazilip mevcut COPY
+      motoruna devredilir; TO akisi SELECT sonucundan CSV/TEXT satirlari
+      olarak uretilir.
 
   DESTEKLENMEYEN (bilincli sinir):
     - Extended protocol uzerinden COPY; SSL/TLS; gercek sonuc tip OID'leri
@@ -123,6 +124,8 @@ type
   { M1: COPY ... FROM STDIN / TO STDOUT (yalniz basit sorgu). }
   TPgCopySpec = record
     TableName: string;
+    Query: string;        // COPY (SELECT ...) TO STDOUT
+    IsQuery: Boolean;
     Cols: TStrArray;
     Options: string;
     FromStdin: Boolean;
@@ -600,8 +603,10 @@ end;
 function TryParsePgCopy(const Sql: string; out Spec: TPgCopySpec;
   out AErr: string): Boolean;
 var
-  p, n: Integer;
+  p, n, qStart, depth: Integer;
   tbl: string;
+  qch: Char;
+  inQuote: Boolean;
 begin
   Result := False;
   AErr := '';
@@ -611,57 +616,134 @@ begin
   n := Length(Sql);
   PgSkipWs(Sql, p);
   if not PgMatchWord(Sql, p, 'COPY') then Exit;
-  if not PgReadIdent(Sql, p, tbl) then
-  begin
-    AErr := 'COPY: tablo adi bekleniyordu';
-    Exit;
-  end;
-  Spec.TableName := tbl;
 
   PgSkipWs(Sql, p);
   if (p <= n) and (Sql[p] = '(') then
   begin
-    Inc(p);
-    while True do
+    // COPY (SELECT ...) TO STDOUT
+    qStart := p;
+    depth := 0;
+    inQuote := False;
+    qch := #0;
+    while p <= n do
     begin
-      PgSkipWs(Sql, p);
-      if not PgReadIdent(Sql, p, tbl) then
+      if inQuote then
       begin
-        AErr := 'COPY: kolon adi bekleniyordu';
-        Exit;
-      end;
-      SetLength(Spec.Cols, Length(Spec.Cols) + 1);
-      Spec.Cols[High(Spec.Cols)] := tbl;
-      PgSkipWs(Sql, p);
-      if (p <= n) and (Sql[p] = ',') then Inc(p)
-      else if (p <= n) and (Sql[p] = ')') then
-      begin
-        Inc(p);
-        Break;
+        if Sql[p] = '\' then
+        begin
+          Inc(p, 2);
+          Continue;
+        end;
+        if Sql[p] = qch then
+        begin
+          if (p < n) and (Sql[p + 1] = qch) then
+            Inc(p, 2)
+          else
+          begin
+            inQuote := False;
+            Inc(p);
+          end;
+        end
+        else
+          Inc(p);
       end
       else
       begin
-        AErr := 'COPY: kolon listesi kapatilmadi';
-        Exit;
+        case Sql[p] of
+          '''', '"':
+            begin
+              inQuote := True;
+              qch := Sql[p];
+              Inc(p);
+            end;
+          '(':
+            begin
+              Inc(depth);
+              Inc(p);
+            end;
+          ')':
+            begin
+              Dec(depth);
+              Inc(p);
+              if depth = 0 then Break;
+            end;
+        else
+          Inc(p);
+        end;
       end;
     end;
-  end;
-
-  PgSkipWs(Sql, p);
-  if PgMatchWord(Sql, p, 'FROM') then
-  begin
+    if (depth <> 0) or inQuote then
+    begin
+      AErr := 'COPY: sorgu parantezi kapatilmadi';
+      Exit;
+    end;
+    Spec.Query := Trim(Copy(Sql, qStart + 1, p - qStart - 2));
+    if Spec.Query = '' then
+    begin
+      AErr := 'COPY: sorgu bos';
+      Exit;
+    end;
     PgSkipWs(Sql, p);
-    if not PgMatchWord(Sql, p, 'STDIN') then Exit;  // dosya COPY motoruna kalsin
-    Spec.FromStdin := True;
-  end
-  else if PgMatchWord(Sql, p, 'TO') then
-  begin
+    if not PgMatchWord(Sql, p, 'TO') then Exit;
     PgSkipWs(Sql, p);
     if not PgMatchWord(Sql, p, 'STDOUT') then Exit;
+    Spec.IsQuery := True;
     Spec.ToStdout := True;
   end
   else
-    Exit;
+  begin
+    if not PgReadIdent(Sql, p, tbl) then
+    begin
+      AErr := 'COPY: tablo adi bekleniyordu';
+      Exit;
+    end;
+    Spec.TableName := tbl;
+
+    PgSkipWs(Sql, p);
+    if (p <= n) and (Sql[p] = '(') then
+    begin
+      Inc(p);
+      while True do
+      begin
+        PgSkipWs(Sql, p);
+        if not PgReadIdent(Sql, p, tbl) then
+        begin
+          AErr := 'COPY: kolon adi bekleniyordu';
+          Exit;
+        end;
+        SetLength(Spec.Cols, Length(Spec.Cols) + 1);
+        Spec.Cols[High(Spec.Cols)] := tbl;
+        PgSkipWs(Sql, p);
+        if (p <= n) and (Sql[p] = ',') then Inc(p)
+        else if (p <= n) and (Sql[p] = ')') then
+        begin
+          Inc(p);
+          Break;
+        end
+        else
+        begin
+          AErr := 'COPY: kolon listesi kapatilmadi';
+          Exit;
+        end;
+      end;
+    end;
+
+    PgSkipWs(Sql, p);
+    if PgMatchWord(Sql, p, 'FROM') then
+    begin
+      PgSkipWs(Sql, p);
+      if not PgMatchWord(Sql, p, 'STDIN') then Exit;  // dosya COPY motoruna kalsin
+      Spec.FromStdin := True;
+    end
+    else if PgMatchWord(Sql, p, 'TO') then
+    begin
+      PgSkipWs(Sql, p);
+      if not PgMatchWord(Sql, p, 'STDOUT') then Exit;
+      Spec.ToStdout := True;
+    end
+    else
+      Exit;
+  end;
 
   PgSkipWs(Sql, p);
   Spec.Options := Trim(Copy(Sql, p, MaxInt));
@@ -868,44 +950,65 @@ begin
     if Spec.Format = 'csv' then Spec.Delimiter := ',' else Spec.Delimiter := #9;
   end;
 
-  try
-    td := FSql.TableDb.GetTable(Spec.TableName);
-  except
-    on E: Exception do
+  Res := Default(TSqlResult);
+  if Spec.IsQuery then
+  begin
+    try
+      Res := FSql.Exec(Spec.Query);
+    except
+      on E: Exception do
+      begin
+        SendPg(S, ErrorMsg(E.Message));
+        Exit(SendPg(S, ReadyMsg));
+      end;
+    end;
+    if Length(Res.Fields) = 0 then
     begin
-      SendPg(S, ErrorMsg(E.Message));
+      SendPg(S, ErrorMsg('COPY: sorgu kolon dondurmedi'));
       Exit(SendPg(S, ReadyMsg));
     end;
-  end;
-  if Length(Spec.Cols) = 0 then
-  begin
-    SetLength(names, Length(td.Cols));
-    for i := 0 to High(td.Cols) do names[i] := td.Cols[i].Name;
+    names := Res.Fields;
   end
   else
-    names := Spec.Cols;
-  if Length(names) = 0 then
   begin
-    SendPg(S, ErrorMsg('COPY: tabloda kolon yok'));
-    Exit(SendPg(S, ReadyMsg));
-  end;
-
-  sql := 'SELECT ';
-  for i := 0 to High(names) do
-  begin
-    if i > 0 then sql := sql + ', ';
-    sql := sql + names[i];
-  end;
-  sql := sql + ' FROM ' + Spec.TableName;
-
-  Res := Default(TSqlResult);
-  try
-    Res := FSql.Exec(sql);
-  except
-    on E: Exception do
+    try
+      td := FSql.TableDb.GetTable(Spec.TableName);
+    except
+      on E: Exception do
+      begin
+        SendPg(S, ErrorMsg(E.Message));
+        Exit(SendPg(S, ReadyMsg));
+      end;
+    end;
+    if Length(Spec.Cols) = 0 then
     begin
-      SendPg(S, ErrorMsg(E.Message));
+      SetLength(names, Length(td.Cols));
+      for i := 0 to High(td.Cols) do names[i] := td.Cols[i].Name;
+    end
+    else
+      names := Spec.Cols;
+    if Length(names) = 0 then
+    begin
+      SendPg(S, ErrorMsg('COPY: tabloda kolon yok'));
       Exit(SendPg(S, ReadyMsg));
+    end;
+
+    sql := 'SELECT ';
+    for i := 0 to High(names) do
+    begin
+      if i > 0 then sql := sql + ', ';
+      sql := sql + names[i];
+    end;
+    sql := sql + ' FROM ' + Spec.TableName;
+
+    try
+      Res := FSql.Exec(sql);
+    except
+      on E: Exception do
+      begin
+        SendPg(S, ErrorMsg(E.Message));
+        Exit(SendPg(S, ReadyMsg));
+      end;
     end;
   end;
 

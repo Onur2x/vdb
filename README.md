@@ -401,7 +401,7 @@ loss (2251/2251 SQL tests + 8/8 crash chain green at every step).
 
 ### TR: Mevcut Durum (2026-10-19)
 ```
-sqltest:      2459/2459  (tümü yeşil; M10 IDENTITY/JSONPath union + pgwire COPY dahil)
+sqltest:      2462/2462  (tümü yeşil; M10 IDENTITY/JSONPath union + pgwire COPY dahil)
 crashtest:    8/8        (çökme dayanıklılığı — veri kaybı YOK)
 rawchk:       29/29      (akışlı ↔ genel diferansiyel)
 mrowchk:      0 hata     (çok-satırlı VALUES + atomiklik)
@@ -421,7 +421,7 @@ vdbclienttest: 101/101
 - ✅ Mutasyon: 3 kapı (FAIL→geri al→yeşil)
 
 ### EN: Current Status (2026-10-15)
-sqltest **2459/2459 (all green, including M10 IDENTITY, JSONPath union and pgwire COPY)**, crash-durability suite **8/8** (kill at arbitrary points, zero data loss), plus crypt (60/60), DLL API (170/170) and client (101/101) suites green. All R-12 features (Auth, Prepared Statements, Pool Capacity) are complete and mutation-tested.
+sqltest **2462/2462 (all green, including M10 IDENTITY, JSONPath union and pgwire COPY)**, crash-durability suite **8/8** (kill at arbitrary points, zero data loss), plus crypt (60/60), DLL API (170/170) and client (101/101) suites green. All R-12 features (Auth, Prepared Statements, Pool Capacity) are complete and mutation-tested.
 
 ---
 

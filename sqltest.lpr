@@ -10996,6 +10996,16 @@ begin
       Pos('1'#9'aa'#10, CopyDataText) > 0,
       StringReplace(CopyDataText, #10, '\n', [rfReplaceAll]));
 
+    Dogrula('pg COPY (SELECT) TO STDOUT',
+      Query('COPY (SELECT id, s FROM pg_copy ORDER BY id) TO STDOUT ' +
+        'WITH (FORMAT csv, HEADER)'), '');
+    Dogrula('pg COPY (SELECT) tag COPY 4', FindTag('COPY 4'), '');
+    Dogrula('pg COPY (SELECT) CSV icerik',
+      (Pos('id,s'#10, CopyDataText) = 1) and
+      (Pos('1,aa'#10, CopyDataText) > 0) and
+      (Pos('4,dd'#10, CopyDataText) > 0),
+      StringReplace(CopyDataText, #10, '\n', [rfReplaceAll]));
+
     // ---- Extended query protocol (parametresiz) ----
     FreeAndNil(msgs);
     Dogrula('pg ext Parse',
