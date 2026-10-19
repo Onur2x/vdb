@@ -12,9 +12,9 @@
 
 uses
   SysUtils, Classes, Math, VDbCore, VDbTypes, VDbTable, VDbSql, VDbSync, VDbCrc32,
-  VDbCrypt, VDbSpatial, VDbRange, VDbMonitor, VDbPlatform, VDbCost,
+  VDbCrypt, VDbKdf, VDbSpatial, VDbRange, VDbMonitor, VDbPlatform, VDbCost,
   VDbExtension, VDbText, VDbParallel, VDbReplication, VDbNet, VDbSqlServer,
-  VDbClientNet, dynlibs;
+  VDbClientNet, VDbMetricsHttp, VDbPgWire, dynlibs;
 { VDbTypes: TStrArray / TStrMatrix gibi paylasilan tipler artik tek
   kaynaktan geliyor (ayri birimde ikinci tanim FPC'de sessizce
   FARKLI tip uretip derleme hatasi veriyordu). }
@@ -31,6 +31,14 @@ var
 const
   Q = '''';   // tek tirnak
   WAL_MAGIC_BEKLENEN = LongWord($57414C52);   // 'WALR'
+
+type
+  { M9: /metrics HTTP testi icin metod-isaretcisi saglayici. }
+  TMetricsTestProvider = class
+  public
+    Text: string;
+    function Get: string;
+  end;
 
 { ------------------------------------------------------------ yardimcilar }
 
@@ -304,13 +312,13 @@ procedure T74_KayitSifreleme;
 }
 var
   myKv: TVDb;
-  v: TBytes;
+  v, ct, tag, back: TBytes;
   k: TBytes;
   kp, dbp: string;
   sK: TQWordArray;
   sV: TValArray;
   i: Integer;
-  bulundu: Boolean;
+  bulundu, aeadHata: Boolean;
 
   procedure Dogrula(const Ad: string; Cond: Boolean; const E: string = '');
   begin
@@ -533,6 +541,39 @@ begin
   finally
     myKv.Free;
   end;
+
+  // ---- l) M6: AEAD (AES-256-GCM) zarf bicimi ----
+  k := TestKey(5);
+  ct := nil;
+  Dogrula('l) AEAD sifreleme basarili',
+    VDbCryptEncrypt(k, VDbStrToBytes('aead-gizli-metin'), ct));
+  Dogrula('l) zarf VDB magic ile basliyor',
+    VDbCryptIsAead(ct) and
+    (VDbCryptBytesToStr(Copy(ct, 0, 8)) = 'VDBAEAD1'));
+  back := nil;
+  Dogrula('l) AEAD cozme dogru',
+    VDbCryptDecrypt(k, ct, back) and
+    (VDbBytesToStr(back) = 'aead-gizli-metin'));
+  if Length(ct) > 0 then
+    ct[High(ct)] := ct[High(ct)] xor $01;
+  aeadHata := False;
+  try
+    VDbCryptDecrypt(k, ct, back);
+  except
+    on E: EVdbCryptError do
+      aeadHata := True;
+  end;
+  Dogrula('l) bozulmus AEAD etiketi REDDEDILDI', aeadHata);
+
+  // ---- m) eski CTR+HMAC zarfi hala okunuyor (geriye donuk uyum) ----
+  ct := nil;
+  Dogrula('m) eski zarf uretildi',
+    VDbCryptEncryptLegacy(k, VDbStrToBytes('eski-zarf-metni'), ct));
+  Dogrula('m) eski zarf AEAD magic TASIMIYOR', not VDbCryptIsAead(ct));
+  back := nil;
+  Dogrula('m) eski zarf yeni kodla cozuldu',
+    VDbCryptDecrypt(k, ct, back) and
+    (VDbBytesToStr(back) = 'eski-zarf-metni'));
 end;
 
 procedure T75_SifrelemeDayaniklilik;
@@ -2654,7 +2695,8 @@ procedure T105_ShowStats;
 { R-24 (2026-10-13) SHOW STATS / SHOW STATS TABLE t — pg_stat benzeri
   izleme metrikleri.
 
-  a) sekil: SHOW STATS -> 2 kolon (name|value) x 6 metrik satiri
+  a) sekil: SHOW STATS -> 2 kolon (name|value) x 13 metrik satiri
+     (M9: dosya/bellek/blok onbellegi metrikleri eklendi)
   b) commands sayaci AST gecen cumlelerle DOGRU artar
      (delta = eklenen 5 komut + ilk SHOW STATS'un kendisi = 6)
   c) sure metrikleri tutarliligi: total_us >= max_us, avg_us <= max_us
@@ -2670,6 +2712,7 @@ procedure T105_ShowStats;
   delta 0 ve v0=0 -> testler FAIL. }
 var
   v0, v1, tot, mx, av, w0, w1, ta0, ta1, crow: Int64;
+  mt: string;
 
   function StatOf(const Nm: string): string;
   var k: Integer;
@@ -2706,10 +2749,38 @@ begin
   Dogrula('SHOW STATS 2 kolon (name,value)',
     (Length(R.Fields) = 2) and (R.Fields[0] = 'name') and
     (R.Fields[1] = 'value'), R.Msg);
-  Dogrula('SHOW STATS 6 metrik satiri', Length(R.Rows) = 6,
+  Dogrula('SHOW STATS 13 metrik satiri', Length(R.Rows) = 13,
     IntToStr(Length(R.Rows)));
   Dogrula('ilk metrik commands',
     (Length(R.Rows) >= 1) and (R.Rows[0][0] = 'commands'), '');
+
+  // ---- a2) M9 ek metrikler ----
+  Dogrula('data_file_bytes > 0',
+    StrToInt64Def(StatOf('data_file_bytes'), -1) > 0, StatOf('data_file_bytes'));
+  Dogrula('tables okunur', StrToInt64Def(StatOf('tables'), -1) >= 0,
+    StatOf('tables'));
+  Dogrula('batch_active False', StatOf('batch_active') = 'False',
+    StatOf('batch_active'));
+  Dogrula('read_cache_blocks bicimi used/max',
+    Pos('/', StatOf('read_cache_blocks')) > 0, StatOf('read_cache_blocks'));
+  Dogrula('cache_hits >= 0', StrToInt64Def(StatOf('cache_hits'), -1) >= 0,
+    StatOf('cache_hits'));
+  Dogrula('cache_misses >= 0', StrToInt64Def(StatOf('cache_misses'), -1) >= 0,
+    StatOf('cache_misses'));
+  Dogrula('cache_hit_ratio_pct 0..100',
+    (StrToFloatDef(StatOf('cache_hit_ratio_pct'), -1) >= 0) and
+    (StrToFloatDef(StatOf('cache_hit_ratio_pct'), 101) <= 100),
+    StatOf('cache_hit_ratio_pct'));
+
+  // ---- a3) M9 Prometheus metin ciktisi ----
+  mt := sq.GetMetricsText;
+  Dogrula('metrics vdb_up=1', Pos('vdb_up 1', mt) > 0, '');
+  Dogrula('metrics commands_total', Pos('vdb_commands_total ', mt) > 0, '');
+  Dogrula('metrics plan cache', Pos('vdb_plan_cache_size ', mt) > 0, '');
+  Dogrula('metrics read cache', Pos('vdb_read_cache_hits_total ', mt) > 0, '');
+  Dogrula('metrics data file', Pos('vdb_data_file_bytes ', mt) > 0, '');
+  Dogrula('metrics batch_active', Pos('vdb_batch_active 0', mt) > 0, '');
+  Dogrula('metrics TYPE satiri', Pos('# TYPE vdb_up gauge', mt) > 0, '');
 
   // ---- b) commands delta ----
   v0 := StrToInt64Def(StatOf('commands'), -1);
@@ -2722,6 +2793,8 @@ begin
   v1 := StrToInt64Def(StatOf('commands'), -1);
   Dogrula('commands +6 artar (5 komut + ilk SHOW STATS)',
     v1 - v0 = 6, 'delta=' + IntToStr(v1 - v0));
+  Dogrula('tables >= 1 (st olustu)', StrToInt64Def(StatOf('tables'), -1) >= 1,
+    StatOf('tables'));
 
   // ---- c) sure metrikleri ----
   tot := StrToInt64Def(StatOf('total_us'), -1);
@@ -3921,6 +3994,18 @@ begin
       'SELECT s FROM t WHERE s BETWEEN ' + Q + '007' + Q + ' AND ' + Q + '9' + Q, 2);
   Chk('DISTINCT (007 ve 7 farkli)', 'SELECT DISTINCT s FROM t', 2);
   Chk('DISTINCT n (7 iki kez)', 'SELECT DISTINCT n FROM t', 1);
+  // H-ek: IFADE (aritmetik) karsilastirmasi sayisal olmali. Aksi halde `(v+0) > 9`
+  // metin sirasiyla '10' > '9' YANLIS olur ve 10 degerini kacirir.
+  sq.Exec('CREATE TABLE te(id INTEGER PRIMARY KEY, v INTEGER)');
+  sq.Exec('INSERT INTO te(v) VALUES(10),(9),(100),(2)');
+  Chk('ifade: (v+0) > 9 -> 10,100', 'SELECT id FROM te WHERE (v+0) > 9', 2);
+  Chk('ifade: (v+0) > 99 -> yalniz 100', 'SELECT id FROM te WHERE (v+0) > 99', 1);
+  Chk('ifade: (v*1) < 10 -> 9,2 (metin sirasi 0 verirdi)',
+      'SELECT id FROM te WHERE (v*1) < 10', 2);
+  Chk('ifade: (v+0) BETWEEN 9 AND 10 -> 10,9',
+      'SELECT id FROM te WHERE (v+0) BETWEEN 9 AND 10', 2);
+  Chk('ifade: unary -(v) < -9 -> 10,100',
+      'SELECT id FROM te WHERE -v < -9', 2);
 end;
 
 procedure T08_Join;
@@ -10203,6 +10288,946 @@ begin
   if FileExists(D + '\mvccbatch.odb.wal') then DeleteFile(D + '\mvccbatch.odb.wal');
 end;
 
+{ M1: PostgreSQL wire testi icin ham istemci yardimcilari (BE). }
+function TPgI16(V: Integer): AnsiString;
+var
+  u: Word;
+begin
+  u := Word(V);
+  Result := AnsiChar(u shr 8) + AnsiChar(u and $FF);
+end;
+
+function TPgI32(V: LongInt): AnsiString;
+var
+  u: Cardinal;
+begin
+  u := Cardinal(V);
+  Result := AnsiChar(u shr 24) + AnsiChar((u shr 16) and $FF) +
+    AnsiChar((u shr 8) and $FF) + AnsiChar(u and $FF);
+end;
+
+function TPgSend(S: TVdbSocket; const M: AnsiString): Boolean;
+begin
+  Result := False;
+  if M = '' then Exit(True);
+  Result := VdbSendAll(S, M[1], Length(M));
+end;
+
+function TPgRecvMsg(S: TVdbSocket; out T: AnsiChar; out Body: AnsiString): Boolean;
+var
+  b: Byte;
+  l: LongInt;
+  bb: array[0..3] of Byte;
+begin
+  Result := False;
+  Body := '';
+  if not VdbRecvU8(S, b) then Exit;
+  T := AnsiChar(b);
+  if not VdbRecvAll(S, bb, 4) then Exit;
+  l := LongInt((Cardinal(bb[0]) shl 24) or (Cardinal(bb[1]) shl 16) or
+    (Cardinal(bb[2]) shl 8) or Cardinal(bb[3]));
+  if l < 4 then Exit;
+  SetLength(Body, l - 4);
+  if (l - 4) > 0 then
+    if not VdbRecvAll(S, Body[1], l - 4) then Exit;
+  Result := True;
+end;
+
+function TPgReadUntilReady(S: TVdbSocket; out Msgs: TStringList): Boolean;
+var
+  t: AnsiChar;
+  b: AnsiString;
+begin
+  Result := False;
+  Msgs := TStringList.Create;
+  while TPgRecvMsg(S, t, b) do
+  begin
+    Msgs.Add(t + '|' + b);
+    if t = 'Z' then Exit(True);
+  end;
+end;
+
+function TPgBody(const M: string): string;
+begin
+  Result := Copy(M, 3, MaxInt);
+end;
+
+function TPgTag(const Body: string): string;
+var
+  p: Integer;
+begin
+  p := Pos(#0, Body);
+  if p > 0 then Result := Copy(Body, 1, p - 1)
+  else Result := Body;
+end;
+
+function TPgFieldNames(const Body: AnsiString): TStrArray;
+var
+  n, i, p, st: Integer;
+begin
+  SetLength(Result, 0);
+  if Length(Body) < 2 then Exit;
+  n := (Ord(Body[1]) shl 8) or Ord(Body[2]);
+  SetLength(Result, n);
+  p := 3;
+  for i := 0 to n - 1 do
+  begin
+    st := p;
+    while (p <= Length(Body)) and (Body[p] <> #0) do Inc(p);
+    Result[i] := Copy(Body, st, p - st);
+    Inc(p);        // ad sonu
+    Inc(p, 18);    // tableOid+attnum+typeOid+typlen+typmod+format
+  end;
+end;
+
+function TPgRow(const Body: AnsiString): TStrArray;
+var
+  n, i, p, l: Integer;
+begin
+  SetLength(Result, 0);
+  if Length(Body) < 2 then Exit;
+  n := (Ord(Body[1]) shl 8) or Ord(Body[2]);
+  SetLength(Result, n);
+  p := 3;
+  for i := 0 to n - 1 do
+  begin
+    if p + 3 > Length(Body) then Exit;
+    l := (Ord(Body[p]) shl 24) or (Ord(Body[p + 1]) shl 16) or
+      (Ord(Body[p + 2]) shl 8) or Ord(Body[p + 3]);
+    Inc(p, 4);
+    Result[i] := Copy(Body, p, l);
+    Inc(p, l);
+  end;
+end;
+
+{ M10: GENERATED ALWAYS AS (...) STORED }
+procedure T118_AeadKdf;
+var
+  key, nonce, pt, aad, ct, tag, tag2, outb: TBytes;
+  pwd, salt, secret, ad, h: TBytes;
+  ok: Boolean;
+
+  function Hx(const S: string): TBytes;
+  var
+    i: Integer;
+  begin
+    SetLength(Result, Length(S) div 2);
+    for i := 1 to Length(Result) do
+      Result[i - 1] := StrToInt('$' + Copy(S, (i - 1) * 2 + 1, 2));
+  end;
+
+  function HxOf(const B: TBytes): string;
+  var
+    i: Integer;
+  begin
+    Result := '';
+    for i := 0 to High(B) do
+      Result := Result + IntToHex(B[i], 2);
+  end;
+
+  function RepeatByte(B: Byte; N: Integer): TBytes;
+  begin
+    SetLength(Result, N);
+    if N > 0 then FillChar(Result[0], N, B);
+  end;
+
+begin
+  Grp('M6 AES-256-GCM + Argon2id vektorleri');
+
+  // NIST SP 800-38D: sifir anahtar/nonce, 16 bayt sifir duz metin.
+  key := Hx('0000000000000000000000000000000000000000000000000000000000000000');
+  nonce := Hx('000000000000000000000000');
+  pt := Hx('00000000000000000000000000000000');
+  aad := nil;
+  ok := VDbCryptGcmSeal(key, nonce, pt, aad, ct, tag);
+  Dogrula('GCM NIST sifreli metin', ok and
+    (LowerCase(HxOf(ct)) = 'cea7403d4d606b6e074ec5d3baf39d18'), HxOf(ct));
+  Dogrula('GCM NIST etiket', ok and
+    (LowerCase(HxOf(tag)) = 'd0d1c8a799996bf0265b98b5d48ab919'), HxOf(tag));
+
+  tag2 := Copy(tag, 0, Length(tag));
+  if Length(tag2) > 0 then
+    tag2[0] := tag2[0] xor $01;
+  outb := nil;
+  Dogrula('GCM bozulmus etiket reddedildi',
+    not VDbCryptGcmOpen(key, nonce, ct, tag2, aad, outb));
+
+  // RFC 9106 Argon2id test vektoru: p=4, T=32, m=32 KiB, t=3.
+  pwd := RepeatByte($01, 32);
+  salt := RepeatByte($02, 16);
+  secret := RepeatByte($03, 8);
+  ad := RepeatByte($04, 12);
+  h := nil;
+  ok := VDbArgon2id(pwd, salt, secret, ad, 3, 32, 4, 32, h);
+  Dogrula('Argon2id RFC 9106', ok and
+    (LowerCase(HxOf(h)) = '0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659'),
+    HxOf(h));
+end;
+
+procedure T117_Generated;
+var
+  kv2: TVDb;
+  tb2: TVTableDb;
+  sq2: TVSql;
+  r: TSqlResult;
+  raised: Boolean;
+  vals: string;
+begin
+  Grp('M10 GENERATED ALWAYS AS (STORED)');
+  ForceDirectories(D + '\gen');
+  kv2 := TVDb.Create;
+  try
+    kv2.Open(D + '\gen');
+    tb2 := TVTableDb.Create(kv2);
+    try
+      tb2.Open(D + '\gen');
+      sq2 := TVSql.Create(tb2);
+      try
+        sq2.Exec('CREATE TABLE g(a INTEGER PRIMARY KEY, b INTEGER, ' +
+          'c INTEGER GENERATED ALWAYS AS (b * 2) STORED)');
+        sq2.Exec('INSERT INTO g(a,b) VALUES (1,5)');
+        r := sq2.Exec('SELECT c FROM g WHERE a=1');
+        Dogrula('generated INSERT (5*2=10)',
+          (Length(r.Rows) = 1) and (r.Rows[0][0] = '10'),
+          'c=' + r.Rows[0][0]);
+
+        // Acikca verilen deger YOK SAYILIR; hesaplanan deger kazanir.
+        sq2.Exec('INSERT INTO g(a,b,c) VALUES (2,7,999)');
+        r := sq2.Exec('SELECT c FROM g WHERE a=2');
+        Dogrula('generated acik deger ezer (7*2=14)',
+          (Length(r.Rows) = 1) and (r.Rows[0][0] = '14'),
+          'c=' + r.Rows[0][0]);
+
+        // Coklu VALUES (BatchInsert yolu).
+        sq2.Exec('INSERT INTO g(a,b) VALUES (3,1),(4,2)');
+        r := sq2.Exec('SELECT a,c FROM g WHERE a>=3 ORDER BY a');
+        vals := '';
+        if Length(r.Rows) = 2 then
+          vals := r.Rows[0][0] + ':' + r.Rows[0][1] + ',' +
+                  r.Rows[1][0] + ':' + r.Rows[1][1];
+        Dogrula('generated coklu VALUES (1,2)',
+          vals = '3:2,4:4', vals);
+
+        // UPDATE temel kolonu degistirince generated yeniden hesaplanir.
+        sq2.Exec('UPDATE g SET b=10 WHERE a=1');
+        r := sq2.Exec('SELECT c FROM g WHERE a=1');
+        Dogrula('generated UPDATE (10*2=20)',
+          (Length(r.Rows) = 1) and (r.Rows[0][0] = '20'),
+          'c=' + r.Rows[0][0]);
+
+        // Ifade fonksiyonu (ExprToText -> VDbExprVal ayni dili konusur).
+        sq2.Exec('CREATE TABLE g2(a TEXT, ' +
+          'u TEXT GENERATED ALWAYS AS (UPPER(a)) STORED)');
+        sq2.Exec('INSERT INTO g2(a) VALUES (''abc'')');
+        r := sq2.Exec('SELECT u FROM g2');
+        Dogrula('generated UPPER (abc->ABC)',
+          (Length(r.Rows) = 1) and (r.Rows[0][0] = 'ABC'),
+          'u=' + r.Rows[0][0]);
+
+        // ALTER ADD COLUMN GENERATED: mevcut satirlar geriye donuk hesaplanir.
+        sq2.Exec('ALTER TABLE g2 ADD COLUMN z INTEGER ' +
+          'GENERATED ALWAYS AS (1 + 1) STORED');
+        r := sq2.Exec('SELECT z FROM g2');
+        Dogrula('ALTER ADD GENERATED mevcut satiri doldurdu',
+          (Length(r.Rows) = 1) and (r.Rows[0][0] = '2'),
+          'z=' + r.Rows[0][0]);
+        sq2.Exec('INSERT INTO g2(a) VALUES (''xy'')');
+        r := sq2.Exec('SELECT u,z FROM g2 ORDER BY a');
+        vals := '';
+        if Length(r.Rows) = 2 then
+          vals := r.Rows[0][0] + ':' + r.Rows[0][1] + ',' +
+                  r.Rows[1][0] + ':' + r.Rows[1][1];
+        Dogrula('ALTER ADD GENERATED sonrasi INSERT',
+          vals = 'ABC:2,XY:2', vals);
+
+        // IDENTITY desteklenmez.
+        raised := False;
+        try
+          sq2.Exec('CREATE TABLE g3(a INTEGER GENERATED ALWAYS AS IDENTITY)');
+        except
+          raised := True;
+        end;
+        Dogrula('GENERATED AS IDENTITY reddedildi', raised, '');
+      finally
+        sq2.Free;
+      end;
+    finally
+      tb2.Close;
+      tb2.Free;
+    end;
+  finally
+    kv2.Close;
+    kv2.Free;
+  end;
+
+  // Sema 6. alan (hex ifade) ile yeniden acilista korunur.
+  kv2 := TVDb.Create;
+  try
+    kv2.Open(D + '\gen');
+    tb2 := TVTableDb.Create(kv2);
+    try
+      tb2.Open(D + '\gen');
+      sq2 := TVSql.Create(tb2);
+      try
+        r := sq2.Exec('SELECT c FROM g WHERE a=2');
+        Dogrula('generated yeniden acilis (c=14)',
+          (Length(r.Rows) = 1) and (r.Rows[0][0] = '14'),
+          'c=' + r.Rows[0][0]);
+        r := sq2.Exec('SELECT u FROM g2 WHERE a=''abc''');
+        Dogrula('generated yeniden acilis (UPPER)',
+          (Length(r.Rows) = 1) and (r.Rows[0][0] = 'ABC'),
+          'u=' + r.Rows[0][0]);
+        r := sq2.Exec('SELECT z FROM g2 WHERE a=''abc''');
+        Dogrula('ALTER ADD GENERATED yeniden acilis (z=2)',
+          (Length(r.Rows) = 1) and (r.Rows[0][0] = '2'),
+          'z=' + r.Rows[0][0]);
+        sq2.Exec('INSERT INTO g(a,b) VALUES (5,3)');
+        r := sq2.Exec('SELECT c FROM g WHERE a=5');
+        Dogrula('generated yeniden acilis sonrasi INSERT',
+          (Length(r.Rows) = 1) and (r.Rows[0][0] = '6'),
+          'c=' + r.Rows[0][0]);
+      finally
+        sq2.Free;
+      end;
+    finally
+      tb2.Close;
+      tb2.Free;
+    end;
+  finally
+    kv2.Close;
+    kv2.Free;
+  end;
+end;
+
+procedure T116_PgWire;
+const
+  PPORT = 54720;
+var
+  srv: TVdbPgServer;
+  err: string;
+  s: TVdbSocket;
+  msgs: TStringList;
+  i, j: Integer;
+  body, tag: string;
+  row: TStrArray;
+  ok: Boolean;
+  b: Byte;
+  startup, param: AnsiString;
+
+  function ConnectAndStart: Boolean;
+  var
+    st: AnsiString;
+    t: AnsiChar;
+    bb: AnsiString;
+  begin
+    Result := False;
+    s := VdbTcpConnect('127.0.0.1', PPORT);
+    if s = VDB_SOCK_INVALID then Exit;
+    st := TPgI32(8) + TPgI32(80877103);   // SSLRequest
+    if not TPgSend(s, st) then Exit;
+    if not VdbRecvU8(s, b) then Exit;
+    if b <> Ord('N') then Exit;
+    param := 'user'#0 + 'postgres'#0 + 'database'#0 + 'vdb'#0 +
+      'client_encoding'#0 + 'UTF8'#0#0;
+    st := TPgI32(4 + 4 + Length(param)) + TPgI32(196608) + param;
+    if not TPgSend(s, st) then Exit;
+    repeat
+      if not TPgRecvMsg(s, t, bb) then Exit;
+    until t = 'Z';
+    Result := True;
+  end;
+
+  function Query(const Sql: string): Boolean;
+  var
+    st: AnsiString;
+  begin
+    FreeAndNil(msgs);
+    st := 'Q' + TPgI32(Length(Sql) + 1 + 4) + Sql + #0;
+    if not TPgSend(s, st) then Exit(False);
+    Result := TPgReadUntilReady(s, msgs);
+  end;
+
+  function SendExt(T: AnsiChar; const Body: AnsiString): Boolean;
+  begin
+    Result := TPgSend(s, T + TPgI32(Length(Body) + 4) + Body);
+  end;
+
+  function SyncRead: Boolean;
+  begin
+    if not SendExt('S', '') then Exit(False);
+    Result := TPgReadUntilReady(s, msgs);
+  end;
+
+  function TypeSeq: string;
+  var
+    k: Integer;
+  begin
+    Result := '';
+    if msgs = nil then Exit;
+    for k := 0 to msgs.Count - 1 do
+      if msgs[k] <> '' then Result := Result + msgs[k][1];
+  end;
+
+  function FindTag(const Want: string): Boolean;
+  var
+    k: Integer;
+  begin
+    Result := False;
+    if msgs = nil then Exit;
+    for k := 0 to msgs.Count - 1 do
+      if (msgs[k] <> '') and (msgs[k][1] = 'C') and
+         (TPgTag(TPgBody(msgs[k])) = Want) then Exit(True);
+  end;
+
+  function ErrText: string;
+  var
+    k: Integer;
+  begin
+    Result := '';
+    if msgs = nil then Exit;
+    for k := 0 to msgs.Count - 1 do
+      if (msgs[k] <> '') and (msgs[k][1] = 'E') then
+        Exit(TPgBody(msgs[k]));
+  end;
+
+  function RowAt(Idx: Integer): TStrArray;
+  var
+    k, seen: Integer;
+  begin
+    SetLength(Result, 0);
+    if msgs = nil then Exit;
+    seen := 0;
+    for k := 0 to msgs.Count - 1 do
+      if (msgs[k] <> '') and (msgs[k][1] = 'D') then
+      begin
+        if seen = Idx then Exit(TPgRow(TPgBody(msgs[k])));
+        Inc(seen);
+      end;
+  end;
+
+begin
+  Grp('M1 PostgreSQL wire protocol (basit sorgu)');
+  ForceDirectories(D + '\pgsrv');
+  srv := TVdbPgServer.Create(D + '\pgsrv', PPORT);
+  msgs := nil;
+  s := VDB_SOCK_INVALID;
+  try
+    ok := srv.Start(err);
+    Dogrula('pg sunucu basladi', ok, err);
+    if not ok then Exit;
+    Dogrula('pg baglanti + startup (SSL reddi)', ConnectAndStart, '');
+    if s = VDB_SOCK_INVALID then Exit;
+
+    Dogrula('pg DDL calisti',
+      Query('CREATE TABLE pg_t(id INTEGER PRIMARY KEY, s TEXT)'), '');
+    Dogrula('pg DDL tag CREATE TABLE', FindTag('CREATE TABLE'), '');
+    Dogrula('pg INSERT calisti',
+      Query('INSERT INTO pg_t VALUES (1, ''a''), (2, ''b'')'), '');
+    Dogrula('pg INSERT tag INSERT 0 2', FindTag('INSERT 0 2'), '');
+
+    Dogrula('pg SELECT calisti',
+      Query('SELECT id, s FROM pg_t ORDER BY id'), '');
+    ok := False;
+    for i := 0 to msgs.Count - 1 do
+      if (msgs[i] <> '') and (msgs[i][1] = 'T') then
+      begin
+        row := TPgFieldNames(TPgBody(msgs[i]));
+        ok := (Length(row) = 2) and (row[0] = 'id') and (row[1] = 's');
+      end;
+    Dogrula('pg RowDescription alanlari', ok, '');
+    row := RowAt(0);
+    Dogrula('pg ilk satir 1/a',
+      (Length(row) = 2) and (row[0] = '1') and (row[1] = 'a'), '');
+    row := RowAt(1);
+    Dogrula('pg ikinci satir 2/b',
+      (Length(row) = 2) and (row[0] = '2') and (row[1] = 'b'), '');
+    Dogrula('pg SELECT tag SELECT 2', FindTag('SELECT 2'), '');
+
+    Dogrula('pg hata sorgusu yanitladi', Query('SELECT * FROM yok'), '');
+    Dogrula('pg ErrorResponse dolu', ErrText <> '', Copy(ErrText, 1, 40));
+    Dogrula('pg hata sonrasi devam',
+      Query('UPDATE pg_t SET s=''z'' WHERE id=2'), '');
+    Dogrula('pg UPDATE tag UPDATE 1', FindTag('UPDATE 1'), '');
+    Dogrula('pg DELETE calisti', Query('DELETE FROM pg_t WHERE id=1'), '');
+    Dogrula('pg DELETE tag DELETE 1', FindTag('DELETE 1'), '');
+
+    // ---- Extended query protocol (parametresiz) ----
+    FreeAndNil(msgs);
+    Dogrula('pg ext Parse',
+      SendExt('P', 'ext1'#0 + 'SELECT s FROM pg_t'#0 + TPgI16(0)), '');
+    Dogrula('pg ext Bind',
+      SendExt('B', ''#0 + 'ext1'#0 + TPgI16(0) + TPgI16(0) + TPgI16(0)), '');
+    Dogrula('pg ext Describe portal', SendExt('D', 'P' + ''#0), '');
+    Dogrula('pg ext Execute', SendExt('E', ''#0 + TPgI32(0)), '');
+    Dogrula('pg ext Sync', SyncRead, '');
+    Dogrula('pg ext yanit dizisi 12TDCZ', TypeSeq = '12TDCZ', TypeSeq);
+    row := RowAt(0);
+    Dogrula('pg ext satir degeri z',
+      (Length(row) = 1) and (row[0] = 'z'), '');
+    Dogrula('pg ext SELECT tag', FindTag('SELECT 1'), '');
+
+    FreeAndNil(msgs);
+    Dogrula('pg ext Close statement', SendExt('C', 'S' + 'ext1'#0), '');
+    Dogrula('pg ext Close portal', SendExt('C', 'P' + ''#0), '');
+    Dogrula('pg ext Close Sync', SyncRead, '');
+    Dogrula('pg ext Close yanit dizisi 33Z', TypeSeq = '33Z', TypeSeq);
+
+    Dogrula('pg ext DDL', Query('CREATE TABLE pg_ext(a INTEGER PRIMARY KEY, s TEXT)'), '');
+    FreeAndNil(msgs);
+    Dogrula('pg ext INSERT Parse',
+      SendExt('P', 'ins1'#0 + 'INSERT INTO pg_ext VALUES (1,''e'')'#0 + TPgI16(0)), '');
+    Dogrula('pg ext INSERT Bind',
+      SendExt('B', ''#0 + 'ins1'#0 + TPgI16(0) + TPgI16(0) + TPgI16(0)), '');
+    Dogrula('pg ext INSERT Execute', SendExt('E', ''#0 + TPgI32(0)), '');
+    Dogrula('pg ext INSERT Sync', SyncRead, '');
+    Dogrula('pg ext INSERT yanit dizisi 12CZ', TypeSeq = '12CZ', TypeSeq);
+    Dogrula('pg ext INSERT tag', FindTag('INSERT 0 1'), '');
+    Dogrula('pg ext INSERT kalici',
+      Query('SELECT COUNT(*) FROM pg_ext'), '');
+    row := RowAt(0);
+    Dogrula('pg ext INSERT satir sayisi 1',
+      (Length(row) = 1) and (row[0] = '1'), '');
+
+    // Parametreli Parse reddedilir; hata sonrasi Sync'e kadar mesaj yutulur.
+    FreeAndNil(msgs);
+    SendExt('P', 'bad'#0 + 'SELECT 1'#0 + TPgI16(1) + TPgI32(25));
+    SendExt('B', ''#0 + 'bad'#0 + TPgI16(0) + TPgI16(0) + TPgI16(0));
+    SyncRead;
+    Dogrula('pg ext parametre reddi (EZ)', TypeSeq = 'EZ', TypeSeq);
+    Dogrula('pg ext parametre hatasi dolu', ErrText <> '',
+      Copy(ErrText, 1, 40));
+    Dogrula('pg ext hata sonrasi baglanti canli',
+      Query('SELECT COUNT(*) FROM pg_ext'), '');
+    row := RowAt(0);
+    Dogrula('pg ext hata sonrasi satir 1',
+      (Length(row) = 1) and (row[0] = '1'), '');
+
+    // Execute sirasinda SQL hatasi: Parse/Bind basarili, Execute E, Sync Z.
+    FreeAndNil(msgs);
+    SendExt('P', 'bad2'#0 + 'SELECT * FROM yok'#0 + TPgI16(0));
+    SendExt('B', ''#0 + 'bad2'#0 + TPgI16(0) + TPgI16(0) + TPgI16(0));
+    SendExt('E', ''#0 + TPgI32(0));
+    SyncRead;
+    Dogrula('pg ext Execute hatasi (12EZ)', TypeSeq = '12EZ', TypeSeq);
+    Dogrula('pg ext Execute hatasi dolu', ErrText <> '',
+      Copy(ErrText, 1, 40));
+
+    TPgSend(s, 'X' + TPgI32(4));
+    VdbSockClose(s);
+    s := VDB_SOCK_INVALID;
+    FreeAndNil(msgs);
+
+    srv.Stop;
+    ok := srv.Start(err);
+    Dogrula('pg yeniden baslatma', ok, err);
+    if not ok then Exit;
+    Dogrula('pg yeniden baglanti', ConnectAndStart, '');
+    if s = VDB_SOCK_INVALID then Exit;
+    Dogrula('pg kalici SELECT', Query('SELECT COUNT(*) FROM pg_t'), '');
+    row := RowAt(0);
+    Dogrula('pg kalici satir sayisi 1',
+      (Length(row) = 1) and (row[0] = '1'), '');
+    Dogrula('pg kalici deger z', Query('SELECT s FROM pg_t'), '');
+    row := RowAt(0);
+    Dogrula('pg guncel deger z', (Length(row) = 1) and (row[0] = 'z'), '');
+    TPgSend(s, 'X' + TPgI32(4));
+    VdbSockClose(s);
+    s := VDB_SOCK_INVALID;
+  finally
+    if s <> VDB_SOCK_INVALID then VdbSockClose(s);
+    FreeAndNil(msgs);
+    srv.Stop;
+    srv.Free;
+  end;
+end;
+
+function TMetricsTestProvider.Get: string;
+begin
+  Result := Text;
+end;
+
+procedure T115_MetricsHttp;
+// M9: /metrics HTTP ucu (saf yanit + canli soket).
+var
+  pr: TMetricsTestProvider;
+  srv: TVdbMetricsHttpServer;
+  started: Boolean;
+  port, i, tries: Integer;
+  resp, probe: string;
+
+  function Fetch(const Path: string): string;
+  var
+    cc: TVdbSocket;
+    rq: string;
+    k: Integer;
+    b: array[0..4095] of Char;
+  begin
+    Result := '';
+    cc := VdbTcpConnect('127.0.0.1', port);
+    if cc = VDB_SOCK_INVALID then Exit;
+    try
+      rq := 'GET ' + Path + ' HTTP/1.1' + #13#10 + 'Host: localhost' +
+        #13#10 + 'Connection: close' + #13#10 + #13#10;
+      if not VdbSendAll(cc, rq[1], Length(rq)) then Exit;
+      repeat
+        k := VdbRecvSome(cc, b[0], SizeOf(b));
+        if k > 0 then
+        begin
+          SetLength(Result, Length(Result) + k);
+          Move(b[0], Result[Length(Result) - k + 1], k);
+        end;
+      until k <= 0;
+    finally
+      VdbSockClose(cc);
+    end;
+  end;
+
+begin
+  Grp('M9 /metrics HTTP ucu');
+  probe := VdbMetricsHttpResponse('GET /metrics HTTP/1.1'#13#10#13#10,
+    'vdb_up 1'#10);
+  Dogrula('HTTP 200 + govde', (Pos('200 OK', probe) > 0) and
+    (Pos('vdb_up 1', probe) > 0) and
+    (Pos('Content-Length: 9', probe) > 0), '');
+  probe := VdbMetricsHttpResponse('GET /foo HTTP/1.1'#13#10#13#10, '');
+  Dogrula('HTTP 404', Pos('404 Not Found', probe) > 0, '');
+
+  pr := TMetricsTestProvider.Create;
+  try
+    pr.Text := 'vdb_up 1' + #10 + 'vdb_test_metric 42' + #10;
+    srv := nil;
+    started := False;
+    port := 19100;
+    for i := 0 to 9 do
+    begin
+      srv := TVdbMetricsHttpServer.Create(19100 + i, pr.Get);
+      if srv.Start then
+      begin
+        port := 19100 + i;
+        started := True;
+        Break;
+      end;
+      srv.Free;
+      srv := nil;
+    end;
+    Dogrula('metrics sunucu basladi', started,
+      'port=' + IntToStr(port));
+    if started then
+    try
+      resp := '';
+      tries := 0;
+      while (tries < 20) and (resp = '') do
+      begin
+        resp := Fetch('/metrics');
+        if resp = '' then
+        begin
+          Sleep(50);
+          Inc(tries);
+        end;
+      end;
+      Dogrula('GET /metrics 200', Pos('200 OK', resp) > 0,
+        Copy(resp, 1, 20));
+      Dogrula('GET /metrics govde', Pos('vdb_test_metric 42', resp) > 0, '');
+      Dogrula('GET /metrics icerik tipi', Pos('text/plain', resp) > 0, '');
+      resp := Fetch('/foo');
+      Dogrula('GET /foo 404', Pos('404 Not Found', resp) > 0, '');
+    finally
+      srv.Stop;
+      srv.Free;
+    end;
+  finally
+    pr.Free;
+  end;
+end;
+
+procedure T114_Fts;
+// M5: temel tam metin arama (index'siz, satir uzerinde).
+begin
+  Grp('M5 temel FTS');
+  ChkVal('FTS TO_TSVECTOR',
+    'SELECT TO_TSVECTOR(' + SQLIT('Hello, WORLD! 42') + ')', 0, 0,
+    'hello world 42');
+  ChkVal('FTS AND eslesme',
+    'SELECT TS_MATCH(' + SQLIT('Merhaba dünya, VDB!') + ',' +
+    SQLIT('merhaba vdb') + ')', 0, 0, 'True');
+  ChkVal('FTS AND eksik',
+    'SELECT TS_MATCH(' + SQLIT('Merhaba dünya') + ',' +
+    SQLIT('merhaba yok') + ')', 0, 0, 'False');
+  ChkVal('FTS RANK tek terim',
+    'SELECT TS_RANK(' + SQLIT('a a b c a') + ',' + SQLIT('a') + ')', 0, 0, '3');
+  ChkVal('FTS RANK iki terim',
+    'SELECT TS_RANK(' + SQLIT('a b a b') + ',' + SQLIT('a b') + ')', 0, 0, '4');
+  ChkVal('FTS bos sorgu',
+    'SELECT TS_MATCH(' + SQLIT('x') + ',' + SQLIT('') + ')', 0, 0, 'False');
+end;
+
+procedure T113_Vector;
+// M4: JSON sayi dizisi uzerinde vektor fonksiyonlari.
+begin
+  Grp('M4 vektor fonksiyonlari');
+  ChkVal('VEC DIM', 'SELECT VECTOR_DIM(' + Q + '[1,2,3]' + Q + ')',
+    0, 0, '3');
+  ChkVal('VEC NORM [3,4]', 'SELECT VECTOR_NORM(' + Q + '[3,4]' + Q + ')',
+    0, 0, '5');
+  ChkVal('VEC cosine ortogonal', 'SELECT VECTOR_DISTANCE(' + Q + '[1,0]' + Q +
+    ',' + Q + '[0,1]' + Q + ',' + Q + 'cosine' + Q + ')', 0, 0, '1');
+  ChkVal('VEC cosine ayni', 'SELECT VECTOR_DISTANCE(' + Q + '[1,2]' + Q +
+    ',' + Q + '[1,2]' + Q + ',' + Q + 'cosine' + Q + ')', 0, 0, '0');
+  ChkVal('VEC dot', 'SELECT VECTOR_DISTANCE(' + Q + '[1,2]' + Q +
+    ',' + Q + '[3,4]' + Q + ',' + Q + 'dot' + Q + ')', 0, 0, '11');
+  ChkVal('VEC l1', 'SELECT VECTOR_DISTANCE(' + Q + '[1,0]' + Q +
+    ',' + Q + '[0,1]' + Q + ',' + Q + 'l1' + Q + ')', 0, 0, '2');
+  ChkVal('VEC l2 (varsayilan)', 'SELECT ROUND(VECTOR_DISTANCE(' + Q + '[1,0]' + Q +
+    ',' + Q + '[0,1]' + Q + '), 4)', 0, 0, '1.4142');
+  ChkVal('VEC boyut uyusmazligi', 'SELECT VECTOR_DISTANCE(' + Q + '[1,2]' + Q +
+    ',' + Q + '[1]' + Q + ')', 0, 0, '');
+  ChkVal('VEC gecersiz dizi', 'SELECT VECTOR_DIM(' + Q + '[1,"x"]' + Q + ')',
+    0, 0, '');
+  ChkVal('VEC bilinmeyen metrik', 'SELECT VECTOR_DISTANCE(' + Q + '[1]' + Q +
+    ',' + Q + '[1]' + Q + ',' + Q + 'foo' + Q + ')', 0, 0, '');
+end;
+
+procedure T112_JsonPath;
+// M10: JSONPath alt kumesi (JSON_EXTRACT / JSON_VALUE / JSON_EXISTS).
+const
+  J = '{"a":{"b":[10,20,{"c":"x"}]},"n":1.5,"s":"hi","t":true,"z":null}';
+  J2 = '{"items":[{"ad":"a","fiyat":10},{"ad":"b","fiyat":25},' +
+    '{"ad":"c","fiyat":5}],"o":{"x":{"ad":"deep"}}}';
+begin
+  Grp('M10 JSONPath (JSON_EXTRACT/VALUE/EXISTS)');
+  ChkVal('JP koku nesne', 'SELECT JSON_EXTRACT(' + Q + J + Q + ', ' + Q + '$.a' + Q + ')',
+    0, 0, '{"b":[10,20,{"c":"x"}]}');
+  ChkVal('JP dizi indeks', 'SELECT JSON_EXTRACT(' + Q + J + Q + ', ' + Q + '$.a.b[1]' + Q + ')',
+    0, 0, '20');
+  ChkVal('JP negatif indeks', 'SELECT JSON_EXTRACT(' + Q + '[1,2,3]' + Q + ', ' + Q + '$[-1]' + Q + ')',
+    0, 0, '3');
+  ChkVal('JP nesne-dizi karisik', 'SELECT JSON_EXTRACT(' + Q + J + Q +
+    ', ' + Q + '$.a.b[2].c' + Q + ')', 0, 0, '"x"');
+  ChkVal('JP koseli tirnakli anahtar', 'SELECT JSON_EXTRACT(' + Q + J + Q +
+    ', ' + Q + '$["a"]["b"][0]' + Q + ')', 0, 0, '10');
+  ChkVal('JP string skaler', 'SELECT JSON_VALUE(' + Q + J + Q + ', ' + Q + '$.s' + Q + ')',
+    0, 0, 'hi');
+  ChkVal('JP sayi skaler', 'SELECT JSON_VALUE(' + Q + J + Q + ', ' + Q + '$.n' + Q + ')',
+    0, 0, '1.5');
+  ChkVal('JP bool skaler', 'SELECT JSON_VALUE(' + Q + J + Q + ', ' + Q + '$.t' + Q + ')',
+    0, 0, 'True');
+  ChkVal('JP null skaler', 'SELECT JSON_VALUE(' + Q + J + Q + ', ' + Q + '$.z' + Q + ')',
+    0, 0, '');
+  ChkVal('JP nesne JSON_VALUE null', 'SELECT JSON_VALUE(' + Q + J + Q +
+    ', ' + Q + '$.a' + Q + ')', 0, 0, '');
+  ChkVal('JP EXISTS var', 'SELECT JSON_EXISTS(' + Q + J + Q +
+    ', ' + Q + '$.a.b[2].c' + Q + ')', 0, 0, 'True');
+  ChkVal('JP EXISTS yok', 'SELECT JSON_EXISTS(' + Q + J + Q +
+    ', ' + Q + '$.yok' + Q + ')', 0, 0, 'False');
+  ChkVal('JP joker dizi', 'SELECT JSON_EXTRACT(' + Q + '[1,2,3]' + Q +
+    ', ' + Q + '$[*]' + Q + ')', 0, 0, '[1,2,3]');
+  ChkVal('JP joker nesne', 'SELECT JSON_EXTRACT(' + Q + '{"a":1,"b":2}' + Q +
+    ', ' + Q + '$.*' + Q + ')', 0, 0, '[1,2]');
+  ChkVal('JP bozuk JSON null', 'SELECT JSON_EXTRACT(' + Q + '{bozuk' + Q +
+    ', ' + Q + '$.a' + Q + ')', 0, 0, '');
+  ChkVal('JP kacisli string', 'SELECT JSON_EXTRACT(' + Q + '{"s":"a\"b"}' + Q +
+    ', ' + Q + '$.s' + Q + ')', 0, 0, '"a\"b"');
+  // M10 genisletme: ara joker, recursive descent, filtre, slice.
+  ChkVal('JP ara joker dizi', 'SELECT JSON_EXTRACT(' + Q + J2 + Q +
+    ', ' + Q + '$.items[*].ad' + Q + ')', 0, 0, '["a","b","c"]');
+  ChkVal('JP ara joker nesne', 'SELECT JSON_EXTRACT(' + Q + J2 + Q +
+    ', ' + Q + '$.o.*.ad' + Q + ')', 0, 0, '["deep"]');
+  ChkVal('JP recursive descent', 'SELECT JSON_EXTRACT(' + Q + J2 + Q +
+    ', ' + Q + '$..ad' + Q + ')', 0, 0, '["a","b","c","deep"]');
+  ChkVal('JP filtre sayi >', 'SELECT JSON_EXTRACT(' + Q + J2 + Q +
+    ', ' + Q + '$.items[?(@.fiyat > 10)].ad' + Q + ')', 0, 0, '["b"]');
+  ChkVal('JP filtre sayi <=', 'SELECT JSON_EXTRACT(' + Q + J2 + Q +
+    ', ' + Q + '$.items[?(@.fiyat <= 10)].ad' + Q + ')', 0, 0, '["a","c"]');
+  ChkVal('JP filtre string ==', 'SELECT JSON_EXTRACT(' + Q + J2 + Q +
+    ', ' + Q + '$.items[?(@.ad == "b")].fiyat' + Q + ')', 0, 0, '[25]');
+  ChkVal('JP filtre dogruluk', 'SELECT JSON_EXTRACT(' + Q + J2 + Q +
+    ', ' + Q + '$.items[?(@.ad)].ad' + Q + ')', 0, 0, '["a","b","c"]');
+  ChkVal('JP slice 1:3', 'SELECT JSON_EXTRACT(' + Q + J2 + Q +
+    ', ' + Q + '$.items[1:3].ad' + Q + ')', 0, 0, '["b","c"]');
+  ChkVal('JP slice 1:', 'SELECT JSON_EXTRACT(' + Q + '[1,2,3]' + Q +
+    ', ' + Q + '$[1:]' + Q + ')', 0, 0, '[2,3]');
+  ChkVal('JP coklu JSON_VALUE bos', 'SELECT JSON_VALUE(' + Q + J2 + Q +
+    ', ' + Q + '$.items[*].ad' + Q + ')', 0, 0, '');
+  ChkVal('JP EXISTS filtre var', 'SELECT JSON_EXISTS(' + Q + J2 + Q +
+    ', ' + Q + '$.items[?(@.fiyat > 10)]' + Q + ')', 0, 0, 'True');
+  ChkVal('JP EXISTS filtre yok', 'SELECT JSON_EXISTS(' + Q + J2 + Q +
+    ', ' + Q + '$.items[?(@.fiyat > 100)]' + Q + ')', 0, 0, 'False');
+end;
+
+procedure T111_RasgeleDiferansiyel;
+// M8: rastgele WHERE yuklemleri icin ham/akisli yol ile genel yol
+// (ORDER BY ile zorlanir) AYNI satir kumesini vermeli.
+const
+  NR = 4000;
+  NQ = 120;
+var
+  i, qi, bad, x, y, k: Integer;
+  pred, q1, q2: string;
+  A, B: TSqlResult;
+  ka, kb: TStringList;
+  ok: Boolean;
+
+  function RowKey(const R: TStrArray): string;
+  var
+    j: Integer;
+  begin
+    Result := '';
+    for j := 0 to High(R) do
+      Result := Result + R[j] + #1;
+  end;
+
+  procedure KeysOf(const R: TSqlResult; L: TStringList);
+  var
+    j: Integer;
+  begin
+    L.Clear;
+    for j := 0 to High(R.Rows) do
+      L.Add(RowKey(R.Rows[j]));
+    L.Sort;
+  end;
+
+  function RndInt(Lo, Hi: Integer): Integer;
+  begin
+    Result := Lo + Random(Hi - Lo + 1);
+  end;
+
+begin
+  Grp('M8 rasgele WHERE diferansiyel');
+  UseDir('m8_rand');
+  sq.Exec('CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, f FLOAT, s TEXT, b BOOLEAN)');
+  sq.Exec('BEGIN');
+  for i := 1 to NR do
+  begin
+    if i mod 13 = 0 then
+      q1 := 'NULL'
+    else
+      q1 := IntToStr(i mod 200);
+    if i mod 11 = 0 then
+      q2 := Q + Q
+    else if i mod 29 = 0 then
+      q2 := Q + #$C3#$A9 + 'z' + IntToStr(i mod 5) + Q
+    else
+      q2 := Q + 'k' + IntToStr(i mod 17) + Q;
+    sq.Exec(Format('INSERT INTO t VALUES (%d, %s, %d.25, %s, %s)',
+      [i, q1, i mod 500, q2, BoolToStr(i mod 2 = 0, True)]));
+  end;
+  sq.Exec('COMMIT');
+
+  RandSeed := 20261019;
+  bad := 0;
+  ka := TStringList.Create;
+  kb := TStringList.Create;
+  try
+    for qi := 1 to NQ do
+    begin
+      case qi mod 10 of
+        0: begin
+             x := RndInt(0, 199);
+             pred := Format('a BETWEEN %d AND %d', [x, x + RndInt(0, 40)]);
+           end;
+        1: begin
+             x := RndInt(0, 199);
+             y := RndInt(0, 199);
+             pred := Format('a <> %d AND a >= %d', [x, y]);
+           end;
+        2: begin
+             x := RndInt(0, 499);
+             pred := Format('f >= %d.25 AND f < %d.25', [x, x + RndInt(1, 80)]);
+           end;
+        3: pred := 'a IN (' + IntToStr(RndInt(0,199)) + ',' +
+                 IntToStr(RndInt(0,199)) + ',' + IntToStr(RndInt(0,199)) + ')';
+        4: pred := 'a IS NULL';
+        5: pred := Format('s = ''k%d''', [RndInt(0, 16)]);
+        6: pred := 's LIKE ''k1%''';
+        7: pred := 'b = TRUE AND a < ' + IntToStr(RndInt(0, 199));
+        8: pred := '(a < ' + IntToStr(RndInt(0, 199)) + ' OR s = ''k' +
+                 IntToStr(RndInt(0, 16)) + ''')';
+        9: pred := 'NOT (a > ' + IntToStr(RndInt(0, 199)) + ')';
+      end;
+      q1 := 'SELECT id, a, f, s, b FROM t WHERE ' + pred;
+      q2 := q1 + ' ORDER BY id';
+      A := sq.Exec(q1);
+      B := sq.Exec(q2);
+      KeysOf(A, ka);
+      KeysOf(B, kb);
+      ok := (ka.Count = kb.Count);
+      if ok then
+        for k := 0 to ka.Count - 1 do
+          if ka[k] <> kb[k] then
+          begin
+            ok := False;
+            Break;
+          end;
+      if not ok then
+      begin
+        Inc(bad);
+        if bad <= 3 then
+          WriteLn('    FARK [', ka.Count, ' vs ', kb.Count, '] ', pred);
+      end;
+    end;
+  finally
+    ka.Free;
+    kb.Free;
+  end;
+  Dogrula(Format('rasgele WHERE %d/%d birebir', [NQ - bad, NQ]), bad = 0,
+    IntToStr(bad) + ' fark');
+end;
+
+procedure T110_CopyFrom;
+// H13 (2026-10-19): COPY FROM CSV hizli yolu + atomiklik.
+var
+  fn, bad: string;
+  sl: TStringList;
+  R2: TSqlResult;
+  ok: Boolean;
+begin
+  Grp('H13 COPY FROM (CSV)');
+  UseDir('h13_copy');
+  sq.Exec('CREATE TABLE cp(id INTEGER PRIMARY KEY, nm TEXT, q INTEGER)');
+  fn := D + '\h13_copy.csv';
+  bad := D + '\h13_copy_bad.csv';
+  sl := TStringList.Create;
+  try
+    sl.Add('id,nm,q');
+    sl.Add('1,"a,b",10');
+    sl.Add('2,"line1');
+    sl.Add('line2",20');
+    sl.Add('3,,30');
+    sl.SaveToFile(fn);
+  finally
+    sl.Free;
+  end;
+
+  R2 := sq.Exec('COPY cp FROM ''' + fn + ''' WITH (FORMAT CSV, HEADER)');
+  ChkInt('COPY Affected=3', R2.Affected, 3);
+  Chk('COPY 3 satir', 'SELECT id FROM cp', 3);
+  ChkVal('COPY tirnakli virgul', 'SELECT nm FROM cp WHERE id=1', 0, 0, 'a,b');
+  Chk('COPY tirnak icinde satir sonu',
+    'SELECT id FROM cp WHERE nm LIKE ''line1%line2''', 1);
+  ChkVal('COPY bos alan NULL',
+    'SELECT COUNT(*) FROM cp WHERE id=3 AND nm IS NULL', 0, 0, '1');
+
+  // Atomiklik: 2. satir PK ihlali -> 1. satir da yazilmamali.
+  sl := TStringList.Create;
+  try
+    sl.Add('4,dort,40');
+    sl.Add('1,dup,1');
+    sl.SaveToFile(bad);
+  finally
+    sl.Free;
+  end;
+  ok := False;
+  try
+    sq.Exec('COPY cp FROM ''' + bad + '''');
+  except
+    on E: Exception do
+      ok := Pos('duplicate PK', E.Message) > 0;
+  end;
+  Dogrula('COPY atomik PK ihlali hata verir', ok, '');
+  Chk('COPY atomik: 4 yok', 'SELECT id FROM cp WHERE id=4', 0);
+  Chk('COPY atomik: hala 3 satir', 'SELECT id FROM cp', 3);
+end;
+
 { ---------------------------------------------------------------------- main }
 
 var
@@ -10364,6 +11389,15 @@ T92_MVCC_Isoaltion;
        T107_AuthSession;
        T108_PreparedStatement;
        T109_PoolSlotTCP;
+       T110_CopyFrom;
+       T111_RasgeleDiferansiyel;
+       T112_JsonPath;
+       T113_Vector;
+       T114_Fts;
+       T115_MetricsHttp;
+       T116_PgWire;
+       T117_Generated;
+       T118_AeadKdf;
   
       except
         on E: Exception do

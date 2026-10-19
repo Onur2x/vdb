@@ -127,6 +127,7 @@ type
 
   TVdbWorkerThread = class(TThread)
   protected
+    procedure RunItem(const item: TVdbWorkItem);
     procedure Execute; override;
   end;
 
@@ -139,6 +140,9 @@ var
   GQCount: Integer = 0;            // kuyruktaki gorev sayisi
   GWake: PRTLEvent;                // isçileri uyandiran sinyal
   GIdle: PRTLEvent;                // 'kuyruk bos + aktif isçi yok' sinyali
+  {$IFDEF MSWINDOWS}
+  GWorkSem: THandle = 0;           // H6: is dagitimi icin sayma semaforu
+  {$ENDIF}
   GThreads: array of TVdbWorkerThread;
   GWorkerCount: Integer = 0;
   GQuit: Boolean = False;          // isçilere cikis emri
@@ -151,6 +155,41 @@ var
 
 { ------------------------------------------------------------ isçi }
 
+procedure TVdbWorkerThread.RunItem(const item: TVdbWorkItem);
+begin
+  try
+    item.Fn(item.Ctx, item.ChunkIx, item.Lo, item.Hi);
+    GLock.Enter;
+    try
+      Inc(GExecuted);
+      Dec(GActive);
+      if (GQCount = 0) and (GActive = 0) then
+        RTLEventSetEvent(GIdle);
+    finally
+      GLock.Leave;
+    end;
+  except
+    // Istisna isçi parcacigindan disari sizmaz: ilk hata kaydedilir,
+    // kalan gorevler yine de bitirilir, sonunda cagirana yukseltilir.
+    on E: Exception do
+    begin
+      GLock.Enter;
+      try
+        if not GFailed then
+        begin
+          GFailed := True;
+          GErrMsg := E.ClassName + ': ' + E.Message;
+        end;
+        Dec(GActive);
+        if (GQCount = 0) and (GActive = 0) then
+          RTLEventSetEvent(GIdle);
+      finally
+        GLock.Leave;
+      end;
+    end;
+  end;
+end;
+
 procedure TVdbWorkerThread.Execute;
 var
   item: TVdbWorkItem;
@@ -158,11 +197,36 @@ var
 begin
   while True do
   begin
+    {$IFDEF MSWINDOWS}
+    // H6 (2026-10-18): FPC'nin Windows RTLEvent'i AUTO-RESET'tir; tek
+    // SetEvent yalnizca BIR isçiyi uyandirir. Bu yuzden is dagitimi
+    // sayma semaforu ile yapilir: her gorev icin bir token. (Onceden tum
+    // "paralel" isler fiilen TEK isçide kosuyordu; olcum: 8 isçi ≈ 1 isçi.)
+    if GWorkSem = 0 then Sleep(VDB_PAR_POLL_MS)
+    else WaitForSingleObject(GWorkSem, VDB_PAR_POLL_MS);
+    if GQuit then Break;
+    has := False;
+    GLock.Enter;
+    try
+      if GQCount > 0 then
+      begin
+        item := GQueue[GQHead];
+        GQHead := (GQHead + 1) mod Length(GQueue);
+        Dec(GQCount);
+        Inc(GActive);
+        has := True;
+      end;
+    finally
+      GLock.Leave;
+    end;
+    if not has then Continue;   // fazla token (onceki parti)
+    RunItem(item);
+    {$ELSE}
     RTLEventWaitFor(GWake, VDB_PAR_POLL_MS);
     RTLEventResetEvent(GWake);
     if GQuit then Break;
 
-    // Kuyrugu kendi kendine tuket: her turda bir gorev al, calistir.
+    // Kuyrugu kendi kendine tuket (POSIX RTLEvent davranisina birakilir).
     while True do
     begin
       has := False;
@@ -177,44 +241,14 @@ begin
           has := True;
         end
         else if GActive = 0 then
-          RTLEventSetEvent(GIdle);   // her sey bitti -> bekleyeni uyandir
+          RTLEventSetEvent(GIdle);
       finally
         GLock.Leave;
       end;
       if not has then Break;
-
-      try
-        item.Fn(item.Ctx, item.ChunkIx, item.Lo, item.Hi);
-        GLock.Enter;
-        try
-          Inc(GExecuted);
-          Dec(GActive);
-          if (GQCount = 0) and (GActive = 0) then
-            RTLEventSetEvent(GIdle);
-        finally
-          GLock.Leave;
-        end;
-      except
-        // Istisna isçi parcacigindan disari sizmaz: ilk hata kaydedilir,
-        // kalan gorevler yine de bitirilir, sonunda cagirana yukseltilir.
-        on E: Exception do
-        begin
-          GLock.Enter;
-          try
-            if not GFailed then
-            begin
-              GFailed := True;
-              GErrMsg := E.ClassName + ': ' + E.Message;
-            end;
-            Dec(GActive);
-            if (GQCount = 0) and (GActive = 0) then
-              RTLEventSetEvent(GIdle);
-          finally
-            GLock.Leave;
-          end;
-        end;
-      end;
+      RunItem(item);
     end;
+    {$ENDIF}
   end;
 end;
 
@@ -307,6 +341,9 @@ begin
     GWake := RTLEventCreate;
     GIdle := RTLEventCreate;
     RTLEventSetEvent(GIdle);   // baslangicta havuz bosta
+    {$IFDEF MSWINDOWS}
+    GWorkSem := CreateSemaphore(nil, 0, $7FFFFFFF, nil);
+    {$ENDIF}
 
     // Isçiler hemen kosmaya baslar; ilk GLock.Enter'lari init bitene
     // kadar kilit disinda bekler (deadlock yok).
@@ -335,7 +372,12 @@ begin
   finally
     GLock.Leave;
   end;
+  {$IFDEF MSWINDOWS}
+  if GWorkSem <> 0 then
+    ReleaseSemaphore(GWorkSem, GWorkerCount, nil);
+  {$ELSE}
   if GWake <> nil then RTLEventSetEvent(GWake);
+  {$ENDIF}
   // Isçiler elindeki gorevi bitirir, kuyruga döner, GQuit'i gorur ve
   // cikar. WaitFor kapanisin tamamlanmasini garanti eder.
   for i := 0 to High(GThreads) do
@@ -344,6 +386,13 @@ begin
     GThreads[i].Free;
   end;
   SetLength(GThreads, 0);
+  {$IFDEF MSWINDOWS}
+  if GWorkSem <> 0 then
+  begin
+    CloseHandle(GWorkSem);
+    GWorkSem := 0;
+  end;
+  {$ENDIF}
   if GWake <> nil then RTLEventDestroy(GWake);
   if GIdle <> nil then RTLEventDestroy(GIdle);
   GWake := nil;
@@ -397,6 +446,7 @@ begin
     GFailed := False;
     GErrMsg := '';
     RTLEventResetEvent(GIdle);
+    RTLEventResetEvent(GWake);   // yeni parti: sinyali temiz baslat
 
     sz := n div chunks;
     extra := n mod chunks;
@@ -416,7 +466,12 @@ begin
   finally
     GLock.Leave;
   end;
+  {$IFDEF MSWINDOWS}
+  // Her gorev icin BIR token: auto-reset RTLEvent'in aksine adil dagitim.
+  if GWorkSem <> 0 then ReleaseSemaphore(GWorkSem, chunks, nil);
+  {$ELSE}
   RTLEventSetEvent(GWake);
+  {$ENDIF}
 
   // Tum gorevler bitene kadar bekle. Her turda kilitle kontrol; kayip
   // sinyale karsi 10 ms'lik yoklama gecisi de var.
@@ -426,6 +481,10 @@ begin
       GLock.Enter;
       try
         done := (GQCount = 0) and (GActive = 0);
+        // H6: partinin bittigini gorunce uyandirma sinyalini TEMIZLE.
+        // Boylece sonraki parti SetEvent'i kaybolmaz (isçiler resetlemez;
+        // yoksa ilk uyanan digerlerinin sinyalini yutar).
+        if done then RTLEventResetEvent(GWake);
       finally
         GLock.Leave;
       end;

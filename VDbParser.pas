@@ -662,6 +662,7 @@ procedure TVDbParser.ParseColDef(var C: TColDef; Stmt: TSqlCreateTableStmt = nil
 var T, U: string; SavePos, SaveIdx: Integer;
     fk: TFkDef;
     VDbTmpCollation: TVDbLang;   // R-20: cozumlenen dil profili
+    GenAST: TSqlExprNode;        // M10: GENERATED ifadesi
 begin
   C.Ctype := VCT_STR;
   C.NotNull := False;
@@ -669,6 +670,8 @@ begin
   C.Def := '';
   C.Unique := False;
   C.Collate := '';   // R-20
+  C.Generated := False;
+  C.GenExpr := '';
   // Tip adını oku
   C.Ctype := ParseTypeName;
 
@@ -808,6 +811,31 @@ begin
         Expect('NULL');
         C.NotNull := True;
       end;
+    end
+    // ---- M10: GENERATED ALWAYS AS (ifade) [STORED|VIRTUAL] ----
+    else if U = 'GENERATED' then
+    begin
+      ExpectToken(T);
+      if UpperCase(T) <> 'ALWAYS' then
+        raise EVDbException.Create(ecSyntaxError,
+          'GENERATED sonrasi ALWAYS bekleniyor, "' + T + '" bulundu');
+      Expect('AS');
+      if UpperCase(PeekToken) = 'IDENTITY' then
+        raise EVDbException.Create(ecUnsupported,
+          'GENERATED AS IDENTITY desteklenmiyor');
+      Expect('(');
+      GenAST := ParseExpr;
+      try
+        C.GenExpr := ExprToText(GenAST);
+      finally
+        GenAST.Free;
+      end;
+      C.Generated := True;
+      Expect(')');
+      if UpperCase(PeekToken) = 'STORED' then
+        NextToken(T)
+      else if UpperCase(PeekToken) = 'VIRTUAL' then
+        NextToken(T);   // saklama modeli ayni (STORED gibi)
     end
     // ---- R-20: kolon varsayilan collation'i ----
     else if U = 'COLLATE' then

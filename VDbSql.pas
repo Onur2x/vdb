@@ -27,6 +27,8 @@ const
   // Veritabani dosya uzantisi. CREATE DATABASE satis -> satis.odb
   // (klasor + veritabani.odb yerine TEK dosya).
   VDB_EXT = '.odb';
+  // H7: plan onbellegi ust siniri (asilirsa tamamen temizlenir)
+  PLAN_CACHE_CAP = 256;
 
 type
   TSqlResult = VDbAst.TSqlResult;
@@ -65,6 +67,12 @@ type
     FSlowT0Tick: QWord;    // olcum baslangic tik (MSWINDOWS)
     FParser: TVDbParser;   // P-25 (2026-10-17): her sorguda Create/Free yapmamak icin yeniden kullanilan parser
     FExecutor: TVSqlExecutor; // P-25: yeniden kullanilan yurutucu
+    // H7 (2026-10-18): PLAN ONBELLEGI. Ayni SELECT metni tekrar geldiginde
+    // AST yeniden ayristirilmaz. Yalniz PARAMETRESIZ SELECT'ler saklanir
+    // (view-DML AST'yi yerinde degistirir -> yalniz okuma guvenli; parametreli
+    // cagride AST degere bagli). DDL calisinca onbellek temizlenir.
+    FPlanCache: TDictionary<string, TSqlStmtNode>;
+    FPlanHits, FPlanMiss: Int64;
     function Tok(const S: string; var P: Integer; out T: string): Boolean;
     function PeekWord(const S: string; P: Integer): string;
     function TokAt(const S: string; var P: Integer; out T: string;
@@ -149,6 +157,7 @@ type
     procedure NoteSlow(const Sql: string; Ms: Int64; Rows: Integer);
     procedure ExecShowSlowQueries(out Res: TSqlResult);
     function CountSlow: Integer;
+    function GetPlanCacheSize: Integer;   // H7
     // Bu cumle otomatik transaction (batch) icinde calistirilabilir mi?
     function StmtBatchSafe(const S: string): Boolean;
     function ExecRaw(const Sql: string): TSqlResult;
@@ -191,6 +200,16 @@ type
     property LastElapsedMs: Int64 read FLastMs;
     property SlowQueryCount: Integer read CountSlow;
     procedure ClearSlow;   // F-21: kayitlari temizle
+    // --- H7: PLAN ONBELLEGI ---
+    property PlanCacheHits: Int64 read FPlanHits;      // onbellekten calisan SELECT
+    property PlanCacheMisses: Int64 read FPlanMiss;    // yeniden ayristirilan SELECT
+    property PlanCacheSize: Integer read GetPlanCacheSize;
+    procedure ClearPlanCache;                          // sema degisince/zorla temizle
+    // --- M9 (2026-10-19): Prometheus text exposition ---
+    // Saf metin uretir; HTTP ucu/OpenTelemetry disarida (gomulu sunucu,
+    // uygulama veya bir /metrics adaptoru) tarafindan sunulur. Ayni
+    // metrikler SHOW STATS ile de okunabilir.
+    function GetMetricsText: string;
   end;
 
 implementation
@@ -218,10 +237,18 @@ begin
   FSlowNext := 0;
   FParser := TVDbParser.Create;
   FExecutor := TVSqlExecutor.Create(FT);
+  FPlanCache := TDictionary<string, TSqlStmtNode>.Create;   // H7
+  FPlanHits := 0;
+  FPlanMiss := 0;
 end;
 
 destructor TVSql.Destroy;
+var
+  pn: TSqlStmtNode;
 begin
+  // H7: onbellekteki AST'ler sahiplenilir
+  for pn in FPlanCache.Values do pn.Free;
+  FPlanCache.Free;
   FExecutor.Free;
   FParser.Free;
   FSlow.Free;   // F-21: TList<T> ogeleri sahiplendigi icin hepsi serbest
@@ -297,6 +324,86 @@ end;
 function TVSql.CountSlow: Integer;
 begin
   Result := FSlow.Count;
+end;
+
+// --- H7: plan onbellegi API ---
+function TVSql.GetPlanCacheSize: Integer;
+begin
+  Result := FPlanCache.Count;
+end;
+
+procedure TVSql.ClearPlanCache;
+var
+  pn: TSqlStmtNode;
+begin
+  for pn in FPlanCache.Values do pn.Free;
+  FPlanCache.Clear;
+end;
+
+// --- M9: Prometheus text exposition (saf metin; ag katmani disarida) ---
+function TVSql.GetMetricsText: string;
+var
+  ms: TVDbMonitorStats;
+  hits, misses: Int64;
+  usedB, maxB: Integer;
+  avgUs: UInt64;
+  ratio: Double;
+  sl: TStringList;
+begin
+  GetStats(ms);
+  FT.Kv.GetReadCacheStats(hits, misses, usedB, maxB);
+  if ms.CommandCount > 0 then
+    avgUs := ms.TotalDurationUs div ms.CommandCount
+  else
+    avgUs := 0;
+  if (hits + misses) > 0 then
+    ratio := hits * 100.0 / (hits + misses)
+  else
+    ratio := 0;
+  sl := TStringList.Create;
+  try
+    sl.Add('# HELP vdb_up Database open (1) or closed (0).');
+    sl.Add('# TYPE vdb_up gauge');
+    sl.Add('vdb_up 1');
+    sl.Add('# TYPE vdb_commands_total counter');
+    sl.Add('vdb_commands_total ' + IntToStr(ms.CommandCount));
+    sl.Add('# TYPE vdb_command_duration_us_total counter');
+    sl.Add('vdb_command_duration_us_total ' + IntToStr(ms.TotalDurationUs));
+    sl.Add('# TYPE vdb_command_duration_us_max gauge');
+    sl.Add('vdb_command_duration_us_max ' + IntToStr(ms.MaxDurationUs));
+    sl.Add('# TYPE vdb_command_duration_us_avg gauge');
+    sl.Add('vdb_command_duration_us_avg ' + IntToStr(avgUs));
+    sl.Add('# TYPE vdb_slow_queries gauge');
+    sl.Add('vdb_slow_queries ' + IntToStr(FSlow.Count));
+    sl.Add('# TYPE vdb_plan_cache_hits_total counter');
+    sl.Add('vdb_plan_cache_hits_total ' + IntToStr(FPlanHits));
+    sl.Add('# TYPE vdb_plan_cache_misses_total counter');
+    sl.Add('vdb_plan_cache_misses_total ' + IntToStr(FPlanMiss));
+    sl.Add('# TYPE vdb_plan_cache_size gauge');
+    sl.Add('vdb_plan_cache_size ' + IntToStr(FPlanCache.Count));
+    sl.Add('# TYPE vdb_read_cache_hits_total counter');
+    sl.Add('vdb_read_cache_hits_total ' + IntToStr(hits));
+    sl.Add('# TYPE vdb_read_cache_misses_total counter');
+    sl.Add('vdb_read_cache_misses_total ' + IntToStr(misses));
+    sl.Add('# TYPE vdb_read_cache_blocks_used gauge');
+    sl.Add('vdb_read_cache_blocks_used ' + IntToStr(usedB));
+    sl.Add('# TYPE vdb_read_cache_blocks_max gauge');
+    sl.Add('vdb_read_cache_blocks_max ' + IntToStr(maxB));
+    sl.Add('# TYPE vdb_read_cache_hit_ratio gauge');
+    sl.Add('vdb_read_cache_hit_ratio ' + FormatFloat('0.0000', ratio / 100.0));
+    sl.Add('# TYPE vdb_data_file_bytes gauge');
+    sl.Add('vdb_data_file_bytes ' + IntToStr(FT.Kv.DataFileSize));
+    sl.Add('# TYPE vdb_batch_active gauge');
+    if FT.Kv.InBatch then
+      sl.Add('vdb_batch_active 1')
+    else
+      sl.Add('vdb_batch_active 0');
+    sl.Add('# TYPE vdb_tables gauge');
+    sl.Add('vdb_tables ' + IntToStr(Length(FT.TableNames)));
+    Result := sl.Text;
+  finally
+    sl.Free;
+  end;
 end;
 
 procedure TVSql.ExecShowSlowQueries(out Res: TSqlResult);
@@ -3512,6 +3619,28 @@ begin
     end;
   end;
 
+  // H13 (2026-10-19): COPY FROM dosya akisi. COPY sozcugu ile baslamayan
+  // cumlelerde ExecFastCopy False doner ve normal yol aynen calisir.
+  if (Length(Sql) > 6) and ((Sql[1] = 'C') or (Sql[1] = 'c')) then
+  begin
+    SlowMarkStart;
+    try
+      fastOk := FExecutor.ExecFastCopy(Sql, Result);
+      if fastOk then
+      begin
+        FLastMs := ElapsedMs;
+        NoteSlow(Sql, FLastMs, Length(Result.Rows));
+        RecordCommand(Sql, Integer(FLastMs * 1000), 0);
+        Exit;
+      end;
+    except
+      FLastMs := ElapsedMs;
+      NoteSlow(Sql, FLastMs, Length(Result.Rows));
+      RecordCommand(Sql, Integer(FLastMs * 1000), 0);
+      raise;
+    end;
+  end;
+
   // P-23 (2026-10-17): tekil PK nokta SELECT hizli seridi
   // ('S'/'s' ile baslayan, WHERE pk = val iceren basit sorgular)
   if (Length(Sql) > 15) and ((Sql[1] = 'S') or (Sql[1] = 's')) then
@@ -3669,7 +3798,26 @@ begin
     end;
   end;
 
+  // H7 (2026-10-18): PLAN ONBELLEGI. Parametresiz SELECT tekrar gelirse AST
+  // yeniden ayristirilmaz (parse maliyeti atlanir). Onbellekteki AST
+  // sahiplenilir; onbellekten kullanimda Free EDILMEZ.
+  if (Length(FParams) = 0) and IsSelectStatement(Sql) and
+     FPlanCache.TryGetValue(Sql, astStmt) then
+  begin
+    Inc(FPlanHits);
+    SlowMarkStart;
+    try
+      Result := FExecutor.Execute(astStmt);
+    finally
+      FLastMs := ElapsedMs;
+      NoteSlow(Sql, FLastMs, Length(Result.Rows));
+      RecordCommand(Sql, Integer(FLastMs * 1000), 0);
+    end;
+    Exit;
+  end;
+
   // Diger tum komutlar icin AST Pipeline (P-25: FParser ve FExecutor yeniden kullanilir)
+  if (Length(FParams) = 0) and IsSelectStatement(Sql) then Inc(FPlanMiss);
   astStmt := FParser.Parse(Sql, FParams);
   try
     if astStmt = nil then Exit;
@@ -3687,9 +3835,32 @@ begin
       // de sayilir). Sure F-21 ile AYNI olcumden turetilir (ms -> us).
       RecordCommand(Sql, Integer(FLastMs * 1000), 0);
     end;
+
+    // H7: basarili + parametresiz SELECT'i onbellege al (sahiplik aktarilir)
+    if (Length(FParams) = 0) and IsSelectStatement(Sql) then
+    begin
+      if FPlanCache.Count >= PLAN_CACHE_CAP then FPlanCache.Clear;
+      if not FPlanCache.ContainsKey(Sql) then
+      begin
+        FPlanCache.Add(Sql, astStmt);
+        astStmt := nil;   // sahiplik onbellege gecti; finally Free ETMEZ
+      end;
+    end
+    else
+    begin
+      // H7: DDL sonrasi sema degismis olabilir -> plan onbellegi gecersiz
+      pTest := 1;
+      if Tok(Sql, pTest, w1) then
+      begin
+        w1 := UpperCase(w1);
+        if (w1 = 'CREATE') or (w1 = 'DROP') or (w1 = 'ALTER') or
+           (w1 = 'TRUNCATE') or (w1 = 'RENAME') then
+          FPlanCache.Clear;
+      end;
+    end;
     Exit;
   finally
-    astStmt.Free;
+    if astStmt <> nil then astStmt.Free;
   end;
   // ------------------------------------------------------------
   // NOT (2026-10-02): Eski monolitik yol dosya altina tasindi.

@@ -46,7 +46,7 @@ unit VDbText;
 
 interface
 
-uses SysUtils;
+uses SysUtils, Classes;
 
 // ---- temel islemler (geriye uyum) ----
 function VDbTrUpper(const S: string): string;
@@ -124,6 +124,14 @@ function VDbAlphaOfCp(Cp: Integer): TVDbAlpha;
 // Yardimci: alfabe verilip verilmeden, bir dilin varsayilan alfabesini
 // secer (locale'in ilk iki harfi + kod noktasi araligi).
 function VDbAlphaForLang(const LangIn: string): TVDbAlpha;
+
+{ M5 (2026-10-19): temel tam metin arama yardimcilari.
+  Inverted index / BM25 HENUZ YOK; bu fonksiyonlar satir metni uzerinde
+  calisir ve tarama tabanlidir. Token = harf/rakam (ASCII) veya >=128
+  bayt; kucuk harfe cevrilir. }
+function VDbFtsNormalize(const S: string): string;
+function VDbFtsMatch(const Text, Query: string): Boolean;   // tum terimler (AND)
+function VDbFtsRank(const Text, Query: string): Integer;    // terim gecis sayisi
 
 implementation
 
@@ -1181,6 +1189,95 @@ begin
   if Prof.Strength = vsSecondary then Result := Result + '-u-ks'
   else if Prof.Strength = vsTertiary then Result := Result + '-u-ks-u-kc'
   else if Prof.Strength = vsQuaternary then Result := Result + '-u-s4';
+end;
+
+// ---- M5: temel FTS (index'siz) ----
+
+procedure VDbFtsSplit(const S: string; var Toks: TStringList);
+var
+  i: Integer;
+  c: Char;
+  cur: string;
+begin
+  Toks.Clear;
+  cur := '';
+  for i := 1 to Length(S) do
+  begin
+    c := S[i];
+    if ((c >= 'A') and (c <= 'Z')) or ((c >= 'a') and (c <= 'z')) or
+       ((c >= '0') and (c <= '9')) or (Ord(c) >= 128) then
+      cur := cur + c
+    else
+    begin
+      if cur <> '' then
+      begin
+        Toks.Add(VDbTrLower(cur));
+        cur := '';
+      end;
+    end;
+  end;
+  if cur <> '' then
+    Toks.Add(VDbTrLower(cur));
+end;
+
+function VDbFtsNormalize(const S: string): string;
+var
+  L: TStringList;
+  i: Integer;
+begin
+  L := TStringList.Create;
+  try
+    VDbFtsSplit(S, L);
+    Result := '';
+    for i := 0 to L.Count - 1 do
+      if i = 0 then Result := L[i]
+      else Result := Result + ' ' + L[i];
+  finally
+    L.Free;
+  end;
+end;
+
+function VDbFtsMatch(const Text, Query: string): Boolean;
+var
+  T, Q: TStringList;
+  i: Integer;
+begin
+  Result := False;
+  if (Text = '') or (Query = '') then Exit;
+  T := TStringList.Create;
+  Q := TStringList.Create;
+  try
+    VDbFtsSplit(Text, T);
+    VDbFtsSplit(Query, Q);
+    if Q.Count = 0 then Exit;
+    for i := 0 to Q.Count - 1 do
+      if T.IndexOf(Q[i]) < 0 then Exit;
+    Result := True;
+  finally
+    Q.Free;
+    T.Free;
+  end;
+end;
+
+function VDbFtsRank(const Text, Query: string): Integer;
+var
+  T, Q: TStringList;
+  i, j: Integer;
+begin
+  Result := 0;
+  if (Text = '') or (Query = '') then Exit;
+  T := TStringList.Create;
+  Q := TStringList.Create;
+  try
+    VDbFtsSplit(Text, T);
+    VDbFtsSplit(Query, Q);
+    for i := 0 to Q.Count - 1 do
+      for j := 0 to T.Count - 1 do
+        if T[j] = Q[i] then Inc(Result);
+  finally
+    Q.Free;
+    T.Free;
+  end;
 end;
 
 end.

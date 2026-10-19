@@ -76,6 +76,11 @@ function VdbSendAll(ASock: TVdbSocket; const ABuf; ALen: Integer): Boolean;
 { ALen baytin TAMAMINI okur. Karsi taraf erken kapatirsa False. }
 function VdbRecvAll(ASock: TVdbSocket; var ABuf; ALen: Integer): Boolean;
 
+{ En fazla ALen bayt okur (kismi okuma normaldir).
+  0 = karsi taraf kapatti, <0 = hata. HTTP basligi gibi "bitis
+  isaretine kadar oku" kullanimlari icin. }
+function VdbRecvSome(ASock: TVdbSocket; var ABuf; ALen: Integer): Integer;
+
 { ---- Protokol ilkelleri (hepsi KUCUK ENDIAN; platformdan bagimsiz) ---- }
 function VdbSendU8(ASock: TVdbSocket; AV: Byte): Boolean;
 function VdbRecvU8(ASock: TVdbSocket; out AV: Byte): Boolean;
@@ -205,6 +210,13 @@ begin
     Inc(got, n);
   end;
   Result := True;
+end;
+
+function VdbRecvSome(ASock: TVdbSocket; var ABuf; ALen: Integer): Integer;
+begin
+  Result := -1;
+  if (ASock = VDB_SOCK_INVALID) or (ALen <= 0) then Exit(0);
+  Result := fpRecv(ASock, @ABuf, ALen, 0);
 end;
 
 function VdbSendU8(ASock: TVdbSocket; AV: Byte): Boolean;

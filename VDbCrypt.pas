@@ -8,16 +8,22 @@
   Uzerine guvenilemedigi icin primitifler DCPcrypt'ten (MIT, saf
   Pascal) alinmistir; bkz. `dcpcrypt` klasoru.
 
-  KURULUM (encrypt-then-MAC):
+  KURULUM (M6, yeni yazimlar):
+    kayit = 'VDBAEAD1' (8) || nonce(12) || AES-256-GCM(duz) || Tag(16)
+  GCM etiketi dogrulanmadan hicbir duz metin aciga cikmaz.
+  AES-GCM'in GHASH/CTR/GF(2^128) katmani bu dosyada saf Pascal'dir.
+
+  ESKI KURULUM (okunur, yeni yazimda kullanilmaz):
     kayit = IV(16) || duzUzunluk(4,LE) || AES-256-CTR(duz) || Tag(32)
     Tag   = HMAC-SHA256(K_mac, IV || len || sifreli)
-  Cozmede ONCE Tag dogrulanir; bozuk kayit ASLA cozulmez.
   K_enc ve K_mac master anahtardan ayri ayri turetilir:
     K_enc = HMAC-SHA256(master,"VDB-ENC-v1"), K_mac = ...("VDB-MAC-v1")
 
   ANAHTAR DOSYASI: master anahtar `.key` icinde DPAPI
   (CryptProtectData, kullanici kapsamli) ile korunur; baska makineye
-  kopyalanan dosya acilmaz, kullanici hicbir sey girmeye calismaz. }
+  kopyalanan dosya acilmaz, kullanici hicbir sey girmeye calismaz.
+  Paroladan anahtar turetimi v2'de Argon2id (VDbKdf.pas), v1'de
+  PBKDF2-SHA256'dir; eski v1 dosyalari okunmaya devam eder. }
 
 {$mode delphi}{$H+}
 
@@ -53,8 +59,13 @@ const
 { .key dosyasi basligi }
 const
   VDB_KEYFILE_MAGIC = 'VDBK'#0;
-  VDB_KEYFILE_VER   = 1;
+  VDB_KEYFILE_VER   = 1;    { eski: PBKDF2-SHA256 }
+  VDB_KEYFILE_VER_ARGON2 = 2;
   VDB_KEYFILE_HEAD  = 10;   { 4 magic + 1 surum + 1 tuzUz + 4 iterasyon }
+  VDB_KEYFILE2_HEAD = 15;   { 4 magic + 1 surum + 1 tuzUz + 4 t + 4 m + 1 p }
+  VDB_ARGON2_TIME = 3;
+  VDB_ARGON2_MEMORY_KIB = 65536;  { 64 MiB }
+  VDB_ARGON2_LANES = 1;
 
 function VDbPbkdf2Sha256(const Pass, Salt: TBytes; Iter, DkLen: Integer): TBytes;
 function VDbCryptNewSalt(out Salt: TBytes): Boolean;
@@ -66,6 +77,8 @@ function VDbCryptKeyFromPassword(const Password: string; const Salt: TBytes;
 function VDbCryptPasswordLongEnough(const Password: string): Boolean;
 
 function VDbCryptEncrypt(const Key, Plain: TBytes;
+  out OutCipher: TBytes): Boolean;
+function VDbCryptEncryptLegacy(const Key, Plain: TBytes;
   out OutCipher: TBytes): Boolean;
 function VDbCryptDecrypt(const Key, Cipher: TBytes;
   out OutPlain: TBytes): Boolean;
@@ -102,11 +115,25 @@ function VDbCryptHmacSha256(const Key: TBytes; const Data: TBytes): TBytes;
   tum tamponlar STATIK dizi olarak veriliyor (bkz. tuzak 8). }
 function VDbCryptAes256Block(const Key, Block: TBytes): TBytes;
 
+{ M6: AES-256-GCM (AEAD). GcmSeal/Open ham GCM'dir (test vektorleri ve
+  AAD icin); AeadSeal/Open 'VDBAEAD1' zarfli bicimi uretir/cozer.
+  VDbCryptEncrypt artik bu zarfi kullanir; VDbCryptDecrypt eski
+  CTR+HMAC zarflarini da okumaya devam eder. }
+function VDbCryptGcmSeal(const Key, Nonce, Plain, Aad: TBytes;
+  out Cipher, Tag: TBytes): Boolean;
+function VDbCryptGcmOpen(const Key, Nonce, Cipher, Tag, Aad: TBytes;
+  out Plain: TBytes): Boolean;
+function VDbCryptAeadSeal(const Key, Nonce, Plain, Aad: TBytes;
+  out OutCipher: TBytes): Boolean;
+function VDbCryptAeadOpen(const Key, Envelope, Aad: TBytes;
+  out OutPlain: TBytes): Boolean;
+function VDbCryptIsAead(const Cipher: TBytes): Boolean;
+
 implementation
 
 uses
   {$IFDEF MSWINDOWS} Windows, {$ENDIF}
-  dcpcrypt2, dcpblockciphers, dcprijndael, dcpsha256;
+  dcpcrypt2, dcpblockciphers, dcprijndael, dcpsha256, VDbKdf;
 
 {$IFDEF MSWINDOWS}
 const
@@ -265,6 +292,272 @@ begin
   for i := 0 to 15 do
     Result[i] := blkOut[i];
 end;
+
+{ ---------------------------------------------------------------- M6 AEAD
+  AES-256-GCM (NIST SP 800-38D). DCPcrypt yalnizca AES blok saglar;
+  GCM'in GHASH/CTR katmani burada saf Pascal. Kayit zarf bicimi:
+
+    'VDBAEAD1' (8) || nonce (12) || sifreli metin (n) || tag (16)
+
+  Eski AES-256-CTR + HMAC zarfi OKUNMAYA devam eder (magic yoksa eski
+  yol). Yeni yazimlar AEAD'dir; Compact/Reencrypt eski kayitlari da
+  AEAD'ye cevirir. }
+
+const
+  VDB_AEAD_MAGIC = 'VDBAEAD1';
+  VDB_AEAD_NONCE_LEN = 12;
+  VDB_AEAD_TAG_LEN = 16;
+
+function Gf128Mul(const X, Y: TBytes): TBytes;
+var
+  z, v: array[0..15] of Byte;
+  i, j: Integer;
+  lsb: Byte;
+begin
+  if (Length(X) <> 16) or (Length(Y) <> 16) then
+    raise EVdbCryptError.Create('GF(2^128) girdisi 16 bayt olmali',
+      VDB_CRYPTO_ERR);
+  dcpFillChar(z, SizeOf(z), 0);
+  dcpFillChar(v, SizeOf(v), 0);
+  Move(Y[0], v[0], 16);
+  for i := 0 to 127 do
+  begin
+    if (X[i shr 3] and (1 shl (7 - (i and 7)))) <> 0 then
+      for j := 0 to 15 do
+        z[j] := z[j] xor v[j];
+    lsb := v[15] and 1;
+    for j := 15 downto 1 do
+      v[j] := (v[j] shr 1) or ((v[j - 1] and 1) shl 7);
+    v[0] := v[0] shr 1;
+    if lsb <> 0 then
+      v[0] := v[0] xor $E1;
+  end;
+  SetLength(Result, 16);
+  Move(z[0], Result[0], 16);
+end;
+
+function AesBlockOf(Aes: TDCP_rijndael; const B: array of Byte): TBytes;
+var
+  bi, bo: array[0..15] of Byte;
+begin
+  dcpFillChar(bi, SizeOf(bi), 0);
+  dcpFillChar(bo, SizeOf(bo), 0);
+  Move(B[0], bi[0], 16);
+  Aes.EncryptECB(bi[0], bo[0]);
+  SetLength(Result, 16);
+  Move(bo[0], Result[0], 16);
+end;
+
+function GHashOf(const H, Aad, Cipher: TBytes): TBytes;
+var
+  y, blk, lenblk: TBytes;
+  i, n: Integer;
+  tmp: TBytes;
+
+  procedure Feed(const Data: TBytes);
+  var
+    q, m: Integer;
+  begin
+    q := 0;
+    while q < Length(Data) do
+    begin
+      dcpFillChar(blk[0], 16, 0);
+      m := Length(Data) - q;
+      if m > 16 then m := 16;
+      Move(Data[q], blk[0], m);
+      for m := 0 to 15 do
+        y[m] := y[m] xor blk[m];
+      tmp := Gf128Mul(y, H);
+      Move(tmp[0], y[0], 16);
+      Inc(q, 16);
+    end;
+  end;
+
+begin
+  SetLength(y, 16);
+  dcpFillChar(y[0], 16, 0);
+  SetLength(blk, 16);
+  Feed(Aad);
+  Feed(Cipher);
+  SetLength(lenblk, 16);
+  dcpFillChar(lenblk[0], 16, 0);
+  n := Length(Aad) * 8;
+  for i := 0 to 7 do
+    lenblk[7 - i] := Byte((QWord(n) shr (i * 8)) and $FF);
+  n := Length(Cipher) * 8;
+  for i := 0 to 7 do
+    lenblk[15 - i] := Byte((QWord(n) shr (i * 8)) and $FF);
+  for i := 0 to 15 do
+    y[i] := y[i] xor lenblk[i];
+  Result := Gf128Mul(y, H);
+end;
+
+procedure Inc32(var Ctr: TBytes);
+var
+  i: Integer;
+  carry: Integer;
+begin
+  carry := 1;
+  for i := 15 downto 12 do
+  begin
+    carry := carry + Ctr[i];
+    Ctr[i] := Byte(carry and $FF);
+    carry := carry shr 8;
+  end;
+end;
+
+function GcmCtrXor(Aes: TDCP_rijndael; const J0, Data: TBytes): TBytes;
+var
+  ctr, ks: TBytes;
+  i, p, n: Integer;
+begin
+  SetLength(Result, Length(Data));
+  ctr := Copy(J0, 0, 16);
+  p := 0;
+  while p < Length(Data) do
+  begin
+    Inc32(ctr);
+    ks := AesBlockOf(Aes, ctr);
+    n := Length(Data) - p;
+    if n > 16 then n := 16;
+    for i := 0 to n - 1 do
+      Result[p + i] := Data[p + i] xor ks[i];
+    Inc(p, 16);
+  end;
+end;
+
+function VDbCryptGcmSeal(const Key, Nonce, Plain, Aad: TBytes;
+  out Cipher, Tag: TBytes): Boolean;
+var
+  aes: TDCP_rijndael;
+  ccls: TTDCP_rijndaelClass;
+  kSt: array[0..VDB_KEY_LEN - 1] of Byte;
+  iv0: array[0..15] of Byte;
+  j0, h, g, ej0: TBytes;
+  i: Integer;
+begin
+  Result := False;
+  Cipher := nil;
+  Tag := nil;
+  if (Length(Key) <> VDB_KEY_LEN) or (Length(Nonce) <> VDB_AEAD_NONCE_LEN) then
+    Exit;
+  dcpFillChar(kSt, SizeOf(kSt), 0);
+  dcpFillChar(iv0, SizeOf(iv0), 0);
+  Move(Key[0], kSt[0], VDB_KEY_LEN);
+  ccls := TDCP_rijndael;
+  aes := ccls.Create(nil);
+  try
+    aes.Init(kSt, 256, @iv0[0]);
+    h := AesBlockOf(aes, iv0);
+    SetLength(j0, 16);
+    Move(Nonce[0], j0[0], VDB_AEAD_NONCE_LEN);
+    j0[12] := 0; j0[13] := 0; j0[14] := 0; j0[15] := 1;
+    Cipher := GcmCtrXor(aes, j0, Plain);
+    g := GHashOf(h, Aad, Cipher);
+    ej0 := AesBlockOf(aes, j0);
+    SetLength(Tag, VDB_AEAD_TAG_LEN);
+    for i := 0 to VDB_AEAD_TAG_LEN - 1 do
+      Tag[i] := ej0[i] xor g[i];
+  finally
+    aes.Free;
+    dcpFillChar(kSt, SizeOf(kSt), 0);
+  end;
+  Result := True;
+end;
+
+function VDbCryptGcmOpen(const Key, Nonce, Cipher, Tag, Aad: TBytes;
+  out Plain: TBytes): Boolean;
+var
+  aes: TDCP_rijndael;
+  ccls: TTDCP_rijndaelClass;
+  kSt: array[0..VDB_KEY_LEN - 1] of Byte;
+  iv0: array[0..15] of Byte;
+  j0, h, g, ej0: TBytes;
+  i: Integer;
+  diff: Byte;
+begin
+  Result := False;
+  Plain := nil;
+  if (Length(Key) <> VDB_KEY_LEN) or (Length(Nonce) <> VDB_AEAD_NONCE_LEN) or
+     (Length(Tag) <> VDB_AEAD_TAG_LEN) then
+    Exit;
+  dcpFillChar(kSt, SizeOf(kSt), 0);
+  dcpFillChar(iv0, SizeOf(iv0), 0);
+  Move(Key[0], kSt[0], VDB_KEY_LEN);
+  ccls := TDCP_rijndael;
+  aes := ccls.Create(nil);
+  try
+    aes.Init(kSt, 256, @iv0[0]);
+    h := AesBlockOf(aes, iv0);
+    SetLength(j0, 16);
+    Move(Nonce[0], j0[0], VDB_AEAD_NONCE_LEN);
+    j0[12] := 0; j0[13] := 0; j0[14] := 0; j0[15] := 1;
+    g := GHashOf(h, Aad, Cipher);
+    ej0 := AesBlockOf(aes, j0);
+    diff := 0;
+    for i := 0 to VDB_AEAD_TAG_LEN - 1 do
+      diff := diff or (ej0[i] xor g[i] xor Tag[i]);
+    if diff <> 0 then
+      Exit;
+    Plain := GcmCtrXor(aes, j0, Cipher);
+    Result := True;
+  finally
+    aes.Free;
+    dcpFillChar(kSt, SizeOf(kSt), 0);
+  end;
+end;
+
+function VDbCryptIsAead(const Cipher: TBytes): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  if Length(Cipher) < Length(VDB_AEAD_MAGIC) then Exit;
+  for i := 0 to Length(VDB_AEAD_MAGIC) - 1 do
+    if Cipher[i] <> Ord(VDB_AEAD_MAGIC[i + 1]) then Exit;
+  Result := True;
+end;
+
+function VDbCryptAeadSeal(const Key, Nonce, Plain, Aad: TBytes;
+  out OutCipher: TBytes): Boolean;
+var
+  ct, tag: TBytes;
+  m: Integer;
+begin
+  Result := False;
+  OutCipher := nil;
+  if not VDbCryptGcmSeal(Key, Nonce, Plain, Aad, ct, tag) then Exit;
+  m := Length(VDB_AEAD_MAGIC);
+  SetLength(OutCipher, m + VDB_AEAD_NONCE_LEN + Length(ct) + VDB_AEAD_TAG_LEN);
+  Move(VDB_AEAD_MAGIC[1], OutCipher[0], m);
+  Move(Nonce[0], OutCipher[m], VDB_AEAD_NONCE_LEN);
+  if Length(ct) > 0 then
+    Move(ct[0], OutCipher[m + VDB_AEAD_NONCE_LEN], Length(ct));
+  Move(tag[0], OutCipher[m + VDB_AEAD_NONCE_LEN + Length(ct)], VDB_AEAD_TAG_LEN);
+  Result := True;
+end;
+
+function VDbCryptAeadOpen(const Key, Envelope, Aad: TBytes;
+  out OutPlain: TBytes): Boolean;
+var
+  m, n: Integer;
+  nonce, ct, tag: TBytes;
+begin
+  Result := False;
+  OutPlain := nil;
+  m := Length(VDB_AEAD_MAGIC);
+  if not VDbCryptIsAead(Envelope) then Exit;
+  if Length(Envelope) < m + VDB_AEAD_NONCE_LEN + VDB_AEAD_TAG_LEN then Exit;
+  SetLength(nonce, VDB_AEAD_NONCE_LEN);
+  Move(Envelope[m], nonce[0], VDB_AEAD_NONCE_LEN);
+  n := Length(Envelope) - m - VDB_AEAD_NONCE_LEN - VDB_AEAD_TAG_LEN;
+  SetLength(ct, n);
+  if n > 0 then Move(Envelope[m + VDB_AEAD_NONCE_LEN], ct[0], n);
+  SetLength(tag, VDB_AEAD_TAG_LEN);
+  Move(Envelope[m + VDB_AEAD_NONCE_LEN + n], tag[0], VDB_AEAD_TAG_LEN);
+  Result := VDbCryptGcmOpen(Key, nonce, ct, tag, Aad, OutPlain);
+end;
+
 
 function Hmac2(const Key, D1, D2: TBytes): TBytes;
 var
@@ -467,10 +760,13 @@ end;
 
 function VDbKeyFileWrite(const FileName: string; const Password: string;
   out OutKey: TBytes; out OutIter: Integer): Boolean;
+{ M6: yeni .key dosyalari Argon2id (v2) kullanir. Eski v1
+  (PBKDF2-SHA256) dosyalari okunmaya devam eder. }
 var
-  salt, verifier, buf: TBytes;
+  salt, verifier, buf, pw: TBytes;
   f: TFileStream;
   i: Integer;
+  t, m, lanes: Integer;
 begin
   OutKey := nil;
   OutIter := 0;
@@ -480,19 +776,32 @@ begin
 
   salt := nil;
   VDbCryptNewSalt(salt);
-  OutIter := VDB_PBKDF2_ITER;
-  OutKey := VDbCryptDeriveKey(Password, salt, OutIter);
+  t := VDB_ARGON2_TIME;
+  m := VDB_ARGON2_MEMORY_KIB;
+  lanes := VDB_ARGON2_LANES;
+  pw := VDbCryptStrToBytes(Password);
+  if (not VDbArgon2id(pw, salt, nil, nil, t, m, lanes,
+    VDB_KEY_LEN, OutKey)) or (Length(OutKey) <> VDB_KEY_LEN) then
+  begin
+    FillChar(pw[0], Length(pw), 0);
+    raise EVdbCryptError.Create('Argon2id anahtar turetimi basarisiz',
+      VDB_CRYPTO_ERR);
+  end;
+  FillChar(pw[0], Length(pw), 0);
   verifier := VDbCryptVerifier(OutKey);
 
-  { 'VDBK' | surum | tuzUz | iterasyon(LE) | tuz | dogrulayici }
-  SetLength(buf, VDB_KEYFILE_HEAD + Length(salt) + Length(verifier));
+  { 'VDBK' | surum=2 | tuzUz | t(LE) | m(LE) | p | tuz | dogrulayici }
+  SetLength(buf, VDB_KEYFILE2_HEAD + Length(salt) + Length(verifier));
   Move(VDB_KEYFILE_MAGIC[1], buf[0], 4);
-  buf[4] := VDB_KEYFILE_VER;
+  buf[4] := VDB_KEYFILE_VER_ARGON2;
   buf[5] := Byte(Length(salt));
   for i := 0 to 3 do
-    buf[6 + i] := Byte((LongWord(OutIter) shr (i * 8)) and $FF);
-  Move(salt[0], buf[VDB_KEYFILE_HEAD], Length(salt));
-  Move(verifier[0], buf[VDB_KEYFILE_HEAD + Length(salt)], Length(verifier));
+    buf[6 + i] := Byte((LongWord(t) shr (i * 8)) and $FF);
+  for i := 0 to 3 do
+    buf[10 + i] := Byte((LongWord(m) shr (i * 8)) and $FF);
+  buf[14] := Byte(lanes);
+  Move(salt[0], buf[VDB_KEYFILE2_HEAD], Length(salt));
+  Move(verifier[0], buf[VDB_KEYFILE2_HEAD + Length(salt)], Length(verifier));
 
   f := TFileStream.Create(FileName, fmCreate);
   try
@@ -509,19 +818,19 @@ end;
 function VDbKeyFileRead(const FileName: string; const Password: string;
   out OutKey: TBytes; out OutIter: Integer): Boolean;
 var
-  salt, verifier, buf, blob, tmp: TBytes;
+  salt, verifier, buf, blob, tmp, pw: TBytes;
   f: TFileStream;
-  saltLen, i: Integer;
+  saltLen, i, t, m, lanes: Integer;
   n: Int64;
   p: PByte;
-  tam: Boolean;
+  tam, keyOk: Boolean;
 begin
   OutKey := nil;
   OutIter := 0;
   f := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
   try
     n := f.Size;
-    if n < VDB_KEYFILE_HEAD + VDB_TAG_LEN then
+    if n < 6 then
       raise EVdbCryptError.Create('.key dosyasi cok kisa / bozuk (' +
         IntToStr(n) + ' bayt)', VDB_CRYPTO_ERR);
     SetLength(buf, n);
@@ -536,36 +845,69 @@ begin
     if p[i] <> Byte(VDB_KEYFILE_MAGIC[i + 1]) then
       raise EVdbCryptError.Create('bu bir VDB .key dosyasi degil (imza hatali)',
         VDB_CRYPTO_ERR);
-  if p[4] <> VDB_KEYFILE_VER then
-    raise EVdbCryptError.Create('.key surumu desteklenmiyor (dosya ' +
-      IntToStr(p[4]) + ', beklenen ' + IntToStr(VDB_KEYFILE_VER) + ')',
-      VDB_CRYPTO_ERR);
   saltLen := p[5];
   if (saltLen < 8) or (saltLen > 64) then
     raise EVdbCryptError.Create('.key tuz uzunlugu gecersiz (' +
       IntToStr(saltLen) + ')', VDB_CRYPTO_ERR);
-  { DIKKAT: f serbest birakildi; burada DOSYAYA DEGIL, kaydedilmis
-    boyuta bakiliyor. }
-  if n <> VDB_KEYFILE_HEAD + saltLen + VDB_TAG_LEN then
-    raise EVdbCryptError.Create('.key dosya boyutu tutarsiz', VDB_CRYPTO_ERR);
 
-  OutIter := 0;
-  for i := 0 to 3 do
-    OutIter := OutIter or (Integer(p[6 + i]) shl (i * 8));
-  if (OutIter < 1000) or (OutIter > 10000000) then
-    raise EVdbCryptError.Create('.key iterasyon sayisi gecersiz (' +
-      IntToStr(OutIter) + ')', VDB_CRYPTO_ERR);
-
-  SetLength(salt, saltLen);
-  Move(p[VDB_KEYFILE_HEAD], salt[0], saltLen);
-  SetLength(verifier, VDB_TAG_LEN);
-  Move(p[VDB_KEYFILE_HEAD + saltLen], verifier[0], VDB_TAG_LEN);
+  if p[4] = VDB_KEYFILE_VER_ARGON2 then
+  begin
+    if n <> VDB_KEYFILE2_HEAD + saltLen + VDB_TAG_LEN then
+      raise EVdbCryptError.Create('.key dosya boyutu tutarsiz', VDB_CRYPTO_ERR);
+    t := 0;
+    for i := 0 to 3 do
+      t := t or (Integer(p[6 + i]) shl (i * 8));
+    m := 0;
+    for i := 0 to 3 do
+      m := m or (Integer(p[10 + i]) shl (i * 8));
+    lanes := p[14];
+    if (t < 1) or (t > 16) then
+      raise EVdbCryptError.Create('.key Argon2 t gecersiz (' +
+        IntToStr(t) + ')', VDB_CRYPTO_ERR);
+    if (m < 8) or (m > 262144) then
+      raise EVdbCryptError.Create('.key Argon2 m gecersiz (' +
+        IntToStr(m) + ')', VDB_CRYPTO_ERR);
+    if (lanes < 1) or (lanes > 16) or (m < 8 * lanes) then
+      raise EVdbCryptError.Create('.key Argon2 lanes gecersiz (' +
+        IntToStr(lanes) + ')', VDB_CRYPTO_ERR);
+    SetLength(salt, saltLen);
+    Move(p[VDB_KEYFILE2_HEAD], salt[0], saltLen);
+    SetLength(verifier, VDB_TAG_LEN);
+    Move(p[VDB_KEYFILE2_HEAD + saltLen], verifier[0], VDB_TAG_LEN);
+    pw := VDbCryptStrToBytes(Password);
+    keyOk := VDbArgon2id(pw, salt, nil, nil, t, m, lanes,
+      VDB_KEY_LEN, OutKey);
+    FillChar(pw[0], Length(pw), 0);
+    if (not keyOk) or (Length(OutKey) <> VDB_KEY_LEN) then
+      raise EVdbCryptError.Create('.key Argon2id anahtar turetimi basarisiz',
+        VDB_CRYPTO_ERR);
+  end
+  else if p[4] = VDB_KEYFILE_VER then
+  begin
+    if n <> VDB_KEYFILE_HEAD + saltLen + VDB_TAG_LEN then
+      raise EVdbCryptError.Create('.key dosya boyutu tutarsiz', VDB_CRYPTO_ERR);
+    OutIter := 0;
+    for i := 0 to 3 do
+      OutIter := OutIter or (Integer(p[6 + i]) shl (i * 8));
+    if (OutIter < 1000) or (OutIter > 10000000) then
+      raise EVdbCryptError.Create('.key iterasyon sayisi gecersiz (' +
+        IntToStr(OutIter) + ')', VDB_CRYPTO_ERR);
+    SetLength(salt, saltLen);
+    Move(p[VDB_KEYFILE_HEAD], salt[0], saltLen);
+    SetLength(verifier, VDB_TAG_LEN);
+    Move(p[VDB_KEYFILE_HEAD + saltLen], verifier[0], VDB_TAG_LEN);
+    { v1: PBKDF2-SHA256 (geriye donuk uyum). }
+    OutKey := VDbCryptDeriveKey(Password, salt, OutIter);
+  end
+  else
+    raise EVdbCryptError.Create('.key surumu desteklenmiyor (dosya ' +
+      IntToStr(p[4]) + ', beklenen ' + IntToStr(VDB_KEYFILE_VER) + ' veya ' +
+      IntToStr(VDB_KEYFILE_VER_ARGON2) + ')', VDB_CRYPTO_ERR);
 
   { ONEMLI: VDbCryptKeyFromPassword YOK; anahtari dogrulama sonrasi
     BILEREK SILER ("sifreleme icin kullanilamaz" olmasi icin). Burada
     ise anahtari ELDE ETMEMIZ gerekiyor. Dogrulamayi kendimiz
     sabit zamanli karsilastirma ile yapiyoruz. }
-  OutKey := VDbCryptDeriveKey(Password, salt, OutIter);
   blob := VDbCryptVerifier(OutKey);
   tmp := Copy(verifier, 0, Length(verifier));
   tam := VDbCryptEqual(blob, tmp);
@@ -581,8 +923,11 @@ begin
   Result := True;
 end;
 
-function VDbCryptEncrypt(const Key, Plain: TBytes;
+function VDbCryptEncryptLegacy(const Key, Plain: TBytes;
   out OutCipher: TBytes): Boolean;
+{ M6 oncesi zarf: IV(16) || len(4) || AES-256-CTR || HMAC-SHA256(32).
+  Yalnizca geriye donuk uyum testleri ve eski veriyi yeniden sarma
+  araclari icin tutulur; normal yazma yolu VDbCryptEncrypt'tir. }
 var
   iv, kEnc, kMac, body, tag, lenB, outTmp: TBytes;
   aes: TDCP_rijndael;
@@ -661,6 +1006,24 @@ begin
   Result := True;
 end;
 
+function VDbCryptEncrypt(const Key, Plain: TBytes;
+  out OutCipher: TBytes): Boolean;
+var
+  nonce: TBytes;
+begin
+  OutCipher := nil;
+  nonce := nil;
+  if (Length(Key) <> VDB_KEY_LEN) or
+     (not VDbCryptRandom(nonce, VDB_AEAD_NONCE_LEN)) or
+     (not VDbCryptAeadSeal(Key, nonce, Plain, nil, OutCipher)) then
+  begin
+    OutCipher := nil;
+    raise EVdbCryptError.Create('AEAD sifreleme basarisiz (anahtar ' +
+      'uzunlugu ' + IntToStr(Length(Key)) + ')', VDB_CRYPTO_ERR);
+  end;
+  Result := True;
+end;
+
 function VDbCryptDecrypt(const Key, Cipher: TBytes;
   out OutPlain: TBytes): Boolean;
 var
@@ -675,6 +1038,19 @@ var
   bodyOff: Integer;
 begin
   OutPlain := nil;
+  { M6: yeni 'VDBAEAD1' zarfi. GCM etiketi dogrulanmadan hicbir duz
+    metin aciga cikmaz. }
+  if VDbCryptIsAead(Cipher) then
+  begin
+    if not VDbCryptAeadOpen(Key, Cipher, nil, OutPlain) then
+    begin
+      OutPlain := nil;
+      raise EVdbCryptError.Create('kimlik dogrulama BASARISIZ - anahtar ' +
+        'yanlis veya veri bozulmus', VDB_CRYPTO_ERR);
+    end;
+    Result := True;
+    Exit;
+  end;
   if Length(Cipher) < VDB_IV_LEN + 4 + 16 + VDB_TAG_LEN then
     raise EVdbCryptError.Create('sifreli kayit cok kisa (' +
       IntToStr(Length(Cipher)) + ' bayt)', VDB_CRYPTO_ERR);
