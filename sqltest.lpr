@@ -12574,6 +12574,7 @@ var
   dir, fn, rep: string;
   fs: TFileStream;
   h: TVDbRecHead;
+  fh: TVDbFileHead;
   off: Int64;
   i: Integer;
   b: Byte;
@@ -12594,6 +12595,37 @@ begin
     db.Close;
     db.Free;
   end;
+
+  // V2 -> V3 yukseltme: basligi V2 yapip CRC'sini yeniden hesapla.
+  // Open, dosyayi V3'e yukseltmeli; veri ve blok footer'lari korunmali.
+  fs := TFileStream.Create(fn, fmOpenReadWrite);
+  try
+    fs.Position := 0;
+    fs.ReadBuffer(fh, SizeOf(fh));
+    fh.Ver := VDB_FILE_VER_V2;
+    fh.Crc := VDbCrc32Of(fh, SizeOf(fh) - SizeOf(fh.Crc));
+    fs.Position := 0;
+    fs.WriteBuffer(fh, SizeOf(fh));
+  finally
+    fs.Free;
+  end;
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    ok := db.Verify(rep);
+    Dogrula('H5 yukseltme sonrasi Verify', ok, rep);
+  finally
+    db.Close;
+    db.Free;
+  end;
+  fs := TFileStream.Create(fn, fmOpenRead);
+  try
+    fs.ReadBuffer(fh, SizeOf(fh));
+  finally
+    fs.Free;
+  end;
+  Dogrula('H5 V2 dosyasi V3e yukseltildi',
+    fh.Ver = VDB_FILE_VER, IntToStr(fh.Ver));
 
   off := -1;
   fs := TFileStream.Create(fn, fmOpenReadWrite);
