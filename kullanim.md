@@ -20,9 +20,6 @@ lazbuild -B sqltest.lpi
 # DLL / C API
 lazbuild -B vdbapi.lpi
 
-# GUI yönetici
-lazbuild -B yonetim/had.lpi
-
 # Linux/macOS kütüphane
 ./build_lib.sh
 ```
@@ -33,8 +30,6 @@ lazbuild -B yonetim/had.lpi
 |---|---|
 | `sqltest.exe` | SQL test paketi |
 | `vdbapi.dll` / `.so` | C/Delphi DLL API |
-| `vdbtestext.dll` | Test eklentisi (sqltest için) |
-| `vdboldtext.dll` | Eski ABI test eklentisi |
 
 ---
 
@@ -351,21 +346,8 @@ Kurallar:
 
 ## 7. Örnekler
 
-`examples/` altında 11 çalışan proje vardır:
-
-1. Basit kullanım
-2. SQL sorguları
-3. CRUD işlemleri
-4. Transaction
-5. JOIN işlemleri
-6. Şifreleme
-7. TCP sunucu
-8. TCP istemci
-9. JSON veri
-10. İleri özellikler
-11. GUI örneği
-
-Derleme: `examples/build_all.bat`
+Örnek projeler bu depoda tutulmaz; desteklenen içerik motor birimleri,
+`vdbapi` ve `sqltest` paketidir.
 
 ---
 
@@ -376,4 +358,4 @@ lazbuild -B sqltest.lpi
 sqltest.exe C:\temp\vdbtest
 ```
 
-Beklenen son çıktı: `SONUC: gecen=2527 kalan=0`.
+Beklenen son çıktı: `SONUC: gecen=2755 kalan=0`.

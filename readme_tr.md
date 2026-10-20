@@ -87,7 +87,7 @@ begin
 end;
 ```
 
-Daha fazla örnek ve API ayrıntısı: [kullanim.md](kullanim.md)
+API ayrıntıları ve SQL kullanımı: [kullanim.md](kullanim.md)
 
 ---
 
@@ -147,10 +147,6 @@ H3 skiplist (100.000 satır): 100 × (`UPDATE` + indeksli `COUNT(*)`)
 VDb*.pas            Motor birimleri
 sqltest.lpi/lpr     SQL test paketi
 vdbapi.*            DLL / C API projesi
-vdbgui.*            GUI istemci
-vdbwebapi.*         Web API
-vdbcomponents.*     Lazarus bileşenleri
-examples/           Örnek projeler
 dcpcrypt/           Şifreleme bağımlılığı
 dokuman/            Bu dokümanlar (Git dışı)
 ```

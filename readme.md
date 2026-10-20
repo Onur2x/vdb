@@ -87,7 +87,7 @@ begin
 end;
 ```
 
-More examples and API details: [usage.md](usage.md)
+API details and SQL usage: [usage.md](usage.md)
 
 ---
 
@@ -147,10 +147,6 @@ H3 skiplist (100,000 rows): 100 × (`UPDATE` + indexed `COUNT(*)`) takes
 VDb*.pas            Engine units
 sqltest.lpi/lpr     SQL test suite
 vdbapi.*            DLL / C API project
-vdbgui.*            GUI client
-vdbwebapi.*         Web API
-vdbcomponents.*     Lazarus components
-examples/           Sample projects
 dcpcrypt/           Encryption dependency
 dokuman/            These documents (not tracked)
 ```
