@@ -25,7 +25,7 @@ uses
   Classes, SysUtils, Math, Generics.Collections,
   VDbCore, VDbTable, VDbAst, VDbJson, VDbErr, VDbText, VDbXml, VDbSpatial,
   VDbRange, VDbParser, VDbTypes, VDbReplication, VDbParallel, VDbMonitor,
-  VDbPlatform, VDbCost, VDbExtension, VDbVector;
+  VDbPlatform, VDbCost, VDbExtension, VDbVector, VDbArrow;
 
 const
   // F2-18: DISTINCT / UNION tekilleÅŸtirme sonucu ve set-op birlestirme
@@ -538,14 +538,16 @@ type
       hata istisnalari ayni sirada ayni noktalardan firlar. }
     function ExecFastLiteralInsert(const Sql: string;
       out Res: TSqlResult): Boolean;
-    { H13 (2026-10-19): COPY FROM dosya akisi.
-        COPY <tablo> [(kolon,...)] FROM '<yol>'
-          [WITH] [(] [FORMAT CSV|TEXT] [, HEADER] [, DELIMITER 'x']
-                      [, NULL 'x'] [, QUOTE 'x'] [)]
+    { H13 (2026-10-19): COPY dosya akisi.
+        COPY <tablo> [(kolon,...)] FROM '<yol>' [WITH] [(] [FORMAT CSV|TEXT|ARROW]
+                    [, HEADER] [, DELIMITER 'x'] [, NULL 'x'] [, QUOTE 'x'] [)]
+        COPY <tablo> [(kolon,...)] TO '<yol>' [WITH] [(] FORMAT ARROW [)]
       Tum satirlar TEK batch icinde yazilir (atomik); batch zaten aciksa
       (BEGIN / cok cumleli otomatik batch) ona eklenir, kapatilmaz.
       CSV: RFC4180 tirnaklari ("") ve tirnak icinde satir sonu desteklenir.
       TEXT: PostgreSQL benzeri; varsayilan ayirici TAB, NULL '\\N'.
+      ARROW (M2): Arrow IPC stream; dis bagimlilik yok, tip eslemesi
+      INT/DATE/DATETIME/TIME dahil skaler alanlarla sinirlidir.
       Kok neden: her satir icin INSERT cumlesi ayristirmak/calistirmak
       yerine tek gecisli dosya okuma + FT.Insert batch yolu. }
     function ExecFastCopy(const Sql: string;
@@ -9956,6 +9958,7 @@ var
   fmt, nullStr: string;
   delim, quoteCh: Char;
   delimSet, nullSet, header, inParen: Boolean;
+  quoteSet: Boolean;
   fsh: TFileStream;
   buf: array[0..131071] of Byte;
   bPos, bLen: Integer;
@@ -9972,6 +9975,20 @@ var
   ownBatch: Boolean;
   hasInsTrig: Boolean;
   cn, opt, val: string;
+  isTo: Boolean;
+  useMem: Boolean;
+  memRows: TStrMatrix;
+  memIdx, memTotal, k, ci, d, src: Integer;
+  aFields: TStrArray;
+  aTypes: TByteArray;
+  aErr: string;
+  mapIdx: TIntArray;
+  usedSrc: array of Boolean;
+  pks: TStrArray;
+  allRows: TStrMatrix;
+  outRows: TStrMatrix;
+  byName: Boolean;
+  stype, ttype: Byte;
 
   procedure SkipWs;
   begin
@@ -10272,6 +10289,7 @@ begin
   delimSet := False;
   nullSet := False;
   header := False;
+  quoteSet := False;
   SetLength(cnames, 0);
 
   if not ReadIdent(tbl) then
@@ -10299,8 +10317,12 @@ begin
     end;
   end;
 
-  if not MatchKw('FROM') then
-    raise EVDbException.Create(ecSyntaxError, 'COPY: FROM bekleniyordu');
+  if MatchKw('FROM') then
+    isTo := False
+  else if MatchKw('TO') then
+    isTo := True
+  else
+    raise EVDbException.Create(ecSyntaxError, 'COPY: FROM veya TO bekleniyordu');
   if not ReadStr(path) then
     raise EVDbException.Create(ecSyntaxError, 'COPY: dosya yolu (string) bekleniyordu');
 
@@ -10351,9 +10373,9 @@ begin
       if opt = 'FORMAT' then
       begin
         fmt := LowerCase(val);
-        if (fmt <> 'csv') and (fmt <> 'text') then
+        if (fmt <> 'csv') and (fmt <> 'text') and (fmt <> 'arrow') then
           raise EVDbException.Create(ecUnsupported,
-            'COPY: yalniz FORMAT CSV veya TEXT destekleniyor: ' + val);
+            'COPY: yalniz FORMAT CSV, TEXT veya ARROW destekleniyor: ' + val);
       end
       else if opt = 'DELIMITER' then
       begin
@@ -10374,6 +10396,7 @@ begin
           raise EVDbException.Create(ecInvalidArgument,
             'COPY: QUOTE tek karakter olmali');
         quoteCh := val[1];
+        quoteSet := True;
       end
       else if opt = 'ESCAPE' then
       begin
@@ -10409,16 +10432,37 @@ begin
     if fmt = 'text' then nullStr := '\N' else nullStr := '';
   end;
 
-  // --- Dosya / tablo ---
-  if not FileExists(path) then
+  if fmt = 'arrow' then
   begin
-    alt := '';
-    if FT.Kv.FilePath <> '' then
-      alt := IncludeTrailingPathDelimiter(ExtractFileDir(FT.Kv.FilePath)) + path;
-    if (alt <> '') and FileExists(alt) then
-      path := alt
-    else
-      raise EVDbException.Create(ecNotFound, 'COPY: dosya bulunamadi: ' + path);
+    if header or delimSet or nullSet or quoteSet then
+      raise EVDbException.Create(ecUnsupported,
+        'COPY ARROW: HEADER/DELIMITER/NULL/QUOTE kullanilamaz');
+  end
+  else if isTo then
+    raise EVDbException.Create(ecUnsupported,
+      'COPY TO yalniz FORMAT ARROW ile destekleniyor');
+
+  // --- Dosya / tablo ---
+  if not isTo then
+  begin
+    if not FileExists(path) then
+    begin
+      alt := '';
+      if FT.Kv.FilePath <> '' then
+        alt := IncludeTrailingPathDelimiter(ExtractFileDir(FT.Kv.FilePath)) + path;
+      if (alt <> '') and FileExists(alt) then
+        path := alt
+      else
+        raise EVDbException.Create(ecNotFound, 'COPY: dosya bulunamadi: ' + path);
+    end;
+  end
+  else
+  begin
+    if (ExtractFileDir(path) = '') and (FT.Kv.FilePath <> '') then
+      path := IncludeTrailingPathDelimiter(ExtractFileDir(FT.Kv.FilePath)) + path;
+    if not DirectoryExists(ExtractFileDir(path)) then
+      raise EVDbException.Create(ecNotFound,
+        'COPY: hedef dizin bulunamadi: ' + ExtractFileDir(path));
   end;
 
   if not FT.TableExists(tbl) then
@@ -10433,12 +10477,126 @@ begin
     for i := 0 to High(td.Cols) do
       cnames[i] := td.Cols[i].Name;
   end;
-  FT.RequirePriv(tbl, Ord(pkInsert));
+  if isTo then
+    FT.RequirePriv(tbl, Ord(pkSelect))
+  else
+    FT.RequirePriv(tbl, Ord(pkInsert));
 
-  fsh := TFileStream.Create(path, fmOpenRead or fmShareDenyWrite);
+  if fmt = 'arrow' then
+  begin
+    if isTo then
+    begin
+      // Tabloyu Arrow kolonlarina esle ve dosyaya yaz.
+      SetLength(aFields, Length(cnames));
+      SetLength(aTypes, Length(cnames));
+      SetLength(mapIdx, Length(cnames));
+      for i := 0 to High(cnames) do
+      begin
+        ci := -1;
+        for k := 0 to High(td.Cols) do
+          if SameText(td.Cols[k].Name, cnames[i]) then
+          begin
+            ci := k;
+            Break;
+          end;
+        if ci < 0 then
+          raise EVDbException.Create(ecNotFound,
+            'COPY ARROW: kolon bulunamadi: ' + cnames[i]);
+        aFields[i] := td.Cols[ci].Name;
+        aTypes[i] := td.Cols[ci].Ctype;
+        mapIdx[i] := ci;
+      end;
+      FT.ScanRows(td.Name, pks, allRows);
+      SetLength(outRows, Length(allRows));
+      for k := 0 to High(allRows) do
+      begin
+        SetLength(outRows[k], Length(cnames));
+        for i := 0 to High(cnames) do
+          outRows[k][i] := allRows[k][mapIdx[i]];
+      end;
+      if not VDbArrowExport(path, aFields, aTypes, outRows, aErr) then
+        raise EVDbException.Create(ecInvalidArgument,
+          'COPY ARROW yazma hatasi: ' + aErr);
+      Res.Affected := Length(outRows);
+      Res.LastTable := tbl;
+      Res.Msg := IntToStr(Length(outRows)) + ' satir';
+      Result := True;
+      Exit;
+    end;
+
+    if not VDbArrowImport(path, aFields, aTypes, memRows, aErr) then
+      raise EVDbException.Create(ecInvalidArgument,
+        'COPY ARROW okuma hatasi: ' + aErr);
+    if Length(aFields) <> Length(cnames) then
+      raise EVDbException.Create(ecInvalidArgument,
+        Format('COPY ARROW: dosyada %d alan var, %d kolon bekleniyordu',
+          [Length(aFields), Length(cnames)]));
+
+    // Once ada gore esle; olmazsa siraya gore.
+    SetLength(mapIdx, Length(cnames));
+    SetLength(usedSrc, Length(aFields));
+    byName := True;
+    for d := 0 to High(cnames) do
+    begin
+      src := -1;
+      for k := 0 to High(aFields) do
+        if (not usedSrc[k]) and SameText(aFields[k], cnames[d]) then
+        begin
+          src := k;
+          Break;
+        end;
+      if src < 0 then
+      begin
+        byName := False;
+        Break;
+      end;
+      mapIdx[d] := src;
+      usedSrc[src] := True;
+    end;
+    if not byName then
+      for d := 0 to High(cnames) do
+        mapIdx[d] := d;
+
+    for d := 0 to High(cnames) do
+    begin
+      ci := -1;
+      for k := 0 to High(td.Cols) do
+        if SameText(td.Cols[k].Name, cnames[d]) then
+        begin
+          ci := k;
+          Break;
+        end;
+      if ci < 0 then
+        raise EVDbException.Create(ecNotFound,
+          'COPY ARROW: kolon bulunamadi: ' + cnames[d]);
+      stype := aTypes[mapIdx[d]];
+      ttype := td.Cols[ci].Ctype;
+      if not ((stype = ttype) or (ttype = VCT_STR) or
+              ((stype = VCT_INT) and (ttype = VCT_FLOAT))) then
+        raise EVDbException.Create(ecInvalidArgument,
+          Format('COPY ARROW: %s kolonunda tip uyusmuyor (dosya=%d, tablo=%d)',
+            [cnames[d], stype, ttype]));
+    end;
+
+    SetLength(outRows, Length(memRows));
+    for k := 0 to High(memRows) do
+    begin
+      SetLength(outRows[k], Length(cnames));
+      for d := 0 to High(cnames) do
+        outRows[k][d] := memRows[k][mapIdx[d]];
+    end;
+    memRows := outRows;
+    useMem := True;
+    memIdx := 0;
+    memTotal := Length(memRows);
+  end;
+
+  fsh := nil;
+  if not useMem then
+    fsh := TFileStream.Create(path, fmOpenRead or fmShareDenyWrite);
   try
     // UTF-8 BOM varsa atla (yoksa basa don).
-    if fsh.Size >= 3 then
+    if (not useMem) and (fsh.Size >= 3) then
     begin
       fsh.Read(buf, 3);
       if not ((buf[0] = $EF) and (buf[1] = $BB) and (buf[2] = $BF)) then
@@ -10453,7 +10611,7 @@ begin
     lineNo := 0;
     total := 0;
 
-    if header then
+    if (not useMem) and header then
     begin
       if ReadRecord and (Length(row) <> Length(cnames)) then
         raise EVDbException.CreateFmt(ecInvalidArgument,
@@ -10471,8 +10629,19 @@ begin
     ownBatch := not FT.Kv.InBatch;
     if ownBatch then FT.BeginBatch;
     try
-      while ReadRecord do
+      while True do
       begin
+        if useMem then
+        begin
+          if memIdx >= memTotal then Break;
+          row := Copy(memRows[memIdx], 0, Length(memRows[memIdx]));
+          Inc(memIdx);
+          lineNo := memIdx;
+          SetLength(rowQ, Length(row));
+          for k := 0 to High(rowQ) do
+            rowQ[k] := False;
+        end
+        else if not ReadRecord then Break;
         if Length(row) <> Length(cnames) then
           raise EVDbException.CreateFmt(ecInvalidArgument,
             'COPY %s:%d: %d alan bekleniyordu, %d bulundu',
@@ -10505,7 +10674,7 @@ begin
     if hasInsTrig then
       FireTriggers(tbl, Byte(ttAfter), Byte(teInsert), nil, nil, [], Res, False);
   finally
-    fsh.Free;
+    if fsh <> nil then fsh.Free;
   end;
 
   Res.Affected := total;

@@ -12137,6 +12137,120 @@ begin
   end;
 end;
 
+procedure T123_Arrow;
+// M2: Arrow IPC stream disa/içe aktarma (COPY ... TO/FROM ... FORMAT ARROW).
+var
+  fn, fnSub, fnEmpty: string;
+  R2: TSqlResult;
+  ok: Boolean;
+begin
+  Grp('M2 Arrow IPC ice/disa aktarma');
+  UseDir('m2_arrow');
+  sq.Exec('CREATE TABLE ar(id INTEGER PRIMARY KEY, nm TEXT, puan FLOAT, ' +
+    'aktif BOOLEAN, d DATE, ts DATETIME, tm TIME, bl BLOB)');
+  sq.Exec('INSERT INTO ar VALUES(1,' + Q + 'ali' + Q + ',1.5,TRUE,' +
+    Q + '2024-01-02' + Q + ',' + Q + '2024-01-02 03:04:05' + Q + ',' +
+    Q + '03:04:05' + Q + ',' + Q + 'raw' + Q + ')');
+  sq.Exec('INSERT INTO ar VALUES(2,NULL,NULL,FALSE,NULL,NULL,NULL,NULL)');
+  sq.Exec('INSERT INTO ar VALUES(3,' + Q + 'ayse' + Q + ',-2.25,TRUE,' +
+    Q + '1999-12-31' + Q + ',' + Q + '1999-12-31 23:59:59' + Q + ',' +
+    Q + '23:59:59' + Q + ',' + Q + 'x' + Q + ')');
+
+  fn := D + '\m2_arrow\ar.arrow';
+  fnSub := D + '\m2_arrow\ar_sub.arrow';
+  fnEmpty := D + '\m2_arrow\ar_empty.arrow';
+
+  R2 := sq.Exec('COPY ar TO ''' + fn + ''' (FORMAT ARROW)');
+  ChkInt('Arrow TO Affected=3', R2.Affected, 3);
+  Dogrula('Arrow dosyasi olustu', FileExists(fn), fn);
+
+  sq.Exec('CREATE TABLE ar2(id INTEGER PRIMARY KEY, nm TEXT, puan FLOAT, ' +
+    'aktif BOOLEAN, d DATE, ts DATETIME, tm TIME, bl BLOB)');
+  R2 := sq.Exec('COPY ar2 FROM ''' + fn + ''' (FORMAT ARROW)');
+  ChkInt('Arrow FROM Affected=3', R2.Affected, 3);
+  ChkVal('Arrow INT', 'SELECT id FROM ar2 WHERE id=1', 0, 0, '1');
+  ChkVal('Arrow TEXT', 'SELECT nm FROM ar2 WHERE id=3', 0, 0, 'ayse');
+  ChkVal('Arrow FLOAT', 'SELECT puan FROM ar2 WHERE id=3', 0, 0, '-2.25');
+  ChkVal('Arrow BOOL', 'SELECT aktif FROM ar2 WHERE id=1', 0, 0, 'True');
+  ChkVal('Arrow DATE', 'SELECT d FROM ar2 WHERE id=1', 0, 0, '2024-01-02');
+  ChkVal('Arrow DATETIME', 'SELECT ts FROM ar2 WHERE id=1', 0, 0,
+    '2024-01-02 03:04:05');
+  ChkVal('Arrow TIME', 'SELECT tm FROM ar2 WHERE id=1', 0, 0, '03:04:05');
+  ChkVal('Arrow BLOB', 'SELECT bl FROM ar2 WHERE id=1', 0, 0, 'raw');
+  ChkVal('Arrow NULL satiri',
+    'SELECT COUNT(*) FROM ar2 WHERE id=2 AND nm IS NULL AND puan IS NULL ' +
+    'AND d IS NULL AND ts IS NULL AND tm IS NULL AND bl IS NULL', 0, 0, '1');
+
+  // Ayni dosyayi tekrar yuklemek PK ihlali -> batch geri alinmali.
+  ok := False;
+  try
+    sq.Exec('COPY ar2 FROM ''' + fn + ''' (FORMAT ARROW)');
+  except
+    on E: Exception do
+      ok := Pos('duplicate PK', E.Message) > 0;
+  end;
+  Dogrula('Arrow atomik PK ihlali hata verir', ok, '');
+  ChkVal('Arrow atomik: hala 3 satir', 'SELECT COUNT(*) FROM ar2', 0, 0, '3');
+
+  // Kolon alt kumesi + ada gore yeniden siralama.
+  R2 := sq.Exec('COPY ar (id, nm) TO ''' + fnSub + ''' (FORMAT ARROW)');
+  ChkInt('Arrow TO kolon alt kumesi', R2.Affected, 3);
+  sq.Exec('CREATE TABLE ar4(nm TEXT, id INTEGER PRIMARY KEY)');
+  R2 := sq.Exec('COPY ar4 (nm, id) FROM ''' + fnSub + ''' (FORMAT ARROW)');
+  ChkInt('Arrow FROM ada gore esleme', R2.Affected, 3);
+  ChkVal('Arrow alt kume id', 'SELECT id FROM ar4 WHERE nm=' + Q + 'ali' + Q,
+    0, 0, '1');
+  ChkVal('Arrow alt kume nm', 'SELECT nm FROM ar4 WHERE id=3', 0, 0, 'ayse');
+
+  // Sifir satirli tablo.
+  sq.Exec('CREATE TABLE are(id INTEGER PRIMARY KEY, nm TEXT)');
+  R2 := sq.Exec('COPY are TO ''' + fnEmpty + ''' (FORMAT ARROW)');
+  ChkInt('Arrow TO sifir satir', R2.Affected, 0);
+  Dogrula('Arrow bos dosya olustu', FileExists(fnEmpty), fnEmpty);
+  sq.Exec('CREATE TABLE are2(id INTEGER PRIMARY KEY, nm TEXT)');
+  R2 := sq.Exec('COPY are2 FROM ''' + fnEmpty + ''' (FORMAT ARROW)');
+  ChkInt('Arrow FROM sifir satir', R2.Affected, 0);
+  ChkVal('Arrow sifir satir sayisi', 'SELECT COUNT(*) FROM are2', 0, 0, '0');
+
+  // Tip uyusmazligi ve bicim kapisi.
+  sq.Exec('CREATE TABLE arbad(id INTEGER PRIMARY KEY, nm INTEGER)');
+  ok := False;
+  try
+    sq.Exec('COPY arbad FROM ''' + fnSub + ''' (FORMAT ARROW)');
+  except
+    on E: Exception do
+      ok := Pos('tip uyusmuyor', E.Message) > 0;
+  end;
+  Dogrula('Arrow tip uyusmazligi reddedildi', ok, '');
+
+  ok := False;
+  try
+    sq.Exec('COPY ar TO ''' + D + '\m2_arrow\ar.csv'' (FORMAT CSV)');
+  except
+    on E: Exception do
+      ok := Pos('FORMAT ARROW', E.Message) > 0;
+  end;
+  Dogrula('COPY TO yalniz Arrow', ok, '');
+
+  ok := False;
+  try
+    sq.Exec('COPY ar FROM ''' + fn + ''' (FORMAT ARROW, HEADER)');
+  except
+    on E: Exception do
+      ok := Pos('HEADER', E.Message) > 0;
+  end;
+  Dogrula('Arrow HEADER reddedildi', ok, '');
+
+  ok := False;
+  try
+    sq.Exec('COPY ar FROM ''' + D + '\m2_arrow\yok.arrow'' (FORMAT ARROW)');
+  except
+    on E: Exception do
+      ok := Pos('dosya bulunamadi', E.Message) > 0;
+  end;
+  Dogrula('Arrow eksik dosya reddedildi', ok, '');
+end;
+
 function TMetricsTestProvider.Get: string;
 begin
   Result := Text;
@@ -12867,6 +12981,7 @@ T92_MVCC_Isoaltion;
        T119_Trace;
        T121_VectorAnn;
        T122_KvStore;
+       T123_Arrow;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls
