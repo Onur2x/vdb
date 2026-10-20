@@ -12996,6 +12996,48 @@ begin
     db.Close;
     db.Free;
   end;
+  // 4) Ayni batch icinde iki yerinde yazim: tek commit, tek blok CRC
+  //    guncellemesi; iki olu bolge de yeniden kullanilir.
+  dir := baseDir + '_batch';
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    db.Put(1, VDbStrToBytes('AAAA'));
+    db.Put(2, VDbStrToBytes('BBBB'));
+    db.Put(3, VDbStrToBytes('CCCC'));
+    db.Put(4, VDbStrToBytes('DDDD'));
+    db.Delete(1);
+    db.Delete(3);
+  finally
+    db.Close;
+    db.Free;
+  end;
+  fn := dir + '\veritabani.odb';
+  sz0 := FSize(fn);
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    db.BeginBatch;
+    db.Put(5, VDbStrToBytes('EEEE'));
+    db.Put(6, VDbStrToBytes('FFFF'));
+    db.CommitBatch;
+    sz1 := db.DataFileSize;
+    Dogrula('H11.3 batch iki olu bolgeyi kullandi', (sz1 - sz0) < 80,
+      IntToStr(sz1 - sz0) + ' bayt buyudu');
+    ok := db.Get(5, v) and (VDbBytesToStr(v) = 'EEEE');
+    Dogrula('H11.3 batch kayit 5', ok, VDbBytesToStr(v));
+    ok := db.Get(6, v) and (VDbBytesToStr(v) = 'FFFF');
+    Dogrula('H11.3 batch kayit 6', ok, VDbBytesToStr(v));
+    Dogrula('H11.3 batch silinenler yok',
+      (not db.Get(1, v)) and (not db.Get(3, v)), '');
+    ok := db.Get(2, v) and (db.Get(4, v));
+    Dogrula('H11.3 batch diger kayitlar korundu', ok, '');
+    Dogrula('H11.3 batch Verify', db.Verify(rep), rep);
+  finally
+    db.Close;
+    db.Free;
+  end;
 end;
 
 function TMetricsTestProvider.Get: string;
