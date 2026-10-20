@@ -68,12 +68,29 @@ begin
   Result := DbPath + '.undo';
 end;
 
+function OpenUndoRetry(const Path: string; Mode: Word): TFileStream;
+var
+  i: Integer;
+begin
+  Result := nil;
+  for i := 1 to 50 do
+  begin
+    try
+      Result := TFileStream.Create(Path, Mode or fmShareDenyNone);
+      Exit;
+    except
+      if i = 50 then raise;
+      TThread.Sleep(10);
+    end;
+  end;
+end;
+
 function OpenUndoForAppend(const Path: string): TFileStream;
 begin
   if FileExists(Path) then
-    Result := TFileStream.Create(Path, fmOpenReadWrite)
+    Result := OpenUndoRetry(Path, fmOpenReadWrite)
   else
-    Result := TFileStream.Create(Path, fmCreate);
+    Result := OpenUndoRetry(Path, fmCreate);
 end;
 
 function AppendHeadAndData(const Path: string; const H: TVDbUndoHead;
@@ -165,7 +182,7 @@ begin
   h.Size := 0;
   h.Crc := 0;
   Result := False;
-  s := TFileStream.Create(Path, fmOpenReadWrite);
+  s := OpenUndoRetry(Path, fmOpenReadWrite);
   try
     s.Seek(0, soEnd);
     s.WriteBuffer(h, SizeOf(h));
@@ -186,7 +203,7 @@ begin
   try
     if FileExists(UndoPath) then
     begin
-      s := TFileStream.Create(UndoPath, fmCreate);
+      s := OpenUndoRetry(UndoPath, fmCreate);
       s.Free;
     end;
   except
@@ -213,7 +230,7 @@ begin
   Restored := 0;
   if (Db = nil) or (UndoPath = '') or (not FileExists(UndoPath)) then Exit;
 
-  s := TFileStream.Create(UndoPath, fmOpenRead);
+  s := OpenUndoRetry(UndoPath, fmOpenRead);
   positions := TList.Create;
   try
     undoSize := s.Size;
