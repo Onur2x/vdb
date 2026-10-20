@@ -7803,7 +7803,22 @@ begin
   begin
     Src.Arr := e;
     if not FIdxCtype.TryGetValue(k, Src.Ctype) then
-      Src.Ctype := VCT_STR;
+    begin
+      // PK indeksi T.Idx listesinde degildir; bu yuzden FIdxCtype'ta
+      // kaydi yoktur. Varsayilan VCT_STR yanlistir: INTEGER PK'da
+      // ikili arama metin karsilastirmasi yapar ve aralik sorgulari
+      // (id < 101, BETWEEN ...) yanlis sonuc dondurur.
+      if FById.TryGetValue(TableId, nm) then
+      begin
+        t := GetTable(nm);
+        if (ColIdx >= 0) and (ColIdx <= High(t.Cols)) then
+          Src.Ctype := t.Cols[ColIdx].Ctype
+        else
+          Src.Ctype := VCT_STR;
+      end
+      else
+        Src.Ctype := VCT_STR;
+    end;
     Src.NParts := IdxNPartsByKey(k);
     Result := True;
   end;

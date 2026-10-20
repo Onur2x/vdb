@@ -26,7 +26,6 @@ echo.
 REM TR: FPC yolu / FPC path
 set FPC=C:\lazarus\fpc\3.2.4\bin\i386-win32\fpc.exe
 set LAZBUILD=C:\lazarus\lazbuild.exe
-set POWERSHELL=powershell -NoProfile -ExecutionPolicy Bypass -File
 
 REM TR: Birim yollari (ornekler icin) / Unit paths (for examples)
 set UNITS=-Fu.. -Fu..\..\ -Fu..\..\dcpcrypt -Fu..\..\dcpcrypt\Ciphers -Fu..\..\dcpcrypt\Hashes
@@ -59,7 +58,19 @@ if exist ornek11.exe (
     set /a FAIL+=1
 )
 
-echo [12/%TOTAL%] Test Paketi / Test Suite (sqltest)...
+echo [12/%TOTAL%] Ornek 12 - 1M Kayitli GUI Demo / 1M-row GUI demo...
+cd /d "%~dp0examples\12_milyon_demo"
+del *.o *.ppu 2>nul
+%LAZBUILD% -B ornek12.lpi > compile.log 2>&1
+if exist ornek12.exe (
+    echo        OK / Success
+    set /a PASS+=1
+) else (
+    echo        FAIL / Error - compile.log dosyasina bakin
+    set /a FAIL+=1
+)
+
+echo [13/%TOTAL%] Test Paketi / Test Suite (sqltest)...
 cd /d "%~dp0"
 del *.o *.ppu 2>nul
 %LAZBUILD% -B sqltest.lpi > compile.log 2>&1
@@ -71,7 +82,7 @@ if exist sqltest.exe (
     set /a FAIL+=1
 )
 
-echo [13/%TOTAL%] DLL API (vdbapi)...
+echo [14/%TOTAL%] DLL API (vdbapi)...
 cd /d "%~dp0"
 del *.o *.ppu 2>nul
 %LAZBUILD% -B vdbapi.lpi > compile.log 2>&1
@@ -80,22 +91,6 @@ if exist vdbapi.dll (
     set /a PASS+=1
 ) else (
     echo        FAIL / Error - compile.log dosyasina bakin
-    set /a FAIL+=1
-)
-
-echo [14/%TOTAL%] Test Eklentileri / Test Extensions (vdbtestext + vdboldtext)...
-cd /d "%~dp0"
-%POWERSHELL% build_testext.ps1 > compile_ext.log 2>&1
-if exist vdbtestext.dll (
-    if exist vdboldtext.dll (
-        echo        OK / Success
-        set /a PASS+=1
-    ) else (
-        echo        FAIL / Error - vdboldtext.dll uretilmedi
-        set /a FAIL+=1
-    )
-) else (
-    echo        FAIL / Error - compile_ext.log dosyasina bakin
     set /a FAIL+=1
 )
 

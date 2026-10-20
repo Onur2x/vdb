@@ -13595,6 +13595,64 @@ begin
   Chk('COPY atomik: hala 3 satir', 'SELECT id FROM cp', 3);
 end;
 
+procedure T130_PkRangeCtype;
+// Regresyon: INTEGER PK icin gecici (array) indeks kaynagi Ctype'i
+// VCT_STR varsayiyordu. Boylece id < 101 / BETWEEN gibi araliklar
+// metin karsilastirmasiyla yanlis sonuc veriyordu.
+var
+  dir: string;
+  db: TVDb;
+  tdb: TVTableDb;
+  q: TVSql;
+  r: TSqlResult;
+  i: Integer;
+begin
+  Grp('T130 PK aralik indeksi tipi');
+  dir := D + '\t130_pk_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  tdb := TVTableDb.Create(db);
+  try
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      q.Exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+      q.Exec('BEGIN');
+      for i := 1 to 1000 do
+        q.Exec(Format('INSERT INTO t (id,v) VALUES (%d,%s)',
+          [i, QuotedStr('v' + IntToStr(i))]));
+      q.Exec('COMMIT');
+
+      r := q.Exec('SELECT COUNT(*) FROM t WHERE id < 101');
+      Dogrula('T130 id < 101 -> 100',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '100'),
+        r.Rows[0][0]);
+
+      r := q.Exec('SELECT COUNT(*) FROM t WHERE id >= 101 AND id < 201');
+      Dogrula('T130 id >= 101 AND id < 201 -> 100',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '100'),
+        r.Rows[0][0]);
+
+      r := q.Exec('SELECT COUNT(*) FROM t WHERE id BETWEEN 101 AND 200');
+      Dogrula('T130 id BETWEEN 101 AND 200 -> 100',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '100'),
+        r.Rows[0][0]);
+
+      r := q.Exec('SELECT id FROM t WHERE id >= 101 AND id < 201 ORDER BY id');
+      Dogrula('T130 aralik ilk/son id 101/200',
+        (Length(r.Rows) = 100) and (r.Rows[0][0] = '101') and
+        (r.Rows[99][0] = '200'),
+        IntToStr(Length(r.Rows)));
+    finally
+      q.Free;
+    end;
+  finally
+    tdb.Free;
+    db.Free;
+  end;
+end;
+
 { ---------------------------------------------------------------------- main }
 
 var
@@ -13777,6 +13835,7 @@ T92_MVCC_Isoaltion;
        T127_H5_BlockCrc;
        T128_H11_Undo;
        T129_H11_InPlace;
+       T130_PkRangeCtype;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls

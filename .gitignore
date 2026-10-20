@@ -103,3 +103,7 @@ startup_error.txt
 /build_testext.ps1
 /environmentoptions.xml
 /packagefiles.xml
+
+# Örnek 12 üretilen demo verisi / generated demo data
+/examples/12_milyon_demo/milyon_demo_db/
+/examples/12_milyon_demo/seed_result.txt
