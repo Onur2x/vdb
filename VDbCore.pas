@@ -30,6 +30,14 @@ const
   VDB_FLAG_BATCHEND = 2;
   VDB_FLAG_ENCRYPTED = 4;   // Faz D: Encryption (AES)
   VDB_FLAG_COMPRESSED = 8;  // Faz D: Compression (ZLIB)
+  { H5 (2026-10-20): blok-grup CRC. Bir blok, pes pese kayitlarin
+    baytlarini kapsar; blok sonunda Key=blok baslangic offseti, ValLen=0,
+    Crc=CRC32(blok baytlari) olan bir footer kaydi yazilir. Footer
+    kendisi CRC'ye DAHIL DEGILDIR. Kayit-bazi CRC geriye uyumluluk
+    ve rastgele erisim icin korunur; Verify hizli yolda blok CRC'sini
+    kullanir. }
+  VDB_FLAG_BLOCKCRC = 16;
+  VDB_BLOCK_TARGET = 1024 * 1024;   // ~1 MB'lik blok gruplari
   VDB_MAX_VALUE = 16 * 1024 * 1024;
   // P-19w: bu boyuta kadar header+deger TEK WriteBuffer ile yazilir
   // (3 syscall -> 2). Uzerinde ESKI yol birebir calisir (buyuk bloblar
@@ -48,8 +56,12 @@ const
   // edilmis veri SILINIR. Bu yuzden surum yukseltildi: eski surumlu build
   // surumu okuyamayinca dosyayi ACAMAZ (temiz hata) ama KIRPMAZ.
   // V1 dosyalar acildiginda V2'ye yukseltilir (bkz. DetectFormat).
-  VDB_FILE_VER = 2;
+  // SURUM 3 (H5): blok-grup CRC footer'lari eklendi. Kayit duzeni ayni;
+  // V1/V2 dosyalari acilirken V3'e yukseltilir. Eski build'ler V3'u
+  // acamaz (temiz hata) ama dosyayi KIRPMAZ.
+  VDB_FILE_VER = 3;
   VDB_FILE_VER_OLD = 1;
+  VDB_FILE_VER_V2 = 2;
   VDB_HDR_SIZE = 16;
   VDB_HFLAG_HAS_ENCRYPTED = 1;
   { H3 (2026-10-18): zone map / atlanabilir offset bolumu geometrisi.
@@ -265,6 +277,11 @@ FPath: string;
     FWrBufLen: Integer;
     FWrBufBase: Int64;
     FWrBufActive: Boolean;
+    { H5: acik blok grubunun baslangici, bayt sayisi ve kumulatif CRC'si.
+      Blok kapaninca footer yazilir; sayaclar sifirlanir. }
+    FBlockStart: Int64;
+    FBlockBytes: Int64;
+    FBlockCrc: LongWord;
     // Bekleyen (batch ici) yazmalar.
     //
     // FPending   : yazma sirasiyla islenen op listesi
@@ -367,6 +384,10 @@ FPath: string;
       kayitlarini .wal'a yazmasin (yoksa dongu). }
     procedure AppendRec(Key: QWord; const Value: TBytes; IsDel: Boolean;
       DoFlush: Boolean; SkipWAL: Boolean = False);
+    { H5: blok CRC'sine bir kaydin yazilan baytlarini ekler. }
+    procedure BlockCrcAdd(const H: TVDbRecHead; Value: PByte);
+    { H5: acik blogu footer ile kapatir. Blok bossa no-op. }
+    procedure AppendBlockFooter;
     { P-21: aktif toplu yazim tamponunu (varsa) dosyaya bosaltir ve
       tamponu sifirlar. FWrBufActive=False veya tampon bos ise no-op. }
     procedure FlushWriteBuf;
@@ -853,6 +874,13 @@ begin
     Result := ((AFlags and VDB_FLAG_ENCRYPTED) = 0) and (AValLen = 0);
     Exit;
   end;
+  if AFlags = VDB_FLAG_BLOCKCRC then
+  begin
+    { H5: blok footer'i yapisal olarak deger tasimaz; blok bayt sayisi
+      Key alanindadir. }
+    Result := AValLen = 0;
+    Exit;
+  end;
   Result := AllowBatchEnd and (AFlags = VDB_FLAG_BATCHEND);
 end;
 
@@ -1033,12 +1061,11 @@ begin
       if h.Crc <> HeadCrc(h) then
         raise EVDbException.Create(ecCorrupt, 'VDb: dosya basligi CRC hatasi (bozuk)');
       FEncFlags := h.Flags and VDB_HFLAG_HAS_ENCRYPTED;
-      if h.Ver = VDB_FILE_VER_OLD then
+      if (h.Ver = VDB_FILE_VER_OLD) or (h.Ver = VDB_FILE_VER_V2) then
       begin
-        // V1 -> V2 yukseltme. Kayit duzeni ayni; degisen tek sey Flags=2
-        // (BATCHEND) kayitlarinin V1 surumunde KIRPILMASINI engellemek.
-        // Basligi yerinde yeniden yazip fsync -> dosya artik eski buildler
-        // tarafindan guvenle reddedilir (veri kaybi yerine).
+        // V1/V2 -> V3 yukseltme. Kayit duzeni ayni; V3'te blok CRC
+        // footer'lari eklenir. Basligi yerinde yeniden yazip fsync ->
+        // dosya artik eski buildler tarafindan guvenle reddedilir.
         h.Ver := VDB_FILE_VER;
         h.Crc := HeadCrc(h);
         FS.Position := 0;
@@ -1222,6 +1249,59 @@ begin
   FDirty := True;
 end;
 
+procedure TVDb.BlockCrcAdd(const H: TVDbRecHead; Value: PByte);
+begin
+  FBlockCrc := VDbCrc32Update(FBlockCrc, H, SizeOf(H));
+  if (H.ValLen > 0) and (Value <> nil) then
+    FBlockCrc := VDbCrc32UpdatePtr(FBlockCrc, Value, Integer(H.ValLen));
+  Inc(FBlockBytes, Int64(SizeOf(H)) + Int64(H.ValLen));
+end;
+
+procedure TVDb.AppendBlockFooter;
+{ H5: o ana kadar yazilan blok baytlarinin CRC'sini footer kaydi olarak
+  yazar. Footer'in ValLen'i 0'dir (yapisal olarak deger tasimaz); blok
+  bayt sayisi Key alaninda tasinir. Footer kendi CRC'sine dahil edilmez. }
+var
+  h: TVDbRecHead;
+  off: Int64;
+  need, newCap: Integer;
+begin
+  if FBlockBytes <= 0 then Exit;
+  if FBlockBytes > Int64(High(LongWord)) then
+    raise EVDbException.Create(ecLimit, 'VDb: blok boyutu cok buyuk');
+  h.Magic := VDB_MAGIC;
+  h.Crc := VDbCrc32Final(FBlockCrc);
+  h.Seq := 0;
+  h.Key := QWord(FBlockStart);   // blok baslangic offseti (Verify yeniden hesaplayabilir)
+  h.ValLen := 0;
+  h.Flags := VDB_FLAG_BLOCKCRC;
+  need := SizeOf(h);
+  if FWrBufActive then
+  begin
+    off := FWrBufBase + Int64(FWrBufLen);
+    if FWrBufLen + need > Length(FWrBuf) then
+    begin
+      newCap := Length(FWrBuf);
+      while newCap < FWrBufLen + need do
+        Inc(newCap, VDB_WRBUF_MAX);
+      SetLength(FWrBuf, newCap);
+    end;
+    Move(h, FWrBuf[FWrBufLen], need);
+    Inc(FWrBufLen, need);
+    if FWrBufLen >= VDB_WRBUF_MAX then
+      FlushWriteBuf;
+  end
+  else
+  begin
+    off := FS.Seek(0, soEnd);
+    FS.WriteBuffer(h, need);
+  end;
+  FDirty := True;
+  FBlockStart := off + Int64(need);
+  FBlockBytes := 0;
+  FBlockCrc := VDbCrc32Init;
+end;
+
 procedure TVDb.AppendRec(Key: QWord; const Value: TBytes; IsDel: Boolean;
   DoFlush: Boolean; SkipWAL: Boolean);
 { Tum KALICI yazma yollarinin tek kavsi. Put, Delete, CommitBatch ve
@@ -1315,6 +1395,13 @@ begin
         raise EVDbException.CreateFmt(ecIOError,
           'VDb: WAL yazilamadi, islem durduruldu (ana dosyaya yazilmadi): %s',
           [FPath]);
+
+  { H5: hedef blok buyuklugune ulastiysa once mevcut blogu kapat.
+    Boylece yeni kayit yeni blokta baslar; footer'in kendisi bir sonraki
+    bloga dahil edilmez. }
+  if FBlockBytes >= VDB_BLOCK_TARGET then
+    AppendBlockFooter;
+  BlockCrcAdd(h, pv);
 
   { P-21 (2026-10-16): CommitBatch toplu yazim. Tampon AKTIFSE kayit
     baytlari (baslik+deger) dosyaya degil tampona eklenir; offset
@@ -1426,8 +1513,12 @@ begin
   h.ValLen := 0;
   h.Flags := VDB_FLAG_BATCHEND;
   h.Crc := RecCrc(h.Seq, h.Key, h.ValLen, h.Flags, nil);
+  BlockCrcAdd(h, nil);
   off := FS.Seek(0, soEnd);
   FS.WriteBuffer(h, SizeOf(h));
+  { H5: BATCHEND'den sonra blogu kapat. Boylece commit'in gorunur
+    oldugu her noktada bir blok CRC'si de tamamlanmis olur. }
+  AppendBlockFooter;
   FDirty := True;
   if DoFlush then
     VDbFlushStream(FS);
@@ -1531,6 +1622,20 @@ begin
     next := pos + Int64(SizeOf(h)) + Int64(h.ValLen);
     if next > fsize then
     begin torn := True; Break; end; // yari yazilmis
+    { H5: blok footer'i bir kayit degildir; seq/pending/CRC akisina
+      katilmaz. Kayit-bazi CRC'ler zaten dogrulandi; footer yalnizca
+      Verify'in hizli blok kontrolu icindir. }
+    if h.Flags = VDB_FLAG_BLOCKCRC then
+    begin
+      { Footer, BATCHEND'den sonra gelir. Arada commit edilmemis kayit
+        yoksa bu footer da commit'in parcasi sayilir; aksi halde yarim
+        batch kirpilirken commit'li blogun footer'i da silinir ve Verify
+        "blok footer yok" der. }
+      if committed then
+        committedThrough := next;
+      pos := next;
+      Continue;
+    end;
     if h.ValLen > 0 then
     begin
       if Length(buf) < Integer(h.ValLen) then
@@ -1631,6 +1736,11 @@ begin
     VDbFlushStream(FS);
   end;
   FS.Position := FS.Size;
+  { H5: kurtarma sonrasi yeni blok, temizlenmis dosya sonundan baslar.
+    Boylece yarim kalmis bir blok footer'i asla yeni blokla karismaz. }
+  FBlockStart := FS.Size;
+  FBlockBytes := 0;
+  FBlockCrc := VDbCrc32Init;
 end;
 
 function TVDb.FindPending(Key: QWord; out Op: TPendOp): Boolean;
@@ -5347,10 +5457,37 @@ var
   n, nPut, nDel, nEnd, nEnc: Int64;
   expSeq: QWord;
   first: Boolean;
+  blockCrc: LongWord;
+  blockStart: Int64;
+  nBlock: Integer;
+  sawBlock: Boolean;
 
   procedure Bad(const Fmt: string; const Args: array of const);
   begin
     Report := Format('BOZUK @%d: ', [pos]) + Format(Fmt, Args);
+  end;
+
+  function CrcRange(AStart: Int64; ALen: Int64; out ACrc: LongWord): Boolean;
+  var
+    b: TBytes;
+    rem: Int64;
+    got: Integer;
+  begin
+    Result := False;
+    if (AStart < VDB_HDR_SIZE) or (ALen < 0) or (AStart + ALen > fsize) then Exit;
+    SetLength(b, 65536);
+    ACrc := VDbCrc32Init;
+    FS.Position := AStart;
+    rem := ALen;
+    while rem > 0 do
+    begin
+      if rem > Int64(Length(b)) then got := Length(b) else got := Integer(rem);
+      if FS.Read(b[0], got) <> got then Exit;
+      ACrc := VDbCrc32Update(ACrc, b[0], got);
+      Dec(rem, got);
+    end;
+    ACrc := VDbCrc32Final(ACrc);
+    Result := True;
   end;
 
 begin
@@ -5375,6 +5512,10 @@ begin
     if fh.Crc <> HeadCrc(fh) then begin Report := 'BOZUK: baslik CRC'; Exit; end;
     pos := VDB_HDR_SIZE;
     n := 0; nPut := 0; nDel := 0; nEnd := 0; nEnc := 0; first := True; expSeq := 0;
+    blockCrc := VDbCrc32Init;
+    blockStart := pos;
+    nBlock := 0;
+    sawBlock := False;
     while pos + Int64(SizeOf(h)) <= fsize do
     begin
       FS.Position := pos;
@@ -5384,6 +5525,32 @@ begin
       if h.ValLen > VDB_MAX_VALUE then begin Bad('asiri vallen=%d', [h.ValLen]); Exit; end;
       next := pos + Int64(SizeOf(h)) + Int64(h.ValLen);
       if next > fsize then begin Bad('yirtik kuyruk', []); Exit; end;
+      { H5: blok footer'i. Crc alani, footer'in Key alanindaki baslangictan
+        bu footer'a kadar olan blok baytlarinin CRC32'sidir. Normal
+        durumda kumulatif blockCrc yeterlidir; V1/V2'den yukseltilmis
+        dosyada ilk footer'in baslangici FDataStart'tan ileridedir, o
+        durumda aralik yeniden hesaplanir. }
+      if h.Flags = VDB_FLAG_BLOCKCRC then
+      begin
+        if (h.ValLen <> 0) or (h.Seq <> 0) then
+        begin Bad('blok footer bozuk', []); Exit; end;
+        if h.Key <> QWord(blockStart) then
+        begin
+          if not CrcRange(Int64(h.Key), pos - Int64(h.Key), c) then
+          begin Bad('blok araligi okunamadi', []); Exit; end;
+        end
+        else
+          c := VDbCrc32Final(blockCrc);
+        if c <> h.Crc then
+        begin Bad('blok CRC tutmadi (baslangic=%d)', [Int64(h.Key)]); Exit; end;
+        Inc(nBlock);
+        sawBlock := True;
+        blockCrc := VDbCrc32Init;
+        blockStart := next;
+        pos := next;
+        Continue;
+      end;
+      blockCrc := VDbCrc32Update(blockCrc, h, SizeOf(h));
       if h.ValLen > 0 then
       begin
         if Length(buf) < Integer(h.ValLen) then
@@ -5391,6 +5558,7 @@ begin
         if FS.Read(buf[0], h.ValLen) <> Integer(h.ValLen) then
         begin Bad('deger okunamadi', []); Exit; end;
         pv := @buf[0];
+        blockCrc := VDbCrc32Update(blockCrc, buf[0], Integer(h.ValLen));
       end
       else
         pv := nil;
@@ -5424,8 +5592,10 @@ begin
       pos := next;
     end;
     if pos <> fsize then begin Bad('artik %d byte', [fsize - pos]); Exit; end;
-    Report := Format('OK kayit=%d put=%d del=%d batchend=%d sifreli=%d canli=%d olu=%d boyut=%d',
-      [n, nPut, nDel, nEnd, nEnc, FIndex.Count, FDeadBytes, fsize]);
+    if sawBlock and (blockCrc <> VDbCrc32Init) then
+    begin Bad('blok footer yok (baslangic=%d)', [blockStart]); Exit; end;
+    Report := Format('OK kayit=%d put=%d del=%d batchend=%d sifreli=%d canli=%d olu=%d boyut=%d blok=%d',
+      [n, nPut, nDel, nEnd, nEnc, FIndex.Count, FDeadBytes, fsize, nBlock]);
     Result := True;
   finally
     FLock.Leave;

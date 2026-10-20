@@ -12566,6 +12566,72 @@ begin
   end;
 end;
 
+procedure T127_H5_BlockCrc;
+// H5: her commit sonunda blok footer'i yazilir; Verify blok CRC'sini
+// dogrular. Footer CRC'si bozulunca Verify bunu yakalar.
+var
+  db: TVDb;
+  dir, fn, rep: string;
+  fs: TFileStream;
+  h: TVDbRecHead;
+  off: Int64;
+  i: Integer;
+  b: Byte;
+  ok: Boolean;
+begin
+  Grp('H5 blok-grup CRC');
+  dir := D + '\h5_blk';
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    for i := 1 to 3 do
+      db.Put(QWord(i), VDbStrToBytes('blok-' + IntToStr(i)));
+    fn := dir + '\veritabani.odb';
+    ok := db.Verify(rep);
+    Dogrula('H5 Verify blok footer sayisi', ok and (Pos('blok=3', rep) > 0), rep);
+  finally
+    db.Close;
+    db.Free;
+  end;
+
+  off := -1;
+  fs := TFileStream.Create(fn, fmOpenReadWrite);
+  try
+    off := VDB_HDR_SIZE;
+    while off + Int64(SizeOf(h)) <= fs.Size do
+    begin
+      fs.Position := off;
+      fs.ReadBuffer(h, SizeOf(h));
+      if h.Flags = VDB_FLAG_BLOCKCRC then Break;
+      Inc(off, Int64(SizeOf(h)) + Int64(h.ValLen));
+    end;
+    if off + Int64(SizeOf(h)) > fs.Size then off := -1;
+    Dogrula('H5 blok footer bulundu', off > 0, IntToStr(off));
+    if off > 0 then
+    begin
+      fs.Position := off + 4;   // Magic(4) + Crc(4)
+      fs.ReadBuffer(b, 1);
+      b := b xor $01;
+      fs.Position := off + 4;
+      fs.WriteBuffer(b, 1);
+    end;
+  finally
+    fs.Free;
+  end;
+
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    ok := db.Verify(rep);
+    Dogrula('H5 bozuk blok CRC yakalanir',
+      (not ok) and (Pos('blok CRC', rep) > 0), rep);
+  finally
+    db.Close;
+    db.Free;
+  end;
+end;
+
 function TMetricsTestProvider.Get: string;
 begin
   Result := Text;
@@ -13300,6 +13366,7 @@ T92_MVCC_Isoaltion;
        T124_Parquet;
        T125_KolonSifreleme;
        T126_F42_TxIsolation;
+       T127_H5_BlockCrc;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls
