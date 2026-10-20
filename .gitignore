@@ -94,8 +94,6 @@ startup_error.txt
 
 # Depoda tutulmayan uygulama/demo/test projeleri (2026-10-20)
 # Cekirdek kutuphane + sqltest + vdbapi (C API) kalir.
-/examples/
-/yonetim/
 /guimain.*
 /vdbgui.*
 /vdbwebapi.*

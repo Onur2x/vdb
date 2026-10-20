@@ -20,6 +20,9 @@ lazbuild -B sqltest.lpi
 # DLL / C API
 lazbuild -B vdbapi.lpi
 
+# GUI admin
+lazbuild -B yonetim/had.lpi
+
 # Linux/macOS library
 ./build_lib.sh
 ```
@@ -346,8 +349,21 @@ Rules:
 
 ## 7. Examples
 
-Example projects are not tracked in this repository; the engine units,
-`vdbapi` and the `sqltest` suite are the supported contents.
+`examples/` contains 11 runnable projects:
+
+1. Basic usage
+2. SQL queries
+3. CRUD operations
+4. Transactions
+5. JOINs
+6. Encryption
+7. TCP server
+8. TCP client
+9. JSON data
+10. Advanced features
+11. GUI example
+
+Build all: `examples/build_all.bat`
 
 ---
 

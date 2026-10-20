@@ -147,6 +147,8 @@ H3 skiplist (100,000 rows): 100 × (`UPDATE` + indexed `COUNT(*)`) takes
 VDb*.pas            Engine units
 sqltest.lpi/lpr     SQL test suite
 vdbapi.*            DLL / C API project
+examples/           Sample projects
+yonetim/            GUI admin
 dcpcrypt/           Encryption dependency
 dokuman/            These documents (not tracked)
 ```

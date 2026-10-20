@@ -147,6 +147,8 @@ H3 skiplist (100.000 satır): 100 × (`UPDATE` + indeksli `COUNT(*)`)
 VDb*.pas            Motor birimleri
 sqltest.lpi/lpr     SQL test paketi
 vdbapi.*            DLL / C API projesi
+examples/           Örnek projeler
+yonetim/            GUI yönetici
 dcpcrypt/           Şifreleme bağımlılığı
 dokuman/            Bu dokümanlar (Git dışı)
 ```
