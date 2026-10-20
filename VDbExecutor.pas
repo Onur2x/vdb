@@ -13077,7 +13077,7 @@ begin
         begin
           SetLength(Res.Rows[i], 8);
           Res.Rows[i][0] := td.Cols[i].Name;
-          Res.Rows[i][1] := VDbTypeName(td.Cols[i].Ctype);
+          Res.Rows[i][1] := VDbColTypeName(td.Cols[i]);
           Res.Rows[i][2] := BoolToStr(td.Cols[i].NotNull, True);
           Res.Rows[i][3] := BoolToStr(td.Cols[i].Unique, True);
           if td.Cols[i].HasDef then Res.Rows[i][4] := td.Cols[i].Def
@@ -13165,7 +13165,7 @@ begin
         for i := 0 to High(td.Cols) do
         begin
           if i > 0 then cn := cn + ', ';
-          cn := cn + td.Cols[i].Name + ' ' + VDbTypeName(td.Cols[i].Ctype);
+          cn := cn + td.Cols[i].Name + ' ' + VDbColTypeName(td.Cols[i]);
           if td.PkIndex = i then cn := cn + ' PRIMARY KEY';
           if td.Cols[i].NotNull then cn := cn + ' NOT NULL';
           if td.Cols[i].Unique then cn := cn + ' UNIQUE';

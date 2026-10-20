@@ -11839,7 +11839,7 @@ const
   K = 10;
 var
   i, hit: Integer;
-  vals, q, exact, ann: string;
+  vals, q, exact, ann, showSql: string;
 
   function VecJson(a, b, c, d: Double): string;
   begin
@@ -11979,6 +11979,44 @@ begin
     'INSERT INTO vec_rnd_t VALUES (902,' + SQLIT('bozuk') + ')', 0);
   ChkVal('VEC ANN gecersiz vektor atlandi',
     'SELECT COUNT(*) FROM vec_rnd_t', 0, 0, '602');
+
+  // M4: VECTOR(n) kolon tipi + boyut dogrulamasi (TEXT uzerinde JSON dizi).
+  Chk('VEC(n) tablo',
+    'CREATE TABLE vec_dim_t(id INTEGER PRIMARY KEY, v VECTOR(3))', 0);
+  Chk('VEC(n) gecerli deger',
+    'INSERT INTO vec_dim_t VALUES (1,' + SQLIT('[1,2,3]') + ')', 0);
+  Chk('VEC(n) bosluklu gecerli deger',
+    'INSERT INTO vec_dim_t VALUES (2,' + SQLIT('[1, 2, 3]') + ')', 0);
+  ChkErr('VEC(n) eksik boyut reddedildi',
+    'INSERT INTO vec_dim_t VALUES (3,' + SQLIT('[1,2]') + ')');
+  ChkErr('VEC(n) fazla boyut reddedildi',
+    'INSERT INTO vec_dim_t VALUES (4,' + SQLIT('[1,2,3,4]') + ')');
+  ChkErr('VEC(n) sayisal olmayan reddedildi',
+    'INSERT INTO vec_dim_t VALUES (5,' + SQLIT('[1,2,"x"]') + ')');
+  ChkErr('VEC(n) gecersiz DDL reddedildi',
+    'CREATE TABLE vec_bad_t(id INTEGER PRIMARY KEY, v VECTOR(0))');
+  ChkVal('VEC(n) gecerli satirlar korundu',
+    'SELECT COUNT(*) FROM vec_dim_t', 0, 0, '2');
+  R := sq.Exec('SHOW CREATE TABLE vec_dim_t');
+  if Length(R.Rows) > 0 then showSql := R.Rows[0][0] else showSql := '';
+  Dogrula('VEC(n) SHOW CREATE tipi korur', Pos('VECTOR(3)', showSql) > 0,
+    showSql);
+  ChkErr('VEC(n) ALTER uyumsuz boyut reddedildi',
+    'ALTER TABLE vec_dim_t ALTER COLUMN v TYPE VECTOR(4)');
+  Chk('VEC(n) ALTER TEXT boyutu kaldirir',
+    'ALTER TABLE vec_dim_t ALTER COLUMN v TYPE TEXT', 0);
+
+  // M4 yan urunu: ORDER BY ifadesi (kolon olmayan anahtar) artik siralanir.
+  Chk('ORDER BY ifade tablosu',
+    'CREATE TABLE ord_expr_t(id INTEGER PRIMARY KEY, name TEXT)', 0);
+  Chk('ORDER BY ifade satirlari',
+    'INSERT INTO ord_expr_t VALUES (1,' + SQLIT('a') + '),(2,' +
+    SQLIT('abc') + '),(3,' + SQLIT('ab') + '),(4,' + SQLIT('') + ')', 0);
+  ChkVal('ORDER BY ifade aritmetik',
+    'SELECT id FROM ord_expr_t ORDER BY 0 - id LIMIT 1', 0, 0, '4');
+  ChkVal('ORDER BY ifade fonksiyon + kolon',
+    'SELECT id FROM ord_expr_t ORDER BY LENGTH(name) DESC, id LIMIT 1',
+    0, 0, '2');
 end;
 
 function TMetricsTestProvider.Get: string;

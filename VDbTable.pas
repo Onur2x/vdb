@@ -847,6 +847,13 @@ function VDbCheckOK(const Vals: TStrArray; const Groups: TWhereGroups): Boolean;
 procedure VDbSortStrs(var A: TStrArray);   // karsilastirmali (byte) siralama
 // SQL tip adi -> VCT_* (ALTER COLUMN icin; VDbSql.ColTypeOf ile ayni kural)
 function VDbTypeFromName(const S: string): Byte;
+// M4: 'VECTOR(n)' -> n; 'VECTOR' veya vektor olmayan ad -> 0.
+// Gecersiz n (0, 256+, sayi degil) -> 0; cagiran DDL tarafinda hata verir.
+function VDbVectorDimFromName(const S: string): Integer;
+// M4: deger JSON sayi dizisi mi ve tam Dim elemanli mi?
+function VDbVectorDimOK(const S: string; Dim: Integer): Boolean;
+// M4: kolonun SQL tip adi (VECTOR(n) bilgisini korur).
+function VDbColTypeName(const C: TColDef): string;
 // Index siralama: NULL('') en kucuk; sayisal kolonda sayisal karsilastirma.
 function VDbIdxCmp(const A, B: string; Ctype: Byte): Integer;
 // Op (=,>,>=,<,<=) icin [Lo,Hi) dilimi; dilimlenemezse False (ÃƒÂ¶rn. <>, LIKE).
@@ -1298,7 +1305,65 @@ begin
   if (u = 'DATETIME') or (u = 'TIMESTAMP') then Exit(VCT_DATETIME);
   if u = 'TIME' then Exit(VCT_TIME);
   if (u = 'BLOB') or (u = 'BINARY') then Exit(VCT_BLOB);
+  // M4: VECTOR(n) JSON sayi dizisi olarak TEXT'te saklanir.
+  if (u = 'VECTOR') or (Copy(u, 1, 7) = 'VECTOR(') then Exit(VCT_STR);
   Result := VCT_STR; // TEXT / VARCHAR / STRING
+end;
+
+function VDbVectorDimFromName(const S: string): Integer;
+var
+  u, p: string;
+  n: Integer;
+begin
+  Result := 0;
+  u := UpperCase(Trim(S));
+  if u = 'VECTOR' then Exit(0);
+  if (Length(u) > 8) and (Copy(u, 1, 7) = 'VECTOR(') and
+     (u[Length(u)] = ')') then
+  begin
+    p := Trim(Copy(u, 8, Length(u) - 8));
+    if TryStrToInt(p, n) and (n >= 1) and (n <= 255) then Exit(n);
+  end;
+end;
+
+function VDbVectorDimOK(const S: string; Dim: Integer): Boolean;
+var
+  t, num: string;
+  i, n: Integer;
+  c: Char;
+  d: Double;
+begin
+  Result := False;
+  t := Trim(S);
+  if (Length(t) < 2) or (t[1] <> '[') or (t[Length(t)] <> ']') then Exit;
+  t := Trim(Copy(t, 2, Length(t) - 2));
+  if t = '' then Exit(Dim = 0);
+  n := 0;
+  num := '';
+  for i := 1 to Length(t) + 1 do
+  begin
+    if i <= Length(t) then c := t[i] else c := ',';
+    if c = ',' then
+    begin
+      num := Trim(num);
+      if num = '' then Exit(False);
+      if not VDbParseFloat(num, d) then Exit(False);
+      Inc(n);
+      if n > Dim then Exit(False);
+      num := '';
+    end
+    else
+      num := num + c;
+  end;
+  Result := n = Dim;
+end;
+
+function VDbColTypeName(const C: TColDef): string;
+begin
+  if C.VecDim > 0 then
+    Result := 'VECTOR(' + IntToStr(C.VecDim) + ')'
+  else
+    Result := VDbTypeName(C.Ctype);
 end;
 
 function VDbMatchCond(const V: string; const C: TWhereCond): Boolean;
@@ -3727,6 +3792,7 @@ procedure ParseLines(Lines: TStrings);
         t.Cols[lj].Generated := False;   // M10
         t.Cols[lj].GenExpr := '';
         t.Cols[lj].Identity := 0;        // M10: IDENTITY
+        t.Cols[lj].VecDim := 0;          // M4: VECTOR(n)
         if Pos(':', cp[lj]) > 0 then
         begin
           s2 := cp[lj];
@@ -3781,6 +3847,8 @@ procedure ParseLines(Lines: TStrings);
             if (fl and 4) <> 0 then t.Cols[lj].Identity := 1
             else if (fl and 8) <> 0 then t.Cols[lj].Identity := 2
             else t.Cols[lj].Identity := 0;
+            // M4: VECTOR(n) boyutu bayrak ust baytlarinda.
+            t.Cols[lj].VecDim := (fl shr 8) and $FF;
           end
           else
             t.Cols[lj].Ctype := Byte(StrToIntDef(rest, 2));
@@ -4040,6 +4108,9 @@ begin
         // M10: IDENTITY modu bayrak bitlerinde (4=ALWAYS, 8=BY DEFAULT).
         if kv.Value.Cols[i].Identity = 1 then fl := fl or 4
         else if kv.Value.Cols[i].Identity = 2 then fl := fl or 8;
+        // M4: VECTOR(n) boyutu bayrak ust baytlarinda (sema alan sayisi sabit).
+        if kv.Value.Cols[i].VecDim > 0 then
+          fl := fl or ((kv.Value.Cols[i].VecDim and $FF) shl 8);
         s := s + kv.Value.Cols[i].Name + ':' + IntToStr(kv.Value.Cols[i].Ctype) +
           ':' + IntToStr(fl);
         { R-20: collation 5. alan (ad:tip:bayrak:hexdef:collation).
@@ -4540,6 +4611,11 @@ begin
   begin
     if Vals[i] <> '' then
       Vals[i] := VDbNormValue(T.Cols[i].Ctype, Vals[i]);
+    // M4: VECTOR(n) boyut/format dogrulamasi (INSERT/UPDATE/Batch/copy).
+    if (T.Cols[i].VecDim > 0) and (Vals[i] <> '') and
+       (not VDbVectorDimOK(Vals[i], T.Cols[i].VecDim)) then
+      raise EVDbException.CreateFmt(ecTypeMismatch,
+        'VECTOR(%d) bekleniyor: %s', [T.Cols[i].VecDim, T.Cols[i].Name]);
     if T.Cols[i].NotNull and (Vals[i] = '') then
       raise EVDbException.Create(ecNotNullViolation, 'NOT NULL ihlali: ' + T.Cols[i].Name);
     // R-13 Full: bolme anahtari NULL olamaz (hangi bolume dusecegi
@@ -6899,7 +6975,12 @@ begin
   // DEFAULT tip dogrulugu
   v := '';
   if HasDef and (DefVal <> '') then
+  begin
     v := VDbNormValue(c2.Ctype, DefVal);
+    if (c2.VecDim > 0) and (not VDbVectorDimOK(v, c2.VecDim)) then
+      raise EVDbException.CreateFmt(ecTypeMismatch,
+        'VECTOR(%d) varsayilani gecersiz: %s', [c2.VecDim, Col.Name]);
+  end;
   c2.HasDef := HasDef;
   c2.Def := v;
 
@@ -7102,7 +7183,7 @@ procedure TVTableDb.AlterColumnType(const Table, Column, NewType: string);
 var
   t, nt: TTableDef;
   amap: TIntArray;
-  i, ci, nc: Integer;
+  i, ci, nc, ndim: Integer;
   ownDdl: Boolean;
   pks: TStrArray;
   rows: TStrMatrix;
@@ -7121,7 +7202,8 @@ begin
     raise EVDbException.Create(ecUnsupported,
       'PK kolonunun tipi degistirilemez: ' + t.Name + '.' + t.Cols[ci].Name);
   nc := SqlTypeToCtype(NewType);
-  if nc = t.Cols[ci].Ctype then Exit;
+  ndim := VDbVectorDimFromName(NewType);
+  if (nc = t.Cols[ci].Ctype) and (ndim = t.Cols[ci].VecDim) then Exit;
   // R-22 Full: kolon tipi degisirken anahtar bicimi de degisebilir.
   // Surmekte olan CONCURRENTLY insalari ONCEDEN finalize et (AForce):
   // boylece tip degisikligi sonrasi kurulan indeksler guncel bicimle
@@ -7143,12 +7225,22 @@ begin
           raise EVDbException.CreateFmt(ecTypeMismatch, 'tip degistirilemedi (satir %s, deger "%s"): %s',
             [pks[i], v, E.Message]);
       end;
+      if (ndim > 0) and (not VDbVectorDimOK(rows[i][ci], ndim)) then
+        raise EVDbException.CreateFmt(ecTypeMismatch,
+          'tip degistirilemedi: VECTOR(%d) bekleniyor (satir %s)', [ndim, pks[i]]);
     end;
   end;
   CloneDef(t, nt);
   nt.Cols[ci].Ctype := nc;
+  nt.Cols[ci].VecDim := ndim;
   if nt.Cols[ci].HasDef then
+  begin
     nt.Cols[ci].Def := VDbNormValue(nc, nt.Cols[ci].Def);
+    if (ndim > 0) and (nt.Cols[ci].Def <> '') and
+       (not VDbVectorDimOK(nt.Cols[ci].Def, ndim)) then
+      raise EVDbException.CreateFmt(ecTypeMismatch,
+        'tip degistirilemedi: VECTOR(%d) varsayilani gecersiz', [ndim]);
+  end;
   // F2-10: YENI tip altinda SATIRLAR yeniden dogrulanir. Once yalnizca
   // deger normallestiriliyordu; boylece mesela INTEGER -> TEXT sonrasi
   // CHECK (n > 5) veya FK hedefi degisikligi mevcut satirlari ihlal
@@ -7204,7 +7296,14 @@ begin
   t.Cols[ci].HasDef := HasDef;
   t.Cols[ci].Def := '';
   if HasDef then
+  begin
     t.Cols[ci].Def := VDbNormValue(t.Cols[ci].Ctype, DefVal);
+    if (t.Cols[ci].VecDim > 0) and (t.Cols[ci].Def <> '') and
+       (not VDbVectorDimOK(t.Cols[ci].Def, t.Cols[ci].VecDim)) then
+      raise EVDbException.CreateFmt(ecTypeMismatch,
+        'VECTOR(%d) varsayilani gecersiz: %s',
+        [t.Cols[ci].VecDim, t.Cols[ci].Name]);
+  end;
   FTables.AddOrSetValue(t.Name, t);
   MarkSchema;
 end;
@@ -7938,6 +8037,7 @@ begin
     t.Cols[i].Generated := Cols[i].Generated;   // M10
     t.Cols[i].GenExpr := Cols[i].GenExpr;
     t.Cols[i].Identity := Cols[i].Identity;     // M10: IDENTITY
+    t.Cols[i].VecDim := Cols[i].VecDim;         // M4: VECTOR(n)
   end;
   // M10: IDENTITY dogrulamalari. Tek kolon, tamsayi tipi, DEFAULT/GENERATED
   // ile ayni anda kullanilamaz; ALWAYS/BY DEFAULT NOT NULL anlamina gelir.

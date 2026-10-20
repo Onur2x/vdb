@@ -115,6 +115,9 @@ type
     // Sema uyumu icin kolon bayrak alaninda (bit2/bit3) saklanir; boylece
     // sema satirinin alan sayisi degismez ve eski DB'ler aynen okunur.
     Identity: Byte;
+    // M4: VECTOR(n) boyutu. 0 = vektor kisiti yok / normal kolon.
+    // Sema bayrak alaninin 8..15. bitlerinde saklanir; alan sayisi degismez.
+    VecDim: Integer;
   end;
 
   // --- yabanci anahtar ---

@@ -71,7 +71,7 @@ type
     function  CurPos: string;       // hata mesaji icin "pos=N"
 
     { ---- Tür / Alan yardımcıları ---- }
-    function  ParseTypeName: Byte;   // VCT_* donuyor
+    function  ParseTypeName(out AVecDim: Integer): Byte;   // VCT_* donuyor
     procedure ParseColDef(var C: TColDef; Stmt: TSqlCreateTableStmt = nil);
     function  ReadFkAction: string;
 
@@ -725,10 +725,25 @@ end;
   Tür / Alan yardımcıları
   ============================================================ }
 
-function TVDbParser.ParseTypeName: Byte;
+function TVDbParser.ParseTypeName(out AVecDim: Integer): Byte;
 var T, U: string;
 begin
+  AVecDim := 0;
   ExpectToken(T); U := UpperCase(T);
+  // M4: VECTOR(n) -> JSON sayi dizisi (TEXT) + boyut kisiti.
+  if U = 'VECTOR' then
+  begin
+    if TryEat('(') then
+    begin
+      ExpectToken(T);
+      if (not TryStrToInt(Trim(T), AVecDim)) or (AVecDim < 1) or
+         (AVecDim > 255) then
+        raise EVDbException.CreateFmt(ecSyntaxError,
+          'VECTOR boyutu 1..255 olmali: "%s"', [T]);
+      Expect(')');
+    end;
+    Exit(VCT_STR);
+  end;
   // Boyutlu tipler: VARCHAR(n), CHAR(n), DECIMAL(p,s) vs. — boyutu yut
   if U = 'VARCHAR'  then begin if TryEat('(') then begin ExpectToken(T); if not TryEat(')') then Expect(')'); end; Exit(VCT_STR); end;
   if U = 'CHAR'     then begin if TryEat('(') then begin ExpectToken(T); if not TryEat(')') then Expect(')'); end; Exit(VCT_STR); end;
@@ -776,8 +791,9 @@ begin
   C.Generated := False;
   C.GenExpr := '';
   C.Identity := 0;   // M10: GENERATED ... AS IDENTITY
+  C.VecDim := 0;     // M4: VECTOR(n)
   // Tip adını oku
-  C.Ctype := ParseTypeName;
+  C.Ctype := ParseTypeName(C.VecDim);
 
   // Nitelikleri tüket (PRIMARY KEY, NOT NULL, DEFAULT, AUTOINCREMENT, UNIQUE, REFERENCES, CHECK)
   while True do
@@ -3816,7 +3832,16 @@ begin
       end
       else if U = 'TYPE' then
       begin
-        ExpectToken(Result.NewTypeName); Result.Action := ataAlterColType;
+        ExpectToken(Result.NewTypeName);
+        // M4: ALTER COLUMN ... TYPE VECTOR(n) tek token degil.
+        if UpperCase(Result.NewTypeName) = 'VECTOR' then
+          if TryEat('(') then
+          begin
+            ExpectToken(T);
+            Result.NewTypeName := 'VECTOR(' + T + ')';
+            Expect(')');
+          end;
+        Result.Action := ataAlterColType;
       end
       else raise EVDbException.CreateFmt(ecSyntaxError, 'ALTER COLUMN sonrasi bilinmeyen eylem: "%s"', [T]);
     end

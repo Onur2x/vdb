@@ -1375,6 +1375,12 @@ begin
   C.Unique := False;
   C.HasDef := False;
   C.Def := '';
+  // M4: VECTOR(n) boyutu. Gecersiz boyut sessizce TEXT'e dusmesin.
+  C.VecDim := VDbVectorDimFromName(TypeName);
+  if (Copy(UpperCase(Trim(TypeName)), 1, 6) = 'VECTOR') and
+     (C.VecDim = 0) and (not SameText(Trim(TypeName), 'VECTOR')) then
+    raise EVDbException.Create(ecTypeMismatch,
+      'gecersiz VECTOR tipi (VECTOR(n), 1..255): ' + TypeName);
 end;
 
 function TVSql.CompareRowsTbl(const Ra, Rb: array of string; const Td: TTableDef;
