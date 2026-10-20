@@ -131,10 +131,44 @@ function VDbCryptAeadOpen(const Key, Envelope, Aad: TBytes;
   out OutPlain: TBytes): Boolean;
 function VDbCryptIsAead(const Cipher: TBytes): Boolean;
 
+{ ------------------------------------------------------------------
+  M6: KOLON SEVIYESI SIFRELEME
+
+  Her sifreli kolon degeri kendi kendini tanimlar:
+    'VDBC1' (5) | keyId (8, LE) | GCM zarfi (nonce + sifre + tag)
+
+  Anahtar, veritabani dosyasinin yanindaki <db>.colkey dosyasindan
+  yuklenir. Dosyadaki 32 bayt DPAPI ile korunur; anahtar kimligi (keyId)
+  ayni dosyada acik olarak durur. Sema yalnizca "bu kolon sifreli"
+  bilgisini tasir; anahtar kimligi degerin basligindan okunur.
+
+  NONCE: ayni anahtar + ayni (tablo, kolon) + ayni duz metin icin
+  deterministik turetilir. Bu, esitlik/joins/group-by gibi ham karsilastirma
+  yollarini korur; rastgele nonce ayni degeri her yazista farkli gosterip
+  bu yollari sessizce bozardi. Farkli duz metinler icin nonce PRF ile
+  degisir; GCM nonce tekrari pratikte olusmaz.
+  ------------------------------------------------------------------ }
+const
+  VDB_COLKEY_MAGIC = 'VDBCKEY1';
+  VDB_COL_VALUE_MAGIC = 'VDBC1';
+  VDB_COL_NONCE_LEN = 12;
+
+function VDbColumnKeyCreateFile(const FileName: string; out KeyId: QWord): Boolean;
+function VDbColumnKeyLoadFile(const FileName: string; out KeyId: QWord): Boolean;
+procedure VDbColumnKeyRegister(KeyId: QWord; const Key: TBytes);
+function VDbColumnKeyGet(KeyId: QWord; out Key: TBytes): Boolean;
+
+function VDbColumnSeal(KeyId: QWord; TableId, ColIndex: Word;
+  const Plain: TBytes): TBytes;
+function VDbColumnOpen(TableId, ColIndex: Word; const Stored: TBytes): TBytes;
+function VDbColumnIsSealed(const B: TBytes): Boolean; overload;
+function VDbColumnIsSealed(const S: string): Boolean; overload;
+
 implementation
 
 uses
   {$IFDEF MSWINDOWS} Windows, {$ENDIF}
+  Generics.Collections, SyncObjs,
   dcpcrypt2, dcpblockciphers, dcprijndael, dcpsha256, VDbKdf;
 
 {$IFDEF MSWINDOWS}
@@ -1172,8 +1206,8 @@ begin
   inBl.pbData := @Blob[0];
   FillChar(outBl, SizeOf(outBl), 0);
   descr := nil;
-  if not CryptUnprotectData(@outBl, @descr, nil, nil, nil,
-    CRYPTPROTECT_UI_FORBIDDEN, @inBl) then
+  if not CryptUnprotectData(@inBl, @descr, nil, nil, nil,
+    CRYPTPROTECT_UI_FORBIDDEN, @outBl) then
     raise EVdbCryptError.Create('DPAPI acma basarisiz (Win32 ' +
       IntToStr(GetLastError) + ') - anahtar dosyasi baska kullaniciya ' +
       'veya makineye ait olabilir', GetLastError);
@@ -1192,5 +1226,237 @@ begin
   Result := True;
 {$ENDIF}
 end;
+
+{ ==================================================================
+  M6: KOLON ANAHTARI + SIFRELI KOLON DEGERI
+  ================================================================== }
+
+var
+  FColKeys: TDictionary<QWord, TBytes>;
+  FColKeysLock: TCriticalSection;
+
+function ColAad(TableId, ColIndex: Word): TBytes;
+var
+  w: Word;
+begin
+  SetLength(Result, 4);
+  w := TableId;  Move(w, Result[0], 2);
+  w := ColIndex; Move(w, Result[2], 2);
+end;
+
+procedure VDbColumnKeyRegister(KeyId: QWord; const Key: TBytes);
+begin
+  if KeyId = 0 then
+    raise EVdbCryptError.Create('kolon anahtar kimligi 0 olamaz',
+      VDB_CRYPTO_ERR);
+  if Length(Key) <> VDB_KEY_LEN then
+    raise EVdbCryptError.Create('kolon anahtari 32 bayt olmali',
+      VDB_CRYPTO_ERR);
+  FColKeysLock.Enter;
+  try
+    FColKeys.AddOrSetValue(KeyId, Copy(Key, 0, Length(Key)));
+  finally
+    FColKeysLock.Leave;
+  end;
+end;
+
+function VDbColumnKeyGet(KeyId: QWord; out Key: TBytes): Boolean;
+begin
+  Key := nil;
+  FColKeysLock.Enter;
+  try
+    Result := FColKeys.TryGetValue(KeyId, Key);
+    if Result then Key := Copy(Key, 0, Length(Key));
+  finally
+    FColKeysLock.Leave;
+  end;
+end;
+
+function VDbColumnKeyLoadFile(const FileName: string; out KeyId: QWord): Boolean;
+var
+  fs: TFileStream;
+  magic: array[0..7] of AnsiChar;
+  idb: array[0..7] of Byte;
+  lenb: array[0..3] of Byte;
+  blob, key: TBytes;
+  n: LongWord;
+begin
+  Result := False;
+  KeyId := 0;
+  if not FileExists(FileName) then Exit;
+  fs := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
+  try
+    if fs.Size < 8 + 8 + 4 then
+      raise EVdbCryptError.Create('kolon anahtar dosyasi cok kisa: ' +
+        FileName, VDB_CRYPTO_ERR);
+    fs.ReadBuffer(magic, 8);
+    if not CompareMem(@magic[0], @VDB_COLKEY_MAGIC[1], 8) then
+      raise EVdbCryptError.Create('kolon anahtar dosyasi basligi gecersiz: ' +
+        FileName, VDB_CRYPTO_ERR);
+    fs.ReadBuffer(idb, 8);
+    KeyId := QWord(idb[0]) or (QWord(idb[1]) shl 8) or
+             (QWord(idb[2]) shl 16) or (QWord(idb[3]) shl 24) or
+             (QWord(idb[4]) shl 32) or (QWord(idb[5]) shl 40) or
+             (QWord(idb[6]) shl 48) or (QWord(idb[7]) shl 56);
+    fs.ReadBuffer(lenb, 4);
+    n := LongWord(lenb[0]) or (LongWord(lenb[1]) shl 8) or
+         (LongWord(lenb[2]) shl 16) or (LongWord(lenb[3]) shl 24);
+    if (n = 0) or (Int64(n) > fs.Size - fs.Position) then
+      raise EVdbCryptError.Create('kolon anahtar dosyasi bozuk: ' + FileName,
+        VDB_CRYPTO_ERR);
+    SetLength(blob, n);
+    fs.ReadBuffer(blob[0], n);
+  finally
+    fs.Free;
+  end;
+  if KeyId = 0 then
+    raise EVdbCryptError.Create('kolon anahtar kimligi gecersiz: ' + FileName,
+      VDB_CRYPTO_ERR);
+  if not VDbDapiUnprotect(blob, key) then
+    raise EVdbCryptError.Create('kolon anahtari acilamadi: ' + FileName,
+      VDB_CRYPTO_ERR);
+  if Length(key) <> VDB_KEY_LEN then
+    raise EVdbCryptError.Create('kolon anahtari uzunlugu gecersiz: ' + FileName,
+      VDB_CRYPTO_ERR);
+  VDbColumnKeyRegister(KeyId, key);
+  Result := True;
+end;
+
+function VDbColumnKeyCreateFile(const FileName: string; out KeyId: QWord): Boolean;
+var
+  fs: TFileStream;
+  key, blob: TBytes;
+  idb: array[0..7] of Byte;
+  lenb: array[0..3] of Byte;
+  tmp: string;
+  n: LongWord;
+begin
+  Result := False;
+  KeyId := 0;
+  if Trim(FileName) = '' then
+    raise EVdbCryptError.Create('kolon anahtar dosyasi yolu bos',
+      VDB_CRYPTO_ERR);
+  if not VDbCryptNewKey(key) then
+    raise EVdbCryptError.Create('kolon anahtari uretilemedi', VDB_CRYPTO_ERR);
+  if not VDbCryptRandom(blob, 8) then
+    raise EVdbCryptError.Create('kolon anahtar kimligi uretilemedi',
+      VDB_CRYPTO_ERR);
+  Move(blob[0], idb[0], 8);
+  KeyId := QWord(idb[0]) or (QWord(idb[1]) shl 8) or
+           (QWord(idb[2]) shl 16) or (QWord(idb[3]) shl 24) or
+           (QWord(idb[4]) shl 32) or (QWord(idb[5]) shl 40) or
+           (QWord(idb[6]) shl 48) or (QWord(idb[7]) shl 56);
+  if KeyId = 0 then KeyId := 1;
+  if not VDbDapiProtect(key, blob) then
+    raise EVdbCryptError.Create('kolon anahtari korunamadi', VDB_CRYPTO_ERR);
+  n := Length(blob);
+  lenb[0] := Byte(n); lenb[1] := Byte(n shr 8);
+  lenb[2] := Byte(n shr 16); lenb[3] := Byte(n shr 24);
+  tmp := FileName + '.tmp';
+  if FileExists(tmp) then SysUtils.DeleteFile(tmp);
+  fs := TFileStream.Create(tmp, fmCreate);
+  try
+    fs.WriteBuffer(VDB_COLKEY_MAGIC[1], 8);
+    fs.WriteBuffer(idb[0], 8);
+    fs.WriteBuffer(lenb[0], 4);
+    fs.WriteBuffer(blob[0], Length(blob));
+  finally
+    fs.Free;
+  end;
+  if FileExists(FileName) then
+    if not SysUtils.DeleteFile(FileName) then
+      raise EVdbCryptError.Create('eski kolon anahtar dosyasi silinemedi: ' +
+        FileName, VDB_CRYPTO_ERR);
+  if not RenameFile(tmp, FileName) then
+    raise EVdbCryptError.Create('kolon anahtar dosyasi yazilamadi: ' +
+      FileName, VDB_CRYPTO_ERR);
+  VDbColumnKeyRegister(KeyId, key);
+  Result := True;
+end;
+
+function VDbColumnIsSealed(const B: TBytes): Boolean;
+begin
+  Result := False;
+  if Length(B) < Length(VDB_COL_VALUE_MAGIC) then Exit;
+  Result := CompareMem(@B[0], @VDB_COL_VALUE_MAGIC[1],
+    Length(VDB_COL_VALUE_MAGIC));
+end;
+
+function VDbColumnIsSealed(const S: string): Boolean;
+begin
+  Result := False;
+  if Length(S) < Length(VDB_COL_VALUE_MAGIC) then Exit;
+  Result := Copy(S, 1, Length(VDB_COL_VALUE_MAGIC)) = VDB_COL_VALUE_MAGIC;
+end;
+
+function VDbColumnSeal(KeyId: QWord; TableId, ColIndex: Word;
+  const Plain: TBytes): TBytes;
+var
+  key, aad, h, nonce, cipher, tag: TBytes;
+  m: Integer;
+begin
+  Result := nil;
+  if not VDbColumnKeyGet(KeyId, key) then
+    raise EVdbCryptError.Create('kolon anahtari yuklu degil (keyId=' +
+      IntToStr(Int64(KeyId)) + ')', VDB_CRYPTO_ERR);
+  aad := ColAad(TableId, ColIndex);
+  h := Hmac2(key, aad, Plain);
+  SetLength(nonce, VDB_COL_NONCE_LEN);
+  Move(h[0], nonce[0], VDB_COL_NONCE_LEN);
+  if not VDbCryptGcmSeal(key, nonce, Plain, aad, cipher, tag) then
+    raise EVdbCryptError.Create('kolon degeri sifrelenemedi',
+      VDB_CRYPTO_ERR);
+  m := Length(VDB_COL_VALUE_MAGIC);
+  SetLength(Result, m + 8 + VDB_COL_NONCE_LEN + Length(cipher) +
+    VDB_AEAD_TAG_LEN);
+  Move(VDB_COL_VALUE_MAGIC[1], Result[0], m);
+  Move(KeyId, Result[m], 8);
+  Move(nonce[0], Result[m + 8], VDB_COL_NONCE_LEN);
+  if Length(cipher) > 0 then
+    Move(cipher[0], Result[m + 8 + VDB_COL_NONCE_LEN], Length(cipher));
+  Move(tag[0], Result[m + 8 + VDB_COL_NONCE_LEN + Length(cipher)],
+    VDB_AEAD_TAG_LEN);
+end;
+
+function VDbColumnOpen(TableId, ColIndex: Word; const Stored: TBytes): TBytes;
+var
+  key, aad, nonce, cipher, tag: TBytes;
+  keyId: QWord;
+  m, n: Integer;
+begin
+  Result := nil;
+  m := Length(VDB_COL_VALUE_MAGIC);
+  if not VDbColumnIsSealed(Stored) then
+    raise EVdbCryptError.Create('kolon degeri sifreli degil',
+      VDB_CRYPTO_ERR);
+  if Length(Stored) < m + 8 + VDB_COL_NONCE_LEN + VDB_AEAD_TAG_LEN then
+    raise EVdbCryptError.Create('sifreli kolon degeri cok kisa',
+      VDB_CRYPTO_ERR);
+  Move(Stored[m], keyId, 8);
+  if not VDbColumnKeyGet(keyId, key) then
+    raise EVdbCryptError.Create('kolon anahtari yuklu degil (keyId=' +
+      IntToStr(Int64(keyId)) + ') - .colkey dosyasini kontrol edin',
+      VDB_CRYPTO_ERR);
+  SetLength(nonce, VDB_COL_NONCE_LEN);
+  Move(Stored[m + 8], nonce[0], VDB_COL_NONCE_LEN);
+  n := Length(Stored) - m - 8 - VDB_COL_NONCE_LEN - VDB_AEAD_TAG_LEN;
+  SetLength(cipher, n);
+  if n > 0 then
+    Move(Stored[m + 8 + VDB_COL_NONCE_LEN], cipher[0], n);
+  SetLength(tag, VDB_AEAD_TAG_LEN);
+  Move(Stored[m + 8 + VDB_COL_NONCE_LEN + n], tag[0], VDB_AEAD_TAG_LEN);
+  aad := ColAad(TableId, ColIndex);
+  if not VDbCryptGcmOpen(key, nonce, cipher, tag, aad, Result) then
+    raise EVdbCryptError.Create('sifreli kolon degeri cozulemedi ' +
+      '(anahtar yanlis veya veri bozulmus)', VDB_CRYPTO_ERR);
+end;
+
+initialization
+  FColKeysLock := TCriticalSection.Create;
+  FColKeys := TDictionary<QWord, TBytes>.Create;
+
+finalization
+  FColKeys.Free;
+  FColKeysLock.Free;
 
 end.

@@ -118,6 +118,12 @@ type
     // M4: VECTOR(n) boyutu. 0 = vektor kisiti yok / normal kolon.
     // Sema bayrak alaninin 8..15. bitlerinde saklanir; alan sayisi degismez.
     VecDim: Integer;
+    // M6: kolon seviyesi sifreleme. Yalnizca metin/BLOB kolonlarinda
+    // kullanilabilir; sema bayrak alaninin 16. bitinde saklanir.
+    Encrypted: Boolean;
+    // Anahtar dosyasindaki anahtar kimligi (bellekte; semaya yazilmaz).
+    // Sifreli degerin kendi basliginda da ayni kimlik bulunur.
+    ColKeyId: QWord;
   end;
 
   // --- yabanci anahtar ---

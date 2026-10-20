@@ -12,8 +12,8 @@ unit VDbTable;
 interface
 
 uses
-  Classes, SysUtils, SyncObjs, Generics.Collections, VDbCore, VDbErr, VDbText,
-  VDbTypes, VDbSkipList;
+  Classes, SysUtils, SyncObjs, Generics.Collections, VDbCore, VDbCrypt, VDbErr,
+  VDbText, VDbTypes, VDbSkipList;
 
 type
   // Use Pointer for TSqlSelectStmt parameters to avoid circular dependency with VDbAst
@@ -3054,6 +3054,7 @@ var
   p: Integer;
   i: Integer;
   sv: TBytes;
+  raw, sealed: TBytes;
   iv: Int64;
   fv: Double;
   bv: Byte;
@@ -3145,6 +3146,26 @@ begin
   begin
     Grow(2);
     b[p] := T.Cols[i].Ctype; Inc(p);
+    { M6: sifreli kolon. Yalnizca metin/BLOB kolonlarina izin verilir;
+      NULL/bos deger sifrelenmez (motorun string modelinde ikisi ayni). }
+    if T.Cols[i].Encrypted then
+    begin
+      if (i < Length(Vals)) and (Vals[i] <> '') then
+      begin
+        if T.Cols[i].Ctype = VCT_BLOB then
+          raw := VDbS2B(Vals[i])
+        else
+          raw := VDbS2B(UTF8Encode(Vals[i]));
+        sealed := VDbColumnSeal(T.Cols[i].ColKeyId, TableId, i, raw);
+        PutI32(Length(sealed));
+        Grow(Length(sealed));
+        if Length(sealed) > 0 then Move(sealed[0], b[p], Length(sealed));
+        Inc(p, Length(sealed));
+      end
+      else
+        PutI32(-1);
+      Continue;
+    end;
     case T.Cols[i].Ctype of
       VCT_INT:
         if (i < Length(Vals)) and (Vals[i] <> '') and VDbParseInt(Vals[i], iv) then
@@ -3216,6 +3237,8 @@ var
   vl: LongInt;
   iv: Int64;
   fv: Double;
+  rawS: string;
+  plain: TBytes;
 begin
   Result := False;
   p := 0;
@@ -3237,10 +3260,21 @@ begin
       VCT_FLOAT: begin if vl <> 8 then Exit; Move(B[p], fv, 8); Vals[i] := VDbFloatToStr(fv); end;
       VCT_BOOL: begin Vals[i] := BoolToStr(B[p] <> 0, True); end;
     else
-      if ct = VCT_BLOB then
-        Vals[i] := VDbB2S(B, p, vl)          // ham bayt, kodlama yok
+    begin
+      rawS := VDbB2S(B, p, vl);
+      if VDbColumnIsSealed(rawS) then
+      begin
+        plain := VDbColumnOpen(TableId, i, VDbS2B(rawS));
+        if ct = VCT_BLOB then
+          Vals[i] := VDbB2S(plain, 0, Length(plain))
+        else
+          Vals[i] := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
+      end
+      else if ct = VCT_BLOB then
+        Vals[i] := rawS                    // ham bayt, kodlama yok
       else
-        Vals[i] := UTF8Decode(VDbB2S(B, p, vl));
+        Vals[i] := UTF8Decode(rawS);
+    end;
     end;
     Inc(p, vl);
   end;
@@ -3347,7 +3381,11 @@ var
   iv: Int64;
   fv: Double;
   s: RawByteString;
+  tid: Word;
+  plain: TBytes;
 begin
+  tid := 0;
+  if B <> nil then tid := Word(B[0]) or (Word(B[1]) shl 8);
   SetLength(Vals, ColCount);
   for i := 0 to ColCount - 1 do
   begin
@@ -3362,7 +3400,14 @@ begin
     else
       begin
         SetString(s, PAnsiChar(NativeUInt(B) + NativeUInt(FOff[i])), FLen[i]);
-        if FType[i] = VCT_BLOB then Vals[i] := s else Vals[i] := UTF8Decode(s);
+        if VDbColumnIsSealed(s) then
+        begin
+          plain := VDbColumnOpen(tid, i, VDbS2B(s));
+          if FType[i] = VCT_BLOB then Vals[i] := VDbB2S(plain, 0, Length(plain))
+          else Vals[i] := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
+        end
+        else if FType[i] = VCT_BLOB then Vals[i] := s
+        else Vals[i] := UTF8Decode(s);
       end;
     end;
   end;
@@ -3379,6 +3424,7 @@ var
   iv: Int64;
   fv: Double;
   s: AnsiString;
+  plain: TBytes;
 
   function RdU16(out V: Word): Boolean;
   begin
@@ -3421,10 +3467,19 @@ begin
       VCT_FLOAT: begin if vl <> 8 then Exit; Move(B[p], fv, 8); Vals[i] := VDbFloatToStr(fv); end;
       VCT_BOOL: begin Vals[i] := BoolToStr(B[p] <> 0, True); end;
     else
-      if ct = VCT_BLOB then
-        Vals[i] := SliceStr(p, vl)
+    begin
+      s := SliceStr(p, vl);
+      if VDbColumnIsSealed(string(s)) then
+      begin
+        plain := VDbColumnOpen(TableId, i, VDbS2B(string(s)));
+        if ct = VCT_BLOB then Vals[i] := VDbB2S(plain, 0, Length(plain))
+        else Vals[i] := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
+      end
+      else if ct = VCT_BLOB then
+        Vals[i] := s
       else
-        Vals[i] := UTF8Decode(SliceStr(p, vl));
+        Vals[i] := UTF8Decode(s);
+    end;
     end;
     Inc(p, vl);
   end;
@@ -3797,6 +3852,8 @@ procedure ParseLines(Lines: TStrings);
         t.Cols[lj].GenExpr := '';
         t.Cols[lj].Identity := 0;        // M10: IDENTITY
         t.Cols[lj].VecDim := 0;          // M4: VECTOR(n)
+        t.Cols[lj].Encrypted := False;   // M6
+        t.Cols[lj].ColKeyId := 0;
         if Pos(':', cp[lj]) > 0 then
         begin
           s2 := cp[lj];
@@ -3853,6 +3910,8 @@ procedure ParseLines(Lines: TStrings);
             else t.Cols[lj].Identity := 0;
             // M4: VECTOR(n) boyutu bayrak ust baytlarinda.
             t.Cols[lj].VecDim := (fl shr 8) and $FF;
+            // M6: kolon sifreleme bayragi (16. bit).
+            t.Cols[lj].Encrypted := (fl and 16) <> 0;
           end
           else
             t.Cols[lj].Ctype := Byte(StrToIntDef(rest, 2));
@@ -4018,6 +4077,24 @@ procedure ParseLines(Lines: TStrings);
             raise EVDbException.Create(ecSchemaCorrupt, 'katalog fk kolon disi');
         end;
       end;
+      // M6: sifreli kolonlarin anahtar kimligini bagla. Anahtar dosyasi
+      // yoksa sessizce duz metne dusmek yerine acikca hata ver.
+      for lj := 0 to High(t.Cols) do
+        if t.Cols[lj].Encrypted then
+        begin
+          if lj = t.PkIndex then
+            raise EVDbException.Create(ecSchemaCorrupt,
+              'PRIMARY KEY sifreli olamaz: ' + t.Name + '.' + t.Cols[lj].Name);
+          if not (t.Cols[lj].Ctype in [VCT_STR, VCT_DATE, VCT_DATETIME,
+            VCT_TIME, VCT_BLOB]) then
+            raise EVDbException.Create(ecSchemaCorrupt,
+              'sifreli kolon tipi gecersiz: ' + t.Name + '.' + t.Cols[lj].Name);
+          if FKv.ColumnKeyId = 0 then
+            raise EVDbException.Create(ecIOError,
+              'VDb: sifreli kolon var ama kolon anahtari yok: ' +
+              FKv.ColumnKeyPath);
+          t.Cols[lj].ColKeyId := FKv.ColumnKeyId;
+        end;
       FTables.AddOrSetValue(t.Name, t);
       FById.AddOrSetValue(t.TableId, t.Name);
       if t.TableId >= FNextId then FNextId := t.TableId + 1;
@@ -4115,6 +4192,8 @@ begin
         // M4: VECTOR(n) boyutu bayrak ust baytlarinda (sema alan sayisi sabit).
         if kv.Value.Cols[i].VecDim > 0 then
           fl := fl or ((kv.Value.Cols[i].VecDim and $FF) shl 8);
+        // M6: kolon sifreleme bayragi.
+        if kv.Value.Cols[i].Encrypted then fl := fl or 16;
         s := s + kv.Value.Cols[i].Name + ':' + IntToStr(kv.Value.Cols[i].Ctype) +
           ':' + IntToStr(fl);
         { R-20: collation 5. alan (ad:tip:bayrak:hexdef:collation).
@@ -6976,6 +7055,14 @@ begin
       'mevcut tabloya IDENTITY kolonu eklenmesi desteklenmiyor: ' + Col.Name);
   c2 := Col;
   c2.Name := VDbNorm(Col.Name);
+  if c2.Encrypted then
+  begin
+    if not (c2.Ctype in [VCT_STR, VCT_DATE, VCT_DATETIME, VCT_TIME,
+      VCT_BLOB]) then
+      raise EVDbException.Create(ecInvalidArgument,
+        'yalnizca metin/BLOB kolonu sifrelenebilir: ' + c2.Name);
+    c2.ColKeyId := FKv.EnsureColumnKey;
+  end;
   // DEFAULT tip dogrulugu
   v := '';
   if HasDef and (DefVal <> '') then
@@ -8042,6 +8129,8 @@ begin
     t.Cols[i].GenExpr := Cols[i].GenExpr;
     t.Cols[i].Identity := Cols[i].Identity;     // M10: IDENTITY
     t.Cols[i].VecDim := Cols[i].VecDim;         // M4: VECTOR(n)
+    t.Cols[i].Encrypted := Cols[i].Encrypted;   // M6
+    t.Cols[i].ColKeyId := Cols[i].ColKeyId;
   end;
   // M10: IDENTITY dogrulamalari. Tek kolon, tamsayi tipi, DEFAULT/GENERATED
   // ile ayni anda kullanilamaz; ALWAYS/BY DEFAULT NOT NULL anlamina gelir.
@@ -8072,6 +8161,20 @@ begin
   // boylece sentetik PK sayaci ile identity sayaci ayni anda tuketilmez.
   if (PkIndex < 0) and (n >= 0) then PkIndex := n;
   t.PkIndex := PkIndex;
+  // M6: sifreli kolon dogrulamalari. PK sifrelenemez (satir anahtari
+  // duz metin PK'dan uretilir); yalnizca metin/BLOB tipleri desteklenir.
+  for i := 0 to High(t.Cols) do
+    if t.Cols[i].Encrypted then
+    begin
+      if i = t.PkIndex then
+        raise EVDbException.Create(ecInvalidArgument,
+          'PRIMARY KEY kolonu sifrelenemez: ' + t.Cols[i].Name);
+      if not (t.Cols[i].Ctype in [VCT_STR, VCT_DATE, VCT_DATETIME,
+        VCT_TIME, VCT_BLOB]) then
+        raise EVDbException.Create(ecInvalidArgument,
+          'yalnizca metin/BLOB kolonu sifrelenebilir: ' + t.Cols[i].Name);
+      t.Cols[i].ColKeyId := FKv.EnsureColumnKey;
+    end;
   t.AutoInc := 0;
 SetLength(t.Idx, 0);
    for i := 0 to High(t.Cols) do

@@ -7698,6 +7698,7 @@ var
     else Exit;
     ci := FindColIdx(cr.ColumnName, cr.TableQualifier, cn);
     if ci < 0 then Exit;
+    if td.Cols[ci].Encrypted then Exit;   // M6: ham karsilastirma sifreli
     if swap then
       case op of
         sboLt: op := sboGt;
@@ -7757,6 +7758,7 @@ var
     cl := TSqlColumnRefNode(bt.Expr);
     ci2 := FindColIdx(cl.ColumnName, cl.TableQualifier, cn);
     if ci2 < 0 then Exit;
+    if td.Cols[ci2].Encrypted then Exit;   // M6
     loN := TSqlLiteralNode(bt.LowBound);
     hiN := TSqlLiteralNode(bt.HighBound);
 
@@ -7801,6 +7803,7 @@ var
     cl := TSqlColumnRefNode(inN.Expr);
     ci2 := FindColIdx(cl.ColumnName, cl.TableQualifier, cn);
     if ci2 < 0 then Exit;
+    if td.Cols[ci2].Encrypted then Exit;   // M6
     C.Col := ci2; C.Op := sboEq; C.IsText := False; C.IsIn := True;
     C.I := 0; C.F := 0; C.S := '';
     if ct[ci2] = VCT_INT then

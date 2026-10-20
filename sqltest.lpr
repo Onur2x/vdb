@@ -12356,6 +12356,165 @@ begin
   Dogrula('Parquet eksik dosya reddedildi', ok, '');
 end;
 
+procedure T125_KolonSifreleme;
+// M6: kolon seviyesi sifreleme (.colkey + sifreli TEXT/BLOB degerleri).
+var
+  keyPath, odbPath, fn, dir: string;
+  ok: Boolean;
+  fs: TFileStream;
+  raw: RawByteString;
+
+  function DosyadaMetin(const AFileName, S: string): Boolean;
+  var
+    f: TFileStream;
+    b: TBytes;
+  begin
+    Result := False;
+    if not FileExists(AFileName) then Exit;
+    f := TFileStream.Create(AFileName, fmOpenRead or fmShareDenyNone);
+    try
+      SetLength(b, f.Size);
+      if f.Size > 0 then f.ReadBuffer(b[0], f.Size);
+    finally
+      f.Free;
+    end;
+    if Length(b) = 0 then Exit;
+    SetString(raw, PAnsiChar(@b[0]), Length(b));
+    Result := Pos(S, string(raw)) > 0;
+  end;
+
+begin
+  Grp('M6 kolon seviyesi sifreleme');
+  dir := D + '\m6_colenc';
+  UseDir('m6_colenc');
+  keyPath := kv.ColumnKeyPath;
+  Dogrula('colkey baslangicta yok', not FileExists(keyPath), keyPath);
+
+  // .key parola dosyasi da olsun: rekey'in .colkey'i etkilemedigini
+  // ayrica dogrulayacagiz.
+  kv.CreateKeyFile(ChangeFileExt(keyPath, '.key'), 'm6-parola-1');
+  sq.Exec('CREATE TABLE sec(id INTEGER PRIMARY KEY, ad TEXT ENCRYPTED, ' +
+    'notu BLOB ENCRYPTED, acik TEXT)');
+  Dogrula('colkey olustu', FileExists(keyPath), keyPath);
+  Dogrula('ColumnKeyId sifir degil', kv.ColumnKeyId <> 0, '');
+
+  sq.Exec('INSERT INTO sec VALUES(1,''gizli-abc'',''blob-gizli'',''acik-1'')');
+  sq.Exec('INSERT INTO sec VALUES(2,''gizli-abc'',''blob-2'',''acik-2'')');
+  sq.Exec('INSERT INTO sec VALUES(3,NULL,NULL,''acik-3'')');
+  ChkVal('sifreli TEXT okunur', 'SELECT ad FROM sec WHERE id=1',
+    0, 0, 'gizli-abc');
+  ChkVal('sifreli BLOB okunur', 'SELECT notu FROM sec WHERE id=1',
+    0, 0, 'blob-gizli');
+  ChkVal('sifreli TEXT esitlik', 'SELECT COUNT(*) FROM sec WHERE ad=''gizli-abc''',
+    0, 0, '2');
+  ChkVal('sifreli TEXT NULL', 'SELECT COUNT(*) FROM sec WHERE ad IS NULL',
+    0, 0, '1');
+  ChkVal('sifreli GROUP BY', 'SELECT ad FROM sec WHERE ad IS NOT NULL ' +
+    'GROUP BY ad', 0, 0, 'gizli-abc');
+  ChkVal('sifreli ORDER BY', 'SELECT ad FROM sec WHERE ad IS NOT NULL ' +
+    'ORDER BY ad DESC LIMIT 1', 0, 0, 'gizli-abc');
+
+  sq.Exec('UPDATE sec SET ad=''yeni-gizli'' WHERE id=2');
+  ChkVal('sifreli UPDATE', 'SELECT ad FROM sec WHERE id=2', 0, 0, 'yeni-gizli');
+  sq.Exec('UPDATE sec SET ad=''gizli-abc'' WHERE id=2');
+
+  // Farkli tabloda ayni duz metin: JOIN duz metin uzerinden calismali.
+  sq.Exec('CREATE TABLE sec2(id INTEGER PRIMARY KEY, ad TEXT ENCRYPTED)');
+  sq.Exec('INSERT INTO sec2 VALUES(1,''gizli-abc'')');
+  ChkVal('sifreli JOIN', 'SELECT COUNT(*) FROM sec a JOIN sec2 b ' +
+    'ON a.ad=b.ad WHERE a.id=1 AND b.id=1', 0, 0, '1');
+
+  // DDL kapilari.
+  ok := False;
+  try
+    sq.Exec('CREATE TABLE sbad1(id TEXT PRIMARY KEY ENCRYPTED)');
+  except
+    on E: Exception do ok := Pos('PRIMARY KEY', E.Message) > 0;
+  end;
+  Dogrula('sifreli PK reddedildi', ok, '');
+  ok := False;
+  try
+    sq.Exec('CREATE TABLE sbad2(id INTEGER PRIMARY KEY, n INTEGER ENCRYPTED)');
+  except
+    on E: Exception do ok := Pos('metin/BLOB', E.Message) > 0;
+  end;
+  Dogrula('sifreli INTEGER reddedildi', ok, '');
+
+  // ALTER ADD COLUMN ENCRYPTED.
+  sq.Exec('ALTER TABLE sec ADD COLUMN ek TEXT ENCRYPTED');
+  sq.Exec('INSERT INTO sec(id,ad,notu,acik,ek) VALUES(4,''a4'',NULL,''c4'',''ek-gizli'')');
+  ChkVal('ALTER ADD ENCRYPTED', 'SELECT ek FROM sec WHERE id=4',
+    0, 0, 'ek-gizli');
+
+  // Ham dosyada duz metin bulunmamali (kolon degeri sifreli).
+  odbPath := ChangeFileExt(keyPath, '.odb');
+  tb.Close;
+  kv.Close;
+  Dogrula('raw .odb sifreli metni icermiyor',
+    not DosyadaMetin(odbPath, 'gizli-abc'), odbPath);
+  Dogrula('raw .odb ek sifreli metni icermiyor',
+    not DosyadaMetin(odbPath, 'ek-gizli'), odbPath);
+
+  // Yeniden ac: .colkey yuklenmeli ve degerler cozulmeli.
+  kv.Open(dir);
+  kv.OpenKeyFile(ChangeFileExt(keyPath, '.key'), 'm6-parola-1');
+  tb.Open(dir);
+  ChkVal('reopen sonrasi sifreli okuma', 'SELECT ad FROM sec WHERE id=1',
+    0, 0, 'gizli-abc');
+  ChkVal('reopen sonrasi ALTER kolonu', 'SELECT ek FROM sec WHERE id=4',
+    0, 0, 'ek-gizli');
+
+  // Anahtar dosyasi yokken sessizce duz metne dusmemeli.
+  tb.Close;
+  kv.Close;
+  RenameFile(keyPath, keyPath + '.bak');
+  kv.Open(dir);
+  kv.OpenKeyFile(ChangeFileExt(keyPath, '.key'), 'm6-parola-1');
+  ok := False;
+  try
+    tb.Open(dir);
+  except
+    on E: Exception do ok := Pos('kolon anahtari', E.Message) > 0;
+  end;
+  Dogrula('colkey yokken acik hata', ok, '');
+  tb.Close;
+  kv.Close;
+  RenameFile(keyPath + '.bak', keyPath);
+  kv.Open(dir);
+  kv.OpenKeyFile(ChangeFileExt(keyPath, '.key'), 'm6-parola-1');
+  tb.Open(dir);
+
+  // .key rekey kolon sifrelemesini etkilemez.
+  sq.Exec('ALTER DATABASE KEY ''m6-parola-2''');
+  kv.Close; tb.Close; sq.Free; tb.Free; kv.Free;
+  kv := TVDb.Create; tb := TVTableDb.Create(kv); sq := TVSql.Create(tb);
+  kv.Open(dir);
+  Dogrula('rekey sonrasi yeni .key acilir',
+    kv.OpenKeyFile(ChangeFileExt(keyPath, '.key'), 'm6-parola-2'));
+  tb.Open(dir);
+  ChkVal('rekey sonrasi sifreli deger durur',
+    'SELECT ad FROM sec WHERE id=1', 0, 0, 'gizli-abc');
+  Dogrula('rekey .colkey dosyasini silmedi', FileExists(keyPath), keyPath);
+
+  // Arrow disa aktarma duz metin, ice aktarma yeniden sifreler.
+  fn := dir + '\sec.arrow';
+  sq.Exec('COPY sec TO ''' + fn + ''' (FORMAT ARROW)');
+  sq.Exec('CREATE TABLE sec_copy(id INTEGER PRIMARY KEY, ad TEXT ENCRYPTED, ' +
+    'notu BLOB ENCRYPTED, acik TEXT, ek TEXT ENCRYPTED)');
+  sq.Exec('COPY sec_copy FROM ''' + fn + ''' (FORMAT ARROW)');
+  ChkVal('Arrow import sifreli TEXT', 'SELECT ad FROM sec_copy WHERE id=1',
+    0, 0, 'gizli-abc');
+  ChkVal('Arrow import sifreli BLOB', 'SELECT notu FROM sec_copy WHERE id=1',
+    0, 0, 'blob-gizli');
+  ChkVal('Arrow import ALTER kolonu', 'SELECT ek FROM sec_copy WHERE id=4',
+    0, 0, 'ek-gizli');
+
+  // Yedek, sifreli kolonlarin acilmasi icin .colkey'i da tasimali.
+  kv.BackupTo(dir + '\sec_backup.odb');
+  Dogrula('yedek .colkey kopyaladi',
+    FileExists(dir + '\sec_backup.colkey'), dir + '\sec_backup.colkey');
+end;
+
 function TMetricsTestProvider.Get: string;
 begin
   Result := Text;
@@ -13088,6 +13247,7 @@ T92_MVCC_Isoaltion;
        T122_KvStore;
        T123_Arrow;
        T124_Parquet;
+       T125_KolonSifreleme;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls

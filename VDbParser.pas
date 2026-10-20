@@ -792,6 +792,8 @@ begin
   C.GenExpr := '';
   C.Identity := 0;   // M10: GENERATED ... AS IDENTITY
   C.VecDim := 0;     // M4: VECTOR(n)
+  C.Encrypted := False;   // M6: kolon sifreleme
+  C.ColKeyId := 0;
   // Tip adını oku
   C.Ctype := ParseTypeName(C.VecDim);
 
@@ -836,6 +838,11 @@ begin
     else if U = 'UNIQUE' then
     begin
       C.Unique := True;
+    end
+    // ---- M6: kolon seviyesi sifreleme ----
+    else if U = 'ENCRYPTED' then
+    begin
+      C.Encrypted := True;
     end
     else if U = 'REFERENCES' then
     begin

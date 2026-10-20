@@ -326,6 +326,10 @@ FPath: string;
     { Basliktaki Flags alaninin bit 0'i: dosyada en az bir sifreli kayit var.
       Open without anahtar ile dosyanin 'sifreli' oldugu bilinsin diye. }
     FEncFlags: LongWord;
+    { M6: kolon seviyesi sifrelemede kullanilan anahtar kimligi. 0 ise
+      bu veritabaninda henuz kolon anahtari yok. Anahtarin kendisi
+      <db>.colkey dosyasindan yuklenir; burada yalnizca kimlik tutulur. }
+    FColKeyId: QWord;
     function EncryptValue(const Value: TBytes; out Cipher: TBytes): Boolean;
     function DecryptValue(const Cipher: TBytes; out Plain: TBytes): Boolean;
     procedure CheckOpen;
@@ -683,6 +687,13 @@ property DeadBytes: Int64 read FDeadBytes;
     function OpenKeyFile(const FileName, Password: string): Boolean;
     { Bu veritabaninin varsayilan .key yolu. }
     function KeyPath: string;
+    { M6: kolon seviyesi sifreleme anahtari. Dosya yoksa olusturur;
+      varsa yukler. Doner: anahtar kimligi. }
+    function EnsureColumnKey: QWord;
+    { Yuklu kolon anahtarinin kimligi; 0 = yok. }
+    function ColumnKeyId: QWord;
+    { <db>.colkey yolu. }
+    function ColumnKeyPath: string;
     { Etkin anahtarin SHA256 parmak izi (hex) - tanilama/log icin.
       Anahtarin KENDISINI vermez. }
     function EncryptionKeyFingerprint: string;
@@ -793,6 +804,7 @@ FSavepoints := TList<TSavepoint>.Create;
   FDeadBytes := 0;
   FDataStart := VDB_HDR_SIZE;
   FEncFlags := 0;
+  FColKeyId := 0;
   FReadMapEnabled := False;  // H4: olcumle net kazanc yok -> varsayilan kapali
 end;
 
@@ -1601,6 +1613,7 @@ end;
 procedure TVDb.Open(const Dir: string);
 var
   Loc, Old: string;
+  ColKeyFile: string;
 begin
   FLock.Enter;
   try
@@ -1634,6 +1647,15 @@ begin
     FDirSyncFailed := False;
     FNewFile := False;
     FEncFlags := 0;
+    { M6: kolon anahtari varsa acilista yukle. Yoksa sifreli kolon
+      okumalari anahtar isteyene kadar hata verir; sema yukleme ayrica
+      sifreli kolon varken anahtarsiz acilmaya izin vermez. }
+    FColKeyId := 0;
+    ColKeyFile := ChangeFileExt(FPath, '.colkey');
+    if FileExists(ColKeyFile) then
+      if not VDbColumnKeyLoadFile(ColKeyFile, FColKeyId) then
+        raise EVDbException.Create(ecIOError,
+          'VDb: kolon anahtar dosyasi okunamadi: ' + ColKeyFile);
     if not FileExists(FPath) and FileExists(FPath + '.bak') then
     begin
       if not RenameFile(FPath + '.bak', FPath) then
@@ -3977,6 +3999,12 @@ begin
     if FileExists(DestPath) then DeleteFile(DestPath);
     if not RenameFile(tmp, DestPath) then
       raise EVDbException.Create(ecIOError, 'VDb: yedek tasinamadi: ' + DestPath);
+    // M6: sifreli kolonlar varsa anahtar dosyasi da yedegin yanina
+    // kopyalanir; aksi halde yedek tek basina acilamaz.
+    if FileExists(ColumnKeyPath) then
+      if not CopyFileRaw(ColumnKeyPath, ChangeFileExt(DestPath, '.colkey')) then
+        raise EVDbException.Create(ecIOError,
+          'VDb: kolon anahtar dosyasi yedege kopyalanamadi: ' + DestPath);
     VDbFlushDir(dir);
     { R-16: yedek anina kadar bekleyen WAL'i arsive tasir. Yedekten
       SONRA olan degisiklikler arsivde kalir; RECOVER TO TIMESTAMP
@@ -4249,6 +4277,50 @@ end;
 function TVDb.KeyPath: string;
 begin
   Result := ChangeFileExt(FPath, '.key');
+end;
+
+function TVDb.ColumnKeyPath: string;
+begin
+  Result := ChangeFileExt(FPath, '.colkey');
+end;
+
+function TVDb.ColumnKeyId: QWord;
+begin
+  FLock.Enter;
+  try
+    Result := FColKeyId;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TVDb.EnsureColumnKey: QWord;
+var
+  p: string;
+begin
+  FLock.Enter;
+  try
+    if FColKeyId <> 0 then Exit(FColKeyId);
+    if Trim(FPath) = '' then
+      raise EVDbException.Create(ecIOError,
+        'VDb: kolon anahtari icin veritabani yolu yok');
+    p := ColumnKeyPath;
+    if FileExists(p) then
+    begin
+      if not VDbColumnKeyLoadFile(p, FColKeyId) then
+        raise EVDbException.Create(ecIOError,
+          'VDb: kolon anahtar dosyasi okunamadi: ' + p);
+    end
+    else
+    begin
+      if not VDbColumnKeyCreateFile(p, FColKeyId) then
+        raise EVDbException.Create(ecIOError,
+          'VDb: kolon anahtar dosyasi olusturulamadi: ' + p);
+    end;
+    Result := FColKeyId;
+  finally
+    FLock.Leave;
+  end;
 end;
 
 function TVDb.CreateKeyFile(const FileName, Password: string): Boolean;
