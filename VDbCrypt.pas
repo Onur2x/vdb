@@ -168,8 +168,21 @@ implementation
 
 uses
   {$IFDEF MSWINDOWS} Windows, {$ENDIF}
+  {$IFDEF UNIX} BaseUnix, {$ENDIF}
   Generics.Collections, SyncObjs,
   dcpcrypt2, dcpblockciphers, dcprijndael, dcpsha256, VDbKdf;
+
+{ M6: Unix'te DPAPI yok; anahtar dosyasi yalnizca dosya izinleriyle
+  korunur. .colkey'i sahibine okuma/yazma ile sinirla (0600). }
+procedure VDbRestrictKeyFile(const FileName: string);
+{$IFDEF UNIX}
+begin
+  fpChmod(PChar(FileName), &600);
+end;
+{$ELSE}
+begin
+end;
+{$ENDIF}
 
 {$IFDEF MSWINDOWS}
 const
@@ -1363,6 +1376,7 @@ begin
   finally
     fs.Free;
   end;
+  VDbRestrictKeyFile(tmp);
   if FileExists(FileName) then
     if not SysUtils.DeleteFile(FileName) then
       raise EVdbCryptError.Create('eski kolon anahtar dosyasi silinemedi: ' +
