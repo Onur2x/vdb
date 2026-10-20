@@ -290,6 +290,9 @@ type
   TVTableDb = class
   private
     FKv: TVDb;
+    { M11: satir/sema KV erisimi bu arayuz uzerinden yapilir. Varsayilan
+      uygulama TVDbKvStore'dur; ileride ikinci bir backend denenebilir. }
+    FKvStore: IVDbKvStore;
     // KR-7: Coklu Okuma Kilidi (TMultiReadExclusiveWriteSynchronizer).
     // SELECT sorgulari LockRead/UnlockRead ile paralel calisir;
     // INSERT/UPDATE/DELETE/DDL Lock/Unlock (yazma kilidi) ile serialize edilir.
@@ -3529,6 +3532,7 @@ constructor TVTableDb.Create(AKv: TVDb);
 begin
   inherited Create;
   FKv := AKv;
+  FKvStore := TVDbKvStore.Create(FKv);
   // R-26: KV katmanina tablo-id cozucusunu ver. Boylece Recover, zaten
   // CRC icin okudugu her kayittan tablo id'yi bedava cikarir ve tablo
   // taramalari diger tablolarin kayitlarini OKUMAZ.
@@ -4028,7 +4032,7 @@ begin
     parts.Delimiter := '|'; parts.StrictDelimiter := True;
     cp.Delimiter := ','; cp.StrictDelimiter := True;
     // 1) katalog .odb icinde mi?
-    if FKv.Get(VDB_SCHEMA_KEY, b) and (Length(b) > Length(VDB_SCHEMA_TAG)) then
+    if FKvStore.Get(VDB_SCHEMA_KEY, b) and (Length(b) > Length(VDB_SCHEMA_TAG)) then
     begin
       SetLength(raw, Length(b));
       Move(b[0], raw[1], Length(b));
@@ -4240,7 +4244,7 @@ begin
     raw := VDB_SCHEMA_TAG + sLineBreak + sl.Text;
     SetLength(b, Length(raw));
     if Length(raw) > 0 then Move(raw[1], b[0], Length(raw));
-    FKv.Put(VDB_SCHEMA_KEY, b);
+    FKvStore.Put(VDB_SCHEMA_KEY, b);
     // batch icindeyse tek fsync CommitBatch'te olur, burada Flush yok
     if not FKv.InBatch then
       FKv.Flush;
@@ -4291,7 +4295,7 @@ var
 begin
   SetLength(diskNames, 0);
   nDisk := 0;
-  if FKv.Get(VDB_SCHEMA_KEY, b) and (Length(b) > Length(VDB_SCHEMA_TAG)) then
+  if FKvStore.Get(VDB_SCHEMA_KEY, b) and (Length(b) > Length(VDB_SCHEMA_TAG)) then
   begin
     SetLength(raw, Length(b));
     Move(b[0], raw[1], Length(b));
@@ -5181,7 +5185,7 @@ begin
         'partition anahtari NULL olamaz: ' + T.PartCol);
   end;
   key := VDbHashKey(T.Name, Pk);
-  if FKv.Get(key, oldB) then
+  if FKvStore.Get(key, oldB) then
   begin
     // DIKKAT: kararÄ±n esas belirleyicisi exPk'dir; TID karÅŸÄ±laÅŸtÄ±rmasÄ±
     // F-34 MV'lerinde anlamsÄ±zdÄ±r. Normal tabloda exPk esitse aynÄ± satÄ±r
@@ -5195,7 +5199,7 @@ begin
   // replay yapmiyor (ReplayWAL stub) ve her cagri .wal'i bastan aciyor
   // (fmCreate) â€” yani hem ise yaramiyor hem her satirda dosya aciyordu.
   // Gercek dayaniklilik: batch basina tek fsync + BATCHEND + recovery.
-  FKv.Put(key, b);
+  FKvStore.Put(key, b);
   // Indeksleri guncelle (cok kolonlu destekli)
   IdxAddRow(T, Vals, Pk, -1);
 end;
@@ -6743,7 +6747,7 @@ begin
   // ONEMLI: once hepsini cozup KOPYALIYORUZ. Ara adimda (orn. index
   // erisimi) ScanAll tekrar cagrilirsa paylasilan dizi uzerine
     // yazilir ve asagidaki satirlar bozulur -> access violation.
-    FKv.ScanAll(keys, raw, T.TableId);   // R-26: yalnizca bu tablonun satirlari
+    FKvStore.ScanAll(keys, raw, T.TableId);   // R-26: yalnizca bu tablonun satirlari
   // KR-2: on-tahsis (max keys boyutu), sonunda budama.
   SetLength(oldKeys, Length(keys));
   SetLength(pks, Length(keys));
@@ -6789,7 +6793,7 @@ begin
     for i := 0 to High(oldKeys) do
     begin
       // F1-8: silmeden once hash'in gercekten bu satiri gosterdigini dogrula.
-      if FKv.Get(oldKeys[i], b) then
+      if FKvStore.Get(oldKeys[i], b) then
       begin
         if not DecodeRow(b, exTid, exPk, exVals) then
           raise EVDbException.CreateFmt(ecCorrupt,
@@ -6797,12 +6801,12 @@ begin
         if (exTid <> T.TableId) or (exPk <> pks[i]) then
           raise EVDbException.CreateFmt(ecHashCollision, 'VDb: hash carpismasi (tablo=%s, pk=%s)', [T.Name, pks[i]]);
       end;
-      FKv.Delete(oldKeys[i]);
+      FKvStore.Delete(oldKeys[i]);
     end;
     for i := 0 to High(pks) do
     begin
       nb := EncodeRow(T.TableId, pks[i], T, newRows[i]);
-      FKv.Put(VDbHashKey(T.Name, pks[i]), nb);
+      FKvStore.Put(VDbHashKey(T.Name, pks[i]), nb);
     end;
     if ownBatch then FKv.CommitBatch;
   except
@@ -6852,7 +6856,7 @@ begin
     for i := 0 to High(Pks) do
     begin
       // F1-8: silmeden once hash'in gercekten bu satiri gosterdigini dogrula.
-      if FKv.Get(VDbHashKey(T.Name, Pks[i]), b) then
+      if FKvStore.Get(VDbHashKey(T.Name, Pks[i]), b) then
       begin
         if not DecodeRow(b, exTid, exPk, exVals) then
           raise EVDbException.CreateFmt(ecCorrupt,
@@ -6860,12 +6864,12 @@ begin
         if (exTid <> T.TableId) or (exPk <> Pks[i]) then
           raise EVDbException.CreateFmt(ecHashCollision, 'VDb: hash carpismasi (%s, %s)', [T.Name, Pks[i]]);
       end;
-      FKv.Delete(VDbHashKey(T.Name, Pks[i]));
+      FKvStore.Delete(VDbHashKey(T.Name, Pks[i]));
     end;
     for i := 0 to High(Pks) do
     begin
       nb := EncodeRow(T.TableId, Pks[i], T, newRows[i]);
-      FKv.Put(VDbHashKey(T.Name, Pks[i]), nb);
+      FKvStore.Put(VDbHashKey(T.Name, Pks[i]), nb);
     end;
     if ownBatch then FKv.CommitBatch;
   except
@@ -7370,7 +7374,7 @@ begin
   if Trim(NewName) = '' then raise EVDbException.Create(ecInvalidName, 'yeni ad bos olamaz');
 
     // KEY tablo adi ile hashlendigi icin tum anahtarlar degismeli
-    FKv.ScanAll(keys, raw, t.TableId);   // R-26
+    FKvStore.ScanAll(keys, raw, t.TableId);   // R-26
   ownBatch := not FKv.InBatch;
   if ownBatch then FKv.BeginBatch;
   try
@@ -7383,15 +7387,15 @@ begin
         raise EVDbException.CreateFmt(ecCorrupt,
           'VDb: rename sirasinda bozuk satir (tablo=%s, key=%d)', [old, i]);
       if tid <> t.TableId then Continue;
-      FKv.Delete(keys[i]);
+      FKvStore.Delete(keys[i]);
       nb := EncodeRow(tid, pk, t, nv);
       // F1-8: yeni hash baska bir satira aitse Put sessizce onu ezer.
-      if FKv.Get(VDbHashKey(nn, pk), ob) then
+      if FKvStore.Get(VDbHashKey(nn, pk), ob) then
         if DecodeRow(ob, otid, opk, ovals) and
            ((otid <> t.TableId) or (opk <> pk)) then
           raise EVDbException.CreateFmt(ecHashCollision,
             'VDb: hash carpismasi (tablo=%s, pk=%s)', [nn, pk]);
-      FKv.Put(VDbHashKey(nn, pk), nb);
+      FKvStore.Put(VDbHashKey(nn, pk), nb);
     end;
     if ownBatch then FKv.CommitBatch;
   except
@@ -8253,7 +8257,7 @@ begin
             [kv2.Key, kv2.Value.Fks[j].Col, nReferencing]);
       end;
   end;
-    FKv.ScanAll(keys, raw, t.TableId);   // R-26: yalnizca bu tablonun satirlari
+    FKvStore.ScanAll(keys, raw, t.TableId);   // R-26: yalnizca bu tablonun satirlari
     ownBatch := not FKv.InBatch;
   if ownBatch then FKv.BeginBatch;
   try
@@ -8262,7 +8266,7 @@ begin
       k := keys[i];
       if k = VDB_SCHEMA_KEY then Continue;
       if not DecodeRow(raw[i], tid, pk, vals) then Continue;
-      if tid = t.TableId then FKv.Delete(k);
+      if tid = t.TableId then FKvStore.Delete(k);
     end;
     if ownBatch then FKv.CommitBatch;
   except
@@ -8501,7 +8505,7 @@ begin
   // Exists saf aramadir (pending+index+tombstone); yalniz anahtar GERCEKTEN
   // varsa deger okunur ve "duplicate vs hash carpismasi" siniflandirmasi
   // aynen korunur.
-  if FKv.Exists(key) and FKv.Get(key, b) then
+  if FKv.Exists(key) and FKvStore.Get(key, b) then
   begin
     if DecodeRow(b, exTid, exPk, exVals) and (exTid = t.TableId) and (exPk = pk) then
       raise EVDbException.Create(ecDuplicatePrimaryKey, 'duplicate PK: ' + pk)
@@ -8509,7 +8513,7 @@ begin
       raise EVDbException.CreateFmt(ecHashCollision, 'VDb: hash carpismasi (%s, %s)', [t.Name, pk]);
   end;
   b := EncodeRow(t.TableId, pk, t, vals);
-  FKv.Put(key, b);
+  FKvStore.Put(key, b);
   IdxAddRow(t, vals, pk, -1);
 end;
 
@@ -8524,7 +8528,7 @@ begin
   if not ReadRow(t.Name, Pk, vals) then Exit(False);
   CheckRestrict(t, vals, 'DELETE', '');
   IdxDelRow(t, vals, Pk, -1);
-  Result := FKv.Delete(VDbHashKey(t.Name, Pk));
+  Result := FKvStore.Delete(VDbHashKey(t.Name, Pk));
 end;
 
 function TVTableDb.CandidatePks(const T: TTableDef; const Groups: TWhereGroups;
@@ -8653,7 +8657,7 @@ begin
       if not VDbMatchGroups(rows[i], Groups) then Continue;
       CheckRestrict(t, rows[i], 'DELETE', '');
       IdxDelRow(t, rows[i], pks[i], -1);
-      FKv.Delete(VDbHashKey(t.Name, pks[i]));
+      FKvStore.Delete(VDbHashKey(t.Name, pks[i]));
       Inc(Result);
     end;
     if ownBatch then FKv.CommitBatch;
@@ -8672,7 +8676,7 @@ var
 begin
   Result := False;
   t := GetTable(Table);
-  if not FKv.Get(VDbHashKey(t.Name, Pk), b) then Exit;
+  if not FKvStore.Get(VDbHashKey(t.Name, Pk), b) then Exit;
   if not DecodeRow(b, tid, apk, Vals) then Exit;
   if (tid = t.TableId) and (apk = Pk) then
   begin
@@ -8841,7 +8845,7 @@ begin
   if Targets.HasFilter and (t.PartType <> '') then
     for i := 0 to High(t.Cols) do
       if t.Cols[i].Name = t.PartCol then begin pci := i; Break; end;
-    FKv.ScanAll(keys, raw, t.TableId);   // R-26: diger tablolar okunmaz
+    FKvStore.ScanAll(keys, raw, t.TableId);   // R-26: diger tablolar okunmaz
   // keys/raw zaten aday satir sayisi kadar ayrildi. Sonuc dizilerini de
   // basta bir kez ayir; her satirda SetLength yapmak O(N^2) kopyalamaya
   // yol aciyordu.
@@ -9041,12 +9045,12 @@ begin
 
   b := EncodeRow(t.TableId, Pk, t, newVals);
   key := VDbHashKey(t.Name, Pk);
-  if FKv.Get(key, oldB) then
+  if FKvStore.Get(key, oldB) then
     if DecodeRow(oldB, exTid, exPk, exVals) and
        ((exTid <> t.TableId) or (exPk <> Pk)) then
       raise EVDbException.CreateFmt(ecHashCollision,
         'VDb: hash carpismasi (%s, %s)', [t.Name, Pk]);
-  FKv.Put(key, b);
+  FKvStore.Put(key, b);
 
   // Indeks bakimi: yalniz degisen kolonlardan birini iceren indeksler.
   // Once IdxDel(eski)+IdxAdd(yeni) idi; batch icinde eski deger bayat
@@ -9146,7 +9150,7 @@ var
   dummy: TBytes;
 begin
   Result := FKv.Count;
-  if FKv.Get(VDB_SCHEMA_KEY, dummy) then Dec(Result);
+  if FKvStore.Get(VDB_SCHEMA_KEY, dummy) then Dec(Result);
 end;
 
 
@@ -9259,7 +9263,7 @@ begin
     pk := '@mv' + IntToStr(i);
     if ReadRow(VDbNorm(ViewName), pk, vals) then
       IdxDelRow(v, vals, pk, -1);
-    FKv.Delete(VDbHashKey(v.Name, pk));
+    FKvStore.Delete(VDbHashKey(v.Name, pk));
     Inc(i);
   end;
   FTables.Remove(VDbNorm(ViewName));
@@ -9354,7 +9358,7 @@ begin
     pk := '@mv' + IntToStr(i);
     if ReadRow(VDbNorm(ViewName), pk, vals) then
       IdxDelRow(v, vals, pk, -1);
-    FKv.Delete(VDbHashKey(v.Name, pk));
+    FKvStore.Delete(VDbHashKey(v.Name, pk));
     Inc(i);
   end;
   v.AutoInc := 0;
@@ -9374,7 +9378,7 @@ begin
   i := 0;
   while i < v.AutoInc do
   begin
-    FKv.Delete(VDbHashKey(v.Name, '@mv' + IntToStr(i)));
+    FKvStore.Delete(VDbHashKey(v.Name, '@mv' + IntToStr(i)));
     Inc(i);
   end;
   v.AutoInc := 0;
@@ -9536,7 +9540,7 @@ begin
   CheckFk(t, vals);
   
   key := VDbHashKey(t.Name, pk);
-  if FKv.Get(key, b) then
+  if FKvStore.Get(key, b) then
   begin
     if DecodeRow(b, exTid, exPk, exVals) and (exTid = t.TableId) and (exPk = pk) then
       raise EVDbException.Create(ecDuplicatePrimaryKey, 'duplicate PK: ' + pk)
@@ -9545,7 +9549,7 @@ begin
   end;
   
   b := EncodeRow(t.TableId, pk, t, vals);
-  FKv.Put(key, b);
+  FKvStore.Put(key, b);
   IdxAddRow(t, vals, pk, -1);
   
   // RETURNING icin donus degerleri
@@ -9641,7 +9645,7 @@ begin
   
   key := VDbHashKey(t.Name, pk);
   // P-17c: conflict YOKKEN deger ayirmaya gerek yok; Once saf arama.
-  conflict := FKv.Exists(key) and FKv.Get(key, b);
+  conflict := FKv.Exists(key) and FKvStore.Get(key, b);
   
   if conflict then
   begin
@@ -9702,7 +9706,7 @@ begin
 
         // Yeni satir yaz
         b := EncodeRow(t.TableId, pk, t, vals);
-        FKv.Put(key, b);
+        FKvStore.Put(key, b);
         IdxAddRow(t, vals, pk, -1);
 
         OutPk := pk;
@@ -9720,7 +9724,7 @@ begin
   begin
     // Conflict yok - normal insert
     b := EncodeRow(t.TableId, pk, t, vals);
-    FKv.Put(key, b);
+    FKvStore.Put(key, b);
     IdxAddRow(t, vals, pk, -1);
     
     OutPk := pk;

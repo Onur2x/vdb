@@ -40,6 +40,83 @@ type
     function Get: string;
   end;
 
+  { M11: IVDbKvStore'un ikinci (bellek-ici) backend'i. Yalnizca arayuz
+    sozlesmesini ve backend degistirilebilirligini dogrulamak icin. }
+  TMemKvStore = class(TInterfacedObject, IVDbKvStore)
+  private
+    FKeys: array of QWord;
+    FVals: array of TBytes;
+    function Find(Key: QWord): Integer;
+  public
+    procedure Put(Key: QWord; const Value: TBytes);
+    function Get(Key: QWord; out Value: TBytes): Boolean;
+    function Delete(Key: QWord): Boolean;
+    procedure ScanAll(out Keys: TQWordArray; out Vals: TValArray;
+      TableFilter: Integer);
+  end;
+
+function TMemKvStore.Find(Key: QWord): Integer;
+var
+  i: Integer;
+begin
+  for i := 0 to High(FKeys) do
+    if FKeys[i] = Key then Exit(i);
+  Result := -1;
+end;
+
+procedure TMemKvStore.Put(Key: QWord; const Value: TBytes);
+var
+  i: Integer;
+begin
+  i := Find(Key);
+  if i < 0 then
+  begin
+    i := Length(FKeys);
+    SetLength(FKeys, i + 1);
+    SetLength(FVals, i + 1);
+    FKeys[i] := Key;
+  end;
+  FVals[i] := Copy(Value, 0, Length(Value));
+end;
+
+function TMemKvStore.Get(Key: QWord; out Value: TBytes): Boolean;
+var
+  i: Integer;
+begin
+  i := Find(Key);
+  Result := i >= 0;
+  if Result then Value := Copy(FVals[i], 0, Length(FVals[i]))
+  else Value := nil;
+end;
+
+function TMemKvStore.Delete(Key: QWord): Boolean;
+var
+  i, n: Integer;
+begin
+  i := Find(Key);
+  Result := i >= 0;
+  if not Result then Exit;
+  n := High(FKeys);
+  FKeys[i] := FKeys[n];
+  FVals[i] := FVals[n];
+  SetLength(FKeys, n);
+  SetLength(FVals, n);
+end;
+
+procedure TMemKvStore.ScanAll(out Keys: TQWordArray; out Vals: TValArray;
+  TableFilter: Integer);
+var
+  i: Integer;
+begin
+  SetLength(Keys, Length(FKeys));
+  SetLength(Vals, Length(FVals));
+  for i := 0 to High(FKeys) do
+  begin
+    Keys[i] := FKeys[i];
+    Vals[i] := Copy(FVals[i], 0, Length(FVals[i]));
+  end;
+end;
+
 { ------------------------------------------------------------ yardimcilar }
 
 procedure Grp(const N: string);
@@ -12019,6 +12096,47 @@ begin
     0, 0, '2');
 end;
 
+procedure T122_KvStore;
+// M11: IVDbKvStore sozlesmesi. Bellek-ici ikinci backend ve TVDb adapteri
+// ayni arayuz uzerinden ayni temel islemleri yapar.
+var
+  mem, real: IVDbKvStore;
+  db: TVDb;
+  b: TBytes;
+  keys: TQWordArray;
+  vals: TValArray;
+begin
+  Grp('M11 depolama arayuzu (IVDbKvStore)');
+  mem := TMemKvStore.Create;
+  mem.Put(7, VDbStrToBytes('abc'));
+  Dogrula('M11 mem Put/Get', mem.Get(7, b) and (VDbBytesToStr(b) = 'abc'),
+    VDbBytesToStr(b));
+  mem.Put(9, VDbStrToBytes('xyz'));
+  mem.ScanAll(keys, vals, -1);
+  Dogrula('M11 mem ScanAll', Length(keys) = 2, IntToStr(Length(keys)));
+  Dogrula('M11 mem Delete', mem.Delete(7) and (not mem.Get(7, b)), '');
+  mem.ScanAll(keys, vals, -1);
+  Dogrula('M11 mem ScanAll sonrasi',
+    (Length(keys) = 1) and (keys[0] = 9), IntToStr(Length(keys)));
+  mem := nil;
+
+  ForceDirectories(D + '\m11store');
+  db := TVDb.Create;
+  try
+    db.Open(D + '\m11store\kv.odb');
+    real := TVDbKvStore.Create(db);
+    real.Put(42, VDbStrToBytes('satir'));
+    Dogrula('M11 TVDb Put/Get',
+      real.Get(42, b) and (VDbBytesToStr(b) = 'satir'), VDbBytesToStr(b));
+    Dogrula('M11 TVDb Delete',
+      real.Delete(42) and (not real.Get(42, b)), '');
+    real := nil;
+  finally
+    db.Close;
+    db.Free;
+  end;
+end;
+
 function TMetricsTestProvider.Get: string;
 begin
   Result := Text;
@@ -12748,6 +12866,7 @@ T92_MVCC_Isoaltion;
        T118_AeadKdf;
        T119_Trace;
        T121_VectorAnn;
+       T122_KvStore;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls

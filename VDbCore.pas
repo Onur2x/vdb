@@ -60,6 +60,18 @@ const
 type
   TQWordArray = array of QWord;
   TValArray = array of TBytes;
+  { M11: depolama motoru DIKISI. Yalnizca temel KV islemleri bu arayuzde;
+    transaction, WAL, indeks ve sifreleme TVDb'de kalir. Amac, ileride
+    sayfa tabanli ikinci bir backend'in ust katmani degistirmeden
+    denenebilmesi. Bugun TVDbKvStore bunu TVDb'ye delege eder. }
+  IVDbKvStore = interface
+    ['{6D8B2E71-4C1A-4F6E-9E3B-7A5C0D2F1A44}']
+    procedure Put(Key: QWord; const Value: TBytes);
+    function Get(Key: QWord; out Value: TBytes): Boolean;
+    function Delete(Key: QWord): Boolean;
+    procedure ScanAll(out Keys: TQWordArray; out Vals: TValArray;
+      TableFilter: Integer);
+  end;
   { R-26 (2026-10-15): satirin icindeki TABLO ID'yi cozucu.
     KV katmani satir bicimini BILMEZ; cozucuyu VDbTable saglar ve TVDb
     icin atar. Boylece Recover, zaten CRC icin okudugu degerden tablo
@@ -674,6 +686,20 @@ property DeadBytes: Int64 read FDeadBytes;
     { Etkin anahtarin SHA256 parmak izi (hex) - tanilama/log icin.
       Anahtarin KENDISINI vermez. }
     function EncryptionKeyFingerprint: string;
+  end;
+
+  { M11: IVDbKvStore'un TVDb'ye delege eden varsayilan uygulamasi.
+    TVDb'yi SAHIPLENMEZ; yasam dongusu cagirana aittir. }
+  TVDbKvStore = class(TInterfacedObject, IVDbKvStore)
+  private
+    FDb: TVDb;
+  public
+    constructor Create(ADb: TVDb);
+    procedure Put(Key: QWord; const Value: TBytes);
+    function Get(Key: QWord; out Value: TBytes): Boolean;
+    function Delete(Key: QWord): Boolean;
+    procedure ScanAll(out Keys: TQWordArray; out Vals: TValArray;
+      TableFilter: Integer);
   end;
 
 function VDbStrToBytes(const S: RawByteString): TBytes;
@@ -5269,6 +5295,35 @@ begin
   OutPk := '';
   OutVals := nil;
   raise EVDbException.Create(ecUnsupported, 'UpsertRowReturning not implemented');
+end;
+
+{ TVDbKvStore }
+
+constructor TVDbKvStore.Create(ADb: TVDb);
+begin
+  inherited Create;
+  FDb := ADb;
+end;
+
+procedure TVDbKvStore.Put(Key: QWord; const Value: TBytes);
+begin
+  FDb.Put(Key, Value);
+end;
+
+function TVDbKvStore.Get(Key: QWord; out Value: TBytes): Boolean;
+begin
+  Result := FDb.Get(Key, Value);
+end;
+
+function TVDbKvStore.Delete(Key: QWord): Boolean;
+begin
+  Result := FDb.Delete(Key);
+end;
+
+procedure TVDbKvStore.ScanAll(out Keys: TQWordArray; out Vals: TValArray;
+  TableFilter: Integer);
+begin
+  FDb.ScanAll(Keys, Vals, TableFilter);
 end;
 
 initialization
