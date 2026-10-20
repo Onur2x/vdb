@@ -14,7 +14,7 @@ uses
   SysUtils, Classes, Math, VDbCore, VDbTypes, VDbTable, VDbSql, VDbSync, VDbCrc32,
   VDbCrypt, VDbKdf, VDbSpatial, VDbRange, VDbMonitor, VDbPlatform, VDbCost,
   VDbExtension, VDbText, VDbParallel, VDbReplication, VDbNet, VDbSqlServer,
-  VDbClientNet, VDbMetricsHttp, VDbPgWire, VDbTrace, dynlibs;
+  VDbClientNet, VDbMetricsHttp, VDbPgWire, VDbTls, VDbTrace, dynlibs;
 { VDbTypes: TStrArray / TStrMatrix gibi paylasilan tipler artik tek
   kaynaktan geliyor (ayri birimde ikinci tanim FPC'de sessizce
   FARKLI tip uretip derleme hatasi veriyordu). }
@@ -11594,6 +11594,241 @@ begin
   end;
 end;
 
+{ M1: pgwire TLS. Test sertifikasi YALNIZ bu test icindir; 100 yil
+  gecerli, kendinden imzali ECDSA P-256. Gercek kurulumda kullanici
+  kendi sertifika/anahtarini verir. }
+procedure T120_Tls;
+const
+  PPORT = 54731;
+  CERT_LINES: array[0..9] of string = (
+    '-----BEGIN CERTIFICATE-----',
+    'MIIBcDCCARagAwIBAgIUUu+v8AVyF1kfZCACHaOqVsdnqDYwCgYIKoZIzj0EAwIw',
+    'JzESMBAGA1UEAwwJbG9jYWxob3N0MREwDwYDVQQKDAhWREIgVGVzdDAgFw0yNjAx',
+    'MDEwMDAwMDBaGA8yMTI2MDEwMTAwMDAwMFowJzESMBAGA1UEAwwJbG9jYWxob3N0',
+    'MREwDwYDVQQKDAhWREIgVGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJ/T',
+    '1+9TYNfKHAqaWdxck5NxfPOjR3U8c0vetwOxTc959P3PEvBgYhhPjIqSLkgIGNva',
+    'fSEoSP7Eq8rKaq7784ejHjAcMBoGA1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATAK',
+    'BggqhkjOPQQDAgNIADBFAiEAzkonA+1eQ7+HnGsO44+Nfb6yCI7Dt6VvWXrj9Sel',
+    'l+ICIHvv/XSshv8RbS1MrcVsviaAOk8psk6sXRhvROgi7ntP',
+    '-----END CERTIFICATE-----');
+  KEY_LINES: array[0..4] of string = (
+    '-----BEGIN EC PRIVATE KEY-----',
+    'MHcCAQEEIMppOWxheYa0V8UBOqGynYCVXX8Bwbi12x4WeZcJSWHvoAoGCCqGSM49',
+    'AwEHoUQDQgAEn9PX71Ng18ocCppZ3FyTk3F886NHdTxzS963A7FNz3n0/c8S8GBi',
+    'GE+MipIuSAgY29p9IShI/sSryspqrvvzhw==',
+    '-----END EC PRIVATE KEY-----');
+var
+  srv: TVdbPgServer;
+  err, certPath, keyPath: string;
+  sl: TStringList;
+  s: TVdbSocket;
+  ctx: TVdbTlsContext;
+  sess: TVdbTlsSession;
+  ok: Boolean;
+  i: Integer;
+  answer: Byte;
+  t: AnsiChar;
+  bb: AnsiString;
+
+  function TlsSendAll(const Buf; Len: Integer): Boolean;
+  var
+    off, n: Integer;
+    p: PByte;
+  begin
+    Result := False;
+    if Len <= 0 then Exit(True);
+    p := @Buf;
+    off := 0;
+    while off < Len do
+    begin
+      n := sess.Write(p + off, Len - off);
+      if n <= 0 then Exit;
+      Inc(off, n);
+    end;
+    Result := True;
+  end;
+
+  function TlsRecvAll(var Buf; Len: Integer): Boolean;
+  var
+    got, n: Integer;
+    p: PByte;
+  begin
+    Result := False;
+    if Len <= 0 then Exit(True);
+    p := @Buf;
+    got := 0;
+    while got < Len do
+    begin
+      n := sess.Read(p + got, Len - got);
+      if n <= 0 then Exit;
+      Inc(got, n);
+    end;
+    Result := True;
+  end;
+
+  function TlsSendMsg(const M: AnsiString): Boolean;
+  begin
+    Result := False;
+    if M = '' then Exit(True);
+    Result := TlsSendAll(M[1], Length(M));
+  end;
+
+  function TlsRecvMsg(out T: AnsiChar; out Body: AnsiString): Boolean;
+  var
+    b: array[0..3] of Byte;
+    l: LongInt;
+  begin
+    Result := False;
+    Body := '';
+    if not TlsRecvAll(T, 1) then Exit;
+    if not TlsRecvAll(b, 4) then Exit;
+    l := LongInt((Cardinal(b[0]) shl 24) or (Cardinal(b[1]) shl 16) or
+      (Cardinal(b[2]) shl 8) or Cardinal(b[3]));
+    if l < 4 then Exit;
+    SetLength(Body, l - 4);
+    if (l > 4) and not TlsRecvAll(Body[1], l - 4) then Exit;
+    Result := True;
+  end;
+
+  function TlsStartup: Boolean;
+  var
+    param, st: AnsiString;
+  begin
+    Result := False;
+    param := 'user'#0 + 'postgres'#0 + 'database'#0 + 'vdb'#0 +
+      'client_encoding'#0 + 'UTF8'#0#0;
+    st := TPgI32(4 + 4 + Length(param)) + TPgI32(196608) + param;
+    if not TlsSendMsg(st) then Exit;
+    repeat
+      if not TlsRecvMsg(t, bb) then Exit;
+    until t = 'Z';
+    Result := True;
+  end;
+
+  function TlsQuery(const Sql: string; out RowBody: AnsiString): Boolean;
+  var
+    q, seq, body: AnsiString;
+    tt: AnsiChar;
+  begin
+    Result := False;
+    RowBody := '';
+    q := AnsiString(Sql);
+    if not TlsSendMsg('Q' + TPgI32(Length(q) + 5) + q + #0) then Exit;
+    seq := '';
+    while True do
+    begin
+      if not TlsRecvMsg(tt, body) then Exit;
+      seq := seq + AnsiString(tt);
+      if tt = 'D' then RowBody := body;
+      if tt = 'Z' then Break;
+    end;
+    Result := Pos('D', string(seq)) > 0;
+  end;
+
+  { SSLRequest gonderip 'S' yanitini bekleyen ham baglanti. }
+  function OpenRaw(out Sock: TVdbSocket; out Answer: Byte): Boolean;
+  begin
+    Result := False;
+    Sock := VdbTcpConnect('127.0.0.1', PPORT);
+    if Sock = VDB_SOCK_INVALID then Exit;
+    if not TPgSend(Sock, TPgI32(8) + TPgI32(80877103)) then Exit;
+    Result := VdbRecvU8(Sock, Answer);
+  end;
+
+  { TLS sunucusuna SSLRequest YAPMADAN baglanip startup gonderir. }
+  function PlainOnTlsServer: Boolean;
+  var
+    param, st: AnsiString;
+    sock: TVdbSocket;
+  begin
+    Result := False;
+    sock := VdbTcpConnect('127.0.0.1', PPORT);
+    if sock = VDB_SOCK_INVALID then Exit;
+    try
+      param := 'user'#0 + 'postgres'#0 + 'database'#0 + 'vdb'#0 +
+        'client_encoding'#0 + 'UTF8'#0#0;
+      st := TPgI32(4 + 4 + Length(param)) + TPgI32(196608) + param;
+      if not TPgSend(sock, st) then Exit;
+      repeat
+        if not TPgRecvMsg(sock, t, bb) then Exit;
+      until t = 'Z';
+      st := 'Q' + TPgI32(Length('SELECT 1') + 5) + 'SELECT 1'#0;
+      if not TPgSend(sock, st) then Exit;
+      while True do
+      begin
+        if not TPgRecvMsg(sock, t, bb) then Exit;
+        if t = 'D' then Result := True;
+        if t = 'Z' then Break;
+      end;
+    finally
+      VdbSockClose(sock);
+    end;
+  end;
+
+begin
+  Grp('M1 pgwire TLS (OpenSSL)');
+  certPath := D + '\pgtls_cert.pem';
+  keyPath := D + '\pgtls_key.pem';
+  sl := TStringList.Create;
+  try
+    for i := 0 to High(CERT_LINES) do sl.Add(CERT_LINES[i]);
+    sl.SaveToFile(certPath);
+    sl.Clear;
+    for i := 0 to High(KEY_LINES) do sl.Add(KEY_LINES[i]);
+    sl.SaveToFile(keyPath);
+  finally
+    sl.Free;
+  end;
+
+  Dogrula('TLS OpenSSL yuklendi', VDbTlsAvailable, VDbTlsLastError);
+  if not VDbTlsAvailable then Exit;
+
+  ForceDirectories(D + '\pgtls');
+  srv := TVdbPgServer.Create(D + '\pgtls', PPORT);
+  ctx := nil;
+  sess := nil;
+  s := VDB_SOCK_INVALID;
+  try
+    srv.SetTlsFiles(certPath, keyPath);
+    ok := srv.Start(err);
+    Dogrula('TLS sunucu basladi', ok, err);
+    if not ok then Exit;
+    Dogrula('TLS etkin', srv.TlsActive, '');
+
+    ok := OpenRaw(s, answer);
+    Dogrula('TLS SSLRequest yaniti S', ok and (answer = Ord('S')),
+      IntToStr(answer));
+    if not ok then Exit;
+
+    ctx := TVdbTlsContext.CreateClient;
+    ok := ctx.Connect(s, sess, err);
+    Dogrula('TLS istemci el sikismasi', ok, err);
+    if not ok then Exit;
+    Dogrula('TLS oturum kuruldu', sess <> nil, '');
+
+    Dogrula('TLS startup', TlsStartup, '');
+    bb := '';
+    Dogrula('TLS SELECT 1', TlsQuery('SELECT 1 AS tls_probe', bb), '');
+    Dogrula('TLS sonuc degeri 1',
+      (Length(bb) = 7) and (bb[1] = #0) and (bb[2] = #1) and
+      (bb[7] = '1'), IntToStr(Length(bb)));
+
+    FreeAndNil(sess);
+    VdbSockClose(s);
+    s := VDB_SOCK_INVALID;
+    FreeAndNil(ctx);
+
+    Dogrula('TLS sunucuda SSL istemeyen istemci de calisir',
+      PlainOnTlsServer, '');
+  finally
+    if sess <> nil then sess.Free;
+    if ctx <> nil then ctx.Free;
+    if s <> VDB_SOCK_INVALID then VdbSockClose(s);
+    srv.Stop;
+    srv.Free;
+  end;
+end;
+
 function TMetricsTestProvider.Get: string;
 begin
   Result := Text;
@@ -12322,6 +12557,11 @@ T92_MVCC_Isoaltion;
        T117_Generated;
        T118_AeadKdf;
        T119_Trace;
+       { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
+       if VDbTlsAvailable then
+         T120_Tls
+       else
+         WriteLn('   ATLA TLS testi (OpenSSL DLL bulunamadi)');
   
       except
         on E: Exception do

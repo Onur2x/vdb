@@ -6,7 +6,8 @@ unit VDbPgWire;
   "basit sorgu" (Simple Query, 'Q') ile baglanabilmesi.
 
   Desteklenen:
-    - StartupMessage v3 (SSLRequest/GSSENCRequest -> 'N')
+    - StartupMessage v3 (SSLRequest -> 'S' + TLS, yapilandirilmissa;
+      GSSENCRequest -> 'N')
     - AuthenticationOk (trust; parola istenmez)
     - ParameterStatus (server_version, client_encoding, DateStyle,
       integer_datetimes)
@@ -32,9 +33,13 @@ unit VDbPgWire;
       Extended COPY'de ReadyForQuery yalnizca Sync ile gonderilir;
       Describe Portal akisi baslatmaz, NoData doner.
 
+  TLS: sunucu sertifikasi PEM olarak verilir (`SetTlsFiles`); istemci
+  sertifikasi istenmez. OpenSSL dinamik yuklenir. TLS yapilandirilmissa
+  SSLRequest'a 'S' donulur; yapilandirilmamissa 'N' donulur.
+
   DESTEKLENMEYEN (bilincli sinir):
-    - SSL/TLS; gercek sonuc tip OID'leri (tum alanlar TEXT/OID 25).
-    - Binary sonuc formati istenirse hata dondurulur; sonuclar metindir.
+    - GSSENC.
+    - Binary sonuc formati yalniz int8/float8/bool/date/timestamp/text icin.
     - NULL ile bos metin ayrimi: motor ikisini de '' olarak tutar;
       DataRow'da her ikisi de uzunluk 0 olarak gonderilir.
     - Numeric/date/time/timestamp gibi karmasik binary parametreler
@@ -50,23 +55,46 @@ interface
 
 uses
   SysUtils, DateUtils, Classes, SyncObjs, Generics.Collections, VDbTypes, VDbCore, VDbTable, VDbSql, VDbAst,
-  VDbParser, VDbNet, VDbErr;
+  VDbParser, VDbNet, VDbErr, VDbTls;
 
 type
   TVdbPgServer = class;
 
+  { M1: ham soket veya TLS oturumu uzerinden okuma/yazma. TLS
+    baslatilana kadar tum trafik ham soketten gider; SSLRequest
+    geldiginde StartTls ile yukseltilir. }
+  TVdbPgIo = class
+  private
+    FSock: TVdbSocket;
+    FTls: TVdbTlsSession;
+    FTlsErr: string;
+  public
+    constructor Create(ASock: TVdbSocket);
+    destructor Destroy; override;
+    function StartTls(ACtx: TVdbTlsContext): Boolean;
+    function RecvAll(var ABuf; ALen: Integer): Boolean;
+    function SendAll(const ABuf; ALen: Integer): Boolean;
+    function RecvU8(out AV: Byte): Boolean;
+    function SendU8(AV: Byte): Boolean;
+    procedure Shutdown;
+    property Sock: TVdbSocket read FSock;
+    property Tls: TVdbTlsSession read FTls;
+    property TlsError: string read FTlsErr;
+  end;
+
   TVdbPgConn = class(TThread)
   private
     FServer: TVdbPgServer;
-    FSock: TVdbSocket;
+    FIO: TVdbPgIo;
     FSql: TVSql;
+    function GetSock: TVdbSocket;
   protected
     procedure Execute; override;
   public
     constructor Create(AServer: TVdbPgServer; ASock: TVdbSocket);
     destructor Destroy; override;
     procedure Wake;
-    property Sock: TVdbSocket read FSock;
+    property Sock: TVdbSocket read GetSock;
   end;
 
   TVdbPgAccept = class(TThread)
@@ -93,18 +121,27 @@ type
     FLastErr: string;
     FServed: Integer;
     FMaxConns: Integer;
+    FTls: TVdbTlsContext;
+    FTlsCert: string;
+    FTlsKey: string;
     procedure AddConn(AConn: TVdbPgConn);
     procedure CloseEngine;
+    procedure CloseTls;
+    function GetTlsActive: Boolean;
   public
     constructor Create(const ADir: string; APort: Word);
     destructor Destroy; override;
     function Start(out AErr: string): Boolean;
     procedure Stop;
+    { TLS'i etkinlestirir. Start'tan once cagrilmalidir. Sertifika ve
+      anahtar PEM dosyasidir; ikisi de zorunludur. }
+    procedure SetTlsFiles(const ACertFile, AKeyFile: string);
     property Ready: Boolean read FReady;
     property Port: Word read FPort;
     property LastError: string read FLastErr;
     property Served: Integer read FServed;
     property Dir: string read FDir;
+    property TlsActive: Boolean read GetTlsActive;
   end;
 
 implementation
@@ -187,11 +224,116 @@ begin
   Result := T + NetI32(Length(Body) + 4) + Body;
 end;
 
-function RecvI32(S: TVdbSocket; out V: LongInt): Boolean;
+{ ------------------------------------------------------ baglanti G/C }
+constructor TVdbPgIo.Create(ASock: TVdbSocket);
+begin
+  inherited Create;
+  FSock := ASock;
+  FTls := nil;
+  FTlsErr := '';
+end;
+
+destructor TVdbPgIo.Destroy;
+begin
+  if FTls <> nil then
+  begin
+    FTls.Free;
+    FTls := nil;
+  end;
+  if FSock <> VDB_SOCK_INVALID then
+  begin
+    VdbSockClose(FSock);
+    FSock := VDB_SOCK_INVALID;
+  end;
+  inherited Destroy;
+end;
+
+function TVdbPgIo.StartTls(ACtx: TVdbTlsContext): Boolean;
+var
+  sess: TVdbTlsSession;
+  err: string;
+begin
+  Result := False;
+  FTlsErr := '';
+  if (ACtx = nil) or (FTls <> nil) or (FSock = VDB_SOCK_INVALID) then Exit;
+  if not VdbSendU8(FSock, Ord('S')) then Exit;
+  sess := nil;
+  if not ACtx.Accept(FSock, sess, err) then
+  begin
+    FTlsErr := err;
+    Exit;
+  end;
+  FTls := sess;
+  Result := True;
+end;
+
+function TVdbPgIo.RecvAll(var ABuf; ALen: Integer): Boolean;
+var
+  got, n: Integer;
+  p: PByte;
+begin
+  Result := False;
+  if ALen < 0 then Exit;
+  if ALen = 0 then Exit(True);
+  p := @ABuf;
+  if FTls <> nil then
+  begin
+    got := 0;
+    while got < ALen do
+    begin
+      n := FTls.Read(p + got, ALen - got);
+      if n <= 0 then Exit;
+      Inc(got, n);
+    end;
+    Exit(True);
+  end;
+  Result := VdbRecvAll(FSock, ABuf, ALen);
+end;
+
+function TVdbPgIo.SendAll(const ABuf; ALen: Integer): Boolean;
+var
+  sent, n: Integer;
+  p: PByte;
+begin
+  Result := False;
+  if ALen < 0 then Exit;
+  if ALen = 0 then Exit(True);
+  p := @ABuf;
+  if FTls <> nil then
+  begin
+    sent := 0;
+    while sent < ALen do
+    begin
+      n := FTls.Write(p + sent, ALen - sent);
+      if n <= 0 then Exit;
+      Inc(sent, n);
+    end;
+    Exit(True);
+  end;
+  Result := VdbSendAll(FSock, ABuf, ALen);
+end;
+
+function TVdbPgIo.RecvU8(out AV: Byte): Boolean;
+begin
+  Result := RecvAll(AV, 1);
+end;
+
+function TVdbPgIo.SendU8(AV: Byte): Boolean;
+begin
+  Result := SendAll(AV, 1);
+end;
+
+procedure TVdbPgIo.Shutdown;
+begin
+  if FSock <> VDB_SOCK_INVALID then
+    VdbSockShutdown(FSock);
+end;
+
+function RecvI32(S: TVdbPgIo; out V: LongInt): Boolean;
 var
   b: array[0..3] of Byte;
 begin
-  Result := VdbRecvAll(S, b, 4);
+  Result := S.RecvAll(b, 4);
   if Result then
     V := LongInt((Cardinal(b[0]) shl 24) or (Cardinal(b[1]) shl 16) or
       (Cardinal(b[2]) shl 8) or Cardinal(b[3]));
@@ -590,16 +732,17 @@ begin
   Result := w1;
 end;
 
-function SendPg(S: TVdbSocket; const M: AnsiString): Boolean;
+function SendPg(S: TVdbPgIo; const M: AnsiString): Boolean;
 begin
   Result := False;
   if M = '' then Exit(True);
-  Result := VdbSendAll(S, M[1], Length(M));
+  Result := S.SendAll(M[1], Length(M));
 end;
 
 { ------------------------------------------------ startup + basit sorgu }
 
-function ReadStartup(S: TVdbSocket; out AUser: string): Boolean;
+function ReadStartup(S: TVdbPgIo; ATls: TVdbTlsContext;
+  out AUser: string): Boolean;
 var
   len, code: LongInt;
   body: AnsiString;
@@ -614,12 +757,23 @@ begin
     if (len < 8) or (len > 65536) then Exit;
     SetLength(body, len - 4);
     if (len - 4) > 0 then
-      if not VdbRecvAll(S, body[1], len - 4) then Exit;
+      if not S.RecvAll(body[1], len - 4) then Exit;
     code := NetToI32(body, 1);
-    if (code = 80877103) or (code = 80877104) then
+    if code = 80877103 then
     begin
-      // SSLRequest / GSSENCRequest: sifreleme yok -> tek bayt 'N'.
-      if not VdbSendU8(S, Ord('N')) then Exit;
+      // SSLRequest: TLS yapilandirilmissa 'S' + el sikismasi, yoksa 'N'.
+      if ATls = nil then
+      begin
+        if not S.SendU8(Ord('N')) then Exit;
+      end
+      else if not S.StartTls(ATls) then
+        Exit;
+      Continue;
+    end;
+    if code = 80877104 then
+    begin
+      // GSSENCRequest: desteklenmiyor.
+      if not S.SendU8(Ord('N')) then Exit;
       Continue;
     end;
     if code <> 196608 then Exit;       // yalnizca 3.0
@@ -1029,7 +1183,7 @@ begin
   until not FileExists(Result);
 end;
 
-function HandlePgCopyIn(S: TVdbSocket; FSql: TVSql;
+function HandlePgCopyIn(S: TVdbPgIo; FSql: TVSql;
   const Spec: TPgCopySpec; ATerminate: Boolean; out AErr: Boolean): Boolean;
 // ATerminate=True: basit sorgu -> hata/basari sonunda ReadyForQuery.
 // ATerminate=False: extended protocol -> ReadyForQuery yalnizca Sync'te
@@ -1078,13 +1232,13 @@ begin
       fs := TFileStream.Create(path, fmCreate);
       while True do
       begin
-        if not VdbRecvU8(S, b) then Exit;
+        if not S.RecvU8(b) then Exit;
         if not RecvI32(S, len) then Exit;
         plen := len - 4;
         if (plen < 0) or (plen > 64 * 1024 * 1024) then
           Exit(CopyErr('COPY: gecersiz veri parcasi', nil));
         SetLength(buf, plen);
-        if (plen > 0) and not VdbRecvAll(S, buf[1], plen) then Exit;
+        if (plen > 0) and not S.RecvAll(buf[1], plen) then Exit;
         case AnsiChar(b) of
           'd':
             if plen > 0 then fs.WriteBuffer(buf[1], plen);
@@ -1143,7 +1297,7 @@ begin
   end;
 end;
 
-function HandlePgCopyOut(S: TVdbSocket; FSql: TVSql;
+function HandlePgCopyOut(S: TVdbPgIo; FSql: TVSql;
   var Spec: TPgCopySpec; ATerminate: Boolean; out AErr: Boolean): Boolean;
 // ATerminate=True: basit sorgu; False: extended protocol (Ready yok).
 var
@@ -1246,7 +1400,7 @@ begin
     Result := True;
 end;
 
-function HandleQuery(S: TVdbSocket; FSql: TVSql; const Sql: string;
+function HandleQuery(S: TVdbPgIo; FSql: TVSql; const Sql: string;
   out AServed: Boolean): Boolean;
 var
   Res: TSqlResult;
@@ -1343,7 +1497,7 @@ begin
   inherited Create(True);
   FreeOnTerminate := False;
   FServer := AServer;
-  FSock := ASock;
+  FIO := TVdbPgIo.Create(ASock);
   FSql := TVSql.Create(AServer.Ftb);
   AServer.AddConn(Self);
   Start;
@@ -1356,13 +1510,23 @@ begin
     FSql.Free;
     FSql := nil;
   end;
+  if FIO <> nil then
+  begin
+    FIO.Free;
+    FIO := nil;
+  end;
   inherited Destroy;
+end;
+
+function TVdbPgConn.GetSock: TVdbSocket;
+begin
+  if FIO <> nil then Result := FIO.Sock else Result := VDB_SOCK_INVALID;
 end;
 
 procedure TVdbPgConn.Wake;
 begin
-  if FSock <> VDB_SOCK_INVALID then
-    VdbSockShutdown(FSock);
+  if FIO <> nil then
+    FIO.Shutdown;
 end;
 
 procedure TVdbPgConn.Execute;
@@ -1415,7 +1579,7 @@ var
   procedure ExtFail(const Msg: string);
   begin
     skipUntilSync := True;
-    SendPg(FSock, ErrorMsg(Msg));
+    SendPg(FIO, ErrorMsg(Msg));
   end;
 
   function ExecutePortal(var P: TPgPortal): Boolean;
@@ -1436,27 +1600,27 @@ begin
   Stmts := nil;
   Portals := nil;
   try
-    if not ReadStartup(FSock, user) then Exit;
+    if not ReadStartup(FIO, FServer.FTls, user) then Exit;
     Stmts := TDictionary<string, TPgStmt>.Create;
     Portals := TDictionary<string, TPgPortal>.Create;
-    if not SendPg(FSock, AuthOkMsg) then Exit;
-    if not SendPg(FSock, ParamMsg('server_version', '14.0 (VDB)')) then Exit;
-    if not SendPg(FSock, ParamMsg('client_encoding', 'UTF8')) then Exit;
-    if not SendPg(FSock, ParamMsg('DateStyle', 'ISO')) then Exit;
-    if not SendPg(FSock, ParamMsg('integer_datetimes', 'on')) then Exit;
-    if not SendPg(FSock, BackendKeyMsg(1, 0)) then Exit;
-    if not SendPg(FSock, ReadyMsg) then Exit;
+    if not SendPg(FIO, AuthOkMsg) then Exit;
+    if not SendPg(FIO, ParamMsg('server_version', '14.0 (VDB)')) then Exit;
+    if not SendPg(FIO, ParamMsg('client_encoding', 'UTF8')) then Exit;
+    if not SendPg(FIO, ParamMsg('DateStyle', 'ISO')) then Exit;
+    if not SendPg(FIO, ParamMsg('integer_datetimes', 'on')) then Exit;
+    if not SendPg(FIO, BackendKeyMsg(1, 0)) then Exit;
+    if not SendPg(FIO, ReadyMsg) then Exit;
 
     skipUntilSync := False;
     while not Terminated do
     begin
-      if not VdbRecvU8(FSock, typ) then Break;
+      if not FIO.RecvU8(typ) then Break;
       if typ = Ord('X') then Break;          // Terminate
-      if not RecvI32(FSock, len) then Break;
+      if not RecvI32(FIO, len) then Break;
       if (len < 4) or (len > 64 * 1024 * 1024) then Break;
       SetLength(payload, len - 4);
       if (len - 4) > 0 then
-        if not VdbRecvAll(FSock, payload[1], len - 4) then Break;
+        if not FIO.RecvAll(payload[1], len - 4) then Break;
 
       // Hata sonrasi Sync'e kadar tum mesajlari yut.
       if skipUntilSync and (typ <> Ord('S')) then Continue;
@@ -1468,7 +1632,7 @@ begin
           SetLength(sql, Length(sql) - 1);
         Stmts.Remove('');
         Portals.Remove('');
-        if not HandleQuery(FSock, FSql, sql, served) then Break;
+        if not HandleQuery(FIO, FSql, sql, served) then Break;
         if served then InterlockedIncrement(FServer.FServed);
       end
       else if typ = Ord('P') then            // Parse
@@ -1495,7 +1659,7 @@ begin
           st.ParamOids[i2] := oid;
         end;
         Stmts.AddOrSetValue(nm, st);
-        if not SendPg(FSock, PgMsg('1', '')) then Break;
+        if not SendPg(FIO, PgMsg('1', '')) then Break;
       end
       else if typ = Ord('B') then            // Bind
       begin
@@ -1602,7 +1766,7 @@ begin
         pt.ResFmts := rfmts;
         pt.Done := False;
         Portals.AddOrSetValue(nm, pt);
-        if not SendPg(FSock, PgMsg('2', '')) then Break;
+        if not SendPg(FIO, PgMsg('2', '')) then Break;
       end
       else if typ = Ord('D') then            // Describe
       begin
@@ -1618,8 +1782,8 @@ begin
               ExtFail('prepared statement yok: ' + nm);
               Continue;
             end;
-            if not SendPg(FSock, ParamDescMsg(st.ParamOids)) then Break;
-            if not SendPg(FSock, PgMsg('n', '')) then Break;          // NoData
+            if not SendPg(FIO, ParamDescMsg(st.ParamOids)) then Break;
+            if not SendPg(FIO, PgMsg('n', '')) then Break;          // NoData
           end
           else if Portals.TryGetValue(nm, pt) then
           begin
@@ -1629,7 +1793,7 @@ begin
             if TryParsePgCopy(pt.Sql, CopySpec, cpErr) and
                (CopySpec.FromStdin or CopySpec.ToStdout) then
             begin
-              if not SendPg(FSock, PgMsg('n', '')) then Break;
+              if not SendPg(FIO, PgMsg('n', '')) then Break;
             end
             else
             begin
@@ -1642,9 +1806,9 @@ begin
                 ExtFail(pt.Err)
               else if Length(pt.Res.Fields) > 0 then
               begin
-                if not SendPg(FSock, RowDescMsgFmt(pt.Res.Fields, pt.Res.FieldTypes, pt.ResFmts)) then Break;
+                if not SendPg(FIO, RowDescMsgFmt(pt.Res.Fields, pt.Res.FieldTypes, pt.ResFmts)) then Break;
               end
-              else if not SendPg(FSock, PgMsg('n', '')) then Break;
+              else if not SendPg(FIO, PgMsg('n', '')) then Break;
             end;
           end
           else
@@ -1670,9 +1834,9 @@ begin
               pt.Done := True;
               Portals.AddOrSetValue(nm, pt);
               if CopySpec.FromStdin then
-                copyOk := HandlePgCopyIn(FSock, FSql, CopySpec, False, copyErr)
+                copyOk := HandlePgCopyIn(FIO, FSql, CopySpec, False, copyErr)
               else
-                copyOk := HandlePgCopyOut(FSock, FSql, CopySpec, False, copyErr);
+                copyOk := HandlePgCopyOut(FIO, FSql, CopySpec, False, copyErr);
               if copyErr then
                 skipUntilSync := True;
               if not copyOk then Break;
@@ -1691,8 +1855,8 @@ begin
             else
             begin
               for i2 := 0 to High(pt.Res.Rows) do
-                if not SendPg(FSock, DataRowMsgFmt(pt.Res.Rows[i2], pt.Res.FieldTypes, pt.ResFmts)) then Break;
-              if not SendPg(FSock, CommandMsg(CommandTag(pt.Sql, pt.Res))) then Break;
+                if not SendPg(FIO, DataRowMsgFmt(pt.Res.Rows[i2], pt.Res.FieldTypes, pt.ResFmts)) then Break;
+              if not SendPg(FIO, CommandMsg(CommandTag(pt.Sql, pt.Res))) then Break;
               InterlockedIncrement(FServer.FServed);
             end;
           end;
@@ -1709,12 +1873,12 @@ begin
           nm := ReadCStr(payload, p);
           if kind = 'S' then Stmts.Remove(nm) else Portals.Remove(nm);
         end;
-        if not SendPg(FSock, PgMsg('3', '')) then Break;
+        if not SendPg(FIO, PgMsg('3', '')) then Break;
       end
       else if typ = Ord('S') then            // Sync
       begin
         skipUntilSync := False;
-        if not SendPg(FSock, ReadyMsg) then Break;
+        if not SendPg(FIO, ReadyMsg) then Break;
       end
       else if typ = Ord('H') then            // Flush: hemen gonderiyoruz, no-op
       begin
@@ -1728,7 +1892,7 @@ begin
   finally
     Portals.Free;
     Stmts.Free;
-    VdbSockClose(FSock);
+    FreeAndNil(FIO);
   end;
 end;
 
@@ -1770,11 +1934,15 @@ begin
   FConnsLock := TCriticalSection.Create;
   FConns := TList.Create;
   FMaxConns := 16;
+  FTls := nil;
+  FTlsCert := '';
+  FTlsKey := '';
 end;
 
 destructor TVdbPgServer.Destroy;
 begin
   Stop;
+  CloseTls;
   FConns.Free;
   FConnsLock.Free;
   inherited;
@@ -1784,6 +1952,28 @@ procedure TVdbPgServer.CloseEngine;
 begin
   if Ftb <> nil then begin Ftb.Close; Ftb.Free; Ftb := nil; end;
   if Fkv <> nil then begin Fkv.Close; Fkv.Free; Fkv := nil; end;
+end;
+
+procedure TVdbPgServer.CloseTls;
+begin
+  if FTls <> nil then
+  begin
+    FTls.Free;
+    FTls := nil;
+  end;
+end;
+
+function TVdbPgServer.GetTlsActive: Boolean;
+begin
+  Result := FTls <> nil;
+end;
+
+procedure TVdbPgServer.SetTlsFiles(const ACertFile, AKeyFile: string);
+begin
+  if FReady then
+    raise EVdbTlsError.Create('TLS yalniz sunucu baslamadan ayarlanabilir');
+  FTlsCert := ACertFile;
+  FTlsKey := AKeyFile;
 end;
 
 function TVdbPgServer.Start(out AErr: string): Boolean;
@@ -1808,10 +1998,31 @@ begin
       Exit;
     end;
   end;
+  if (FTlsCert <> '') or (FTlsKey <> '') then
+  begin
+    if (FTlsCert = '') or (FTlsKey = '') then
+    begin
+      AErr := 'TLS icin sertifika ve anahtar birlikte verilmeli';
+      CloseEngine;
+      Exit;
+    end;
+    try
+      FTls := TVdbTlsContext.CreateServer(FTlsCert, FTlsKey);
+    except
+      on E: Exception do
+      begin
+        AErr := 'TLS: ' + E.Message;
+        CloseTls;
+        CloseEngine;
+        Exit;
+      end;
+    end;
+  end;
   FListen := VdbTcpListen(FPort);
   if FListen = VDB_SOCK_INVALID then
   begin
     AErr := 'dinleme kurulamadi (port ' + IntToStr(FPort) + ')';
+    CloseTls;
     CloseEngine;
     Exit;
   end;
@@ -1862,6 +2073,7 @@ begin
   finally
     FConnsLock.Leave;
   end;
+  CloseTls;
   CloseEngine;
   FReady := False;
 end;
