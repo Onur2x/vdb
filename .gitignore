@@ -83,6 +83,8 @@ MDLER/
 !README*
 
 # Calisma zamani / runtime (yonetim uygulamasi + test artiklari)
+test_run/
+test_run_out.txt
 ayar.txt
 tema.txt
 *.out

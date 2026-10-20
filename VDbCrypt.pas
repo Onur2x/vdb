@@ -65,7 +65,9 @@ const
   VDB_KEYFILE2_HEAD = 15;   { 4 magic + 1 surum + 1 tuzUz + 4 t + 4 m + 1 p }
   VDB_ARGON2_TIME = 3;
   VDB_ARGON2_MEMORY_KIB = 65536;  { 64 MiB }
-  VDB_ARGON2_LANES = 1;
+  { RFC 9106 ikinci onerilen ayar p=4'tur. Eski .key dosyalari p'yi
+    basliktan okur; bu sabit yalniz yeni dosyalari etkiler. }
+  VDB_ARGON2_LANES = 4;
 
 function VDbPbkdf2Sha256(const Pass, Salt: TBytes; Iter, DkLen: Integer): TBytes;
 function VDbCryptNewSalt(out Salt: TBytes): Boolean;

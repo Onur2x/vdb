@@ -10623,7 +10623,7 @@ end;
 procedure T118_AeadKdf;
 var
   key, nonce, pt, aad, ct, tag, tag2, outb: TBytes;
-  pwd, salt, secret, ad, h: TBytes;
+  pwd, salt, secret, ad, h, h2: TBytes;
   ok: Boolean;
 
   function Hx(const S: string): TBytes;
@@ -10681,6 +10681,15 @@ begin
   Dogrula('Argon2id RFC 9106', ok and
     (LowerCase(HxOf(h)) = '0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659'),
     HxOf(h));
+
+  // M6: paralel p=4 yolunda birden fazla slice/ref turu ve buyuk bellek
+  // ile yaris kosulu olmadigini iki bagimsiz cagrinin esitligiyle dogrula.
+  h := nil;
+  h2 := nil;
+  ok := VDbArgon2id(pwd, salt, secret, ad, 2, 1024, 4, 32, h);
+  ok := ok and VDbArgon2id(pwd, salt, secret, ad, 2, 1024, 4, 32, h2);
+  Dogrula('Argon2id p=4 paralel deterministik',
+    ok and (Length(h) = 32) and (HxOf(h) = HxOf(h2)), HxOf(h));
 end;
 
 procedure T119_Trace;

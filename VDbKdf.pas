@@ -48,6 +48,8 @@ const
 
 type
   TArgonBlock = array[0..127] of QWord;
+  TArgonBlockArray = array of TArgonBlock;
+  PArgonBlockArray = ^TArgonBlockArray;
 
 function RotR64(X: QWord; N: Byte): QWord;
 begin
@@ -290,21 +292,185 @@ begin
   ArgonFillBlock(Zero, Address, Address, False);
 end;
 
+{ M6: bir lane'in tek slice'ini isler. Argon2 v1.3'te ayni slice icinde
+  farkli lane'ler birbirine referans vermez; bu yuzden lane'ler paralel
+  calistirilabilir. Input/Address lane'e ozeldir. }
+procedure ArgonProcessLane(var Mem: TArgonBlockArray;
+  lane, pass, slice, segLen, laneLen, p, m, t: Integer);
+var
+  Input, Address: TArgonBlock;
+  i, cur, prev, ref, refLane: Integer;
+  sameLane, dataInd: Boolean;
+  refArea, startPos, refIndex, z: Int64;
+  J1, J2: LongWord;
+  x, y: QWord;
+begin
+  dataInd := (pass = 0) and (slice < 2);
+  if dataInd then
+  begin
+    FillChar(Input[0], 1024, 0);
+    Input[0] := QWord(pass);
+    Input[1] := QWord(lane);
+    Input[2] := QWord(slice);
+    Input[3] := QWord(m);
+    Input[4] := QWord(t);
+    Input[5] := 2;
+    Input[6] := 0;
+    FillChar(Address[0], 1024, 0);
+  end;
+  if (pass = 0) and (slice = 0) then
+  begin
+    i := 2;
+    if dataInd then
+      ArgonNextAddresses(Address, Input);
+  end
+  else
+    i := 0;
+  while i < segLen do
+  begin
+    cur := lane * laneLen + slice * segLen + i;
+    if (slice = 0) and (i = 0) then
+      prev := lane * laneLen + laneLen - 1
+    else
+      prev := cur - 1;
+    if dataInd then
+    begin
+      if (i mod 128) = 0 then
+        ArgonNextAddresses(Address, Input);
+      J1 := LongWord(Address[i mod 128] and QWord($FFFFFFFF));
+      J2 := LongWord(Address[i mod 128] shr 32);
+    end
+    else
+    begin
+      J1 := LongWord(Mem[prev][0] and QWord($FFFFFFFF));
+      J2 := LongWord(Mem[prev][0] shr 32);
+    end;
+    refLane := Integer(Int64(J2) mod p);
+    if (pass = 0) and (slice = 0) then
+      refLane := lane;
+    sameLane := refLane = lane;
+    if pass = 0 then
+    begin
+      if slice = 0 then
+        refArea := i - 1
+      else if sameLane then
+        refArea := Int64(slice) * segLen + i - 1
+      else if i = 0 then
+        refArea := Int64(slice) * segLen - 1
+      else
+        refArea := Int64(slice) * segLen;
+    end
+    else
+    begin
+      if sameLane then
+        refArea := Int64(laneLen) - segLen + i - 1
+      else if i = 0 then
+        refArea := Int64(laneLen) - segLen - 1
+      else
+        refArea := Int64(laneLen) - segLen;
+    end;
+    if refArea < 1 then refArea := 1;
+    x := (QWord(J1) * QWord(J1)) shr 32;
+    y := (QWord(refArea) * x) shr 32;
+    z := refArea - 1 - Int64(y);
+    if (pass = 0) or (slice = 3) then
+      startPos := 0
+    else
+      startPos := Int64(slice + 1) * segLen;
+    refIndex := (startPos + z) mod laneLen;
+    ref := refLane * laneLen + Integer(refIndex);
+    ArgonFillBlock(Mem[prev], Mem[ref], Mem[cur], pass > 0);
+    Inc(i);
+  end;
+end;
+
+type
+  TArgonLaneCtx = record
+    Mem: PArgonBlockArray;
+    Lane, Pass, Slice, SegLen, LaneLen, Lanes, M, T: Integer;
+  end;
+
+  TArgonLaneThread = class(TThread)
+  private
+    FCtx: TArgonLaneCtx;
+    FFailed: Boolean;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const ACtx: TArgonLaneCtx);
+    property Failed: Boolean read FFailed;
+  end;
+
+constructor TArgonLaneThread.Create(const ACtx: TArgonLaneCtx);
+begin
+  inherited Create(True);
+  FCtx := ACtx;
+  FreeOnTerminate := False;
+  FFailed := False;
+end;
+
+procedure TArgonLaneThread.Execute;
+begin
+  try
+    ArgonProcessLane(FCtx.Mem^, FCtx.Lane, FCtx.Pass, FCtx.Slice,
+      FCtx.SegLen, FCtx.LaneLen, FCtx.Lanes, FCtx.M, FCtx.T);
+  except
+    FFailed := True;
+  end;
+end;
+
+function ArgonProcessSlice(var Mem: TArgonBlockArray;
+  pass, slice, segLen, laneLen, p, m, t: Integer): Boolean;
+var
+  Th: array of TArgonLaneThread;
+  Ctx: TArgonLaneCtx;
+  i, started: Integer;
+begin
+  Result := False;
+  if p <= 1 then
+  begin
+    ArgonProcessLane(Mem, 0, pass, slice, segLen, laneLen, p, m, t);
+    Result := True;
+    Exit;
+  end;
+  SetLength(Th, p);
+  started := 0;
+  try
+    for i := 0 to p - 1 do
+    begin
+      Ctx.Mem := @Mem;
+      Ctx.Lane := i;
+      Ctx.Pass := pass;
+      Ctx.Slice := slice;
+      Ctx.SegLen := segLen;
+      Ctx.LaneLen := laneLen;
+      Ctx.Lanes := p;
+      Ctx.M := m;
+      Ctx.T := t;
+      Th[i] := TArgonLaneThread.Create(Ctx);
+      Th[i].Start;
+      Inc(started);
+    end;
+    for i := 0 to started - 1 do
+      Th[i].WaitFor;
+    for i := 0 to started - 1 do
+      if Th[i].Failed then
+        Exit;
+    Result := True;
+  finally
+    for i := 0 to started - 1 do
+      Th[i].Free;
+  end;
+end;
+
 function VDbArgon2id(const Password, Salt, Secret, Ad: TBytes;
   TimeCost, MemoryKiB, Lanes, HashLen: Integer; out Hash: TBytes): Boolean;
 var
   H0, hb, blkBytes, inBuf: TBytes;
-  Mem: array of TArgonBlock;
+  Mem: TArgonBlockArray;
   C: TArgonBlock;
-  Input, Address: TArgonBlock;
-  m, laneLen, segLen, p, t, lane, slice, cur, prev, ref: Integer;
+  m, laneLen, segLen, p, t, lane, slice: Integer;
   pass, i, j: Integer;
-  refLane: Integer;
-  sameLane: Boolean;
-  refArea, startPos, refIndex, z: Int64;
-  J1, J2: LongWord;
-  x, y: QWord;
-  dataInd: Boolean;
 begin
   Result := False;
   Hash := nil;
@@ -379,86 +545,8 @@ begin
 
   for pass := 0 to t - 1 do
     for slice := 0 to 3 do
-      for lane := 0 to p - 1 do
-      begin
-        dataInd := (pass = 0) and (slice < 2);
-        if dataInd then
-        begin
-          FillChar(Input[0], 1024, 0);
-          Input[0] := QWord(pass);
-          Input[1] := QWord(lane);
-          Input[2] := QWord(slice);
-          Input[3] := QWord(m);
-          Input[4] := QWord(t);
-          Input[5] := 2;
-          Input[6] := 0;
-          FillChar(Address[0], 1024, 0);
-        end;
-        if (pass = 0) and (slice = 0) then
-        begin
-          i := 2;
-          if dataInd then
-            ArgonNextAddresses(Address, Input);
-        end
-        else
-          i := 0;
-        while i < segLen do
-        begin
-          cur := lane * laneLen + slice * segLen + i;
-          if (slice = 0) and (i = 0) then
-            prev := lane * laneLen + laneLen - 1
-          else
-            prev := cur - 1;
-          if dataInd then
-          begin
-            if (i mod 128) = 0 then
-              ArgonNextAddresses(Address, Input);
-            J1 := LongWord(Address[i mod 128] and QWord($FFFFFFFF));
-            J2 := LongWord(Address[i mod 128] shr 32);
-          end
-          else
-          begin
-            J1 := LongWord(Mem[prev][0] and QWord($FFFFFFFF));
-            J2 := LongWord(Mem[prev][0] shr 32);
-          end;
-          refLane := Integer(Int64(J2) mod p);
-          if (pass = 0) and (slice = 0) then
-            refLane := lane;
-          sameLane := refLane = lane;
-          if pass = 0 then
-          begin
-            if slice = 0 then
-              refArea := i - 1
-            else if sameLane then
-              refArea := Int64(slice) * segLen + i - 1
-            else if i = 0 then
-              refArea := Int64(slice) * segLen - 1
-            else
-              refArea := Int64(slice) * segLen;
-          end
-          else
-          begin
-            if sameLane then
-              refArea := Int64(laneLen) - segLen + i - 1
-            else if i = 0 then
-              refArea := Int64(laneLen) - segLen - 1
-            else
-              refArea := Int64(laneLen) - segLen;
-          end;
-          if refArea < 1 then refArea := 1;
-          x := (QWord(J1) * QWord(J1)) shr 32;
-          y := (QWord(refArea) * x) shr 32;
-          z := refArea - 1 - Int64(y);
-          if (pass = 0) or (slice = 3) then
-            startPos := 0
-          else
-            startPos := Int64(slice + 1) * segLen;
-          refIndex := (startPos + z) mod laneLen;
-          ref := refLane * laneLen + Integer(refIndex);
-          ArgonFillBlock(Mem[prev], Mem[ref], Mem[cur], pass > 0);
-          Inc(i);
-        end;
-      end;
+      if not ArgonProcessSlice(Mem, pass, slice, segLen, laneLen, p, m, t) then
+        Exit;
 
   C := Mem[0 * laneLen + laneLen - 1];
   for lane := 1 to p - 1 do
