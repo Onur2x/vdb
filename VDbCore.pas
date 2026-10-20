@@ -37,6 +37,11 @@ const
     ve rastgele erisim icin korunur; Verify hizli yolda blok CRC'sini
     kullanir. }
   VDB_FLAG_BLOCKCRC = 16;
+  { H11 (2026-10-20): yerinde geri kazanilan bolgede kalan bosluk.
+    Kayit bir FREESPACE basligidir; ValLen, kullanilmayan (ama blok CRC'sine
+    dahil) ham bayt sayisidir. Recover/Verify bu kaydi yapisal olarak atlar;
+    FIndex'e girmez. }
+  VDB_FLAG_FREESPACE = 32;
   VDB_BLOCK_TARGET = 1024 * 1024;   // ~1 MB'lik blok gruplari
   VDB_MAX_VALUE = 16 * 1024 * 1024;
   // P-19w: bu boyuta kadar header+deger TEK WriteBuffer ile yazilir
@@ -64,6 +69,10 @@ const
   VDB_FILE_VER_V2 = 2;
   VDB_HDR_SIZE = 16;
   VDB_HFLAG_HAS_ENCRYPTED = 1;
+  { H11: dosyada en az bir yerinde (in-place) yazim yapildi. Boyle bir
+    dosyada kayitlarin dosya sirasindaki seq'i monoton degildir; Verify
+    kati seq+1 kontrolunu atlar. Blok CRC'leri yine guncellenir. }
+  VDB_HFLAG_INPLACE = 2;
   { H3 (2026-10-18): zone map / atlanabilir offset bolumu geometrisi.
     ScanRawIter PAS B/C ile BIREBIR ayni olmali. }
   VDB_RAW_SCAN_SHIFT = 21;         // 2 MB
@@ -136,6 +145,19 @@ type
       boyutuyla orantili gereksiz masraf).
       -1 = bilinmiyor/satir degil -> tablo filtresi uygulanmaz. }
     TableId: Integer;
+  end;
+
+  { H11: yeniden kullanilabilir olu PUT bolgesi (offset + toplam bayt). }
+  TFreeSpan = record
+    Offset: Int64;
+    Size: Int64;
+  end;
+
+  { H11: blok siniri bilgisi. Start = ilk kaydin offseti, Footer = blok
+    footer kaydinin offseti. Blok [Start, Footer) araligini kapsar. }
+  TBlockInfo = record
+    Start: Int64;
+    Footer: Int64;
   end;
 
   TPendOp = record
@@ -305,6 +327,19 @@ FPath: string;
   FDirSyncFailed: Boolean;
     FNewFile: Boolean;
     FDeadBytes: Int64;
+    { H11: olu PUT bolgeleri (first-fit) ve blok haritasi. FFreeSpansDirty
+      True iken liste henuz taranmamis demektir; ilk yerinde yazim
+      denemesinde RebuildFreeSpans calisir. }
+    FFreeSpans: TList<TFreeSpan>;
+    FFreeSpansDirty: Boolean;
+    FBlocks: TList<TBlockInfo>;
+    FDirtyBlocks: TList<Integer>;
+    FDeadQueue: TList<TFreeSpan>;
+    FUsedInPlace: Boolean;
+    { H11: yerinde yazimla ayni transaction'da append edilen kayitlar
+      crash sonrasi geri alinirken dosyanin kirpilacagi boy. }
+    FUndoStartSize: Int64;
+    FUndoMarkerWritten: Boolean;
     { H12 (2026-10-18): SUNUCU TARAFLI SINIRLI BLOK ONBELLEGI. GetSnapshot
       noktasal okumalari kayit basina bir ReadFile yapiyordu; ayni 8 KB
       bloga dusen TEKRARLI okumalar (indeks probe / JOIN) icin blok bazinda
@@ -398,6 +433,21 @@ FPath: string;
     procedure SetWALEnabled(AValue: Boolean);
     procedure AppendBatchEnd(DoFlush: Boolean);
     procedure AppendBatchEndTo(S: TStream; ASeq: QWord);
+    { H11: olu PUT bolgelerini ve FREESPACE kayitlarini tarayip serbest
+      listeyi/blok haritasini kurar. }
+    procedure RebuildFreeSpans;
+    procedure AddFreeSpan(AOffset, ASize: Int64);
+    function TryTakeFreeSpan(Need: Int64; out AOffset, ALeftover: Int64): Boolean;
+    procedure WriteFreeSpace(AOffset, ASize: Int64);
+    procedure QueueDeadSpan(AOffset, ASize: Int64);
+    procedure FlushDeadQueue;
+    function FindBlockForOffset(AOffset: Int64; out AIndex: Integer): Boolean;
+    procedure MarkDirtyBlock(AOffset: Int64);
+    function CrcRange(AStart, ALen: Int64; out ACrc: LongWord): Boolean;
+    procedure UpdateDirtyBlockCrcs;
+    { H11: yerinde yazim sonrasi ana dosyayi fsync eder, blok CRC'lerini
+      gunceller ve undo gunlugunu commit edip siler. }
+    procedure FinalizeInPlaceWrite;
     procedure Recover;
     { KR-1: tablo anahtar dizinini temizler / FIndex'ten yeniden kurar. }
     procedure ClearTableKeys;
@@ -881,6 +931,13 @@ begin
     Result := AValLen = 0;
     Exit;
   end;
+  if AFlags = VDB_FLAG_FREESPACE then
+  begin
+    { H11: bosluk kaydi yapisal olarak deger tasimaz; ValLen ham bos
+      bayt sayisidir, icerik anlamsizdir. }
+    Result := True;
+    Exit;
+  end;
   Result := AllowBatchEnd and (AFlags = VDB_FLAG_BATCHEND);
 end;
 
@@ -940,6 +997,14 @@ FSavepoints := TList<TSavepoint>.Create;
   FDirSyncFailed := False;
   FNewFile := False;
   FDeadBytes := 0;
+  FFreeSpans := TList<TFreeSpan>.Create;
+  FFreeSpansDirty := True;
+  FBlocks := TList<TBlockInfo>.Create;
+  FDirtyBlocks := TList<Integer>.Create;
+  FDeadQueue := TList<TFreeSpan>.Create;
+  FUsedInPlace := False;
+  FUndoStartSize := 0;
+  FUndoMarkerWritten := False;
   FDataStart := VDB_HDR_SIZE;
   FEncFlags := 0;
   FColKeyId := 0;
@@ -952,6 +1017,10 @@ begin
     Close;
   except
   end;
+  FFreeSpans.Free;
+  FBlocks.Free;
+  FDirtyBlocks.Free;
+  FDeadQueue.Free;
   FPending.Free;
   FPendingPuts.Free;
   FPendingDels.Free;
@@ -1060,7 +1129,7 @@ begin
       FS.ReadBuffer(h, SizeOf(h));
       if h.Crc <> HeadCrc(h) then
         raise EVDbException.Create(ecCorrupt, 'VDb: dosya basligi CRC hatasi (bozuk)');
-      FEncFlags := h.Flags and VDB_HFLAG_HAS_ENCRYPTED;
+      FEncFlags := h.Flags and (VDB_HFLAG_HAS_ENCRYPTED or VDB_HFLAG_INPLACE);
       if (h.Ver = VDB_FILE_VER_OLD) or (h.Ver = VDB_FILE_VER_V2) then
       begin
         // V1/V2 -> V3 yukseltme. Kayit duzeni ayni; V3'te blok CRC
@@ -1188,6 +1257,12 @@ begin
       RenameFile(bakPath, FPath);
       raise;
     end;
+    { Yeni dosya tamamen farkli offsetler tasir; eski dosyanin undo
+      gunlugu bu dosyaya UYGULANMAMALIDIR. }
+    VDbUndoDelete(VDbUndoPath(FPath));
+    FUsedInPlace := False;
+    FUndoMarkerWritten := False;
+    FFreeSpansDirty := True;
     Reopen;
   except
     on E: Exception do
@@ -1265,6 +1340,7 @@ var
   h: TVDbRecHead;
   off: Int64;
   need, newCap: Integer;
+  bi: TBlockInfo;
 begin
   if FBlockBytes <= 0 then Exit;
   if FBlockBytes > Int64(High(LongWord)) then
@@ -1297,6 +1373,13 @@ begin
     FS.WriteBuffer(h, need);
   end;
   FDirty := True;
+  if not FFreeSpansDirty then
+  begin
+    bi.Start := FBlockStart;
+    bi.Footer := off;
+    if (bi.Start >= FDataStart) and (bi.Start < bi.Footer) then
+      FBlocks.Add(bi);
+  end;
   FBlockStart := off + Int64(need);
   FBlockBytes := 0;
   FBlockCrc := VDbCrc32Init;
@@ -1331,6 +1414,7 @@ var
   stored: TBytes;      // dosyaya yazilacak deger (sifreli olabilir)
   wbuf: TBytes;        // P-19w: header+deger birlesik yazim tamponu
   need, newCap: Integer;   // P-21: toplu yazim tamponu boyut yonetimi
+  inOff, leftover, spanSize: Int64;
   walFlags: Byte;
 begin
   stored := nil;
@@ -1396,63 +1480,116 @@ begin
           'VDb: WAL yazilamadi, islem durduruldu (ana dosyaya yazilmadi): %s',
           [FPath]);
 
-  { H5: hedef blok buyuklugune ulastiysa once mevcut blogu kapat.
-    Boylece yeni kayit yeni blokta baslar; footer'in kendisi bir sonraki
-    bloga dahil edilmez. }
-  if FBlockBytes >= VDB_BLOCK_TARGET then
-    AppendBlockFooter;
-  BlockCrcAdd(h, pv);
-
-  { P-21 (2026-10-16): CommitBatch toplu yazim. Tampon AKTIFSE kayit
-    baytlari (baslik+deger) dosyaya degil tampona eklenir; offset
-    FWrBufBase + tampondaki konumdur (kayit CommitBatch sonunda TAM o
-    offset'e gidecek). Esikte FlushWriteBuf tek WriteBuffer yapar.
-    Diskteki bayt akisi BIREBIR aynidir: ayni baytlar, ayni sira.
-    Tampon PASIFSE (CommitBatch disi HER yol) asagidaki ESKI yol
-    birebir calisir. }
-  if FWrBufActive then
+  need := Integer(SizeOf(h)) + Integer(h.ValLen);
+  { H11: once olu bir PUT bolgesine yerinde yazmayi dene. Yerinde yazim
+    YALNIZCA kapanmis bir bloktadir (RebuildFreeSpans garanti eder), bu
+    yuzden blok footer CRC'si yeniden hesaplanabilir. Undo kaydi ana
+    dosya degismeden ONCE fsync edilir. }
+  if TryTakeFreeSpan(need, inOff, leftover) then
   begin
-    off := FWrBufBase + Int64(FWrBufLen);
-    need := Integer(SizeOf(h)) + Integer(h.ValLen);
-    if FWrBufLen + need > Length(FWrBuf) then
+    if (not FUndoMarkerWritten) and FInBatch then
     begin
-      newCap := Length(FWrBuf);
-      while newCap < FWrBufLen + need do
-        Inc(newCap, VDB_WRBUF_MAX);
-      SetLength(FWrBuf, newCap);
+      if not VDbUndoTruncateMarker(FPath, FUndoStartSize) then
+        raise EVDbException.Create(ecIOError,
+          'VDb: undo baslangic isareti yazilamadi');
+      FUndoMarkerWritten := True;
     end;
-    Move(h, FWrBuf[FWrBufLen], SizeOf(h));
-    if h.ValLen > 0 then
-      Move(stored[0], FWrBuf[FWrBufLen + SizeOf(h)], h.ValLen);
-    Inc(FWrBufLen, need);
-    if FWrBufLen >= VDB_WRBUF_MAX then
-      FlushWriteBuf;
-  end
-  else
-  begin
-    off := FS.Seek(0, soEnd);
-    { P-19w: header + deger TEK WriteBuffer ile yazilir (3 syscall -> 2).
-      FS.Seek(0, soEnd) KORUNUR: dosya sonunun tek yetkili kaynagi budur.
-      Offset'i bellekte tutmak (in-place guncelleme FS.Position, rollback
-      FS.Size:=, Compact, truncate yollarinda) bir kez invalide
-      edilmediginde sessiz veri bozulmasi riski tasirdi; guvenlik > mikro
-      kazanc. Birlesik yazim veri sozlesmesini DEGISTIRMEZ: ayni baytlar
-      ayni sirayla ayni offset'e yazilir.
-      BUYUK DEGER (blob): birlesik tampon ayirmamak icin ESKI yol birebir
-      (16 MB'a kadar gecici kopya olmasin). }
+    spanSize := Int64(need) + leftover;
+    if not VDbUndoAppendFromStream(FS, FPath, inOff, spanSize) then
+      raise EVDbException.Create(ecIOError,
+        'VDb: yerinde yazim icin undo kaydi yazilamadi');
+    if (FEncFlags and VDB_HFLAG_INPLACE) = 0 then
+    begin
+      FEncFlags := FEncFlags or VDB_HFLAG_INPLACE;
+      FS.Position := 0;
+      WriteHeaderTo(FS);
+      FS.Seek(0, soEnd);
+      VDbFlushStream(FS);
+      CacheInvalidateAt(0, VDB_HDR_SIZE);
+    end;
+    FS.Position := inOff;
     if h.ValLen <= VDB_COMBINE_MAX then
     begin
-      SetLength(wbuf, Integer(SizeOf(h)) + Integer(h.ValLen));
+      SetLength(wbuf, need);
       Move(h, wbuf[0], SizeOf(h));
       if h.ValLen > 0 then
         Move(stored[0], wbuf[SizeOf(h)], h.ValLen);
-      FS.WriteBuffer(wbuf[0], Integer(SizeOf(h)) + Integer(h.ValLen));
+      FS.WriteBuffer(wbuf[0], need);
     end
     else
     begin
       FS.WriteBuffer(h, SizeOf(h));
       if h.ValLen > 0 then
         FS.WriteBuffer(stored[0], h.ValLen);
+    end;
+    if leftover > 0 then
+      WriteFreeSpace(inOff + Int64(need), leftover);
+    MarkDirtyBlock(inOff);
+    CacheInvalidateAt(inOff, Integer(spanSize));
+    off := inOff;
+    FUsedInPlace := True;
+    Dec(FDeadBytes, need);
+    if FDeadBytes < 0 then FDeadBytes := 0;
+  end
+  else
+  begin
+    { H5: hedef blok buyuklugune ulastiysa once mevcut blogu kapat.
+      Boylece yeni kayit yeni blokta baslar; footer'in kendisi bir sonraki
+      bloga dahil edilmez. }
+    if FBlockBytes >= VDB_BLOCK_TARGET then
+      AppendBlockFooter;
+    BlockCrcAdd(h, pv);
+
+    { P-21 (2026-10-16): CommitBatch toplu yazim. Tampon AKTIFSE kayit
+      baytlari (baslik+deger) dosyaya degil tampona eklenir; offset
+      FWrBufBase + tampondaki konumdur (kayit CommitBatch sonunda TAM o
+      offset'e gidecek). Esikte FlushWriteBuf tek WriteBuffer yapar.
+      Diskteki bayt akisi BIREBIR aynidir: ayni baytlar, ayni sira.
+      Tampon PASIFSE (CommitBatch disi HER yol) asagidaki ESKI yol
+      birebir calisir. }
+    if FWrBufActive then
+    begin
+      off := FWrBufBase + Int64(FWrBufLen);
+      if FWrBufLen + need > Length(FWrBuf) then
+      begin
+        newCap := Length(FWrBuf);
+        while newCap < FWrBufLen + need do
+          Inc(newCap, VDB_WRBUF_MAX);
+        SetLength(FWrBuf, newCap);
+      end;
+      Move(h, FWrBuf[FWrBufLen], SizeOf(h));
+      if h.ValLen > 0 then
+        Move(stored[0], FWrBuf[FWrBufLen + SizeOf(h)], h.ValLen);
+      Inc(FWrBufLen, need);
+      if FWrBufLen >= VDB_WRBUF_MAX then
+        FlushWriteBuf;
+    end
+    else
+    begin
+      off := FS.Seek(0, soEnd);
+      { P-19w: header + deger TEK WriteBuffer ile yazilir (3 syscall -> 2).
+        FS.Seek(0, soEnd) KORUNUR: dosya sonunun tek yetkili kaynagi budur.
+        Offset'i bellekte tutmak (in-place guncelleme FS.Position, rollback
+        FS.Size:=, Compact, truncate yollarinda) bir kez invalide
+        edilmediginde sessiz veri bozulmasi riski tasirdi; guvenlik > mikro
+        kazanc. Birlesik yazim veri sozlesmesini DEGISTIRMEZ: ayni baytlar
+        ayni sirayla ayni offset'e yazilir.
+        BUYUK DEGER (blob): birlesik tampon ayirmamak icin ESKI yol birebir
+        (16 MB'a kadar gecici kopya olmasin). }
+      if h.ValLen <= VDB_COMBINE_MAX then
+      begin
+        SetLength(wbuf, Integer(SizeOf(h)) + Integer(h.ValLen));
+        Move(h, wbuf[0], SizeOf(h));
+        if h.ValLen > 0 then
+          Move(stored[0], wbuf[SizeOf(h)], h.ValLen);
+        FS.WriteBuffer(wbuf[0], Integer(SizeOf(h)) + Integer(h.ValLen));
+      end
+      else
+      begin
+        FS.WriteBuffer(h, SizeOf(h));
+        if h.ValLen > 0 then
+          FS.WriteBuffer(stored[0], h.ValLen);
+      end;
     end;
   end;
   FDirty := True;
@@ -1462,7 +1599,12 @@ begin
     Inc(FWALAutoCount);
 
   if FIndex.TryGetValue(Key, loc) then
+  begin
     Inc(FDeadBytes, Int64(SizeOf(h)) + Int64(loc.Size));
+    // H11: eski canli PUT artik olu; commit basarili olunca serbest listeye
+    // alinir. Tombstone'lar zaten FIndex'te yok.
+    QueueDeadSpan(loc.Offset, Int64(SizeOf(h)) + Int64(loc.Size));
+  end;
   if IsDel then
   begin
     Inc(FDeadBytes, Int64(SizeOf(h)) + Int64(h.ValLen));
@@ -1555,6 +1697,7 @@ var
   pendKey: array of QWord;
   pendFlags: array of Byte;
   pendTag: array of Integer;   // R-26: satirin tablo id'si (-1 = satir degil)
+  pendSeq: array of QWord;     // H11: yerinde kayitlar dosya sirasini bozar
   pendN: Integer;
   tag: Integer;
   tagPlain: TBytes;
@@ -1562,15 +1705,71 @@ var
   torn: Boolean;   // dongu bir kayitta kirildi (CRC/magic/yari yazim)
   sawBatchEnd: Boolean; // dosyada HIC BIR BATCHEND kaydi var miydi
   committedThrough: Int64; // son commit'li BATCHEND'den sonraki bayt offseti
+  committedFSeq: QWord;    // son commit'li BATCHEND'in seq'i
   truncatePos: Int64;
 
-  procedure ApplyPending;
+  procedure ApplyPending(AEndSeq: QWord);
+  { H11: bir BATCHEND yalnizca seq'i KENDI seq'inden kucuk/esit olan
+    bekleyen kayitlari kapatir. Yerinde yazilan GELECEK transaction
+    kayitlari dosyada daha erken gorunur; seq filtresi olmadan erken
+    uygulanip sonraki append kayitlari tarafindan ezilirler. }
   var
-    q: Integer;
+    q, k, j, tmp, appliedN, keptN: Integer;
     l2: TDbLoc;
+    order: array of Integer;
+    keepPos: array of Int64;
+    keepSz: array of LongWord;
+    keepKey: array of QWord;
+    keepFlags: array of Byte;
+    keepTag: array of Integer;
+    keepSeq: array of QWord;
   begin
+    if pendN <= 0 then Exit;
+    SetLength(order, 0);
+    appliedN := 0;
     for q := 0 to pendN - 1 do
+      if pendSeq[q] <= AEndSeq then
+      begin
+        SetLength(order, appliedN + 1);
+        order[appliedN] := q;
+        Inc(appliedN);
+      end;
+    // Ayni transaction icinde yerinde + append kayitlari karisik sirada
+    // olabilir; uygulama sirasini seq'e gore duzelt (kucuk insertion sort:
+    // bekleyen set normalde tek transaction kadardir).
+    for q := 1 to appliedN - 1 do
     begin
+      tmp := order[q];
+      j := q - 1;
+      while (j >= 0) and (pendSeq[order[j]] > pendSeq[tmp]) do
+      begin
+        order[j + 1] := order[j];
+        Dec(j);
+      end;
+      order[j + 1] := tmp;
+    end;
+    // Gelecek transaction'a ait kayitlari koru.
+    SetLength(keepPos, pendN);
+    SetLength(keepSz, pendN);
+    SetLength(keepKey, pendN);
+    SetLength(keepFlags, pendN);
+    SetLength(keepTag, pendN);
+    SetLength(keepSeq, pendN);
+    keptN := 0;
+    for q := 0 to pendN - 1 do
+      if pendSeq[q] > AEndSeq then
+      begin
+        keepPos[keptN] := pendPos[q];
+        keepSz[keptN] := pendSz[q];
+        keepKey[keptN] := pendKey[q];
+        keepFlags[keptN] := pendFlags[q];
+        keepTag[keptN] := pendTag[q];
+        keepSeq[keptN] := pendSeq[q];
+        Inc(keptN);
+      end;
+    for k := 0 to appliedN - 1 do
+    begin
+      q := order[k];
       if FIndex.TryGetValue(pendKey[q], l2) then
         Inc(FDeadBytes, Int64(SizeOf(h)) + Int64(l2.Size));
       if pendFlags[q] = VDB_FLAG_DEL then
@@ -1588,9 +1787,19 @@ var
         FIndex.AddOrSetValue(pendKey[q], l2);
       end;
     end;
+    // Kalanlari basa tasi.
+    for q := 0 to keptN - 1 do
+    begin
+      pendPos[q] := keepPos[q];
+      pendSz[q] := keepSz[q];
+      pendKey[q] := keepKey[q];
+      pendFlags[q] := keepFlags[q];
+      pendTag[q] := keepTag[q];
+      pendSeq[q] := keepSeq[q];
+    end;
+    pendN := keptN;
     FTableKeysDirty := True;   // KR-1: kurtarma sirasinda FIndex degisti
     FTableRowCount.Clear;
-    pendN := 0;
   end;
 
 begin
@@ -1602,6 +1811,13 @@ begin
   FTableRowCount.Clear;
   FSeq := 0;
   FDeadBytes := 0;
+  FFreeSpans.Clear;
+  FBlocks.Clear;
+  FDeadQueue.Clear;
+  FDirtyBlocks.Clear;
+  FFreeSpansDirty := True;
+  FUsedInPlace := False;
+  FUndoMarkerWritten := False;
   fsize := FS.Size;
   pos := FDataStart;
   SetLength(buf, 65536);
@@ -1610,6 +1826,7 @@ begin
   torn := False;
   sawBatchEnd := False;   // ONEMLI: Boolean yereller otomatik sifirlanmaz
   committedThrough := FDataStart;
+  committedFSeq := 0;
   while pos + Int64(SizeOf(h)) <= fsize do
   begin
     FS.Position := pos;
@@ -1633,6 +1850,13 @@ begin
         "blok footer yok" der. }
       if committed then
         committedThrough := next;
+      pos := next;
+      Continue;
+    end;
+    { H11: FREESPACE yapisal bir bosluk kaydidir; FIndex'e girmez,
+      seq akisina dahil edilmez ve ham baytlari blok CRC disinda anlamsizdir. }
+    if h.Flags = VDB_FLAG_FREESPACE then
+    begin
       pos := next;
       Continue;
     end;
@@ -1670,11 +1894,15 @@ begin
       tag := -1;
     if h.Flags = VDB_FLAG_BATCHEND then
     begin
-      // batch tamam: gecici kayitlar gecerli
-      ApplyPending;
+      // batch tamam: yalnizca bu BATCHEND'in seq'ine kadar olan kayitlar
+      // gecerli. Daha yuksek seq'li yerinde kayitlar gelecek transaction'a
+      // aittir; beklemede kalirlar.
+      ApplyPending(h.Seq);
       committed := True;
       sawBatchEnd := True;
       committedThrough := next;  // BATCHEND'den sonraki bayt
+      if h.Seq > committedFSeq then
+        committedFSeq := h.Seq;
     end
     else
     begin
@@ -1686,12 +1914,14 @@ begin
         SetLength(pendKey, pendN + 64);
         SetLength(pendFlags, pendN + 64);
         SetLength(pendTag, pendN + 64);
+        SetLength(pendSeq, pendN + 64);
       end;
       pendPos[pendN] := pos;
       pendSz[pendN] := h.ValLen;
       pendKey[pendN] := h.Key;
       pendFlags[pendN] := h.Flags;
       pendTag[pendN] := tag;      // R-26
+      pendSeq[pendN] := h.Seq;
       Inc(pendN);
       committed := False;
     end;
@@ -1713,14 +1943,18 @@ begin
   //  - temiz/torn: yalniz torn kuyruğu kes (pos).
   if not sawBatchEnd then
   begin
-    if pendN > 0 then ApplyPending;
+    if pendN > 0 then ApplyPending(High(QWord));
+    if FSeq > committedFSeq then committedFSeq := FSeq;
     committed := True;
     truncatePos := pos;
   end
   else if not committed then
   begin
     truncatePos := committedThrough;
-    if pendN > 0 then FSeq := FSeq - QWord(pendN);
+    // H11: yerinde kayitlar yuzunden pending seq'ler bitisik degil;
+    // basit "pendN kadar geri sar" yanlis olur. Son commit'li BATCHEND'in
+    // seq'i guvenli tavandir.
+    FSeq := committedFSeq;
   end
   else
     truncatePos := pos;
@@ -1741,6 +1975,290 @@ begin
   FBlockStart := FS.Size;
   FBlockBytes := 0;
   FBlockCrc := VDbCrc32Init;
+end;
+
+procedure TVDb.AddFreeSpan(AOffset, ASize: Int64);
+var
+  sp: TFreeSpan;
+begin
+  if (AOffset < 0) or (ASize <= 0) then Exit;
+  if FFreeSpansDirty then Exit;   // yeniden kurulum zaten bulacak
+  sp.Offset := AOffset;
+  sp.Size := ASize;
+  FFreeSpans.Add(sp);
+end;
+
+procedure TVDb.RebuildFreeSpans;
+{ H11: dosyayi bir kez tarar; YALNIZCA olu PUT kayitlarini ve mevcut
+  FREESPACE kayitlarini serbest listeye alir. Tombstone (DEL) ASLA
+  serbest birakilmaz: recovery onu gorerek eski PUT'u bastirir; baytlari
+  baska kayitla ezilirse silinen anahtar geri gelir. Bir serbest bolge
+  ancak arkasinda bir blok footer'i varsa (yani kapanmis blokta) kabul
+  edilir; boylece blok CRC'si her zaman yeniden hesaplanabilir. }
+var
+  pos, next, fsize: Int64;
+  h: TVDbRecHead;
+  loc: TDbLoc;
+  sp: TFreeSpan;
+  blockSpans: TList<TFreeSpan>;
+  blockStart: Int64;
+  i: Integer;
+  base: Byte;
+  bi: TBlockInfo;
+begin
+  FFreeSpans.Clear;
+  FBlocks.Clear;
+  FDeadQueue.Clear;
+  FDirtyBlocks.Clear;
+  blockSpans := TList<TFreeSpan>.Create;
+  try
+    fsize := FS.Size;
+    pos := FDataStart;
+    blockStart := FDataStart;
+    while pos + Int64(SizeOf(h)) <= fsize do
+    begin
+      FS.Position := pos;
+      if FS.Read(h, SizeOf(h)) <> SizeOf(h) then Break;
+      if h.Magic <> VDB_MAGIC then Break;
+      if h.ValLen > VDB_MAX_VALUE then Break;
+      next := pos + Int64(SizeOf(h)) + Int64(h.ValLen);
+      if next > fsize then Break;
+      if h.Flags = VDB_FLAG_BLOCKCRC then
+      begin
+        bi.Start := Int64(h.Key);
+        bi.Footer := pos;
+        if (bi.Start >= FDataStart) and (bi.Start < bi.Footer) then
+        begin
+          FBlocks.Add(bi);
+          for i := 0 to blockSpans.Count - 1 do
+            FFreeSpans.Add(blockSpans[i]);
+        end;
+        blockSpans.Clear;
+        blockStart := next;
+        pos := next;
+        Continue;
+      end;
+      if h.Flags = VDB_FLAG_FREESPACE then
+      begin
+        sp.Offset := pos;
+        sp.Size := next - pos;
+        blockSpans.Add(sp);
+        pos := next;
+        Continue;
+      end;
+      if h.Flags <> VDB_FLAG_BATCHEND then
+      begin
+        base := Byte(h.Flags and not Byte(VDB_FLAG_ENCRYPTED));
+        // Yalnizca PUT tabanli kayitlar serbest birakilabilir. DEL
+        // (tombstone) korunur; BATCHEND/BLOCKCRC zaten yukarida elendi.
+        if base = VDB_FLAG_PUT then
+        begin
+          if not (FIndex.TryGetValue(h.Key, loc) and (loc.Offset = pos)) then
+          begin
+            sp.Offset := pos;
+            sp.Size := next - pos;
+            blockSpans.Add(sp);
+          end;
+        end;
+      end;
+      pos := next;
+    end;
+    // Son blogun footer'i yoksa (acik/yirtik kuyruk) oradaki span'lar
+    // kullanilmaz; blok CRC'si guncellenemez.
+  finally
+    blockSpans.Free;
+  end;
+  FFreeSpansDirty := False;
+end;
+
+function TVDb.FindBlockForOffset(AOffset: Int64; out AIndex: Integer): Boolean;
+var
+  lo, hi, mid: Integer;
+  bi: TBlockInfo;
+begin
+  Result := False;
+  lo := 0;
+  hi := FBlocks.Count - 1;
+  while lo <= hi do
+  begin
+    mid := (lo + hi) div 2;
+    bi := FBlocks[mid];
+    if AOffset < bi.Start then
+      hi := mid - 1
+    else if AOffset >= bi.Footer then
+      lo := mid + 1
+    else
+    begin
+      AIndex := mid;
+      Exit(True);
+    end;
+  end;
+end;
+
+function TVDb.TryTakeFreeSpan(Need: Int64; out AOffset, ALeftover: Int64): Boolean;
+var
+  i, bi: Integer;
+  sp: TFreeSpan;
+  left: Int64;
+begin
+  Result := False;
+  if Need <= 0 then Exit;
+  { Toplu yazim tamponu aktifken footer'lar henuz diskte degil; rebuild
+    onlari goremez ve FBlocks eksik kalir. Once tamponu bosalt. }
+  if FFreeSpansDirty and FWrBufActive then
+    FlushWriteBuf;
+  if FFreeSpansDirty then RebuildFreeSpans;
+  i := 0;
+  while i < FFreeSpans.Count do
+  begin
+    sp := FFreeSpans[i];
+    if sp.Size < Need then
+    begin
+      Inc(i);
+      Continue;
+    end;
+    left := sp.Size - Need;
+    if (left > 0) and (left < Int64(SizeOf(TVDbRecHead))) then
+    begin
+      Inc(i);
+      Continue;
+    end;
+    if not FindBlockForOffset(sp.Offset, bi) then
+    begin
+      // Blok haritasi yok -> CRC guncellenemez; bu span'i kullanma.
+      FFreeSpans.Delete(i);
+      Continue;
+    end;
+    FFreeSpans.Delete(i);
+    AOffset := sp.Offset;
+    ALeftover := left;
+    Exit(True);
+  end;
+end;
+
+procedure TVDb.WriteFreeSpace(AOffset, ASize: Int64);
+var
+  fh: TVDbRecHead;
+begin
+  if ASize < Int64(SizeOf(fh)) then Exit;
+  fh.Magic := VDB_MAGIC;
+  fh.Seq := 0;
+  fh.Key := 0;
+  fh.ValLen := LongWord(ASize - Int64(SizeOf(fh)));
+  fh.Flags := VDB_FLAG_FREESPACE;
+  fh.Crc := RecCrc(0, 0, fh.ValLen, fh.Flags, nil);
+  FS.Position := AOffset;
+  FS.WriteBuffer(fh, SizeOf(fh));
+  AddFreeSpan(AOffset, ASize);
+  FDirty := True;
+end;
+
+procedure TVDb.QueueDeadSpan(AOffset, ASize: Int64);
+var
+  sp: TFreeSpan;
+begin
+  if (AOffset < 0) or (ASize <= 0) then Exit;
+  if FFreeSpansDirty then Exit;
+  sp.Offset := AOffset;
+  sp.Size := ASize;
+  FDeadQueue.Add(sp);
+end;
+
+procedure TVDb.FlushDeadQueue;
+var
+  i: Integer;
+begin
+  if FFreeSpansDirty then
+  begin
+    FDeadQueue.Clear;
+    Exit;
+  end;
+  for i := 0 to FDeadQueue.Count - 1 do
+    FFreeSpans.Add(FDeadQueue[i]);
+  FDeadQueue.Clear;
+end;
+
+procedure TVDb.MarkDirtyBlock(AOffset: Int64);
+var
+  bi: Integer;
+begin
+  if not FindBlockForOffset(AOffset, bi) then Exit;
+  if FDirtyBlocks.IndexOf(bi) < 0 then
+    FDirtyBlocks.Add(bi);
+end;
+
+function TVDb.CrcRange(AStart, ALen: Int64; out ACrc: LongWord): Boolean;
+var
+  b: TBytes;
+  rem, got: Int64;
+begin
+  Result := False;
+  if (AStart < VDB_HDR_SIZE) or (ALen < 0) or (AStart + ALen > FS.Size) then Exit;
+  SetLength(b, 65536);
+  ACrc := VDbCrc32Init;
+  FS.Position := AStart;
+  rem := ALen;
+  while rem > 0 do
+  begin
+    if rem > Int64(Length(b)) then got := Length(b) else got := rem;
+    if FS.Read(b[0], Integer(got)) <> Integer(got) then Exit;
+    ACrc := VDbCrc32Update(ACrc, b[0], Integer(got));
+    Dec(rem, got);
+  end;
+  ACrc := VDbCrc32Final(ACrc);
+  Result := True;
+end;
+
+procedure TVDb.UpdateDirtyBlockCrcs;
+var
+  i: Integer;
+  bi: TBlockInfo;
+  c, oldCrc: LongWord;
+  oldBytes: TBytes;
+begin
+  if FDirtyBlocks.Count = 0 then Exit;
+  for i := 0 to FDirtyBlocks.Count - 1 do
+  begin
+    bi := FBlocks[FDirtyBlocks[i]];
+    // Footer'in eski CRC'sini de undo gunlugune al: crash sonrasi geri
+    // sarma hem veriyi hem footer CRC'sini eski tutarli hale getirir.
+    FS.Position := bi.Footer + 4;
+    FS.ReadBuffer(oldCrc, 4);
+    SetLength(oldBytes, 4);
+    Move(oldCrc, oldBytes[0], 4);
+    if not VDbUndoAppend(FPath, bi.Footer + 4, oldBytes) then
+      raise EVDbException.Create(ecIOError, 'VDb: blok footer undo kaydi yazilamadi');
+    if not CrcRange(bi.Start, bi.Footer - bi.Start, c) then
+      raise EVDbException.Create(ecIOError, 'VDb: blok CRC yeniden hesaplanamadi');
+    FS.Position := bi.Footer + 4;
+    FS.WriteBuffer(c, 4);
+    CacheInvalidateAt(bi.Footer, SizeOf(TVDbRecHead));
+  end;
+  FDirtyBlocks.Clear;
+  FDirty := True;
+end;
+
+procedure TVDb.FinalizeInPlaceWrite;
+begin
+  if not FUsedInPlace then Exit;
+  UpdateDirtyBlockCrcs;
+  // Yerinde yazim + footer CRC guncellemeleri ayni fsync ile kalici olur.
+  // SyncWrite=False ise kullanici dayanikliliktan vazgecmistir; ana dosya
+  // fsync edilmez, yalniz undo commit isareti yazilir.
+  if FSyncWrite then
+  begin
+    VDbFlushStream(FS);
+    FDirty := False;
+    FSyncWriteLast := GetTickCount64;
+  end
+  else
+    FDirty := True;
+  if not VDbUndoCommit(FPath) then
+    raise EVDbException.Create(ecIOError, 'VDb: undo commit isareti yazilamadi');
+  VDbUndoDelete(VDbUndoPath(FPath));
+  FUsedInPlace := False;
+  FUndoMarkerWritten := False;
+  FlushDeadQueue;
 end;
 
 function TVDb.FindPending(Key: QWord; out Op: TPendOp): Boolean;
@@ -1955,13 +2473,20 @@ begin
 end;
 
 procedure TVDb.Close;
+var
+  restored: Integer;
 begin
   FLock.Enter;
   try
     if FClosed then Exit;
     if FInBatch then AbortBatch;
     try
-      if FS <> nil then VDbFlushStream(FS);
+      if FS <> nil then
+      begin
+        if FileExists(VDbUndoPath(FPath)) then
+          VDbUndoRollback(FS, VDbUndoPath(FPath), restored);
+        VDbFlushStream(FS);
+      end;
     finally
       if FLcked then
       begin
@@ -2039,15 +2564,26 @@ end
       // GROUP COMMIT: SyncWrite=True olsa bile, SyncWriteInterval > 0 ise
       // fsync bu sure icinde toplanir. Boylece tekil yazimlar ~10-100x
       // hizlanir; en fazla SyncWriteInterval ms gecikme olur.
+      FUndoStartSize := FS.Size;
+      FUndoMarkerWritten := False;
       AppendRec(Key, Value, False, False);
-      if FSyncWrite and ((FSyncWriteInterval <= 0) or
-         (GetTickCount64 - FSyncWriteLast >= QWord(FSyncWriteInterval))) then
+      if FUsedInPlace then
       begin
-        AppendBatchEnd(True);
-        FSyncWriteLast := GetTickCount64;
+        AppendBatchEnd(False);
+        FinalizeInPlaceWrite;
       end
       else
-        AppendBatchEnd(False);   // fsync ertelendi (group commit)
+      begin
+        if FSyncWrite and ((FSyncWriteInterval <= 0) or
+           (GetTickCount64 - FSyncWriteLast >= QWord(FSyncWriteInterval))) then
+        begin
+          AppendBatchEnd(True);
+          FSyncWriteLast := GetTickCount64;
+        end
+        else
+          AppendBatchEnd(False);   // fsync ertelendi (group commit)
+        FlushDeadQueue;
+      end;
     end;
   finally
     FLock.Leave;
@@ -3708,15 +4244,26 @@ if not FIndex.ContainsKey(Key) then
     //
     // GROUP COMMIT: Put ile ayni mantik - fsync SyncWriteInterval
     // icinde toplanir.
+    FUndoStartSize := FS.Size;
+    FUndoMarkerWritten := False;
     AppendRec(Key, nil, True, False);
-    if FSyncWrite and ((FSyncWriteInterval <= 0) or
-       (GetTickCount64 - FSyncWriteLast >= QWord(FSyncWriteInterval))) then
+    if FUsedInPlace then
     begin
-      AppendBatchEnd(True);
-      FSyncWriteLast := GetTickCount64;
+      AppendBatchEnd(False);
+      FinalizeInPlaceWrite;
     end
     else
-      AppendBatchEnd(False);   // fsync ertelendi (group commit)
+    begin
+      if FSyncWrite and ((FSyncWriteInterval <= 0) or
+         (GetTickCount64 - FSyncWriteLast >= QWord(FSyncWriteInterval))) then
+      begin
+        AppendBatchEnd(True);
+        FSyncWriteLast := GetTickCount64;
+      end
+      else
+        AppendBatchEnd(False);   // fsync ertelendi (group commit)
+      FlushDeadQueue;
+    end;
     Result := True;
   finally
     FLock.Leave;
@@ -3734,6 +4281,10 @@ begin
     FBatchOwner := VDbGetTxnSession;
     TxnGateOpen(FBatchOwner);
     FSnapshotSeq := FSeq + 1;  // R-01: transaction snapshot — gorunen: tamamlanmis (Seq<=FSeq) + bu batch'taki yazmalar (Seq=FSeq+1)
+    { H11: yerinde yazim bu transaction'da append edilen kayitlarla
+      karisirsa, crash geri almasinda dosya bu boya kirpilir. }
+    FUndoStartSize := FS.Size;
+    FUndoMarkerWritten := False;
     PendingClear;
     FPendingPuts.Clear;
     FPendingDels.Clear;
@@ -3767,6 +4318,7 @@ var
   i: Integer;
   op: TPendOp;
   savedSize: Int64;
+  restored: Integer;
 begin
   FLock.Enter;
   try
@@ -3782,6 +4334,8 @@ begin
     if Assigned(FBeforeCommit) then
       FBeforeCommit();
     savedSize := FS.Size;
+    FUndoStartSize := savedSize;
+    FUndoMarkerWritten := False;
     try
       // F1-2: ON-DOGRULAMA
       for i := 0 to FPending.Count - 1 do
@@ -3814,21 +4368,35 @@ begin
         end;
         if PendingCount > 0 then
           AppendBatchEnd(False);
-        // GROUP COMMIT: SyncWriteInterval > 0 ise ve yeterli sure gecmediyse
-        // fsync ertelenir. Boylece SQL katmaninin her UPDATE/DELETE icin
-        // kullandigi BeginBatch/CommitBatch de group commit ile calisir.
-        // FDirty False birakilmaz (siradaki Flush/CommitBatch'te tekrar denenecek).
-        if (FSyncWriteInterval <= 0) or
-           (GetTickCount64 - FSyncWriteLast >= QWord(FSyncWriteInterval)) then
+        if FUsedInPlace then
+          // H11: yerinde yazimda blok CRC guncellemeleri + BATCHEND ayni
+          // fsync ile kalici olur; ardindan undo commit edilir.
+          FinalizeInPlaceWrite
+        else
         begin
-          VDbFlushStream(FS);
-          FDirty := False;
-          FSyncWriteLast := GetTickCount64;
+          // GROUP COMMIT: SyncWriteInterval > 0 ise ve yeterli sure gecmediyse
+          // fsync ertelenir. Boylece SQL katmaninin her UPDATE/DELETE icin
+          // kullandigi BeginBatch/CommitBatch de group commit ile calisir.
+          // FDirty False birakilmaz (siradaki Flush/CommitBatch'te tekrar denenecek).
+          if (FSyncWriteInterval <= 0) or
+             (GetTickCount64 - FSyncWriteLast >= QWord(FSyncWriteInterval)) then
+          begin
+            VDbFlushStream(FS);
+            FDirty := False;
+            FSyncWriteLast := GetTickCount64;
+          end;
+          FlushDeadQueue;
         end;
       except
         on E: Exception do
         begin
           try
+            if FileExists(VDbUndoPath(FPath)) then
+              VDbUndoRollback(FS, VDbUndoPath(FPath), restored);
+            FUsedInPlace := False;
+            FUndoMarkerWritten := False;
+            FDirtyBlocks.Clear;
+            FDeadQueue.Clear;
             FS.Size := savedSize;
             VDbFlushStream(FS);
             // H12: kuyruk kirpildi -> bu bolgedeki olasi onbellek bloklari
@@ -3857,12 +4425,20 @@ begin
 end;
 
 procedure TVDb.AbortBatch;
+var
+  restored: Integer;
 begin
   FLock.Enter;
   try
     { Kapanis/ROLLBACK her zaman guvenlidir: yalnizca commit edilmemis
       degisiklikleri atar. Sahip denetimi burada yapilmaz; aksi halde
       baska oturumun acik biraktigi batch yuzunden DB kapatilamaz. }
+    if (FS <> nil) and FileExists(VDbUndoPath(FPath)) then
+      VDbUndoRollback(FS, VDbUndoPath(FPath), restored);
+    FUsedInPlace := False;
+    FUndoMarkerWritten := False;
+    FDirtyBlocks.Clear;
+    FDeadQueue.Clear;
     PendingClear;
     FPendingPuts.Clear;
     FPendingDels.Clear;
@@ -5469,6 +6045,7 @@ var
   blockStart: Int64;
   nBlock: Integer;
   sawBlock: Boolean;
+  hasInPlace: Boolean;
 
   procedure Bad(const Fmt: string; const Args: array of const);
   begin
@@ -5518,6 +6095,7 @@ begin
     if fh.Magic <> VDB_FILE_MAGIC then begin Report := 'BOZUK: VODB imzasi yok'; Exit; end;
     if fh.Ver <> VDB_FILE_VER then begin Report := 'BOZUK: desteklenmeyen surum'; Exit; end;
     if fh.Crc <> HeadCrc(fh) then begin Report := 'BOZUK: baslik CRC'; Exit; end;
+    hasInPlace := (fh.Flags and VDB_HFLAG_INPLACE) <> 0;
     pos := VDB_HDR_SIZE;
     n := 0; nPut := 0; nDel := 0; nEnd := 0; nEnc := 0; first := True; expSeq := 0;
     blockCrc := VDbCrc32Init;
@@ -5570,6 +6148,15 @@ begin
       end
       else
         pv := nil;
+      { H11: FREESPACE'in ham baytlari anlamsizdir; kayit-bazi CRC
+        dogrulanmaz, seq akisina katilmaz. Blok CRC'sine ise GIRER
+        (yukarida eklendi). }
+      if h.Flags = VDB_FLAG_FREESPACE then
+      begin
+        Inc(n);
+        pos := next;
+        Continue;
+      end;
       c := RecCrc(h.Seq, h.Key, h.ValLen, h.Flags, pv);
       if c <> h.Crc then begin Bad('CRC tutmadi key=%d', [h.Key]); Exit; end;
       if not RecFlagsValid(h.Flags, h.ValLen, True) then
@@ -5578,9 +6165,12 @@ begin
       // Recover'da "commit isareti" yanlis yorumlanir.
       if (h.Flags = VDB_FLAG_BATCHEND) and ((h.Key <> 0) or (h.ValLen <> 0)) then
       begin Bad('BATCHEND bozuk (key=%d vallen=%d)', [h.Key, h.ValLen]); Exit; end;
-      if first then begin expSeq := h.Seq; first := False; end;
-      if h.Seq <> expSeq then begin Bad('seq kirik beklenen=%d gelen=%d', [expSeq, h.Seq]); Exit; end;
-      Inc(expSeq);
+      if not hasInPlace then
+      begin
+        if first then begin expSeq := h.Seq; first := False; end;
+        if h.Seq <> expSeq then begin Bad('seq kirik beklenen=%d gelen=%d', [expSeq, h.Seq]); Exit; end;
+        Inc(expSeq);
+      end;
       // F2-17: ONCEDEN "del degilse put" sayiliyordu; BATCHEND kayitlari
       // da put olarak sayildigi icin rapor yanilticiydi (399 put + 399
       // BATCHEND -> "put=798"). Artik ucuncu sayac ayri.

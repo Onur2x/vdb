@@ -12676,6 +12676,8 @@ var
   v: TBytes;
   off: Int64;
   ok: Boolean;
+  restored: Integer;
+  sz0: Int64;
 
   procedure OverwriteAt(AOff: Int64; const S: RawByteString);
   begin
@@ -12768,6 +12770,228 @@ begin
     ok := db.Get(1, v) and (VDbBytesToStr(v) = 'AAAA');
     Dogrula('H11 ters sira en eski degeri geri yukledi', ok, VDbBytesToStr(v));
     Dogrula('H11 ters sira sonrasi Verify', db.Verify(rep), rep);
+  finally
+    db.Close;
+    db.Free;
+  end;
+  // 4) Commit edilmemis yerinde+append transaction'inda baslangic isareti
+  //    dosyayi islem basindaki boya kirpar; append edilen yarim kayit kalmaz.
+  dir := baseDir + '_trunc';
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    db.Put(1, VDbStrToBytes('AAAA'));
+  finally
+    db.Close;
+    db.Free;
+  end;
+  fn := dir + '\veritabani.odb';
+  fs := TFileStream.Create(fn, fmOpenRead);
+  try
+    sz0 := fs.Size;
+  finally
+    fs.Free;
+  end;
+  fs := TFileStream.Create(fn, fmOpenReadWrite);
+  try
+    fs.Seek(0, soEnd);
+    SetLength(v, 16);
+    FillChar(v[0], 16, 0);
+    fs.WriteBuffer(v[0], 16);
+    Dogrula('H11 undo baslangic isareti',
+      VDbUndoTruncateMarker(fn, sz0), '');
+    Dogrula('H11 commit edilmemis rollback',
+      VDbUndoRollback(fs, VDbUndoPath(fn), restored), '');
+    Dogrula('H11 rollback dosyayi islem basina kirpti',
+      fs.Size = sz0, IntToStr(fs.Size) + '/' + IntToStr(sz0));
+  finally
+    fs.Free;
+  end;
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    ok := db.Get(1, v) and (VDbBytesToStr(v) = 'AAAA');
+    Dogrula('H11 kirpma sonrasi kayit korundu', ok, VDbBytesToStr(v));
+    Dogrula('H11 kirpma sonrasi Verify', db.Verify(rep), rep);
+  finally
+    db.Close;
+    db.Free;
+  end;
+end;
+
+procedure T129_H11_InPlace;
+// H11.2/H11.3: olu PUT bolgelerinin yerinde yeniden kullanimi, kalan
+// boslugun FREESPACE olarak birakilmasi, blok CRC'sinin guncellenmesi ve
+// dosya sirasi bozulan seq'lerin recovery'de dogru uygulanmasi.
+var
+  baseDir, dir, fn, rep: string;
+  db: TVDb;
+  v: TBytes;
+  sz0, sz1, sz2: Int64;
+  ok: Boolean;
+  fs: TFileStream;
+  fh: TVDbFileHead;
+
+  function FSize(const AName: string): Int64;
+  var
+    f: TFileStream;
+  begin
+    f := TFileStream.Create(AName, fmOpenRead);
+    try
+      Result := f.Size;
+    finally
+      f.Free;
+    end;
+  end;
+
+  function HasInPlaceFlag: Boolean;
+  begin
+    fs := TFileStream.Create(fn, fmOpenRead);
+    try
+      fs.ReadBuffer(fh, VDB_HDR_SIZE);
+      Result := (fh.Flags and VDB_HFLAG_INPLACE) <> 0;
+    finally
+      fs.Free;
+    end;
+  end;
+
+  function MakeVal(ALen: Integer; ACh: AnsiChar): TBytes;
+  begin
+    SetLength(Result, ALen);
+    if ALen > 0 then
+      FillChar(Result[0], ALen, Byte(ACh));
+  end;
+
+begin
+  Grp('H11 yerinde yazim / serbest bolge');
+  baseDir := D + '\h11_inplace_' + IntToStr(GetTickCount64);
+
+  // 1) Olu PUT bolgesi yeni kayitla yeniden kullanilir; silinen anahtar
+  //    recovery'de geri gelmez.
+  dir := baseDir + '_reuse';
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    db.Put(1, VDbStrToBytes('AAAA'));
+    db.Put(2, VDbStrToBytes('BBBB'));
+    db.Delete(1);
+  finally
+    db.Close;
+    db.Free;
+  end;
+  fn := dir + '\veritabani.odb';
+  sz0 := FSize(fn);
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    db.Put(3, VDbStrToBytes('CCCC'));
+    sz1 := db.DataFileSize;
+    Dogrula('H11.3 olu PUT bolgesi yeniden kullanildi',
+      (sz1 - sz0) < 80, IntToStr(sz1 - sz0) + ' bayt buyudu');
+    ok := db.Get(3, v) and (VDbBytesToStr(v) = 'CCCC');
+    Dogrula('H11.3 yeni deger okunur', ok, VDbBytesToStr(v));
+    Dogrula('H11.3 silinen anahtar geri gelmedi', not db.Get(1, v), '');
+    ok := db.Get(2, v) and (VDbBytesToStr(v) = 'BBBB');
+    Dogrula('H11.3 diger anahtar korundu', ok, VDbBytesToStr(v));
+    Dogrula('H11.3 Verify blok CRC dahil', db.Verify(rep), rep);
+  finally
+    db.Close;
+    db.Free;
+  end;
+  Dogrula('H11.3 dosya INPLACE bayragi tasir', HasInPlaceFlag, '');
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    ok := db.Get(3, v) and (VDbBytesToStr(v) = 'CCCC');
+    Dogrula('H11.3 reopen sonrasi deger', ok, VDbBytesToStr(v));
+    Dogrula('H11.3 reopen sonrasi silinen yok', not db.Get(1, v), '');
+    Dogrula('H11.3 reopen Verify', db.Verify(rep), rep);
+  finally
+    db.Close;
+    db.Free;
+  end;
+
+  // 2) Kalan bosluk FREESPACE olur ve sonraki kucuk kayit onu tekrar
+  //    kullanabilir.
+  dir := baseDir + '_free';
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    db.Put(1, MakeVal(100, 'A'));
+    db.Delete(1);
+  finally
+    db.Close;
+    db.Free;
+  end;
+  fn := dir + '\veritabani.odb';
+  sz0 := FSize(fn);
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    db.Put(2, VDbStrToBytes('BBBB'));
+    sz1 := db.DataFileSize;
+    Dogrula('H11.3 buyuk bolgeden kucuk kayit (FREESPACE)',
+      (sz1 - sz0) < 80, IntToStr(sz1 - sz0) + ' bayt buyudu');
+    ok := db.Get(2, v) and (VDbBytesToStr(v) = 'BBBB');
+    Dogrula('H11.3 FREESPACE sonrasi kayit 2', ok, VDbBytesToStr(v));
+    Dogrula('H11.3 FREESPACE Verify', db.Verify(rep), rep);
+    db.Put(3, MakeVal(30, 'C'));
+    sz2 := db.DataFileSize;
+    Dogrula('H11.3 kalan FREESPACE yeniden kullanildi',
+      (sz2 - sz1) < 80, IntToStr(sz2 - sz1) + ' bayt buyudu');
+    ok := db.Get(3, v) and (Length(v) = 30) and (v[0] = Ord('C'));
+    Dogrula('H11.3 ikinci yerinde kayit', ok, IntToStr(Length(v)));
+    ok := db.Get(2, v) and (VDbBytesToStr(v) = 'BBBB');
+    Dogrula('H11.3 onceki kayit korundu', ok, VDbBytesToStr(v));
+    Dogrula('H11.3 ikinci FREESPACE Verify', db.Verify(rep), rep);
+  finally
+    db.Close;
+    db.Free;
+  end;
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    ok := db.Get(3, v) and (Length(v) = 30);
+    Dogrula('H11.3 reopen ikinci kayit', ok, IntToStr(Length(v)));
+    Dogrula('H11.3 reopen FREESPACE Verify', db.Verify(rep), rep);
+  finally
+    db.Close;
+    db.Free;
+  end;
+
+  // 3) Dosya sirasi bozuk seq: T2'nin yerinde kaydi T1'in append
+  //    kaydindan once gorunur. Recovery BATCHEND seq filtresi olmadan
+  //    T1'i sonra uygulayip T2'yi ezerdi.
+  dir := baseDir + '_order';
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    db.Put(1, VDbStrToBytes('AAAA'));
+    db.Delete(1);
+  finally
+    db.Close;
+    db.Free;
+  end;
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    db.Put(1, VDbStrToBytes('LONGGG'));   // 35 bayt: 33'luk bolgeye sigmaz
+    db.Put(1, VDbStrToBytes('ZZZZ'));     // 33 bayt: eski bolgeye yerinde
+  finally
+    db.Close;
+    db.Free;
+  end;
+  fn := dir + '\veritabani.odb';
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    ok := db.Get(1, v) and (VDbBytesToStr(v) = 'ZZZZ');
+    Dogrula('H11.3 recovery seq sirasini korudu', ok, VDbBytesToStr(v));
+    Dogrula('H11.3 seq sirasi Verify', db.Verify(rep), rep);
   finally
     db.Close;
     db.Free;
@@ -13510,6 +13734,7 @@ T92_MVCC_Isoaltion;
        T126_F42_TxIsolation;
        T127_H5_BlockCrc;
        T128_H11_Undo;
+       T129_H11_InPlace;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls

@@ -21,6 +21,10 @@ uses
 const
   VDB_UNDO_MAGIC        = $4F444E55;  // 'UNDO' little-endian
   VDB_UNDO_COMMIT_MAGIC = $544D4D43;  // 'CMMT' little-endian
+  { H11: islem basindaki dosya boyu. Yerinde yazimla ayni transaction'da
+    append edilen kayitlar crash sonrasi geri alinirken dosya bu boya
+    kirpilir; aksi halde BATCHEND kalir ve yarim transaction gorunur. }
+  VDB_UNDO_TRUNC_MAGIC  = $4E525254;  // 'TRNR' little-endian
   // Bozuk/art niyetli bir basliktan dolayi devasa bellek ayirmayi engelle.
   VDB_UNDO_MAX_SPAN     = 32 * 1024 * 1024;
 
@@ -37,6 +41,14 @@ function VDbUndoPath(const DbPath: string): string;
 // kayit olabilir; geri yukleme TERS sirada yapilir.
 function VDbUndoAppend(const DbPath: string; AOffset: Int64;
   const OldData: TBytes): Boolean;
+// Db'deki [AOffset, AOffset+ASize) araliginin ESKI baytlarini gunluge
+// ekler. Cagiran, ana dosyayi degistirmeden ONCE bunu cagirmalidir.
+function VDbUndoAppendFromStream(Db: TFileStream; const DbPath: string;
+  AOffset: Int64; ASize: Int64): Boolean;
+// Islem basindaki dosya boyunu gunluge isaretler. Yerinde yazimla ayni
+// transaction'da append edilen kayitlar varsa, commit edilmemis gunluk
+// geri alinirken dosya bu boya kirpilir.
+function VDbUndoTruncateMarker(const DbPath: string; AOldSize: Int64): Boolean;
 // Commit isareti ekler ve fsync eder. Undo dosyasi yoksa no-op True.
 function VDbUndoCommit(const DbPath: string): Boolean;
 // Acilista cagrilir. Commit isareti varsa dosyayi siler (veri zaten
@@ -100,6 +112,46 @@ begin
   Result := AppendHeadAndData(VDbUndoPath(DbPath), h, OldData);
 end;
 
+function VDbUndoAppendFromStream(Db: TFileStream; const DbPath: string;
+  AOffset: Int64; ASize: Int64): Boolean;
+var
+  data: TBytes;
+begin
+  Result := False;
+  if (Db = nil) or (AOffset < 0) or (ASize < 0) or
+     (ASize > VDB_UNDO_MAX_SPAN) or (AOffset + ASize > Db.Size) then
+    Exit;
+  SetLength(data, ASize);
+  if ASize > 0 then
+  begin
+    Db.Position := AOffset;
+    Db.ReadBuffer(data[0], Integer(ASize));
+  end;
+  Result := VDbUndoAppend(DbPath, AOffset, data);
+end;
+
+function VDbUndoTruncateMarker(const DbPath: string; AOldSize: Int64): Boolean;
+var
+  h: TVDbUndoHead;
+  s: TFileStream;
+begin
+  Result := False;
+  if AOldSize < 0 then Exit;
+  h.Magic := VDB_UNDO_TRUNC_MAGIC;
+  h.Offset := AOldSize;
+  h.Size := 0;
+  h.Crc := 0;
+  s := OpenUndoForAppend(VDbUndoPath(DbPath));
+  try
+    s.Seek(0, soEnd);
+    s.WriteBuffer(h, SizeOf(h));
+    VDbFlushStream(s);
+    Result := True;
+  finally
+    s.Free;
+  end;
+end;
+
 function VDbUndoCommit(const DbPath: string): Boolean;
 var
   h: TVDbUndoHead;
@@ -155,6 +207,7 @@ var
   i: Integer;
   data: TBytes;
   committed: Boolean;
+  truncSize: Int64;
 begin
   Result := True;
   Restored := 0;
@@ -166,6 +219,7 @@ begin
     undoSize := s.Size;
     pos := 0;
     committed := False;
+    truncSize := -1;
     while pos + Int64(SizeOf(h)) <= undoSize do
     begin
       s.Position := pos;
@@ -174,6 +228,14 @@ begin
       begin
         committed := True;
         Break;
+      end;
+      if h.Magic = VDB_UNDO_TRUNC_MAGIC then
+      begin
+        if (h.Size <> 0) or (h.Offset < 0) then Break;
+        if (truncSize < 0) or (h.Offset < truncSize) then
+          truncSize := h.Offset;
+        pos := pos + Int64(SizeOf(h));
+        Continue;
       end;
       if h.Magic <> VDB_UNDO_MAGIC then Break;
       if h.Size > VDB_UNDO_MAX_SPAN then Break;
@@ -235,6 +297,11 @@ begin
           Db.WriteBuffer(data[0], h.Size);
         Inc(Restored);
       end;
+      { Islem basinda append edilmis kayitlar varsa (yerinde + append ayni
+        transaction'da), commit edilmemis gunluk geri alinirken bunlari da
+        at: dosya islem basindaki boya kirpilir. }
+      if (truncSize >= 0) and (Db.Size > truncSize) then
+        Db.Size := truncSize;
       VDbFlushStream(Db);
     end;
   finally
