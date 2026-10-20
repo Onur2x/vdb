@@ -3057,7 +3057,12 @@ var
   i: Integer;
   one: TSqlResult;
   allSelect: Boolean;
+  prevSess: Cardinal;
 begin
+  prevSess := VDbGetWriteSession;
+  VDbSetWriteSession(FSessionId);
+  FT.Kv.WaitForeignTxn(FSessionId);
+  try
   // Once tum cumleler SELECT mi kontrol et
   allSelect := True;
   for i := 0 to High(Stmts) do
@@ -3103,6 +3108,9 @@ begin
     Result := ExecAllInner(Stmts);
   finally
     FT.Unlock;
+  end;
+  finally
+    VDbSetWriteSession(prevSess);
   end;
 end;
 
@@ -3163,6 +3171,7 @@ end;
 function TVSql.Exec(const Sql: string): TSqlResult;
 var
   st: TStrArray;
+  prevSess: Cardinal;
 begin
 
   // KR-7 (MREW): SELECT sorgulari LockRead (paralel), yazma Lock (seri).
@@ -3174,6 +3183,16 @@ begin
     SetLength(Result.Fields, 0); SetLength(Result.Rows, 0);
     Exit;
   end;
+
+  { F-42: oturum kimligini TUM Exec boyunca sabit tut. Executor kendi
+    finally'sinda onceki degere dondurur; hizli yollar (literal INSERT,
+    nokta SELECT) Execute'a ugradigi icin kimligi kendileri kurmaz.
+    Bu sarmalayici olmadan hizli yol yazmalari 0 kimlikle kalir ve acik
+    bir transaction'in sahibiyle uyusmaz. }
+  prevSess := VDbGetWriteSession;
+  VDbSetWriteSession(FSessionId);
+  FT.Kv.WaitForeignTxn(FSessionId);
+  try
 
   if (Length(st) = 1) and IsSelectStatement(st[0]) then
   begin
@@ -3207,12 +3226,16 @@ begin
   finally
     FT.Unlock;
   end;
+  finally
+    VDbSetWriteSession(prevSess);
+  end;
 end;
 
 function TVSql.Exec(const Sql: string; const Params: array of string): TSqlResult;
 var
   i: Integer;
   st: TStrArray;
+  prevSess: Cardinal;
 begin
 
   // KR-7 (MREW): SELECT sorgulari LockRead (paralel), yazma Lock (seri).
@@ -3224,6 +3247,11 @@ begin
     SetLength(Result.Fields, 0); SetLength(Result.Rows, 0);
     Exit;
   end;
+
+  prevSess := VDbGetWriteSession;
+  VDbSetWriteSession(FSessionId);
+  FT.Kv.WaitForeignTxn(FSessionId);
+  try
 
   if (Length(st) = 1) and IsSelectStatement(st[0]) then
   begin
@@ -3261,6 +3289,9 @@ begin
   // fazla parametre sessizce yoksayilir; eksik Tok'ta patlar
   finally
     FT.Unlock;
+  end;
+  finally
+    VDbSetWriteSession(prevSess);
   end;
 end;
 
@@ -3630,6 +3661,9 @@ begin
   Result.Affected := 0; Result.Msg := ''; SetLength(Result.Fields, 0);
   SetLength(Result.FieldTypes, 0); SetLength(Result.Rows, 0);
   Result.LastTable := ''; Result.Stmts := 1;
+
+  { F-42: dogrudan ExecRaw cagrilari da yabanci acik transaction'i beklesin. }
+  FT.Kv.WaitForeignTxn(FSessionId);
 
   // F-40: READ COMMITTED / READ UNCOMMITTED -> her cumle yeni snapshot.
   if FT.Kv.InBatch and

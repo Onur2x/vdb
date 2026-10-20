@@ -230,6 +230,18 @@ FPath: string;
     FSyncWriteInterval: Integer;
     FSyncWriteLast: QWord;   // son fsync zaman damgasi (GetTickCount64)
     FInBatch: Boolean;
+    { F-42: acik batch'in sahibi oturum. 0 = ham TVDb API (eski global
+      davranis). Baska bir oturum batch sahibi iken yazma reddedilir ve
+      okuma yalnizca commit edilmis gorunumu gorur. }
+    FBatchOwner: Cardinal;
+    { F-42: oturumlararasi seri calisma kapisi. Bir SQL oturumu acik
+      transaction tutarken diger SQL oturumlari cumle basinda burada
+      bekler. Boylece henuz commit edilmemis indeks/sema degisiklikleri
+      baska oturuma sizmaz; kapi FT.Lock'tan ONCE alinir. }
+    FGateLock: TCriticalSection;
+    FGateEvent: TEvent;
+    FGateOpen: Boolean;
+    FGateOwner: Cardinal;
     // MVCC / Snapshot Isolation (R-01):
     // FSnapshotSeq: transaction-level snapshot sequence (BeginBatch'ta FSeq+1).
     // Okuma gorunurlugu: Loc.Seq <= SnapshotSeq.
@@ -330,6 +342,13 @@ FPath: string;
       bu veritabaninda henuz kolon anahtari yok. Anahtarin kendisi
       <db>.colkey dosyasindan yuklenir; burada yalnizca kimlik tutulur. }
     FColKeyId: QWord;
+    procedure TxnGateOpen(AOwner: Cardinal);
+    procedure TxnGateClose;
+    function BatchIsMine: Boolean;
+    { F-42: acik batch baska oturuma aitse yazma reddedilir. Boylece
+      ikinci oturumun yazmasi sessizce birinci oturumun transaction'ina
+      katilmaz. }
+    procedure RequireBatchWrite;
     function EncryptValue(const Value: TBytes; out Cipher: TBytes): Boolean;
     function DecryptValue(const Cipher: TBytes; out Plain: TBytes): Boolean;
     procedure CheckOpen;
@@ -442,6 +461,11 @@ private
     procedure RefreshBatchSnapshot;
     procedure CommitBatch;
     procedure AbortBatch; // NOT: tablo indexleri onarilmaz, TVTableDb.AbortBatch kullan
+    { F-42: baska bir SQL oturumunun acik transaction'i varsa, o bitene
+      kadar bekler. TVSql.Exec/ExecAll tarafindan FT.Lock'tan ONCE
+      cagrilir; boylece kilitlenme olmaz. ASessionId=0 (ham API/ic
+      is parcaci) beklemez. }
+    procedure WaitForeignTxn(ASessionId: Cardinal);
     procedure Flush;
     function Count: Integer;
     { KR-1B: COUNT(*) O(1). Tablonun daha once DOGRULANMIS canli satir sayisi
@@ -715,10 +739,92 @@ property DeadBytes: Int64 read FDeadBytes;
 
 function VDbStrToBytes(const S: RawByteString): TBytes;
 function VDbBytesToStr(const B: TBytes): RawByteString;
+
+{ F-42: cumleyi calistiran oturumun kimligi (thread yerel). TVDb batch
+  sahipligini ve gorunurlugunu bu kimlige gore ayirir. 0 = oturum yok. }
+procedure VDbSetTxnSession(AId: Cardinal);
+function VDbGetTxnSession: Cardinal;
 implementation
 
 uses
   VDbCrc32, VDbSync, VDbCrypt;
+
+threadvar
+  GVdbTxnSession: Cardinal;
+
+procedure VDbSetTxnSession(AId: Cardinal);
+begin
+  GVdbTxnSession := AId;
+end;
+
+function VDbGetTxnSession: Cardinal;
+begin
+  Result := GVdbTxnSession;
+end;
+
+function TVDb.BatchIsMine: Boolean;
+begin
+  { Oturum kimligi 0 = ham TVDb API'si ya da motorun kendi ic is parcacigi.
+    Bunlar eski global batch davranisini korur; yalnizca kimligi olan
+    farkli SQL oturumlari birbirinden yalitilir. }
+  Result := FInBatch and ((FBatchOwner = 0) or
+    (VDbGetTxnSession = 0) or (FBatchOwner = VDbGetTxnSession));
+end;
+
+procedure TVDb.RequireBatchWrite;
+begin
+  if FInBatch and (FBatchOwner <> 0) and
+     (VDbGetTxnSession <> 0) and
+     (FBatchOwner <> VDbGetTxnSession) then
+    raise EVDbException.Create(ecLockConflict,
+      'VDb: baska bir oturumun acik islemi var; once COMMIT veya ROLLBACK');
+end;
+
+procedure TVDb.TxnGateOpen(AOwner: Cardinal);
+begin
+  if FGateLock = nil then Exit;
+  FGateLock.Enter;
+  try
+    FGateOwner := AOwner;
+    FGateOpen := True;
+    FGateEvent.ResetEvent;
+  finally
+    FGateLock.Leave;
+  end;
+end;
+
+procedure TVDb.TxnGateClose;
+begin
+  if FGateLock = nil then Exit;
+  FGateLock.Enter;
+  try
+    FGateOpen := False;
+    FGateOwner := 0;
+  finally
+    FGateLock.Leave;
+  end;
+  FGateEvent.SetEvent;
+end;
+
+procedure TVDb.WaitForeignTxn(ASessionId: Cardinal);
+begin
+  if (ASessionId = 0) or (FGateLock = nil) or (FGateEvent = nil) then Exit;
+  while True do
+  begin
+    FGateLock.Enter;
+    try
+      if (not FGateOpen) or (FGateOwner = 0) or
+         (FGateOwner = ASessionId) then
+        Exit;
+    finally
+      FGateLock.Leave;
+    end;
+    { Manual-reset olay: kapanista isaretlenir, yeni transaction acilisinda
+      sifirlanir. 1 sn'lik uyku, kacirilan sinyalde sonsuz bekleme yerine
+      durumu yeniden denetler. }
+    FGateEvent.WaitFor(1000);
+  end;
+end;
 
 { 2026-10-05: kayit bayragi gecerliligi.
   VDB_FLAG_ENCRYPTED bir KARSILIK (bit) olarak PUT ile birlikte
@@ -782,6 +888,10 @@ begin
   SetLength(FCacheSlots, FCacheMaxBlocks);
   for i := 0 to FCacheMaxBlocks - 1 do
     FCacheSlots[i].Blk := -1;
+  FGateLock := TCriticalSection.Create;
+  FGateEvent := TEvent.Create(nil, True, False, '');
+  FGateOpen := False;
+  FGateOwner := 0;
   FIndex := TDictionary<QWord, TDbLoc>.Create;
   FTableKeys := TDictionary<Integer, TList<QWord>>.Create;
   FTableKeysDirty := True;
@@ -825,6 +935,8 @@ begin
   ClearTableKeys;
   FTableKeys.Free;
   FTableRowCount.Free;
+  FGateEvent.Free;
+  FGateLock.Free;
   FLock.Free;
   SetLength(FCacheSlots, 0);
   FCacheMap.Free;
@@ -1702,6 +1814,7 @@ begin
     FLcked := True;
     FClosed := False;
     FInBatch := False;
+    FBatchOwner := 0;
     PendingClear;
     FPendingPuts.Clear;
     FPendingDels.Clear;
@@ -1769,6 +1882,7 @@ begin
   FLock.Enter;
   try
     CheckOpen;
+    RequireBatchWrite;
     if FInBatch then
     begin
       // Ayni key batch icinde birden fazla yazilabilir (orn. INSERT sonra
@@ -2180,7 +2294,7 @@ end;
 function TVDb.Get(Key: QWord; out Value: TBytes): Boolean;
 begin
   // R-01 MVCC: batch icinde transaction snapshot'indan oku; batch disi eski Get davranisi (High(QWord) = her sey gorunur)
-  if FInBatch and (FSnapshotSeq > 0) then
+  if BatchIsMine and (FSnapshotSeq > 0) then
     Result := GetSnapshot(Key, Value, FSnapshotSeq)
   else
     Result := GetSnapshot(Key, Value, High(QWord));
@@ -2189,7 +2303,7 @@ function TVDb.Exists(Key: QWord): Boolean;
 // Dosyaya dokunmadan net durum: pending + index birlikte.
 begin
   // R-01 MVCC: batch icinde transaction snapshot'indan kontrol et; batch disi eski davranis (High(QWord))
-  if FInBatch and (FSnapshotSeq > 0) then
+  if BatchIsMine and (FSnapshotSeq > 0) then
     Result := ExistsSnapshot(Key, FSnapshotSeq)
   else
     Result := ExistsSnapshot(Key, High(QWord));
@@ -2230,7 +2344,7 @@ begin
 
   // 1. Batch icindeyse: pending ops snapshot Seq'sine gore gorunur mu?
   inBatchVisible := False;
-  if FInBatch and FindPending(Key, op) then
+  if BatchIsMine and FindPending(Key, op) then
   begin
     // Pending op gorunur ise: op'nin mantiksel Seq'si FSeq+1'dir (henuz commit edilmemis).
     // SnapshotSeq >= FSeq+1 ise gorunur, degilse gorunmez.
@@ -2377,8 +2491,8 @@ begin
   if FClosed then
     raise EVDbException.Create(ecDatabaseNotOpen, 'VDb: once Open cagir');
 
-  // Batch icindeki pending ops
-  if FInBatch and FindPending(Key, op) then
+  // Batch icindeki pending ops (yalniz batch sahibi oturum gorur)
+  if BatchIsMine and FindPending(Key, op) then
   begin
     if (SnapshotSeq > FSeq) and (not op.IsDel) then Exit(True);
     Exit(False);
@@ -2566,7 +2680,7 @@ begin
   pendDels := TDictionary<QWord, Byte>.Create;
   try
     // Batch icindeki pending ops: SnapshotSeq > FSeq ise gorunur
-    if FInBatch and (SnapshotSeq > FSeq) then
+    if BatchIsMine and (SnapshotSeq > FSeq) then
       for n := 0 to FPending.Count - 1 do
         if FPending[n].IsDel then
           pendDels.AddOrSetValue(FPending[n].Key, 0)
@@ -2713,7 +2827,7 @@ begin
     end;
 
     // 2. Batch icindeki pending PUT'lar (SnapshotSeq > FSeq ise)
-    if FInBatch and (SnapshotSeq > FSeq) then
+    if BatchIsMine and (SnapshotSeq > FSeq) then
     begin
       for n := 0 to FPending.Count - 1 do
       begin
@@ -2841,7 +2955,7 @@ begin
   pendDels := TDictionary<QWord, Byte>.Create;
   try
     // Batch icindeki pending ops: SnapshotSeq > FSeq ise gorunur
-    if FInBatch and (SnapshotSeq > FSeq) then
+    if BatchIsMine and (SnapshotSeq > FSeq) then
       for n := 0 to FPending.Count - 1 do
         if FPending[n].IsDel then
           pendDels.AddOrSetValue(FPending[n].Key, 0)
@@ -2998,7 +3112,7 @@ begin
     //    daima dogruydu — burada dogal olarak dusuruldu.)
     //    H6: offset parcasi YOKTUR; yalnizca ilk parcada (OffLo = 0) verilir,
     //    aksi halde N isci ayni pending satiri N kez sayardi.
-    if FInBatch and (SnapshotSeq > FSeq) and (OffLo = 0) then
+    if BatchIsMine and (SnapshotSeq > FSeq) and (OffLo = 0) then
       for n := 0 to FPending.Count - 1 do
       begin
         op := FPending[n];
@@ -3020,7 +3134,7 @@ function TVDb.ScanRawIterAll(TableFilter: Integer;
   Cb: TVDbRawCb; User: Pointer): Boolean;
 // ScanAll'in snapshot secim kuraliyla birebir ayni.
 begin
-  if FInBatch and (FSnapshotSeq > 0) then
+  if BatchIsMine and (FSnapshotSeq > 0) then
     Result := ScanRawIter(FSnapshotSeq, TableFilter, Cb, User)
   else
     Result := ScanRawIter(High(QWord), TableFilter, Cb, User);
@@ -3054,7 +3168,7 @@ function TVDb.ScanRawIterAllZoned(TableFilter: Integer;
 // H3: ScanRawIterAll ile ayni snapshot kurali; yalnizca zone map'in
 // atlanabilir buldugu offset bolumleri okunmaz.
 begin
-  if FInBatch and (FSnapshotSeq > 0) then
+  if BatchIsMine and (FSnapshotSeq > 0) then
     Result := ScanRawIter(FSnapshotSeq, TableFilter, Cb, User,
       0, High(Int64), SkipBuckets, SkipLen, CurBucket)
   else
@@ -3067,7 +3181,7 @@ function TVDb.ScanRawIterAllRange(TableFilter: Integer; OffLo, OffHi: Int64;
 // H6: ScanRawIterAll ile ayni snapshot kurali; yalnizca [OffLo, OffHi)
 // offset araligindaki kayit baslangiclari islenir.
 begin
-  if FInBatch and (FSnapshotSeq > 0) then
+  if BatchIsMine and (FSnapshotSeq > 0) then
     Result := ScanRawIter(FSnapshotSeq, TableFilter, Cb, User, OffLo, OffHi)
   else
     Result := ScanRawIter(High(QWord), TableFilter, Cb, User, OffLo, OffHi);
@@ -3421,6 +3535,7 @@ begin
   FLock.Enter;
   try
     CheckOpen;
+    RequireBatchWrite;
     if FInBatch then
     begin
       // "put-then-del" kisayolu SADECE anahtar diskte OLMAYAN bir
@@ -3498,6 +3613,8 @@ begin
     if FInBatch then
       raise EVDbException.Create(ecTransactionState, 'VDb: batch zaten acik');
     FInBatch := True;
+    FBatchOwner := VDbGetTxnSession;
+    TxnGateOpen(FBatchOwner);
     FSnapshotSeq := FSeq + 1;  // R-01: transaction snapshot — gorunen: tamamlanmis (Seq<=FSeq) + bu batch'taki yazmalar (Seq=FSeq+1)
     PendingClear;
     FPendingPuts.Clear;
@@ -3513,7 +3630,10 @@ begin
   try
     CheckOpen;
     if FInBatch then
+    begin
+      RequireBatchWrite;
       FSnapshotSeq := FSeq + 1;
+    end;
   finally
     FLock.Leave;
   end;
@@ -3535,6 +3655,7 @@ begin
     CheckOpen;
     if not FInBatch then
       raise EVDbException.Create(ecTransactionState, 'VDb: batch acik degil');
+    RequireBatchWrite;
     { R-11: DEFERRABLE kisitlarin COMMIT oncesi denetimi.
       Buraya, HICBIR kayit dosyaya yazilmadan ONCE cagrilir: ihlal
       varsa hicbir sey yazilmamis olur, otomatik geri alma (rollback)
@@ -3609,6 +3730,8 @@ begin
       FPendingPuts.Clear;
       FPendingDels.Clear;
       FInBatch := False;
+      FBatchOwner := 0;
+      TxnGateClose;
     end;
   finally
     FLock.Leave;
@@ -3619,10 +3742,15 @@ procedure TVDb.AbortBatch;
 begin
   FLock.Enter;
   try
+    { Kapanis/ROLLBACK her zaman guvenlidir: yalnizca commit edilmemis
+      degisiklikleri atar. Sahip denetimi burada yapilmaz; aksi halde
+      baska oturumun acik biraktigi batch yuzunden DB kapatilamaz. }
     PendingClear;
     FPendingPuts.Clear;
     FPendingDels.Clear;
     FInBatch := False;
+    FBatchOwner := 0;
+    TxnGateClose;
     ClearSavepoints;
   finally
     FLock.Leave;
@@ -3641,12 +3769,15 @@ begin
   FLock.Enter;
   try
     CheckOpen;
+    if FInBatch then RequireBatchWrite;
     // SQL standardi: SAVEPOINT, acik bir transaction olmasa da calisir —
     // o zaman ORTUK (implicit) transaction baslatilir. Bizde "batch" bu
     // anlama gelir. Once hata veriyordu; test grubu R-02 tamamen kirildi.
     if not FInBatch then
     begin
       FInBatch := True;
+      FBatchOwner := VDbGetTxnSession;
+      FSnapshotSeq := FSeq + 1;
       PendingClear;
       FPendingPuts.Clear;
       FPendingDels.Clear;
@@ -5340,7 +5471,7 @@ end;
   // R-01 MVCC: batch icinde transaction snapshot'indan taran; batch disi eski ScanAll (High(QWord) = her sey gorunur)
   // R-26: TableFilter >= 0 ise yalnizca o tablonun satirlari dosyadan okunur.
   begin
-    if FInBatch and (FSnapshotSeq > 0) then
+    if BatchIsMine and (FSnapshotSeq > 0) then
       ScanSnapshot(Keys, Vals, FSnapshotSeq, -1, TableFilter)
     else
       ScanSnapshot(Keys, Vals, High(QWord), -1, TableFilter);

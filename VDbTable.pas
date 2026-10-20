@@ -899,17 +899,16 @@ implementation
 uses
   VDbSync, VDbParallel;
 
-threadvar
-  GVdbWriteSession: Cardinal;
-
 procedure VdbSetWriteSession(AId: Cardinal);
 begin
-  GVdbWriteSession := AId;
+  // F-42: oturum kimligi artik VDbCore'da tutulur; TVDb hem satir
+  // kilitlerini hem batch sahipligini ayni degerden okur.
+  VDbSetTxnSession(AId);
 end;
 
 function VdbGetWriteSession: Cardinal;
 begin
-  Result := GVdbWriteSession;
+  Result := VDbGetTxnSession;
 end;
 
 { ------------------------- F-41: satir kilidi ------------------------- }

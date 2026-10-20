@@ -12515,6 +12515,57 @@ begin
     FileExists(dir + '\sec_backup.colkey'), dir + '\sec_backup.colkey');
 end;
 
+procedure T126_F42_TxIsolation;
+// F-42: ayni TVDb uzerinde iki oturum kimligi. Acik transaction'in
+// commit edilmemis yazisi diger oturuma gorunmez; diger oturum yazamaz;
+// commit sonrasi herkes gorur.
+var
+  db: TVDb;
+  dir: string;
+  k: QWord;
+  v: TBytes;
+  ok: Boolean;
+begin
+  Grp('F-42 oturum yalitimi');
+  dir := D + '\f42_iso';
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    k := 42;
+    VDbSetTxnSession(1001);
+    db.BeginBatch;
+    db.Put(k, VDbStrToBytes('a'));
+
+    VDbSetTxnSession(1002);
+    ok := db.Get(k, v);
+    Dogrula('F42 diger oturum commit edilmemisi gormez', not ok, '');
+
+    ok := False;
+    try
+      db.Put(k, VDbStrToBytes('b'));
+    except
+      on E: Exception do ok := Pos('baska bir oturum', E.Message) > 0;
+    end;
+    Dogrula('F42 diger oturum yazamaz', ok, '');
+
+    VDbSetTxnSession(1001);
+    ok := db.Get(k, v);
+    Dogrula('F42 sahibi kendi yazisini gorur',
+      ok and (VDbBytesToStr(v) = 'a'), '');
+
+    db.CommitBatch;
+    VDbSetTxnSession(1002);
+    ok := db.Get(k, v);
+    Dogrula('F42 commit sonrasi diger oturum gorur',
+      ok and (VDbBytesToStr(v) = 'a'), '');
+  finally
+    VDbSetTxnSession(0);
+    db.Close;
+    db.Free;
+  end;
+end;
+
 function TMetricsTestProvider.Get: string;
 begin
   Result := Text;
@@ -13248,6 +13299,7 @@ T92_MVCC_Isoaltion;
        T123_Arrow;
        T124_Parquet;
        T125_KolonSifreleme;
+       T126_F42_TxIsolation;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls
