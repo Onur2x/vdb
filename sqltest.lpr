@@ -14,7 +14,7 @@ uses
   SysUtils, Classes, Math, VDbCore, VDbTypes, VDbTable, VDbSql, VDbSync, VDbCrc32,
   VDbCrypt, VDbKdf, VDbSpatial, VDbRange, VDbMonitor, VDbPlatform, VDbCost,
   VDbExtension, VDbText, VDbParallel, VDbReplication, VDbNet, VDbSqlServer,
-  VDbClientNet, VDbMetricsHttp, VDbPgWire, VDbTls, VDbTrace, dynlibs;
+  VDbClientNet, VDbMetricsHttp, VDbPgWire, VDbTls, VDbTrace, dynlibs, VDbUndo;
 { VDbTypes: TStrArray / TStrMatrix gibi paylasilan tipler artik tek
   kaynaktan geliyor (ayri birimde ikinci tanim FPC'de sessizce
   FARKLI tip uretip derleme hatasi veriyordu). }
@@ -12664,6 +12664,116 @@ begin
   end;
 end;
 
+procedure T128_H11_Undo;
+// H11.1: .undo gunlugu. Commit isareti yoksa eski span baytlari acilista
+// geri yuklenir; commit isareti varsa gunluk atilir. Ayni offset icin
+// birden fazla kayit TERS sirada geri yuklenir.
+var
+  baseDir, dir, fn, rep: string;
+  db: TVDb;
+  fs: TFileStream;
+  h: TVDbRecHead;
+  v: TBytes;
+  off: Int64;
+  ok: Boolean;
+
+  procedure OverwriteAt(AOff: Int64; const S: RawByteString);
+  begin
+    fs := TFileStream.Create(fn, fmOpenReadWrite);
+    try
+      fs.Position := AOff;
+      if Length(S) > 0 then
+        fs.WriteBuffer(S[1], Length(S));
+    finally
+      fs.Free;
+    end;
+  end;
+
+  procedure MakeDb(const ADir, AValue: string);
+  begin
+    ForceDirectories(ADir);
+    db := TVDb.Create;
+    try
+      db.Open(ADir);
+      db.Put(1, VDbStrToBytes(AValue));
+    finally
+      db.Close;
+      db.Free;
+    end;
+    fn := ADir + '\veritabani.odb';
+    fs := TFileStream.Create(fn, fmOpenRead);
+    try
+      fs.Position := VDB_HDR_SIZE;
+      fs.ReadBuffer(h, SizeOf(h));
+      off := VDB_HDR_SIZE + Int64(SizeOf(h));
+    finally
+      fs.Free;
+    end;
+  end;
+
+begin
+  Grp('H11 undo gunlugu');
+  baseDir := D + '\h11_undo_' + IntToStr(GetTickCount64);
+
+  // 1) Commit isareti yok: yarim yerinde yazim geri alinir.
+  dir := baseDir + '_a';
+  MakeDb(dir, 'AAAA');
+  Dogrula('H11 ilk kayit degeri 4 bayt', h.ValLen = 4, IntToStr(h.ValLen));
+  Dogrula('H11 undo kaydi yazildi',
+    VDbUndoAppend(fn, off, VDbStrToBytes('AAAA')), '');
+  OverwriteAt(off, 'BBBB');
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    ok := db.Get(1, v) and (VDbBytesToStr(v) = 'AAAA');
+    Dogrula('H11 undo yarim yazimi geri aldi', ok, VDbBytesToStr(v));
+    Dogrula('H11 undo sonrasi Verify', db.Verify(rep), rep);
+  finally
+    db.Close;
+    db.Free;
+  end;
+  Dogrula('H11 undo dosyasi silindi', not FileExists(VDbUndoPath(fn)), '');
+
+  // 2) Commit isareti varsa eski baytlar geri yazilmaz.
+  dir := baseDir + '_b';
+  MakeDb(dir, 'AAAA');
+  Dogrula('H11 commit undo kaydi yazildi',
+    VDbUndoAppend(fn, off, VDbStrToBytes('ZZZZ')), '');
+  Dogrula('H11 undo commit isareti yazildi', VDbUndoCommit(fn), '');
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    ok := db.Get(1, v) and (VDbBytesToStr(v) = 'AAAA');
+    Dogrula('H11 commit undo geri yuklenmedi', ok, VDbBytesToStr(v));
+    Dogrula('H11 commit undo sonrasi Verify', db.Verify(rep), rep);
+  finally
+    db.Close;
+    db.Free;
+  end;
+  Dogrula('H11 commit undo dosyasi silindi',
+    not FileExists(VDbUndoPath(fn)), '');
+
+  // 3) Ayni offset iki kez: ters sira -> en eski deger.
+  dir := baseDir + '_c';
+  MakeDb(dir, 'AAAA');
+  Dogrula('H11 ters sira undo 1',
+    VDbUndoAppend(fn, off, VDbStrToBytes('AAAA')), '');
+  OverwriteAt(off, 'BBBB');
+  Dogrula('H11 ters sira undo 2',
+    VDbUndoAppend(fn, off, VDbStrToBytes('BBBB')), '');
+  OverwriteAt(off, 'CCCC');
+  db := TVDb.Create;
+  try
+    db.Open(dir);
+    ok := db.Get(1, v) and (VDbBytesToStr(v) = 'AAAA');
+    Dogrula('H11 ters sira en eski degeri geri yukledi', ok, VDbBytesToStr(v));
+    Dogrula('H11 ters sira sonrasi Verify', db.Verify(rep), rep);
+  finally
+    db.Close;
+    db.Free;
+  end;
+end;
+
 function TMetricsTestProvider.Get: string;
 begin
   Result := Text;
@@ -13399,6 +13509,7 @@ T92_MVCC_Isoaltion;
        T125_KolonSifreleme;
        T126_F42_TxIsolation;
        T127_H5_BlockCrc;
+       T128_H11_Undo;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls

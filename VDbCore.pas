@@ -768,7 +768,7 @@ function VDbGetTxnSession: Cardinal;
 implementation
 
 uses
-  VDbCrc32, VDbSync, VDbCrypt;
+  VDbCrc32, VDbSync, VDbCrypt, VDbUndo;
 
 threadvar
   GVdbTxnSession: Cardinal;
@@ -1836,6 +1836,7 @@ procedure TVDb.Open(const Dir: string);
 var
   Loc, Old: string;
   ColKeyFile: string;
+  Restored: Integer;
 begin
   FLock.Enter;
   try
@@ -1928,6 +1929,13 @@ begin
     PendingClear;
     FPendingPuts.Clear;
     FPendingDels.Clear;
+    { H11.1: yerinde yazim gunlugu varsa once onu uygula/at. Commit
+      isareti yoksa eski baytlar geri yuklenir; ardindan normal Recover
+      calisir. }
+    if FileExists(VDbUndoPath(FPath)) then
+      if not VDbUndoRollback(FS, VDbUndoPath(FPath), Restored) then
+        raise EVDbException.Create(ecCorrupt,
+          'VDb: undo gunlugu geri yuklenemedi: ' + VDbUndoPath(FPath));
     if FS.Size = 0 then
     begin
       WriteHeaderTo(FS);
