@@ -25,7 +25,7 @@ uses
   Classes, SysUtils, Math, Generics.Collections,
   VDbCore, VDbTable, VDbAst, VDbJson, VDbErr, VDbText, VDbXml, VDbSpatial,
   VDbRange, VDbParser, VDbTypes, VDbReplication, VDbParallel, VDbMonitor,
-  VDbPlatform, VDbCost, VDbExtension, VDbVector, VDbArrow;
+  VDbPlatform, VDbCost, VDbExtension, VDbVector, VDbArrow, VDbParquet;
 
 const
   // F2-18: DISTINCT / UNION tekilleÅŸtirme sonucu ve set-op birlestirme
@@ -9989,6 +9989,7 @@ var
   outRows: TStrMatrix;
   byName: Boolean;
   stype, ttype: Byte;
+  wrote, readOk: Boolean;
 
   procedure SkipWs;
   begin
@@ -10373,9 +10374,10 @@ begin
       if opt = 'FORMAT' then
       begin
         fmt := LowerCase(val);
-        if (fmt <> 'csv') and (fmt <> 'text') and (fmt <> 'arrow') then
+        if (fmt <> 'csv') and (fmt <> 'text') and (fmt <> 'arrow') and
+           (fmt <> 'parquet') then
           raise EVDbException.Create(ecUnsupported,
-            'COPY: yalniz FORMAT CSV, TEXT veya ARROW destekleniyor: ' + val);
+            'COPY: yalniz FORMAT CSV, TEXT, ARROW veya PARQUET destekleniyor: ' + val);
       end
       else if opt = 'DELIMITER' then
       begin
@@ -10432,15 +10434,15 @@ begin
     if fmt = 'text' then nullStr := '\N' else nullStr := '';
   end;
 
-  if fmt = 'arrow' then
+  if (fmt = 'arrow') or (fmt = 'parquet') then
   begin
     if header or delimSet or nullSet or quoteSet then
       raise EVDbException.Create(ecUnsupported,
-        'COPY ARROW: HEADER/DELIMITER/NULL/QUOTE kullanilamaz');
+        'COPY ' + UpperCase(fmt) + ': HEADER/DELIMITER/NULL/QUOTE kullanilamaz');
   end
   else if isTo then
     raise EVDbException.Create(ecUnsupported,
-      'COPY TO yalniz FORMAT ARROW ile destekleniyor');
+      'COPY TO yalniz FORMAT ARROW veya PARQUET ile destekleniyor');
 
   // --- Dosya / tablo ---
   if not isTo then
@@ -10482,11 +10484,11 @@ begin
   else
     FT.RequirePriv(tbl, Ord(pkInsert));
 
-  if fmt = 'arrow' then
+  if (fmt = 'arrow') or (fmt = 'parquet') then
   begin
     if isTo then
     begin
-      // Tabloyu Arrow kolonlarina esle ve dosyaya yaz.
+      // Tabloyu Arrow/Parquet kolonlarina esle ve dosyaya yaz.
       SetLength(aFields, Length(cnames));
       SetLength(aTypes, Length(cnames));
       SetLength(mapIdx, Length(cnames));
@@ -10501,7 +10503,7 @@ begin
           end;
         if ci < 0 then
           raise EVDbException.Create(ecNotFound,
-            'COPY ARROW: kolon bulunamadi: ' + cnames[i]);
+            'COPY ' + UpperCase(fmt) + ': kolon bulunamadi: ' + cnames[i]);
         aFields[i] := td.Cols[ci].Name;
         aTypes[i] := td.Cols[ci].Ctype;
         mapIdx[i] := ci;
@@ -10514,9 +10516,13 @@ begin
         for i := 0 to High(cnames) do
           outRows[k][i] := allRows[k][mapIdx[i]];
       end;
-      if not VDbArrowExport(path, aFields, aTypes, outRows, aErr) then
+      if fmt = 'arrow' then
+        wrote := VDbArrowExport(path, aFields, aTypes, outRows, aErr)
+      else
+        wrote := VDbParquetExport(path, aFields, aTypes, outRows, aErr);
+      if not wrote then
         raise EVDbException.Create(ecInvalidArgument,
-          'COPY ARROW yazma hatasi: ' + aErr);
+          'COPY ' + UpperCase(fmt) + ' yazma hatasi: ' + aErr);
       Res.Affected := Length(outRows);
       Res.LastTable := tbl;
       Res.Msg := IntToStr(Length(outRows)) + ' satir';
@@ -10524,13 +10530,17 @@ begin
       Exit;
     end;
 
-    if not VDbArrowImport(path, aFields, aTypes, memRows, aErr) then
+    if fmt = 'arrow' then
+      readOk := VDbArrowImport(path, aFields, aTypes, memRows, aErr)
+    else
+      readOk := VDbParquetImport(path, aFields, aTypes, memRows, aErr);
+    if not readOk then
       raise EVDbException.Create(ecInvalidArgument,
-        'COPY ARROW okuma hatasi: ' + aErr);
+        'COPY ' + UpperCase(fmt) + ' okuma hatasi: ' + aErr);
     if Length(aFields) <> Length(cnames) then
       raise EVDbException.Create(ecInvalidArgument,
-        Format('COPY ARROW: dosyada %d alan var, %d kolon bekleniyordu',
-          [Length(aFields), Length(cnames)]));
+        Format('COPY %s: dosyada %d alan var, %d kolon bekleniyordu',
+          [UpperCase(fmt), Length(aFields), Length(cnames)]));
 
     // Once ada gore esle; olmazsa siraya gore.
     SetLength(mapIdx, Length(cnames));
@@ -10568,14 +10578,14 @@ begin
         end;
       if ci < 0 then
         raise EVDbException.Create(ecNotFound,
-          'COPY ARROW: kolon bulunamadi: ' + cnames[d]);
+          'COPY ' + UpperCase(fmt) + ': kolon bulunamadi: ' + cnames[d]);
       stype := aTypes[mapIdx[d]];
       ttype := td.Cols[ci].Ctype;
       if not ((stype = ttype) or (ttype = VCT_STR) or
               ((stype = VCT_INT) and (ttype = VCT_FLOAT))) then
         raise EVDbException.Create(ecInvalidArgument,
-          Format('COPY ARROW: %s kolonunda tip uyusmuyor (dosya=%d, tablo=%d)',
-            [cnames[d], stype, ttype]));
+          Format('COPY %s: %s kolonunda tip uyusmuyor (dosya=%d, tablo=%d)',
+            [UpperCase(fmt), cnames[d], stype, ttype]));
     end;
 
     SetLength(outRows, Length(memRows));

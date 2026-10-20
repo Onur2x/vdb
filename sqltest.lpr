@@ -12251,6 +12251,111 @@ begin
   Dogrula('Arrow eksik dosya reddedildi', ok, '');
 end;
 
+procedure T124_Parquet;
+// M2: Parquet (duz sema, UNCOMPRESSED) disa/ice aktarma.
+var
+  fn, fnSub, fnEmpty: string;
+  R2: TSqlResult;
+  ok: Boolean;
+begin
+  Grp('M2 Parquet ice/disa aktarma');
+  UseDir('m2_parquet');
+  sq.Exec('CREATE TABLE pq(id INTEGER PRIMARY KEY, nm TEXT, puan FLOAT, ' +
+    'aktif BOOLEAN, d DATE, ts DATETIME, tm TIME, bl BLOB)');
+  sq.Exec('INSERT INTO pq VALUES(1,' + Q + 'ali' + Q + ',1.5,TRUE,' +
+    Q + '2024-01-02' + Q + ',' + Q + '2024-01-02 03:04:05' + Q + ',' +
+    Q + '03:04:05' + Q + ',' + Q + 'raw' + Q + ')');
+  sq.Exec('INSERT INTO pq VALUES(2,NULL,NULL,FALSE,NULL,NULL,NULL,NULL)');
+  sq.Exec('INSERT INTO pq VALUES(3,' + Q + 'ayse' + Q + ',-2.25,TRUE,' +
+    Q + '1999-12-31' + Q + ',' + Q + '1999-12-31 23:59:59' + Q + ',' +
+    Q + '23:59:59' + Q + ',' + Q + 'x' + Q + ')');
+
+  fn := D + '\m2_parquet\pq.parquet';
+  fnSub := D + '\m2_parquet\pq_sub.parquet';
+  fnEmpty := D + '\m2_parquet\pq_empty.parquet';
+
+  R2 := sq.Exec('COPY pq TO ''' + fn + ''' (FORMAT PARQUET)');
+  ChkInt('Parquet TO Affected=3', R2.Affected, 3);
+  Dogrula('Parquet dosyasi olustu', FileExists(fn), fn);
+
+  sq.Exec('CREATE TABLE pq2(id INTEGER PRIMARY KEY, nm TEXT, puan FLOAT, ' +
+    'aktif BOOLEAN, d DATE, ts DATETIME, tm TIME, bl BLOB)');
+  R2 := sq.Exec('COPY pq2 FROM ''' + fn + ''' (FORMAT PARQUET)');
+  ChkInt('Parquet FROM Affected=3', R2.Affected, 3);
+  ChkVal('Parquet INT', 'SELECT id FROM pq2 WHERE id=1', 0, 0, '1');
+  ChkVal('Parquet TEXT', 'SELECT nm FROM pq2 WHERE id=3', 0, 0, 'ayse');
+  ChkVal('Parquet FLOAT', 'SELECT puan FROM pq2 WHERE id=3', 0, 0, '-2.25');
+  ChkVal('Parquet BOOL', 'SELECT aktif FROM pq2 WHERE id=1', 0, 0, 'True');
+  ChkVal('Parquet DATE', 'SELECT d FROM pq2 WHERE id=1', 0, 0, '2024-01-02');
+  ChkVal('Parquet DATETIME', 'SELECT ts FROM pq2 WHERE id=1', 0, 0,
+    '2024-01-02 03:04:05');
+  ChkVal('Parquet TIME', 'SELECT tm FROM pq2 WHERE id=1', 0, 0, '03:04:05');
+  ChkVal('Parquet BLOB', 'SELECT bl FROM pq2 WHERE id=1', 0, 0, 'raw');
+  ChkVal('Parquet NULL satiri',
+    'SELECT COUNT(*) FROM pq2 WHERE id=2 AND nm IS NULL AND puan IS NULL ' +
+    'AND d IS NULL AND ts IS NULL AND tm IS NULL AND bl IS NULL', 0, 0, '1');
+
+  // Ayni dosyayi tekrar yuklemek PK ihlali -> batch geri alinmali.
+  ok := False;
+  try
+    sq.Exec('COPY pq2 FROM ''' + fn + ''' (FORMAT PARQUET)');
+  except
+    on E: Exception do
+      ok := Pos('duplicate PK', E.Message) > 0;
+  end;
+  Dogrula('Parquet atomik PK ihlali hata verir', ok, '');
+  ChkVal('Parquet atomik: hala 3 satir', 'SELECT COUNT(*) FROM pq2', 0, 0, '3');
+
+  // Kolon alt kumesi + ada gore yeniden siralama.
+  R2 := sq.Exec('COPY pq (id, nm) TO ''' + fnSub + ''' (FORMAT PARQUET)');
+  ChkInt('Parquet TO kolon alt kumesi', R2.Affected, 3);
+  sq.Exec('CREATE TABLE pq4(nm TEXT, id INTEGER PRIMARY KEY)');
+  R2 := sq.Exec('COPY pq4 (nm, id) FROM ''' + fnSub + ''' (FORMAT PARQUET)');
+  ChkInt('Parquet FROM ada gore esleme', R2.Affected, 3);
+  ChkVal('Parquet alt kume id', 'SELECT id FROM pq4 WHERE nm=' + Q + 'ali' + Q,
+    0, 0, '1');
+  ChkVal('Parquet alt kume nm', 'SELECT nm FROM pq4 WHERE id=3', 0, 0, 'ayse');
+
+  // Sifir satirli tablo.
+  sq.Exec('CREATE TABLE pqe(id INTEGER PRIMARY KEY, nm TEXT)');
+  R2 := sq.Exec('COPY pqe TO ''' + fnEmpty + ''' (FORMAT PARQUET)');
+  ChkInt('Parquet TO sifir satir', R2.Affected, 0);
+  Dogrula('Parquet bos dosya olustu', FileExists(fnEmpty), fnEmpty);
+  sq.Exec('CREATE TABLE pqe2(id INTEGER PRIMARY KEY, nm TEXT)');
+  R2 := sq.Exec('COPY pqe2 FROM ''' + fnEmpty + ''' (FORMAT PARQUET)');
+  ChkInt('Parquet FROM sifir satir', R2.Affected, 0);
+  ChkVal('Parquet sifir satir sayisi', 'SELECT COUNT(*) FROM pqe2', 0, 0, '0');
+
+  // Tip uyusmazligi ve bicim kapisi.
+  sq.Exec('CREATE TABLE pqbad(id INTEGER PRIMARY KEY, nm INTEGER)');
+  ok := False;
+  try
+    sq.Exec('COPY pqbad FROM ''' + fnSub + ''' (FORMAT PARQUET)');
+  except
+    on E: Exception do
+      ok := Pos('tip uyusmuyor', E.Message) > 0;
+  end;
+  Dogrula('Parquet tip uyusmazligi reddedildi', ok, '');
+
+  ok := False;
+  try
+    sq.Exec('COPY pq FROM ''' + fn + ''' (FORMAT PARQUET, HEADER)');
+  except
+    on E: Exception do
+      ok := Pos('HEADER', E.Message) > 0;
+  end;
+  Dogrula('Parquet HEADER reddedildi', ok, '');
+
+  ok := False;
+  try
+    sq.Exec('COPY pq FROM ''' + D + '\m2_parquet\yok.parquet'' (FORMAT PARQUET)');
+  except
+    on E: Exception do
+      ok := Pos('dosya bulunamadi', E.Message) > 0;
+  end;
+  Dogrula('Parquet eksik dosya reddedildi', ok, '');
+end;
+
 function TMetricsTestProvider.Get: string;
 begin
   Result := Text;
@@ -12982,6 +13087,7 @@ T92_MVCC_Isoaltion;
        T121_VectorAnn;
        T122_KvStore;
        T123_Arrow;
+       T124_Parquet;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls
