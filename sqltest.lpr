@@ -11829,6 +11829,158 @@ begin
   end;
 end;
 
+{ M4: HNSW yakinlik indeksi. 600 satirlik iki veri kumesi kullanir:
+  - cizgi: mesafeler tekduze -> ANN kesin sonucu bulmali.
+  - rastgele: gercek ANN davranisi; recall olculur (>= 0.9 beklenir).
+  Yazma/silme sonrasi DataSeq degisir; indeks tembel yeniden kurulur. }
+procedure T121_VectorAnn;
+const
+  N = 600;
+  K = 10;
+var
+  i, hit: Integer;
+  vals, q, exact, ann: string;
+
+  function VecJson(a, b, c, d: Double): string;
+  begin
+    Result := '[' + VDbFloatToStr(a) + ',' + VDbFloatToStr(b) + ',' +
+      VDbFloatToStr(c) + ',' + VDbFloatToStr(d) + ']';
+  end;
+
+  function Rnd(Seed: Integer): Double;
+  begin
+    // Deterministik, (0,1) arasi.
+    Result := Frac(Abs(Sin(Seed * 12.9898 + 78.233) * 43758.5453));
+  end;
+
+  function IdsOf(const Sql: string): string;
+  var
+    j: Integer;
+  begin
+    Result := '';
+    R := sq.Exec(Sql);
+    for j := 0 to High(R.Rows) do
+      if Length(R.Rows[j]) > 0 then
+      begin
+        if Result <> '' then Result := Result + ',';
+        Result := Result + R.Rows[j][0];
+      end;
+  end;
+
+  function Items(const S: string): Integer;
+  var
+    L: TStringList;
+  begin
+    if S = '' then Exit(0);
+    L := TStringList.Create;
+    try
+      L.Delimiter := ',';
+      L.StrictDelimiter := True;
+      L.DelimitedText := S;
+      Result := L.Count;
+    finally
+      L.Free;
+    end;
+  end;
+
+  function Overlap(const A, B: string): Integer;
+  var
+    LA, LB: TStringList;
+    j: Integer;
+  begin
+    Result := 0;
+    LA := TStringList.Create;
+    LB := TStringList.Create;
+    try
+      LA.Delimiter := ',';
+      LA.StrictDelimiter := True;
+      LA.DelimitedText := A;
+      LB.Delimiter := ',';
+      LB.StrictDelimiter := True;
+      LB.DelimitedText := B;
+      for j := 0 to LA.Count - 1 do
+        if LB.IndexOf(LA[j]) >= 0 then Inc(Result);
+    finally
+      LB.Free;
+      LA.Free;
+    end;
+  end;
+
+begin
+  Grp('M4 HNSW vektor indeksi (ANN)');
+  Chk('VEC ANN tablo cizgi',
+    'CREATE TABLE vec_line_t(id INTEGER PRIMARY KEY, v TEXT)', 0);
+  vals := '';
+  for i := 1 to N do
+  begin
+    if vals <> '' then vals := vals + ',';
+    vals := vals + '(' + IntToStr(i) + ',' +
+      SQLIT(VecJson(i * 0.01, i * 0.011, i * 0.012, i * 0.013)) + ')';
+  end;
+  Chk('VEC ANN cizgi satirlari',
+    'INSERT INTO vec_line_t VALUES ' + vals, 0);
+  q := VecJson(0.1, 0.11, 0.12, 0.13);
+  exact := IdsOf('SELECT id FROM vec_line_t WHERE id >= 0 ORDER BY ' +
+    'VECTOR_DISTANCE(v,' + SQLIT(q) + ') LIMIT ' + IntToStr(K));
+  ann := IdsOf('SELECT id FROM vec_line_t ORDER BY ' +
+    'VECTOR_DISTANCE(v,' + SQLIT(q) + ') LIMIT ' + IntToStr(K));
+  Dogrula('VEC ANN cizgi 10 sonuc', Items(ann) = K, ann);
+  // Esit mesafeli komsularin kendi arasindaki sirasi tanimsizdir; kume ayni.
+  Dogrula('VEC ANN cizgi kesin kume ile ayni', Overlap(ann, exact) = K,
+    ann + ' / ' + exact);
+
+  Chk('VEC ANN tablo rastgele',
+    'CREATE TABLE vec_rnd_t(id INTEGER PRIMARY KEY, v TEXT)', 0);
+  vals := '';
+  for i := 1 to N do
+  begin
+    if vals <> '' then vals := vals + ',';
+    vals := vals + '(' + IntToStr(i) + ',' +
+      SQLIT(VecJson(Rnd(i * 4 + 1), Rnd(i * 4 + 2), Rnd(i * 4 + 3),
+        Rnd(i * 4 + 4))) + ')';
+  end;
+  Chk('VEC ANN rastgele satirlari',
+    'INSERT INTO vec_rnd_t VALUES ' + vals, 0);
+  q := VecJson(0.5, 0.5, 0.5, 0.5);
+  exact := IdsOf('SELECT id FROM vec_rnd_t WHERE id >= 0 ORDER BY ' +
+    'VECTOR_DISTANCE(v,' + SQLIT(q) + ') LIMIT ' + IntToStr(K));
+  ann := IdsOf('SELECT id FROM vec_rnd_t ORDER BY ' +
+    'VECTOR_DISTANCE(v,' + SQLIT(q) + ') LIMIT ' + IntToStr(K));
+  hit := Overlap(ann, exact);
+  Dogrula('VEC ANN rastgele 10 sonuc', Items(ann) = K, ann);
+  Dogrula('VEC ANN rastgele recall >= 0.9', hit >= 9,
+    IntToStr(hit) + '/10');
+
+  // Cosine: ayni veri kumesi, farkli metrik -> ayri indeks anahtari.
+  exact := IdsOf('SELECT id FROM vec_rnd_t WHERE id >= 0 ORDER BY ' +
+    'VECTOR_DISTANCE(v,' + SQLIT(q) + ',' + SQLIT('cosine') + ') LIMIT ' +
+    IntToStr(K));
+  ann := IdsOf('SELECT id FROM vec_rnd_t ORDER BY ' +
+    'VECTOR_DISTANCE(v,' + SQLIT(q) + ',' + SQLIT('cosine') + ') LIMIT ' +
+    IntToStr(K));
+  hit := Overlap(ann, exact);
+  Dogrula('VEC ANN cosine recall >= 0.9', hit >= 9, IntToStr(hit) + '/10');
+
+  // Cache invalidation: en yakin noktayi ekle.
+  q := VecJson(0.123, 0.456, 0.789, 0.321);
+  Chk('VEC ANN yeni en yakin satir',
+    'INSERT INTO vec_rnd_t VALUES (901,' + SQLIT(q) + ')', 0);
+  ann := IdsOf('SELECT id FROM vec_rnd_t ORDER BY ' +
+    'VECTOR_DISTANCE(v,' + SQLIT(q) + ') LIMIT 1');
+  Dogrula('VEC ANN yazma sonrasi taze indeks', ann = '901', ann);
+  // Guncelle: ayni satiri uzaklastir.
+  Chk('VEC ANN satiri uzaklastir',
+    'UPDATE vec_rnd_t SET v = ' + SQLIT(VecJson(9, 9, 9, 9)) +
+    ' WHERE id = 901', -1);
+  ann := IdsOf('SELECT id FROM vec_rnd_t ORDER BY ' +
+    'VECTOR_DISTANCE(v,' + SQLIT(q) + ') LIMIT 1');
+  Dogrula('VEC ANN update sonrasi taze indeks', ann <> '901', ann);
+  Chk('VEC ANN gecersiz vektor satiri',
+    'INSERT INTO vec_rnd_t VALUES (902,' + SQLIT('bozuk') + ')', 0);
+  ChkVal('VEC ANN gecersiz vektor atlandi',
+    'SELECT COUNT(*) FROM vec_rnd_t', 0, 0, '602');
+end;
+
 function TMetricsTestProvider.Get: string;
 begin
   Result := Text;
@@ -12557,6 +12709,7 @@ T92_MVCC_Isoaltion;
        T117_Generated;
        T118_AeadKdf;
        T119_Trace;
+       T121_VectorAnn;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls

@@ -25,7 +25,7 @@ uses
   Classes, SysUtils, Math, Generics.Collections,
   VDbCore, VDbTable, VDbAst, VDbJson, VDbErr, VDbText, VDbXml, VDbSpatial,
   VDbRange, VDbParser, VDbTypes, VDbReplication, VDbParallel, VDbMonitor,
-  VDbPlatform, VDbCost, VDbExtension;
+  VDbPlatform, VDbCost, VDbExtension, VDbVector;
 
 const
   // F2-18: DISTINCT / UNION tekilleÅŸtirme sonucu ve set-op birlestirme
@@ -123,6 +123,10 @@ type
     { M5: tablo id + kolon -> inverted FTS index; Seq degisince yeniden kurulur. }
     FFtsIndexes: TDictionary<string, TVdbFtsIndex>;
     FFtsSeqs: TDictionary<string, QWord>;
+    { M4: tablo id + kolon + metrik -> HNSW yakinlik indeksi. Ayni sekilde
+      Seq degisince tembel olarak yeniden kurulur. }
+    FVecIndexes: TDictionary<string, TVdbVectorIndex>;
+    FVecSeqs: TDictionary<string, QWord>;
     // H3: COUNT(*) + indekslenebilir WHERE icin yalnizca indeks girdilerini
     // sayan yol. FCountOnly yalnizca TryIndexCount cagrisi boyunca aciktir;
     // NarrowRows bu modda satir OKUMAZ, FCountResult'a sayiyi yazar.
@@ -419,6 +423,13 @@ type
     function TryFtsNarrow(Stmt: TSqlSelectStmt; const td: TTableDef;
       const ColNames: TStrArray; const ColTypes: TByteArray;
       out Pks: TStrArray; out Rows: TStrMatrix): Boolean;
+    { M4: ORDER BY VECTOR_DISTANCE(kolon, sabit) LIMIT k olan tek tablo
+      sorgusunda HNSW indeksinden k aday getirir. Sonuc kumesi normal
+      WHERE/ORDER BY/LIMIT hattindan gecer; indeks yalnizca aday daraltir.
+      Semantik yaklasiktir (ANN); WHERE/JOIN/CTE/agregasyon varsa kullanilmaz. }
+    function TryVectorNarrow(Stmt: TSqlSelectStmt; const td: TTableDef;
+      const ColNames: TStrArray; const ColTypes: TByteArray;
+      out Pks: TStrArray; out Rows: TStrMatrix): Boolean;
     procedure ExecJoinScan(Stmt: TSqlSelectStmt; out MergedRows: TStrMatrix;
       out MergedColNames: TStrArray; out MergedColTypes: TByteArray);
     { P5-WIN: pencere kolonlarini satirlarla ayni sirada hesaplar.
@@ -617,12 +628,15 @@ begin
   FZoneMaps := TDictionary<Integer, TVDbZoneMap>.Create;
   FFtsIndexes := TDictionary<string, TVdbFtsIndex>.Create;
   FFtsSeqs := TDictionary<string, QWord>.Create;
+  FVecIndexes := TDictionary<string, TVdbVectorIndex>.Create;
+  FVecSeqs := TDictionary<string, QWord>.Create;
 end;
 
 destructor TVSqlExecutor.Destroy;
 var
   m: TVDbZoneMap;
   f: TVdbFtsIndex;
+  v: TVdbVectorIndex;
 begin
   if FZoneMaps <> nil then
   begin
@@ -635,6 +649,12 @@ begin
     FreeAndNil(FFtsIndexes);
   end;
   FreeAndNil(FFtsSeqs);
+  if FVecIndexes <> nil then
+  begin
+    for v in FVecIndexes.Values do v.Free;
+    FreeAndNil(FVecIndexes);
+  end;
+  FreeAndNil(FVecSeqs);
   inherited Destroy;
 end;
 
@@ -4679,6 +4699,11 @@ var
   sortCols: TVdbSortCols;
   idx: TIntArray;
   newRows: TStrMatrix;
+  // ORDER BY ifadeleri (or. VECTOR_DISTANCE): onceden hesaplanan anahtarlar.
+  exprKeys: TStrMatrix;
+  exprTypes: TByteArray;
+  keyCols: TIntArray;
+  hasExpr: Boolean;
   // F3-3/F3-2: quicksort yigini. Derinlik log2(N) oldugu icin 64 cerverek
   // fazladir; yine de tasma OLSA bile dizi disina yazmamak icin asagidaki
   // VDB_SORT_STACK_MAX sinirinda hata verilir (ulasilamaz, savunma).
@@ -4690,8 +4715,162 @@ var
   // R-14 Full: yola karar (tamsayi hizli yolu / paralel dagitim).
   intPath, usePar: Boolean;
 
+  function ExprCt(E: TSqlExprNode): Byte;
+  var
+    ci: Integer;
+  begin
+    Result := VCT_STR;
+    if E = nil then Exit;
+    if E is TSqlColumnRefNode then
+    begin
+      ci := FindColIdx(TSqlColumnRefNode(E).ColumnName, '', ColNames);
+      if (ci >= 0) and (ci <= High(ColTypes)) then Exit(ColTypes[ci]);
+      Exit;
+    end;
+    if E is TSqlLiteralNode then
+    begin
+      case TSqlLiteralNode(E).LitType of
+        sltInt, sltFloat: Exit(VCT_FLOAT);
+        sltBool: Exit(VCT_BOOL);
+      end;
+      Exit;
+    end;
+    if E is TSqlBinaryOpNode then
+    begin
+      case TSqlBinaryOpNode(E).Op of
+        sboAdd, sboSub, sboMul, sboDiv, sboMod: Exit(VCT_FLOAT);
+        sboEq, sboNeq, sboLt, sboLte, sboGt, sboGte, sboAnd, sboOr, sboLike,
+          sboILike: Exit(VCT_BOOL);
+      end;
+      Exit;
+    end;
+    if E is TSqlFuncCallNode then
+    begin
+      if SameText(TSqlFuncCallNode(E).FuncName, 'VECTOR_DISTANCE') or
+         SameText(TSqlFuncCallNode(E).FuncName, 'VECTOR_NORM') or
+         SameText(TSqlFuncCallNode(E).FuncName, 'LENGTH') or
+         SameText(TSqlFuncCallNode(E).FuncName, 'ABS') or
+         SameText(TSqlFuncCallNode(E).FuncName, 'ROUND') or
+         SameText(TSqlFuncCallNode(E).FuncName, 'FLOOR') or
+         SameText(TSqlFuncCallNode(E).FuncName, 'CEIL') or
+         SameText(TSqlFuncCallNode(E).FuncName, 'CEILING') then
+        Exit(VCT_FLOAT);
+      Exit;
+    end;
+    if E is TSqlWindowNode then
+      Exit(VCT_INT);
+  end;
+
+  function CmpExpr(ia, ib: Integer): Integer;
+  var
+    kk: Integer;
+  begin
+    for kk := 0 to OrderBy.Count - 1 do
+    begin
+      Result := VDbIdxCmp(exprKeys[ia][kk], exprKeys[ib][kk], exprTypes[kk]);
+      if Result <> 0 then
+      begin
+        if OrderBy[kk].Desc then Result := -Result;
+        Exit;
+      end;
+    end;
+    Result := 0;
+  end;
+
 begin
   if (OrderBy = nil) or (OrderBy.Count = 0) or (Length(Rows) < 2) then Exit;
+
+  // ORDER BY ifadesi (kolon olmayan anahtar) varsa, anahtarlari satir basina
+  // BIR KEZ hesapla. Eskiden yalnizca kolon anahtarlari destekleniyordu;
+  // `ORDER BY VECTOR_DISTANCE(...)` sessizce yok sayiliyordu.
+  hasExpr := False;
+  for k := 0 to OrderBy.Count - 1 do
+    if Keys[k] = '' then hasExpr := True;
+  if hasExpr then
+  begin
+    SetLength(exprKeys, Length(Rows));
+    SetLength(exprTypes, OrderBy.Count);
+    SetLength(keyCols, OrderBy.Count);
+    for k := 0 to OrderBy.Count - 1 do
+    begin
+      keyCols[k] := -1;
+      if Keys[k] <> '' then
+      begin
+        keyCols[k] := FindColIdx(Keys[k], '', ColNames);
+        if keyCols[k] >= 0 then
+        begin
+          if keyCols[k] <= High(ColTypes) then exprTypes[k] := ColTypes[keyCols[k]]
+          else exprTypes[k] := VCT_STR;
+        end
+        else
+          raise EVDbException.Create(ecColumnNotFound,
+            'ORDER BY bilinmeyen kolon: ' + Keys[k]);
+      end
+      else
+        exprTypes[k] := ExprCt(OrderBy[k].Expr);
+      for i := 0 to High(Rows) do
+      begin
+        SetLength(exprKeys[i], OrderBy.Count);
+        if keyCols[k] >= 0 then
+        begin
+          if keyCols[k] <= High(Rows[i]) then
+            exprKeys[i][k] := Rows[i][keyCols[k]]
+          else
+            exprKeys[i][k] := '';
+        end
+        else
+          exprKeys[i][k] := EvalExpr(OrderBy[k].Expr, Rows[i], ColNames, ColTypes);
+      end;
+    end;
+    SetLength(idx, Length(Rows));
+    for i := 0 to High(Rows) do idx[i] := i;
+    // Yinelemeli quicksort (kucuk yigin).
+    SP := 0;
+    StackL[0] := 0; StackH[0] := High(idx); Inc(SP);
+    while SP > 0 do
+    begin
+      Dec(SP);
+      L := StackL[SP]; H := StackH[SP];
+      while L < H do
+      begin
+        pIdx := idx[(L + H) div 2];
+        i := L; j := H;
+        repeat
+          while (i < H) and (CmpExpr(idx[i], pIdx) < 0) do Inc(i);
+          while (j > L) and (CmpExpr(idx[j], pIdx) > 0) do Dec(j);
+          if i <= j then
+          begin
+            tIdx := idx[i]; idx[i] := idx[j]; idx[j] := tIdx;
+            Inc(i); Dec(j);
+          end;
+        until i > j;
+        if (j - L) < (H - i) then
+        begin
+          if i < H then
+          begin
+            if SP > High(StackL) then
+              raise EVDbException.Create(ecLimit, 'siralama yigini asildi');
+            StackL[SP] := i; StackH[SP] := H; Inc(SP);
+          end;
+          H := j;
+        end
+        else
+        begin
+          if L < j then
+          begin
+            if SP > High(StackL) then
+              raise EVDbException.Create(ecLimit, 'siralama yigini asildi');
+            StackL[SP] := L; StackH[SP] := j; Inc(SP);
+          end;
+          L := i;
+        end;
+      end;
+    end;
+    SetLength(newRows, Length(Rows));
+    for i := 0 to High(idx) do newRows[i] := Rows[idx[i]];
+    Rows := newRows;
+    Exit;
+  end;
 
   // 1. Siralama kolonlarini onceden coz (her karsilastirmada Name arama!)
   SetLength(sortCols, OrderBy.Count);
@@ -8067,6 +8246,119 @@ begin
   end;
 end;
 
+function TVSqlExecutor.TryVectorNarrow(Stmt: TSqlSelectStmt;
+  const td: TTableDef; const ColNames: TStrArray;
+  const ColTypes: TByteArray; out Pks: TStrArray;
+  out Rows: TStrMatrix): Boolean;
+const
+  // Kucuk tabloda ANN'e gerek yok: tam tarama zaten hizli ve kesin.
+  ANN_MIN_ROWS = 512;
+var
+  fn: TSqlFuncCallNode;
+  lit: TSqlLiteralNode;
+  cref: TSqlColumnRefNode;
+  ci, i, n, k: Integer;
+  metric, key, col: string;
+  q: TDoubleArray;
+  idx: TVdbVectorIndex;
+  allPks, ids, loadedPks: TStrArray;
+  allRows, loadedRows: TStrMatrix;
+  vec, dists: TDoubleArray;
+  seq, storedSeq: QWord;
+  row: TStrArray;
+begin
+  Result := False;
+  Pks := nil;
+  Rows := nil;
+  if Stmt = nil then Exit;
+  if Stmt.HasJoin then Exit;
+  if (Stmt.MoreJoins <> nil) and (Stmt.MoreJoins.Count > 0) then Exit;
+  if (Stmt.WithQueries <> nil) and (Stmt.WithQueries.Count > 0) then Exit;
+  if Stmt.SetOp <> sokNone then Exit;
+  if Stmt.WhereClause <> nil then Exit;
+  if Stmt.HavingClause <> nil then Exit;
+  if Stmt.QualifyClause <> nil then Exit;
+  if Stmt.IsDistinct then Exit;
+  if (Stmt.GroupByCols <> nil) and (Stmt.GroupByCols.Count > 0) then Exit;
+  if HasAggregate(Stmt) or HasWindow(Stmt) then Exit;
+  if Stmt.ForUpdate or (Stmt.AsOf <> saoNone) then Exit;
+  if (Stmt.OrderBy = nil) or (Stmt.OrderBy.Count <> 1) then Exit;
+  if Stmt.OrderBy[0].Desc then Exit;
+  if (Stmt.LimitVal <= 0) or (Stmt.LimitVal > 100000) then Exit;
+  if not (Stmt.OrderBy[0].Expr is TSqlFuncCallNode) then Exit;
+  fn := TSqlFuncCallNode(Stmt.OrderBy[0].Expr);
+  if not SameText(fn.FuncName, 'VECTOR_DISTANCE') then Exit;
+  if (fn.Args = nil) or (fn.Args.Count < 2) then Exit;
+  if not (fn.Args[0] is TSqlColumnRefNode) then Exit;
+  cref := TSqlColumnRefNode(fn.Args[0]);
+  ci := FindColIdx(cref.ColumnName, '', ColNames);
+  if (ci < 0) or (ci > High(ColTypes)) then Exit;
+  if not (fn.Args[1] is TSqlLiteralNode) then Exit;
+  lit := TSqlLiteralNode(fn.Args[1]);
+  if lit.LitType <> sltString then Exit;
+  if not VDbVectorParse(lit.StrVal, q) then Exit;
+  if Length(q) = 0 then Exit;
+  metric := 'l2';
+  if fn.Args.Count >= 3 then
+  begin
+    if not (fn.Args[2] is TSqlLiteralNode) then Exit;
+    metric := LowerCase(TSqlLiteralNode(fn.Args[2]).StrVal);
+  end;
+  metric := VDbVectorMetric(metric);
+  if metric = '' then Exit;
+  if FT.RlsApplies(Stmt.FromTable) then Exit;
+
+  col := LowerCase(cref.ColumnName);
+  key := IntToStr(td.TableId) + ':' + col + ':' + metric;
+  if not FVecIndexes.TryGetValue(key, idx) then
+  begin
+    idx := TVdbVectorIndex.Create(Length(q), metric);
+    FVecIndexes.Add(key, idx);
+    FVecSeqs.Add(key, High(QWord));
+  end;
+  seq := QWord(FT.Kv.DataSeqValue);
+  if (not FVecSeqs.TryGetValue(key, storedSeq)) or (storedSeq <> seq) then
+  begin
+    idx.Clear;
+    FT.ScanRows(Stmt.FromTable, allPks, allRows);
+    for i := 0 to High(allPks) do
+      if (i <= High(allRows)) and (ci <= High(allRows[i])) and
+         VDbVectorParse(allRows[i][ci], vec) and
+         (Length(vec) = idx.Dim) then
+        idx.Add(allPks[i], vec);
+    allPks := nil;
+    allRows := nil;
+    FVecSeqs[key] := seq;
+  end;
+
+  // Kucuk tablo: indeks kuruldu ama kesin yol daha dogru ve yeterince hizli.
+  if idx.Count <= ANN_MIN_ROWS then Exit;
+
+  k := Stmt.LimitVal + Max(0, Stmt.OffsetVal);
+  if not idx.Search(q, k, ids, dists) then
+  begin
+    SetLength(Pks, 0);
+    SetLength(Rows, 0);
+    Exit(True);
+  end;
+
+  SetLength(loadedPks, 0);
+  SetLength(loadedRows, 0);
+  n := 0;
+  for i := 0 to High(ids) do
+    if FT.ReadRow(Stmt.FromTable, ids[i], row) then
+    begin
+      SetLength(loadedPks, n + 1);
+      SetLength(loadedRows, n + 1);
+      loadedPks[n] := ids[i];
+      loadedRows[n] := row;
+      Inc(n);
+    end;
+  Pks := loadedPks;
+  Rows := loadedRows;
+  Result := True;
+end;
+
 procedure TVSqlExecutor.ExecSelect(Stmt: TSqlSelectStmt; out Res: TSqlResult);
 var
   td: TTableDef;
@@ -8338,6 +8630,13 @@ begin
         { M5: TS_MATCH conjunct'lari varsa once inverted index ile daralt.
           WHERE yine asagida aynen uygulanir; sonuc kumesi degismez. }
         if TryFtsNarrow(Stmt, td, colNames, colTypes, pks, allRows) then
+        begin
+          SkipOffsetLimit := False;
+          isExactNarrow := False;
+        end
+        { M4: ORDER BY VECTOR_DISTANCE(...) LIMIT k -> HNSW adaylari.
+          WHERE/ORDER/LIMIT asagida aynen uygulanir. }
+        else if TryVectorNarrow(Stmt, td, colNames, colTypes, pks, allRows) then
         begin
           SkipOffsetLimit := False;
           isExactNarrow := False;
