@@ -94,6 +94,7 @@ type
     FUser: string;              // R-12 devam: auth
     FPass: string;              // R-12 devam
     FMaxConns: Integer;      // R-12 devam: maksimum TCP baglanti
+    procedure SetMaxConns(AValue: Integer);
     procedure AddConn(AConn: TVdbServerConn);
     procedure CloseEngine;
   public
@@ -111,6 +112,9 @@ type
     property Served: Integer read FServed;
     property Dir: string read FDir;
     property SessionId: Integer read FSessionId;
+    { Eszamanli TCP baglanti siniri (varsayilan 64). Start'tan once
+      veya calisirken degistirilebilir; 1..4096 araligina kirpilir. }
+    property MaxConns: Integer read FMaxConns write SetMaxConns;
   end;
 
 implementation
@@ -365,6 +369,14 @@ begin
   FListen := VDB_SOCK_INVALID;
   FConnsLock := TCriticalSection.Create;
   FConns := TList.Create;
+  FMaxConns := 64;
+end;
+
+procedure TVdbSqlServer.SetMaxConns(AValue: Integer);
+begin
+  if AValue < 1 then AValue := 1;
+  if AValue > 4096 then AValue := 4096;
+  FMaxConns := AValue;
 end;
 
 destructor TVdbSqlServer.Destroy;
@@ -420,7 +432,6 @@ begin
   FSessionId := 1;     // varsayilan aktif oturum
   FUser := 'admin';    // varsayilan oturum bilgileri
   FPass := 'admin123';
-  FMaxConns := 4;  // R-12 devam: kapasite (havuz-slot sayisi)
   FAccept := TVdbServerAccept.Create(Self);
   Result := True;
 end;

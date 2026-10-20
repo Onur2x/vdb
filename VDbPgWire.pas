@@ -124,6 +124,7 @@ type
     FTls: TVdbTlsContext;
     FTlsCert: string;
     FTlsKey: string;
+    procedure SetMaxConns(AValue: Integer);
     procedure AddConn(AConn: TVdbPgConn);
     procedure CloseEngine;
     procedure CloseTls;
@@ -142,6 +143,9 @@ type
     property Served: Integer read FServed;
     property Dir: string read FDir;
     property TlsActive: Boolean read GetTlsActive;
+    { Eszamanli TCP baglanti siniri (varsayilan 64). 1..4096 araligina
+      kirpilir; Start'tan once veya calisirken degistirilebilir. }
+    property MaxConns: Integer read FMaxConns write SetMaxConns;
   end;
 
 implementation
@@ -1933,10 +1937,17 @@ begin
   FListen := VDB_SOCK_INVALID;
   FConnsLock := TCriticalSection.Create;
   FConns := TList.Create;
-  FMaxConns := 16;
+  FMaxConns := 64;
   FTls := nil;
   FTlsCert := '';
   FTlsKey := '';
+end;
+
+procedure TVdbPgServer.SetMaxConns(AValue: Integer);
+begin
+  if AValue < 1 then AValue := 1;
+  if AValue > 4096 then AValue := 4096;
+  FMaxConns := AValue;
 end;
 
 destructor TVdbPgServer.Destroy;
