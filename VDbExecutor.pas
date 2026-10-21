@@ -7326,7 +7326,7 @@ begin
       c := FindColIdx(Copy(gb, dp + 1, MaxInt), Copy(gb, 1, dp - 1), ColNames)
     else
       c := FindColIdx(gb, '', ColNames);
-    if (c < 0) or (c > High(td.Cols)) then Exit;
+    if (c < 0) or (c > High(td.Cols)) or (c > High(ColTypes)) then Exit;
     ctx.GroupCols[j] := c;
   end;
 
@@ -7367,7 +7367,7 @@ begin
       if not (fn.Arg is TSqlColumnRefNode) then Exit;
       cr := TSqlColumnRefNode(fn.Arg);
       c := FindColIdx(cr.ColumnName, cr.TableQualifier, ColNames);
-      if (c < 0) or (c > High(td.Cols)) then Exit;
+      if (c < 0) or (c > High(td.Cols)) or (c > High(ColTypes)) then Exit;
       if ((fn.FuncName = 'SUM') or (fn.FuncName = 'AVG')) and
          not ((ColTypes[c] = VCT_INT) or (ColTypes[c] = VCT_FLOAT) or
               (ColTypes[c] = VCT_BOOL)) then Exit;
