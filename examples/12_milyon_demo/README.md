@@ -72,29 +72,38 @@ alınmıştır; farklı donanımda değişebilir.
 | `COUNT(*)` | 83–204 ms | tam tablo |
 | PK aralığıyla ilk sayfa | 1.244 ms | indeks ilk yükleme |
 | PK aralığıyla sonraki sayfa | 1–2 ms | 100 satır |
-| `ORDER BY id LIMIT 100` | 6.024–7.399 ms | Seq Scan + Sort |
-| `ORDER BY bakiye DESC LIMIT 100` | 62.565–62.743 ms | 1M satır sıralama |
-| `GROUP BY sehir` | 8.917–9.091 ms | tam tablo |
-| Şehir + yaş `COUNT(*)` | 816–6.284 ms | soğuk/sıcak indeks |
+| `ORDER BY id LIMIT 100` | 1,2 s / 0,11 s | ilk indeks yüklemesi / sonraki sayfa |
+| `ORDER BY id LIMIT 100 OFFSET 500000` | 0,11 s | indeks konumuna atlama |
+| `ORDER BY bakiye DESC LIMIT 100` | 5,7–7,0 s | top-N; tam sıralama 48–50 s |
+| `ORDER BY ad_soyad ASC LIMIT 100` | 3,6–4,0 s | top-N, indeks yok |
+| `ORDER BY yas DESC LIMIT 100` | 5,5–5,8 s | top-N, indeks yok |
+| `ORDER BY sehir ASC LIMIT 100` | 5,4 s / 0,41 s | ilk indeks yüklemesi / sonraki |
+| `ORDER BY sehir, yas DESC LIMIT 100` | 3,9–4,0 s | top-N |
+| `GROUP BY sehir` | 3,8–4,5 s | tam tablo |
+| Şehir + yaş `COUNT(*)` | 0,83–0,98 s | sıcak indeks |
 
-## Neden bazı sorgular yavaş?
+## Sorgu hızı nasıl iyileştirildi?
 
-Motor, `ORDER BY ... LIMIT ... OFFSET ...` sorgularında henüz “index order +
-erken durma” (top-N / limit pushdown) optimizasyonunu uygulamıyor. Örneğin
-`ORDER BY id LIMIT 100 OFFSET 0` planı şöyledir:
+H12 ile motor `ORDER BY ... LIMIT` sorgularında iki yolu kullanır:
 
-```text
-Seq Scan on vdb_buyuk
-Sort
-Limit
-```
+1. **İndeks sırası + erken durma.** `ORDER BY id` veya `ORDER BY sehir`
+   indeksli bir kolondaysa satırlar indeks sırasıyla okunur ve `LIMIT`
+   dolunca durulur. PK sıralamasında `OFFSET` verilmişse WHERE yokken
+   satırlar tek tek okunmadan doğrudan indeksteki konuma atlanır. Bu yüzden
+   `ORDER BY id LIMIT 100 OFFSET 500000` bile yaklaşık 0,1 s sürer.
+2. **Top-N heap.** `bakiye`, `ad_soyad`, `yas` gibi indekssiz kolonlarda
+   tüm 1.000.000 satır taranır, ancak yalnız `LIMIT + OFFSET` kadar en iyi
+   satır bellekte tutulur. Tam sıralama yerine `O(N log K)` çalışır:
+   `bakiye` sıralaması 62 s yerine yaklaşık 6 s'ye iner.
 
-Bu yüzden her sayfa 1.000.000 satırı tarayıp sıralayabilir. Aynı durum
-`bakiye` ve `ad_soyad` sıralamalarında da geçerlidir; `bakiye` sıralaması
-yaklaşık 62 saniye sürer.
+İlk `ORDER BY id`/`ORDER BY sehir` sorgusu indeks kaynağını belleğe
+yüklediği için 1–5 s sürebilir; aynı oturumdaki sonraki sayfalar hızlıdır.
+`ORDER BY ...` için uygun indeks yoksa motor hâlâ tüm tabloyu tarar;
+`LIMIT` yoksa tam sıralama maliyeti (yaklaşık 48 s) geri döner.
 
-Demo, **filtresiz ve ID sıralı** sayfalarda bu maliyetten kaçınmak için
-`LIMIT/OFFSET` yerine PK aralığı kullanır:
+Demo, ID sıralı sayfalarda `LIMIT/OFFSET` yerine PK aralığını kullanmaya
+devam eder; bu, sayfa numarasından bağımsız olarak yalnızca sayfa kadar
+satır okur:
 
 ```sql
 SELECT ... FROM vdb_buyuk
@@ -102,10 +111,6 @@ WHERE id >= 1 AND id < 101
 ORDER BY id;
 ```
 
-Bu sorgu PK indeksini kullanır ve yalnızca sayfa kadar satır okur. Filtre
-veya farklı sıralama seçildiğinde motorun mevcut tam tarama davranışı
-devreye girer.
-
-Şehir filtresi `idx_buyuk_sehir` indeksini kullanabilir; ancak filtre
-sonucu `ORDER BY id` ile sıralanacaksa yine tüm eşleşen satırlar
-sıralanabilir. `GROUP BY` ve `ILIKE` da doğası gereği tam tarama yapar.
+Şehir filtresi `idx_buyuk_sehir` indeksini kullanabilir; filtre sonucu
+`ORDER BY id` ile sıralanacaksa eşleşen satırlar sıralanır. `GROUP BY`,
+`ILIKE` ve indekssiz sıralamalar doğası gereği tam tarama yapar.

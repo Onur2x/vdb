@@ -5372,7 +5372,7 @@ begin
   Chk('ASC varsayilani NULL once',
       'SELECT id FROM f WHERE ad IS NULL ORDER BY ad ASC', 2);
   ChkVal('ASC varsayilani ilk deger NULL',
-      'SELECT id FROM f WHERE ad IS NULL ORDER BY ad ASC FETCH FIRST 1 ROWS ONLY', 0, 0, '2');
+      'SELECT id FROM f WHERE ad IS NULL ORDER BY ad ASC, id ASC FETCH FIRST 1 ROWS ONLY', 0, 0, '2');
   // varsayilan DESC'de: NULL en kucuk -> sona
   ChkVal('DESC varsayilani ilk deger',
       'SELECT id FROM f ORDER BY ad DESC', 0, 0, '5');
@@ -13653,6 +13653,88 @@ begin
   end;
 end;
 
+procedure T131_H12_TopN;
+// H12: ORDER BY ... LIMIT icin top-N yolunun ve indeks sirasiyla
+// OFFSET atlamanin dogru satirlari dondurdugunu dogrular.
+var
+  dir: string;
+  db: TVDb;
+  tdb: TVTableDb;
+  q: TVSql;
+  r: TSqlResult;
+  i: Integer;
+  fs: TFormatSettings;
+begin
+  Grp('T131 H12 ORDER BY LIMIT top-N');
+  fs := DefaultFormatSettings;
+  fs.DecimalSeparator := '.';
+  dir := D + '\t131_topn_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  tdb := TVTableDb.Create(db);
+  try
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      q.Exec('CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, f FLOAT, s TEXT)');
+      q.Exec('BEGIN');
+      for i := 1 to 200 do
+        q.Exec(Format('INSERT INTO t (id,n,f,s) VALUES (%d,%d,%s,%s)',
+          [i, 200 - i, FloatToStr(i * 1.25, fs), QuotedStr(Format('s%.4d', [201 - i]))]));
+      q.Exec('COMMIT');
+
+      r := q.Exec('SELECT id FROM t ORDER BY n DESC LIMIT 3 OFFSET 4');
+      Dogrula('T131 int DESC LIMIT/OFFSET',
+        (Length(r.Rows) = 3) and (r.Rows[0][0] = '5') and
+        (r.Rows[1][0] = '6') and (r.Rows[2][0] = '7'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT id FROM t ORDER BY f ASC LIMIT 2 OFFSET 10');
+      Dogrula('T131 float ASC LIMIT/OFFSET',
+        (Length(r.Rows) = 2) and (r.Rows[0][0] = '11') and
+        (r.Rows[1][0] = '12'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT id FROM t ORDER BY s ASC LIMIT 2 OFFSET 10');
+      Dogrula('T131 text ASC LIMIT/OFFSET',
+        (Length(r.Rows) = 2) and (r.Rows[0][0] = '190') and
+        (r.Rows[1][0] = '189'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT id FROM t ORDER BY id LIMIT 3 OFFSET 100');
+      Dogrula('T131 PK sirasi OFFSET atlama',
+        (Length(r.Rows) = 3) and (r.Rows[0][0] = '101') and
+        (r.Rows[1][0] = '102') and (r.Rows[2][0] = '103'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT id FROM t ORDER BY id DESC LIMIT 3');
+      Dogrula('T131 PK DESC LIMIT',
+        (Length(r.Rows) = 3) and (r.Rows[0][0] = '200') and
+        (r.Rows[1][0] = '199') and (r.Rows[2][0] = '198'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT id FROM t WHERE id >= 50 AND id < 150 ' +
+        'ORDER BY id LIMIT 2 OFFSET 10');
+      Dogrula('T131 WHERE + PK sirasi OFFSET',
+        (Length(r.Rows) = 2) and (r.Rows[0][0] = '60') and
+        (r.Rows[1][0] = '61'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT id FROM t ORDER BY n DESC LIMIT 4 OFFSET 196');
+      Dogrula('T131 int DESC derin OFFSET',
+        (Length(r.Rows) = 4) and (r.Rows[0][0] = '197') and
+        (r.Rows[3][0] = '200'),
+        IntToStr(Length(r.Rows)));
+    finally
+      q.Free;
+    end;
+  finally
+    tdb.Free;
+    db.Free;
+  end;
+end;
+
 { ---------------------------------------------------------------------- main }
 
 var
@@ -13836,6 +13918,7 @@ T92_MVCC_Isoaltion;
        T128_H11_Undo;
        T129_H11_InPlace;
        T130_PkRangeCtype;
+       T131_H12_TopN;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls

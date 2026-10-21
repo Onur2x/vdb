@@ -327,7 +327,8 @@ type
       const ColNames: TStrArray; const ColTypes: TByteArray): Boolean;
     procedure DoSort(var Rows: TStrMatrix; const Keys: TStrArray;
       OrderBy: TList<TOrderItem>;
-      const ColNames: TStrArray; const ColTypes: TByteArray);
+      const ColNames: TStrArray; const ColTypes: TByteArray;
+      const MaxRows: Integer = -1);
     function HasAggregate(Stmt: TSqlSelectStmt): Boolean;
     // F-09: QUALIFY ifadesini degerlendirir; pencere fonksiyonu
     // cagrilari WinVals[RowIx][WinSlot[j]] uzerinden cozulur.
@@ -4296,6 +4297,12 @@ begin
 
   off := Stmt.OffsetVal;
   lim := Stmt.LimitVal;
+  if lim = 0 then
+  begin
+    SetLength(Rows, 0);
+    Result := True;
+    Exit;
+  end;
   need := lim;
   if need < 0 then need := -1;
   // KR-2: geometrik kapasite buyumesi — SetLength(+1) kopyalamasi engellenir.
@@ -4307,7 +4314,31 @@ begin
   if cap < 1 then cap := 1;
   SetLength(Rows, cap);
   n := 0;
-  if desc then
+  { WHERE yoksa PK indeksindeki her giris canli bir satirdir. OFFSET'i
+    okuma sirasinda tek tek atlamak yerine dogrudan indeks konumuna atla;
+    derin OFFSET'te yuz binlerce satir okumak gerekmez. Ikincil
+    indekslerde eski/olu giris olabilecegi icin bu yol yalniz PK'de. }
+  if (Stmt.WhereClause = nil) and (ci = Td.PkIndex) then
+  begin
+    if off >= hi - lo then
+    begin
+      SetLength(Rows, 0);
+      Result := True;
+      Exit;
+    end;
+    if desc then i := hi - 1 - off else i := lo + off;
+    while (i >= lo) and (i < hi) do
+    begin
+      if FT.ReadRow(Td.Name, e[i].Pk, rv) then
+      begin
+        if n >= cap then begin cap := cap * 2; SetLength(Rows, cap); end;
+        Rows[n] := rv; Inc(n);
+        if (need >= 0) and (n >= need) then Break;
+      end;
+      if desc then Dec(i) else Inc(i);
+    end;
+  end
+  else if desc then
   begin
     i := hi - 1;
     while i >= lo do
@@ -4695,7 +4726,8 @@ end;
   //---------------------------------------------------------- }
 procedure TVSqlExecutor.DoSort(var Rows: TStrMatrix; const Keys: TStrArray;
   OrderBy: TList<TOrderItem>;
-  const ColNames: TStrArray; const ColTypes: TByteArray);
+  const ColNames: TStrArray; const ColTypes: TByteArray;
+  const MaxRows: Integer);
 var
   i, j, k, kidx, m, c, validCount: Integer;
   sortCols: TVdbSortCols;
@@ -4779,6 +4811,115 @@ var
     Result := 0;
   end;
 
+  function CmpSortIdx(a, b: Integer): Integer;
+  begin
+    if hasExpr then
+      Result := CmpExpr(a, b)
+    else
+      Result := VdbSortCompareRows(sortCols, Rows, a, b);
+  end;
+
+  { H12: ORDER BY ... LIMIT icin yalniz en iyi K satiri tut.
+    QuickSort tum N satiri siralar; burada N satir taranir ama yalniz
+    K elemanli max-heap tutulur (O(N log K)). K = LIMIT + OFFSET. }
+  procedure TopK(const K: Integer);
+  var
+    heap: TIntArray;
+    nHeap, i, child, parent, tmp: Integer;
+    stackL, stackH: array[0..VDB_SORT_STACK_MAX - 1] of Integer;
+    sp, l, h, p, j, t: Integer;
+  begin
+    if K <= 0 then
+    begin
+      SetLength(Rows, 0);
+      Exit;
+    end;
+    SetLength(heap, K);
+    nHeap := 0;
+    for i := 0 to High(Rows) do
+    begin
+      if nHeap < K then
+      begin
+        heap[nHeap] := i;
+        Inc(nHeap);
+        child := nHeap - 1;
+        while child > 0 do
+        begin
+          parent := (child - 1) div 2;
+          if CmpSortIdx(heap[parent], heap[child]) >= 0 then Break;
+          tmp := heap[parent]; heap[parent] := heap[child]; heap[child] := tmp;
+          child := parent;
+        end;
+      end
+      else if CmpSortIdx(i, heap[0]) < 0 then
+      begin
+        heap[0] := i;
+        parent := 0;
+        while True do
+        begin
+          child := parent * 2 + 1;
+          if child >= nHeap then Break;
+          if (child + 1 < nHeap) and
+             (CmpSortIdx(heap[child + 1], heap[child]) > 0) then
+            Inc(child);
+          if CmpSortIdx(heap[parent], heap[child]) >= 0 then Break;
+          tmp := heap[parent]; heap[parent] := heap[child]; heap[child] := tmp;
+          parent := child;
+        end;
+      end;
+    end;
+
+    // Heap'te kalan K satiri kendi arasinda sirala (K kucuk).
+    sp := 0;
+    if nHeap > 1 then
+    begin
+      stackL[0] := 0; stackH[0] := nHeap - 1; sp := 1;
+    end;
+    while sp > 0 do
+    begin
+      Dec(sp);
+      l := stackL[sp]; h := stackH[sp];
+      while l < h do
+      begin
+        p := heap[(l + h) div 2];
+        i := l; j := h;
+        repeat
+          while (i < h) and (CmpSortIdx(heap[i], p) < 0) do Inc(i);
+          while (j > l) and (CmpSortIdx(heap[j], p) > 0) do Dec(j);
+          if i <= j then
+          begin
+            t := heap[i]; heap[i] := heap[j]; heap[j] := t;
+            Inc(i); Dec(j);
+          end;
+        until i > j;
+        if (j - l) < (h - i) then
+        begin
+          if i < h then
+          begin
+            if sp > High(stackL) then
+              raise EVDbException.Create(ecLimit, 'siralama yigini asildi');
+            stackL[sp] := i; stackH[sp] := h; Inc(sp);
+          end;
+          h := j;
+        end
+        else
+        begin
+          if l < j then
+          begin
+            if sp > High(stackL) then
+              raise EVDbException.Create(ecLimit, 'siralama yigini asildi');
+            stackL[sp] := l; stackH[sp] := j; Inc(sp);
+          end;
+          l := i;
+        end;
+      end;
+    end;
+
+    SetLength(newRows, nHeap);
+    for i := 0 to nHeap - 1 do newRows[i] := Rows[heap[i]];
+    Rows := newRows;
+  end;
+
 begin
   if (OrderBy = nil) or (OrderBy.Count = 0) or (Length(Rows) < 2) then Exit;
 
@@ -4826,6 +4967,7 @@ begin
     end;
     SetLength(idx, Length(Rows));
     for i := 0 to High(Rows) do idx[i] := i;
+    // H12: ifade anahtarlarinda (VECTOR_DISTANCE vb.) tam siralama korunur.
     // Yinelemeli quicksort (kucuk yigin).
     SP := 0;
     StackL[0] := 0; StackH[0] := High(idx); Inc(SP);
@@ -4923,6 +5065,13 @@ begin
   // 2. Indeks dizisi olustur
   SetLength(idx, Length(Rows));
   for i := 0 to High(Rows) do idx[i] := i;
+
+  // H12: LIMIT/OFFSET varsa tum kumeyi siralama yerine en iyi K satiri sec.
+  if (MaxRows >= 0) and (MaxRows < Length(idx)) then
+  begin
+    TopK(MaxRows);
+    Exit;
+  end;
 
   // 3. R-14 Full: yola karar ver.
   //    - Tamsayi hizli yolu: tekil INT/BOOL kolon + acik NULLS konumu yok.
@@ -8849,7 +8998,17 @@ begin
             'ORDER BY bilinmeyen kolon: ' + orderKeys[i]);
       end;
     if not deferOrder then
-      DoSort(filteredRows, orderKeys, Stmt.OrderBy, colNames, colTypes);
+    begin
+      { H12: DISTINCT/pencere/QUALIFY/set-op yoksa ve LIMIT varsa
+        yalniz LIMIT+OFFSET kadar satiri sec; tum kumeyi siralama. }
+      if (Stmt.LimitVal >= 0) and (not Stmt.IsDistinct) and
+         (not HasWindow(Stmt)) and (Stmt.QualifyClause = nil) and
+         (Stmt.SetOp = sokNone) then
+        DoSort(filteredRows, orderKeys, Stmt.OrderBy, colNames, colTypes,
+          Stmt.LimitVal + Stmt.OffsetVal)
+      else
+        DoSort(filteredRows, orderKeys, Stmt.OrderBy, colNames, colTypes);
+    end;
   end;
   // Projection
   if Stmt.Columns.Count = 0 then
@@ -8965,7 +9124,12 @@ begin
         else outRows[j][tmpSlot] := '';
       end;
     end;
-    DoSort(outRows, orderKeys, Stmt.OrderBy, outCols, outTypes);
+    if (Stmt.LimitVal >= 0) and (not Stmt.IsDistinct) and
+       (Stmt.SetOp = sokNone) then
+      DoSort(outRows, orderKeys, Stmt.OrderBy, outCols, outTypes,
+        Stmt.LimitVal + Stmt.OffsetVal)
+    else
+      DoSort(outRows, orderKeys, Stmt.OrderBy, outCols, outTypes);
     // gecici kolonlari kirp
     if origCols < Length(outCols) then
     begin

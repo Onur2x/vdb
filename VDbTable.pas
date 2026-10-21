@@ -6741,6 +6741,13 @@ begin
       Result := IdxColsOf(t, j);
       Exit;
     end;
+  // PK, T.Idx listesinde ayri bir TIdxDef degildir; yine de tek kolonlu
+  // sirali bir indeks gibi kullanilabilir (ORDER BY id LIMIT ...).
+  if ColIdx = t.PkIndex then
+  begin
+    SetLength(Result, 1);
+    Result[0] := ColIdx;
+  end;
 end;
 
 function TVTableDb.IdxColsOf(const T: TTableDef; IdxPos: Integer): TIntArray;

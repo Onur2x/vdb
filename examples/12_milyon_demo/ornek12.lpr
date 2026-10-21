@@ -807,8 +807,9 @@ begin
   if FOrderDesc then Dir := 'DESC' else Dir := 'ASC';
 
   { Filtresiz ID sirasinda LIMIT/OFFSET yerine PK araligi kullan.
-    Motor ORDER BY id + LIMIT icin hala Seq Scan + Sort seciyor;
-    PK araligi ise yalnizca sayfa kadar satir okur. }
+    H12 ile motor ORDER BY id + LIMIT icin indeks sirasini ve erken
+    durmayi destekliyor; PK araligi yine de sayfa numarasindan bagimsiz
+    olarak yalnizca sayfa kadar satir okur. }
   if (Where = '') and (FSortIndex = 0) and (not FOrderDesc) then
   begin
     StartId := Int64(FPage) * FPageSize + 1;
