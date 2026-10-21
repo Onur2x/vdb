@@ -13735,6 +13735,114 @@ begin
   end;
 end;
 
+procedure T132_H12_StreamTopN;
+// H12b: ham akisli top-N yolunun WHERE on-eleme, BOOL ve NULL siralama
+// davranisini dogrular; alias/ifade siralamalari genel yola dusmelidir.
+var
+  dir: string;
+  db: TVDb;
+  tdb: TVTableDb;
+  q: TVSql;
+  r: TSqlResult;
+  i: Integer;
+  fs: TFormatSettings;
+begin
+  Grp('T132 H12b akisli top-N');
+  fs := DefaultFormatSettings;
+  fs.DecimalSeparator := '.';
+  dir := D + '\t132_stream_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  tdb := TVTableDb.Create(db);
+  try
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      q.Exec('CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, f FLOAT, s TEXT)');
+      q.Exec('BEGIN');
+      for i := 1 to 200 do
+        q.Exec(Format('INSERT INTO t (id,n,f,s) VALUES (%d,%d,%s,%s)',
+          [i, 200 - i, FloatToStr(i * 1.25, fs), QuotedStr(Format('s%.4d', [201 - i]))]));
+      q.Exec('COMMIT');
+
+      r := q.Exec('SELECT id FROM t WHERE s >= ''s0081'' AND s <= ''s0100'' ' +
+        'ORDER BY n ASC LIMIT 3');
+      Dogrula('T132 TEXT aralik + ORDER BY LIMIT',
+        (Length(r.Rows) = 3) and (r.Rows[0][0] = '120') and
+        (r.Rows[1][0] = '119') and (r.Rows[2][0] = '118'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT id FROM t WHERE n >= 50 AND n < 60 ' +
+        'ORDER BY f DESC LIMIT 3');
+      Dogrula('T132 sayisal aralik + ORDER BY LIMIT',
+        (Length(r.Rows) = 3) and (r.Rows[0][0] = '150') and
+        (r.Rows[1][0] = '149') and (r.Rows[2][0] = '148'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT id FROM t ORDER BY n LIMIT 0');
+      Dogrula('T132 LIMIT 0 bos', Length(r.Rows) = 0, IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT id FROM t ORDER BY n LIMIT 5 OFFSET 500');
+      Dogrula('T132 OFFSET sinir disi bos', Length(r.Rows) = 0,
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT n AS nn FROM t ORDER BY nn LIMIT 1');
+      Dogrula('T132 alias ORDER BY genel yol',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '0'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT id FROM t ORDER BY n + 0 LIMIT 1');
+      Dogrula('T132 ifade ORDER BY genel yol',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '200'),
+        IntToStr(Length(r.Rows)));
+
+      q.Exec('CREATE TABLE tb (id INTEGER PRIMARY KEY, b BOOLEAN)');
+      q.Exec('BEGIN');
+      for i := 1 to 10 do
+        if i mod 2 = 0 then
+          q.Exec(Format('INSERT INTO tb (id,b) VALUES (%d,TRUE)', [i]))
+        else
+          q.Exec(Format('INSERT INTO tb (id,b) VALUES (%d,FALSE)', [i]));
+      q.Exec('COMMIT');
+      r := q.Exec('SELECT b FROM tb ORDER BY b DESC LIMIT 3');
+      Dogrula('T132 BOOL DESC ilk 3 True',
+        (Length(r.Rows) = 3) and (r.Rows[0][0] = 'True') and
+        (r.Rows[1][0] = 'True') and (r.Rows[2][0] = 'True'),
+        IntToStr(Length(r.Rows)));
+      r := q.Exec('SELECT b FROM tb ORDER BY b ASC LIMIT 3');
+      Dogrula('T132 BOOL ASC ilk 3 False',
+        (Length(r.Rows) = 3) and (r.Rows[0][0] = 'False') and
+        (r.Rows[1][0] = 'False') and (r.Rows[2][0] = 'False'),
+        IntToStr(Length(r.Rows)));
+
+      q.Exec('CREATE TABLE tn (id INTEGER PRIMARY KEY, v INTEGER)');
+      q.Exec('INSERT INTO tn (id,v) VALUES (1,10),(2,NULL),(3,5),(4,NULL),(5,7)');
+      r := q.Exec('SELECT v FROM tn ORDER BY v ASC LIMIT 2');
+      Dogrula('T132 NULL varsayilan ASC once',
+        (Length(r.Rows) = 2) and (r.Rows[0][0] = '') and (r.Rows[1][0] = ''),
+        IntToStr(Length(r.Rows)));
+      r := q.Exec('SELECT id FROM tn ORDER BY v DESC LIMIT 2');
+      Dogrula('T132 NULL varsayilan DESC sonda',
+        (Length(r.Rows) = 2) and (r.Rows[0][0] = '1') and (r.Rows[1][0] = '5'),
+        IntToStr(Length(r.Rows)));
+      r := q.Exec('SELECT id FROM tn ORDER BY v ASC NULLS LAST LIMIT 2');
+      Dogrula('T132 NULLS LAST',
+        (Length(r.Rows) = 2) and (r.Rows[0][0] = '3') and (r.Rows[1][0] = '5'),
+        IntToStr(Length(r.Rows)));
+      r := q.Exec('SELECT v FROM tn ORDER BY v DESC NULLS FIRST LIMIT 2');
+      Dogrula('T132 NULLS FIRST',
+        (Length(r.Rows) = 2) and (r.Rows[0][0] = '') and (r.Rows[1][0] = ''),
+        IntToStr(Length(r.Rows)));
+    finally
+      q.Free;
+    end;
+  finally
+    tdb.Free;
+    db.Free;
+  end;
+end;
+
 { ---------------------------------------------------------------------- main }
 
 var
@@ -13919,6 +14027,7 @@ T92_MVCC_Isoaltion;
        T129_H11_InPlace;
        T130_PkRangeCtype;
        T131_H12_TopN;
+       T132_H12_StreamTopN;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls

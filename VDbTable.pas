@@ -760,6 +760,11 @@ function VDbDecodeRawRowP(B: PByte; Len: Integer;
 procedure VDbRowFromOffsetsP(B: PByte; ColCount: Integer;
   const FType: array of Byte; const FOff, FLen: array of Integer;
   out Vals: TStrArray);
+{ H12: tek kolonu cozer (top-N akisli taramada tum satiri string
+  matrisine cevirmeden siralama anahtarini almak icin). Deger bicimi
+  VDbRowFromOffsetsP ile birebir aynidir. }
+function VDbColFromOffsetsP(B: PByte; ColCount, Col: Integer;
+  const FType: array of Byte; const FOff, FLen: array of Integer): string;
 { P-18a (2026-10-16): VDbPeekRawRow'un PByte+Len surumu. ScanRawIter
   geri-cagrisinda kayit tamponu TBytes DEGIL, chunk icinde bir araliktir;
   yeni TBytes ayirmadan ayni sinir kontrolleriyle onizlenir. Semantigi
@@ -3408,6 +3413,42 @@ begin
         else if FType[i] = VCT_BLOB then Vals[i] := s
         else Vals[i] := UTF8Decode(s);
       end;
+    end;
+  end;
+end;
+
+function VDbColFromOffsetsP(B: PByte; ColCount, Col: Integer;
+  const FType: array of Byte; const FOff, FLen: array of Integer): string;
+var
+  iv: Int64;
+  fv: Double;
+  s: RawByteString;
+  tid: Word;
+  plain: TBytes;
+begin
+  Result := '';
+  if (B = nil) or (Col < 0) or (Col >= ColCount) or
+     (Col > High(FType)) or (Col > High(FOff)) or (Col > High(FLen)) then Exit;
+  if (FOff[Col] < 0) or (FLen[Col] = 0) then Exit;
+  tid := Word(B[0]) or (Word(B[1]) shl 8);
+  case FType[Col] of
+    VCT_INT:
+      begin Move(B[FOff[Col]], iv, 8); Result := IntToStr(iv); end;
+    VCT_FLOAT:
+      begin Move(B[FOff[Col]], fv, 8); Result := VDbFloatToStr(fv); end;
+    VCT_BOOL:
+      Result := BoolToStr(B[FOff[Col]] <> 0, True);
+  else
+    begin
+      SetString(s, PAnsiChar(NativeUInt(B) + NativeUInt(FOff[Col])), FLen[Col]);
+      if VDbColumnIsSealed(s) then
+      begin
+        plain := VDbColumnOpen(tid, Col, VDbS2B(s));
+        if FType[Col] = VCT_BLOB then Result := VDbB2S(plain, 0, Length(plain))
+        else Result := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
+      end
+      else if FType[Col] = VCT_BLOB then Result := s
+      else Result := UTF8Decode(s);
     end;
   end;
 end;

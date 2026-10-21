@@ -419,6 +419,12 @@ type
       Sekil/guvenlik uymazsa False -> genel yol AYNEN calisir. }
     function TryStreamSelect(Stmt: TSqlSelectStmt; const td: TTableDef;
       out Res: TSqlResult): Boolean;
+    { H12: ORDER BY ... LIMIT icin tek tabloyu ham akistan okur; yalniz
+      en iyi K = LIMIT + OFFSET satiri tutar. WHERE varsa satir yine
+      RowMatches ile dogrulanir. Sekil uymazsa False -> genel yol. }
+    function TryStreamOrderLimit(Stmt: TSqlSelectStmt; const td: TTableDef;
+      const ColNames: TStrArray; const ColTypes: TByteArray;
+      out Pks: TStrArray; out Rows: TStrMatrix): Boolean;
     { M5: WHERE icindeki TS_MATCH(col, 'sorgu') conjunct'larini inverted
       index ile daraltir. Semantik degismez: WHERE sonradan aynen uygulanir. }
     function TryFtsNarrow(Stmt: TSqlSelectStmt; const td: TTableDef;
@@ -7428,6 +7434,275 @@ type
   end;
   PStreamSelCtx = ^TStreamSelCtx;
 
+  { H12: ORDER BY ... LIMIT icin akisli top-N. Tum satirlar string
+    matrisine cevrilmez; yalniz siralama anahtari + PK tutulur. }
+  TStreamOrderRec = record
+    Pk: string;
+    Seq: Int64;
+    IsNull: Boolean;
+    I: Int64;
+    F: Double;
+    S: string;
+  end;
+
+  TStreamOrderCtx = record
+    Exec: TVSqlExecutor;
+    TableId: Word;
+    TableName: string;
+    HashPrefix: QWord;
+    ColCnt: Integer;
+    FType: TByteArray;
+    FOff, FLen: TIntArray;
+    ColNames: TStrArray;
+    ColTypes: TByteArray;
+    Where: TSqlExprNode;
+    NeedFull: Boolean;
+    RawConds: array of TRawCond;
+    SortCol: Integer;
+    SortType: Byte;
+    Desc: Boolean;
+    NullsPos: Integer;
+    K: Integer;
+    N: Integer;
+    Heap: array of TStreamOrderRec;
+    Seen: Int64;
+    Failed: Boolean;
+  end;
+  PStreamOrderCtx = ^TStreamOrderCtx;
+
+function VdbStreamSelRawPass(const Conds: array of TRawCond;
+  Buf: PByte; const FType: TByteArray; const FOff, FLen: TIntArray): Boolean; forward;
+
+function VdbStreamOrderCmp(const A, B: TStreamOrderRec;
+  C: PStreamOrderCtx): Integer;
+var
+  n: Integer;
+begin
+  if A.IsNull or B.IsNull then
+  begin
+    if A.IsNull and B.IsNull then
+    begin
+      if A.Seq < B.Seq then Exit(-1);
+      if A.Seq > B.Seq then Exit(1);
+      Exit(0);
+    end;
+    n := C^.NullsPos;
+    if n < 0 then
+    begin
+      if A.IsNull then Result := -1 else Result := 1;
+      if C^.Desc then Result := -Result;
+    end
+    else if A.IsNull then
+    begin
+      if n = 0 then Result := -1 else Result := 1;
+    end
+    else
+    begin
+      if n = 0 then Result := 1 else Result := -1;
+    end;
+    Exit;
+  end;
+  case C^.SortType of
+    VCT_INT, VCT_BOOL:
+      begin
+        if A.I < B.I then Result := -1
+        else if A.I > B.I then Result := 1
+        else Result := 0;
+      end;
+    VCT_FLOAT:
+      begin
+        if A.F < B.F then Result := -1
+        else if A.F > B.F then Result := 1
+        else Result := 0;
+      end;
+  else
+    Result := CompareStr(A.S, B.S);
+  end;
+  if (Result <> 0) and C^.Desc then Result := -Result;
+  if Result = 0 then
+  begin
+    if A.Seq < B.Seq then Result := -1
+    else if A.Seq > B.Seq then Result := 1;
+  end;
+end;
+
+procedure VdbStreamOrderHeapAdd(C: PStreamOrderCtx; const R: TStreamOrderRec);
+var
+  child, parent: Integer;
+  tmp: TStreamOrderRec;
+begin
+  if C^.N < C^.K then
+  begin
+    C^.Heap[C^.N] := R;
+    Inc(C^.N);
+    child := C^.N - 1;
+    while child > 0 do
+    begin
+      parent := (child - 1) div 2;
+      if VdbStreamOrderCmp(C^.Heap[parent], C^.Heap[child], C) >= 0 then Break;
+      tmp := C^.Heap[parent]; C^.Heap[parent] := C^.Heap[child];
+      C^.Heap[child] := tmp;
+      child := parent;
+    end;
+  end
+  else if VdbStreamOrderCmp(R, C^.Heap[0], C) < 0 then
+  begin
+    C^.Heap[0] := R;
+    parent := 0;
+    while True do
+    begin
+      child := parent * 2 + 1;
+      if child >= C^.N then Break;
+      if (child + 1 < C^.N) and
+         (VdbStreamOrderCmp(C^.Heap[child + 1], C^.Heap[child], C) > 0) then
+        Inc(child);
+      if VdbStreamOrderCmp(C^.Heap[parent], C^.Heap[child], C) >= 0 then Break;
+      tmp := C^.Heap[parent]; C^.Heap[parent] := C^.Heap[child];
+      C^.Heap[child] := tmp;
+      parent := child;
+    end;
+  end;
+end;
+
+function VdbStreamOrderWouldAccept(C: PStreamOrderCtx;
+  const R: TStreamOrderRec): Boolean;
+begin
+  if C^.N < C^.K then Exit(True);
+  Result := VdbStreamOrderCmp(R, C^.Heap[0], C) < 0;
+end;
+
+function VdbRawPkFromBuf(B: PByte; Len: Integer): string;
+var
+  n: Integer;
+  s: RawByteString;
+begin
+  Result := '';
+  if (B = nil) or (Len < 4) then Exit;
+  n := B[2] or (Integer(B[3]) shl 8);
+  if (n < 0) or (4 + n > Len) then Exit;
+  SetString(s, PAnsiChar(NativeUInt(B) + 4), n);
+  Result := UTF8Decode(s);
+end;
+
+procedure VdbStreamOrderSort(C: PStreamOrderCtx);
+var
+  stackL, stackH: array[0..63] of Integer;
+  sp, l, h, i, j: Integer;
+  p, t: TStreamOrderRec;
+begin
+  sp := 0;
+  if C^.N > 1 then
+  begin
+    stackL[0] := 0; stackH[0] := C^.N - 1; sp := 1;
+  end;
+  while sp > 0 do
+  begin
+    Dec(sp);
+    l := stackL[sp]; h := stackH[sp];
+    while l < h do
+    begin
+      p := C^.Heap[(l + h) div 2];
+      i := l; j := h;
+      repeat
+        while (i < h) and (VdbStreamOrderCmp(C^.Heap[i], p, C) < 0) do Inc(i);
+        while (j > l) and (VdbStreamOrderCmp(C^.Heap[j], p, C) > 0) do Dec(j);
+        if i <= j then
+        begin
+          t := C^.Heap[i]; C^.Heap[i] := C^.Heap[j]; C^.Heap[j] := t;
+          Inc(i); Dec(j);
+        end;
+      until i > j;
+      if (j - l) < (h - i) then
+      begin
+        if i < h then
+        begin
+          if sp > High(stackL) then Exit;
+          stackL[sp] := i; stackH[sp] := h; Inc(sp);
+        end;
+        h := j;
+      end
+      else
+      begin
+        if l < j then
+        begin
+          if sp > High(stackL) then Exit;
+          stackL[sp] := l; stackH[sp] := j; Inc(sp);
+        end;
+        l := i;
+      end;
+    end;
+  end;
+end;
+
+function VdbStreamOrderCb(Key: QWord; Buf: PByte; Len: Integer;
+  User: Pointer): Boolean;
+var
+  C: PStreamOrderCtx;
+  tid: Word;
+  keyHash: QWord;
+  vals: TStrArray;
+  R: TStreamOrderRec;
+  iv: Int64;
+  fv: Double;
+begin
+  C := User;
+  Result := True;
+  if Key = VDB_SCHEMA_KEY then Exit;
+  if not VDbPeekRawRowKeyHashTo(Buf, Len, C^.ColCnt, tid, C^.HashPrefix,
+       keyHash, C^.ColCnt - 1, C^.FType, C^.FOff, C^.FLen) then
+  begin
+    C^.Failed := True; Exit(False);
+  end;
+  if tid <> C^.TableId then Exit;
+  if keyHash <> Key then
+  begin
+    C^.Failed := True; Exit(False);
+  end;
+  // Dinamik/uyumsuz alan tipi varsa ham anahtar yolu guvenli degil.
+  if C^.FType[C^.SortCol] <> C^.SortType then
+  begin
+    C^.Failed := True; Exit(False);
+  end;
+  Inc(C^.Seen);
+  if (Length(C^.RawConds) > 0) and
+     (not VdbStreamSelRawPass(C^.RawConds, Buf, C^.FType, C^.FOff, C^.FLen)) then
+    Exit;
+  if C^.NeedFull then
+  begin
+    VDbRowFromOffsetsP(Buf, C^.ColCnt, C^.FType, C^.FOff, C^.FLen, vals);
+    if (C^.Where <> nil) and
+       (not C^.Exec.RowMatches(C^.Where, vals, C^.ColNames, C^.ColTypes)) then
+      Exit;
+  end;
+  R.Pk := '';
+  R.Seq := C^.Seen;
+  R.IsNull := (C^.FOff[C^.SortCol] < 0) or (C^.FLen[C^.SortCol] = 0);
+  R.I := 0; R.F := 0; R.S := '';
+  if not R.IsNull then
+  begin
+    case C^.SortType of
+      VCT_INT:
+        begin Move(Buf[C^.FOff[C^.SortCol]], iv, 8); R.I := iv; end;
+      VCT_BOOL:
+        R.I := Ord(Buf[C^.FOff[C^.SortCol]] <> 0);
+      VCT_FLOAT:
+        begin Move(Buf[C^.FOff[C^.SortCol]], fv, 8); R.F := fv; end;
+    else
+      begin
+        R.S := VDbColFromOffsetsP(Buf, C^.ColCnt, C^.SortCol,
+                                  C^.FType, C^.FOff, C^.FLen);
+        if R.S = '' then R.IsNull := True;
+      end;
+    end;
+  end;
+  // PK string'ini yalnizca heap'e girecek adaylar icin coz.
+  if VdbStreamOrderWouldAccept(C, R) then
+  begin
+    R.Pk := VdbRawPkFromBuf(Buf, Len);
+    VdbStreamOrderHeapAdd(C, R);
+  end;
+end;
+
 { H1b: kayittaki ham baytlar saf-ASCII mi? (>=128 varsa ham bayt kiyasi
   ile cozulmus-string kiyasi farkli olabilir; o durumda filtreleme yapmayiz.) }
 function VdbBytesAscii(P: PByte; L: Integer): Boolean;
@@ -8263,6 +8538,180 @@ begin
   Result := True;
 end;
 
+function TVSqlExecutor.TryStreamOrderLimit(Stmt: TSqlSelectStmt;
+  const td: TTableDef; const ColNames: TStrArray; const ColTypes: TByteArray;
+  out Pks: TStrArray; out Rows: TStrMatrix): Boolean;
+var
+  ctx: TStreamOrderCtx;
+  cr: TSqlColumnRefNode;
+  i, j, start, cnt: Integer;
+  k64: Int64;
+  rv: TStrArray;
+
+  { H12: WHERE'in AND zincirinden guvenli, gerekli (ama yeterli olmayan)
+    ham kosular cikar. Amac yalnizca kesin uymayan satiri RowMatches'ten
+    once elemek; nihai dogrulama her zaman RowMatches'tir. }
+  procedure AddRawCond(E: TSqlExprNode);
+  var
+    b: TSqlBinaryOpNode;
+    c: TRawCond;
+    cc: TSqlColumnRefNode;
+    lit: TSqlLiteralNode;
+    op: TSqlBinaryOp;
+    ci: Integer;
+    swap: Boolean;
+  begin
+    if E = nil then Exit;
+    if (E is TSqlBinaryOpNode) and (TSqlBinaryOpNode(E).Op = sboAnd) then
+    begin
+      AddRawCond(TSqlBinaryOpNode(E).Left);
+      AddRawCond(TSqlBinaryOpNode(E).Right);
+      Exit;
+    end;
+    if not (E is TSqlBinaryOpNode) then Exit;
+    b := TSqlBinaryOpNode(E);
+    op := b.Op;
+    if not (op in [sboEq, sboNeq, sboLt, sboLte, sboGt, sboGte]) then Exit;
+    swap := False;
+    if b.Left is TSqlColumnRefNode then
+    begin
+      cc := TSqlColumnRefNode(b.Left);
+      if not (b.Right is TSqlLiteralNode) then Exit;
+      lit := TSqlLiteralNode(b.Right);
+    end
+    else if b.Right is TSqlColumnRefNode then
+    begin
+      cc := TSqlColumnRefNode(b.Right);
+      if not (b.Left is TSqlLiteralNode) then Exit;
+      lit := TSqlLiteralNode(b.Left);
+      swap := True;
+    end
+    else Exit;
+    ci := FindColIdx(cc.ColumnName, cc.TableQualifier, ColNames);
+    if (ci < 0) or (ci > High(td.Cols)) then Exit;
+    if td.Cols[ci].Encrypted or (td.Cols[ci].Collate <> '') then Exit;
+    if swap then
+      case op of
+        sboLt: op := sboGt;
+        sboLte: op := sboGte;
+        sboGt: op := sboLt;
+        sboGte: op := sboLte;
+      end;
+    FillChar(c, SizeOf(c), 0);
+    c.Col := ci;
+    c.Op := op;
+    c.IsIn := False;
+    c.InIsFloat := False;
+    if ColTypes[ci] = VCT_INT then
+    begin
+      if lit.LitType <> sltInt then Exit;
+      c.IsFloat := False; c.IsText := False;
+      c.I := lit.IntVal;
+    end
+    else if ColTypes[ci] = VCT_FLOAT then
+    begin
+      if lit.LitType = sltInt then c.F := lit.IntVal
+      else if lit.LitType = sltFloat then c.F := lit.FloatVal
+      else Exit;
+      c.IsFloat := True; c.IsText := False;
+    end
+    else if ColTypes[ci] = VCT_STR then
+    begin
+      if not (op in [sboEq, sboNeq]) then Exit;
+      if lit.LitType <> sltString then Exit;
+      if not VdbStrPureAscii(lit.StrVal) then Exit;
+      c.IsFloat := False; c.IsText := True;
+      c.S := lit.StrVal;
+    end
+    else Exit;
+    SetLength(ctx.RawConds, Length(ctx.RawConds) + 1);
+    ctx.RawConds[High(ctx.RawConds)] := c;
+  end;
+
+begin
+  Result := False;
+  SetLength(Pks, 0);
+  SetLength(Rows, 0);
+  if (Stmt.OrderBy = nil) or (Stmt.OrderBy.Count <> 1) then Exit;
+  if Stmt.HasJoin or Stmt.IsDistinct or (Stmt.SetOp <> sokNone) then Exit;
+  if HasAggregate(Stmt) or (Stmt.GroupByCols.Count > 0) then Exit;
+  if HasWindow(Stmt) or (Stmt.QualifyClause <> nil) then Exit;
+  if (Stmt.LimitVal < 0) or (Stmt.OffsetVal < 0) then Exit;
+  if not (Stmt.OrderBy[0].Expr is TSqlColumnRefNode) then Exit;
+  if Stmt.OrderBy[0].Collate <> '' then Exit;
+  cr := TSqlColumnRefNode(Stmt.OrderBy[0].Expr);
+  ctx.SortCol := -1;
+  for j := 0 to High(td.Cols) do
+    if VDbNorm(td.Cols[j].Name) = VDbNorm(cr.ColumnName) then
+    begin ctx.SortCol := j; Break; end;
+  if ctx.SortCol < 0 then Exit;
+  if td.Cols[ctx.SortCol].Encrypted or (td.Cols[ctx.SortCol].Collate <> '') then Exit;
+  ctx.SortType := td.Cols[ctx.SortCol].Ctype;
+  if not (ctx.SortType in [VCT_INT, VCT_BOOL, VCT_FLOAT, VCT_STR]) then Exit;
+  k64 := Int64(Stmt.LimitVal) + Int64(Stmt.OffsetVal);
+  if k64 <= 0 then
+  begin
+    // LIMIT 0: tarama gerekmez.
+    if Stmt.LimitVal = 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+    Exit;
+  end;
+  // Cok derin OFFSET'te K buyur; bu durumda genel/top-N yol daha uygun.
+  if k64 > 200000 then Exit;
+
+  ctx.Exec := Self;
+  ctx.TableId := td.TableId;
+  ctx.TableName := td.Name;
+  ctx.HashPrefix := VDbHashKeyPrefix(td.Name);
+  ctx.ColCnt := Length(td.Cols);
+  SetLength(ctx.FType, ctx.ColCnt);
+  SetLength(ctx.FOff, ctx.ColCnt);
+  SetLength(ctx.FLen, ctx.ColCnt);
+  ctx.ColNames := ColNames;
+  ctx.ColTypes := ColTypes;
+  ctx.Where := Stmt.WhereClause;
+  ctx.NeedFull := Stmt.WhereClause <> nil;
+  SetLength(ctx.RawConds, 0);
+  if ctx.NeedFull then AddRawCond(Stmt.WhereClause);
+  ctx.Desc := Stmt.OrderBy[0].Desc;
+  ctx.NullsPos := Stmt.OrderBy[0].NullsPos;
+  ctx.K := k64;
+  ctx.N := 0;
+  ctx.Seen := 0;
+  ctx.Failed := False;
+  SetLength(ctx.Heap, ctx.K);
+
+  if not FT.Kv.ScanRawIterAll(td.TableId, VdbStreamOrderCb, @ctx) then Exit;
+  if ctx.Failed then Exit;
+
+  VdbStreamOrderSort(@ctx);
+  start := Stmt.OffsetVal;
+  if start >= ctx.N then
+  begin
+    Result := True;
+    Exit;
+  end;
+  cnt := ctx.N - start;
+  if Stmt.LimitVal < cnt then cnt := Stmt.LimitVal;
+  SetLength(Pks, cnt);
+  SetLength(Rows, cnt);
+  for i := 0 to cnt - 1 do
+  begin
+    if not FT.ReadRow(td.Name, ctx.Heap[start + i].Pk, rv) then
+    begin
+      SetLength(Pks, 0);
+      SetLength(Rows, 0);
+      Exit(False);
+    end;
+    Pks[i] := ctx.Heap[start + i].Pk;
+    Rows[i] := rv;
+  end;
+  Result := True;
+end;
+
 function TVSqlExecutor.TryFtsNarrow(Stmt: TSqlSelectStmt;
   const td: TTableDef; const ColNames: TStrArray;
   const ColTypes: TByteArray; out Pks: TStrArray;
@@ -8532,6 +8981,8 @@ var
   distinctOut: TStrMatrix;
   rowKey: string;
   isDup, found, SkipOffsetLimit, HasSetOp, deferOrder, isExactNarrow: Boolean;
+  preferStream: Boolean;
+  orderName: string;
   baseIdx, tmpSlot, origCols: Integer;
   // H1 (2026-10-18): LIMIT erken-cikis
   capSel: Integer;
@@ -8833,7 +9284,47 @@ begin
       else if FT.RlsApplies(Stmt.FromTable) then
         SkipOffsetLimit := False   // R-19: asagida satir satir filtrelenir
       else
-        SkipOffsetLimit := TryIndexOrder(td, Stmt, colNames, colTypes, filteredRows);
+      begin
+        // H12b: Kucuk LIMIT'te siralama kolonu PK degilse ve WHERE PK'ya
+        // basvurmuyorsa ham akisli top-N genellikle ikincil indeksin ilk
+        // (bellek ici) insasindan cok daha hizlidir. PK sirasi korunur.
+        preferStream := False;
+        if (Length(allRows) = 0) and
+           (Stmt.OrderBy <> nil) and (Stmt.OrderBy.Count = 1) and
+           (Stmt.LimitVal >= 0) and
+           (Int64(Stmt.LimitVal) + Int64(Stmt.OffsetVal) <= 10000) and
+           (Stmt.OrderBy[0].Expr is TSqlColumnRefNode) then
+        begin
+          orderName := TSqlColumnRefNode(Stmt.OrderBy[0].Expr).ColumnName;
+          if (td.PkIndex < 0) or
+             (VDbNorm(orderName) <> VDbNorm(td.Cols[td.PkIndex].Name)) then
+            if (Stmt.WhereClause = nil) or (td.PkIndex < 0) or
+               (not VdbStreamSelRefersCol(Stmt.WhereClause,
+                 td.Cols[td.PkIndex].Name)) then
+              preferStream := True;
+        end;
+        if preferStream then
+        begin
+          SkipOffsetLimit := TryStreamOrderLimit(Stmt, td, colNames,
+            colTypes, pks, filteredRows);
+          if not SkipOffsetLimit then
+            SkipOffsetLimit := TryIndexOrder(td, Stmt, colNames, colTypes,
+              filteredRows);
+        end
+        else
+        begin
+          SkipOffsetLimit := TryIndexOrder(td, Stmt, colNames, colTypes,
+            filteredRows);
+          // H12: indeks yoksa ORDER BY ... LIMIT icin ham akisli top-N.
+          // WHERE PK'ya basvuruyorsa NarrowRows'un PK daraltmasi daha iyidir.
+          if (not SkipOffsetLimit) and (Length(allRows) = 0) and
+             ((Stmt.WhereClause = nil) or (td.PkIndex < 0) or
+              (not VdbStreamSelRefersCol(Stmt.WhereClause,
+                td.Cols[td.PkIndex].Name))) then
+            SkipOffsetLimit := TryStreamOrderLimit(Stmt, td, colNames,
+              colTypes, pks, filteredRows);
+        end;
+      end;
       if not SkipOffsetLimit then
       begin
         { YOL 2: Satir adaylarini DARALT - PK nokta aramasi veya indeks dilimi.

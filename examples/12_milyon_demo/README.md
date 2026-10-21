@@ -74,32 +74,44 @@ alınmıştır; farklı donanımda değişebilir.
 | PK aralığıyla sonraki sayfa | 1–2 ms | 100 satır |
 | `ORDER BY id LIMIT 100` | 1,2 s / 0,11 s | ilk indeks yüklemesi / sonraki sayfa |
 | `ORDER BY id LIMIT 100 OFFSET 500000` | 0,11 s | indeks konumuna atlama |
-| `ORDER BY bakiye DESC LIMIT 100` | 5,7–7,0 s | top-N; tam sıralama 48–50 s |
-| `ORDER BY ad_soyad ASC LIMIT 100` | 3,6–4,0 s | top-N, indeks yok |
-| `ORDER BY yas DESC LIMIT 100` | 5,5–5,8 s | top-N, indeks yok |
-| `ORDER BY sehir ASC LIMIT 100` | 5,4 s / 0,41 s | ilk indeks yüklemesi / sonraki |
-| `ORDER BY sehir, yas DESC LIMIT 100` | 3,9–4,0 s | top-N |
+| `ORDER BY bakiye DESC LIMIT 100` | 0,39–0,40 s | akışlı top-N; tam sıralama 48–50 s |
+| `ORDER BY ad_soyad ASC LIMIT 100` | 0,66–0,67 s | akışlı top-N, metin anahtar |
+| `ORDER BY yas DESC LIMIT 100` | 0,39–0,41 s | akışlı top-N |
+| `ORDER BY sehir ASC LIMIT 100` | 0,64–0,66 s | akışlı top-N; ilk indeks yüklemesi atlanır |
+| `ORDER BY bakiye DESC LIMIT 100 OFFSET 500` | 0,41 s | akışlı top-N + OFFSET |
+| `WHERE sehir = 'Ankara' ORDER BY yas DESC LIMIT 100` | 0,78 s | ham WHERE ön elemesi + top-N |
+| `ORDER BY sehir, yas DESC LIMIT 100` | 3,9–4,0 s | çok kolonlu top-N (akış dışı) |
 | `GROUP BY sehir` | 3,8–4,5 s | tam tablo |
 | Şehir + yaş `COUNT(*)` | 0,83–0,98 s | sıcak indeks |
 
 ## Sorgu hızı nasıl iyileştirildi?
 
-H12 ile motor `ORDER BY ... LIMIT` sorgularında iki yolu kullanır:
+H12 ile motor `ORDER BY ... LIMIT` sorgularında üç yolu kullanır:
 
-1. **İndeks sırası + erken durma.** `ORDER BY id` veya `ORDER BY sehir`
-   indeksli bir kolondaysa satırlar indeks sırasıyla okunur ve `LIMIT`
-   dolunca durulur. PK sıralamasında `OFFSET` verilmişse WHERE yokken
-   satırlar tek tek okunmadan doğrudan indeksteki konuma atlanır. Bu yüzden
-   `ORDER BY id LIMIT 100 OFFSET 500000` bile yaklaşık 0,1 s sürer.
-2. **Top-N heap.** `bakiye`, `ad_soyad`, `yas` gibi indekssiz kolonlarda
-   tüm 1.000.000 satır taranır, ancak yalnız `LIMIT + OFFSET` kadar en iyi
-   satır bellekte tutulur. Tam sıralama yerine `O(N log K)` çalışır:
-   `bakiye` sıralaması 62 s yerine yaklaşık 6 s'ye iner.
+1. **İndeks sırası + erken durma.** PK sıralamasında (`ORDER BY id`)
+   satırlar indeks sırasıyla okunur ve `LIMIT` dolunca durulur. `OFFSET`
+   verilmişse WHERE yokken satırlar tek tek okunmadan doğrudan indeksteki
+   konuma atlanır. Bu yüzden `ORDER BY id LIMIT 100 OFFSET 500000` bile
+   yaklaşık 0,1 s sürer.
+2. **Ham akışlı top-N.** `bakiye`, `ad_soyad`, `yas`, `sehir` gibi küçük
+   `LIMIT`li sıralamalarda motor 1.000.000 satırı string matrisine çevirmez.
+   Ham kayıt tamponundan yalnız sıralama anahtarı çıkarılır; PK metni yalnız
+   heap'e girecek adaylar için üretilir. Yalnız `LIMIT + OFFSET` kadar en iyi
+   satır bellekte tutulur. Bu yol `ORDER BY bakiye DESC LIMIT 100` süresini
+   yaklaşık 6 s'den 0,4 s'ye, metin sıralamasını 3,6 s'den 0,66 s'ye indirir.
+3. **Ham WHERE ön elemesi.** `WHERE sehir = 'Ankara'` gibi güvenli
+   koşullar satır çözülmeden önce ham baytlarda elenir; hayatta kalan
+   adaylar normal `RowMatches` ile yeniden doğrulanır. Bu sayede filtreli
+   sıralama da yaklaşık 0,8 s'de kalır.
 
-İlk `ORDER BY id`/`ORDER BY sehir` sorgusu indeks kaynağını belleğe
-yüklediği için 1–5 s sürebilir; aynı oturumdaki sonraki sayfalar hızlıdır.
-`ORDER BY ...` için uygun indeks yoksa motor hâlâ tüm tabloyu tarar;
-`LIMIT` yoksa tam sıralama maliyeti (yaklaşık 48 s) geri döner.
+`ORDER BY sehir ASC LIMIT 100` artık ikincil indeksin ilk bellek içi
+kurulumunu beklemez; ham akışlı top-N ile yaklaşık 0,65 s'de yanıt verir.
+`ORDER BY id` ise PK indeks yolunu kullanmaya devam eder.
+
+Çok kolonlu `ORDER BY sehir, yas DESC LIMIT 100`, ifade sıralamaları ve
+`LIMIT`siz sıralamalar akışlı top-N kapsamı dışındadır; bunlarda tam sıralama
+maliyeti (yaklaşık 4 s veya 48 s) geri döner. `GROUP BY`, `ILIKE` ve indekssiz
+tam tarama gerektiren işlemler doğası gereği tüm tabloyu okur.
 
 Demo, ID sıralı sayfalarda `LIMIT/OFFSET` yerine PK aralığını kullanmaya
 devam eder; bu, sayfa numarasından bağımsız olarak yalnızca sayfa kadar
@@ -111,6 +123,7 @@ WHERE id >= 1 AND id < 101
 ORDER BY id;
 ```
 
-Şehir filtresi `idx_buyuk_sehir` indeksini kullanabilir; filtre sonucu
-`ORDER BY id` ile sıralanacaksa eşleşen satırlar sıralanır. `GROUP BY`,
-`ILIKE` ve indekssiz sıralamalar doğası gereği tam tarama yapar.
+Şehir filtresi `WHERE sehir = ...` için ham ön eleme kullanılabilir;
+filtre sonucu küçük `LIMIT`li bir sıralamaya giriyorsa akışlı top-N devreye
+girer. `GROUP BY`, `ILIKE` ve indekssiz tam tarama gerektiren işlemler
+doğası gereği tüm tabloyu okur.
