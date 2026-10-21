@@ -13921,6 +13921,259 @@ begin
   end;
 end;
 
+procedure T134_H12c_MultiTopN;
+// H12c: cok kolonlu ham akisli top-N; karma yon, NULLS konumu, WHERE
+// on-elemesi ve ifade/alias geri donusu dogrulanir.
+var
+  dir: string;
+  db: TVDb;
+  tdb: TVTableDb;
+  q: TVSql;
+  r: TSqlResult;
+
+  function Ids(const Res: TSqlResult): string;
+  var
+    k: Integer;
+  begin
+    Result := '';
+    for k := 0 to High(Res.Rows) do
+      Result := Result + Res.Rows[k][0] + ',';
+  end;
+
+begin
+  Grp('T134 H12c cok kolonlu akisli top-N');
+  dir := D + '\t134_multi_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  tdb := TVTableDb.Create(db);
+  try
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      q.Exec('CREATE TABLE tm (id INTEGER PRIMARY KEY, g TEXT, n INTEGER, ' +
+        'f FLOAT, b BOOLEAN)');
+      q.Exec('INSERT INTO tm (id,g,n,f,b) VALUES ' +
+        '(1,''b'',2,2.5,TRUE),(2,''a'',1,1.5,TRUE),(3,''a'',3,3.5,FALSE),' +
+        '(4,''a'',2,2.0,TRUE),(5,''b'',NULL,9.0,TRUE),' +
+        '(6,''b'',1,0.5,FALSE),(7,NULL,5,5.0,TRUE),(8,NULL,4,4.0,FALSE),' +
+        '(9,''c'',3,NULL,TRUE),(10,''c'',2,1.0,NULL),' +
+        '(11,''a'',NULL,8.0,FALSE),(12,''b'',1,NULL,TRUE)');
+
+      r := q.Exec('SELECT id FROM tm ORDER BY g ASC, n DESC LIMIT 3');
+      Dogrula('T134 metin + sayisal, LIMIT',
+        (Length(r.Rows) = 3) and
+        (r.Rows[0][0] = '7') and (r.Rows[1][0] = '8') and
+        (r.Rows[2][0] = '3'),
+        Ids(r));
+
+      r := q.Exec('SELECT id FROM tm ORDER BY g ASC NULLS LAST, n DESC LIMIT 3');
+      Dogrula('T134 NULLS LAST + LIMIT',
+        (Length(r.Rows) = 3) and
+        (r.Rows[0][0] = '3') and (r.Rows[1][0] = '4') and
+        (r.Rows[2][0] = '2'),
+        Ids(r));
+
+      r := q.Exec('SELECT id FROM tm ORDER BY n ASC, f DESC LIMIT 3');
+      Dogrula('T134 sayisal + float, karma icerik',
+        (Length(r.Rows) = 3) and
+        (r.Rows[0][0] = '5') and (r.Rows[1][0] = '11') and
+        (r.Rows[2][0] = '2'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT id FROM tm ORDER BY g DESC NULLS FIRST, n ASC ' +
+        'LIMIT 2 OFFSET 1');
+      Dogrula('T134 DESC + NULLS FIRST + OFFSET',
+        (Length(r.Rows) = 2) and
+        (r.Rows[0][0] = '7') and (r.Rows[1][0] = '10'),
+        Ids(r));
+
+      r := q.Exec('SELECT id FROM tm WHERE g = ''b'' ORDER BY n DESC, f ASC ' +
+        'LIMIT 3');
+      Dogrula('T134 WHERE on-elemesi + cok kolon',
+        (Length(r.Rows) = 3) and
+        (r.Rows[0][0] = '1') and (r.Rows[1][0] = '12') and
+        (r.Rows[2][0] = '6'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT id FROM tm ORDER BY b ASC, n DESC LIMIT 3');
+      Dogrula('T134 BOOL + sayisal',
+        (Length(r.Rows) = 3) and
+        (r.Rows[0][0] = '10') and (r.Rows[1][0] = '8') and
+        (r.Rows[2][0] = '3'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT id FROM tm WHERE g = ''b'' ' +
+        'ORDER BY g ASC, n DESC, f ASC LIMIT 4');
+      Dogrula('T134 uc kolon, son anahtar',
+        (Length(r.Rows) = 4) and
+        (r.Rows[0][0] = '1') and (r.Rows[1][0] = '12') and
+        (r.Rows[2][0] = '6') and (r.Rows[3][0] = '5'),
+        Ids(r));
+
+      r := q.Exec('SELECT id FROM tm WHERE n >= 0 ' +
+        'ORDER BY n + 0 DESC LIMIT 1');
+      Dogrula('T134 ifade anahtari genel yola duser',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '7'),
+        Ids(r));
+
+      r := q.Exec('SELECT id FROM tm WHERE g = ''b'' ' +
+        'ORDER BY LENGTH(g) DESC, n DESC, id ASC LIMIT 2');
+      Dogrula('T134 ifade + LIMIT top-N',
+        (Length(r.Rows) = 2) and
+        (r.Rows[0][0] = '1') and (r.Rows[1][0] = '6'),
+        Ids(r));
+
+      r := q.Exec('SELECT id, n AS nn FROM tm ORDER BY g, nn LIMIT 1');
+      Dogrula('T134 alias anahtari genel yola duser',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '8'),
+        Ids(r));
+
+      r := q.Exec('SELECT id FROM tm ORDER BY g ASC, n DESC LIMIT 0');
+      Dogrula('T134 cok kolon LIMIT 0 bos', Length(r.Rows) = 0,
+        IntToStr(Length(r.Rows)));
+    finally
+      q.Free;
+    end;
+  finally
+    tdb.Free;
+    db.Free;
+  end;
+end;
+
+procedure T135_H14_FloatSort;
+// H14: tek kolonlu FLOAT siralamasi icin anahtarlar onceden cozulur.
+// Sonuclar genel yolla (metin kiyasi) BIREBIR ayni olmalidir.
+var
+  dir: string;
+  db: TVDb;
+  tdb: TVTableDb;
+  q: TVSql;
+  r: TSqlResult;
+  i: Integer;
+  fs: TFormatSettings;
+begin
+  Grp('T135 H14 FLOAT siralama hizli yolu');
+  fs := DefaultFormatSettings;
+  fs.DecimalSeparator := '.';
+  dir := D + '\t135_fsort_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  tdb := TVTableDb.Create(db);
+  try
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      q.Exec('CREATE TABLE tf (id INTEGER PRIMARY KEY, f FLOAT)');
+      q.Exec('INSERT INTO tf (id,f) VALUES ' +
+        '(1,2.5),(2,NULL),(3,-1.75),(4,2.5),(5,0),(6,10.125),(7,-3.5),(8,1)');
+
+      // WHERE PK'ya referans verir -> genel yol (bellek ici siralama).
+      r := q.Exec('SELECT id FROM tf WHERE id >= 0 ORDER BY f ASC');
+      Dogrula('T135 FLOAT ASC siralama',
+        (Length(r.Rows) = 8) and
+        (r.Rows[0][0] = '2') and    // NULL en kucuk
+        (r.Rows[1][0] = '7') and    // -3.5
+        (r.Rows[2][0] = '3') and    // -1.75
+        (r.Rows[3][0] = '5') and    // 0
+        (r.Rows[4][0] = '8') and    // 1
+        (((r.Rows[5][0] = '1') and (r.Rows[6][0] = '4')) or
+         ((r.Rows[5][0] = '4') and (r.Rows[6][0] = '1'))) and  // 2.5 = 2.5
+        (r.Rows[7][0] = '6'),       // 10.125
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT id FROM tf WHERE id >= 0 ORDER BY f DESC');
+      Dogrula('T135 FLOAT DESC siralama',
+        (Length(r.Rows) = 8) and
+        (r.Rows[0][0] = '6') and
+        (((r.Rows[1][0] = '1') and (r.Rows[2][0] = '4')) or
+         ((r.Rows[1][0] = '4') and (r.Rows[2][0] = '1'))) and  // 2.5 = 2.5
+        (r.Rows[3][0] = '8') and
+        (r.Rows[4][0] = '5') and
+        (r.Rows[5][0] = '3') and
+        (r.Rows[6][0] = '7') and
+        (r.Rows[7][0] = '2'),        // NULL en buyuk
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT id FROM tf WHERE id >= 0 ORDER BY f ASC LIMIT 3');
+      Dogrula('T135 FLOAT ASC LIMIT',
+        (Length(r.Rows) = 3) and
+        (r.Rows[0][0] = '2') and (r.Rows[1][0] = '7') and
+        (r.Rows[2][0] = '3'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT id FROM tf WHERE id >= 0 ORDER BY f DESC ' +
+        'LIMIT 2 OFFSET 1');
+      Dogrula('T135 FLOAT DESC LIMIT/OFFSET',
+        (Length(r.Rows) = 2) and
+        (((r.Rows[0][0] = '1') and (r.Rows[1][0] = '4')) or
+         ((r.Rows[0][0] = '4') and (r.Rows[1][0] = '1'))),
+        IntToStr(Length(r.Rows)));
+
+      // NULLS FIRST/LAST acik yazildiginda genel yola dusulur.
+      r := q.Exec('SELECT id FROM tf WHERE id >= 0 ' +
+        'ORDER BY f ASC NULLS LAST LIMIT 1');
+      Dogrula('T135 FLOAT NULLS LAST',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '7'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT id FROM tf WHERE id >= 0 ' +
+        'ORDER BY f DESC NULLS FIRST LIMIT 1');
+      Dogrula('T135 FLOAT NULLS FIRST',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '2'),
+        IntToStr(Length(r.Rows)));
+
+      // Cok kolonlu siralamada float kolonu ikinci srada.
+      r := q.Exec('SELECT id FROM tf WHERE id >= 0 ORDER BY f ASC, id DESC ' +
+        'LIMIT 2');
+      Dogrula('T135 FLOAT + kolon siralama',
+        (Length(r.Rows) = 2) and
+        (r.Rows[0][0] = '2') and (r.Rows[1][0] = '7'),
+        IntToStr(Length(r.Rows)));
+
+      // Paralel yol esigi (>= 2048 satir) uzerinde siralama dogru mu?
+      q.Exec('CREATE TABLE tp (id INTEGER PRIMARY KEY, f FLOAT)');
+      q.Exec('BEGIN');
+      for i := 1 to 3000 do
+        q.Exec(Format('INSERT INTO tp (id,f) VALUES (%d,%s)',
+          [i, FloatToStr((3000 - i) * 0.5, fs)]));
+      q.Exec('COMMIT');
+      r := q.Exec('SELECT id, f FROM tp WHERE id >= 0 ORDER BY f ASC LIMIT 3');
+      Dogrula('T135 paralel yol siralama',
+        (Length(r.Rows) = 3) and
+        (r.Rows[0][0] = '3000') and (r.Rows[1][0] = '2999') and
+        (r.Rows[2][0] = '2998'),
+        IntToStr(Length(r.Rows)));
+      r := q.Exec('SELECT id, f FROM tp WHERE id >= 0 ORDER BY f DESC LIMIT 3');
+      Dogrula('T135 paralel yol DESC',
+        (Length(r.Rows) = 3) and
+        (r.Rows[0][0] = '1') and (r.Rows[1][0] = '2') and
+        (r.Rows[2][0] = '3'),
+        IntToStr(Length(r.Rows)));
+      // LIMIT'siz tam siralama -> paralel dagitim yolu.
+      r := q.Exec('SELECT id, f FROM tp WHERE id >= 0 ORDER BY f ASC');
+      Dogrula('T135 tam siralama (paralel yol)',
+        (Length(r.Rows) = 3000) and
+        (r.Rows[0][0] = '3000') and
+        (r.Rows[1499][0] = '1501') and
+        (r.Rows[2999][0] = '1'),
+        IntToStr(Length(r.Rows)));
+      r := q.Exec('SELECT id, f FROM tp WHERE id >= 0 ORDER BY f DESC');
+      Dogrula('T135 tam siralama DESC (paralel yol)',
+        (Length(r.Rows) = 3000) and
+        (r.Rows[0][0] = '1') and
+        (r.Rows[2999][0] = '3000'),
+        IntToStr(Length(r.Rows)));
+    finally
+      q.Free;
+    end;
+  finally
+    tdb.Free;
+    db.Free;
+  end;
+end;
+
 procedure T132_H12_StreamTopN;
 // H12b: ham akisli top-N yolunun WHERE on-eleme, BOOL ve NULL siralama
 // davranisini dogrular; alias/ifade siralamalari genel yola dusmelidir.
@@ -14215,6 +14468,8 @@ T92_MVCC_Isoaltion;
        T131_H12_TopN;
        T132_H12_StreamTopN;
        T133_H13_StreamGroupBy;
+       T134_H12c_MultiTopN;
+       T135_H14_FloatSort;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls

@@ -432,6 +432,12 @@ type
     function TryStreamOrderLimit(Stmt: TSqlSelectStmt; const td: TTableDef;
       const ColNames: TStrArray; const ColTypes: TByteArray;
       out Pks: TStrArray; out Rows: TStrMatrix): Boolean;
+    { H12c (2026-10-21): cok kolonlu ORDER BY ... LIMIT icin ayni ham akisli
+      top-N yolu. Karma yon (ASC/DESC), farkli tipler ve NULLS konumlari
+      desteklenir; ifade anahtarlari genel yola birakilir. }
+    function TryStreamOrderMultiLimit(Stmt: TSqlSelectStmt; const td: TTableDef;
+      const ColNames: TStrArray; const ColTypes: TByteArray;
+      out Pks: TStrArray; out Rows: TStrMatrix): Boolean;
     { M5: WHERE icindeki TS_MATCH(col, 'sorgu') conjunct'larini inverted
       index ile daraltir. Semantik degismez: WHERE sonradan aynen uygulanir. }
     function TryFtsNarrow(Stmt: TSqlSelectStmt; const td: TTableDef;
@@ -4411,6 +4417,16 @@ type
     gorevlerin baglam kaydinda tasinir). }
   TVdbSortCols = array of TSortColInfo;
 
+  { H14: tekil FLOAT kolonunda onceden cozulmus anahtar plani. Anahtarlar
+    SATIR-INDEKSLI (Idx dizisi satir numarasi tutar). Genel yolda her
+    kiyasta VDbParseFloat cagriliyordu; 1M satirda ~60 s suruyordu. }
+  TSortFloatPlan = record
+    Keys: array of Double;   // satir-indeksli sayisal anahtarlar
+    Null: TByteArray;        // satir-indeksli NULL bayragi (1 = NULL)
+    Desc: Boolean;
+    Valid: Boolean;          // tum degerler sayisala donustu mu?
+  end;
+
   { R-14 Full: paralel siralama gorev baglami. Parca quicksort'u ve
     birlestirme turlari bu kaydin alanlarini okur; yalnizca Idx
     dizisinin goreve ayrilmis araligina yazilir (thread-guvenli). }
@@ -4422,6 +4438,9 @@ type
     IntKeys: array of Int64;   // UseInt: satir-indeksli anahtarlar
     UseInt: Boolean;           // tekil tamsayi kolonu hizli yolu
     IntDesc: Boolean;
+    { H14: tekil FLOAT kolonu hizli yolu. Anahtarlar satir basina ONCEDEN
+      cozulur; karsilastirmada VDbParseFloat cagrilmaz. }
+    Plan: TSortFloatPlan;      // Valid = True ise float anahtarlari hazir
   end;
 
   { R-14 Full: bir birlestirme turunun baglami. Src'den Dst'ye; her
@@ -4514,6 +4533,67 @@ end;
   anahtarlarda orijinal satir indeksiyle baginti kurar (tie-break):
   paralel cikti boylece KARARLI (stable) olur ve esit satirlar ekleme
   sirasinda kalir. Toplam siralama olur (merge icin zorunlu). }
+{ H14: tek kolonlu FLOAT siralamasi icin anahtar plani olusturur.
+  Anahtarlar SATIR-INDEKSLI (Rows dizisinin sirasiyla). Genel yolda her
+  karsilastirmada VDbParseFloat cagriliyordu; 1M satirlik FLOAT siralamasi
+  ~64 s suruyordu, simdi ~5 s.
+  Dondus: False = plan kullanilamaz (bir deger sayisala donusmedi) ->
+  genel yol AYNEN calisir (sonuc degismez). }
+function VdbBuildFloatPlan(const Rows: TStrMatrix; Col: Integer;
+  Desc: Boolean; out Plan: TSortFloatPlan): Boolean;
+var
+  i: Integer;
+  v: Double;
+begin
+  Result := False;
+  Plan.Keys := nil;
+  Plan.Null := nil;
+  Plan.Desc := Desc;
+  Plan.Valid := False;
+  if Col < 0 then Exit;
+  SetLength(Plan.Keys, Length(Rows));
+  SetLength(Plan.Null, Length(Rows));
+  for i := 0 to High(Rows) do
+  begin
+    if (Col > High(Rows[i])) or (Rows[i][Col] = '') then
+    begin
+      Plan.Null[i] := 1;      // bos metin = NULL
+      Plan.Keys[i] := 0;
+      Continue;
+    end;
+    if not VDbParseFloat(Rows[i][Col], v) then
+    begin
+      // Sayisala donusmeyen deger: genel yola don (metin kiyasi).
+      SetLength(Plan.Keys, 0);
+      SetLength(Plan.Null, 0);
+      Exit(False);
+    end;
+    Plan.Null[i] := 0;
+    Plan.Keys[i] := v;
+  end;
+  Plan.Valid := True;
+  Result := True;
+end;
+
+{ H14: iki satiri onceden cozulmus FLOAT anahtarlariyla karsilastirir.
+  NULL kurali genel yolla ayni: NULL "en kucuk" sayilir, DESC ile terslenir.
+  Esitlikte 0 doner (baginti kuran kisi ek karar verir). }
+function VdbSortCmpFloatPlan(const Plan: TSortFloatPlan;
+  ra, rb: Integer): Integer;
+begin
+  if (Plan.Null[ra] <> 0) or (Plan.Null[rb] <> 0) then
+  begin
+    if (Plan.Null[ra] <> 0) and (Plan.Null[rb] <> 0) then Exit(0);
+    if Plan.Null[ra] <> 0 then Result := -1 else Result := 1;
+    if Plan.Desc then Result := -Result;
+    Exit;
+  end;
+  if Plan.Keys[ra] < Plan.Keys[rb] then Result := -1
+  else if Plan.Keys[ra] > Plan.Keys[rb] then Result := 1
+  else Result := 0;
+  if (Result <> 0) and Plan.Desc then Result := -Result;
+end;
+
 function VdbSortCmpRow(const T: TVdbSortTask; ra, rb: Integer): Integer;
 begin
   if T.UseInt then
@@ -4531,6 +4611,8 @@ begin
       else Result := 0;
     end;
   end
+  else if T.Plan.Valid then
+    Result := VdbSortCmpFloatPlan(T.Plan, ra, rb)
   else
     Result := VdbSortCompareRows(T.Cols, T.Rows, ra, rb);
   if Result = 0 then Result := ra - rb;
@@ -4650,7 +4732,8 @@ end;
   Cagiran on kosullari saglar: N >= VDB_PAR_SORT_MIN_ROWS, havuz acik
   ve >= 2 isci. Satir deposu (Rows) ve kolon bilgileri salt-okunur. }
 procedure VdbParallelSortIdx(var Idx: TIntArray; N: Integer;
-  const Rows: TStrMatrix; const Cols: TVdbSortCols; UseInt, IntDesc: Boolean);
+  const Rows: TStrMatrix; const Cols: TVdbSortCols; UseInt, IntDesc: Boolean;
+  const Plan: TSortFloatPlan);
 var
   T: TVdbSortTask;
   MT: TVdbMergeTask;
@@ -4667,6 +4750,7 @@ begin
   T.Cols := Cols;
   T.UseInt := UseInt;
   T.IntDesc := IntDesc;
+  T.Plan := Plan;
   if UseInt then
   begin
     // Hizli yol: tamsayi anahtarlar ana is parcaciginda BIR kez
@@ -4761,6 +4845,9 @@ var
   desc: Boolean;
   // R-14 Full: yola karar (tamsayi hizli yolu / paralel dagitim).
   intPath, usePar: Boolean;
+  // H14: tek kolonlu FLOAT siralamasi icin onceden cozulmus anahtarlar.
+  fPlan: TSortFloatPlan;
+  useFPlan: Boolean;
 
   function ExprCt(E: TSqlExprNode): Byte;
   var
@@ -4828,6 +4915,17 @@ var
   begin
     if hasExpr then
       Result := CmpExpr(a, b)
+    else if useFPlan then
+      Result := VdbSortCmpFloatPlan(fPlan, a, b)
+    else
+      Result := VdbSortCompareRows(sortCols, Rows, a, b);
+  end;
+
+  { H14: seri yolda iki satiri karsilastirir. }
+  function CmpRows2(a, b: Integer): Integer;
+  begin
+    if useFPlan then
+      Result := VdbSortCmpFloatPlan(fPlan, a, b)
     else
       Result := VdbSortCompareRows(sortCols, Rows, a, b);
   end;
@@ -4980,7 +5078,10 @@ begin
     end;
     SetLength(idx, Length(Rows));
     for i := 0 to High(Rows) do idx[i] := i;
-    // H12: ifade anahtarlarinda (VECTOR_DISTANCE vb.) tam siralama korunur.
+    // NOT: ifade anahtarlarinda (VECTOR_DISTANCE vb.) tam siralama korunur.
+    // TopK burada K siralamayi degil, "en iyi K satiri" secimini yapar; esit
+    // anahtarlarda secim sirasi degisebilir. HNSW (M4) aday kumesi ile
+    // karsilastirilan testlerde kume farki olusur -> bu yol kullanilmaz.
     // Yinelemeli quicksort (kucuk yigin).
     SP := 0;
     StackL[0] := 0; StackH[0] := High(idx); Inc(SP);
@@ -5075,6 +5176,17 @@ begin
   SetLength(sortCols, validCount);
   if validCount = 0 then Exit;
 
+  { H14: tek kolonlu FLOAT siralamasi icin anahtarlar ONCEDEN cozulur.
+    Genel yolda her kiyasta VDbParseFloat cagriliyordu; 1M satirlik
+    FLOAT siralamasi ~64 s suruyordu. Plan gecerli degilse genel yol
+    AYNEN calisir (sonuc degismez). }
+  useFPlan := False;
+  fPlan.Valid := False;
+  if (validCount = 1) and (sortCols[0].CType = VCT_FLOAT) and
+     (sortCols[0].NullsPos < 0) and (sortCols[0].Collate = '') then
+    useFPlan := VdbBuildFloatPlan(Rows, sortCols[0].ColIdx,
+      sortCols[0].Desc, fPlan);
+
   // 2. Indeks dizisi olustur
   SetLength(idx, Length(Rows));
   for i := 0 to High(Rows) do idx[i] := i;
@@ -5103,7 +5215,7 @@ begin
 
   if usePar then
     VdbParallelSortIdx(idx, Length(Rows), Rows, sortCols, intPath,
-      intPath and sortCols[0].Desc)
+      intPath and sortCols[0].Desc, fPlan)
   else if intPath then
   begin
     // Tekil sayisal kolon icin ultra-hizli tamsayi QuickSort.
@@ -5191,8 +5303,8 @@ begin
         pIdx := idx[(L + H) div 2];
         i := L; j := H;
         repeat
-          while (i < H) and (VdbSortCompareRows(sortCols, Rows, idx[i], pIdx) < 0) do Inc(i);
-          while (j > L) and (VdbSortCompareRows(sortCols, Rows, idx[j], pIdx) > 0) do Dec(j);
+          while (i < H) and (CmpRows2(idx[i], pIdx) < 0) do Inc(i);
+          while (j > L) and (CmpRows2(idx[j], pIdx) > 0) do Dec(j);
           if i <= j then
           begin
             tIdx := idx[i]; idx[i] := idx[j]; idx[j] := tIdx;
@@ -7019,6 +7131,8 @@ type
     S: string;
   end;
 
+  TRawCondArray = array of TRawCond;
+
   TStreamGroupState = record
     Key: TStrArray;
     Plans: array of TAggPlan;
@@ -7037,7 +7151,7 @@ type
     GroupCols: TIntArray;
     Plans: array of TAggPlan;      // SELECT sira indeksli sablon
     Where: TSqlExprNode;
-    RawConds: array of TRawCond;
+    RawConds: TRawCondArray;
     MaxCol: Integer;
     Groups: array of TStreamGroupState;
     Map: TDictionary<string, Integer>;
@@ -7979,7 +8093,7 @@ type
     ColTypes: TByteArray;
     Where: TSqlExprNode;
     NeedFull: Boolean;
-    RawConds: array of TRawCond;
+    RawConds: TRawCondArray;
     SortCol: Integer;
     SortType: Byte;
     Desc: Boolean;
@@ -7991,6 +8105,49 @@ type
     Failed: Boolean;
   end;
   PStreamOrderCtx = ^TStreamOrderCtx;
+
+  { H12c: cok kolonlu akisli top-N. Her satir icin SortCnt kadar anahtar
+    saklanir; karsilastirma kolon kolon, kendi yonu ve NULLS konumuyla
+    yapilir. Arrays only for accepted heap candidates. }
+  TStreamOrderKey = record
+    IsNull: Boolean;
+    I: Int64;
+    F: Double;
+    S: string;
+  end;
+
+  TStreamOrderMultiRec = record
+    Pk: string;
+    Seq: Int64;
+    Keys: array of TStreamOrderKey;
+  end;
+
+  TStreamOrderMultiCtx = record
+    Exec: TVSqlExecutor;
+    TableId: Word;
+    TableName: string;
+    HashPrefix: QWord;
+    ColCnt: Integer;
+    FType: TByteArray;
+    FOff, FLen: TIntArray;
+    ColNames: TStrArray;
+    ColTypes: TByteArray;
+    Where: TSqlExprNode;
+    NeedFull: Boolean;
+    RawConds: TRawCondArray;
+    SortCols: TIntArray;
+    SortTypes: TByteArray;
+    Descs: array of Boolean;
+    NullsPos: TIntArray;
+    SortCnt: Integer;
+    Scratch: TStreamOrderMultiRec;
+    K: Integer;
+    N: Integer;
+    Heap: array of TStreamOrderMultiRec;
+    Seen: Int64;
+    Failed: Boolean;
+  end;
+  PStreamOrderMultiCtx = ^TStreamOrderMultiCtx;
 
 function VdbStreamOrderCmp(const A, B: TStreamOrderRec;
   C: PStreamOrderCtx): Integer;
@@ -8220,6 +8377,322 @@ begin
     R.Pk := VdbRawPkFromBuf(Buf, Len);
     VdbStreamOrderHeapAdd(C, R);
   end;
+end;
+
+{ H12c: cok kolonlu top-N karsilastirmasi. Tek kolonlu yolla ayni NULLS
+  kurallarini uygular; esitlikte fiziksel okuma sirasi (Seq) bagintiyi
+  belirler. }
+function VdbStreamOrderMultiCmp(const A, B: TStreamOrderMultiRec;
+  C: PStreamOrderMultiCtx): Integer;
+var
+  k, np: Integer;
+  aNull, bNull: Boolean;
+begin
+  for k := 0 to C^.SortCnt - 1 do
+  begin
+    aNull := A.Keys[k].IsNull;
+    bNull := B.Keys[k].IsNull;
+    if aNull or bNull then
+    begin
+      if aNull and bNull then Continue;   // ikisi de NULL -> sonraki anahtar
+      np := C^.NullsPos[k];
+      if np < 0 then
+      begin
+        if aNull then Result := -1 else Result := 1;
+        if C^.Descs[k] then Result := -Result;
+      end
+      else if aNull then
+      begin
+        if np = 0 then Result := -1 else Result := 1;
+      end
+      else
+      begin
+        if np = 0 then Result := 1 else Result := -1;
+      end;
+      Exit;
+    end;
+    case C^.SortTypes[k] of
+      VCT_INT, VCT_BOOL:
+        begin
+          if A.Keys[k].I < B.Keys[k].I then Result := -1
+          else if A.Keys[k].I > B.Keys[k].I then Result := 1
+          else Result := 0;
+        end;
+      VCT_FLOAT:
+        begin
+          if A.Keys[k].F < B.Keys[k].F then Result := -1
+          else if A.Keys[k].F > B.Keys[k].F then Result := 1
+          else Result := 0;
+        end;
+    else
+      Result := CompareStr(A.Keys[k].S, B.Keys[k].S);
+    end;
+    if Result <> 0 then
+    begin
+      if C^.Descs[k] then Result := -Result;
+      Exit;
+    end;
+  end;
+  if A.Seq < B.Seq then Result := -1
+  else if A.Seq > B.Seq then Result := 1
+  else Result := 0;
+end;
+
+procedure VdbStreamOrderMultiHeapAdd(C: PStreamOrderMultiCtx;
+  const R: TStreamOrderMultiRec);
+var
+  child, parent: Integer;
+  tmp: TStreamOrderMultiRec;
+begin
+  if C^.N < C^.K then
+  begin
+    C^.Heap[C^.N] := R;
+    Inc(C^.N);
+    child := C^.N - 1;
+    while child > 0 do
+    begin
+      parent := (child - 1) div 2;
+      if VdbStreamOrderMultiCmp(C^.Heap[parent], C^.Heap[child], C) >= 0 then Break;
+      tmp := C^.Heap[parent]; C^.Heap[parent] := C^.Heap[child];
+      C^.Heap[child] := tmp;
+      child := parent;
+    end;
+  end
+  else if VdbStreamOrderMultiCmp(R, C^.Heap[0], C) < 0 then
+  begin
+    C^.Heap[0] := R;
+    parent := 0;
+    while True do
+    begin
+      child := parent * 2 + 1;
+      if child >= C^.N then Break;
+      if (child + 1 < C^.N) and
+         (VdbStreamOrderMultiCmp(C^.Heap[child + 1], C^.Heap[child], C) > 0) then
+        Inc(child);
+      if VdbStreamOrderMultiCmp(C^.Heap[parent], C^.Heap[child], C) >= 0 then Break;
+      tmp := C^.Heap[parent]; C^.Heap[parent] := C^.Heap[child];
+      C^.Heap[child] := tmp;
+      parent := child;
+    end;
+  end;
+end;
+
+function VdbStreamOrderMultiWouldAccept(C: PStreamOrderMultiCtx;
+  const R: TStreamOrderMultiRec): Boolean;
+begin
+  if C^.N < C^.K then Exit(True);
+  Result := VdbStreamOrderMultiCmp(R, C^.Heap[0], C) < 0;
+end;
+
+procedure VdbStreamOrderMultiSort(C: PStreamOrderMultiCtx);
+var
+  stackL, stackH: array[0..63] of Integer;
+  sp, l, h, i, j: Integer;
+  p, t: TStreamOrderMultiRec;
+begin
+  sp := 0;
+  if C^.N > 1 then
+  begin
+    stackL[0] := 0; stackH[0] := C^.N - 1; sp := 1;
+  end;
+  while sp > 0 do
+  begin
+    Dec(sp);
+    l := stackL[sp]; h := stackH[sp];
+    while l < h do
+    begin
+      p := C^.Heap[(l + h) div 2];
+      i := l; j := h;
+      repeat
+        while (i < h) and (VdbStreamOrderMultiCmp(C^.Heap[i], p, C) < 0) do Inc(i);
+        while (j > l) and (VdbStreamOrderMultiCmp(C^.Heap[j], p, C) > 0) do Dec(j);
+        if i <= j then
+        begin
+          t := C^.Heap[i]; C^.Heap[i] := C^.Heap[j]; C^.Heap[j] := t;
+          Inc(i); Dec(j);
+        end;
+      until i > j;
+      if (j - l) < (h - i) then
+      begin
+        if i < h then
+        begin
+          if sp > High(stackL) then Exit;
+          stackL[sp] := i; stackH[sp] := h; Inc(sp);
+        end;
+        h := j;
+      end
+      else
+      begin
+        if l < j then
+        begin
+          if sp > High(stackL) then Exit;
+          stackL[sp] := l; stackH[sp] := j; Inc(sp);
+        end;
+        l := i;
+      end;
+    end;
+  end;
+end;
+
+function VdbStreamOrderMultiCb(Key: QWord; Buf: PByte; Len: Integer;
+  User: Pointer): Boolean;
+var
+  C: PStreamOrderMultiCtx;
+  tid: Word;
+  keyHash: QWord;
+  vals: TStrArray;
+  R: TStreamOrderMultiRec;
+  j, ci: Integer;
+  iv: Int64;
+  fv: Double;
+begin
+  C := User;
+  Result := True;
+  if Key = VDB_SCHEMA_KEY then Exit;
+  if not VDbPeekRawRowKeyHashTo(Buf, Len, C^.ColCnt, tid, C^.HashPrefix,
+       keyHash, C^.ColCnt - 1, C^.FType, C^.FOff, C^.FLen) then
+  begin
+    C^.Failed := True; Exit(False);
+  end;
+  if tid <> C^.TableId then Exit;
+  if keyHash <> Key then
+  begin
+    C^.Failed := True; Exit(False);
+  end;
+  // Tum siralama kolonlarinin ham tipi semayla uyusmali.
+  for j := 0 to C^.SortCnt - 1 do
+    if C^.FType[C^.SortCols[j]] <> C^.SortTypes[j] then
+    begin
+      C^.Failed := True; Exit(False);
+    end;
+  Inc(C^.Seen);
+  if (Length(C^.RawConds) > 0) and
+     (not VdbStreamSelRawPass(C^.RawConds, Buf, C^.FType, C^.FOff, C^.FLen)) then
+    Exit;
+  if C^.NeedFull then
+  begin
+    VDbRowFromOffsetsP(Buf, C^.ColCnt, C^.FType, C^.FOff, C^.FLen, vals);
+    if (C^.Where <> nil) and
+       (not C^.Exec.RowMatches(C^.Where, vals, C^.ColNames, C^.ColTypes)) then
+      Exit;
+  end;
+
+  R.Seq := C^.Seen;
+  for j := 0 to C^.SortCnt - 1 do
+  begin
+    ci := C^.SortCols[j];
+    C^.Scratch.Keys[j].IsNull := (C^.FOff[ci] < 0) or (C^.FLen[ci] = 0);
+    C^.Scratch.Keys[j].I := 0;
+    C^.Scratch.Keys[j].F := 0;
+    C^.Scratch.Keys[j].S := '';
+    if not C^.Scratch.Keys[j].IsNull then
+    begin
+      case C^.SortTypes[j] of
+        VCT_INT:
+          begin Move(Buf[C^.FOff[ci]], iv, 8); C^.Scratch.Keys[j].I := iv; end;
+        VCT_BOOL:
+          C^.Scratch.Keys[j].I := Ord(Buf[C^.FOff[ci]] <> 0);
+        VCT_FLOAT:
+          begin Move(Buf[C^.FOff[ci]], fv, 8); C^.Scratch.Keys[j].F := fv; end;
+      else
+        begin
+          C^.Scratch.Keys[j].S := VDbColFromOffsetsP(Buf, C^.ColCnt, ci,
+            C^.FType, C^.FOff, C^.FLen);
+          if C^.Scratch.Keys[j].S = '' then C^.Scratch.Keys[j].IsNull := True;
+        end;
+      end;
+    end;
+  end;
+  // Anahtar dizisini yalniz heap'e girecek adaylar icin ayir.
+  if VdbStreamOrderMultiWouldAccept(C, C^.Scratch) then
+  begin
+    SetLength(R.Keys, C^.SortCnt);
+    for j := 0 to C^.SortCnt - 1 do
+      R.Keys[j] := C^.Scratch.Keys[j];
+    R.Pk := VdbRawPkFromBuf(Buf, Len);
+    VdbStreamOrderMultiHeapAdd(C, R);
+  end;
+end;
+
+{ H12/H13: WHERE'in AND zincirinden guvenli, gerekli ama yeterli olmayan
+  ham kosular cikarir. Nihai dogrulama her zaman RowMatches'tir. }
+procedure VdbStreamOrderAddRawCond(var Conds: TRawCondArray;
+  Exec: TVSqlExecutor; E: TSqlExprNode; const td: TTableDef;
+  const ColNames: TStrArray; const ColTypes: TByteArray);
+var
+  b: TSqlBinaryOpNode;
+  c: TRawCond;
+  cc: TSqlColumnRefNode;
+  lit: TSqlLiteralNode;
+  op: TSqlBinaryOp;
+  ci: Integer;
+  swap: Boolean;
+begin
+  if E = nil then Exit;
+  if (E is TSqlBinaryOpNode) and (TSqlBinaryOpNode(E).Op = sboAnd) then
+  begin
+    VdbStreamOrderAddRawCond(Conds, Exec, TSqlBinaryOpNode(E).Left, td, ColNames, ColTypes);
+    VdbStreamOrderAddRawCond(Conds, Exec, TSqlBinaryOpNode(E).Right, td, ColNames, ColTypes);
+    Exit;
+  end;
+  if not (E is TSqlBinaryOpNode) then Exit;
+  b := TSqlBinaryOpNode(E);
+  op := b.Op;
+  if not (op in [sboEq, sboNeq, sboLt, sboLte, sboGt, sboGte]) then Exit;
+  swap := False;
+  if b.Left is TSqlColumnRefNode then
+  begin
+    cc := TSqlColumnRefNode(b.Left);
+    if not (b.Right is TSqlLiteralNode) then Exit;
+    lit := TSqlLiteralNode(b.Right);
+  end
+  else if b.Right is TSqlColumnRefNode then
+  begin
+    cc := TSqlColumnRefNode(b.Right);
+    if not (b.Left is TSqlLiteralNode) then Exit;
+    lit := TSqlLiteralNode(b.Left);
+    swap := True;
+  end
+  else Exit;
+  ci := Exec.FindColIdx(cc.ColumnName, cc.TableQualifier, ColNames);
+  if (ci < 0) or (ci > High(td.Cols)) then Exit;
+  if td.Cols[ci].Encrypted or (td.Cols[ci].Collate <> '') then Exit;
+  if swap then
+    case op of
+      sboLt: op := sboGt;
+      sboLte: op := sboGte;
+      sboGt: op := sboLt;
+      sboGte: op := sboLte;
+    end;
+  FillChar(c, SizeOf(c), 0);
+  c.Col := ci;
+  c.Op := op;
+  c.IsIn := False;
+  c.InIsFloat := False;
+  if ColTypes[ci] = VCT_INT then
+  begin
+    if lit.LitType <> sltInt then Exit;
+    c.IsFloat := False; c.IsText := False;
+    c.I := lit.IntVal;
+  end
+  else if ColTypes[ci] = VCT_FLOAT then
+  begin
+    if lit.LitType = sltInt then c.F := lit.IntVal
+    else if lit.LitType = sltFloat then c.F := lit.FloatVal
+    else Exit;
+    c.IsFloat := True; c.IsText := False;
+  end
+  else if ColTypes[ci] = VCT_STR then
+  begin
+    if not (op in [sboEq, sboNeq]) then Exit;
+    if lit.LitType <> sltString then Exit;
+    if not VdbStrPureAscii(lit.StrVal) then Exit;
+    c.IsFloat := False; c.IsText := True;
+    c.S := lit.StrVal;
+  end
+  else Exit;
+  SetLength(Conds, Length(Conds) + 1);
+  Conds[High(Conds)] := c;
 end;
 
 { H1b: kayittaki ham baytlar saf-ASCII mi? (>=128 varsa ham bayt kiyasi
@@ -9067,91 +9540,14 @@ var
   k64: Int64;
   rv: TStrArray;
 
-  { H12: WHERE'in AND zincirinden guvenli, gerekli (ama yeterli olmayan)
-    ham kosular cikar. Amac yalnizca kesin uymayan satiri RowMatches'ten
-    once elemek; nihai dogrulama her zaman RowMatches'tir. }
-  procedure AddRawCond(E: TSqlExprNode);
-  var
-    b: TSqlBinaryOpNode;
-    c: TRawCond;
-    cc: TSqlColumnRefNode;
-    lit: TSqlLiteralNode;
-    op: TSqlBinaryOp;
-    ci: Integer;
-    swap: Boolean;
-  begin
-    if E = nil then Exit;
-    if (E is TSqlBinaryOpNode) and (TSqlBinaryOpNode(E).Op = sboAnd) then
-    begin
-      AddRawCond(TSqlBinaryOpNode(E).Left);
-      AddRawCond(TSqlBinaryOpNode(E).Right);
-      Exit;
-    end;
-    if not (E is TSqlBinaryOpNode) then Exit;
-    b := TSqlBinaryOpNode(E);
-    op := b.Op;
-    if not (op in [sboEq, sboNeq, sboLt, sboLte, sboGt, sboGte]) then Exit;
-    swap := False;
-    if b.Left is TSqlColumnRefNode then
-    begin
-      cc := TSqlColumnRefNode(b.Left);
-      if not (b.Right is TSqlLiteralNode) then Exit;
-      lit := TSqlLiteralNode(b.Right);
-    end
-    else if b.Right is TSqlColumnRefNode then
-    begin
-      cc := TSqlColumnRefNode(b.Right);
-      if not (b.Left is TSqlLiteralNode) then Exit;
-      lit := TSqlLiteralNode(b.Left);
-      swap := True;
-    end
-    else Exit;
-    ci := FindColIdx(cc.ColumnName, cc.TableQualifier, ColNames);
-    if (ci < 0) or (ci > High(td.Cols)) then Exit;
-    if td.Cols[ci].Encrypted or (td.Cols[ci].Collate <> '') then Exit;
-    if swap then
-      case op of
-        sboLt: op := sboGt;
-        sboLte: op := sboGte;
-        sboGt: op := sboLt;
-        sboGte: op := sboLte;
-      end;
-    FillChar(c, SizeOf(c), 0);
-    c.Col := ci;
-    c.Op := op;
-    c.IsIn := False;
-    c.InIsFloat := False;
-    if ColTypes[ci] = VCT_INT then
-    begin
-      if lit.LitType <> sltInt then Exit;
-      c.IsFloat := False; c.IsText := False;
-      c.I := lit.IntVal;
-    end
-    else if ColTypes[ci] = VCT_FLOAT then
-    begin
-      if lit.LitType = sltInt then c.F := lit.IntVal
-      else if lit.LitType = sltFloat then c.F := lit.FloatVal
-      else Exit;
-      c.IsFloat := True; c.IsText := False;
-    end
-    else if ColTypes[ci] = VCT_STR then
-    begin
-      if not (op in [sboEq, sboNeq]) then Exit;
-      if lit.LitType <> sltString then Exit;
-      if not VdbStrPureAscii(lit.StrVal) then Exit;
-      c.IsFloat := False; c.IsText := True;
-      c.S := lit.StrVal;
-    end
-    else Exit;
-    SetLength(ctx.RawConds, Length(ctx.RawConds) + 1);
-    ctx.RawConds[High(ctx.RawConds)] := c;
-  end;
-
 begin
   Result := False;
   SetLength(Pks, 0);
   SetLength(Rows, 0);
-  if (Stmt.OrderBy = nil) or (Stmt.OrderBy.Count <> 1) then Exit;
+  if Stmt.OrderBy = nil then Exit;
+  if Stmt.OrderBy.Count > 1 then
+    Exit(TryStreamOrderMultiLimit(Stmt, td, ColNames, ColTypes, Pks, Rows));
+  if Stmt.OrderBy.Count <> 1 then Exit;
   if Stmt.HasJoin or Stmt.IsDistinct or (Stmt.SetOp <> sokNone) then Exit;
   if HasAggregate(Stmt) or (Stmt.GroupByCols.Count > 0) then Exit;
   if HasWindow(Stmt) or (Stmt.QualifyClause <> nil) then Exit;
@@ -9194,7 +9590,8 @@ begin
   ctx.Where := Stmt.WhereClause;
   ctx.NeedFull := Stmt.WhereClause <> nil;
   SetLength(ctx.RawConds, 0);
-  if ctx.NeedFull then AddRawCond(Stmt.WhereClause);
+  if ctx.NeedFull then
+    VdbStreamOrderAddRawCond(ctx.RawConds, Self, Stmt.WhereClause, td, ColNames, ColTypes);
   ctx.Desc := Stmt.OrderBy[0].Desc;
   ctx.NullsPos := Stmt.OrderBy[0].NullsPos;
   ctx.K := k64;
@@ -9207,6 +9604,106 @@ begin
   if ctx.Failed then Exit;
 
   VdbStreamOrderSort(@ctx);
+  start := Stmt.OffsetVal;
+  if start >= ctx.N then
+  begin
+    Result := True;
+    Exit;
+  end;
+  cnt := ctx.N - start;
+  if Stmt.LimitVal < cnt then cnt := Stmt.LimitVal;
+  SetLength(Pks, cnt);
+  SetLength(Rows, cnt);
+  for i := 0 to cnt - 1 do
+  begin
+    if not FT.ReadRow(td.Name, ctx.Heap[start + i].Pk, rv) then
+    begin
+      SetLength(Pks, 0);
+      SetLength(Rows, 0);
+      Exit(False);
+    end;
+    Pks[i] := ctx.Heap[start + i].Pk;
+    Rows[i] := rv;
+  end;
+  Result := True;
+end;
+
+function TVSqlExecutor.TryStreamOrderMultiLimit(Stmt: TSqlSelectStmt;
+  const td: TTableDef; const ColNames: TStrArray; const ColTypes: TByteArray;
+  out Pks: TStrArray; out Rows: TStrMatrix): Boolean;
+var
+  ctx: TStreamOrderMultiCtx;
+  cr: TSqlColumnRefNode;
+  i, j, start, cnt: Integer;
+  k64: Int64;
+  rv: TStrArray;
+begin
+  Result := False;
+  SetLength(Pks, 0);
+  SetLength(Rows, 0);
+  if (Stmt.OrderBy = nil) or (Stmt.OrderBy.Count < 2) then Exit;
+  if Stmt.HasJoin or Stmt.IsDistinct or (Stmt.SetOp <> sokNone) then Exit;
+  if HasAggregate(Stmt) or (Stmt.GroupByCols.Count > 0) then Exit;
+  if HasWindow(Stmt) or (Stmt.QualifyClause <> nil) then Exit;
+  if (Stmt.LimitVal < 0) or (Stmt.OffsetVal < 0) then Exit;
+
+  ctx.SortCnt := Stmt.OrderBy.Count;
+  SetLength(ctx.SortCols, ctx.SortCnt);
+  SetLength(ctx.SortTypes, ctx.SortCnt);
+  SetLength(ctx.Descs, ctx.SortCnt);
+  SetLength(ctx.NullsPos, ctx.SortCnt);
+  for i := 0 to ctx.SortCnt - 1 do
+  begin
+    if not (Stmt.OrderBy[i].Expr is TSqlColumnRefNode) then Exit;
+    if Stmt.OrderBy[i].Collate <> '' then Exit;
+    cr := TSqlColumnRefNode(Stmt.OrderBy[i].Expr);
+    ctx.SortCols[i] := -1;
+    for j := 0 to High(td.Cols) do
+      if VDbNorm(td.Cols[j].Name) = VDbNorm(cr.ColumnName) then
+      begin ctx.SortCols[i] := j; Break; end;
+    if ctx.SortCols[i] < 0 then Exit;
+    if td.Cols[ctx.SortCols[i]].Encrypted or
+       (td.Cols[ctx.SortCols[i]].Collate <> '') then Exit;
+    ctx.SortTypes[i] := td.Cols[ctx.SortCols[i]].Ctype;
+    if not (ctx.SortTypes[i] in [VCT_INT, VCT_BOOL, VCT_FLOAT, VCT_STR]) then Exit;
+    ctx.Descs[i] := Stmt.OrderBy[i].Desc;
+    ctx.NullsPos[i] := Stmt.OrderBy[i].NullsPos;
+  end;
+
+  k64 := Int64(Stmt.LimitVal) + Int64(Stmt.OffsetVal);
+  if k64 <= 0 then
+  begin
+    if Stmt.LimitVal = 0 then Result := True;
+    Exit;
+  end;
+  if k64 > 200000 then Exit;
+
+  ctx.Exec := Self;
+  ctx.TableId := td.TableId;
+  ctx.TableName := td.Name;
+  ctx.HashPrefix := VDbHashKeyPrefix(td.Name);
+  ctx.ColCnt := Length(td.Cols);
+  SetLength(ctx.FType, ctx.ColCnt);
+  SetLength(ctx.FOff, ctx.ColCnt);
+  SetLength(ctx.FLen, ctx.ColCnt);
+  ctx.ColNames := ColNames;
+  ctx.ColTypes := ColTypes;
+  ctx.Where := Stmt.WhereClause;
+  ctx.NeedFull := Stmt.WhereClause <> nil;
+  SetLength(ctx.RawConds, 0);
+  if ctx.NeedFull then
+    VdbStreamOrderAddRawCond(ctx.RawConds, Self, Stmt.WhereClause, td, ColNames, ColTypes);
+  ctx.K := k64;
+  ctx.N := 0;
+  ctx.Seen := 0;
+  ctx.Failed := False;
+  SetLength(ctx.Heap, ctx.K);
+  SetLength(ctx.Scratch.Keys, ctx.SortCnt);
+
+  if not FT.Kv.ScanRawIterAll(td.TableId, VdbStreamOrderMultiCb, @ctx) then Exit;
+  if ctx.Failed then Exit;
+
+  VdbStreamOrderMultiSort(@ctx);
   start := Stmt.OffsetVal;
   if start >= ctx.N then
   begin

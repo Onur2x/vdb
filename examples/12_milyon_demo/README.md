@@ -74,13 +74,18 @@ alınmıştır; farklı donanımda değişebilir.
 | PK aralığıyla sonraki sayfa | 1–2 ms | 100 satır |
 | `ORDER BY id LIMIT 100` | 1,2 s / 0,11 s | ilk indeks yüklemesi / sonraki sayfa |
 | `ORDER BY id LIMIT 100 OFFSET 500000` | 0,11 s | indeks konumuna atlama |
-| `ORDER BY bakiye DESC LIMIT 100` | 0,39–0,40 s | akışlı top-N; tam sıralama 48–50 s |
+| `ORDER BY bakiye DESC LIMIT 100` | 0,39–0,40 s | akışlı top-N; tam sıralama 5,0–5,7 s |
 | `ORDER BY ad_soyad ASC LIMIT 100` | 0,66–0,67 s | akışlı top-N, metin anahtar |
 | `ORDER BY yas DESC LIMIT 100` | 0,39–0,41 s | akışlı top-N |
 | `ORDER BY sehir ASC LIMIT 100` | 0,64–0,66 s | akışlı top-N; ilk indeks yüklemesi atlanır |
 | `ORDER BY bakiye DESC LIMIT 100 OFFSET 500` | 0,41 s | akışlı top-N + OFFSET |
 | `WHERE sehir = 'Ankara' ORDER BY yas DESC LIMIT 100` | 0,78 s | ham WHERE ön elemesi + top-N |
-| `ORDER BY sehir, yas DESC LIMIT 100` | 3,9–4,0 s | çok kolonlu top-N (akış dışı) |
+| `ORDER BY sehir, yas DESC LIMIT 100` | 0,67–0,74 s | çok kolonlu akışlı top-N (önce 3,9–4,0 s) |
+| `WHERE sehir = 'Ankara' ORDER BY yas DESC, bakiye ASC LIMIT 100` | 0,78–0,80 s | çok kolonlu + WHERE ön elemesi |
+| `ORDER BY ad_soyad, yas DESC LIMIT 100` | 0,69 s | çok kolonlu akışlı top-N |
+| `ORDER BY bakiye DESC` (LIMIT'siz, tam sıralama) | 5,0–5,7 s | FLOAT anahtar ön çözümü (önce 64,2 s) |
+| `ORDER BY yas DESC` (LIMIT'siz) | 4,4–5,3 s | tam sıralama |
+| `ORDER BY ad_soyad` (LIMIT'siz) | 6,9 s | tam sıralama |
 | `GROUP BY sehir` (`COUNT`, `AVG`) | 0,82–0,90 s | H13 tek pass; önceki 3,8–4,5 s |
 | `GROUP BY sehir` (`COUNT`) | 0,79–0,82 s | H13 tek pass |
 | `GROUP BY yas` (`COUNT`, `MIN`, `MAX`) | 0,64–0,67 s | H13 tek pass |
@@ -103,6 +108,10 @@ H12 ile motor `ORDER BY ... LIMIT` sorgularında üç yolu kullanır:
    heap'e girecek adaylar için üretilir. Yalnız `LIMIT + OFFSET` kadar en iyi
    satır bellekte tutulur. Bu yol `ORDER BY bakiye DESC LIMIT 100` süresini
    yaklaşık 6 s'den 0,4 s'ye, metin sıralamasını 3,6 s'den 0,66 s'ye indirir.
+   H12c ile bu yol **birden fazla sıralama kolonuna** da genişletildi:
+   `ORDER BY sehir, yas DESC LIMIT 100` 3,9–4,0 s'den 0,67 s'ye iner. Karma
+   yön (`ASC` + `DESC`) ve `NULLS FIRST/LAST` desteklenir; ifade ve alias
+   anahtarları genel yola düşer.
 3. **Ham WHERE ön elemesi.** `WHERE sehir = 'Ankara'` gibi güvenli
    koşullar satır çözülmeden önce ham baytlarda elenir; hayatta kalan
    adaylar normal `RowMatches` ile yeniden doğrulanır. Bu sayede filtreli
@@ -112,9 +121,10 @@ H12 ile motor `ORDER BY ... LIMIT` sorgularında üç yolu kullanır:
 kurulumunu beklemez; ham akışlı top-N ile yaklaşık 0,65 s'de yanıt verir.
 `ORDER BY id` ise PK indeks yolunu kullanmaya devam eder.
 
-Çok kolonlu `ORDER BY sehir, yas DESC LIMIT 100`, ifade sıralamaları ve
-`LIMIT`siz sıralamalar akışlı top-N kapsamı dışındadır; bunlarda tam sıralama
-maliyeti (yaklaşık 4 s veya 48 s) geri döner.
+H14 ile `LIMIT` olmayan tam sıralamalarda da darboğaz kaldırıldı: tek kolonlu
+`FLOAT` sıralamada değerler satır başına **bir kez** sayıya çevrilir ve
+karşılaştırma artık her seferinde metni yeniden ayrıştırmaz. `ORDER BY bakiye
+DESC` (1.000.000 satır) 64,2 s'den 5,0–5,7 s'ye iner.
 
 H13 ile tek tablolu `GROUP BY` sorguları da ham akıştan tek pass'te
 hesaplanır. 1.000.000 satır önce string matrisine çevrilmez; her satır için
