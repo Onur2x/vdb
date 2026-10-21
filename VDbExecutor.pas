@@ -414,6 +414,13 @@ type
       dahil davranis degismez). }
     function TryStreamAgg(Stmt: TSqlSelectStmt; const td: TTableDef;
       out Res: TSqlResult): Boolean;
+    { H13 (2026-10-21): GROUP BY + basit aggregate'leri ham akistan tek
+      passede hesaplar. Tum satirlar string matrisine cevrilmez; her grup
+      icin yalniz anahtar + sayaclar tutulur. Sekil uymazsa False -> genel
+      ExecGroupBy yolu AYNEN calisir. }
+    function TryStreamGroupBy(Stmt: TSqlSelectStmt; const td: TTableDef;
+      const ColNames: TStrArray; const ColTypes: TByteArray;
+      out Res: TSqlResult; out OutTypes: TByteArray): Boolean;
     { H1 (2026-10-18): Indekssiz tek-tablo LIMIT'li SELECT'te satirlari HAM
       akistan okuyup LIMIT kadar eslesen bulunca DURUR (tum tabloyu cozmez).
       Sekil/guvenlik uymazsa False -> genel yol AYNEN calisir. }
@@ -6981,6 +6988,539 @@ begin
 end;
 
 { ------------------------------------------------------------
+  H13 (2026-10-21) - TryStreamGroupBy
+  ------------------------------------------------------------
+  ExecGroupBy tum satirlari once TStrMatrix'e cevirip her satir icin
+  grup anahtarini TList uzerinde LINEER ariyor, sonra her grubun satir
+  indekslerini ayri ayri dolasip aggregate'i yeniden hesapliyordu.
+  1M satir / ~12 grup icin bu ~4 s suruyordu.
+
+  Bu yol ayni sonucu ham kayit tamponu uzerinden uretir:
+    * satirlar matrise cevrilmez,
+    * grup arama TDictionary ile O(1) (ilk-gorulme sirasi korunur),
+    * COUNT/SUM/AVG/MIN/MAX her satirda grup sayacina EKLENIR.
+  Yalniz guvenli sekil desteklenir; WHERE varsa satir yine RowMatches
+  ile dogrulanir. ORDER BY/OFFSET/LIMIT cagiran tarafta FinishGroup'ta
+  uygulanir. Sekil uymazsa False -> ExecGroupBy AYNEN calisir. }
+type
+  { Ham WHERE on-elemesi (H1/H12b ile ayni kayit; yalniz "kesinlikle
+    uymuyor" satiri eler, aday yine RowMatches ile dogrulanir). }
+  TRawCond = record
+    Col: Integer;
+    Op: TSqlBinaryOp;
+    IsFloat: Boolean;
+    IsText: Boolean;
+    IsIn: Boolean;
+    InIsFloat: Boolean;
+    InInts: array of Int64;
+    InFloats: array of Double;
+    I: Int64;
+    F: Double;
+    S: string;
+  end;
+
+  TStreamGroupState = record
+    Key: TStrArray;
+    Plans: array of TAggPlan;
+  end;
+
+  TStreamGroupCtx = record
+    Exec: TVSqlExecutor;
+    TableId: Word;
+    HashPrefix: QWord;
+    ColCnt: Integer;
+    FType: TByteArray;
+    FOff, FLen: TIntArray;
+    Ct: TByteArray;
+    ColNames: TStrArray;
+    ColTypes: TByteArray;
+    GroupCols: TIntArray;
+    Plans: array of TAggPlan;      // SELECT sira indeksli sablon
+    Where: TSqlExprNode;
+    RawConds: array of TRawCond;
+    MaxCol: Integer;
+    Groups: array of TStreamGroupState;
+    Map: TDictionary<string, Integer>;
+    Failed: Boolean;
+  end;
+  PStreamGroupCtx = ^TStreamGroupCtx;
+
+function VdbStreamSelRawPass(const Conds: array of TRawCond;
+  Buf: PByte; const FType: TByteArray; const FOff, FLen: TIntArray): Boolean; forward;
+function VdbStrPureAscii(const S: string): Boolean; forward;
+
+function VdbStreamGroupCb(Key: QWord; Buf: PByte; Len: Integer;
+  User: Pointer): Boolean;
+var
+  C: PStreamGroupCtx;
+  tid: Word;
+  kh: QWord;
+  j, ci, gi: Integer;
+  gkey, gv: string;
+  vals: TStrArray;
+  st: ^TStreamGroupState;
+  iv: Int64;
+  fv: Double;
+
+  procedure NewGroup;
+  var
+    k: Integer;
+  begin
+    SetLength(C^.Groups, Length(C^.Groups) + 1);
+    gi := High(C^.Groups);
+    st := @C^.Groups[gi];
+    SetLength(st^.Key, Length(C^.GroupCols));
+    for k := 0 to High(C^.GroupCols) do
+      st^.Key[k] := VDbColFromOffsetsP(Buf, C^.ColCnt, C^.GroupCols[k],
+        C^.FType, C^.FOff, C^.FLen);
+    SetLength(st^.Plans, Length(C^.Plans));
+    for k := 0 to High(C^.Plans) do
+    begin
+      st^.Plans[k] := C^.Plans[k];
+      st^.Plans[k].Cnt := 0;
+      st^.Plans[k].AvgCnt := 0;
+      st^.Plans[k].SumF := 0;
+      st^.Plans[k].MinI := 0;
+      st^.Plans[k].MaxI := 0;
+      st^.Plans[k].MinF := 0;
+      st^.Plans[k].MaxF := 0;
+      st^.Plans[k].HasMin := False;
+      st^.Plans[k].HasMax := False;
+    end;
+    C^.Map.Add(gkey, gi);
+  end;
+
+begin
+  C := User;
+  Result := True;
+  if Key = VDB_SCHEMA_KEY then Exit;
+  if not VDbPeekRawRowKeyHashTo(Buf, Len, C^.ColCnt, tid, C^.HashPrefix,
+       kh, C^.MaxCol, C^.FType, C^.FOff, C^.FLen) then
+  begin
+    C^.Failed := True; Exit(False);
+  end;
+  if tid <> C^.TableId then Exit;
+  if kh <> Key then
+  begin
+    C^.Failed := True; Exit(False);
+  end;
+
+  // H13: basit WHERE kosullarinda satiri cozmeden kesin eleme.
+  if (C^.Where <> nil) and (Length(C^.RawConds) > 0) then
+    if not VdbStreamSelRawPass(C^.RawConds, Buf, C^.FType,
+      C^.FOff, C^.FLen) then Exit;
+
+  // WHERE: nihai dogrulama her zaman RowMatches (ham yol yalniz hizlandirir).
+  if C^.Where <> nil then
+  begin
+    VDbRowFromOffsetsP(Buf, C^.ColCnt, C^.FType, C^.FOff, C^.FLen, vals);
+    if not C^.Exec.RowMatches(C^.Where, vals, C^.ColNames, C^.ColTypes) then
+      Exit;
+  end;
+
+  // Uzunluk-onekli anahtar: ayirici/veri cakismasi imkansiz.
+  gkey := '';
+  for j := 0 to High(C^.GroupCols) do
+  begin
+    gv := VDbColFromOffsetsP(Buf, C^.ColCnt, C^.GroupCols[j],
+      C^.FType, C^.FOff, C^.FLen);
+    gkey := gkey + IntToStr(Length(gv)) + ':' + gv;
+  end;
+  if not C^.Map.TryGetValue(gkey, gi) then NewGroup;
+
+  st := @C^.Groups[gi];
+  for j := 0 to High(st^.Plans) do
+  begin
+    if st^.Plans[j].Fn = nil then Continue;
+    if st^.Plans[j].Col < 0 then                 // COUNT(*)
+    begin
+      Inc(st^.Plans[j].Cnt);
+      Continue;
+    end;
+    ci := st^.Plans[j].Col;
+    // EvalAggregateValue bos metni NULL sayar.
+    if (C^.FOff[ci] < 0) or (C^.FLen[ci] = 0) then Continue;
+    if st^.Plans[j].Fn.FuncName = 'COUNT' then
+    begin
+      Inc(st^.Plans[j].Cnt);
+      Continue;
+    end;
+    // SUM/AVG/MIN/MAX: guvenli sekil kontrolu INT/FLOAT/BOOL ile sinirli.
+    case C^.Ct[ci] of
+      VCT_INT:
+        begin
+          if C^.FLen[ci] <> 8 then begin C^.Failed := True; Exit(False); end;
+          Move(Buf[C^.FOff[ci]], iv, 8);
+          fv := iv * 1.0;
+        end;
+      VCT_FLOAT:
+        begin
+          if C^.FLen[ci] <> 8 then begin C^.Failed := True; Exit(False); end;
+          Move(Buf[C^.FOff[ci]], fv, 8);
+          if not ((fv = fv) and (fv < 1e308) and (fv > -1e308)) then
+          begin
+            C^.Failed := True; Exit(False);
+          end;
+        end;
+    else
+      begin
+        if C^.FLen[ci] <> 1 then begin C^.Failed := True; Exit(False); end;
+        if Buf[C^.FOff[ci]] <> 0 then fv := -1 else fv := 0;
+      end;
+    end;
+    Inc(st^.Plans[j].Cnt);
+    Inc(st^.Plans[j].AvgCnt);
+    st^.Plans[j].SumF := st^.Plans[j].SumF + fv;
+    if st^.Plans[j].Fn.FuncName = 'MIN' then
+    begin
+      if not st^.Plans[j].HasMin then
+      begin
+        st^.Plans[j].HasMin := True;
+        if C^.Ct[ci] = VCT_INT then st^.Plans[j].MinI := iv
+        else st^.Plans[j].MinF := fv;
+      end
+      else if C^.Ct[ci] = VCT_INT then
+      begin
+        if iv < st^.Plans[j].MinI then st^.Plans[j].MinI := iv;
+      end
+      else if fv < st^.Plans[j].MinF then st^.Plans[j].MinF := fv;
+    end
+    else if st^.Plans[j].Fn.FuncName = 'MAX' then
+    begin
+      if not st^.Plans[j].HasMax then
+      begin
+        st^.Plans[j].HasMax := True;
+        if C^.Ct[ci] = VCT_INT then st^.Plans[j].MaxI := iv
+        else st^.Plans[j].MaxF := fv;
+      end
+      else if C^.Ct[ci] = VCT_INT then
+      begin
+        if iv > st^.Plans[j].MaxI then st^.Plans[j].MaxI := iv;
+      end
+      else if fv > st^.Plans[j].MaxF then st^.Plans[j].MaxF := fv;
+    end;
+  end;
+end;
+
+function TVSqlExecutor.TryStreamGroupBy(Stmt: TSqlSelectStmt;
+  const td: TTableDef; const ColNames: TStrArray;
+  const ColTypes: TByteArray; out Res: TSqlResult;
+  out OutTypes: TByteArray): Boolean;
+var
+  j, c, gi: Integer;
+  E: TSqlExprNode;
+  fn: TSqlFuncCallNode;
+  cr: TSqlColumnRefNode;
+  ctx: TStreamGroupCtx;
+  plans: array of TAggPlan;
+  selGroup: TIntArray;
+  gb: string;
+  dp: Integer;
+  st: ^TStreamGroupState;
+  plan: TAggPlan;
+  conj: TList<TSqlExprNode>;
+  cnd: TRawCond;
+
+  procedure CollectAnd(E: TSqlExprNode);
+  begin
+    if E = nil then Exit;
+    if (E is TSqlBinaryOpNode) and (TSqlBinaryOpNode(E).Op = sboAnd) then
+    begin
+      CollectAnd(TSqlBinaryOpNode(E).Left);
+      CollectAnd(TSqlBinaryOpNode(E).Right);
+    end
+    else conj.Add(E);
+  end;
+
+  { H13: AND zincirindeki basit kiyaslari ham on-elemeye cevirir. Destek
+    disi kosul atlanir; hicbir zaman yanlis eleme yapilmaz (RowMatches son
+    sozdur). }
+  function TryRawCond(E: TSqlExprNode; out C: TRawCond): Boolean;
+  var
+    b: TSqlBinaryOpNode;
+    op: TSqlBinaryOp;
+    swap: Boolean;
+    crl: TSqlColumnRefNode;
+    lit: TSqlLiteralNode;
+    ci2: Integer;
+  begin
+    Result := False;
+    if not (E is TSqlBinaryOpNode) then Exit;
+    b := TSqlBinaryOpNode(E);
+    op := b.Op;
+    if not (op in [sboEq, sboNeq, sboLt, sboLte, sboGt, sboGte]) then Exit;
+    swap := False;
+    if b.Left is TSqlColumnRefNode then
+    begin
+      crl := TSqlColumnRefNode(b.Left);
+      if not (b.Right is TSqlLiteralNode) then Exit;
+      lit := TSqlLiteralNode(b.Right);
+    end
+    else if b.Right is TSqlColumnRefNode then
+    begin
+      crl := TSqlColumnRefNode(b.Right);
+      if not (b.Left is TSqlLiteralNode) then Exit;
+      lit := TSqlLiteralNode(b.Left);
+      swap := True;
+    end
+    else Exit;
+    ci2 := FindColIdx(crl.ColumnName, crl.TableQualifier, ColNames);
+    if (ci2 < 0) or (ci2 > High(td.Cols)) or (ci2 > High(ColTypes)) then Exit;
+    if td.Cols[ci2].Encrypted then Exit;
+    if swap then
+      case op of
+        sboLt: op := sboGt;
+        sboLte: op := sboGte;
+        sboGt: op := sboLt;
+        sboGte: op := sboLte;
+      end;
+    C.Col := ci2; C.Op := op; C.IsFloat := False; C.IsText := False;
+    C.IsIn := False; C.InIsFloat := False;
+    C.I := 0; C.F := 0; C.S := '';
+    C.InInts := nil; C.InFloats := nil;
+    if ColTypes[ci2] = VCT_INT then
+    begin
+      if lit.LitType <> sltInt then Exit;
+      C.I := lit.IntVal;
+      Exit(True);
+    end;
+    if ColTypes[ci2] = VCT_FLOAT then
+    begin
+      if lit.LitType = sltInt then C.F := lit.IntVal
+      else if lit.LitType = sltFloat then C.F := lit.FloatVal
+      else Exit;
+      C.IsFloat := True;
+      Exit(True);
+    end;
+    if ColTypes[ci2] = VCT_STR then
+    begin
+      if not (op in [sboEq, sboNeq]) then Exit;
+      if lit.LitType <> sltString then Exit;
+      if not VdbStrPureAscii(lit.StrVal) then Exit;
+      C.IsText := True;
+      C.S := lit.StrVal;
+      Exit(True);
+    end;
+  end;
+
+begin
+  Result := False;
+  if (Stmt.FromTable = '') or Stmt.HasJoin then Exit;
+  if (Stmt.SetOp <> sokNone) or (Stmt.RightSelect <> nil) then Exit;
+  if Stmt.AsOf <> saoNone then Exit;
+  if Stmt.WithQueries.Count > 0 then Exit;
+  if Stmt.IsDistinct then Exit;
+  if HasWindow(Stmt) or (Stmt.QualifyClause <> nil) then Exit;
+  if Stmt.HavingClause <> nil then Exit;   // HAVING: genel yol
+  if Stmt.GroupByCols.Count = 0 then Exit;
+  if Stmt.Columns.Count = 0 then Exit;
+  if td.IsView then Exit;
+  if FT.RlsApplies(Stmt.FromTable) then Exit;
+
+  SetLength(ctx.GroupCols, Stmt.GroupByCols.Count);
+  for j := 0 to Stmt.GroupByCols.Count - 1 do
+  begin
+    gb := Stmt.GroupByCols[j];
+    dp := Pos('.', gb);
+    if dp > 0 then
+      c := FindColIdx(Copy(gb, dp + 1, MaxInt), Copy(gb, 1, dp - 1), ColNames)
+    else
+      c := FindColIdx(gb, '', ColNames);
+    if (c < 0) or (c > High(td.Cols)) then Exit;
+    ctx.GroupCols[j] := c;
+  end;
+
+  SetLength(plans, Stmt.Columns.Count);
+  SetLength(selGroup, Stmt.Columns.Count);
+  for j := 0 to Stmt.Columns.Count - 1 do
+  begin
+    selGroup[j] := -1;
+    FillChar(plans[j], SizeOf(TAggPlan), 0);
+    E := Stmt.Columns[j].Expr;
+    if E is TSqlColumnRefNode then
+    begin
+      cr := TSqlColumnRefNode(E);
+      c := FindColIdx(cr.ColumnName, cr.TableQualifier, ColNames);
+      if c < 0 then Exit;
+      gi := -1;
+      for dp := 0 to High(ctx.GroupCols) do
+        if ctx.GroupCols[dp] = c then begin gi := dp; Break; end;
+      if gi < 0 then Exit;   // GROUP BY disi duz kolon: genel yol
+      selGroup[j] := gi;
+      Continue;
+    end;
+    if not (E is TSqlFuncCallNode) then Exit;
+    fn := TSqlFuncCallNode(E);
+    if not ((fn.FuncName = 'COUNT') or (fn.FuncName = 'SUM') or
+            (fn.FuncName = 'AVG') or (fn.FuncName = 'MIN') or
+            (fn.FuncName = 'MAX')) then Exit;
+    if fn.IsDistinct or (fn.Filter <> nil) then Exit;
+    plan := plans[j];
+    plan.Fn := fn;
+    if fn.IsStar then
+    begin
+      if fn.FuncName <> 'COUNT' then Exit;
+      plan.Col := -1;
+    end
+    else
+    begin
+      if not (fn.Arg is TSqlColumnRefNode) then Exit;
+      cr := TSqlColumnRefNode(fn.Arg);
+      c := FindColIdx(cr.ColumnName, cr.TableQualifier, ColNames);
+      if (c < 0) or (c > High(td.Cols)) then Exit;
+      if ((fn.FuncName = 'SUM') or (fn.FuncName = 'AVG')) and
+         not ((ColTypes[c] = VCT_INT) or (ColTypes[c] = VCT_FLOAT) or
+              (ColTypes[c] = VCT_BOOL)) then Exit;
+      if ((fn.FuncName = 'MIN') or (fn.FuncName = 'MAX')) and
+         not ((ColTypes[c] = VCT_INT) or (ColTypes[c] = VCT_FLOAT)) then Exit;
+      plan.Col := c;
+    end;
+    plans[j] := plan;
+  end;
+
+  ctx.Exec := Self;
+  ctx.TableId := td.TableId;
+  ctx.HashPrefix := VDbHashKeyPrefix(td.Name);
+  ctx.ColCnt := Length(td.Cols);
+  SetLength(ctx.FType, ctx.ColCnt);
+  SetLength(ctx.FOff, ctx.ColCnt);
+  SetLength(ctx.FLen, ctx.ColCnt);
+  SetLength(ctx.Ct, ctx.ColCnt);
+  for j := 0 to High(ColTypes) do
+    if j < ctx.ColCnt then ctx.Ct[j] := ColTypes[j];
+  ctx.ColNames := ColNames;
+  ctx.ColTypes := ColTypes;
+  ctx.Plans := plans;
+  ctx.Where := Stmt.WhereClause;
+  SetLength(ctx.RawConds, 0);
+  if Stmt.WhereClause <> nil then
+  begin
+    conj := TList<TSqlExprNode>.Create;
+    try
+      CollectAnd(Stmt.WhereClause);
+      for j := 0 to conj.Count - 1 do
+        if TryRawCond(conj[j], cnd) then
+        begin
+          SetLength(ctx.RawConds, Length(ctx.RawConds) + 1);
+          ctx.RawConds[High(ctx.RawConds)] := cnd;
+        end;
+    finally
+      conj.Free;
+    end;
+  end;
+  ctx.Groups := nil;
+  ctx.Failed := False;
+
+  ctx.MaxCol := -1;
+  for j := 0 to High(ctx.GroupCols) do
+    if ctx.GroupCols[j] > ctx.MaxCol then ctx.MaxCol := ctx.GroupCols[j];
+  for j := 0 to High(plans) do
+    if (plans[j].Fn <> nil) and (plans[j].Col > ctx.MaxCol) then
+      ctx.MaxCol := plans[j].Col;
+  for j := 0 to High(ctx.RawConds) do
+    if ctx.RawConds[j].Col > ctx.MaxCol then
+      ctx.MaxCol := ctx.RawConds[j].Col;
+  // RowMatches tam satiri ister: WHERE varsa TUM kolonlarin ofseti gecerli
+  // olmali (aksi halde onceki satirdan kalan FOff/FLen kullanilirdi).
+  if Stmt.WhereClause <> nil then
+    ctx.MaxCol := ctx.ColCnt - 1;
+
+  ctx.Map := TDictionary<string, Integer>.Create;
+  try
+    if not FT.Kv.ScanRawIterAll(td.TableId, VdbStreamGroupCb, @ctx) then Exit;
+    if ctx.Failed then Exit;
+
+    SetLength(Res.Fields, Stmt.Columns.Count);
+    SetLength(OutTypes, Stmt.Columns.Count);
+    for j := 0 to Stmt.Columns.Count - 1 do
+    begin
+      if Stmt.Columns[j].Alias <> '' then
+        Res.Fields[j] := Stmt.Columns[j].Alias
+      else if Stmt.Columns[j].Expr is TSqlFuncCallNode then
+        Res.Fields[j] := TSqlFuncCallNode(Stmt.Columns[j].Expr).FuncName
+      else if Stmt.Columns[j].Expr is TSqlColumnRefNode then
+        Res.Fields[j] := TSqlColumnRefNode(Stmt.Columns[j].Expr).ColumnName
+      else
+        Res.Fields[j] := 'col' + IntToStr(j + 1);
+
+      OutTypes[j] := VCT_STR;
+      if Stmt.Columns[j].Expr is TSqlColumnRefNode then
+      begin
+        cr := TSqlColumnRefNode(Stmt.Columns[j].Expr);
+        c := FindColIdx(cr.ColumnName, cr.TableQualifier, ColNames);
+        if (c >= 0) and (c <= High(ColTypes)) then OutTypes[j] := ColTypes[c];
+      end
+      else if Stmt.Columns[j].Expr is TSqlFuncCallNode then
+      begin
+        fn := TSqlFuncCallNode(Stmt.Columns[j].Expr);
+        if fn.FuncName = 'COUNT' then OutTypes[j] := VCT_INT
+        else if (fn.FuncName = 'SUM') or (fn.FuncName = 'AVG') then
+          OutTypes[j] := VCT_FLOAT
+        else if ((fn.FuncName = 'MIN') or (fn.FuncName = 'MAX')) and
+                (fn.Arg is TSqlColumnRefNode) then
+        begin
+          cr := TSqlColumnRefNode(fn.Arg);
+          c := FindColIdx(cr.ColumnName, cr.TableQualifier, ColNames);
+          if (c >= 0) and (c <= High(ColTypes)) then OutTypes[j] := ColTypes[c];
+        end;
+      end;
+    end;
+
+    SetLength(Res.Rows, Length(ctx.Groups));
+    for gi := 0 to High(ctx.Groups) do
+    begin
+      SetLength(Res.Rows[gi], Stmt.Columns.Count);
+      st := @ctx.Groups[gi];
+      for j := 0 to Stmt.Columns.Count - 1 do
+      begin
+        if selGroup[j] >= 0 then
+        begin
+          if selGroup[j] <= High(st^.Key) then
+            Res.Rows[gi][j] := st^.Key[selGroup[j]]
+          else
+            Res.Rows[gi][j] := '';
+          Continue;
+        end;
+        plan := st^.Plans[j];
+        if plan.Fn = nil then begin Res.Rows[gi][j] := ''; Continue; end;
+        if plan.Fn.FuncName = 'COUNT' then
+          Res.Rows[gi][j] := IntToStr(plan.Cnt)
+        else if plan.Fn.FuncName = 'SUM' then
+        begin
+          if plan.Cnt > 0 then Res.Rows[gi][j] := VDbFloatToStr(plan.SumF)
+          else Res.Rows[gi][j] := '';
+        end
+        else if plan.Fn.FuncName = 'AVG' then
+        begin
+          if plan.AvgCnt > 0 then
+            Res.Rows[gi][j] := VDbFloatToStr(plan.SumF / plan.AvgCnt)
+          else Res.Rows[gi][j] := '';
+        end
+        else if plan.Fn.FuncName = 'MIN' then
+        begin
+          if not plan.HasMin then Res.Rows[gi][j] := ''
+          else if ctx.Ct[plan.Col] = VCT_INT then
+            Res.Rows[gi][j] := IntToStr(plan.MinI)
+          else Res.Rows[gi][j] := VDbFloatToStr(plan.MinF);
+        end
+        else
+        begin
+          if not plan.HasMax then Res.Rows[gi][j] := ''
+          else if ctx.Ct[plan.Col] = VCT_INT then
+            Res.Rows[gi][j] := IntToStr(plan.MaxI)
+          else Res.Rows[gi][j] := VDbFloatToStr(plan.MaxF);
+        end;
+      end;
+    end;
+    Res.Affected := Length(Res.Rows);
+    Res.Msg := 'OK';
+    Result := True;
+  finally
+    ctx.Map.Free;
+  end;
+end;
+
+{ ------------------------------------------------------------
   ExecSelect
   //---------------------------------------------------------- }
 { ------------------------------------------------------------
@@ -7389,24 +7929,6 @@ end;
   Sekil/guvenlik uymazsa False doner ve genel yol AYNEN calisir. }
 
 type
-  { H1 ham-yuklem: tek kolon kiyasi (col op literal). Raw kiyas YALNIZ
-    "kesinlikle UYMUYOR" satiri elemek icin kullanilir; uyan aday yine
-    RowMatches ile dogrulanir. Boylece yanlis eleme (sessiz satir kaybi)
-    imkansizdir: yalnizca INT/FLOAT kolon + sayisal literal, NULL -> elenir. }
-  TRawCond = record
-    Col: Integer;          // taban tablo kolon indeksi
-    Op: TSqlBinaryOp;      // sboEq..sboGte
-    IsFloat: Boolean;
-    IsText: Boolean;       // H1b: TEXT esitlik/esitsizlik (bayt kiyasi)
-    IsIn: Boolean;         // H1c: sayisal IN (liste)
-    InIsFloat: Boolean;    // IN listesi float mi (kolon tipine gore)
-    InInts: array of Int64;
-    InFloats: array of Double;
-    I: Int64;
-    F: Double;
-    S: string;             // IsText: saf-ASCII literal baytlari
-  end;
-
   TStreamSelCtx = record
     Exec: TVSqlExecutor;
     TableId: Word;
@@ -7469,9 +7991,6 @@ type
     Failed: Boolean;
   end;
   PStreamOrderCtx = ^TStreamOrderCtx;
-
-function VdbStreamSelRawPass(const Conds: array of TRawCond;
-  Buf: PByte; const FType: TByteArray; const FOff, FLen: TIntArray): Boolean; forward;
 
 function VdbStreamOrderCmp(const A, B: TStreamOrderRec;
   C: PStreamOrderCtx): Integer;
@@ -9256,6 +9775,12 @@ begin
         // Sekli uymazsa False; asagidaki genel yol AYNEN calisir.
         if TryStreamAgg(Stmt, td, Res) then
           Exit;
+        // H13: GROUP BY + basit aggregate -> ham akistan tek pass.
+        if TryStreamGroupBy(Stmt, td, colNames, colTypes, Res, outTypes) then
+        begin
+          FinishGroup;
+          Exit;
+        end;
         // H3: WHERE'li saf COUNT(*) -> indeks dilimini satir okumadan say.
         if TryIndexCount(td, Stmt, colNames, colTypes, cnt64) then
         begin

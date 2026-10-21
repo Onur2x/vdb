@@ -13735,6 +13735,192 @@ begin
   end;
 end;
 
+procedure T133_H13_StreamGroupBy;
+// H13: GROUP BY'in ham akistan tek pass'te hesaplanmasi; cok kolonlu grup,
+// WHERE ham on-elemesi, NULL/empty grup, COUNT(kolon), MIN/MAX/SUM/AVG,
+// LIMIT/OFFSET ve HAVING/DISTINCT geri donusu.
+var
+  dir: string;
+  db: TVDb;
+  tdb: TVTableDb;
+  q: TVSql;
+  r: TSqlResult;
+  i: Integer;
+  fs: TFormatSettings;
+  city: string;
+  b: string;
+begin
+  Grp('T133 H13 akisli GROUP BY');
+  fs := DefaultFormatSettings;
+  fs.DecimalSeparator := '.';
+  dir := D + '\t133_group_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  tdb := TVTableDb.Create(db);
+  try
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      q.Exec('CREATE TABLE g (id INTEGER PRIMARY KEY, sehir TEXT, ' +
+        'yas INTEGER, bakiye FLOAT, aktif BOOLEAN)');
+      q.Exec('BEGIN');
+      for i := 1 to 30 do
+      begin
+        if i mod 3 = 0 then city := 'Ankara'
+        else if i mod 3 = 1 then city := 'Izmir'
+        else city := 'Bursa';
+        if i mod 2 = 0 then b := 'TRUE' else b := 'FALSE';
+        q.Exec(Format('INSERT INTO g (id,sehir,yas,bakiye,aktif) VALUES (%d,%s,%d,%s,%s)',
+          [i, QuotedStr(city), i, FloatToStr(i * 1.5, fs), b]));
+      end;
+      q.Exec('COMMIT');
+
+      r := q.Exec('SELECT sehir, COUNT(*) AS n, SUM(yas) AS sy, ' +
+        'MIN(yas) AS mn, MAX(yas) AS mx, AVG(bakiye) AS ab ' +
+        'FROM g GROUP BY sehir ORDER BY sehir');
+      Dogrula('T133 tek kolon COUNT/SUM/MIN/MAX/AVG',
+        (Length(r.Rows) = 3) and
+        (r.Rows[0][0] = 'Ankara') and (r.Rows[0][1] = '10') and
+        (r.Rows[0][2] = '165') and (r.Rows[0][3] = '3') and
+        (r.Rows[0][4] = '30') and (r.Rows[0][5] = '24.75') and
+        (r.Rows[1][0] = 'Bursa') and (r.Rows[1][1] = '10') and
+        (r.Rows[1][2] = '155') and (r.Rows[1][5] = '23.25') and
+        (r.Rows[2][0] = 'Izmir') and (r.Rows[2][1] = '10') and
+        (r.Rows[2][2] = '145') and (r.Rows[2][5] = '21.75'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT sehir, aktif, COUNT(*) AS n, SUM(yas) AS sy ' +
+        'FROM g GROUP BY sehir, aktif ORDER BY sehir, aktif');
+      Dogrula('T133 cok kolonlu GROUP BY',
+        (Length(r.Rows) = 6) and
+        (r.Rows[0][0] = 'Ankara') and (r.Rows[0][1] = 'False') and
+        (r.Rows[0][2] = '5') and (r.Rows[0][3] = '75') and
+        (r.Rows[1][0] = 'Ankara') and (r.Rows[1][1] = 'True') and
+        (r.Rows[1][2] = '5') and (r.Rows[1][3] = '90'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT aktif, COUNT(*) AS n, SUM(yas) AS sy ' +
+        'FROM g WHERE sehir = ''Ankara'' GROUP BY aktif ORDER BY aktif');
+      Dogrula('T133 WHERE TEXT + GROUP BY',
+        (Length(r.Rows) = 2) and
+        (r.Rows[0][0] = 'False') and (r.Rows[0][1] = '5') and
+        (r.Rows[0][2] = '75') and
+        (r.Rows[1][0] = 'True') and (r.Rows[1][1] = '5') and
+        (r.Rows[1][2] = '90'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g WHERE yas > 20 ' +
+        'GROUP BY sehir ORDER BY sehir');
+      Dogrula('T133 WHERE sayisal + GROUP BY',
+        (Length(r.Rows) = 3) and
+        (r.Rows[0][0] = 'Ankara') and (r.Rows[0][1] = '4') and
+        (r.Rows[1][0] = 'Bursa') and (r.Rows[1][1] = '3') and
+        (r.Rows[2][0] = 'Izmir') and (r.Rows[2][1] = '3'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g WHERE yas >= 10 ' +
+        'AND yas <= 12 GROUP BY sehir ORDER BY sehir');
+      Dogrula('T133 WHERE AND zinciri + GROUP BY',
+        (Length(r.Rows) = 3) and (r.Rows[0][1] = '1') and
+        (r.Rows[1][1] = '1') and (r.Rows[2][1] = '1'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g ' +
+        'WHERE sehir <> ''Ankara'' GROUP BY sehir ORDER BY sehir');
+      Dogrula('T133 WHERE TEXT <> + GROUP BY',
+        (Length(r.Rows) = 2) and
+        (r.Rows[0][0] = 'Bursa') and (r.Rows[0][1] = '10') and
+        (r.Rows[1][0] = 'Izmir') and (r.Rows[1][1] = '10'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g ' +
+        'WHERE sehir = ''Ankara'' OR sehir = ''Izmir'' GROUP BY sehir ORDER BY sehir');
+      Dogrula('T133 WHERE OR (ham on-eleme yok)',
+        (Length(r.Rows) = 2) and
+        (r.Rows[0][0] = 'Ankara') and (r.Rows[0][1] = '10') and
+        (r.Rows[1][0] = 'Izmir') and (r.Rows[1][1] = '10'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g ' +
+        'WHERE yas > 20 OR yas < 5 GROUP BY sehir ORDER BY sehir');
+      Dogrula('T133 WHERE OR farkli kolon (tam satir)',
+        (Length(r.Rows) = 3) and
+        (r.Rows[0][0] = 'Ankara') and (r.Rows[0][1] = '5') and
+        (r.Rows[1][0] = 'Bursa') and (r.Rows[1][1] = '4') and
+        (r.Rows[2][0] = 'Izmir') and (r.Rows[2][1] = '5'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g ' +
+        'WHERE sehir = ''Yok'' GROUP BY sehir');
+      Dogrula('T133 WHERE sonuc yok', Length(r.Rows) = 0,
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT sehir FROM g GROUP BY sehir ORDER BY sehir');
+      Dogrula('T133 aggregate olmadan GROUP BY',
+        (Length(r.Rows) = 3) and (r.Rows[0][0] = 'Ankara') and
+        (r.Rows[1][0] = 'Bursa') and (r.Rows[2][0] = 'Izmir'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g GROUP BY sehir ' +
+        'ORDER BY sehir LIMIT 2 OFFSET 1');
+      Dogrula('T133 GROUP BY LIMIT/OFFSET',
+        (Length(r.Rows) = 2) and (r.Rows[0][0] = 'Bursa') and
+        (r.Rows[1][0] = 'Izmir'), IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g GROUP BY sehir LIMIT 0');
+      Dogrula('T133 GROUP BY LIMIT 0', Length(r.Rows) = 0,
+        IntToStr(Length(r.Rows)));
+
+      q.Exec('CREATE TABLE gn (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)');
+      q.Exec('INSERT INTO gn (id,v,s) VALUES ' +
+        '(1,NULL,NULL),(2,NULL,NULL),(3,5,''a''),(4,5,''a''),(5,7,''b'')');
+      r := q.Exec('SELECT v, COUNT(*) AS n, COUNT(v) AS cv, SUM(v) AS sv ' +
+        'FROM gn GROUP BY v ORDER BY v');
+      Dogrula('T133 NULL grup + COUNT(kolon)',
+        (Length(r.Rows) = 3) and
+        (r.Rows[0][0] = '') and (r.Rows[0][1] = '2') and
+        (r.Rows[0][2] = '0') and (r.Rows[0][3] = '') and
+        (r.Rows[1][0] = '5') and (r.Rows[1][1] = '2') and
+        (r.Rows[1][2] = '2') and (r.Rows[1][3] = '10') and
+        (r.Rows[2][0] = '7') and (r.Rows[2][1] = '1'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT s, COUNT(*) AS n FROM gn GROUP BY s ORDER BY s');
+      Dogrula('T133 NULL/empty metin grubu',
+        (Length(r.Rows) = 3) and (r.Rows[0][1] = '2') and
+        (r.Rows[1][1] = '2') and (r.Rows[2][1] = '1'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g GROUP BY sehir ' +
+        'HAVING COUNT(*) >= 10 ORDER BY sehir');
+      Dogrula('T133 HAVING genel yol',
+        (Length(r.Rows) = 3) and (r.Rows[0][1] = '10') and
+        (r.Rows[1][1] = '10') and (r.Rows[2][1] = '10'),
+        IntToStr(Length(r.Rows)));
+
+      r := q.Exec('SELECT DISTINCT sehir FROM g GROUP BY sehir ORDER BY sehir');
+      Dogrula('T133 DISTINCT + GROUP BY genel yol',
+        (Length(r.Rows) = 3) and (r.Rows[0][0] = 'Ankara'),
+        IntToStr(Length(r.Rows)));
+
+      q.Exec('CREATE TABLE gu (id INTEGER PRIMARY KEY, s TEXT)');
+      q.Exec('INSERT INTO gu (id,s) VALUES (1,''İzmir''),(2,''Izmir''),(3,''İzmir'')');
+      r := q.Exec('SELECT s, COUNT(*) AS n FROM gu GROUP BY s ORDER BY s');
+      Dogrula('T133 UTF-8 grup anahtari',
+        (Length(r.Rows) = 2) and
+        (((r.Rows[0][1] = '2') and (r.Rows[1][1] = '1')) or
+         ((r.Rows[0][1] = '1') and (r.Rows[1][1] = '2'))),
+        IntToStr(Length(r.Rows)));
+    finally
+      q.Free;
+    end;
+  finally
+    tdb.Free;
+    db.Free;
+  end;
+end;
+
 procedure T132_H12_StreamTopN;
 // H12b: ham akisli top-N yolunun WHERE on-eleme, BOOL ve NULL siralama
 // davranisini dogrular; alias/ifade siralamalari genel yola dusmelidir.
@@ -14028,6 +14214,7 @@ T92_MVCC_Isoaltion;
        T130_PkRangeCtype;
        T131_H12_TopN;
        T132_H12_StreamTopN;
+       T133_H13_StreamGroupBy;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls

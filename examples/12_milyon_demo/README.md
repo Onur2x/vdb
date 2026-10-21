@@ -81,7 +81,11 @@ alınmıştır; farklı donanımda değişebilir.
 | `ORDER BY bakiye DESC LIMIT 100 OFFSET 500` | 0,41 s | akışlı top-N + OFFSET |
 | `WHERE sehir = 'Ankara' ORDER BY yas DESC LIMIT 100` | 0,78 s | ham WHERE ön elemesi + top-N |
 | `ORDER BY sehir, yas DESC LIMIT 100` | 3,9–4,0 s | çok kolonlu top-N (akış dışı) |
-| `GROUP BY sehir` | 3,8–4,5 s | tam tablo |
+| `GROUP BY sehir` (`COUNT`, `AVG`) | 0,82–0,90 s | H13 tek pass; önceki 3,8–4,5 s |
+| `GROUP BY sehir` (`COUNT`) | 0,79–0,82 s | H13 tek pass |
+| `GROUP BY yas` (`COUNT`, `MIN`, `MAX`) | 0,64–0,67 s | H13 tek pass |
+| `GROUP BY sehir` (aggregate yok) | 0,78–0,82 s | H13 tek pass |
+| `WHERE sehir = 'Ankara' GROUP BY yas` | 0,79–0,81 s | H13 + ham WHERE ön elemesi |
 | Şehir + yaş `COUNT(*)` | 0,83–0,98 s | sıcak indeks |
 
 ## Sorgu hızı nasıl iyileştirildi?
@@ -110,8 +114,22 @@ kurulumunu beklemez; ham akışlı top-N ile yaklaşık 0,65 s'de yanıt verir.
 
 Çok kolonlu `ORDER BY sehir, yas DESC LIMIT 100`, ifade sıralamaları ve
 `LIMIT`siz sıralamalar akışlı top-N kapsamı dışındadır; bunlarda tam sıralama
-maliyeti (yaklaşık 4 s veya 48 s) geri döner. `GROUP BY`, `ILIKE` ve indekssiz
-tam tarama gerektiren işlemler doğası gereği tüm tabloyu okur.
+maliyeti (yaklaşık 4 s veya 48 s) geri döner.
+
+H13 ile tek tablolu `GROUP BY` sorguları da ham akıştan tek pass'te
+hesaplanır. 1.000.000 satır önce string matrisine çevrilmez; her satır için
+grup anahtarı çıkarılır, hash tablosunda grup bulunur ve `COUNT`, `SUM`,
+`AVG`, `MIN`, `MAX` sayaçları doğrudan güncellenir. `WHERE` koşulu güvenli
+biçimde ham baytlarda ön elenir. Bu yol `GROUP BY sehir` süresini yaklaşık
+3,8–4,5 s'den 0,8 s'ye indirir. `HAVING`, `JOIN`, `DISTINCT`, pencere/ifade
+içeren aggregate'ler ve karmaşık `GROUP BY` biçimleri genel yola düşer;
+`ILIKE` ve indekssiz tam tarama gerektiren işlemler doğası gereği tüm
+tabloyu okur.
+
+> `SUM`/`AVG` kayan noktalı sonuçlarda, akışlı toplama sırası nedeniyle
+> genel yola göre son ondalık hanede küçük bir yuvarlama farkı görülebilir;
+> bu davranış H6/H12 akışlı toplamalarıyla aynıdır. `COUNT`, `MIN`, `MAX`
+> ve tam sayı toplamları bu durumdan etkilenmez.
 
 Demo, ID sıralı sayfalarda `LIMIT/OFFSET` yerine PK aralığını kullanmaya
 devam eder; bu, sayfa numarasından bağımsız olarak yalnızca sayfa kadar
@@ -125,5 +143,5 @@ ORDER BY id;
 
 Şehir filtresi `WHERE sehir = ...` için ham ön eleme kullanılabilir;
 filtre sonucu küçük `LIMIT`li bir sıralamaya giriyorsa akışlı top-N devreye
-girer. `GROUP BY`, `ILIKE` ve indekssiz tam tarama gerektiren işlemler
-doğası gereği tüm tabloyu okur.
+girer. Basit `GROUP BY` sorguları H13 ile tek pass'te tamamlanır; `ILIKE` ve
+indekssiz tam tarama gerektiren işlemler doğası gereği tüm tabloyu okur.
