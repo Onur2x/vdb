@@ -3779,6 +3779,7 @@ var
   covPos: Integer;      // F-19: index-only tarama icin indeks konumu
   covAll: Boolean;
   st: TVDbTableStats;   // R-15 Full CBO: ANALYZE istatistigi
+  mcvCnt: Int64;        // H8: esitlik degeri icin MCV sayimi
   // H3: skiplist/dizi ortak aralik kaynagi
   src, bestSrc: TIdxSource;
   hasLo, hasHi: Boolean;
@@ -4100,6 +4101,13 @@ begin
     begin
       covPos := FT.IdxPosOfCol(Td.TableId, bestCol);
       covAll := (covPos >= 0) and FT.IdxCoversAll(Td, covPos);
+      // H8: tek esitlikte MCV varsa dilimi saymadan karar ver. Boylece
+      // 500k ayni degerli skew'te indeks girdilerini bosuna saymayiz.
+      if (not hasIn) and hasLo and hasHi and bestLoInc and bestHiInc and
+         (bestLoVal = bestHiVal) and
+         VdbStatsMCVLookup(st, Td.Cols[bestCol].Name, bestLoVal, mcvCnt) and
+         (not VdbIndexIsSelective(st.RowCount, mcvCnt, covAll)) then
+        Exit;
       if not VdbIndexIsSelective(st.RowCount,
         IdxSourceCountBounds(bestSrc, bestLoVal, bestHiVal,
           hasLo, hasHi, bestLoInc, bestHiInc), covAll) then
@@ -16006,7 +16014,7 @@ var
   hasStats: Boolean;
   tblStats: TVDbTableStats;
   est: TVdbCostEstimate;
-  eqDistinct, eqNulls, rangeRows: Int64;
+  eqDistinct, eqNulls, eqMCV, rangeRows: Int64;
   covAll: Boolean;
   base: string;
   stA, stB: TVDbTableStats;
@@ -16087,12 +16095,12 @@ var
     Secicilik = RowCount / distinct ile tahmin edilir. Yalnizca TEK bir
     esitlik kullanilir; bulanamazsa False doner ve cagri sezgisel
     (range) tahmine duser. }
-  function EqColStats(T: TTableDef; out Distinct, Nulls: Int64): Boolean;
+  function EqColStats(T: TTableDef; out Distinct, Nulls, MCVCount: Int64): Boolean;
   var
     conj: TList<TSqlExprNode>;
-    k, ci, cj: Integer;
+    k, ci, cj, m: Integer;
     b: TSqlBinaryOpNode;
-    colName: string;
+    colName, litVal: string;
 
     procedure Push(C: TSqlExprNode);
     begin
@@ -16108,6 +16116,7 @@ var
     Result := False;
     Distinct := 0;
     Nulls := 0;
+    MCVCount := -1;
     if (sel = nil) or (sel.WhereClause = nil) then Exit;
     conj := TList<TSqlExprNode>.Create;
     try
@@ -16124,11 +16133,19 @@ var
             if VDbNorm(T.Cols[cj].Name) = VDbNorm(colName) then
             begin ci := cj; Break; end;
           if ci < 0 then Continue;
+          litVal := TSqlLiteralNode(b.Right).AsString;
           for cj := 0 to High(tblStats.ColStats) do
             if SameText(tblStats.ColStats[cj].ColName, T.Cols[ci].Name) then
             begin
               Distinct := tblStats.ColStats[cj].DistinctCount;
               Nulls := tblStats.ColStats[cj].NullCount;
+              MCVCount := -1;
+              for m := 0 to High(tblStats.ColStats[cj].MCV) do
+                if tblStats.ColStats[cj].MCV[m].Value = litVal then
+                begin
+                  MCVCount := tblStats.ColStats[cj].MCV[m].Count;
+                  Break;
+                end;
               if Distinct > 0 then Exit(True);
             end;
         end;
@@ -16355,8 +16372,13 @@ begin
         begin
           // R-15 Full CBO: seciciligi ANALYZE istatistiginden tahmin et
           // ve indeksin gercekten kazanip kazanmadigina karar ver.
-          if EqColStats(td, eqDistinct, eqNulls) then
-            est := VdbChooseScan(tblStats.RowCount, eqDistinct, eqNulls, True, covAll)
+          if EqColStats(td, eqDistinct, eqNulls, eqMCV) then
+          begin
+            if eqMCV >= 0 then
+              est := VdbChooseScanForRows(tblStats.RowCount, eqMCV, True, covAll)
+            else
+              est := VdbChooseScan(tblStats.RowCount, eqDistinct, eqNulls, True, covAll);
+          end
           else if RangeColEst(td, rangeRows) then
             // H8: aralik seçiciliği ANALYZE min/max'tan (uniform) -> gerçek
             // yürütmenin dilim-temelli kararıyla tutarlı.
@@ -16459,10 +16481,56 @@ var
   avgRowLen: Integer;
   i, j: Integer;
   totalLen: Int64;
-  colNames, colDistinct, colNulls, colMins, colMaxs: array of string;
+  colNames, colDistinct, colNulls, colMins, colMaxs, colMCVs: array of string;
   distinctCounts, nullCounts: array of Int64;
   minVals, maxVals: array of string;
   dicts: array of TDictionary<string, Integer>;   // R-15: gercek distinct
+
+  { H8: en sik 32 degeri MCV olarak paketle. Cok yuksek distinct'li
+    kolonlarda tarama maliyetini sinirlamak icin 200k ustunu atla. }
+  function BuildMCV(d: TDictionary<string, Integer>): string;
+  const
+    MCV_MAX = 32;
+  var
+    bestV: array[0..MCV_MAX - 1] of string;
+    bestC: array[0..MCV_MAX - 1] of Int64;
+    n, pos, k, c: Integer;
+    pair: TPair<string, Integer>;
+    vals: array of string;
+    cnts: array of Int64;
+  begin
+    Result := '';
+    if (d.Count = 0) or (d.Count > 200000) then Exit;
+    n := 0;
+    for pair in d do
+    begin
+      c := pair.Value;
+      pos := n;
+      for k := 0 to n - 1 do
+        if c > bestC[k] then
+        begin
+          pos := k;
+          Break;
+        end;
+      if pos >= MCV_MAX then Continue;
+      if n < MCV_MAX then Inc(n);
+      for k := n - 1 downto pos + 1 do
+      begin
+        bestV[k] := bestV[k - 1];
+        bestC[k] := bestC[k - 1];
+      end;
+      bestV[pos] := pair.Key;
+      bestC[pos] := c;
+    end;
+    SetLength(vals, n);
+    SetLength(cnts, n);
+    for k := 0 to n - 1 do
+    begin
+      vals[k] := bestV[k];
+      cnts[k] := bestC[k];
+    end;
+    Result := VdbStatsPackMCV(vals, cnts);
+  end;
 begin
   // Stmt.TableName ile tablo hedeflenir (ANALYZE [TABLE] <tablo>)
   if Stmt.TableName = '' then
@@ -16497,6 +16565,7 @@ begin
   SetLength(colNulls, Length(td.Cols));
   SetLength(colMins, Length(td.Cols));
   SetLength(colMaxs, Length(td.Cols));
+  SetLength(colMCVs, Length(td.Cols));
   SetLength(distinctCounts, Length(td.Cols));
   SetLength(nullCounts, Length(td.Cols));
   SetLength(minVals, Length(td.Cols));
@@ -16529,8 +16598,10 @@ begin
             Inc(nullCounts[j])
           else
           begin
-            if not dicts[j].ContainsKey(rows[i][j]) then
-              dicts[j].Add(rows[i][j], 0);
+            if dicts[j].ContainsKey(rows[i][j]) then
+              dicts[j][rows[i][j]] := dicts[j][rows[i][j]] + 1
+            else
+              dicts[j].Add(rows[i][j], 1);
             if (minVals[j] = '') or (rows[i][j] < minVals[j]) then
               minVals[j] := rows[i][j];
             if (maxVals[j] = '') or (rows[i][j] > maxVals[j]) then
@@ -16540,7 +16611,10 @@ begin
       end;
     end;
     for j := 0 to High(td.Cols) do
+    begin
       distinctCounts[j] := dicts[j].Count;
+      colMCVs[j] := BuildMCV(dicts[j]);
+    end;
   finally
     for j := 0 to High(dicts) do dicts[j].Free;
   end;
@@ -16558,7 +16632,7 @@ begin
 
   // VDbMonitor'a kaydet (genişletilmiş)
   RecordTableStats(td.Name, rowCount, avgRowLen, idxCount,
-    colNames, colDistinct, colNulls, colMins, colMaxs);
+    colNames, colDistinct, colNulls, colMins, colMaxs, colMCVs);
 
   Res.Affected := 1;
   Res.Msg := Format('ANALYZE %s: rows=%d, avg_len=%d, indexes=%d',

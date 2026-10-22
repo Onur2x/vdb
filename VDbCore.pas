@@ -166,6 +166,18 @@ type
     IsDel: Boolean;
   end;
 
+  { 2026-10-22 HIZ: ertelenmis yerinde yazim.
+    CommitBatch, batch icindeki TUM yerinde yazimlari once bu listede
+    toplar; undo gunlugu TEK fsync ile kalici hale getirildikten SONRA
+    ana dosyaya uygular. Boylece:
+      - undo dosyasi kayit basina acilip kapanmaz (olculen: 6 ms/kayit),
+      - "undo once kalici, sonra veri" sirasi korunur (crash guvenligi). }
+  TInPlaceOp = record
+    Off: Int64;
+    Data: TBytes;      // yazilacak kayit baytlari (baslik + deger)
+    Leftover: Int64;   // kayittan sonra kalan bos alan (0 = yok)
+  end;
+
   TVDbRecHead = packed record
     Magic: LongWord;
     Crc: LongWord;
@@ -336,6 +348,11 @@ FPath: string;
     FDirtyBlocks: TList<Integer>;
     FDeadQueue: TList<TFreeSpan>;
     FUsedInPlace: Boolean;
+    { 2026-10-22 HIZ: CommitBatch icinde yerinde yazimlar ertelenir.
+      FInPlaceDefer=True iken AppendRec dosyaya yazmaz, op'u listeye
+      ekler. ApplyDeferredInPlace: undo fsync -> baytlari yaz. }
+    FInPlaceDefer: Boolean;
+    FInPlaceOps: TList<TInPlaceOp>;
     { H11: yerinde yazimla ayni transaction'da append edilen kayitlar
       crash sonrasi geri alinirken dosyanin kirpilacagi boy. }
     FUndoStartSize: Int64;
@@ -448,6 +465,9 @@ FPath: string;
     { H11: yerinde yazim sonrasi ana dosyayi fsync eder, blok CRC'lerini
       gunceller ve undo gunlugunu commit edip siler. }
     procedure FinalizeInPlaceWrite;
+    { 2026-10-22 HIZ: ertelenmis yerinde yazimlari uygular (once undo fsync). }
+    procedure ApplyDeferredInPlace;
+    procedure ClearDeferredInPlace;
     procedure Recover;
     { KR-1: tablo anahtar dizinini temizler / FIndex'ten yeniden kurar. }
     procedure ClearTableKeys;
@@ -1003,6 +1023,8 @@ FSavepoints := TList<TSavepoint>.Create;
   FDirtyBlocks := TList<Integer>.Create;
   FDeadQueue := TList<TFreeSpan>.Create;
   FUsedInPlace := False;
+  FInPlaceDefer := False;
+  FInPlaceOps := TList<TInPlaceOp>.Create;
   FUndoStartSize := 0;
   FUndoMarkerWritten := False;
   FDataStart := VDB_HDR_SIZE;
@@ -1021,6 +1043,7 @@ begin
   FBlocks.Free;
   FDirtyBlocks.Free;
   FDeadQueue.Free;
+  FInPlaceOps.Free;
   FPending.Free;
   FPendingPuts.Free;
   FPendingDels.Free;
@@ -1416,6 +1439,7 @@ var
   need, newCap: Integer;   // P-21: toplu yazim tamponu boyut yonetimi
   inOff, leftover, spanSize: Int64;
   walFlags: Byte;
+  op: TInPlaceOp;
 begin
   stored := nil;
   if IsDel then
@@ -1507,23 +1531,43 @@ begin
       VDbFlushStream(FS);
       CacheInvalidateAt(0, VDB_HDR_SIZE);
     end;
-    FS.Position := inOff;
-    if h.ValLen <= VDB_COMBINE_MAX then
+    if FInPlaceDefer then
     begin
-      SetLength(wbuf, need);
-      Move(h, wbuf[0], SizeOf(h));
+      { Batch icinde: dosyaya SIMDI yazma; undo once kalici olacak. }
+      SetLength(op.Data, need);
+      Move(h, op.Data[0], SizeOf(h));
       if h.ValLen > 0 then
-        Move(stored[0], wbuf[SizeOf(h)], h.ValLen);
-      FS.WriteBuffer(wbuf[0], need);
+        Move(stored[0], op.Data[SizeOf(h)], h.ValLen);
+      op.Off := inOff;
+      op.Leftover := leftover;
+      FInPlaceOps.Add(op);
+      if leftover > 0 then
+        AddFreeSpan(inOff + Int64(need), leftover);
     end
     else
     begin
-      FS.WriteBuffer(h, SizeOf(h));
-      if h.ValLen > 0 then
-        FS.WriteBuffer(stored[0], h.ValLen);
+      { Tekil yazim: undo'yu HEMEN kalici kil, sonra ana dosyaya yaz. }
+      if not VDbUndoSync(FPath) then
+        raise EVDbException.Create(ecIOError,
+          'VDb: undo gunlugu fsync edilemedi');
+      FS.Position := inOff;
+      if h.ValLen <= VDB_COMBINE_MAX then
+      begin
+        SetLength(wbuf, need);
+        Move(h, wbuf[0], SizeOf(h));
+        if h.ValLen > 0 then
+          Move(stored[0], wbuf[SizeOf(h)], h.ValLen);
+        FS.WriteBuffer(wbuf[0], need);
+      end
+      else
+      begin
+        FS.WriteBuffer(h, SizeOf(h));
+        if h.ValLen > 0 then
+          FS.WriteBuffer(stored[0], h.ValLen);
+      end;
+      if leftover > 0 then
+        WriteFreeSpace(inOff + Int64(need), leftover);
     end;
-    if leftover > 0 then
-      WriteFreeSpace(inOff + Int64(need), leftover);
     MarkDirtyBlock(inOff);
     CacheInvalidateAt(inOff, Integer(spanSize));
     off := inOff;
@@ -2213,21 +2257,30 @@ procedure TVDb.UpdateDirtyBlockCrcs;
 var
   i: Integer;
   bi: TBlockInfo;
-  c, oldCrc: LongWord;
+  c: LongWord;
+  oldCrcs: array of LongWord;
   oldBytes: TBytes;
 begin
   if FDirtyBlocks.Count = 0 then Exit;
+  { 2026-10-22 HIZ: ONCE tum eski footer CRC'lerini undo'ya ekle, TEK
+    fsync ile kalici yap, SONRA footer'lari yaz. Boylece "undo once
+    kalici, sonra veri" sirasi korunur ve kayit basina fsync kalkar. }
+  SetLength(oldCrcs, FDirtyBlocks.Count);
   for i := 0 to FDirtyBlocks.Count - 1 do
   begin
     bi := FBlocks[FDirtyBlocks[i]];
-    // Footer'in eski CRC'sini de undo gunlugune al: crash sonrasi geri
-    // sarma hem veriyi hem footer CRC'sini eski tutarli hale getirir.
     FS.Position := bi.Footer + 4;
-    FS.ReadBuffer(oldCrc, 4);
+    FS.ReadBuffer(oldCrcs[i], 4);
     SetLength(oldBytes, 4);
-    Move(oldCrc, oldBytes[0], 4);
+    Move(oldCrcs[i], oldBytes[0], 4);
     if not VDbUndoAppend(FPath, bi.Footer + 4, oldBytes) then
       raise EVDbException.Create(ecIOError, 'VDb: blok footer undo kaydi yazilamadi');
+  end;
+  if not VDbUndoSync(FPath) then
+    raise EVDbException.Create(ecIOError, 'VDb: undo gunlugu fsync edilemedi');
+  for i := 0 to FDirtyBlocks.Count - 1 do
+  begin
+    bi := FBlocks[FDirtyBlocks[i]];
     if not CrcRange(bi.Start, bi.Footer - bi.Start, c) then
       raise EVDbException.Create(ecIOError, 'VDb: blok CRC yeniden hesaplanamadi');
     FS.Position := bi.Footer + 4;
@@ -2238,9 +2291,54 @@ begin
   FDirty := True;
 end;
 
+{ 2026-10-22 HIZ: ertelenmis yerinde yazimlari uygular.
+  SIRA KRITIK: undo gunlugu fsync (kalici) -> ana dosya baytlari.
+  Boylece crash'te yarim kalan bir yerinde yazim, undo'dan geri alinabilir. }
+procedure TVDb.ApplyDeferredInPlace;
+var
+  i: Integer;
+  op: TInPlaceOp;
+  fh: TVDbRecHead;
+  lofs: Int64;
+begin
+  if FInPlaceOps.Count = 0 then Exit;
+  if not VDbUndoSync(FPath) then
+    raise EVDbException.Create(ecIOError, 'VDb: undo gunlugu fsync edilemedi');
+  for i := 0 to FInPlaceOps.Count - 1 do
+  begin
+    op := FInPlaceOps[i];
+    FS.Position := op.Off;
+    if Length(op.Data) > 0 then
+      FS.WriteBuffer(op.Data[0], Length(op.Data));
+    if op.Leftover >= Int64(SizeOf(fh)) then
+    begin
+      { WriteFreeSpace'un dosyaya yazan kismi (AddFreeSpan yapildi). }
+      lofs := op.Off + Int64(Length(op.Data));
+      fh.Magic := VDB_MAGIC;
+      fh.Seq := 0;
+      fh.Key := 0;
+      fh.ValLen := LongWord(op.Leftover - Int64(SizeOf(fh)));
+      fh.Flags := VDB_FLAG_FREESPACE;
+      fh.Crc := RecCrc(0, 0, fh.ValLen, fh.Flags, nil);
+      FS.Position := lofs;
+      FS.WriteBuffer(fh, SizeOf(fh));
+    end;
+  end;
+  FDirty := True;
+end;
+
+procedure TVDb.ClearDeferredInPlace;
+begin
+  if FInPlaceOps <> nil then FInPlaceOps.Clear;
+end;
+
 procedure TVDb.FinalizeInPlaceWrite;
 begin
   if not FUsedInPlace then Exit;
+  { 2026-10-22 HIZ: batch'te ertelenen yerinde yazimlari simdi uygula
+    (once undo fsync). Tekil yazimda liste zaten bostur. }
+  ApplyDeferredInPlace;
+  ClearDeferredInPlace;
   UpdateDirtyBlockCrcs;
   // Yerinde yazim + footer CRC guncellemeleri ayni fsync ile kalici olur.
   // SyncWrite=False ise kullanici dayanikliliktan vazgecmistir; ana dosya
@@ -2488,6 +2586,8 @@ begin
         VDbFlushStream(FS);
       end;
     finally
+      { 2026-10-22: undo gunlugu onbellegi acik kalmasin. }
+      VDbUndoCacheClose;
       if FLcked then
       begin
         try VDbUnlockStream(FS); except end;
@@ -4357,12 +4457,15 @@ begin
         FWrBufLen := 0;
         FWrBufBase := FS.Seek(0, soEnd);
         FWrBufActive := True;
+        ClearDeferredInPlace;
+        FInPlaceDefer := True;
         try
           for i := 0 to FPending.Count - 1 do
             AppendRec(FPending[i].Key, FPending[i].Value, FPending[i].IsDel,
               False, False);
           FlushWriteBuf;
         finally
+          FInPlaceDefer := False;
           FWrBufActive := False;
           FWrBufLen := 0;
         end;
@@ -4394,6 +4497,8 @@ begin
             if FileExists(VDbUndoPath(FPath)) then
               VDbUndoRollback(FS, VDbUndoPath(FPath), restored);
             FUsedInPlace := False;
+            FInPlaceDefer := False;
+            ClearDeferredInPlace;
             FUndoMarkerWritten := False;
             FDirtyBlocks.Clear;
             FDeadQueue.Clear;
@@ -4436,6 +4541,8 @@ begin
     if (FS <> nil) and FileExists(VDbUndoPath(FPath)) then
       VDbUndoRollback(FS, VDbUndoPath(FPath), restored);
     FUsedInPlace := False;
+    FInPlaceDefer := False;
+    ClearDeferredInPlace;
     FUndoMarkerWritten := False;
     FDirtyBlocks.Clear;
     FDeadQueue.Clear;

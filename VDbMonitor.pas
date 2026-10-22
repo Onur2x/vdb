@@ -40,6 +40,13 @@ type
     MaxDurationUs: UInt64;
   end;
 
+  { H8: en sik tekrarlanan degerler (MCV). Skew'li esitliklerde
+    RowCount/DistinctCount ortalamasi gercek satir sayisini gizler. }
+  TVDbMCVEntry = record
+    Value: string;
+    Count: Int64;
+  end;
+
   { R-15: Cost-Based Optimizer — tablo istatistikleri }
   TVDbTableStats = record
     TableName: string;
@@ -54,6 +61,7 @@ type
       NullCount: Int64;
       MinVal: string;
       MaxVal: string;
+      MCV: array of TVDbMCVEntry;
     end;
   end;
 
@@ -70,8 +78,14 @@ function FlushStats: Boolean;
 function FlushBufferToFile: Boolean;
 // R-15: Cost-Based Optimizer — tablo istatistikleri (genişletilmiş)
 function RecordTableStats(const TableName: string; RowCount: Int64; AvgRowLen: Integer; IndexCount: Integer;
-  const ColNames, ColDistinct, ColNulls, ColMins, ColMaxs: array of string): Boolean;
+  const ColNames, ColDistinct, ColNulls, ColMins, ColMaxs, ColMCVs: array of string): Boolean;
 function GetTableStats(const TableName: string; out S: TVDbTableStats): Boolean;
+// H8: MCV paketleme / sorgulama yardimcilari.
+function VdbStatsPackMCV(const Values: array of string; const Counts: array of Int64): string;
+function VdbStatsMCVLookup(const S: TVDbTableStats; const ColName, Value: string;
+  out Count: Int64): Boolean;
+function VdbStatsMCVInfo(const S: TVDbTableStats; const ColName: string;
+  out Total: Int64; out Entries: Integer): Boolean;
 // R-24: ANALYZE edilmis tekil tablo sayisi (SHOW STATS icin)
 function AnalyzedTableCount: Integer;
 
@@ -159,22 +173,143 @@ begin
   Result := True;
 end;
 
+function StatsHexEncode(const S: string): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 1 to Length(S) do
+    Result := Result + IntToHex(Ord(S[i]), 2);
+end;
+
+function StatsHexDecode(const S: string): string;
+var
+  i, n, b: Integer;
+  raw: AnsiString;
+begin
+  n := Length(S) div 2;
+  SetLength(raw, n);
+  for i := 0 to n - 1 do
+  begin
+    b := StrToIntDef('$' + Copy(S, i * 2 + 1, 2), -1);
+    if (b < 0) or (b > 255) then
+    begin
+      Result := '';
+      Exit;
+    end;
+    raw[i + 1] := AnsiChar(b);
+  end;
+  Result := string(raw);
+end;
+
+function VdbStatsPackMCV(const Values: array of string;
+  const Counts: array of Int64): string;
+var
+  i, n: Integer;
+begin
+  Result := '';
+  n := Length(Values);
+  if Length(Counts) < n then n := Length(Counts);
+  for i := 0 to n - 1 do
+  begin
+    if Values[i] = '' then Continue;
+    if Result <> '' then Result := Result + '^';
+    Result := Result + StatsHexEncode(Values[i]) + '~' + IntToStr(Counts[i]);
+  end;
+end;
+
+procedure StatsUnpackMCV(const APacked: string; var Entries: array of TVDbMCVEntry;
+  out N: Integer);
+var
+  parts, kv: TStringList;
+  i, p: Integer;
+begin
+  N := 0;
+  if APacked = '' then Exit;
+  parts := TStringList.Create;
+  try
+    parts.Delimiter := '^';
+    parts.DelimitedText := APacked;
+    for i := 0 to parts.Count - 1 do
+    begin
+      p := Pos('~', parts[i]);
+      if p <= 1 then Continue;
+      if N > High(Entries) then Break;
+      kv := TStringList.Create;
+      try
+        kv.Delimiter := '~';
+        kv.DelimitedText := parts[i];
+        if kv.Count < 2 then Continue;
+        Entries[N].Value := StatsHexDecode(kv[0]);
+        Entries[N].Count := StrToInt64Def(kv[1], 0);
+        if Entries[N].Value <> '' then Inc(N);
+      finally
+        kv.Free;
+      end;
+    end;
+  finally
+    parts.Free;
+  end;
+end;
+
+function VdbStatsMCVLookup(const S: TVDbTableStats; const ColName, Value: string;
+  out Count: Int64): Boolean;
+var
+  i, j: Integer;
+begin
+  Result := False;
+  Count := 0;
+  for i := 0 to High(S.ColStats) do
+    if SameText(S.ColStats[i].ColName, ColName) then
+    begin
+      for j := 0 to High(S.ColStats[i].MCV) do
+        if S.ColStats[i].MCV[j].Value = Value then
+        begin
+          Count := S.ColStats[i].MCV[j].Count;
+          Exit(True);
+        end;
+      Exit;
+    end;
+end;
+
+function VdbStatsMCVInfo(const S: TVDbTableStats; const ColName: string;
+  out Total: Int64; out Entries: Integer): Boolean;
+var
+  i, j: Integer;
+begin
+  Result := False;
+  Total := 0;
+  Entries := 0;
+  for i := 0 to High(S.ColStats) do
+    if SameText(S.ColStats[i].ColName, ColName) then
+    begin
+      for j := 0 to High(S.ColStats[i].MCV) do
+      begin
+        Inc(Total, S.ColStats[i].MCV[j].Count);
+        Inc(Entries);
+      end;
+      Exit(True);
+    end;
+end;
+
 // R-15: Cost-Based Optimizer — tablo istatistikleri (genişletilmiş)
 function RecordTableStats(const TableName: string; RowCount: Int64; AvgRowLen: Integer; IndexCount: Integer;
-  const ColNames, ColDistinct, ColNulls, ColMins, ColMaxs: array of string): Boolean;
+  const ColNames, ColDistinct, ColNulls, ColMins, ColMaxs, ColMCVs: array of string): Boolean;
 var
-  ts: string;
   i: Integer;
-  colStats: string;
+  colStats, one: string;
 begin
   Result := True;
-  // Kolon istatistiklerini tek string'e paketle: col1:distinct,null,min,max;col2:...
+  // Kolon istatistiklerini tek string'e paketle: col1:distinct,null,min,max[,mcv];...
   colStats := '';
   for i := 0 to High(ColNames) do
   begin
     if colStats <> '' then colStats := colStats + ';';
-    colStats := colStats + Format('%s:%s,%s,%s,%s',
+    one := Format('%s:%s,%s,%s,%s',
       [ColNames[i], ColDistinct[i], ColNulls[i], ColMins[i], ColMaxs[i]]);
+    if (i <= High(ColMCVs)) and (ColMCVs[i] <> '') then
+      one := one + ',' + ColMCVs[i];
+    colStats := colStats + one;
   end;
   // Format: TableName|RowCount|AvgRowLen|IndexCount|LastAnalyze|ColStats
   GTableStats.Add(Format('TBLSTATS:%s|%d|%d|%d|%d|%s',
@@ -183,9 +318,10 @@ end;
 
 function GetTableStats(const TableName: string; out S: TVDbTableStats): Boolean;
 var
-  i, j: Integer;
+  i, j, k, nMcv: Integer;
   ts: string;
   parts, colParts, statParts: TStringList;
+  mcvTmp: array[0..63] of TVDbMCVEntry;
 begin
   Result := False;
   S.TableName := '';
@@ -242,6 +378,15 @@ begin
                       S.ColStats[j].NullCount := StrToIntDef(statParts[1], 0);
                       S.ColStats[j].MinVal := statParts[2];
                       S.ColStats[j].MaxVal := statParts[3];
+                      SetLength(S.ColStats[j].MCV, 0);
+                      if statParts.Count >= 5 then
+                      begin
+                        nMcv := 0;
+                        StatsUnpackMCV(statParts[4], mcvTmp, nMcv);
+                        SetLength(S.ColStats[j].MCV, nMcv);
+                        for k := 0 to nMcv - 1 do
+                          S.ColStats[j].MCV[k] := mcvTmp[k];
+                      end;
                     end;
                   end;
                 finally

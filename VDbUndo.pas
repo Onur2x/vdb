@@ -37,10 +37,22 @@ type
   end;
 
 function VDbUndoPath(const DbPath: string): string;
-// Eski span'i gunluge ekler ve fsync eder. Ayni offset icin birden fazla
-// kayit olabilir; geri yukleme TERS sirada yapilir.
+// Eski span'i gunluge ekler. Ayni offset icin birden fazla kayit olabilir;
+// geri yukleme TERS sirada yapilir.
+//
+// 2026-10-22 HIZ: gunluk dosyasi artik HER kayit icin yeniden acilip
+// kapatilmaz; ayni yol icin tek bir handle onbellekte tutulur ve fsync
+// cagiranin istedigi anda (VDbUndoSync / VDbUndoCommit) yapilir.
+// ONEMLI: fsync, ana dosyaya yerinde yazmadan ONCE cagrilmalidir; aksi
+// halde crash'te geri alinamayan yarim span kalabilir. TVDb bunu
+// CommitBatch icinde toplu (tek fsync) olarak saglar.
 function VDbUndoAppend(const DbPath: string; AOffset: Int64;
   const OldData: TBytes): Boolean;
+// Onbellekteki gunluk handle'ini fsync eder (yoksa no-op True).
+// Cagiran, ana dosyayi degistirmeden ONCE bunu cagirmalidir.
+function VDbUndoSync(const DbPath: string): Boolean;
+// Onbellekteki gunluk handle'ini kapatir. Dosyayi silmez.
+procedure VDbUndoCacheClose;
 // Db'deki [AOffset, AOffset+ASize) araliginin ESKI baytlarini gunluge
 // ekler. Cagiran, ana dosyayi degistirmeden ONCE bunu cagirmalidir.
 function VDbUndoAppendFromStream(Db: TFileStream; const DbPath: string;
@@ -93,23 +105,62 @@ begin
     Result := OpenUndoRetry(Path, fmCreate);
 end;
 
+{ 2026-10-22 HIZ: undo gunlugu handle onbellegi.
+  Olcum (120 kayitlik batch): her kayit icin dosyayi ac/kapat 750 ms,
+  tek handle ile 0 ms. Filtre suruculeri/AV, var olan bir dosyayi
+  fmOpenReadWrite ile her acista taradigi icin maliyet kayit basina
+  ~6 ms'ye cikiyordu.
+  Kilit: TVDb yazma yollari FLock altinda calisir; bu onbellek de
+  yalnizca oradan kullanilir. Farkli bir yol istenirse eski handle
+  kapatilir (tek veritabani dosyasi kullanan uygulamalarda no-op). }
+var
+  GUndo: TFileStream = nil;
+  GUndoPath: string = '';
+
+procedure VDbUndoCacheClose;
+begin
+  if GUndo <> nil then
+  begin
+    FreeAndNil(GUndo);
+  end;
+  GUndoPath := '';
+end;
+
+function UndoStream(const Path: string): TFileStream;
+begin
+  if (GUndo <> nil) and (GUndoPath = Path) then Exit(GUndo);
+  VDbUndoCacheClose;
+  GUndo := OpenUndoForAppend(Path);
+  GUndoPath := Path;
+  Result := GUndo;
+end;
+
+function VDbUndoSync(const DbPath: string): Boolean;
+begin
+  Result := True;
+  if (GUndo <> nil) and (GUndoPath = VDbUndoPath(DbPath)) then
+  begin
+    try
+      VDbFlushStream(GUndo);
+    except
+      Result := False;
+    end;
+  end;
+end;
+
 function AppendHeadAndData(const Path: string; const H: TVDbUndoHead;
   const Data: TBytes): Boolean;
 var
   s: TFileStream;
 begin
   Result := False;
-  s := OpenUndoForAppend(Path);
-  try
-    s.Seek(0, soEnd);
-    s.WriteBuffer(H, SizeOf(H));
-    if H.Size > 0 then
-      s.WriteBuffer(Data[0], H.Size);
-    VDbFlushStream(s);
-    Result := True;
-  finally
-    s.Free;
-  end;
+  s := UndoStream(Path);
+  s.Seek(0, soEnd);
+  s.WriteBuffer(H, SizeOf(H));
+  if H.Size > 0 then
+    s.WriteBuffer(Data[0], H.Size);
+  { fsync YOK: cagiran VDbUndoSync ile toplu yapar. }
+  Result := True;
 end;
 
 function VDbUndoAppend(const DbPath: string; AOffset: Int64;
@@ -158,15 +209,12 @@ begin
   h.Offset := AOldSize;
   h.Size := 0;
   h.Crc := 0;
-  s := OpenUndoForAppend(VDbUndoPath(DbPath));
-  try
-    s.Seek(0, soEnd);
-    s.WriteBuffer(h, SizeOf(h));
-    VDbFlushStream(s);
-    Result := True;
-  finally
-    s.Free;
-  end;
+  s := UndoStream(VDbUndoPath(DbPath));
+  s.Seek(0, soEnd);
+  s.WriteBuffer(h, SizeOf(h));
+  { Isaret ana dosya yazimindan ONCE kalici olmali: hemen fsync. }
+  VDbFlushStream(s);
+  Result := True;
 end;
 
 function VDbUndoCommit(const DbPath: string): Boolean;
@@ -174,6 +222,7 @@ var
   h: TVDbUndoHead;
   Path: string;
   s: TFileStream;
+  sahip: Boolean;
 begin
   Path := VDbUndoPath(DbPath);
   if not FileExists(Path) then Exit(True);
@@ -182,14 +231,23 @@ begin
   h.Size := 0;
   h.Crc := 0;
   Result := False;
-  s := OpenUndoRetry(Path, fmOpenReadWrite);
+  if (GUndo <> nil) and (GUndoPath = Path) then
+  begin
+    s := GUndo;
+    sahip := False;
+  end
+  else
+  begin
+    s := OpenUndoRetry(Path, fmOpenReadWrite);
+    sahip := True;
+  end;
   try
     s.Seek(0, soEnd);
     s.WriteBuffer(h, SizeOf(h));
     VDbFlushStream(s);
     Result := True;
   finally
-    s.Free;
+    if sahip then s.Free;
   end;
 end;
 
@@ -198,6 +256,8 @@ var
   s: TFileStream;
 begin
   if UndoPath = '' then Exit;
+  { Onbellekteki handle acikken dosya silinemez/truncate edilemez. }
+  VDbUndoCacheClose;
   // Once truncate et: DeleteFile basarisiz olsa bile dosya bos kalir ve
   // bir sonraki acilista yanlislikla eski veriyi geri yuklemez.
   try
@@ -230,6 +290,8 @@ begin
   Restored := 0;
   if (Db = nil) or (UndoPath = '') or (not FileExists(UndoPath)) then Exit;
 
+  { Onbellekteki yazma handle'i acikken okuma/temizlik yapilamaz. }
+  VDbUndoCacheClose;
   s := OpenUndoRetry(UndoPath, fmOpenRead);
   positions := TList.Create;
   try
