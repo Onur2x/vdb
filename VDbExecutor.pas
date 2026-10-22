@@ -4258,6 +4258,29 @@ type
 
   TRawCondArray = array of TRawCond;
 
+  { H20: ham boolean agaci. AND/OR/NOT/resim (3VL) tam olarak
+    degerlendirilir; yalniz guvenli yapraklar agaca alinir. }
+  TRawTreeKind = (rttAnd, rttOr, rttNot, rttCmp, rttLike, rttILike,
+    rttIsNull, rttIsNotNull, rttUnknown);
+
+  TRawTreeNode = record
+    Kind: TRawTreeKind;
+    Left, Right: Integer;     // -1 = yok
+    Col: Integer;
+    Op: TSqlBinaryOp;
+    I: Int64;
+    F: Double;
+    S: string;                // LIKE/ILIKE deseni
+    LitNull: Boolean;         // literal NULL veya '' (VDb'de NULL sayilir)
+  end;
+
+  TRawTree = array of TRawTreeNode;
+
+  { Ham agac sonucu. rvUnknown SQL UNKNOWN (NULL) demektir; WHERE'te
+    secilmez. rvUndecided yalniz guvenli olmayan satir (tip/ASCII/2^53)
+    icin doner ve satirin cozulup EvalBool ile denenmesini ister. }
+  TRawValue = (rvFalse, rvTrue, rvUnknown, rvUndecided);
+
   { H17: WHERE'li saf COUNT(*) icin ham akis baglami. }
   TStreamCountCtx = record
     Exec: TVSqlExecutor;
@@ -4271,6 +4294,8 @@ type
     Where: TSqlExprNode;
     RawConds: TRawCondArray;
     RawAll: Boolean;          // H18: WHERE tamamen ham kosullarla kesin cozulebilir
+    RawTree: TRawTree;        // H20
+    RawTreeRoot: Integer;
     NeedIdx: TIntArray;
     MaxCol: Integer;
     Vals: TStrArray;
@@ -4287,6 +4312,8 @@ function VdbStreamSelRawPassEx(const Conds: array of TRawCond;
 procedure VdbStreamOrderAddRawCond(var Conds: TRawCondArray;
   Exec: TVSqlExecutor; E: TSqlExprNode; const td: TTableDef;
   const ColNames: TStrArray; const ColTypes: TByteArray); forward;
+function VdbEvalRawTree(const Tree: TRawTree; Node: Integer;
+  Buf: PByte; const FType: TByteArray; const FOff, FLen: TIntArray): TRawValue; forward;
 
 function VdbStreamCountCb(Key: QWord; Buf: PByte; Len: Integer;
   User: Pointer): Boolean;
@@ -4309,6 +4336,22 @@ begin
   if kh <> Key then
   begin
     C^.Failed := True; Exit(False);
+  end;
+  // H20: WHERE'in tam boolean agaci ham baytlardan kesin cozulebiliyorsa
+  // AND/OR/NOT/NULL uc-degerli mantigiyla say; yalniz guvenli olmayan
+  // satirlarda cozme yoluna dus.
+  if C^.RawTreeRoot >= 0 then
+  begin
+    case VdbEvalRawTree(C^.RawTree, C^.RawTreeRoot, Buf, C^.FType,
+      C^.FOff, C^.FLen) of
+      rvFalse, rvUnknown: Exit;
+      rvTrue:
+        begin
+          Inc(C^.Count);
+          Exit;
+        end;
+      // rvUndecided: asagidaki ham on-eleme ve cozme yolu devam eder.
+    end;
   end;
   // H17: basit AND kosullarinda satiri cozmeden kesin eleme.
   // H18: WHERE tamamen ham kosullardan olusuyorsa ve satir tip/ASCII
@@ -4486,6 +4529,311 @@ var
     end;
   end;
 
+  { H20: ham boolean agaci kurucusu. Guvenli olmayan tek bir dugumde
+    -1 doner; bu durumda H17/H18 on-elemesi ve genel yol aynen calisir. }
+  function TreeAdd(AKind: TRawTreeKind): Integer;
+  begin
+    Result := Length(ctx.RawTree);
+    SetLength(ctx.RawTree, Result + 1);
+    with ctx.RawTree[Result] do
+    begin
+      Kind := AKind;
+      Left := -1;
+      Right := -1;
+      Col := -1;
+      Op := sboEq;
+      I := 0;
+      F := 0;
+      S := '';
+      LitNull := False;
+    end;
+  end;
+
+  function SwapCmp(AOp: TSqlBinaryOp): TSqlBinaryOp;
+  begin
+    case AOp of
+      sboLt: Result := sboGt;
+      sboLte: Result := sboGte;
+      sboGt: Result := sboLt;
+      sboGte: Result := sboLte;
+    else Result := AOp;
+    end;
+  end;
+
+  function TreeCmp(ci2: Integer; AOp: TSqlBinaryOp;
+    lit: TSqlLiteralNode): Integer;
+  const
+    SAFE_INT: Int64 = 9007199254740992;
+  var
+    q, n: Integer;
+    isNull: Boolean;
+    iv: Int64;
+    fv: Double;
+    sv: string;
+  begin
+    Result := -1;
+    if (ci2 < 0) or (ci2 > High(td.Cols)) or (ci2 > High(ColTypes)) then Exit;
+    if td.Cols[ci2].Encrypted or (td.Cols[ci2].Collate <> '') then Exit;
+    if lit = nil then Exit;
+    isNull := False; iv := 0; fv := 0; sv := '';
+    if ColTypes[ci2] = VCT_INT then
+    begin
+      if lit.LitType = sltNull then isNull := True
+      else if lit.LitType = sltInt then
+      begin
+        if (lit.IntVal > SAFE_INT) or (lit.IntVal < -SAFE_INT) then Exit;
+        iv := lit.IntVal;
+      end
+      else Exit;
+    end
+    else if ColTypes[ci2] = VCT_FLOAT then
+    begin
+      if lit.LitType = sltNull then isNull := True
+      else if lit.LitType = sltInt then fv := lit.IntVal
+      else if lit.LitType = sltFloat then fv := lit.FloatVal
+      else Exit;
+    end
+    else if ColTypes[ci2] = VCT_STR then
+    begin
+      if not (AOp in [sboEq, sboNeq]) then Exit;
+      if lit.LitType = sltNull then isNull := True
+      else if lit.LitType = sltString then
+      begin
+        for q := 1 to Length(lit.StrVal) do
+          if lit.StrVal[q] >= #128 then Exit;
+        if lit.StrVal = '' then isNull := True
+        else sv := lit.StrVal;
+      end
+      else Exit;
+    end
+    else Exit;
+    n := TreeAdd(rttCmp);
+    with ctx.RawTree[n] do
+    begin
+      Col := ci2;
+      Op := AOp;
+      LitNull := isNull;
+      I := iv;
+      F := fv;
+      S := sv;
+    end;
+    Result := n;
+  end;
+
+  function TreeLike(ci2: Integer; AKind: TRawTreeKind;
+    lit: TSqlLiteralNode): Integer;
+  var
+    q, n: Integer;
+    isNull: Boolean;
+    pat: string;
+  begin
+    Result := -1;
+    if (ci2 < 0) or (ci2 > High(td.Cols)) or (ci2 > High(ColTypes)) then Exit;
+    if td.Cols[ci2].Encrypted or (td.Cols[ci2].Collate <> '') then Exit;
+    if ColTypes[ci2] <> VCT_STR then Exit;
+    if lit = nil then Exit;
+    isNull := False; pat := '';
+    if lit.LitType = sltNull then isNull := True
+    else if lit.LitType = sltString then
+    begin
+      for q := 1 to Length(lit.StrVal) do
+        if lit.StrVal[q] >= #128 then Exit;
+      if lit.StrVal = '' then isNull := True
+      else if AKind = rttILike then pat := VDbTrLower(lit.StrVal)
+      else pat := lit.StrVal;
+    end
+    else Exit;
+    n := TreeAdd(AKind);
+    with ctx.RawTree[n] do
+    begin
+      Col := ci2;
+      LitNull := isNull;
+      S := pat;
+    end;
+    Result := n;
+  end;
+
+  function TreeNode1(AKind: TRawTreeKind; AChild: Integer): Integer;
+  begin
+    Result := -1;
+    if AChild < 0 then Exit;
+    Result := TreeAdd(AKind);
+    ctx.RawTree[Result].Left := AChild;
+  end;
+
+  function BuildTree(E: TSqlExprNode): Integer;
+  var
+    b: TSqlBinaryOpNode;
+    u: TSqlUnaryOpNode;
+    inN: TSqlInNode;
+    bt: TSqlBetweenNode;
+    cr: TSqlColumnRefNode;
+    lit: TSqlLiteralNode;
+    ci2, saved, q, l, r, n: Integer;
+    opsw: TSqlBinaryOp;
+  begin
+    Result := -1;
+    if E = nil then Exit;
+    saved := Length(ctx.RawTree);
+
+    if E is TSqlBinaryOpNode then
+    begin
+      b := TSqlBinaryOpNode(E);
+      if (b.Op = sboAnd) or (b.Op = sboOr) then
+      begin
+        l := BuildTree(b.Left);
+        r := BuildTree(b.Right);
+        if (l < 0) or (r < 0) then
+        begin
+          SetLength(ctx.RawTree, saved);
+          Exit;
+        end;
+        if b.Op = sboAnd then n := TreeAdd(rttAnd)
+        else n := TreeAdd(rttOr);
+        ctx.RawTree[n].Left := l;
+        ctx.RawTree[n].Right := r;
+        Exit(n);
+      end;
+      if b.Op in [sboLike, sboILike] then
+      begin
+        if not ((b.Left is TSqlColumnRefNode) and
+                (b.Right is TSqlLiteralNode)) then Exit;
+        cr := TSqlColumnRefNode(b.Left);
+        lit := TSqlLiteralNode(b.Right);
+        ci2 := FindColIdx(cr.ColumnName, cr.TableQualifier, ColNames);
+        if b.Op = sboLike then Result := TreeLike(ci2, rttLike, lit)
+        else Result := TreeLike(ci2, rttILike, lit);
+        Exit;
+      end;
+      if b.Op in [sboEq, sboNeq, sboLt, sboLte, sboGt, sboGte] then
+      begin
+        if (b.Left is TSqlColumnRefNode) and (b.Right is TSqlLiteralNode) then
+        begin
+          cr := TSqlColumnRefNode(b.Left);
+          lit := TSqlLiteralNode(b.Right);
+          opsw := b.Op;
+        end
+        else if (b.Right is TSqlColumnRefNode) and
+                (b.Left is TSqlLiteralNode) then
+        begin
+          cr := TSqlColumnRefNode(b.Right);
+          lit := TSqlLiteralNode(b.Left);
+          opsw := SwapCmp(b.Op);
+        end
+        else Exit;
+        ci2 := FindColIdx(cr.ColumnName, cr.TableQualifier, ColNames);
+        Result := TreeCmp(ci2, opsw, lit);
+        Exit;
+      end;
+      Exit;
+    end;
+
+    if E is TSqlUnaryOpNode then
+    begin
+      u := TSqlUnaryOpNode(E);
+      if u.Op = suoNot then
+      begin
+        l := BuildTree(u.Operand);
+        if l < 0 then Exit;
+        Result := TreeNode1(rttNot, l);
+        Exit;
+      end;
+      if u.Op in [suoIsNull, suoIsNotNull] then
+      begin
+        if not (u.Operand is TSqlColumnRefNode) then Exit;
+        cr := TSqlColumnRefNode(u.Operand);
+        ci2 := FindColIdx(cr.ColumnName, cr.TableQualifier, ColNames);
+        if (ci2 < 0) or (ci2 > High(td.Cols)) or
+           (ci2 > High(ColTypes)) then Exit;
+        if td.Cols[ci2].Encrypted then Exit;
+        if u.Op = suoIsNull then n := TreeAdd(rttIsNull)
+        else n := TreeAdd(rttIsNotNull);
+        ctx.RawTree[n].Col := ci2;
+        Exit(n);
+      end;
+      Exit;
+    end;
+
+    if E is TSqlInNode then
+    begin
+      inN := TSqlInNode(E);
+      if inN.SubSelect <> nil then Exit;
+      if not (inN.Expr is TSqlColumnRefNode) then Exit;
+      if inN.List.Count = 0 then Exit;
+      // Cok uzun IN listelerinde derin OR zinciri kurma; genel yol kalsin.
+      if inN.List.Count > 64 then Exit;
+      cr := TSqlColumnRefNode(inN.Expr);
+      ci2 := FindColIdx(cr.ColumnName, cr.TableQualifier, ColNames);
+      if (ci2 < 0) or (ci2 > High(td.Cols)) or
+         (ci2 > High(ColTypes)) then Exit;
+      // IN, genel yolda STRING esitligiyle calisir. Yalniz INT (guvenli
+      // aralik) ve ASCII TEXT icin "=" yapragina cevirmek birebir aynidir.
+      if not (ColTypes[ci2] in [VCT_INT, VCT_STR]) then Exit;
+      l := -1;
+      for q := 0 to inN.List.Count - 1 do
+      begin
+        if not (inN.List[q] is TSqlLiteralNode) then
+        begin
+          SetLength(ctx.RawTree, saved);
+          Exit;
+        end;
+        lit := TSqlLiteralNode(inN.List[q]);
+        r := TreeCmp(ci2, sboEq, lit);
+        if r < 0 then
+        begin
+          SetLength(ctx.RawTree, saved);
+          Exit;
+        end;
+        if l < 0 then l := r
+        else
+        begin
+          n := TreeAdd(rttOr);
+          ctx.RawTree[n].Left := l;
+          ctx.RawTree[n].Right := r;
+          l := n;
+        end;
+      end;
+      if inN.IsNot then l := TreeNode1(rttNot, l);
+      Result := l;
+      Exit;
+    end;
+
+    if E is TSqlBetweenNode then
+    begin
+      bt := TSqlBetweenNode(E);
+      if not (bt.Expr is TSqlColumnRefNode) then Exit;
+      if not (bt.LowBound is TSqlLiteralNode) or
+         not (bt.HighBound is TSqlLiteralNode) then Exit;
+      // Genel yol, iki sinirdan biri NULL ise BETWEEN'in TAMAMINI UNKNOWN
+      // dondurur (kisa devre). Ayni davranisi koru; desenlemek yanlis olur.
+      if (TSqlLiteralNode(bt.LowBound).LitType = sltNull) or
+         (TSqlLiteralNode(bt.HighBound).LitType = sltNull) or
+         ((TSqlLiteralNode(bt.LowBound).LitType = sltString) and
+          (TSqlLiteralNode(bt.LowBound).StrVal = '')) or
+         ((TSqlLiteralNode(bt.HighBound).LitType = sltString) and
+          (TSqlLiteralNode(bt.HighBound).StrVal = '')) then
+      begin
+        Result := TreeAdd(rttUnknown);
+        Exit;
+      end;
+      cr := TSqlColumnRefNode(bt.Expr);
+      ci2 := FindColIdx(cr.ColumnName, cr.TableQualifier, ColNames);
+      l := TreeCmp(ci2, sboGte, TSqlLiteralNode(bt.LowBound));
+      r := TreeCmp(ci2, sboLte, TSqlLiteralNode(bt.HighBound));
+      if (l < 0) or (r < 0) then
+      begin
+        SetLength(ctx.RawTree, saved);
+        Exit;
+      end;
+      n := TreeAdd(rttAnd);
+      ctx.RawTree[n].Left := l;
+      ctx.RawTree[n].Right := r;
+      if bt.IsNot then n := TreeNode1(rttNot, n);
+      Result := n;
+      Exit;
+    end;
+  end;
+
 begin
   Result := False;
   if Stmt.WhereClause = nil then Exit;
@@ -4533,6 +4881,8 @@ begin
   VdbStreamOrderAddRawCond(ctx.RawConds, Self, Stmt.WhereClause, td,
     ColNames, ColTypes);
   ctx.RawAll := RawCover(Stmt.WhereClause);
+  ctx.RawTree := nil;
+  ctx.RawTreeRoot := BuildTree(Stmt.WhereClause);
   ctx.MaxCol := maxCol;
   ctx.Count := 0;
   ctx.Failed := False;
@@ -9544,6 +9894,135 @@ var
   dummy: Boolean;
 begin
   Result := VdbStreamSelRawPassEx(Conds, Buf, FType, FOff, FLen, dummy);
+end;
+
+{ H20: ham boolean agacini SQL uc-degerli mantigiyla degerlendirir.
+  NULL kiyasi UNKNOWN doner; WHERE'te secilmez. rvUndecided yalniz
+  guvenli olmayan satir icin doner (cagiran cozme yoluna duser). }
+function VdbEvalRawTree(const Tree: TRawTree; Node: Integer;
+  Buf: PByte; const FType: TByteArray; const FOff, FLen: TIntArray): TRawValue;
+const
+  SAFE_INT: Int64 = 9007199254740992;
+var
+  n: TRawTreeNode;
+  l, r: TRawValue;
+  iv: Int64;
+  fv: Double;
+  ok: Boolean;
+  outlen: Integer;
+  lbuf: array[0..8191] of Byte;
+begin
+  Result := rvUndecided;
+  if (Node < 0) or (Node > High(Tree)) then Exit;
+  n := Tree[Node];
+  case n.Kind of
+    rttAnd:
+      begin
+        l := VdbEvalRawTree(Tree, n.Left, Buf, FType, FOff, FLen);
+        if l = rvFalse then Exit(rvFalse);
+        r := VdbEvalRawTree(Tree, n.Right, Buf, FType, FOff, FLen);
+        if r = rvFalse then Exit(rvFalse);
+        if (l = rvUndecided) or (r = rvUndecided) then Exit(rvUndecided);
+        if (l = rvTrue) and (r = rvTrue) then Exit(rvTrue);
+        Result := rvUnknown;
+      end;
+    rttOr:
+      begin
+        l := VdbEvalRawTree(Tree, n.Left, Buf, FType, FOff, FLen);
+        if l = rvTrue then Exit(rvTrue);
+        r := VdbEvalRawTree(Tree, n.Right, Buf, FType, FOff, FLen);
+        if r = rvTrue then Exit(rvTrue);
+        if (l = rvUndecided) or (r = rvUndecided) then Exit(rvUndecided);
+        if (l = rvFalse) and (r = rvFalse) then Exit(rvFalse);
+        Result := rvUnknown;
+      end;
+    rttNot:
+      begin
+        l := VdbEvalRawTree(Tree, n.Left, Buf, FType, FOff, FLen);
+        case l of
+          rvTrue: Result := rvFalse;
+          rvFalse: Result := rvTrue;
+          rvUnknown: Result := rvUnknown;
+        else
+          Result := rvUndecided;
+        end;
+      end;
+    rttIsNull, rttIsNotNull:
+      begin
+        if (n.Col < 0) or (n.Col > High(FOff)) then Exit(rvUndecided);
+        ok := (FOff[n.Col] < 0) or (FLen[n.Col] = 0);
+        if n.Kind = rttIsNotNull then ok := not ok;
+        if ok then Result := rvTrue else Result := rvFalse;
+      end;
+    rttUnknown:
+      Result := rvUnknown;
+    rttCmp:
+      begin
+        if (n.Col < 0) or (n.Col > High(FOff)) then Exit(rvUndecided);
+        if (FOff[n.Col] < 0) or (FLen[n.Col] = 0) then Exit(rvUnknown);
+        if n.LitNull then Exit(rvUnknown);
+        if FType[n.Col] = VCT_INT then
+        begin
+          if FLen[n.Col] <> 8 then Exit(rvUndecided);
+          Move((Buf + FOff[n.Col])^, iv, 8);
+          if (iv > SAFE_INT) or (iv < -SAFE_INT) then Exit(rvUndecided);
+          case n.Op of
+            sboEq: ok := iv = n.I;
+            sboNeq: ok := iv <> n.I;
+            sboLt: ok := iv < n.I;
+            sboLte: ok := iv <= n.I;
+            sboGt: ok := iv > n.I;
+            sboGte: ok := iv >= n.I;
+          else Exit(rvUndecided);
+          end;
+          if ok then Result := rvTrue else Result := rvFalse;
+        end
+        else if FType[n.Col] = VCT_FLOAT then
+        begin
+          if FLen[n.Col] <> 8 then Exit(rvUndecided);
+          Move((Buf + FOff[n.Col])^, fv, 8);
+          case n.Op of
+            sboEq: ok := fv = n.F;
+            sboNeq: ok := fv <> n.F;
+            sboLt: ok := fv < n.F;
+            sboLte: ok := fv <= n.F;
+            sboGt: ok := fv > n.F;
+            sboGte: ok := fv >= n.F;
+          else Exit(rvUndecided);
+          end;
+          if ok then Result := rvTrue else Result := rvFalse;
+        end
+        else if FType[n.Col] = VCT_STR then
+        begin
+          if not (n.Op in [sboEq, sboNeq]) then Exit(rvUndecided);
+          if not VdbBytesAscii(Buf + FOff[n.Col], FLen[n.Col]) then
+            Exit(rvUndecided);
+          ok := VdbBytesEqP(Buf + FOff[n.Col], FLen[n.Col], n.S);
+          if n.Op = sboNeq then ok := not ok;
+          if ok then Result := rvTrue else Result := rvFalse;
+        end
+        else Exit(rvUndecided);
+      end;
+    rttLike, rttILike:
+      begin
+        if (n.Col < 0) or (n.Col > High(FOff)) then Exit(rvUndecided);
+        if (FOff[n.Col] < 0) or (FLen[n.Col] = 0) then Exit(rvUnknown);
+        if n.LitNull then Exit(rvUnknown);
+        if FType[n.Col] <> VCT_STR then Exit(rvUndecided);
+        if not VdbBytesAscii(Buf + FOff[n.Col], FLen[n.Col]) then
+          Exit(rvUndecided);
+        if n.Kind = rttILike then
+        begin
+          if FLen[n.Col] * 2 > SizeOf(lbuf) then Exit(rvUndecided);
+          if not VdbTrLowerAsciiTo(Buf + FOff[n.Col], FLen[n.Col],
+               @lbuf[0], outlen) then Exit(rvUndecided);
+          ok := VdbBytesLikeMatch(@lbuf[0], outlen, n.S);
+        end
+        else
+          ok := VdbBytesLikeMatch(Buf + FOff[n.Col], FLen[n.Col], n.S);
+        if ok then Result := rvTrue else Result := rvFalse;
+      end;
+  end;
 end;
 
 { H3: zone kosulu bu bolumde ASLA eslesemez mi? (yalnizca kanit varsa

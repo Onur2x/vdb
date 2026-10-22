@@ -103,6 +103,11 @@ alınmıştır; farklı donanımda değişebilir.
 | `COUNT(*) WHERE ad_soyad LIKE '%a%'` | 0,44–0,45 s | H19 ham kesin; önceki ~2,0 s |
 | `COUNT(*) WHERE ad_soyad ILIKE 'A%'` | 0,44 s | H19 ham kesin |
 | `COUNT(*)` + GUI bileşik filtre (`ILIKE` + şehir + yaş + bakiye) | 0,52–0,53 s | H19 ham kesin; önceki 0,92–0,95 s (ilk 15–20 s) |
+| `COUNT(*) WHERE ad_soyad NOT LIKE '%a%'` | 0,42–0,50 s | H20 ham boolean ağacı; önceki 2,2 s |
+| `COUNT(*) WHERE yas < 25 OR yas > 60` | 0,42 s | H20 ham boolean ağacı; önceki 5,2 s |
+| `COUNT(*) WHERE yas BETWEEN 30 AND 50` | 0,42 s | H20 ham boolean ağacı; önceki 3,9 s |
+| `COUNT(*) WHERE sehir IN ('Ankara','Izmir')` | 0,42–0,44 s | H20 ham boolean ağacı; önceki 1,14 s |
+| `COUNT(*) WHERE sehir='Ankara' AND yas BETWEEN 30 AND 50` | 0,41–0,42 s | H20 ham boolean ağacı; önceki 0,92 s |
 | `COUNT(*) WHERE yas > 40` | 0,39–0,45 s | H18 ham kesin; önceki 2,75 s |
 | `COUNT(*) WHERE aktif = 1` | 0,41–0,44 s | H18 ham kesin; önceki 5,6 s |
 | `COUNT(*) WHERE bakiye > 5000` | 0,39–0,41 s | H18 ham kesin; önceki 5,75 s |
@@ -204,6 +209,20 @@ yoluna girer. UTF-8 kayıt, ASCII dışı desen, tip uyuşmazlığı veya uzun s
 o satır çözme+`EvalBool` yoluna düşer. Böylece `ILIKE '%a%'` 2,8–3,0 s yerine
 0,50–0,56 s, `LIKE '%a%'` ~2,0 s yerine 0,44–0,45 s, GUI bileşik filtre
 0,92–0,95 s yerine 0,52–0,53 s sürer.
+
+H20 ile saf `COUNT(*)` yolunda WHERE artık yalnız AND zinciri değil, **tam
+boolean ağacı** olarak ham baytlardan değerlendirilir. `AND`/`OR`/`NOT` SQL'in üç değerli mantığıyla
+(`TRUE`/`FALSE`/`UNKNOWN`) çözülür; `NOT LIKE`, `NOT IN`, `NOT BETWEEN`,
+`BETWEEN`, `IN`, `IS NULL`/`IS NOT NULL` ve bunların `OR` ile karışımları
+`EvalBool` çağrılmadan sayılır. `IN`, genel yoldaki string eşitliğiyle birebir
+aynı kalsın diye yalnız güvenli aralıktaki `INT` ve ASCII `TEXT` için `=` /
+`OR` yapraklarına açılır; `FLOAT IN` genel yola düşer. `BETWEEN` iki
+karşılaştırmaya açılır; iki sınırdan biri `NULL` ise genel yolun kısa devre
+davranışı korunarak sonuç `UNKNOWN` olur. UTF-8 kayıt/desen, 2^53 dışı `INT`
+veya tip uyuşmazlığında o satır çözme+`EvalBool` yoluna düşer. Böylece
+`NOT LIKE '%a%'` 2,2 s yerine 0,42–0,50 s, `yas < 25 OR yas > 60` 5,2 s
+yerine 0,42 s, `yas BETWEEN 30 AND 50` 3,9 s yerine 0,42 s, `sehir IN (...)`
+1,14 s yerine 0,42–0,44 s sürer.
 
 > `SUM`/`AVG` kayan noktalı sonuçlarda, akışlı toplama sırası nedeniyle
 > genel yola göre son ondalık hanede küçük bir yuvarlama farkı görülebilir;

@@ -14717,6 +14717,119 @@ begin
   end;
 end;
 
+procedure T142_H20_RawBoolTree;
+// H20: ham boolean agaci AND/OR/NOT/BETWEEN/IN/IS NULL ile uc-degerli
+// mantigi tam cozer. Sonuc genel yolla (COUNT(id)) birebir ayni olmalidir.
+var
+  dir: string;
+  db: TVDb;
+  tdb: TVTableDb;
+  q: TVSql;
+  r1, r2: TSqlResult;
+
+  procedure Cmp(const A, B: string);
+  var
+    s1, s2, aa: string;
+  begin
+    r1 := q.Exec(A);
+    r2 := q.Exec(B);
+    aa := A;
+    aa := StringReplace(aa, 'COUNT(*)', 'COUNT(id)', []);
+    if (Length(r1.Rows) > 0) and (Length(r1.Rows[0]) > 0) then
+      s1 := r1.Rows[0][0] else s1 := '<yok>';
+    if (Length(r2.Rows) > 0) and (Length(r2.Rows[0]) > 0) then
+      s2 := r2.Rows[0][0] else s2 := '<yok>';
+    if s1 = s2 then
+      Dogrula('T142 ayni: ' + aa, True, '')
+    else
+      Dogrula('T142 ayni: ' + aa, False, 'ham=' + s1 + ' genel=' + s2);
+  end;
+
+  procedure C(const W: string);
+  begin
+    Cmp('SELECT COUNT(*) FROM p WHERE ' + W,
+        'SELECT COUNT(id) FROM p WHERE ' + W);
+  end;
+
+begin
+  Grp('T142 H20 ham boolean agaci / genel yol farki');
+  dir := D + '\t142_rawtree_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  tdb := TVTableDb.Create(db);
+  try
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      q.Exec('CREATE TABLE p (id INTEGER PRIMARY KEY, i INTEGER, ' +
+        'f FLOAT, s TEXT, b BOOLEAN)');
+      q.Exec('INSERT INTO p (id,i,f,s,b) VALUES ' +
+        '(1,1,1.5,''Ali'',TRUE),' +
+        '(2,2,2.5,''ali'',FALSE),' +
+        '(3,NULL,NULL,NULL,NULL),' +
+        '(4,3,3.5,'''',TRUE),' +
+        '(5,-1,-2.5,''ğ'',FALSE),' +
+        '(6,42,0.0,''a%b'',TRUE),' +
+        '(7,9007199254740993,1000000000000.0,''I'',NULL),' +
+        '(8,9007199254740992,-0.0,''Ayşe'',FALSE)');
+
+      // Saf AND/OR/NOT ve oncelik.
+      C('i = 1 OR i = 2 OR i = 42');
+      C('i = 1 OR i = 2 AND s = ''ali''');
+      C('(i = 1 OR i = 2) AND s <> ''ali''');
+      C('NOT (i = 1 OR i = 2)');
+      C('NOT (i > 0 AND s LIKE ''A%'')');
+      C('i > 0 OR s LIKE ''A%''');
+      C('i > 0 OR s ILIKE ''a%''');
+      C('i > 0 OR s = ''Ali''');
+      C('f > 0.0 OR f < -1.0');
+      C('s LIKE ''A%'' OR i = 42');
+
+      // BETWEEN / NOT BETWEEN, sinir ve NULL.
+      C('i BETWEEN 1 AND 3');
+      C('i NOT BETWEEN 1 AND 3');
+      C('i BETWEEN NULL AND 42');
+      C('i NOT BETWEEN NULL AND 42');
+      C('NOT (i BETWEEN 1 AND 3)');
+      C('f BETWEEN -1.0 AND 2.0');
+
+      // IN / NOT IN, NULL ogeli liste ve 2^53 siniri.
+      C('i IN (1,2,42)');
+      C('i NOT IN (2,3)');
+      C('i IN (42,NULL)');
+      C('i NOT IN (42,NULL)');
+      C('NOT (i IN (1,2))');
+      C('i IN (9007199254740992)');
+      C('i IN (9007199254740993)');
+      C('s IN (''Ali'',''ali'')');
+      C('s IN (''Ali'',NULL)');
+      C('s NOT IN (''Ali'',NULL)');
+
+      // IS NULL / IS NOT NULL ve NULL uc-degerli mantigi.
+      C('s IS NULL');
+      C('s IS NOT NULL');
+      C('NOT (i IS NULL)');
+      C('s IS NOT NULL AND i IS NULL');
+      C('s = '''' OR s IS NULL');
+      C('s <> ''''');
+      C('NOT (s = '''')');
+      C('s = '''' OR i = 1');
+      C('i = 1 OR i IS NULL');
+
+      // Ham yola girmeyen karisik OR: genel yol korunmali.
+      C('s = ''ğ'' OR i = 1');
+      C('b = TRUE OR i = 1');
+      C('s > ''Ali'' OR i = 1');
+    finally
+      q.Free;
+    end;
+  finally
+    tdb.Free;
+    db.Free;
+  end;
+end;
+
 procedure T137_H15_StreamHaving;
 // H15: akisli GROUP BY + HAVING yolu, genel yolla BIREBIR ayni sonucu
 // vermelidir. Genel yol, HAVING'e daima dogru bir ek kosul eklenerek
@@ -15152,6 +15265,7 @@ T92_MVCC_Isoaltion;
        T139_H17_StreamFilteredCount;
        T140_H18_RawExactCount;
        T141_H19_RawLikeCount;
+       T142_H20_RawBoolTree;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls
