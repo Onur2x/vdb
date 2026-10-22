@@ -14370,6 +14370,153 @@ begin
   end;
 end;
 
+procedure T139_H17_StreamFilteredCount;
+// H17: WHERE'li saf COUNT(*) ham akis yolu, genel yolla BIREBIR ayni sonucu
+// vermelidir. Genel yol COUNT(id) ile zorlanir: H17 yalniz COUNT(*) kabul
+// eder, id PK'si NULL olamadigi icin iki sayim ayni olmalidir.
+var
+  dir: string;
+  db: TVDb;
+  tdb: TVTableDb;
+  q: TVSql;
+  r1, r2: TSqlResult;
+
+  procedure Cmp(const A, B: string);
+  var
+    s1, s2: string;
+  begin
+    r1 := q.Exec(A);
+    r2 := q.Exec(B);
+    if (Length(r1.Rows) > 0) and (Length(r1.Rows[0]) > 0) then
+      s1 := r1.Rows[0][0] else s1 := '<yok>';
+    if (Length(r2.Rows) > 0) and (Length(r2.Rows[0]) > 0) then
+      s2 := r2.Rows[0][0] else s2 := '<yok>';
+    if s1 = s2 then
+      Dogrula('T139 ayni: ' + A, True, '')
+    else
+      Dogrula('T139 ayni: ' + A, False, 'akis=' + s1 + ' genel=' + s2);
+  end;
+
+begin
+  Grp('T139 H17 akisli WHERE''li COUNT(*) / genel yol farki');
+  dir := D + '\t139_fcount_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  tdb := TVTableDb.Create(db);
+  try
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      q.Exec('CREATE TABLE d (id INTEGER PRIMARY KEY, s TEXT, n INTEGER, ' +
+        'f FLOAT, b BOOLEAN)');
+      q.Exec('INSERT INTO d (id,s,n,f,b) VALUES ' +
+        '(1,''a'',10,1.5,TRUE),(2,''a'',20,2.5,TRUE),(3,''b'',30,3.5,FALSE),' +
+        '(4,''b'',5,0.5,FALSE),(5,''c'',NULL,NULL,NULL),(6,NULL,7,7.0,TRUE),' +
+        '(7,''a'',20,2.5,NULL),(8,''b'',NULL,1.25,TRUE),(9,'''',99,9.9,FALSE),' +
+        '(10,''ğ'',15,1.0,TRUE),(11,''ağa'',NULL,2.0,FALSE)');
+
+      Cmp('SELECT COUNT(*) FROM d WHERE n > 5',
+          'SELECT COUNT(id) FROM d WHERE n > 5');
+      Cmp('SELECT COUNT(*) FROM d WHERE s = ''a''',
+          'SELECT COUNT(id) FROM d WHERE s = ''a''');
+      Cmp('SELECT COUNT(*) FROM d WHERE s <> ''a''',
+          'SELECT COUNT(id) FROM d WHERE s <> ''a''');
+      Cmp('SELECT COUNT(*) FROM d WHERE s > ''a''',
+          'SELECT COUNT(id) FROM d WHERE s > ''a''');
+      Cmp('SELECT COUNT(*) FROM d WHERE s LIKE ''%a%''',
+          'SELECT COUNT(id) FROM d WHERE s LIKE ''%a%''');
+      Cmp('SELECT COUNT(*) FROM d WHERE s NOT LIKE ''%a%''',
+          'SELECT COUNT(id) FROM d WHERE s NOT LIKE ''%a%''');
+      Cmp('SELECT COUNT(*) FROM d WHERE s ILIKE ''%A%''',
+          'SELECT COUNT(id) FROM d WHERE s ILIKE ''%A%''');
+      Cmp('SELECT COUNT(*) FROM d WHERE s LIKE ''_''',
+          'SELECT COUNT(id) FROM d WHERE s LIKE ''_''');
+      Cmp('SELECT COUNT(*) FROM d WHERE s LIKE ''ğ''',
+          'SELECT COUNT(id) FROM d WHERE s LIKE ''ğ''');
+      Cmp('SELECT COUNT(*) FROM d WHERE s IS NULL',
+          'SELECT COUNT(id) FROM d WHERE s IS NULL');
+      Cmp('SELECT COUNT(*) FROM d WHERE s IS NOT NULL',
+          'SELECT COUNT(id) FROM d WHERE s IS NOT NULL');
+      Cmp('SELECT COUNT(*) FROM d WHERE n IS NULL',
+          'SELECT COUNT(id) FROM d WHERE n IS NULL');
+      Cmp('SELECT COUNT(*) FROM d WHERE n BETWEEN 10 AND 30',
+          'SELECT COUNT(id) FROM d WHERE n BETWEEN 10 AND 30');
+      Cmp('SELECT COUNT(*) FROM d WHERE n NOT BETWEEN 10 AND 30',
+          'SELECT COUNT(id) FROM d WHERE n NOT BETWEEN 10 AND 30');
+      Cmp('SELECT COUNT(*) FROM d WHERE n IN (10,30,99)',
+          'SELECT COUNT(id) FROM d WHERE n IN (10,30,99)');
+      Cmp('SELECT COUNT(*) FROM d WHERE n NOT IN (10,30)',
+          'SELECT COUNT(id) FROM d WHERE n NOT IN (10,30)');
+      Cmp('SELECT COUNT(*) FROM d WHERE s IN (''a'',''b'')',
+          'SELECT COUNT(id) FROM d WHERE s IN (''a'',''b'')');
+      Cmp('SELECT COUNT(*) FROM d WHERE f > 2.0',
+          'SELECT COUNT(id) FROM d WHERE f > 2.0');
+      Cmp('SELECT COUNT(*) FROM d WHERE b = TRUE',
+          'SELECT COUNT(id) FROM d WHERE b = TRUE');
+      Cmp('SELECT COUNT(*) FROM d WHERE b IS NULL',
+          'SELECT COUNT(id) FROM d WHERE b IS NULL');
+      Cmp('SELECT COUNT(*) FROM d WHERE n > 5 AND s <> ''c''',
+          'SELECT COUNT(id) FROM d WHERE n > 5 AND s <> ''c''');
+      Cmp('SELECT COUNT(*) FROM d WHERE n > 20 OR s = ''a''',
+          'SELECT COUNT(id) FROM d WHERE n > 20 OR s = ''a''');
+      Cmp('SELECT COUNT(*) FROM d WHERE NOT (n > 20)',
+          'SELECT COUNT(id) FROM d WHERE NOT (n > 20)');
+      Cmp('SELECT COUNT(*) FROM d WHERE COALESCE(s,''x'') = ''x''',
+          'SELECT COUNT(id) FROM d WHERE COALESCE(s,''x'') = ''x''');
+      Cmp('SELECT COUNT(*) FROM d WHERE UPPER(s) = ''A''',
+          'SELECT COUNT(id) FROM d WHERE UPPER(s) = ''A''');
+      Cmp('SELECT COUNT(*) FROM d WHERE CASE WHEN n > 20 THEN 1 ELSE 0 END = 1',
+          'SELECT COUNT(id) FROM d WHERE CASE WHEN n > 20 THEN 1 ELSE 0 END = 1');
+      Cmp('SELECT COUNT(*) FROM d WHERE 1 = 1',
+          'SELECT COUNT(id) FROM d WHERE 1 = 1');
+      Cmp('SELECT COUNT(*) FROM d WHERE 1 = 0',
+          'SELECT COUNT(id) FROM d WHERE 1 = 0');
+      Cmp('SELECT COUNT(*) FROM d WHERE n > 5 AND (s LIKE ''a%'' OR s = ''c'')',
+          'SELECT COUNT(id) FROM d WHERE n > 5 AND (s LIKE ''a%'' OR s = ''c'')');
+      Cmp('SELECT COUNT(*) FROM d WHERE n IN (SELECT n FROM d WHERE n > 20)',
+          'SELECT COUNT(id) FROM d WHERE n IN (SELECT n FROM d WHERE n > 20)');
+      Cmp('SELECT COUNT(*) FROM d WHERE EXISTS (SELECT id FROM d WHERE n = 99)',
+          'SELECT COUNT(id) FROM d WHERE EXISTS (SELECT id FROM d WHERE n = 99)');
+      Cmp('SELECT COUNT(*) FROM d WHERE n > 5 LIMIT 1',
+          'SELECT COUNT(id) FROM d WHERE n > 5 LIMIT 1');
+      Cmp('SELECT COUNT(*) AS c FROM d WHERE n > 5',
+          'SELECT COUNT(id) FROM d WHERE n > 5');
+      r1 := q.Exec('SELECT COUNT(*) AS c FROM d WHERE n > 5');
+      if (Length(r1.Fields) = 1) and (r1.Fields[0] = 'c') and
+         (Length(r1.Rows) = 1) and (r1.Rows[0][0] = '7') then
+        Dogrula('T139 alias/alan adi', True, '')
+      else if Length(r1.Fields) > 0 then
+        Dogrula('T139 alias/alan adi', False, r1.Fields[0])
+      else
+        Dogrula('T139 alias/alan adi', False, 'alan yok');
+      // Pending batch gorunurlugu: akisli tarama bekleyen satirlari da gormeli.
+      db.BeginBatch;
+      try
+        q.Exec('INSERT INTO d (id,s,n,f,b) VALUES (12,''z'',50,1.0,TRUE)');
+        Cmp('SELECT COUNT(*) FROM d WHERE n > 5',
+            'SELECT COUNT(id) FROM d WHERE n > 5');
+        Cmp('SELECT COUNT(*) FROM d WHERE s LIKE ''z%''',
+            'SELECT COUNT(id) FROM d WHERE s LIKE ''z%''');
+      finally
+        db.AbortBatch;
+      end;
+      // Guncelleme/silme sonrasi akisli tarama guncel veriyi gormeli.
+      q.Exec('UPDATE d SET n = 60 WHERE id = 1');
+      q.Exec('DELETE FROM d WHERE id = 2');
+      Cmp('SELECT COUNT(*) FROM d WHERE n > 5',
+          'SELECT COUNT(id) FROM d WHERE n > 5');
+      Cmp('SELECT COUNT(*) FROM d WHERE s = ''a''',
+          'SELECT COUNT(id) FROM d WHERE s = ''a''');
+    finally
+      q.Free;
+    end;
+  finally
+    tdb.Free;
+    db.Free;
+  end;
+end;
+
 procedure T137_H15_StreamHaving;
 // H15: akisli GROUP BY + HAVING yolu, genel yolla BIREBIR ayni sonucu
 // vermelidir. Genel yol, HAVING'e daima dogru bir ek kosul eklenerek
@@ -14802,6 +14949,7 @@ T92_MVCC_Isoaltion;
        T136_H13_GroupDiff;
        T137_H15_StreamHaving;
        T138_H16_StreamDistinct;
+       T139_H17_StreamFilteredCount;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls

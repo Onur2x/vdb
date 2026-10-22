@@ -100,6 +100,11 @@ alınmıştır; farklı donanımda değişebilir.
 | `SELECT DISTINCT yas … ORDER BY yas` | 0,48 s | H16 tek pass; önceki 4,6 s |
 | `SELECT DISTINCT id … ORDER BY id` | 1,63 s | H16 tek pass; önceki 5,5 s |
 | Şehir + yaş `COUNT(*)` | 0,83–0,98 s | sıcak indeks |
+| `COUNT(*) WHERE ad_soyad ILIKE '%a%'` | 2,8–3,0 s | H17 tek pass; önceki 6,2 s |
+| `COUNT(*)` + GUI bileşik filtre (`ILIKE` + şehir + yaş + bakiye) | 0,88 s | H17 + ham ön eleme; önceki 15–20 s |
+| `COUNT(*) WHERE sehir='Ankara' AND yas 30..50` | 0,64 s | H17 + ham ön eleme; önceki 7,9 s |
+| `COUNT(*) WHERE aktif=0` | 1,4 s | H17; önceki 5,6 s |
+| `COUNT(*) WHERE yas 30..50 AND bakiye>=1000` | 3,4–3,5 s | H17; seçici olmayan filtre, önceki 9,5–9,9 s |
 
 ## Sorgu hızı nasıl iyileştirildi?
 
@@ -162,6 +167,17 @@ satır yine `RowMatches` ile doğrulanır. Şifreli kolonlarda değer çözüler
 tekilleştirilir; BOOL sıralaması ise genel yoldaki mevcut davranışı korumak
 için akışlı yola alınmaz.
 
+H17 ile tek tablolu saf `COUNT(*)` sorguları `WHERE` ile birlikte ham akıştan
+tek pass'te sayılır. Motor tüm satırları string matrisine çevirmez; yalnız
+`WHERE`'in referans verdiği kolonları çözer. `AND` ile bağlanan basit sayısal
+karşılaştırmalar ve ASCII metin eşitliği ham baytlarda ön elenir; kalan adaylar
+tam `EvalBool` ile doğrulanır. Böylece `COUNT(*) WHERE ad_soyad ILIKE '%a%'`
+6,2 s yerine 2,8–3,0 s, GUI'nin bileşik filtre sayımı 15–20 s yerine yaklaşık
+0,88 s sürer. Alt sorgu, pencere, aggregate, `TS_MATCH`, JOIN, `GROUP BY`,
+`DISTINCT`, `ORDER BY`, `LIMIT/OFFSET`, VIEW ve RLS içeren sorgular genel yola
+düşer. Ayrıca indeksli sayım yolu (H3) artık farklı kolon/OR/IN/LIKE içeren
+`WHERE` için indeks kurmaya çalışmadan H17'ye devreder.
+
 > `SUM`/`AVG` kayan noktalı sonuçlarda, akışlı toplama sırası nedeniyle
 > genel yola göre son ondalık hanede küçük bir yuvarlama farkı görülebilir;
 > bu davranış H6/H12 akışlı toplamalarıyla aynıdır. `COUNT`, `MIN`, `MAX`
@@ -179,5 +195,7 @@ ORDER BY id;
 
 Şehir filtresi `WHERE sehir = ...` için ham ön eleme kullanılabilir;
 filtre sonucu küçük `LIMIT`li bir sıralamaya giriyorsa akışlı top-N devreye
-girer. Basit `GROUP BY` sorguları H13 ile tek pass'te tamamlanır; `ILIKE` ve
-indekssiz tam tarama gerektiren işlemler doğası gereği tüm tabloyu okur.
+girer. Basit `GROUP BY` sorguları H13 ile tek pass'te, `WHERE`'li saf
+`COUNT(*)` sorguları H17 ile tek pass'te tamamlanır; `ILIKE` ve indekssiz tam
+tarama gerektiren işlemler doğası gereği tüm tabloyu okur, ancak H17 bu
+durumda da satır matrisi kurmaz.

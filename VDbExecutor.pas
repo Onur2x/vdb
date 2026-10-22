@@ -395,6 +395,13 @@ type
     function TryIndexCount(const Td: TTableDef; Stmt: TSqlSelectStmt;
       const ColNames: TStrArray; const ColTypes: TByteArray;
       out Cnt: Int64): Boolean;
+    { H17: Saf COUNT(*) + WHERE -> ham akistan tek pass. WHERE'in
+      referans verdigi kolonlar satir basina yalniz bir kez cozulur; tum
+      satir matrisi kurulmaz. Alt sorgu/pencere/aggregate iceren WHERE
+      genel yola birakilir. Sekil uymazsa False. }
+    function TryStreamFilteredCount(Stmt: TSqlSelectStmt;
+      const td: TTableDef; const ColNames: TStrArray;
+      const ColTypes: TByteArray; out Res: TSqlResult): Boolean;
     { R-13 Full: WHERE'den bolme hedef kumesini cikarir (partition
       pruning). Guvenlik: yalniz AND'lenen ve anlasilabilen kosullar
       (bolme kolonunda '=' ya da IN, literal degerlerle) katki verir;
@@ -4153,6 +4160,44 @@ var
   pks: TStrArray;
   rows: TStrMatrix;
   exact: Boolean;
+  oneCol: Integer;
+
+  { H17: H3'un yalnizca TEK kolonlu WHERE'de kesin sayabildigini onceden
+    anlar. Farkli kolon/OR/IN/LIKE varsa indeks kurmaya (pahali) girmeden
+    False doner; cagri H17 ham akis yoluna duser. }
+  function SameColCond(E: TSqlExprNode; var ACol: Integer): Boolean;
+  var
+    b: TSqlBinaryOpNode;
+    cr: TSqlColumnRefNode;
+    ci2: Integer;
+  begin
+    Result := False;
+    if E = nil then Exit(False);
+    if E is TSqlBinaryOpNode then
+    begin
+      b := TSqlBinaryOpNode(E);
+      if b.Op = sboAnd then
+        Exit(SameColCond(b.Left, ACol) and SameColCond(b.Right, ACol));
+      if not (b.Op in [sboEq, sboNeq, sboLt, sboLte, sboGt, sboGte]) then Exit;
+      if (b.Left is TSqlColumnRefNode) and (b.Right is TSqlLiteralNode) then
+        cr := TSqlColumnRefNode(b.Left)
+      else if (b.Right is TSqlColumnRefNode) and (b.Left is TSqlLiteralNode) then
+        cr := TSqlColumnRefNode(b.Right)
+      else Exit;
+    end
+    else if (E is TSqlBetweenNode) and (not TSqlBetweenNode(E).IsNot) and
+            (TSqlBetweenNode(E).Expr is TSqlColumnRefNode) and
+            (TSqlBetweenNode(E).LowBound is TSqlLiteralNode) and
+            (TSqlBetweenNode(E).HighBound is TSqlLiteralNode) then
+      cr := TSqlColumnRefNode(TSqlBetweenNode(E).Expr)
+    else Exit;
+    ci2 := FindColIdx(cr.ColumnName, cr.TableQualifier, ColNames);
+    if (ci2 < 0) or (ci2 > High(Td.Cols)) then Exit;
+    if ACol < 0 then ACol := ci2
+    else if ci2 <> ACol then Exit;
+    Result := True;
+  end;
+
 begin
   Result := False;
   Cnt := 0;
@@ -4175,6 +4220,8 @@ begin
   if (Stmt.LimitVal >= 0) or (Stmt.OffsetVal <> 0) then Exit;
   if Td.IsView then Exit;
   if FT.RlsApplies(Stmt.FromTable) then Exit;
+  oneCol := -1;
+  if not SameColCond(Stmt.WhereClause, oneCol) then Exit;
   FCountOnly := True;
   try
     if not NarrowRows(Td, Stmt.WhereClause, ColNames, ColTypes,
@@ -4185,6 +4232,234 @@ begin
   finally
     FCountOnly := False;
   end;
+end;
+
+type
+  { Ham WHERE on-elemesi (H13/H1/H12b ile ayni kayit; yalniz "kesinlikle
+    uymuyor" satiri eler, aday yine tam WHERE ile dogrulanir). }
+  TRawCond = record
+    Col: Integer;
+    Op: TSqlBinaryOp;
+    IsFloat: Boolean;
+    IsText: Boolean;
+    IsIn: Boolean;
+    InIsFloat: Boolean;
+    InInts: array of Int64;
+    InFloats: array of Double;
+    I: Int64;
+    F: Double;
+    S: string;
+  end;
+
+  TRawCondArray = array of TRawCond;
+
+  { H17: WHERE'li saf COUNT(*) icin ham akis baglami. }
+  TStreamCountCtx = record
+    Exec: TVSqlExecutor;
+    TableId: Word;
+    HashPrefix: QWord;
+    ColCnt: Integer;
+    FType: TByteArray;
+    FOff, FLen: TIntArray;
+    ColNames: TStrArray;
+    ColTypes: TByteArray;
+    Where: TSqlExprNode;
+    RawConds: TRawCondArray;
+    NeedIdx: TIntArray;
+    MaxCol: Integer;
+    Vals: TStrArray;
+    Count: Int64;
+    Failed: Boolean;
+  end;
+  PStreamCountCtx = ^TStreamCountCtx;
+
+function VdbStreamSelRawPass(const Conds: array of TRawCond;
+  Buf: PByte; const FType: TByteArray; const FOff, FLen: TIntArray): Boolean; forward;
+procedure VdbStreamOrderAddRawCond(var Conds: TRawCondArray;
+  Exec: TVSqlExecutor; E: TSqlExprNode; const td: TTableDef;
+  const ColNames: TStrArray; const ColTypes: TByteArray); forward;
+
+function VdbStreamCountCb(Key: QWord; Buf: PByte; Len: Integer;
+  User: Pointer): Boolean;
+var
+  C: PStreamCountCtx;
+  tid: Word;
+  kh: QWord;
+  i: Integer;
+begin
+  C := User;
+  Result := True;
+  if Key = VDB_SCHEMA_KEY then Exit;
+  if not VDbPeekRawRowKeyHashTo(Buf, Len, C^.ColCnt, tid, C^.HashPrefix,
+       kh, C^.MaxCol, C^.FType, C^.FOff, C^.FLen) then
+  begin
+    C^.Failed := True; Exit(False);
+  end;
+  if tid <> C^.TableId then Exit;
+  if kh <> Key then
+  begin
+    C^.Failed := True; Exit(False);
+  end;
+  // H17: basit AND kosullarinda satiri cozmeden kesin eleme.
+  if (Length(C^.RawConds) > 0) and
+     (not VdbStreamSelRawPass(C^.RawConds, Buf, C^.FType,
+        C^.FOff, C^.FLen)) then Exit;
+  for i := 0 to High(C^.NeedIdx) do
+    C^.Vals[C^.NeedIdx[i]] := VDbColFromOffsetsP(Buf, C^.ColCnt,
+      C^.NeedIdx[i], C^.FType, C^.FOff, C^.FLen);
+  if C^.Exec.EvalBool(C^.Where, C^.Vals, C^.ColNames, C^.ColTypes) then
+    Inc(C^.Count);
+end;
+
+function TVSqlExecutor.TryStreamFilteredCount(Stmt: TSqlSelectStmt;
+  const td: TTableDef; const ColNames: TStrArray;
+  const ColTypes: TByteArray; out Res: TSqlResult): Boolean;
+var
+  fn: TSqlFuncCallNode;
+  need: array of Boolean;
+  ctx: TStreamCountCtx;
+  i, maxCol: Integer;
+
+  { WHERE'in referans verdigi kolonlari toplar. Alt sorgu, pencere ve
+    aggregate dugumlerinde False doner: bunlar genel yolda kalir. }
+  function Walk(E: TSqlExprNode): Boolean;
+  var
+    q: Integer;
+  begin
+    Result := False;
+    if E = nil then Exit(True);
+    if E is TSqlLiteralNode then Exit(True);
+    if E is TSqlColumnRefNode then
+    begin
+      q := FindColIdx(TSqlColumnRefNode(E).ColumnName,
+                      TSqlColumnRefNode(E).TableQualifier, ColNames);
+      if (q < 0) or (q > High(need)) then Exit(False);
+      need[q] := True;
+      Exit(True);
+    end;
+    if E is TSqlBinaryOpNode then
+      Exit(Walk(TSqlBinaryOpNode(E).Left) and
+           Walk(TSqlBinaryOpNode(E).Right));
+    if E is TSqlUnaryOpNode then
+      Exit(Walk(TSqlUnaryOpNode(E).Operand));
+    if E is TSqlCastNode then
+      Exit(Walk(TSqlCastNode(E).Expr));
+    if E is TSqlCollateNode then
+      Exit(Walk(TSqlCollateNode(E).Inner));
+    if E is TSqlNullIfNode then
+      Exit(Walk(TSqlNullIfNode(E).Arg1) and Walk(TSqlNullIfNode(E).Arg2));
+    if E is TSqlCoalesceNode then
+    begin
+      for q := 0 to TSqlCoalesceNode(E).Args.Count - 1 do
+        if not Walk(TSqlCoalesceNode(E).Args[q]) then Exit(False);
+      Exit(True);
+    end;
+    if E is TSqlFuncCallNode then
+    begin
+      // FTS eslesmesi tablo baglamina baglidir; genel yolda kalsin.
+      if SameText(TSqlFuncCallNode(E).FuncName, 'TS_MATCH') then Exit(False);
+      // WHERE icinde aggregate gecersizdir; hata genel yolda uretilsin.
+      if IsAggFuncName(TSqlFuncCallNode(E).FuncName) then Exit(False);
+      if not Walk(TSqlFuncCallNode(E).Arg) then Exit(False);
+      if not Walk(TSqlFuncCallNode(E).Filter) then Exit(False);
+      if TSqlFuncCallNode(E).Args <> nil then
+        for q := 0 to TSqlFuncCallNode(E).Args.Count - 1 do
+          if not Walk(TSqlFuncCallNode(E).Args[q]) then Exit(False);
+      Exit(True);
+    end;
+    if E is TSqlInNode then
+    begin
+      if TSqlInNode(E).SubSelect <> nil then Exit(False);
+      if not Walk(TSqlInNode(E).Expr) then Exit(False);
+      for q := 0 to TSqlInNode(E).List.Count - 1 do
+        if not Walk(TSqlInNode(E).List[q]) then Exit(False);
+      Exit(True);
+    end;
+    if E is TSqlBetweenNode then
+      Exit(Walk(TSqlBetweenNode(E).Expr) and
+           Walk(TSqlBetweenNode(E).LowBound) and
+           Walk(TSqlBetweenNode(E).HighBound));
+    if E is TSqlCaseNode then
+    begin
+      if not Walk(TSqlCaseNode(E).Operand) then Exit(False);
+      for q := 0 to TSqlCaseNode(E).Whens.Count - 1 do
+        if (not Walk(TSqlCaseNode(E).Whens[q].Cond)) or
+           (not Walk(TSqlCaseNode(E).Whens[q].Value)) then Exit(False);
+      Exit(Walk(TSqlCaseNode(E).ElseExpr));
+    end;
+    if E is TSqlJsonKeyNode then
+    begin
+      if not Walk(TSqlJsonKeyNode(E).Left) then Exit(False);
+      for q := 0 to TSqlJsonKeyNode(E).Keys.Count - 1 do
+        if not Walk(TSqlJsonKeyNode(E).Keys[q]) then Exit(False);
+      Exit(True);
+    end;
+    // TSqlSubqueryNode / TSqlQuantNode / TSqlAggNode / TSqlWindowNode /
+    // bilinmeyen dugum: genel yol.
+  end;
+
+begin
+  Result := False;
+  if Stmt.WhereClause = nil then Exit;
+  if Stmt.Columns.Count <> 1 then Exit;
+  if not (Stmt.Columns[0].Expr is TSqlFuncCallNode) then Exit;
+  fn := TSqlFuncCallNode(Stmt.Columns[0].Expr);
+  if (fn.FuncName <> 'COUNT') or (not fn.IsStar) or
+     fn.IsDistinct or (fn.Filter <> nil) then Exit;
+  if Stmt.FromTable = '' then Exit;
+  if Stmt.HasJoin or (Stmt.SetOp <> sokNone) or (Stmt.RightSelect <> nil) then Exit;
+  if Stmt.AsOf <> saoNone then Exit;
+  if Stmt.WithQueries.Count > 0 then Exit;
+  if Stmt.IsDistinct then Exit;
+  if Stmt.GroupByCols.Count > 0 then Exit;
+  if Stmt.HavingClause <> nil then Exit;
+  if Stmt.QualifyClause <> nil then Exit;
+  if HasWindow(Stmt) then Exit;
+  if (Stmt.OrderBy <> nil) and (Stmt.OrderBy.Count > 0) then Exit;
+  if (Stmt.LimitVal >= 0) or (Stmt.OffsetVal <> 0) then Exit;
+  if td.IsView then Exit;
+  if FT.RlsApplies(Stmt.FromTable) then Exit;
+  SetLength(need, Length(td.Cols));
+  if not Walk(Stmt.WhereClause) then Exit;
+  ctx := Default(TStreamCountCtx);
+  maxCol := -1;
+  for i := 0 to High(need) do
+    if need[i] then
+    begin
+      SetLength(ctx.NeedIdx, Length(ctx.NeedIdx) + 1);
+      ctx.NeedIdx[High(ctx.NeedIdx)] := i;
+      if i > maxCol then maxCol := i;
+    end;
+  ctx.Exec := Self;
+  ctx.TableId := td.TableId;
+  ctx.HashPrefix := VDbHashKeyPrefix(td.Name);
+  ctx.ColCnt := Length(td.Cols);
+  SetLength(ctx.FType, ctx.ColCnt);
+  SetLength(ctx.FOff, ctx.ColCnt);
+  SetLength(ctx.FLen, ctx.ColCnt);
+  SetLength(ctx.Vals, ctx.ColCnt);
+  ctx.ColNames := ColNames;
+  ctx.ColTypes := ColTypes;
+  ctx.Where := Stmt.WhereClause;
+  ctx.RawConds := nil;
+  VdbStreamOrderAddRawCond(ctx.RawConds, Self, Stmt.WhereClause, td,
+    ColNames, ColTypes);
+  ctx.MaxCol := maxCol;
+  ctx.Count := 0;
+  ctx.Failed := False;
+  if not FT.Kv.ScanRawIterAll(td.TableId, VdbStreamCountCb, @ctx) then Exit;
+  if ctx.Failed then Exit;
+  SetLength(Res.Fields, 1);
+  if Stmt.Columns[0].Alias <> '' then Res.Fields[0] := Stmt.Columns[0].Alias
+  else Res.Fields[0] := fn.FuncName;
+  SetLength(Res.FieldTypes, 1);
+  Res.FieldTypes[0] := VCT_INT;
+  SetLength(Res.Rows, 1);
+  SetLength(Res.Rows[0], 1);
+  Res.Rows[0][0] := IntToStr(ctx.Count);
+  Res.Affected := 1;
+  Res.Msg := 'OK';
+  Result := True;
 end;
 
 function TVSqlExecutor.TryIndexOrder(const Td: TTableDef; Stmt: TSqlSelectStmt;
@@ -7146,24 +7421,6 @@ end;
   ile dogrulanir. ORDER BY/OFFSET/LIMIT cagiran tarafta FinishGroup'ta
   uygulanir. Sekil uymazsa False -> ExecGroupBy AYNEN calisir. }
 type
-  { Ham WHERE on-elemesi (H1/H12b ile ayni kayit; yalniz "kesinlikle
-    uymuyor" satiri eler, aday yine RowMatches ile dogrulanir). }
-  TRawCond = record
-    Col: Integer;
-    Op: TSqlBinaryOp;
-    IsFloat: Boolean;
-    IsText: Boolean;
-    IsIn: Boolean;
-    InIsFloat: Boolean;
-    InInts: array of Int64;
-    InFloats: array of Double;
-    I: Int64;
-    F: Double;
-    S: string;
-  end;
-
-  TRawCondArray = array of TRawCond;
-
   TStreamGroupState = record
     Key: TStrArray;
     Plans: array of TAggPlan;
@@ -7190,8 +7447,6 @@ type
   end;
   PStreamGroupCtx = ^TStreamGroupCtx;
 
-function VdbStreamSelRawPass(const Conds: array of TRawCond;
-  Buf: PByte; const FType: TByteArray; const FOff, FLen: TIntArray): Boolean; forward;
 function VdbStrPureAscii(const S: string): Boolean; forward;
 
 function VdbStreamGroupCb(Key: QWord; Buf: PByte; Len: Integer;
@@ -10705,6 +10960,10 @@ begin
           Res.Msg := 'OK';
           Exit;
         end;
+        // H17: WHERE'li saf COUNT(*) -> ham akistan, yalniz WHERE'in
+        // referans verdigi kolonlari cozerek tek pass.
+        if TryStreamFilteredCount(Stmt, td, colNames, colTypes, Res) then
+          Exit;
         // YOL 1 (en hizli): ORDER BY tek kolon ve o kolon indeksliyse satirlar
       // INDEKS sirasiyla okunur; OFFSET/LIMIT satir okunurken uygulanir.
       // F1-12: Eger SetOp varsa (UNION/EXCEPT/INTERSECT), ORDER BY/LIMIT/OFFSET
