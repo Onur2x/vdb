@@ -14726,6 +14726,8 @@ var
   tdb: TVTableDb;
   q: TVSql;
   r1, r2: TSqlResult;
+  longInts, longStrs, longFloats: string;
+  k: Integer;
 
   procedure Cmp(const A, B: string);
   var
@@ -14794,7 +14796,24 @@ begin
       C('NOT (i BETWEEN 1 AND 3)');
       C('f BETWEEN -1.0 AND 2.0');
 
+      // H23: uzun IN listeleri (dengeli OR agaci) ve FLOAT IN.
+      longInts := '1';
+      for k := 2 to 2000 do longInts := longInts + ',' + IntToStr(k);
+      longStrs := '''s0''';
+      for k := 1 to 200 do longStrs := longStrs + ',''s' + IntToStr(k) + '''';
+      longFloats := '1.5';
+      for k := 1 to 200 do longFloats := longFloats + ',' +
+        IntToStr(k) + '.5';
+      C('i IN (' + longInts + ')');
+      C('i NOT IN (' + longInts + ')');
+      C('f IN (' + longFloats + ')');
+      C('f NOT IN (' + longFloats + ',NULL)');
+      C('s IN (' + longStrs + ')');
+      C('s NOT IN (' + longStrs + ',NULL)');
+
       // IN / NOT IN, NULL ogeli liste ve 2^53 siniri.
+      C('f IN (1.5,2.5,-2.5)');
+      C('f NOT IN (1.5,NULL)');
       C('i IN (1,2,42)');
       C('i NOT IN (2,3)');
       C('i IN (42,NULL)');
@@ -14821,6 +14840,217 @@ begin
       C('s = ''ğ'' OR i = 1');
       C('b = TRUE OR i = 1');
       C('s > ''Ali'' OR i = 1');
+    finally
+      q.Free;
+    end;
+  finally
+    tdb.Free;
+    db.Free;
+  end;
+end;
+
+procedure T143_H21_RawTreeSelectPaths;
+// H21: H20 boolean agaci yalniz COUNT(*) yolunda degil; akisli SELECT,
+// tek/cok kolon ORDER BY ... LIMIT, GROUP BY ve DISTINCT yollarinda da
+// on-eleme olarak kullanilir. Sonuc, genel yol ile birebir ayni olmalidir.
+var
+  dir: string;
+  db: TVDb;
+  tdb: TVTableDb;
+  q: TVSql;
+  r1, r2: TSqlResult;
+
+  function RowSet(const R: TSqlResult): string;
+  var
+    k, m: Integer;
+    s: string;
+    a: array of string;
+    tmp: string;
+  begin
+    SetLength(a, Length(R.Rows));
+    for k := 0 to High(R.Rows) do
+    begin
+      s := '';
+      for m := 0 to High(R.Rows[k]) do
+        s := s + IntToStr(Length(R.Rows[k][m])) + ':' + R.Rows[k][m] + '|';
+      a[k] := s;
+    end;
+    // Kucuk test kumeleri: basit kabarcik siralamasi yeterli.
+    for k := 0 to High(a) do
+      for m := k + 1 to High(a) do
+        if a[m] < a[k] then
+        begin tmp := a[k]; a[k] := a[m]; a[m] := tmp; end;
+    Result := '';
+    for k := 0 to High(a) do Result := Result + a[k];
+  end;
+
+  procedure Cmp(const A, B, Etiket: string);
+  var
+    s1, s2: string;
+  begin
+    r1 := q.Exec(A);
+    r2 := q.Exec(B);
+    s1 := RowSet(r1);
+    s2 := RowSet(r2);
+    if s1 = s2 then
+      Dogrula('T143 ayni: ' + Etiket, True, '')
+    else
+      Dogrula('T143 ayni: ' + Etiket, False,
+        'akisli=' + s1 + ' genel=' + s2);
+  end;
+
+  procedure C(const W: string);
+  begin
+    // H1 akisli SELECT (filtre + erken projeksiyon).
+    Cmp('SELECT id,i,s FROM p WHERE ' + W,
+        'SELECT id,i,s FROM p WHERE ' + W + ' ORDER BY id+0',
+        'H1 ' + W);
+    // H12b tek kolon top-N.
+    Cmp('SELECT id,i FROM p WHERE (' + W + ') AND i < 1000 ORDER BY i LIMIT 5',
+        'SELECT id,i FROM p WHERE (' + W + ') AND i < 1000 ORDER BY i+0 LIMIT 5',
+        'H12b ' + W);
+    // H12c cok kolon top-N.
+    Cmp('SELECT id,i FROM p WHERE (' + W + ') AND i < 1000 ORDER BY i, id LIMIT 5',
+        'SELECT id,i FROM p WHERE (' + W + ') AND i < 1000 ORDER BY i+0, id LIMIT 5',
+        'H12c ' + W);
+    // H13 akisli GROUP BY (HAVING DISTINCT genel yola zorlar, sonucu degistirmez).
+    Cmp('SELECT s, COUNT(*) AS n FROM p WHERE ' + W + ' GROUP BY s',
+        'SELECT s, COUNT(*) AS n FROM p WHERE ' + W +
+        ' GROUP BY s HAVING COUNT(DISTINCT s) >= 0',
+        'H13 ' + W);
+    // H16 akisli DISTINCT (COLLATE'li ORDER BY genel yola zorlar).
+    Cmp('SELECT DISTINCT s FROM p WHERE ' + W,
+        'SELECT DISTINCT s FROM p WHERE ' + W + ' ORDER BY s COLLATE TR',
+        'H16 ' + W);
+  end;
+
+begin
+  Grp('T143 H21 ham boolean agaci / SELECT yollari');
+  dir := D + '\t143_rawtree_sel_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  tdb := TVTableDb.Create(db);
+  try
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      q.Exec('CREATE TABLE p (id INTEGER PRIMARY KEY, i INTEGER, ' +
+        'f FLOAT, s TEXT, b BOOLEAN)');
+      q.Exec('INSERT INTO p (id,i,f,s,b) VALUES ' +
+        '(1,1,1.5,''Ali'',TRUE),' +
+        '(2,2,2.5,''ali'',FALSE),' +
+        '(3,NULL,NULL,NULL,NULL),' +
+        '(4,3,3.5,'''',TRUE),' +
+        '(5,-1,-2.5,''ğ'',FALSE),' +
+        '(6,42,0.0,''a%b'',TRUE),' +
+        '(7,9007199254740993,1000000000000.0,''I'',NULL),' +
+        '(8,9007199254740992,-0.0,''Ayşe'',FALSE)');
+
+      C('i = 1 OR i = 2 OR i = 42');
+      C('NOT (i > 0 AND s LIKE ''A%'')');
+      C('i BETWEEN 1 AND 3 OR s = ''ğ''');
+      C('i NOT BETWEEN 1 AND 3');
+      C('i IN (1,2,42)');
+      C('s IN (''Ali'',''ali'')');
+      C('s IS NULL OR i = 1');
+      C('s IS NOT NULL AND i IS NULL');
+      C('f > 0.0 OR f < -1.0');
+      C('s LIKE ''A%'' OR i = 42');
+    finally
+      q.Free;
+    end;
+  finally
+    tdb.Free;
+    db.Free;
+  end;
+end;
+
+procedure T144_H22_DeepOffsetLive;
+// H22: ikincil indekste WHERE'siz derin OFFSET, satirlari tam cozmeden
+// atlanir. Silinmis satirlarin olu indeks girdileri OFFSET sayimini
+// bozmamali; sonuc eski (WHERE'li) indeks yoluyla birebir ayni olmali.
+var
+  dir: string;
+  db: TVDb;
+  tdb: TVTableDb;
+  q: TVSql;
+  i: Integer;
+  delSql: string;
+
+  function Ids(const R: TSqlResult): string;
+  var
+    k: Integer;
+  begin
+    Result := '';
+    for k := 0 to High(R.Rows) do
+      Result := Result + R.Rows[k][0] + ',';
+  end;
+
+  procedure Cmp(const A, B, Etiket: string);
+  var
+    r1, r2: TSqlResult;
+    s1, s2: string;
+  begin
+    r1 := q.Exec(A);
+    r2 := q.Exec(B);
+    s1 := Ids(r1);
+    s2 := Ids(r2);
+    if s1 = s2 then
+      Dogrula('T144 ayni: ' + Etiket, True, '')
+    else
+      Dogrula('T144 ayni: ' + Etiket, False,
+        'yeni=' + s1 + ' eski=' + s2);
+  end;
+
+  procedure C(const Ord, Off: string);
+  begin
+    Cmp('SELECT id FROM p ORDER BY g ' + Ord + ' LIMIT 5 OFFSET ' + Off,
+        'SELECT id FROM p WHERE id >= 0 ORDER BY g ' + Ord +
+        ' LIMIT 5 OFFSET ' + Off,
+        Ord + ' OFFSET ' + Off);
+  end;
+
+begin
+  Grp('T144 H22 derin OFFSET canlilik denetimi');
+  dir := D + '\t144_offset_live_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  tdb := TVTableDb.Create(db);
+  try
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      q.Exec('CREATE TABLE p (id INTEGER PRIMARY KEY, g TEXT, n INTEGER)');
+      q.Exec('BEGIN');
+      for i := 1 to 12000 do
+        q.Exec(Format('INSERT INTO p (id,g,n) VALUES (%d,%s,%d)',
+          [i, QuotedStr(Format('g%.2d', [i mod 20])), i]));
+      q.Exec('COMMIT');
+      q.Exec('CREATE INDEX ix_p_g ON p (g)');
+      // Derin OFFSET bolgesinde olu indeks girdileri olustur. Tek DELETE
+      // cumlesi kullanilir; 400+ ayri Exec testi yavaslatirdi.
+      delSql := 'DELETE FROM p WHERE id IN (';
+      for i := 9000 to 12000 do
+        if i mod 7 = 3 then
+          delSql := delSql + IntToStr(i) + ',';
+      delSql[Length(delSql)] := ')';
+      q.Exec(delSql);
+
+      // LIMIT+OFFSET > 10000: H12b yerine indeks sirasi yolu kullanilir.
+      C('ASC', '10001');
+      C('ASC', '10050');
+      C('ASC', '10200');
+      C('ASC', '10500');
+      C('ASC', '11000');
+      C('ASC', '11400');
+      C('DESC', '10001');
+      C('DESC', '10050');
+      C('DESC', '10200');
+      C('DESC', '10500');
+      C('DESC', '11000');
+      C('DESC', '11400');
     finally
       q.Free;
     end;
@@ -15266,6 +15496,8 @@ T92_MVCC_Isoaltion;
        T140_H18_RawExactCount;
        T141_H19_RawLikeCount;
        T142_H20_RawBoolTree;
+       T143_H21_RawTreeSelectPaths;
+       T144_H22_DeepOffsetLive;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls

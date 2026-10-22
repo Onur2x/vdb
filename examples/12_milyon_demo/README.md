@@ -108,6 +108,18 @@ alınmıştır; farklı donanımda değişebilir.
 | `COUNT(*) WHERE yas BETWEEN 30 AND 50` | 0,42 s | H20 ham boolean ağacı; önceki 3,9 s |
 | `COUNT(*) WHERE sehir IN ('Ankara','Izmir')` | 0,42–0,44 s | H20 ham boolean ağacı; önceki 1,14 s |
 | `COUNT(*) WHERE sehir='Ankara' AND yas BETWEEN 30 AND 50` | 0,41–0,42 s | H20 ham boolean ağacı; önceki 0,92 s |
+| `WHERE yas < 25 OR yas > 60 ORDER BY yas DESC LIMIT 100` | 0,47–0,59 s | H21 ham ağaç + top-N; önceki 8,7–10,5 s |
+| `WHERE NOT (yas BETWEEN 30 AND 50) ORDER BY yas DESC LIMIT 100` | 0,48–0,53 s | H21; önceki 6,8–8,9 s |
+| `WHERE sehir IN ('Ankara','Izmir') ORDER BY yas DESC LIMIT 100` | 0,47–0,52 s | H21; önceki 3,3–4,2 s |
+| `WHERE (yas BETWEEN 30 AND 50) OR bakiye > 9000 ORDER BY yas DESC, id ASC LIMIT 100` | 0,52–0,59 s | H21; önceki 9,8–11,5 s |
+| `WHERE yas < 25 OR yas > 60 GROUP BY sehir` | 0,61–0,66 s | H21 + H13; önceki 8,3–9,7 s |
+| `WHERE NOT (yas BETWEEN 30 AND 50) GROUP BY sehir` | 0,75–0,77 s | H21 + H13; önceki 7,2–9,4 s |
+| `SELECT DISTINCT sehir WHERE yas < 25 OR yas > 60` | 0,56–0,61 s | H21 + H16; önceki 8,4–8,7 s |
+| `WHERE yas > 60 ORDER BY yas DESC LIMIT 100` | 0,42 s | H21 `RowMatches` atlama; önceki 1,84–2,05 s |
+| `ORDER BY sehir LIMIT 10 OFFSET 100000` | 0,61–0,63 s | H22 canlılık denetimli atlama; önceki 0,86–0,89 s |
+| `ORDER BY sehir LIMIT 10 OFFSET 500000` | 1,44–1,48 s | H22; önceki 2,77–2,78 s |
+| `COUNT(*) WHERE yas IN (0..2000)` | 0,44 s | H23 sıralı küme; önceki 9,86 s |
+| `COUNT(*) WHERE bakiye IN (2000 FLOAT)` | 0,44 s | H23 sıralı küme; önceki 254,9 s |
 | `COUNT(*) WHERE yas > 40` | 0,39–0,45 s | H18 ham kesin; önceki 2,75 s |
 | `COUNT(*) WHERE aktif = 1` | 0,41–0,44 s | H18 ham kesin; önceki 5,6 s |
 | `COUNT(*) WHERE bakiye > 5000` | 0,39–0,41 s | H18 ham kesin; önceki 5,75 s |
@@ -216,13 +228,46 @@ boolean ağacı** olarak ham baytlardan değerlendirilir. `AND`/`OR`/`NOT` SQL'i
 `BETWEEN`, `IN`, `IS NULL`/`IS NOT NULL` ve bunların `OR` ile karışımları
 `EvalBool` çağrılmadan sayılır. `IN`, genel yoldaki string eşitliğiyle birebir
 aynı kalsın diye yalnız güvenli aralıktaki `INT` ve ASCII `TEXT` için `=` /
-`OR` yapraklarına açılır; `FLOAT IN` genel yola düşer. `BETWEEN` iki
+`OR` yapraklarına açılır; `FLOAT IN` ve 64+ öğeli listeler bu turda genel yola
+düşer (H23 ile tamamlandı). `BETWEEN` iki
 karşılaştırmaya açılır; iki sınırdan biri `NULL` ise genel yolun kısa devre
 davranışı korunarak sonuç `UNKNOWN` olur. UTF-8 kayıt/desen, 2^53 dışı `INT`
 veya tip uyuşmazlığında o satır çözme+`EvalBool` yoluna düşer. Böylece
 `NOT LIKE '%a%'` 2,2 s yerine 0,42–0,50 s, `yas < 25 OR yas > 60` 5,2 s
 yerine 0,42 s, `yas BETWEEN 30 AND 50` 3,9 s yerine 0,42 s, `sehir IN (...)`
 1,14 s yerine 0,42–0,44 s sürer.
+
+H21 bu ham boolean ağacını yalnız `COUNT(*)` ile sınırlı bırakmaz; filtreli
+SELECT, H12b/H12c sıralama, H13 `GROUP BY` ve H16 `DISTINCT` yolları da aynı
+ağacı kullanır. `rvFalse`/`rvUnknown` satırlar hiç çözülmeden elenir; `rvTrue`
+satırı çözülür ama `RowMatches` atlanır; güvenli olmayan yaprakta eski ham ön
+eleme + `RowMatches` yoluna düşülür. Bu yüzden `OR`/`NOT`/`BETWEEN`/`IN`
+içeren sorgular yalnız eşleşen satırları çözer. 1M demoda
+`yas < 25 OR yas > 60 ORDER BY yas DESC LIMIT 100` 8,7–10,5 s yerine
+0,47–0,59 s; `NOT (yas BETWEEN 30 AND 50)` 6,8–8,9 s yerine 0,48–0,53 s;
+`(yas BETWEEN 30 AND 50) OR bakiye > 9000` 9,8–11,5 s yerine 0,52–0,59 s;
+aynı filtrelerle `GROUP BY` 7,2–9,7 s yerine 0,61–0,77 s, `DISTINCT`
+7,1–8,7 s yerine 0,56–0,61 s sürer. Basit `WHERE yas > 60` bile
+`RowMatches` atlandığı için sıralamada 1,84–2,05 s yerine 0,42 s,
+`GROUP BY`'da 1,97–2,06 s yerine 0,52–0,53 s, `DISTINCT`'te 5,59–5,78 s
+yerine 0,48–0,50 s olur.
+
+H22, `WHERE` yokken ikincil indeks sırasıyla okunan derin `OFFSET`'te
+satırları tam çözmeden indeks girdilerini atlar. Her atlanan girdi için
+`FT.Kv.Get` + `VDbPeekRawRowP` ile hafif canlılık denetimi yapılır; eski
+şema veya bozuk satırda `FT.ReadRow` ile aynı görünürlük kararına düşülür.
+Silinmiş satırların ölü indeks girdileri `OFFSET` sayımını bozmaz. PK yolu ve
+`WHERE`'li ikincil indeks yolu değişmez. 1M demoda
+`ORDER BY sehir LIMIT 10 OFFSET 100000` 0,86–0,89 s yerine 0,61–0,63 s,
+`OFFSET 500000` 2,77–2,78 s yerine 1,44–1,48 s sürer.
+
+H23 `IN`/`NOT IN` listesini kolon tipine göre tek bir sıralı kümede tutar:
+`INT`, `FLOAT` ve ASCII `TEXT` için ikili arama yapılır; 64 öğe sınırı
+kaldırılmıştır ve satır başına maliyet O(log n)'dir. `NULL`/boş metin öğesi
+`UNKNOWN` semantiğini korur (eşleşme yoksa `UNKNOWN`, eşleşme varsa `TRUE`);
+ASCII dışı metin, 2^53 dışı `INT`, tip uyuşmazlığı ve NaN genel yola düşer.
+2000 öğeli listelerde `yas IN (0..2000)` 9,86 s yerine 0,44 s,
+`bakiye IN (2000 FLOAT)` 254,9 s yerine 0,44 s sürer.
 
 > `SUM`/`AVG` kayan noktalı sonuçlarda, akışlı toplama sırası nedeniyle
 > genel yola göre son ondalık hanede küçük bir yuvarlama farkı görülebilir;
