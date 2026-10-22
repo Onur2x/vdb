@@ -90,6 +90,14 @@ type
     function FindCol(ACol: Integer): Integer;
   end;
 
+  { H15: akisli GROUP BY yolunda HAVING icin aggregate dugumu -> deger
+    eslemesi. Akisli yol kaynak satirlari tutmadigindan HAVING'deki
+    aggregate'lar sayaclardan hesaplanip burada dondurulur. }
+  TVdbHavingOv = record
+    N: TSqlExprNode;
+    V: string;
+  end;
+
   { TVSqlExecutor }
 
   TVSqlExecutor = class
@@ -141,6 +149,12 @@ type
     FAggSrcRows: TStrMatrix;
     FAggCNames: TStrArray;
     FAggCTypes: TByteArray;
+    { H15: akisli GROUP BY yolunda HAVING icin aggregate degerleri.
+      Akisli yol grup satirlarini TUTMAZ; aggregate'lar sayac olarak
+      hesaplanir. HAVING ifadesindeki aggregate cagrilari bu eslemeden
+      cozulur (genel yolla ayni sonuc). }
+    FHavingOv: array of TVdbHavingOv;
+    FHavingOvOn: Boolean;
     // F-27/F-28: NATURAL JOIN / USING eslesmesi. FJoinUsing True iken JOIN
     // karsilastirmasi OnCondition yerine bu kolon ciftleriyle yapilir.
     FJoinUsing: Boolean;
@@ -1878,8 +1892,19 @@ begin
     // 4.3: HAVING'de aggregate dogrudan yazilabilir. Grup baglami acikken
     // deger grup satirlari uzerinden hesaplanir; baglam yoksa eski
     // davranis (COUNT(*) -> '1', SUM(x) -> tek satir degeri) surer.
-    if (FAggIdx <> nil) and IsAggFuncName(fn.FuncName) then
+    if IsAggFuncName(fn.FuncName) and ((FAggIdx <> nil) or FHavingOvOn) then
+    begin
+      // H15: akisli GROUP BY yolunda kaynak satir yok; aggregate degeri
+      // grup sayaclarindan onceden hesaplanip dugum kimligiyle eslenir.
+      if FHavingOvOn then
+      begin
+        for i := 0 to High(FHavingOv) do
+          if FHavingOv[i].N = Expr then Exit(FHavingOv[i].V);
+        raise EVDbException.Create(ecUnsupported,
+          'HAVING aggregate degeri hesaplanmadi: ' + fn.FuncName);
+      end;
       Exit(EvalAggregateValue(fn, FAggSrcRows, FAggIdx, FAggCNames, FAggCTypes));
+    end;
     // F-35: User-defined function execution
     { NOT: Argumanlar AST olarak degil, DEGERLENMIS METIN olarak
       gecirilir. TVTableDb.ExecuteFunction parametreleri TStrArray alir
@@ -7259,7 +7284,7 @@ begin
       Inc(st^.Plans[j].Cnt);
       Continue;
     end;
-    // SUM/AVG/MIN/MAX: guvenli sekil kontrolu INT/FLOAT/BOOL ile sinirli.
+    // SUM/AVG/MIN/MAX: guvenli sekil kontrolu INT/FLOAT ile sinirli.
     case C^.Ct[ci] of
       VCT_INT:
         begin
@@ -7278,8 +7303,12 @@ begin
         end;
     else
       begin
+        { BOOL: genel yolda deger 'True'/'False' metnidir ve
+          VDbParseFloat'a GIRMEZ -> toplama katkisi 0, avg sayaci artmaz.
+          Ayni sonucu vermek icin yalnizca bos olmayan sayac artirilir. }
         if C^.FLen[ci] <> 1 then begin C^.Failed := True; Exit(False); end;
-        if Buf[C^.FOff[ci]] <> 0 then fv := -1 else fv := 0;
+        Inc(st^.Plans[j].Cnt);
+        Continue;
       end;
     end;
     Inc(st^.Plans[j].Cnt);
@@ -7334,6 +7363,10 @@ var
   plan: TAggPlan;
   conj: TList<TSqlExprNode>;
   cnd: TRawCond;
+  // H15: HAVING destegi
+  havNodes: array of TSqlExprNode;   // HAVING'deki aggregate cagri dugumleri
+  nRow: Integer;
+  havingOk: Boolean;
 
   procedure CollectAnd(E: TSqlExprNode);
   begin
@@ -7417,6 +7450,153 @@ var
     end;
   end;
 
+  { H15: HAVING AST'sini tarar. Desteklenen her aggregate cagrisi icin
+    plans dizisinin SONUNA bir plan ekler ve dugum kimligini havNodes'a
+    yazar. Desteklenmeyen bir bicim (DISTINCT/FILTER, ifade argumani,
+    metin MIN/MAX, STRING_AGG/PERCENTILE, alt sorgu, pencere) varsa
+    False doner: cagiran genel yola duser (sonuc birebir ayni kalir). }
+  function CollectHavingAgg(E: TSqlExprNode): Boolean;
+  var
+    f2: TSqlFuncCallNode;
+    cr2: TSqlColumnRefNode;
+    c2, k2: Integer;
+    p2: TAggPlan;
+  begin
+    Result := False;
+    if E = nil then Exit(True);
+    if E is TSqlAggNode then Exit;          // STRING_AGG/PERCENTILE
+    if E is TSqlSubqueryNode then Exit;     // skaler/EXISTS alt sorgu
+    if E is TSqlQuantNode then Exit;        // ANY/SOME/ALL
+    if E is TSqlWindowNode then Exit;       // pencere fonksiyonu
+    if E is TSqlFuncCallNode then
+    begin
+      f2 := TSqlFuncCallNode(E);
+      if IsAggFuncName(f2.FuncName) then
+      begin
+        if not ((f2.FuncName = 'COUNT') or (f2.FuncName = 'SUM') or
+                (f2.FuncName = 'AVG') or (f2.FuncName = 'MIN') or
+                (f2.FuncName = 'MAX')) then Exit;
+        if f2.IsDistinct or (f2.Filter <> nil) then Exit;
+        FillChar(p2, SizeOf(TAggPlan), 0);
+        p2.Fn := f2;
+        if f2.IsStar then
+        begin
+          if f2.FuncName <> 'COUNT' then Exit;
+          p2.Col := -1;
+        end
+        else
+        begin
+          if not (f2.Arg is TSqlColumnRefNode) then Exit;
+          cr2 := TSqlColumnRefNode(f2.Arg);
+          c2 := FindColIdx(cr2.ColumnName, cr2.TableQualifier, ColNames);
+          if (c2 < 0) or (c2 > High(td.Cols)) or (c2 > High(ColTypes)) then
+            Exit;
+          if td.Cols[c2].Encrypted then Exit;   // sifreli uzunluk != acik metin
+          if ((f2.FuncName = 'SUM') or (f2.FuncName = 'AVG')) and
+             not ((ColTypes[c2] = VCT_INT) or (ColTypes[c2] = VCT_FLOAT) or
+                  (ColTypes[c2] = VCT_BOOL)) then Exit;
+          if ((f2.FuncName = 'MIN') or (f2.FuncName = 'MAX')) and
+             not ((ColTypes[c2] = VCT_INT) or (ColTypes[c2] = VCT_FLOAT)) then
+            Exit;
+          p2.Col := c2;
+        end;
+        SetLength(plans, Length(plans) + 1);
+        plans[High(plans)] := p2;
+        SetLength(havNodes, Length(havNodes) + 1);
+        havNodes[High(havNodes)] := E;
+        Exit(True);
+      end;
+      // Aggregate olmayan fonksiyon: argumanlarini tara.
+      if (f2.Arg <> nil) and (not CollectHavingAgg(f2.Arg)) then Exit;
+      if f2.Args <> nil then
+        for k2 := 0 to f2.Args.Count - 1 do
+          if not CollectHavingAgg(f2.Args[k2]) then Exit;
+      Exit(True);
+    end;
+    if E is TSqlBinaryOpNode then
+    begin
+      if not CollectHavingAgg(TSqlBinaryOpNode(E).Left) then Exit;
+      Exit(CollectHavingAgg(TSqlBinaryOpNode(E).Right));
+    end;
+    if E is TSqlUnaryOpNode then
+      Exit(CollectHavingAgg(TSqlUnaryOpNode(E).Operand));
+    if E is TSqlCastNode then
+      Exit(CollectHavingAgg(TSqlCastNode(E).Expr));
+    if E is TSqlCollateNode then
+      Exit(CollectHavingAgg(TSqlCollateNode(E).Inner));
+    if E is TSqlBetweenNode then
+    begin
+      if not CollectHavingAgg(TSqlBetweenNode(E).Expr) then Exit;
+      if not CollectHavingAgg(TSqlBetweenNode(E).LowBound) then Exit;
+      Exit(CollectHavingAgg(TSqlBetweenNode(E).HighBound));
+    end;
+    if E is TSqlInNode then
+    begin
+      if TSqlInNode(E).SubSelect <> nil then Exit;   // IN (SELECT ...)
+      if not CollectHavingAgg(TSqlInNode(E).Expr) then Exit;
+      for k2 := 0 to TSqlInNode(E).List.Count - 1 do
+        if not CollectHavingAgg(TSqlInNode(E).List[k2]) then Exit;
+      Exit(True);
+    end;
+    if E is TSqlCaseNode then
+    begin
+      if not CollectHavingAgg(TSqlCaseNode(E).Operand) then Exit;
+      for k2 := 0 to TSqlCaseNode(E).Whens.Count - 1 do
+      begin
+        if not CollectHavingAgg(TSqlCaseNode(E).Whens[k2].Cond) then Exit;
+        if not CollectHavingAgg(TSqlCaseNode(E).Whens[k2].Value) then Exit;
+      end;
+      Exit(CollectHavingAgg(TSqlCaseNode(E).ElseExpr));
+    end;
+    if E is TSqlNullIfNode then
+    begin
+      if not CollectHavingAgg(TSqlNullIfNode(E).Arg1) then Exit;
+      Exit(CollectHavingAgg(TSqlNullIfNode(E).Arg2));
+    end;
+    if E is TSqlCoalesceNode then
+    begin
+      for k2 := 0 to TSqlCoalesceNode(E).Args.Count - 1 do
+        if not CollectHavingAgg(TSqlCoalesceNode(E).Args[k2]) then Exit;
+      Exit(True);
+    end;
+    if E is TSqlJsonKeyNode then
+    begin
+      if not CollectHavingAgg(TSqlJsonKeyNode(E).Left) then Exit;
+      for k2 := 0 to TSqlJsonKeyNode(E).Keys.Count - 1 do
+        if not CollectHavingAgg(TSqlJsonKeyNode(E).Keys[k2]) then Exit;
+      Exit(True);
+    end;
+    // Literal / kolon referansi: yaprak.
+    Exit(True);
+  end;
+
+  { Bir TAggPlan'in (grup sayaclarindan) metin degerini uretir.
+    SELECT cikti kolonlari ve HAVING aggregate'leri AYNI donusumu kullanir
+    (genel yol EvalAggregateValue ile birebir ayni bicim). }
+  function AggPlanValue(const P: TAggPlan; const Ct: TByteArray): string;
+  begin
+    if P.Fn = nil then Exit('');
+    if P.Fn.FuncName = 'COUNT' then Exit(IntToStr(P.Cnt));
+    if P.Fn.FuncName = 'SUM' then
+    begin
+      if P.Cnt > 0 then Exit(VDbFloatToStr(P.SumF)) else Exit('');
+    end;
+    if P.Fn.FuncName = 'AVG' then
+    begin
+      if P.AvgCnt > 0 then Exit(VDbFloatToStr(P.SumF / P.AvgCnt)) else Exit('');
+    end;
+    if P.Fn.FuncName = 'MIN' then
+    begin
+      if not P.HasMin then Exit('')
+      else if Ct[P.Col] = VCT_INT then Exit(IntToStr(P.MinI))
+      else Exit(VDbFloatToStr(P.MinF));
+    end;
+    // MAX
+    if not P.HasMax then Exit('')
+    else if Ct[P.Col] = VCT_INT then Exit(IntToStr(P.MaxI))
+    else Exit(VDbFloatToStr(P.MaxF));
+  end;
+
 begin
   Result := False;
   if (Stmt.FromTable = '') or Stmt.HasJoin then Exit;
@@ -7425,7 +7605,6 @@ begin
   if Stmt.WithQueries.Count > 0 then Exit;
   if Stmt.IsDistinct then Exit;
   if HasWindow(Stmt) or (Stmt.QualifyClause <> nil) then Exit;
-  if Stmt.HavingClause <> nil then Exit;   // HAVING: genel yol
   if Stmt.GroupByCols.Count = 0 then Exit;
   if Stmt.Columns.Count = 0 then Exit;
   if td.IsView then Exit;
@@ -7441,6 +7620,9 @@ begin
     else
       c := FindColIdx(gb, '', ColNames);
     if (c < 0) or (c > High(td.Cols)) or (c > High(ColTypes)) then Exit;
+    // M6/H13: sifreli kolonun ham baytlari acik metin degil; genel yol
+    // (cozulmus satirlar) kullanilmalidir.
+    if td.Cols[c].Encrypted then Exit;
     ctx.GroupCols[j] := c;
   end;
 
@@ -7482,6 +7664,8 @@ begin
       cr := TSqlColumnRefNode(fn.Arg);
       c := FindColIdx(cr.ColumnName, cr.TableQualifier, ColNames);
       if (c < 0) or (c > High(td.Cols)) or (c > High(ColTypes)) then Exit;
+      // M6: sifreli kolonun ham uzunlugu acik metinden farkli -> genel yol.
+      if td.Cols[c].Encrypted then Exit;
       if ((fn.FuncName = 'SUM') or (fn.FuncName = 'AVG')) and
          not ((ColTypes[c] = VCT_INT) or (ColTypes[c] = VCT_FLOAT) or
               (ColTypes[c] = VCT_BOOL)) then Exit;
@@ -7490,6 +7674,15 @@ begin
       plan.Col := c;
     end;
     plans[j] := plan;
+  end;
+
+  // H15: HAVING'deki aggregate'ler icin ek planlar (dizinin sonuna).
+  // selGroup[j]/st^.Plans[j] eslemesi yalniz ilk Stmt.Columns.Count ogeyi
+  // kullanir; ek planlar yalniz HAVING degerleri icindir.
+  if Stmt.HavingClause <> nil then
+  begin
+    SetLength(havNodes, 0);
+    if not CollectHavingAgg(Stmt.HavingClause) then Exit;
   end;
 
   ctx.Exec := Self;
@@ -7580,53 +7773,50 @@ begin
       end;
     end;
 
+    // H15: HAVING eslesmeyen gruplari duserir -> satirlar sikistirilir.
     SetLength(Res.Rows, Length(ctx.Groups));
+    nRow := 0;
     for gi := 0 to High(ctx.Groups) do
     begin
-      SetLength(Res.Rows[gi], Stmt.Columns.Count);
       st := @ctx.Groups[gi];
+      SetLength(Res.Rows[nRow], Stmt.Columns.Count);
       for j := 0 to Stmt.Columns.Count - 1 do
       begin
         if selGroup[j] >= 0 then
         begin
           if selGroup[j] <= High(st^.Key) then
-            Res.Rows[gi][j] := st^.Key[selGroup[j]]
+            Res.Rows[nRow][j] := st^.Key[selGroup[j]]
           else
-            Res.Rows[gi][j] := '';
+            Res.Rows[nRow][j] := '';
           Continue;
         end;
-        plan := st^.Plans[j];
-        if plan.Fn = nil then begin Res.Rows[gi][j] := ''; Continue; end;
-        if plan.Fn.FuncName = 'COUNT' then
-          Res.Rows[gi][j] := IntToStr(plan.Cnt)
-        else if plan.Fn.FuncName = 'SUM' then
-        begin
-          if plan.Cnt > 0 then Res.Rows[gi][j] := VDbFloatToStr(plan.SumF)
-          else Res.Rows[gi][j] := '';
-        end
-        else if plan.Fn.FuncName = 'AVG' then
-        begin
-          if plan.AvgCnt > 0 then
-            Res.Rows[gi][j] := VDbFloatToStr(plan.SumF / plan.AvgCnt)
-          else Res.Rows[gi][j] := '';
-        end
-        else if plan.Fn.FuncName = 'MIN' then
-        begin
-          if not plan.HasMin then Res.Rows[gi][j] := ''
-          else if ctx.Ct[plan.Col] = VCT_INT then
-            Res.Rows[gi][j] := IntToStr(plan.MinI)
-          else Res.Rows[gi][j] := VDbFloatToStr(plan.MinF);
-        end
-        else
-        begin
-          if not plan.HasMax then Res.Rows[gi][j] := ''
-          else if ctx.Ct[plan.Col] = VCT_INT then
-            Res.Rows[gi][j] := IntToStr(plan.MaxI)
-          else Res.Rows[gi][j] := VDbFloatToStr(plan.MaxF);
-        end;
+        Res.Rows[nRow][j] := AggPlanValue(st^.Plans[j], ctx.Ct);
       end;
+      // H15: HAVING — kolon referanslari CIKTI kolonlarina cozulur (genel
+      // yolla ayni); aggregate cagrilari FHavingOv uzerinden cozulur.
+      if Stmt.HavingClause <> nil then
+      begin
+        SetLength(FHavingOv, Length(havNodes));
+        for j := 0 to High(havNodes) do
+        begin
+          FHavingOv[j].N := havNodes[j];
+          FHavingOv[j].V := AggPlanValue(
+            st^.Plans[Stmt.Columns.Count + j], ctx.Ct);
+        end;
+        FHavingOvOn := True;
+        try
+          havingOk := EvalBool(Stmt.HavingClause, Res.Rows[nRow],
+            Res.Fields, OutTypes);
+        finally
+          FHavingOvOn := False;
+          SetLength(FHavingOv, 0);
+        end;
+        if not havingOk then Continue;
+      end;
+      Inc(nRow);
     end;
-    Res.Affected := Length(Res.Rows);
+    SetLength(Res.Rows, nRow);
+    Res.Affected := nRow;
     Res.Msg := 'OK';
     Result := True;
   finally

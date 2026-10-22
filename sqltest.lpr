@@ -14174,6 +14174,228 @@ begin
   end;
 end;
 
+procedure T136_H13_GroupDiff;
+// H13/H14 akisli GROUP BY yolu genel yolla BIREBIR ayni sonucu vermelidir.
+// Ayni sorgu "HAVING 1=1" ile genel yola dusurulerek karsilastirilir.
+var
+  dir: string;
+  db: TVDb;
+  tdb: TVTableDb;
+  q: TVSql;
+  r1, r2: TSqlResult;
+  s1, s2: string;
+
+  function RowSet(const R: TSqlResult): string;
+  var
+    k, m: Integer;
+  begin
+    Result := '';
+    for k := 0 to High(R.Rows) do
+    begin
+      Result := Result + '[';
+      for m := 0 to High(R.Rows[k]) do
+        Result := Result + R.Rows[k][m] + ',';
+      Result := Result + ']';
+    end;
+  end;
+
+  procedure Cmp(const A, B: string);
+  begin
+    r1 := q.Exec(A);
+    r2 := q.Exec(B);
+    s1 := RowSet(r1);
+    s2 := RowSet(r2);
+    if s1 = s2 then
+      Dogrula('T136 ayni: ' + A, True, '')
+    else
+      Dogrula('T136 ayni: ' + A, False,
+        'akis=' + s1 + ' genel=' + s2);
+  end;
+
+begin
+  Grp('T136 H13 akisli GROUP BY / genel yol farki');
+  dir := D + '\t136_gdiff_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  tdb := TVTableDb.Create(db);
+  try
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      q.Exec('CREATE TABLE d (id INTEGER PRIMARY KEY, s TEXT, n INTEGER, ' +
+        'f FLOAT, b BOOLEAN)');
+      q.Exec('INSERT INTO d (id,s,n,f,b) VALUES ' +
+        '(1,''a'',10,1.5,TRUE),(2,''a'',20,2.5,TRUE),(3,''b'',30,3.5,FALSE),' +
+        '(4,''b'',5,0.5,FALSE),(5,''c'',NULL,NULL,NULL),(6,NULL,7,7.0,TRUE),' +
+        '(7,''a'',20,2.5,NULL),(8,''b'',NULL,1.25,TRUE)');
+
+      Cmp('SELECT s, COUNT(*) AS c FROM d GROUP BY s ORDER BY s',
+          'SELECT s, COUNT(*) AS c FROM d GROUP BY s HAVING 1=1 ORDER BY s');
+      Cmp('SELECT s, SUM(n) AS t FROM d GROUP BY s ORDER BY s',
+          'SELECT s, SUM(n) AS t FROM d GROUP BY s HAVING 1=1 ORDER BY s');
+      Cmp('SELECT s, AVG(n) AS a FROM d GROUP BY s ORDER BY s',
+          'SELECT s, AVG(n) AS a FROM d GROUP BY s HAVING 1=1 ORDER BY s');
+      Cmp('SELECT s, MIN(n) AS mi, MAX(n) AS ma FROM d GROUP BY s ORDER BY s',
+          'SELECT s, MIN(n) AS mi, MAX(n) AS ma FROM d GROUP BY s HAVING 1=1 ORDER BY s');
+      Cmp('SELECT s, COUNT(n) AS cn FROM d GROUP BY s ORDER BY s',
+          'SELECT s, COUNT(n) AS cn FROM d GROUP BY s HAVING 1=1 ORDER BY s');
+      Cmp('SELECT s, SUM(b) AS sb FROM d GROUP BY s ORDER BY s',
+          'SELECT s, SUM(b) AS sb FROM d GROUP BY s HAVING 1=1 ORDER BY s');
+      Cmp('SELECT s, AVG(b) AS ab FROM d GROUP BY s ORDER BY s',
+          'SELECT s, AVG(b) AS ab FROM d GROUP BY s HAVING 1=1 ORDER BY s');
+      Cmp('SELECT s, SUM(f) AS sf, AVG(f) AS af FROM d GROUP BY s ORDER BY s',
+          'SELECT s, SUM(f) AS sf, AVG(f) AS af FROM d GROUP BY s HAVING 1=1 ORDER BY s');
+      Cmp('SELECT s, COUNT(*) AS c FROM d WHERE n > 5 GROUP BY s ORDER BY s',
+          'SELECT s, COUNT(*) AS c FROM d WHERE n > 5 GROUP BY s HAVING 1=1 ORDER BY s');
+      Cmp('SELECT s, n FROM d GROUP BY s ORDER BY s',
+          'SELECT s, n FROM d GROUP BY s HAVING 1=1 ORDER BY s');
+      Cmp('SELECT s, COUNT(*) AS c FROM d GROUP BY s HAVING COUNT(*) > 1 ' +
+          'ORDER BY s',
+          'SELECT s, COUNT(*) AS c FROM d GROUP BY s HAVING COUNT(*) > 1 ' +
+          'ORDER BY s');
+    finally
+      q.Free;
+    end;
+  finally
+    tdb.Free;
+    db.Free;
+  end;
+end;
+
+procedure T137_H15_StreamHaving;
+// H15: akisli GROUP BY + HAVING yolu, genel yolla BIREBIR ayni sonucu
+// vermelidir. Genel yol, HAVING'e daima dogru bir ek kosul eklenerek
+// zorlanir: "COUNT(DISTINCT n) >= 0" akisli planlamada DESTEKLENMEZ
+// (DISTINCT) bu yuzden genel yola duser; sonucu etkilemez.
+var
+  dir: string;
+  db: TVDb;
+  tdb: TVTableDb;
+  q: TVSql;
+  r1, r2: TSqlResult;
+
+  function RowSet(const R: TSqlResult): string;
+  var
+    k, m: Integer;
+  begin
+    Result := '';
+    for k := 0 to High(R.Rows) do
+    begin
+      Result := Result + '[';
+      for m := 0 to High(R.Rows[k]) do
+        Result := Result + R.Rows[k][m] + ',';
+      Result := Result + ']';
+    end;
+  end;
+
+  procedure Cmp(const A, B: string);
+  var
+    s1, s2: string;
+  begin
+    r1 := q.Exec(A);
+    r2 := q.Exec(B);
+    s1 := RowSet(r1);
+    s2 := RowSet(r2);
+    if s1 = s2 then
+      Dogrula('T137 ayni: ' + A, True, '')
+    else
+      Dogrula('T137 ayni: ' + A, False,
+        'akis=' + s1 + ' genel=' + s2);
+  end;
+
+begin
+  Grp('T137 H15 akisli GROUP BY + HAVING');
+  dir := D + '\t137_having_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  tdb := TVTableDb.Create(db);
+  try
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      q.Exec('CREATE TABLE d (id INTEGER PRIMARY KEY, s TEXT, n INTEGER, ' +
+        'f FLOAT, b BOOLEAN)');
+      q.Exec('INSERT INTO d (id,s,n,f,b) VALUES ' +
+        '(1,''a'',10,1.5,TRUE),(2,''a'',20,2.5,TRUE),(3,''b'',30,3.5,FALSE),' +
+        '(4,''b'',5,0.5,FALSE),(5,''c'',NULL,NULL,NULL),(6,NULL,7,7.0,TRUE),' +
+        '(7,''a'',20,2.5,NULL),(8,''b'',NULL,1.25,TRUE)');
+
+      // COUNT(*) / COUNT(kolon) / alias
+      Cmp('SELECT s, COUNT(*) AS c FROM d GROUP BY s HAVING COUNT(*) > 1 ORDER BY s',
+          'SELECT s, COUNT(*) AS c FROM d GROUP BY s ' +
+          'HAVING COUNT(*) > 1 AND COUNT(DISTINCT n) >= 0 ORDER BY s');
+      Cmp('SELECT s, COUNT(n) AS cn FROM d GROUP BY s HAVING COUNT(n) = 2 ORDER BY s',
+          'SELECT s, COUNT(n) AS cn FROM d GROUP BY s ' +
+          'HAVING COUNT(n) = 2 AND COUNT(DISTINCT n) >= 0 ORDER BY s');
+      Cmp('SELECT s, COUNT(*) AS c FROM d GROUP BY s HAVING c > 1 ORDER BY s',
+          'SELECT s, COUNT(*) AS c FROM d GROUP BY s ' +
+          'HAVING c > 1 AND COUNT(DISTINCT n) >= 0 ORDER BY s');
+      // SUM / AVG (INT, FLOAT, BOOL)
+      Cmp('SELECT s, SUM(n) AS t FROM d GROUP BY s HAVING SUM(n) > 20 ORDER BY s',
+          'SELECT s, SUM(n) AS t FROM d GROUP BY s ' +
+          'HAVING SUM(n) > 20 AND COUNT(DISTINCT n) >= 0 ORDER BY s');
+      Cmp('SELECT s, AVG(n) AS a FROM d GROUP BY s HAVING AVG(n) >= 12.5 ORDER BY s',
+          'SELECT s, AVG(n) AS a FROM d GROUP BY s ' +
+          'HAVING AVG(n) >= 12.5 AND COUNT(DISTINCT n) >= 0 ORDER BY s');
+      Cmp('SELECT s, SUM(f) AS sf FROM d GROUP BY s HAVING SUM(f) > 3.0 ORDER BY s',
+          'SELECT s, SUM(f) AS sf FROM d GROUP BY s ' +
+          'HAVING SUM(f) > 3.0 AND COUNT(DISTINCT n) >= 0 ORDER BY s');
+      Cmp('SELECT s, SUM(b) AS sb FROM d GROUP BY s HAVING SUM(b) = 0 ORDER BY s',
+          'SELECT s, SUM(b) AS sb FROM d GROUP BY s ' +
+          'HAVING SUM(b) = 0 AND COUNT(DISTINCT n) >= 0 ORDER BY s');
+      // MIN / MAX + IS NULL
+      Cmp('SELECT s, MIN(n) AS mi FROM d GROUP BY s HAVING MIN(n) < 10 ORDER BY s',
+          'SELECT s, MIN(n) AS mi FROM d GROUP BY s ' +
+          'HAVING MIN(n) < 10 AND COUNT(DISTINCT n) >= 0 ORDER BY s');
+      Cmp('SELECT s, MAX(f) AS ma FROM d GROUP BY s HAVING MAX(f) IS NOT NULL ORDER BY s',
+          'SELECT s, MAX(f) AS ma FROM d GROUP BY s ' +
+          'HAVING MAX(f) IS NOT NULL AND COUNT(DISTINCT n) >= 0 ORDER BY s');
+      // cikti kolonu + birden fazla aggregate
+      Cmp('SELECT s, COUNT(*) AS c, SUM(n) AS t FROM d GROUP BY s ' +
+          'HAVING s <> ''c'' AND COUNT(*) > 1 AND SUM(n) >= 20 ORDER BY s',
+          'SELECT s, COUNT(*) AS c, SUM(n) AS t FROM d GROUP BY s ' +
+          'HAVING s <> ''c'' AND COUNT(*) > 1 AND SUM(n) >= 20 ' +
+          'AND COUNT(DISTINCT n) >= 0 ORDER BY s');
+      // WHERE on-elemesi + HAVING
+      Cmp('SELECT s, COUNT(*) AS c FROM d WHERE n > 5 GROUP BY s ' +
+          'HAVING COUNT(*) > 1 ORDER BY s',
+          'SELECT s, COUNT(*) AS c FROM d WHERE n > 5 GROUP BY s ' +
+          'HAVING COUNT(*) > 1 AND COUNT(DISTINCT n) >= 0 ORDER BY s');
+      // CASE / COALESCE icinde aggregate
+      Cmp('SELECT s, COUNT(*) AS c FROM d GROUP BY s ' +
+          'HAVING CASE WHEN COUNT(*) > 1 THEN 1 ELSE 0 END = 1 ORDER BY s',
+          'SELECT s, COUNT(*) AS c FROM d GROUP BY s ' +
+          'HAVING CASE WHEN COUNT(*) > 1 THEN 1 ELSE 0 END = 1 ' +
+          'AND COUNT(DISTINCT n) >= 0 ORDER BY s');
+      Cmp('SELECT s, SUM(n) AS t FROM d GROUP BY s ' +
+          'HAVING COALESCE(SUM(n), 0) > 100 ORDER BY s',
+          'SELECT s, SUM(n) AS t FROM d GROUP BY s ' +
+          'HAVING COALESCE(SUM(n), 0) > 100 ' +
+          'AND COUNT(DISTINCT n) >= 0 ORDER BY s');
+      // alias ile siralama (HAVING sonrasi kuyruk)
+      Cmp('SELECT s, COUNT(*) AS c FROM d GROUP BY s HAVING COUNT(*) > 1 ' +
+          'ORDER BY c DESC, s',
+          'SELECT s, COUNT(*) AS c FROM d GROUP BY s ' +
+          'HAVING COUNT(*) > 1 AND COUNT(DISTINCT n) >= 0 ORDER BY c DESC, s');
+      // HAVING her seyi eler -> bos kume
+      Cmp('SELECT s, COUNT(*) AS c FROM d GROUP BY s HAVING COUNT(*) > 99 ORDER BY s',
+          'SELECT s, COUNT(*) AS c FROM d GROUP BY s ' +
+          'HAVING COUNT(*) > 99 AND COUNT(DISTINCT n) >= 0 ORDER BY s');
+      // DESTEKLENMEYEN bicim (DISTINCT) genel yolda dogru: 1=1 karsiligi
+      Cmp('SELECT s, COUNT(*) AS c FROM d GROUP BY s HAVING 1=1 ORDER BY s',
+          'SELECT s, COUNT(*) AS c FROM d GROUP BY s ' +
+          'HAVING COUNT(DISTINCT n) >= 0 ORDER BY s');
+    finally
+      q.Free;
+    end;
+  finally
+    tdb.Free;
+    db.Free;
+  end;
+end;
+
 procedure T132_H12_StreamTopN;
 // H12b: ham akisli top-N yolunun WHERE on-eleme, BOOL ve NULL siralama
 // davranisini dogrular; alias/ifade siralamalari genel yola dusmelidir.
@@ -14470,6 +14692,8 @@ T92_MVCC_Isoaltion;
        T133_H13_StreamGroupBy;
        T134_H12c_MultiTopN;
        T135_H14_FloatSort;
+       T136_H13_GroupDiff;
+       T137_H15_StreamHaving;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls

@@ -91,6 +91,10 @@ alınmıştır; farklı donanımda değişebilir.
 | `GROUP BY yas` (`COUNT`, `MIN`, `MAX`) | 0,64–0,67 s | H13 tek pass |
 | `GROUP BY sehir` (aggregate yok) | 0,78–0,82 s | H13 tek pass |
 | `WHERE sehir = 'Ankara' GROUP BY yas` | 0,79–0,81 s | H13 + ham WHERE ön elemesi |
+| `GROUP BY sehir HAVING COUNT(*) > 100000` | 0,78 s | H15; önceki 3,8 s |
+| `GROUP BY sehir HAVING AVG(yas) > 40` (`SUM(bakiye)` ile) | 0,88 s | H15; önceki 17,3 s |
+| `GROUP BY sehir HAVING c > 100000` (alias) | 0,77 s | H15, çıktı alias'ı |
+| `GROUP BY sehir HAVING COUNT(*) > 50000 AND MAX(bakiye) > 0` | 0,84 s | H15, çok koşullu |
 | Şehir + yaş `COUNT(*)` | 0,83–0,98 s | sıcak indeks |
 
 ## Sorgu hızı nasıl iyileştirildi?
@@ -131,10 +135,16 @@ hesaplanır. 1.000.000 satır önce string matrisine çevrilmez; her satır içi
 grup anahtarı çıkarılır, hash tablosunda grup bulunur ve `COUNT`, `SUM`,
 `AVG`, `MIN`, `MAX` sayaçları doğrudan güncellenir. `WHERE` koşulu güvenli
 biçimde ham baytlarda ön elenir. Bu yol `GROUP BY sehir` süresini yaklaşık
-3,8–4,5 s'den 0,8 s'ye indirir. `HAVING`, `JOIN`, `DISTINCT`, pencere/ifade
-içeren aggregate'ler ve karmaşık `GROUP BY` biçimleri genel yola düşer;
-`ILIKE` ve indekssiz tam tarama gerektiren işlemler doğası gereği tüm
-tabloyu okur.
+3,8–4,5 s'den 0,8 s'ye indirir.
+
+H15 ile `HAVING` de aynı tek pass içinde uygulanır: HAVING'deki
+`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` için ek sayaçlar kurulur ve grup satırı
+hazırlandıktan sonra koşul değerlendirilir. Böylece `HAVING COUNT(*) > …`
+3,8 s yerine yaklaşık 0,78 s, `AVG(yas)`+`SUM(bakiye)` koşulu 17,3 s yerine
+yaklaşık 0,88 s sürer. `JOIN`, `DISTINCT`, `DISTINCT`/`FILTER` içeren
+aggregate'ler, ifade argümanlı veya metin/BOOL `MIN`/`MAX`, alt sorgu/pencere
+içeren `HAVING` ve karmaşık `GROUP BY` biçimleri genel yola düşer; `ILIKE` ve
+indekssiz tam tarama gerektiren işlemler doğası gereği tüm tabloyu okur.
 
 > `SUM`/`AVG` kayan noktalı sonuçlarda, akışlı toplama sırası nedeniyle
 > genel yola göre son ondalık hanede küçük bir yuvarlama farkı görülebilir;
