@@ -4245,6 +4245,8 @@ type
     Op: TSqlBinaryOp;
     IsFloat: Boolean;
     IsText: Boolean;
+    IsLike: Boolean;          // H19: LIKE, S = desen
+    IsILike: Boolean;         // H19: ILIKE, S = Turkce-duyarli kucuk desen
     IsIn: Boolean;
     InIsFloat: Boolean;
     InInts: array of Int64;
@@ -4435,6 +4437,21 @@ var
       b := TSqlBinaryOpNode(E);
       if b.Op = sboAnd then
         Exit(RawCover(b.Left) and RawCover(b.Right));
+      if b.Op in [sboLike, sboILike] then
+      begin
+        if not ((b.Left is TSqlColumnRefNode) and
+                (b.Right is TSqlLiteralNode)) then Exit;
+        cr := TSqlColumnRefNode(b.Left);
+        lit := TSqlLiteralNode(b.Right);
+        ci2 := FindColIdx(cr.ColumnName, cr.TableQualifier, ColNames);
+        if (ci2 < 0) or (ci2 > High(td.Cols)) or (ci2 > High(ColTypes)) then Exit;
+        if td.Cols[ci2].Encrypted or (td.Cols[ci2].Collate <> '') then Exit;
+        if ColTypes[ci2] <> VCT_STR then Exit;
+        if lit.LitType <> sltString then Exit;
+        for q := 1 to Length(lit.StrVal) do
+          if lit.StrVal[q] >= #128 then Exit(False);
+        Exit(True);
+      end;
       if not (b.Op in [sboEq, sboNeq, sboLt, sboLte, sboGt, sboGte]) then Exit;
       if (b.Left is TSqlColumnRefNode) and (b.Right is TSqlLiteralNode) then
       begin
@@ -9184,6 +9201,34 @@ begin
   if not (E is TSqlBinaryOpNode) then Exit;
   b := TSqlBinaryOpNode(E);
   op := b.Op;
+  if op in [sboLike, sboILike] then
+  begin
+    // H19: LIKE/ILIKE yalniz "kolon OP literal" biciminde ve ASCII
+    // desenle ham baytlara uygulanir. ILIKE deseni Turkce-duyarli
+    // kucuk harfe cevrilir (VDbTrLower ile ayni).
+    if not ((b.Left is TSqlColumnRefNode) and
+            (b.Right is TSqlLiteralNode)) then Exit;
+    cc := TSqlColumnRefNode(b.Left);
+    lit := TSqlLiteralNode(b.Right);
+    ci := Exec.FindColIdx(cc.ColumnName, cc.TableQualifier, ColNames);
+    if (ci < 0) or (ci > High(td.Cols)) then Exit;
+    if td.Cols[ci].Encrypted or (td.Cols[ci].Collate <> '') then Exit;
+    if ColTypes[ci] <> VCT_STR then Exit;
+    if lit.LitType <> sltString then Exit;
+    if not VdbStrPureAscii(lit.StrVal) then Exit;
+    FillChar(c, SizeOf(c), 0);
+    c.Col := ci;
+    c.Op := op;
+    c.IsIn := False;
+    c.InIsFloat := False;
+    c.IsLike := op = sboLike;
+    c.IsILike := op = sboILike;
+    if c.IsILike then c.S := VDbTrLower(lit.StrVal)
+    else c.S := lit.StrVal;
+    SetLength(Conds, Length(Conds) + 1);
+    Conds[High(Conds)] := c;
+    Exit;
+  end;
   if not (op in [sboEq, sboNeq, sboLt, sboLte, sboGt, sboGte]) then Exit;
   swap := False;
   if b.Left is TSqlColumnRefNode then
@@ -9270,6 +9315,62 @@ begin
   Result := True;
 end;
 
+{ H19: VDbLikeMatch'in ham-bayt esdegeri. '%' ve '_' bayt bazinda
+  calisir; VDbLikeMatch ile birebir ayni geri-izleme kurali. }
+function VdbBytesLikeMatch(P: PByte; L: Integer; const Pat: string): Boolean;
+var
+  ti, pi, star, mark: Integer;
+begin
+  ti := 0; pi := 1; star := 0; mark := 0;
+  while ti < L do
+  begin
+    if (pi <= Length(Pat)) and
+       ((Pat[pi] = '_') or (Pat[pi] = Char(P[ti]))) then
+    begin
+      Inc(ti); Inc(pi);
+    end
+    else if (pi <= Length(Pat)) and (Pat[pi] = '%') then
+    begin
+      star := pi; mark := ti; Inc(pi);
+    end
+    else if star <> 0 then
+    begin
+      pi := star + 1; Inc(mark); ti := mark;
+    end
+    else Exit(False);
+  end;
+  while (pi <= Length(Pat)) and (Pat[pi] = '%') do Inc(pi);
+  Result := pi > Length(Pat);
+end;
+
+{ H19: ASCII satiri VDbTrLower ile ayni sekilde kucultur. Turkce
+  modda 'I' -> 'i' DEGIL, UTF-8 'ı' (C4 B1) olur. Cikti en fazla
+  2*L bayttir; cagiran tampon boyutunu garanti eder. }
+function VdbTrLowerAsciiTo(P: PByte; L: Integer; OutP: PByte;
+  out OutLen: Integer): Boolean;
+var
+  i, o: Integer;
+  b: Byte;
+begin
+  o := 0;
+  for i := 0 to L - 1 do
+  begin
+    b := P[i];
+    if b >= 128 then Exit(False);
+    if b = Ord('I') then
+    begin
+      OutP[o] := $C4; OutP[o + 1] := $B1; Inc(o, 2);
+    end
+    else
+    begin
+      if (b >= Ord('A')) and (b <= Ord('Z')) then Inc(b, 32);
+      OutP[o] := b; Inc(o);
+    end;
+  end;
+  OutLen := o;
+  Result := True;
+end;
+
 { Ham kosullari degerlendirir: True = "uyabilir" (elem yok),
   False = "kesinlikle uymaz" (satiri cozmeden ele). Yalniz AND zincirinden
   cikan kosullar cagrilir; bu yuzden tek bir kosunun False'u yeterlidir. }
@@ -9284,7 +9385,8 @@ var
   iv: Int64;
   fv: Double;
   ok: Boolean;
-  iv2: Integer;
+  iv2, outlen: Integer;
+  lbuf: array[0..8191] of Byte;
 begin
   Result := True;
   AllDecided := True;
@@ -9292,6 +9394,41 @@ begin
   begin
     c := Conds[k];
     if FOff[c.Col] < 0 then Exit(False);        // NULL: kiyas FALSE (3-degerli)
+    if c.IsLike or c.IsILike then
+    begin
+      // H19: yalniz saf-ASCII kayit + ASCII desen. ILIKE'da satir Turkce
+      // duyarli kucultulur ('I' -> UTF-8 'ı'); desen kurulurken cevrilmistir.
+      if FType[c.Col] <> VCT_STR then
+      begin
+        AllDecided := False;
+        Continue;
+      end;
+      if FLen[c.Col] = 0 then Exit(False);      // '' hicbir kiyasta eslesmez
+      if not VdbBytesAscii(Buf + FOff[c.Col], FLen[c.Col]) then
+      begin
+        AllDecided := False;
+        Continue;
+      end;
+      if c.IsILike then
+      begin
+        if FLen[c.Col] * 2 > SizeOf(lbuf) then
+        begin
+          AllDecided := False;
+          Continue;
+        end;
+        if not VdbTrLowerAsciiTo(Buf + FOff[c.Col], FLen[c.Col],
+             @lbuf[0], outlen) then
+        begin
+          AllDecided := False;
+          Continue;
+        end;
+        ok := VdbBytesLikeMatch(@lbuf[0], outlen, c.S);
+      end
+      else
+        ok := VdbBytesLikeMatch(Buf + FOff[c.Col], FLen[c.Col], c.S);
+      if not ok then Exit(False);
+      Continue;
+    end;
     if c.IsIn then
     begin
       // H1c: sayisal IN. NULL yukarida elendi. Kolon tipi beklenenden farkli

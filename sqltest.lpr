@@ -14628,6 +14628,95 @@ begin
   end;
 end;
 
+procedure T141_H19_RawLikeCount;
+// H19: LIKE/ILIKE ham bayt yolu, genel yolla birebir ayni olmalidir.
+// Ozellikle Turkce 'I' -> 'ı' (UTF-8 C4 B1) ve bayt bazli '_' davranisi.
+var
+  dir: string;
+  db: TVDb;
+  tdb: TVTableDb;
+  q: TVSql;
+  r1, r2: TSqlResult;
+
+  procedure Cmp(const A, B: string);
+  var
+    s1, s2, aa, bb: string;
+  begin
+    r1 := q.Exec(A);
+    r2 := q.Exec(B);
+    aa := A; bb := B;
+    aa := StringReplace(aa, 'COUNT(*)', 'COUNT(id)', []);
+    bb := StringReplace(bb, 'COUNT(*)', 'COUNT(id)', []);
+    if (Length(r1.Rows) > 0) and (Length(r1.Rows[0]) > 0) then
+      s1 := r1.Rows[0][0] else s1 := '<yok>';
+    if (Length(r2.Rows) > 0) and (Length(r2.Rows[0]) > 0) then
+      s2 := r2.Rows[0][0] else s2 := '<yok>';
+    if s1 = s2 then
+      Dogrula('T141 ayni: ' + aa, True, '')
+    else
+      Dogrula('T141 ayni: ' + aa, False, 'ham=' + s1 + ' genel=' + s2);
+  end;
+
+  procedure C(const W: string);
+  begin
+    Cmp('SELECT COUNT(*) FROM l WHERE ' + W,
+        'SELECT COUNT(id) FROM l WHERE ' + W);
+  end;
+
+begin
+  Grp('T141 H19 ham LIKE/ILIKE COUNT(*) / genel yol farki');
+  dir := D + '\t141_rawlike_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  tdb := TVTableDb.Create(db);
+  try
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      q.Exec('CREATE TABLE l (id INTEGER PRIMARY KEY, s TEXT)');
+      q.Exec('INSERT INTO l (id,s) VALUES ' +
+        '(1,''Ali''),(2,''ali''),(3,''Irmak''),(4,''irmak''),' +
+        '(5,''Ayşe''),(6,''IŞIL''),(7,''i''),(8,''I''),' +
+        '(9,''''),(10,NULL),(11,''a_b''),(12,''aXb''),(13,''a%b'')');
+      q.Exec('INSERT INTO l (id,s) VALUES (14,''' +
+        StringOfChar('a', 5000) + ''')');
+
+      C('s LIKE ''A%''');
+      C('s LIKE ''a%''');
+      C('s LIKE ''%a%''');
+      C('s LIKE ''_''');
+      C('s LIKE ''__''');
+      C('s LIKE ''A_''');
+      C('s LIKE ''%''');
+      C('s LIKE ''''');
+      C('s NOT LIKE ''A%''');
+      C('s LIKE ''a_b''');
+      C('s LIKE ''a%b''');
+      C('s ILIKE ''a%''');
+      C('s ILIKE ''A%''');
+      C('s ILIKE ''i%''');
+      C('s ILIKE ''I%''');
+      C('s ILIKE ''%i%''');
+      C('s ILIKE ''_''');
+      C('s ILIKE ''__''');
+      C('s ILIKE ''%a%''');
+      C('s ILIKE ''%A%''');
+      C('s ILIKE ''Ayşe''');
+      C('s ILIKE ''%ş%''');
+      C('s NOT ILIKE ''a%''');
+      C('s ILIKE ''%a%'' AND s LIKE ''A%''');
+      C('s ILIKE ''%a%'' AND id > 0');
+      C('id > 0 AND s ILIKE ''%a%''');
+    finally
+      q.Free;
+    end;
+  finally
+    tdb.Free;
+    db.Free;
+  end;
+end;
+
 procedure T137_H15_StreamHaving;
 // H15: akisli GROUP BY + HAVING yolu, genel yolla BIREBIR ayni sonucu
 // vermelidir. Genel yol, HAVING'e daima dogru bir ek kosul eklenerek
@@ -15062,6 +15151,7 @@ T92_MVCC_Isoaltion;
        T138_H16_StreamDistinct;
        T139_H17_StreamFilteredCount;
        T140_H18_RawExactCount;
+       T141_H19_RawLikeCount;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls

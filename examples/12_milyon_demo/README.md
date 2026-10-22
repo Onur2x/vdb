@@ -99,8 +99,10 @@ alınmıştır; farklı donanımda değişebilir.
 | `SELECT DISTINCT sehir` (`ORDER BY`'sız) | 0,64 s | H16 tek pass; önceki 3,8 s |
 | `SELECT DISTINCT yas … ORDER BY yas` | 0,48 s | H16 tek pass; önceki 4,6 s |
 | `SELECT DISTINCT id … ORDER BY id` | 1,63 s | H16 tek pass; önceki 5,5 s |
-| `COUNT(*) WHERE ad_soyad ILIKE '%a%'` | 2,8–3,0 s | H17 tek pass; önceki 6,2 s |
-| `COUNT(*)` + GUI bileşik filtre (`ILIKE` + şehir + yaş + bakiye) | 0,92–0,95 s | H17 + ham ön eleme; önceki 15–20 s |
+| `COUNT(*) WHERE ad_soyad ILIKE '%a%'` | 0,50–0,56 s | H19 ham kesin; önceki 2,8–3,0 s (ilk 6,2 s) |
+| `COUNT(*) WHERE ad_soyad LIKE '%a%'` | 0,44–0,45 s | H19 ham kesin; önceki ~2,0 s |
+| `COUNT(*) WHERE ad_soyad ILIKE 'A%'` | 0,44 s | H19 ham kesin |
+| `COUNT(*)` + GUI bileşik filtre (`ILIKE` + şehir + yaş + bakiye) | 0,52–0,53 s | H19 ham kesin; önceki 0,92–0,95 s (ilk 15–20 s) |
 | `COUNT(*) WHERE yas > 40` | 0,39–0,45 s | H18 ham kesin; önceki 2,75 s |
 | `COUNT(*) WHERE aktif = 1` | 0,41–0,44 s | H18 ham kesin; önceki 5,6 s |
 | `COUNT(*) WHERE bakiye > 5000` | 0,39–0,41 s | H18 ham kesin; önceki 5,75 s |
@@ -175,9 +177,10 @@ H17 ile tek tablolu saf `COUNT(*)` sorguları `WHERE` ile birlikte ham akıştan
 tek pass'te sayılır. Motor tüm satırları string matrisine çevirmez; yalnız
 `WHERE`'in referans verdiği kolonları çözer. `AND` ile bağlanan basit sayısal
 karşılaştırmalar ve ASCII metin eşitliği ham baytlarda ön elenir; kalan adaylar
-tam `EvalBool` ile doğrulanır. Böylece `COUNT(*) WHERE ad_soyad ILIKE '%a%'`
-6,2 s yerine 2,8–3,0 s, GUI'nin bileşik filtre sayımı 15–20 s yerine yaklaşık
-0,92–0,95 s sürer. Alt sorgu, pencere, aggregate, `TS_MATCH`, JOIN, `GROUP BY`,
+tam `EvalBool` ile doğrulanır. H17 tek başına `ILIKE '%a%'` sayımını 6,2 s'den
+2,8–3,0 s'ye, GUI'nin bileşik filtre sayımını 15–20 s'den ~0,92 s'ye indirdi;
+H19 bu iki durumu sırasıyla 0,50–0,56 s ve 0,52–0,53 s'ye taşıdı. Alt sorgu,
+pencere, aggregate, `TS_MATCH`, JOIN, `GROUP BY`,
 `DISTINCT`, `ORDER BY`, `LIMIT/OFFSET`, VIEW ve RLS içeren sorgular genel yola
 düşer. Ayrıca indeksli sayım yolu (H3) artık farklı kolon/OR/IN/LIKE içeren
 `WHERE` için indeks kurmaya çalışmadan H17'ye devreder.
@@ -192,6 +195,15 @@ PK sayımları indeks hızlı yolunda kalır. Böylece `yas > 40` 2,75 s yerine
 0,39–0,45 s, `aktif = 1` 5,6 s yerine 0,41–0,44 s, `bakiye > 5000` 5,75 s
 yerine 0,39–0,41 s, `sehir = 'Ankara'` 4,98 s yerine 0,39–0,44 s sürer ve
 ilk şehir filtresindeki ~5 s'lik indeks kurulumu ortadan kalkar.
+
+H19 ile saf ASCII kayıt ve ASCII desende `LIKE`/`ILIKE` de ham baytlarda,
+`VDbLikeMatch` ile birebir aynı `%`/`_` geri-izlemesiyle değerlendirilir.
+`ILIKE` Türkçe duyarlı küçültmeyi aynen uygular (`I` → UTF-8 `ı`, `A–Z` →
+`a–z`); böylece `ILIKE`/`LIKE` içeren WHERE de H18'in string çözmeden sayma
+yoluna girer. UTF-8 kayıt, ASCII dışı desen, tip uyuşmazlığı veya uzun satırda
+o satır çözme+`EvalBool` yoluna düşer. Böylece `ILIKE '%a%'` 2,8–3,0 s yerine
+0,50–0,56 s, `LIKE '%a%'` ~2,0 s yerine 0,44–0,45 s, GUI bileşik filtre
+0,92–0,95 s yerine 0,52–0,53 s sürer.
 
 > `SUM`/`AVG` kayan noktalı sonuçlarda, akışlı toplama sırası nedeniyle
 > genel yola göre son ondalık hanede küçük bir yuvarlama farkı görülebilir;
