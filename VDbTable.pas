@@ -624,6 +624,9 @@ type
     function IndexNames(const Table: string): TStrArray;
     function TryGetMemIndex(TableId: Word; ColIdx: Integer; out Entries: TIdxEntries): Boolean;
     function TryGetIdxSource(TableId: Word; ColIdx: Integer; out Src: TIdxSource): Boolean;
+    { H18: indeks kaynagi HAZIR mi? Insa tetiklemez. H3'un pahali
+      BuildOneIndex cagrisini onlemek icin kullanilir. }
+    function IdxSourceReady(TableId: Word; ColIdx: Integer): Boolean;
     function IdxNParts(TableId: Word; ColIdx: Integer): Integer;
     function IdxPosOfName(const Table, IdxName: string): Integer;      // F-19
 function IdxEntryCount(TableId: Word; IdxPos: Integer): Integer;      // F-17
@@ -7796,6 +7799,15 @@ begin
   sk := TIdxSkip.Create(ct, cts);
   sk.LoadFromEntries(E);
   FSkipIdx.AddOrSetValue(k, sk);
+end;
+
+function TVTableDb.IdxSourceReady(TableId: Word; ColIdx: Integer): Boolean;
+var
+  k: Int64;
+begin
+  k := IdxKey(TableId, ColIdx);
+  Result := FMemIdx.ContainsKey(k) or FSkipIdx.ContainsKey(k) or
+            (FIdxDirty.IndexOf(k) >= 0);
 end;
 
 function TVTableDb.TryGetIdxSource(TableId: Word; ColIdx: Integer;

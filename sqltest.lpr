@@ -14517,6 +14517,117 @@ begin
   end;
 end;
 
+procedure T140_H18_RawExactCount;
+// H18: WHERE tamamen ham kosullarla cozulebildiginde string cozme ve
+// EvalBool atlanir. Sonuc, genel yolla (COUNT(id)) birebir ayni olmalidir.
+// Sinir durumlari: NULL/'' , UTF-8 metin, dinamik tip, 2^53 disi INT,
+// FLOAT, BOOLEAN ve ham olmayan kosullarla karisik AND.
+var
+  dir: string;
+  db: TVDb;
+  tdb: TVTableDb;
+  q: TVSql;
+  r1, r2: TSqlResult;
+
+  procedure Cmp(const A, B: string);
+  var
+    s1, s2: string;
+  begin
+    r1 := q.Exec(A);
+    r2 := q.Exec(B);
+    if (Length(r1.Rows) > 0) and (Length(r1.Rows[0]) > 0) then
+      s1 := r1.Rows[0][0] else s1 := '<yok>';
+    if (Length(r2.Rows) > 0) and (Length(r2.Rows[0]) > 0) then
+      s2 := r2.Rows[0][0] else s2 := '<yok>';
+    if s1 = s2 then
+      Dogrula('T140 ayni: ' + A, True, '')
+    else
+      Dogrula('T140 ayni: ' + A, False, 'ham=' + s1 + ' genel=' + s2);
+  end;
+
+begin
+  Grp('T140 H18 ham kesin COUNT(*) / genel yol farki');
+  dir := D + '\t140_rawcount_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  tdb := TVTableDb.Create(db);
+  try
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      q.Exec('CREATE TABLE h (id INTEGER PRIMARY KEY, i INTEGER, f FLOAT, ' +
+        's TEXT, b BOOLEAN, m TEXT)');
+      q.Exec('INSERT INTO h (id,i,f,s,b,m) VALUES ' +
+        '(1,42,2.5,''a'',TRUE,''x''),' +
+        '(2,-7,1.25,''b'',FALSE,123),' +
+        '(3,0,2.5,NULL,NULL,''x''),' +
+        '(4,9007199254740992,0.0,''ğ'',TRUE,NULL),' +
+        '(5,9007199254740993,-1.5,''ağa'',FALSE,7)');
+
+      Cmp('SELECT COUNT(*) FROM h WHERE i = 42',
+          'SELECT COUNT(id) FROM h WHERE i = 42');
+      Cmp('SELECT COUNT(*) FROM h WHERE i > 42',
+          'SELECT COUNT(id) FROM h WHERE i > 42');
+      Cmp('SELECT COUNT(*) FROM h WHERE i < 0',
+          'SELECT COUNT(id) FROM h WHERE i < 0');
+      Cmp('SELECT COUNT(*) FROM h WHERE i <> 42',
+          'SELECT COUNT(id) FROM h WHERE i <> 42');
+      Cmp('SELECT COUNT(*) FROM h WHERE i BETWEEN -7 AND 42',
+          'SELECT COUNT(id) FROM h WHERE i BETWEEN -7 AND 42');
+      Cmp('SELECT COUNT(*) FROM h WHERE i IN (-7,42,999)',
+          'SELECT COUNT(id) FROM h WHERE i IN (-7,42,999)');
+      Cmp('SELECT COUNT(*) FROM h WHERE i = 1.5',
+          'SELECT COUNT(id) FROM h WHERE i = 1.5');
+      Cmp('SELECT COUNT(*) FROM h WHERE i >= 9007199254740992',
+          'SELECT COUNT(id) FROM h WHERE i >= 9007199254740992');
+      Cmp('SELECT COUNT(*) FROM h WHERE i = 9007199254740993',
+          'SELECT COUNT(id) FROM h WHERE i = 9007199254740993');
+      Cmp('SELECT COUNT(*) FROM h WHERE i > 9007199254740992',
+          'SELECT COUNT(id) FROM h WHERE i > 9007199254740992');
+      Cmp('SELECT COUNT(*) FROM h WHERE f = 2.5',
+          'SELECT COUNT(id) FROM h WHERE f = 2.5');
+      Cmp('SELECT COUNT(*) FROM h WHERE f > 2.0',
+          'SELECT COUNT(id) FROM h WHERE f > 2.0');
+      Cmp('SELECT COUNT(*) FROM h WHERE f <> 2.5',
+          'SELECT COUNT(id) FROM h WHERE f <> 2.5');
+      Cmp('SELECT COUNT(*) FROM h WHERE s = ''a''',
+          'SELECT COUNT(id) FROM h WHERE s = ''a''');
+      Cmp('SELECT COUNT(*) FROM h WHERE s <> ''a''',
+          'SELECT COUNT(id) FROM h WHERE s <> ''a''');
+      Cmp('SELECT COUNT(*) FROM h WHERE s = ''ğ''',
+          'SELECT COUNT(id) FROM h WHERE s = ''ğ''');
+      Cmp('SELECT COUNT(*) FROM h WHERE s = ''ağa''',
+          'SELECT COUNT(id) FROM h WHERE s = ''ağa''');
+      Cmp('SELECT COUNT(*) FROM h WHERE s IS NULL',
+          'SELECT COUNT(id) FROM h WHERE s IS NULL');
+      Cmp('SELECT COUNT(*) FROM h WHERE s IS NOT NULL',
+          'SELECT COUNT(id) FROM h WHERE s IS NOT NULL');
+      Cmp('SELECT COUNT(*) FROM h WHERE s = ''''',
+          'SELECT COUNT(id) FROM h WHERE s = ''''');
+      Cmp('SELECT COUNT(*) FROM h WHERE i > 0 AND s = ''a''',
+          'SELECT COUNT(id) FROM h WHERE i > 0 AND s = ''a''');
+      Cmp('SELECT COUNT(*) FROM h WHERE i > 0 AND s LIKE ''a%''',
+          'SELECT COUNT(id) FROM h WHERE i > 0 AND s LIKE ''a%''');
+      Cmp('SELECT COUNT(*) FROM h WHERE i > 0 AND b = TRUE',
+          'SELECT COUNT(id) FROM h WHERE i > 0 AND b = TRUE');
+      Cmp('SELECT COUNT(*) FROM h WHERE m = 123',
+          'SELECT COUNT(id) FROM h WHERE m = 123');
+      Cmp('SELECT COUNT(*) FROM h WHERE NOT (i > 42)',
+          'SELECT COUNT(id) FROM h WHERE NOT (i > 42)');
+      Cmp('SELECT COUNT(*) FROM h WHERE i = 42 OR i = 0',
+          'SELECT COUNT(id) FROM h WHERE i = 42 OR i = 0');
+      Cmp('SELECT COUNT(*) FROM h WHERE id >= 2 AND id < 5',
+          'SELECT COUNT(id) FROM h WHERE id >= 2 AND id < 5');
+    finally
+      q.Free;
+    end;
+  finally
+    tdb.Free;
+    db.Free;
+  end;
+end;
+
 procedure T137_H15_StreamHaving;
 // H15: akisli GROUP BY + HAVING yolu, genel yolla BIREBIR ayni sonucu
 // vermelidir. Genel yol, HAVING'e daima dogru bir ek kosul eklenerek
@@ -14950,6 +15061,7 @@ T92_MVCC_Isoaltion;
        T137_H15_StreamHaving;
        T138_H16_StreamDistinct;
        T139_H17_StreamFilteredCount;
+       T140_H18_RawExactCount;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls

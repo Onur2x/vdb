@@ -99,12 +99,16 @@ alınmıştır; farklı donanımda değişebilir.
 | `SELECT DISTINCT sehir` (`ORDER BY`'sız) | 0,64 s | H16 tek pass; önceki 3,8 s |
 | `SELECT DISTINCT yas … ORDER BY yas` | 0,48 s | H16 tek pass; önceki 4,6 s |
 | `SELECT DISTINCT id … ORDER BY id` | 1,63 s | H16 tek pass; önceki 5,5 s |
-| Şehir + yaş `COUNT(*)` | 0,83–0,98 s | sıcak indeks |
 | `COUNT(*) WHERE ad_soyad ILIKE '%a%'` | 2,8–3,0 s | H17 tek pass; önceki 6,2 s |
-| `COUNT(*)` + GUI bileşik filtre (`ILIKE` + şehir + yaş + bakiye) | 0,88 s | H17 + ham ön eleme; önceki 15–20 s |
-| `COUNT(*) WHERE sehir='Ankara' AND yas 30..50` | 0,64 s | H17 + ham ön eleme; önceki 7,9 s |
-| `COUNT(*) WHERE aktif=0` | 1,4 s | H17; önceki 5,6 s |
-| `COUNT(*) WHERE yas 30..50 AND bakiye>=1000` | 3,4–3,5 s | H17; seçici olmayan filtre, önceki 9,5–9,9 s |
+| `COUNT(*)` + GUI bileşik filtre (`ILIKE` + şehir + yaş + bakiye) | 0,92–0,95 s | H17 + ham ön eleme; önceki 15–20 s |
+| `COUNT(*) WHERE yas > 40` | 0,39–0,45 s | H18 ham kesin; önceki 2,75 s |
+| `COUNT(*) WHERE aktif = 1` | 0,41–0,44 s | H18 ham kesin; önceki 5,6 s |
+| `COUNT(*) WHERE bakiye > 5000` | 0,39–0,41 s | H18 ham kesin; önceki 5,75 s |
+| `COUNT(*) WHERE sehir = 'Ankara'` | 0,39–0,44 s | H18; 5 s'lik indeks kurulumu yok, önceki 4,98 s |
+| `COUNT(*) WHERE sehir='Ankara' AND yas 30..50` | 0,39–0,42 s | H18 ham kesin; önceki 7,9 s |
+| `COUNT(*) WHERE aktif=1 AND bakiye>5000` | 0,42–0,44 s | H18 ham kesin |
+| `COUNT(*) WHERE yas 30..50 AND bakiye>=1000` | 0,44 s | H18 ham kesin; önceki 9,5–9,9 s |
+| PK aralığı `COUNT(*)` | 0–15 ms / 1,1 s | H3 indeks sayımı (sıcak / ilk yükleme) |
 
 ## Sorgu hızı nasıl iyileştirildi?
 
@@ -173,10 +177,21 @@ tek pass'te sayılır. Motor tüm satırları string matrisine çevirmez; yalnı
 karşılaştırmalar ve ASCII metin eşitliği ham baytlarda ön elenir; kalan adaylar
 tam `EvalBool` ile doğrulanır. Böylece `COUNT(*) WHERE ad_soyad ILIKE '%a%'`
 6,2 s yerine 2,8–3,0 s, GUI'nin bileşik filtre sayımı 15–20 s yerine yaklaşık
-0,88 s sürer. Alt sorgu, pencere, aggregate, `TS_MATCH`, JOIN, `GROUP BY`,
+0,92–0,95 s sürer. Alt sorgu, pencere, aggregate, `TS_MATCH`, JOIN, `GROUP BY`,
 `DISTINCT`, `ORDER BY`, `LIMIT/OFFSET`, VIEW ve RLS içeren sorgular genel yola
 düşer. Ayrıca indeksli sayım yolu (H3) artık farklı kolon/OR/IN/LIKE içeren
 `WHERE` için indeks kurmaya çalışmadan H17'ye devreder.
+
+H18 ile `WHERE` **tamamen** ham çözülebilir koşullardan oluşuyorsa (AND'lenen
+`INT`/`FLOAT` karşılaştırmaları ve ASCII `TEXT` `=`/`<>`) hiç string çözme ve
+`EvalBool` yapılmadan sayılır. `NULL`/boş değerler genel yolla aynı 3-değerli
+mantıkla işlenir; tip uyuşmazlığı, UTF-8 kayıt, 2^53 dışı `INT` veya ham
+olmayan bir koşul varsa o satır eski çözme+`EvalBool` yoluna düşer. H3 de PK
+dışı indeks hazır değilse tüm tabloyu tarayan indeks kurulumunu başlatmaz;
+PK sayımları indeks hızlı yolunda kalır. Böylece `yas > 40` 2,75 s yerine
+0,39–0,45 s, `aktif = 1` 5,6 s yerine 0,41–0,44 s, `bakiye > 5000` 5,75 s
+yerine 0,39–0,41 s, `sehir = 'Ankara'` 4,98 s yerine 0,39–0,44 s sürer ve
+ilk şehir filtresindeki ~5 s'lik indeks kurulumu ortadan kalkar.
 
 > `SUM`/`AVG` kayan noktalı sonuçlarda, akışlı toplama sırası nedeniyle
 > genel yola göre son ondalık hanede küçük bir yuvarlama farkı görülebilir;

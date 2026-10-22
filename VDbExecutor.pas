@@ -4222,6 +4222,9 @@ begin
   if FT.RlsApplies(Stmt.FromTable) then Exit;
   oneCol := -1;
   if not SameColCond(Stmt.WhereClause, oneCol) then Exit;
+  // H18: PK disi indeks hazir degilse BuildOneIndex (tum tabloyu tarar)
+  // baslatma; H17 ham akis yolu daha hizli ve ongorulebilir.
+  if (oneCol <> Td.PkIndex) and (not FT.IdxSourceReady(Td.TableId, oneCol)) then Exit;
   FCountOnly := True;
   try
     if not NarrowRows(Td, Stmt.WhereClause, ColNames, ColTypes,
@@ -4265,6 +4268,7 @@ type
     ColTypes: TByteArray;
     Where: TSqlExprNode;
     RawConds: TRawCondArray;
+    RawAll: Boolean;          // H18: WHERE tamamen ham kosullarla kesin cozulebilir
     NeedIdx: TIntArray;
     MaxCol: Integer;
     Vals: TStrArray;
@@ -4275,6 +4279,9 @@ type
 
 function VdbStreamSelRawPass(const Conds: array of TRawCond;
   Buf: PByte; const FType: TByteArray; const FOff, FLen: TIntArray): Boolean; forward;
+function VdbStreamSelRawPassEx(const Conds: array of TRawCond;
+  Buf: PByte; const FType: TByteArray; const FOff, FLen: TIntArray;
+  out AllDecided: Boolean): Boolean; forward;
 procedure VdbStreamOrderAddRawCond(var Conds: TRawCondArray;
   Exec: TVSqlExecutor; E: TSqlExprNode; const td: TTableDef;
   const ColNames: TStrArray; const ColTypes: TByteArray); forward;
@@ -4286,6 +4293,7 @@ var
   tid: Word;
   kh: QWord;
   i: Integer;
+  decided: Boolean;
 begin
   C := User;
   Result := True;
@@ -4301,9 +4309,18 @@ begin
     C^.Failed := True; Exit(False);
   end;
   // H17: basit AND kosullarinda satiri cozmeden kesin eleme.
-  if (Length(C^.RawConds) > 0) and
-     (not VdbStreamSelRawPass(C^.RawConds, Buf, C^.FType,
-        C^.FOff, C^.FLen)) then Exit;
+  // H18: WHERE tamamen ham kosullardan olusuyorsa ve satir tip/ASCII
+  // guvenliyse hic string cozmeden say.
+  if Length(C^.RawConds) > 0 then
+  begin
+    if not VdbStreamSelRawPassEx(C^.RawConds, Buf, C^.FType,
+         C^.FOff, C^.FLen, decided) then Exit;
+    if C^.RawAll and decided then
+    begin
+      Inc(C^.Count);
+      Exit;
+    end;
+  end;
   for i := 0 to High(C^.NeedIdx) do
     C^.Vals[C^.NeedIdx[i]] := VDbColFromOffsetsP(Buf, C^.ColCnt,
       C^.NeedIdx[i], C^.FType, C^.FOff, C^.FLen);
@@ -4398,6 +4415,60 @@ var
     // bilinmeyen dugum: genel yol.
   end;
 
+  { H18: WHERE'in TAMAMI ham kosullarla kesin cozulebilir mi? Yalniz
+    AND'lenen, tek kolon/literal karsilastirmalari; INT icin 2^53 siniri
+    (genel yol Double ile kiyaslar), TEXT icin yalniz ASCII esitlik/
+    esitsizlik. Guvenli degilse False -> eski cozme+EvalBool yolu. }
+  function RawCover(E: TSqlExprNode): Boolean;
+  const
+    SAFE_INT: Int64 = 9007199254740992;
+  var
+    b: TSqlBinaryOpNode;
+    cr: TSqlColumnRefNode;
+    lit: TSqlLiteralNode;
+    ci2, q: Integer;
+  begin
+    Result := False;
+    if E = nil then Exit(False);
+    if E is TSqlBinaryOpNode then
+    begin
+      b := TSqlBinaryOpNode(E);
+      if b.Op = sboAnd then
+        Exit(RawCover(b.Left) and RawCover(b.Right));
+      if not (b.Op in [sboEq, sboNeq, sboLt, sboLte, sboGt, sboGte]) then Exit;
+      if (b.Left is TSqlColumnRefNode) and (b.Right is TSqlLiteralNode) then
+      begin
+        cr := TSqlColumnRefNode(b.Left);
+        lit := TSqlLiteralNode(b.Right);
+      end
+      else if (b.Right is TSqlColumnRefNode) and (b.Left is TSqlLiteralNode) then
+      begin
+        cr := TSqlColumnRefNode(b.Right);
+        lit := TSqlLiteralNode(b.Left);
+      end
+      else Exit;
+      ci2 := FindColIdx(cr.ColumnName, cr.TableQualifier, ColNames);
+      if (ci2 < 0) or (ci2 > High(td.Cols)) or (ci2 > High(ColTypes)) then Exit;
+      if td.Cols[ci2].Encrypted or (td.Cols[ci2].Collate <> '') then Exit;
+      if ColTypes[ci2] = VCT_INT then
+      begin
+        if lit.LitType <> sltInt then Exit;
+        if (lit.IntVal > SAFE_INT) or (lit.IntVal < -SAFE_INT) then Exit;
+        Exit(True);
+      end;
+      if ColTypes[ci2] = VCT_FLOAT then
+        Exit((lit.LitType = sltInt) or (lit.LitType = sltFloat));
+      if ColTypes[ci2] = VCT_STR then
+      begin
+        if not (b.Op in [sboEq, sboNeq]) then Exit;
+        if lit.LitType <> sltString then Exit;
+        for q := 1 to Length(lit.StrVal) do
+          if lit.StrVal[q] >= #128 then Exit(False);
+        Exit(True);
+      end;
+    end;
+  end;
+
 begin
   Result := False;
   if Stmt.WhereClause = nil then Exit;
@@ -4444,6 +4515,7 @@ begin
   ctx.RawConds := nil;
   VdbStreamOrderAddRawCond(ctx.RawConds, Self, Stmt.WhereClause, td,
     ColNames, ColTypes);
+  ctx.RawAll := RawCover(Stmt.WhereClause);
   ctx.MaxCol := maxCol;
   ctx.Count := 0;
   ctx.Failed := False;
@@ -9201,8 +9273,11 @@ end;
 { Ham kosullari degerlendirir: True = "uyabilir" (elem yok),
   False = "kesinlikle uymaz" (satiri cozmeden ele). Yalniz AND zincirinden
   cikan kosullar cagrilir; bu yuzden tek bir kosunun False'u yeterlidir. }
-function VdbStreamSelRawPass(const Conds: array of TRawCond;
-  Buf: PByte; const FType: TByteArray; const FOff, FLen: TIntArray): Boolean;
+function VdbStreamSelRawPassEx(const Conds: array of TRawCond;
+  Buf: PByte; const FType: TByteArray; const FOff, FLen: TIntArray;
+  out AllDecided: Boolean): Boolean;
+const
+  SAFE_INT: Int64 = 9007199254740992;
 var
   k: Integer;
   c: TRawCond;
@@ -9212,6 +9287,7 @@ var
   iv2: Integer;
 begin
   Result := True;
+  AllDecided := True;
   for k := 0 to High(Conds) do
   begin
     c := Conds[k];
@@ -9222,7 +9298,11 @@ begin
       // ise HIC filtreleme (Continue -> genel RowMatches dogru sonucu verir).
       if c.InIsFloat then
       begin
-        if (FType[c.Col] <> VCT_FLOAT) or (FLen[c.Col] <> 8) then Continue;
+        if (FType[c.Col] <> VCT_FLOAT) or (FLen[c.Col] <> 8) then
+        begin
+          AllDecided := False;
+          Continue;
+        end;
         Move((Buf + FOff[c.Col])^, fv, 8);
         ok := False;
         for iv2 := 0 to High(c.InFloats) do
@@ -9230,7 +9310,11 @@ begin
       end
       else
       begin
-        if (FType[c.Col] <> VCT_INT) or (FLen[c.Col] <> 8) then Continue;
+        if (FType[c.Col] <> VCT_INT) or (FLen[c.Col] <> 8) then
+        begin
+          AllDecided := False;
+          Continue;
+        end;
         Move((Buf + FOff[c.Col])^, iv, 8);
         ok := False;
         for iv2 := 0 to High(c.InInts) do
@@ -9245,9 +9329,17 @@ begin
       // hicbir operatorle eslesmez; kiyas BAYT duzenidir. Yalniz saf-ASCII
       // kayit+literal icin filtrelenir (codepage farki riskini onler);
       // aksi halde Continue -> genel yol dogru sonucu verir.
-      if FType[c.Col] <> VCT_STR then Continue;
+      if FType[c.Col] <> VCT_STR then
+      begin
+        AllDecided := False;
+        Continue;
+      end;
       if FLen[c.Col] = 0 then Exit(False);      // '' hicbir kiyasta eslesmez
-      if not VdbBytesAscii(Buf + FOff[c.Col], FLen[c.Col]) then Continue;
+      if not VdbBytesAscii(Buf + FOff[c.Col], FLen[c.Col]) then
+      begin
+        AllDecided := False;
+        Continue;
+      end;
       if c.Op = sboEq then
       begin
         if not VdbBytesEqP(Buf + FOff[c.Col], FLen[c.Col], c.S) then Exit(False);
@@ -9262,7 +9354,11 @@ begin
     begin
       // Kayittaki GERCEK alan tipi beklenen tip degilse HIC filtreleme
       // (dinamik tip olabilir; genel yol dogru sonucu verir).
-      if (FType[c.Col] <> VCT_FLOAT) or (FLen[c.Col] <> 8) then Continue;
+      if (FType[c.Col] <> VCT_FLOAT) or (FLen[c.Col] <> 8) then
+      begin
+        AllDecided := False;
+        Continue;
+      end;
       Move(Buf[FOff[c.Col]], fv, 8);
       case c.Op of
         sboEq: ok := fv = c.F;
@@ -9277,8 +9373,20 @@ begin
     end
     else
     begin
-      if (FType[c.Col] <> VCT_INT) or (FLen[c.Col] <> 8) then Continue;
+      if (FType[c.Col] <> VCT_INT) or (FLen[c.Col] <> 8) then
+      begin
+        AllDecided := False;
+        Continue;
+      end;
       Move(Buf[FOff[c.Col]], iv, 8);
+      // Genel yol INT'i Double ile kiyaslar. 2^53 disinda Int64 kiyasi
+      // Double kiyasindan farkli olabilir; o satiri karara baglama.
+      if (iv > SAFE_INT) or (iv < -SAFE_INT) or
+         (c.I > SAFE_INT) or (c.I < -SAFE_INT) then
+      begin
+        AllDecided := False;
+        Continue;
+      end;
       case c.Op of
         sboEq: ok := iv = c.I;
         sboNeq: ok := iv <> c.I;
@@ -9291,6 +9399,14 @@ begin
       if not ok then Exit(False);
     end;
   end;
+end;
+
+function VdbStreamSelRawPass(const Conds: array of TRawCond;
+  Buf: PByte; const FType: TByteArray; const FOff, FLen: TIntArray): Boolean;
+var
+  dummy: Boolean;
+begin
+  Result := VdbStreamSelRawPassEx(Conds, Buf, FType, FOff, FLen, dummy);
 end;
 
 { H3: zone kosulu bu bolumde ASLA eslesemez mi? (yalnizca kanit varsa
