@@ -12411,6 +12411,9 @@ begin
     0, 0, '1');
   ChkVal('sifreli GROUP BY', 'SELECT ad FROM sec WHERE ad IS NOT NULL ' +
     'GROUP BY ad', 0, 0, 'gizli-abc');
+  // H16: akisli DISTINCT sifreli kolonda cozulmus degeri tekillestirmeli.
+  ChkVal('sifreli DISTINCT', 'SELECT DISTINCT ad FROM sec ' +
+    'WHERE ad IS NOT NULL ORDER BY ad', 0, 0, 'gizli-abc');
   ChkVal('sifreli ORDER BY', 'SELECT ad FROM sec WHERE ad IS NOT NULL ' +
     'ORDER BY ad DESC LIMIT 1', 0, 0, 'gizli-abc');
 
@@ -14263,6 +14266,110 @@ begin
   end;
 end;
 
+procedure T138_H16_StreamDistinct;
+// H16: tek kolonlu akisli DISTINCT yolu, genel yolla BIREBIR ayni sonucu
+// vermelidir. Genel yol, SELECT listesine ayni kolonun ikinci bir kopyasi
+// eklenerek zorlanir (Columns.Count = 2 -> akisli yol uymaz); DISTINCT
+// cifti ayni oldugu icin sonuc kumesi degismez.
+var
+  dir: string;
+  db: TVDb;
+  tdb: TVTableDb;
+  q: TVSql;
+  r1, r2: TSqlResult;
+
+  function FirstCol(const R: TSqlResult; Sorted: Boolean): string;
+  var
+    k, m: Integer;
+    a: TStrArray;
+    s: string;
+  begin
+    Result := '';
+    SetLength(a, Length(R.Rows));
+    for k := 0 to High(R.Rows) do
+      if Length(R.Rows[k]) > 0 then a[k] := R.Rows[k][0] else a[k] := '';
+    if Sorted then
+    begin
+      // kucuk test kumesi: basit secmeli siralama
+      for k := 0 to High(a) do
+      begin
+        for m := k + 1 to High(a) do
+          if a[m] < a[k] then
+          begin s := a[k]; a[k] := a[m]; a[m] := s; end;
+      end;
+    end;
+    for k := 0 to High(a) do Result := Result + '[' + a[k] + ']';
+  end;
+
+  procedure Cmp(const A, B: string; Sorted: Boolean = False);
+  var
+    s1, s2: string;
+  begin
+    r1 := q.Exec(A);
+    r2 := q.Exec(B);
+    s1 := FirstCol(r1, Sorted);
+    s2 := FirstCol(r2, Sorted);
+    if s1 = s2 then
+      Dogrula('T138 ayni: ' + A, True, '')
+    else
+      Dogrula('T138 ayni: ' + A, False,
+        'akis=' + s1 + ' genel=' + s2);
+  end;
+
+begin
+  Grp('T138 H16 akisli DISTINCT / genel yol farki');
+  dir := D + '\t138_distinct_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  tdb := TVTableDb.Create(db);
+  try
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      q.Exec('CREATE TABLE d (id INTEGER PRIMARY KEY, s TEXT, n INTEGER, ' +
+        'f FLOAT, b BOOLEAN)');
+      q.Exec('INSERT INTO d (id,s,n,f,b) VALUES ' +
+        '(1,''a'',10,1.5,TRUE),(2,''a'',20,2.5,TRUE),(3,''b'',30,3.5,FALSE),' +
+        '(4,''b'',5,0.5,FALSE),(5,''c'',NULL,NULL,NULL),(6,NULL,7,7.0,TRUE),' +
+        '(7,''a'',20,2.5,NULL),(8,''b'',NULL,1.25,TRUE),(9,'''',99,9.9,FALSE)');
+
+      Cmp('SELECT DISTINCT s FROM d ORDER BY s',
+          'SELECT DISTINCT s, s FROM d ORDER BY s');
+      Cmp('SELECT DISTINCT s FROM d ORDER BY s DESC',
+          'SELECT DISTINCT s, s FROM d ORDER BY s DESC');
+      Cmp('SELECT DISTINCT s FROM d ORDER BY s NULLS FIRST',
+          'SELECT DISTINCT s, s FROM d ORDER BY s NULLS FIRST');
+      Cmp('SELECT DISTINCT s FROM d ORDER BY s DESC NULLS LAST',
+          'SELECT DISTINCT s, s FROM d ORDER BY s DESC NULLS LAST');
+      Cmp('SELECT DISTINCT s AS c FROM d ORDER BY c',
+          'SELECT DISTINCT s AS c, s FROM d ORDER BY s');
+      Cmp('SELECT DISTINCT n FROM d ORDER BY n',
+          'SELECT DISTINCT n, n FROM d ORDER BY n');
+      Cmp('SELECT DISTINCT f FROM d ORDER BY f',
+          'SELECT DISTINCT f, f FROM d ORDER BY f');
+      Cmp('SELECT DISTINCT b FROM d ORDER BY b',
+          'SELECT DISTINCT b, b FROM d ORDER BY b');
+      Cmp('SELECT DISTINCT s FROM d WHERE n > 5 ORDER BY s',
+          'SELECT DISTINCT s, s FROM d WHERE n > 5 ORDER BY s');
+      Cmp('SELECT DISTINCT s FROM d WHERE n IS NULL ORDER BY s',
+          'SELECT DISTINCT s, s FROM d WHERE n IS NULL ORDER BY s');
+      Cmp('SELECT DISTINCT s FROM d ORDER BY s LIMIT 2 OFFSET 1',
+          'SELECT DISTINCT s, s FROM d ORDER BY s LIMIT 2 OFFSET 1');
+      Cmp('SELECT DISTINCT n FROM d ORDER BY n LIMIT 3',
+          'SELECT DISTINCT n, n FROM d ORDER BY n LIMIT 3');
+      Cmp('SELECT DISTINCT s FROM d', 'SELECT DISTINCT s, s FROM d', True);
+      Cmp('SELECT DISTINCT n FROM d', 'SELECT DISTINCT n, n FROM d', True);
+      Cmp('SELECT DISTINCT f FROM d', 'SELECT DISTINCT f, f FROM d', True);
+    finally
+      q.Free;
+    end;
+  finally
+    tdb.Free;
+    db.Free;
+  end;
+end;
+
 procedure T137_H15_StreamHaving;
 // H15: akisli GROUP BY + HAVING yolu, genel yolla BIREBIR ayni sonucu
 // vermelidir. Genel yol, HAVING'e daima dogru bir ek kosul eklenerek
@@ -14694,6 +14801,7 @@ T92_MVCC_Isoaltion;
        T135_H14_FloatSort;
        T136_H13_GroupDiff;
        T137_H15_StreamHaving;
+       T138_H16_StreamDistinct;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls

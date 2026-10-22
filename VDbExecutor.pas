@@ -440,6 +440,12 @@ type
       Sekil/guvenlik uymazsa False -> genel yol AYNEN calisir. }
     function TryStreamSelect(Stmt: TSqlSelectStmt; const td: TTableDef;
       out Res: TSqlResult): Boolean;
+    { H16: tek kolonlu SELECT DISTINCT ... [ORDER BY ayni kolon] sorgusunu
+      ham akistan tek pass'te tekillestirir. Tum satir matrisi kurulmaz;
+      yalniz secilen kolon cozulur. Sekil uymazsa False -> genel yol. }
+    function TryStreamDistinct(Stmt: TSqlSelectStmt; const td: TTableDef;
+      const ColNames: TStrArray; const ColTypes: TByteArray;
+      out Res: TSqlResult): Boolean;
     { H12: ORDER BY ... LIMIT icin tek tabloyu ham akistan okur; yalniz
       en iyi K = LIMIT + OFFSET satiri tutar. WHERE varsa satir yine
       RowMatches ile dogrulanir. Sekil uymazsa False -> genel yol. }
@@ -8260,6 +8266,29 @@ type
   end;
   PStreamSelCtx = ^TStreamSelCtx;
 
+  { H16: tek kolonlu akisli DISTINCT baglami. Satir matrisi yerine yalniz
+    secilen kolonun degeri ve tekillestirme sozlugu tutulur. }
+  TStreamDistinctCtx = record
+    Exec: TVSqlExecutor;
+    TableId: Word;
+    HashPrefix: QWord;
+    ColCnt: Integer;
+    FType: TByteArray;
+    FOff, FLen: TIntArray;
+    ColNames: TStrArray;
+    ColTypes: TByteArray;
+    Where: TSqlExprNode;
+    ColIdx: Integer;
+    NeedFull: Boolean;
+    Seen: Int64;
+    Failed: Boolean;
+    Overflow: Boolean;
+    Keys: TDictionary<string, Integer>;
+    Vals: TStrArray;
+    N, Cap: Integer;
+  end;
+  PStreamDistinctCtx = ^TStreamDistinctCtx;
+
   { H12: ORDER BY ... LIMIT icin akisli top-N. Tum satirlar string
     matrisine cevrilmez; yalniz siralama anahtari + PK tutulur. }
   TStreamOrderRec = record
@@ -9238,6 +9267,196 @@ begin
   Inc(ctx^.Emitted);
   if (ctx^.Limit >= 0) and (ctx^.Emitted >= ctx^.Limit) then Exit(False);
   Result := True;
+end;
+
+function VdbStreamDistinctCb(Key: QWord; Buf: PByte; Len: Integer;
+  User: Pointer): Boolean;
+var
+  C: PStreamDistinctCtx;
+  tid: Word;
+  keyHash: QWord;
+  v: string;
+  vals: TStrArray;
+  maxCol: Integer;
+begin
+  C := User;
+  Result := True;
+  if Key = VDB_SCHEMA_KEY then Exit;
+  if C^.NeedFull then maxCol := C^.ColCnt - 1 else maxCol := C^.ColIdx;
+  if not VDbPeekRawRowKeyHashTo(Buf, Len, C^.ColCnt, tid, C^.HashPrefix,
+       keyHash, maxCol, C^.FType, C^.FOff, C^.FLen) then
+  begin
+    C^.Failed := True; Exit(False);
+  end;
+  if tid <> C^.TableId then Exit;
+  if keyHash <> Key then
+  begin
+    C^.Failed := True; Exit(False);
+  end;
+  Inc(C^.Seen);
+  if C^.NeedFull then
+  begin
+    VDbRowFromOffsetsP(Buf, C^.ColCnt, C^.FType, C^.FOff, C^.FLen, vals);
+    if (C^.Where <> nil) and
+       (not C^.Exec.RowMatches(C^.Where, vals, C^.ColNames, C^.ColTypes)) then
+      Exit;
+    if (C^.ColIdx >= 0) and (C^.ColIdx <= High(vals)) then
+      v := vals[C^.ColIdx]
+    else
+      v := '';
+  end
+  else
+    v := VDbColFromOffsetsP(Buf, C^.ColCnt, C^.ColIdx,
+                            C^.FType, C^.FOff, C^.FLen);
+  if C^.Keys.ContainsKey(v) then Exit;
+  if C^.N >= VDB_MAX_RESULT_ROWS then
+  begin
+    C^.Overflow := True; Exit(False);
+  end;
+  C^.Keys.Add(v, 0);
+  if C^.N >= C^.Cap then
+  begin
+    if C^.Cap < 16 then C^.Cap := 16 else C^.Cap := C^.Cap * 2;
+    SetLength(C^.Vals, C^.Cap);
+  end;
+  C^.Vals[C^.N] := v;
+  Inc(C^.N);
+end;
+
+function TVSqlExecutor.TryStreamDistinct(Stmt: TSqlSelectStmt;
+  const td: TTableDef; const ColNames: TStrArray; const ColTypes: TByteArray;
+  out Res: TSqlResult): Boolean;
+var
+  ctx: TStreamDistinctCtx;
+  ci, i, n, start, cnt: Integer;
+  cr: TSqlColumnRefNode;
+  fieldName: string;
+  ctype: Byte;
+  rows: TStrMatrix;
+  orderKeys, sortNames: TStrArray;
+  sortTypes: TByteArray;
+  ok: Boolean;
+
+  function SameName(const A, B: string): Boolean;
+  var
+    pa, pb: Integer;
+    na, nb: string;
+  begin
+    na := A;
+    nb := B;
+    pa := Pos('.', na);
+    pb := Pos('.', nb);
+    if pa > 0 then na := Copy(na, pa + 1, MaxInt);
+    if pb > 0 then nb := Copy(nb, pb + 1, MaxInt);
+    Result := VDbNorm(na) = VDbNorm(nb);
+  end;
+
+begin
+  Result := False;
+  if Stmt.LimitVal = 0 then Exit;
+  if Stmt.OffsetVal < 0 then Exit;
+  if (Stmt.FromTable = '') or Stmt.HasJoin then Exit;
+  if (Stmt.SetOp <> sokNone) or (Stmt.RightSelect <> nil) then Exit;
+  if Stmt.AsOf <> saoNone then Exit;
+  if Stmt.WithQueries.Count > 0 then Exit;
+  if not Stmt.IsDistinct then Exit;
+  if (Stmt.GroupByCols.Count > 0) or HasAggregate(Stmt) then Exit;
+  if HasWindow(Stmt) then Exit;
+  if (Stmt.QualifyClause <> nil) or (Stmt.HavingClause <> nil) then Exit;
+  if Stmt.Columns.Count <> 1 then Exit;
+  if not (Stmt.Columns[0].Expr is TSqlColumnRefNode) then Exit;
+  if FT.RlsApplies(Stmt.FromTable) then Exit;
+  cr := TSqlColumnRefNode(Stmt.Columns[0].Expr);
+  ci := FindColIdx(cr.ColumnName, cr.TableQualifier, ColNames);
+  if (ci < 0) or (ci > High(td.Cols)) then Exit;
+  if (ci > High(ColTypes)) then Exit;
+  // ORDER BY yalnizca ayni kolon (veya alias'i) ve tek anahtar olabilir.
+  if (Stmt.OrderBy <> nil) and (Stmt.OrderBy.Count > 0) then
+  begin
+    if Stmt.OrderBy.Count <> 1 then Exit;
+    // BOOL siralama genel yolda tamsayi hizli yolunda anahtar uretemedigi
+    // icin fiilen siralamiyor (mevcut davranis). Ayni cikti sirasini korumak
+    // uzere akisli yolu BOOL'de ORDER BY ile acmiyoruz.
+    if not (ColTypes[ci] in [VCT_INT, VCT_FLOAT, VCT_STR]) then Exit;
+    if not (Stmt.OrderBy[0].Expr is TSqlColumnRefNode) then Exit;
+    if Stmt.OrderBy[0].Collate <> '' then Exit;
+    // Kolon tanimli bir collation tasiyorsa genel yol onu uygular.
+    if td.Cols[ci].Collate <> '' then Exit;
+    ok := SameName(TSqlColumnRefNode(Stmt.OrderBy[0].Expr).ColumnName,
+                   td.Cols[ci].Name);
+    if (not ok) and (Stmt.Columns[0].Alias <> '') then
+      ok := SameName(TSqlColumnRefNode(Stmt.OrderBy[0].Expr).ColumnName,
+                     Stmt.Columns[0].Alias);
+    if not ok then Exit;
+  end;
+  if Stmt.Columns[0].Alias <> '' then fieldName := Stmt.Columns[0].Alias
+  else fieldName := cr.ColumnName;
+  ctype := ColTypes[ci];
+
+  ctx := Default(TStreamDistinctCtx);
+  SetLength(ctx.FType, Length(td.Cols));
+  SetLength(ctx.FOff, Length(td.Cols));
+  SetLength(ctx.FLen, Length(td.Cols));
+  ctx.Exec := Self;
+  ctx.TableId := td.TableId;
+  ctx.HashPrefix := VDbHashKeyPrefix(td.Name);
+  ctx.ColCnt := Length(td.Cols);
+  ctx.ColNames := ColNames;
+  ctx.ColTypes := ColTypes;
+  ctx.Where := Stmt.WhereClause;
+  ctx.ColIdx := ci;
+  ctx.NeedFull := Stmt.WhereClause <> nil;
+  ctx.N := 0;
+  ctx.Cap := 0;
+  ctx.Keys := TDictionary<string, Integer>.Create;
+  try
+    if not FT.Kv.ScanRawIterAll(td.TableId, VdbStreamDistinctCb, @ctx) then
+    begin
+      if ctx.Overflow then
+        raise EVDbException.CreateFmt(ecLimit,
+          'DISTINCT sonucu cok buyuk (>%d satir)', [VDB_MAX_RESULT_ROWS]);
+      Exit(False);
+    end;
+    if ctx.Failed then Exit(False);
+    n := ctx.N;
+    if (Stmt.OrderBy <> nil) and (Stmt.OrderBy.Count > 0) then
+    begin
+      SetLength(rows, n);
+      for i := 0 to n - 1 do
+      begin
+        SetLength(rows[i], 1);
+        rows[i][0] := ctx.Vals[i];
+      end;
+      SetLength(orderKeys, 1);
+      orderKeys[0] := '__vdb_distinct_key__';
+      SetLength(sortNames, 1);
+      sortNames[0] := '__vdb_distinct_key__';
+      SetLength(sortTypes, 1);
+      sortTypes[0] := ctype;
+      DoSort(rows, orderKeys, Stmt.OrderBy, sortNames, sortTypes);
+      for i := 0 to n - 1 do ctx.Vals[i] := rows[i][0];
+    end;
+    start := Stmt.OffsetVal;
+    if start > n then start := n;
+    cnt := n - start;
+    if (Stmt.LimitVal >= 0) and (Stmt.LimitVal < cnt) then
+      cnt := Stmt.LimitVal;
+    SetLength(Res.Fields, 1);
+    Res.Fields[0] := fieldName;
+    SetLength(Res.FieldTypes, 1);
+    Res.FieldTypes[0] := ctype;
+    SetLength(Res.Rows, cnt);
+    for i := 0 to cnt - 1 do
+    begin
+      SetLength(Res.Rows[i], 1);
+      Res.Rows[i][0] := ctx.Vals[start + i];
+    end;
+    Res.Affected := cnt;
+    Res.Msg := 'OK';
+    Result := True;
+  finally
+    ctx.Keys.Free;
+  end;
 end;
 
 function TVSqlExecutor.TryStreamSelect(Stmt: TSqlSelectStmt; const td: TTableDef;
@@ -10454,6 +10673,9 @@ begin
         end
         else
         begin
+        // H16: tek kolonlu SELECT DISTINCT -> ham akistan tek pass.
+        if TryStreamDistinct(Stmt, td, colNames, colTypes, Res) then
+          Exit;
         // H1 (2026-10-18): indekssiz, LIMIT'li, ORDER BY'siz tek tablo
         // SELECT'i ham akistan okuyup LIMIT dolunca durur. Uymazsa False.
         if TryStreamSelect(Stmt, td, Res) then

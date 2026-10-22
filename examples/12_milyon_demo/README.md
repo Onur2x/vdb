@@ -95,6 +95,10 @@ alınmıştır; farklı donanımda değişebilir.
 | `GROUP BY sehir HAVING AVG(yas) > 40` (`SUM(bakiye)` ile) | 0,88 s | H15; önceki 17,3 s |
 | `GROUP BY sehir HAVING c > 100000` (alias) | 0,77 s | H15, çıktı alias'ı |
 | `GROUP BY sehir HAVING COUNT(*) > 50000 AND MAX(bakiye) > 0` | 0,84 s | H15, çok koşullu |
+| `SELECT DISTINCT sehir … ORDER BY sehir` | 0,64 s | H16 tek pass; önceki 6,0 s |
+| `SELECT DISTINCT sehir` (`ORDER BY`'sız) | 0,64 s | H16 tek pass; önceki 3,8 s |
+| `SELECT DISTINCT yas … ORDER BY yas` | 0,48 s | H16 tek pass; önceki 4,6 s |
+| `SELECT DISTINCT id … ORDER BY id` | 1,63 s | H16 tek pass; önceki 5,5 s |
 | Şehir + yaş `COUNT(*)` | 0,83–0,98 s | sıcak indeks |
 
 ## Sorgu hızı nasıl iyileştirildi?
@@ -145,6 +149,18 @@ yaklaşık 0,88 s sürer. `JOIN`, `DISTINCT`, `DISTINCT`/`FILTER` içeren
 aggregate'ler, ifade argümanlı veya metin/BOOL `MIN`/`MAX`, alt sorgu/pencere
 içeren `HAVING` ve karmaşık `GROUP BY` biçimleri genel yola düşer; `ILIKE` ve
 indekssiz tam tarama gerektiren işlemler doğası gereği tüm tabloyu okur.
+
+H16 ile tek kolonlu `SELECT DISTINCT kolon` sorguları da ham akıştan tek
+pass'te tekilleştirilir. Motor tüm satırları string matrisine çevirip
+sıralamak yerine yalnız seçilen kolonu çıkarır ve değerleri hash kümesinde
+tutar; `ORDER BY` aynı kolon/alias üzerindeyse yalnız tekilleşmiş değerler
+sıralanır. `LIMIT/OFFSET` tekilleştirmeden sonra uygulanır. Böylece
+`SELECT DISTINCT sehir … ORDER BY sehir` 6,0 s yerine yaklaşık 0,64 s,
+`DISTINCT yas` 4,6 s yerine 0,48 s sürer. Çok kolonlu/ifadeli DISTINCT,
+JOIN, `GROUP BY`, pencere, set-op ve RLS genel yola düşer; `WHERE` varsa
+satır yine `RowMatches` ile doğrulanır. Şifreli kolonlarda değer çözülerek
+tekilleştirilir; BOOL sıralaması ise genel yoldaki mevcut davranışı korumak
+için akışlı yola alınmaz.
 
 > `SUM`/`AVG` kayan noktalı sonuçlarda, akışlı toplama sırası nedeniyle
 > genel yola göre son ondalık hanede küçük bir yuvarlama farkı görülebilir;
