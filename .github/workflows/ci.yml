@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Haftalik rasgele SQL diferansiyeli (M8).
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-test:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lazarus/FPC kur
+        run: choco install lazarus --no-progress -y
+
+      - name: lazbuild yolunu bul
+        shell: pwsh
+        run: |
+          $roots = @('C:\tools\lazarus', "$env:ProgramFiles\Lazarus",
+            "${env:ProgramFiles(x86)}\Lazarus", 'C:\lazarus')
+          $lb = $null
+          foreach ($r in $roots) {
+            if (Test-Path $r) {
+              $lb = Get-ChildItem -Path $r -Filter lazbuild.exe -Recurse `
+                -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($lb) { break }
+            }
+          }
+          if (-not $lb) {
+            throw 'lazbuild.exe bulunamadi (Lazarus kurulumu basarisiz?)'
+          }
+          "LAZBUILD=$($lb.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Derle
+        shell: pwsh
+        run: |
+          & $env:LAZBUILD -B sqltest.lpi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Testler (tam sqltest + rasgele SQL diferansiyeli)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbtest'
+          $out = & .\sqltest.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'TUM SQL TESTLERI GECTI') {
+            Write-Error 'sqltest basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'sqltest kalan > 0'
+            exit 1
+          }

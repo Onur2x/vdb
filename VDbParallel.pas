@@ -255,10 +255,10 @@ end;
 { ------------------------------------------------------------ yardimcilar }
 
 function DefaultParallelWorkers: Integer;
+{$IFDEF MSWINDOWS}
 var
-  {$IFDEF MSWINDOWS}
   si: TSystemInfo;
-  {$ENDIF}
+{$ENDIF}
 begin
   {$IFDEF MSWINDOWS}
   FillChar(si, SizeOf(si), 0);

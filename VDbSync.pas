@@ -45,7 +45,9 @@ implementation
 uses
   SysUtils
   {$IFDEF WINDOWS}, Windows{$ENDIF}
-  {$IFDEF UNIX}, BaseUnix{$ENDIF};
+  { FpFsync/FpFlock BaseUnix'te YOK; Unix biriminde bildirilir (FPC 3.2.x).
+    BaseUnix FpOpen/FpClose sabitleri icin korunur. }
+  {$IFDEF UNIX}, BaseUnix, Unix{$ENDIF};
 
 procedure VDbFlushStream(S: TFileStream);
 begin

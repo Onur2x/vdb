@@ -11,7 +11,7 @@
 {$mode delphi}{$H+}
 
 uses
-  SysUtils, Classes, Math, VDbCore, VDbTypes, VDbTable, VDbSql, VDbSync, VDbCrc32,
+  SysUtils, Classes, Math, StrUtils, VDbCore, VDbTypes, VDbTable, VDbSql, VDbSync, VDbCrc32,
   VDbCrypt, VDbKdf, VDbSpatial, VDbRange, VDbMonitor, VDbPlatform, VDbCost,
   VDbExtension, VDbText, VDbParallel, VDbReplication, VDbNet, VDbSqlServer,
   VDbClientNet, VDbMetricsHttp, VDbPgWire, VDbTls, VDbTrace, dynlibs, VDbUndo;
@@ -15362,6 +15362,205 @@ begin
   VDbTraceClear;
 end;
 
+procedure T147_M8_SqlancerStil;
+// M8: SQLancer tarzi rasgele SELECT uretimi + diferansiyel oracle.
+// Iki veritabani AYNI veriyle kurulur: A'da ikincil indeksler + ANALYZE,
+// B'de hic indeks yok. Uretilen her sorgu ikisinde de calistirilir ve
+// sonuc kumeleri BIREBIR karsilastirilir. Boylece indeksli/taramali
+// yollar, CBO/MCV tahminleri ve H12-H23 hizli yollari ayni semantigi
+// korumak zorundadir. Sabit tohum -> tekrarlanabilir.
+const
+  FZ_ROWS = 220;
+  FZ_QUERIES = 200;
+var
+  dirA, dirB: string;
+  dbA, dbB: TVDb;
+  tbA, tbB: TVTableDb;
+  qa, qb: TVSql;
+  i, qi, ran, errors, mism: Integer;
+  ins, sql, firstDiff, firstErr, errA, errB: string;
+  ra, rb: TSqlResult;
+  seed0: LongInt;
+
+  function MakePred: string;
+  var
+    x, y: Integer;
+  begin
+    case Random(10) of
+      0: Result := Format('n = %d', [Random(56) - 3]);
+      1: Result := Format('n > %d', [Random(53) - 3]);
+      2: begin
+           x := Random(50) - 3;
+           y := x + Random(12);
+           Result := Format('n BETWEEN %d AND %d', [x, y]);
+         end;
+      3: Result := 'k = ' + QuotedStr('k' + IntToStr(Random(10)));
+      4: Result := 'k LIKE ' + QuotedStr('k' + IntToStr(Random(10)) + '%');
+      5: Result := 'b = TRUE';
+      6: Result := Format('f < %d', [Random(7) - 3]);
+      7: Result := 'n IS NULL';
+      8: Result := Format('n IN (%d,%d,%d)',
+        [Random(53) - 3, Random(53) - 3, Random(53) - 3]);
+    else
+      Result := Format('(n > %d OR k = %s) AND b IS NOT NULL',
+        [Random(50), QuotedStr('k' + IntToStr(Random(10)))]);
+    end;
+  end;
+
+  function MakeQuery: string;
+  var
+    p: string;
+    lim, off: Integer;
+  begin
+    p := MakePred;
+    lim := 1 + Random(25);
+    off := Random(30);
+    case Random(8) of
+      0: Result := 'SELECT id,n,k FROM fz WHERE ' + p + ' ORDER BY id';
+      1: Result := Format('SELECT id,k FROM fz WHERE %s ORDER BY id LIMIT %d OFFSET %d',
+        [p, lim, off]);
+      2: Result := Format(
+        'SELECT k, COUNT(*) AS c, SUM(n) AS s, MIN(f) AS mi, MAX(n) AS ma ' +
+        'FROM fz WHERE %s GROUP BY k HAVING COUNT(*) > %d ORDER BY k',
+        [p, Random(4)]);
+      3: Result := 'SELECT DISTINCT k FROM fz WHERE ' + p + ' ORDER BY k';
+      4: Result := 'SELECT COUNT(*) FROM fz WHERE ' + p;
+      5: Result := Format('SELECT id,n FROM fz WHERE %s ORDER BY n, id LIMIT %d',
+        [p, lim]);
+      6: Result := Format(
+        'SELECT a.id, b.id FROM fz a JOIN fz b ON a.n = b.n ' +
+        'WHERE a.id < %d AND b.id < %d ORDER BY a.id, b.id',
+        [10 + Random(40), 10 + Random(40)]);
+    else
+      Result := Format(
+        'SELECT id FROM fz WHERE n IN (SELECT n FROM fz WHERE %s) ' +
+        'AND id <= %d ORDER BY id', [p, 60 + Random(160)]);
+    end;
+  end;
+
+  function RowsText(const Res: TSqlResult): string;
+  var
+    r, c: Integer;
+  begin
+    Result := '';
+    for r := 0 to High(Res.Rows) do
+    begin
+      for c := 0 to High(Res.Rows[r]) do
+        Result := Result + '[' + Res.Rows[r][c] + ']';
+      Result := Result + #10;
+    end;
+  end;
+
+  function TryExec(Q: TVSql; const S: string; out Res: TSqlResult;
+    out Err: string): Boolean;
+  begin
+    Err := '';
+    try
+      Res := Q.Exec(S);
+      Result := True;
+    except
+      on E: Exception do
+      begin
+        Result := False;
+        Err := E.ClassName + ': ' + E.Message;
+      end;
+    end;
+  end;
+
+begin
+  Grp('M8 SQLancer tarzi rasgele SELECT + indeks diferansiyeli');
+  seed0 := RandSeed;
+  RandSeed := 147147;
+  dirA := D + '\t147_fz_idx_' + IntToStr(GetTickCount64);
+  dirB := D + '\t147_fz_seq_' + IntToStr(GetTickCount64);
+  ForceDirectories(dirA);
+  ForceDirectories(dirB);
+  dbA := TVDb.Create;
+  dbB := TVDb.Create;
+  tbA := TVTableDb.Create(dbA);
+  tbB := TVTableDb.Create(dbB);
+  qa := nil;
+  qb := nil;
+  ran := 0;
+  errors := 0;
+  mism := 0;
+  firstDiff := '';
+  firstErr := '';
+  try
+    dbA.Open(dirA);
+    dbB.Open(dirB);
+    tbA.Open(dirA);
+    tbB.Open(dirB);
+    qa := TVSql.Create(tbA);
+    qb := TVSql.Create(tbB);
+    try
+      qa.Exec('CREATE TABLE fz (id INTEGER PRIMARY KEY, n INTEGER, ' +
+        'k TEXT, f FLOAT, b BOOLEAN)');
+      qb.Exec('CREATE TABLE fz (id INTEGER PRIMARY KEY, n INTEGER, ' +
+        'k TEXT, f FLOAT, b BOOLEAN)');
+      qa.Exec('BEGIN');
+      qb.Exec('BEGIN');
+      for i := 1 to FZ_ROWS do
+      begin
+        ins := Format('INSERT INTO fz VALUES (%d,%s,%s,%s,%s)', [i,
+          IfThen(i mod 17 = 0, 'NULL', IntToStr((i * 7) mod 53 - 3)),
+          IfThen(i mod 19 = 0, 'NULL', QuotedStr('k' + IntToStr(i mod 10))),
+          IfThen(i mod 23 = 0, 'NULL', IntToStr((i mod 13) - 4)),
+          IfThen(i mod 29 = 0, 'NULL', IfThen(i mod 2 = 0, 'TRUE', 'FALSE'))]);
+        qa.Exec(ins);
+        qb.Exec(ins);
+      end;
+      qa.Exec('COMMIT');
+      qb.Exec('COMMIT');
+      // Yalniz A: indeksler + istatistik. B saf tarama yoludur.
+      qa.Exec('CREATE INDEX ix_fz_n ON fz(n)');
+      qa.Exec('CREATE INDEX ix_fz_k ON fz(k)');
+      qa.Exec('CREATE INDEX ix_fz_f ON fz(f)');
+      qa.Exec('CREATE INDEX ix_fz_b ON fz(b)');
+      qa.Exec('ANALYZE fz');
+
+      for qi := 1 to FZ_QUERIES do
+      begin
+        sql := MakeQuery;
+        if not TryExec(qa, sql, ra, errA) then
+        begin
+          Inc(errors);
+          if firstErr = '' then firstErr := 'A: ' + errA + ' | ' + sql;
+          Continue;
+        end;
+        if not TryExec(qb, sql, rb, errB) then
+        begin
+          Inc(errors);
+          if firstErr = '' then firstErr := 'B: ' + errB + ' | ' + sql;
+          Continue;
+        end;
+        Inc(ran);
+        if RowsText(ra) <> RowsText(rb) then
+        begin
+          Inc(mism);
+          if firstDiff = '' then firstDiff := sql;
+        end;
+      end;
+    finally
+      qb.Free;
+      qa.Free;
+    end;
+  finally
+    tbB.Free;
+    tbA.Free;
+    dbB.Free;
+    dbA.Free;
+  end;
+  RandSeed := seed0;
+
+  Dogrula('tum rasgele sorgular calisti',
+    (ran = FZ_QUERIES) and (errors = 0),
+    'calisan=' + IntToStr(ran) + ' hata=' + IntToStr(errors) +
+    ' ilk=' + Copy(firstErr, 1, 160));
+  Dogrula('indeksli ve indekssiz sonuc ayni', mism = 0,
+    'fark=' + IntToStr(mism) + ' ilk=' + Copy(firstDiff, 1, 160));
+end;
+
 procedure T137_H15_StreamHaving;
 // H15: akisli GROUP BY + HAVING yolu, genel yolla BIREBIR ayni sonucu
 // vermelidir. Genel yol, HAVING'e daima dogru bir ek kosul eklenerek
@@ -15802,6 +16001,7 @@ T92_MVCC_Isoaltion;
        T144_H22_DeepOffsetLive;
        T145_H8_MCV;
        T146_M9_OTLP;
+       T147_M8_SqlancerStil;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls

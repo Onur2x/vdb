@@ -54,7 +54,7 @@ function VDbTlsLastError: string;
 implementation
 
 uses
-  Windows, dynlibs;
+  {$IFDEF WINDOWS}Windows, {$ENDIF}dynlibs;
 
 const
   SSL_FILETYPE_PEM = 1;
