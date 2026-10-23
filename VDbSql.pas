@@ -3896,9 +3896,11 @@ begin
     SlowMarkStart;
     try
       spanChild := VDbTraceBegin('sql.execute', spanRoot);
+      VDbTraceSetCurrent(spanChild);
       try
         Result := FExecutor.Execute(astStmt);
       finally
+        VDbTraceSetCurrent(nil);
         VDbTraceEnd(spanChild);
       end;
     finally
@@ -3924,9 +3926,11 @@ begin
     SlowMarkStart;
     try
       spanChild := VDbTraceBegin('sql.execute', spanRoot);
+      VDbTraceSetCurrent(spanChild);
       try
         Result := FExecutor.Execute(astStmt);
       finally
+        VDbTraceSetCurrent(nil);
         VDbTraceEnd(spanChild);
       end;
     finally

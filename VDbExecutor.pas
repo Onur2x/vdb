@@ -25,7 +25,8 @@ uses
   Classes, SysUtils, Math, Generics.Collections,
   VDbCore, VDbTable, VDbAst, VDbJson, VDbErr, VDbText, VDbXml, VDbSpatial,
   VDbRange, VDbParser, VDbTypes, VDbReplication, VDbParallel, VDbMonitor,
-  VDbPlatform, VDbCost, VDbExtension, VDbVector, VDbArrow, VDbParquet;
+  VDbPlatform, VDbCost, VDbExtension, VDbVector, VDbArrow, VDbParquet,
+  VDbTrace;
 
 const
   // F2-18: DISTINCT / UNION tekilleÅŸtirme sonucu ve set-op birlestirme
@@ -17370,6 +17371,7 @@ var
   i: Integer;
   o1, o2: string;
   prevSess: Cardinal;
+  spanFetch: TVDbTraceSpan;
 begin
 
   Result.Affected := 0;
@@ -17414,7 +17416,17 @@ begin
         FCurQualifier := TSqlSelectStmt(Stmt).FromAlias
       else
         FCurQualifier := TSqlSelectStmt(Stmt).FromTable;
-      ExecSelect(TSqlSelectStmt(Stmt), Result);
+      { M9: satir uretimi ayri 'sql.fetch' span'i. Ebeveyn, VDbSql'in
+        thread-local olarak isaretledigi 'sql.execute' span'idir. Kaba
+        hizli yollarda (PK nokta SELECT, literal INSERT) ExecSelect
+        calismadigi icin fetch span'i uretilmez. }
+      spanFetch := VDbTraceBeginChild('sql.fetch');
+      try
+        ExecSelect(TSqlSelectStmt(Stmt), Result);
+        VDbTraceSetAttr(spanFetch, 'db.rows', IntToStr(Length(Result.Rows)));
+      finally
+        VDbTraceEnd(spanFetch);
+      end;
     end
   else if Stmt is TSqlInsertStmt then ExecInsert(TSqlInsertStmt(Stmt), Result)
   else if Stmt is TSqlUpdateStmt then ExecUpdate(TSqlUpdateStmt(Stmt), Result)

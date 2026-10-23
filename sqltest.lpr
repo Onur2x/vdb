@@ -40,6 +40,23 @@ type
     function Get: string;
   end;
 
+  { M9: OTLP export testi icin tek istek yakalayan yerel HTTP alicisi. }
+  TOtlpCaptureThread = class(TThread)
+  private
+    FListen: TVdbSocket;
+    FPort: Word;
+    FRequest: string;
+    FStarted: Boolean;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    property Port: Word read FPort;
+    property Request: string read FRequest;
+    property Started: Boolean read FStarted;
+  end;
+
   { M11: IVDbKvStore'un ikinci (bellek-ici) backend'i. Yalnizca arayuz
     sozlesmesini ve backend degistirilebilirligini dogrulamak icin. }
   TMemKvStore = class(TInterfacedObject, IVDbKvStore)
@@ -114,6 +131,109 @@ begin
   begin
     Keys[i] := FKeys[i];
     Vals[i] := Copy(FVals[i], 0, Length(FVals[i]));
+  end;
+end;
+
+{ ---- M9 OTLP test alicisi ---- }
+
+constructor TOtlpCaptureThread.Create;
+var
+  i: Integer;
+  s: TVdbSocket;
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FListen := VDB_SOCK_INVALID;
+  FStarted := False;
+  FPort := 0;
+  for i := 0 to 9 do
+  begin
+    s := VdbTcpListen(19300 + i);
+    if s <> VDB_SOCK_INVALID then
+    begin
+      FListen := s;
+      FPort := 19300 + i;
+      FStarted := True;
+      Break;
+    end;
+  end;
+  if FStarted then Start;
+end;
+
+destructor TOtlpCaptureThread.Destroy;
+begin
+  Terminate;
+  if not Finished then
+  begin
+    if FListen <> VDB_SOCK_INVALID then VdbSockClose(FListen);
+    FListen := VDB_SOCK_INVALID;
+    WaitFor;
+  end;
+  inherited Destroy;
+end;
+
+procedure TOtlpCaptureThread.Execute;
+var
+  s: TVdbSocket;
+  buf: array[0..4095] of Char;
+  req, resp: string;
+  n, hdrEnd, p, clen, want: Integer;
+  numStr: string;
+  i, v: Integer;
+begin
+  s := VdbTcpAccept(FListen);
+  if s = VDB_SOCK_INVALID then Exit;
+  try
+    req := '';
+    hdrEnd := 0;
+    repeat
+      n := VdbRecvSome(s, buf[0], SizeOf(buf));
+      if n <= 0 then Break;
+      SetLength(req, Length(req) + n);
+      Move(buf[0], req[Length(req) - n + 1], n);
+      hdrEnd := Pos(#13#10#13#10, req);
+    until hdrEnd > 0;
+
+    if hdrEnd > 0 then
+    begin
+      { Content-Length: <n> (VDbTraceExportOTLP tam bu bicimi yollar). }
+      clen := 0;
+      p := Pos('Content-Length: ', req);
+      if p > 0 then
+      begin
+        numStr := '';
+        i := p + Length('Content-Length: ');
+        while (i <= Length(req)) and (req[i] in ['0'..'9']) do
+        begin
+          numStr := numStr + req[i];
+          Inc(i);
+        end;
+        v := StrToIntDef(numStr, -1);
+        if v > 0 then clen := v;
+      end;
+      want := hdrEnd + 3 + clen;
+      while Length(req) < want do
+      begin
+        n := VdbRecvSome(s, buf[0], SizeOf(buf));
+        if n <= 0 then Break;
+        SetLength(req, Length(req) + n);
+        Move(buf[0], req[Length(req) - n + 1], n);
+      end;
+    end;
+
+    FRequest := req;
+    resp := 'HTTP/1.1 200 OK' + #13#10 +
+      'Content-Type: application/json' + #13#10 +
+      'Content-Length: 2' + #13#10 +
+      'Connection: close' + #13#10 + #13#10 + '{}';
+    VdbSendAll(s, resp[1], Length(resp));
+  finally
+    VdbSockClose(s);
+    if FListen <> VDB_SOCK_INVALID then
+    begin
+      VdbSockClose(FListen);
+      FListen := VDB_SOCK_INVALID;
+    end;
   end;
 end;
 
@@ -15161,6 +15281,87 @@ begin
   end;
 end;
 
+procedure T146_M9_OTLP;
+// M9: OTLP/HTTP JSON govdesi, 'sql.fetch' cocuk span'i ve yerel aliciya
+// gercek POST. Alici tek istegi yakalar; govde ve basliklar dogrulanir.
+var
+  j, err, host, path: string;
+  port: Word;
+  th: TOtlpCaptureThread;
+  ok: Boolean;
+begin
+  Grp('M9 OTLP export + sql.fetch span');
+
+  { NOT: Dogrula'nin ayrinti argumani, kosuldan ONCE degerlendirilebilir;
+    bu yuzden parse cagrisi ayri bir ifadeye alinir. }
+  ok := VdbParseOtlpEndpoint('', host, path, port);
+  Dogrula('endpoint varsayilan',
+    ok and (host = '127.0.0.1') and (port = 4318) and (path = '/v1/traces'),
+    host + ':' + IntToStr(port) + path);
+  ok := VdbParseOtlpEndpoint('http://example.com:9999/custom/traces',
+    host, path, port);
+  Dogrula('endpoint tam',
+    ok and (host = 'example.com') and (port = 9999) and
+    (path = '/custom/traces'),
+    host + ':' + IntToStr(port) + path);
+  ok := VdbParseOtlpEndpoint('127.0.0.1:4319/v1/traces', host, path, port);
+  Dogrula('endpoint http semasiz',
+    ok and (host = '127.0.0.1') and (port = 4319),
+    host + ':' + IntToStr(port) + path);
+  ok := VdbParseOtlpEndpoint('https://example.com/v1/traces',
+    host, path, port);
+  Dogrula('endpoint https reddedilir', not ok, '');
+  ok := VdbParseOtlpEndpoint('http://example.com:0/v1/traces',
+    host, path, port);
+  Dogrula('endpoint gecersiz port', not ok, '');
+
+  VDbTraceClear;
+  VDbTraceSetEnabled(True);
+  try
+    R := sq.Exec('SELECT 146 AS otlp_probe');
+  finally
+    VDbTraceSetEnabled(False);
+  end;
+  j := VDbTraceGetOTLPJSON;
+  Dogrula('OTLP resourceSpans', Pos('"resourceSpans"', j) > 0, '');
+  Dogrula('OTLP scopeSpans', Pos('"scopeSpans"', j) > 0, '');
+  Dogrula('OTLP scope adi', Pos('"name":"vdb.trace"', j) > 0, '');
+  Dogrula('sql.fetch span', Pos('"name":"sql.fetch"', j) > 0, '');
+  Dogrula('sql.fetch db.rows=1',
+    Pos('"key":"db.rows","value":{"stringValue":"1"}', j) > 0, '');
+  Dogrula('sql.fetch parentSpanId var', Pos('"parentSpanId":', j) > 0, '');
+  Dogrula('kok span bos parentSpanId gondermez',
+    Pos('"parentSpanId":""', j) = 0, '');
+
+  th := nil;
+  try
+    th := TOtlpCaptureThread.Create;
+    Dogrula('OTLP dinleyici basladi', th.Started,
+      'port=' + IntToStr(th.Port));
+    if th.Started then
+    begin
+      ok := VDbTraceExportOTLP(
+        'http://127.0.0.1:' + IntToStr(th.Port) + '/v1/traces', err);
+      Dogrula('OTLP export 2xx', ok, err);
+      Dogrula('istek POST /v1/traces',
+        Pos('POST /v1/traces HTTP/1.1', th.Request) > 0,
+        Copy(th.Request, 1, 60));
+      Dogrula('Content-Type application/json',
+        Pos('Content-Type: application/json', th.Request) > 0, '');
+      Dogrula('govdede resourceSpans',
+        Pos('"resourceSpans"', th.Request) > 0, '');
+      Dogrula('govdede sql.fetch', Pos('"name":"sql.fetch"', th.Request) > 0, '');
+    end;
+  finally
+    th.Free;
+  end;
+
+  ok := VDbTraceExportOTLP('http://127.0.0.1:1/v1/traces', err);
+  Dogrula('baglanti yoksa False', (not ok) and (err <> ''), err);
+
+  VDbTraceClear;
+end;
+
 procedure T137_H15_StreamHaving;
 // H15: akisli GROUP BY + HAVING yolu, genel yolla BIREBIR ayni sonucu
 // vermelidir. Genel yol, HAVING'e daima dogru bir ek kosul eklenerek
@@ -15600,6 +15801,7 @@ T92_MVCC_Isoaltion;
        T143_H21_RawTreeSelectPaths;
        T144_H22_DeepOffsetLive;
        T145_H8_MCV;
+       T146_M9_OTLP;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls
