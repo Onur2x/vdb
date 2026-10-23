@@ -269,6 +269,34 @@ ASCII dışı metin, 2^53 dışı `INT`, tip uyuşmazlığı ve NaN genel yola d
 2000 öğeli listelerde `yas IN (0..2000)` 9,86 s yerine 0,44 s,
 `bakiye IN (2000 FLOAT)` 254,9 s yerine 0,44 s sürer.
 
+H8 ile `ANALYZE` her kolon için değer frekanslarını sayar ve en sık 32 değeri
+MCV (most common values) olarak saklar. Eşitlik tahmininde (`kolon = sabit`)
+değer MCV'de varsa gerçek satır sayısı kullanılır; yoksa eski
+`RowCount / DistinctCount` ortalamasına düşülür. MCV, istatistik satırında
+`kolon:distinct,null,min,max,mcv` alanının son parçasıdır; değerler hex
+kodlanır, böylece metin baytları korunur. Çok yüksek distinct'te (200.000
+üstü) MCV üretilmez. `EXPLAIN` ile gerçek yürütme aynı MCV kararını kullanır.
+
+1.000.000 satırlık demo veritabanında geçici bir `mcv_skew` tablosuyla
+ölçüldü: 100 farklı `k` değeri, %90 `A`, satır başına 100 baytlık `pad`,
+`ix_skew_k` indeksi. `ANALYZE mcv_skew` sonrası:
+
+| Sorgu | MCV yok | MCV var |
+|---|---:|---:|
+| `k = 'A'` tahmini | 10.000 satır (Index Scan) | 900.000 satır (Seq Scan) |
+| `k = 'A'` gerçek | 900.000 | 900.000 |
+| `k = 'B7'` tahmini | 10.000 satır (Index Scan) | 1.011 satır (Index Scan) |
+| `k = 'B7'` gerçek | 1.011 | 1.011 |
+
+Aynı tabloda `SELECT id, pad FROM mcv_skew WHERE k = 'A'` (900.000 satır)
+sıcak cache'te üç kez ölçüldü: MCV yokken 3.531 / 4.250 / 4.750 ms, MCV
+varken 4.031 / 4.515 / 4.656 ms. `k = 'B7'` MCV ile 16 ms sürdü. Bu veri
+kümesinde MCV'nin planı Seq Scan'e çevirmesi ölçülebilir bir hız kazancı
+sağlamadı; fark tekrar gürültüsü içinde kaldı. MCV'nin asıl katkısı tahmin
+doğruluğu ve yüksek gecikmeli/soğuk diskte yanlış indeks seçimini önlemesidir;
+seyrek değerler indekste kalır. Geçici tablo ölçüm sonrası silindi ve
+`VACUUM` ile veritabanı 135.389.108 bayta döndürüldü.
+
 > `SUM`/`AVG` kayan noktalı sonuçlarda, akışlı toplama sırası nedeniyle
 > genel yola göre son ondalık hanede küçük bir yuvarlama farkı görülebilir;
 > bu davranış H6/H12 akışlı toplamalarıyla aynıdır. `COUNT`, `MIN`, `MAX`

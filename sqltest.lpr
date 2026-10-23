@@ -15060,6 +15060,107 @@ begin
   end;
 end;
 
+procedure T145_H8_MCV;
+// H8: skew'li esitlikte MCV (en sik deger) kullanilir. Ayni tabloda
+// 'A' 90 kez, diger 10 deger birer kez gecer. Distinct ortalamasi
+// (100/11) indeksi secerdi; MCV 90 ile Seq Scan secer. Seyrek degerde
+// indeks korunur.
+var
+  dir: string;
+  db: TVDb;
+  tdb: TVTableDb;
+  q: TVSql;
+  i: Integer;
+  all, kk: string;
+  st: TVDbTableStats;
+  cnt, total: Int64;
+  nEnt: Integer;
+
+  function PlanOf(const S: string): string;
+  var
+    p: Integer;
+  begin
+    R := q.Exec(S);
+    Result := '';
+    for p := 0 to High(R.Rows) do
+      Result := Result + R.Rows[p][0] + ' | ';
+  end;
+
+begin
+  Grp('T145 H8 MCV skew esitlik');
+  dir := D + '\t145_mcv_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  tdb := TVTableDb.Create(db);
+  try
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      q.Exec('CREATE TABLE mcv (id INTEGER PRIMARY KEY, k TEXT, n INTEGER)');
+      q.Exec('BEGIN');
+      for i := 1 to 100 do
+      begin
+        if i <= 90 then
+        begin
+          kk := 'A';
+          q.Exec(Format('INSERT INTO mcv VALUES (%d,%s,0)', [i, QuotedStr(kk)]));
+        end
+        else
+        begin
+          kk := 'B' + IntToStr(i - 90);
+          q.Exec(Format('INSERT INTO mcv VALUES (%d,%s,%d)',
+            [i, QuotedStr(kk), i]));
+        end;
+      end;
+      q.Exec('COMMIT');
+      q.Exec('CREATE INDEX ix_mcv_k ON mcv(k)');
+      q.Exec('CREATE INDEX ix_mcv_n ON mcv(n)');
+      q.Exec('ANALYZE mcv');
+
+      // MCV gercekten okunuyor mu?
+      Dogrula('MCV istatistigi okundu', GetTableStats('mcv', st), '');
+      Dogrula('MCV A=90',
+        VdbStatsMCVLookup(st, 'k', 'A', cnt) and (cnt = 90),
+        IntToStr(cnt));
+      Dogrula('MCV toplami 100',
+        VdbStatsMCVInfo(st, 'k', total, nEnt) and (total = 100),
+        IntToStr(total));
+      Dogrula('MCV deger sayisi 11', nEnt = 11, IntToStr(nEnt));
+
+      all := PlanOf('EXPLAIN SELECT * FROM mcv WHERE k = ' + QuotedStr('A'));
+      Dogrula('skew A -> Seq Scan', Pos('Seq Scan', all) > 0, all);
+      Dogrula('skew A -> indeks DEGIL', Pos('ix_mcv_k', all) = 0, all);
+
+      all := PlanOf('EXPLAIN SELECT * FROM mcv WHERE k = ' + QuotedStr('B3'));
+      Dogrula('seyrek B3 -> Index Scan',
+        Pos('Index Scan using ix_mcv_k', all) > 0, all);
+
+      all := PlanOf('EXPLAIN SELECT * FROM mcv WHERE n = 0');
+      Dogrula('skew n=0 -> Seq Scan', Pos('Seq Scan', all) > 0, all);
+      all := PlanOf('EXPLAIN SELECT * FROM mcv WHERE n = 100');
+      Dogrula('seyrek n=100 -> Index Scan',
+        Pos('Index Scan using ix_mcv_n', all) > 0, all);
+
+      // CBO yalnizca plan secer; sonuc kumeleri degismez.
+      R := q.Exec('SELECT COUNT(*) FROM mcv WHERE k = ' + QuotedStr('A'));
+      Dogrula('MCV A sayimi 90', (Length(R.Rows) = 1) and
+        (R.Rows[0][0] = '90'), R.Rows[0][0]);
+      R := q.Exec('SELECT COUNT(*) FROM mcv WHERE k = ' + QuotedStr('B3'));
+      Dogrula('MCV B3 sayimi 1', (Length(R.Rows) = 1) and
+        (R.Rows[0][0] = '1'), R.Rows[0][0]);
+      R := q.Exec('SELECT COUNT(*) FROM mcv WHERE n = 0');
+      Dogrula('MCV n=0 sayimi 90', (Length(R.Rows) = 1) and
+        (R.Rows[0][0] = '90'), R.Rows[0][0]);
+    finally
+      q.Free;
+    end;
+  finally
+    tdb.Free;
+    db.Free;
+  end;
+end;
+
 procedure T137_H15_StreamHaving;
 // H15: akisli GROUP BY + HAVING yolu, genel yolla BIREBIR ayni sonucu
 // vermelidir. Genel yol, HAVING'e daima dogru bir ek kosul eklenerek
@@ -15498,6 +15599,7 @@ T92_MVCC_Isoaltion;
        T142_H20_RawBoolTree;
        T143_H21_RawTreeSelectPaths;
        T144_H22_DeepOffsetLive;
+       T145_H8_MCV;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls
