@@ -39,6 +39,9 @@ uses
 const
   VDB_WAL_MAGIC       = $334C5756;   // 'VWL3'
   VDB_WAL_VER         = 1;
+  { Meta sayfa numarasi (VDbPageStore.VDB_HDR_PAGE ile ayni; bu birim
+    depo birimine bagimli olmamak icin yerel sabit tutar). }
+  VDB_WAL_META_PAGE   = 0;
   VDB_WAL_REC_FRAME   = $31574656;   // 'VFW1'
   VDB_WAL_REC_COMMIT  = $31435746;   // 'FWC1'
   VDB_WAL_REC_HDR     = 20;          // bayt
@@ -447,10 +450,10 @@ begin
     sayfalari yazilip dosya uzatilmali, yoksa meta'daki sayfa sayisi
     dosya boyutundan buyuk gorunur. }
   for i := 0 to appliedCount - 1 do
-    if (applied[i].PageNo <> VDB_HDR_PAGE) and Assigned(Apply) then
+    if (applied[i].PageNo <> VDB_WAL_META_PAGE) and Assigned(Apply) then
       Apply(applied[i].PageNo, @applied[i].Data);
   for i := 0 to appliedCount - 1 do
-    if (applied[i].PageNo = VDB_HDR_PAGE) and Assigned(Apply) then
+    if (applied[i].PageNo = VDB_WAL_META_PAGE) and Assigned(Apply) then
       Apply(applied[i].PageNo, @applied[i].Data);
   Stats.Frames := appliedCount;
   Result := True;

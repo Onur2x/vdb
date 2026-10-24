@@ -130,9 +130,9 @@ Sayfa motorunu yazmak kolay; asıl maliyet şu 4 dosyada. Plan bunları hesaba k
 - [x] 1.7 `heapchk`: 200k satır + 200k rastgele işlem, **20/20, kalan=0**; INSERT sonrası tüm anahtarlar birebir okunur
 - [x] 1.8 `VDbPageWal.pas`: sayfa-imajlı WAL, commit kaydı, checkpoint, replay
 - [x] 1.9 `crashtest` v3 backend ile **11/11**; süreç `kill -9` sonrası 0 kayıp
-- [ ] 1.10 `VDbIdxFile.pas`: `.odb.idx` (key → sayfa, slot), açılışta dosya boyutu + son commit LSN + CRC doğrulaması
-- [ ] 1.11 Bozuk/bayat/eksik `.idx` → otomatik tam tarama; **veri kaybı yok** testi
-- [ ] 1.12 Ölçüm: dosya **≤ 11 MB**, açılış **≤ 150 ms** (200k)
+- [x] 1.10 `VDbIdxFile.pas`: `.odb.idx` (key → sayfa, slot), açılışta dosya boyutu + son commit LSN + CRC doğrulaması
+- [x] 1.11 Bozuk/bayat/eksik `.idx` → otomatik tam tarama; **veri kaybı yok** testi (`idxchk` 17/17)
+- [x] 1.12 Ölçüm: dosya **9,76 MB**, açılış **31 ms** (idx ile) / **63 ms** (tam tarama) — 200k
 
 ### Sprint 2 — SQL'e bağlama (Gün 6-10)
 
@@ -235,8 +235,9 @@ Key 8 B | Len 4 B (bit31 = taşma) | veri (satır içi)  ya da  | ilkTaşmaSayfa
   Zincir sayfaları da `VDbPage` formatında (`VDB_PAGE_OVERFLOW`) olduğu için
   CRC ve yapı denetiminden geçer; bozuk zincir **sessizce yanlış veri
   döndürmez**.
-- **Dizin:** `key → (sayfa, slot)` açık adresleme tablosu, bellek içinde,
-  açılışta sayfalar taranarak kurulur (Sprint 1.10'da `.odb.idx` hızlandıracak).
+- **Dizin:** `key → (sayfa, slot)` açık adresleme tablosu, bellek içinde.
+  Açılışta `.odb.idx` taze ise oradan yüklenir (31 ms / 200k), değilse tüm
+  heap sayfaları taranır (63 ms) — yedek yol her zaman çalışır.
 - **Güncelleme:** aynı boyut + satır içi ise **yerinde** yazılır (slot sabit).
   Boyut değişirse eski değer saklanır, silinir, yeniden eklenir; ekleme
   başarısız olursa eski değer geri konur (veri kaybı yok).
@@ -298,11 +299,45 @@ aksi halde açık hata; (c) WAL çerçeveleri mühürsüz imaj taşıyordu.
 
 ---
 
+## Kalıcı anahtar dizini (`.odb.idx`) ve ölçüm (1.10–1.12)
+
+`VDbIdxFile.pas` + `TVdbHeap.TryLoadIdx/SaveIdx`. Dizin, heap'in bellek
+tablosunun (`key → sayfa, slot`) bir kopyasıdır ve **hiçbir zaman veri
+kaynağı değildir**:
+
+- Yalnızca temiz kapanışta (checkpoint sonrası) yazılır; `.tmp` + rename ile
+  atomik, kesik `.idx` oluşmaz.
+- Açılışta üç şey tutmalı: **LSN**, **sayfa sayısı**, **dosya boyu** — ayrıca
+  başlık ve kayıt CRC'leri. Biri tutmazsa dosya sessizce yok sayılır ve tam
+  tarama yapılır. Veri kaybı mümkün değil, sadece açılış yavaşlar.
+- Kayıt 16 B (`Key 8 | PageNo 4 | Slot 2 | Pad 2`) → 200k satırda 3,2 MB.
+  Sıkıştırma (varint) v3.1'e bırakıldı.
+
+`idxchk` 17/17: temel yaz/kapat/aç, bozuk idx, kesik idx, bayat idx (eski LSN),
+idx yok, sil/güncelle sonrası kapat-aç; her senaryoda **tüm değerler birebir**.
+
+### Ölçüm — 200.000 satır × 32 B değer, win32, `tests/bench/benchv3`, 3 tur medyan
+
+| Metrik | Ölçüm | Hedef |
+|---|---|---|
+| Veritabanı dosyası | **9.756.672 B** = 48,8 B/satır | ≤ 11 MB ✔ |
+| `.idx` | 3.200.064 B = 16,0 B/satır | — |
+| Açılış (idx ile) | **31 ms** | ≤ 150 ms ✔ |
+| Açılış (tam tarama) | 63 ms | (yedek yol) |
+| Toplu yazım + commit + checkpoint | **2,34 µs/satır** | ≤ 5 µs ✔ |
+| PK nokta okuma | **0,39 µs/satır** | ≤ 7 µs ✔ |
+| WAL (temiz kapanış sonrası) | 4096 B (yalnız başlık) | budanmış ✔ |
+
+En yavaş tek ölçüm 32 ms; ilk turda `.idx` soğuk önbellekten okunduğu için
+16–32 ms aralığı görüldü. Tam tarama (yedek yol) 62–78 ms.
+
+---
+
 ## Kapılar (pazarlık dışı)
 
 1. v2 dalı bozulmaz: `v2.3` etiketinde `sqltest` **3112/3112 (win32)**, 3077/3077 (win64/Linux).
 2. v3.0 yayınlanmadan `kalan=0` üç platformda.
-3. `crashtest` 11/11 ve P-DUR sözleşmesi: commit ve `Flush` fsync eder.
+3. `crashtest` 11/11, `idxchk` 17/17 ve P-DUR sözleşmesi: commit ve `Flush` fsync eder.
 4. Göç hiçbir senaryoda kaynak `.odb`'yi değiştirmez; `.v2bak` üretir.
 5. Bozuk `.idx` hiçbir zaman veri kaybına yol açmaz — yalnız yavaşlar.
 6. Rakamlar yalnız aynı ortamda ölçülerek raporlanır.

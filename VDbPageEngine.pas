@@ -45,6 +45,9 @@ type
       FPending: array of TPending;
       FInTxn: Boolean;
       FWalStats: TVdbWalStats;
+      FPath: string;
+      FIdxUsed: Boolean;
+      FIdxErr: string;
     procedure OnSpill(PageNo: LongWord; P: PVdbPage);
     function OnMiss(PageNo: LongWord; P: PVdbPage): Boolean;
     procedure ApplyRecovered(PageNo: LongWord; P: PVdbPage);
@@ -89,6 +92,12 @@ type
     property InTxn: Boolean read FInTxn;
     { Son acilista kurtarma istatistigi. }
     property RecoveryStats: TVdbWalStats read FWalStats;
+    { Acilista `.odb.idx` hizli yolu kullanildi mi? Kullanilmadiysa tam
+      tarama yapildi ve FIdxErr nedenini verir (veri kaybi soz konusu degil). }
+    property IdxUsed: Boolean read FIdxUsed;
+    property IdxErr: string read FIdxErr;
+    { Dizinin kalici kopyasini simdi yazar (normalde Close yapar). }
+    procedure SaveIdx;
   end;
 
 implementation
@@ -96,6 +105,7 @@ implementation
 constructor TVdbPageEngine.Create(const ADbPath: string; APoolPages: Integer);
 begin
   inherited Create;
+  FPath := ADbPath;
   FStore := TVDbPageStore.Create(ADbPath, APoolPages);
   { WAL yolu: <db>.wal. Boylece tek dosya adi sozlesmesi korunur. }
   FWal := TVdbPageWal.Create(ADbPath + '.wal');
@@ -137,7 +147,14 @@ begin
   end;
 
   FHeap := TVdbHeap.Create(FStore);
-  FHeap.Open;
+  FIdxUsed := False;
+  FIdxErr := '';
+  { Acilis hizlandirmasi: `.odb.idx` taze ve saglamsa tarama atlanir.
+    Herhangi bir uyumsuzlukta tam tarama yapilir; veri kaybi olmaz. }
+  if not FHeap.TryLoadIdx(FPath + '.idx', FIdxErr) then
+    FHeap.Open
+  else
+    FIdxUsed := True;
 
   { Kurtarma sonrasi temiz bir taban: her sey diskte ve fsync'li. }
   if FWal.HasContent then
@@ -149,6 +166,16 @@ begin
   ClearPending;
 end;
 
+procedure TVdbPageEngine.SaveIdx;
+begin
+  if FHeap = nil then Exit;
+  try
+    FHeap.SaveIdx(FPath + '.idx');
+  except
+    { idx istege bagli: yazilamazsa acilis yalniz yavaslar. }
+  end;
+end;
+
 procedure TVdbPageEngine.Close;
 begin
   if FHeap = nil then Exit;
@@ -156,6 +183,8 @@ begin
     Commit(True);
   { Kapanista tam checkpoint: veri dosyasi guncel, WAL bos. }
   Checkpoint(True);
+  { Checkpoint sonrasi dizin taze: acilis taramasi atlanabilir. }
+  SaveIdx;
   FStore.OnSpill := nil;
   FStore.OnMiss := nil;
   ClearPending;

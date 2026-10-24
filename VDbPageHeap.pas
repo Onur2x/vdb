@@ -35,7 +35,7 @@ unit VDbPageHeap;
 interface
 
 uses
-  SysUtils, VDbPage, VDbPageStore;
+  SysUtils, VDbPage, VDbPageStore, VDbIdxFile;
 
 const
   VDB_CELL_HDR      = 12;
@@ -100,6 +100,14 @@ type
     constructor Create(AStore: TVDbPageStore);
     { Tum heap sayfalarini tarayip dizini kurar. }
     procedure Open;
+
+    { `.odb.idx` hizli yolu: dosya taze ve saglamsa dizini taramadan kurar.
+      Herhangi bir uyumsuzlukta False doner ve Err nedenini yazar; cagiran
+      tam tarama yapmalidir. Veri kaybi mumkun degil, yalniz acilis yavaslar. }
+    function TryLoadIdx(const FileName: string; out Err: string): Boolean;
+
+    { Dizinin o anki kopyasini `.odb.idx` olarak yazar (checkpoint sonrasi). }
+    procedure SaveIdx(const FileName: string);
 
     { Yeni anahtar ekler. Anahtar zaten varsa False. }
     function Insert(Key: QWord; const Value: TBytes): Boolean;
@@ -629,6 +637,86 @@ begin
     end;
   end;
   FWritePage := lastHeap;
+end;
+
+function TVdbHeap.TryLoadIdx(const FileName: string; out Err: string): Boolean;
+var
+  entries: TVdbIdxEntryArray;
+  hdr: TVdbIdxHeader;
+  i: LongWord;
+  L: TLoc;
+  P: PVdbPage;
+  size: Int64;
+begin
+  Result := False;
+  if not VDbIdxLoad(FileName, entries, hdr, Err) then
+    Exit;
+  size := Int64(FStore.PageCount) * VDB_PAGE_SIZE;
+  if hdr.DbLSN <> FStore.LSN then
+  begin
+    Err := Format('idx bayat (idx LSN=%d, veri LSN=%d)',
+      [hdr.DbLSN, FStore.LSN]);
+    Exit;
+  end;
+  if hdr.DbPageCount <> FStore.PageCount then
+  begin
+    Err := Format('idx sayfa sayisi uyusmuyor (idx=%d, veri=%d)',
+      [hdr.DbPageCount, FStore.PageCount]);
+    Exit;
+  end;
+  if hdr.DbSize <> size then
+  begin
+    Err := Format('idx dosya boyu uyusmuyor (idx=%d, veri=%d)',
+      [hdr.DbSize, size]);
+    Exit;
+  end;
+  for i := 0 to High(entries) do
+    if (entries[i].PageNo = 0) or (entries[i].PageNo >= FStore.PageCount) then
+    begin
+      Err := Format('idx kaydi gecersiz sayfa %d', [entries[i].PageNo]);
+      Exit;
+    end;
+
+  DirReset;
+  for i := 0 to High(entries) do
+  begin
+    L.PageNo := entries[i].PageNo;
+    L.Slot := entries[i].Slot;
+    DirAdd(entries[i].Key, L);   // FCount'u da artirir
+  end;
+  { Yazma sayfasi: en son ayrilan sayfa heap ise oradan devam et. }
+  FWritePage := 0;
+  if FStore.PageCount > 1 then
+    if FStore.GetRawPage(FStore.PageCount - 1, P) then
+    begin
+      if PageTypeOf(P) = VDB_PAGE_HEAP then
+        FWritePage := FStore.PageCount - 1;
+      FStore.Release(FStore.PageCount - 1, False);
+    end;
+  Move(hdr.Reserved[0], FHeapPages, 4);
+  Move(hdr.Reserved[4], FOvfPages, 4);
+  Result := True;
+end;
+
+procedure TVdbHeap.SaveIdx(const FileName: string);
+var
+  entries: TVdbIdxEntryArray;
+  i, n: LongWord;
+begin
+  n := 0;
+  SetLength(entries, FCount);
+  for i := 0 to FCap - 1 do
+    if FUsed[i] = 1 then
+    begin
+      entries[n].Key := FKey[i];
+      entries[n].PageNo := FLoc[i].PageNo;
+      entries[n].Slot := FLoc[i].Slot;
+      entries[n].Pad := 0;
+      Inc(n);
+    end;
+  SetLength(entries, n);
+  VDbIdxSave(FileName, entries, FStore.LSN, FStore.PageCount,
+    Int64(FStore.PageCount) * VDB_PAGE_SIZE, FHeapPages, FOvfPages);
 end;
 
 function TVdbHeap.Insert(Key: QWord; const Value: TBytes): Boolean;
