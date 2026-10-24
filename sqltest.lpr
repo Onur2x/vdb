@@ -15967,10 +15967,32 @@ end;
 var
   arg: string;
   tmp: string;
+  i: Integer;
+  backend: string;
 begin
   nPass := 0; nFail := 0; nGrp := 0;
   sq := nil; tb := nil; kv := nil;
-  if (ParamCount >= 1) and (Trim(ParamStr(1)) <> '') then
+  { v3 hazirligi (2026-10-24): --backend=v2|v3. Varsayilan v2 (bugunku motor).
+    v3 backend'i henuz yok; istendiginde testler kosulmaz ve BASARILI
+    sayilmaz (yanlis yesil olmasin diye "GECTI" satiri yazilmaz). }
+  backend := 'v2';
+  for i := 1 to ParamCount do
+  begin
+    arg := Trim(ParamStr(i));
+    if Pos('--backend=', LowerCase(arg)) = 1 then
+      backend := LowerCase(Copy(arg, Length('--backend=') + 1, MaxInt));
+  end;
+  if (backend <> 'v2') then
+  begin
+    WriteLn('VDB SQL tam testi');
+    WriteLn('ATLA: --backend=', backend, ' isteniyor ama bu surumde yalniz v2 var.');
+    WriteLn('SONUC: gecen=0  kalan=0  (TUMU ATLANDI)');
+    WriteLn('v3 BACKEND HENUZ YOK - TEST KOSULMADI');
+    ExitCode := 2;
+    Exit;
+  end;
+  if (ParamCount >= 1) and (Trim(ParamStr(1)) <> '') and
+     (Pos('--', ParamStr(1)) <> 1) then
   begin
     D := ParamStr(1);
     ForceDirectories(D);
@@ -15983,6 +16005,7 @@ begin
   end;
   WriteLn('VDB SQL tam testi');
   WriteLn('Klasor: ', D);
+  WriteLn('Backend: ', backend);
   try
     try
         T01_Veritabani;

@@ -116,13 +116,13 @@ Sayfa motorunu yazmak kolay; asıl maliyet şu 4 dosyada. Plan bunları hesaba k
 - [x] 0.3 `.gitignore`: `YEDEK/`, `--help/`, `bench_live.*` eklenir (şu an untracked)
 - [x] 0.4 Bu plan repoya `V3_YOL_HARITASI.md` olarak eklenir (ilerleme buradan işaretlenir)
 - [x] 0.5 `vdb_kapsamli_yol_haritasi.md` §1.3 ve §2.2 tabloları yukarıdaki gerçek ölçümlerle değiştirilir (belgedeki 7,7x / 19,5x / "PK'da 2,1x öndeyiz" ifadeleri bugünkü ölçümle çelişiyor)
-- [ ] 0.6 `sqltest`'e `--backend=v2|v3` anahtarı; v3 yokken testler `ATLA`
+- [x] 0.6 `sqltest`'e `--backend=v2|v3` anahtarı; v3 yokken testler `ATLA` (v3/bilinmeyen backend → `ATLA`, **exit=2**, yanlış yeşil yok; v2 → 3112/3112 exit=0)
 - [x] 0.7 `benchcmp.pas` + `benchcmp.py` repoya `tests/bench/` altına alınır (tekrarlanabilir kıyas takımı, 3 tekrar + medyan)
 
 ### Sprint 1 — Sayfa motoru çekirdeği (Gün 1-5)
 
-- [ ] 1.1 `VDbPage.pas`: 4 KB sabit sayfa, başlık, slot dizini, CRC32, tip alanı
-- [ ] 1.2 `pagechk`: 100k rastgele ekle/oku/güncelle/sil, referans map ile birebir; **0 hata** kapısı
+- [x] 1.1 `VDbPage.pas`: 4 KB sabit sayfa, başlık, slot dizini, CRC32, tip alanı
+- [x] 1.2 `pagechk`: 100k rastgele ekle/oku/güncelle/sil, referans map ile birebir; **0 hata** kapısı (21/21, `kalan=0`)
 - [ ] 1.3 `VDbPageStore.pas`: buffer pool (CLOCK, pin/dirty/LRU), sayfa ayır/serbest bırak
 - [ ] 1.4 `freelist`: trunk page zinciri; silinen sayfa yeniden kullanılır
 - [ ] 1.5 `VDbPageHeap.pas`: slotted heap insert/güncelle/sil, >2 KB için overflow zinciri
@@ -162,6 +162,38 @@ Sayfa motorunu yazmak kolay; asıl maliyet şu 4 dosyada. Plan bunları hesaba k
 - [ ] 3.11 `crashtest` 8/8, fuzz (T111, 3VL, T147 SQLancer) v3'te temiz
 - [ ] 3.12 Ölçüm tablosu `hiztesti.md` + `speedtest.md` + `readme*.md` güncellenir — **yalnız ölçülmüş sayılar**
 - [ ] 3.13 `git tag v3.0` + push; CI yeşil
+
+---
+
+## Sayfa formatı (Gün 1'de sabitlendi — `VDbPage.pas`)
+
+```
+0   ..  23    başlık (24 bayt)
+24  ..  ...   slot dizini, yukarı büyür (slot = 4 bayt: Off, Len)
+... .. 4091   hücre gövdesi, aşağı büyür
+4092 .. 4095  CRC32 (0..4091 üzerinde)
+```
+
+Başlık: `Magic('VP') | PageType | Flags | PageNo | SlotCount | FreeSpace |
+ContentOff | FragBytes | LSN`. `Slot.Off = 0` → slot boş.
+
+**Üç değişmez kural (sonraki günler bunlara dayanıyor):**
+
+1. **Slot indeksleri kararlıdır.** `PageCompact` yalnızca gövdeyi yeniden
+   paketler; slot *i* her zaman aynı hücreyi gösterir. Bu yüzden heap katmanı
+   `(sayfaNo, slot)` çiftini güvenle tutabilir. (İlk sürüm slotları yeniden
+   numaralandırıyordu; `pagechk` bunu 170 hata ile yakaladı ve düzeltildi.)
+2. **CRC yalnızca mühürlemede hesaplanır.** INSERT/UPDATE/DELETE 4 KB CRC
+   ödemez; `PageSeal` sayfa diske/WAL'e yazılırken çağrılır. Bellekteki yapı
+   denetimi `PageCheckStruct` ile (CRC'siz) yapılır. Aksi halde 200k satırlık
+   toplu INSERT'te ~800 MB fazladan CRC hesaplanırdı.
+3. **Silme O(1)'dir.** Baytlar yerinde kalır, `FragBytes` ile muhasebe edilir,
+   yer gerekince `PageCompact` geri kazanır.
+
+Ölçüm (pagechk): 4096 baytlık sayfaya 100 baytlık **39 hücre** sığdı
+(3900 bayt yük, 12 bayt artık) → yük doluluğu **%95,7**. 100.000 rastgele
+işlem (25.318 ekle / 25.129 sil / 17.384 güncelle / 5.027 sıkıştır) sonunda
+8 sayfanın tamamı referans modelle **birebir** aynı, `kalan=0`.
 
 ---
 

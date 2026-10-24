@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, v3]
   pull_request:
   schedule:
     # Haftalik rasgele SQL diferansiyeli (M8).
@@ -46,6 +46,22 @@ jobs:
         run: |
           & $env:LAZBUILD -B sqltest.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:LAZBUILD -B pagechk.lpi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Sayfa cekirdegi kapisi (pagechk)
+        shell: pwsh
+        run: |
+          $out = & .\pagechk.exe 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'SAYFA CEKIRDEGI DOGRULANDI') {
+            Write-Error 'pagechk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'pagechk kalan > 0'
+            exit 1
+          }
 
       - name: Testler (tam sqltest + rasgele SQL diferansiyeli)
         shell: pwsh
