@@ -1242,10 +1242,12 @@ begin
         if (plen < 0) or (plen > 64 * 1024 * 1024) then
           Exit(CopyErr('COPY: gecersiz veri parcasi', nil));
         SetLength(buf, plen);
-        if (plen > 0) and not S.RecvAll(buf[1], plen) then Exit;
+        // TBytes 0-tabanlidir: buf[1] kullanmak 1 bayt tasma (heap
+        // bozulmasi) ve veriyi bir bayt kaydirarak yazmak demekti.
+        if (plen > 0) and not S.RecvAll(buf[0], plen) then Exit;
         case AnsiChar(b) of
           'd':
-            if plen > 0 then fs.WriteBuffer(buf[1], plen);
+            if plen > 0 then fs.WriteBuffer(buf[0], plen);
           'c':
             Break;
           'H':

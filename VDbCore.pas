@@ -2704,11 +2704,19 @@ const
 {$IFDEF MSWINDOWS}
 type
   { Windows birimini KULLANMIYORUZ (kendi TCriticalSection'i SyncObjs'inkini
-    golgeliyor); ReadFile'i dogrudan kernel32'den baglariz. Yerlesim
-    Win32 OVERLAPPED ile aynidir (yalniz offset alanlari kullanilir). }
+    golgeliyor); ReadFile'i dogrudan kernel32'den baglariz.
+    2026-10-24 (Win64): Internal/InternalHigh ULONG_PTR'dir; Win64'te 8 bayt.
+    Bunlar 4 bayt sayilirsa TUM alanlar 8 bayt kayar ve kernel offset'i
+    hEvent'ten (daima 0) okur -> her konumsal okuma dosya basindan yapilir
+    (belirti: "VDb: index/data uyusmazligi"). Yerlesim platforma gore. }
   TVDbOverlapped = record
+    {$IFDEF CPU64}
+    Internal: QWord;
+    InternalHigh: QWord;
+    {$ELSE}
     Internal: LongWord;
     InternalHigh: LongWord;
+    {$ENDIF}
     Offset: LongWord;
     OffsetHigh: LongWord;
     hEvent: THandle;

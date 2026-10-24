@@ -13742,6 +13742,7 @@ begin
 
   // Buradan itibaren cumle bize ait: hatalar ecSyntaxError ile bildirilir.
   Result := True;
+  useMem := False;
   Res.Affected := 0;
   Res.Msg := '';
   Res.LastTable := '';
