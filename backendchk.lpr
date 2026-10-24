@@ -1,0 +1,560 @@
+program backendchk;
+
+{ VDB v3 - Backend dikisi dogrulama (Sprint 2 / 2.1-2.4)
+
+  Denetlenenler:
+    1) TVDbBackendV2: TVDb ile BIREBIR ayni sonuc (put/get/delete/count/
+       scan, toplu yazim, geri alma).
+    2) TVDbBackendV3: ayni arayuz sozlesmesi sayfa motoru uzerinde.
+    3) v3 toplu yazim: CommitBatch sonrasi kalici; AbortBatch sonrasi
+       HICBIR SEY yazilmamis (yeniden acilista gorunmez).
+    4) v3 parti icinde okuma kaplamayi gorur.
+    5) v3 tablo filtresi (row tag) ScanAll ve ScanRawIterAll'da.
+    6) v3 checkpoint esigi: cok kucuk esikte WAL budanir, veri korunur.
+    7) v3 kucuk havuzda N satir toplu yazim (tahliye + WAL yolu).
+    8) v2 ve v3 ayni arayuzle ayni sonucu verir (davranis esitligi).
+
+  Cikis kodu: 0 = hepsi gecti, 1 = hata.
+  Kullanim: backendchk <calisma_dizini> [satir_sayisi]
+}
+
+{$mode delphi}{$H+}
+
+uses
+  Classes, SysUtils, VDbBackendApi, VDbCore, VDbBackendV2, VDbBackendV3,
+  VDbPageEngine;
+
+var
+  gPass, gFail: Int64;
+  gDir: string;
+
+procedure Ok(const S: string);
+begin
+  Inc(gPass);
+  WriteLn('   OK   ', S);
+end;
+
+procedure Fail(const S: string);
+begin
+  Inc(gFail);
+  WriteLn('   FAIL ', S);
+end;
+
+procedure MakeVal(Key: QWord; Len, Seed: Integer; out V: TBytes);
+var
+  i: Integer;
+begin
+  SetLength(V, Len);
+  for i := 0 to Len - 1 do
+    V[i] := Byte(((Key * 37) + QWord(Seed) * 101 + QWord(i) * 7) and $FF);
+end;
+
+function ValEq(const A, B: TBytes): Boolean;
+begin
+  Result := (Length(A) = Length(B)) and
+            ((Length(A) = 0) or CompareMem(@A[0], @B[0], Length(A)));
+end;
+
+function DirOf(const Name: string): string;
+begin
+  Result := IncludeTrailingPathDelimiter(gDir) + Name;
+end;
+
+procedure CleanDir;
+var
+  sr: TSearchRec;
+  base: string;
+begin
+  base := IncludeTrailingPathDelimiter(gDir);
+  if FindFirst(base + '*', faAnyFile, sr) = 0 then
+  begin
+    repeat
+      if (sr.Name <> '.') and (sr.Name <> '..') then
+        if (sr.Attr and faDirectory) = 0 then
+          DeleteFile(base + sr.Name);
+    until FindNext(sr) <> 0;
+    FindClose(sr);
+  end;
+end;
+
+{ ================================================= 1) v2 adaptor: birebir }
+
+procedure TestV2Adapter;
+var
+  db: TVDb;
+  b: IVDbBackend;
+  v, w: TBytes;
+  i: Integer;
+  keys: TQWordArray;
+  vals: TValArray;
+begin
+  CleanDir;
+  db := TVDb.Create;
+  try
+    db.Open(DirOf('v2.odb'));
+    b := TVDbBackendV2.Create(db);
+    for i := 1 to 100 do
+    begin
+      MakeVal(i, 24, 5, v);
+      b.Put(i, v);
+    end;
+    if b.Count = 100 then Ok('v2 adaptor: 100 kayit')
+    else Fail(Format('v2 adaptor: count=%d', [b.Count]));
+    if b.Exists(50) and not b.Exists(101) then Ok('v2 adaptor: Exists dogru')
+    else Fail('v2 adaptor: Exists yanlis');
+
+    MakeVal(50, 24, 5, v);
+    if b.Get(50, w) and ValEq(w, v) then Ok('v2 adaptor: Get birebir')
+    else Fail('v2 adaptor: Get yanlis');
+
+    if b.Delete(50) and (not b.Exists(50)) and (b.Count = 99) then
+      Ok('v2 adaptor: Delete + Count')
+    else Fail('v2 adaptor: Delete yanlis');
+
+    keys := nil;
+    vals := nil;
+    b.ScanAll(keys, vals, -1);
+    if Length(keys) = 99 then Ok('v2 adaptor: ScanAll 99 kayit')
+    else Fail(Format('v2 adaptor: ScanAll=%d', [Length(keys)]));
+
+    b.BeginBatch;
+    if not b.InBatch then Fail('v2 adaptor: InBatch False')
+    else Ok('v2 adaptor: InBatch True');
+    for i := 200 to 299 do
+    begin
+      MakeVal(i, 24, 5, v);
+      b.Put(i, v);
+    end;
+    b.CommitBatch;
+    if (b.Count = 199) and b.Exists(299) then
+      Ok('v2 adaptor: CommitBatch kalici (199)')
+    else
+      Fail(Format('v2 adaptor: CommitBatch sonrasi count=%d', [b.Count]));
+
+    b.BeginBatch;
+    for i := 300 to 399 do
+    begin
+      MakeVal(i, 24, 5, v);
+      b.Put(i, v);
+    end;
+    b.AbortBatch;
+    if (b.Count = 199) and (not b.Exists(300)) then
+      Ok('v2 adaptor: AbortBatch geri aldi')
+    else
+      Fail(Format('v2 adaptor: AbortBatch sonrasi count=%d', [b.Count]));
+
+    b := nil;
+  finally
+    db.Free;
+  end;
+end;
+
+{ ======================================================= 2) v3 temel sozlesme }
+
+function RowTag(const PlainValue: TBytes; ValueLen: Integer): Integer;
+begin
+  { Degerin ilk bayti tablo kimligi; 0 = satir degil. }
+  if ValueLen < 1 then Exit(-1);
+  Result := PlainValue[0];
+  if Result = 0 then Result := -1;
+end;
+
+function MakeTagged(Tag: Byte; Key: QWord; Len: Integer): TBytes;
+var
+  i: Integer;
+begin
+  SetLength(Result, Len);
+  Result[0] := Tag;
+  for i := 1 to Len - 1 do
+    Result[i] := Byte(((Key * 37) + QWord(i) * 7) and $FF);
+end;
+
+procedure TestV3Basic(N: Integer);
+var
+  b: IVDbBackend;
+  v, w: TBytes;
+  i: Integer;
+  path: string;
+begin
+  CleanDir;
+  path := DirOf('v3.odb');
+  b := TVdbBackendV3.Create(path, True, 64);
+  for i := 1 to 100 do
+  begin
+    MakeVal(i, 24, 5, v);
+    b.Put(i, v);
+  end;
+  if b.Count = 100 then Ok('v3: 100 kayit')
+  else Fail(Format('v3: count=%d', [b.Count]));
+  if b.Exists(50) and not b.Exists(101) then Ok('v3: Exists dogru')
+  else Fail('v3: Exists yanlis');
+  MakeVal(50, 24, 5, v);
+  if b.Get(50, w) and ValEq(w, v) then Ok('v3: Get birebir')
+  else Fail('v3: Get yanlis');
+  if b.Delete(50) and (not b.Exists(50)) and (b.Count = 99) then
+    Ok('v3: Delete + Count')
+  else Fail('v3: Delete yanlis');
+  MakeVal(60, 40, 9, v);
+  b.Put(60, v);
+  if b.Get(60, w) and ValEq(w, v) then Ok('v3: guncelleme birebir')
+  else Fail('v3: guncelleme yanlis');
+  b.Flush;
+  b := nil;
+
+  b := TVdbBackendV3.Create(path, False, 64);
+  if b.Count = 99 then Ok('v3: yeniden acilista 99 kayit')
+  else Fail(Format('v3: yeniden acilis count=%d', [b.Count]));
+  MakeVal(60, 40, 9, v);
+  if b.Get(60, w) and ValEq(w, v) then Ok('v3: yeniden acilista deger birebir')
+  else Fail('v3: yeniden acilista deger yanlis');
+  if not b.Exists(50) then Ok('v3: silinen anahtar kalici')
+  else Fail('v3: silinen anahtar geri geldi');
+  b := nil;
+end;
+
+{ ================================================== 3) v3 toplu yazim / abort }
+
+procedure TestV3Batch;
+var
+  b: IVDbBackend;
+  v: TBytes;
+  i: Integer;
+  path: string;
+begin
+  CleanDir;
+  path := DirOf('batch.odb');
+  b := TVdbBackendV3.Create(path, True, 64);
+  b.BeginBatch;
+  for i := 1 to 200 do
+  begin
+    MakeVal(i, 24, 3, v);
+    b.Put(i, v);
+  end;
+  if b.Get(150, v) and (Length(v) = 24) then
+    Ok('v3: parti icinde okuma kaplamayi gorur')
+  else
+    Fail('v3: parti icinde okuma basarisiz');
+  b.CommitBatch;
+  if (b.Count = 200) and (not b.InBatch) then
+    Ok('v3: CommitBatch 200 kayit')
+  else
+    Fail(Format('v3: CommitBatch count=%d', [b.Count]));
+
+  b.BeginBatch;
+  for i := 201 to 400 do
+  begin
+    MakeVal(i, 24, 3, v);
+    b.Put(i, v);
+  end;
+  b.Delete(1);
+  if not b.Exists(1) then Ok('v3: parti icinde silme gorunur')
+  else Fail('v3: parti icinde silme gorunmedi');
+  b.AbortBatch;
+  if b.Exists(1) and (b.Count = 200) and (not b.Exists(201)) then
+    Ok('v3: AbortBatch hicbir sey yazmadi')
+  else
+    Fail(Format('v3: AbortBatch sonrasi count=%d', [b.Count]));
+
+  b.BeginBatch;
+  for i := 1 to 50 do b.Delete(i);
+  b.CommitBatch;
+  if b.Count = 150 then Ok('v3: partide toplu silme (150)')
+  else Fail(Format('v3: toplu silme count=%d', [b.Count]));
+  b := nil;
+
+  b := TVdbBackendV3.Create(path, False, 64);
+  if (b.Count = 150) and (not b.Exists(201)) then
+    Ok('v3: abort partisi yeniden acilista da yok')
+  else
+    Fail(Format('v3: abort sonrasi kalicilik bozuk (count=%d)', [b.Count]));
+  b := nil;
+end;
+
+{ ================================================== 4) tablo filtresi (row tag) }
+
+var
+  gRawHits: Integer;
+  gRawStopAt: Integer;
+
+function RawCb(Key: QWord; Buf: PByte; Len: Integer; User: Pointer): Boolean;
+begin
+  Inc(gRawHits);
+  Result := (gRawStopAt = 0) or (gRawHits < gRawStopAt);
+end;
+
+procedure TestV3Filter;
+var
+  b: IVDbBackend;
+  i: Integer;
+  keys: TQWordArray;
+  vals: TValArray;
+  path: string;
+begin
+  CleanDir;
+  path := DirOf('filter.odb');
+  b := TVdbBackendV3.Create(path, True, 64);
+  b.SetRowTagFunc(RowTag);
+  b.BeginBatch;
+  for i := 1 to 300 do
+  begin
+    if (i mod 3) = 0 then
+      b.Put(i, MakeTagged(2, i, 20))
+    else
+      b.Put(i, MakeTagged(1, i, 20));
+  end;
+  b.Put(9999, MakeTagged(0, 9999, 8));   // sema: etiket 0 -> filtre disi
+  b.CommitBatch;
+
+  keys := nil; vals := nil;
+  b.ScanAll(keys, vals, 1);
+  if Length(keys) = 201 then Ok('v3: ScanAll tablo 1 -> 201 kayit')
+  else Fail(Format('v3: ScanAll tablo 1 -> %d', [Length(keys)]));
+
+  keys := nil; vals := nil;
+  b.ScanAll(keys, vals, 2);
+  if Length(keys) = 101 then Ok('v3: ScanAll tablo 2 -> 101 kayit (100 + sema)')
+  else Fail(Format('v3: ScanAll tablo 2 -> %d', [Length(keys)]));
+
+  keys := nil; vals := nil;
+  b.ScanAll(keys, vals, -1);
+  if Length(keys) = 301 then Ok('v3: ScanAll filtresiz -> 301 kayit')
+  else Fail(Format('v3: ScanAll filtresiz -> %d', [Length(keys)]));
+  b := nil;
+
+  b := TVdbBackendV3.Create(path, False, 64);
+  b.SetRowTagFunc(RowTag);
+  gRawHits := 0;
+  gRawStopAt := 0;
+  b.ScanRawIterAll(2, RawCb, nil);
+  if gRawHits = 101 then Ok('v3: ScanRawIterAll tablo 2 -> 101')
+  else Fail(Format('v3: ScanRawIterAll tablo 2 -> %d', [gRawHits]));
+
+  gRawHits := 0;
+  gRawStopAt := 10;
+  b.ScanRawIterAll(2, RawCb, nil);
+  if gRawHits = 10 then Ok('v3: ScanRawIterAll erken durur (10)')
+  else Fail(Format('v3: erken durma %d', [gRawHits]));
+  b := nil;
+end;
+
+{ ================================================== 5) checkpoint esigi }
+
+procedure TestV3Checkpoint;
+var
+  be: TVdbBackendV3;
+  b: IVDbBackend;
+  v: TBytes;
+  i: Integer;
+  path: string;
+  wal: Int64;
+begin
+  CleanDir;
+  path := DirOf('ckpt.odb');
+  be := TVdbBackendV3.Create(path, True, 64);
+  b := be;                       { ayri referans: be'yi b serbest birakir }
+  be.CheckpointBytes := 64 * 1024;   // cok kucuk: her partide checkpoint
+  for i := 1 to 2000 do
+  begin
+    MakeVal(i, 32, 4, v);
+    b.Put(i, v);
+    if (i mod 100) = 0 then b.Flush;
+  end;
+  b.Flush;
+  wal := be.Engine.Wal.Bytes;
+  if wal <= 64 * 1024 then
+    Ok(Format('v3: checkpoint esigi calisti (WAL=%d bayt)', [wal]))
+  else
+    Fail(Format('v3: WAL esigi asildi (%d bayt)', [wal]));
+  b := nil;                      { be'yi serbest birakir; sonra DOKUNMA }
+
+  b := TVdbBackendV3.Create(path, False, 64);
+  if b.Count = 2000 then Ok('v3: checkpoint sonrasi 2000 kayit korundu')
+  else Fail(Format('v3: checkpoint sonrasi count=%d', [b.Count]));
+  b := nil;
+end;
+
+{ ================================================== 6) kucuk havuz + N }
+
+procedure TestV3SmallPool(N: Integer);
+var
+  b: IVDbBackend;
+  v, w: TBytes;
+  i: Integer;
+  path: string;
+  bad: Integer;
+  keys: TQWordArray;
+  vals: TValArray;
+begin
+  CleanDir;
+  path := DirOf('pool.odb');
+  b := TVdbBackendV3.Create(path, True, 8);
+  b.BeginBatch;
+  for i := 1 to N do
+  begin
+    MakeVal(i, 32, 6, v);
+    b.Put(i, v);
+  end;
+  b.CommitBatch;
+  if b.Count = N then Ok(Format('v3: kucuk havuzda %d satir yazildi', [N]))
+  else Fail(Format('v3: kucuk havuz count=%d', [b.Count]));
+  b.Flush;
+  b := nil;
+
+  b := TVdbBackendV3.Create(path, False, 8);
+  bad := 0;
+  for i := 1 to N do
+  begin
+    if not b.Get(i, w) then
+    begin
+      Inc(bad);
+      if bad < 3 then WriteLn(Format('        eksik: %d', [i]));
+      Continue;
+    end;
+    MakeVal(i, 32, 6, v);
+    if not ValEq(w, v) then
+    begin
+      Inc(bad);
+      if bad < 3 then WriteLn(Format('        bozuk: %d', [i]));
+    end;
+  end;
+  if bad = 0 then Ok(Format('v3: kucuk havuzda %d satirin tamami birebir', [N]))
+  else Fail(Format('v3: kucuk havuzda %d bozuk', [bad]));
+
+  keys := nil; vals := nil;
+  b.ScanAll(keys, vals, -1);
+  if Length(keys) = N then Ok('v3: kucuk havuz ScanAll tam')
+  else Fail(Format('v3: kucuk havuz ScanAll=%d', [Length(keys)]));
+  b := nil;
+end;
+
+{ ================================================== 7) v2 / v3 davranis esitligi }
+
+procedure TestEquivalence(N: Integer);
+var
+  db: TVDb;
+  b2: IVDbBackend;
+  b3: IVDbBackend;
+  v, a, b: TBytes;
+  i: Integer;
+  k2, k3: TQWordArray;
+  va2, va3: TValArray;
+  same: Boolean;
+begin
+  CleanDir;
+  db := TVDb.Create;
+  try
+    db.Open(DirOf('eq_v2.odb'));
+    b2 := TVDbBackendV2.Create(db);
+    b3 := TVdbBackendV3.Create(DirOf('eq_v3.odb'), True, 128);
+    for i := 1 to N do
+    begin
+      MakeVal(i, 28, 8, v);
+      b2.Put(i, v);
+      b3.Put(i, v);
+    end;
+    for i := 1 to N do
+      if (i mod 5) = 0 then
+      begin
+        b2.Delete(i);
+        b3.Delete(i);
+      end;
+    for i := 1 to N do
+      if (i mod 7) = 0 then
+      begin
+        MakeVal(i, 36, 2, v);
+        b2.Put(i, v);
+        b3.Put(i, v);
+      end;
+    b2.Flush;
+    b3.Flush;
+
+    if b2.Count = b3.Count then
+      Ok(Format('esitlik: count ayni (%d)', [b2.Count]))
+    else
+      Fail(Format('esitlik: count v2=%d v3=%d', [b2.Count, b3.Count]));
+
+    k2 := nil; va2 := nil; k3 := nil; va3 := nil;
+    b2.ScanAll(k2, va2, -1);
+    b3.ScanAll(k3, va3, -1);
+    { Sira motorun fiziksel duzenine baglidir (v3 sayfa sirasi, v2 kova
+      sirasi); karsilastirma KUME + DEGER uzerinden yapilir. }
+    same := Length(k2) = Length(k3);
+    if same then
+      for i := 0 to High(k2) do
+      begin
+        if not b3.Get(k2[i], b) then
+        begin
+          same := False;
+          WriteLn(Format('        v3 eksik anahtar: %d', [k2[i]]));
+          Break;
+        end;
+        if not ValEq(va2[i], b) then
+        begin
+          same := False;
+          WriteLn(Format('        v3 farkli deger: %d', [k2[i]]));
+          Break;
+        end;
+      end;
+    if same then Ok('esitlik: ScanAll kume ve degerler birebir')
+    else Fail(Format('esitlik: ScanAll farkli (v2=%d v3=%d)',
+      [Length(k2), Length(k3)]));
+
+    same := True;
+    for i := 1 to N do
+    begin
+      if b2.Get(i, a) <> b3.Get(i, b) then
+      begin
+        same := False;
+        Break;
+      end;
+      if not ValEq(a, b) then
+      begin
+        same := False;
+        Break;
+      end;
+    end;
+    if same then Ok('esitlik: nokta okumalari birebir')
+    else Fail('esitlik: nokta okumalari farkli');
+
+    b2 := nil;
+    b3 := nil;
+  finally
+    db.Free;
+  end;
+end;
+
+{ ================================================================== ana }
+
+var
+  N: Integer;
+begin
+  gPass := 0;
+  gFail := 0;
+  N := 5000;
+  if ParamCount >= 1 then gDir := ParamStr(1) else gDir := GetCurrentDir;
+  if ParamCount >= 2 then N := StrToIntDef(ParamStr(2), N);
+  if not DirectoryExists(gDir) then ForceDirectories(gDir);
+
+  WriteLn('VDB v3 backendchk - backend dikisi kapisi');
+  WriteLn('dizin=', gDir, '  N=', N);
+  WriteLn;
+
+  TestV2Adapter;
+  TestV3Basic(N);
+  TestV3Batch;
+  TestV3Filter;
+  TestV3Checkpoint;
+  TestV3SmallPool(N);
+  TestEquivalence(1000);
+
+  WriteLn;
+  WriteLn('================================================');
+  WriteLn(Format('SONUC: gecen=%d kalan=%d', [gPass, gFail]));
+  if gFail = 0 then
+  begin
+    WriteLn('BACKEND DIKISI DOGRULANDI');
+    Halt(0);
+  end;
+  WriteLn('BACKEND DIKISI HATALI');
+  Halt(1);
+end.

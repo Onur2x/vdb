@@ -15,7 +15,7 @@ interface
 
 uses
   Classes, SysUtils, SyncObjs, Generics.Collections, VDbErr,
-  VDbTypes, DateUtils;
+  VDbTypes, DateUtils, VDbBackendApi;
 
 const
   VDB_MAGIC = $56444231;
@@ -79,34 +79,9 @@ const
   VDB_RAW_SCAN_MAX_BUCKET = 8192;
 
 type
-  TQWordArray = array of QWord;
-  TValArray = array of TBytes;
-  { M11: depolama motoru DIKISI. Yalnizca temel KV islemleri bu arayuzde;
-    transaction, WAL, indeks ve sifreleme TVDb'de kalir. Amac, ileride
-    sayfa tabanli ikinci bir backend'in ust katmani degistirmeden
-    denenebilmesi. Bugun TVDbKvStore bunu TVDb'ye delege eder. }
-  IVDbKvStore = interface
-    ['{6D8B2E71-4C1A-4F6E-9E3B-7A5C0D2F1A44}']
-    procedure Put(Key: QWord; const Value: TBytes);
-    function Get(Key: QWord; out Value: TBytes): Boolean;
-    function Delete(Key: QWord): Boolean;
-    procedure ScanAll(out Keys: TQWordArray; out Vals: TValArray;
-      TableFilter: Integer);
-  end;
-  { R-26 (2026-10-15): satirin icindeki TABLO ID'yi cozucu.
-    KV katmani satir bicimini BILMEZ; cozucuyu VDbTable saglar ve TVDb
-    icin atar. Boylece Recover, zaten CRC icin okudugu degerden tablo
-    id'yi bedava cikarir.
-      >= 0 : bu kayit o tabloya ait satir
-      -1   : satir degil (semaya benzer ozel kayit) -> filtre uygulanmaz }
-  TVDbRowTagFunc = function(const PlainValue: TBytes; ValueLen: Integer): Integer;
-  { P-18a (2026-10-16): ScanRawIter geri cagrisi. Buf, motorun ic tamponuna
-    (bucket chunk'i) isaret eder — YALNIZ cagri sirasinda gecerlidir,
-    saklanmamali/kopyalamadan kullanilmalidir. Return False => tarama
-    derhal durdurulur (ScanRawIter False doner). EN: zero-copy raw scan
-    callback; buffer valid only during the call. }
-  TVDbRawCb = function(Key: QWord; Buf: PByte; Len: Integer;
-    User: Pointer): Boolean;
+  { TQWordArray, TValArray, IVDbKvStore, TVDbRowTagFunc, TVDbRawCb ve
+    TDbCommitHook artik VDbBackendApi biriminde (Sprint 2 / 2.1): ayni
+    tipleri v3 backend de kullaniyor. Buradan `uses` ile gorunurler. }
 
   { H6 (2026-10-18): PARALEL TARAMA icin ONCEDEN HAZIRLANMIS aday kumesi.
     PrepareRawScan adaylari BIR KEZ toplar ve offset bucket'larina gore
@@ -226,11 +201,8 @@ type
     Crc: LongWord;   // ilk 12 byte'in CRC32'si
   end;
 
-  { R-11: COMMIT oncesi calisacak geri-cagirim tipi. Bir METOT adresi
-    tutuldugu icin duz TProcedure degil, `procedure of object` olmali.
-    TVTableDb kendi deferrable-kisit denetimini bu kanca ile VDb'ye
-    baglar (bkz. TVTableDb.Open). }
-  TDbCommitHook = procedure of object;
+  { R-11: TDbCommitHook VDbBackendApi'de tanimli (v3 backend de kullaniyor).
+    COMMIT oncesi calisir; TVTableDb deferrable-kisit denetimini buraya baglar. }
 
   TVDb = class
   private

@@ -15,7 +15,7 @@ uses
     yoksa TEvent.Create "Failed to create OS basic event" verir. }
   {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes, Math, StrUtils, VDbCore, VDbTypes, VDbTable, VDbSql, VDbSync, VDbCrc32,
-  VDbCrypt, VDbKdf, VDbSpatial, VDbRange, VDbMonitor, VDbPlatform, VDbCost,
+  VDbBackendApi, VDbCrypt, VDbKdf, VDbSpatial, VDbRange, VDbMonitor, VDbPlatform, VDbCost,
   VDbExtension, VDbText, VDbParallel, VDbReplication, VDbNet, VDbSqlServer,
   VDbClientNet, VDbMetricsHttp, VDbPgWire, VDbTls, VDbTrace, dynlibs, VDbUndo;
 { VDbTypes: TStrArray / TStrMatrix gibi paylasilan tipler artik tek

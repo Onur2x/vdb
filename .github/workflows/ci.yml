@@ -56,6 +56,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:LAZBUILD -B idxchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:LAZBUILD -B backendchk.lpi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Sayfa deposu kapisi (storechk)
         shell: pwsh
@@ -128,6 +130,21 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'idxchk kalan > 0'
+            exit 1
+          }
+
+      - name: Backend dikisi kapisi (backendchk)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbbackendchk'
+          $out = & .\backendchk.exe $dir 5000 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'BACKEND DIKISI DOGRULANDI') {
+            Write-Error 'backendchk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'backendchk kalan > 0'
             exit 1
           }
 

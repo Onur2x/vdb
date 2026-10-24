@@ -110,6 +110,8 @@ type
 
     property Path: string read FPath;
     property BufferedCount: Integer read FBufferCount;
+    { WAL dosyasinin su anki boyu (checkpoint esigi icin). }
+    function Bytes: Int64;
   end;
 
 implementation
@@ -469,6 +471,14 @@ begin
   WriteHeader;
   VDbFlushStream(FStream);
   FHasContent := False;
+end;
+
+function TVdbPageWal.Bytes: Int64;
+begin
+  if FStream = nil then
+    Exit(0);
+  Result := FStream.Size +
+    Int64(FBufferCount) * (VDB_PAGE_SIZE + VDB_WAL_REC_HDR);
 end;
 
 end.

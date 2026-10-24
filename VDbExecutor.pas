@@ -22,7 +22,7 @@ unit VDbExecutor;
 interface
 
 uses
-  Classes, SysUtils, Math, Generics.Collections,
+  Classes, SysUtils, Math, Generics.Collections, VDbBackendApi,
   VDbCore, VDbTable, VDbAst, VDbJson, VDbErr, VDbText, VDbXml, VDbSpatial,
   VDbRange, VDbParser, VDbTypes, VDbReplication, VDbParallel, VDbMonitor,
   VDbPlatform, VDbCost, VDbExtension, VDbVector, VDbArrow, VDbParquet,

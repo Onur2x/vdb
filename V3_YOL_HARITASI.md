@@ -136,11 +136,13 @@ Sayfa motorunu yazmak kolay; asıl maliyet şu 4 dosyada. Plan bunları hesaba k
 
 ### Sprint 2 — SQL'e bağlama (Gün 6-10)
 
-- [ ] 2.1 `IVDbBackend` arayüzü: `Put/Get/Delete/ScanAll` + `BeginBatch/CommitBatch/AbortBatch/Flush/InBatch/Exists/Count/ScanRawIterAll/EnsureColumnKey/SetBeforeCommit`
-- [ ] 2.2 `TVDbBackendV2`: mevcut `TVDb`'yi sarmalar
-- [ ] 2.3 `sqltest --backend=v2` hâlâ **3112/3112 (win32)** — dikiş regresyon yapmadı
-- [ ] 2.4 `TVDbBackendV3`: arayüzü sayfa motoruna bağlar, WAL fsync ve grup commit dahil
-- [ ] 2.5 `VDbTable.pas` içindeki 48 somut `FKv.` çağrısı arayüze taşınır
+- [x] 2.1 `IVDbBackend` arayüzü: `Put/Get/Delete/ScanAll` + `BeginBatch/CommitBatch/AbortBatch/Flush/InBatch/Exists/Count/ScanRawIterAll/EnsureColumnKey/SetBeforeCommit` — `VDbBackendApi.pas` (yalnız `SysUtils`'e bağımlı; v3 backend v2 motorunu link etmez). `TQWordArray/TValArray/TVDbRawCb/TDbCommitHook/TVDbRowTagFunc/IVDbKvStore` buraya taşındı.
+- [x] 2.2 `TVDbBackendV2`: mevcut `TVDb`'yi sarmalar — `VDbBackendV2.pas`. `TVDb`'nin taban sınıfı DEĞİŞTİRİLMEDİ (Create/Free ile yönetilen ~50 çağrı yeri var; referans sayılı arayüz use-after-free riski taşır). Arayüz referans saymaz.
+- [x] 2.3 `sqltest --backend=v2` hâlâ **3112/3112 (win32)** — dikiş regresyon yapmadı
+- [x] 2.4 `TVDbBackendV3`: arayüzü sayfa motoruna bağlar — `VDbBackendV3.pas`, `backendchk` **35/35**. Parti modeli: yazmalar önce bellek kaplamasına, `CommitBatch` motora uygular + `Commit(True)`, `AbortBatch` kaplamayı atar (gerçek geri alma). Checkpoint eşiği `VDB_V3_CHECKPOINT_BYTES = 8 MB` (`Wal.Bytes` ile).
+      Checkpoint politikası: commit yalnız WAL'i fsync eder; checkpoint WAL boyu
+      eşiği (8 MB) veya boşta/kapanışta yapılır.
+- [ ] 2.5 `VDbTable.pas` içindeki 48 somut `FKv.` çağrısı arayüze taşınır — `FKvB: IVDbBackend` alanı eklendi, `FKvStore` kaldırıldı; 53 `FKv.`/37 `FKvStore.` çağrısı arayüze taşındı. `FKv` yalnız Verify/Backup/replication gibi henüz arayüzde olmayan çağrılar ve `Kv` özelliği için duruyor.
 - [ ] 2.6 `TVSql` / `TVExecutor` arayüz tipine geçer; davranış değişmez
 - [ ] 2.7 v3'te `m11store`, `f2_wal`, `h11_*` testleri geçer
 - [ ] 2.8 `MIGRATE TO v3` + `MIGRATE VERIFY` (satır sayısı, PK örnekleme, CRC); 200k satır göçü **0 fark**
