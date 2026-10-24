@@ -729,6 +729,12 @@ function IdxColsOfTable(TableId: Word; ColIdx: Integer): TIntArray;
     function ViewSelectText(const ViewName: string): string;
     function IsView(const Name: string): Boolean;
     property Kv: TVDb read FKv;
+    { Sprint 2.6 (2026-10-24): motor arayuzu. SQL/executor katmani satir
+      yolunda bunu kullanir; boylece altinda v2 (satir-kayit dosyasi) ya da
+      v3 (4 KB sayfa motoru) olabilir. `Kv` yalnizca henuz arayuzde
+      olmayan cekirdek islemleri (Verify/Backup/arsiv/replication/zone-scan
+      gibi v2'ye ozgu yollar) icin duruyor. }
+    property Backend: IVDbBackend read FKvB;
   end;
 
 const

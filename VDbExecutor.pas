@@ -5043,7 +5043,7 @@ begin
   ctx.MaxCol := maxCol;
   ctx.Count := 0;
   ctx.Failed := False;
-  if not FT.Kv.ScanRawIterAll(td.TableId, VdbStreamCountCb, @ctx) then Exit;
+  if not FT.Backend.ScanRawIterAll(td.TableId, VdbStreamCountCb, @ctx) then Exit;
   if ctx.Failed then Exit;
   SetLength(Res.Fields, 1);
   if Stmt.Columns[0].Alias <> '' then Res.Fields[0] := Stmt.Columns[0].Alias
@@ -5097,7 +5097,7 @@ var
   begin
     Result := False;
     if Pk = '' then Exit;
-    if not FT.Kv.Get(VDbHashKey(Td.Name, Pk), b) then Exit;
+    if not FT.Backend.Get(VDbHashKey(Td.Name, Pk), b) then Exit;
     if Length(b) = 0 then Exit;
     if VDbPeekRawRowP(@b[0], Length(b), Length(Td.Cols), tid, apk,
          pkFType, pkFOff, pkFLen) then
@@ -7838,7 +7838,7 @@ begin
         ayni kod oldugu icin alan adi/deger bicimi degismez. --- }
   useCounter := False;
   allStar := False;
-  if not FT.Kv.InBatch then
+  if not FT.Backend.InBatch then
   begin
     allStar := True;
     for j := 0 to High(plans) do
@@ -7994,7 +7994,7 @@ begin
       FT.Kv.ReleasePreparedScan(prep);
       prepared := False;
     end;
-    if not FT.Kv.ScanRawIterAll(td.TableId, VdbAggRawCb, @ctx) then
+    if not FT.Backend.ScanRawIterAll(td.TableId, VdbAggRawCb, @ctx) then
       Exit;
   end;
   { KR-1B: saf COUNT(*) (allStar => autocommit) dogrulamali tarayarak sayildi;
@@ -8659,7 +8659,7 @@ begin
 
   ctx.Map := TDictionary<string, Integer>.Create;
   try
-    if not FT.Kv.ScanRawIterAll(td.TableId, VdbStreamGroupCb, @ctx) then Exit;
+    if not FT.Backend.ScanRawIterAll(td.TableId, VdbStreamGroupCb, @ctx) then Exit;
     if ctx.Failed then Exit;
 
     SetLength(Res.Fields, Stmt.Columns.Count);
@@ -9050,7 +9050,7 @@ var
   ct: TByteArray;
   i: Integer;
 begin
-  if not FT.Kv.InBatch then
+  if not FT.Backend.InBatch then
     raise EVDbException.Create(ecTransactionState,
       'SELECT ... FOR UPDATE yalniz acik islem (BEGIN) icinde kullanilabilir');
   if (Stmt.FromTable = '') or Stmt.HasJoin or
@@ -10771,7 +10771,7 @@ begin
   ctx.Cap := 0;
   ctx.Keys := TDictionary<string, Integer>.Create;
   try
-    if not FT.Kv.ScanRawIterAll(td.TableId, VdbStreamDistinctCb, @ctx) then
+    if not FT.Backend.ScanRawIterAll(td.TableId, VdbStreamDistinctCb, @ctx) then
     begin
       if ctx.Overflow then
         raise EVDbException.CreateFmt(ecLimit,
@@ -11172,7 +11172,7 @@ begin
   // Batch icinde bekleyen PUT/DELETE'ler FIdxVer'i ARTIRMAZ (dosyaya da
   // yazilmazlar). Harita pending degisimlerini kacirabilecegi icin batch
   // sirasinda zone map NE kullanilir NE de insa edilir.
-  if FT.Kv.InBatch then
+  if FT.Backend.InBatch then
   begin
     SetLength(zCols, 0);
     SetLength(zFloat, 0);
@@ -11376,7 +11376,7 @@ begin
   ctx.Failed := False;
   SetLength(ctx.Heap, ctx.K);
 
-  if not FT.Kv.ScanRawIterAll(td.TableId, VdbStreamOrderCb, @ctx) then Exit;
+  if not FT.Backend.ScanRawIterAll(td.TableId, VdbStreamOrderCb, @ctx) then Exit;
   if ctx.Failed then Exit;
 
   VdbStreamOrderSort(@ctx);
@@ -11479,7 +11479,7 @@ begin
   SetLength(ctx.Heap, ctx.K);
   SetLength(ctx.Scratch.Keys, ctx.SortCnt);
 
-  if not FT.Kv.ScanRawIterAll(td.TableId, VdbStreamOrderMultiCb, @ctx) then Exit;
+  if not FT.Backend.ScanRawIterAll(td.TableId, VdbStreamOrderMultiCb, @ctx) then Exit;
   if ctx.Failed then Exit;
 
   VdbStreamOrderMultiSort(@ctx);
@@ -12823,9 +12823,9 @@ begin
     for i := 0 to Stmt.OnConflictSetExprs.Count - 1 do
       upsertSetExprs[i] := Stmt.OnConflictSetExprs[i];
 
-    if (Stmt.ValuesRows.Count > 1) and not FT.Kv.InBatch then
+    if (Stmt.ValuesRows.Count > 1) and not FT.Backend.InBatch then
     begin
-      FT.Kv.BeginBatch;
+      FT.Backend.BeginBatch;
       try
         for i := 0 to Stmt.ValuesRows.Count - 1 do
         begin
@@ -12959,7 +12959,7 @@ begin
             end;
           end;
         end;
-        FT.Kv.CommitBatch;
+        FT.Backend.CommitBatch;
       except
         FT.AbortBatch;
         raise;
@@ -13386,9 +13386,9 @@ begin
   begin
     // Cok satir: genel yol ile ayni ATOMIKLIK (batch yoksa tumu icin ac).
     bi := 0;
-    if not FT.Kv.InBatch then
+    if not FT.Backend.InBatch then
     begin
-      FT.Kv.BeginBatch;
+      FT.Backend.BeginBatch;
       bi := 1;
     end;
     try
@@ -13397,7 +13397,7 @@ begin
         RlsRequireInsert(tbl, cnames, rows[bi2]);   // R-19
         FT.Insert(tbl, cnames, rows[bi2]);
       end;
-      if bi = 1 then FT.Kv.CommitBatch;
+      if bi = 1 then FT.Backend.CommitBatch;
     except
       if bi = 1 then FT.AbortBatch;
       raise;
@@ -14103,7 +14103,7 @@ begin
       (Length(FT.TriggersFor(tbl, Byte(ttAfter), Byte(teInsert))) > 0);
     if hasInsTrig then
       FireTriggers(tbl, Byte(ttBefore), Byte(teInsert), nil, nil, [], Res, False);
-    ownBatch := not FT.Kv.InBatch;
+    ownBatch := not FT.Backend.InBatch;
     if ownBatch then FT.BeginBatch;
     try
       while True do
@@ -14484,9 +14484,9 @@ begin
             'UPDATE: PK kolonu guncellenemez: ' + colNames[setIdx]);
 
 
-  if not FT.Kv.InBatch then
+  if not FT.Backend.InBatch then
   begin
-    FT.Kv.BeginBatch;
+    FT.Backend.BeginBatch;
     try
       for i := 0 to High(allRows) do
       begin
@@ -14537,7 +14537,7 @@ begin
         FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teUpdate),
           allRows[i], newVals, colNames, Res, True);
       end;
-      FT.Kv.CommitBatch;
+      FT.Backend.CommitBatch;
       // F-36: AFTER UPDATE STATEMENT tetikleyiciler (tum satirlardan sonra)
       FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teUpdate), nil, nil, [], Res, False);
     except
@@ -14704,9 +14704,9 @@ begin
     rCount := toDelete.Count;
     if rCount > 0 then
     begin
-      if not FT.Kv.InBatch then
+      if not FT.Backend.InBatch then
       begin
-        FT.Kv.BeginBatch;
+        FT.Backend.BeginBatch;
         try
           for i := 0 to toDelete.Count - 1 do
           begin
@@ -14719,7 +14719,7 @@ begin
             FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete),
               allRows[toDelete[i]], nil, allColNames, Res, True);
           end;
-          FT.Kv.CommitBatch;
+          FT.Backend.CommitBatch;
           // F-36: AFTER DELETE STATEMENT tetikleyiciler (tum satirlardan sonra)
           FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete), nil, nil, [], Res, False);
         except
@@ -17334,7 +17334,7 @@ begin
   Res.Rows[7][1] := IntToStr(Length(FT.TableNames));
   SetLength(Res.Rows[8], 2);
   Res.Rows[8][0] := 'batch_active';
-  Res.Rows[8][1] := BoolToStr(FT.Kv.InBatch, True);
+  Res.Rows[8][1] := BoolToStr(FT.Backend.InBatch, True);
   SetLength(Res.Rows[9], 2);
   Res.Rows[9][0] := 'read_cache_blocks';
   Res.Rows[9][1] := IntToStr(usedB) + '/' + IntToStr(maxB);

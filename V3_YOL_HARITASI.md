@@ -143,7 +143,7 @@ Sayfa motorunu yazmak kolay; asıl maliyet şu 4 dosyada. Plan bunları hesaba k
       Checkpoint politikası: commit yalnız WAL'i fsync eder; checkpoint WAL boyu
       eşiği (8 MB) veya boşta/kapanışta yapılır.
 - [ ] 2.5 `VDbTable.pas` içindeki 48 somut `FKv.` çağrısı arayüze taşınır — `FKvB: IVDbBackend` alanı eklendi, `FKvStore` kaldırıldı; 53 `FKv.`/37 `FKvStore.` çağrısı arayüze taşındı. `FKv` yalnız Verify/Backup/replication gibi henüz arayüzde olmayan çağrılar ve `Kv` özelliği için duruyor.
-- [ ] 2.6 `TVSql` / `TVExecutor` arayüz tipine geçer; davranış değişmez
+- [x] 2.6 `TVSql` / `TVExecutor` arayüz tipine geçer; davranış değişmez — `TVTableDb.Backend: IVDbBackend` özelliği eklendi; `FT.Kv.` üzerinden yapılan 30 arayüz karşılığı çağrı (ScanRawIterAll/Get/InBatch/BeginBatch/CommitBatch/Flush) `FT.Backend.` oldu. `Kv` yalnız arayüzde olmayan v2'ye özgü yollar için (Verify/Backup/arşiv/replication/zone-scan/`Dirty`/`FilePath`) kaldı. v2 kapısı **3112/3112**.
 - [ ] 2.7 v3'te `m11store`, `f2_wal`, `h11_*` testleri geçer
 - [ ] 2.8 `MIGRATE TO v3` + `MIGRATE VERIFY` (satır sayısı, PK örnekleme, CRC); 200k satır göçü **0 fark**
 - [ ] 2.9 v3 tam `sqltest` koşusu; kalan testler sınıflandırılır (kapsam / hata / v3.1)

@@ -403,7 +403,7 @@ begin
     sl.Add('# TYPE vdb_data_file_bytes gauge');
     sl.Add('vdb_data_file_bytes ' + IntToStr(FT.Kv.DataFileSize));
     sl.Add('# TYPE vdb_batch_active gauge');
-    if FT.Kv.InBatch then
+    if FT.Backend.InBatch then
       sl.Add('vdb_batch_active 1')
     else
       sl.Add('vdb_batch_active 0');
@@ -3136,7 +3136,7 @@ begin
   if Length(Stmts) = 0 then Exit;
 
   ownBatch := False;
-  if FAutoTx and (Length(Stmts) > 1) and not FT.Kv.InBatch then
+  if FAutoTx and (Length(Stmts) > 1) and not FT.Backend.InBatch then
   begin
     okAll := True;
     for i := 0 to High(Stmts) do
@@ -3168,7 +3168,7 @@ begin
   end;
   Result.Msg := 'OK';
   // P-DUR: basarili yazma sonrasi kirliyse flush'la.
-  if FT.Kv.Dirty then FT.Kv.Flush;
+  if FT.Kv.Dirty then FT.Backend.Flush;
 end;
 
 function TVSql.Exec(const Sql: string): TSqlResult;
@@ -3224,7 +3224,7 @@ begin
       Result := ExecRaw(st[0]);
       Result.Stmts := 1;
       // P-DUR: tek cumlelik yazma burada saglama alinir (ExecAllInner kendi yapar).
-      if FT.Kv.Dirty then FT.Kv.Flush;
+      if FT.Kv.Dirty then FT.Backend.Flush;
     end
     else
       Result := ExecAllInner(st);  // KR-7: recursive Lock yok
@@ -3289,7 +3289,7 @@ begin
       Result := ExecRaw(st[0]);
       Result.Stmts := 1;
       // P-DUR: tek cumlelik yazma burada saglama alinir (ExecAllInner kendi yapar).
-      if FT.Kv.Dirty then FT.Kv.Flush;
+      if FT.Kv.Dirty then FT.Backend.Flush;
     end
     else
       Result := ExecAllInner(st);  // KR-7: recursive Lock yok
@@ -3689,7 +3689,7 @@ begin
   FT.Kv.WaitForeignTxn(FSessionId);
 
   // F-40: READ COMMITTED / READ UNCOMMITTED -> her cumle yeni snapshot.
-  if FT.Kv.InBatch and
+  if FT.Backend.InBatch and
      (FExecutor.Isolation in [ilReadUncommitted, ilReadCommitted]) then
     FT.Kv.RefreshBatchSnapshot;
 
