@@ -52,6 +52,11 @@ build_*.log
 # Yedek klasörü / Backup folder (dahil etme)
 yedek2/
 
+# v3 oncesi yerel yedekler (2026-10-24)
+/YEDEK/
+/--help/
+/bench_live.pas
+
 # mtakip projesi (farklı proje / different project)
 mtakip/
 
@@ -108,3 +113,7 @@ startup_error.txt
 # Örnek 12 üretilen demo verisi / generated demo data
 /examples/12_milyon_demo/milyon_demo_db/
 /examples/12_milyon_demo/seed_result.txt
+
+# Yerel deneme dosyalari (v3 hazirligi, 2026-10-24) — !*.pas kuralindan SONRA
+# gelmeli, aksi halde yeniden izlenir.
+/bench_live.pas
