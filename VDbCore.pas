@@ -339,6 +339,19 @@ FPath: string;
   FDirSyncFailed: Boolean;
     FNewFile: Boolean;
     FDeadBytes: Int64;
+    { H25 (2026-10-24): OTOMATIK SIKISTIRMA. Tek satirlik (autocommit)
+      UPDATE/DELETE yerinde yazmadigi icin olusan olu bolgeler dosyayi
+      buyutur. Commit sonunda olu oran esigi asilirsa Compact otomatik
+      calisir. Varsayilan: ACIK, esik %35, en kucuk dosya 4 MB.
+      Kapatmak icin AutoCompactEnabled := False. }
+    FAutoCompactOn: Boolean;
+    FAutoCompactRatio: Double;
+    FAutoCompactMinBytes: Int64;
+    FAutoCompactCount: Int64;
+    { Yeniden giris korumasi (Compact -> CommitBatch gibi bir yol
+      tetiklemez; yine de savunma amacli). }
+    FAutoCompactBusy: Boolean;
+    FLastAutoCompactError: string;
     { H11: olu PUT bolgeleri (first-fit) ve blok haritasi. FFreeSpansDirty
       True iken liste henuz taranmamis demektir; ilk yerinde yazim
       denemesinde RebuildFreeSpans calisir. }
@@ -462,6 +475,10 @@ FPath: string;
     procedure WriteFreeSpace(AOffset, ASize: Int64);
     procedure QueueDeadSpan(AOffset, ASize: Int64);
     procedure FlushDeadQueue;
+    { H25 (2026-10-24): commit sonunda olu oran esigi asildiysa Compact
+      calistirir. Kilit zaten tutuluyor; Compact kendi kilidini de alir
+      (TCriticalSection rekursif). Batch acikken HIC cagrilmaz. }
+    procedure MaybeAutoCompact;
     function FindBlockForOffset(AOffset: Int64; out AIndex: Integer): Boolean;
     procedure MarkDirtyBlock(AOffset: Int64);
     function CrcRange(AStart, ALen: Int64; out ACrc: LongWord): Boolean;
@@ -766,6 +783,18 @@ property CurrentSeq: QWord read FSeq;
   // ama dosya adi kalici degil; isletme bir uyari vermelidir.
   property DirSyncFailed: Boolean read FDirSyncFailed;
 property DeadBytes: Int64 read FDeadBytes;
+    { H25 (2026-10-24): OTOMATIK SIKISTIRMA ayarlari. Commit sonunda olu
+      bayt orani AutoCompactRatio'yu gecerse ve dosya AutoCompactMinBytes
+      esigini asmissa Compact kendiliginden calisir. Tahmin edilebilir
+      gecikme isteyen uygulamalar bunu kapatip AutoCompact'i elle cagirir. }
+    property AutoCompactEnabled: Boolean read FAutoCompactOn write FAutoCompactOn;
+    property AutoCompactRatio: Double read FAutoCompactRatio write FAutoCompactRatio;
+    property AutoCompactMinBytes: Int64 read FAutoCompactMinBytes write FAutoCompactMinBytes;
+    { Simdiye kadar yapilan otomatik sikistirma sayisi (tanilama). }
+    property AutoCompactCount: Int64 read FAutoCompactCount;
+    { Son otomatik sikistirma hatasi (bos = hata yok). Commit'i
+      BASARISIZ yapmaz; yalnizca bilgi amaclidir. }
+    property LastAutoCompactError: string read FLastAutoCompactError;
     property SyncWrite: Boolean read FSyncWrite write FSyncWrite;
     // GROUP COMMIT: SyncWrite=True iken fsync'ler bu sure (ms) icinde
     // toplanir. 0 = her yazmada fsync (varsayilan, eski davranis).
@@ -1021,6 +1050,14 @@ FSavepoints := TList<TSavepoint>.Create;
   FDirSyncFailed := False;
   FNewFile := False;
   FDeadBytes := 0;
+  { H25: otomatik sikistirma varsayilan ACIK. Esik %35 olu bayt ve en az
+    4 MB dosya; kucuk DB'lerde hic dokunmaz. }
+  FAutoCompactOn := True;
+  FAutoCompactRatio := 0.35;
+  FAutoCompactMinBytes := 4 * 1024 * 1024;
+  FAutoCompactCount := 0;
+  FAutoCompactBusy := False;
+  FLastAutoCompactError := '';
   FFreeSpans := TList<TFreeSpan>.Create;
   FFreeSpansDirty := True;
   FBlocks := TList<TBlockInfo>.Create;
@@ -2807,6 +2844,9 @@ end
           AppendBatchEnd(False);   // fsync ertelendi (group commit)
         FlushDeadQueue;
       end;
+      { H25: tek yazim (autocommit) tamamlandi; olu oran esigi asildiysa
+        dosyayi simdi sikistir. }
+      MaybeAutoCompact;
     end;
   finally
     FLock.Leave;
@@ -4498,6 +4538,8 @@ if not FIndex.ContainsKey(Key) then
         AppendBatchEnd(False);   // fsync ertelendi (group commit)
       FlushDeadQueue;
     end;
+    { H25: tek silme (autocommit) tamamlandi; esik asildiysa sikistir. }
+    MaybeAutoCompact;
     Result := True;
   finally
     FLock.Leave;
@@ -4553,7 +4595,10 @@ var
   op: TPendOp;
   savedSize: Int64;
   restored: Integer;
+  { H25: yalnizca BASARILI commit sonrasi otomatik sikistirma denenir. }
+  committed: Boolean;
 begin
+  committed := False;
   FLock.Enter;
   try
     CheckOpen;
@@ -4627,6 +4672,7 @@ begin
           end;
           FlushDeadQueue;
         end;
+        committed := True;
       except
         on E: Exception do
         begin
@@ -4660,6 +4706,9 @@ begin
       FInBatch := False;
       FBatchOwner := 0;
       TxnGateClose;
+      { H25: batch kapandi, kilit elimizde. Esik asildiysa tek parca
+        icinde sikistir (Compact kilidi rekursif olarak yeniden alir). }
+      if committed then MaybeAutoCompact;
     end;
   finally
     FLock.Leave;
@@ -4970,6 +5019,33 @@ begin
     Result := True;
   finally
     FLock.Leave;
+  end;
+end;
+
+procedure TVDb.MaybeAutoCompact;
+// H25: commit tamamlandiktan SONRA cagrilir. Karar O(1); yalnizca esik
+// asilirsa dosya bir kez bastan yazilir. Hata commit'i BOZMAZ (veri zaten
+// fsync'li); yalnizca LastAutoCompactError'a yazilir.
+var
+  oldS, newS: Int64;
+begin
+  if (not FAutoCompactOn) or FAutoCompactBusy then Exit;
+  if FInBatch or FClosed or (FS = nil) then Exit;
+  if FDeadBytes <= 0 then Exit;
+  if FS.Size < FAutoCompactMinBytes then Exit;
+  if (Double(FDeadBytes) / Double(FS.Size)) < FAutoCompactRatio then Exit;
+  FAutoCompactBusy := True;
+  try
+    try
+      Compact(oldS, newS);
+      Inc(FAutoCompactCount);
+      FLastAutoCompactError := '';
+    except
+      on E: Exception do
+        FLastAutoCompactError := E.Message;
+    end;
+  finally
+    FAutoCompactBusy := False;
   end;
 end;
 

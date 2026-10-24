@@ -145,6 +145,10 @@ Tek satırlık (autocommit) yazma, 20.000 satır, varsayılan `SyncWrite=True`:
 | `DELETE` (PK) | 6,87 ms/satır | **0,374 ms/satır (2.673/sn)** |
 
 Ayrıntı ve kök nedenler: [hiztesti.md](hiztesti.md#5-tek-satırlık-yazma-autocommit--2026-10-24).
+Tek satırlık yazım dosyaya ekleme yaptığı için ölü bölgeler birikir; motor
+bunu **otomatik sıkıştırma** ile toparlar (`AutoCompactEnabled=True`,
+eşik `AutoCompactRatio=0,35`, `AutoCompactMinBytes=4 MB`; commit sonunda
+yalnızca eşik aşıldığında çalışır).
 
 H3 skiplist (100.000 satır): 100 × (`UPDATE` + indeksli `COUNT(*)`)
 **0,39–0,42 ms/döngü** — önceki 24,99 ms'e göre **~60–64x**.

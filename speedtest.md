@@ -194,6 +194,31 @@ span per row and immediately searched, giving O(n²) overall. The list is now
 kept sorted by size: lookup is a binary search (O(log n)), insertion of
 equal-sized spans is O(1).
 
+### Automatic compaction (H25) — against file growth
+
+Single-row writes now append, so heavy autocommit `UPDATE`/`DELETE` traffic
+accumulates dead regions and the file grows. The engine now recovers on its
+own: after every successful commit, if `DeadBytes / FileSize` crosses the
+threshold, `Compact` runs (atomic `.tmp` + rename, the old file stays as
+`.bak`). The decision is O(1); the file is rewritten in one pass only when the
+threshold is actually crossed.
+
+| Setting | Default | Meaning |
+|---|---:|---|
+| `AutoCompactEnabled` | `True` | Set `False` to turn it off |
+| `AutoCompactRatio` | `0.35` | Dead-byte ratio threshold |
+| `AutoCompactMinBytes` | 4 MB | Databases below this size are never compacted |
+
+Measurement (`sqltest` T148, 300 rows, 60 KB file): at 36% dead,
+**63,505 → 23,008 bytes**; afterwards `DeadBytes=0` and row counts, PK and
+secondary-index reads, `INSERT`/`UPDATE`/`DELETE`, `Verify`, and results after
+reopening are all unchanged. With the feature disabled the dead bytes keep
+accumulating (23,064 bytes) and nothing is compacted. Compaction is only
+attempted after a commit that wrote data; the `.bak`, `.tmp` and fsync cost is
+paid only when the threshold is crossed. When measuring raw write throughput,
+set `AutoCompactEnabled := False`, otherwise the one-off compaction at the end
+of a large batch leaks into the numbers.
+
 ### Measured floor
 
 Raw `fsync` on this machine is ≈0.29–0.32 ms. With `SyncWrite=True` the floor
@@ -211,13 +236,15 @@ All performance changes were made while the following gates were green
 
 | Gate | Result |
 |---|---|
-| `sqltest` — win32 (lazbuild, `-B`) | **3090 / 3090** (`kalan=0`) |
-| `sqltest` — win64 (`-Px86_64 -Twin64 -O1`) | **3055 / 3055** (`kalan=0`) |
-| `sqltest` — Linux (WSL, FPC 3.2.4) | **3055 / 3055** (`kalan=0`) |
+| `sqltest` — win32 (lazbuild, `-B`) | **3110 / 3110** (`kalan=0`) |
+| `sqltest` — win64 (`-Px86_64 -Twin64 -O1`) | **3075 / 3075** (`kalan=0`) |
+| `sqltest` — Linux (WSL, FPC 3.2.4) | **3075 / 3075** (`kalan=0`) |
 
 The H11 (undo journal / in-place) tests were updated to the new contract:
 dead-span reuse is verified for multi-row transactions, while single-row
-writes take the append path.
+writes take the append path. H25 added `sqltest` T148 (20 checks: threshold
+behaviour, file shrinking, data/index integrity, disable/re-enable, and
+durability after reopening).
 
 Earlier campaigns also ran `crashtest`, `rawchk`, `mrowchk`, `fuzzchk`,
 `sqlite_diff`, `hashchk`, `copychk`, `zonechk`, `skipchk` and `countchk`

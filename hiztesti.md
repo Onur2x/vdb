@@ -194,6 +194,31 @@ sonraki toplu yazımlarda yeniden kullanılır, `VACUUM`/`Compact` geri kazanır
 boya göre sıralı tutulur; arama ikili arama ile O(log n), eşit boylu
 bölgelerde ekleme O(1).
 
+### Otomatik sıkıştırma (H25) — büyüyen dosya sorununa karşı
+
+Tek satırlık yazma artık dosyaya ekleme yaptığı için yoğun autocommit
+`UPDATE`/`DELETE` trafiğinde ölü bölgeler birikir ve dosya büyür. Motor bunu
+kendiliğinden toparlar: her başarılı commit'ten sonra `ÖlüBayt / DosyaBoyu`
+oranı eşiği geçerse `Compact` çalışır (atomik `.tmp` + rename, `.bak` kalır).
+Karar O(1)'dir; sıkıştırma yalnızca eşik aşıldığında, dosya bir kez baştan
+yazılarak yapılır.
+
+| Ayar | Varsayılan | Anlamı |
+|---|---:|---|
+| `AutoCompactEnabled` | `True` | Kapatmak için `False` |
+| `AutoCompactRatio` | `0,35` | Ölü bayt oranı eşiği |
+| `AutoCompactMinBytes` | 4 MB | Bu boyutun altındaki DB'ye dokunulmaz |
+
+Ölçüm (`sqltest` T148, 300 satır, 60 KB dosya): %36 ölü oranda
+**63.505 → 23.008 bayt**; sıkıştırma sonrası `DeadBytes=0`, satır sayısı,
+PK/ikincil indeks okumaları, `INSERT`/`UPDATE`/`DELETE`, `Verify` ve
+yeniden açma sonrası sonuçlar aynı. Kapalıyken ölü bayt birikmeye devam eder
+(23.064 bayt) ve sıkıştırma yapılmaz. Sıkıştırma yalnızca veri yazan commit
+sonunda denenir; `.bak`, `.tmp` ve fsync maliyeti yalnızca eşik aşıldığında
+ödenir. Ham yazma hızını ölçerken `AutoCompactEnabled := False` yapılmalıdır,
+aksi halde büyük toplu işlemlerin sonunda bir defalık sıkıştırma süresi
+ölçüme karışır.
+
 ### Ölçülen taban çizgisi
 
 Bu makinede ham `fsync` ≈ 0,29–0,32 ms. `SyncWrite=True` ile tek satırlık
@@ -209,13 +234,15 @@ Bu değişiklikler aşağıdaki kapılar yeşilken yapıldı (2026-10-24):
 
 | Kapı | Sonuç |
 |---|---|
-| `sqltest` — win32 (lazbuild, `-B`) | **3090 / 3090** (`kalan=0`) |
-| `sqltest` — win64 (`-Px86_64 -Twin64 -O1`) | **3055 / 3055** (`kalan=0`) |
-| `sqltest` — Linux (WSL, FPC 3.2.4) | **3055 / 3055** (`kalan=0`) |
+| `sqltest` — win32 (lazbuild, `-B`) | **3110 / 3110** (`kalan=0`) |
+| `sqltest` — win64 (`-Px86_64 -Twin64 -O1`) | **3075 / 3075** (`kalan=0`) |
+| `sqltest` — Linux (WSL, FPC 3.2.4) | **3075 / 3075** (`kalan=0`) |
 
 H11 (undo günlüğü / yerinde yazım) testleri yeni sözleşmeye göre
 güncellendi: ölü bölge yeniden kullanımı çok satırlı işlemde doğrulanır,
-tek satırlık yazma ekleme yolundan gider.
+tek satırlık yazma ekleme yolundan gider. H25 için `sqltest` T148 eklendi
+(20 doğrulama: eşik davranışı, dosya küçülmesi, veri/indeks bütünlüğü,
+kapatma-açma, yeniden açma sonrası kalıcılık).
 
 Daha eski kampanyalarda `crashtest`, `rawchk`, `mrowchk`, `fuzzchk`,
 `sqlite_diff`, `hashchk`, `copychk`, `zonechk`, `skipchk`, `countchk` de

@@ -15576,6 +15576,142 @@ begin
     'fark=' + IntToStr(mism) + ' ilk=' + Copy(firstDiff, 1, 160));
 end;
 
+procedure T148_H25_AutoCompact;
+// H25 (2026-10-24): OTOMATIK SIKISTIRMA.
+// Tek satirlik (autocommit) UPDATE/DELETE artik yerinde yazmadigi icin
+// dosyada olu bolgeler birikir. Commit sonunda olu oran esigi asilirsa
+// Compact kendiliginden calisir. Dogrulananlar:
+//  1) varsayilan MinBytes (4 MB) altindaki DB'de esik asilsa da calismaz
+//  2) esik dusurulunce BIR SONRAKI commit'te tam olarak bir kez calisir
+//  3) dosya kuculur, olu bayt sifirlanir, veri/indeks/yazma yollari sag
+//  4) AutoCompactEnabled=False iken hic calismaz, olu bayt birikir
+//  5) yeniden acildiginda ilk commit'te calisir
+const
+  NROW = 300;
+var
+  dir: string;
+  db: TVDb;
+  tdb: TVTableDb;
+  q: TVSql;
+  r: TSqlResult;
+  i, n: Integer;
+  sz0, sz1, dead0, cnt0: Int64;
+  rep: string;
+begin
+  Grp('H25 otomatik sikistirma');
+  dir := D + PathDelim + 't148_autocompact_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  db := TVDb.Create;
+  tdb := TVTableDb.Create(db);
+  try
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      q.Exec('CREATE TABLE ac (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)');
+      db.BeginBatch;
+      for i := 1 to NROW do
+        tdb.Insert('ac', ['id', 'a', 'b'],
+          [IntToStr(i), IntToStr(i), 'satir' + IntToStr(i)]);
+      db.CommitBatch;
+      q.Exec('CREATE INDEX ix_ac_a ON ac (a)');
+
+      // 1) Kucuk dosya (varsayilan 4 MB esigin altinda): sikistirma YOK.
+      for i := 1 to NROW do
+        q.Exec(Format('UPDATE ac SET a = %d WHERE id = %d', [i * 3, i]));
+      Dogrula('kucuk dosyada otomatik sikistirma yok',
+        db.AutoCompactCount = 0, 'sayac=' + IntToStr(db.AutoCompactCount));
+      Dogrula('olu bayt birikti', db.DeadBytes > 0,
+        'olu=' + IntToStr(db.DeadBytes) + ' boyut=' + IntToStr(db.DataFileSize));
+
+      // 2) Esik dusurulunce bir SONRAKI commit'te tam bir kez calisir.
+      db.AutoCompactMinBytes := 4096;
+      db.AutoCompactRatio := 0.25;
+      cnt0 := db.AutoCompactCount;
+      sz0 := db.DataFileSize;
+      dead0 := db.DeadBytes;
+      Dogrula('sikistirma oncesi esik asilmisti',
+        (sz0 >= 4096) and (dead0 >= 0) and
+        (Double(dead0) / Double(sz0) >= 0.25),
+        'olu=' + IntToStr(dead0) + ' boyut=' + IntToStr(sz0));
+      q.Exec('UPDATE ac SET a = 999 WHERE id = 1');
+      Dogrula('esik asilinca commit sonunda sikistirildi',
+        db.AutoCompactCount = cnt0 + 1,
+        'sayac=' + IntToStr(db.AutoCompactCount));
+      sz1 := db.DataFileSize;
+      Dogrula('dosya kuculdu', (sz1 > 0) and (sz0 > sz1),
+        IntToStr(sz0) + ' -> ' + IntToStr(sz1));
+      Dogrula('sikistirma sonrasi olu bayt sifir', db.DeadBytes = 0,
+        'olu=' + IntToStr(db.DeadBytes));
+      Dogrula('otomatik sikistirma hatasiz',
+        db.LastAutoCompactError = '', db.LastAutoCompactError);
+
+      // 3) Veri butunlugu (semasi/indeksi onbellekte: reopen YOK).
+      r := q.Exec('SELECT COUNT(*) FROM ac');
+      Dogrula('sikistirma sonrasi satir sayisi', r.Rows[0][0] = IntToStr(NROW),
+        r.Rows[0][0]);
+      r := q.Exec('SELECT a FROM ac WHERE id = 150');
+      Dogrula('sikistirma sonrasi PK degeri', r.Rows[0][0] = '450',
+        r.Rows[0][0]);
+      r := q.Exec('SELECT a FROM ac WHERE id = 1');
+      Dogrula('sikistirma sonrasi guncel deger', r.Rows[0][0] = '999',
+        r.Rows[0][0]);
+      r := q.Exec('SELECT COUNT(*) FROM ac WHERE a = 450');
+      Dogrula('sikistirma sonrasi ikincil indeks yolu',
+        r.Rows[0][0] = '1', r.Rows[0][0]);
+      q.Exec('INSERT INTO ac (id,a,b) VALUES (9001, 1, ''yeni'')');
+      q.Exec('UPDATE ac SET b = ''degisti'' WHERE id = 9001');
+      q.Exec('DELETE FROM ac WHERE id = 9001');
+      r := q.Exec('SELECT COUNT(*) FROM ac');
+      Dogrula('sikistirma sonrasi yazma yollari sag',
+        r.Rows[0][0] = IntToStr(NROW), r.Rows[0][0]);
+      Dogrula('sikistirma sonrasi Verify', db.Verify(rep), Copy(rep, 1, 140));
+
+      // 4) Kapatilinca calismaz, olu bayt birikir.
+      db.AutoCompactEnabled := False;
+      cnt0 := db.AutoCompactCount;
+      for i := 1 to NROW do
+        q.Exec(Format('UPDATE ac SET a = %d WHERE id = %d', [i * 5, i]));
+      Dogrula('kapatinca otomatik sikistirma yok',
+        db.AutoCompactCount = cnt0,
+        'sayac=' + IntToStr(db.AutoCompactCount));
+      Dogrula('kapatinca olu bayt birikiyor', db.DeadBytes > 0,
+        'olu=' + IntToStr(db.DeadBytes));
+
+      // 5) Yeniden acilinca ilk commit'te calisir.
+      db.AutoCompactEnabled := True;
+      q.Exec('UPDATE ac SET a = 7777 WHERE id = 2');
+      Dogrula('yeniden acinca sikistirildi',
+        db.AutoCompactCount = cnt0 + 1,
+        'sayac=' + IntToStr(db.AutoCompactCount));
+      r := q.Exec('SELECT a FROM ac WHERE id = 2');
+      Dogrula('yeniden acma sonrasi deger', r.Rows[0][0] = '7777',
+        r.Rows[0][0]);
+    finally
+      q.Free;
+    end;
+    tdb.Close;
+    db.Close;
+    // Kalicilik: sikistirilmis dosya yeniden acilinca ayni veriyi verir.
+    db.Open(dir);
+    tdb.Open(dir);
+    q := TVSql.Create(tdb);
+    try
+      r := q.Exec('SELECT COUNT(*) FROM ac');
+      n := StrToIntDef(r.Rows[0][0], -1);
+      Dogrula('reopen sonrasi satir sayisi', n = NROW, IntToStr(n));
+      r := q.Exec('SELECT a FROM ac WHERE id = 2');
+      Dogrula('reopen sonrasi deger', r.Rows[0][0] = '7777', r.Rows[0][0]);
+      Dogrula('reopen sonrasi Verify', db.Verify(rep), Copy(rep, 1, 140));
+    finally
+      q.Free;
+    end;
+  finally
+    tdb.Free;
+    db.Free;
+  end;
+end;
+
 procedure T137_H15_StreamHaving;
 // H15: akisli GROUP BY + HAVING yolu, genel yolla BIREBIR ayni sonucu
 // vermelidir. Genel yol, HAVING'e daima dogru bir ek kosul eklenerek
@@ -16017,6 +16153,7 @@ T92_MVCC_Isoaltion;
        T145_H8_MCV;
        T146_M9_OTLP;
        T147_M8_SqlancerStil;
+       T148_H25_AutoCompact;
        { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
        if VDbTlsAvailable then
          T120_Tls
