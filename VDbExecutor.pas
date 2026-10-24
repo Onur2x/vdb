@@ -11887,6 +11887,13 @@ begin
   //  gecmis goruntusu yalnizca tek tablo taramasinda kurulabilir.)
   if Stmt.AsOf <> saoNone then
   begin
+    { Sprint 3.6: sayfa WAL'i mantiksal gunluk tutmaz (yalniz sayfa imaji),
+      bu yuzden v3'te zaman yolculugu/PITR yok. Kv = nil iken
+      BuildAsOfRows nil'e dokunur; acik hata verilir. }
+    if FT.Kv = nil then
+      raise EVDbException.Create(ecUnsupported,
+        'AS OF v3 sayfa motorunda yok (v3.1: sayfa WAL''i uzerinde ' +
+        'zaman yolculugu ile gelecek)');
     if Stmt.HasJoin then
       raise EVDbException.Create(ecUnsupported,
         'AS OF ile JOIN desteklenmiyor (yalnizca tek tablo taranir)');
@@ -16740,7 +16747,8 @@ begin
   { Sprint 2.9: v3 sayfa motorunda `Kv = nil`. v2 motorunun veri dosyasi,
     WAL arsiv/replikasyon yollarina dayanan yonetim komutlari v3'te yoktur;
     sessiz AV yerine NET bir "desteklenmiyor" hatasi verilir. (BACKUP ve
-    VERIFY ve VACUUM backend uzerinden eklendi; kalanlar 3.6/v3.1.) }
+    VERIFY ve VACUUM backend uzerinden eklendi; 3.5 replikasyon ve 3.6
+    PITR/arsiv burada acikca reddedilir; kalanlar v3.1.) }
   if (FT.Kv = nil) and (Stmt.Kind in [
       admRecoverTo,
       admArchiveSet, admArchiveList, admAlterDbKey, admSavepoint,
@@ -16748,8 +16756,21 @@ begin
       admReplicationStart, admReplicationStop, admCreateReplSlot,
       admDropReplSlot, admShowReplicationStatus, admReplicationPump,
       admShowReplSlots, admShowStats]) then
+  begin
+    { Sprint 3.5/3.6: gruplara gore yol gosteren mesaj. }
+    if Stmt.Kind in [admReplicationStart, admReplicationStop,
+      admCreateReplSlot, admDropReplSlot, admShowReplicationStatus,
+      admReplicationPump, admShowReplSlots] then
+      raise EVDbException.Create(ecUnsupported,
+        'REPLICATION v3 sayfa motorunda yok ' +
+        '(v3.1: mantiksal gunluk ile gelecek)');
+    if Stmt.Kind in [admRecoverTo, admArchiveSet, admArchiveList] then
+      raise EVDbException.Create(ecUnsupported,
+        'PITR / WAL arsivi v3 sayfa motorunda yok ' +
+        '(v3.1: sayfa WAL''i uzerinde mantiksal gunluk ile gelecek)');
     raise EVDbException.Create(ecUnsupported,
       'Bu yonetim komutu v3 sayfa motorunda henuz desteklenmiyor (v3.1)');
+  end;
   case Stmt.Kind of
     admVerify:
       begin
@@ -17072,6 +17093,9 @@ begin
     // R-17: Streaming Replication
     admReplicationStart:
       begin
+        { Sprint 3.5: v3'te replikasyon yok; ExecAdmin basindaki kapi
+          (Kv = nil) bu ve tum replikasyon cumlelerini ecUnsupported ile
+          reddeder. }
         // Slot dosyasi veritabaninin yaninda tutulur.
         SetReplicationDataDir(ExtractFileDir(FT.Backend.FilePath));
         // ---- R-17 Full: GERCEK TCP AKIS MODU ----
@@ -17133,6 +17157,7 @@ begin
       end;
     admReplicationPump:
       begin
+        // Sprint 3.5: v3'te replikasyon yok (bkz. ExecAdmin kapisi).
         // R-17 Full: TCP akisinda tek adim PUMP anlamsizdir; akis zaten
         // canlidir. PUMP yalnizca dosya (log-shipping) modunda gecerlidir.
         if TcpActiveForDb(FT.Kv) then
@@ -17178,6 +17203,7 @@ begin
       end;
     admCreateReplSlot:
       begin
+        // Sprint 3.5: v3'te replikasyon yok (bkz. ExecAdmin kapisi).
         SetReplicationDataDir(ExtractFileDir(FT.Backend.FilePath));
         if CreateReplicationSlot(Stmt.ReplSlot) then
           Res.Msg := 'replication slot created: ' + Stmt.ReplSlot
@@ -17187,6 +17213,7 @@ begin
       end;
     admDropReplSlot:
       begin
+        // Sprint 3.5: v3'te replikasyon yok (bkz. ExecAdmin kapisi).
         SetReplicationDataDir(ExtractFileDir(FT.Backend.FilePath));
         DropReplicationSlot(Stmt.ReplSlot);
         Res.Affected := 1; Res.Msg := 'replication slot dropped: ' + Stmt.ReplSlot;

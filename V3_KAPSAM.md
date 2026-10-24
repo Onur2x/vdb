@@ -83,7 +83,7 @@ için test gövdesi anlamsızdır; **arayüzle** koşan eşdeğerleri v3 kapıla
 
 Bunlar ayrı bir v2 dosyası açıp v2 motorunun davranışını sınar (H-serisi
 hızlandırma testleri, RLS/RBAC kalıcılığı, GENERATED, izolasyon, CBO/MCV,
-SQLancer stil diferansiyel). v3 eşdeğerleri `v3sqlchk` (47/47) ve bu koşudaki
+SQLancer stil diferansiyel). v3 eşdeğerleri `v3sqlchk` (115/115) ve bu koşudaki
 SQL testleriyle kapsanır.
 
 `T94_RBAC_Persist`, `T94c_RLS_Persist`, `T117_Generated`, `T126_F42_TxIsolation`,
@@ -154,14 +154,14 @@ v3 koşusu yalnız "kapsam" değil, **gerçek kusurlar** ortaya çıkardı:
 |---|---|---|
 | `VERIFY` (sayfa CRC + heap) | **var** (Sprint 3.1) | 3.1 ✔ |
 | `BACKUP` / `RESTORE` (tek `.odb`, checkpoint sonrası sayfa kopyası) | **var** (Sprint 3.2) | 3.2 ✔ |
-| PITR (`RECOVER TO`) / WAL arşivi | yok | 3.6 |
+| PITR (`RECOVER TO`) / WAL arşivi / `AS OF` | **yok**; `ecUnsupported` + yol gösteren mesaj (Sprint 3.6) | 3.6 ✔ (gerçek PITR v3.1) |
 | `VACUUM` / `Compact` (canlı kayıtlar yeni dosyaya, atomik değişim) | **var** (Sprint 3.3) | 3.3 ✔ |
 | `AutoCompact` | yok (v2'de de varsayılan **kapalı**) | v3.1 |
 | Sayfa düzeyi **AES-256-GCM** şifreleme (zarf: nonce+şifre+tag = 4124 B) | **var** (Sprint 3.4) | 3.4 ✔ |
 | `ALTER DATABASE KEY` (v3 dosya rekey) | `ecUnsupported` | 3.4b / v3.1 |
 | Kayıt/kolon düzeyi şifreleme (v2 tarzı) | yok; sayfa şifreleme tüm veriyi kapsar | — |
-| `START REPLICATION` | yok | 3.5 (v3.1 mantıksal günlük) |
-| Zone map | kapalı (tam tarama) | 3.7 |
+| `START REPLICATION` / `PUMP` / slot / `SHOW` / `STOP` | **yok**; hepsi `ecUnsupported` + "v3.1: mantıksal günlük" (Sprint 3.5) | 3.5 ✔ (gerçek replikasyon v3.1) |
+| Zone map (bölüm budama) | **kapalı**: v3 düz tam tarama yapar; sonuçlar birebir doğru (Sprint 3.7) | 3.7 ✔ (budama v3.1) |
 | `SAVEPOINT` | `ecUnsupported` | v3.1 |
 | B+tree / BETWEEN hızlandırma / `.idx` varint | yok | v3.1 |
 
@@ -175,7 +175,25 @@ sqltest.exe <dir2> --backend=v3  # SONUC: gecen=2252 kalan=0 atlanan=58
 
 Kapılar (yeniden koşuldu, hepsi yeşil):
 `pagechk 21/21`, `storechk 15/15`, `heapchk 20/20`, `idxchk 17/17`,
-`crashtest 11/11`, `backendchk 82/82`, `v3sqlchk 60/60`, `migchk 13/13`.
+`crashtest 11/11`, `backendchk 82/82`, `v3sqlchk 115/115`, `migchk 13/13`.
+
+### Replikasyon, PITR ve zone map kararları (Sprint 3.5-3.7)
+
+Üç yetenek de v3.0'da **bilinçli olarak yoktur** ve hepsi sessiz no-op/çökme
+yerine **ölçülebilir bir sözleşme** verir:
+
+| Yetenek | v3.0 davranışı | Test |
+|---|---|---|
+| `START REPLICATION` (dosya/TCP), `PUMP`, `CREATE/DROP REPLICATION SLOT`, `SHOW REPLICATION STATUS/SLOTS`, `STOP REPLICATION` | `ecUnsupported`, mesaj `REPLICATION v3 sayfa motorunda yok (v3.1: mantiksal gunluk ile gelecek)` | `v3sqlchk` 9 kontrol: hiçbiri dosya bırakmaz, veri bozulmaz, yeniden açılış sağlam |
+| `AS OF SEQUENCE/VERSION/TIMESTAMP`, `ARCHIVE WAL SET/LIST`, `RECOVER TO NOW/TIMESTAMP` | `ecUnsupported`, mesaj `PITR / WAL arsivi ... (v3.1: ... mantiksal gunluk ...)` veya `AS OF v3 ... (v3.1: ...)` | `v3sqlchk` 8 kontrol: güncel okuma/PK erişimi etkilenmez, arşiv dizini oluşmaz, `VERIFY` geçer |
+| Zone map | **budama yok**: `Kv = nil` olduğu için v3 genel tam tarama yolunu kullanır | `v3sqlchk` 22 kontrol: 3000 satırda 8 aralık + eşitlik/`IN`/`<>`/karma sorgular Pascal'da hesaplanan beklentiyle **birebir** |
+
+Gerekçe: v3 WAL'i **sayfa imajı** tutar (mantıksal kayıt yok), dolayısıyla
+zamansal sorgu ve mantıksal replikasyon için gereken anahtar/değer geçmişi
+yoktur. Zone map ise v2'nin ham kayıt ofsetlerine dayanır; v3 heap hücre
+biçiminde yeniden inşa edilmesi gerekir. Üçü de v3.1'e (mantıksal günlük ve
+sayfa biçimine uyarlanmış bölüm haritası) bırakıldı; v3.0 kabul hedefleri
+dosya boyutu ve açılış hızı olduğu için bu ödün bilinçlidir.
 
 ### Sayfa şifreleme (Sprint 3.4)
 

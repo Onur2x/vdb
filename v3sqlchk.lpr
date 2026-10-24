@@ -667,6 +667,341 @@ begin
   end;
 end;
 
+function ExecErr(const S: TV3Sql; const Sql: string; out Code, Msg: string): Boolean;
+begin
+  Result := False;
+  Code := '';
+  Msg := '';
+  try
+    S.Sq.Exec(Sql);
+  except
+    on E: EVDbException do
+    begin
+      Result := True;
+      Code := VDbErrorName(E.ErrorCode);
+      Msg := E.Message;
+    end;
+    on E: Exception do
+    begin
+      Result := True;
+      Code := E.ClassName;
+      Msg := E.Message;
+    end;
+  end;
+end;
+
+{ Sprint 3.5: v3 sayfa motorunda replikasyon yok. Her replikasyon cumlesi
+  sessiz no-op ya da nil erisimi DEGIL, ecUnsupported + v3.1 mesaji vermeli.
+  Durum/slot sorgulari ise hata degil durust cevap dondurur; STOP idempotent. }
+procedure TestReplicationUnsupported;
+var
+  S: TV3Sql;
+  r: TSqlResult;
+  code, msg: string;
+  base: string;
+  sr: TSearchRec;
+  found: Boolean;
+
+  procedure ExpectUnsupported(const Sql: string);
+  begin
+    if not ExecErr(S, Sql, code, msg) then
+      Fail('repl: hata bekleniyordu: ' + Sql)
+    else if code <> 'ecUnsupported' then
+      Fail('repl: kod ' + code + ' (ecUnsupported bekleniyordu): ' + Sql)
+    else if Pos('v3.1', msg) = 0 then
+      Fail('repl: mesajda v3.1 yok: ' + msg)
+    else
+      Ok('repl: ecUnsupported -> ' + Sql);
+  end;
+
+begin
+  WriteLn;
+  WriteLn('Sprint 3.5 - v3''te replikasyon: acik ecUnsupported');
+  CleanDir;
+  OpenV3(S, 'repl.odb', True);
+  try
+    r := Exec(S, 'CREATE TABLE t (id INTEGER PRIMARY KEY, ad TEXT)');
+    if not gErr then Ok('repl: tablo olustu')
+    else Fail('repl: CREATE TABLE: ' + r.Msg);
+    r := Exec(S, 'INSERT INTO t VALUES (1, ''Ali'')');
+    if not gErr then Ok('repl: baslangic satiri yazildi')
+    else Fail('repl: INSERT: ' + r.Msg);
+
+    ExpectUnsupported('START REPLICATION PRIMARY DEST ''ship1'' SLOT ''s1''');
+    ExpectUnsupported('START REPLICATION STANDBY ''ship1'' SLOT ''s2''');
+    ExpectUnsupported('START REPLICATION PRIMARY TCP PORT 5599 SLOT ''s3''');
+    ExpectUnsupported('PUMP REPLICATION');
+    ExpectUnsupported('CREATE REPLICATION SLOT ''x1''');
+    ExpectUnsupported('DROP REPLICATION SLOT ''x1''');
+
+    { Durum/slot/stop da ayni kapiya takilir: v3'te replikasyon durumu
+      yoktur, sessiz "none" yerine acik ecUnsupported. }
+    ExpectUnsupported('SHOW REPLICATION STATUS');
+    ExpectUnsupported('SHOW REPLICATION SLOTS');
+    ExpectUnsupported('STOP REPLICATION');
+
+    { Reddedilen cumleler veriye/semaya dokunmamali. }
+    r := Exec(S, 'SELECT COUNT(*) FROM t');
+    if (not gErr) and (Cel(r, 0, 0) = '1') then
+      Ok('repl: reddedilen cumleler veriyi bozmadi')
+    else
+      Fail('repl: veri bozuldu: ' + r.Msg);
+  finally
+    CloseV3(S);
+  end;
+
+  { Slot/status dosyasi olusmamis olmali (v2 yollari hic calismadi). }
+  base := IncludeTrailingPathDelimiter(gDir);
+  found := False;
+  if FindFirst(base + '.repl*', faAnyFile, sr) = 0 then
+  begin
+    found := True;
+    FindClose(sr);
+  end;
+  if not found then
+    Ok('repl: .replslots/status dosyasi olusmadi')
+  else
+    Fail('repl: v3''te replikasyon dosyasi olustu');
+
+  { Yeniden acilis: dosya saglam, sema yerinde. }
+  OpenV3(S, 'repl.odb', False);
+  try
+    r := Exec(S, 'SELECT ad FROM t WHERE id = 1');
+    if (not gErr) and (Cel(r, 0, 0) = 'Ali') then
+      Ok('repl: yeniden acilista veri yerinde')
+    else
+      Fail('repl: yeniden acilis: ' + r.Msg);
+  finally
+    CloseV3(S);
+  end;
+end;
+
+  { Sprint 3.6: PITR / zaman yolculugu. Sayfa WAL'i yalniz sayfa imaji
+  tutar; mantiksal gunluk (zaman damgasi/surum) olmadigi icin v3'te
+  AS OF / RECOVER TO / WAL arsivi ACIKCA reddedilir. }
+procedure TestPitrUnsupported;
+var
+  S: TV3Sql;
+  r: TSqlResult;
+  code, msg, base: string;
+  sr: TSearchRec;
+  found: Boolean;
+
+  procedure ExpectPitrUnsupported(const Sql: string);
+  begin
+    if not ExecErr(S, Sql, code, msg) then
+      Fail('pitr: hata bekleniyordu: ' + Sql)
+    else if code <> 'ecUnsupported' then
+      Fail('pitr: kod ' + code + ' (ecUnsupported bekleniyordu): ' + Sql)
+    else if Pos('v3.1', msg) = 0 then
+      Fail('pitr: mesajda v3.1 yok: ' + msg)
+    else
+      Ok('pitr: ecUnsupported -> ' + Sql);
+  end;
+
+begin
+  WriteLn;
+  WriteLn('Sprint 3.6 - v3''te PITR / zaman yolculugu: acik ecUnsupported');
+  CleanDir;
+  base := IncludeTrailingPathDelimiter(gDir);
+  OpenV3(S, 'pitr.odb', True);
+  try
+    r := Exec(S, 'CREATE TABLE t (id INTEGER PRIMARY KEY, ad TEXT)');
+    if not gErr then Ok('pitr: tablo olustu') else Fail('pitr: CREATE: ' + r.Msg);
+    r := Exec(S, 'INSERT INTO t VALUES (1, ''Ali''), (2, ''Veli'')');
+    if not gErr then Ok('pitr: 2 satir yazildi') else Fail('pitr: INSERT: ' + r.Msg);
+
+    ExpectPitrUnsupported('SELECT id FROM t AS OF SEQUENCE 0');
+    ExpectPitrUnsupported('SELECT id FROM t AS OF VERSION 3');
+    ExpectPitrUnsupported('SELECT id FROM t AS OF TIMESTAMP ''2026-10-25 12:00:00''');
+    ExpectPitrUnsupported('SELECT COUNT(*) FROM t AS OF SEQUENCE 0');
+    ExpectPitrUnsupported('ARCHIVE WAL SET DIR=''' + base + 'arsiv''');
+    ExpectPitrUnsupported('ARCHIVE WAL LIST');
+    ExpectPitrUnsupported('RECOVER TO NOW');
+    { Zaman damgasi yerel bicimde uretilir: ayristirici TryStrToDateTime
+      kullanir; boylece test gercekten "gecerli damga + v3 kapisi" sinar. }
+    ExpectPitrUnsupported('RECOVER TO TIMESTAMP ''' + DateTimeToStr(Now) + '''');
+
+    { Guncel okuma bozulmadi. }
+    r := Exec(S, 'SELECT COUNT(*) FROM t');
+    if (not gErr) and (Cel(r, 0, 0) = '2') then
+      Ok('pitr: guncel okuma etkilenmedi')
+    else
+      Fail('pitr: guncel okuma bozuldu: ' + r.Msg);
+    r := Exec(S, 'SELECT ad FROM t WHERE id = 2');
+    if (not gErr) and (Cel(r, 0, 0) = 'Veli') then
+      Ok('pitr: anahtar erisimi etkilenmedi')
+    else
+      Fail('pitr: anahtar erisimi: ' + r.Msg);
+  finally
+    CloseV3(S);
+  end;
+
+  { Arsiv dizini olusmamis olmali. }
+  found := DirectoryExists(base + 'arsiv');
+  if not found then Ok('pitr: arsiv dizini olusmadi')
+  else Fail('pitr: v3''te arsiv dizini olustu');
+
+  { Yeniden acilis: dosya saglam. }
+  OpenV3(S, 'pitr.odb', False);
+  try
+    r := Exec(S, 'SELECT COUNT(*) FROM t');
+    if (not gErr) and (Cel(r, 0, 0) = '2') then
+      Ok('pitr: yeniden acilista veri yerinde')
+    else
+      Fail('pitr: yeniden acilis: ' + r.Msg);
+    r := Exec(S, 'VERIFY');
+    if (not gErr) and (r.Affected = 1) and (Pos('VERIFY:', r.Msg) = 1) then
+      Ok('pitr: VERIFY gecti: ' + r.Msg)
+    else
+      Fail('pitr: VERIFY: ' + r.Msg);
+  finally
+    CloseV3(S);
+  end;
+end;
+
+  { Sprint 3.7: zone map v3'te DEVRE DISI (duz tam tarama). Budama olmadigi
+  icin sonuclar degismemeli: 3000 satirlik tabloda aralik/esitlik/IN
+  sorgularinin sonuclari Pascal'da hesaplanan beklentiyle birebir
+  karsilastirilir. }
+procedure TestZoneMapFallback;
+const
+  N = 3000;
+  MODU = 997;
+var
+  S: TV3Sql;
+  r: TSqlResult;
+  vals: array[0..N - 1] of Integer;
+  i, a, b, k, exp: Integer;
+  bat: string;
+
+  function CountRange(Lo, Hi: Integer): Integer;
+  var
+    j: Integer;
+  begin
+    Result := 0;
+    for j := 0 to N - 1 do
+      if (vals[j] >= Lo) and (vals[j] < Hi) then Inc(Result);
+  end;
+
+  function CountEq(V: Integer): Integer;
+  var
+    j: Integer;
+  begin
+    Result := 0;
+    for j := 0 to N - 1 do
+      if vals[j] = V then Inc(Result);
+  end;
+
+  procedure CheckCount(const Sql: string; AExpected: Integer);
+  var
+    rr: TSqlResult;
+    got: Integer;
+  begin
+    rr := Exec(S, Sql);
+    if gErr then
+    begin
+      Fail('zonemap: ' + Sql + ': ' + rr.Msg);
+      Exit;
+    end;
+    got := StrToIntDef(Cel(rr, 0, 0), -1);
+    if got = AExpected then
+      Ok(Format('zonemap: %s -> %d', [Sql, got]))
+    else
+      Fail(Format('zonemap: %s -> %d (beklenen %d)', [Sql, got, AExpected]));
+  end;
+
+begin
+  WriteLn;
+  WriteLn('Sprint 3.7 - v3''te zone map devre disi: tam tarama dogru sonuc');
+  CleanDir;
+  OpenV3(S, 'zone.odb', True);
+  try
+    r := Exec(S, 'CREATE TABLE z (id INTEGER PRIMARY KEY, val INTEGER, ad TEXT)');
+    if not gErr then Ok('zonemap: tablo olustu') else Fail('zonemap: CREATE: ' + r.Msg);
+
+    { Toplu INSERT (tek cumlede 3000 satir cok uzun olur; parti halinde). }
+    bat := '';
+    for i := 0 to N - 1 do
+    begin
+      vals[i] := (i * 37) mod MODU;
+      if bat <> '' then bat := bat + ',';
+      bat := bat + Format('(%d,%d,''n%d'')', [i + 1, vals[i], i + 1]);
+      if ((i + 1) mod 100 = 0) or (i = N - 1) then
+      begin
+        r := Exec(S, 'INSERT INTO z VALUES ' + bat);
+        if gErr then
+        begin
+          Fail('zonemap: INSERT: ' + r.Msg);
+          Break;
+        end;
+        bat := '';
+      end;
+    end;
+    if not gErr then Ok('zonemap: 3000 satir yazildi');
+
+    CheckCount('SELECT COUNT(*) FROM z', N);
+
+    { Aralik sorgulari (zone map budamasinin asil hedefi). }
+    for i := 0 to 7 do
+    begin
+      a := i * 125;
+      b := a + 125;
+      CheckCount(Format('SELECT COUNT(*) FROM z WHERE val >= %d AND val < %d', [a, b]),
+        CountRange(a, b));
+    end;
+    CheckCount('SELECT COUNT(*) FROM z WHERE val >= 900', CountRange(900, MODU));
+    CheckCount('SELECT COUNT(*) FROM z WHERE val < 10', CountRange(0, 10));
+    CheckCount('SELECT COUNT(*) FROM z WHERE val >= 997 AND val < 2000', 0);
+    CheckCount('SELECT COUNT(*) FROM z WHERE val > 996', 0);
+
+    { Esitlik + IN + esitsizlik. }
+    CheckCount('SELECT COUNT(*) FROM z WHERE val = 5', CountEq(5));
+    CheckCount('SELECT COUNT(*) FROM z WHERE val = 0', CountEq(0));
+    CheckCount('SELECT COUNT(*) FROM z WHERE val = 996', CountEq(996));
+    CheckCount('SELECT COUNT(*) FROM z WHERE val <> 500', N - CountEq(500));
+    CheckCount('SELECT COUNT(*) FROM z WHERE val IN (1, 2, 3, 997)',
+      CountEq(1) + CountEq(2) + CountEq(3) + CountEq(997));
+
+    { Karma kosul: aralik + PK kosulu. }
+    exp := 0;
+    for k := 0 to N - 1 do
+      if (vals[k] >= 400) and (vals[k] < 600) and (k + 1 > 1000) then Inc(exp);
+    CheckCount('SELECT COUNT(*) FROM z WHERE val >= 400 AND val < 600 AND id > 1000', exp);
+
+    { Budama yoklugunda da dogru satirlar gelir: en kucuk degerin PK'si. }
+    r := Exec(S, 'SELECT id FROM z WHERE val = 0 ORDER BY id LIMIT 1');
+    if (not gErr) and (Cel(r, 0, 0) = '1') then
+      Ok('zonemap: val = 0 -> ilk PK 1')
+    else
+      Fail('zonemap: val = 0 sorgusu: ' + r.Msg);
+
+    { ORDER BY + LIMIT (akış/top-N yolu v3'te genel yola duser). }
+    r := Exec(S, 'SELECT val FROM z ORDER BY val DESC, id LIMIT 3');
+    if (not gErr) and (Length(r.Rows) = 3) and (Cel(r, 0, 0) = IntToStr(MODU - 1)) then
+      Ok('zonemap: ORDER BY val DESC LIMIT 3 ilk deger ' + IntToStr(MODU - 1))
+    else
+      Fail('zonemap: ORDER BY: ' + r.Msg);
+  finally
+    CloseV3(S);
+  end;
+
+  { Yeniden acilis: ayni sonuclar. }
+  OpenV3(S, 'zone.odb', False);
+  try
+    CheckCount('SELECT COUNT(*) FROM z', N);
+    CheckCount('SELECT COUNT(*) FROM z WHERE val >= 125 AND val < 250',
+      CountRange(125, 250));
+    r := Exec(S, 'VERIFY');
+    if (not gErr) and (r.Affected = 1) then
+      Ok('zonemap: yeniden acilis sonrasi VERIFY: ' + r.Msg)
+    else
+      Fail('zonemap: VERIFY: ' + r.Msg);
+  finally
+    CloseV3(S);
+  end;
+end;
+
 { ================================================================== ana }
 
 var
@@ -692,6 +1027,9 @@ begin
   TestVerifySql;
   TestBackupRestoreSql;
   TestVacuumSql;
+  TestReplicationUnsupported;
+  TestPitrUnsupported;
+  TestZoneMapFallback;
   TestIntegrity(N);
 
   WriteLn;
