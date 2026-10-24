@@ -34,7 +34,7 @@ unit VDbPageWal;
 interface
 
 uses
-  SysUtils, Classes, VDbPage, VDbCrc32, VDbSync;
+  SysUtils, Classes, VDbPage, VDbCrc32, VDbSync, VDbPageCrypto;
 
 const
   VDB_WAL_MAGIC       = $334C5756;   // 'VWL3'
@@ -45,6 +45,12 @@ const
   VDB_WAL_REC_FRAME   = $31574656;   // 'VFW1'
   VDB_WAL_REC_COMMIT  = $31435746;   // 'FWC1'
   VDB_WAL_REC_HDR     = 20;          // bayt
+
+  { Sprint 3.4: sifreli WAL basligi alanlari (meta sayfa yerlesimiyle ayni). }
+  VDB_WAL_FLAGS       = 16;   // LongWord
+  VDB_WAL_KEYCHECK    = 20;   // 16 bayt
+  VDB_WAL_SALT        = 36;   // 16 bayt
+  VDB_WAL_FLAG_ENC    = 1;
 
 type
   EVdbWal = class(Exception);
@@ -73,6 +79,12 @@ type
       FBufferCount: Integer;
       FLSN: LongWord;
       FHasContent: Boolean;
+      { Sprint 3.4: sifreli WAL. }
+      FEncryptedMode: Boolean;   // cagiran (motor) sifreleme istiyor mu
+      FWalEncrypted: Boolean;    // diskteki baslik ne diyor
+      FKey: TBytes;
+      FSalt: TBytes;
+      FKeyCheck: TBytes;
     procedure WriteHeader;
     procedure ReadHeader;
     function WriteRecord(Magic, PageNo, PayloadLen: LongWord;
@@ -86,6 +98,11 @@ type
     { WAL dosyasini kesif/olustur (yoksa baslik yazar). }
     procedure Open;
     procedure Close;
+
+    { Sprint 3.4: Open'dan ONCE cagrilir. Anahtar 32 bayt; tuz depodan
+      gelir (AAD ayni olsun). }
+    procedure SetEncryptionKey(const AKey, ASalt: TBytes);
+    property Encrypted: Boolean read FEncryptedMode;
 
     { WAL'de uygulanacak (commit edilmis) cerceve var mi? Acilista
       kurtarma gerekip gerekmedigine karar vermek icin. }
@@ -131,6 +148,17 @@ begin
   Result := VDbCrc32Final(c);
 end;
 
+function BytesEqual(const A, B: TBytes): Boolean;
+var
+  i: Integer;
+begin
+  Result := Length(A) = Length(B);
+  if not Result then Exit;
+  for i := 0 to High(A) do
+    if A[i] <> B[i] then Exit(False);
+  Result := True;
+end;
+
 { ------------------------------------------------------------------ baslik }
 
 procedure TVDbPageWal.WriteHeader;
@@ -140,6 +168,7 @@ var
   magic, ver: LongWord;
   ps: Word;
   lsn: LongWord;
+  flags: LongWord;
 begin
   FillChar(buf, SizeOf(buf), 0);
   magic := VDB_WAL_MAGIC;
@@ -150,6 +179,15 @@ begin
   Move(ver, buf[4], 4);
   Move(ps, buf[8], 2);
   Move(lsn, buf[12], 4);
+  if FEncryptedMode then
+  begin
+    flags := VDB_WAL_FLAG_ENC;
+    Move(flags, buf[VDB_WAL_FLAGS], 4);
+    if Length(FKeyCheck) = VDB_ENC_CHECK_LEN then
+      Move(FKeyCheck[0], buf[VDB_WAL_KEYCHECK], VDB_ENC_CHECK_LEN);
+    if Length(FSalt) = VDB_ENC_SALT_LEN then
+      Move(FSalt[0], buf[VDB_WAL_SALT], VDB_ENC_SALT_LEN);
+  end;
   q := PLongWord(@buf[VDB_PAGE_BODY_END]);
   q^ := VDbCrc32Of(buf, VDB_PAGE_BODY_END);
   FStream.Position := 0;
@@ -160,6 +198,9 @@ procedure TVDbPageWal.ReadHeader;
 var
   buf: TVDbPageBuf;
   magic, ver, lsn, crc: LongWord;
+  flags: LongWord;
+  storedCheck, storedSalt: TBytes;
+  i: Integer;
   ps: Word;
   q: PLongWord;
 begin
@@ -183,6 +224,32 @@ begin
     raise EVdbWal.Create('WAL basligi bozuk (CRC tutmadi)');
   Move(buf[12], lsn, 4);
   FLSN := lsn;
+
+  Move(buf[VDB_WAL_FLAGS], flags, 4);
+  if (flags and VDB_WAL_FLAG_ENC) <> 0 then
+  begin
+    if Length(FKey) <> VDB_ENC_KEY_LEN then
+      raise EVdbWal.Create(
+        'sifreli WAL: anahtar gerekli (SetEncryptionKey)');
+    SetLength(storedSalt, VDB_ENC_SALT_LEN);
+    Move(buf[VDB_WAL_SALT], storedSalt[0], VDB_ENC_SALT_LEN);
+    if not BytesEqual(storedSalt, FSalt) then
+      raise EVdbWal.Create(
+        'WAL baska bir veritabanina ait (tuz farkli)');
+    SetLength(storedCheck, VDB_ENC_CHECK_LEN);
+    Move(buf[VDB_WAL_KEYCHECK], storedCheck[0], VDB_ENC_CHECK_LEN);
+    if not BytesEqual(storedCheck, FKeyCheck) then
+      raise EVdbWal.Create(
+        'yanlis anahtar: WAL dogrulayici tutmadi');
+    FWalEncrypted := True;
+  end
+  else
+  begin
+    if FEncryptedMode then
+      raise EVdbWal.Create(
+        'WAL sifresiz ama veritabani sifreli (eski WAL dosyasini silin)');
+    FWalEncrypted := False;
+  end;
 end;
 
 { ------------------------------------------------------------------ yasam }
@@ -194,6 +261,22 @@ begin
   FBufferCount := 0;
   FHasContent := False;
   FLSN := 0;
+  FEncryptedMode := False;
+  FWalEncrypted := False;
+  FKey := nil;
+  FSalt := nil;
+  FKeyCheck := nil;
+end;
+
+procedure TVdbPageWal.SetEncryptionKey(const AKey, ASalt: TBytes);
+begin
+  if Length(AKey) <> VDB_ENC_KEY_LEN then
+    raise EVdbWal.Create(Format('WAL anahtari %d bayt (beklenen %d)',
+      [Length(AKey), VDB_ENC_KEY_LEN]));
+  FKey := Copy(AKey, 0, Length(AKey));
+  FSalt := Copy(ASalt, 0, Length(ASalt));
+  FKeyCheck := VDbPageKeyCheck(FKey);
+  FEncryptedMode := True;
 end;
 
 destructor TVdbPageWal.Destroy;
@@ -240,6 +323,7 @@ begin
     FLSN := 0;
     WriteHeader;
     VDbFlushStream(FStream);
+    FWalEncrypted := FEncryptedMode;
     FHasContent := False;
   end;
 end;
@@ -324,6 +408,7 @@ end;
 function TVdbPageWal.Commit(DoSync: Boolean; LSN: LongWord): Boolean;
 var
   i: Integer;
+  env, plain: TBytes;
 begin
   Result := False;
   if FStream = nil then
@@ -332,8 +417,21 @@ begin
   FLSN := LSN;
   FStream.Position := FStream.Size;
   for i := 0 to FBufferCount - 1 do
-    WriteRecord(VDB_WAL_REC_FRAME, FBuffer[i].PageNo, VDB_PAGE_SIZE,
-      FBuffer[i].Data);
+  begin
+    if FWalEncrypted then
+    begin
+      SetLength(plain, VDB_PAGE_SIZE);
+      Move(FBuffer[i].Data, plain[0], VDB_PAGE_SIZE);
+      if not VDbPageSeal(FKey, FSalt, FBuffer[i].PageNo, plain, env) then
+        raise EVdbWal.Create(Format('WAL cercevesi %d sifrelenemedi',
+          [FBuffer[i].PageNo]));
+      WriteRecord(VDB_WAL_REC_FRAME, FBuffer[i].PageNo, VDB_ENC_ENVELOPE,
+        env[0]);
+    end
+    else
+      WriteRecord(VDB_WAL_REC_FRAME, FBuffer[i].PageNo, VDB_PAGE_SIZE,
+        FBuffer[i].Data);
+  end;
   WriteRecord(VDB_WAL_REC_COMMIT, 0, 0, LSN);
   if DoSync then
     VDbFlushStream(FStream);
@@ -351,6 +449,9 @@ var
   magic, lsn, payLen, pageNo, crc: LongWord;
   calc: LongWord;
   payload: TVDbPageBuf;
+  raw: TBytes;
+  plain: TBytes;
+  expectedLen: LongWord;
   pending: TPendingArray;
   pendingCount: Integer;
   applied: TPendingArray;
@@ -406,10 +507,15 @@ begin
       Stats.TornTail := True;
       Break;
     end;
-    if (magic = VDB_WAL_REC_FRAME) and (payLen <> VDB_PAGE_SIZE) then
+    if magic = VDB_WAL_REC_FRAME then
     begin
-      Stats.TornTail := True;
-      Break;
+      if FWalEncrypted then expectedLen := VDB_ENC_ENVELOPE
+      else expectedLen := VDB_PAGE_SIZE;
+      if payLen <> expectedLen then
+      begin
+        Stats.TornTail := True;
+        Break;
+      end;
     end;
     if (magic = VDB_WAL_REC_COMMIT) and (payLen <> 0) then
     begin
@@ -419,13 +525,19 @@ begin
     calc := WalCrc(hdr[0], 16, hdr[0], 0);
     if payLen > 0 then
     begin
-      got := FStream.Read(payload[0], VDB_PAGE_SIZE);
-      if got <> VDB_PAGE_SIZE then
+      if payLen > 65536 then
       begin
         Stats.TornTail := True;
         Break;
       end;
-      calc := WalCrc(hdr[0], 16, payload[0], VDB_PAGE_SIZE);
+      SetLength(raw, payLen);
+      got := FStream.Read(raw[0], payLen);
+      if got <> Integer(payLen) then
+      begin
+        Stats.TornTail := True;
+        Break;
+      end;
+      calc := WalCrc(hdr[0], 16, raw[0], payLen);
     end;
     if calc <> crc then
     begin
@@ -435,6 +547,16 @@ begin
 
     if magic = VDB_WAL_REC_FRAME then
     begin
+      if FWalEncrypted then
+      begin
+        if not VDbPageOpen(FKey, FSalt, pageNo, raw, plain) then
+          raise EVdbWal.Create(Format(
+            'WAL cercevesi %d cozulemedi (yanlis anahtar ya da bozuk kayit)',
+            [pageNo]));
+        Move(plain[0], payload[0], VDB_PAGE_SIZE);
+      end
+      else
+        Move(raw[0], payload[0], VDB_PAGE_SIZE);
       AddTo(pending, pendingCount, pageNo, payload);
     end
     else

@@ -48,6 +48,12 @@ type
       FPath: string;
       FIdxUsed: Boolean;
       FIdxErr: string;
+      { Sprint 3.4: acilis anahtari (Open'dan once). }
+      FKey: TBytes;
+      FPassword: string;
+      FHasPassword: Boolean;
+    procedure InitEngine(const ADbPath: string; APoolPages: Integer);
+    function GetEncrypted: Boolean;
     procedure OnSpill(PageNo: LongWord; P: PVdbPage);
     function OnMiss(PageNo: LongWord; P: PVdbPage): Boolean;
     procedure ApplyRecovered(PageNo: LongWord; P: PVdbPage);
@@ -56,6 +62,13 @@ type
     procedure ClearPending;
   public
     constructor Create(const ADbPath: string; APoolPages: Integer = VDB_DEF_POOL);
+    { Sprint 3.4: sifreli dosya. Anahtar 32 bayt AES-256'dir; parola
+      verilirse PBKDF2-SHA256 ile dosyaya ozgu tuzdan turetilir. Anahtar
+      Open'dan ONCE verilir; sifresiz dosyaya anahtar vermek net hatadir. }
+    constructor CreateWithKey(const ADbPath: string; const AKey: TBytes;
+      APoolPages: Integer = VDB_DEF_POOL);
+    constructor CreateWithPassword(const ADbPath, APassword: string;
+      APoolPages: Integer = VDB_DEF_POOL);
     destructor Destroy; override;
 
     { Var olan dosyayi acar; ACreate=True ise yoksa olusturur. }
@@ -96,6 +109,9 @@ type
       tarama yapildi ve FIdxErr nedenini verir (veri kaybi soz konusu degil). }
     property IdxUsed: Boolean read FIdxUsed;
     property IdxErr: string read FIdxErr;
+    { Sprint 3.4: dosya sifreli mi ve anahtar parmak izi (8 hex). }
+    property Encrypted: Boolean read GetEncrypted;
+    function KeyFingerprint: string;
     { Dizinin kalici kopyasini simdi yazar (normalde Close yapar). }
     procedure SaveIdx;
 
@@ -112,11 +128,25 @@ type
 
 implementation
 
-constructor TVdbPageEngine.Create(const ADbPath: string; APoolPages: Integer);
+function TVdbPageEngine.GetEncrypted: Boolean;
 begin
-  inherited Create;
+  Result := (FStore <> nil) and FStore.Encrypted;
+end;
+
+function TVdbPageEngine.KeyFingerprint: string;
+begin
+  if FStore <> nil then Result := FStore.KeyFingerprint
+  else Result := '';
+end;
+
+procedure TVdbPageEngine.InitEngine(const ADbPath: string; APoolPages: Integer);
+begin
   FPath := ADbPath;
   FStore := TVDbPageStore.Create(ADbPath, APoolPages);
+  if FHasPassword then
+    FStore.SetEncryptionPassword(FPassword)
+  else if Length(FKey) > 0 then
+    FStore.SetEncryptionKey(FKey);
   { WAL yolu: <db>.wal. Boylece tek dosya adi sozlesmesi korunur. }
   FWal := TVdbPageWal.Create(ADbPath + '.wal');
   FInTxn := False;
@@ -124,6 +154,35 @@ begin
   FWalStats.Commits := 0;
   FWalStats.TornTail := False;
   FWalStats.Bytes := 0;
+end;
+
+constructor TVdbPageEngine.Create(const ADbPath: string; APoolPages: Integer);
+begin
+  inherited Create;
+  FKey := nil;
+  FHasPassword := False;
+  FPassword := '';
+  InitEngine(ADbPath, APoolPages);
+end;
+
+constructor TVdbPageEngine.CreateWithKey(const ADbPath: string;
+  const AKey: TBytes; APoolPages: Integer);
+begin
+  inherited Create;
+  FKey := Copy(AKey, 0, Length(AKey));
+  FHasPassword := False;
+  FPassword := '';
+  InitEngine(ADbPath, APoolPages);
+end;
+
+constructor TVdbPageEngine.CreateWithPassword(const ADbPath, APassword: string;
+  APoolPages: Integer);
+begin
+  inherited Create;
+  FKey := nil;
+  FHasPassword := True;
+  FPassword := APassword;
+  InitEngine(ADbPath, APoolPages);
 end;
 
 destructor TVdbPageEngine.Destroy;
@@ -144,6 +203,8 @@ var
   st: TVdbWalStats;
 begin
   FStore.Open(ACreate);
+  if FStore.Encrypted then
+    FWal.SetEncryptionKey(FStore.Key, FStore.Salt);
   FWal.Open;
   FStore.OnSpill := OnSpill;
   FStore.OnMiss := OnMiss;

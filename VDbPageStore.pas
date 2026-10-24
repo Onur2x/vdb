@@ -31,7 +31,8 @@ unit VDbPageStore;
 interface
 
 uses
-  SysUtils, Classes, DateUtils, Generics.Collections, VDbCrc32, VDbPage, VDbSync;
+  SysUtils, Classes, DateUtils, Generics.Collections, VDbCrc32, VDbPage, VDbSync,
+  VDbCrypt, VDbPageCrypto;
 
 const
   VDB_FILE_MAGIC   = $33424456;   // 'VDB3' (little endian)
@@ -40,6 +41,13 @@ const
   VDB_HDR_PAGE     = 0;
   VDB_DEF_POOL     = 512;         // 512 x 4 KB = 2 MB
   VDB_MAX_POOL     = 65536;
+
+  { Sprint 3.4: meta sayfa alanlari (duz metin; sir tutmaz). }
+  VDB_META_SALT     = 36;   // 16 bayt
+  VDB_META_ITER     = 52;   // LongWord
+  VDB_META_KEYCHECK = 56;   // 16 bayt
+  VDB_META_FLAGS    = 72;   // LongWord
+  VDB_META_FLAG_ENC = 1;
 
   { Freelist trunk sayfasi (ham 4096 bayt, VDbPage basligi KULLANILMAZ). }
   VDB_TRUNK_MAGIC  = $31544656;   // 'VFT1'
@@ -105,6 +113,15 @@ type
       FOnSpill: TVdbPageSpillProc;
       FOnMiss: TVdbPageMissProc;
       FSpillActive: Boolean;
+      { Sprint 3.4: sayfa sifreleme. }
+      FEncrypted: Boolean;
+      FKey: TBytes;
+      FSalt: TBytes;
+      FKeyCheck: TBytes;
+      FPassword: TBytes;
+      FHasPassword: Boolean;
+      FIterations: Integer;
+      FFreshPage: LongWord;
     function HashOf(PageNo: LongWord): LongWord;
     function FindFrame(PageNo: LongWord): Integer;
     procedure HashPut(PageNo: LongWord; Idx: Integer);
@@ -114,6 +131,10 @@ type
     function PickVictim: Integer;
     function GetPageInternal(PageNo: LongWord; DoVerify: Boolean;
       out P: PVdbPage): Boolean;
+    function OffsetOf(PageNo: LongWord): Int64;
+    function RequiredFileSize(PageCount: LongWord): Int64;
+    procedure SetupEncryptionForCreate;
+    procedure CheckEncryptionOnOpen(const Meta: TVdbPageBuf);
     procedure ReadPageAt(PageNo: LongWord; P: PVdbPage);
     procedure WritePageAt(PageNo: LongWord; P: PVdbPage);
     procedure ExtendFile(out NewPageNo: LongWord);
@@ -186,6 +207,14 @@ type
       (paylasim kilidi sorunu yok). }
     procedure CopyCommittedTo(const DestPath: string);
 
+    { Sprint 3.4: sayfa sifreleme. Open cagrilmadan ONCE verilmelidir.
+      Key 32 bayt AES-256 anahtaridir; Password verilirse PBKDF2-SHA256
+      ile dosyaya ozgu tuzdan turetilir. Sifreli dosya anahtarsiz,
+      sifresiz dosya anahtarla ACILMAZ (sessiz yanlis yapilandirma yok). }
+    procedure SetEncryptionKey(const AKey: TBytes);
+    procedure SetEncryptionPassword(const APassword: string);
+    function KeyFingerprint: string;
+
     { WAL kurtarma: sayfa imajini yazar. Onbellekte varsa tazeler ve
       kirli isaretler; yoksa dogrudan dosyaya yazar. PageNo=0 ise meta
       alanlari da tazelenir. }
@@ -223,15 +252,40 @@ type
     property PageCount: LongWord read FPageCount;
     property FreeCount: LongWord read FFreeCount;
     property LSN: LongWord read FLSN;
+
+    { Sprint 3.4: dosya sifreli mi, anahtar ve tuz (WAL ayni anahtari ve
+      tuzu kullanir). }
+    property Encrypted: Boolean read FEncrypted;
+    property Key: TBytes read FKey;
+    property Salt: TBytes read FSalt;
+    { RESTORE dogrulamasi: 16 baytlik anahtar dogrulayici. }
+    property KeyCheck: TBytes read FKeyCheck;
   end;
 
 implementation
 
 { ------------------------------------------------------------------ yardimci }
 
-function FileOffsetOf(PageNo: LongWord): Int64; inline;
+function TVDbPageStore.OffsetOf(PageNo: LongWord): Int64;
 begin
-  Result := Int64(PageNo) * VDB_PAGE_SIZE;
+  if FEncrypted then
+  begin
+    if PageNo = 0 then
+      Result := 0
+    else
+      Result := VDB_PAGE_SIZE + Int64(PageNo - 1) * VDB_ENC_ENVELOPE;
+  end
+  else
+    Result := Int64(PageNo) * VDB_PAGE_SIZE;
+end;
+
+function TVDbPageStore.RequiredFileSize(PageCount: LongWord): Int64;
+begin
+  if PageCount < 1 then PageCount := 1;
+  if FEncrypted then
+    Result := VDB_PAGE_SIZE + Int64(PageCount - 1) * VDB_ENC_ENVELOPE
+  else
+    Result := Int64(PageCount) * VDB_PAGE_SIZE;
 end;
 
 { ================================================================ hash tablo }
@@ -341,6 +395,7 @@ begin
   HashReset;
   FClock := 0;
   FLSN := 0;
+  FIterations := VDB_ENC_ITER;
 end;
 
 destructor TVDbPageStore.Destroy;
@@ -351,6 +406,90 @@ begin
     { yikici hata firlatmaz }
   end;
   inherited Destroy;
+end;
+
+procedure TVDbPageStore.SetEncryptionKey(const AKey: TBytes);
+begin
+  if Length(AKey) <> VDB_ENC_KEY_LEN then
+    raise EVdbPageStore.Create(Format(
+      'sifreleme anahtari %d bayt (beklenen %d)', [Length(AKey), VDB_ENC_KEY_LEN]));
+  FKey := Copy(AKey, 0, Length(AKey));
+  FHasPassword := False;
+  FPassword := nil;
+end;
+
+procedure TVDbPageStore.SetEncryptionPassword(const APassword: string);
+begin
+  if APassword = '' then
+    raise EVdbPageStore.Create('bos parola');
+  FPassword := VDbCryptStrToBytes(APassword);
+  FKey := nil;
+  FHasPassword := True;
+end;
+
+function TVDbPageStore.KeyFingerprint: string;
+begin
+  if Length(FKey) > 0 then
+    Result := VDbPageKeyFingerprint(FKey)
+  else
+    Result := '';
+end;
+
+procedure TVDbPageStore.SetupEncryptionForCreate;
+begin
+  if FHasPassword then
+  begin
+    FSalt := VDbPageNewSalt;
+    FKey := VDbPageKeyFromPassword(FPassword, FSalt, FIterations);
+  end
+  else if Length(FKey) > 0 then
+    FSalt := VDbPageNewSalt
+  else
+    FSalt := nil;
+  FEncrypted := Length(FKey) > 0;
+  if FEncrypted then
+    FKeyCheck := VDbPageKeyCheck(FKey)
+  else
+    FKeyCheck := nil;
+end;
+
+procedure TVDbPageStore.CheckEncryptionOnOpen(const Meta: TVdbPageBuf);
+var
+  flags: LongWord;
+  stored, computed: TBytes;
+  i: Integer;
+begin
+  Move(Meta[VDB_META_FLAGS], flags, SizeOf(flags));
+  if (flags and VDB_META_FLAG_ENC) <> 0 then
+  begin
+    SetLength(FSalt, VDB_ENC_SALT_LEN);
+    Move(Meta[VDB_META_SALT], FSalt[0], VDB_ENC_SALT_LEN);
+    Move(Meta[VDB_META_ITER], FIterations, SizeOf(FIterations));
+    if FIterations < 1 then FIterations := VDB_ENC_ITER;
+    if FHasPassword then
+      FKey := VDbPageKeyFromPassword(FPassword, FSalt, FIterations);
+    if Length(FKey) = 0 then
+      raise EVdbPageStore.Create(
+        'sifreli veritabani: anahtar gerekli (SetEncryptionKey/Password)');
+    SetLength(stored, VDB_ENC_CHECK_LEN);
+    Move(Meta[VDB_META_KEYCHECK], stored[0], VDB_ENC_CHECK_LEN);
+    computed := VDbPageKeyCheck(FKey);
+    for i := 0 to VDB_ENC_CHECK_LEN - 1 do
+      if stored[i] <> computed[i] then
+        raise EVdbPageStore.Create(
+          'yanlis anahtar: sifre cozme reddedildi (anahtar dogrulayici tutmadi)');
+    FKeyCheck := computed;
+    FEncrypted := True;
+  end
+  else
+  begin
+    if (Length(FKey) > 0) or FHasPassword then
+      raise EVdbPageStore.Create(
+        'dosya sifresiz: anahtar verilmemeli (once ALTER/yeni dosya ile sifreleyin)');
+    FEncrypted := False;
+    FSalt := nil;
+    FKeyCheck := nil;
+  end;
 end;
 
 procedure TVDbPageStore.LoadMeta;
@@ -389,8 +528,9 @@ begin
   Move(buf[20], FFreeCount, SizeOf(FFreeCount));
   Move(buf[24], FLSN, SizeOf(FLSN));
   Move(buf[28], FCreated, SizeOf(FCreated));
+  CheckEncryptionOnOpen(buf);
   fileLen := FStream.Size;
-  if fileLen < Int64(FPageCount) * VDB_PAGE_SIZE then
+  if fileLen < RequiredFileSize(FPageCount) then
     raise EVdbPageStore.Create(Format(
       'dosya kesik: %d bayt, baslikta %d sayfa yaziyor',
       [fileLen, FPageCount]));
@@ -405,6 +545,7 @@ var
   q: PLongWord;
   magic, ver: LongWord;
   ps: Word;
+  flags: LongWord;
 begin
   FillChar(buf, SizeOf(buf), 0);
   magic := VDB_FILE_MAGIC;
@@ -418,6 +559,16 @@ begin
   Move(FFreeCount, buf[20], SizeOf(FFreeCount));
   Move(FLSN, buf[24], SizeOf(FLSN));
   Move(FCreated, buf[28], SizeOf(FCreated));
+  if FEncrypted then
+  begin
+    if Length(FSalt) = VDB_ENC_SALT_LEN then
+      Move(FSalt[0], buf[VDB_META_SALT], VDB_ENC_SALT_LEN);
+    Move(FIterations, buf[VDB_META_ITER], SizeOf(FIterations));
+    if Length(FKeyCheck) = VDB_ENC_CHECK_LEN then
+      Move(FKeyCheck[0], buf[VDB_META_KEYCHECK], VDB_ENC_CHECK_LEN);
+    flags := VDB_META_FLAG_ENC;
+    Move(flags, buf[VDB_META_FLAGS], SizeOf(flags));
+  end;
   crc := VDbCrc32Of(buf, VDB_PAGE_BODY_END);
   q := PLongWord(@buf[VDB_PAGE_BODY_END]);
   q^ := crc;
@@ -444,12 +595,13 @@ begin
       LoadMeta
     else
     begin
+      SetupEncryptionForCreate;
       FPageCount := 1;
       FFreeTrunk := 0;
       FFreeCount := 0;
       FLSN := 1;
       FCreated := DateTimeToUnix(Now, False);
-      FStream.Size := VDB_PAGE_SIZE;
+      FStream.Size := RequiredFileSize(1);
       SaveMeta;
       VDbFlushStream(FStream);
     end;
@@ -490,19 +642,54 @@ end;
 { ============================================================ okuma/yazma }
 
 procedure TVDbPageStore.ReadPageAt(PageNo: LongWord; P: PVdbPage);
+var
+  env: TBytes;
+  plain: TBytes;
 begin
   if PageNo >= FPageCount then
     raise EVdbPageStore.Create(Format('sayfa %d yok (toplam %d)',
       [PageNo, FPageCount]));
-  FStream.Position := FileOffsetOf(PageNo);
-  FStream.ReadBuffer(P^, VDB_PAGE_SIZE);
+  FStream.Position := OffsetOf(PageNo);
+  if FEncrypted then
+  begin
+    { Yeni uzatilan sayfa: dosya sifirla doldurulmustur; sifreli zarf yok.
+      PageInit hemen uzerine yazacagi icin okuma atlanir. }
+    if PageNo = FFreshPage then
+    begin
+      FFreshPage := 0;
+      FillChar(P^, VDB_PAGE_SIZE, 0);
+      Inc(FReads);
+      Exit;
+    end;
+    SetLength(env, VDB_ENC_ENVELOPE);
+    FStream.ReadBuffer(env[0], VDB_ENC_ENVELOPE);
+    if not VDbPageOpen(FKey, FSalt, PageNo, env, plain) then
+      raise EVdbPageStore.Create(Format(
+        'sayfa %d: sifre cozulemedi (yanlis anahtar ya da bozuk zarf)',
+        [PageNo]));
+    Move(plain[0], P^, VDB_PAGE_SIZE);
+  end
+  else
+    FStream.ReadBuffer(P^, VDB_PAGE_SIZE);
   Inc(FReads);
 end;
 
 procedure TVDbPageStore.WritePageAt(PageNo: LongWord; P: PVdbPage);
+var
+  env: TBytes;
+  plain: TBytes;
 begin
-  FStream.Position := FileOffsetOf(PageNo);
-  FStream.WriteBuffer(P^, VDB_PAGE_SIZE);
+  FStream.Position := OffsetOf(PageNo);
+  if FEncrypted then
+  begin
+    SetLength(plain, VDB_PAGE_SIZE);
+    Move(P^, plain[0], VDB_PAGE_SIZE);
+    if not VDbPageSeal(FKey, FSalt, PageNo, plain, env) then
+      raise EVdbPageStore.Create(Format('sayfa %d sifrelenemedi', [PageNo]));
+    FStream.WriteBuffer(env[0], VDB_ENC_ENVELOPE);
+  end
+  else
+    FStream.WriteBuffer(P^, VDB_PAGE_SIZE);
   Inc(FWrites);
 end;
 
@@ -635,7 +822,8 @@ procedure TVDbPageStore.ExtendFile(out NewPageNo: LongWord);
 begin
   NewPageNo := FPageCount;
   Inc(FPageCount);
-  FStream.Size := Int64(FPageCount) * VDB_PAGE_SIZE;
+  FStream.Size := RequiredFileSize(FPageCount);
+  FFreshPage := NewPageNo;
   FMetaDirty := True;
 end;
 
@@ -1011,6 +1199,7 @@ var
   q: PLongWord;
   magic, ver: LongWord;
   ps: Word;
+  encFlags: LongWord;
 begin
   FillChar(Buf, SizeOf(Buf), 0);
   magic := VDB_FILE_MAGIC;
@@ -1024,6 +1213,16 @@ begin
   Move(FFreeCount, Buf[20], SizeOf(FFreeCount));
   Move(FLSN, Buf[24], SizeOf(FLSN));
   Move(FCreated, Buf[28], SizeOf(FCreated));
+  if FEncrypted then
+  begin
+    if Length(FSalt) = VDB_ENC_SALT_LEN then
+      Move(FSalt[0], Buf[VDB_META_SALT], VDB_ENC_SALT_LEN);
+    Move(FIterations, Buf[VDB_META_ITER], SizeOf(FIterations));
+    if Length(FKeyCheck) = VDB_ENC_CHECK_LEN then
+      Move(FKeyCheck[0], Buf[VDB_META_KEYCHECK], VDB_ENC_CHECK_LEN);
+    encFlags := VDB_META_FLAG_ENC;
+    Move(encFlags, Buf[VDB_META_FLAGS], SizeOf(encFlags));
+  end;
   crc := VDbCrc32Of(Buf, VDB_PAGE_BODY_END);
   q := PLongWord(@Buf[VDB_PAGE_BODY_END]);
   q^ := crc;
@@ -1036,6 +1235,7 @@ var
   meta: TVdbPageBuf;
   pno: LongWord;
   P: PVdbPage;
+  plain, env: TBytes;
 begin
   if FStream = nil then
     raise EVdbPageStore.Create('depolama acik degil (CopyCommittedTo)');
@@ -1055,7 +1255,17 @@ begin
         raise EVdbPageStore.Create(Format(
           'kopya: sayfa %d okunamadi', [pno]));
       try
-        fs.WriteBuffer(P^, VDB_PAGE_SIZE);
+        if FEncrypted then
+        begin
+          SetLength(plain, VDB_PAGE_SIZE);
+          Move(P^, plain[0], VDB_PAGE_SIZE);
+          if not VDbPageSeal(FKey, FSalt, pno, plain, env) then
+            raise EVdbPageStore.Create(Format(
+              'kopya: sayfa %d sifrelenemedi', [pno]));
+          fs.WriteBuffer(env[0], VDB_ENC_ENVELOPE);
+        end
+        else
+          fs.WriteBuffer(P^, VDB_PAGE_SIZE);
       finally
         Release(pno, False);
       end;
@@ -1100,12 +1310,17 @@ begin
   if PageNo >= FPageCount then
   begin
     FPageCount := PageNo + 1;
-    FStream.Size := Int64(FPageCount) * VDB_PAGE_SIZE;
+    FStream.Size := RequiredFileSize(FPageCount);
   end;
-  FStream.Position := FileOffsetOf(PageNo);
-  FStream.WriteBuffer(P^, VDB_PAGE_SIZE);
   if PageNo = VDB_HDR_PAGE then
+  begin
+    { Meta sayfa her zaman DUZ metindir (sir tutmaz, sifreleme zarfi yok). }
+    FStream.Position := 0;
+    FStream.WriteBuffer(P^, VDB_PAGE_SIZE);
     LoadMeta;
+  end
+  else
+    WritePageAt(PageNo, P);
 end;
 
 function TVDbPageStore.IsResident(PageNo: LongWord): Boolean;

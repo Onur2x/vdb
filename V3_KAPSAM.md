@@ -157,7 +157,9 @@ v3 koşusu yalnız "kapsam" değil, **gerçek kusurlar** ortaya çıkardı:
 | PITR (`RECOVER TO`) / WAL arşivi | yok | 3.6 |
 | `VACUUM` / `Compact` (canlı kayıtlar yeni dosyaya, atomik değişim) | **var** (Sprint 3.3) | 3.3 ✔ |
 | `AutoCompact` | yok (v2'de de varsayılan **kapalı**) | v3.1 |
-| Kayıt/kolon şifreleme (v3 sayfa düzeyi AES-GCM) | yok | 3.4 |
+| Sayfa düzeyi **AES-256-GCM** şifreleme (zarf: nonce+şifre+tag = 4124 B) | **var** (Sprint 3.4) | 3.4 ✔ |
+| `ALTER DATABASE KEY` (v3 dosya rekey) | `ecUnsupported` | 3.4b / v3.1 |
+| Kayıt/kolon düzeyi şifreleme (v2 tarzı) | yok; sayfa şifreleme tüm veriyi kapsar | — |
 | `START REPLICATION` | yok | 3.5 (v3.1 mantıksal günlük) |
 | Zone map | kapalı (tam tarama) | 3.7 |
 | `SAVEPOINT` | `ecUnsupported` | v3.1 |
@@ -173,4 +175,28 @@ sqltest.exe <dir2> --backend=v3  # SONUC: gecen=2252 kalan=0 atlanan=58
 
 Kapılar (yeniden koşuldu, hepsi yeşil):
 `pagechk 21/21`, `storechk 15/15`, `heapchk 20/20`, `idxchk 17/17`,
-`crashtest 11/11`, `backendchk 61/61`, `v3sqlchk 60/60`, `migchk 13/13`.
+`crashtest 11/11`, `backendchk 82/82`, `v3sqlchk 60/60`, `migchk 13/13`.
+
+### Sayfa şifreleme (Sprint 3.4)
+
+Varsayılan **kapalı**; v3 dosyası eskisi gibi düz metindir. Şifreli dosya
+`CreateWithKey` (32 bayt AES-256) veya `CreateWithPassword` (PBKDF2-SHA256,
+200000 tur) ile açılır:
+
+```
+b := TVdbBackendV3.CreateWithKey('veri.odb', anahtar, True);
+b.Encrypted        // True
+b.KeyFingerprint   // 8 hex
+```
+
+Zarf sırası: sayfa imajı → CRC32 (`PageSeal`) → AES-256-GCM
+(`nonce 12 | şifre 4096 | tag 16` = **4124 bayt**). AAD sayfa numarasına ve
+dosya tuzuna bağlıdır. Meta sayfa 0 düz metin kalır (yalnız sayfa sayısı,
+freelist, LSN, tuz, iterasyon, anahtar doğrulayıcı; kullanıcı verisi yok).
+WAL çerçeveleri de aynı zarfla yazılır. Anahtarsız/yanlış anahtarlı açma,
+bozuk zarf ve farklı anahtarlı `RESTORE` **net hata** verir; sessiz bozuk
+veri dönmez. `VACUUM` aynı anahtarla yeni dosya üretir.
+
+Bilinçli sınır: `ALTER DATABASE KEY` (mevcut v3 dosyasını yeniden
+şifreleme) bu sürümde yoktur (`ecUnsupported`); anahtar dosya oluştururken
+seçilir.

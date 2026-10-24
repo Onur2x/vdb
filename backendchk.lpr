@@ -22,7 +22,7 @@ program backendchk;
 
 uses
   Classes, SysUtils, VDbBackendApi, VDbCore, VDbBackendV2, VDbBackendV3,
-  VDbPageEngine, VDbPage, VDbPageStore;
+  VDbPageEngine, VDbPage, VDbPageStore, VDbPageCrypto;
 
 var
   gPass, gFail: Int64;
@@ -75,6 +75,29 @@ begin
     until FindNext(sr) <> 0;
     FindClose(sr);
   end;
+end;
+
+{ Dosyada ham bayt dizisi var mi (sifreleme sizinti denetimi). }
+function FileHasBytes(const APath: string; const Needle: TBytes): Boolean;
+var
+  fs: TFileStream;
+  data: TBytes;
+  i, n, m: Integer;
+begin
+  Result := False;
+  if not FileExists(APath) then Exit;
+  fs := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  try
+    n := fs.Size;
+    SetLength(data, n);
+    if n > 0 then fs.ReadBuffer(data[0], n);
+  finally
+    fs.Free;
+  end;
+  m := Length(Needle);
+  if m = 0 then Exit(True);
+  for i := 0 to n - m do
+    if CompareMem(@data[i], @Needle[0], m) then Exit(True);
 end;
 
 { ================================================= 1) v2 adaptor: birebir }
@@ -874,6 +897,291 @@ begin
   v3 := nil;
 end;
 
+{ Sprint 3.4: sayfa duzeyi AES-GCM sifreleme kapisi. }
+procedure TestV3Encryption(N: Integer);
+const
+  MARK: array[0..15] of AnsiChar = 'V3GIZLI-MARKER01';
+var
+  v3: TVdbBackendV3;
+  b: IVDbBackend;
+  v, got, key, key2: TBytes;
+  rep, msg: string;
+  raised: Boolean;
+  plainPath, encPath, bakPath, walPath: string;
+  oldB, newB: Int64;
+  fs: TFileStream;
+  x: Byte;
+  eng: TVdbPageEngine;
+  i: Integer;
+begin
+  CleanDir;
+  WriteLn;
+  WriteLn('Sprint 3.4 - sayfa sifreleme (AES-256-GCM)');
+
+  key := VDbPageNewKey;
+  key2 := VDbPageNewKey;
+  SetLength(v, Length(MARK));
+  Move(MARK[0], v[0], Length(MARK));
+
+  { 1) Varsayilan sifresiz: deger dosyada duz metin. }
+  plainPath := DirOf('enc_plain.odb');
+  v3 := TVdbBackendV3.Create(plainPath, True, 32);
+  b := v3;
+  b.Put(1, v);
+  b.Flush;
+  if not v3.Encrypted then
+    Ok('enc1) varsayilan sifreleme KAPALI')
+  else
+    Fail('enc1) varsayilan sifreleme acik');
+  b := nil;
+  v3 := nil;
+  if FileHasBytes(plainPath, v) then
+    Ok('enc1) sifresiz dosyada deger duz metin (geriye uyum)')
+  else
+    Fail('enc1) sifresiz dosyada deger bulunamadi');
+
+  { 2) Sifreli olustur: dosyada duz metin YOK. }
+  encPath := DirOf('enc1.odb');
+  v3 := TVdbBackendV3.CreateWithKey(encPath, key, True, 32);
+  b := v3;
+  if v3.Encrypted then
+    Ok('enc2) sifreli v3 dosyasi acildi')
+  else
+    Fail('enc2) dosya sifreli degil');
+  if v3.KeyFingerprint = VDbPageKeyFingerprint(key) then
+    Ok('enc2) anahtar parmak izi: ' + v3.KeyFingerprint)
+  else
+    Fail('enc2) anahtar parmak izi yanlis');
+  b.Put(1, v);
+  b.Put(2, v);
+  b.Flush;
+  if b.Verify(rep) then
+    Ok('enc2) sifreli dosyada VERIFY gecti')
+  else
+    Fail('enc2) VERIFY: ' + rep);
+  b := nil;
+  v3 := nil;
+  if not FileHasBytes(encPath, v) then
+    Ok('enc2) sifreli dosyada duz metin YOK')
+  else
+    Fail('enc2) SIZINTI: sifreli dosyada duz metin var');
+
+  { 3) Dogru anahtarla yeniden acma. }
+  v3 := TVdbBackendV3.CreateWithKey(encPath, key, False, 32);
+  b := v3;
+  if b.Get(1, got) and ValEq(got, v) then
+    Ok('enc3) dogru anahtarla okundu (duz metin dondu)')
+  else
+    Fail('enc3) dogru anahtarla okunamadi');
+  b := nil;
+  v3 := nil;
+
+  { 4) Anahtarsiz acma: net hata, sessiz bozuk veri yok. }
+  raised := False;
+  msg := '';
+  try
+    v3 := TVdbBackendV3.Create(encPath, False, 32);
+  except
+    on E: Exception do
+    begin
+      raised := True;
+      msg := E.Message;
+    end;
+  end;
+  if raised and (Pos('anahtar', LowerCase(msg)) > 0) then
+    Ok('enc4) anahtarsiz acma reddedildi: ' + msg)
+  else
+    Fail('enc4) anahtarsiz acma reddedilmedi (msg=' + msg + ')');
+  FreeAndNil(v3);
+
+  { 5) Yanlis anahtar: anahtar dogrulayici tutmaz. }
+  raised := False;
+  msg := '';
+  try
+    v3 := TVdbBackendV3.CreateWithKey(encPath, key2, False, 32);
+  except
+    on E: Exception do
+    begin
+      raised := True;
+      msg := E.Message;
+    end;
+  end;
+  if raised and (Pos('anahtar', LowerCase(msg)) > 0) then
+    Ok('enc5) yanlis anahtar reddedildi: ' + msg)
+  else
+    Fail('enc5) yanlis anahtar reddedilmedi (msg=' + msg + ')');
+  FreeAndNil(v3);
+
+  { 6) Yedek: sifreli kalir, ayni anahtarla acilir. }
+  v3 := TVdbBackendV3.CreateWithKey(encPath, key, False, 32);
+  b := v3;
+  bakPath := DirOf('enc1_backup.odb');
+  b.BackupTo(bakPath);
+  if FileExists(bakPath) and (not FileHasBytes(bakPath, v)) then
+    Ok('enc6) yedek sifreli (duz metin yok)')
+  else
+    Fail('enc6) yedek sifreli degil / yok');
+  b := nil;
+  v3 := nil;
+
+  v3 := TVdbBackendV3.CreateWithKey(bakPath, key, False, 32);
+  b := v3;
+  if b.Get(1, got) and ValEq(got, v) then
+    Ok('enc6) yedek dogru anahtarla okundu')
+  else
+    Fail('enc6) yedek okunamadi');
+  b := nil;
+  v3 := nil;
+
+  raised := False;
+  try
+    v3 := TVdbBackendV3.CreateWithKey(bakPath, key2, False, 32);
+  except
+    on E: Exception do raised := True;
+  end;
+  FreeAndNil(v3);
+  if raised then
+    Ok('enc6) yedege YANLIS anahtarla erisim reddedildi')
+  else
+    Fail('enc6) yedege yanlis anahtarla erisildi');
+
+  { 7) RESTORE: farkli anahtarli yedek reddedilir. }
+  v3 := TVdbBackendV3.CreateWithKey(DirOf('enc1_restore.odb'), key2, True, 32);
+  b := v3;
+  raised := False;
+  msg := '';
+  try
+    b.RestoreFrom(bakPath);
+  except
+    on E: Exception do
+    begin
+      raised := True;
+      msg := E.Message;
+    end;
+  end;
+  if raised and (Pos('anahtar', LowerCase(msg)) > 0) then
+    Ok('enc7) farkli anahtarli RESTORE reddedildi')
+  else
+    Fail('enc7) farkli anahtarli RESTORE kabul edildi (msg=' + msg + ')');
+  b := nil;
+  v3 := nil;
+
+  { 8) VACUUM sifrelemeyi korur ve hala duz metin sizdirmaz. }
+  v3 := TVdbBackendV3.CreateWithKey(encPath, key, False, 32);
+  b := v3;
+  b.Compact(oldB, newB);
+  if v3.Encrypted and b.Get(1, got) and ValEq(got, v) then
+    Ok(Format('enc8) VACUUM sifreli kaldi (%d -> %d bayt)', [oldB, newB]))
+  else
+    Fail('enc8) VACUUM sonrasi sifreleme/veri bozuldu');
+  b := nil;
+  v3 := nil;
+  if not FileHasBytes(encPath, v) then
+    Ok('enc8) VACUUM sonrasi duz metin yok')
+  else
+    Fail('enc8) VACUUM sonrasi SIZINTI');
+
+  { 9) Bozuk zarf: etiket tutmaz, acikca reddedilir. }
+  fs := TFileStream.Create(encPath, fmOpenReadWrite or fmShareDenyWrite);
+  try
+    fs.Position := 4096 + 100;
+    fs.ReadBuffer(x, 1);
+    x := x xor $FF;
+    fs.Position := 4096 + 100;
+    fs.WriteBuffer(x, 1);
+  finally
+    fs.Free;
+  end;
+  v3 := nil;
+  raised := False;
+  msg := '';
+  try
+    v3 := TVdbBackendV3.CreateWithKey(encPath, key, False, 32);
+    b := v3;
+    b.Get(1, got);
+  except
+    on E: Exception do
+    begin
+      raised := True;
+      msg := E.Message;
+    end;
+  end;
+  if raised and (Pos('cozulemedi', LowerCase(msg)) > 0) then
+    Ok('enc9) bozuk zarf reddedildi: ' + msg)
+  else
+    Fail('enc9) bozuk zarf sessizce gecti (msg=' + msg + ')');
+  b := nil;
+  v3 := nil;
+
+  { 10) WAL cerceveleri de sifreli; cokme sonrasi anahtarla kurtarma. }
+  walPath := DirOf('enc_wal.odb');
+  eng := TVdbPageEngine.CreateWithKey(walPath, key, 32);
+  try
+    eng.Open(True);
+    eng.Insert(1, v);
+    eng.Commit(True);
+    if not FileHasBytes(walPath + '.wal', v) then
+      Ok('enc10) WAL duz metin icermiyor')
+    else
+      Fail('enc10) SIZINTI: WAL duz metin iceriyor');
+    eng.SimulateCrash;
+  finally
+    eng.Free;
+  end;
+
+  eng := TVdbPageEngine.CreateWithKey(walPath, key, 32);
+  try
+    eng.Open(False);
+    if eng.TryGet(1, got) and ValEq(got, v) then
+      Ok('enc10) sifreli WAL cokme sonrasi anahtarla kurtarildi')
+    else
+      Fail('enc10) sifreli WAL kurtarilamadi');
+  finally
+    eng.Free;
+  end;
+
+  { 11) Parola modu: PBKDF2 ile turetilen anahtar kalici. }
+  v3 := TVdbBackendV3.CreateWithPassword(DirOf('enc_pw.odb'), 'gizli-parola', True, 32);
+  b := v3;
+  b.Put(7, v);
+  b.Flush;
+  b := nil;
+  v3 := nil;
+  v3 := TVdbBackendV3.CreateWithPassword(DirOf('enc_pw.odb'), 'gizli-parola', False, 32);
+  b := v3;
+  if v3.Encrypted and b.Get(7, got) and ValEq(got, v) then
+    Ok('enc11) parola ile yeniden acma calisti')
+  else
+    Fail('enc11) parola ile acilamadi');
+  b := nil;
+  v3 := nil;
+
+  raised := False;
+  try
+    v3 := TVdbBackendV3.CreateWithPassword(DirOf('enc_pw.odb'), 'yanlis', False, 32);
+  except
+    on E: Exception do raised := True;
+  end;
+  FreeAndNil(v3);
+  if raised then
+    Ok('enc11) yanlis parola reddedildi')
+  else
+    Fail('enc11) yanlis parola kabul edildi');
+
+  { 12) Sifreli dosyaya anahtarsiz "duz" erisim net hata. }
+  raised := False;
+  try
+    v3 := TVdbBackendV3.Create(encPath, False, 32);
+  except
+    on E: Exception do raised := True;
+  end;
+  FreeAndNil(v3);
+  if raised then
+    Ok('enc12) sifreli dosya sifresiz acilamadi')
+  else
+    Fail('enc12) sifreli dosya sifresiz acildi');
+end;
+
 { ================================================================== ana }
 
 var
@@ -900,6 +1208,7 @@ begin
   TestV3Verify(N);
   TestV3BackupRestore(N);
   TestV3Compact(N);
+  TestV3Encryption(N);
   TestEquivalence(1000);
 
   WriteLn;

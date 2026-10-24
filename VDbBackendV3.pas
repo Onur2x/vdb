@@ -65,6 +65,15 @@ type
       FScanFilter: Integer;
       FCompactEng: TVdbPageEngine;
       FCompactN: Int64;
+      { Sprint 3.4: acilis anahtari (parola Open'da turetilir, sonra
+        yalniz ham anahtar tutulur; VACUUM/RESTORE yeniden acarken kullanilir). }
+      FKey: TBytes;
+      FPassword: string;
+      FHasPassword: Boolean;
+    procedure InitBackend(const ADbPath: string; ACreate: Boolean;
+      APoolPages: Integer);
+    function NewEngine(const APath: string): TVdbPageEngine;
+    function GetEncrypted: Boolean;
     procedure ApplyBatch;
     function EffectiveCount: Integer;
     procedure MaybeCheckpoint;
@@ -78,9 +87,20 @@ type
     { ADbPath: .odb dosya yolu. ACreate=True ise yoksa olusturur. }
     constructor Create(const ADbPath: string; ACreate: Boolean = True;
       APoolPages: Integer = VDB_DEF_POOL);
+
+    { Sprint 3.4: sifreli v3 dosyasi. Anahtar 32 baytlık AES-256'dir;
+      parola verilirse PBKDF2-SHA256 ile turetilir. Sifresiz dosyaya
+      anahtar vermek net hatadir. }
+    constructor CreateWithKey(const ADbPath: string; const AKey: TBytes;
+      ACreate: Boolean = True; APoolPages: Integer = VDB_DEF_POOL);
+    constructor CreateWithPassword(const ADbPath, APassword: string;
+      ACreate: Boolean = True; APoolPages: Integer = VDB_DEF_POOL);
     destructor Destroy; override;
 
     property Engine: TVdbPageEngine read FEng;
+    { Sprint 3.4: sayfa sifreleme durumu ve anahtar parmak izi (8 hex). }
+    property Encrypted: Boolean read GetEncrypted;
+    function KeyFingerprint: string;
     { Checkpoint esigi (bayt). 0 = yalnizca kapanis/Flush'ta. }
     property CheckpointBytes: Int64 read FCheckpointBytes write FCheckpointBytes;
 
@@ -129,23 +149,78 @@ type
 
 implementation
 
-constructor TVdbBackendV3.Create(const ADbPath: string; ACreate: Boolean;
+function TVdbBackendV3.GetEncrypted: Boolean;
+begin
+  Result := (FEng <> nil) and FEng.Encrypted;
+end;
+
+function TVdbBackendV3.KeyFingerprint: string;
+begin
+  if FEng <> nil then Result := FEng.KeyFingerprint
+  else Result := '';
+end;
+
+procedure TVdbBackendV3.InitBackend(const ADbPath: string; ACreate: Boolean;
   APoolPages: Integer);
 begin
-  inherited Create;
   FPath := ADbPath;
   FBatch := TDictionary<QWord, TBatchRec>.Create;
   FBatchOpen := False;
   FDirty := False;
   FCheckpointBytes := VDB_V3_CHECKPOINT_BYTES;
   FPoolPages := APoolPages;
-  FEng := TVdbPageEngine.Create(ADbPath, APoolPages);
+  FEng := NewEngine(ADbPath);
   try
     FEng.Open(ACreate);
   except
     FreeAndNil(FEng);
     raise;
   end;
+  { Parola modunda turetilmis ham anahtar; VACUUM/RESTORE yeniden acarken
+    ayni anahtar kullanilir. }
+  FKey := Copy(FEng.Store.Key, 0, Length(FEng.Store.Key));
+  FPassword := '';
+  FHasPassword := False;
+end;
+
+function TVdbBackendV3.NewEngine(const APath: string): TVdbPageEngine;
+begin
+  if FHasPassword then
+    Result := TVdbPageEngine.CreateWithPassword(APath, FPassword, FPoolPages)
+  else if Length(FKey) > 0 then
+    Result := TVdbPageEngine.CreateWithKey(APath, FKey, FPoolPages)
+  else
+    Result := TVdbPageEngine.Create(APath, FPoolPages);
+end;
+
+constructor TVdbBackendV3.Create(const ADbPath: string; ACreate: Boolean;
+  APoolPages: Integer);
+begin
+  inherited Create;
+  FKey := nil;
+  FPassword := '';
+  FHasPassword := False;
+  InitBackend(ADbPath, ACreate, APoolPages);
+end;
+
+constructor TVdbBackendV3.CreateWithKey(const ADbPath: string;
+  const AKey: TBytes; ACreate: Boolean; APoolPages: Integer);
+begin
+  inherited Create;
+  FKey := Copy(AKey, 0, Length(AKey));
+  FPassword := '';
+  FHasPassword := False;
+  InitBackend(ADbPath, ACreate, APoolPages);
+end;
+
+constructor TVdbBackendV3.CreateWithPassword(const ADbPath, APassword: string;
+  ACreate: Boolean; APoolPages: Integer);
+begin
+  inherited Create;
+  FKey := nil;
+  FPassword := APassword;
+  FHasPassword := True;
+  InitBackend(ADbPath, ACreate, APoolPages);
 end;
 
 destructor TVdbBackendV3.Destroy;
@@ -534,8 +609,9 @@ procedure TVdbBackendV3.RestoreFrom(const SrcPath: string);
 var
   tmp: string;
   src, dst: TFileStream;
-  hdr: array[0..15] of Byte;
-  magic, ver: LongWord;
+  hdr: array[0..75] of Byte;
+  magic, ver, flags: LongWord;
+  i: Integer;
 begin
   if FBatchOpen then
     raise EVdbBackendV3.Create('acik parti varken geri yukleme yapilamaz');
@@ -545,7 +621,7 @@ begin
     raise EVdbBackendV3.Create('RESTORE: kaynak ile hedef ayni dosya');
   src := TFileStream.Create(SrcPath, fmOpenRead or fmShareDenyNone);
   try
-    if src.Size < 32 then
+    if src.Size < SizeOf(hdr) then
       raise EVdbBackendV3.Create('RESTORE: kaynak dosya cok kisa');
     src.ReadBuffer(hdr, SizeOf(hdr));
   finally
@@ -555,6 +631,23 @@ begin
   Move(hdr[4], ver, SizeOf(ver));
   if (magic <> VDB_FILE_MAGIC) or (ver <> VDB_FILE_VER) then
     raise EVdbBackendV3.Create('RESTORE: kaynak v3 sayfa motoru dosyasi degil');
+
+  { Sifreleme bicimi ve anahtar kaynakla AYNI olmali; aksi halde geri
+    yuklenen dosya acilamaz ya da yanlis anahtarla sessizce kalirdi. }
+  Move(hdr[VDB_META_FLAGS], flags, SizeOf(flags));
+  if (flags and VDB_META_FLAG_ENC) <> 0 then
+  begin
+    if not FEng.Store.Encrypted then
+      raise EVdbBackendV3.Create(
+        'RESTORE: kaynak sifreli, hedef sifresiz (once sifreli olarak acin)');
+    for i := 0 to 15 do
+      if hdr[VDB_META_KEYCHECK + i] <> FEng.Store.KeyCheck[i] then
+        raise EVdbBackendV3.Create(
+          'RESTORE: yedek farkli anahtarla sifrelenmis (anahtar dogrulayici tutmadi)');
+  end
+  else if FEng.Store.Encrypted then
+    raise EVdbBackendV3.Create(
+      'RESTORE: kaynak sifresiz, hedef sifreli');
 
   { Calisan durumu diske indir; sonra motoru kapat. }
   if FDirty then
@@ -613,7 +706,7 @@ begin
 
   tmp := FPath + '.compact.tmp';
   if FileExists(tmp) then DeleteFile(tmp);
-  newEng := TVdbPageEngine.Create(tmp, FPoolPages);
+  newEng := NewEngine(tmp);
   try
     try
       newEng.Open(True);
@@ -675,7 +768,7 @@ begin
     { Yeni dosyanin WAL'i ve dizini ESKI dosyaya aittir; asla kullanilmaz. }
     if FileExists(wal) then DeleteFile(wal);
     if FileExists(idx) then DeleteFile(idx);
-    FEng := TVdbPageEngine.Create(FPath, FPoolPages);
+    FEng := NewEngine(FPath);
     try
       FEng.Open(False);
     except
@@ -694,7 +787,7 @@ begin
         end;
         if FileExists(FPath) then
         begin
-          FEng := TVdbPageEngine.Create(FPath, FPoolPages);
+          FEng := NewEngine(FPath);
           FEng.Open(False);
         end;
       except
