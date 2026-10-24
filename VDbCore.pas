@@ -453,6 +453,10 @@ FPath: string;
     { H11: olu PUT bolgelerini ve FREESPACE kayitlarini tarayip serbest
       listeyi/blok haritasini kurar. }
     procedure RebuildFreeSpans;
+    { 2026-10-24 (yazma hizi): FFreeSpans Size'a gore ARTAN sirali tutulur.
+      Arama ikili arama ile O(log n); esit boylu bolgelerde ekleme O(1). }
+    procedure SortFreeSpans;
+    procedure InsertFreeSpan(const sp: TFreeSpan);
     procedure AddFreeSpan(AOffset, ASize: Int64);
     function TryTakeFreeSpan(Need: Int64; out AOffset, ALeftover: Int64): Boolean;
     procedure WriteFreeSpace(AOffset, ASize: Int64);
@@ -1508,8 +1512,21 @@ begin
   { H11: once olu bir PUT bolgesine yerinde yazmayi dene. Yerinde yazim
     YALNIZCA kapanmis bir bloktadir (RebuildFreeSpans garanti eder), bu
     yuzden blok footer CRC'si yeniden hesaplanabilir. Undo kaydi ana
-    dosya degismeden ONCE fsync edilir. }
-  if TryTakeFreeSpan(need, inOff, leftover) then
+    dosya degismeden ONCE fsync edilir.
+
+    2026-10-24 (yazma hizi) - YERINDE YAZIM YALNIZCA GERCEK TOPLU ISLEMDE:
+    Yerinde yazim iki fsync gerektirir (once undo on-goruntusu, sonra commit
+    isareti). Tek satirlik bir UPDATE/DELETE icin bu, sadece-ekleme yolunun
+    TEK fsync'inden pahalidir; ayrica her seferinde .undo dosyasi
+    olusturulup siliniyordu (Windows'ta dosya olustur/sil + AV taramasi
+    ~2,5 ms). Olculen: tek satir UPDATE 3,8 ms -> 0,35 ms.
+    Tek yazimda (FInBatch=False veya 1 op'lik batch) artik EKLEME yolu
+    kullanilir; yerinde yazim cok satirli transaction'larda (H11'in asil
+    hedefi) aynen korunur. Bedeli: tek satir guncellemelerinde dosya
+    buyur; olu bolgeler sonraki toplu yazimlarda yeniden kullanilir ve
+    VACUUM/Compact alani geri kazanir. }
+  if (FInBatch and (FPending.Count > 1)) and
+     TryTakeFreeSpan(need, inOff, leftover) then
   begin
     if (not FUndoMarkerWritten) and FInBatch then
     begin
@@ -2021,6 +2038,72 @@ begin
   FBlockCrc := VDbCrc32Init;
 end;
 
+procedure TVDb.SortFreeSpans;
+{ FFreeSpans'i Size'a gore artan sirada yerinde siralar (ikili quick sort).
+  Yalnizca yeniden kurulumdan sonra cagrilir; normal akista liste sirali
+  kalir (InsertFreeSpan). }
+  procedure QSort(Lo, Hi: Integer);
+  var
+    i, j: Integer;
+    p, t: TFreeSpan;
+  begin
+    while Lo < Hi do
+    begin
+      i := Lo;
+      j := Hi;
+      p := FFreeSpans[(Lo + Hi) div 2];
+      repeat
+        while FFreeSpans[i].Size < p.Size do Inc(i);
+        while FFreeSpans[j].Size > p.Size do Dec(j);
+        if i <= j then
+        begin
+          if i < j then
+          begin
+            t := FFreeSpans[i];
+            FFreeSpans[i] := FFreeSpans[j];
+            FFreeSpans[j] := t;
+          end;
+          Inc(i);
+          Dec(j);
+        end;
+      until i > j;
+      // Kucuk parca ozyinelemeli, buyuk parca dongude (yigin derinligi O(log n))
+      if (j - Lo) < (Hi - i) then
+      begin
+        QSort(Lo, j);
+        Lo := i;
+      end
+      else
+      begin
+        QSort(i, Hi);
+        Hi := j;
+      end;
+    end;
+  end;
+begin
+  if FFreeSpans.Count > 1 then
+    QSort(0, FFreeSpans.Count - 1);
+end;
+
+procedure TVDb.InsertFreeSpan(const sp: TFreeSpan);
+{ Sirali listeye ekler. Ayni boydaki bolgeler grubun SONUNA gider; toplu
+  silmede tum bolgeler ayni boyda oldugu icin ekleme O(1) olur. }
+var
+  lo, hi, mid: Integer;
+begin
+  lo := 0;
+  hi := FFreeSpans.Count;
+  while lo < hi do
+  begin
+    mid := (lo + hi) div 2;
+    if FFreeSpans[mid].Size <= sp.Size then
+      lo := mid + 1
+    else
+      hi := mid;
+  end;
+  FFreeSpans.Insert(lo, sp);
+end;
+
 procedure TVDb.AddFreeSpan(AOffset, ASize: Int64);
 var
   sp: TFreeSpan;
@@ -2029,7 +2112,7 @@ begin
   if FFreeSpansDirty then Exit;   // yeniden kurulum zaten bulacak
   sp.Offset := AOffset;
   sp.Size := ASize;
-  FFreeSpans.Add(sp);
+  InsertFreeSpan(sp);
 end;
 
 procedure TVDb.RebuildFreeSpans;
@@ -2112,6 +2195,7 @@ begin
   finally
     blockSpans.Free;
   end;
+  SortFreeSpans;
   FFreeSpansDirty := False;
 end;
 
@@ -2141,43 +2225,72 @@ end;
 
 function TVDb.TryTakeFreeSpan(Need: Int64; out AOffset, ALeftover: Int64): Boolean;
 var
-  i, bi: Integer;
+  lo, hi, mid, idx, bi: Integer;
   sp: TFreeSpan;
-  left: Int64;
 begin
   Result := False;
+  AOffset := 0;
+  ALeftover := 0;
   if Need <= 0 then Exit;
   { Toplu yazim tamponu aktifken footer'lar henuz diskte degil; rebuild
     onlari goremez ve FBlocks eksik kalir. Once tamponu bosalt. }
   if FFreeSpansDirty and FWrBufActive then
     FlushWriteBuf;
   if FFreeSpansDirty then RebuildFreeSpans;
-  i := 0;
-  while i < FFreeSpans.Count do
-  begin
-    sp := FFreeSpans[i];
-    if sp.Size < Need then
+  { 2026-10-24 (yazma hizi): onceki kod listeyi 0'dan tarayip her seferinde
+    ilk uyan bolgeyi aliyordu (TList.Delete(0) O(n)). Cok satirli DELETE'te
+    her olu bolge listeye eklenip hemen alindigi icin toplam O(n^2) olusuyor
+    ve 100.000 satirlik DELETE 0,157 ms/satir (toplam 15,7 sn) suruyordu.
+    Liste artik Size'a gore sirali; asagidaki iki ikili arama ile uygun
+    bolge O(log n) bulunur:
+      (1) Need kadar yer birakan EN KUCUK bolge (artik >= baslik boyu),
+      (2) yok ise tam oturan (Size = Need) bolge.
+    Ikisi de yoksa tarama yapilmaz; cagiran ekleme yoluna gecer. }
+  repeat
+    idx := -1;
+    lo := 0;
+    hi := FFreeSpans.Count;
+    while lo < hi do
     begin
-      Inc(i);
-      Continue;
+      mid := (lo + hi) div 2;
+      if FFreeSpans[mid].Size >= Need + Int64(SizeOf(TVDbRecHead)) then
+      begin
+        idx := mid;
+        hi := mid;
+      end
+      else
+        lo := mid + 1;
     end;
-    left := sp.Size - Need;
-    if (left > 0) and (left < Int64(SizeOf(TVDbRecHead))) then
+    if idx < 0 then
     begin
-      Inc(i);
-      Continue;
+      lo := 0;
+      hi := FFreeSpans.Count;
+      while lo < hi do
+      begin
+        mid := (lo + hi) div 2;
+        if FFreeSpans[mid].Size >= Need then
+        begin
+          if FFreeSpans[mid].Size = Need then
+            idx := mid;
+          hi := mid;
+        end
+        else
+          lo := mid + 1;
+      end;
     end;
+    if idx < 0 then Exit;
+    sp := FFreeSpans[idx];
     if not FindBlockForOffset(sp.Offset, bi) then
     begin
       // Blok haritasi yok -> CRC guncellenemez; bu span'i kullanma.
-      FFreeSpans.Delete(i);
+      FFreeSpans.Delete(idx);
       Continue;
     end;
-    FFreeSpans.Delete(i);
+    FFreeSpans.Delete(idx);
     AOffset := sp.Offset;
-    ALeftover := left;
+    ALeftover := sp.Size - Need;
     Exit(True);
-  end;
+  until False;
 end;
 
 procedure TVDb.WriteFreeSpace(AOffset, ASize: Int64);
@@ -2217,8 +2330,18 @@ begin
     FDeadQueue.Clear;
     Exit;
   end;
-  for i := 0 to FDeadQueue.Count - 1 do
-    FFreeSpans.Add(FDeadQueue[i]);
+  if FDeadQueue.Count = 0 then Exit;
+  // Tek tek ikili ekleme kucuk partilerde iyi; buyuk partide tek siralama
+  // daha ucuz (liste zaten sirali, birlesme yerine toptan siralama).
+  if FDeadQueue.Count >= 16 then
+  begin
+    for i := 0 to FDeadQueue.Count - 1 do
+      FFreeSpans.Add(FDeadQueue[i]);
+    SortFreeSpans;
+  end
+  else
+    for i := 0 to FDeadQueue.Count - 1 do
+      InsertFreeSpan(FDeadQueue[i]);
   FDeadQueue.Clear;
 end;
 
@@ -4492,6 +4615,9 @@ begin
           // fsync ertelenir. Boylece SQL katmaninin her UPDATE/DELETE icin
           // kullandigi BeginBatch/CommitBatch de group commit ile calisir.
           // FDirty False birakilmaz (siradaki Flush/CommitBatch'te tekrar denenecek).
+          //
+          // NOT (P-DUR): burada SyncWrite'a BAKILMAZ. SQL commit'i SyncWrite
+          // kapali olsa bile dayanikli olmalidir (sqltest T24 bunu dogrular).
           if (FSyncWriteInterval <= 0) or
              (GetTickCount64 - FSyncWriteLast >= QWord(FSyncWriteInterval)) then
           begin
@@ -4728,6 +4854,9 @@ begin
   FLock.Enter;
   try
     CheckOpen;
+    // P-DUR sozlesmesi: SQL commit'i ve acik Flush cagrisi HER ZAMAN
+    // dayaniklidir (SyncWrite kapali olsa bile). SyncWrite yalnizca ham
+    // TVDb.Put yolunda fsync'i erteler; burada bakilmaz.
     // GROUP COMMIT: SyncWriteInterval > 0 ise ve yeterli sure gecmediyse
     // fsync ertelenir. Boylece SQL katmaninin her Exec sonrasi cagirdigi
     // Flush bile group commit ile calisir. FDirty False birakilmaz

@@ -142,30 +142,89 @@ Her adımda `sqltest` ve 8'li çökme zinciri yeşil kaldı.
 
 ---
 
-## 5. Doğruluk kapıları
+## 5. Tek satırlık yazma (autocommit) — 2026-10-24
 
-Performans değişiklikleri aşağıdaki kapılar yeşilken yapıldı:
+Şikâyet: "INSERT, UPDATE ve DELETE hâlâ çok yavaş". Tek satırlık (autocommit)
+yazma yolu ölçüldü; iki darboğaz bulundu ve giderildi.
 
-| Kapı | Sonuç |
-|---|---|
-| `sqltest` | 2527 / 2527 |
-| `crashtest` | 8 / 8 (veri kaybı yok) |
-| `rawchk` | 29 / 29 |
-| `mrowchk` | 0 hata |
-| `fuzzchk` | 3000 / 3000 |
-| `sqlite_diff` | 4000 / 4000 |
-| `hashchk` | 80 / 80 |
-| `copychk` | 17 / 17 |
-| `zonechk` | 0 hata |
-| `skipchk` | 0 hata |
-| `countchk` | 120 / 120 |
+Koşullar: Windows, FPC 3.2.4 i386-win32, `-O1`, SQL metniyle (`sq.Exec`),
+varsayılan dayanıklılık (`SyncWrite=True`, `SyncWriteInterval=0` → her commit
+fsync), 20.000 satır, tek süreç.
 
-Depoda artık yalnızca `sqltest` bulunur; diğerleri tek seferlik doğrulama
-araçlarıydı. Sonuçlar burada kayıt altındadır.
+| İşlem (20.000 satır, tek tek) | Önce | Sonra | Kazanç |
+|---|---:|---:|---:|
+| `INSERT` autocommit | 74,0 sn — 3,70 ms/satır (270/sn) | **8,61 sn — 0,430 ms/satır (2.324/sn)** | **8,6x** |
+| `UPDATE` (PK) autocommit | 138,9 sn — 6,94 ms/satır (144/sn) | **7,74 sn — 0,387 ms/satır (2.585/sn)** | **17,9x** |
+| `DELETE` (PK) autocommit | 137,3 sn — 6,87 ms/satır (146/sn) | **7,48 sn — 0,374 ms/satır (2.673/sn)** | **18,4x** |
+
+Toplu (tek transaction) yolda ayrı bir O(n²) darboğazı bulundu ve giderildi
+(100.000 satır, tek transaction):
+
+| Toplu işlem | Önce | Sonra | Kazanç |
+|---|---:|---:|---:|
+| `DELETE ... WHERE` (tek cümle) | 0,1575 ms/satır (15,8 sn) | **0,0134 ms/satır (1,34 sn)** | **11,7x** |
+| PK `DELETE` (açık batch) | 0,1735 ms/satır (17,3 sn) | **0,0296 ms/satır (2,96 sn)** | **5,9x** |
+| `UPDATE ... WHERE` (tek cümle) | 0,0226 ms/satır | 0,0223 ms/satır | — |
+| `INSERT` (açık batch) | 0,0065 ms/satır (154 bin/sn) | 0,0064 ms/satır (156 bin/sn) | — |
+
+### Kök neden 1 — her INSERT'te şemanın tamamı yeniden yazılıyordu
+
+`TVTableDb.BumpAutoInc`, sayaç ilerlediğinde `MarkSchema` → `SaveSchema`
+çağırıyordu; `SaveSchema` tüm tablo/rol/RLS metnini üretip `GuardSchemaLoss`
+denetimiyle birlikte KV'ye yazıyor ve fsync ediyordu. Tek satırlık INSERT
+başına yaklaşık 3,0 ms. Artık sayaç yalnız bellekte ilerler
+(`FAutoIncDirty`); şema `Close` sırasında veya bir sonraki yapısal DDL'de bir
+kez yazılır. Sayaç kaybolursa `ReadRow`/`MaxPkInt` ile kendini onarır.
+
+### Kök neden 2 — tek satırlık yazımda yerinde (in-place) güncelleme
+
+Ölü bölge yeniden kullanımı tek satırlık UPDATE/DELETE'te üç fsync (undo
+ön-görüntüsü, ana dosya, undo commit işareti) ve her seferinde `.undo`
+dosyasının oluşturulup silinmesi demekti (Windows'ta dosya oluştur/sil
+≈ 1,5 ms). Artık yerinde yazım yalnızca **çok satırlı** işlemde
+(`FInBatch and FPending.Count > 1`) kullanılır; tek satırlık yazım tek
+fsync'lik ekleme yolundan gider. Bedeli dosya büyümesidir; ölü bölgeler
+sonraki toplu yazımlarda yeniden kullanılır, `VACUUM`/`Compact` geri kazanır.
+
+### Ek — serbest bölge araması O(n²) idi
+
+`TryTakeFreeSpan` listeyi baştan tarayıp ilk uyan bölgeyi alıyordu
+(`TList.Delete(0)` = O(n)). 100.000 satırlık `DELETE`'te her satır yeni bir
+ölü bölge üretip hemen arandığı için toplam O(n²) oluşuyordu. Liste artık
+boya göre sıralı tutulur; arama ikili arama ile O(log n), eşit boylu
+bölgelerde ekleme O(1).
+
+### Ölçülen taban çizgisi
+
+Bu makinede ham `fsync` ≈ 0,29–0,32 ms. `SyncWrite=True` ile tek satırlık
+yazmanın tabanı ≈ 0,35 ms/cümle (~2.800/sn) ve bu sınıra ulaşıldı. Daha
+yüksek hız isteyen `SyncWriteInterval` (grup commit) veya açık transaction
+kullanmalıdır; grup commit ile `INSERT` 0,030 ms/cümle (~33.000/sn).
 
 ---
 
-## 6. Ölçümü tekrarlama
+## 6. Doğruluk kapıları
+
+Bu değişiklikler aşağıdaki kapılar yeşilken yapıldı (2026-10-24):
+
+| Kapı | Sonuç |
+|---|---|
+| `sqltest` — win32 (lazbuild, `-B`) | **3090 / 3090** (`kalan=0`) |
+| `sqltest` — win64 (`-Px86_64 -Twin64 -O1`) | **3055 / 3055** (`kalan=0`) |
+| `sqltest` — Linux (WSL, FPC 3.2.4) | **3055 / 3055** (`kalan=0`) |
+
+H11 (undo günlüğü / yerinde yazım) testleri yeni sözleşmeye göre
+güncellendi: ölü bölge yeniden kullanımı çok satırlı işlemde doğrulanır,
+tek satırlık yazma ekleme yolundan gider.
+
+Daha eski kampanyalarda `crashtest`, `rawchk`, `mrowchk`, `fuzzchk`,
+`sqlite_diff`, `hashchk`, `copychk`, `zonechk`, `skipchk`, `countchk` de
+yeşildi; bu araçlar tek seferlik doğrulama araçlarıydı ve depoda yalnızca
+`sqltest` kaldı.
+
+---
+
+## 7. Ölçümü tekrarlama
 
 `sqltest` ile doğruluk:
 
@@ -174,7 +233,8 @@ lazbuild -B sqltest.lpi
 sqltest.exe C:\temp\vdbtest
 ```
 
-Beklenen: `SONUC: gecen=2527 kalan=0`.
+Beklenen: `SONUC: gecen=3090 kalan=0` (win32) veya `gecen=3055 kalan=0`
+(win64/Linux; OpenSSL DLL yoksa birkaç TLS testi ATLA sayılır).
 
 Benchmark programları (`idxbench`, `skipchk`, `countchk`) temizlik sırasında
 kaldırıldı. Aynı ölçümleri tekrarlamak için 1M satırlık veri üretip ilgili
@@ -182,7 +242,7 @@ SQL'leri `sqltest`/kendi harness'ınız üzerinden çalıştırabilirsiniz.
 
 ---
 
-## 7. Yorum
+## 8. Yorum
 
 - VDB'nin güçlü olduğu yer **PK nokta araması** ve **tek dosya/gömülü**
   kullanım senaryolarıdır.

@@ -136,6 +136,16 @@ Highlights (1,000,000 rows):
 | `ScanAll` | 437 ms |
 | 1M INSERT (single transaction) | 55.84 s (~17,907/s) |
 
+Single-row (autocommit) writes, 20,000 rows, default `SyncWrite=True`:
+
+| Operation | Before | After |
+|---|---:|---:|
+| `INSERT` | 3.70 ms/row | **0.430 ms/row (2,324/s)** |
+| `UPDATE` (PK) | 6.94 ms/row | **0.387 ms/row (2,585/s)** |
+| `DELETE` (PK) | 6.87 ms/row | **0.374 ms/row (2,673/s)** |
+
+Details and root causes: [speedtest.md](speedtest.md#5-single-row-writes-autocommit--2026-10-24).
+
 H3 skiplist (100,000 rows): 100 × (`UPDATE` + indexed `COUNT(*)`) takes
 **0.39–0.42 ms per cycle**, down from 24.99 ms — about **60–64x** faster.
 

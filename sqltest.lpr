@@ -12996,6 +12996,10 @@ begin
 
   // 1) Olu PUT bolgesi yeni kayitla yeniden kullanilir; silinen anahtar
   //    recovery'de geri gelmez.
+  //    2026-10-24 (yazma hizi): yerinde yazim artik YALNIZCA cok satirli
+  //    islemde kullanilir (tek satirlik yazim tek fsync'lik ekleme yolundan
+  //    gider, bkz. VDbCore.AppendRec). Bu yuzden yeniden kullanim iki
+  //    op'lik bir islemle olculur.
   dir := baseDir + '_reuse';
   ForceDirectories(dir);
   db := TVDb.Create;
@@ -13004,6 +13008,7 @@ begin
     db.Put(1, VDbStrToBytes('AAAA'));
     db.Put(2, VDbStrToBytes('BBBB'));
     db.Delete(1);
+    db.Delete(2);
   finally
     db.Close;
     db.Free;
@@ -13013,14 +13018,18 @@ begin
   db := TVDb.Create;
   try
     db.Open(dir);
+    db.BeginBatch;
     db.Put(3, VDbStrToBytes('CCCC'));
+    db.Put(4, VDbStrToBytes('DDDD'));
+    db.CommitBatch;
     sz1 := db.DataFileSize;
     Dogrula('H11.3 olu PUT bolgesi yeniden kullanildi',
       (sz1 - sz0) < 80, IntToStr(sz1 - sz0) + ' bayt buyudu');
     ok := db.Get(3, v) and (VDbBytesToStr(v) = 'CCCC');
     Dogrula('H11.3 yeni deger okunur', ok, VDbBytesToStr(v));
-    Dogrula('H11.3 silinen anahtar geri gelmedi', not db.Get(1, v), '');
-    ok := db.Get(2, v) and (VDbBytesToStr(v) = 'BBBB');
+    Dogrula('H11.3 silinen anahtarlar geri gelmedi',
+      (not db.Get(1, v)) and (not db.Get(2, v)), '');
+    ok := db.Get(4, v) and (VDbBytesToStr(v) = 'DDDD');
     Dogrula('H11.3 diger anahtar korundu', ok, VDbBytesToStr(v));
     Dogrula('H11.3 Verify blok CRC dahil', db.Verify(rep), rep);
   finally
@@ -13041,7 +13050,7 @@ begin
   end;
 
   // 2) Kalan bosluk FREESPACE olur ve sonraki kucuk kayit onu tekrar
-  //    kullanabilir.
+  //    kullanabilir (ayni islem icinde; tek satir kurali icin bkz. 1).
   dir := baseDir + '_free';
   ForceDirectories(dir);
   db := TVDb.Create;
@@ -13058,22 +13067,18 @@ begin
   db := TVDb.Create;
   try
     db.Open(dir);
-    db.Put(2, VDbStrToBytes('BBBB'));
+    db.BeginBatch;
+    db.Put(2, VDbStrToBytes('BBBB'));      // buyuk bolgeye yerinde
+    db.Put(3, MakeVal(30, 'C'));           // kalan FREESPACE'e yerinde
+    db.CommitBatch;
     sz1 := db.DataFileSize;
     Dogrula('H11.3 buyuk bolgeden kucuk kayit (FREESPACE)',
       (sz1 - sz0) < 80, IntToStr(sz1 - sz0) + ' bayt buyudu');
     ok := db.Get(2, v) and (VDbBytesToStr(v) = 'BBBB');
     Dogrula('H11.3 FREESPACE sonrasi kayit 2', ok, VDbBytesToStr(v));
-    Dogrula('H11.3 FREESPACE Verify', db.Verify(rep), rep);
-    db.Put(3, MakeVal(30, 'C'));
-    sz2 := db.DataFileSize;
-    Dogrula('H11.3 kalan FREESPACE yeniden kullanildi',
-      (sz2 - sz1) < 80, IntToStr(sz2 - sz1) + ' bayt buyudu');
     ok := db.Get(3, v) and (Length(v) = 30) and (v[0] = Ord('C'));
     Dogrula('H11.3 ikinci yerinde kayit', ok, IntToStr(Length(v)));
-    ok := db.Get(2, v) and (VDbBytesToStr(v) = 'BBBB');
-    Dogrula('H11.3 onceki kayit korundu', ok, VDbBytesToStr(v));
-    Dogrula('H11.3 ikinci FREESPACE Verify', db.Verify(rep), rep);
+    Dogrula('H11.3 FREESPACE Verify', db.Verify(rep), rep);
   finally
     db.Close;
     db.Free;
@@ -13083,15 +13088,18 @@ begin
     db.Open(dir);
     ok := db.Get(3, v) and (Length(v) = 30);
     Dogrula('H11.3 reopen ikinci kayit', ok, IntToStr(Length(v)));
+    ok := db.Get(2, v) and (VDbBytesToStr(v) = 'BBBB');
+    Dogrula('H11.3 reopen ilk kayit', ok, VDbBytesToStr(v));
     Dogrula('H11.3 reopen FREESPACE Verify', db.Verify(rep), rep);
   finally
     db.Close;
     db.Free;
   end;
 
-  // 3) Dosya sirasi bozuk seq: T2'nin yerinde kaydi T1'in append
-  //    kaydindan once gorunur. Recovery BATCHEND seq filtresi olmadan
-  //    T1'i sonra uygulayip T2'yi ezerdi.
+  // 3) Dosya sirasi bozuk seq: yerinde kayit (dusuk offset, YUKSEK seq)
+  //    dosyada kendisinden once yazilmis append kaydindan (yuksek offset,
+  //    DUSUK seq) sonra uygulanmalidir. Recovery BATCHEND seq filtresi
+  //    olmadan eski degeri geri getirirdi.
   dir := baseDir + '_order';
   ForceDirectories(dir);
   db := TVDb.Create;
@@ -13106,8 +13114,11 @@ begin
   db := TVDb.Create;
   try
     db.Open(dir);
-    db.Put(1, VDbStrToBytes('LONGGG'));   // 35 bayt: 33'luk bolgeye sigmaz
-    db.Put(1, VDbStrToBytes('ZZZZ'));     // 33 bayt: eski bolgeye yerinde
+    db.Put(1, VDbStrToBytes('LONGGG'));   // 39 bayt: 37'lik bolgeye sigmaz
+    db.BeginBatch;
+    db.Put(9, MakeVal(100, 'N'));         // append (yuksek offset, dusuk seq)
+    db.Put(1, VDbStrToBytes('ZZZZ'));     // yerinde (dusuk offset, yuksek seq)
+    db.CommitBatch;
   finally
     db.Close;
     db.Free;

@@ -136,6 +136,16 @@ sqltest.exe C:\temp\vdbtest
 | `ScanAll` | 437 ms |
 | 1M INSERT (tek transaction) | 55,84 sn (~17.907/sn) |
 
+Tek satırlık (autocommit) yazma, 20.000 satır, varsayılan `SyncWrite=True`:
+
+| İşlem | Önce | Sonra |
+|---|---:|---:|
+| `INSERT` | 3,70 ms/satır | **0,430 ms/satır (2.324/sn)** |
+| `UPDATE` (PK) | 6,94 ms/satır | **0,387 ms/satır (2.585/sn)** |
+| `DELETE` (PK) | 6,87 ms/satır | **0,374 ms/satır (2.673/sn)** |
+
+Ayrıntı ve kök nedenler: [hiztesti.md](hiztesti.md#5-tek-satırlık-yazma-autocommit--2026-10-24).
+
 H3 skiplist (100.000 satır): 100 × (`UPDATE` + indeksli `COUNT(*)`)
 **0,39–0,42 ms/döngü** — önceki 24,99 ms'e göre **~60–64x**.
 

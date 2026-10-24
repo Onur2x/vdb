@@ -331,6 +331,10 @@ type
     // Yalniz ANA thread erisir; is parcaciklari kendi dizileriyle ugrasir.
     FConcBuilders: TList<TVdbConcRec>;
     FSchemaDirty: Boolean;
+    { 2026-10-24 (yazma hizi): YALNIZ oto-sayac ilerledi. Sema yapisal olarak
+      degismedi; kayit Close'da (veya bir sonraki DDL'de) yazilir. Boylece
+      tek satirlik INSERT basina sema kaydi yazilmaz. }
+    FAutoIncDirty: Boolean;
     // P-24: Batch yazim sirasinda tablo semasini ve kolon siralamasini onbellekleme
     FBatchTableCached: Boolean;
     FBatchTableDef: TTableDef;
@@ -4380,6 +4384,7 @@ begin
     sl.Free;
   end;
   FSchemaDirty := False;
+  FAutoIncDirty := False;
   // F2-7: "bu tablo kasitli silindi" isaretleri (FIntentDrop) basariyla
   // yazilmis semadan SONRA temizlenir. Once temizlenmiyordu: liste
   // sonsuza dek birikiyor ve ayni adli tablo YENIDEN olusturulduktan
@@ -4500,9 +4505,19 @@ procedure TVTableDb.BumpAutoInc(const T: TTableDef; NewVal: Int64);
 // FTables.AddOrSetValue(t.Name, t) ile TTableDef kayidini bastan yaziyordu;
 // SaveSchema semayi zaten ayrica kirli sayiyordu. Sozluk yazmasi O(1) ve
 // kopyalanacak dizi yok.
+//
+// 2026-10-24 (yazma hizi): Sayac yukseltmesi ARTIK kalici yazma TETIKLEMEZ.
+// Once MarkSchema cagriliyordu; batch DISINDA her tek satirlik INSERT bu
+// yuzden TUM SEMAYI (GuardSchemaLoss + sema metni + KV Put + fsync) yeniden
+// yaziyordu (olculen: tek satirlik INSERT 3,70 ms; bunun ~3,0 ms'i sema).
+// Sayac degisimi artik yalnizca kirli bayragi kaldirir; sema Close'ta veya
+// bir sonraki YAPISAL DDL'de BIR KEZ yazilir. CommitBatch yalnizca yapisal
+// degisikligi (FSchemaDirty) yazar; sayac icin her islemde sema yazilmaz.
+// Dayaniklilik kaybi yok: sayac okunamazsa acilista ReadRow/MaxPkInt ile
+// kendini onarir (bkz. ApplyIdentity ve Insert'teki oto-sayac yolu).
 begin
   FAutoInc.AddOrSetValue(T.TableId, NewVal);
-  MarkSchema;
+  FAutoIncDirty := True;
 end;
 
 procedure TVTableDb.ApplyIdentity(const T: TTableDef; var Vals: TStrArray);
@@ -4688,7 +4703,7 @@ begin
   ResetBatchTableCache;
   // sayaclari kalici yap; Close asla patlamaz
   try
-    if FSchemaDirty then
+    if FSchemaDirty or FAutoIncDirty then
       SaveSchema;
   except
   end;

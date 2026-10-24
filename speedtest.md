@@ -142,30 +142,90 @@ The SQL suite and the 8-step crash chain stayed green at every step.
 
 ---
 
-## 5. Correctness gates
+## 5. Single-row writes (autocommit) — 2026-10-24
 
-All performance changes were made while the following gates were green:
+Complaint: "insert, update and delete are still very slow". The single-row
+(autocommit) write path was measured; two bottlenecks were found and fixed.
 
-| Gate | Result |
-|---|---|
-| `sqltest` | 2527 / 2527 |
-| `crashtest` | 8 / 8 (zero data loss) |
-| `rawchk` | 29 / 29 |
-| `mrowchk` | 0 errors |
-| `fuzzchk` | 3000 / 3000 |
-| `sqlite_diff` | 4000 / 4000 |
-| `hashchk` | 80 / 80 |
-| `copychk` | 17 / 17 |
-| `zonechk` | 0 errors |
-| `skipchk` | 0 errors |
-| `countchk` | 120 / 120 |
+Conditions: Windows, FPC 3.2.4 i386-win32, `-O1`, via SQL text (`sq.Exec`),
+default durability (`SyncWrite=True`, `SyncWriteInterval=0` → fsync on every
+commit), 20,000 rows, single process.
 
-Only `sqltest` remains in the repository; the others were one-off verification
-tools. Their results are recorded here.
+| Operation (20,000 rows, one at a time) | Before | After | Gain |
+|---|---:|---:|---:|
+| `INSERT` autocommit | 74.0 s — 3.70 ms/row (270/s) | **8.61 s — 0.430 ms/row (2,324/s)** | **8.6x** |
+| `UPDATE` (PK) autocommit | 138.9 s — 6.94 ms/row (144/s) | **7.74 s — 0.387 ms/row (2,585/s)** | **17.9x** |
+| `DELETE` (PK) autocommit | 137.3 s — 6.87 ms/row (146/s) | **7.48 s — 0.374 ms/row (2,673/s)** | **18.4x** |
+
+The bulk (single transaction) path held a separate O(n²) bottleneck, also
+fixed (100,000 rows, single transaction):
+
+| Bulk operation | Before | After | Gain |
+|---|---:|---:|---:|
+| `DELETE ... WHERE` (one statement) | 0.1575 ms/row (15.8 s) | **0.0134 ms/row (1.34 s)** | **11.7x** |
+| PK `DELETE` (open batch) | 0.1735 ms/row (17.3 s) | **0.0296 ms/row (2.96 s)** | **5.9x** |
+| `UPDATE ... WHERE` (one statement) | 0.0226 ms/row | 0.0223 ms/row | — |
+| `INSERT` (open batch) | 0.0065 ms/row (154k/s) | 0.0064 ms/row (156k/s) | — |
+
+### Root cause 1 — the whole schema was rewritten on every INSERT
+
+`TVTableDb.BumpAutoInc` called `MarkSchema` → `SaveSchema` whenever the
+counter advanced; `SaveSchema` serialized the entire table/role/RLS text, ran
+the `GuardSchemaLoss` check, wrote it to the KV store and fsynced. That cost
+~3.0 ms on every single-row INSERT. The counter now only advances in memory
+(`FAutoIncDirty`); the schema is written once on `Close` or on the next
+structural DDL. A lost counter self-heals via `ReadRow`/`MaxPkInt`.
+
+### Root cause 2 — in-place updates on single-row writes
+
+Reusing a dead span for a single-row UPDATE/DELETE meant three fsyncs (undo
+pre-image, main file, undo commit marker) plus creating and deleting the
+`.undo` file on every write (≈1.5 ms on Windows). In-place writing is now used
+only for **multi-row** operations (`FInBatch and FPending.Count > 1`);
+single-row writes take the append path with a single fsync. The trade-off is
+file growth: dead spans are reused by later bulk writes and reclaimed by
+`VACUUM`/`Compact`.
+
+### Extra — free-span lookup was O(n²)
+
+`TryTakeFreeSpan` scanned the list from the start and took the first fitting
+span (`TList.Delete(0)` is O(n)). A 100,000-row `DELETE` produced a new dead
+span per row and immediately searched, giving O(n²) overall. The list is now
+kept sorted by size: lookup is a binary search (O(log n)), insertion of
+equal-sized spans is O(1).
+
+### Measured floor
+
+Raw `fsync` on this machine is ≈0.29–0.32 ms. With `SyncWrite=True` the floor
+for a single-row write is ≈0.35 ms/statement (~2,800/s), and that floor is
+reached. Users needing more should use `SyncWriteInterval` (group commit) or
+an explicit transaction; with group commit an `INSERT` costs 0.030 ms
+(~33,000/s).
 
 ---
 
-## 6. Reproducing the measurements
+## 6. Correctness gates
+
+All performance changes were made while the following gates were green
+(2026-10-24):
+
+| Gate | Result |
+|---|---|
+| `sqltest` — win32 (lazbuild, `-B`) | **3090 / 3090** (`kalan=0`) |
+| `sqltest` — win64 (`-Px86_64 -Twin64 -O1`) | **3055 / 3055** (`kalan=0`) |
+| `sqltest` — Linux (WSL, FPC 3.2.4) | **3055 / 3055** (`kalan=0`) |
+
+The H11 (undo journal / in-place) tests were updated to the new contract:
+dead-span reuse is verified for multi-row transactions, while single-row
+writes take the append path.
+
+Earlier campaigns also ran `crashtest`, `rawchk`, `mrowchk`, `fuzzchk`,
+`sqlite_diff`, `hashchk`, `copychk`, `zonechk`, `skipchk` and `countchk`
+green; those were one-off tools and only `sqltest` remains in the repository.
+
+---
+
+## 7. Reproducing the measurements
 
 Correctness with `sqltest`:
 
@@ -174,7 +234,8 @@ lazbuild -B sqltest.lpi
 sqltest.exe C:\temp\vdbtest
 ```
 
-Expected: `SONUC: gecen=2527 kalan=0`.
+Expected: `SONUC: gecen=3090 kalan=0` (win32) or `gecen=3055 kalan=0`
+(win64/Linux; a few TLS/OpenSSL tests are skipped when the DLL is missing).
 
 The benchmark programs (`idxbench`, `skipchk`, `countchk`) were removed during
 cleanup. To repeat the numbers, generate a 1M-row dataset and run the relevant
@@ -182,7 +243,7 @@ SQL through `sqltest` or your own harness.
 
 ---
 
-## 7. Observations
+## 8. Observations
 
 - VDB is strongest at **PK point lookups** and **single-file/embedded** use.
 - SQLite is still clearly ahead on bulk `INSERT`, `UPDATE` and `DELETE`; this
