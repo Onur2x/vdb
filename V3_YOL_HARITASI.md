@@ -123,8 +123,8 @@ Sayfa motorunu yazmak kolay; asıl maliyet şu 4 dosyada. Plan bunları hesaba k
 
 - [x] 1.1 `VDbPage.pas`: 4 KB sabit sayfa, başlık, slot dizini, CRC32, tip alanı
 - [x] 1.2 `pagechk`: 100k rastgele ekle/oku/güncelle/sil, referans map ile birebir; **0 hata** kapısı (21/21, `kalan=0`)
-- [ ] 1.3 `VDbPageStore.pas`: buffer pool (CLOCK, pin/dirty/LRU), sayfa ayır/serbest bırak
-- [ ] 1.4 `freelist`: trunk page zinciri; silinen sayfa yeniden kullanılır
+- [x] 1.3 `VDbPageStore.pas`: buffer pool (CLOCK, pin/dirty/LRU), sayfa ayır/serbest bırak (15/15, `storechk`)
+- [x] 1.4 `freelist`: trunk page zinciri; silinen sayfa yeniden kullanılır (trunk sızmıyor: boşalınca sayfa olarak geri kazanılır)
 - [ ] 1.5 `VDbPageHeap.pas`: slotted heap insert/güncelle/sil, >2 KB için overflow zinciri
 - [ ] 1.6 Sayfa bölme (`split`) + doluluk %70–90 hedefi
 - [ ] 1.7 `heapchk`: 1M op, 0 hata; INSERT sonrası tüm anahtarlar okunabilir
@@ -194,6 +194,30 @@ ContentOff | FragBytes | LSN`. `Slot.Off = 0` → slot boş.
 (3900 bayt yük, 12 bayt artık) → yük doluluğu **%95,7**. 100.000 rastgele
 işlem (25.318 ekle / 25.129 sil / 17.384 güncelle / 5.027 sıkıştır) sonunda
 8 sayfanın tamamı referans modelle **birebir** aynı, `kalan=0`.
+
+---
+
+## Depo katmanı (Gün 2-3 — `VDbPageStore.pas`)
+
+Dosya: `sayfa 0 = başlık`, `sayfa 1..N = veri`. Başlık kendi CRC'siyle
+korunur; v2 dosyası açılırsa `MIGRATE TO v3` hatası verir.
+
+- **Buffer pool:** CLOCK (ikinci şans), pin/dirty, varsayılan 512 sayfa (2 MB).
+  Pinli sayfa tahliye edilemez; tümü pinliyse açık hata.
+- **CRC:** yalnızca yazarken (`Flush`/tahliye). Okurken `PageVerify` ile
+  denetlenir, bozuk sayfa sessizce kabul edilmez.
+- **Freelist:** LIFO, trunk sayfaları 1019 sayfa numarası taşır, dolunca
+  yeni trunk başa eklenir. Trunk sayfası VDbPage formatı kullanmaz,
+  kendi sihirli sayısı + CRC'si vardır.
+- **Trunk yan yükü:** ilk serbest bırakma 1 sayfa büyütür (trunk).
+  Trunk boşalınca **sızmaz**; sıradaki ayırmada sayfa olarak geri verilir
+  (`storechk` bunu doğruluyor).
+
+Ölçüm (`storechk`, 2000 sayfa): 2000 sayfa yazıldı, 64'lük havuzda
+**3936 tahliye** ile geri okundu, desen birebir; 667 sayfa serbest bırakılıp
+yeniden ayrıldı, veri sayfası eklenmedi; kapat/aç sonrası CRC'ler geçerli;
+bozulmuş veri **ve** başlık sayfası reddedildi; 8'lik havuzda 20.000 rasgele
+erişim 0 hata. Sonuç: `gecen=15 kalan=0`.
 
 ---
 

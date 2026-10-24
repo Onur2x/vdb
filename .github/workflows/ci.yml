@@ -48,6 +48,23 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:LAZBUILD -B pagechk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:LAZBUILD -B storechk.lpi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Sayfa deposu kapisi (storechk)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbstorechk'
+          $out = & .\storechk.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'SAYFA DEPOSU DOGRULANDI') {
+            Write-Error 'storechk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'storechk kalan > 0'
+            exit 1
+          }
 
       - name: Sayfa cekirdegi kapisi (pagechk)
         shell: pwsh
