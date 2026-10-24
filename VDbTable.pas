@@ -687,6 +687,11 @@ function IdxColsOfTable(TableId: Word; ColIdx: Integer): TIntArray;
       const OnConflictTarget: TStrArray;
       const SetValues: TSetValuePairs;
       out OutPk: string; out OutVals: TStrArray): Boolean;
+    { Sprint 2.9: ON CONFLICT(<hedef>) icin UNIQUE indeks uzerinden catisan
+      satirin PK'sini bulur. PK catismasi yolundan AYRI tutulur: PK'siz
+      tabloda ON CONFLICT(a) (a UNIQUE) eskiden hicbir sey yapmiyordu. }
+    function FindConflictPk(const T: TTableDef; const Vals: TStrArray;
+      const Target: TStrArray; out FoundPk: string): Boolean;
     // F-35: User-defined function / procedure support
     function FunctionExists(const FuncName: string): Boolean;
     function ExecuteFunction(const FuncName: string; const Args: TStrArray): string;
@@ -9797,6 +9802,53 @@ begin
   Result := True;
 end;
 
+function TVTableDb.FindConflictPk(const T: TTableDef; const Vals: TStrArray;
+  const Target: TStrArray; out FoundPk: string): Boolean;
+{ ON CONFLICT(<hedef>) hedefi bir UNIQUE indeks/kolon kumesidir. Catisan
+  satirin PK'si dondurulur. Indeks varsa aralik aramasi, yoksa tam tarama. }
+var
+  icols: TIntArray;
+  ikey: string;
+  i, k, lo, hi: Integer;
+  e: TIdxEntries;
+  pks: TStrArray;
+  rows: TStrMatrix;
+begin
+  Result := False;
+  FoundPk := '';
+  if Length(Target) = 0 then Exit;
+  SetLength(icols, Length(Target));
+  for i := 0 to High(Target) do
+  begin
+    icols[i] := FindCol(T, Target[i]);
+    if icols[i] < 0 then
+      raise EVDbException.Create(ecColumnNotFound,
+        'ON CONFLICT hedefi kolon yok: ' + Target[i]);
+  end;
+  ikey := VDbIdxJoin(Vals, icols);
+  if ikey = '' then Exit;            // NULL hedef catismaz
+  if (Length(icols) = 1) and TryGetMemIndex(T.TableId, icols[0], e) then
+  begin
+    lo := 0; hi := 0;
+    if VDbIdxRange(e, T.Cols[icols[0]].Ctype, '=', Vals[icols[0]], lo, hi) then
+      for k := lo to hi - 1 do
+      begin
+        FoundPk := e[k].Pk;
+        Result := True;
+        Exit;
+      end;
+    Exit;
+  end;
+  ScanRows(T.Name, pks, rows);
+  for k := 0 to High(pks) do
+    if VDbIdxJoin(rows[k], icols) = ikey then
+    begin
+      FoundPk := pks[k];
+      Result := True;
+      Exit;
+    end;
+end;
+
 function TVTableDb.UpsertRowReturning(const Table: string; const ColNames, Values: TStrArray;
   const OnConflictAction: TOnConflictAction;
   const OnConflictTarget: TStrArray;
@@ -9816,6 +9868,8 @@ var
   exVals: TStrArray;
   conflict: Boolean;
   doUpdate: Boolean;
+  cfPk: string;
+  excl: string;
 begin
   Result := False;
   OutPk := '';
@@ -9876,7 +9930,21 @@ begin
     if pk = '' then raise EVDbException.Create(ecInvalidName, 'PK bos olamaz');
   end;
   
-  CheckConstraints(t, vals, '');
+  { Sprint 2.9: ON CONFLICT(<hedef>) hedefi bir UNIQUE kolon/indeks olabilir.
+    Catisma ONCE cozulur: aksi halde UNIQUE denetimi daha satir yazilmadan
+    hata firlatir ve DO UPDATE hic calismazdi. Catisan satirin PK'si
+    `ExcludePk` olarak verilir; boylece satirin KENDI degeri ihlal sayilmaz
+    (klasik upsert semantigi). }
+  excl := '';
+  if (Length(OnConflictTarget) > 0) and (OnConflictAction <> ocaNone) then
+    if FindConflictPk(t, vals, OnConflictTarget, cfPk) then
+    begin
+      excl := cfPk;
+      pk := cfPk;
+      if t.PkIndex >= 0 then vals[t.PkIndex] := pk;
+    end;
+
+  CheckConstraints(t, vals, excl);
   if t.PkIndex >= 0 then pk := vals[t.PkIndex];
   if not VDbCheckOK(vals, t.Checks) then
     raise EVDbException.Create(ecCheckViolation, 'CHECK ihlali: ' + t.Name);

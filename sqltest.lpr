@@ -15,7 +15,7 @@ uses
     yoksa TEvent.Create "Failed to create OS basic event" verir. }
   {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes, Math, StrUtils, VDbCore, VDbTypes, VDbTable, VDbSql, VDbSync, VDbCrc32,
-  VDbBackendApi, VDbCrypt, VDbKdf, VDbSpatial, VDbRange, VDbMonitor, VDbPlatform, VDbCost,
+  VDbBackendApi, VDbBackendV3, VDbCrypt, VDbKdf, VDbSpatial, VDbRange, VDbMonitor, VDbPlatform, VDbCost,
   VDbExtension, VDbText, VDbParallel, VDbReplication, VDbNet, VDbSqlServer,
   VDbClientNet, VDbMetricsHttp, VDbPgWire, VDbTls, VDbTrace, dynlibs, VDbUndo;
 { VDbTypes: TStrArray / TStrMatrix gibi paylasilan tipler artik tek
@@ -30,6 +30,11 @@ var
   R: TSqlResult;
   nPass, nFail, nGrp: Integer;
   grpName: string;
+  { Sprint 2.9: --backend=v3 gercek kosu. `gBe` dolu ise ana veritabani v3
+    sayfa motorundadir ve `kv` nil kalir (v2'ye ozgu yollar kullanilamaz). }
+  gV3: Boolean = False;
+  gBe: IVDbBackend = nil;
+  nSkip: Integer = 0;
 
 const
   Q = '''';   // tek tirnak
@@ -408,15 +413,65 @@ begin
 end;
 
 // Ayri bir calisma yerinde gecici acma/kapatma
+function DbFileOf(const P: string): string;
+begin
+  if SameText(ExtractFileExt(P), '.odb') then
+    Result := P
+  else
+    Result := IncludeTrailingPathDelimiter(P) + 'veritabani.odb';
+end;
+
+procedure CloseDb;
+begin
+  if sq <> nil then FreeAndNil(sq);
+  if tb <> nil then
+  begin
+    tb.Close;
+    FreeAndNil(tb);
+  end;
+  if kv <> nil then
+  begin
+    kv.Close;
+    FreeAndNil(kv);
+  end;
+  gBe := nil;
+  sq := nil; tb := nil; kv := nil;
+end;
+
+{ Sprint 2.9: ana veritabaniyi secilen backend ile acar. `P` bir klasor ya da
+  .odb dosyasi olabilir (TVDb.Open ile ayni kural). }
+procedure NewDb(const P: string);
+var
+  f, dir: string;
+begin
+  CloseDb;
+  if gV3 then
+  begin
+    f := DbFileOf(P);
+    dir := ExtractFileDir(f);
+    if dir = '' then dir := '.';
+    ForceDirectories(dir);
+    gBe := TVdbBackendV3.Create(f, True, 256);
+    tb := TVTableDb.CreateBackend(gBe);
+    sq := TVSql.Create(tb);
+    tb.Open(IncludeTrailingPathDelimiter(dir));
+  end
+  else
+  begin
+    kv := TVDb.Create;
+    tb := TVTableDb.Create(kv);
+    sq := TVSql.Create(tb);
+    kv.Open(P);
+    tb.Open(P);
+  end;
+end;
+
 procedure Fresh(const Nm: string);
 var p: string;
 begin
   p := D + PathDelim + Nm;
   ForceDirectories(p);
-  if tb <> nil then begin tb.Close; kv.Close; sq.Free; tb.Free; kv.Free; end;
-  kv := TVDb.Create; tb := TVTableDb.Create(kv); sq := TVSql.Create(tb);
-  kv.Open(p);
-  tb.Open(p);
+  NewDb(p);
 end;
 
 procedure UseDir(const Nm: string);
@@ -424,10 +479,7 @@ var p: string;
 begin
   p := D + PathDelim + Nm;
   ForceDirectories(p);
-  if tb <> nil then begin tb.Close; kv.Close; sq.Free; tb.Free; kv.Free; end;
-  kv := TVDb.Create; tb := TVTableDb.Create(kv); sq := TVSql.Create(tb);
-  kv.Open(p);
-  tb.Open(p);
+  NewDb(p);
 end;
 
 procedure CorruptLastByte(const P: string);
@@ -453,11 +505,7 @@ end;
 
 procedure Shutdown;
 begin
-  if tb <> nil then
-  begin
-    tb.Close; kv.Close; sq.Free; tb.Free; kv.Free;
-    sq := nil; tb := nil; kv := nil;
-  end;
+  CloseDb;
 end;
 
 { ------------------------------------------------------------------ TESTLER }
@@ -7290,6 +7338,19 @@ begin
   // Test 8: RETURNING with UPSERT (R-04)
   Chk('ON CONFLICT DO UPDATE RETURNING val',
       'INSERT INTO t(id, val) VALUES(1, ''ret'') ON CONFLICT(id) DO UPDATE SET val=EXCLUDED.val RETURNING val', -1);
+
+  { Sprint 2.9 regresyon kapisi: tablo duzeyi UNIQUE(...) ONCEDEN parser
+    tarafindan yutuluyordu; ne indeks ne kolon bayragi olusuyor, yani
+    kisit SESSIZCE yok sayiliyordu. Artik UNIQUE indeks kurulur. }
+  sq.Exec('CREATE TABLE t5(a TEXT, b TEXT, UNIQUE(a))');
+  sq.Exec('INSERT INTO t5(a,b) VALUES(''x'',''1'')');
+  ChkErr('tablo duzeyi UNIQUE(a) tekrari reddeder',
+      'INSERT INTO t5(a,b) VALUES(''x'',''2'')');
+  ChkVal('tablo duzeyi UNIQUE sonrasi tek satir',
+      'SELECT COUNT(*) FROM t5', 0, 0, '1');
+  Chk('tablo duzeyi UNIQUE + ON CONFLICT DO UPDATE',
+      'INSERT INTO t5(a,b) VALUES(''x'',''3'') ON CONFLICT(a) DO UPDATE SET b=EXCLUDED.b', -1);
+  ChkVal('UNIQUE hedefli UPSERT degeri', 'SELECT b FROM t5 WHERE a=''x''', 0, 0, '3');
 end;
 
 procedure T11_Delete;
@@ -7648,9 +7709,16 @@ begin
   Chk('tam tarama', 'SELECT COUNT(*) FROM t', 1);
   Chk('ORDER BY + LIMIT', 'SELECT s FROM t ORDER BY v DESC LIMIT 1', 1);
   ChkVal('ORDER BY DESC ilk', 'SELECT s FROM t ORDER BY v DESC LIMIT 1', 0, 0, 'satir1000');
-  R := sq.Exec('VACUUM');
-  Ok('buyuk veride VACUUM', R.Msg);
-  ChkVal('VACUUM sonrasi 1000 satir', 'SELECT COUNT(*) FROM t', 0, 0, '1000');
+  { Sprint 2.9: VACUUM v2 veri dosyasini yeniden yazar; v3 sayfa motorunda
+    karsiligi v3.1'de (sayfa birlestirme). Test v3'te bu bolumu atlar. }
+  if gV3 then
+    WriteLn('   ATLA VACUUM (v3 sayfa motorunda v3.1)')
+  else
+  begin
+    R := sq.Exec('VACUUM');
+    Ok('buyuk veride VACUUM', R.Msg);
+    ChkVal('VACUUM sonrasi 1000 satir', 'SELECT COUNT(*) FROM t', 0, 0, '1000');
+  end;
 end;
 
 { -------------------------------------------------- 20) coklu kayit / coklu komut }
@@ -15962,6 +16030,282 @@ begin
   end;
 end;
 
+{ Sprint 2.9: test kosucusu. Her test kendi try/except'inde kosar;
+  boylece bir hata kalan testleri durdurmaz ve siniflandirma yapilabilir. }
+type
+  TTestRec = record
+    Nm: string;
+    P: procedure;
+  end;
+
+const
+  TEST_SAYISI = 178;
+
+  { v3 kosusunda ATLA: bu testler yalniz v2 motorunun (TVDb/WAL/arsiv/
+    zone/indeks .idx) ozel yollarini kullanir; v3'te karsiligi yoktur.
+    Liste iki kaynaktan olusur: (a) govdesinde `kv.`/`TVDb.Create` gecen
+    testler (otomatik tarandi), (b) yalniz v2 yonetim komutlarini
+    (BACKUP/VACUUM/VERIFY + SAVEPOINT) sinayan testler. }
+  V2_ONLY: array[0..58] of string = (
+    'T101_TcpReplication',
+    'T105_ShowStats',
+    'T117_Generated',
+    'T122_KvStore',
+    'T125_KolonSifreleme',
+    'T126_F42_TxIsolation',
+    'T127_H5_BlockCrc',
+    'T128_H11_Undo',
+    'T129_H11_InPlace',
+    'T130_PkRangeCtype',
+    'T131_H12_TopN',
+    'T132_H12_StreamTopN',
+    'T133_H13_StreamGroupBy',
+    'T134_H12c_MultiTopN',
+    'T135_H14_FloatSort',
+    'T136_H13_GroupDiff',
+    'T137_H15_StreamHaving',
+    'T138_H16_StreamDistinct',
+    'T139_H17_StreamFilteredCount',
+    'T140_H18_RawExactCount',
+    'T141_H19_RawLikeCount',
+    'T142_H20_RawBoolTree',
+    'T143_H21_RawTreeSelectPaths',
+    'T144_H22_DeepOffsetLive',
+    'T145_H8_MCV',
+    'T147_M8_SqlancerStil',
+    'T148_H25_AutoCompact',
+    'T15_Bakim',
+    'T21_KritikHataDogrulama',
+    'T24_Dayaniklilik',
+    'T36_F1_RecoverKirpma',
+    'T37_F1_CommitBatchAtomik',
+    'T42_F1_BatchInsertAtomik',
+    'T43_F1_MigrateLegacy',
+    'T46_F2_SemaBozukSatir',
+    'T53_F2_DDLAtomik',
+    'T57_F2_BozukDosya',
+    'T58_F2_VerifyBATCHEND',
+    'T59_F2_DizinFlush',
+    'T60_F2_WALKilit',
+    'T61_F2_GetDogruluk',
+    'T63_F2_BozukKayitTespit',
+    'T64_F2_PKsizTablo',
+    'T65_F2_UniqueIndex',
+    'T69_YonetimAPI',
+    'T70_YonetimBakim',
+    'T72_WALReplay',
+    'T73_OtomatikWAL',
+    'T74_KayitSifreleme',
+    'T75_SifrelemeDayaniklilik',
+    'T76_ReplayWALSifreleme',
+    'T77_AlterDatabaseKey',
+    'T78_AsofGecmis',
+    'T79_Savepoint',
+    'T92_MVCC_Isoaltion',
+    'T94_RBAC_Persist',
+    'T94c_RLS_Persist',
+    'T95_WALArsiv',
+    'T95b_Replication'
+  );
+
+var
+  TESTLER: array[0..TEST_SAYISI - 1] of TTestRec;
+
+function IsV2Only(const Nm: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 0 to High(V2_ONLY) do
+    if V2_ONLY[i] = Nm then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+procedure BuildTests;
+begin
+  TESTLER[0].Nm := 'T01_Veritabani'; TESTLER[0].P := T01_Veritabani;
+  TESTLER[1].Nm := 'T02_Tipler'; TESTLER[1].P := T02_Tipler;
+  TESTLER[2].Nm := 'T03_CreateKisit'; TESTLER[2].P := T03_CreateKisit;
+  TESTLER[3].Nm := 'T04_Insert'; TESTLER[3].P := T04_Insert;
+  TESTLER[4].Nm := 'T05_SelectTemel'; TESTLER[4].P := T05_SelectTemel;
+  TESTLER[5].Nm := 'T06_Where'; TESTLER[5].P := T06_Where;
+  TESTLER[6].Nm := 'T07_TipKarsilastirma'; TESTLER[6].P := T07_TipKarsilastirma;
+  TESTLER[7].Nm := 'T08_Join'; TESTLER[7].P := T08_Join;
+  TESTLER[8].Nm := 'T08b_JoinZincir'; TESTLER[8].P := T08b_JoinZincir;
+  TESTLER[9].Nm := 'T08c_RightFullJoin'; TESTLER[9].P := T08c_RightFullJoin;
+  TESTLER[10].Nm := 'T08c_AltSorgu'; TESTLER[10].P := T08c_AltSorgu;
+  TESTLER[11].Nm := 'T08d_CaseWhen'; TESTLER[11].P := T08d_CaseWhen;
+  TESTLER[12].Nm := 'T08e_CTE'; TESTLER[12].P := T08e_CTE;
+  TESTLER[13].Nm := 'T08f_Pencere'; TESTLER[13].P := T08f_Pencere;
+  TESTLER[14].Nm := 'T08g_Collation'; TESTLER[14].P := T08g_Collation;
+  TESTLER[15].Nm := 'T08h_CrossJoin'; TESTLER[15].P := T08h_CrossJoin;
+  TESTLER[16].Nm := 'T08i_NaturalUsing'; TESTLER[16].P := T08i_NaturalUsing;
+  TESTLER[17].Nm := 'T08j_Lateral'; TESTLER[17].P := T08j_Lateral;
+  TESTLER[18].Nm := 'T08k_MatView'; TESTLER[18].P := T08k_MatView;
+  TESTLER[19].Nm := 'T08l_ViewDML'; TESTLER[19].P := T08l_ViewDML;
+  TESTLER[20].Nm := 'T08m_StoredProc'; TESTLER[20].P := T08m_StoredProc;
+  TESTLER[21].Nm := 'T08n_Trigger'; TESTLER[21].P := T08n_Trigger;
+  TESTLER[22].Nm := 'T08i_JoinAggregate'; TESTLER[22].P := T08i_JoinAggregate;
+  TESTLER[23].Nm := 'T09_GroupAggregate'; TESTLER[23].P := T09_GroupAggregate;
+  TESTLER[24].Nm := 'T09b_HavingAggregate'; TESTLER[24].P := T09b_HavingAggregate;
+  TESTLER[25].Nm := 'T09c_NotOrDNF'; TESTLER[25].P := T09c_NotOrDNF;
+  TESTLER[26].Nm := 'T09d_NotNull3VL'; TESTLER[26].P := T09d_NotNull3VL;
+  TESTLER[27].Nm := 'T09e_NullIfCoalesce'; TESTLER[27].P := T09e_NullIfCoalesce;
+  TESTLER[28].Nm := 'T09f_ILike'; TESTLER[28].P := T09f_ILike;
+  TESTLER[29].Nm := 'T09g_AnySomeAll'; TESTLER[29].P := T09g_AnySomeAll;
+  TESTLER[30].Nm := 'T09h_FetchFirstNulls'; TESTLER[30].P := T09h_FetchFirstNulls;
+  TESTLER[31].Nm := 'T09i_Qualify'; TESTLER[31].P := T09i_Qualify;
+  TESTLER[32].Nm := 'T09j_AggDistinct'; TESTLER[32].P := T09j_AggDistinct;
+  TESTLER[33].Nm := 'T09k_Filter'; TESTLER[33].P := T09k_Filter;
+  TESTLER[34].Nm := 'T09l_Explain'; TESTLER[34].P := T09l_Explain;
+  TESTLER[35].Nm := 'T09m_PartialIndex'; TESTLER[35].P := T09m_PartialIndex;
+  TESTLER[36].Nm := 'T09n_ExprIndex'; TESTLER[36].P := T09n_ExprIndex;
+  TESTLER[37].Nm := 'T09o_CoveringIndex'; TESTLER[37].P := T09o_CoveringIndex;
+  TESTLER[38].Nm := 'T09p_SlowQuery'; TESTLER[38].P := T09p_SlowQuery;
+  TESTLER[39].Nm := 'T09r_Xml'; TESTLER[39].P := T09r_Xml;
+  TESTLER[40].Nm := 'T09s_Spatial'; TESTLER[40].P := T09s_Spatial;
+  TESTLER[41].Nm := 'T09t_Range'; TESTLER[41].P := T09t_Range;
+  TESTLER[42].Nm := 'T10_Update'; TESTLER[42].P := T10_Update;
+  TESTLER[43].Nm := 'T10b_Upsert'; TESTLER[43].P := T10b_Upsert;
+  TESTLER[44].Nm := 'T11_Delete'; TESTLER[44].P := T11_Delete;
+  TESTLER[45].Nm := 'T11_Returning'; TESTLER[45].P := T11_Returning;
+  TESTLER[46].Nm := 'T12_Transaction'; TESTLER[46].P := T12_Transaction;
+  TESTLER[47].Nm := 'T13_AlterTable'; TESTLER[47].P := T13_AlterTable;
+  TESTLER[48].Nm := 'T14_Index'; TESTLER[48].P := T14_Index;
+  TESTLER[49].Nm := 'T15_Bakim'; TESTLER[49].P := T15_Bakim;
+  TESTLER[50].Nm := 'T16_Parametreli'; TESTLER[50].P := T16_Parametreli;
+  TESTLER[51].Nm := 'T17_Json'; TESTLER[51].P := T17_Json;
+  TESTLER[52].Nm := 'T18_Kalici'; TESTLER[52].P := T18_Kalici;
+  TESTLER[53].Nm := 'T19_Olcek'; TESTLER[53].P := T19_Olcek;
+  TESTLER[54].Nm := 'T20_CokluKayit'; TESTLER[54].P := T20_CokluKayit;
+  TESTLER[55].Nm := 'T21_KritikHataDogrulama'; TESTLER[55].P := T21_KritikHataDogrulama;
+  TESTLER[56].Nm := 'T22_MinMaxTipKiyas'; TESTLER[56].P := T22_MinMaxTipKiyas;
+  TESTLER[57].Nm := 'T23_Blob'; TESTLER[57].P := T23_Blob;
+  TESTLER[58].Nm := 'T24_Dayaniklilik'; TESTLER[58].P := T24_Dayaniklilik;
+  TESTLER[59].Nm := 'T25_F1_UnionSiraVeLimit'; TESTLER[59].P := T25_F1_UnionSiraVeLimit;
+  TESTLER[60].Nm := 'T26_F1_OrderByTip'; TESTLER[60].P := T26_F1_OrderByTip;
+  TESTLER[61].Nm := 'T27_F1_OrderByBilinmeyenKolon'; TESTLER[61].P := T27_F1_OrderByBilinmeyenKolon;
+  TESTLER[62].Nm := 'T28_F1_JoinTipKiyas'; TESTLER[62].P := T28_F1_JoinTipKiyas;
+  TESTLER[63].Nm := 'T29_F1_UpdateBilinmeyenKolon'; TESTLER[63].P := T29_F1_UpdateBilinmeyenKolon;
+  TESTLER[64].Nm := 'T30_F1_DeleteDatabase'; TESTLER[64].P := T30_F1_DeleteDatabase;
+  TESTLER[65].Nm := 'T31_F1_NotInNull'; TESTLER[65].P := T31_F1_NotInNull;
+  TESTLER[66].Nm := 'T32_F1_LimitGecersiz'; TESTLER[66].P := T32_F1_LimitGecersiz;
+  TESTLER[67].Nm := 'T33_F1_SumBosKume'; TESTLER[67].P := T33_F1_SumBosKume;
+  TESTLER[68].Nm := 'T34_F1_AlterRenameBozukSatir'; TESTLER[68].P := T34_F1_AlterRenameBozukSatir;
+  TESTLER[69].Nm := 'T35_F1_OffsetAlias'; TESTLER[69].P := T35_F1_OffsetAlias;
+  TESTLER[70].Nm := 'T36_F1_RecoverKirpma'; TESTLER[70].P := T36_F1_RecoverKirpma;
+  TESTLER[71].Nm := 'T37_F1_CommitBatchAtomik'; TESTLER[71].P := T37_F1_CommitBatchAtomik;
+  TESTLER[72].Nm := 'T38_F1_CheckRestrictFiltresi'; TESTLER[72].P := T38_F1_CheckRestrictFiltresi;
+  TESTLER[73].Nm := 'T39_F1_UniqueBayatAnahtar'; TESTLER[73].P := T39_F1_UniqueBayatAnahtar;
+  TESTLER[74].Nm := 'T40_F1_AlterDropColumnFK'; TESTLER[74].P := T40_F1_AlterDropColumnFK;
+  TESTLER[75].Nm := 'T41_F1_AlterAddColumnNotNull'; TESTLER[75].P := T41_F1_AlterAddColumnNotNull;
+  TESTLER[76].Nm := 'T42_F1_BatchInsertAtomik'; TESTLER[76].P := T42_F1_BatchInsertAtomik;
+  TESTLER[77].Nm := 'T43_F1_MigrateLegacy'; TESTLER[77].P := T43_F1_MigrateLegacy;
+  TESTLER[78].Nm := 'T44_F1_ParserDerinlik'; TESTLER[78].P := T44_F1_ParserDerinlik;
+  TESTLER[79].Nm := 'T45_F1_SplitStatements'; TESTLER[79].P := T45_F1_SplitStatements;
+  TESTLER[80].Nm := 'T46_F2_SemaBozukSatir'; TESTLER[80].P := T46_F2_SemaBozukSatir;
+  TESTLER[81].Nm := 'T47_F2_BosTabloAdi'; TESTLER[81].P := T47_F2_BosTabloAdi;
+  TESTLER[82].Nm := 'T48_F2_DropTableFK'; TESTLER[82].P := T48_F2_DropTableFK;
+  TESTLER[83].Nm := 'T49_F2_SelfRefFK'; TESTLER[83].P := T49_F2_SelfRefFK;
+  TESTLER[84].Nm := 'T50_F2_IdxBLOBKarisim'; TESTLER[84].P := T50_F2_IdxBLOBKarisim;
+  TESTLER[85].Nm := 'T51_F2_DropColumnIdx'; TESTLER[85].P := T51_F2_DropColumnIdx;
+  TESTLER[86].Nm := 'T52_F2_AlterColumnType'; TESTLER[86].P := T52_F2_AlterColumnType;
+  TESTLER[87].Nm := 'T53_F2_DDLAtomik'; TESTLER[87].P := T53_F2_DDLAtomik;
+  TESTLER[88].Nm := 'T54_F2_UnionDistinct'; TESTLER[88].P := T54_F2_UnionDistinct;
+  TESTLER[89].Nm := 'T55_F2_PencereBellek'; TESTLER[89].P := T55_F2_PencereBellek;
+  TESTLER[90].Nm := 'T56_F2_AltSorgu'; TESTLER[90].P := T56_F2_AltSorgu;
+  TESTLER[91].Nm := 'T57_F2_BozukDosya'; TESTLER[91].P := T57_F2_BozukDosya;
+  TESTLER[92].Nm := 'T58_F2_VerifyBATCHEND'; TESTLER[92].P := T58_F2_VerifyBATCHEND;
+  TESTLER[93].Nm := 'T59_F2_DizinFlush'; TESTLER[93].P := T59_F2_DizinFlush;
+  TESTLER[94].Nm := 'T60_F2_WALKilit'; TESTLER[94].P := T60_F2_WALKilit;
+  TESTLER[95].Nm := 'T61_F2_GetDogruluk'; TESTLER[95].P := T61_F2_GetDogruluk;
+  TESTLER[96].Nm := 'T62_F2_DropColumnBatch'; TESTLER[96].P := T62_F2_DropColumnBatch;
+  TESTLER[97].Nm := 'T63_F2_BozukKayitTespit'; TESTLER[97].P := T63_F2_BozukKayitTespit;
+  TESTLER[98].Nm := 'T64_F2_PKsizTablo'; TESTLER[98].P := T64_F2_PKsizTablo;
+  TESTLER[99].Nm := 'T65_F2_UniqueIndex'; TESTLER[99].P := T65_F2_UniqueIndex;
+  TESTLER[100].Nm := 'T66_F2_DropColCokKolluIndeks'; TESTLER[100].P := T66_F2_DropColCokKolluIndeks;
+  TESTLER[101].Nm := 'T67_F3_Hijyen'; TESTLER[101].P := T67_F3_Hijyen;
+  TESTLER[102].Nm := 'T68_F3_CokKolluOndek'; TESTLER[102].P := T68_F3_CokKolluOndek;
+  TESTLER[103].Nm := 'T69_YonetimAPI'; TESTLER[103].P := T69_YonetimAPI;
+  TESTLER[104].Nm := 'T70_YonetimBakim'; TESTLER[104].P := T70_YonetimBakim;
+  TESTLER[105].Nm := 'T71_SemaSorgulari'; TESTLER[105].P := T71_SemaSorgulari;
+  TESTLER[106].Nm := 'T72_WALReplay'; TESTLER[106].P := T72_WALReplay;
+  TESTLER[107].Nm := 'T73_OtomatikWAL'; TESTLER[107].P := T73_OtomatikWAL;
+  TESTLER[108].Nm := 'T74_KayitSifreleme'; TESTLER[108].P := T74_KayitSifreleme;
+  TESTLER[109].Nm := 'T75_SifrelemeDayaniklilik'; TESTLER[109].P := T75_SifrelemeDayaniklilik;
+  TESTLER[110].Nm := 'T76_ReplayWALSifreleme'; TESTLER[110].P := T76_ReplayWALSifreleme;
+  TESTLER[111].Nm := 'T77_AlterDatabaseKey'; TESTLER[111].P := T77_AlterDatabaseKey;
+  TESTLER[112].Nm := 'T78_AsofGecmis'; TESTLER[112].P := T78_AsofGecmis;
+  TESTLER[113].Nm := 'T79_Savepoint'; TESTLER[113].P := T79_Savepoint;
+  TESTLER[114].Nm := 'T79b_IsolationForUpdate'; TESTLER[114].P := T79b_IsolationForUpdate;
+  TESTLER[115].Nm := 'T90_MVCC_Snapshot'; TESTLER[115].P := T90_MVCC_Snapshot;
+  TESTLER[116].Nm := 'T91_MVCC_Nested'; TESTLER[116].P := T91_MVCC_Nested;
+  TESTLER[117].Nm := 'T92_MVCC_Isoaltion'; TESTLER[117].P := T92_MVCC_Isoaltion;
+  TESTLER[118].Nm := 'T93_RBAC'; TESTLER[118].P := T93_RBAC;
+  TESTLER[119].Nm := 'T94_RBAC_Persist'; TESTLER[119].P := T94_RBAC_Persist;
+  TESTLER[120].Nm := 'T94b_RLS'; TESTLER[120].P := T94b_RLS;
+  TESTLER[121].Nm := 'T94c_RLS_Persist'; TESTLER[121].P := T94c_RLS_Persist;
+  TESTLER[122].Nm := 'T94d_Collation'; TESTLER[122].P := T94d_Collation;
+  TESTLER[123].Nm := 'T94e_Collation_Persist'; TESTLER[123].P := T94e_Collation_Persist;
+  TESTLER[124].Nm := 'T94f_Monitoring'; TESTLER[124].P := T94f_Monitoring;
+  TESTLER[125].Nm := 'T95_WALArsiv'; TESTLER[125].P := T95_WALArsiv;
+  TESTLER[126].Nm := 'T95b_Replication'; TESTLER[126].P := T95b_Replication;
+  TESTLER[127].Nm := 'T97_CrossPlatform'; TESTLER[127].P := T97_CrossPlatform;
+  TESTLER[128].Nm := 'T98_CBO'; TESTLER[128].P := T98_CBO;
+  TESTLER[129].Nm := 'T99_Extension'; TESTLER[129].P := T99_Extension;
+  TESTLER[130].Nm := 'T100_Parallel'; TESTLER[130].P := T100_Parallel;
+  TESTLER[131].Nm := 'T101_TcpReplication'; TESTLER[131].P := T101_TcpReplication;
+  TESTLER[132].Nm := 'T102_ConcurrentIndex'; TESTLER[132].P := T102_ConcurrentIndex;
+  TESTLER[133].Nm := 'T103_IcuCollation'; TESTLER[133].P := T103_IcuCollation;
+  TESTLER[134].Nm := 'T104_HashPartition'; TESTLER[134].P := T104_HashPartition;
+  TESTLER[135].Nm := 'T105_ShowStats'; TESTLER[135].P := T105_ShowStats;
+  TESTLER[136].Nm := 'T106_TcpSqlServer'; TESTLER[136].P := T106_TcpSqlServer;
+  TESTLER[137].Nm := 'T107_AuthSession'; TESTLER[137].P := T107_AuthSession;
+  TESTLER[138].Nm := 'T108_PreparedStatement'; TESTLER[138].P := T108_PreparedStatement;
+  TESTLER[139].Nm := 'T109_PoolSlotTCP'; TESTLER[139].P := T109_PoolSlotTCP;
+  TESTLER[140].Nm := 'T110_CopyFrom'; TESTLER[140].P := T110_CopyFrom;
+  TESTLER[141].Nm := 'T111_RasgeleDiferansiyel'; TESTLER[141].P := T111_RasgeleDiferansiyel;
+  TESTLER[142].Nm := 'T112_JsonPath'; TESTLER[142].P := T112_JsonPath;
+  TESTLER[143].Nm := 'T113_Vector'; TESTLER[143].P := T113_Vector;
+  TESTLER[144].Nm := 'T114_Fts'; TESTLER[144].P := T114_Fts;
+  TESTLER[145].Nm := 'T115_MetricsHttp'; TESTLER[145].P := T115_MetricsHttp;
+  TESTLER[146].Nm := 'T116_PgWire'; TESTLER[146].P := T116_PgWire;
+  TESTLER[147].Nm := 'T117_Generated'; TESTLER[147].P := T117_Generated;
+  TESTLER[148].Nm := 'T118_AeadKdf'; TESTLER[148].P := T118_AeadKdf;
+  TESTLER[149].Nm := 'T119_Trace'; TESTLER[149].P := T119_Trace;
+  TESTLER[150].Nm := 'T121_VectorAnn'; TESTLER[150].P := T121_VectorAnn;
+  TESTLER[151].Nm := 'T122_KvStore'; TESTLER[151].P := T122_KvStore;
+  TESTLER[152].Nm := 'T123_Arrow'; TESTLER[152].P := T123_Arrow;
+  TESTLER[153].Nm := 'T124_Parquet'; TESTLER[153].P := T124_Parquet;
+  TESTLER[154].Nm := 'T125_KolonSifreleme'; TESTLER[154].P := T125_KolonSifreleme;
+  TESTLER[155].Nm := 'T126_F42_TxIsolation'; TESTLER[155].P := T126_F42_TxIsolation;
+  TESTLER[156].Nm := 'T127_H5_BlockCrc'; TESTLER[156].P := T127_H5_BlockCrc;
+  TESTLER[157].Nm := 'T128_H11_Undo'; TESTLER[157].P := T128_H11_Undo;
+  TESTLER[158].Nm := 'T129_H11_InPlace'; TESTLER[158].P := T129_H11_InPlace;
+  TESTLER[159].Nm := 'T130_PkRangeCtype'; TESTLER[159].P := T130_PkRangeCtype;
+  TESTLER[160].Nm := 'T131_H12_TopN'; TESTLER[160].P := T131_H12_TopN;
+  TESTLER[161].Nm := 'T132_H12_StreamTopN'; TESTLER[161].P := T132_H12_StreamTopN;
+  TESTLER[162].Nm := 'T133_H13_StreamGroupBy'; TESTLER[162].P := T133_H13_StreamGroupBy;
+  TESTLER[163].Nm := 'T134_H12c_MultiTopN'; TESTLER[163].P := T134_H12c_MultiTopN;
+  TESTLER[164].Nm := 'T135_H14_FloatSort'; TESTLER[164].P := T135_H14_FloatSort;
+  TESTLER[165].Nm := 'T136_H13_GroupDiff'; TESTLER[165].P := T136_H13_GroupDiff;
+  TESTLER[166].Nm := 'T137_H15_StreamHaving'; TESTLER[166].P := T137_H15_StreamHaving;
+  TESTLER[167].Nm := 'T138_H16_StreamDistinct'; TESTLER[167].P := T138_H16_StreamDistinct;
+  TESTLER[168].Nm := 'T139_H17_StreamFilteredCount'; TESTLER[168].P := T139_H17_StreamFilteredCount;
+  TESTLER[169].Nm := 'T140_H18_RawExactCount'; TESTLER[169].P := T140_H18_RawExactCount;
+  TESTLER[170].Nm := 'T141_H19_RawLikeCount'; TESTLER[170].P := T141_H19_RawLikeCount;
+  TESTLER[171].Nm := 'T142_H20_RawBoolTree'; TESTLER[171].P := T142_H20_RawBoolTree;
+  TESTLER[172].Nm := 'T143_H21_RawTreeSelectPaths'; TESTLER[172].P := T143_H21_RawTreeSelectPaths;
+  TESTLER[173].Nm := 'T144_H22_DeepOffsetLive'; TESTLER[173].P := T144_H22_DeepOffsetLive;
+  TESTLER[174].Nm := 'T145_H8_MCV'; TESTLER[174].P := T145_H8_MCV;
+  TESTLER[175].Nm := 'T146_M9_OTLP'; TESTLER[175].P := T146_M9_OTLP;
+  TESTLER[176].Nm := 'T147_M8_SqlancerStil'; TESTLER[176].P := T147_M8_SqlancerStil;
+  TESTLER[177].Nm := 'T148_H25_AutoCompact'; TESTLER[177].P := T148_H25_AutoCompact;
+end;
+
 { ---------------------------------------------------------------------- main }
 
 var
@@ -15972,9 +16316,9 @@ var
 begin
   nPass := 0; nFail := 0; nGrp := 0;
   sq := nil; tb := nil; kv := nil;
-  { v3 hazirligi (2026-10-24): --backend=v2|v3. Varsayilan v2 (bugunku motor).
-    v3 backend'i henuz yok; istendiginde testler kosulmaz ve BASARILI
-    sayilmaz (yanlis yesil olmasin diye "GECTI" satiri yazilmaz). }
+  { Sprint 2.9 (2026-10-24): --backend=v2|v3. v3 gercek kosudur: ana
+    veritabani sayfa motorundadir; v2'ye ozgu testler ATLA olarak
+    isaretlenir (sessiz yesil YOK). Bilinmeyen backend reddedilir. }
   backend := 'v2';
   for i := 1 to ParamCount do
   begin
@@ -15982,15 +16326,14 @@ begin
     if Pos('--backend=', LowerCase(arg)) = 1 then
       backend := LowerCase(Copy(arg, Length('--backend=') + 1, MaxInt));
   end;
-  if (backend <> 'v2') then
+  if (backend <> 'v2') and (backend <> 'v3') then
   begin
     WriteLn('VDB SQL tam testi');
-    WriteLn('ATLA: --backend=', backend, ' isteniyor ama bu surumde yalniz v2 var.');
-    WriteLn('SONUC: gecen=0  kalan=0  (TUMU ATLANDI)');
-    WriteLn('v3 BACKEND HENUZ YOK - TEST KOSULMADI');
+    WriteLn('HATA: bilinmeyen backend: ', backend, ' (v2|v3)');
     ExitCode := 2;
     Exit;
   end;
+  gV3 := (backend = 'v3');
   if (ParamCount >= 1) and (Trim(ParamStr(1)) <> '') and
      (Pos('--', ParamStr(1)) <> 1) then
   begin
@@ -16007,208 +16350,52 @@ begin
   WriteLn('Klasor: ', D);
   WriteLn('Backend: ', backend);
   try
-    try
-        T01_Veritabani;
-        T02_Tipler;
-        T03_CreateKisit;
-        T04_Insert;
-        T05_SelectTemel;
-        T06_Where;
-        T07_TipKarsilastirma;
-        T08_Join;
-        T08b_JoinZincir;
-        T08c_RightFullJoin;
-        T08c_AltSorgu;
-        T08d_CaseWhen;
-        T08e_CTE;
-        T08f_Pencere;
-        T08g_Collation;
-        T08h_CrossJoin;
-        T08i_NaturalUsing;
-        T08j_Lateral;
-        T08k_MatView;
-        T08l_ViewDML;
-        T08m_StoredProc;
-        T08n_Trigger;
-        T08i_JoinAggregate;
-        T09_GroupAggregate;
-        T09b_HavingAggregate;
-        T09c_NotOrDNF;
-        T09d_NotNull3VL;
-        T09e_NullIfCoalesce;
-        T09f_ILike;
-        T09g_AnySomeAll;
-        T09h_FetchFirstNulls;
-        T09i_Qualify;
-        T09j_AggDistinct;
-        T09k_Filter;
-        T09l_Explain;
-        T09m_PartialIndex;
-        T09n_ExprIndex;
-        T09o_CoveringIndex;
-        T09p_SlowQuery;
-        T09r_Xml;
-        T09s_Spatial;
-        T09t_Range;
-        T10_Update;
-        T10b_Upsert;
-        T11_Delete;
-        T11_Returning;
-        T12_Transaction;
-        T13_AlterTable;
-        T14_Index;
-        T15_Bakim;
-        T16_Parametreli;
-        T17_Json;
-        T18_Kalici;
-        T19_Olcek;
-        T20_CokluKayit;
-        T21_KritikHataDogrulama;
-        T22_MinMaxTipKiyas;
-        T23_Blob;
-        T24_Dayaniklilik;
-        T25_F1_UnionSiraVeLimit;
-        T26_F1_OrderByTip;
-        T27_F1_OrderByBilinmeyenKolon;
-        T28_F1_JoinTipKiyas;
-        T29_F1_UpdateBilinmeyenKolon;
-        T30_F1_DeleteDatabase;
-        T31_F1_NotInNull;
-        T32_F1_LimitGecersiz;
-        T33_F1_SumBosKume;
-        T34_F1_AlterRenameBozukSatir;
-        T35_F1_OffsetAlias;
-        T36_F1_RecoverKirpma;
-        T37_F1_CommitBatchAtomik;
-        T38_F1_CheckRestrictFiltresi;
-        T39_F1_UniqueBayatAnahtar;
-        T40_F1_AlterDropColumnFK;
-        T41_F1_AlterAddColumnNotNull;
-        T42_F1_BatchInsertAtomik;
-        T43_F1_MigrateLegacy;
-        T44_F1_ParserDerinlik;
-        T45_F1_SplitStatements;
-        T46_F2_SemaBozukSatir;
-        T47_F2_BosTabloAdi;
-        T48_F2_DropTableFK;
-        T49_F2_SelfRefFK;
-        T50_F2_IdxBLOBKarisim;
-        T51_F2_DropColumnIdx;
-        T52_F2_AlterColumnType;
-        T53_F2_DDLAtomik;
-        T54_F2_UnionDistinct;
-        T55_F2_PencereBellek;
-        T56_F2_AltSorgu;
-        T57_F2_BozukDosya;
-        T58_F2_VerifyBATCHEND;
-      T59_F2_DizinFlush;
-      T60_F2_WALKilit;
-      T61_F2_GetDogruluk;
-      T62_F2_DropColumnBatch;
-      T63_F2_BozukKayitTespit;
-      T64_F2_PKsizTablo;
-      T65_F2_UniqueIndex;
-      T66_F2_DropColCokKolluIndeks;
-      T67_F3_Hijyen;
-      T68_F3_CokKolluOndek;
-      T69_YonetimAPI;
-      T70_YonetimBakim;
-      T71_SemaSorgulari;
-      T72_WALReplay;
-      T73_OtomatikWAL;
-      T74_KayitSifreleme;
-      T75_SifrelemeDayaniklilik;
-      T76_ReplayWALSifreleme;
-      T77_AlterDatabaseKey;
-      T78_AsofGecmis;
-      T79_Savepoint;
-      T79b_IsolationForUpdate;
-      T90_MVCC_Snapshot;
-      T91_MVCC_Nested;
-T92_MVCC_Isoaltion;
-      T93_RBAC;
-      T94_RBAC_Persist;
-      T94b_RLS;
-      T94c_RLS_Persist;
-      T94d_Collation;
-      T94e_Collation_Persist;
-      T94f_Monitoring;
-      T95_WALArsiv;
-      T95b_Replication;
-      T97_CrossPlatform;
-      T98_CBO;
-      T99_Extension;
-      T100_Parallel;
-      T101_TcpReplication;
-      T102_ConcurrentIndex;
-      T103_IcuCollation;
-      T104_HashPartition;
-      T105_ShowStats;
-      T106_TcpSqlServer;
-       T107_AuthSession;
-       T108_PreparedStatement;
-       T109_PoolSlotTCP;
-       T110_CopyFrom;
-       T111_RasgeleDiferansiyel;
-       T112_JsonPath;
-       T113_Vector;
-       T114_Fts;
-       T115_MetricsHttp;
-       T116_PgWire;
-       T117_Generated;
-       T118_AeadKdf;
-       T119_Trace;
-       T121_VectorAnn;
-       T122_KvStore;
-       T123_Arrow;
-       T124_Parquet;
-       T125_KolonSifreleme;
-       T126_F42_TxIsolation;
-       T127_H5_BlockCrc;
-       T128_H11_Undo;
-       T129_H11_InPlace;
-       T130_PkRangeCtype;
-       T131_H12_TopN;
-       T132_H12_StreamTopN;
-       T133_H13_StreamGroupBy;
-       T134_H12c_MultiTopN;
-       T135_H14_FloatSort;
-       T136_H13_GroupDiff;
-       T137_H15_StreamHaving;
-       T138_H16_StreamDistinct;
-       T139_H17_StreamFilteredCount;
-       T140_H18_RawExactCount;
-       T141_H19_RawLikeCount;
-       T142_H20_RawBoolTree;
-       T143_H21_RawTreeSelectPaths;
-       T144_H22_DeepOffsetLive;
-       T145_H8_MCV;
-       T146_M9_OTLP;
-       T147_M8_SqlancerStil;
-       T148_H25_AutoCompact;
-       { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
-       if VDbTlsAvailable then
-         T120_Tls
-       else
-         WriteLn('   ATLA TLS testi (OpenSSL DLL bulunamadi)');
-  
+    BuildTests;
+    for i := 0 to High(TESTLER) do
+    begin
+      if gV3 and IsV2Only(TESTLER[i].Nm) then
+      begin
+        Inc(nSkip);
+        WriteLn('   ATLA ', TESTLER[i].Nm, ' (v2''ye ozgu yol)');
+        Continue;
+      end;
+      try
+        if gV3 then WriteLn('## ', TESTLER[i].Nm);
+        TESTLER[i].P;
       except
         on E: Exception do
         begin
           Inc(nFail);
           WriteLn;
-          WriteLn('!! KESILDI (', grpName, '): ', E.ClassName, ': ', E.Message);
+          WriteLn('!! KESILDI (', TESTLER[i].Nm, '): ', E.ClassName, ': ', E.Message);
         end;
       end;
-    finally
-      Shutdown;
     end;
-    WriteLn;
-    WriteLn('================================================');
-    WriteLn('SONUC: gecen=', nPass, '  kalan=', nFail);
-    if nFail = 0 then WriteLn('TUM SQL TESTLERI GECTI')
-    else WriteLn('HATA VAR');
-  end.
+    { TLS testi OpenSSL DLL'leri gerektirir; yoksa atlanir. }
+    if VDbTlsAvailable then
+    begin
+      try
+        T120_Tls;
+      except
+        on E: Exception do
+        begin
+          Inc(nFail);
+          WriteLn('!! KESILDI (T120_Tls): ', E.ClassName, ': ', E.Message);
+        end;
+      end;
+    end
+    else
+      WriteLn('   ATLA TLS testi (OpenSSL DLL bulunamadi)');
+  finally
+    Shutdown;
+  end;
+
+  WriteLn;
+  WriteLn('================================================');
+  WriteLn('SONUC: gecen=', nPass, '  kalan=', nFail, '  atlanan=', nSkip);
+  if nFail = 0 then WriteLn('TUM SQL TESTLERI GECTI')
+  else WriteLn('HATA VAR');
+end.
   
   
   

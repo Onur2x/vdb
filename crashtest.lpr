@@ -20,6 +20,7 @@ program crashtest;
 {$mode delphi}{$H+}
 
 uses
+  {$IFDEF MSWINDOWS}Windows,{$ENDIF}
   SysUtils, Classes, Process,
   VDbPage, VDbPageStore, VDbPageHeap, VDbPageWal, VDbPageEngine, VDbSync;
 
@@ -624,6 +625,14 @@ end;
 var
   D: string;
 begin
+  { 2026-10-24 (CI): Windows'ta islenmemis bir calisma-zamani hatasi MESAJ
+    KUTUSU acar; konsolu olmayan (poNoConsole) alt surecte bu kutu, CI
+    adimini saatlerce asili birakir. Hata kutularini kapat: surec sessizce
+    hata koduyla olur, test bunu normal sekilde degerlendirir. }
+  {$IFDEF MSWINDOWS}
+  SetErrorMode(SEM_FAILCRITICALERRORS or SEM_NOGPFAULTERRORBOX or
+    SEM_NOOPENFILEERRORBOX);
+  {$ENDIF}
   if (ParamStr(1) = 'child') and (ParamCount >= 3) then
   begin
     RunChild(ParamStr(2), ParamStr(3));

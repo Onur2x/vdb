@@ -3590,6 +3590,7 @@ var T, U: string; C: TColDef; i: Integer;
     Fk: TFkDef; fkColName, fkRef, fkRefCol: string;
     chkText: string; depth: Integer;
     pname: string; k: Integer; isPK: Boolean;
+    ucols: TStrArray;
 begin
   Result := TSqlCreateTableStmt.Create;
   try
@@ -3624,7 +3625,23 @@ begin
       end;
       if U = 'UNIQUE' then
       begin
-        NextToken(T); Expect('('); ExpectToken(T); Expect(')');
+        { Sprint 2.9: tablo duzeyi UNIQUE(c1[, c2...]) — kisit KORUNUR. }
+        NextToken(T); Expect('(');
+        SetLength(ucols, 0);
+        while True do
+        begin
+          ExpectToken(T);
+          SetLength(ucols, Length(ucols) + 1);
+          ucols[High(ucols)] := VDbNorm(T);
+          if PeekToken = ',' then begin NextToken(T); Continue; end;
+          Expect(')');
+          Break;
+        end;
+        if Length(ucols) > 0 then
+        begin
+          SetLength(Result.Uniques, Length(Result.Uniques) + 1);
+          Result.Uniques[High(Result.Uniques)] := Copy(ucols, 0, Length(ucols));
+        end;
         if PeekToken = ',' then begin NextToken(T); Continue; end;
         if PeekToken = ')' then begin NextToken(T); Break; end;
         Break;

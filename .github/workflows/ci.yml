@@ -111,7 +111,20 @@ jobs:
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'vdbcrashtest'
-          $out = & .\crashtest.exe $dir 2>&1 | Out-String
+          # 2026-10-24: bu adim bir kez 42 dk asili kaldi (bir alt surecte
+          # Windows mesaj kutusu). Surec icinde SetErrorMode eklendi; burada
+          # ayrica SERT bir sure siniri var ki asilma 45 dk'lik is sinirini
+          # yemesin.
+          $log = Join-Path $env:RUNNER_TEMP 'crashtest.out'
+          $p = Start-Process -FilePath '.\crashtest.exe' -ArgumentList @($dir) `
+            -NoNewWindow -PassThru -RedirectStandardOutput $log
+          if (-not $p.WaitForExit(300000)) {
+            try { $p.Kill() } catch {}
+            Write-Host '::error title=crashtest::300 sn icinde bitmedi (asilma)'
+            Write-Error 'crashtest zaman asimi'
+            exit 1
+          }
+          $out = Get-Content $log -Raw
           $out | Write-Host
           if ($out -notmatch 'COKME KURTARMA DOGRULANDI') {
             # Log'a erisemeyenler icin son satirlar ANOTASYON olarak yazilir
@@ -201,5 +214,31 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'sqltest kalan > 0'
+            exit 1
+          }
+
+      - name: v3 backend ile SQL kapsam kapisi (sqltest --backend=v3)
+        shell: pwsh
+        run: |
+          # Sprint 2.9: ayni testler v3 sayfa motoru uzerinde kosar. Yalniz
+          # v2 motorunun veri dosyasi/WAL/arsiv/SAVEPOINT yollarini kullanan
+          # testler ATLA olarak sayilir (sessiz yesil yok: sayi raporlanir).
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbtestv3'
+          $out = & .\sqltest.exe $dir --backend=v3 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'Backend: v3') {
+            Write-Error 'sqltest v3: backend secilemedi'
+            exit 1
+          }
+          if ($out -notmatch 'TUM SQL TESTLERI GECTI') {
+            Write-Error 'sqltest v3 basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'sqltest v3 kalan > 0'
+            exit 1
+          }
+          if ($out -notmatch 'atlanan=[1-9]') {
+            Write-Error 'sqltest v3: ATLA sayisi beklenmedik (0)'
             exit 1
           }

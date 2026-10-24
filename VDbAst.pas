@@ -473,6 +473,11 @@ type
     Checks: TWhereGroups;
     Fks: array of TFkDef;
     CheckExprs: TList<TSqlExprNode>;
+    { Sprint 2.9: tablo duzeyi UNIQUE(c1, c2, ...) kisitlari. ONCEDEN
+      parser bunlari yutup ATIYORDU: ne kolon bayragi ne indeks olusuyordu,
+      yani kisit SESSIZCE yok sayiliyordu (v2'de de). Simdi burada
+      toplanir; CREATE TABLE bunlari UNIQUE indeks olarak kurar. }
+    Uniques: array of TStrArray;
     // R-13: Table Partitioning
     PartitionType: string; // 'RANGE', 'LIST', 'HASH'
     PartitionCol: string;  // kolon adı

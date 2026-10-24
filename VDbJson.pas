@@ -2540,7 +2540,7 @@ begin
         raise EVDbException.Create(ecForeignKeyViolation, 'dongusel FK bagimliligi');
     end;
     sinceCommit := 0;
-    Tb.Kv.BeginBatch;
+    Tb.BeginBatch;      // Sprint 2.9: backend-bagimsiz (v2/v3)
     try
       for oi := 0 to High(torder) do
       begin

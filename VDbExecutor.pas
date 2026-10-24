@@ -11206,7 +11206,9 @@ begin
   SetLength(ctx.ZoneCols, 0);
   SetLength(ctx.ZoneIsFloat, 0);
   zBCount := 0;
-  if Length(zCols) > 0 then
+  { Sprint 2.9: zone map v2 motorunun veri dosyasi surumune baglidir;
+    v3'te (Kv = nil) ne kullanilir ne insa edilir — duz tam tarama. }
+  if (Length(zCols) > 0) and (FT.Kv <> nil) then
   begin
     zGenSeq := FT.Kv.DataSeqValue;
     zGenEpoch := FT.Kv.DataEpochValue;
@@ -14913,6 +14915,12 @@ begin
   end;
   // R-13: Table Partitioning - tablo tanimina ekleme
   FT.CreateTable(Stmt.Table, Stmt.Cols, Stmt.PkIndex, Stmt.Checks, Stmt.Fks, Stmt.PartitionType, Stmt.PartitionCol, Stmt.PartitionValues);
+  { Sprint 2.9: tablo duzeyi UNIQUE(...) kisitlari UNIQUE indeks olarak
+    kurulur. ONCEDEN parser bunlari yutuyordu -> kisit SESSIZCE yok
+    sayiliyordu (tekrarli deger kabul ediliyordu). }
+  for i := 0 to High(Stmt.Uniques) do
+    FT.CreateIndexCols(Stmt.Table, 'u_' + VDbNorm(Stmt.Table) + '_' + IntToStr(i + 1),
+      Stmt.Uniques[i], True);
   Res.Affected := 1; Res.LastTable := Stmt.Table; Res.Msg := 'OK';
 end;
 
@@ -16728,6 +16736,18 @@ var
   nExt, kExt: Integer;
   ei: TVdbExtensionInfo;
 begin
+  { Sprint 2.9: v3 sayfa motorunda `Kv = nil`. v2 motorunun veri dosyasi,
+    WAL, arsiv, yedek ve replikasyon yollarina dayanan yonetim komutlari
+    v3'te yoktur; sessiz AV yerine NET bir "desteklenmiyor" hatasi verilir. }
+  if (FT.Kv = nil) and (Stmt.Kind in [
+      admVerify, admVacuum, admBackupDb, admRecoverTo, admRestoreFrom,
+      admArchiveSet, admArchiveList, admAlterDbKey, admSavepoint,
+      admReleaseSavepoint, admRollbackToSavepoint,
+      admReplicationStart, admReplicationStop, admCreateReplSlot,
+      admDropReplSlot, admShowReplicationStatus, admReplicationPump,
+      admShowReplSlots, admShowStats]) then
+    raise EVDbException.Create(ecUnsupported,
+      'Bu yonetim komutu v3 sayfa motorunda henuz desteklenmiyor (v3.1)');
   case Stmt.Kind of
     admVerify:
       begin
