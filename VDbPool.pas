@@ -442,6 +442,8 @@ function TVDbPool.Exec(const Sql: string): TSqlResult;
 var
   Q: TVSql;
 begin
+  { Bkz. VDbSql.ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
+  FillChar(Result, SizeOf(Result), 0);
   Q := Acquire;
   try
     Result := Q.Exec(Sql);
@@ -455,6 +457,8 @@ function TVDbPool.Exec(const Sql: string;
 var
   Q: TVSql;
 begin
+  { Bkz. VDbSql.ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
+  FillChar(Result, SizeOf(Result), 0);
   Q := Acquire;
   try
     Result := Q.Exec(Sql, Params);

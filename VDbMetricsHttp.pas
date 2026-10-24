@@ -159,7 +159,9 @@ begin
   if FThread <> nil then
   begin
     FThread.Terminate;
-    { Engellenmis accept'i uyandirmak icin dinleme soketini kapat. }
+    { Engellenmis accept'i uyandirmak icin once shutdown, sonra kapat
+      (Unix'te close tek basina accept'i uyandirmaz). }
+    VdbSockShutdown(FListen);
     VdbSockClose(FListen);
     FListen := VDB_SOCK_INVALID;
     FThread.WaitFor;

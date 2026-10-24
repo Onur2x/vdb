@@ -843,7 +843,7 @@ var
 begin
   secs := MS div 1000;
   if secs < 0 then secs := 0;
-  Result := FormatDateTime('hh:nn:ss', secs / 86400.0);
+  Result := FormatDateTime('hh:nn:ss', UnixToDateTime(secs));
 end;
 
 function TimestampStr(Value: Int64; UnitKind: Integer): string;
@@ -857,8 +857,8 @@ begin
   else
     secs := Value div 1000;
   end;
-  Result := FormatDateTime('yyyy-mm-dd hh:nn:ss',
-    EncodeDate(1970, 1, 1) + secs / 86400.0);
+  // UnixToDateTime: "1970-01-01 + secs/86400.0" FPC'de hassasiyet kaybediyor.
+  Result := FormatDateTime('yyyy-mm-dd hh:nn:ss', UnixToDateTime(secs));
 end;
 
 function TryDateDays(const S: string; out Days: Int64): Boolean;
@@ -902,7 +902,7 @@ begin
   Result := TryStrToDateTime(S, d, fs);
   if not Result then Result := TryStrToDateTime(S, d);
   if Result then
-    Secs := Round((d - EncodeDate(1970, 1, 1)) * 86400.0);
+    Secs := DateTimeToUnix(d);
 end;
 
 function FloatFromStr(const S: string): Double;
@@ -1322,8 +1322,7 @@ begin
   Inc(P, 12);
   days := Int64(julian) - 2440588;
   secs := days * 86400 + nanos div 1000000000;
-  Result := FormatDateTime('yyyy-mm-dd hh:nn:ss',
-    EncodeDate(1970, 1, 1) + secs / 86400.0);
+  Result := FormatDateTime('yyyy-mm-dd hh:nn:ss', UnixToDateTime(secs));
 end;
 
 function TimeValueStr(V: Int64; UnitKind: Integer): string;

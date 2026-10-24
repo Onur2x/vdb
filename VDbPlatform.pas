@@ -28,10 +28,9 @@ uses
   SysUtils;
 
 type
-  { Kisa sure olcumu icin platform-nötr tik (milisaniye). Windows'ta
-    GetTickCount64, diger platformlarda duvar saati farkindan hesaplanir.
-    TUM motor birimleri bunu kullanmali: boylece Linux/macOS derlemesinde
-    Windows'a ozgu GetTickCount64 bagimliligi kalmaz. }
+  { Kisa sure olcumu icin platform-notr tik (milisaniye). Iki platformda da
+    MONOTONIK saat (GetTickCount64) kullanilir; duvar saati degildir.
+    TUM motor birimleri bunu kullanmali. }
   TVDbTick = QWord;
   { Desteklenen isletim sistemleri. Derleme-anindan bagimsiz test icin
     enum'a cevrildi. }
@@ -98,13 +97,11 @@ uses
 
 function VdbTickMs: QWord;
 begin
-  {$IFDEF MSWINDOWS}
+  { MONOTONIK saat. Eski Unix uygulamasi duvar saatini (Now) kullaniyordu;
+    saat geriye adim atinca QWord farki devasa/negatif degerlere sapiyor,
+    sure metrikleri (SHOW STATS max_us) ve yavas-sorgu esigi bozuluyordu.
+    FPC'nin GetTickCount64'i Unix'te CLOCK_MONOTONIC'tir. }
   Result := GetTickCount64;
-  {$ELSE}
-  { Unix: duvar saati farki (milisaniye). Kısa sureler icin yeterli;
-    Linux'ta Now mikro-saniye cozunurlukludur. }
-  Result := QWord(Round(Now * MSecsPerDay));
-  {$ENDIF}
 end;
 
 function VdbCurrentOS: TVDbOS;

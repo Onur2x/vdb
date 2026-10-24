@@ -113,6 +113,8 @@ function TVTimeTravel.ExecSnapshot(const Sql: string): TSqlResult;
 var
   sq: TVSql;
 begin
+  { Bkz. VDbSql.ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
+  FillChar(Result, SizeOf(Result), 0);
   if FActive then
     raise EVDbException.Create(ecUnsupported,
       'TimeTravel: aktif snapshot modunda SQL calistirilamaz - ' +

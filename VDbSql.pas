@@ -276,14 +276,13 @@ begin
 end;
 
 function TVSql.ElapsedMs: Int64;
-// Platform BAGIMSIZ sure olcer.
-//
-// R-23: artik dogrudan VdbTickMs kullanilir. Bu, Windows'ta
-// VdbTickMs (~1 ms), Linux/macOS'ta Now farki (~mikro-saniye
-// cozunurluk) uzerinden ayni Int64 ms sonucu verir; cagiran kod
-// platformu hic bilmez.
+// Platform BAGIMSIZ sure olcer. Monotonik tik: geriye gitmez; yine de
+// QWord farkinin sarmamasi icin savunmali.
 begin
-  Result := Int64(VdbTickMs - FSlowT0Tick);
+  if VdbTickMs >= FSlowT0Tick then
+    Result := Int64(VdbTickMs - FSlowT0Tick)
+  else
+    Result := 0;
 end;
 
 procedure TVSql.NoteSlow(const Sql: string; Ms: Int64; Rows: Integer);
@@ -3059,6 +3058,8 @@ var
   allSelect: Boolean;
   prevSess: Cardinal;
 begin
+  { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
+  FillChar(Result, SizeOf(Result), 0);
   prevSess := VDbGetWriteSession;
   VDbSetWriteSession(FSessionId);
   FT.Kv.WaitForeignTxn(FSessionId);
@@ -3123,6 +3124,8 @@ var
   one: TSqlResult;
   ownBatch, okAll: Boolean;
 begin
+  { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
+  FillChar(Result, SizeOf(Result), 0);
   Result.Affected := 0;
   Result.Msg := '';
   SetLength(Result.Fields, 0);
@@ -3173,6 +3176,8 @@ var
   st: TStrArray;
   prevSess: Cardinal;
 begin
+  { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
+  FillChar(Result, SizeOf(Result), 0);
 
   // KR-7 (MREW): SELECT sorgulari LockRead (paralel), yazma Lock (seri).
   st := SplitStatements(Sql);
@@ -3237,6 +3242,8 @@ var
   st: TStrArray;
   prevSess: Cardinal;
 begin
+  { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
+  FillChar(Result, SizeOf(Result), 0);
 
   // KR-7 (MREW): SELECT sorgulari LockRead (paralel), yazma Lock (seri).
   st := SplitStatements(Sql);
@@ -3393,6 +3400,8 @@ var
   path, f: string;
   nkv: TVDb;
 begin
+  { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
+  FillChar(Result, SizeOf(Result), 0);
   ifNotExists := False;
   if PeekWord(Sql, P) = 'IF' then
   begin
@@ -3436,6 +3445,8 @@ var
   t, f: string;
   ifExists: Boolean;
 begin
+  { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
+  FillChar(Result, SizeOf(Result), 0);
   ifExists := False;
   if PeekWord(Sql, P) = 'IF' then
   begin
@@ -3483,6 +3494,8 @@ var
   okv: Boolean;
   ms: QWord;
 begin
+  { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
+  FillChar(Result, SizeOf(Result), 0);
   if PeekWord(Sql, P) = 'DATABASE' then
     Tok(Sql, P, t);   // 'DATABASE' tokeni tuketildi
   if not Tok(Sql, P, t) then raise EVDbException.Create(ecInvalidName, 'veritabani adi yok');
@@ -3512,6 +3525,8 @@ function TVSql.ExecCloseDatabase(const Sql: string; var P: Integer): TSqlResult;
 var
   t, f: string;
 begin
+  { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
+  FillChar(Result, SizeOf(Result), 0);
   if PeekWord(Sql, P) = 'DATABASE' then
     Tok(Sql, P, t);
   f := FT.Kv.FilePath;
@@ -3529,6 +3544,8 @@ var
   dest: string;
   ms: QWord;
 begin
+  { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
+  FillChar(Result, SizeOf(Result), 0);
   ExpectWord(Sql, P, 'TO');   // "BACKUP TO '<dosya>'"
   if not Tok(Sql, P, dest) then raise EVDbException.Create(ecInvalidName, 'dosya adi yok');
   dest := Trim(dest);
@@ -3658,6 +3675,12 @@ var
   fastOk: Boolean;
   spanRoot, spanChild: TVDbTraceSpan;
 begin
+  { FPC 3.2.2 / x86_64: bazi cagri baglamlarinda yonetilen alanli kayit
+    donduren fonksiyonun gecici sonucu sifirlanmiyor; onceki cagridan
+    kalan (artik serbest birakilmis) dizi isaretcileri SetLength tarafindan
+    yeniden finalize edilip yigin bozulmasina yol aciyor. Sonuc deposunu
+    finalize ETMEDEN sifirla; girisde sahiplenilmis veri yoktur. }
+  FillChar(Result, SizeOf(Result), 0);
   Result.Affected := 0; Result.Msg := ''; SetLength(Result.Fields, 0);
   SetLength(Result.FieldTypes, 0); SetLength(Result.Rows, 0);
   Result.LastTable := ''; Result.Stmts := 1;
@@ -3683,13 +3706,13 @@ begin
       begin
         FLastMs := ElapsedMs;
         NoteSlow(Sql, FLastMs, Length(Result.Rows));
-        RecordCommand(Sql, Integer(FLastMs * 1000), 0);
+        RecordCommand(Sql, FLastMs * 1000, 0);
         Exit;
       end;
     except
       FLastMs := ElapsedMs;
       NoteSlow(Sql, FLastMs, Length(Result.Rows));
-      RecordCommand(Sql, Integer(FLastMs * 1000), 0);
+      RecordCommand(Sql, FLastMs * 1000, 0);
       raise;
     end;
   end;
@@ -3705,13 +3728,13 @@ begin
       begin
         FLastMs := ElapsedMs;
         NoteSlow(Sql, FLastMs, Length(Result.Rows));
-        RecordCommand(Sql, Integer(FLastMs * 1000), 0);
+        RecordCommand(Sql, FLastMs * 1000, 0);
         Exit;
       end;
     except
       FLastMs := ElapsedMs;
       NoteSlow(Sql, FLastMs, Length(Result.Rows));
-      RecordCommand(Sql, Integer(FLastMs * 1000), 0);
+      RecordCommand(Sql, FLastMs * 1000, 0);
       raise;
     end;
   end;
@@ -3727,13 +3750,13 @@ begin
       begin
         FLastMs := ElapsedMs;
         NoteSlow(Sql, FLastMs, Length(Result.Rows));
-        RecordCommand(Sql, Integer(FLastMs * 1000), 0);
+        RecordCommand(Sql, FLastMs * 1000, 0);
         Exit;
       end;
     except
       FLastMs := ElapsedMs;
       NoteSlow(Sql, FLastMs, Length(Result.Rows));
-      RecordCommand(Sql, Integer(FLastMs * 1000), 0);
+      RecordCommand(Sql, FLastMs * 1000, 0);
       raise;
     end;
   end;
@@ -3906,7 +3929,7 @@ begin
     finally
       FLastMs := ElapsedMs;
       NoteSlow(Sql, FLastMs, Length(Result.Rows));
-      RecordCommand(Sql, Integer(FLastMs * 1000), 0);
+      RecordCommand(Sql, FLastMs * 1000, 0);
     end;
     Exit;
   end;
@@ -3940,7 +3963,7 @@ begin
       // global sayaclara yazilir (SHOW STATS bunlari okur). Hata
       // yolunda da kaydedilir (pg_stat benzeri: basarisiz cumleler
       // de sayilir). Sure F-21 ile AYNI olcumden turetilir (ms -> us).
-      RecordCommand(Sql, Integer(FLastMs * 1000), 0);
+      RecordCommand(Sql, FLastMs * 1000, 0);
     end;
 
     // H7: basarili + parametresiz SELECT'i onbellege al (sahiplik aktarilir)

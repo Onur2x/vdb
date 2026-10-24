@@ -72,7 +72,7 @@ type
 // Dış API
 function MonitorConfig(out C: TVDbMonitorConfig): Boolean;
 function UpdateConfig(C: TVDbMonitorConfig): Boolean;
-function RecordCommand(Sql: string; DurationUs: Integer; DBId: Integer): Boolean;
+function RecordCommand(Sql: string; DurationUs: Int64; DBId: Integer): Boolean;
 function GetStats(out S: TVDbMonitorStats): Boolean;
 function FlushStats: Boolean;
 function FlushBufferToFile: Boolean;
@@ -119,7 +119,7 @@ begin
   GConfig := C;
 end;
 
-function RecordCommand(Sql: string; DurationUs: Integer; DBId: Integer): Boolean;
+function RecordCommand(Sql: string; DurationUs: Int64; DBId: Integer): Boolean;
 var
   ts: string;
 begin
@@ -129,9 +129,13 @@ begin
   // bir MUTASYON KALINTISI vardi (sayaclar hic artmiyordu, hicbir test
   // GStats'i gozlemlemedigi icin yagmurlu gun hatasi kalmisti). T105
   // (SHOW STATS) artik sayaclari dogrudan gozlemliyor.
+  // Negatif sure olamaz: saat geriye adim atarsa (eski duvar-saati tik'i)
+  // QWord alanlara devasa deger yazilip max_us bozuluyordu. Savunmali kelepce.
+  if DurationUs < 0 then DurationUs := 0;
   Inc(GStats.CommandCount);
-  Inc(GStats.TotalDurationUs, DurationUs);
-  if DurationUs > GStats.MaxDurationUs then GStats.MaxDurationUs := DurationUs;
+  Inc(GStats.TotalDurationUs, UInt64(DurationUs));
+  if UInt64(DurationUs) > GStats.MaxDurationUs then
+    GStats.MaxDurationUs := UInt64(DurationUs);
   // Gunluk dosyasina YAZMA yalnizca acikca etkinlestirilmisken yapilir
   // (GConfig.FileName = '' iken tampanda '.mon.edb' adli bir dosya
   // olusurdu — test klasorlerine gereksiz dosya birakmamak icin).

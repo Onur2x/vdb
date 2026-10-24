@@ -3267,6 +3267,9 @@ end;
   var
     lst: TList<QWord>;
   begin
+    { Kurucu yarida kalirsa (ornegin TEvent.Create basarisiz) yikici
+      calisir ve bu alan henuz olusturulmamis olabilir. }
+    if FTableKeys = nil then Exit;
     for lst in FTableKeys.Values do
       lst.Free;
     FTableKeys.Clear;
@@ -4704,6 +4707,9 @@ procedure TVDb.ClearSavepoints;
 var
   i: Integer;
 begin
+  { Yarim kalmis kurulumda (constructor istisnasi) Destroy cagrilirsa
+    asil hatayi maskelememek icin nil korumasi. }
+  if FSavepoints = nil then Exit;
   for i := 0 to FSavepoints.Count - 1 do
     FSavepoints[i].IndexSnapshot.Free;
   FSavepoints.Clear;

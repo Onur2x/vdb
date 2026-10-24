@@ -794,10 +794,14 @@ var
   l, c: TVdbSocket;
 begin
   Terminate;
-  { Windows'ta engellenmis accept'i uyandirmanin guvenli yolu dinleme
-    soketini KAPATMAKTIR (shutdown dinleme soketinde tanimli degil). }
   l := FListen;
   FListen := VDB_SOCK_INVALID;
+  { Unix: close() tek basina engellenmis accept()'i UYANDIRMAZ; soket
+    kapanana kadar accept blokta kalir (sqltest'te STOP REPLICATION'in
+    sonsuz beklemesinin nedeni). Once shutdown ile uyandir, sonra kapat.
+    Windows'ta dinleme soketinde shutdown tanimli degildir (hata doner),
+    accept'i kapatma uyandirir; iki cagri da zararsizdir. }
+  VdbSockShutdown(l);
   VdbSockClose(l);
   { Aktif baglanti (ACK bekleme) shutdown ile uyandirilir; kapanisini
     Execute yapar. }

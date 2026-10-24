@@ -2054,6 +2054,8 @@ begin
   FStopping := True;
   if FListen <> VDB_SOCK_INVALID then
   begin
+    { Unix: engellenmis accept'i once shutdown uyandirir. }
+    VdbSockShutdown(FListen);
     VdbSockClose(FListen);
     FListen := VDB_SOCK_INVALID;
   end;

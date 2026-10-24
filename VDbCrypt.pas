@@ -1409,7 +1409,9 @@ var
   key, aad, h, nonce, cipher, tag: TBytes;
   m: Integer;
 begin
-  Result := nil;
+  { Bkz. VDbB2S: gecici sonuc sifirlanmis olmayabilir; Result := nil de
+    bayat isaretciyi finalize ederdi. }
+  FillChar(Result, SizeOf(Result), 0);
   if not VDbColumnKeyGet(KeyId, key) then
     raise EVdbCryptError.Create('kolon anahtari yuklu degil (keyId=' +
       IntToStr(Int64(KeyId)) + ')', VDB_CRYPTO_ERR);
@@ -1438,7 +1440,9 @@ var
   keyId: QWord;
   m, n: Integer;
 begin
-  Result := nil;
+  { Bkz. VDbB2S: gecici sonuc sifirlanmis olmayabilir; Result := nil de
+    bayat isaretciyi finalize ederdi. }
+  FillChar(Result, SizeOf(Result), 0);
   m := Length(VDB_COL_VALUE_MAGIC);
   if not VDbColumnIsSealed(Stored) then
     raise EVdbCryptError.Create('kolon degeri sifreli degil',

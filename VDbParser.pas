@@ -4613,6 +4613,9 @@ begin
     else
       W.IsRecursive := False;
     repeat
+      { Her CTE icin W'yi sifirla: aksi halde ColAliases/Materialize/CYCLE
+        alanlari onceki CTE'den (veya stack copunden) sizar. }
+      W := Default(TWithQuery);
       ExpectToken(T);
       W.Name := VDbNorm(T);
       W.Select := nil;

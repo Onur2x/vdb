@@ -612,7 +612,7 @@ begin
   Result := TryStrToDateTime(S, d, fs);
   if not Result then Result := TryStrToDateTime(S, d);
   if Result then
-    Secs := Round((d - EncodeDate(1970, 1, 1)) * 86400.0);
+    Secs := DateTimeToUnix(d);
 end;
 
 function ExportBody(const Fields: TStrArray; const Types: TByteArray;
@@ -1107,13 +1107,14 @@ end;
 
 function ArrowDateTimeStr(Secs: Int64): string;
 begin
-  Result := FormatDateTime('yyyy-mm-dd hh:nn:ss',
-    EncodeDate(1970, 1, 1) + Secs / 86400.0);
+  // UnixToDateTime: 1970-01-01 + Secs/86400.0 ifadesi FPC'de sabit
+  // katlama sirasinda hassasiyet kaybediyor (03:04:05 -> 03:02:48).
+  Result := FormatDateTime('yyyy-mm-dd hh:nn:ss', UnixToDateTime(Secs));
 end;
 
 function ArrowTimeStr(Secs: Int64): string;
 begin
-  Result := FormatDateTime('hh:nn:ss', Secs / 86400.0);
+  Result := FormatDateTime('hh:nn:ss', UnixToDateTime(Secs));
 end;
 
 procedure ArrowDecodeBatch(const B: TBytes; const AF: TArrowFieldArray;

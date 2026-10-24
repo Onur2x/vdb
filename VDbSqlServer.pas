@@ -443,9 +443,13 @@ var
 begin
   if not FReady then Exit;
   FStopping := True;
-  { 1) dinlemeyi KAPAT (engellenmis accept'i uyandirmanin tek yolu) }
+  { 1) dinlemeyi uyandir + KAPAT. Unix'te close() tek basina engellenmis
+    accept()'i uyandirmaz; once shutdown gerekir (yoksa WaitFor sonsuza
+    kadar bekler). Windows'ta dinleme soketinde shutdown hata doner,
+    accept'i kapatma uyandirir. }
   if FListen <> VDB_SOCK_INVALID then
   begin
+    VdbSockShutdown(FListen);
     VdbSockClose(FListen);
     FListen := VDB_SOCK_INVALID;
   end;

@@ -186,7 +186,15 @@ begin
   p := @ABuf;
   while sent < ALen do
   begin
+    { Unix: karsi taraf kapatmissa send() SIGPIPE uretir ve sureci
+      sonlandirir (sqltest'te R-17 TCP testinde gorulen exit 141).
+      MSG_NOSIGNAL ile EPIPE normal hata olarak doner; dongu False ile
+      cikar. Windows'ta bayrak yoktur. }
+{$IFDEF UNIX}
+    n := fpSend(ASock, p + sent, ALen - sent, MSG_NOSIGNAL);
+{$ELSE}
     n := fpSend(ASock, p + sent, ALen - sent, 0);
+{$ENDIF}
     if n <= 0 then Exit;
     Inc(sent, n);
   end;

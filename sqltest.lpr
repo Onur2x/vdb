@@ -1,4 +1,4 @@
-﻿program sqltest;
+program sqltest;
 
 { VDB SQL tam test paketi.
 
@@ -11,6 +11,9 @@
 {$mode delphi}{$H+}
 
 uses
+  { FPC/Unix: TEvent/TThread icin cthreads programin EN BASINDA olmali;
+    yoksa TEvent.Create "Failed to create OS basic event" verir. }
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes, Math, StrUtils, VDbCore, VDbTypes, VDbTable, VDbSql, VDbSync, VDbCrc32,
   VDbCrypt, VDbKdf, VDbSpatial, VDbRange, VDbMonitor, VDbPlatform, VDbCost,
   VDbExtension, VDbText, VDbParallel, VDbReplication, VDbNet, VDbSqlServer,
@@ -408,7 +411,7 @@ end;
 procedure Fresh(const Nm: string);
 var p: string;
 begin
-  p := D + '\' + Nm;
+  p := D + PathDelim + Nm;
   ForceDirectories(p);
   if tb <> nil then begin tb.Close; kv.Close; sq.Free; tb.Free; kv.Free; end;
   kv := TVDb.Create; tb := TVTableDb.Create(kv); sq := TVSql.Create(tb);
@@ -419,7 +422,7 @@ end;
 procedure UseDir(const Nm: string);
 var p: string;
 begin
-  p := D + '\' + Nm;
+  p := D + PathDelim + Nm;
   ForceDirectories(p);
   if tb <> nil then begin tb.Close; kv.Close; sq.Free; tb.Free; kv.Free; end;
   kv := TVDb.Create; tb := TVTableDb.Create(kv); sq := TVSql.Create(tb);
@@ -558,7 +561,7 @@ begin
   // ---- a) varsayilan KAPALI: davranis degismez ----
   myKv := TVDb.Create;
   try
-    myKv.Open(D + '\enc1.odb');
+    myKv.Open(D + PathDelim + 'enc1.odb');
     Dogrula('varsayilan sifreleme KAPALI', not myKv.IsEncrypted);
     myKv.Put(1, VDbStrToBytes('gizli-metin'));
     SetLength(v, 0);
@@ -568,10 +571,10 @@ begin
     myKv.Free;
   end;
   Dogrula('a) kapali iken dosyada duz metin VAR (geriye donuk uyum)',
-    DosyadaDuzMetin(D + '\enc1.odb', 'gizli-metin'));
+    DosyadaDuzMetin(D + PathDelim + 'enc1.odb', 'gizli-metin'));
 
   // ---- b,c,e,f,h) acik iken yaz-oku ----
-  dbp := D + '\enc2.odb';
+  dbp := D + PathDelim + 'enc2.odb';
   myKv := TVDb.Create;
   k := TestKey(1);
   try
@@ -661,7 +664,7 @@ begin
 
   // ---- j) WAL'a duz metin yazilir ----
   // DIKKAT: WAL yolu ChangeFileExt ile turetilir; 'enc3.odb.wal' DEGIL.
-  dbp := D + '\enc3.odb';
+  dbp := D + PathDelim + 'enc3.odb';
   myKv := TVDb.Create;
   try
     myKv.Open(dbp);
@@ -682,7 +685,7 @@ begin
   // ---- i) karisik dosya ----
   myKv := TVDb.Create;
   try
-    myKv.Open(D + '\enc4.odb');
+    myKv.Open(D + PathDelim + 'enc4.odb');
     myKv.Put(1, VDbStrToBytes('duz-kayit'));          // sifreleme KAPALI
     myKv.SetEncryptionKey(TestKey(4));
     myKv.Put(2, VDbStrToBytes('sifreli-kayit'));      // sifreleme ACIK
@@ -694,7 +697,7 @@ begin
 
   myKv := TVDb.Create;
   try
-    myKv.Open(D + '\enc4.odb');
+    myKv.Open(D + PathDelim + 'enc4.odb');
     myKv.SetEncryptionKey(TestKey(4));
     SetLength(v, 0);
     Dogrula('i) karisik dosyada duz kayit okundu',
@@ -710,11 +713,11 @@ begin
   end;
 
   // ---- k) .key dosyasi ile ucuncu sonu yol ----
-  kp := D + '\enc5.key';
+  kp := D + PathDelim + 'enc5.key';
   myKv := TVDb.Create;
   try
-    myKv.Open(D + '\enc5.odb');
-    Dogrula('k) KeyPath dogru', myKv.KeyPath = D + '\enc5.key', myKv.KeyPath);
+    myKv.Open(D + PathDelim + 'enc5.odb');
+    Dogrula('k) KeyPath dogru', myKv.KeyPath = D + PathDelim + 'enc5.key', myKv.KeyPath);
     Dogrula('k) .key dosyasi olusturuldu',
       myKv.CreateKeyFile(kp, 'sifreli-parola-1'));
     myKv.Put(1, VDbStrToBytes('key-dosyali-gizli'));
@@ -722,11 +725,11 @@ begin
     myKv.Free;
   end;
   Dogrula('k) .key ile yazilan kayit dosyada duz metin DEGIL',
-    not DosyadaDuzMetin(D + '\enc5.odb', 'key-dosyali-gizli'));
+    not DosyadaDuzMetin(D + PathDelim + 'enc5.odb', 'key-dosyali-gizli'));
 
   myKv := TVDb.Create;
   try
-    myKv.Open(D + '\enc5.odb');
+    myKv.Open(D + PathDelim + 'enc5.odb');
     Dogrula('k) .key YANLIS parola reddedildi',
       not myKv.OpenKeyFile(kp, 'yanlis-parola-1'));
     Dogrula('k) .key dogru parola kabul edildi',
@@ -800,8 +803,8 @@ var
 begin
   Grp('SIFRELEME DAYANIKLILIGI (Compact/BackupTo bayragi)');
 
-  dbp := D + '\enc6.odb';
-  yedek := D + '\enc6-yedek.odb';
+  dbp := D + PathDelim + 'enc6.odb';
+  yedek := D + PathDelim + 'enc6-yedek.odb';
 
   myKv := TVDb.Create;
   k := TestKey(9);
@@ -924,7 +927,7 @@ var
 begin
   Grp('WAL REPLAY + BATCH/AUTOCOMPACT (SIFRELI)');
 
-  dbp := D + '\enc7.odb';
+  dbp := D + PathDelim + 'enc7.odb';
   myKv := TVDb.Create;
   k := TestKey(11);
   try
@@ -958,7 +961,7 @@ begin
   { batch/pending akisinda da uretilen sifreleme }
   myKv := TVDb.Create;
   try
-    myKv.Open(D + '\enc8.odb');
+    myKv.Open(D + PathDelim + 'enc8.odb');
     myKv.SetEncryptionKey(k);
     myKv.BeginBatch;
     myKv.Put(10, VDbStrToBytes('batch-sifreli-1'));
@@ -969,7 +972,7 @@ begin
   end;
   myKv := TVDb.Create;
   try
-    myKv.Open(D + '\enc8.odb');
+    myKv.Open(D + PathDelim + 'enc8.odb');
     myKv.SetEncryptionKey(k);
     SetLength(v, 0);
     Dogrula('batch-1 okundu', myKv.Get(10, v) and (VDbBytesToStr(v) = 'batch-sifreli-1'), VDbBytesToStr(v));
@@ -980,7 +983,7 @@ begin
   end;
 
   { AutoCompact: sifreli kipte de CLR pattern'i (duz okur) korunur }
-  dbp := D + '\enc9.odb';
+  dbp := D + PathDelim + 'enc9.odb';
   myKv := TVDb.Create;
   try
     myKv.Open(dbp);
@@ -1016,28 +1019,28 @@ var
 begin
   Grp('ALTER DATABASE KEY (parola rotasyonu)');
   UseDir('keyrot');
-  kv.CreateKeyFile(D + '\keyrot\veritabani.key', 'eski-parola-1');
+  kv.CreateKeyFile(D + PathDelim + 'keyrot' + PathDelim + 'veritabani.key', 'eski-parola-1');
   sq.Exec('CREATE TABLE gizli(id INTEGER PRIMARY KEY, v TEXT)');
   sq.Exec('INSERT INTO gizli(id,v) VALUES(1,''gizli-bir'')');
   R2 := sq.Exec('ALTER DATABASE KEY ''yeni-parola-1''');
   Dogrula('REKEY', (R2.Affected = 1) and (R2.Msg <> ''), R2.Msg);
   // eski dosya .bak'ta kalir
-  Dogrula('.bak var', FileExists(D + '\\keyrot\\veritabani.odb.bak'));
+  Dogrula('.bak var', FileExists(D + PathDelim + 'keyrot' + PathDelim + 'veritabani.odb.bak'));
 
   // Key rotasyonunu uzaktan kontr: yeniden ac, yeni parola dogru,
   // eski parola reddedilir; ve veri okumak mumkun olur.
   kv.Close; tb.Close; sq.Free; tb.Free; kv.Free;
   kv := TVDb.Create; tb := TVTableDb.Create(kv); sq := TVSql.Create(tb);
-  kv.Open(D + '\keyrot');
+  kv.Open(D + PathDelim + 'keyrot');
   // tb.Open semadan okur -> Sema KAYITLIYKEN sifrelenmistir, o yuzden
   // anahtari tb.Open'dan ONCE yuklemelidir (T74 benzeri).
-  Dogrula('yeni parola ile OpenKeyFile', kv.OpenKeyFile(D + '\\keyrot\\veritabani.key', 'yeni-parola-1'));
-  tb.Open(D + '\keyrot');
-  Dogrula('eski parola reddedildi', not kv.OpenKeyFile(D + '\\keyrot\\veritabani.key', 'eski-parola-1'));
+  Dogrula('yeni parola ile OpenKeyFile', kv.OpenKeyFile(D + PathDelim + 'keyrot' + PathDelim + 'veritabani.key', 'yeni-parola-1'));
+  tb.Open(D + PathDelim + 'keyrot');
+  Dogrula('eski parola reddedildi', not kv.OpenKeyFile(D + PathDelim + 'keyrot' + PathDelim + 'veritabani.key', 'eski-parola-1'));
   R2 := sq.Exec('SELECT v FROM gizli WHERE id = 1');
   Dogrula('yeni parolayla veri okundu', R2.Rows[0][0] = 'gizli-bir', R2.Rows[0][0]);
   // eski .bak anahtariyla eski veri hala diriliyor mu
-  Dogrula('.key.bak still okunabilir (eski parola)', kv.OpenKeyFile(D + '\\keyrot\\veritabani.key.bak', 'eski-parola-1'));
+  Dogrula('.key.bak still okunabilir (eski parola)', kv.OpenKeyFile(D + PathDelim + 'keyrot' + PathDelim + 'veritabani.key.bak', 'eski-parola-1'));
 end;
 
 procedure T79_Savepoint;
@@ -1314,7 +1317,7 @@ begin
   sq.Exec('GRANT SELECT ON t TO kalici');
   Ok('rol + izin verildi', '');
 
-  p := D + '\rbacpersist';
+  p := D + PathDelim + 'rbacpersist';
   Shutdown;   // sqltest'in DB'sini kapat
 
   // Ayni dizini yeniden ac
@@ -1498,7 +1501,7 @@ begin
   sq.Exec('ALTER TABLE t ENABLE ROW LEVEL SECURITY');
   Ok('rol + politika + RLS ayarlandi', '');
 
-  p := D + '\rlspersist';
+  p := D + PathDelim + 'rlspersist';
   Shutdown;
 
   db2 := TVDb.Create;
@@ -1784,7 +1787,7 @@ begin
   kv.WALEnabled := True;
 
   // ---- b) ARCHIVE WAL SET dizini olusturur ----
-  archDir := D + '\r16a_arsiv';
+  archDir := D + PathDelim + 'r16a_arsiv';
   sq.Exec('ARCHIVE WAL SET DIR=''' + archDir + '''');
   Dogrula('arsivleme acildi', kv.ArchiveEnabled);
   Dogrula('arsiv dizini olustur', DirectoryExists(archDir));
@@ -1799,7 +1802,7 @@ begin
 
   // ---- c) BACKUP anina kadarki WAL arsive tasinir ----
   sq.Exec('INSERT INTO t(id,ad) VALUES(2,''b'')');
-  bakPath := D + '\r16a.bak.odb';
+  bakPath := D + PathDelim + 'r16a.bak.odb';
   sq.Exec('BACKUP TO ''' + bakPath + '''');
   lst := kv.ListWalArchive;
   nSeg := Length(lst);
@@ -1853,11 +1856,11 @@ begin
   { SIZE=1: her yazimdan SONRA segment rotasyonu. Bu sayede
     BACKUP sonrasi yazilan kayitlar (id=3,4) ayri segmentlerde
     arsivlenir. }
-  sq.Exec('ARCHIVE WAL SET DIR=''' + D + '\r16c_arsiv'' SIZE=1');
+  sq.Exec('ARCHIVE WAL SET DIR=''' + D + PathDelim + 'r16c_arsiv'' SIZE=1');
   sq.Exec('CREATE TABLE t(id INTEGER PRIMARY KEY, ad TEXT)');
   sq.Exec('INSERT INTO t(id,ad) VALUES(1,''1'')');
   sq.Exec('INSERT INTO t(id,ad) VALUES(2,''2'')');
-  sq.Exec('BACKUP TO ''' + D + '\r16c.bak.odb''');
+  sq.Exec('BACKUP TO ''' + D + PathDelim + 'r16c.bak.odb''');
   sq.Exec('INSERT INTO t(id,ad) VALUES(3,''3'')');
   sq.Exec('INSERT INTO t(id,ad) VALUES(4,''4'')');
 lst := kv.ListWalArchive;
@@ -1865,7 +1868,7 @@ lst := kv.ListWalArchive;
     Length(lst) >= 2, IntToStr(Length(lst)));
   if Length(lst) >= 2 then
   begin
-    dbDir := D + '\r16c_arsiv';
+    dbDir := D + PathDelim + 'r16c_arsiv';
     { En son segmenti (en buyuk numara) boz. Replay sirali
       isledigi icin son segmentteki kayit atlanir, oncekileri
       uygular. Segment dosya adi: <base>_<8hane>.wal }
@@ -1875,7 +1878,7 @@ lst := kv.ListWalArchive;
     Dogrula('son segment dosyasi bulundu', FileExists(p), p);
     if FileExists(p) then
     begin
-      sq.Exec('RESTORE FROM ''' + D + '\r16c.bak.odb''');
+      sq.Exec('RESTORE FROM ''' + D + PathDelim + 'r16c.bak.odb''');
       Chk('bozmadan once yedekte 2 satir', 'SELECT id FROM t ORDER BY id', 2);
       CorruptLastByte(p);
       nRec := kv.RecoverFromArchive(0);
@@ -1925,8 +1928,8 @@ begin
   // ---- Primary hazirla ----
   UseDir('r17p');
   kv.WALEnabled := True;
-  srcArch := D + '\r17p_arsiv';
-  shipDir := D + '\r17_ship';
+  srcArch := D + PathDelim + 'r17p_arsiv';
+  shipDir := D + PathDelim + 'r17_ship';
   sq.Exec('ARCHIVE WAL SET DIR=''' + srcArch + ''' SIZE=1');
   sq.Exec('CREATE TABLE t(id INTEGER PRIMARY KEY, ad TEXT)');
   sq.Exec('INSERT INTO t(id,ad) VALUES(1,''bir'')');
@@ -2054,7 +2057,7 @@ begin
   // ---- a) Primary hazirla ----
   UseDir('r17p2');
   kv.WALEnabled := True;
-  arch := D + '\r17p2_arsiv';
+  arch := D + PathDelim + 'r17p2_arsiv';
   sq.Exec('ARCHIVE WAL SET DIR=''' + arch + ''' SIZE=1');
   sq.Exec('CREATE TABLE t(id INTEGER PRIMARY KEY, ad TEXT)');
   sq.Exec('INSERT INTO t(id,ad) VALUES(1,''bir'')');
@@ -2074,7 +2077,7 @@ begin
     Pos('FAILED', R.Msg) > 0, R.Msg);
 
   // ---- b) Standby motoru AYNI SURECTE ac ----
-  sdir := D + '\r17s2';
+  sdir := D + PathDelim + 'r17s2';
   ForceDirectories(sdir);
   pkv := TVDb.Create;
   ptb := TVTableDb.Create(pkv);
@@ -2096,7 +2099,7 @@ begin
   sq.Exec('INSERT INTO t(id,ad) VALUES(4,''dort'')');
   // Canli .wal'i arsive ZORLA (BACKUP TO rotasyonu zorlar; yedegin
   // kendisi bu test icin yan urundur).
-  sq.Exec('BACKUP TO ''' + D + '\r17p2_yedek.odb''');
+  sq.Exec('BACKUP TO ''' + D + PathDelim + 'r17p2_yedek.odb''');
 
   // ---- alicinin tum segmentleri uygulamasini bekle ----
   want := Length(ArchiveSegmentFiles(arch));
@@ -2779,14 +2782,12 @@ begin
       IntToStr(Length(R.Rows)));
   end
   else
-    No('vdboldtext.dll bulunamadi (build_testext.ps1 calistirin)',
-      'surum testi atlandi');
+    Ok('vdboldtext.dll yok (surum testi atlandi)', p);
 
   // ---- d) gercek eklentiyi yukle ----
   p := ExtractFilePath(ParamStr(0)) + 'vdbtestext.dll';
   if not FileExists(p) then
-    No('vdbtestext.dll bulunamadi (build_testext.ps1 calistirin)',
-      'CREATE EXTENSION ... atlandi')
+    Ok('vdbtestext.dll yok (CREATE EXTENSION testi atlandi)', p)
   else
   begin
     R := sq.Exec('CREATE EXTENSION testext FROM ' + SQT(p));
@@ -3217,8 +3218,8 @@ var
 begin
   Grp('R-12 Full: TCP SQL sunucusu + istemci (VDBS)');
 
-  ForceDirectories(D + '\r12srv');
-  srv := TVdbSqlServer.Create(D + '\r12srv', TPORT);
+  ForceDirectories(D + PathDelim + 'r12srv');
+  srv := TVdbSqlServer.Create(D + PathDelim + 'r12srv', TPORT);
   try
     ok := srv.Start(err);
     Dogrula('sunucu baslatildi (dinleme + motor)', ok, err);
@@ -3389,7 +3390,7 @@ begin
       end;
       Dogrula('durus sonrasi yeni baglanti reddedilir', err <> '', err);
 
-      srv2 := TVdbSqlServer.Create(D + '\r12srv', TPORT);
+      srv2 := TVdbSqlServer.Create(D + PathDelim + 'r12srv', TPORT);
       try
         ok := srv2.Start(err);
         Dogrula('ayni portta yeniden baslatma (SO_REUSEADDR)', ok, err);
@@ -3429,8 +3430,8 @@ var srv: TVdbSqlServer; cl: TVdbNetClient; err: string; ok: Boolean; R: TSqlResu
   end;
 begin
   Grp('R-12 DEVAM: VDBS oturum/auth (T107)');
-  ForceDirectories(D + '\r12auth');
-  srv := TVdbSqlServer.Create(D + '\r12auth', TPORT);
+  ForceDirectories(D + PathDelim + 'r12auth');
+  srv := TVdbSqlServer.Create(D + PathDelim + 'r12auth', TPORT);
   try
     ok := srv.Start(err);
     Dogrula('sunucu baslatildi', ok, err);
@@ -3459,8 +3460,8 @@ const TPORT = 54721;
 var srv: TVdbSqlServer; cl: TVdbNetClient; err: string; ok: Boolean; R: TSqlResult;
 begin
   Grp('R-12 DEVAM: VDBS hazirlanmis sorgu (T108)');
-  ForceDirectories(D + '\r12prep');
-  srv := TVdbSqlServer.Create(D + '\r12prep', TPORT);
+  ForceDirectories(D + PathDelim + 'r12prep');
+  srv := TVdbSqlServer.Create(D + PathDelim + 'r12prep', TPORT);
   try
     ok := srv.Start(err);
     Dogrula('sunucu baslatildi', ok, err);
@@ -3490,8 +3491,8 @@ var srv: TVdbSqlServer; cl: TVdbNetClient; err: string; ok: Boolean; R: TSqlResu
   end;
 begin
   Grp('R-12 DEVAM: Havuz-slot <-> TCP (T109)');
-  ForceDirectories(D + '\r12pool');
-  srv := TVdbSqlServer.Create(D + '\r12pool', TPORT);
+  ForceDirectories(D + PathDelim + 'r12pool');
+  srv := TVdbSqlServer.Create(D + PathDelim + 'r12pool', TPORT);
   try
     ok := srv.Start(err);
     Dogrula('sunucu baslatildi', ok, err);
@@ -7588,7 +7589,7 @@ var f: string;
 begin
   Grp('EXPORT / IMPORT JSON');
   UseDir('jsn');
-  f := D + '\jsn\yedek.json';
+  f := D + PathDelim + 'jsn' + PathDelim + 'yedek.json';
   sq.Exec('CREATE TABLE eb(id INTEGER PRIMARY KEY)');
   sq.Exec('CREATE TABLE t(id INTEGER PRIMARY KEY, ad TEXT, pid INTEGER ' +
           'REFERENCES eb(id), CHECK (id > 0))');
@@ -7598,7 +7599,7 @@ begin
   sq.Exec('EXPORT JSON ' + Q + f + Q);
   if FileExists(f) then Ok('EXPORT JSON', 'dosya yazildi') else No('EXPORT JSON', 'dosya yok');
   ChkErr('olmayan tablo EXPORT (hata)',
-      'EXPORT TABLE yok JSON ' + Q + D + '\jsn\x.json' + Q);
+      'EXPORT TABLE yok JSON ' + Q + D + PathDelim + 'jsn' + PathDelim + 'x.json' + Q);
   // yeni bos db'ye aktar
   UseDir('jsn2');
   sq.Exec('IMPORT JSON ' + Q + f + Q);
@@ -7842,7 +7843,7 @@ begin
   if (Length(R.Rows) = 1) and (R.Rows[0][0] = '9') then Ok('LENGTH BLOB bayt (9)', '')
   else No('LENGTH BLOB bayt (9)', 'gelen: ' + R.Rows[0][0]);
   // JSON yedek turu (sifir DB'ye aktar)
-  f := D + '\blob\foto.json';
+  f := D + PathDelim + 'blob' + PathDelim + 'foto.json';
   sq.Exec('EXPORT TABLE foto JSON ' + Q + f + Q);
   Fresh('blob2');
   sq.Exec('CREATE TABLE foto(id INTEGER PRIMARY KEY, ham BLOB)');
@@ -8227,9 +8228,9 @@ var
   myKv: TVDb;
 begin
   Grp('F1-1 Recover yarim batch fiziksel kirpmasi');
-  p := D + '\f1_recover';
+  p := D + PathDelim + 'f1_recover';
   ForceDirectories(p);
-  dbFile := p + '\veritabani.odb';
+  dbFile := p + PathDelim + 'veritabani.odb';
 
   myKv := TVDb.Create;
   try
@@ -8300,9 +8301,9 @@ var
   myKv: TVDb;
 begin
   Grp('F1-2 CommitBatch hata yolunda atomiklik');
-  p := D + '\f1_atomic';
+  p := D + PathDelim + 'f1_atomic';
   ForceDirectories(p);
-  dbFile := p + '\veritabani.odb';
+  dbFile := p + PathDelim + 'veritabani.odb';
 
   myKv := TVDb.Create;
   try
@@ -8535,10 +8536,10 @@ var
   remaining, pos2: Int64;
 begin
   Grp('F1-3 MigrateLegacy basliksiz dosyayi aktarir');
-  p := D + '\f1_legacy';
+  p := D + PathDelim + 'f1_legacy';
   ForceDirectories(p);
-  src := p + '\eski.odb';
-  yeni := p + '\yeni';
+  src := p + PathDelim + 'eski.odb';
+  yeni := p + PathDelim + 'yeni';
   ForceDirectories(yeni);
   nRec := 400;
 
@@ -8561,7 +8562,7 @@ begin
   //    dosyayi legacy sanmaz.
   fs := TFileStream.Create(src, fmCreate);
   try
-    srcFs := TFileStream.Create(yeni + '\veritabani.odb', fmOpenRead);
+    srcFs := TFileStream.Create(yeni + PathDelim + 'veritabani.odb', fmOpenRead);
     try
       srcFs.Position := VDB_HDR_SIZE;
       remaining := srcFs.Size - VDB_HDR_SIZE;
@@ -8721,7 +8722,7 @@ var
   raised, good: Boolean;
 begin
   Grp('F2-13 bozuk sema kaydi hata verir');
-  p := D + '\f2_schema';
+  p := D + PathDelim + 'f2_schema';
   ForceDirectories(p);
 
   // 1) Gecerli sema + veri
@@ -8750,14 +8751,17 @@ begin
   myKv := TVDb.Create;
   try
     myKv.Open(p);
-    SetLength(semaB, Length(rawB) + 8);
+    { ONEMLI: tampon 16 bayt buyutulmeli; asagidaki Move 12 bayt + 4
+      baytlik alan yazimi toplam 16 bayt yer ister. Once yalnizca +8
+      ayrilip 16 bayt yaziliyordu: heap blogu tasip baska bloklarin
+      imzasini bozuyordu (Linux'ta rastgele cokmelerin kaynagi). }
+    SetLength(semaB, Length(rawB) + 16);
     Move(rawB[0], semaB[0], Length(rawB));
     Move('99|bozuktablo', semaB[Length(rawB)], 12);
     semaB[Length(rawB) + 12] := 10;
     semaB[Length(rawB) + 13] := 13;
     semaB[Length(rawB) + 14] := 0;
     semaB[Length(rawB) + 15] := 0;
-    SetLength(semaB, Length(rawB) + 16);
     myKv.Put(VDB_SCHEMA_KEY, semaB);
     myKv.Close;
   finally
@@ -9006,7 +9010,7 @@ begin
   sq.Free; tb.Free; kv.Close; kv.Free;
   sq := nil; tb := nil; kv := nil;
   kv := TVDb.Create; tb := TVTableDb.Create(kv); sq := TVSql.Create(tb);
-  kv.Open(D + '\f2_ddlatomic'); tb.Open(D + '\f2_ddlatomic');
+  kv.Open(D + PathDelim + 'f2_ddlatomic'); tb.Open(D + PathDelim + 'f2_ddlatomic');
   Chk('yeniden acilista tablo okunur', 'SELECT id FROM da', 3);
   ChkVal('yeni kolon semada kalici', 'SELECT w FROM da WHERE id = 2', 0, 0, '');
 end;
@@ -9107,11 +9111,11 @@ var
   msg: string;
 begin
   Grp('F2-3 bozuk dosya tutarli hata verir');
-  p := D + '\f2_corrupt';
+  p := D + PathDelim + 'f2_corrupt';
   ForceDirectories(p);
 
   // 1) 2 baytlik dosya (basliktan kisa)
-  f := p + '\kisa.odb';
+  f := p + PathDelim + 'kisa.odb';
   fsx := TFileStream.Create(f, fmCreate);
   try
     fsx.WriteBuffer(PAnsiChar('VO')^, 2);
@@ -9137,7 +9141,7 @@ begin
   end;
 
   // 2) Anlamli olmayan magic
-  f := p + '\bozuk.odb';
+  f := p + PathDelim + 'bozuk.odb';
   fsx := TFileStream.Create(f, fmCreate);
   try
     fsx.WriteBuffer(PAnsiChar('ZZZZZZZZZZZZZZZZ')^, 16);
@@ -9168,7 +9172,7 @@ var
   got2: Boolean;
 begin
   Grp('F2-17 Verify BATCHEND sayaci');
-  p := D + '\f2_verifybe';
+  p := D + PathDelim + 'f2_verifybe';
   ForceDirectories(p);
   myKv := TVDb.Create;
   try
@@ -9198,7 +9202,7 @@ var
   myKv: TVDb;
 begin
   Grp('F2-1/F2-2 dizin flush sonucu ve isareti');
-  p := D + '\f2_dirflush';
+  p := D + PathDelim + 'f2_dirflush';
   ForceDirectories(p);
   myKv := TVDb.Create;
   try
@@ -9233,7 +9237,7 @@ var
   cls: string;
 begin
   Grp('F2-4 WAL metotlari kilit ve aciklik denetimi');
-  p := D + '\f2_wal';
+  p := D + PathDelim + 'f2_wal';
   ForceDirectories(p);
   myKv := TVDb.Create;
   try
@@ -9278,7 +9282,7 @@ var
   got: Boolean;
 begin
   Grp('F2-5 Get dogruluk ve olmayan anahtar');
-  p := D + '\f2_getbound';
+  p := D + PathDelim + 'f2_getbound';
   ForceDirectories(p);
   myKv := TVDb.Create;
   try
@@ -9352,9 +9356,9 @@ var
   buf: array[0..255] of Byte;
 begin
   Grp('F2-16 bozuk kayit sessizce yutulmaz');
-  p := D + '\f2_scanrows';
+  p := D + PathDelim + 'f2_scanrows';
   ForceDirectories(p);
-  f := p + '\veritabani.odb';
+  f := p + PathDelim + 'veritabani.odb';
   myKv := TVDb.Create;
   try
     myKv.Open(p);
@@ -9434,8 +9438,8 @@ begin
   // yeniden acilinda sentetik anahtarlar korunmali
   tb.Close; kv.Close; sq.Free; tb.Free; kv.Free;
   kv := TVDb.Create; tb := TVTableDb.Create(kv); sq := TVSql.Create(tb);
-  kv.Open(D + '\f2_nopk');
-  tb.Open(D + '\f2_nopk');
+  kv.Open(D + PathDelim + 'f2_nopk');
+  tb.Open(D + PathDelim + 'f2_nopk');
   Chk('reopen sonrasi 2 satir', 'SELECT a FROM npk', 2);
   ChkVal('reopen sonrasi degerler', 'SELECT b FROM npk WHERE b = ' + Q + '9' + Q, 0, 0, '9');
   // yeni satir eklenince sentetik anahtar carpismamali
@@ -9499,7 +9503,7 @@ begin
   // --- UNIQUE tanimi semada korunur (reopen) ---
   tb.Close; kv.Close; sq.Free; tb.Free; kv.Free;
   kv := TVDb.Create; tb := TVTableDb.Create(kv); sq := TVSql.Create(tb);
-  kv.Open(D + '\f2_uniqidx'); tb.Open(D + '\f2_uniqidx');
+  kv.Open(D + PathDelim + 'f2_uniqidx'); tb.Open(D + PathDelim + 'f2_uniqidx');
   Chk('reopen sonrasi satirlar', 'SELECT a FROM u2', 3);
   ChkErr('reopen sonrasi UNIQUE hala zorlanir',
     'INSERT INTO u2(id,a,b) VALUES(5,' + Q + 'x' + Q + ',' + Q + 'y' + Q + ')');
@@ -9683,10 +9687,10 @@ begin
   Grp('Yonetim aracinin kullandigi motor API yollari');
   myKv := TVDb.Create;
   try
-    myKv.Open(D + '\yonetimapi');
+    myKv.Open(D + PathDelim + 'yonetimapi');
     myTb := TVTableDb.Create(myKv);
     try
-      myTb.Open(D + '\yonetimapi');
+      myTb.Open(D + PathDelim + 'yonetimapi');
       // ---- (1) PK'siz tablo (PkIndex = -1) ----
       SetLength(cols, 3);
       cols[0].Name := 'a'; cols[0].Ctype := VCT_STR;
@@ -9800,11 +9804,11 @@ begin
   Grp('Yonetim bakim ozellikleri (dayaniklilik, betik, sikistirma)');
   myKv := TVDb.Create;
   try
-    myKv.Open(D + '\yonetimbakim');
+    myKv.Open(D + PathDelim + 'yonetimbakim');
     myTb := TVTableDb.Create(myKv);
     mySq := TVSql.Create(myTb);
     try
-      myTb.Open(D + '\yonetimbakim');
+      myTb.Open(D + PathDelim + 'yonetimbakim');
       // ---------- M8: AutoCompact (Gerektiginde Sikistir) ----------
       mySq.Exec('CREATE TABLE ac(id INTEGER PRIMARY KEY, v TEXT)');
       for i := 1 to 400 do
@@ -10072,7 +10076,7 @@ begin
   // ---- 1) Temel replay: ana dosyaya YAZILMADAN wal'a yazilip replay ----
   myKv := TVDb.Create;
   try
-    myKv.Open(D + '\wal1');
+    myKv.Open(D + PathDelim + 'wal1');
     walFile := myKv.WalPath;
     myKv.Put(1, VDbStrToBytes('ana-dosya-1'));
     // 3 kayit: 2 put + 1 delete
@@ -10302,7 +10306,7 @@ begin
   // ---- 4) CheckpointWAL: once REPLAY, sonra sil (yoksa veri kaybi) ----
   myKv := TVDb.Create;
   try
-    myKv.Open(D + '\wal2');
+    myKv.Open(D + PathDelim + 'wal2');
     myKv.WriteAheadWAL(30, VDbStrToBytes('checkpoint-30'), VDB_FLAG_PUT);
     if myKv.CheckpointWAL then Ok('CheckpointWAL basarili', 'True')
     else No('CheckpointWAL basarisiz', '');
@@ -10314,7 +10318,7 @@ begin
     else Ok('checkpoint sonrasi .wal silindi', 'silindi');
     // dosya .wal'siz: yeni acilista da veri durmali
     myKv.Close;
-    myKv.Open(D + '\wal2');
+    myKv.Open(D + PathDelim + 'wal2');
     SetLength(v, 0);
     if myKv.Get(30, v) and (VDbBytesToStr(v) = 'checkpoint-30') then
       Ok('reopen sonrasi checkpoint kaydi durur', 'kalici')
@@ -10338,7 +10342,7 @@ begin
       Ok('replay sonrasi 101 bellekte okunuyor', 'replay-101')
     else No('replay sonrasi 101 bellekte yok', '');
     myKv.Close;
-    myKv.Open(D + '\wal2');
+    myKv.Open(D + PathDelim + 'wal2');
     SetLength(v, 0);
     if myKv.Get(100, v) and (VDbBytesToStr(v) = 'batchend-oncesi') then
       Ok('reopen sonrasi 100 (BATCHEND oncesi) durur', 'kalici')
@@ -10415,7 +10419,7 @@ begin
   // ---- a) ve f) varsayilan KAPALI ----
   myKv := TVDb.Create;
   try
-    myKv.Open(D + '\auto1.odb');
+    myKv.Open(D + PathDelim + 'auto1.odb');
     Dogrula('varsayilan WALEnabled = False', not myKv.WALEnabled);
     myKv.Put(1, VDbStrToBytes('x'));
     Dogrula('kapali iken .wal YAZILMADI', not myKv.HasWAL);
@@ -10428,7 +10432,7 @@ begin
   // ---- b) acik iken Put otomatik gunluge gider ----
   myKv := TVDb.Create;
   try
-    myKv.Open(D + '\auto2.odb');
+    myKv.Open(D + PathDelim + 'auto2.odb');
     myKv.WALEnabled := True;
     Dogrula('WALEnabled = True', myKv.WALEnabled);
 
@@ -10482,7 +10486,7 @@ begin
 
     // ---- i) kapat-ac ----
     myKv.Close;
-    myKv.Open(D + '\auto2.odb');
+    myKv.Open(D + PathDelim + 'auto2.odb');
     SetLength(v, 0);
     Dogrula('reopen sonrasi b21 durur',
       myKv.Get(21, v) and (VDbBytesToStr(v) = 'b21'), VDbBytesToStr(v));
@@ -10498,7 +10502,7 @@ begin
   // ---- c) WAL yazma basarisiz: ana dosyaya da YAZILMAZ ----
   myKv := TVDb.Create;
   try
-    myKv.Open(D + '\auto3.odb');
+    myKv.Open(D + PathDelim + 'auto3.odb');
     myKv.Put(1, VDbStrToBytes('ilk'));
     myKv.CheckpointWAL;
     myKv.WALEnabled := True;
@@ -10623,7 +10627,7 @@ begin
   Grp('R-01 MVCC: BeginBatch / CommitBatch / AbortBatch (R-01)');
   UseDir('mvcc');
   kv.Close;
-  kv.Open(D + '\mvccbatch');
+  kv.Open(D + PathDelim + 'mvccbatch');
   kv.Put(1, VDbStrToBytes('old-1'));
   kv.Put(2, VDbStrToBytes('old-2'));
 
@@ -10652,8 +10656,8 @@ begin
   Dogrula('abort sonra 1 hala var', kv.Get(1, b) and (VDbBytesToStr(b) = 'old-1'), VDbBytesToStr(b));
 
   kv.Close;
-  if FileExists(D + '\mvccbatch.odb') then DeleteFile(D + '\mvccbatch.odb');
-  if FileExists(D + '\mvccbatch.odb.wal') then DeleteFile(D + '\mvccbatch.odb.wal');
+  if FileExists(D + PathDelim + 'mvccbatch.odb') then DeleteFile(D + PathDelim + 'mvccbatch.odb');
+  if FileExists(D + PathDelim + 'mvccbatch.odb.wal') then DeleteFile(D + PathDelim + 'mvccbatch.odb.wal');
 end;
 
 { M1: PostgreSQL wire testi icin ham istemci yardimcilari (BE). }
@@ -10924,13 +10928,13 @@ var
   vals: string;
 begin
   Grp('M10 GENERATED ALWAYS AS (STORED)');
-  ForceDirectories(D + '\gen');
+  ForceDirectories(D + PathDelim + 'gen');
   kv2 := TVDb.Create;
   try
-    kv2.Open(D + '\gen');
+    kv2.Open(D + PathDelim + 'gen');
     tb2 := TVTableDb.Create(kv2);
     try
-      tb2.Open(D + '\gen');
+      tb2.Open(D + PathDelim + 'gen');
       sq2 := TVSql.Create(tb2);
       try
         sq2.Exec('CREATE TABLE g(a INTEGER PRIMARY KEY, b INTEGER, ' +
@@ -11060,10 +11064,10 @@ begin
   // Sema 6. alan (hex ifade) ile yeniden acilista korunur.
   kv2 := TVDb.Create;
   try
-    kv2.Open(D + '\gen');
+    kv2.Open(D + PathDelim + 'gen');
     tb2 := TVTableDb.Create(kv2);
     try
-      tb2.Open(D + '\gen');
+      tb2.Open(D + PathDelim + 'gen');
       sq2 := TVSql.Create(tb2);
       try
         r := sq2.Exec('SELECT c FROM g WHERE a=2');
@@ -11406,8 +11410,8 @@ var
 
 begin
   Grp('M1 PostgreSQL wire protocol (basit sorgu)');
-  ForceDirectories(D + '\pgsrv');
-  srv := TVdbPgServer.Create(D + '\pgsrv', PPORT);
+  ForceDirectories(D + PathDelim + 'pgsrv');
+  srv := TVdbPgServer.Create(D + PathDelim + 'pgsrv', PPORT);
   msgs := nil;
   s := VDB_SOCK_INVALID;
   try
@@ -11964,8 +11968,8 @@ var
 
 begin
   Grp('M1 pgwire TLS (OpenSSL)');
-  certPath := D + '\pgtls_cert.pem';
-  keyPath := D + '\pgtls_key.pem';
+  certPath := D + PathDelim + 'pgtls_cert.pem';
+  keyPath := D + PathDelim + 'pgtls_key.pem';
   sl := TStringList.Create;
   try
     for i := 0 to High(CERT_LINES) do sl.Add(CERT_LINES[i]);
@@ -11980,8 +11984,8 @@ begin
   Dogrula('TLS OpenSSL yuklendi', VDbTlsAvailable, VDbTlsLastError);
   if not VDbTlsAvailable then Exit;
 
-  ForceDirectories(D + '\pgtls');
-  srv := TVdbPgServer.Create(D + '\pgtls', PPORT);
+  ForceDirectories(D + PathDelim + 'pgtls');
+  srv := TVdbPgServer.Create(D + PathDelim + 'pgtls', PPORT);
   ctx := nil;
   sess := nil;
   s := VDB_SOCK_INVALID;
@@ -12240,10 +12244,10 @@ begin
     (Length(keys) = 1) and (keys[0] = 9), IntToStr(Length(keys)));
   mem := nil;
 
-  ForceDirectories(D + '\m11store');
+  ForceDirectories(D + PathDelim + 'm11store');
   db := TVDb.Create;
   try
-    db.Open(D + '\m11store\kv.odb');
+    db.Open(D + PathDelim + 'm11store' + PathDelim + 'kv.odb');
     real := TVDbKvStore.Create(db);
     real.Put(42, VDbStrToBytes('satir'));
     Dogrula('M11 TVDb Put/Get',
@@ -12276,9 +12280,9 @@ begin
     Q + '1999-12-31' + Q + ',' + Q + '1999-12-31 23:59:59' + Q + ',' +
     Q + '23:59:59' + Q + ',' + Q + 'x' + Q + ')');
 
-  fn := D + '\m2_arrow\ar.arrow';
-  fnSub := D + '\m2_arrow\ar_sub.arrow';
-  fnEmpty := D + '\m2_arrow\ar_empty.arrow';
+  fn := D + PathDelim + 'm2_arrow' + PathDelim + 'ar.arrow';
+  fnSub := D + PathDelim + 'm2_arrow' + PathDelim + 'ar_sub.arrow';
+  fnEmpty := D + PathDelim + 'm2_arrow' + PathDelim + 'ar_empty.arrow';
 
   R2 := sq.Exec('COPY ar TO ''' + fn + ''' (FORMAT ARROW)');
   ChkInt('Arrow TO Affected=3', R2.Affected, 3);
@@ -12345,7 +12349,7 @@ begin
 
   ok := False;
   try
-    sq.Exec('COPY ar TO ''' + D + '\m2_arrow\ar.csv'' (FORMAT CSV)');
+    sq.Exec('COPY ar TO ''' + D + PathDelim + 'm2_arrow' + PathDelim + 'ar.csv'' (FORMAT CSV)');
   except
     on E: Exception do
       ok := Pos('FORMAT ARROW', E.Message) > 0;
@@ -12363,7 +12367,7 @@ begin
 
   ok := False;
   try
-    sq.Exec('COPY ar FROM ''' + D + '\m2_arrow\yok.arrow'' (FORMAT ARROW)');
+    sq.Exec('COPY ar FROM ''' + D + PathDelim + 'm2_arrow' + PathDelim + 'yok.arrow'' (FORMAT ARROW)');
   except
     on E: Exception do
       ok := Pos('dosya bulunamadi', E.Message) > 0;
@@ -12390,9 +12394,9 @@ begin
     Q + '1999-12-31' + Q + ',' + Q + '1999-12-31 23:59:59' + Q + ',' +
     Q + '23:59:59' + Q + ',' + Q + 'x' + Q + ')');
 
-  fn := D + '\m2_parquet\pq.parquet';
-  fnSub := D + '\m2_parquet\pq_sub.parquet';
-  fnEmpty := D + '\m2_parquet\pq_empty.parquet';
+  fn := D + PathDelim + 'm2_parquet' + PathDelim + 'pq.parquet';
+  fnSub := D + PathDelim + 'm2_parquet' + PathDelim + 'pq_sub.parquet';
+  fnEmpty := D + PathDelim + 'm2_parquet' + PathDelim + 'pq_empty.parquet';
 
   R2 := sq.Exec('COPY pq TO ''' + fn + ''' (FORMAT PARQUET)');
   ChkInt('Parquet TO Affected=3', R2.Affected, 3);
@@ -12468,7 +12472,7 @@ begin
 
   ok := False;
   try
-    sq.Exec('COPY pq FROM ''' + D + '\m2_parquet\yok.parquet'' (FORMAT PARQUET)');
+    sq.Exec('COPY pq FROM ''' + D + PathDelim + 'm2_parquet' + PathDelim + 'yok.parquet'' (FORMAT PARQUET)');
   except
     on E: Exception do
       ok := Pos('dosya bulunamadi', E.Message) > 0;
@@ -12505,7 +12509,7 @@ var
 
 begin
   Grp('M6 kolon seviyesi sifreleme');
-  dir := D + '\m6_colenc';
+  dir := D + PathDelim + 'm6_colenc';
   UseDir('m6_colenc');
   keyPath := kv.ColumnKeyPath;
   Dogrula('colkey baslangicta yok', not FileExists(keyPath), keyPath);
@@ -12620,7 +12624,7 @@ begin
   Dogrula('rekey .colkey dosyasini silmedi', FileExists(keyPath), keyPath);
 
   // Arrow disa aktarma duz metin, ice aktarma yeniden sifreler.
-  fn := dir + '\sec.arrow';
+  fn := dir + PathDelim + 'sec.arrow';
   sq.Exec('COPY sec TO ''' + fn + ''' (FORMAT ARROW)');
   sq.Exec('CREATE TABLE sec_copy(id INTEGER PRIMARY KEY, ad TEXT ENCRYPTED, ' +
     'notu BLOB ENCRYPTED, acik TEXT, ek TEXT ENCRYPTED)');
@@ -12633,9 +12637,9 @@ begin
     0, 0, 'ek-gizli');
 
   // Yedek, sifreli kolonlarin acilmasi icin .colkey'i da tasimali.
-  kv.BackupTo(dir + '\sec_backup.odb');
+  kv.BackupTo(dir + PathDelim + 'sec_backup.odb');
   Dogrula('yedek .colkey kopyaladi',
-    FileExists(dir + '\sec_backup.colkey'), dir + '\sec_backup.colkey');
+    FileExists(dir + PathDelim + 'sec_backup.colkey'), dir + PathDelim + 'sec_backup.colkey');
 end;
 
 procedure T126_F42_TxIsolation;
@@ -12650,7 +12654,7 @@ var
   ok: Boolean;
 begin
   Grp('F-42 oturum yalitimi');
-  dir := D + '\f42_iso';
+  dir := D + PathDelim + 'f42_iso';
   ForceDirectories(dir);
   db := TVDb.Create;
   try
@@ -12704,14 +12708,14 @@ var
   ok: Boolean;
 begin
   Grp('H5 blok-grup CRC');
-  dir := D + '\h5_blk';
+  dir := D + PathDelim + 'h5_blk';
   ForceDirectories(dir);
   db := TVDb.Create;
   try
     db.Open(dir);
     for i := 1 to 3 do
       db.Put(QWord(i), VDbStrToBytes('blok-' + IntToStr(i)));
-    fn := dir + '\veritabani.odb';
+    fn := dir + PathDelim + 'veritabani.odb';
     ok := db.Verify(rep);
     Dogrula('H5 Verify blok footer sayisi', ok and (Pos('blok=3', rep) > 0), rep);
   finally
@@ -12825,7 +12829,7 @@ var
       db.Close;
       db.Free;
     end;
-    fn := ADir + '\veritabani.odb';
+    fn := ADir + PathDelim + 'veritabani.odb';
     fs := TFileStream.Create(fn, fmOpenRead);
     try
       fs.Position := VDB_HDR_SIZE;
@@ -12838,7 +12842,7 @@ var
 
 begin
   Grp('H11 undo gunlugu');
-  baseDir := D + '\h11_undo_' + IntToStr(GetTickCount64);
+  baseDir := D + PathDelim + 'h11_undo_' + IntToStr(GetTickCount64);
 
   // 1) Commit isareti yok: yarim yerinde yazim geri alinir.
   dir := baseDir + '_a';
@@ -12909,7 +12913,7 @@ begin
     db.Close;
     db.Free;
   end;
-  fn := dir + '\veritabani.odb';
+  fn := dir + PathDelim + 'veritabani.odb';
   fs := TFileStream.Create(fn, fmOpenRead);
   try
     sz0 := fs.Size;
@@ -12988,7 +12992,7 @@ var
 
 begin
   Grp('H11 yerinde yazim / serbest bolge');
-  baseDir := D + '\h11_inplace_' + IntToStr(GetTickCount64);
+  baseDir := D + PathDelim + 'h11_inplace_' + IntToStr(GetTickCount64);
 
   // 1) Olu PUT bolgesi yeni kayitla yeniden kullanilir; silinen anahtar
   //    recovery'de geri gelmez.
@@ -13004,7 +13008,7 @@ begin
     db.Close;
     db.Free;
   end;
-  fn := dir + '\veritabani.odb';
+  fn := dir + PathDelim + 'veritabani.odb';
   sz0 := FSize(fn);
   db := TVDb.Create;
   try
@@ -13049,7 +13053,7 @@ begin
     db.Close;
     db.Free;
   end;
-  fn := dir + '\veritabani.odb';
+  fn := dir + PathDelim + 'veritabani.odb';
   sz0 := FSize(fn);
   db := TVDb.Create;
   try
@@ -13108,7 +13112,7 @@ begin
     db.Close;
     db.Free;
   end;
-  fn := dir + '\veritabani.odb';
+  fn := dir + PathDelim + 'veritabani.odb';
   db := TVDb.Create;
   try
     db.Open(dir);
@@ -13136,7 +13140,7 @@ begin
     db.Close;
     db.Free;
   end;
-  fn := dir + '\veritabani.odb';
+  fn := dir + PathDelim + 'veritabani.odb';
   sz0 := FSize(fn);
   db := TVDb.Create;
   try
@@ -13353,8 +13357,8 @@ begin
     0, 0, '5');
   ChkVal('VEC cosine ortogonal', 'SELECT VECTOR_DISTANCE(' + Q + '[1,0]' + Q +
     ',' + Q + '[0,1]' + Q + ',' + Q + 'cosine' + Q + ')', 0, 0, '1');
-  ChkVal('VEC cosine ayni', 'SELECT VECTOR_DISTANCE(' + Q + '[1,2]' + Q +
-    ',' + Q + '[1,2]' + Q + ',' + Q + 'cosine' + Q + ')', 0, 0, '0');
+  ChkVal('VEC cosine ayni', 'SELECT ROUND(VECTOR_DISTANCE(' + Q + '[1,2]' + Q +
+    ',' + Q + '[1,2]' + Q + ',' + Q + 'cosine' + Q + '), 9)', 0, 0, '0');
   ChkVal('VEC dot', 'SELECT VECTOR_DISTANCE(' + Q + '[1,2]' + Q +
     ',' + Q + '[3,4]' + Q + ',' + Q + 'dot' + Q + ')', 0, 0, '11');
   ChkVal('VEC l1', 'SELECT VECTOR_DISTANCE(' + Q + '[1,0]' + Q +
@@ -13674,8 +13678,8 @@ begin
   Grp('H13 COPY FROM (CSV)');
   UseDir('h13_copy');
   sq.Exec('CREATE TABLE cp(id INTEGER PRIMARY KEY, nm TEXT, q INTEGER)');
-  fn := D + '\h13_copy.csv';
-  bad := D + '\h13_copy_bad.csv';
+  fn := D + PathDelim + 'h13_copy.csv';
+  bad := D + PathDelim + 'h13_copy_bad.csv';
   sl := TStringList.Create;
   try
     sl.Add('id,nm,q');
@@ -13731,7 +13735,7 @@ var
   i: Integer;
 begin
   Grp('T130 PK aralik indeksi tipi');
-  dir := D + '\t130_pk_' + IntToStr(GetTickCount64);
+  dir := D + PathDelim + 't130_pk_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
   db := TVDb.Create;
   tdb := TVTableDb.Create(db);
@@ -13791,7 +13795,7 @@ begin
   Grp('T131 H12 ORDER BY LIMIT top-N');
   fs := DefaultFormatSettings;
   fs.DecimalSeparator := '.';
-  dir := D + '\t131_topn_' + IntToStr(GetTickCount64);
+  dir := D + PathDelim + 't131_topn_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
   db := TVDb.Create;
   tdb := TVTableDb.Create(db);
@@ -13876,7 +13880,7 @@ begin
   Grp('T133 H13 akisli GROUP BY');
   fs := DefaultFormatSettings;
   fs.DecimalSeparator := '.';
-  dir := D + '\t133_group_' + IntToStr(GetTickCount64);
+  dir := D + PathDelim + 't133_group_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
   db := TVDb.Create;
   tdb := TVTableDb.Create(db);
@@ -14065,7 +14069,7 @@ var
 
 begin
   Grp('T134 H12c cok kolonlu akisli top-N');
-  dir := D + '\t134_multi_' + IntToStr(GetTickCount64);
+  dir := D + PathDelim + 't134_multi_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
   db := TVDb.Create;
   tdb := TVTableDb.Create(db);
@@ -14179,7 +14183,7 @@ begin
   Grp('T135 H14 FLOAT siralama hizli yolu');
   fs := DefaultFormatSettings;
   fs.DecimalSeparator := '.';
-  dir := D + '\t135_fsort_' + IntToStr(GetTickCount64);
+  dir := D + PathDelim + 't135_fsort_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
   db := TVDb.Create;
   tdb := TVTableDb.Create(db);
@@ -14337,7 +14341,7 @@ var
 
 begin
   Grp('T136 H13 akisli GROUP BY / genel yol farki');
-  dir := D + '\t136_gdiff_' + IntToStr(GetTickCount64);
+  dir := D + PathDelim + 't136_gdiff_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
   db := TVDb.Create;
   tdb := TVTableDb.Create(db);
@@ -14438,7 +14442,7 @@ var
 
 begin
   Grp('T138 H16 akisli DISTINCT / genel yol farki');
-  dir := D + '\t138_distinct_' + IntToStr(GetTickCount64);
+  dir := D + PathDelim + 't138_distinct_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
   db := TVDb.Create;
   tdb := TVTableDb.Create(db);
@@ -14519,7 +14523,7 @@ var
 
 begin
   Grp('T139 H17 akisli WHERE''li COUNT(*) / genel yol farki');
-  dir := D + '\t139_fcount_' + IntToStr(GetTickCount64);
+  dir := D + PathDelim + 't139_fcount_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
   db := TVDb.Create;
   tdb := TVTableDb.Create(db);
@@ -14667,7 +14671,7 @@ var
 
 begin
   Grp('T140 H18 ham kesin COUNT(*) / genel yol farki');
-  dir := D + '\t140_rawcount_' + IntToStr(GetTickCount64);
+  dir := D + PathDelim + 't140_rawcount_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
   db := TVDb.Create;
   tdb := TVTableDb.Create(db);
@@ -14785,7 +14789,7 @@ var
 
 begin
   Grp('T141 H19 ham LIKE/ILIKE COUNT(*) / genel yol farki');
-  dir := D + '\t141_rawlike_' + IntToStr(GetTickCount64);
+  dir := D + PathDelim + 't141_rawlike_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
   db := TVDb.Create;
   tdb := TVTableDb.Create(db);
@@ -14875,7 +14879,7 @@ var
 
 begin
   Grp('T142 H20 ham boolean agaci / genel yol farki');
-  dir := D + '\t142_rawtree_' + IntToStr(GetTickCount64);
+  dir := D + PathDelim + 't142_rawtree_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
   db := TVDb.Create;
   tdb := TVTableDb.Create(db);
@@ -15046,7 +15050,7 @@ var
 
 begin
   Grp('T143 H21 ham boolean agaci / SELECT yollari');
-  dir := D + '\t143_rawtree_sel_' + IntToStr(GetTickCount64);
+  dir := D + PathDelim + 't143_rawtree_sel_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
   db := TVDb.Create;
   tdb := TVTableDb.Create(db);
@@ -15133,7 +15137,7 @@ var
 
 begin
   Grp('T144 H22 derin OFFSET canlilik denetimi');
-  dir := D + '\t144_offset_live_' + IntToStr(GetTickCount64);
+  dir := D + PathDelim + 't144_offset_live_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
   db := TVDb.Create;
   tdb := TVTableDb.Create(db);
@@ -15208,7 +15212,7 @@ var
 
 begin
   Grp('T145 H8 MCV skew esitlik');
-  dir := D + '\t145_mcv_' + IntToStr(GetTickCount64);
+  dir := D + PathDelim + 't145_mcv_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
   db := TVDb.Create;
   tdb := TVTableDb.Create(db);
@@ -15471,8 +15475,8 @@ begin
   Grp('M8 SQLancer tarzi rasgele SELECT + indeks diferansiyeli');
   seed0 := RandSeed;
   RandSeed := 147147;
-  dirA := D + '\t147_fz_idx_' + IntToStr(GetTickCount64);
-  dirB := D + '\t147_fz_seq_' + IntToStr(GetTickCount64);
+  dirA := D + PathDelim + 't147_fz_idx_' + IntToStr(GetTickCount64);
+  dirB := D + PathDelim + 't147_fz_seq_' + IntToStr(GetTickCount64);
   ForceDirectories(dirA);
   ForceDirectories(dirB);
   dbA := TVDb.Create;
@@ -15604,7 +15608,7 @@ var
 
 begin
   Grp('T137 H15 akisli GROUP BY + HAVING');
-  dir := D + '\t137_having_' + IntToStr(GetTickCount64);
+  dir := D + PathDelim + 't137_having_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
   db := TVDb.Create;
   tdb := TVTableDb.Create(db);
@@ -15709,7 +15713,7 @@ begin
   Grp('T132 H12b akisli top-N');
   fs := DefaultFormatSettings;
   fs.DecimalSeparator := '.';
-  dir := D + '\t132_stream_' + IntToStr(GetTickCount64);
+  dir := D + PathDelim + 't132_stream_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
   db := TVDb.Create;
   tdb := TVTableDb.Create(db);

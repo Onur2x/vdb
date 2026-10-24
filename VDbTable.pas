@@ -1054,12 +1054,18 @@ end;
 
 function VDbS2B(const S: RawByteString): TBytes;
 begin
+  { Bkz. VDbB2S: gecici sonuc sifirlanmis olmayabilir. }
+  FillChar(Result, SizeOf(Result), 0);
   SetLength(Result, Length(S));
   if Length(S) > 0 then Move(S[1], Result[0], Length(S));
 end;
 
 function VDbB2S(const B: TBytes; Pos, Len: Integer): RawByteString;
 begin
+  { FPC 3.2.2/x86_64: yonetilen tur donduren fonksiyonun gecici sonucu
+    sifirlanmis olmayabilir; SetLength(Result, ...) o bayat isaretciyi
+    finalize etmeye calisip yigini bozar. Sahiplenilmis veri yoktur. }
+  FillChar(Result, SizeOf(Result), 0);
   SetLength(Result, Len);
   if Len > 0 then Move(B[Pos], Result[1], Len);
 end;
@@ -8428,10 +8434,16 @@ begin
             end;
         end;
         if nReferencing > 0 then
+        begin
+          cdef := kv2.Key;
+          if (kv2.Value.Fks[j].Col >= 0) and
+             (kv2.Value.Fks[j].Col < Length(kv2.Value.Cols)) then
+            cdef := cdef + '.' + kv2.Value.Cols[kv2.Value.Fks[j].Col].Name;
           raise EVDbException.CreateFmt(ecForeignKeyViolation,
-            'tablo dusurulemez: %s.%s icinde %d satir bu tabloyu gosteriyor ' +
+            'tablo dusurulemez: %s icinde %d satir bu tabloyu gosteriyor ' +
             '(once cocuk satirlari silin veya FK kaldirin)',
-            [kv2.Key, kv2.Value.Fks[j].Col, nReferencing]);
+            [cdef, nReferencing]);
+        end;
       end;
   end;
     FKvStore.ScanAll(keys, raw, t.TableId);   // R-26: yalnizca bu tablonun satirlari
@@ -9391,6 +9403,7 @@ procedure TVTableDb.CreateMaterializedView(const ViewName: string; const SelectS
 var
   v: TTableDef;
 begin
+  v := Default(TTableDef); // tum alanlar (ozellikle IsView) tanimli olsun
   if FTables.ContainsKey(VDbNorm(ViewName)) then
   begin
     if IfNotExists then Exit
