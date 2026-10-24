@@ -150,6 +150,11 @@ type
     function ExecOpenDatabase(const Sql: string; var P: Integer): TSqlResult;
     function ExecCloseDatabase(const Sql: string; var P: Integer): TSqlResult;
     function ExecBackupTo(const Sql: string; var P: Integer): TSqlResult;
+    { Sprint 2.8: v2 -> v3 gocu. Kaynak acik veritabanidir. }
+    function ExecMigrateTo(const Sql: string; var P: Integer): TSqlResult;
+    function ExecMigrateVerify(const Sql: string; var P: Integer): TSqlResult;
+    { Tek tirnakli dosya yolu argumanini okur (MIGRATE/BACKUP ortak). }
+    function PathArg(const Sql: string; var P: Integer): string;
     procedure ExecVerify(out Res: TSqlResult);
     procedure ExecListDatabases(out Res: TSqlResult);
     // --- F-21: YAVAS SORGU TESPITI ---
@@ -217,7 +222,7 @@ type
 implementation
 
 uses
-  VDbCore, VDbJson, VDbPlatform, VDbMonitor, VDbTrace;   // VDbCore: CREATE/DROP DATABASE icin TVDb
+  VDbCore, VDbJson, VDbPlatform, VDbMonitor, VDbTrace, VDbMigrate;   // VDbCore: CREATE/DROP DATABASE icin TVDb
 
 constructor TVSql.Create(AT: TVTableDb);
 begin
@@ -3010,6 +3015,7 @@ begin
        (w = 'SAVEPOINT') or (w = 'RELEASE') or (w = 'VACUUM') or (w = 'REINDEX') or
        (w = 'EXPORT') or (w = 'IMPORT') or (w = 'ATTACH') or (w = 'DETACH') or
        (w = 'OPEN') or (w = 'USE') or (w = 'CLOSE') or (w = 'BACKUP') or
+       (w = 'MIGRATE') or
        (w = 'VERIFY') or (w = 'REFRESH') or (w = 'TRIGGER') then
       Exit(False);
     if (w = 'CREATE') or (w = 'DROP') or (w = 'DELETE') then
@@ -3563,6 +3569,70 @@ begin
   Result.Msg := 'YEDEK: ' + dest + '  (' + IntToStr(VdbTickMs - ms) + ' ms)';
 end;
 
+function TVSql.PathArg(const Sql: string; var P: Integer): string;
+begin
+  if not Tok(Sql, P, Result) then
+    raise EVDbException.Create(ecInvalidName, 'dosya adi yok');
+  Result := Trim(Result);
+  if (Length(Result) >= 2) and (Result[1] = '''') and
+     (Result[Length(Result)] = '''') then
+    Result := Copy(Result, 2, Length(Result) - 2);
+  Result := Trim(Result);
+  if Result = '' then
+    raise EVDbException.Create(ecInvalidName, 'dosya adi bos');
+end;
+
+function TVSql.ExecMigrateTo(const Sql: string; var P: Integer): TSqlResult;
+// MIGRATE TO v3 'yeni.odb'
+//   Acik (v2) veritabaninin KV uzayini v3 sayfa dosyasina birebir kopyalar.
+var
+  dest, w: string;
+  rep: TVdbMigrateReport;
+  err: string;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  if FT.Kv = nil then
+    raise EVDbException.Create(ecUnsupported,
+      'MIGRATE: kaynak zaten v3 sayfa motoru');
+  { Cagiran 'MIGRATE TO' tuketti; sirada surum etiketi var. }
+  if not Tok(Sql, P, w) then
+    raise EVDbException.Create(ecSyntaxError,
+      'MIGRATE TO v3 ''<dosya>'' bekleniyor');
+  if not SameText(w, 'v3') then
+    raise EVDbException.Create(ecSyntaxError,
+      'MIGRATE TO v3 bekleniyor (bulunan: ' + w + ')');
+  dest := PathArg(Sql, P);
+  if not SameText(ExtractFileExt(dest), VDB_EXT) then
+    dest := dest + VDB_EXT;
+  if not VdbMigrateToV3(FT.Backend, dest, 256, rep, err) then
+    raise EVDbException.Create(ecIOError, 'MIGRATE basarisiz: ' + err);
+  Result.Affected := rep.Keys;
+  Result.LastTable := '';
+  Result.Stmts := 1;
+  Result.Msg := Format('GOC v3: %s  kayit=%d  bayt=%d  %d ms',
+    [dest, rep.Keys, rep.Bytes, rep.Ms]);
+end;
+
+function TVSql.ExecMigrateVerify(const Sql: string; var P: Integer): TSqlResult;
+// MIGRATE VERIFY '<goc.odb>' - acik veritabani ile hedefi bayt bayt karsilastirir
+var
+  dest: string;
+  rep: TVdbMigrateReport;
+  err: string;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  dest := PathArg(Sql, P);
+  if not SameText(ExtractFileExt(dest), VDB_EXT) then
+    dest := dest + VDB_EXT;
+  if not VdbMigrateVerify(FT.Backend, dest, 256, rep, err) then
+    raise EVDbException.Create(ecCorrupt, 'MIGRATE VERIFY basarisiz: ' + err);
+  Result.Affected := rep.Keys;
+  Result.LastTable := '';
+  Result.Stmts := 1;
+  Result.Msg := Format('GOC DOGRULANDI: %s  kayit=%d  bayt=%d  fark=0  %d ms',
+    [dest, rep.Keys, rep.Bytes, rep.Ms]);
+end;
+
 procedure TVSql.ExecVerify(out Res: TSqlResult);
 // VERIFY -> salt-okunur butunluk denetimi (sonuc Msg'de)
 var
@@ -3888,6 +3958,21 @@ begin
     else if w1 = 'BACKUP' then
     begin
       Result := ExecBackupTo(Sql, pTest);
+      Exit;
+    end
+    else if w1 = 'MIGRATE' then
+    begin
+      if not Tok(Sql, pTest, w2) then
+        raise EVDbException.Create(ecSyntaxError,
+          'MIGRATE TO v3 ''<dosya>'' veya MIGRATE VERIFY ''<dosya>'' bekleniyor');
+      w2 := UpperCase(w2);
+      if w2 = 'VERIFY' then
+        Result := ExecMigrateVerify(Sql, pTest)
+      else if w2 = 'TO' then
+        Result := ExecMigrateTo(Sql, pTest)
+      else
+        raise EVDbException.Create(ecSyntaxError,
+          'MIGRATE VERIFY veya MIGRATE TO v3 bekleniyor (bulunan: ' + w2 + ')');
       Exit;
     end
     else if (w1 = 'CREATE') and Tok(Sql, pTest, w2) and (UpperCase(w2) = 'DATABASE') then

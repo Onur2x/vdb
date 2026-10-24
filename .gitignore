@@ -40,6 +40,8 @@ build_*.log
 # Test verileri / Test data
 *.odb
 *.wal
+*.idx
+*.colkey
 *.key
 *.bak
 *_onceki

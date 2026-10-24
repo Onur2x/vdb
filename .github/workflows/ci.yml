@@ -60,6 +60,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:LAZBUILD -B v3sqlchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:LAZBUILD -B migchk.lpi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Sayfa deposu kapisi (storechk)
         shell: pwsh
@@ -169,6 +171,21 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'v3sqlchk kalan > 0'
+            exit 1
+          }
+
+      - name: v2 -> v3 goc kapisi (migchk)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbmigchk'
+          $out = & .\migchk.exe $dir 5000 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'V2 -> V3 GOCU DOGRULANDI') {
+            Write-Error 'migchk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'migchk kalan > 0'
             exit 1
           }
 
