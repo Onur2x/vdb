@@ -110,6 +110,13 @@ jobs:
           $out = & .\crashtest.exe $dir 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'COKME KURTARMA DOGRULANDI') {
+            # Log'a erisemeyenler icin son satirlar ANOTASYON olarak yazilir
+            # (check-run annotations API'si genel repolarda kimlik dogrulamadan
+            # okunabilir).
+            $tail = ($out -split "`r?`n" | Where-Object { $_.Trim() -ne '' } |
+              Select-Object -Last 25) -join ' || '
+            $tail = $tail -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+            Write-Host "::error title=crashtest::$tail"
             Write-Error 'crashtest basarisiz'
             exit 1
           }

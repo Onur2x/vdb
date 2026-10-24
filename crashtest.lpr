@@ -170,6 +170,7 @@ var
   i, bad: Integer;
   v, got: TBytes;
   t0: TDateTime;
+  st: TVdbWalStats;
 
   function ReadMarker: Integer;
   var
@@ -200,7 +201,18 @@ begin
     proc.Parameters.Add(markerPath);
     proc.Options := [poNoConsole];
     proc.Execute;
-    Sleep(2500);
+    { 2026-10-24: sabit Sleep yarisa bagliydi; yavas CI kosucusunda alt
+      surec henuz ilk commit'i yazmadan olduruluyor ve test "gecersiz"
+      sayiliyordu. Artik isaret dosyasi BEKLENIYOR (en fazla 30 sn) ve
+      en az 2000 satir (80 commit) gorulmeden oldurulmuyor; boylece
+      replay yolu her kosuda gercekten sinanir. }
+    t0 := Now;
+    marker := 0;
+    while (marker < 2000) and (Now - t0 < 30 / 86400) do
+    begin
+      Sleep(50);
+      marker := ReadMarker;
+    end;
     { kill -9 esdegeri: TerminateProcess }
     proc.Terminate(1);
     proc.WaitOnExit;
@@ -232,13 +244,16 @@ begin
     end;
     if bad = 0 then
       Ok(Format('kill -9: commit edilmis %d satirin TAMAMI yerinde', [marker]));
+    { 2026-10-24: bu satirlar ONCEDEN eng.Free'den SONRA calisiyordu
+      (serbest birakilmis nesnenin alani okunuyordu -> cop deger, bazen
+      erisim ihlali). Istatistikler artik Free'den once kopyalaniyor. }
+    st := eng.RecoveryStats;
   finally
     eng.Free;
   end;
   if FileExists(path + '.wal') then
     WriteLn(Format('        (kurtarma: %d cerceve, %d commit, torn=%s)',
-      [eng.RecoveryStats.Frames, eng.RecoveryStats.Commits,
-       BoolToStr(eng.RecoveryStats.TornTail, True)]));
+      [st.Frames, st.Commits, BoolToStr(st.TornTail, True)]));
 end;
 
 { ================================================= 4) kesik WAL kuyrugu }
@@ -594,8 +609,10 @@ begin
           sl.Free;
         end;
         { Checkpoint seyrek: WAL'de commit edilmis cerceve kalsin ki
-          kill -9 sonrasi replay yolu gercekten calissin. }
-        if (i mod 500) = 0 then
+          kill -9 sonrasi replay yolu gercekten calissin. 2026-10-24:
+          500 -> 5000. Cok sik checkpoint, olum anini checkpoint'le
+          cakistirip testi sessizce "replay yok" durumuna dusuruyordu. }
+        if (i mod 5000) = 0 then
           eng.Checkpoint(True);
       end;
     end;
