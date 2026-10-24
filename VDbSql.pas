@@ -3062,7 +3062,7 @@ begin
   FillChar(Result, SizeOf(Result), 0);
   prevSess := VDbGetWriteSession;
   VDbSetWriteSession(FSessionId);
-  FT.Kv.WaitForeignTxn(FSessionId);
+  FT.Backend.WaitForeignTxn(FSessionId);
   try
   // Once tum cumleler SELECT mi kontrol et
   allSelect := True;
@@ -3168,7 +3168,7 @@ begin
   end;
   Result.Msg := 'OK';
   // P-DUR: basarili yazma sonrasi kirliyse flush'la.
-  if FT.Kv.Dirty then FT.Backend.Flush;
+  if FT.Backend.Dirty then FT.Backend.Flush;
 end;
 
 function TVSql.Exec(const Sql: string): TSqlResult;
@@ -3196,7 +3196,7 @@ begin
     bir transaction'in sahibiyle uyusmaz. }
   prevSess := VDbGetWriteSession;
   VDbSetWriteSession(FSessionId);
-  FT.Kv.WaitForeignTxn(FSessionId);
+  FT.Backend.WaitForeignTxn(FSessionId);
   try
 
   if (Length(st) = 1) and IsSelectStatement(st[0]) then
@@ -3224,7 +3224,7 @@ begin
       Result := ExecRaw(st[0]);
       Result.Stmts := 1;
       // P-DUR: tek cumlelik yazma burada saglama alinir (ExecAllInner kendi yapar).
-      if FT.Kv.Dirty then FT.Backend.Flush;
+      if FT.Backend.Dirty then FT.Backend.Flush;
     end
     else
       Result := ExecAllInner(st);  // KR-7: recursive Lock yok
@@ -3257,7 +3257,7 @@ begin
 
   prevSess := VDbGetWriteSession;
   VDbSetWriteSession(FSessionId);
-  FT.Kv.WaitForeignTxn(FSessionId);
+  FT.Backend.WaitForeignTxn(FSessionId);
   try
 
   if (Length(st) = 1) and IsSelectStatement(st[0]) then
@@ -3289,7 +3289,7 @@ begin
       Result := ExecRaw(st[0]);
       Result.Stmts := 1;
       // P-DUR: tek cumlelik yazma burada saglama alinir (ExecAllInner kendi yapar).
-      if FT.Kv.Dirty then FT.Backend.Flush;
+      if FT.Backend.Dirty then FT.Backend.Flush;
     end
     else
       Result := ExecAllInner(st);  // KR-7: recursive Lock yok
@@ -3307,7 +3307,7 @@ end;
 function TVSql.DbDir: string;
 // Etkin veritabaninin klasoru. TVDb.Open(Dir) -> <Dir>\veritabani.odb
 begin
-  Result := ExtractFileDir(FT.Kv.FilePath);
+  Result := ExtractFileDir(FT.Backend.FilePath);
 end;
 
 function TVSql.DbParent: string;
@@ -3465,8 +3465,8 @@ begin
   end;
   // Etkin veritabani kendini silemez
   if SameText(ExtractFileExt(f), VDB_EXT) and
-     SameText(ExtractFileName(f), ExtractFileName(FT.Kv.FilePath)) and
-     SameText(ExtractFileDir(f), ExtractFileDir(FT.Kv.FilePath)) then
+     SameText(ExtractFileName(f), ExtractFileName(FT.Backend.FilePath)) and
+     SameText(ExtractFileDir(f), ExtractFileDir(FT.Backend.FilePath)) then
     raise EVDbException.Create(ecInvalidState, 'etkin veritabani silinemez');
   if not DeleteFile(f) then
     raise EVDbException.Create(ecDatabaseLocked, 'silinemedi (dosya kilitli olabilir): ' + f);
@@ -3529,7 +3529,7 @@ begin
   FillChar(Result, SizeOf(Result), 0);
   if PeekWord(Sql, P) = 'DATABASE' then
     Tok(Sql, P, t);
-  f := FT.Kv.FilePath;
+  f := FT.Backend.FilePath;
   FT.Close;        // bekleyen sema yazimi
   FT.Kv.Close;     // dosya kilidini birakir
   Result.Affected := 1;
@@ -3613,7 +3613,7 @@ begin
   SetLength(Res.Fields, 2);
   Res.Fields[0] := 'database';
   Res.Fields[1] := 'current';
-  curPath := FT.Kv.FilePath;
+  curPath := FT.Backend.FilePath;
   root := DbParent;
   n := 0;
   curListed := False;
@@ -3686,12 +3686,12 @@ begin
   Result.LastTable := ''; Result.Stmts := 1;
 
   { F-42: dogrudan ExecRaw cagrilari da yabanci acik transaction'i beklesin. }
-  FT.Kv.WaitForeignTxn(FSessionId);
+  FT.Backend.WaitForeignTxn(FSessionId);
 
   // F-40: READ COMMITTED / READ UNCOMMITTED -> her cumle yeni snapshot.
   if FT.Backend.InBatch and
      (FExecutor.Isolation in [ilReadUncommitted, ilReadCommitted]) then
-    FT.Kv.RefreshBatchSnapshot;
+    FT.Backend.RefreshBatchSnapshot;
 
   spanRoot := VDbTraceBegin('sql.query', nil);
   VDbTraceSetAttr(spanRoot, 'db.statement', Sql);

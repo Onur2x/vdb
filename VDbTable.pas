@@ -517,11 +517,16 @@ type
     procedure IdxDelRow(const T: TTableDef; const Vals: TStrArray;
       const Pk: string; const OnlyPos: Integer);
     procedure BuildPkIdx(const T: TTableDef; out E: TIdxEntries);
+    { Kurucularin ortak alan kurulumu (Sprint 2.7). }
+    procedure InitCore;
     // Satirin TUM indekslerine ait anahtarlarini hesaplar (cok kolonlu destek)
     procedure IdxKeysOfRow(const T: TTableDef; const Vals: TStrArray;
       out Keys: TStrArray);
   public
     constructor Create(AKv: TVDb);
+    { Sprint 2.7: motoru dogrudan IVDbBackend olarak alan kurucu (v3 sayfa
+      motoru). `Kv` bu durumda nil'dir. }
+    constructor CreateBackend(const ABackend: IVDbBackend);
     destructor Destroy; override;
     procedure Open(const Dir: string);
     procedure Close;
@@ -3654,6 +3659,26 @@ begin
   // CRC icin okudugu her kayittan tablo id'yi bedava cikarir ve tablo
   // taramalari diger tablolarin kayitlarini OKUMAZ.
   FKvB.SetRowTagFunc(@VDbRowTagOf);
+  InitCore;
+end;
+
+{ Sprint 2.7 (2026-10-24): motoru dogrudan arayuzden alan kurucu. `Kv` nil
+  kalir: v3 sayfa motorunda v2'ye ozgu cekirdek islemler (Verify/Backup/
+  arsiv/replication) yoktur; onlari kullanan yollar v3'te cagrilmamalidir. }
+constructor TVTableDb.CreateBackend(const ABackend: IVDbBackend);
+begin
+  inherited Create;
+  if ABackend = nil then
+    raise EVDbException.Create(ecInvalidArgument,
+      'TVTableDb.CreateBackend: backend nil');
+  FKv := nil;
+  FKvB := ABackend;
+  FKvB.SetRowTagFunc(@VDbRowTagOf);
+  InitCore;
+end;
+
+procedure TVTableDb.InitCore;
+begin
   FLock := TMultiReadExclusiveWriteSynchronizer.Create;
   FTables := TDictionary<string, TTableDef>.Create;
   FById := TDictionary<Word, string>.Create;

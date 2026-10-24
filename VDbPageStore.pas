@@ -522,6 +522,7 @@ end;
 function TVDbPageStore.LoadFrame(PageNo: LongWord): Integer;
 var
   idx: Integer;
+  fromPending: Boolean;
 begin
   idx := PickVictim;
   if FFrames[idx].PageNo <> 0 then
@@ -543,15 +544,19 @@ begin
     HashDel(FFrames[idx].PageNo);
     Inc(FEvictions);
   end;
+  fromPending := False;
   if Assigned(FOnMiss) and FOnMiss(PageNo, @FFrames[idx].Data) then
   begin
-    { imaj WAL tamponundan geldi; diskten okumaya gerek yok }
+    { imaj WAL tamponundan geldi; diskten okumaya gerek yok. Bu imaj
+      veri dosyasinda HENUZ yok: cerceve kirli isaretlenmezse checkpoint
+      onu atlar ve WAL budanir -> sayfa kaybolur. }
+    fromPending := True;
   end
   else
     ReadPageAt(PageNo, @FFrames[idx].Data);
   FFrames[idx].PageNo := PageNo;
   FFrames[idx].Pins := 0;
-  FFrames[idx].Dirty := False;
+  FFrames[idx].Dirty := fromPending;
   FFrames[idx].Ref := True;
   HashPut(PageNo, idx);
   Result := idx;

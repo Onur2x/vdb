@@ -58,6 +58,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:LAZBUILD -B backendchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:LAZBUILD -B v3sqlchk.lpi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Sayfa deposu kapisi (storechk)
         shell: pwsh
@@ -152,6 +154,21 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'backendchk kalan > 0'
+            exit 1
+          }
+
+      - name: v3 SQL katmani kapisi (v3sqlchk)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbv3sqlchk'
+          $out = & .\v3sqlchk.exe $dir 1200 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'V3 SQL KATMANI DOGRULANDI') {
+            Write-Error 'v3sqlchk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'v3sqlchk kalan > 0'
             exit 1
           }
 

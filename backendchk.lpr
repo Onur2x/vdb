@@ -375,6 +375,63 @@ end;
 
 { ================================================== 6) kucuk havuz + N }
 
+{ Regresyon: sayfa tahliye edilip WAL tamponuna (pending) girdikten SONRA
+  yeniden okunup degistirilirse, checkpoint ESKI pending imajini yeni
+  cercevenin uzerine yazmamalidir. Bu hata sema kaydinin ve/veya
+  guncellenen sayfalarin sessizce kaybolmasina yol aciyordu. }
+procedure TestV3SpillReread(N: Integer);
+var
+  b: IVDbBackend;
+  v, w: TBytes;
+  i: Integer;
+  path: string;
+  bad: Integer;
+begin
+  CleanDir;
+  path := DirOf('spill.odb');
+  b := TVdbBackendV3.Create(path, True, 4);   // 4 cerceve: tahliye kacinilmaz
+  b.BeginBatch;
+  for i := 1 to N do
+  begin
+    MakeVal(i, 40, 1, v);
+    b.Put(i, v);
+  end;
+  b.CommitBatch;                              // sayfalar WAL tamponunda
+  { Ayni anahtarlari FARKLI boyutta yeniden yaz: eski deger artik diskte
+    degil, pending imajinda; okuma OnMiss ile oradan gelir. }
+  b.BeginBatch;
+  for i := N downto 1 do
+  begin
+    MakeVal(i, 64, 2, v);
+    b.Put(i, v);
+  end;
+  b.CommitBatch;
+  b.Flush;                                    // tam checkpoint + WAL budama
+  b := nil;
+
+  b := TVdbBackendV3.Create(path, False, 4);
+  bad := 0;
+  for i := 1 to N do
+  begin
+    MakeVal(i, 64, 2, v);
+    if not b.Get(i, w) then
+    begin
+      Inc(bad);
+      if bad <= 3 then WriteLn(Format('        kayip: %d', [i]));
+    end
+    else if not ValEq(w, v) then
+    begin
+      Inc(bad);
+      if bad <= 3 then WriteLn(Format('        bozuk: %d', [i]));
+    end;
+  end;
+  if bad = 0 then
+    Ok(Format('v3: tahliye sonrasi yeniden yazim %d satir birebir', [N]))
+  else
+    Fail(Format('v3: tahliye sonrasi %d satir bozuk', [bad]));
+  b := nil;
+end;
+
 procedure TestV3SmallPool(N: Integer);
 var
   b: IVDbBackend;
@@ -544,6 +601,7 @@ begin
   TestV3Batch;
   TestV3Filter;
   TestV3Checkpoint;
+  TestV3SpillReread(N);
   TestV3SmallPool(N);
   TestEquivalence(1000);
 

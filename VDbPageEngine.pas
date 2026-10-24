@@ -229,12 +229,17 @@ begin
   if i >= 0 then
   begin
     Move(P^, FPending[i].Data, VDB_PAGE_SIZE);
+    PageSeal(@FPending[i].Data);
     Exit;
   end;
   SetLength(FPending, Length(FPending) + 1);
   i := High(FPending);
   FPending[i].PageNo := PageNo;
   Move(P^, FPending[i].Data, VDB_PAGE_SIZE);
+  { Cerceveden tahliye aninda CRC BAYAT olabilir (sayfa henuz
+    muhurlenmemis). Pending imaji sonradan OnMiss ile okunup
+    dogrulanacagi icin burada muhurle. }
+  PageSeal(@FPending[i].Data);
 end;
 
 procedure TVdbPageEngine.ClearPending;
@@ -256,6 +261,12 @@ begin
   i := PendingIndex(PageNo);
   if i < 0 then Exit(False);
   Move(FPending[i].Data, P^, VDB_PAGE_SIZE);
+  { DIKKAT: imaj artik cercevede; pending'deki kopya BAYAT. Kalirsa
+    Checkpoint onu daha yeni cerceve imajinin uzerine yazar (veri kaybi).
+    Bu yuzden kaydi buradan dusur: pending ile cerceve asla ayni sayfayi
+    ayni anda tutmaz. }
+  FPending[i] := FPending[High(FPending)];
+  SetLength(FPending, Length(FPending) - 1);
   Result := True;
 end;
 
@@ -359,9 +370,14 @@ begin
   if FStore = nil then
     raise EVdbPageEngine.Create('motor acik degil');
   { Tahliye edilmis sayfalar once dosyaya, sonra onbellekteki kirli
-    sayfalar. InstallPage tahliye tetiklemez. }
+    sayfalar yazilir. InstallPage tahliye tetiklemez.
+    Onemli: bir sayfa onbellekte varsa cerceve imaji pending kopyasindan
+    HER ZAMAN daha yeni/esittir (yuklemede kirli isaretlenir). O yuzden
+    pending yalnizca YERLESIK OLMAYAN sayfalar icin kurulur; aksi halde
+    eski imaj yeni cercevenin uzerine yazilirdi. }
   for i := 0 to High(FPending) do
-    FStore.InstallPage(FPending[i].PageNo, @FPending[i].Data);
+    if not FStore.IsResident(FPending[i].PageNo) then
+      FStore.InstallPage(FPending[i].PageNo, @FPending[i].Data);
   ClearPending;
   FStore.Flush(DoSync);
   if DoSync then

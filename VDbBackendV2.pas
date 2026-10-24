@@ -48,6 +48,10 @@ type
     function ColumnKeyId: QWord;
     function ColumnKeyPath: string;
     procedure SetBeforeCommit(Proc: TDbCommitHook);
+    function GetDirty: Boolean;
+    procedure WaitForeignTxn(ASessionId: Cardinal);
+    procedure RefreshBatchSnapshot;
+    function GetFilePath: string;
     procedure SetRowTagFunc(AValue: TVDbRowTagFunc);
   end;
 
@@ -146,6 +150,26 @@ end;
 procedure TVDbBackendV2.SetRowTagFunc(AValue: TVDbRowTagFunc);
 begin
   FDb.RowTagFunc := AValue;
+end;
+
+function TVDbBackendV2.GetDirty: Boolean;
+begin
+  Result := FDb.Dirty;
+end;
+
+procedure TVDbBackendV2.WaitForeignTxn(ASessionId: Cardinal);
+begin
+  FDb.WaitForeignTxn(ASessionId);
+end;
+
+procedure TVDbBackendV2.RefreshBatchSnapshot;
+begin
+  FDb.RefreshBatchSnapshot;
+end;
+
+function TVDbBackendV2.GetFilePath: string;
+begin
+  Result := FDb.FilePath;
 end;
 
 end.

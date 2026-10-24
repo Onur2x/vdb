@@ -608,6 +608,19 @@ type
 
 implementation
 
+var
+  { Sprint 2.7: v3 backend'inde DataSeqValue/DataEpochValue yok. FTS ve VEC
+    onbellegi "veri degisti mi" sinyalini bu sayac uzerinden alir: her
+    cagride artar, yani v3'te onbellek her sorguda yeniden kurulur
+    (dogruluk > hiz). v2 yolunda hic kullanilmaz. }
+  VdbV3EpochCounter: QWord = 0;
+
+function VdbV3Epoch: QWord;
+begin
+  Inc(VdbV3EpochCounter);
+  Result := VdbV3EpochCounter;
+end;
+
 type
   { FPC'de TList<TList<T>> desteklenmedigi icin yardimci alt sinif }
   TIntList = class(TList<Integer>)
@@ -7847,7 +7860,11 @@ begin
         allStar := False;
         Break;
       end;
-    if allStar and FT.Kv.TryGetTableRowCount(td.TableId, ncnt) then
+    { Sprint 2.7: satir-sayisi onbellegi ve zone-map/paralel tarama v2'ye
+      ozgu yollardir. v3'te (Kv = nil) bunlar atlanir; COUNT(*) tam
+      taramayla dogrulanir, paralel yol seri yola duser. v3.1 konusu. }
+    if allStar and (FT.Kv <> nil) and
+       FT.Kv.TryGetTableRowCount(td.TableId, ncnt) then
     begin
       for j := 0 to High(plans) do
         plans[j].Cnt := ncnt;
@@ -7880,10 +7897,14 @@ begin
     if plans[j].Col > mc then mc := plans[j].Col;
   ctx.MaxCol := mc;
 
-  { H6: paralel uygunluk. Kucuk tabloda ve SUM/AVG VCT_FLOAT'ta seri yol
-    korunur (bit-ayni sonuc). Aday kumesi BIR KEZ hazirlanir; isciler
-    yalnizca kendi dilimini tarar (isci basina O(n) FIndex dolasimi YOK). }
-  kc := FT.Kv.TableKeyCount(td.TableId);
+  { H6: paralel uygunluk. Kucuk tabloda ve SUM/AVG VCT_FLOAT'ta
+    seri yol korunur (bit-ayni sonuc). Aday kumesi BIR KEZ hazirlanir;
+    isciler yalnizca kendi dilimini tarar (isci basina O(n) FIndex
+    dolasimi YOK). Sprint 2.7: v3'te (Kv = nil) paralel yol yoktur;
+    kc = 0 -> seri. }
+  kc := 0;
+  if FT.Kv <> nil then
+    kc := FT.Kv.TableKeyCount(td.TableId);
   usePar := (kc >= VDB_PAR_AGG_MIN_ROWS) and (kc <= VDB_PAR_AGG_MAX_ROWS);
   if usePar then
     for j := 0 to High(plans) do
@@ -7898,7 +7919,7 @@ begin
   prepared := False;
   if usePar then
   begin
-    if not FT.Kv.PrepareRawScan(td.TableId, prep) then
+    if (FT.Kv = nil) or (not FT.Kv.PrepareRawScan(td.TableId, prep)) then
       usePar := False
     else
     begin
@@ -7999,7 +8020,7 @@ begin
   end;
   { KR-1B: saf COUNT(*) (allStar => autocommit) dogrulamali tarayarak sayildi;
     sonucu cache'e yaz -> sonraki ayni COUNT taramasiz O(1) doner. }
-  if allStar then
+  if allStar and (FT.Kv <> nil) then
     FT.Kv.SetTableRowCount(td.TableId, plans[0].Cnt);
   end;
 
@@ -11257,8 +11278,14 @@ begin
   SetLength(ctx.OutRows, 0);
   ctx.Failed := False;
 
-  zScanOk := FT.Kv.ScanRawIterAllZoned(td.TableId, zSkipPtr, Length(zSkip),
-    @ctx.CurBucket, VdbStreamSelCb, @ctx);
+  zScanOk := True;
+  if FT.Kv <> nil then
+    zScanOk := FT.Kv.ScanRawIterAllZoned(td.TableId, zSkipPtr, Length(zSkip),
+      @ctx.CurBucket, VdbStreamSelCb, @ctx)
+  else
+    { Sprint 2.7: v3'te zone map yok; ayni secim geri cagrisi filtresiz
+      tam tarama uzerinde calisir (sonuc ayni, yalniz budama yok). }
+    zScanOk := FT.Backend.ScanRawIterAll(td.TableId, VdbStreamSelCb, @ctx);
 
   // H3: insa edilen haritayi yayinla (yalnizca veri hala ayni surumdeyse).
   // LIMIT ile erken durulduysa yalnizca TAM islenen on-ek bucket'lar
@@ -11584,7 +11611,10 @@ begin
         FFtsIndexes.Add(key, fts);
         FFtsSeqs.Add(key, High(QWord));
       end;
-      curSeq := QWord(FT.Kv.DataSeqValue);
+      { Sprint 2.7: v3'te DataSeqValue yok; FTS onbellegi her sorguda
+        yeniden kurulur (dogruluk > hiz). }
+      if FT.Kv <> nil then curSeq := QWord(FT.Kv.DataSeqValue)
+      else curSeq := VdbV3Epoch;
       if (not FFtsSeqs.TryGetValue(key, storedSeq)) or (storedSeq <> curSeq) then
       begin
         fts.Clear;
@@ -11714,7 +11744,10 @@ begin
     FVecIndexes.Add(key, idx);
     FVecSeqs.Add(key, High(QWord));
   end;
-  seq := QWord(FT.Kv.DataSeqValue);
+  { Sprint 2.7: v3'te DataSeqValue yok; VEC onbellegi her sorguda
+    yeniden kurulur. }
+  if FT.Kv <> nil then seq := QWord(FT.Kv.DataSeqValue)
+  else seq := VdbV3Epoch;
   if (not FVecSeqs.TryGetValue(key, storedSeq)) or (storedSeq <> seq) then
   begin
     idx.Clear;
@@ -13917,8 +13950,8 @@ begin
     if not FileExists(path) then
     begin
       alt := '';
-      if FT.Kv.FilePath <> '' then
-        alt := IncludeTrailingPathDelimiter(ExtractFileDir(FT.Kv.FilePath)) + path;
+      if FT.Backend.FilePath <> '' then
+        alt := IncludeTrailingPathDelimiter(ExtractFileDir(FT.Backend.FilePath)) + path;
       if (alt <> '') and FileExists(alt) then
         path := alt
       else
@@ -13927,8 +13960,8 @@ begin
   end
   else
   begin
-    if (ExtractFileDir(path) = '') and (FT.Kv.FilePath <> '') then
-      path := IncludeTrailingPathDelimiter(ExtractFileDir(FT.Kv.FilePath)) + path;
+    if (ExtractFileDir(path) = '') and (FT.Backend.FilePath <> '') then
+      path := IncludeTrailingPathDelimiter(ExtractFileDir(FT.Backend.FilePath)) + path;
     if not DirectoryExists(ExtractFileDir(path)) then
       raise EVDbException.Create(ecNotFound,
         'COPY: hedef dizin bulunamadi: ' + ExtractFileDir(path));
@@ -15495,9 +15528,27 @@ begin
     txBegin:           FT.BeginBatch;
     txCommit:          begin FT.CommitBatch; FT.UnlockRows(FSessionId); end;
     txRollback:        begin FT.AbortBatch; FT.UnlockRows(FSessionId); end;
-    txSavepoint:       FT.Kv.Savepoint(Stmt.SavepointName);
-    txRollbackTo:      FT.Kv.RollbackToSavepoint(Stmt.SavepointName);
-    txReleaseSavepoint: FT.Kv.ReleaseSavepoint(Stmt.SavepointName);
+    { Sprint 2.7: SAVEPOINT v2'nin WAL geri-alma noktalarina dayanir. v3
+      backend'inde (Kv = nil) henuz yok; sessizce yutmak yerine acik hata.
+      v3.1'de sayfa-duzeyi undo ile gelecek. }
+    txSavepoint:
+      if FT.Kv = nil then
+        raise EVDbException.Create(ecUnsupported,
+          'SAVEPOINT v3 sayfa motorunda henuz desteklenmiyor (v3.1)')
+      else
+        FT.Kv.Savepoint(Stmt.SavepointName);
+    txRollbackTo:
+      if FT.Kv = nil then
+        raise EVDbException.Create(ecUnsupported,
+          'ROLLBACK TO SAVEPOINT v3 sayfa motorunda henuz desteklenmiyor (v3.1)')
+      else
+        FT.Kv.RollbackToSavepoint(Stmt.SavepointName);
+    txReleaseSavepoint:
+      if FT.Kv = nil then
+        raise EVDbException.Create(ecUnsupported,
+          'RELEASE SAVEPOINT v3 sayfa motorunda henuz desteklenmiyor (v3.1)')
+      else
+        FT.Kv.ReleaseSavepoint(Stmt.SavepointName);
   end;
   Res.Affected := 0; Res.Msg := 'OK';
 end;
@@ -16936,18 +16987,29 @@ begin
         Res.Msg := 'PRAGMA ' + Stmt.PragmaName + ': OK';
       end;
     // R-02: SAVEPOINT / Nested Transaction
+    // Sprint 2.7: v3 sayfa motorunda (Kv = nil) geri-alma noktalari henuz
+    // yok; sessiz no-op yerine acik hata (v3.1).
     admSavepoint:
       begin
+        if FT.Kv = nil then
+          raise EVDbException.Create(ecUnsupported,
+            'SAVEPOINT v3 sayfa motorunda henuz desteklenmiyor (v3.1)');
         FT.Kv.Savepoint(Stmt.SavepointName);
         Res.Affected := 1; Res.Msg := 'SAVEPOINT ' + Stmt.SavepointName + ' OK';
       end;
     admReleaseSavepoint:
       begin
+        if FT.Kv = nil then
+          raise EVDbException.Create(ecUnsupported,
+            'RELEASE SAVEPOINT v3 sayfa motorunda henuz desteklenmiyor (v3.1)');
         FT.Kv.ReleaseSavepoint(Stmt.SavepointName);
         Res.Affected := 1; Res.Msg := 'RELEASE SAVEPOINT ' + Stmt.SavepointName + ' OK';
       end;
     admRollbackToSavepoint:
       begin
+        if FT.Kv = nil then
+          raise EVDbException.Create(ecUnsupported,
+            'ROLLBACK TO SAVEPOINT v3 sayfa motorunda henuz desteklenmiyor (v3.1)');
         FT.Kv.RollbackToSavepoint(Stmt.SavepointName);
         Res.Affected := 1; Res.Msg := 'ROLLBACK TO SAVEPOINT ' + Stmt.SavepointName + ' OK';
       end;
@@ -16955,7 +17017,7 @@ begin
     admReplicationStart:
       begin
         // Slot dosyasi veritabaninin yaninda tutulur.
-        SetReplicationDataDir(ExtractFileDir(FT.Kv.FilePath));
+        SetReplicationDataDir(ExtractFileDir(FT.Backend.FilePath));
         // ---- R-17 Full: GERCEK TCP AKIS MODU ----
         if Stmt.ReplTcp then
         begin
@@ -17024,7 +17086,7 @@ begin
         end
         else
         begin
-          SetReplicationDataDir(ExtractFileDir(FT.Kv.FilePath));
+          SetReplicationDataDir(ExtractFileDir(FT.Backend.FilePath));
           if GetReplicationStatus(st) then
           begin
             if PumpReplication(FT.Kv, st.PrimaryConnInfo, nRep, pmsg) then
@@ -17060,7 +17122,7 @@ begin
       end;
     admCreateReplSlot:
       begin
-        SetReplicationDataDir(ExtractFileDir(FT.Kv.FilePath));
+        SetReplicationDataDir(ExtractFileDir(FT.Backend.FilePath));
         if CreateReplicationSlot(Stmt.ReplSlot) then
           Res.Msg := 'replication slot created: ' + Stmt.ReplSlot
         else
@@ -17069,13 +17131,13 @@ begin
       end;
     admDropReplSlot:
       begin
-        SetReplicationDataDir(ExtractFileDir(FT.Kv.FilePath));
+        SetReplicationDataDir(ExtractFileDir(FT.Backend.FilePath));
         DropReplicationSlot(Stmt.ReplSlot);
         Res.Affected := 1; Res.Msg := 'replication slot dropped: ' + Stmt.ReplSlot;
       end;
     admShowReplSlots:
       begin
-        SetReplicationDataDir(ExtractFileDir(FT.Kv.FilePath));
+        SetReplicationDataDir(ExtractFileDir(FT.Backend.FilePath));
         slots := GetReplicationSlots;
         SetLength(Res.Fields, 4);
         Res.Fields[0] := 'slot'; Res.Fields[1] := 'restart_lsn';

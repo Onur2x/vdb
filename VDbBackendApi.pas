@@ -85,6 +85,20 @@ type
     function ColumnKeyPath: string;
     procedure SetBeforeCommit(Proc: TDbCommitHook);
 
+    { --- motor durumu (Sprint 2.7) --- }
+    { Commit edilmemis yazma var mi (Flush karari icin). }
+    function GetDirty: Boolean;
+    property Dirty: Boolean read GetDirty;
+    { v3 tek yazar: karsilik yok (no-op). v2'de baska oturumun acik
+      islemi bitene kadar bekler. }
+    procedure WaitForeignTxn(ASessionId: Cardinal);
+    { READ COMMITTED icin gorunurluk penceresini ilerletir. v3'te
+      snapshot/MVCC yok: no-op. }
+    procedure RefreshBatchSnapshot;
+    { Veri dosyasinin tam yolu (goreli yollarin cozumu icin). }
+    function GetFilePath: string;
+    property FilePath: string read GetFilePath;
+
     { Satir icindeki tablo kimligini cozen fonksiyon (R-26 filtresi). }
     procedure SetRowTagFunc(AValue: TVDbRowTagFunc);
   end;

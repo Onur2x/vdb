@@ -98,6 +98,10 @@ type
     function ColumnKeyId: QWord;
     function ColumnKeyPath: string;
     procedure SetBeforeCommit(Proc: TDbCommitHook);
+    function GetDirty: Boolean;
+    procedure WaitForeignTxn(ASessionId: Cardinal);
+    procedure RefreshBatchSnapshot;
+    function GetFilePath: string;
     procedure SetRowTagFunc(AValue: TVDbRowTagFunc);
   end;
 
@@ -453,6 +457,27 @@ end;
 procedure TVdbBackendV3.SetRowTagFunc(AValue: TVDbRowTagFunc);
 begin
   FRowTag := AValue;
+end;
+
+function TVdbBackendV3.GetDirty: Boolean;
+begin
+  Result := FDirty or (FBatchOpen and (FBatch.Count > 0));
+end;
+
+procedure TVdbBackendV3.WaitForeignTxn(ASessionId: Cardinal);
+begin
+  { v3.0 tek yazar: beklenecek yabanci islem yok. }
+end;
+
+procedure TVdbBackendV3.RefreshBatchSnapshot;
+begin
+  { v3.0'da snapshot/MVCC yok: parti icinde her okuma en guncel kaplamayi
+    ve motoru gorur; ilerletilecek gorunurluk penceresi yok. }
+end;
+
+function TVdbBackendV3.GetFilePath: string;
+begin
+  Result := FPath;
 end;
 
 end.
