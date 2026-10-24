@@ -150,7 +150,7 @@ v3 koşusu yalnız "kapsam" değil, **gerçek kusurlar** ortaya çıkardı:
 
 | Yetenek | Durum | Sürüm |
 |---|---|---|
-| `VERIFY` (sayfa CRC + heap) | yok | 3.1 |
+| `VERIFY` (sayfa CRC + heap) | **var** (Sprint 3.1) | 3.1 ✔ |
 | `BACKUP` / `RESTORE` / PITR | yok | 3.2 |
 | `VACUUM` / `Compact` / AutoCompact | yok | 3.3 |
 | Kayıt/kolon şifreleme (v3 sayfa düzeyi AES-GCM) | yok | 3.4 |

@@ -31,7 +31,7 @@ unit VDbPageStore;
 interface
 
 uses
-  SysUtils, Classes, DateUtils, VDbCrc32, VDbPage, VDbSync;
+  SysUtils, Classes, DateUtils, Generics.Collections, VDbCrc32, VDbPage, VDbSync;
 
 const
   VDB_FILE_MAGIC   = $33424456;   // 'VDB3' (little endian)
@@ -191,6 +191,16 @@ type
       Heap taramasi VDbPage formatinda OLMAYAN sayfalari bu sekilde ayirt
       eder; aksi halde bozuk sayfa sessizce atlanirdi. }
     function IsTrunkPage(P: PVdbPage): Boolean;
+
+    { Sprint 3.1: freelist'i bastan sona dogrular ve serbest sayfa
+      numaralarini dondurur. Denetimler: trunk zinciri dongusuz, her trunk
+      kendi numarasini dogru tasir, sayac gecerli, her girdi aralikta,
+      girdiler tekrarsiz ve toplam = meta FreeCount. }
+    function VerifyFreeList(out FreePages: TVdbPageNoArray;
+      out Err: string): Boolean;
+
+    { Freelist'in bas sayfasi (0 = bos). }
+    function GetFreeTrunk: LongWord;
 
     { Kirli sayfa tahliyesinden once cagrilacak kanca (write-ahead WAL). }
     property OnSpill: TVdbPageSpillProc read FOnSpill write FOnSpill;
@@ -723,6 +733,92 @@ begin
     Exit;
   end;
   Result := True;
+end;
+
+function TVDbPageStore.GetFreeTrunk: LongWord;
+begin
+  Result := FFreeTrunk;
+end;
+
+function TVDbPageStore.VerifyFreeList(out FreePages: TVdbPageNoArray;
+  out Err: string): Boolean;
+var
+  trunk, cnt, i, entry, nextTrunk: LongWord;
+  P: PVdbPage;
+  seen: TDictionary<LongWord, Boolean>;
+  e: string;
+begin
+  Result := False;
+  Err := '';
+  FreePages := nil;
+  if FStream = nil then
+  begin
+    Err := 'depo acik degil';
+    Exit;
+  end;
+  seen := TDictionary<LongWord, Boolean>.Create;
+  try
+    trunk := FFreeTrunk;
+    while trunk <> 0 do
+    begin
+      if trunk >= FPageCount then
+      begin
+        Err := Format('freelist trunk numarasi aralik disi: %d (sayfa=%d)',
+          [trunk, FPageCount]);
+        Exit;
+      end;
+      if seen.ContainsKey(trunk) then
+      begin
+        Err := Format('freelist trunk zinciri dongulu: %d', [trunk]);
+        Exit;
+      end;
+      seen.Add(trunk, True);
+      if not GetPageInternal(trunk, False, P) then
+      begin
+        Err := Format('freelist trunk okunamadi: %d', [trunk]);
+        Exit;
+      end;
+      try
+        if not TrunkCheck(P, e) then
+        begin
+          Err := Format('freelist trunk %d bozuk: %s', [trunk, e]);
+          Exit;
+        end;
+        cnt := TrunkGet(P);
+        for i := 0 to cnt - 1 do
+        begin
+          entry := TrunkEntry(P, i);
+          if (entry = 0) or (entry >= FPageCount) then
+          begin
+            Err := Format('freelist girdisi aralik disi: %d (trunk %d)',
+              [entry, trunk]);
+            Exit;
+          end;
+          if seen.ContainsKey(entry) then
+          begin
+            Err := Format('freelist girdisi yineleniyor: %d', [entry]);
+            Exit;
+          end;
+          seen.Add(entry, True);
+          SetLength(FreePages, Length(FreePages) + 1);
+          FreePages[High(FreePages)] := entry;
+        end;
+        nextTrunk := TrunkNext(P);
+      finally
+        Release(trunk, False);
+      end;
+      trunk := nextTrunk;
+    end;
+    if LongWord(Length(FreePages)) <> FFreeCount then
+    begin
+      Err := Format('freelist sayaci tutmuyor: zincirde %d, meta %d',
+        [Length(FreePages), FFreeCount]);
+      Exit;
+    end;
+    Result := True;
+  finally
+    seen.Free;
+  end;
 end;
 
 procedure TVDbPageStore.FreePage(PageNo: LongWord);

@@ -156,7 +156,7 @@ Sayfa motorunu yazmak kolay; asıl maliyet şu 4 dosyada. Plan bunları hesaba k
 
 ### Sprint 3 — Eşitlik ve kapı (Gün 11-15)
 
-- [ ] 3.1 `Verify` v3'te (sayfa CRC + heap bütünlüğü + anahtar dizini)
+- [x] 3.1 `Verify` v3'te (sayfa CRC + heap bütünlüğü + anahtar dizini) — `TVdbPageEngine.Verify` + `TVDbPageStore.VerifyFreeList`; `IVDbBackend.Verify` üzerinden `VERIFY` SQL komutu v3'te çalışır (v2'de `TVDb.Verify`'e devam). Denetimler: tüm sayfalarda yapı + CRC32, sayfa başlığındaki numara, freelist trunk zinciri (döngü/aralık/tekrar/sayaç), heap hücre başlığı ve **tüm taşma zinciri** (her halka + ilan edilen uzunluk), yinelenen anahtar, dosyadaki anahtar sayısı = bellek dizini. Onaylanmamış WAL çerçevesi varsa önce checkpoint; açık parti/işlemde net ret. Kapılar: `backendchk` **41/41** (sağlıklı dosya, taşma zincirleri, açık parti reddi, bozulma enjeksiyonu), `v3sqlchk` **49/49** (SQL `VERIFY` + işlem içinde ret).
 - [ ] 3.2 `BACKUP` / `RESTORE` v3'te
 - [ ] 3.3 `Compact` (boş sayfa geri kazanımı); `AutoCompact` varsayılan **False** kalır
 - [ ] 3.4 Şifreleme: sayfa düzeyinde AES-GCM; `enc1..enc9` testleri v3'te geçer

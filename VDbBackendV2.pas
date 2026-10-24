@@ -53,6 +53,9 @@ type
     procedure RefreshBatchSnapshot;
     function GetFilePath: string;
     procedure SetRowTagFunc(AValue: TVDbRowTagFunc);
+
+    { Sprint 3.1: v2 dosya butunlugu denetimi (TVDb.Verify'e devreder). }
+    function Verify(out Report: string): Boolean;
   end;
 
 implementation
@@ -170,6 +173,11 @@ end;
 function TVDbBackendV2.GetFilePath: string;
 begin
   Result := FDb.FilePath;
+end;
+
+function TVDbBackendV2.Verify(out Report: string): Boolean;
+begin
+  Result := FDb.Verify(Report);
 end;
 
 end.

@@ -103,6 +103,10 @@ type
     procedure RefreshBatchSnapshot;
     function GetFilePath: string;
     procedure SetRowTagFunc(AValue: TVDbRowTagFunc);
+
+    { Sprint 3.1: sayfa motorunun tam butunluk denetimi (CRC + freelist
+      + heap + tasma zincirleri). Acik parti varsa denetim yapilmaz. }
+    function Verify(out Report: string): Boolean;
   end;
 
 implementation
@@ -478,6 +482,18 @@ end;
 function TVdbBackendV3.GetFilePath: string;
 begin
   Result := FPath;
+end;
+
+function TVdbBackendV3.Verify(out Report: string): Boolean;
+begin
+  { Acik partideki degisiklikler henuz durabil degil; denetim yalnizca
+    onaylanmis durumu kapsar. Sessizce commit etmek yerine acikca reddet. }
+  if FBatchOpen then
+  begin
+    Report := 'acik parti varken VERIFY yapilamaz (once COMMIT/ROLLBACK)';
+    Exit(False);
+  end;
+  Result := FEng.Verify(Report);
 end;
 
 end.

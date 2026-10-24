@@ -22,7 +22,7 @@ program backendchk;
 
 uses
   Classes, SysUtils, VDbBackendApi, VDbCore, VDbBackendV2, VDbBackendV3,
-  VDbPageEngine;
+  VDbPageEngine, VDbPage, VDbPageStore;
 
 var
   gPass, gFail: Int64;
@@ -580,6 +580,100 @@ begin
   end;
 end;
 
+{ ========================================== 8) v3 VERIFY (Sprint 3.1) }
+
+procedure TestV3Verify(N: Integer);
+var
+  v3: TVdbBackendV3;
+  b: IVdbBackend;
+  eng: TVdbPageEngine;
+  v: TBytes;
+  i: Integer;
+  pno: LongWord;
+  P: PVdbPage;
+  rep: string;
+  magic: Word;
+  corrupt, found: Boolean;
+begin
+  CleanDir;
+  v3 := TVdbBackendV3.Create(DirOf('verify.odb'), True, 128);
+  b := v3;
+  eng := v3.Engine;
+  for i := 1 to N do
+  begin
+    MakeVal(i, 40 + (i mod 60), 5, v);
+    b.Put(i, v);
+  end;
+  for i := 1 to N do
+    if (i mod 4) = 0 then
+      b.Delete(i);
+  { Tasma zincirleri de denetimden gecsin (1000 bayt esigi asilir). }
+  MakeVal(900001, 2500, 9, v);
+  b.Put(900001, v);
+  MakeVal(900002, 9000, 11, v);
+  b.Put(900002, v);
+  b.Flush;
+
+  if b.Verify(rep) then
+    Ok('v3 VERIFY saglikli dosyada gecti: ' + rep)
+  else
+    Fail('v3 VERIFY saglikli dosyada dustu: ' + rep);
+  if Pos('anahtar=', rep) > 0 then
+    Ok('v3 VERIFY raporu anahtar sayisi iceriyor')
+  else
+    Fail('v3 VERIFY raporu eksik: ' + rep);
+  if Pos('tasma=0 ', rep) = 0 then
+    Ok('v3 VERIFY tasma zincirlerini sonuna kadar yurudu')
+  else
+    Fail('v3 VERIFY tasma sayaci beklenmedik: ' + rep);
+
+  { Acik parti varken denetim yapilmaz: sessiz commit yerine net ret. }
+  b.BeginBatch;
+  b.Put(900001, v);
+  if (not b.Verify(rep)) and (Pos('acik parti', rep) > 0) then
+    Ok('v3 VERIFY acik partide reddedildi')
+  else
+    Fail('v3 VERIFY acik partide yanlis sonuc: ' + rep);
+  b.AbortBatch;
+
+  { Bozulma enjeksiyonu: heap sayfasinin govdesinden bir bayt cevrilir.
+    Bellekteki anahtar dizini saglam kalir; hatayi yalnizca sayfa
+    denetimi (CRC/yapi) yakalayabilir. }
+  found := False;
+  for pno := 1 to eng.Store.PageCount - 1 do
+  begin
+    if not eng.Store.GetRawPage(pno, P) then Continue;
+    corrupt := False;
+    Move(P^[0], magic, SizeOf(magic));
+    if (magic = VDB_PAGE_MAGIC) and (PageTypeOf(P) = VDB_PAGE_HEAP) and
+       (PageSlotCount(P) > 0) then
+    begin
+      P^[100] := P^[100] xor $FF;
+      corrupt := True;
+    end;
+    eng.Store.Release(pno, corrupt);
+    if corrupt then
+    begin
+      found := True;
+      Break;
+    end;
+  end;
+  if not found then
+    Fail('v3 VERIFY: bozulacak heap sayfasi bulunamadi')
+  else
+  begin
+    eng.Store.Flush(True);
+    if (not b.Verify(rep)) and
+       ((Pos('CRC', rep) > 0) or (Pos('bozuk', rep) > 0)) then
+      Ok('v3 VERIFY bozuk sayfayi yakaladi: ' + rep)
+    else
+      Fail('v3 VERIFY bozuk sayfayi kacirdi: ' + rep);
+  end;
+
+  b := nil;
+  v3 := nil;
+end;
+
 { ================================================================== ana }
 
 var
@@ -603,6 +697,7 @@ begin
   TestV3Checkpoint;
   TestV3SpillReread(N);
   TestV3SmallPool(N);
+  TestV3Verify(N);
   TestEquivalence(1000);
 
   WriteLn;

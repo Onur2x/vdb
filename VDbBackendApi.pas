@@ -101,6 +101,11 @@ type
 
     { Satir icindeki tablo kimligini cozen fonksiyon (R-26 filtresi). }
     procedure SetRowTagFunc(AValue: TVDbRowTagFunc);
+
+    { Sprint 3.1: dosya butunlugu denetimi. v2'de TVDb.Verify, v3'te
+      sayfa motorunun tam taramasidir (CRC + freelist + heap + tasma).
+      Report: tek satir ozet veya hata nedeni. }
+    function Verify(out Report: string): Boolean;
   end;
 
 implementation

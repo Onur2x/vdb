@@ -16713,6 +16713,7 @@ end;
 procedure TVSqlExecutor.ExecAdmin(Stmt: TSqlAdminStmt; out Res: TSqlResult);
 var
   rep: string;
+  okv: Boolean;           // Sprint 3.1: VERIFY (v2: Kv / v3: Backend)
   vOld, vNew: Int64;
   tbls, tmpi: TStrArray;
   tmprow: TStrMatrix;
@@ -16740,7 +16741,7 @@ begin
     WAL, arsiv, yedek ve replikasyon yollarina dayanan yonetim komutlari
     v3'te yoktur; sessiz AV yerine NET bir "desteklenmiyor" hatasi verilir. }
   if (FT.Kv = nil) and (Stmt.Kind in [
-      admVerify, admVacuum, admBackupDb, admRecoverTo, admRestoreFrom,
+      admVacuum, admBackupDb, admRecoverTo, admRestoreFrom,
       admArchiveSet, admArchiveList, admAlterDbKey, admSavepoint,
       admReleaseSavepoint, admRollbackToSavepoint,
       admReplicationStart, admReplicationStop, admCreateReplSlot,
@@ -16751,7 +16752,11 @@ begin
   case Stmt.Kind of
     admVerify:
       begin
-        if FT.Kv.Verify(rep) then
+        if FT.Kv <> nil then
+          okv := FT.Kv.Verify(rep)
+        else
+          okv := FT.Backend.Verify(rep);
+        if okv then
         begin Res.Affected := 1; Res.Msg := 'VERIFY: ' + rep; end
         else
         begin Res.Affected := 0; Res.Msg := 'VERIFY HATASI: ' + rep; end;

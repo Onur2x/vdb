@@ -513,6 +513,46 @@ begin
   end;
 end;
 
+{ ==================================== 8) VERIFY (Sprint 3.1) }
+
+procedure TestVerifySql;
+var
+  S: TV3Sql;
+  r: TSqlResult;
+  i: Integer;
+begin
+  CleanDir;
+  OpenV3(S, 'verify.odb', True);
+  try
+    Exec(S, 'CREATE TABLE v (id INTEGER PRIMARY KEY, ad TEXT)');
+    for i := 1 to 50 do
+      Exec(S, Format('INSERT INTO v VALUES (%d, ''kayit%d'')', [i, i]));
+    for i := 1 to 50 do
+      if (i mod 5) = 0 then
+        Exec(S, Format('DELETE FROM v WHERE id = %d', [i]));
+
+    r := Exec(S, 'VERIFY');
+    if (not gErr) and (r.Affected = 1) and (Pos('VERIFY:', r.Msg) = 1) and
+       (Pos('anahtar=', r.Msg) > 0) then
+      Ok('SQL VERIFY gecti: ' + r.Msg)
+    else
+      Fail('SQL VERIFY: ' + r.Msg);
+
+    { Islem icinde VERIFY reddedilir; hata firlatmak yerine Affected=0
+      ve net mesaj doner. }
+    Exec(S, 'BEGIN');
+    r := Exec(S, 'VERIFY');
+    if (not gErr) and (r.Affected = 0) and (Pos('VERIFY HATASI:', r.Msg) = 1)
+       and (Pos('acik parti', r.Msg) > 0) then
+      Ok('SQL VERIFY acik islemde reddedildi')
+    else
+      Fail('SQL VERIFY acik islemde: ' + r.Msg);
+    Exec(S, 'ROLLBACK');
+  finally
+    CloseV3(S);
+  end;
+end;
+
 { ================================================================== ana }
 
 var
@@ -535,6 +575,7 @@ begin
   TestConstraints;
   TestIndex;
   TestJoin;
+  TestVerifySql;
   TestIntegrity(N);
 
   WriteLn;

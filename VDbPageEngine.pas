@@ -26,7 +26,7 @@ unit VDbPageEngine;
 interface
 
 uses
-  SysUtils, VDbPage, VDbPageStore, VDbPageHeap, VDbPageWal;
+  SysUtils, Generics.Collections, VDbPage, VDbPageStore, VDbPageHeap, VDbPageWal;
 
 type
   EVdbPageEngine = class(Exception);
@@ -98,6 +98,16 @@ type
     property IdxErr: string read FIdxErr;
     { Dizinin kalici kopyasini simdi yazar (normalde Close yapar). }
     procedure SaveIdx;
+
+    { Sprint 3.1: VERIFY — dosyanin kendisini bastan sona denetler.
+      Dizin (bellek) yeniden kurulmaz; yalniz okunur. Denetimler:
+        * her sayfa: yapisal gecerlilik + CRC32 (PageVerify)
+        * freelist: trunk zinciri, kendi numarasi, sayac, tekrar eden
+          girdi, aralik, serbest sayfa sayisi = meta FreeCount
+        * heap: hucre basligi, tasma zinciri (her halka okunur), yinelenen
+          anahtar, anahtar sayisi = Count
+      Report: tek satir ozet (sayfa/serbest/heap/tasma/anahtar) veya hata. }
+    function Verify(out Report: string): Boolean;
   end;
 
 implementation
@@ -383,6 +393,232 @@ begin
   if DoSync then
     FWal.Truncate(FStore.LSN);
   Result := True;
+end;
+
+function TVdbPageEngine.Verify(out Report: string): Boolean;
+var
+  pno, i, n: LongWord;
+  P: PVdbPage;
+  e: string;
+  magic: Word;
+  freePages: TVdbPageNoArray;
+  freeSet: TDictionary<LongWord, Boolean>;
+  keySet: TDictionary<QWord, Boolean>;
+  chainSet: TDictionary<LongWord, Boolean>;
+  d: PByte;
+  POvf: PVdbPage;
+  dl, take: Integer;
+  key: QWord;
+  len: LongWord;
+  ovf: Boolean;
+  heapPages, ovfPages, ovfWalk, keys: Integer;
+  chain, ovfNo, nextNo: LongWord;
+  fi: Integer;
+  got: Int64;
+begin
+  Report := '';
+  if FStore = nil then
+    raise EVdbPageEngine.Create('motor acik degil');
+  if FInTxn then
+  begin
+    Report := 'acik islem varken VERIFY yapilamaz';
+    Exit(False);
+  end;
+  { Onaylanmis ama henuz dosyaya gecmemis cerceveler varsa once yaz.
+    Boylece dogrulanan sey DISKTEKI gercek durumdur. }
+  if FWal.HasContent or (Length(FPending) > 0) then
+    if not Checkpoint(True) then
+    begin
+      Report := 'checkpoint basarisiz';
+      Exit(False);
+    end;
+
+  heapPages := 0;
+  ovfPages := 0;
+  keys := 0;
+  freeSet := TDictionary<LongWord, Boolean>.Create;
+  keySet := TDictionary<QWord, Boolean>.Create;
+  chainSet := TDictionary<LongWord, Boolean>.Create;
+  try
+    { --- 1) freelist zinciri --- }
+    if not FStore.VerifyFreeList(freePages, e) then
+    begin
+      Report := 'freelist: ' + e;
+      Exit(False);
+    end;
+    for fi := 0 to High(freePages) do
+      freeSet.Add(freePages[fi], True);
+
+    { --- 2) tum sayfalar: yapi + CRC --- }
+    pno := 1;
+    while pno < FStore.PageCount do
+    begin
+      if freeSet.ContainsKey(pno) then
+      begin
+        Inc(pno);
+        Continue;
+      end;
+      if not FStore.GetRawPage(pno, P) then
+      begin
+        Report := Format('sayfa %d okunamadi', [pno]);
+        Exit(False);
+      end;
+      try
+        Move(P^[0], magic, SizeOf(magic));
+        if magic <> VDB_PAGE_MAGIC then
+        begin
+          Report := Format('sayfa %d taninmiyor (ne VDbPage ne trunk)', [pno]);
+          Exit(False);
+        end;
+        if not PageVerify(P, e) then
+        begin
+          Report := Format('sayfa %d bozuk: %s', [pno, e]);
+          Exit(False);
+        end;
+        if PageNoOf(P) <> pno then
+        begin
+          Report := Format('sayfa %d basligindaki numara %d', [pno, PageNoOf(P)]);
+          Exit(False);
+        end;
+        case PageTypeOf(P) of
+          VDB_PAGE_HEAP:
+            begin
+              Inc(heapPages);
+              n := PageSlotCount(P);
+              for i := 0 to n - 1 do
+              begin
+                if not PageGetCell(P, i, d, dl) then Continue;
+                if dl < VDB_CELL_HDR then
+                begin
+                  Report := Format('sayfa %d slot %d: hucre cok kisa (%d)',
+                    [pno, i, dl]);
+                  Exit(False);
+                end;
+                Move(d^, key, 8);
+                Move((d + 8)^, len, 4);
+                ovf := (len and VDB_OVF_FLAG) <> 0;
+                if ovf and (dl < VDB_CELL_HDR + 4) then
+                begin
+                  Report := Format('sayfa %d slot %d: tasma isaretli ama zincir yok',
+                    [pno, i]);
+                  Exit(False);
+                end;
+                if keySet.ContainsKey(key) then
+                begin
+                  Report := Format('yinelenen anahtar $%.16x (sayfa %d)', [key, pno]);
+                  Exit(False);
+                end;
+                keySet.Add(key, True);
+                Inc(keys);
+                if ovf then
+                begin
+                  { Tasma zincirini sonuna kadar yuru: her halka gecerli
+                    olmali ve toplam bayt ilan edilen uzunlugu tutmali. }
+                  Move((d + VDB_CELL_HDR)^, chain, 4);
+                  got := 0;
+                  ovfWalk := 0;
+                  ovfNo := chain;
+                  while ovfNo <> 0 do
+                  begin
+                    Inc(ovfWalk);
+                    if (ovfNo >= FStore.PageCount) then
+                    begin
+                      Report := Format(
+                        'sayfa %d slot %d: tasma halkasi aralik disi: %d',
+                        [pno, i, ovfNo]);
+                      Exit(False);
+                    end;
+                    if ovfWalk > (Integer(len and VDB_LEN_MASK) div VDB_OVF_CHUNK) + 3 then
+                    begin
+                      Report := Format(
+                        'sayfa %d slot %d: tasma zinciri dongulu (%d)',
+                        [pno, i, ovfNo]);
+                      Exit(False);
+                    end;
+                    if not FStore.GetRawPage(ovfNo, POvf) then
+                    begin
+                      Report := Format('tasma sayfasi %d okunamadi', [ovfNo]);
+                      Exit(False);
+                    end;
+                    if chainSet.ContainsKey(ovfNo) then
+                    begin
+                      Report := Format(
+                        'tasma sayfasi %d birden fazla zincirde', [ovfNo]);
+                      Exit(False);
+                    end;
+                    chainSet.Add(ovfNo, True);
+                    try
+                      if PageTypeOf(POvf) <> VDB_PAGE_OVERFLOW then
+                      begin
+                        Report := Format('sayfa %d tasma sayfasi degil (tip %d)',
+                          [ovfNo, PageTypeOf(POvf)]);
+                        Exit(False);
+                      end;
+                      if not PageGetCell(POvf, 0, d, dl) or (dl < 4) then
+                      begin
+                        Report := Format('tasma sayfasi %d hucre 0 gecersiz', [ovfNo]);
+                        Exit(False);
+                      end;
+                      Move(d^, nextNo, 4);
+                      take := dl - 4;
+                      if got + take > Int64(len and VDB_LEN_MASK) then
+                        take := Integer(Int64(len and VDB_LEN_MASK) - got);
+                      if take > 0 then Inc(got, take);
+                    finally
+                      FStore.Release(ovfNo, False);
+                    end;
+                    ovfNo := nextNo;
+                  end;
+                  if got <> Int64(len and VDB_LEN_MASK) then
+                  begin
+                    Report := Format('sayfa %d slot %d: tasma eksik %d/%d bayt',
+                      [pno, i, got, len and VDB_LEN_MASK]);
+                    Exit(False);
+                  end;
+                end;
+              end;
+            end;
+          VDB_PAGE_OVERFLOW:
+            Inc(ovfPages);
+        else
+          begin
+            Report := Format('sayfa %d: bilinmeyen sayfa tipi %d',
+              [pno, PageTypeOf(P)]);
+            Exit(False);
+          end;
+        end;
+      finally
+        FStore.Release(pno, False);
+      end;
+      Inc(pno);
+    end;
+
+    if keys <> FHeap.Count then
+    begin
+      Report := Format('anahtar sayisi tutmuyor: dosyada %d, dizinde %d',
+        [keys, FHeap.Count]);
+      Exit(False);
+    end;
+
+    { Tasma sayfalarinin TAMAMI bir hucre zincirine ait olmali. Sayfa
+      taramasi ile zincir yuruyusu karsilastirilir; artik kalan tasma
+      sayfasi sessiz cop olurdu. }
+    if ovfPages <> chainSet.Count then
+    begin
+      Report := Format(
+        'sahipsiz tasma sayfasi: dosyada %d, zincirlerde %d',
+        [ovfPages, chainSet.Count]);
+      Exit(False);
+    end;
+
+    Report := Format('sayfa=%d serbest=%d heap=%d tasma=%d anahtar=%d lsn=%d',
+      [FStore.PageCount, Length(freePages), heapPages, ovfPages, keys, FStore.LSN]);
+    Result := True;
+  finally
+    chainSet.Free;
+    keySet.Free;
+    freeSet.Free;
+  end;
 end;
 
 end.
