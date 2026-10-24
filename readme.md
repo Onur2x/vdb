@@ -145,10 +145,10 @@ Single-row (autocommit) writes, 20,000 rows, default `SyncWrite=True`:
 | `DELETE` (PK) | 6.87 ms/row | **0.374 ms/row (2,673/s)** |
 
 Details and root causes: [speedtest.md](speedtest.md#5-single-row-writes-autocommit--2026-10-24).
-Because single-row writes now append, dead regions accumulate; the engine
-reclaims them with **automatic compaction** (`AutoCompactEnabled=True`,
-`AutoCompactRatio=0.35`, `AutoCompactMinBytes=4 MB`; attempted at commit time
-only when the threshold is crossed).
+Because single-row writes now append, dead regions accumulate; the engine can
+reclaim them with optional **automatic compaction** (`AutoCompactEnabled`,
+**off by default**; `AutoCompactRatio=0.35`, `AutoCompactMinBytes=4 MB`;
+when enabled, attempted at commit time only if the threshold is crossed).
 
 H3 skiplist (100,000 rows): 100 × (`UPDATE` + indexed `COUNT(*)`) takes
 **0.39–0.42 ms per cycle**, down from 24.99 ms — about **60–64x** faster.

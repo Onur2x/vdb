@@ -198,14 +198,19 @@ bölgelerde ekleme O(1).
 
 Tek satırlık yazma artık dosyaya ekleme yaptığı için yoğun autocommit
 `UPDATE`/`DELETE` trafiğinde ölü bölgeler birikir ve dosya büyür. Motor bunu
-kendiliğinden toparlar: her başarılı commit'ten sonra `ÖlüBayt / DosyaBoyu`
-oranı eşiği geçerse `Compact` çalışır (atomik `.tmp` + rename, `.bak` kalır).
-Karar O(1)'dir; sıkıştırma yalnızca eşik aşıldığında, dosya bir kez baştan
-yazılarak yapılır.
+otomatik toparlayabilir: **açıldığında**, her başarılı commit'ten sonra
+`ÖlüBayt / DosyaBoyu` oranı eşiği geçerse `Compact` çalışır (atomik `.tmp` +
+rename, `.bak` kalır). Karar O(1)'dir; sıkıştırma yalnızca eşik aşıldığında,
+dosya bir kez baştan yazılarak yapılır.
+
+**Varsayılan KAPALIDIR.** Sıkıştırma dosyayı baştan yazdığı için o commit
+bir defalık uzun sürer (çok büyük DB'de saniyeler). Tahmin edilebilir commit
+gecikmesi isteniyorsa kapalı bırakılıp `VACUUM`/`AutoCompact` uygun anda elle
+çağrılmalıdır.
 
 | Ayar | Varsayılan | Anlamı |
 |---|---:|---|
-| `AutoCompactEnabled` | `True` | Kapatmak için `False` |
+| `AutoCompactEnabled` | `False` | Açmak için `True` |
 | `AutoCompactRatio` | `0,35` | Ölü bayt oranı eşiği |
 | `AutoCompactMinBytes` | 4 MB | Bu boyutun altındaki DB'ye dokunulmaz |
 
@@ -215,9 +220,7 @@ PK/ikincil indeks okumaları, `INSERT`/`UPDATE`/`DELETE`, `Verify` ve
 yeniden açma sonrası sonuçlar aynı. Kapalıyken ölü bayt birikmeye devam eder
 (23.064 bayt) ve sıkıştırma yapılmaz. Sıkıştırma yalnızca veri yazan commit
 sonunda denenir; `.bak`, `.tmp` ve fsync maliyeti yalnızca eşik aşıldığında
-ödenir. Ham yazma hızını ölçerken `AutoCompactEnabled := False` yapılmalıdır,
-aksi halde büyük toplu işlemlerin sonunda bir defalık sıkıştırma süresi
-ölçüme karışır.
+ödenir.
 
 ### Ölçülen taban çizgisi
 
@@ -234,15 +237,15 @@ Bu değişiklikler aşağıdaki kapılar yeşilken yapıldı (2026-10-24):
 
 | Kapı | Sonuç |
 |---|---|
-| `sqltest` — win32 (lazbuild, `-B`) | **3110 / 3110** (`kalan=0`) |
-| `sqltest` — win64 (`-Px86_64 -Twin64 -O1`) | **3075 / 3075** (`kalan=0`) |
-| `sqltest` — Linux (WSL, FPC 3.2.4) | **3075 / 3075** (`kalan=0`) |
+| `sqltest` — win32 (lazbuild, `-B`) | **3112 / 3112** (`kalan=0`) |
+| `sqltest` — win64 (`-Px86_64 -Twin64 -O1`) | **3077 / 3077** (`kalan=0`) |
+| `sqltest` — Linux (WSL, FPC 3.2.4) | **3077 / 3077** (`kalan=0`) |
 
 H11 (undo günlüğü / yerinde yazım) testleri yeni sözleşmeye göre
 güncellendi: ölü bölge yeniden kullanımı çok satırlı işlemde doğrulanır,
 tek satırlık yazma ekleme yolundan gider. H25 için `sqltest` T148 eklendi
-(20 doğrulama: eşik davranışı, dosya küçülmesi, veri/indeks bütünlüğü,
-kapatma-açma, yeniden açma sonrası kalıcılık).
+(21 doğrulama: varsayılan kapalı, eşik davranışı, dosya küçülmesi,
+veri/indeks bütünlüğü, kapatma-açma, yeniden açma sonrası kalıcılık).
 
 Daha eski kampanyalarda `crashtest`, `rawchk`, `mrowchk`, `fuzzchk`,
 `sqlite_diff`, `hashchk`, `copychk`, `zonechk`, `skipchk`, `countchk` de

@@ -197,15 +197,20 @@ equal-sized spans is O(1).
 ### Automatic compaction (H25) — against file growth
 
 Single-row writes now append, so heavy autocommit `UPDATE`/`DELETE` traffic
-accumulates dead regions and the file grows. The engine now recovers on its
-own: after every successful commit, if `DeadBytes / FileSize` crosses the
-threshold, `Compact` runs (atomic `.tmp` + rename, the old file stays as
-`.bak`). The decision is O(1); the file is rewritten in one pass only when the
-threshold is actually crossed.
+accumulates dead regions and the file grows. The engine can reclaim them on its
+own: when **enabled**, after every successful commit, if
+`DeadBytes / FileSize` crosses the threshold, `Compact` runs (atomic `.tmp` +
+rename, the old file stays as `.bak`). The decision is O(1); the file is
+rewritten in one pass only when the threshold is actually crossed.
+
+**It is OFF by default.** Compaction rewrites the whole file, so that one
+commit takes longer (seconds on a very large database). If commit latency must
+stay predictable, leave it off and call `VACUUM`/`AutoCompact` explicitly at a
+suitable time.
 
 | Setting | Default | Meaning |
 |---|---:|---|
-| `AutoCompactEnabled` | `True` | Set `False` to turn it off |
+| `AutoCompactEnabled` | `False` | Set `True` to turn it on |
 | `AutoCompactRatio` | `0.35` | Dead-byte ratio threshold |
 | `AutoCompactMinBytes` | 4 MB | Databases below this size are never compacted |
 
@@ -215,9 +220,7 @@ secondary-index reads, `INSERT`/`UPDATE`/`DELETE`, `Verify`, and results after
 reopening are all unchanged. With the feature disabled the dead bytes keep
 accumulating (23,064 bytes) and nothing is compacted. Compaction is only
 attempted after a commit that wrote data; the `.bak`, `.tmp` and fsync cost is
-paid only when the threshold is crossed. When measuring raw write throughput,
-set `AutoCompactEnabled := False`, otherwise the one-off compaction at the end
-of a large batch leaks into the numbers.
+paid only when the threshold is crossed.
 
 ### Measured floor
 
@@ -236,14 +239,14 @@ All performance changes were made while the following gates were green
 
 | Gate | Result |
 |---|---|
-| `sqltest` — win32 (lazbuild, `-B`) | **3110 / 3110** (`kalan=0`) |
-| `sqltest` — win64 (`-Px86_64 -Twin64 -O1`) | **3075 / 3075** (`kalan=0`) |
-| `sqltest` — Linux (WSL, FPC 3.2.4) | **3075 / 3075** (`kalan=0`) |
+| `sqltest` — win32 (lazbuild, `-B`) | **3112 / 3112** (`kalan=0`) |
+| `sqltest` — win64 (`-Px86_64 -Twin64 -O1`) | **3077 / 3077** (`kalan=0`) |
+| `sqltest` — Linux (WSL, FPC 3.2.4) | **3077 / 3077** (`kalan=0`) |
 
 The H11 (undo journal / in-place) tests were updated to the new contract:
 dead-span reuse is verified for multi-row transactions, while single-row
-writes take the append path. H25 added `sqltest` T148 (20 checks: threshold
-behaviour, file shrinking, data/index integrity, disable/re-enable, and
+writes take the append path. H25 added `sqltest` T148 (21 checks: default-off,
+threshold behaviour, file shrinking, data/index integrity, disable/re-enable, and
 durability after reopening).
 
 Earlier campaigns also ran `crashtest`, `rawchk`, `mrowchk`, `fuzzchk`,

@@ -341,9 +341,10 @@ FPath: string;
     FDeadBytes: Int64;
     { H25 (2026-10-24): OTOMATIK SIKISTIRMA. Tek satirlik (autocommit)
       UPDATE/DELETE yerinde yazmadigi icin olusan olu bolgeler dosyayi
-      buyutur. Commit sonunda olu oran esigi asilirsa Compact otomatik
-      calisir. Varsayilan: ACIK, esik %35, en kucuk dosya 4 MB.
-      Kapatmak icin AutoCompactEnabled := False. }
+      buyutur. AutoCompactEnabled=True yapilirsa commit sonunda olu oran
+      esigi asildiginda Compact otomatik calisir. VARSAYILAN KAPALI:
+      sikistirma dosyayi bastan yazdigi icin commit gecikmesi bir defalik
+      artar; isteyen acar. Esik %35, en kucuk dosya 4 MB. }
     FAutoCompactOn: Boolean;
     FAutoCompactRatio: Double;
     FAutoCompactMinBytes: Int64;
@@ -783,10 +784,11 @@ property CurrentSeq: QWord read FSeq;
   // ama dosya adi kalici degil; isletme bir uyari vermelidir.
   property DirSyncFailed: Boolean read FDirSyncFailed;
 property DeadBytes: Int64 read FDeadBytes;
-    { H25 (2026-10-24): OTOMATIK SIKISTIRMA ayarlari. Commit sonunda olu
-      bayt orani AutoCompactRatio'yu gecerse ve dosya AutoCompactMinBytes
-      esigini asmissa Compact kendiliginden calisir. Tahmin edilebilir
-      gecikme isteyen uygulamalar bunu kapatip AutoCompact'i elle cagirir. }
+    { H25 (2026-10-24): OTOMATIK SIKISTIRMA ayarlari. VARSAYILAN KAPALI.
+      AutoCompactEnabled := True yapilirsa commit sonunda olu bayt orani
+      AutoCompactRatio'yu gecerse ve dosya AutoCompactMinBytes esigini
+      asmissa Compact kendiliginden calisir. Tahmin edilebilir gecikme
+      isteyen uygulamalar kapali tutup AutoCompact'i elle cagirir. }
     property AutoCompactEnabled: Boolean read FAutoCompactOn write FAutoCompactOn;
     property AutoCompactRatio: Double read FAutoCompactRatio write FAutoCompactRatio;
     property AutoCompactMinBytes: Int64 read FAutoCompactMinBytes write FAutoCompactMinBytes;
@@ -1050,9 +1052,10 @@ FSavepoints := TList<TSavepoint>.Create;
   FDirSyncFailed := False;
   FNewFile := False;
   FDeadBytes := 0;
-  { H25: otomatik sikistirma varsayilan ACIK. Esik %35 olu bayt ve en az
-    4 MB dosya; kucuk DB'lerde hic dokunmaz. }
-  FAutoCompactOn := True;
+  { H25: otomatik sikistirma varsayilan KAPALI. Cevirmek icin
+    AutoCompactEnabled := True. Esik %35 olu bayt ve en az 4 MB dosya;
+    kucuk DB'lerde hic dokunmaz. }
+  FAutoCompactOn := False;
   FAutoCompactRatio := 0.35;
   FAutoCompactMinBytes := 4 * 1024 * 1024;
   FAutoCompactCount := 0;
