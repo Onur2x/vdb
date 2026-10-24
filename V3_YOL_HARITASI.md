@@ -128,8 +128,8 @@ Sayfa motorunu yazmak kolay; asıl maliyet şu 4 dosyada. Plan bunları hesaba k
 - [x] 1.5 `VDbPageHeap.pas`: slotted heap insert/güncelle/sil, >2 KB için overflow zinciri (12 B hücre başlığı, 1000 B üstü taşma zinciri)
 - [x] 1.6 Sayfa bölme yerine **yazma sayfası + boş sayfa geri kazanımı**: sayfa dolunca yeni sayfa, sayfa tamamen boşalınca freelist'e döner; doluluk %95,7 (hücre) / %48,8 B satır
 - [x] 1.7 `heapchk`: 200k satır + 200k rastgele işlem, **20/20, kalan=0**; INSERT sonrası tüm anahtarlar birebir okunur
-- [ ] 1.8 `VDbPageWal.pas`: sayfa-imajlı WAL, commit kaydı, checkpoint, replay
-- [ ] 1.9 `crashtest` v3 backend ile **8/8**; süreç `kill -9` sonrası 0 kayıp
+- [x] 1.8 `VDbPageWal.pas`: sayfa-imajlı WAL, commit kaydı, checkpoint, replay
+- [x] 1.9 `crashtest` v3 backend ile **11/11**; süreç `kill -9` sonrası 0 kayıp
 - [ ] 1.10 `VDbIdxFile.pas`: `.odb.idx` (key → sayfa, slot), açılışta dosya boyutu + son commit LSN + CRC doğrulaması
 - [ ] 1.11 Bozuk/bayat/eksik `.idx` → otomatik tam tarama; **veri kaybı yok** testi
 - [ ] 1.12 Ölçüm: dosya **≤ 11 MB**, açılış **≤ 150 ms** (200k)
@@ -159,7 +159,7 @@ Sayfa motorunu yazmak kolay; asıl maliyet şu 4 dosyada. Plan bunları hesaba k
 - [ ] 3.8 win32 tam kapı: **`kalan=0`**
 - [ ] 3.9 win64 (-O1 ve optimizasyonsuz) tam kapı: **`kalan=0`**
 - [ ] 3.10 Linux/WSL tam kapı: **`kalan=0`**
-- [ ] 3.11 `crashtest` 8/8, fuzz (T111, 3VL, T147 SQLancer) v3'te temiz
+- [ ] 3.11 `crashtest` 11/11, fuzz (T111, 3VL, T147 SQLancer) v3'te temiz
 - [ ] 3.12 Ölçüm tablosu `hiztesti.md` + `speedtest.md` + `readme*.md` güncellenir — **yalnız ölçülmüş sayılar**
 - [ ] 3.13 `git tag v3.0` + push; CI yeşil
 
@@ -263,11 +263,46 @@ zincir sayfası **açılışta** CRC ile yakalanır.
 
 ---
 
+## WAL ve çökme kurtarma (Sprint 1.8–1.9)
+
+`VDbPageWal.pas` + `VDbPageEngine.pas` — **sayfa imajlı, write-ahead** günlük.
+Commit öncesi veritabanı dosyasına sayfa **yazılmaz**; sıra:
+
+1. Kirli sayfalar + meta imajı WAL'e çerçeve olarak eklenir,
+2. commit kaydı yazılır ve **fsync** edilir (burada durabilirlik tamam),
+3. `Checkpoint` ayrı adımdır: imajlar veri dosyasına yazılır, fsync, WAL budanır.
+
+Havuz dolduğunda kirli sayfa `OnSpill` ile WAL tamponuna (bellekte) taşınır;
+sonraki okuma `OnMiss` ile diskten değil tampondan karşılanır. Böylece eski
+imaj diske sızmaz.
+
+Dosya biçimi: `<db>.wal`, 4096 B başlık (`VWL3`), 20 B kayıt başlığı
+(`Magic|LSN|PayloadLen|PageNo|Crc`), 4096 B yüklü `VFW1` çerçeveleri ve
+`FWC1` commit kaydı. Meta sayfa (0) de çerçeve olarak loglanır; kurtarmada
+**en son** uygulanır (önce dosya uzatılmalı).
+
+Kurtarma yalnız commit kaydıyla kapanmış çerçeveleri uygular; bozuk CRC'li
+kayıt veya kesik kuyruk **durur** — yarım işlem yazılmaz. Çerçeve imajları
+yazılırken `PageSeal` uygulanır, böylece replay sonrası sayfa CRC'si geçerlidir.
+
+`crashtest` (11/11, `kalan=0`): temel commit/aç, commit edilmemiş atılır,
+gerçek `kill -9` (commit edilmiş 28.150 satırın tamamı; kurtarma 5 çerçeve /
+7 commit), kesik WAL kuyruğu, bozuk WAL çerçevesi + bozuk sayfa → **açık hata**,
+torn page onarımı, 8 sayfalık havuzda 5000 satır, bozuk WAL başlığı.
+
+Testler sırasında bulunan gerçek hatalar: (a) commit sırasında `IsCached`
+tahliye tetikleyip yoğun yazımda sayfa kaybettiriyordu → `InstallPage` artık
+onbellekteki imajı tazeler, tahliye etmez; (b) sihirli sayısı bozuk sayfa
+"freelist trunk" sanılıp sessizce atlanıyordu → `IsTrunkPage` ile ayırt edilir,
+aksi halde açık hata; (c) WAL çerçeveleri mühürsüz imaj taşıyordu.
+
+---
+
 ## Kapılar (pazarlık dışı)
 
 1. v2 dalı bozulmaz: `v2.3` etiketinde `sqltest` **3112/3112 (win32)**, 3077/3077 (win64/Linux).
 2. v3.0 yayınlanmadan `kalan=0` üç platformda.
-3. `crashtest` 8/8 ve P-DUR sözleşmesi: commit ve `Flush` fsync eder.
+3. `crashtest` 11/11 ve P-DUR sözleşmesi: commit ve `Flush` fsync eder.
 4. Göç hiçbir senaryoda kaynak `.odb`'yi değiştirmez; `.v2bak` üretir.
 5. Bozuk `.idx` hiçbir zaman veri kaybına yol açmaz — yalnız yavaşlar.
 6. Rakamlar yalnız aynı ortamda ölçülerek raporlanır.
@@ -289,7 +324,7 @@ zincir sayfası **açılışta** CRC ile yakalanır.
 
 ## "Bitti" tanımı
 
-- Üç platformda `sqltest` `kalan=0`, `crashtest` 8/8
+- Üç platformda `sqltest` `kalan=0`, `crashtest` 11/11
 - 200k satır: dosya ≤ 11 MB, açılış ≤ 150 ms, PK ve yazma gerilememiş
 - `MIGRATE TO v3` 200k satırda 0 fark
 - v2.3 etiketi ve dalı bozulmamış

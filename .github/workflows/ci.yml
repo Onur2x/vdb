@@ -52,6 +52,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:LAZBUILD -B heapchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:LAZBUILD -B crashtest.lpi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Sayfa deposu kapisi (storechk)
         shell: pwsh
@@ -94,6 +96,21 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'heapchk kalan > 0'
+            exit 1
+          }
+
+      - name: Cokme kurtarma kapisi (crashtest)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbcrashtest'
+          $out = & .\crashtest.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'COKME KURTARMA DOGRULANDI') {
+            Write-Error 'crashtest basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'crashtest kalan > 0'
             exit 1
           }
 

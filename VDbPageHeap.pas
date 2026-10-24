@@ -585,8 +585,12 @@ begin
       Move(P^[0], magic, SizeOf(magic));
       if magic <> VDB_PAGE_MAGIC then
       begin
-        { Freelist trunk sayfasi: heap verisi degil. }
-        Continue;
+        { Freelist trunk sayfasi olabilir; AMA yalnizca gercekten trunk ise
+          atlanir. Aksi halde bozuk sayfa sessizce yok sayilirdi. }
+        if FStore.IsTrunkPage(P) then
+          Continue;
+        raise EVdbHeap.Create(Format(
+          'sayfa %d taninmiyor (ne VDbPage ne trunk) - acilis taramasi', [pno]));
       end;
       if not PageVerify(P, e) then
         raise EVdbHeap.Create(Format('sayfa %d bozuk (acilis taramasi): %s',

@@ -49,6 +49,17 @@ const
 type
   EVdbPageStore = class(Exception);
 
+  { Kirli sayfa onbellege sigmadiginda, DISKE YAZILMADAN ONCE cagrilir.
+    v3 motoru bunu WAL'e cerceve eklemek icin kullanir (write-ahead).
+    Atanmamis ise sayfa dogrudan diske yazilir (WAL'siz kullanim). }
+  TVdbPageSpillProc = procedure(PageNo: LongWord; P: PVdbPage) of object;
+
+  { Onbellekte olmayan sayfa icin alternatif kaynak (WAL tamponu).
+    True donerse sayfa imaji P'ye yazilmis olmalidir; diskten okunmaz. }
+  TVdbPageMissProc = function(PageNo: LongWord; P: PVdbPage): Boolean of object;
+
+  TVdbPageNoArray = array of LongWord;
+
   TVDbStoreStats = record
     PageCount: LongWord;   // dosyadaki toplam sayfa (0 dahil)
     FreeCount: LongWord;   // freelist'teki sayfa sayisi
@@ -91,6 +102,9 @@ type
       FMetaDirty: Boolean;
       FLocked: Boolean;
       FReadOnly: Boolean;
+      FOnSpill: TVdbPageSpillProc;
+      FOnMiss: TVdbPageMissProc;
+      FSpillActive: Boolean;
     function HashOf(PageNo: LongWord): LongWord;
     function FindFrame(PageNo: LongWord): Integer;
     procedure HashPut(PageNo: LongWord; Idx: Integer);
@@ -123,6 +137,10 @@ type
     procedure Open(ACreate: Boolean = False);
     procedure Close;
 
+    { Test/kurtarma: diske HICBIR SEY yazmadan kapat (surec olumu
+      simulasyonu). Bellekteki kirli sayfalar ve WAL tamponu atilir. }
+    procedure CloseNoFlush;
+
     { Sayfayi okur ve pinler. Basarisizsa False (sayfa yok / CRC bozuk). }
     function GetPage(PageNo: LongWord; out P: PVdbPage): Boolean;
 
@@ -149,6 +167,36 @@ type
 
     { Tum pinleri sifirlar ve onbellegi bosaltir (test/kurtarma icin). }
     procedure DropCache;
+
+    { Su anda onbellekte KIRLI olan sayfa numaralari (tekil). Commit
+      sirasinda WAL'e yazilacak cerceveleri belirlemek icin. }
+    function DirtyPages: TVdbPageNoArray;
+
+    { Checkpoint LSN'ini ayarlar; sonraki SaveMeta bu degeri yazar. }
+    procedure SetLSN(Value: LongWord);
+
+    { Meta sayfasinin guncel imajini uretir (WAL'e cerceve olarak
+      yazmak icin; diske yazmaz). }
+    procedure BuildMetaImage(out Buf: TVdbPageBuf);
+
+    { WAL kurtarma: sayfa imajini yazar. Onbellekte varsa tazeler ve
+      kirli isaretler; yoksa dogrudan dosyaya yazar. PageNo=0 ise meta
+      alanlari da tazelenir. }
+    procedure InstallPage(PageNo: LongWord; P: PVdbPage);
+
+    { Sayfa onbellekte mi? (Yukleme/tahliye tetiklemez.) }
+    function IsResident(PageNo: LongWord): Boolean;
+
+    { Sayfa gecerli bir freelist trunk sayfasi mi (sihirli sayi + CRC)?
+      Heap taramasi VDbPage formatinda OLMAYAN sayfalari bu sekilde ayirt
+      eder; aksi halde bozuk sayfa sessizce atlanirdi. }
+    function IsTrunkPage(P: PVdbPage): Boolean;
+
+    { Kirli sayfa tahliyesinden once cagrilacak kanca (write-ahead WAL). }
+    property OnSpill: TVdbPageSpillProc read FOnSpill write FOnSpill;
+
+    { Onbellekte bulunmayan sayfa icin alternatif kaynak (WAL tamponu). }
+    property OnMiss: TVdbPageMissProc read FOnMiss write FOnMiss;
 
     function Stats: TVDbStoreStats;
     function PageSize: Integer;
@@ -412,6 +460,16 @@ begin
   end;
 end;
 
+procedure TVDbPageStore.CloseNoFlush;
+begin
+  if FStream = nil then Exit;
+  if FLocked then VDbUnlockStream(FStream);
+  FreeAndNil(FStream);
+  FLocked := False;
+  FMetaDirty := False;
+  DropCache;
+end;
+
 { ============================================================ okuma/yazma }
 
 procedure TVDbPageStore.ReadPageAt(PageNo: LongWord; P: PVdbPage);
@@ -470,14 +528,27 @@ begin
   begin
     if FFrames[idx].Dirty then
     begin
-      PageSeal(@FFrames[idx].Data);
-      WritePageAt(FFrames[idx].PageNo, @FFrames[idx].Data);
+      if Assigned(FOnSpill) then
+        { Write-ahead: sayfa WAL tamponuna alinir, DISKE YAZILMAZ.
+          Commit edilmemis sayfa veritabani dosyasina hicbir zaman
+          girmez; okuma OnMiss ile tampondan karsilanir. }
+        FOnSpill(FFrames[idx].PageNo, @FFrames[idx].Data)
+      else
+      begin
+        PageSeal(@FFrames[idx].Data);
+        WritePageAt(FFrames[idx].PageNo, @FFrames[idx].Data);
+      end;
       FFrames[idx].Dirty := False;
     end;
     HashDel(FFrames[idx].PageNo);
     Inc(FEvictions);
   end;
-  ReadPageAt(PageNo, @FFrames[idx].Data);
+  if Assigned(FOnMiss) and FOnMiss(PageNo, @FFrames[idx].Data) then
+  begin
+    { imaj WAL tamponundan geldi; diskten okumaya gerek yok }
+  end
+  else
+    ReadPageAt(PageNo, @FFrames[idx].Data);
   FFrames[idx].PageNo := PageNo;
   FFrames[idx].Pins := 0;
   FFrames[idx].Dirty := False;
@@ -802,6 +873,94 @@ begin
   if FHashKey <> nil then
     HashReset;
   FClock := 0;
+end;
+
+function TVDbPageStore.DirtyPages: TVdbPageNoArray;
+var
+  i, n: Integer;
+begin
+  SetLength(Result, 0);
+  n := 0;
+  for i := 0 to FPoolPages - 1 do
+    if (FFrames[i].PageNo <> 0) and FFrames[i].Dirty and
+       (FFrames[i].PageNo <> VDB_HDR_PAGE) then
+    begin
+      SetLength(Result, n + 1);
+      Result[n] := FFrames[i].PageNo;
+      Inc(n);
+    end;
+end;
+
+procedure TVDbPageStore.SetLSN(Value: LongWord);
+begin
+  FLSN := Value;
+  FMetaDirty := True;
+end;
+
+procedure TVDbPageStore.BuildMetaImage(out Buf: TVdbPageBuf);
+var
+  crc: LongWord;
+  q: PLongWord;
+  magic, ver: LongWord;
+  ps: Word;
+begin
+  FillChar(Buf, SizeOf(Buf), 0);
+  magic := VDB_FILE_MAGIC;
+  ver := VDB_FILE_VER;
+  ps := VDB_PAGE_SIZE;
+  Move(magic, Buf[0], SizeOf(magic));
+  Move(ver, Buf[4], SizeOf(ver));
+  Move(ps, Buf[8], SizeOf(ps));
+  Move(FPageCount, Buf[12], SizeOf(FPageCount));
+  Move(FFreeTrunk, Buf[16], SizeOf(FFreeTrunk));
+  Move(FFreeCount, Buf[20], SizeOf(FFreeCount));
+  Move(FLSN, Buf[24], SizeOf(FLSN));
+  Move(FCreated, Buf[28], SizeOf(FCreated));
+  crc := VDbCrc32Of(Buf, VDB_PAGE_BODY_END);
+  q := PLongWord(@Buf[VDB_PAGE_BODY_END]);
+  q^ := crc;
+end;
+
+procedure TVDbPageStore.InstallPage(PageNo: LongWord; P: PVdbPage);
+var
+  idx: Integer;
+begin
+  if FStream = nil then
+    raise EVdbPageStore.Create('depolama acik degil (InstallPage)');
+  idx := FindFrame(PageNo);
+  if idx >= 0 then
+  begin
+    { Sayfa onbellekte: imaji tazele ve kirli isaretle; Flush yazacak.
+      Boylece tahliye tetiklenmez ve pending listesi commit sirasinda
+      degismez. }
+    if FFrames[idx].Pins > 0 then
+      raise EVdbPageStore.Create(Format(
+        'InstallPage: sayfa %d pinli (kurtarma sirasinda beklenmiyordu)', [PageNo]));
+    Move(P^, FFrames[idx].Data, VDB_PAGE_SIZE);
+    FFrames[idx].Dirty := True;
+    Exit;
+  end;
+  if PageNo >= FPageCount then
+  begin
+    FPageCount := PageNo + 1;
+    FStream.Size := Int64(FPageCount) * VDB_PAGE_SIZE;
+  end;
+  FStream.Position := FileOffsetOf(PageNo);
+  FStream.WriteBuffer(P^, VDB_PAGE_SIZE);
+  if PageNo = VDB_HDR_PAGE then
+    LoadMeta;
+end;
+
+function TVDbPageStore.IsResident(PageNo: LongWord): Boolean;
+begin
+  Result := FindFrame(PageNo) >= 0;
+end;
+
+function TVDbPageStore.IsTrunkPage(P: PVdbPage): Boolean;
+var
+  e: string;
+begin
+  Result := TrunkCheck(P, e);
 end;
 
 function TVDbPageStore.Stats: TVDbStoreStats;
