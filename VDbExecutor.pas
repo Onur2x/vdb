@@ -16738,10 +16738,11 @@ var
   ei: TVdbExtensionInfo;
 begin
   { Sprint 2.9: v3 sayfa motorunda `Kv = nil`. v2 motorunun veri dosyasi,
-    WAL, arsiv, yedek ve replikasyon yollarina dayanan yonetim komutlari
-    v3'te yoktur; sessiz AV yerine NET bir "desteklenmiyor" hatasi verilir. }
+    WAL arsiv/replikasyon yollarina dayanan yonetim komutlari v3'te yoktur;
+    sessiz AV yerine NET bir "desteklenmiyor" hatasi verilir. (BACKUP ve
+    VERIFY Sprint 3.1/3.2'de backend uzerinden eklendi; VACUUM 3.3.) }
   if (FT.Kv = nil) and (Stmt.Kind in [
-      admVacuum, admBackupDb, admRecoverTo, admRestoreFrom,
+      admVacuum, admRecoverTo,
       admArchiveSet, admArchiveList, admAlterDbKey, admSavepoint,
       admReleaseSavepoint, admRollbackToSavepoint,
       admReplicationStart, admReplicationStop, admCreateReplSlot,
@@ -16791,11 +16792,22 @@ begin
       end;
     admBackupDb:
       begin
-        FT.Kv.BackupTo(Stmt.BackupPath);
-        Res.Affected := 1;
-        Res.Msg := 'OK';
-        if FT.Kv.ArchiveEnabled then
-          Res.Msg := Res.Msg + ' (WAL arsivlendi)';
+        if FT.Kv <> nil then
+        begin
+          FT.Kv.BackupTo(Stmt.BackupPath);
+          Res.Affected := 1;
+          Res.Msg := 'OK';
+          if FT.Kv.ArchiveEnabled then
+            Res.Msg := Res.Msg + ' (WAL arsivlendi)';
+        end
+        else
+        begin
+          { Sprint 3.2: checkpoint sonrasi sayfa imajlarinin bayt-bayt
+            kopyasi; tek .odb, kendi kendine yeter. }
+          FT.Backend.BackupTo(Stmt.BackupPath);
+          Res.Affected := 1;
+          Res.Msg := 'OK';
+        end;
       end;
     // ---- R-16: WAL ARSIVLEME + PITR ----
     admArchiveSet:
@@ -16833,8 +16845,19 @@ begin
       end;
     admRestoreFrom:
       begin
-        FT.Kv.RestoreFrom(Stmt.BackupPath);
-        Res.Affected := 1; Res.Msg := 'geri yuklendi';
+        if FT.Kv <> nil then
+        begin
+          FT.Kv.RestoreFrom(Stmt.BackupPath);
+          Res.Affected := 1; Res.Msg := 'geri yuklendi';
+        end
+        else
+        begin
+          { Sprint 3.2: dosya atomik degistirilir; ardindan sema, indeksler
+            ve ertelenen kisitlar diskten yeniden yuklenir. }
+          FT.Backend.RestoreFrom(Stmt.BackupPath);
+          FT.ReloadSchema;
+          Res.Affected := 1; Res.Msg := 'geri yuklendi';
+        end;
       end;
     admRecoverTo:
       begin

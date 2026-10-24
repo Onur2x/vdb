@@ -553,6 +553,64 @@ begin
   end;
 end;
 
+{ ================================ 8) BACKUP / RESTORE (Sprint 3.2) }
+
+procedure TestBackupRestoreSql;
+var
+  S: TV3Sql;
+  r: TSqlResult;
+  i: Integer;
+  bak: string;
+begin
+  CleanDir;
+  bak := DirOf('sql_backup.odb');
+  OpenV3(S, 'sql_br.odb', True);
+  try
+    Exec(S, 'CREATE TABLE b (id INTEGER PRIMARY KEY, ad TEXT)');
+    for i := 1 to 100 do
+      Exec(S, Format('INSERT INTO b VALUES (%d, ''s%d'')', [i, i]));
+
+    r := Exec(S, Format('BACKUP TO ''%s''', [bak]));
+    if (not gErr) and (r.Affected = 1) and FileExists(bak) then
+      Ok('SQL BACKUP dosya olusturdu')
+    else
+      Fail('SQL BACKUP: ' + r.Msg);
+
+    Exec(S, 'DELETE FROM b WHERE id <= 50');
+    r := Exec(S, 'SELECT COUNT(*) FROM b');
+    if (not gErr) and (Cel(r, 0, 0) = '50') then
+      Ok('BACKUP sonrasi 50 satir silindi')
+    else
+      Fail('BACKUP sonrasi silme: ' + Cel(r, 0, 0));
+
+    r := Exec(S, Format('RESTORE FROM ''%s''', [bak]));
+    if (not gErr) and (r.Affected = 1) then
+      Ok('SQL RESTORE calisti')
+    else
+      Fail('SQL RESTORE: ' + r.Msg);
+
+    { RESTORE sonrasi sema BELLEKTEN degil, yeni dosyadan yuklenmeli. }
+    r := Exec(S, 'SELECT COUNT(*) FROM b');
+    if (not gErr) and (Cel(r, 0, 0) = '100') then
+      Ok('RESTORE 100 satiri geri getirdi')
+    else
+      Fail('RESTORE sonrasi COUNT: ' + Cel(r, 0, 0));
+    r := Exec(S, 'SELECT ad FROM b WHERE id = 75');
+    if (not gErr) and (Cel(r, 0, 0) = 's75') then
+      Ok('RESTORE sema + veri tutarli')
+    else
+      Fail('RESTORE PK okumasi: ' + Cel(r, 0, 0));
+
+    r := Exec(S, 'VERIFY');
+    if (not gErr) and (r.Affected = 1) and (Pos('VERIFY:', r.Msg) = 1) then
+      Ok('RESTORE sonrasi SQL VERIFY gecti')
+    else
+      Fail('RESTORE sonrasi VERIFY: ' + r.Msg);
+  finally
+    CloseV3(S);
+  end;
+end;
+
 { ================================================================== ana }
 
 var
@@ -576,6 +634,7 @@ begin
   TestIndex;
   TestJoin;
   TestVerifySql;
+  TestBackupRestoreSql;
   TestIntegrity(N);
 
   WriteLn;

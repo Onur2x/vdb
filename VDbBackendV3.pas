@@ -30,7 +30,8 @@ interface
 
 uses
   SysUtils, Classes, Generics.Collections,
-  VDbBackendApi, VDbPage, VDbPageStore, VDbPageHeap, VDbPageWal, VDbPageEngine;
+  VDbBackendApi, VDbPage, VDbPageStore, VDbPageHeap, VDbPageWal, VDbPageEngine,
+  VDbSync;
 
 const
   { Bu boyuttan buyuk WAL'de commit sonrasi checkpoint yapilir. Cok kucuk
@@ -57,6 +58,7 @@ type
       FBeforeCommit: TDbCommitHook;
       FCheckpointBytes: Int64;
       FDirty: Boolean;
+      FPoolPages: Integer;
       FScanKeys: TQWordArray;
       FScanVals: TValArray;
       FScanN: Integer;
@@ -107,6 +109,12 @@ type
     { Sprint 3.1: sayfa motorunun tam butunluk denetimi (CRC + freelist
       + heap + tasma zincirleri). Acik parti varsa denetim yapilmaz. }
     function Verify(out Report: string): Boolean;
+
+    { Sprint 3.2: checkpoint sonrasi bayt-bayt yedek; geri yukleme dosyayi
+      atomik degistirir (eski dosya .bak kalir), WAL/idx temizlenir, motor
+      yeniden acilir. Ust katman semayi yeniden yuklemelidir. }
+    procedure BackupTo(const DestPath: string);
+    procedure RestoreFrom(const SrcPath: string);
   end;
 
 implementation
@@ -120,6 +128,7 @@ begin
   FBatchOpen := False;
   FDirty := False;
   FCheckpointBytes := VDB_V3_CHECKPOINT_BYTES;
+  FPoolPages := APoolPages;
   FEng := TVdbPageEngine.Create(ADbPath, APoolPages);
   try
     FEng.Open(ACreate);
@@ -494,6 +503,114 @@ begin
     Exit(False);
   end;
   Result := FEng.Verify(Report);
+end;
+
+procedure TVdbBackendV3.BackupTo(const DestPath: string);
+begin
+  if FBatchOpen then
+    raise EVdbBackendV3.Create('acik parti varken yedek alinamaz (once COMMIT/ROLLBACK)');
+  { Bellekte commit edilmemis degisiklik varsa once durabil hale getir. }
+  if FDirty then
+  begin
+    FEng.Commit(True);
+    FDirty := False;
+  end;
+  { Checkpoint dosyayi tamamlar ve WAL'i budar: kopya kendi kendine yeter. }
+  FEng.Checkpoint(True);
+  FEng.Store.CopyCommittedTo(DestPath);
+end;
+
+procedure TVdbBackendV3.RestoreFrom(const SrcPath: string);
+var
+  tmp, bak, wal, idx: string;
+  src, dst: TFileStream;
+  hdr: array[0..15] of Byte;
+  magic, ver: LongWord;
+begin
+  if FBatchOpen then
+    raise EVdbBackendV3.Create('acik parti varken geri yukleme yapilamaz');
+  if not FileExists(SrcPath) then
+    raise EVdbBackendV3.Create('RESTORE: yedek dosyasi bulunamadi: ' + SrcPath);
+  if SameFileName(ExpandFileName(SrcPath), ExpandFileName(FPath)) then
+    raise EVdbBackendV3.Create('RESTORE: kaynak ile hedef ayni dosya');
+  src := TFileStream.Create(SrcPath, fmOpenRead or fmShareDenyNone);
+  try
+    if src.Size < 32 then
+      raise EVdbBackendV3.Create('RESTORE: kaynak dosya cok kisa');
+    src.ReadBuffer(hdr, SizeOf(hdr));
+  finally
+    src.Free;
+  end;
+  Move(hdr[0], magic, SizeOf(magic));
+  Move(hdr[4], ver, SizeOf(ver));
+  if (magic <> VDB_FILE_MAGIC) or (ver <> VDB_FILE_VER) then
+    raise EVdbBackendV3.Create('RESTORE: kaynak v3 sayfa motoru dosyasi degil');
+
+  { Calisan durumu diske indir; sonra motoru kapat. }
+  if FDirty then
+  begin
+    FEng.Commit(True);
+    FDirty := False;
+  end;
+  FEng.Checkpoint(True);
+
+  tmp := FPath + '.restore.tmp';
+  bak := FPath + '.bak';
+  wal := FPath + '.wal';
+  idx := FPath + '.idx';
+  if FileExists(tmp) then DeleteFile(tmp);
+  src := TFileStream.Create(SrcPath, fmOpenRead or fmShareDenyNone);
+  try
+    dst := TFileStream.Create(tmp, fmCreate);
+    try
+      dst.CopyFrom(src, 0);
+      VDbFlushStream(dst);
+    finally
+      dst.Free;
+    end;
+  finally
+    src.Free;
+  end;
+
+  FreeAndNil(FEng);
+  FEng := nil;
+  try
+    if FileExists(bak) then DeleteFile(bak);
+    if not RenameFile(FPath, bak) then
+      raise EVdbBackendV3.Create('RESTORE: mevcut dosya .bak yapilamadi');
+    try
+      if not RenameFile(tmp, FPath) then
+        raise EVdbBackendV3.Create('RESTORE: yeni dosya yerine konamadi');
+    except
+      RenameFile(bak, FPath);
+      raise;
+    end;
+    { Yeni dosyanin WAL'i ve dizini ESKI dosyaya aittir; asla kullanilmaz. }
+    if FileExists(wal) then DeleteFile(wal);
+    if FileExists(idx) then DeleteFile(idx);
+    FEng := TVdbPageEngine.Create(FPath, FPoolPages);
+    FEng.Open(False);
+  except
+    { Yarim kalan geri yuklemede .bak'tan don. }
+    if FEng = nil then
+    begin
+      try
+        if FileExists(bak) then
+        begin
+          if FileExists(FPath) then DeleteFile(FPath);
+          RenameFile(bak, FPath);
+        end;
+        if FileExists(FPath) then
+        begin
+          FEng := TVdbPageEngine.Create(FPath, FPoolPages);
+          FEng.Open(False);
+        end;
+      except
+        FreeAndNil(FEng);
+      end;
+    end;
+    raise;
+  end;
 end;
 
 end.

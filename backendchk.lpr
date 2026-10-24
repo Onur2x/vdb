@@ -674,6 +674,108 @@ begin
   v3 := nil;
 end;
 
+{ ==================================== 9) v3 BACKUP / RESTORE (Sprint 3.2) }
+
+procedure TestV3BackupRestore(N: Integer);
+var
+  v3: TVdbBackendV3;
+  b, b2: IVdbBackend;
+  v, got: TBytes;
+  i: Integer;
+  rep, bak, junk: string;
+  raised: Boolean;
+begin
+  CleanDir;
+  bak := DirOf('br_backup.odb');
+  junk := DirOf('br_junk.odb');
+  v3 := TVdbBackendV3.Create(DirOf('br_main.odb'), True, 128);
+  b := v3;
+  for i := 1 to N do
+  begin
+    MakeVal(i, 30 + (i mod 40), 3, v);
+    b.Put(i, v);
+  end;
+  { Bir tasma degeri de yedege girsin. }
+  MakeVal(500001, 5000, 7, v);
+  b.Put(500001, v);
+  b.Flush;
+
+  b.BackupTo(bak);
+  if FileExists(bak) then Ok('v3 BACKUP dosyasi olustu')
+  else Fail('v3 BACKUP dosyasi yok');
+
+  { Yedegi BAGIMSIZ bir motorla ac ve dogrula: yedek kendi kendine yeter. }
+  b2 := TVdbBackendV3.Create(bak, False, 64);
+  if b2.Verify(rep) then Ok('v3 BACKUP dogrulandi: ' + rep)
+  else Fail('v3 BACKUP bozuk: ' + rep);
+  if b2.Count = N + 1 then Ok('v3 BACKUP anahtar sayisi dogru')
+  else Fail(Format('v3 BACKUP Count=%d beklenen %d', [b2.Count, N + 1]));
+  MakeVal(500001, 5000, 7, v);
+  if b2.Get(500001, got) and (Length(got) = Length(v)) and
+     (CompareMem(@got[0], @v[0], Length(v))) then
+    Ok('v3 BACKUP tasma degeri birebir')
+  else
+    Fail('v3 BACKUP tasma degeri bozuk');
+  b2 := nil;
+
+  { Asil dosyayi degistir: yedekten farkli bir durum olussun. }
+  for i := 1 to N do
+    if (i mod 3) = 0 then
+      b.Delete(i);
+  MakeVal(700001, 20, 4, v);
+  b.Put(700001, v);
+  b.Flush;
+
+  b.RestoreFrom(bak);
+  if b.Count = N + 1 then Ok('v3 RESTORE anahtar sayisini geri getirdi')
+  else Fail(Format('v3 RESTORE Count=%d beklenen %d', [b.Count, N + 1]));
+  if not b.Get(700001, got) then Ok('v3 RESTORE sonradan eklenen anahtari atti')
+  else Fail('v3 RESTORE sonradan eklenen anahtar duruyor');
+  if b.Verify(rep) then Ok('v3 RESTORE sonrasi VERIFY gecti')
+  else Fail('v3 RESTORE sonrasi VERIFY: ' + rep);
+  if FileExists(DirOf('br_main.odb.bak')) then
+    Ok('v3 RESTORE eski dosyayi .bak birakti')
+  else
+    Fail('v3 RESTORE .bak birakmadi');
+
+  { Acik parti varken yedek alinmaz. }
+  b.BeginBatch;
+  MakeVal(888888, 10, 2, v);
+  b.Put(888888, v);
+  raised := False;
+  try
+    b.BackupTo(DirOf('br_x.odb'));
+  except
+    on E: Exception do raised := True;
+  end;
+  b.AbortBatch;
+  if raised then Ok('v3 BACKUP acik partide reddedildi')
+  else Fail('v3 BACKUP acik partide sessizce gecti');
+
+  { v3 olmayan kaynak reddedilir; mevcut veritabani bozulmaz. }
+  with TFileStream.Create(junk, fmCreate) do
+  try
+    WriteBuffer('bu bir vdb dosyasi degil', 25);
+  finally
+    Free;
+  end;
+  raised := False;
+  try
+    b.RestoreFrom(junk);
+  except
+    on E: Exception do raised := True;
+  end;
+  if raised then Ok('v3 RESTORE v3 olmayan dosyayi reddetti')
+  else Fail('v3 RESTORE v3 olmayan dosyayi kabul etti');
+  if b.Verify(rep) and (b.Count = N + 1) then
+    Ok('v3 RESTORE reddinden sonra veritabani saglam')
+  else
+    Fail('v3 RESTORE reddinden sonra bozulma: ' + rep);
+
+  b := nil;
+  v3 := nil;
+end;
+
 { ================================================================== ana }
 
 var
@@ -698,6 +800,7 @@ begin
   TestV3SpillReread(N);
   TestV3SmallPool(N);
   TestV3Verify(N);
+  TestV3BackupRestore(N);
   TestEquivalence(1000);
 
   WriteLn;

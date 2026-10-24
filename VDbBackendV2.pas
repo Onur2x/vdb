@@ -56,6 +56,10 @@ type
 
     { Sprint 3.1: v2 dosya butunlugu denetimi (TVDb.Verify'e devreder). }
     function Verify(out Report: string): Boolean;
+
+    { Sprint 3.2: v2 TVDb.BackupTo / RestoreFrom'a devreder. }
+    procedure BackupTo(const DestPath: string);
+    procedure RestoreFrom(const SrcPath: string);
   end;
 
 implementation
@@ -178,6 +182,16 @@ end;
 function TVDbBackendV2.Verify(out Report: string): Boolean;
 begin
   Result := FDb.Verify(Report);
+end;
+
+procedure TVDbBackendV2.BackupTo(const DestPath: string);
+begin
+  FDb.BackupTo(DestPath);
+end;
+
+procedure TVDbBackendV2.RestoreFrom(const SrcPath: string);
+begin
+  FDb.RestoreFrom(SrcPath);
 end;
 
 end.

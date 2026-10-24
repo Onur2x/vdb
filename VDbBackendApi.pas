@@ -106,6 +106,12 @@ type
       sayfa motorunun tam taramasidir (CRC + freelist + heap + tasma).
       Report: tek satir ozet veya hata nedeni. }
     function Verify(out Report: string): Boolean;
+
+    { Sprint 3.2: tutarli yedek (tek .odb) ve geri yukleme. Yedek, checkpoint
+      sonrasi sayfa imajlarinin bayt-bayt kopyasidir; geri yukleme kaynak
+      dosyayi atomik olarak yerine koyar ve eski dosyayi .bak birakir. }
+    procedure BackupTo(const DestPath: string);
+    procedure RestoreFrom(const SrcPath: string);
   end;
 
 implementation

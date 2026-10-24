@@ -181,7 +181,14 @@ var
     if not FileExists(markerPath) then Exit;
     sl := TStringList.Create;
     try
-      sl.LoadFromFile(markerPath);
+      { Alt surec isaret dosyasini `SaveToFile` ile YENIDEN olusturur; o
+        anda okuma paylasim ihlali verebilir. Bu bir yaris durumudur, veri
+        hatasi degildir: bu turu atla, sonraki turda tekrar oku. }
+      try
+        sl.LoadFromFile(markerPath);
+      except
+        on E: Exception do Exit;
+      end;
       if sl.Count > 0 then
         Result := StrToIntDef(Trim(sl[0]), 0);
     finally

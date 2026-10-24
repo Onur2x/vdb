@@ -3562,7 +3562,12 @@ begin
   if not SameText(ExtractFileExt(dest), VDB_EXT) then
     dest := dest + VDB_EXT;
   ms := VdbTickMs;
-  FT.Kv.BackupTo(dest);
+  { Sprint 3.2: v3 sayfa motorunda `Kv = nil`; yedek backend uzerinden alinir.
+    Bu yol SQL metnini parser'a vermeden calisan hizli yoldur. }
+  if FT.Kv <> nil then
+    FT.Kv.BackupTo(dest)
+  else
+    FT.Backend.BackupTo(dest);
   Result.Affected := 1;
   Result.LastTable := '';
   Result.Stmts := 1;

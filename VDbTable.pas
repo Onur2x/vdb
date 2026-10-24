@@ -530,6 +530,10 @@ type
     destructor Destroy; override;
     procedure Open(const Dir: string);
     procedure Close;
+    { Sprint 3.2: dosya disaridan degistirildi (RESTORE). Bellekteki sema,
+      indeksler ve ertelenen kisit listesi atilir; sema diskten yeniden
+      yuklenir. Indeksler ilk okumada tembel yeniden kurulur. }
+    procedure ReloadSchema;
     // ddl/dml
     procedure CreateTable(const Name: string; const Cols: TColArray; PkIndex: Integer;
       const Checks: TWhereGroups; const Fks: array of TFkDef;
@@ -4678,6 +4682,16 @@ begin
   FKvB.SetBeforeCommit(FCommitHook);
   // Indeksler BURADA kurulmaz (tembel): ilk okumada TryGetMemIndex
   // veriden kurar. 95.000 satirlik tabloda dosya acilisi 4,5 sn -> ~0 ms.
+end;
+
+procedure TVTableDb.ReloadSchema;
+begin
+  { R-22: yarim kalan eszamanli indeks insasi yeni dosyaya ait degildir. }
+  StopConcBuilders;
+  ResetBatchTableCache;
+  ClearSchemaSnapshot;
+  FDeferredRows.Clear;
+  LoadSchema;
 end;
 
 procedure TVTableDb.ResetBatchTableCache;

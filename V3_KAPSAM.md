@@ -151,7 +151,8 @@ v3 koşusu yalnız "kapsam" değil, **gerçek kusurlar** ortaya çıkardı:
 | Yetenek | Durum | Sürüm |
 |---|---|---|
 | `VERIFY` (sayfa CRC + heap) | **var** (Sprint 3.1) | 3.1 ✔ |
-| `BACKUP` / `RESTORE` / PITR | yok | 3.2 |
+| `BACKUP` / `RESTORE` (tek `.odb`, checkpoint sonrası sayfa kopyası) | **var** (Sprint 3.2) | 3.2 ✔ |
+| PITR (`RECOVER TO`) / WAL arşivi | yok | 3.6 |
 | `VACUUM` / `Compact` / AutoCompact | yok | 3.3 |
 | Kayıt/kolon şifreleme (v3 sayfa düzeyi AES-GCM) | yok | 3.4 |
 | `START REPLICATION` | yok | 3.5 (v3.1 mantıksal günlük) |

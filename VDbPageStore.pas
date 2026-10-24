@@ -179,6 +179,13 @@ type
       yazmak icin; diske yazmaz). }
     procedure BuildMetaImage(out Buf: TVdbPageBuf);
 
+    { Sprint 3.2: checkpoint sonrasi tutarli, bayt-bayt kopya. Meta sayfa
+      imaji yeniden uretilir, tum sayfalar onbellek/diskten okunup hedefe
+      yazilir. Hedef once .tmp olarak yazilir, fsync edilir, sonra yerine
+      gecer; yarim kalmis yedek olusmaz. Kaynak dosya ACILMADAN kopyalanir
+      (paylasim kilidi sorunu yok). }
+    procedure CopyCommittedTo(const DestPath: string);
+
     { WAL kurtarma: sayfa imajini yazar. Onbellekte varsa tazeler ve
       kirli isaretler; yoksa dogrudan dosyaya yazar. PageNo=0 ise meta
       alanlari da tazelenir. }
@@ -1020,6 +1027,55 @@ begin
   crc := VDbCrc32Of(Buf, VDB_PAGE_BODY_END);
   q := PLongWord(@Buf[VDB_PAGE_BODY_END]);
   q^ := crc;
+end;
+
+procedure TVDbPageStore.CopyCommittedTo(const DestPath: string);
+var
+  tmp, dir: string;
+  fs: TFileStream;
+  meta: TVdbPageBuf;
+  pno: LongWord;
+  P: PVdbPage;
+begin
+  if FStream = nil then
+    raise EVdbPageStore.Create('depolama acik degil (CopyCommittedTo)');
+  if DestPath = '' then
+    raise EVdbPageStore.Create('CopyCommittedTo: hedef yol bos');
+  dir := ExtractFileDir(DestPath);
+  if dir <> '' then ForceDirectories(dir);
+  tmp := DestPath + '.tmp';
+  if FileExists(tmp) then DeleteFile(tmp);
+  BuildMetaImage(meta);
+  fs := TFileStream.Create(tmp, fmCreate);
+  try
+    fs.WriteBuffer(meta, SizeOf(meta));
+    for pno := 1 to FPageCount - 1 do
+    begin
+      if not GetRawPage(pno, P) then
+        raise EVdbPageStore.Create(Format(
+          'kopya: sayfa %d okunamadi', [pno]));
+      try
+        fs.WriteBuffer(P^, VDB_PAGE_SIZE);
+      finally
+        Release(pno, False);
+      end;
+    end;
+    VDbFlushStream(fs);
+  finally
+    fs.Free;
+  end;
+  try
+    if FileExists(DestPath) then
+      if not DeleteFile(DestPath) then
+        raise EVdbPageStore.Create('kopya: eski hedef silinemedi: ' + DestPath);
+    if not RenameFile(tmp, DestPath) then
+      raise EVdbPageStore.Create('kopya: hedefe tasinamadi: ' + DestPath);
+    if dir <> '' then
+      VDbFlushDir(dir);
+  except
+    if FileExists(tmp) then DeleteFile(tmp);
+    raise;
+  end;
 end;
 
 procedure TVDbPageStore.InstallPage(PageNo: LongWord; P: PVdbPage);
