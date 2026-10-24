@@ -126,6 +126,12 @@ type
     { Sayfayi okur ve pinler. Basarisizsa False (sayfa yok / CRC bozuk). }
     function GetPage(PageNo: LongWord; out P: PVdbPage): Boolean;
 
+    { Sayfayi CRC/yapi denetimi YAPMADAN okur ve pinler. Yalnizca sayfa
+      tipini kesfetmek icin (freelist trunk sayfalari VDbPage formati
+      kullanmaz) ve PageInit oncesi kullanilir. Cagiran, icerigi
+      PageCheckStruct/PageVerify ile KENDISI dogrulamalidir. }
+    function GetRawPage(PageNo: LongWord; out P: PVdbPage): Boolean;
+
     { Freelist'ten ya da dosya sonundan sayfa ayirir; pinli ve PageInit
       edilmis olarak doner. }
     function AllocPage(PageType: Byte; out PageNo: LongWord;
@@ -512,6 +518,11 @@ end;
 function TVDbPageStore.GetPage(PageNo: LongWord; out P: PVdbPage): Boolean;
 begin
   Result := GetPageInternal(PageNo, True, P);
+end;
+
+function TVDbPageStore.GetRawPage(PageNo: LongWord; out P: PVdbPage): Boolean;
+begin
+  Result := GetPageInternal(PageNo, False, P);
 end;
 
 procedure TVDbPageStore.Release(PageNo: LongWord; Dirty: Boolean);

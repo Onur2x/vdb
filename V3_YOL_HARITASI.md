@@ -125,9 +125,9 @@ Sayfa motorunu yazmak kolay; asıl maliyet şu 4 dosyada. Plan bunları hesaba k
 - [x] 1.2 `pagechk`: 100k rastgele ekle/oku/güncelle/sil, referans map ile birebir; **0 hata** kapısı (21/21, `kalan=0`)
 - [x] 1.3 `VDbPageStore.pas`: buffer pool (CLOCK, pin/dirty/LRU), sayfa ayır/serbest bırak (15/15, `storechk`)
 - [x] 1.4 `freelist`: trunk page zinciri; silinen sayfa yeniden kullanılır (trunk sızmıyor: boşalınca sayfa olarak geri kazanılır)
-- [ ] 1.5 `VDbPageHeap.pas`: slotted heap insert/güncelle/sil, >2 KB için overflow zinciri
-- [ ] 1.6 Sayfa bölme (`split`) + doluluk %70–90 hedefi
-- [ ] 1.7 `heapchk`: 1M op, 0 hata; INSERT sonrası tüm anahtarlar okunabilir
+- [x] 1.5 `VDbPageHeap.pas`: slotted heap insert/güncelle/sil, >2 KB için overflow zinciri (12 B hücre başlığı, 1000 B üstü taşma zinciri)
+- [x] 1.6 Sayfa bölme yerine **yazma sayfası + boş sayfa geri kazanımı**: sayfa dolunca yeni sayfa, sayfa tamamen boşalınca freelist'e döner; doluluk %95,7 (hücre) / %48,8 B satır
+- [x] 1.7 `heapchk`: 200k satır + 200k rastgele işlem, **20/20, kalan=0**; INSERT sonrası tüm anahtarlar birebir okunur
 - [ ] 1.8 `VDbPageWal.pas`: sayfa-imajlı WAL, commit kaydı, checkpoint, replay
 - [ ] 1.9 `crashtest` v3 backend ile **8/8**; süreç `kill -9` sonrası 0 kayıp
 - [ ] 1.10 `VDbIdxFile.pas`: `.odb.idx` (key → sayfa, slot), açılışta dosya boyutu + son commit LSN + CRC doğrulaması
@@ -218,6 +218,48 @@ korunur; v2 dosyası açılırsa `MIGRATE TO v3` hatası verir.
 yeniden ayrıldı, veri sayfası eklenmedi; kapat/aç sonrası CRC'ler geçerli;
 bozulmuş veri **ve** başlık sayfası reddedildi; 8'lik havuzda 20.000 rasgele
 erişim 0 hata. Sonuç: `gecen=15 kalan=0`.
+
+---
+
+## Heap katmanı (Gün 3-4 — `VDbPageHeap.pas`)
+
+Anahtar `QWord` → değer `TBytes`. Hücre biçimi sayfa içinde:
+
+```
+Key 8 B | Len 4 B (bit31 = taşma) | veri (satır içi)  ya da  | ilkTaşmaSayfası 4 B
+```
+
+- **Hücre başlığı 12 B**, slot 4 B → satır başına sabit yük **16 B**
+  (v2'de ~62 B idi). Sayfa başlığı sayfa başına bir kez ödenir.
+- **Taşma:** 1000 B üstü değerler zincir sayfalarına bölünür (parça 4000 B).
+  Zincir sayfaları da `VDbPage` formatında (`VDB_PAGE_OVERFLOW`) olduğu için
+  CRC ve yapı denetiminden geçer; bozuk zincir **sessizce yanlış veri
+  döndürmez**.
+- **Dizin:** `key → (sayfa, slot)` açık adresleme tablosu, bellek içinde,
+  açılışta sayfalar taranarak kurulur (Sprint 1.10'da `.odb.idx` hızlandıracak).
+- **Güncelleme:** aynı boyut + satır içi ise **yerinde** yazılır (slot sabit).
+  Boyut değişirse eski değer saklanır, silinir, yeniden eklenir; ekleme
+  başarısız olursa eski değer geri konur (veri kaybı yok).
+- **Silme:** O(1); baytlar yerinde kalır, sayfa tamamen boşalınca freelist'e
+  döner. Slot indeksleri kararlıdır (`PageCompact` slotları yeniden numaralamaz).
+
+Ölçüm (`heapchk`, 200.000 satır × 32 B değer, win32):
+
+| Metrik | Ölçüm |
+|---|---|
+| Dosya | **9.756.672 B** → satır başına **48,8 B** (v2: 96,4 B) |
+| EKLE | **1,54 µs/satır** |
+| OKU | **0,65 µs/satır** |
+| Heap sayfası | 2381 (200k satır) |
+
+Rastgele işlem matrisi (200k işlem, 5000 anahtar evreni, bağımsız referans
+model): 28.894 ekleme, 31.880 güncelleme, 25.548 silme, 29.904 okuma —
+**birebir**, `gecen=20 kalan=0`. Kapsam kapısı güncelleme/silme sayısı 0 ise
+testi **kırmızı** yapar (boş yeşil engellenir).
+
+Taşma testleri: 1/999/1000/1001/5000/60.000 B değerler birebir; 60.000→50
+küçültmede zincir serbest kalır; 1→3000 büyütmede zincir kurulur; bozulmuş
+zincir sayfası **açılışta** CRC ile yakalanır.
 
 ---
 

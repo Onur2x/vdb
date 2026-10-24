@@ -50,6 +50,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:LAZBUILD -B storechk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:LAZBUILD -B heapchk.lpi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Sayfa deposu kapisi (storechk)
         shell: pwsh
@@ -77,6 +79,21 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'pagechk kalan > 0'
+            exit 1
+          }
+
+      - name: Heap kapisi (heapchk)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbheapchk'
+          $out = & .\heapchk.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'HEAP DOGRULANDI') {
+            Write-Error 'heapchk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'heapchk kalan > 0'
             exit 1
           }
 
