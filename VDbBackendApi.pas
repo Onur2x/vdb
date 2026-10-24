@@ -112,6 +112,11 @@ type
       dosyayi atomik olarak yerine koyar ve eski dosyayi .bak birakir. }
     procedure BackupTo(const DestPath: string);
     procedure RestoreFrom(const SrcPath: string);
+
+    { Sprint 3.3: VACUUM - canli kayitlari yeni, sikisik bir dosyaya yazar
+      ve atomik olarak yerine koyar. Bos sayfalar/olu baytlar dosyadan
+      gercekten dusulur. Eski dosya .bak kalir. }
+    procedure Compact(out OldBytes, NewBytes: Int64);
   end;
 
 implementation

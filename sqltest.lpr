@@ -7709,11 +7709,8 @@ begin
   Chk('tam tarama', 'SELECT COUNT(*) FROM t', 1);
   Chk('ORDER BY + LIMIT', 'SELECT s FROM t ORDER BY v DESC LIMIT 1', 1);
   ChkVal('ORDER BY DESC ilk', 'SELECT s FROM t ORDER BY v DESC LIMIT 1', 0, 0, 'satir1000');
-  { Sprint 2.9: VACUUM v2 veri dosyasini yeniden yazar; v3 sayfa motorunda
-    karsiligi v3.1'de (sayfa birlestirme). Test v3'te bu bolumu atlar. }
-  if gV3 then
-    WriteLn('   ATLA VACUUM (v3 sayfa motorunda v3.1)')
-  else
+  { Sprint 3.3: VACUUM artik v3'te de calisir (canli kayitlar yeni dosyaya
+    yazilir, dosya atomik degistirilir). }
   begin
     R := sq.Exec('VACUUM');
     Ok('buyuk veride VACUUM', R.Msg);
@@ -16044,9 +16041,10 @@ const
   { v3 kosusunda ATLA: bu testler yalniz v2 motorunun (TVDb/WAL/arsiv/
     zone/indeks .idx) ozel yollarini kullanir; v3'te karsiligi yoktur.
     Liste iki kaynaktan olusur: (a) govdesinde `kv.`/`TVDb.Create` gecen
-    testler (otomatik tarandi), (b) yalniz v2 yonetim komutlarini
-    (BACKUP/VACUUM/VERIFY + SAVEPOINT) sinayan testler. }
-  V2_ONLY: array[0..58] of string = (
+    testler (otomatik tarandi), (b) SAVEPOINT gibi v3.1'e ertelenen
+    yonetim komutlarini sinayan testler. (BACKUP/VACUUM/VERIFY artik
+    v3'te backend uzerinden calisir; T15_Bakim bu yuzden listede degil.) }
+  V2_ONLY: array[0..57] of string = (
     'T101_TcpReplication',
     'T105_ShowStats',
     'T117_Generated',
@@ -16074,7 +16072,6 @@ const
     'T145_H8_MCV',
     'T147_M8_SqlancerStil',
     'T148_H25_AutoCompact',
-    'T15_Bakim',
     'T21_KritikHataDogrulama',
     'T24_Dayaniklilik',
     'T36_F1_RecoverKirpma',

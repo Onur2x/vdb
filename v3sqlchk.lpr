@@ -611,6 +611,62 @@ begin
   end;
 end;
 
+{ ==================================== 10) VACUUM (Sprint 3.3) }
+
+procedure TestVacuumSql;
+var
+  S: TV3Sql;
+  r: TSqlResult;
+  i: Integer;
+  big: string;
+begin
+  CleanDir;
+  OpenV3(S, 'vac.odb', True);
+  try
+    Exec(S, 'CREATE TABLE v (id INTEGER PRIMARY KEY, t TEXT)');
+    big := StringOfChar('x', 300);
+    for i := 1 to 200 do
+      Exec(S, Format('INSERT INTO v VALUES (%d, ''%s'')', [i, big]));
+    { 180 satiri sil: dosyada buyuk miktarda olu bayt kalsin. }
+    for i := 1 to 200 do
+      if (i mod 10) <> 0 then
+        Exec(S, Format('DELETE FROM v WHERE id = %d', [i]));
+
+    r := Exec(S, 'VACUUM');
+    if (not gErr) and (r.Affected = 1) and (Pos('VACUUM ', r.Msg) = 1) then
+      Ok('SQL VACUUM: ' + r.Msg)
+    else
+      Fail('SQL VACUUM: ' + r.Msg);
+
+    r := Exec(S, 'SELECT COUNT(*) FROM v');
+    if (not gErr) and (Cel(r, 0, 0) = '20') then
+      Ok('VACUUM sonrasi 20 canli satir')
+    else
+      Fail('VACUUM sonrasi COUNT: ' + Cel(r, 0, 0));
+    r := Exec(S, 'SELECT t FROM v WHERE id = 100');
+    if (not gErr) and (Length(Cel(r, 0, 0)) = 300) then
+      Ok('VACUUM sonrasi deger birebir')
+    else
+      Fail('VACUUM sonrasi deger: ' + Cel(r, 0, 0));
+
+    { Sema yeni dosyadan yuklendi: yazim da calismali. }
+    Exec(S, 'INSERT INTO v VALUES (999, ''yeni'')');
+    r := Exec(S, 'SELECT COUNT(*) FROM v');
+    if (not gErr) and (Cel(r, 0, 0) = '21') then
+      Ok('VACUUM sonrasi yazim calisiyor')
+    else
+      Fail('VACUUM sonrasi yazim: ' + Cel(r, 0, 0));
+
+    r := Exec(S, 'VERIFY');
+    if (not gErr) and (r.Affected = 1) then
+      Ok('VACUUM sonrasi VERIFY gecti')
+    else
+      Fail('VACUUM sonrasi VERIFY: ' + r.Msg);
+  finally
+    CloseV3(S);
+  end;
+end;
+
 { ================================================================== ana }
 
 var
@@ -635,6 +691,7 @@ begin
   TestJoin;
   TestVerifySql;
   TestBackupRestoreSql;
+  TestVacuumSql;
   TestIntegrity(N);
 
   WriteLn;

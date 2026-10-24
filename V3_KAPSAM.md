@@ -11,10 +11,11 @@ test `ATLA` olarak **sayılır ve raporlanır**.
 | Koşu | Komut | Geçen | Kalan | Atlanan |
 |---|---|---|---|---|
 | v2 (taban çizgisi) | `sqltest <dir> --backend=v2` | **3116** | **0** | 0 |
-| v3 (yeni motor) | `sqltest <dir> --backend=v3` | **2244** | **0** | **59** |
+| v3 (yeni motor) | `sqltest <dir> --backend=v3` | **2252** | **0** | **58** |
 
-v3 koşusunda ayrıca 1 test içi bölüm atlanır: `T19_Olcek` içindeki `VACUUM`
-(v3'te karşılığı Sprint 3.3'te gelecek sayfa birleştirme).
+v3 koşusunda test içi bölüm atlaması yoktur. Sprint 3.3'te `VACUUM`
+(Compact) v3'e geldiği için `T19_Olcek` içindeki VACUUM bölümü ve
+`T15_Bakim` testinin tamamı artık v3'te de koşar.
 
 `--backend=v3` verilmediğinde program eskisi gibi v2 yolunu kullanır; v2
 kapısı CI'da **3116/3116** ile aynen korunur.
@@ -29,11 +30,11 @@ koşar (`TTestRec` dizisi + `BuildTests`), böylece tek hata diğerlerini
 maskelemez; hata `!! KESILDI (<test>): <sınıf>: <mesaj>` olarak yazılır ve
 sayaca eklenir.
 
-## 2. v3'te neden koşmayan testler (59)
+## 2. v3'te neden koşmayan testler (58)
 
 Üç grup vardır. Gruplama test gövdesinin gerçekten dokunduğu yüzeye göre
-otomatik tarandı (`kv.`, `pkv.`, `myKv`, `TVDb.Create`), iki test ise elle
-eklendi (yalnız v2 yönetim komutlarını sınar).
+otomatik tarandı (`kv.`, `pkv.`, `myKv`, `TVDb.Create`); `T79_Savepoint` elle
+eklendi (v3.1'e ertelenen yönetim komutu).
 
 ### (a) Gövdesi doğrudan v2 veri dosyası / WAL / arşiv API'sine dokunur — 33
 
@@ -94,15 +95,16 @@ SQL testleriyle kapsanır.
 `T143_H21_RawTreeSelectPaths`, `T144_H22_DeepOffsetLive`, `T145_H8_MCV`,
 `T147_M8_SqlancerStil`, `T148_H25_AutoCompact`
 
-### (c) Yalnız v2 yönetim komutlarını sınar (elle eklendi) — 2
+### (c) v3.1'e ertelenen yönetim komutunu sınar (elle eklendi) - 1
 
 | Test | Komut | v3 karşılığı |
 |---|---|---|
-| T15_Bakim | VACUUM / REINDEX / VERIFY | Sprint 3.1 (Verify), 3.3 (Compact) |
 | T79_Savepoint | SAVEPOINT / ROLLBACK TO | v3.1 (sayfa düzeyi undo) |
 
-v3'te bu komutlar **sessiz geçmez**: `ecUnsupported` +
-"v3 sayfa motorunda henüz desteklenmiyor (v3.1)" hatası verir (Sprint 2.7/2.9).
+Sprint 3.3'te `VACUUM`/`Compact` de v3'e geldiği için `T15_Bakim` artık
+listede değil; v3'te tam koşar. `SAVEPOINT` ise **sessiz geçmez**:
+`ecUnsupported` + "v3 sayfa motorunda henüz desteklenmiyor (v3.1)" hatası
+verir (Sprint 2.7/2.9).
 
 ## 3. Bu adımda bulunan ve düzeltilen gerçek hatalar
 
@@ -153,7 +155,8 @@ v3 koşusu yalnız "kapsam" değil, **gerçek kusurlar** ortaya çıkardı:
 | `VERIFY` (sayfa CRC + heap) | **var** (Sprint 3.1) | 3.1 ✔ |
 | `BACKUP` / `RESTORE` (tek `.odb`, checkpoint sonrası sayfa kopyası) | **var** (Sprint 3.2) | 3.2 ✔ |
 | PITR (`RECOVER TO`) / WAL arşivi | yok | 3.6 |
-| `VACUUM` / `Compact` / AutoCompact | yok | 3.3 |
+| `VACUUM` / `Compact` (canlı kayıtlar yeni dosyaya, atomik değişim) | **var** (Sprint 3.3) | 3.3 ✔ |
+| `AutoCompact` | yok (v2'de de varsayılan **kapalı**) | v3.1 |
 | Kayıt/kolon şifreleme (v3 sayfa düzeyi AES-GCM) | yok | 3.4 |
 | `START REPLICATION` | yok | 3.5 (v3.1 mantıksal günlük) |
 | Zone map | kapalı (tam tarama) | 3.7 |
@@ -165,9 +168,9 @@ v3 koşusu yalnız "kapsam" değil, **gerçek kusurlar** ortaya çıkardı:
 ```
 lazbuild -B sqltest.lpi
 sqltest.exe <dir> --backend=v2   # SONUC: gecen=3116 kalan=0 atlanan=0
-sqltest.exe <dir2> --backend=v3  # SONUC: gecen=2244 kalan=0 atlanan=59
+sqltest.exe <dir2> --backend=v3  # SONUC: gecen=2252 kalan=0 atlanan=58
 ```
 
 Kapılar (yeniden koşuldu, hepsi yeşil):
 `pagechk 21/21`, `storechk 15/15`, `heapchk 20/20`, `idxchk 17/17`,
-`crashtest 11/11`, `backendchk 36/36`, `v3sqlchk 47/47`, `migchk 13/13`.
+`crashtest 11/11`, `backendchk 61/61`, `v3sqlchk 60/60`, `migchk 13/13`.

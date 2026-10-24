@@ -16740,9 +16740,9 @@ begin
   { Sprint 2.9: v3 sayfa motorunda `Kv = nil`. v2 motorunun veri dosyasi,
     WAL arsiv/replikasyon yollarina dayanan yonetim komutlari v3'te yoktur;
     sessiz AV yerine NET bir "desteklenmiyor" hatasi verilir. (BACKUP ve
-    VERIFY Sprint 3.1/3.2'de backend uzerinden eklendi; VACUUM 3.3.) }
+    VERIFY ve VACUUM backend uzerinden eklendi; kalanlar 3.6/v3.1.) }
   if (FT.Kv = nil) and (Stmt.Kind in [
-      admVacuum, admRecoverTo,
+      admRecoverTo,
       admArchiveSet, admArchiveList, admAlterDbKey, admSavepoint,
       admReleaseSavepoint, admRollbackToSavepoint,
       admReplicationStart, admReplicationStop, admCreateReplSlot,
@@ -16768,7 +16768,15 @@ begin
       end;
     admVacuum:
       begin
-        FT.Kv.Compact(vOld, vNew);
+        if FT.Kv <> nil then
+          FT.Kv.Compact(vOld, vNew)
+        else
+        begin
+          { Sprint 3.3: v3 VACUUM - canli kayitlar yeni dosyaya yazilir,
+            dosya atomik degistirilir; sema yeni dosyadan yuklenir. }
+          FT.Backend.Compact(vOld, vNew);
+          FT.ReloadSchema;
+        end;
         Res.Affected := 1;
         Res.Msg := Format('VACUUM %d -> %d bayt (%d kazanc)', [vOld, vNew, vOld - vNew]);
       end;

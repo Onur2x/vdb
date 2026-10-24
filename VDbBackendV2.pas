@@ -60,6 +60,9 @@ type
     { Sprint 3.2: v2 TVDb.BackupTo / RestoreFrom'a devreder. }
     procedure BackupTo(const DestPath: string);
     procedure RestoreFrom(const SrcPath: string);
+
+    { Sprint 3.3: v2 TVDb.Compact'a devreder. }
+    procedure Compact(out OldBytes, NewBytes: Int64);
   end;
 
 implementation
@@ -192,6 +195,11 @@ end;
 procedure TVDbBackendV2.RestoreFrom(const SrcPath: string);
 begin
   FDb.RestoreFrom(SrcPath);
+end;
+
+procedure TVDbBackendV2.Compact(out OldBytes, NewBytes: Int64);
+begin
+  FDb.Compact(OldBytes, NewBytes);
 end;
 
 end.

@@ -776,6 +776,104 @@ begin
   v3 := nil;
 end;
 
+{ ============================================ 10) v3 VACUUM (Sprint 3.3) }
+
+procedure TestV3Compact(N: Integer);
+var
+  v3: TVdbBackendV3;
+  b: IVdbBackend;
+  v, got: TBytes;
+  i: Integer;
+  rep: string;
+  oldB, newB: Int64;
+  raised: Boolean;
+begin
+  CleanDir;
+  v3 := TVdbBackendV3.Create(DirOf('compact.odb'), True, 128);
+  b := v3;
+  for i := 1 to N do
+  begin
+    MakeVal(i, 60, 5, v);
+    b.Put(i, v);
+  end;
+  { Sisme uret: buyuk tasma degerleri yaz, sonra hepsini sil. }
+  for i := 1 to 200 do
+  begin
+    MakeVal(1000000 + i, 6000, 9, v);
+    b.Put(1000000 + i, v);
+  end;
+  for i := 1 to N do
+    if (i mod 2) = 0 then
+      b.Delete(i);
+  for i := 1 to 200 do
+    b.Delete(1000000 + i);
+  b.Flush;
+
+  b.Compact(oldB, newB);
+  if newB < oldB then
+    Ok(Format('v3 VACUUM dosyayi kuculttu: %d -> %d bayt', [oldB, newB]))
+  else
+    Fail(Format('v3 VACUUM kucultmedi: %d -> %d', [oldB, newB]));
+  if b.Count = (N + 1) div 2 then
+    Ok('v3 VACUUM anahtar sayisi dogru')
+  else
+    Fail(Format('v3 VACUUM Count=%d beklenen %d', [b.Count, (N + 1) div 2]));
+  if b.Verify(rep) then
+    Ok('v3 VACUUM sonrasi VERIFY: ' + rep)
+  else
+    Fail('v3 VACUUM sonrasi VERIFY: ' + rep);
+
+  MakeVal(1, 60, 5, v);
+  if b.Get(1, got) and (Length(got) = Length(v)) and
+     CompareMem(@got[0], @v[0], Length(v)) then
+    Ok('v3 VACUUM canli deger birebir')
+  else
+    Fail('v3 VACUUM canli deger bozuk');
+  if not b.Get(2, got) then
+    Ok('v3 VACUUM silinen anahtari geri getirmedi')
+  else
+    Fail('v3 VACUUM silinen anahtar geri geldi');
+
+  { VACUUM sonrasi yazim/okuma ayni oturumda calismali. }
+  MakeVal(777, 1200, 3, v);
+  b.Put(777, v);
+  b.Flush;
+  if b.Get(777, got) and (Length(got) = Length(v)) then
+    Ok('v3 VACUUM sonrasi yazim calisiyor')
+  else
+    Fail('v3 VACUUM sonrasi yazim bozuk');
+  if FileExists(DirOf('compact.odb.bak')) then
+    Ok('v3 VACUUM eski dosyayi .bak birakti')
+  else
+    Fail('v3 VACUUM .bak birakmadi');
+
+  b.BeginBatch;
+  b.Put(888, v);
+  raised := False;
+  try
+    b.Compact(oldB, newB);
+  except
+    on E: Exception do raised := True;
+  end;
+  b.AbortBatch;
+  if raised then Ok('v3 VACUUM acik partide reddedildi')
+  else Fail('v3 VACUUM acik partide sessizce gecti');
+
+  b := nil;
+  v3 := nil;
+
+  { Bos veritabani uzerinde VACUUM: gecerli ve minimum boyut. }
+  v3 := TVdbBackendV3.Create(DirOf('empty.odb'), True, 16);
+  b := v3;
+  b.Compact(oldB, newB);
+  if (newB > 0) and (newB <= 64 * 1024) and (b.Count = 0) and b.Verify(rep) then
+    Ok(Format('v3 VACUUM bos veritabani: %d bayt', [newB]))
+  else
+    Fail(Format('v3 VACUUM bos veritabani: %d bayt, count=%d', [newB, b.Count]));
+  b := nil;
+  v3 := nil;
+end;
+
 { ================================================================== ana }
 
 var
@@ -801,6 +899,7 @@ begin
   TestV3SmallPool(N);
   TestV3Verify(N);
   TestV3BackupRestore(N);
+  TestV3Compact(N);
   TestEquivalence(1000);
 
   WriteLn;

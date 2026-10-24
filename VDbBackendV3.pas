@@ -63,12 +63,17 @@ type
       FScanVals: TValArray;
       FScanN: Integer;
       FScanFilter: Integer;
+      FCompactEng: TVdbPageEngine;
+      FCompactN: Int64;
     procedure ApplyBatch;
     function EffectiveCount: Integer;
     procedure MaybeCheckpoint;
     function PassFilter(Key: QWord; const Value: TBytes;
       TableFilter: Integer): Boolean;
     procedure ScanCb(Key: QWord; const Value: TBytes);
+    { Sprint 3.3: VACUUM/Compact yardimcilari. }
+    procedure CompactCb(Key: QWord; const Value: TBytes);
+    procedure SwapDbFile(const NewFilePath: string);
   public
     { ADbPath: .odb dosya yolu. ACreate=True ise yoksa olusturur. }
     constructor Create(const ADbPath: string; ACreate: Boolean = True;
@@ -115,6 +120,11 @@ type
       yeniden acilir. Ust katman semayi yeniden yuklemelidir. }
     procedure BackupTo(const DestPath: string);
     procedure RestoreFrom(const SrcPath: string);
+
+    { Sprint 3.3: VACUUM - canli kayitlar yeni ve sikisik dosyaya yazilir,
+      atomik olarak yerine konur; bos sayfalar/olu baytlar dosyadan duser.
+      Eski dosya .bak kalir. Ust katman semayi yeniden yuklemelidir. }
+    procedure Compact(out OldBytes, NewBytes: Int64);
   end;
 
 implementation
@@ -522,7 +532,7 @@ end;
 
 procedure TVdbBackendV3.RestoreFrom(const SrcPath: string);
 var
-  tmp, bak, wal, idx: string;
+  tmp: string;
   src, dst: TFileStream;
   hdr: array[0..15] of Byte;
   magic, ver: LongWord;
@@ -555,9 +565,6 @@ begin
   FEng.Checkpoint(True);
 
   tmp := FPath + '.restore.tmp';
-  bak := FPath + '.bak';
-  wal := FPath + '.wal';
-  idx := FPath + '.idx';
   if FileExists(tmp) then DeleteFile(tmp);
   src := TFileStream.Create(SrcPath, fmOpenRead or fmShareDenyNone);
   try
@@ -572,15 +579,95 @@ begin
     src.Free;
   end;
 
+  SwapDbFile(tmp);
+end;
+
+procedure TVdbBackendV3.CompactCb(Key: QWord; const Value: TBytes);
+begin
+  if not FCompactEng.Insert(Key, Value) then
+    raise EVdbBackendV3.Create(Format(
+      'VACUUM: anahtar $%.16x yeni dosyaya yazilamadi', [Key]));
+  Inc(FCompactN);
+end;
+
+procedure TVdbBackendV3.Compact(out OldBytes, NewBytes: Int64);
+var
+  tmp: string;
+  newEng: TVdbPageEngine;
+  fs: TFileStream;
+begin
+  if FBatchOpen then
+    raise EVdbBackendV3.Create('acik parti varken VACUUM yapilamaz');
+  if FDirty then
+  begin
+    FEng.Commit(True);
+    FDirty := False;
+  end;
+  FEng.Checkpoint(True);
+  fs := TFileStream.Create(FPath, fmOpenRead or fmShareDenyNone);
+  try
+    OldBytes := fs.Size;
+  finally
+    fs.Free;
+  end;
+
+  tmp := FPath + '.compact.tmp';
+  if FileExists(tmp) then DeleteFile(tmp);
+  newEng := TVdbPageEngine.Create(tmp, FPoolPages);
+  try
+    try
+      newEng.Open(True);
+      FCompactEng := newEng;
+      FCompactN := 0;
+      try
+        FEng.ScanAll(CompactCb);
+      finally
+        FCompactEng := nil;
+      end;
+      newEng.Close;   // checkpoint + idx; dosya tam ve kendi kendine yeter
+    finally
+      FreeAndNil(newEng);
+    end;
+  except
+    { Yarim kalan gecici dosya bir sonraki VACUUM'u etkilemesin. }
+    if FileExists(tmp) then DeleteFile(tmp);
+    raise;
+  end;
+
+  { Kaynak dosya ve yeni dosya ayni canli anahtar kumesini tasimali. }
+  if FCompactN <> FEng.Count then
+  begin
+    if FileExists(tmp) then DeleteFile(tmp);
+    raise EVdbBackendV3.Create(Format(
+      'VACUUM: anahtar sayisi tutmuyor (yazilan %d, kaynak %d)',
+      [FCompactN, FEng.Count]));
+  end;
+
+  SwapDbFile(tmp);
+  fs := TFileStream.Create(FPath, fmOpenRead or fmShareDenyNone);
+  try
+    NewBytes := fs.Size;
+  finally
+    fs.Free;
+  end;
+end;
+
+procedure TVdbBackendV3.SwapDbFile(const NewFilePath: string);
+var
+  bak, wal, idx: string;
+begin
+  bak := FPath + '.bak';
+  wal := FPath + '.wal';
+  idx := FPath + '.idx';
   FreeAndNil(FEng);
   FEng := nil;
   try
     if FileExists(bak) then DeleteFile(bak);
     if not RenameFile(FPath, bak) then
-      raise EVdbBackendV3.Create('RESTORE: mevcut dosya .bak yapilamadi');
+      raise EVdbBackendV3.Create('dosya degistirme: mevcut dosya .bak yapilamadi');
     try
-      if not RenameFile(tmp, FPath) then
-        raise EVdbBackendV3.Create('RESTORE: yeni dosya yerine konamadi');
+      if not RenameFile(NewFilePath, FPath) then
+        raise EVdbBackendV3.Create('dosya degistirme: yeni dosya yerine konamadi');
     except
       RenameFile(bak, FPath);
       raise;
@@ -589,9 +676,14 @@ begin
     if FileExists(wal) then DeleteFile(wal);
     if FileExists(idx) then DeleteFile(idx);
     FEng := TVdbPageEngine.Create(FPath, FPoolPages);
-    FEng.Open(False);
+    try
+      FEng.Open(False);
+    except
+      FreeAndNil(FEng);
+      raise;
+    end;
   except
-    { Yarim kalan geri yuklemede .bak'tan don. }
+    { Yarim kalan degistirmede .bak'tan don. }
     if FEng = nil then
     begin
       try
