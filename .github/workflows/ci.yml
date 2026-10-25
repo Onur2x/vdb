@@ -315,19 +315,30 @@ jobs:
         run: |
           # fpc'yi lazbuild'in kurulu oldugu agac altinda ara (choco
           # kurulumu: <lazarus>\fpc\<surum>\bin\i386-win32\fpc.exe).
+          # Bulunamazsa adaylar tek tek denenir ve hata ::error:: ile
+          # ANNOTATION olarak yayinlanir (is loglari anonim okunamaz).
           $lazRoot = Split-Path $env:LAZBUILD -Parent
+          $cands = @()
+          $cands += (Join-Path $lazRoot 'fpc')
+          $cands += (Join-Path $lazRoot '..\fpc')
+          $cands += 'C:\tools\lazarus\fpc'
+          $cands += 'C:\lazarus\fpc'
+          $cands += (Join-Path $env:ProgramFiles 'Lazarus\fpc')
           $fpcExe = $null
-          $cand = Get-ChildItem -Path (Join-Path $lazRoot 'fpc') -Filter fpc.exe `
-            -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match 'i386-win32' } |
-            Select-Object -First 1
-          if ($cand) { $fpcExe = $cand.FullName }
-          if (-not $fpcExe) {
-            $c = Get-Command fpc -ErrorAction SilentlyContinue
-            if ($c) { $fpcExe = $c.Source }
+          foreach ($c in $cands) {
+            if (-not (Test-Path $c)) { continue }
+            $hit = Get-ChildItem -Path $c -Filter fpc.exe -Recurse `
+              -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match 'i386-win32' } |
+              Select-Object -First 1
+            if ($hit) { $fpcExe = $hit.FullName; break }
           }
           if (-not $fpcExe) {
-            Write-Error 'fpc.exe bulunamadi'
+            $w = & where.exe fpc 2>$null
+            if ($LASTEXITCODE -eq 0 -and $w) { $fpcExe = ($w | Select-Object -First 1) }
+          }
+          if (-not $fpcExe) {
+            Write-Host "::error::fpc.exe bulunamadi (lazRoot=$lazRoot)"
             exit 1
           }
           Write-Host "FPC=$fpcExe"
@@ -351,9 +362,13 @@ jobs:
           foreach ($e in $console) {
             $d = Join-Path 'examples' $e[0]
             Push-Location $d
-            & $fpcExe -B -Mdelphi @units ($e[1] + '.lpr') 2>&1 | Out-String | Write-Host
+            $o = & $fpcExe -B -Mdelphi @units ($e[1] + '.lpr') 2>&1 | Out-String
+            Write-Host $o
             if (-not (Test-Path ($e[1] + '.exe'))) {
               Write-Host ("  FAIL " + $e[0])
+              $tail = ($o -split "`r?`n" | Where-Object {
+                $_ -match 'Error|Fatal' } | Select-Object -Last 3) -join ' | '
+              Write-Host ("::error title=ornek " + $e[0] + "::" + $tail)
               $fail++
             } else { Write-Host ("  OK   " + $e[0]) }
             Pop-Location
@@ -362,15 +377,19 @@ jobs:
           foreach ($e in @(@('11_gui_ornek', 'ornek11'), @('12_milyon_demo', 'ornek12'))) {
             $d = Join-Path 'examples' $e[0]
             Push-Location $d
-            & $env:LAZBUILD -B ($e[1] + '.lpi') 2>&1 | Out-String | Write-Host
+            $o = & $env:LAZBUILD -B ($e[1] + '.lpi') 2>&1 | Out-String
+            Write-Host $o
             if (-not (Test-Path ($e[1] + '.exe'))) {
               Write-Host ("  FAIL " + $e[0])
+              $tail = ($o -split "`r?`n" | Where-Object {
+                $_ -match 'Error|Fatal' } | Select-Object -Last 3) -join ' | '
+              Write-Host ("::error title=ornek " + $e[0] + "::" + $tail)
               $fail++
             } else { Write-Host ("  OK   " + $e[0]) }
             Pop-Location
           }
           if ($fail -gt 0) {
-            Write-Error ("ornek derlemesi: " + $fail + " basarisiz")
+            Write-Host ("::error::ornek derlemesi: " + $fail + " basarisiz")
             exit 1
           }
           Write-Host 'TUM ORNEKLER DERLENDI'
