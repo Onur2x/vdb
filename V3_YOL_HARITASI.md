@@ -176,6 +176,46 @@ CI'da düzeltilen iki kusur (bu kapanışta bulundu):
    hatayı **annotation** olarak yayınlıyor — iş logları anonim okunamadığı
    için teşhis bu yolla yapıldı.
 
+### v3.2 ilerlemesi (2026-10-25, ölçülen)
+
+"v3 bitti" ilanı geri alındı; v2 ile işlevsel eşitlik için v3.2 açıldı.
+Aşağıdakiler **tamamlandı ve iki motorda da test edildi** (aynı test hem
+`--backend=v2` hem `--backend=v3` koşar):
+
+| Konu | Yapılan | Test | Ölçüm |
+|---|---|---|---|
+| Kısmi geri alma | `IVdbBackend.Savepoint/RollbackToSavepoint/ReleaseSavepoint`; v3'te parti kaplaması üzerinde journal, sema yığını (`TVTableSavepoint`), indeks onarımı | T149 (yinelenen isim, olmayan isim, DDL geri alma, örtük işlem, hedef korunur) | v3 geçti |
+| `ALTER DATABASE KEY` | v3: dosya bütünü yeni parola ile yeniden şifrelenir (tmp + `.bak`, anahtar sayısı doğrulamalı, hata→eski kimlik) | T150 (5 doğrulama) | v3 geçti |
+| Kolon şifreleme | `.colkey` biçimi v2 ile aynı (`VDbCrypt`); `ENCRYPTED` kolon şifresiz dosyada açık hata | T151 (10 doğrulama) | v3 geçti |
+| TCP sunucusu | `VDbSqlServer` artık `IVdbBackend` (`VdbOpenOrCreate`), varsayılan v3 | T106 | v3 geçti |
+| Yönetim API (ölçüm) | `DeadBytes`, `DataFileSize`, `AutoCompact*` sözleşmede; v3'te ölü alan = freelist × 4096 | T152 (iki backend) | v3: 12.288 B → dosya 32.768 → 12.288 B |
+| Otomatik sıkıştırma | v2 ile aynı varsayılan (KAPALI, %35, 4 MB); commit/autocommit sonrası yalnız eşik aşılınca; hata commit'i bozmaz | T152 | v3 geçti |
+| KV depolama | `VDbBackendApi.TVdbBackendKvStore` (`IVDbKvStore` ← `IVdbBackend`) | T153 | v3 geçti |
+| Yönetim aracı yolları | PK'siz tablo, sentetik anahtar, `UpdateRowInPlace`, çok kolonlu UNIQUE indeks, `AutoCompact`, `ExecAll`, `VACUUM`, `REINDEX` | T154 | v3 geçti |
+| Akışlı top-N | T132 v3'te koşuyor | T132 | v3 geçti |
+| Rasgele diferansiyel | 200 sabit tohumlu SELECT; indeksli vs saf tarama | T147 | v3: 200/200, **0 fark** |
+
+Son ölçüm: `sqltest --backend=v3` **2721 geçen / 0 kalan / 34 atlanan**,
+`--backend=v2` **3166 / 0 / 0**. Atlanan 34'ün tamamı v2'nin iç
+mekanizmalarına (blok CRC, undo, in-place, WAL kayıt biçimi, oturum
+yalitimi) bağlı testlerdir — bunlar v3'te **yok** ve v3'te açık hata verir.
+
+**v3.2'de kalanlar (henüz yapılmadı):**
+
+1. **PITR / `AS OF` / WAL arşivi (T78, T95).** v3 WAL'i sayfa imgesi
+   taşır; zaman ekseni yok. Gereken: commit kayıtlarına monoton LSN +
+   zaman damgası, isteğe bağlı mantıksal değişim günlüğü (eski değer
+   dahil) ve `RECOVER TO <zaman>` (taban yedek + ileri replay, ya da
+   canlı dosyada geriye undo). Tasarım kararı verilmeden kod yazılmayacak.
+2. **Replikasyon (T95b, T101).** Yukarıdaki mantıksal günlüğe bağlıdır;
+   o olmadan "replikasyon" yalnız dosya kopyası olur (yanlış güven).
+3. **Oturum yalitimi (T126).** v3 tek yazar/tek parti kullanır; ikinci
+   oturum açık partiyi görmemeli. Bugün SQL sunucusu istekleri
+   sıraya soktuğu için sessiz hata yok; API düzeyinde çok oturum
+   kullanılacaksa önce oturum sahipliği eklenmeli.
+4. Zone map (sayfa düzeyi budama) ve dosya boyu optimizasyonları —
+   performans işi, doğruluk riski yok.
+
 ### Sıradaki sürüme ertelenen (v3.2)
 - Sıralı anahtar düzeni + B+tree yaprakları → **BETWEEN / aralık sorguları**
 - Replication (mantıksal değişim günlüğü)

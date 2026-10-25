@@ -173,6 +173,54 @@ Be.BackupTo('yedek\2026-10-25.odb');
 Be.Compact(oldB, newB);          // VACUUM'un programatik karşılığı
 ```
 
+### 5.1 Kısmi geri alma (v3.2)
+
+`SAVEPOINT` artık v3'te de v2 ile aynı semantikle çalışır:
+
+```pascal
+Be.Savepoint('adim1');
+try
+  Sq.Exec('UPDATE hesap SET bakiye = bakiye - 100 WHERE id = 1');
+  Sq.Exec('UPDATE hesap SET bakiye = bakiye + 100 WHERE id = 2');
+except
+  Be.RollbackToSavepoint('adim1');   // hedef savepoint KALIR
+  raise;
+end;
+Be.ReleaseSavepoint('adim1');        // commit ETMEZ
+```
+
+- Aynı isimle ikinci `SAVEPOINT` reddedilir (`ecDuplicateSavepoint`).
+- `COMMIT`/`ROLLBACK` bütün savepoint'leri düşürür.
+- `SAVEPOINT` açık işlem yoksa örtük işlem açar.
+
+### 5.2 Otomatik sıkıştırma (v3.2)
+
+v2'deki yönetim ayarları artık `IVdbBackend` sözleşmesinde; **varsayılan
+KAPALI**:
+
+```pascal
+Be.AutoCompactEnabled := True;        // açıkça istiyorsanız
+Be.AutoCompactRatio := 0.35;          // ölü alan / dosya oranı eşiği
+Be.AutoCompactMinBytes := 4 * 1024 * 1024;
+WriteLn(Be.DeadBytes, ' / ', Be.DataFileSize,
+        ' sikistirma=', Be.AutoCompactCount,
+        ' hata=', Be.LastAutoCompactError);
+```
+
+Karar her commit'ten sonra O(1)'dir; yalnız eşik aşılırsa dosya bir kez
+baştan yazılır. Sıkıştırma hatası commit'i **bozmaz** (veri zaten
+fsync'li); hata `LastAutoCompactError`'a yazılır.
+
+### 5.3 Ham anahtar-değer yüzeyi (v3.2)
+
+Motorun somut tipini bilmeden `IVDbKvStore`:
+
+```pascal
+var St: IVDbKvStore;
+St := TVdbBackendKvStore.Create(Be);   // Be: IVdbBackend
+St.Put(1, VDbStrToBytes('deger'));
+```
+
 ---
 
 ## 6. `SHOW STATS` (v3 sütunları)
@@ -231,18 +279,22 @@ veritabani.colkey      kolon anahtarı (yalnız kolon şifrelemesi kullanılırs
 
 ---
 
-## 9. v3.1'de olmayanlar (planlı sınırlar)
+## 9. v3.2'de hâlâ olmayanlar (planlı sınırlar)
 
 | Özellik | Durum | Not |
 |---|---|---|
-| `SAVEPOINT` / `ROLLBACK TO` | yok (v3.2) | net `EVDbException` verir; iç içe kısmi geri alma için tek işlem kullanın veya işlemi bölün |
-| PITR (`RECOVER TO`), WAL arşivi | yok | günlük `BACKUP TO` ile yetinin |
-| Replication (`START REPLICATION` vb.) | yok | tek dosya, tek yazıcı |
+| PITR (`RECOVER TO`), WAL arşivi | yok | günlük `BACKUP TO` ile yetinin; v3 WAL'i sayfa imgesidir, zaman ekseni yok |
+| Replication (`START REPLICATION` vb.) | yok | mantıksal değişim günlüğü gerektirir; tek dosya, tek yazıcı |
+| Oturum yalitimi (aynı açık veritabanında ikinci oturum) | yok | SQL sunucusu istekleri sıraya sokar; API düzeyinde çok oturum için oturum sahipliği gerekir |
 | Zone map / bölüm budama | yok | sonuçlar doğru, tam tarama |
-| `ALTER DATABASE KEY` | yok | parola dosya oluşturulurken belirlenir |
-| TCP SQL sunucusu (`VDbSqlServer`) | v2 motorunda | `examples/07`/`08` v2'dir; M7 kapsam dışı |
+| MVCC (çok yazarlı) | yok | tek yazıcı + okuyucu snapshot |
 
-Bunlar **sessizce yanlış sonuç vermez**: her biri açık bir
+v3.2'de **çözülenler**: `SAVEPOINT`/`ROLLBACK TO` (§5.1),
+`ALTER DATABASE KEY`, kolon şifreleme (`.colkey`), `IVdbBackend` üzerinde
+yönetim/ölçüm API'si ve otomatik sıkıştırma (§5.2), `TVdbBackendKvStore`
+(§5.3), `VDbSqlServer`'ın v3 motoruyla çalışması.
+
+Yukarıdaki olmayanlar **sessizce yanlış sonuç vermez**: her biri açık bir
 `ecUnsupported` hatası ve yol gösteren mesaj döndürür.
 
 ---
