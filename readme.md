@@ -159,17 +159,20 @@ H3 skiplist (100,000 rows): 100 × (`UPDATE` + indexed `COUNT(*)`) takes
 
 | Metric | v2 | **v3.0** |
 |---|---:|---:|
-| File size | 19.3 MB (96.4 B/row) | **15.5 MB (77.6 B/row)** |
+| Data file (`.odb`) | 19.3 MB (96.4 B/row) | **15.5 MB (77.6 B/row)** |
+| `+.odb.idx` (derived open cache) | — | +3.5 MB |
+| **Total on disk** | **19.3 MB** | **19.0 MB** |
 | Open | 984 ms | **32 ms** |
 | PK point lookup | 6.25 µs | **6.25 µs** |
 | Bulk INSERT | 4.46 µs/row | 6.64 µs/row |
 | Autocommit INSERT | 0.431 ms/row | 0.557 ms/row |
 | `COUNT(*)` | 31 ms | 62 ms |
 
-v3.0 shrinks the file by **19.5 %** and opens it **~31x** faster; PK and parse
-costs match v2. Bulk writes are ~1.5x, `COUNT(*)` 2x and single-row writes
-~1.3x slower. Root causes (page-image WAL's 2x write volume, no per-table row
-counter) and the v3.1 plan:
+v3.0 opens the database **~31x** faster and shrinks the data file by **19.5 %**;
+together with the `.odb.idx` it writes next to it (deletable, derived cache) the
+total on disk shrinks by only **1.2 %**. PK and parse costs match v2. Bulk
+writes are ~1.5x, `COUNT(*)` 2x and single-row writes ~1.3x slower. Root causes
+(page-image WAL's 2x write volume, no per-table row counter) and the v3.1 plan:
 [speedtest.md](speedtest.md#9-v30-page-engine--v2-and-v3-on-the-same-scale-2026-10-25).
 
 ---

@@ -52,7 +52,7 @@ Bunlar v3'ün kıyaslanacağı gerçek taban çizgisi. Tüm sayılar benim ölç
 
 | Metrik | Hedef | Ölçüm yöntemi | v3.0 ölçülen (2026-10-25) | Durum |
 |---|---|---|---|---|
-| Dosya boyutu | **≤ 11 MB** (≤ 55 B/satır) | `DataFileSize` | sayfa harness **9,76 MB** (48,8 B/satır); SQL harness 15,5 MB (77,6) | kısmen |
+| Dosya boyutu | **≤ 11 MB** (≤ 55 B/satır) | `DataFileSize` | sayfa harness **9,76 MB** (48,8 B/satır) + `.idx` 3,20; SQL harness 15,5 MB (77,6) + `.idx` 3,52 → **diskte toplam 19,0 MB** | kısmen |
 | Açılış | **≤ 150 ms** | `kv.Open` süresi (3 tekrarın medyanı) | **32 ms** (v2: 984) | ✔ |
 | `COUNT(*)` | **≤ 16 ms** | tam tarama | 62 ms (v2: 31) | ✘ v3.1 |
 | PK nokta | **≤ 7 µs** (gerilemez) | `WHERE id=` | **6,25 µs** (v2: 6,25) | ✔ |
@@ -64,6 +64,14 @@ Başarısız üç metrik **kabul edilmiş tasarım maliyetidir** (sayfa imajlı 
 yazma hacmi; tablo başına satır sayacının olmaması). Kök nedenler ve ölçümler
 `hiztesti.md` §9'da. v3.1 hedefleri: mantıksal (küçük) WAL çerçevesi, tablo
 başına canlı satır sayacı, toplu dosya uzatma (ölçülen: sayfa başına 45–50 µs).
+
+**Boyut konusunda dikkat (dürüstlük):** v3 veri dosyası v2'den %19,5 küçük, ama
+yanına **`.odb.idx`** (3,52 MB; anahtar → sayfa/slot açılış önbelleği) yazıyor.
+`.idx` silinebilir (açılış 79 ms, hedef 150 ms) fakat yok sayılırsa toplam
+diskteki kazanç %19,5 değil **%1,2** olur. Asıl boyut kazancı için v3.1'de
+(a) PK dizisinin heap ile aynı anahtarı ikinci kez yazması (hücre başına
+12 B başlık + 4 B slot + ayrı PK girdisi) ve (b) hücre başlığının sıkıştırılması
+incelenecek; `.idx` için varsayılan açık/kapalı kararı da bekliyor.
 
 Not: `COUNT(*)` hedefi 16 ms çünkü ölçüm gösterdi ki fark CPU değil **okunacak bayt**;
 dosya yarıya inince tarama da yaklaşık yarıya iner.

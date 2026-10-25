@@ -297,13 +297,22 @@ every commit).
 
 | Metric | v2 | **v3** | Difference |
 |---|---:|---:|---|
-| File size (200k rows) | 19,278,424 B (96.4 B/row) | **15,527,936 B (77.6 B/row)** | **−19.5 %** |
+| Data file (`.odb`) | 19,278,424 B (96.4 B/row) | **15,527,936 B (77.6 B/row)** | **−19.5 %** |
+| Open index (`.odb.idx`) | — | 3,520,080 B (17.6 B/row) | +3.5 MB |
+| **Total on disk** | **19,278,555 B** | **19,048,016 B** | **−1.2 %** |
 | Open | 984 ms | **32 ms** | **30.8x faster** |
 | Bulk INSERT (one batch) | 4.455 µs/row | 6.640 µs/row | 1.49x slower |
 | Autocommit INSERT | 0.431 ms/row | 0.557 ms/row | 1.29x slower |
 | PK point lookup | 6.25 µs | **6.25 µs** | equal |
 | parse-only `SELECT 1` | 3.90 µs | **3.90 µs** | equal |
 | `COUNT(*)` | 31 ms | 62 ms | 2.0x slower |
+
+**What is `.odb.idx`, and should it count?** It is a **derived cache** of the
+heap index (key → page/slot) loaded at open instead of rebuilt; it is not a data
+source and deleting it loses nothing (open takes 79 ms instead of 16 ms, target
+150 ms). It does take disk, so it is shown on its own line and in the total.
+Counting `.odb` alone the win is 19.5 %; with `.idx` it is 1.2 % — both numbers
+belong in the report, the 19.5 % alone is misleading.
 
 Everything except bulk insert, autocommit insert and `COUNT(*)` is on par with
 or better than v2. Those three regressions are **measured and accepted** costs
@@ -357,8 +366,9 @@ counter).
 
 | Target | Target value | Measured | Status |
 |---|---:|---:|---|
-| File size (SQL harness, 3 columns) | ≤ 11 MB | 15.5 MB | **missed** |
-| File size (page harness, 32 B values) | ≤ 11 MB | **9.76 MB** | met |
+| File size (SQL harness, `.odb` only) | ≤ 11 MB | 15.5 MB | **missed** |
+| File size (SQL harness, `.odb` + `.idx`) | ≤ 11 MB | 19.0 MB | **missed** |
+| File size (page harness, 32 B values) | ≤ 11 MB | **9.76 MB** (+3.20 MB `.idx`) | met (`.odb` only) |
 | Open | ≤ 150 ms | **32 ms** | met (4.7x headroom) |
 | PK point | ≤ 7 µs | **6.25 µs** | met |
 | Bulk INSERT | ≤ 5 µs | 6.64 µs | **missed** (v2: 4.46) |
@@ -367,7 +377,10 @@ counter).
 
 The file-size target mixed two harnesses: `benchv3` (page engine, 32 B values,
 9,756,672 B = 48.8 B/row) meets it; `benchcmp` (SQL layer, 3 columns, ~24 B
-text) does not. Both are listed separately.
+text) does not. Both are listed separately. Note also that v3 writes a
+derived `.odb.idx` next to the data file (3.5 MB for 200k rows); it can be
+deleted at any time (open then does a full scan, 79 ms, still under target),
+but it does occupy disk, so both figures are given.
 
 **Honest summary:** v3.0 wins on file size and especially open time; PK and
 parse costs are identical to v2. On the other hand bulk writes are ~1.5x,

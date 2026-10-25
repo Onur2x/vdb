@@ -296,13 +296,22 @@ autocommit INSERT, varsayılan dayanıklılık (`SyncWrite=True`, her commit fsy
 
 | Metrik | v2 | **v3** | Fark |
 |---|---:|---:|---|
-| Dosya boyutu (200k satır) | 19.278.424 B (96,4 B/satır) | **15.527.936 B (77,6 B/satır)** | **−19,5 %** |
+| Veri dosyası (`.odb`) | 19.278.424 B (96,4 B/satır) | **15.527.936 B (77,6 B/satır)** | **−19,5 %** |
+| Açılış dizini (`.odb.idx`) | — | 3.520.080 B (17,6 B/satır) | +3,5 MB |
+| **Diskteki toplam** | **19.278.555 B** | **19.048.016 B** | **−1,2 %** |
 | Açılış | 984 ms | **32 ms** | **30,8x hızlı** |
 | Toplu INSERT (tek batch) | 4,455 µs/satır | 6,640 µs/satır | 1,49x yavaş |
 | Autocommit INSERT | 0,431 ms/satır | 0,557 ms/satır | 1,29x yavaş |
 | PK nokta araması | 6,25 µs | **6,25 µs** | eşit |
 | parse-only `SELECT 1` | 3,90 µs | **3,90 µs** | eşit |
 | `COUNT(*)` | 31 ms | 62 ms | 2,0x yavaş |
+
+**`.odb.idx` nedir, sayılmalı mı?** Açılışta heap dizinini (anahtar → sayfa/slot)
+yeniden kurmak yerine diskten yükleyen **türetilmiş bir önbellektir**; veri
+kaynağı değildir, silinirse hiçbir şey kaybolmaz (açılış 16 ms yerine 79 ms
+sürer, hedef 150 ms). Diskte yer kapladığı için yukarıda **ayrı satırda ve
+toplamda** gösterildi. Yalnız `.odb` sayıldığında kazanç %19,5; `.idx` ile
+birlikte %1,2'dir — iki sayı da yazılmalıdır, tek başına %19,5 yanıltıcıdır.
 
 Not: `autocommit`, `toplu INSERT` ve `COUNT(*)` dışındaki satırlarda v3
 gerilemiyor. Bu tablodaki üç gerileme **ölçülmüş ve kabul edilmiş**
