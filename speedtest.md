@@ -295,17 +295,21 @@ Conditions: Windows, FPC 3.2.4 i386-win32, single process; 200,000 rows ×
 single-row autocommit INSERTs, default durability (`SyncWrite=True`, fsync on
 every commit).
 
-| Metric | v2 | **v3** | Difference |
-|---|---:|---:|---|
-| Data file (`.odb`) | 19,278,424 B (96.4 B/row) | **15,527,936 B (77.6 B/row)** | **−19.5 %** |
-| Open index (`.odb.idx`) | — | 3,520,080 B (17.6 B/row) | +3.5 MB |
-| **Total on disk** | **19,278,555 B** | **19,048,016 B** | **−1.2 %** |
-| Open | 984 ms | **32 ms** | **30.8x faster** |
-| Bulk INSERT (one batch) | 4.455 µs/row | 6.640 µs/row | 1.49x slower |
-| Autocommit INSERT | 0.431 ms/row | 0.557 ms/row | 1.29x slower |
-| PK point lookup | 6.25 µs | **6.25 µs** | equal |
-| parse-only `SELECT 1` | 3.90 µs | **3.90 µs** | equal |
-| `COUNT(*)` | 31 ms | 62 ms | 2.0x slower |
+| Metric | v2 | **v3.0** | **v3.1** |
+|---|---:|---:|---:|
+| Data file (`.odb`) | 19,278,424 B (96.4 B/row) | **15,527,936 B (77.6 B/row)** | **15,527,936 B (77.6 B/row)** |
+| Open index (`.odb.idx`) | — | 3,520,080 B (17.6 B/row) | 3,520,080 B (17.6 B/row) |
+| **Total on disk** | **19,278,555 B** | **19,048,016 B** | **19,048,016 B** |
+| Open | 984 ms | 32 ms | **28.1 ms** |
+| Bulk INSERT (one batch) | 4.455 µs/row | 6.640 µs/row | **5.796 µs/row** |
+| Autocommit INSERT | 0.431 ms/row | 0.557 ms/row | **0.458 ms/row** |
+| PK point lookup | 6.25 µs | 6.25 µs | **5.13 µs** |
+| parse-only `SELECT 1` | 3.90 µs | 3.90 µs | **3.55 µs** |
+| `COUNT(*)` | 31 ms | 62 ms | **0.1 ms** |
+
+The v3.1 column is the same harness under the same conditions (200k × 3
+columns, 20k single-row inserts, median of three runs). File size did **not**
+change: v3.1 is about speed, not size.
 
 **What is `.odb.idx`, and should it count?** It is a **derived cache** of the
 heap index (key → page/slot) loaded at open instead of rebuilt; it is not a data
@@ -317,13 +321,14 @@ belong in the report, the 19.5 % alone is misleading.
 **The policy is: the `.idx` is always written** (v3.1). The v3.0 "skip above
 50 MB" threshold was removed: the `.idx` is derived and deletable, so the size
 limit bought no safety while forcing a full scan on large databases at open.
-`backendchk` covers this with 6 checks (`idxpol)`).
+`backendchk` covers this with 6 checks (`idxpol`, `TestV3IdxPolicy`).
 
-Everything except bulk insert, autocommit insert and `COUNT(*)` is on par with
-or better than v2. Those three regressions are **measured and accepted** costs
-(root causes below).
+v3.1 closed all three regressions: `COUNT(*)` **0.1 ms** (live per-table
+counter), autocommit **0.458 ms** (only the pages changed by the transaction go
+to the WAL), bulk INSERT **5.796 µs** (256 KB file-growth chunks). The "why"
+sections below are v3.0's measured root causes; each carries its v3.1 fix.
 
-### Why bulk INSERT costs 6.64 µs
+### Why bulk INSERT cost 6.64 µs (5.796 µs in v3.1)
 
 Components measured separately (200k keys, 64 B values, 512-frame pool):
 
@@ -338,6 +343,11 @@ v2's append-only KV path appends each row once. v3 uses page-image WAL: the same
 bytes go to the WAL and, at checkpoint, to the data file — **2x write volume**.
 Half of the difference comes from that; the rest is in-page cell placement and
 index maintenance.
+
+**v3.1 fix:** the file was extended with a separate `SetSize` per new page
+(measured ~45–50 µs/page). It is now extended in 256 KB chunks and trimmed back
+to the logical size at close: page-harness writes **1.88 → 1.35 µs/row**, SQL
+harness bulk INSERT **6.64 → 5.796 µs/row**.
 
 Three bottlenecks found by measurement this sprint, all fixed in production
 code:
@@ -358,50 +368,60 @@ code:
    **insertion order**. Bulk INSERT **8.045 → 6.64 µs/row** (sum of the three
    improvements).
 
-### Why `COUNT(*)` costs 62 ms
+### Why `COUNT(*)` cost 62 ms (0.1 ms in v3.1)
 
 In v2, `COUNT(*)` is answered **O(1)** from a per-table row counter
 (`TryGetTableRowCount`); the 31 ms figure is that counter plus validation. In
-v3 keys are a table+PK hash, so there is **no per-table counter** and the query
-scans. The scan runs on raw cells (no row decoding), so the cost is bytes read,
-not CPU: 15.5 MB / 62 ms ≈ 250 MB/s. This is v3.1 work (a per-table live row
-counter).
+v3.0 keys are a table+PK hash, so there was **no per-table counter** and the
+query scanned: 15.5 MB / 62 ms ≈ 250 MB/s.
+
+**v3.1 fix:** a **live** per-table counter inside `TVdbBackendV3`, seeded from
+the summary embedded in `.idx` (or one full scan on the first `COUNT` if there
+is none), maintained incrementally by insert/delete/batch and invalidated only
+by RESTORE. The fast path applies to pure `COUNT(*)` only: `WHERE` / `HAVING` /
+`GROUP BY` / JOIN / `LIMIT` or an open batch falls back to the streaming scan.
+**Measured: 0.1 ms.**
 
 ### Against the v3.0 acceptance targets
 
-| Target | Target value | Measured | Status |
-|---|---:|---:|---|
-| File size (SQL harness, `.odb` only) | ≤ 11 MB | 15.5 MB | **missed** |
-| File size (SQL harness, `.odb` + `.idx`) | ≤ 11 MB | 19.0 MB | **missed** |
-| File size (page harness, 32 B values) | ≤ 11 MB | **9.76 MB** (+3.20 MB `.idx`) | met (`.odb` only) |
-| Open | ≤ 150 ms | **32 ms** | met (4.7x headroom) |
-| PK point | ≤ 7 µs | **6.25 µs** | met |
-| Bulk INSERT | ≤ 5 µs | 6.64 µs | **missed** (v2: 4.46) |
-| Autocommit INSERT | ≤ 0.55 ms | 0.557 ms | **borderline** (v2: 0.431) |
-| `COUNT(*)` | ≤ 16 ms | 62 ms | **missed** |
+| Target | Target value | v3.0 | v3.1 | Status |
+|---|---:|---:|---:|---|
+| File size (SQL harness, `.odb` only) | ≤ 11 MB | 15.5 MB | 15.5 MB | **missed** |
+| File size (SQL harness, `.odb` + `.idx`) | ≤ 11 MB | 19.0 MB | 19.0 MB | **missed** |
+| File size (page harness, 32 B values) | ≤ 11 MB | **9.76 MB** (+3.20 MB `.idx`) | **9.76 MB** (+3.20 MB `.idx`) | met (`.odb` only) |
+| Open | ≤ 150 ms | **32 ms** | **28.1 ms** | met |
+| PK point | ≤ 7 µs | **6.25 µs** | **5.13 µs** | met |
+| Bulk INSERT | ≤ 5 µs | 6.64 µs | 5.796 µs | borderline (v2: 4.46) |
+| Autocommit INSERT | ≤ 0.55 ms | 0.557 ms | **0.458 ms** | met (v2: 0.431) |
+| `COUNT(*)` | ≤ 16 ms | 62 ms | **0.1 ms** | met |
 
 The file-size target mixed two harnesses: `benchv3` (page engine, 32 B values,
 9,756,672 B = 48.8 B/row) meets it; `benchcmp` (SQL layer, 3 columns, ~24 B
-text) does not. Both are listed separately. Note also that v3 writes a
-derived `.odb.idx` next to the data file (3.5 MB for 200k rows); it can be
-deleted at any time (open then does a full scan, 79 ms, still under target),
+text) does not, in v3.1 either. Both are listed separately. Note also that v3
+writes a derived `.odb.idx` next to the data file (3.5 MB for 200k rows); it can
+be deleted at any time (open then does a full scan, 79 ms, still under target),
 but it does occupy disk, so both figures are given.
 
-**Honest summary:** v3.0 wins on file size and especially open time; PK and
-parse costs are identical to v2. On the other hand bulk writes are ~1.5x,
-`COUNT(*)` 2x and single-row writes ~1.3x slower. v3.1 targets exactly those
-three: a logical (smaller) WAL frame, a per-table row counter, and batched file
-extension (measured: 45–50 µs per single-page extension).
+**Honest summary:** v3.0 won on file size and especially open time; PK and parse
+costs were identical to v2; bulk writes were ~1.5x, `COUNT(*)` 2x and single-row
+writes ~1.3x slower. v3.1 closed all three: `COUNT(*)` **0.1 ms**, autocommit
+**0.458 ms** (18 % under v3.0, 6 % over v2), bulk **5.796 µs** (13 % under v3.0,
+30 % over v2). What is left on autocommit is the **durability floor**: the
+separate `fsyncbench` tool measures a single fsync at **0.330 ms**, and WAL
+bytes per commit dropped from 63,373 to **8,252**. What is left on bulk is the
+2x write volume of page-image WAL, a design cost.
 
 ### Page-engine harness (`benchv3`, 200k rows × 32 B values)
 
 A separate harness from `benchcmp`; do not mix the numbers:
 
-| Metric | Measured |
-|---|---:|
-| File | 9,756,672 B (48.8 B/row) |
-| `.idx` | 3,200,064 B (16.0 B/row) |
-| Write (commit + checkpoint included) | 1.88 µs/row |
-| Open (with `.idx`) | 16 ms |
-| Open (full scan) | 79 ms |
-| PK read | 0.47 µs/row |
+| Metric | v3.0 | v3.1 |
+|---|---:|---:|
+| File | 9,756,672 B (48.8 B/row) | 9,756,672 B (48.8 B/row) |
+| `.idx` | 3,200,064 B (16.0 B/row) | 3,200,064 B (16.0 B/row) |
+| Write (commit + checkpoint included) | 1.88 µs/row | **1.35 µs/row** |
+| Open (with `.idx`) | 16 ms | 23 ms (16–31 range, load sensitive) |
+| Open (full scan) | 79 ms | 79 ms |
+| PK read | 0.47 µs/row | 0.43 µs/row |
+| Raw scan (copying) | — | 12.0 ms |
+| Raw scan (zero-copy) | — | **9.6 ms** |

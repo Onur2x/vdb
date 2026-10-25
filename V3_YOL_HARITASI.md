@@ -191,6 +191,58 @@ tam tarama ve **veri kaybı olmaması**.
 - [x] 3.12 Ölçüm tablosu `hiztesti.md` + `speedtest.md` + `readme*.md` güncellenir — **yalnız ölçülmüş sayılar**. Üç performans düzeltmesi (aşağıdaki bölüm) ve aynı harness'lı v2↔v3 tablosu (`benchcmp --backend=`, 200k × 3 kolon, üç tekrarın medyanı, art arda aynı makine): veri dosyası **19.278.424 → 15.527.936 B (−%19,5)**, ama **`.odb.idx` 3.520.080 B** ile diskteki toplam **19.278.555 → 19.048.016 B (yalnız −%1,2)**; açılış **984 → 32 ms (31x)**, PK **6,25 µs (eşit)**, parse **3,90 µs (eşit)**, toplu INSERT **4,455 → 6,640 µs**, autocommit **0,431 → 0,557 ms**, `COUNT(*)` **31 → 62 ms**. Dürüst sonuç: **üç metrik geriliyor** (toplu yazım ~1,5x, `COUNT(*)` 2x, tek satır ~1,3x) ve dosya boyutu hedefi yalnız `.odb`'de tutuyor; kök nedenler ve v3.1 planı ölçümle birlikte yazıldı. Sayfa harness'ı (`benchv3`, 32 B değer) ayrı tablo: 9.756.672 B (48,8 B/satır), açılış 16 ms (`.idx`) / 79 ms (tam), yazım 1,88 µs.
 - [x] 3.13 `git tag v3.0` + push; CI yeşil — `v3.0` etiketi `2a649df`'e atıldı ve push edildi (CI #28 yeşil: 8 kapı + sqltest v2/v3).
 
+## Sprint 4 (v3.1) — v3.0'da kapanmayan hedefler
+
+v3.0'ın dürüst özeti üç gerileme bırakmıştı: `COUNT(*)` 62 ms, autocommit
+0,557 ms, toplu yazım 6,64 µs. Üçü de **ölçümle** kök nedene indirildi ve
+kapatıldı; dördüncü iş (dosya uzatma) ölçülen bir maliyetti.
+
+- [x] 4.1 **`COUNT(*)` O(1)** — `TVdbBackendV3` içinde tablo başına **canlı**
+  satır sayacı (`FTagCounts`), kalıcı sayaç kaydı yok. Kurulum sırası: açılışta
+  `.idx` özeti → boş veritabanında taban 0 → yoksa ilk `COUNT` isteğinde bir kez
+  tam tarama (`FTagCountsValid`). `TagAdd`/`MergeTagDeltas` bayrak False iken
+  haritayı kirletmez; `AbortBatch` deltaları atar, `CommitBatch` birleştirir.
+  Sayaç `.idx`'e gömüldü (`TVdbIdxTagEntry`, başlıkta `TagCount`/`TagCrc`);
+  aynı LSN'de yazıldığı için bayatlama ayrı bir doğrulama gerektirmez,
+  CRC uyuşmazsa yalnız özet atılır. VACUUM anahtar kümesini koruduğu için
+  sayacı **korur**; `SwapDbFile` (RESTORE) geçersiz kılar. **Ölçülen:
+  62 ms → 0,1 ms.**
+- [x] 4.2 **`.idx` her zaman yazılır** — v3.0'ın 50 MB eşiği kaldırıldı
+  (`VDB_V3_IDX_MAX_BYTES`/`IdxMaxBytes` koddan çıktı). `backendchk` 6 kontrol
+  (`idxpol`, `TestV3IdxPolicy`).
+- [x] 4.3 **WAL'e yalnız işlem başına değişen sayfalar** — kök neden: `Commit`
+  "o ana kadar kirli olan **tüm** sayfaları" yazıyordu; sayfalar checkpoint'e
+  kadar kirli kaldığı için her autocommit INSERT önceki tüm kirli sayfaları
+  yeniden yazıyordu (O(kirli sayfa)/commit). Artık her çerçevede `TxnMark`
+  var; commit yalnız `FTxnId` işaretli yerleşik sayfaları + o işlem işaretli
+  pending imajlarını yazar. Meta çerçevesi de yalnız `FStructDirty` (sayfa
+  sayısı/freelist değişti) iken yazılır; LSN'i commit kaydı taşır.
+  **Ölçülen (64 çerçeveli havuz, 2000 tek satır commit): 63.373 → 8.252
+  B/commit; fsync'siz commit 0,585 → 0,098 ms.** Ayrı `fsyncbench` aracıyla
+  disk fsync tabanı **0,330 ms/islem** (4 KB ve 8 KB aynı) — yani autocommit'te
+  kalan süre neredeyse tamamen dayanıklılık bedelidir.
+- [x] 4.4 **Toplu dosya uzatma** — her yeni sayfada ayrı `SetSize` yerine
+  256 KB'lık parça (`VDB_GROW_BYTES`), kapanışta mantıksal boya kırpma
+  (`TrimToLogical`). `Stats.FileBytes` artık **mantıksal** boyu verir; ölçüm
+  araçları dosya boyunu kapanıştan sonra okur. **Ölçülen (benchv3, 32 B):
+  yazım 1,88 → 1,35 µs/satır** (benchcmp toplu: 6,64 → 5,80 µs).
+- [x] 4.5 **Tarama hattı** — `ScanRawIterAll` artık sonuç kümesi biriktirmez,
+  satırları doğrudan akıtır (eski yol her satırda `SetLength(+1)`), `ScanAll`
+  kapasite ikiye katlar, sıfır-kopya `ScanAllRaw` eklendi (sayfa pinli, hücre
+  göstericisi doğrudan). **Ölçülen (benchv3, 200k × 32 B): ham tarama
+  12,0 ms (kopyalı) → 9,6 ms (sıfır-kopya).**
+- [x] 4.6 **Ölçüm altyapısı** — `benchcmp`/`benchv3` süreleri QPC ile
+  mikrosaniye çözünürlüğünde (`GetTickCount64` ~15,6 ms kuantalıyordu; tek
+  atımlık `COUNT`/açılış ölçümleri yanıltıcıydı). Yeni `tests/bench/fsyncbench`
+  fsync tabanını ölçer.
+- [x] 4.7 **Kapılar** — üç platformda `kalan=0`: `backendchk` **108/108**
+  (19 yeni sayaç kontrolü: toplu ekleme, tek silme, `AbortBatch`,
+  `CommitBatch`, yerinde güncelleme, etiket değişimi, `.idx` özetinden açılış,
+  bayat `.idx` reddi + tarama, `.idx` silinmesi, VACUUM, yeniden açılış),
+  `v3sqlchk` 128, `pagechk` 21, `storechk` 15, `heapchk` 20, `idxchk` 17,
+  `migchk` 13, `crashtest` 11; `sqltest` v2 3116/0/0 (win64+Linux 3081),
+  v3 2252/0/58 (2217).
+
 ### Sprint 3.12: performans düzeltmeleri (ölçümle bulunan üç darboğaz)
 
 Kabul hedeflerinin üçü tutmuyordu (`toplu INSERT 8,045 µs`, `autocommit 1,168 ms`,

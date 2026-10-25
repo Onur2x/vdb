@@ -154,28 +154,33 @@ bunu **isteğe bağlı otomatik sıkıştırma** ile toparlayabilir
 H3 skiplist (100.000 satır): 100 × (`UPDATE` + indeksli `COUNT(*)`)
 **0,39–0,42 ms/döngü** — önceki 24,99 ms'e göre **~60–64x**.
 
-### v3.0 sayfa motoru (200.000 satır, aynı harness, medyan)
+### v3.0/v3.1 sayfa motoru (200.000 satır, aynı harness, medyan)
 
 `benchcmp --backend=v2|v3`, 3 kolonlu 200k satır, aynı makine, art arda:
 
-| Metrik | v2 | **v3.0** |
-|---|---:|---:|
-| Veri dosyası (`.odb`) | 19,3 MB (96,4 B/satır) | **15,5 MB (77,6 B/satır)** |
-| `+.odb.idx` (türetilmiş açılış önbelleği) | — | +3,5 MB |
-| **Diskteki toplam** | **19,3 MB** | **19,0 MB** |
-| Açılış | 984 ms | **32 ms** |
-| PK nokta araması | 6,25 µs | **6,25 µs** |
-| Toplu INSERT | 4,46 µs/satır | 6,64 µs/satır |
-| Autocommit INSERT | 0,431 ms/satır | 0,557 ms/satır |
-| `COUNT(*)` | 31 ms | 62 ms |
+| Metrik | v2 | **v3.0** | **v3.1** |
+|---|---:|---:|---:|
+| Veri dosyası (`.odb`) | 19,3 MB (96,4 B/satır) | **15,5 MB (77,6 B/satır)** | **15,5 MB (77,6 B/satır)** |
+| `+.odb.idx` (türetilmiş açılış önbelleği) | — | +3,5 MB | +3,5 MB |
+| **Diskteki toplam** | **19,3 MB** | **19,0 MB** | **19,0 MB** |
+| Açılış | 984 ms | **32 ms** | **28,1 ms** |
+| PK nokta araması | 6,25 µs | 6,25 µs | **5,13 µs** |
+| Toplu INSERT | 4,46 µs/satır | 6,64 µs/satır | **5,80 µs/satır** |
+| Autocommit INSERT | 0,431 ms/satır | 0,557 ms/satır | **0,458 ms/satır** |
+| `COUNT(*)` | 31 ms | 62 ms | **0,1 ms** |
 
 v3.0 açılışı **~31x** hızlandırıyor, veri dosyasını **%19,5** küçültüyor; ama
 yanına yazdığı `.odb.idx` (silinebilir, türetilmiş önbellek) ile birlikte
 diskteki toplam yalnız **%1,2** küçülüyor. `.idx` **her zaman yazılır** (v3.1,
 boyut eşiği kaldırıldı). PK ve parse maliyeti v2 ile aynı.
-Toplu yazım ~1,5x, `COUNT(*)` 2x ve tek satır yazım ~1,3x daha yavaş. Kök
-nedenler (sayfa imajlı WAL'in 2x yazma hacmi, tablo başına satır sayacının
-olmaması) ve v3.1 planı:
+
+v3.1 v3.0'ın üç gerilemesini kapattı: `COUNT(*)` **62 → 0,1 ms** (tablo başına
+canlı sayaç), autocommit **0,557 → 0,458 ms** (WAL'e yalnız işlemde değişen
+sayfalar; ölçülen WAL hacmi 63.373 → 8.252 B/commit), toplu INSERT
+**6,64 → 5,80 µs** (256 KB'lık dosya uzatma parçaları; sayfa motoru yazımı
+1,88 → 1,35 µs). Autocommit'te kalan fark dayanıklılık tabanıdır: tek fsync
+**0,330 ms** ölçüldü. Dosya boyutu değişmedi.
+Kök nedenler ve tüm ölçümler:
 [hiztesti.md](hiztesti.md#9-v30-sayfa-motoru--aynı-tartıda-v2-karşılaştırması-2026-10-25).
 
 ---

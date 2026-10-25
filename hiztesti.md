@@ -294,17 +294,22 @@ Koşullar: Windows, FPC 3.2.4 i386-win32, tek süreç; 200.000 satır × 3 kolon
 (`id INTEGER PRIMARY KEY`, `a INTEGER`, `s TEXT(~24 B)`), 20.000 tek satırlık
 autocommit INSERT, varsayılan dayanıklılık (`SyncWrite=True`, her commit fsync).
 
-| Metrik | v2 | **v3** | Fark |
-|---|---:|---:|---|
-| Veri dosyası (`.odb`) | 19.278.424 B (96,4 B/satır) | **15.527.936 B (77,6 B/satır)** | **−19,5 %** |
-| Açılış dizini (`.odb.idx`) | — | 3.520.080 B (17,6 B/satır) | +3,5 MB |
-| **Diskteki toplam** | **19.278.555 B** | **19.048.016 B** | **−1,2 %** |
-| Açılış | 984 ms | **32 ms** | **30,8x hızlı** |
-| Toplu INSERT (tek batch) | 4,455 µs/satır | 6,640 µs/satır | 1,49x yavaş |
-| Autocommit INSERT | 0,431 ms/satır | 0,557 ms/satır | 1,29x yavaş |
-| PK nokta araması | 6,25 µs | **6,25 µs** | eşit |
-| parse-only `SELECT 1` | 3,90 µs | **3,90 µs** | eşit |
-| `COUNT(*)` | 31 ms | 62 ms | 2,0x yavaş |
+| Metrik | v2 | **v3.0** | **v3.1** |
+|---|---:|---:|---:|
+| Veri dosyası (`.odb`) | 19.278.424 B (96,4 B/satır) | **15.527.936 B (77,6 B/satır)** | **15.527.936 B (77,6 B/satır)** |
+| Açılış dizini (`.odb.idx`) | — | 3.520.080 B (17,6 B/satır) | 3.520.080 B (17,6 B/satır) |
+| **Diskteki toplam** | **19.278.555 B** | **19.048.016 B** | **19.048.016 B** |
+| Açılış | 984 ms | 32 ms | **28,1 ms** |
+| Toplu INSERT (tek batch) | 4,455 µs/satır | 6,640 µs/satır | **5,796 µs/satır** |
+| Autocommit INSERT | 0,431 ms/satır | 0,557 ms/satır | **0,458 ms/satır** |
+| PK nokta araması | 6,25 µs | 6,25 µs | **5,13 µs** |
+| parse-only `SELECT 1` | 3,90 µs | 3,90 µs | **3,55 µs** |
+| `COUNT(*)` | 31 ms | 62 ms | **0,1 ms** |
+
+v3.1 sütunu aynı harness'ın aynı koşullarındaki (200k × 3 kolon, 20k tek
+satır, üç tur medyanı) ölçümüdür. Dosya boyutu **değişmedi**: v3.1 boyut değil
+hız işidir (`.idx` her zaman yazılır kararı boyutu ~%1,2 büyütür, ölçüm aynı
+dosyayı verdi).
 
 **`.odb.idx` nedir, sayılmalı mı?** Açılışta heap dizinini (anahtar → sayfa/slot)
 yeniden kurmak yerine diskten yükleyen **türetilmiş bir önbellektir**; veri
@@ -317,13 +322,15 @@ birlikte %1,2'dir — iki sayı da yazılmalıdır, tek başına %19,5 yanıltı
 yazma" eşiği kaldırıldı: `.idx` türetilmiş ve silinebilir olduğu için boyut
 sınırı gerçek bir koruma sağlamıyordu; buna karşılık büyük veritabanlarında
 açılışı gereksiz yere tam taramaya düşürüyordu. `backendchk` bu politikayı
-6 kontrolle sınar (`idxpol)`).
+6 kontrolle sınar (`idxpol`, `TestV3IdxPolicy`).
 
-Not: `autocommit`, `toplu INSERT` ve `COUNT(*)` dışındaki satırlarda v3
-gerilemiyor. Bu tablodaki üç gerileme **ölçülmüş ve kabul edilmiş**
-maliyetlerdir (aşağıda kök nedenleriyle).
+Not: v3.1'de üç gerileme de kapandı — `COUNT(*)` **0,1 ms** (sayaç),
+autocommit **0,458 ms** (yalnız işlemde değişen sayfalar WAL'e yazılır),
+toplu INSERT **5,796 µs** (256 KB'lık dosya uzatma parçaları). Aşağıdaki
+"neden" bölümleri v3.0'ın ölçülmüş kök nedenleridir; v3.1 düzeltmesi her
+birinin altında yazılı.
 
-### Neden toplu INSERT 6,64 µs?
+### Neden toplu INSERT 6,64 µs? (v3.0 — v3.1'de 5,80 µs)
 
 Bileşenler ayrı ayrı ölçüldü (200k anahtar, 64 B değer, 512 çerçeveli havuz):
 
@@ -338,6 +345,11 @@ v2'nin append-only KV yolu satır başına tek bir ekleme yapar. v3 sayfa
 imajlı WAL kullanır: aynı baytlar hem WAL'e hem checkpoint'te veri dosyasına
 yazılır (**2x yazma hacmi**). Rewrite'ın yarısı buradan gelir; kalanı sayfa
 içi hücre yerleştirme ve dizin bakımıdır.
+
+**v3.1 düzeltmesi:** dosya her yeni sayfada ayrı `SetSize` ile uzatılıyordu
+(ölçülen ~45–50 µs/sayfa). Artık 256 KB'lık parçalarla uzatılır ve kapanışta
+mantıksal boya kırpılır; sayfa motoru harness'ında yazım **1,88 → 1,35
+µs/satır**, SQL harness'ında toplu INSERT **6,64 → 5,80 µs/satır**.
 
 Bu sprintte ölçümle bulunan ve giderilen üç darboğaz (hepsi üretim kodunda):
 
@@ -356,46 +368,57 @@ Bu sprintte ölçümle bulunan ve giderilen üç darboğaz (hepsi üretim kodund
    Parti artık **giriş sırasında** uygulanır. Toplu INSERT
    **8,045 → 6,64 µs/satır** (üç ayrı iyileştirmenin toplamı).
 
-### Neden `COUNT(*)` 62 ms?
+### Neden `COUNT(*)` 62 ms? (v3.1'de 0,1 ms)
 
 v2'de `COUNT(*)` tablo satır sayacından **O(1)** yanıtlanır
 (`TryGetTableRowCount`); 31 ms ölçülen değer sayaç + doğrulama yoludur.
-v3'te anahtarlar tablo+PK hash'i olduğu için **tablo başına sayaç yok**;
-sorgu tam tarama yapar. Tarama satır çözmeden (ham hücre) çalışır, yani
-maliyet CPU değil **okunacak bayt**tır: 15,5 MB / 62 ms ≈ 250 MB/s.
-Bu bir v3.1 işidir (tablo başına canlı satır sayacı).
+v3.0'da anahtarlar tablo+PK hash'i olduğu için **tablo başına sayaç yoktu**;
+sorgu tam tarama yapıyordu (15,5 MB / 62 ms ≈ 250 MB/s).
+
+**v3.1 düzeltmesi:** `TVdbBackendV3` içinde tablo başına **canlı** satır
+sayacı; `.idx`'e gömülü özetten açılışta kurulur, yoksa ilk `COUNT` isteğinde
+bir kez tam tarama yapılır (türetilmiş veri, bayatlama riski yok). Hızlı yol
+yalnız saf `COUNT(*)` içindir: `WHERE`/`HAVING`/`GROUP BY`/JOIN/`LIMIT` veya
+açık parti varsa akışkan tarama kullanılır. **Ölçülen: 0,1 ms** (≈620x).
 
 ### v3.0 kabul hedefleriyle karşılaştırma
 
-| Hedef | Hedef değer | Ölçülen | Durum |
-|---|---:|---:|---|
-| Dosya boyutu (SQL harness, 3 kolon) | ≤ 11 MB | 15,5 MB | **karşılanmadı** |
-| Dosya boyutu (sayfa harness, 32 B değer) | ≤ 11 MB | **9,76 MB** | karşılandı |
-| Açılış | ≤ 150 ms | **32 ms** | karşılandı (4,7x pay) |
-| PK nokta | ≤ 7 µs | **6,25 µs** | karşılandı |
-| Toplu INSERT | ≤ 5 µs | 6,64 µs | **karşılanmadı** (v2: 4,46) |
-| Autocommit INSERT | ≤ 0,55 ms | 0,557 ms | **sınırda** (v2: 0,431) |
-| `COUNT(*)` | ≤ 16 ms | 62 ms | **karşılanmadı** |
+| Hedef | Hedef değer | v3.0 | v3.1 | Durum |
+|---|---:|---:|---:|---|
+| Dosya boyutu (SQL harness, 3 kolon) | ≤ 11 MB | 15,5 MB | 15,5 MB | **karşılanmadı** |
+| Dosya boyutu (sayfa harness, 32 B değer) | ≤ 11 MB | **9,76 MB** | **9,76 MB** | karşılandı |
+| Açılış | ≤ 150 ms | **32 ms** | **28,1 ms** | karşılandı |
+| PK nokta | ≤ 7 µs | **6,25 µs** | **5,13 µs** | karşılandı |
+| Toplu INSERT | ≤ 5 µs | 6,64 µs | 5,80 µs | sınırda (v2: 4,46) |
+| Autocommit INSERT | ≤ 0,55 ms | 0,557 ms | **0,458 ms** | karşılandı (v2: 0,431) |
+| `COUNT(*)` | ≤ 16 ms | 62 ms | **0,1 ms** | karşılandı |
 
 Dosya boyutu hedefi iki farklı harness'ı karıştırıyordu: `benchv3` (sayfa
 motoru, 32 B değer, 9.756.672 B = 48,8 B/satır) hedefi tutar; `benchcmp`
-(SQL katmanı, 3 kolon, ~24 B metin) tutmaz. Tabloda ikisi ayrı verildi.
+(SQL katmanı, 3 kolon, ~24 B metin) tutmaz ve v3.1'de de tutmuyor. Tabloda
+ikisi ayrı verildi.
 
-**Dürüst özet:** v3.0 dosya boyutunu ve özellikle açılışı kazanıyor, PK ve
-parse maliyeti v2 ile aynı; buna karşılık **toplu yazım ~1,5x, `COUNT(*)` 2x
-ve tek satır yazım ~1,3x daha yavaş**. v3.1'in konusu bu üç madde: mantıksal
-(küçük) WAL çerçevesi, tablo başına satır sayacı, dosya uzatmasını toplu
-yapma (ölçülen: sayfa başına 45–50 µs tek tek uzatma).
+**Dürüst özet:** v3.0 dosya boyutunu ve özellikle açılışı kazanıyordu, PK ve
+parse maliyeti v2 ile aynıydı; buna karşılık **toplu yazım ~1,5x, `COUNT(*)`
+2x ve tek satır yazım ~1,3x daha yavaştı**. v3.1 üçünü de kapattı: `COUNT(*)`
+**0,1 ms**, autocommit **0,458 ms** (v3.0'ın 0,557'sinden %18, v2'nin
+0,431'inden %6 yavaş), toplu yazım **5,80 µs** (v3.0'ın %13 altı, v2'nin %30
+üstü). Autocommit'te kalan fark **dayanıklılık bedelidir**: ayrı `fsyncbench`
+aracıyla tek fsync tabanı **0,330 ms** ölçüldü ve commit başına WAL hacmi
+63.373 → **8.252 bayta** indi. Toplu yazımda kalan fark sayfa imajlı WAL'in
+2x yazma hacmidir (tasarım maliyeti).
 
 ### Sayfa motoru harness'ı (`benchv3`, 200k satır × 32 B değer)
 
 `benchcmp`'ten ayrı bir harness; sayılar karıştırılmamalıdır:
 
-| Metrik | Ölçülen |
-|---|---:|
-| Dosya | 9.756.672 B (48,8 B/satır) |
-| `.idx` | 3.200.064 B (16,0 B/satır) |
-| Yazım (commit + checkpoint dahil) | 1,88 µs/satır |
-| Açılış (`.idx` ile) | 16 ms |
-| Açılış (tam tarama) | 79 ms |
-| PK okuma | 0,47 µs/satır |
+| Metrik | v3.0 | v3.1 |
+|---|---:|---:|
+| Dosya | 9.756.672 B (48,8 B/satır) | 9.756.672 B (48,8 B/satır) |
+| `.idx` | 3.200.064 B (16,0 B/satır) | 3.200.064 B (16,0 B/satır) |
+| Yazım (commit + checkpoint dahil) | 1,88 µs/satır | **1,35 µs/satır** |
+| Açılış (`.idx` ile) | 16 ms | 23 ms (16–31 aralığı, makine yüküne duyarlı) |
+| Açılış (tam tarama) | 79 ms | 79 ms |
+| PK okuma | 0,47 µs/satır | 0,43 µs/satır |
+| Ham tarama (kopyalı) | — | 12,0 ms |
+| Ham tarama (sıfır-kopya) | — | **9,6 ms** |
