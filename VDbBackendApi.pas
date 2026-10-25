@@ -109,6 +109,12 @@ type
     function EnsureColumnKey: QWord;
     function ColumnKeyId: QWord;
     function ColumnKeyPath: string;
+    { v3.2: dosyanin BUTUNU sifreli mi?
+      v2: kayit seviyesi anahtar yuklu mu (TVDb.IsEncrypted).
+      v3: sayfa dosyasi parola/anahtar ile sifreli mi (Store.Encrypted).
+      Kolon sifrelemesi v3'te dosya sifrelemesine dayanir; bu yuzden
+      TVTableDb ENCRYPTED kolon isteginde v3'te bunu arar. }
+    function FileEncrypted: Boolean;
     procedure SetBeforeCommit(Proc: TDbCommitHook);
 
     { --- motor durumu (Sprint 2.7) --- }

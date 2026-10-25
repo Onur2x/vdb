@@ -427,6 +427,10 @@ type
     procedure RestoreSchemaSnapshot;
     procedure ClearSchemaSnapshot;
     { v3.2: savepoint sema yedegi yardimcilari. }
+    { v3.2: ENCRYPTED kolon destegi. v2'de deger duzeyinde kayit sifrelemesi
+      vardir. v3'te kolon degerleri dosya butunu sifrelendigi icin korunur;
+      dosya sifresizse sessizce duz metin yazmak yerine ACIK hata verilir. }
+    procedure CheckColEncryption;
     function FindSavepoint(const Name: string): Integer;
     procedure PushSchemaSavepoint(const Name: string);
     procedure RestoreSavepointSchema(Index: Integer);
@@ -4228,6 +4232,7 @@ procedure ParseLines(Lines: TStrings);
             raise EVDbException.Create(ecIOError,
               'VDb: sifreli kolon var ama kolon anahtari yok: ' +
               FKvB.ColumnKeyPath);
+          CheckColEncryption;
           t.Cols[lj].ColKeyId := FKvB.ColumnKeyId;
         end;
       FTables.AddOrSetValue(t.Name, t);
@@ -4708,6 +4713,18 @@ begin
   FreeAndNil(FSnapTables);
   FreeAndNil(FSnapById);
   FreeAndNil(FSnapAutoInc);   // P-17a
+end;
+
+procedure TVTableDb.CheckColEncryption;
+begin
+  { Yalniz v3 sayfa motoru (FKv = nil) icin gecerlidir: v3'te kolon
+    degerleri ancak DOSYA sifreliyse korunur. Sifresiz dosyaya "sifreli"
+    kolon yazmak kullaniciyi yaniltir; bu yuzden reddedilir.
+    v2'de kayit anahtari modeli vardir, kontrol VDbCore'dadir. }
+  if (FKv = nil) and (not FKvB.FileEncrypted) then
+    raise EVDbException.Create(ecUnsupported,
+      'v3: ENCRYPTED kolon icin dosya sifreli olmali ' +
+      '(parolali acilis ya da ALTER DATABASE KEY)');
 end;
 
 { --------------------------------------------------- v3.2: SAVEPOINT }
@@ -7369,6 +7386,7 @@ begin
       VCT_BLOB]) then
       raise EVDbException.Create(ecInvalidArgument,
         'yalnizca metin/BLOB kolonu sifrelenebilir: ' + c2.Name);
+    CheckColEncryption;
     c2.ColKeyId := FKvB.EnsureColumnKey;
   end;
   // DEFAULT tip dogrulugu
@@ -8505,6 +8523,7 @@ begin
         VCT_TIME, VCT_BLOB]) then
         raise EVDbException.Create(ecInvalidArgument,
           'yalnizca metin/BLOB kolonu sifrelenebilir: ' + t.Cols[i].Name);
+      CheckColEncryption;
       t.Cols[i].ColKeyId := FKvB.EnsureColumnKey;
     end;
   t.AutoInc := 0;

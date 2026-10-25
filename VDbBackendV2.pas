@@ -63,6 +63,7 @@ type
     function EnsureColumnKey: QWord;
     function ColumnKeyId: QWord;
     function ColumnKeyPath: string;
+    function FileEncrypted: Boolean;
     procedure SetBeforeCommit(Proc: TDbCommitHook);
     function GetDirty: Boolean;
     procedure WaitForeignTxn(ASessionId: Cardinal);
@@ -218,6 +219,12 @@ end;
 function TVDbBackendV2.ColumnKeyPath: string;
 begin
   Result := FDb.ColumnKeyPath;
+end;
+
+function TVDbBackendV2.FileEncrypted: Boolean;
+begin
+  { v2: kayit seviyesi anahtar yuklu ise degerler sifreli yazilir. }
+  Result := FDb.IsEncrypted;
 end;
 
 procedure TVDbBackendV2.SetBeforeCommit(Proc: TDbCommitHook);

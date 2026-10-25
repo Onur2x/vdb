@@ -16199,6 +16199,163 @@ begin
   end;
 end;
 
+procedure T151_KolonSifrelemeV3;
+{ v3.2 (2026-10-25): kolon sifrelemesinin v3 karsiligi.
+  v3'te kolon degerleri DOSYA sifrelemesi ile korunur (sayfa deposu AES).
+  Bu yuzden:
+    (a) sifresiz dosyada ENCRYPTED kolon ACIK hata verir (sessiz duz metin
+        yok) — hem CREATE TABLE hem ALTER TABLE ADD COLUMN,
+    (b) parolali dosyada ENCRYPTED kolon normal calisir, .colkey olusur,
+    (c) ham dosyada duz metin BULUNMAZ,
+    (d) parola ile yeniden acilinca degerler cozulur. }
+var
+  dir, f, ck: string;
+  be: IVdbBackend;
+  tb2: TVTableDb;
+  q2: TVSql;
+  ok: Boolean;
+  msg: string;
+  R2: TSqlResult;
+
+  function DosyadaMetin(const AFileName, S: string): Boolean;
+  var
+    fs: TFileStream;
+    b: TBytes;
+    raw: RawByteString;
+  begin
+    Result := False;
+    if not FileExists(AFileName) then Exit;
+    fs := TFileStream.Create(AFileName, fmOpenRead or fmShareDenyNone);
+    try
+      SetLength(b, fs.Size);
+      if fs.Size > 0 then fs.ReadBuffer(b[0], fs.Size);
+    finally
+      fs.Free;
+    end;
+    if Length(b) = 0 then Exit;
+    SetString(raw, PAnsiChar(@b[0]), Length(b));
+    Result := Pos(S, string(raw)) > 0;
+  end;
+
+begin
+  Grp('T151 kolon sifreleme (v3: dosya sifrelemesi)');
+  dir := D + PathDelim + 't151_colenc_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  f := dir + PathDelim + 'veritabani.odb';
+
+  // (a) sifresiz dosyada reddedilir
+  be := nil;
+  VdbOpenOrCreate(f, be);
+  tb2 := TVTableDb.CreateBackend(be);
+  q2 := TVSql.Create(tb2);
+  try
+    tb2.Open(dir);
+    ok := False;
+    msg := '';
+    try
+      q2.Exec('CREATE TABLE s1(id INTEGER PRIMARY KEY, ad TEXT ENCRYPTED)');
+    except
+      on E: Exception do
+      begin
+        ok := Pos('dosya sifreli', E.Message) > 0;
+        msg := E.Message;
+      end;
+    end;
+    Dogrula('sifresiz dosyada ENCRYPTED kolon reddedilir', ok, msg);
+    q2.Exec('CREATE TABLE s2(id INTEGER PRIMARY KEY, ad TEXT)');
+    ok := False;
+    msg := '';
+    try
+      q2.Exec('ALTER TABLE s2 ADD COLUMN ek TEXT ENCRYPTED');
+    except
+      on E: Exception do
+      begin
+        ok := Pos('dosya sifreli', E.Message) > 0;
+        msg := E.Message;
+      end;
+    end;
+    Dogrula('sifresiz dosyada ALTER ADD ENCRYPTED reddedilir', ok, msg);
+  finally
+    q2.Free;
+    tb2.Free;
+    be := nil;
+  end;
+  DeleteFile(f);
+  DeleteFile(f + '.wal');
+  DeleteFile(f + '.idx');
+  DeleteFile(ChangeFileExt(f, '.colkey'));
+
+  // (b)-(d) parolali dosya
+  be := nil;
+  VdbOpenWithPassword(f, 'kolon-parola', be);
+  tb2 := TVTableDb.CreateBackend(be);
+  q2 := TVSql.Create(tb2);
+  try
+    tb2.Open(dir);
+    q2.Exec('CREATE TABLE sec(id INTEGER PRIMARY KEY, ad TEXT ENCRYPTED, ' +
+      'notu BLOB ENCRYPTED, acik TEXT)');
+    ck := ChangeFileExt(f, '.colkey');
+    Dogrula('colkey olustu', FileExists(ck), ck);
+    q2.Exec('INSERT INTO sec VALUES(1,''gizli-abc'',''blob-gizli'',''acik-1'')');
+    q2.Exec('INSERT INTO sec VALUES(2,NULL,NULL,''acik-2'')');
+    R2 := q2.Exec('SELECT ad FROM sec WHERE id=1');
+    Dogrula('sifreli (dosya) TEXT okunur',
+      (Length(R2.Rows) = 1) and (R2.Rows[0][0] = 'gizli-abc'),
+      IntToStr(Length(R2.Rows)));
+    R2 := q2.Exec('SELECT notu FROM sec WHERE id=1');
+    Dogrula('sifreli (dosya) BLOB okunur',
+      (Length(R2.Rows) = 1) and (R2.Rows[0][0] = 'blob-gizli'),
+      IntToStr(Length(R2.Rows)));
+  finally
+    q2.Free;
+    tb2.Free;
+    be := nil;
+  end;
+
+  // (c) ham dosyada duz metin yok
+  Dogrula('raw .odb sifreli metni icermiyor',
+    not DosyadaMetin(f, 'gizli-abc'), f);
+  Dogrula('raw .odb BLOB sifreli metni icermiyor',
+    not DosyadaMetin(f, 'blob-gizli'), f);
+
+  // (d) parola ile yeniden ac
+  be := nil;
+  VdbOpenWithPassword(f, 'kolon-parola', be);
+  tb2 := TVTableDb.CreateBackend(be);
+  q2 := TVSql.Create(tb2);
+  try
+    tb2.Open(dir);
+    R2 := q2.Exec('SELECT ad FROM sec WHERE id=1');
+    Dogrula('reopen sonrasi sifreli okuma',
+      (Length(R2.Rows) = 1) and (R2.Rows[0][0] = 'gizli-abc'),
+      IntToStr(Length(R2.Rows)));
+    R2 := q2.Exec('SELECT acik FROM sec WHERE id=2');
+    Dogrula('acik kolon da dogru',
+      (Length(R2.Rows) = 1) and (R2.Rows[0][0] = 'acik-2'),
+      IntToStr(Length(R2.Rows)));
+  finally
+    q2.Free;
+    tb2.Free;
+    be := nil;
+  end;
+
+  // yanlis parola: acilmaz (sessiz duz metin yok)
+  ok := False;
+  msg := '';
+  be := nil;
+  try
+    VdbOpenWithPassword(f, 'yanlis-parola', be);
+  except
+    on E: Exception do
+    begin
+      ok := True;
+      msg := E.Message;
+    end;
+  end;
+  be := nil;
+  Dogrula('yanlis parola ile acilmaz', ok, msg);
+end;
+
 { Sprint 2.9: test kosucusu. Her test kendi try/except'inde kosar;
   boylece bir hata kalan testleri durdurmaz ve siniflandirma yapilabilir. }
 type
@@ -16208,7 +16365,7 @@ type
   end;
 
 const
-  TEST_SAYISI = 180;
+  TEST_SAYISI = 181;
 
   { v3 kosusunda ATLA: bu testler yalniz v2 motorunun (TVDb/WAL/arsiv/
     zone/indeks .idx) ozel yollarini kullanir; v3'te karsiligi yoktur.
@@ -16463,6 +16620,7 @@ begin
   TESTLER[177].Nm := 'T148_H25_AutoCompact'; TESTLER[177].P := T148_H25_AutoCompact;
   TESTLER[178].Nm := 'T149_SavepointV32'; TESTLER[178].P := T149_SavepointV32;
   TESTLER[179].Nm := 'T150_AlterDbKeyV3'; TESTLER[179].P := T150_AlterDbKeyV3;
+  TESTLER[180].Nm := 'T151_KolonSifrelemeV3'; TESTLER[180].P := T151_KolonSifrelemeV3;
 end;
 
 { ---------------------------------------------------------------------- main }

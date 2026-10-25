@@ -31,7 +31,7 @@ interface
 uses
   SysUtils, Classes, Generics.Collections,
   VDbBackendApi, VDbPage, VDbPageStore, VDbPageHeap, VDbPageWal, VDbPageEngine,
-  VDbIdxFile, VDbSync;
+  VDbIdxFile, VDbSync, VDbCrypt;
 
 const
   { Bu boyuttan buyuk WAL'de commit sonrasi checkpoint yapilir. Cok kucuk
@@ -203,6 +203,7 @@ type
     function EnsureColumnKey: QWord;
     function ColumnKeyId: QWord;
     function ColumnKeyPath: string;
+    function FileEncrypted: Boolean;
     procedure SetBeforeCommit(Proc: TDbCommitHook);
     function GetDirty: Boolean;
     procedure WaitForeignTxn(ASessionId: Cardinal);
@@ -1010,58 +1011,47 @@ end;
 
 function TVdbBackendV3.EnsureColumnKey: QWord;
 var
-  f: TFileStream;
-  key: TBytes;
   id: QWord;
 begin
-  { v3.0'da kolon sifreleme henuz yok; anahtar dosyasi bicimi v2 ile ayni
-    kalsin diye rastgele 32 bayt + kimlik yazilir. Kullanim Sprint 3.4'te. }
+  { v3.2: .colkey bicimi v2 ile AYNI olmali (VDbCrypt): ilk 8 bayt sihir,
+    sonra anahtar kimligi, sonra DPAPI ile korunmus 32 baytlik anahtar.
+    Dosya varsa yuklenir (anahtar SUREC KAYIT DEFTERINE yazilir; satir
+    kodlayicisi degeri onunla muhurler), yoksa uretilir. }
   if FileExists(ColumnKeyPath) then
   begin
-    f := TFileStream.Create(ColumnKeyPath, fmOpenRead or fmShareDenyNone);
-    try
-      SetLength(key, 40);
-      if f.Size >= 40 then
-      begin
-        f.ReadBuffer(key[0], 40);
-        Move(key[32], id, 8);
-        Exit(id);
-      end;
-    finally
-      f.Free;
-    end;
-    Exit(0);
+    id := 0;
+    if not VDbColumnKeyLoadFile(ColumnKeyPath, id) then
+      raise EVdbBackendV3.Create('kolon anahtari yuklenemedi: ' +
+        ColumnKeyPath);
+    Exit(id);
   end;
-  SetLength(key, 40);
-  Randomize;
-  id := (QWord(Random(MaxInt)) shl 33) xor QWord(Random(MaxInt)) xor
-    (QWord(GetTickCount64) shl 7);
-  Move(id, key[32], 8);
-  f := TFileStream.Create(ColumnKeyPath, fmCreate);
-  try
-    f.WriteBuffer(key[0], 40);
-  finally
-    f.Free;
-  end;
+  id := 0;
+  if not VDbColumnKeyCreateFile(ColumnKeyPath, id) then
+    raise EVdbBackendV3.Create('kolon anahtari olusturulamadi: ' +
+      ColumnKeyPath);
   Result := id;
+end;
+
+function TVdbBackendV3.FileEncrypted: Boolean;
+begin
+  { v3.2: kolon sifrelemesi dosya sifrelemesine dayanir; sayfa deposu
+    parola/anahtar ile acildiysa True. }
+  Result := (FEng <> nil) and FEng.Store.Encrypted;
 end;
 
 function TVdbBackendV3.ColumnKeyId: QWord;
 var
-  f: TFileStream;
-  buf: TBytes;
+  id: QWord;
 begin
   Result := 0;
   if not FileExists(ColumnKeyPath) then Exit;
-  f := TFileStream.Create(ColumnKeyPath, fmOpenRead or fmShareDenyNone);
-  try
-    if f.Size < 40 then Exit;
-    SetLength(buf, 40);
-    f.ReadBuffer(buf[0], 40);
-    Move(buf[32], Result, 8);
-  finally
-    f.Free;
-  end;
+  { Yukleme AYNI ZAMANDA anahtari surce kayit defterine yazar; sifreli
+    kolon degerlerinin cozulmesi icin bu sart. }
+  id := 0;
+  if not VDbColumnKeyLoadFile(ColumnKeyPath, id) then
+    raise EVdbBackendV3.Create('kolon anahtari yuklenemedi: ' +
+      ColumnKeyPath);
+  Result := id;
 end;
 
 procedure TVdbBackendV3.SetBeforeCommit(Proc: TDbCommitHook);
