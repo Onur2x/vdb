@@ -9516,10 +9516,10 @@ begin
   ChkInt('DELETE bir satir', sq.Exec('DELETE FROM npk WHERE b = ' + Q + '1' + Q).Affected, 1);
   Chk('kalan 2 satir', 'SELECT a FROM npk', 2);
   // yeniden acilinda sentetik anahtarlar korunmali
-  tb.Close; kv.Close; sq.Free; tb.Free; kv.Free;
-  kv := TVDb.Create; tb := TVTableDb.Create(kv); sq := TVSql.Create(tb);
-  kv.Open(D + PathDelim + 'f2_nopk');
-  tb.Open(D + PathDelim + 'f2_nopk');
+  { 2026-10-25 (v3): reopen artik backend-farkinda `NewDb` ile yapilir;
+    bu test v3 kosusunda da calisir (onceden TVDb.Create kullandigi icin
+    ATLA listesindeydi). }
+  NewDb(D + PathDelim + 'f2_nopk');
   Chk('reopen sonrasi 2 satir', 'SELECT a FROM npk', 2);
   ChkVal('reopen sonrasi degerler', 'SELECT b FROM npk WHERE b = ' + Q + '9' + Q, 0, 0, '9');
   // yeni satir eklenince sentetik anahtar carpismamali
@@ -9581,9 +9581,7 @@ begin
   sq.Exec('INSERT INTO u2(id,a,b) VALUES(4,' + Q + 'w' + Q + ',' + Q + 'y' + Q + ')');
   Chk('3 farkli cift kabul edildi', 'SELECT a FROM u2', 3);
   // --- UNIQUE tanimi semada korunur (reopen) ---
-  tb.Close; kv.Close; sq.Free; tb.Free; kv.Free;
-  kv := TVDb.Create; tb := TVTableDb.Create(kv); sq := TVSql.Create(tb);
-  kv.Open(D + PathDelim + 'f2_uniqidx'); tb.Open(D + PathDelim + 'f2_uniqidx');
+  NewDb(D + PathDelim + 'f2_uniqidx');
   Chk('reopen sonrasi satirlar', 'SELECT a FROM u2', 3);
   ChkErr('reopen sonrasi UNIQUE hala zorlanir',
     'INSERT INTO u2(id,a,b) VALUES(5,' + Q + 'x' + Q + ',' + Q + 'y' + Q + ')');
@@ -16065,8 +16063,12 @@ const
     Liste iki kaynaktan olusur: (a) govdesinde `kv.`/`TVDb.Create` gecen
     testler (otomatik tarandi), (b) SAVEPOINT gibi v3.1'e ertelenen
     yonetim komutlarini sinayan testler. (BACKUP/VACUUM/VERIFY artik
-    v3'te backend uzerinden calisir; T15_Bakim bu yuzden listede degil.) }
-  V2_ONLY: array[0..57] of string = (
+    v3'te backend uzerinden calisir; T15_Bakim bu yuzden listede degil.)
+
+    2026-10-25: T64 ve T65 ARTIK KOSAR (tek engelleri reopen'in elle
+    TVDb.Create ile yapilmasiydi; backend-farkinda `NewDb` ile degistirildi).
+    Ayni desen digerlerinde de var; sirayla tasinacak. }
+  V2_ONLY: array[0..55] of string = (
     'T101_TcpReplication',
     'T105_ShowStats',
     'T117_Generated',
@@ -16108,8 +16110,6 @@ const
     'T60_F2_WALKilit',
     'T61_F2_GetDogruluk',
     'T63_F2_BozukKayitTespit',
-    'T64_F2_PKsizTablo',
-    'T65_F2_UniqueIndex',
     'T69_YonetimAPI',
     'T70_YonetimBakim',
     'T72_WALReplay',
