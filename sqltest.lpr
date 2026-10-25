@@ -16498,6 +16498,210 @@ begin
   st := nil;
 end;
 
+procedure T154_YonetimYollari;
+{ v3.2 (2026-10-25): yonetim aracinin (yonetim/) dayandigi motor API
+  yollarinin v3 karsiligi. T69/T70 `TVDb`yi dogrudan kullanir; burada AYNI
+  TVTableDb yuzeyi backend (v3) uzerinde sinanir:
+    PK'siz tablo + sentetik anahtar, UpdateRowInPlace, Delete, cok kolonlu
+    UNIQUE indeks, kolon silme, AutoCompact esikleri, ExecAll atomikligi,
+    VACUUM ve REINDEX. }
+const
+  NROW = 400;
+  NKEEP = 50;
+var
+  be: IVdbBackend;
+  kv2: TVDb;
+  tb2: TVTableDb;
+  sq2: TVSql;
+  cols: TColArray;
+  pks: TStrArray;
+  rows: TStrMatrix;
+  vals: TStrArray;
+  stmts: TStrArray;
+  r: TSqlResult;
+  n, i: Integer;
+  raised, did: Boolean;
+  vOld, vNew, dead: Int64;
+  dir, foundC: string;
+
+  procedure ChkQ(const Nm, Sql: string; const Exp: string);
+  begin
+    r := sq2.Exec(Sql);
+    if (Length(r.Rows) > 0) and (Length(r.Rows[0]) > 0) and
+       (r.Rows[0][0] = Exp) then
+      Ok(Nm, Exp)
+    else if (Length(r.Rows) = 0) or (Length(r.Rows[0]) = 0) then
+      No(Nm, 'sonuc hucre yok')
+    else
+      No(Nm, 'beklenen "' + Exp + '" gelen "' + r.Rows[0][0] + '"');
+  end;
+
+begin
+  Grp('T154 yonetim API yollari (backend)');
+  dir := D + PathDelim + 't154_yon';
+  ForceDirectories(dir);
+  be := nil;
+  kv2 := nil;
+  if gV3 then
+  begin
+    VdbOpenOrCreate(DbFileOf(dir), be);
+    tb2 := TVTableDb.CreateBackend(be);
+  end
+  else
+  begin
+    kv2 := TVDb.Create;
+    kv2.Open(dir);
+    tb2 := TVTableDb.Create(kv2);
+  end;
+  sq2 := TVSql.Create(tb2);
+  try
+    tb2.Open(dir);
+
+    // ---- (1) PK'siz tablo (yonetim diyalogu PK zorlamaz) ----
+    SetLength(cols, 3);
+    cols[0].Name := 'a'; cols[0].Ctype := VCT_STR;
+    cols[1].Name := 'b'; cols[1].Ctype := VCT_INT;
+    cols[2].Name := 'c'; cols[2].Ctype := VCT_STR; cols[2].Unique := True;
+    tb2.CreateTable('nopk', cols, -1, [], []);
+    Dogrula('PK-siz tablo olusturuldu', tb2.GetTable('nopk').PkIndex < 0,
+      IntToStr(tb2.GetTable('nopk').PkIndex));
+    tb2.Insert('nopk', ['a', 'b', 'c'], ['x', '1', 'p']);
+    tb2.Insert('nopk', ['a', 'b', 'c'], ['x', '2', 'q']);
+    n := tb2.ScanRows('nopk', pks, rows);
+    ChkInt('2 satir eklendi', n, 2);
+    Dogrula('sentetik anahtar uretildi',
+      (Length(pks) = 2) and (Copy(pks[0], 1, 1) = '@'),
+      IntToStr(Length(pks)));
+
+    // ---- (2) UpdateRowInPlace + UNIQUE denetimi ----
+    SetLength(vals, 3);
+    vals[0] := 'x'; vals[1] := '2'; vals[2] := 'GUNCELDI';
+    Dogrula('UpdateRowInPlace (sentetik anahtar)',
+      tb2.UpdateRowInPlace('nopk', pks[1], vals), pks[1]);
+    tb2.ScanRows('nopk', pks, rows);
+    foundC := '';
+    for i := 0 to High(rows) do
+      if rows[i][2] = 'GUNCELDI' then foundC := rows[i][2];
+    Dogrula('satir gercekten guncellendi', foundC = 'GUNCELDI', foundC);
+    SetLength(vals, 3);
+    vals[0] := 'x'; vals[1] := '1'; vals[2] := 'GUNCELDI';
+    raised := False;
+    try
+      tb2.UpdateRowInPlace('nopk', pks[0], vals);
+    except
+      raised := True;
+    end;
+    Dogrula('UpdateRowInPlace UNIQUE denetimi', raised, '');
+
+    // ---- (3) Delete ----
+    Dogrula('Delete (sentetik anahtar)', tb2.Delete('nopk', pks[0]), pks[0]);
+    n := tb2.ScanRows('nopk', pks, rows);
+    ChkInt('silinen 1 satir kaldi', n, 1);
+
+    // ---- (4) cok kolonlu + UNIQUE indeks ----
+    tb2.CreateIndexCols('nopk', 'ix_ab', ['a', 'b'], True);
+    raised := False;
+    try
+      tb2.Insert('nopk', ['a', 'b', 'c'], ['x', '2', 'duplicate']);
+    except
+      raised := True;
+    end;
+    Dogrula('UNIQUE cok kolonlu indeks zorlanir', raised, '');
+    tb2.Insert('nopk', ['a', 'b', 'c'], ['x', '3', 'farkli']);
+    n := tb2.ScanRows('nopk', pks, rows);
+    ChkInt('farkli cift kabul edildi', n, 2);
+    tb2.CreateIndexCols('nopk', 'ix_bc', ['b', 'c'], False);
+    Ok('UNIQUE olmayan cok kolunlu indeks kuruldu', 'ix_bc');
+
+    // ---- (5) kolon silme ----
+    tb2.AlterDropColumn('nopk', 'c');
+    raised := False;
+    n := 0;
+    try
+      n := tb2.ScanRows('nopk', pks, rows);
+    except
+      raised := True;
+    end;
+    Dogrula('ilk kolon silinebildi (PK degil)', not raised, '');
+    ChkInt('kolon silme sonrasi satir korunur', n, 2);
+
+    // ---- (6) AutoCompact esikleri ----
+    sq2.Exec('CREATE TABLE ac(id INTEGER PRIMARY KEY, v TEXT)');
+    sq2.Exec('BEGIN');
+    for i := 1 to NROW do
+      sq2.Exec('INSERT INTO ac(id,v) VALUES(' + IntToStr(i) + ',' +
+        Q + 'veri-' + IntToStr(i) + Q + ')');
+    sq2.Exec('COMMIT');
+    for i := 1 to NROW - NKEEP do
+      sq2.Exec('DELETE FROM ac WHERE id = ' + IntToStr(i));
+    if gV3 then dead := be.DeadBytes else dead := kv2.DeadBytes;
+    Dogrula('olu bayt birikti', dead > 0, IntToStr(dead));
+    did := False;
+    if gV3 then did := be.AutoCompact(vOld, vNew, 0.99, 1000000000)
+    else did := kv2.AutoCompact(vOld, vNew, 0.99, 1000000000);
+    Dogrula('esik altinda sikistirma yok', not did, '');
+    if gV3 then did := be.AutoCompact(vOld, vNew, 0.0, 1024)
+    else did := kv2.AutoCompact(vOld, vNew, 0.0, 1024);
+    Dogrula('esik asilinca sikistirildi', did,
+      IntToStr(vOld) + ' -> ' + IntToStr(vNew));
+    ChkInt('sikistirma sonrasi tablo sayisi', Length(tb2.TableNames), 2);
+    ChkInt('sikistirma sonrasi canli kayit', tb2.DataKeyCount, 2 + NKEEP);
+    ChkQ('sikistirma sonrasi satir sayisi', 'SELECT COUNT(*) FROM ac',
+      IntToStr(NKEEP));
+    ChkQ('son satir degeri', 'SELECT v FROM ac WHERE id = 400', 'veri-400');
+
+    // ---- (7) ExecAll atomikligi ----
+    stmts := sq2.SplitStatements(
+      'CREATE TABLE betik(id INTEGER PRIMARY KEY, v TEXT);' +
+      'INSERT INTO betik(id,v) VALUES(1,' + Q + 'a' + Q + ');' +
+      'INSERT INTO betik(id,v) VALUES(2,' + Q + 'b' + Q + ');' +
+      'INSERT INTO betik(id,v) VALUES(3,' + Q + 'c' + Q + ')');
+    ChkInt('betik 4 cumle olarak bolundu', Length(stmts), 4);
+    r := sq2.ExecAll(stmts);
+    ChkInt('ExecAll Affected', r.Affected, 4);
+    ChkQ('betik: veri dogru', 'SELECT COUNT(*) FROM betik', '3');
+    stmts := sq2.SplitStatements(
+      'INSERT INTO betik(id,v) VALUES(4,' + Q + 'd' + Q + ');' +
+      'INSERT INTO yok_boyle_tablo(id) VALUES(1)');
+    raised := False;
+    try
+      sq2.ExecAll(stmts);
+    except
+      raised := True;
+    end;
+    Dogrula('betik hatasi bildirildi', raised, '');
+    ChkQ('hatali betikte hicbiri uygulanmadi', 'SELECT COUNT(*) FROM betik', '3');
+    stmts := sq2.SplitStatements(
+      'BEGIN;' +
+      'INSERT INTO betik(id,v) VALUES(10,' + Q + 'x' + Q + ');' +
+      'INSERT INTO betik(id,v) VALUES(11,' + Q + 'y' + Q + ');' +
+      'COMMIT');
+    sq2.ExecAll(stmts);
+    ChkQ('BEGIN/COMMIT betigi', 'SELECT COUNT(*) FROM betik', '5');
+    stmts := sq2.SplitStatements(
+      'BEGIN;' +
+      'INSERT INTO betik(id,v) VALUES(20,' + Q + 'z' + Q + ');' +
+      'ROLLBACK');
+    sq2.ExecAll(stmts);
+    ChkQ('ROLLBACK betigi geri aldi', 'SELECT COUNT(*) FROM betik', '5');
+
+    // ---- (8) bakim komutlari ----
+    sq2.Exec('VACUUM');
+    ChkQ('VACUUM sonrasi veri saglam', 'SELECT COUNT(*) FROM ac',
+      IntToStr(NKEEP));
+    sq2.Exec('REINDEX');
+    ChkQ('REINDEX sonrasi veri saglam', 'SELECT COUNT(*) FROM ac',
+      IntToStr(NKEEP));
+    ChkQ('REINDEX sonrasi indeksle arama', 'SELECT v FROM ac WHERE id = 400',
+      'veri-400');
+  finally
+    sq2.Free;
+    tb2.Free;
+    be := nil;
+    kv2.Free;
+  end;
+end;
+
 { Sprint 2.9: test kosucusu. Her test kendi try/except'inde kosar;
   boylece bir hata kalan testleri durdurmaz ve siniflandirma yapilabilir. }
 type
@@ -16507,7 +16711,7 @@ type
   end;
 
 const
-  TEST_SAYISI = 183;
+  TEST_SAYISI = 184;
 
   { v3 kosusunda ATLA: bu testler yalniz v2 motorunun (TVDb/WAL/arsiv/
     zone/indeks .idx) ozel yollarini kullanir; v3'te karsiligi yoktur.
@@ -16764,6 +16968,7 @@ begin
   TESTLER[180].Nm := 'T151_KolonSifrelemeV3'; TESTLER[180].P := T151_KolonSifrelemeV3;
   TESTLER[181].Nm := 'T152_OtoSikistirmaV3'; TESTLER[181].P := T152_OtoSikistirmaV3;
   TESTLER[182].Nm := 'T153_KvStoreBackend'; TESTLER[182].P := T153_KvStoreBackend;
+  TESTLER[183].Nm := 'T154_YonetimYollari'; TESTLER[183].P := T154_YonetimYollari;
 end;
 
 { ---------------------------------------------------------------------- main }
