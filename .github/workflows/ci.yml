@@ -68,6 +68,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:LAZBUILD -B vdbmig.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:LAZBUILD -B factorychk.lpi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Sayfa deposu kapisi (storechk)
         shell: pwsh
@@ -242,6 +244,21 @@ jobs:
           }
           if ($vout -notmatch 'TAMAM') {
             Write-Error 'vdbmig verify TAMAM demedi'
+            exit 1
+          }
+
+      - name: Uygulama giris noktasi kapisi (factorychk)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbfactorychk'
+          $out = & .\factorychk.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'FACTORY DOGRULANDI') {
+            Write-Error 'factorychk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'factorychk kalan > 0'
             exit 1
           }
 

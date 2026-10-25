@@ -23,8 +23,13 @@ type
   TVDbBackendV2 = class(TInterfacedObject, IVDbBackend)
   private
     FDb: TVDb;
+    FOwnsDb: Boolean;
   public
     constructor Create(ADb: TVDb);
+    { VDbFactory icin: adaptor kapanirken TVDb'yi de kapatir/serbest
+      birakir. Boylece uygulama kodu TVDb tipini hic tanimaz. }
+    constructor CreateOwned(ADb: TVDb);
+    destructor Destroy; override;
     property Db: TVDb read FDb;
 
     procedure Put(Key: QWord; const Value: TBytes);
@@ -74,6 +79,27 @@ begin
   if ADb = nil then
     raise EVdbBackendV2.Create('TVDbBackendV2: db nil');
   FDb := ADb;
+  FOwnsDb := False;
+end;
+
+constructor TVDbBackendV2.CreateOwned(ADb: TVDb);
+begin
+  Create(ADb);
+  FOwnsDb := True;
+end;
+
+destructor TVDbBackendV2.Destroy;
+begin
+  if FOwnsDb and (FDb <> nil) then
+  begin
+    try
+      FDb.Close;
+    except
+      { Kapanis hatasi yikiciyi durdurmaz; asil veri zaten dosyada. }
+    end;
+    FreeAndNil(FDb);
+  end;
+  inherited Destroy;
 end;
 
 procedure TVDbBackendV2.Put(Key: QWord; const Value: TBytes);

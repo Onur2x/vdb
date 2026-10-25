@@ -659,7 +659,11 @@ var
   entries: TVdbIdxEntryArray;
   tags: TVdbIdxTagArray;
   hdr: TVdbIdxHeader;
-  i: LongWord;
+  { DIKKAT: Integer olmali. LongWord iken `for i := 0 to High(entries)`
+    ifadesinde High(bos dizi) = -1, isaretsiz tipe cevrilince $FFFFFFFF olur
+    ve BOS veritabaninda (idx'te 0 kayit) dongu 4 milyar kez donup erisim
+    ihlali verir. Bos v3 dosyasi yeniden ACILAMIYORDU (2026-10-25). }
+  i: Integer;
   L: TLoc;
   P: PVdbPage;
   size: Int64;
