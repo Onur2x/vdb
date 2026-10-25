@@ -1368,25 +1368,19 @@ begin
   p := D + PathDelim + 'rbacpersist';
   Shutdown;   // sqltest'in DB'sini kapat
 
-  // Ayni dizini yeniden ac
-  db2 := TVDb.Create;
-  td2 := TVTableDb.Create(db2);
-  try
-    db2.Open(p);
-    td2.Open(p);
-    if td2.RoleExists('kalici') then Ok('rol yeniden acilista korundu', 'kalici')
-    else No('rol yeniden acilista korundu', 'rol kayboldu');
-    td2.SetCurrentRole('kalici');
-    if td2.RoleCan('t', Ord(pkSelect)) then Ok('izin yeniden acilista korundu', '')
-    else No('izin yeniden acilista korundu', 'izin kayboldu');
-    if not td2.RoleCan('t', Ord(pkInsert)) then
-      Ok('INSERT izni verilmemisti, korunuyor', '')
-    else No('INSERT izni verilmemisti, korunuyor', 'beklenmedik izin var');
-    td2.SetCurrentRole('');
-  finally
-    td2.Free;
-    db2.Free;
-  end;
+  { 2026-10-25 (v3): yeniden acilis backend-farkinda `NewDb` ile yapilir.
+    Boylece RBAC kaliciligi v3 kosusunda da sinanir (onceden elle
+    TVDb.Create kullandigi icin ATLA listesindeydi). }
+  NewDb(p);
+  if tb.RoleExists('kalici') then Ok('rol yeniden acilista korundu', 'kalici')
+  else No('rol yeniden acilista korundu', 'rol kayboldu');
+  tb.SetCurrentRole('kalici');
+  if tb.RoleCan('t', Ord(pkSelect)) then Ok('izin yeniden acilista korundu', '')
+  else No('izin yeniden acilista korundu', 'izin kayboldu');
+  if not tb.RoleCan('t', Ord(pkInsert)) then
+    Ok('INSERT izni verilmemisti, korunuyor', '')
+  else No('INSERT izni verilmemisti, korunuyor', 'beklenmedik izin var');
+  tb.SetCurrentRole('');
 
   Ok('RBAC kalicilik', '');
 end;
@@ -1552,24 +1546,17 @@ begin
   p := D + PathDelim + 'rlspersist';
   Shutdown;
 
-  db2 := TVDb.Create;
-  td2 := TVTableDb.Create(db2);
-  try
-    db2.Open(p);
-    td2.Open(p);
-    if td2.RlsEnabled('t') then Ok('RLS bayragi yeniden acilista korundu', '')
-    else No('RLS bayragi yeniden acilista korundu', 'RLS kapali geldi');
-    if td2.PolicyCount = 1 then Ok('politika yeniden acilista korundu', '1')
-    else No('politika yeniden acilista korundu', IntToStr(td2.PolicyCount) + ' adet');
-    td2.SetCurrentRole('pu');
-    if td2.RlsApplies('t') then Ok('RLS etkin rol icin uygulaniyor', '')
-    else No('RLS etkin rol icin uygulaniyor', 'uygulanmadi');
-    if Length(td2.RlsUsing('t', 1)) = 1 then Ok('politika kosulu geri yuklendi', '')
-    else No('politika kosulu geri yuklendi', 'kosul yok');
-  finally
-    td2.Free;
-    db2.Free;
-  end;
+  { 2026-10-25 (v3): backend-farkinda yeniden acilis. }
+  NewDb(p);
+  if tb.RlsEnabled('t') then Ok('RLS bayragi yeniden acilista korundu', '')
+  else No('RLS bayragi yeniden acilista korundu', 'RLS kapali geldi');
+  if tb.PolicyCount = 1 then Ok('politika yeniden acilista korundu', '1')
+  else No('politika yeniden acilista korundu', IntToStr(tb.PolicyCount) + ' adet');
+  tb.SetCurrentRole('pu');
+  if tb.RlsApplies('t') then Ok('RLS etkin rol icin uygulaniyor', '')
+  else No('RLS etkin rol icin uygulaniyor', 'uygulanmadi');
+  if Length(tb.RlsUsing('t', 1)) = 1 then Ok('politika kosulu geri yuklendi', '')
+  else No('politika kosulu geri yuklendi', 'kosul yok');
 
   Ok('RLS kalicilik', '');
 end;
@@ -10999,6 +10986,7 @@ end;
 procedure T117_Generated;
 var
   kv2: TVDb;
+  be2: IVdbBackend;
   tb2: TVTableDb;
   sq2: TVSql;
   r: TSqlResult;
@@ -11007,14 +10995,27 @@ var
 begin
   Grp('M10 GENERATED ALWAYS AS (STORED)');
   ForceDirectories(D + PathDelim + 'gen');
-  kv2 := TVDb.Create;
-  try
+  { 2026-10-25 (v3): bagimsiz gecici veritabani artik backend-farkinda
+    acilir; onceden elle TVDb.Create kullandigi icin v3 kosusunda
+    ATLA listesindeydi. }
+  kv2 := nil;
+  be2 := nil;
+  if gV3 then
+  begin
+    be2 := TVdbBackendV3.Create(D + PathDelim + 'gen' + PathDelim +
+      'veritabani.odb', True, 64);
+    tb2 := TVTableDb.CreateBackend(be2);
+  end
+  else
+  begin
+    kv2 := TVDb.Create;
     kv2.Open(D + PathDelim + 'gen');
     tb2 := TVTableDb.Create(kv2);
+  end;
+  try
+    tb2.Open(D + PathDelim + 'gen');
+    sq2 := TVSql.Create(tb2);
     try
-      tb2.Open(D + PathDelim + 'gen');
-      sq2 := TVSql.Create(tb2);
-      try
         sq2.Exec('CREATE TABLE g(a INTEGER PRIMARY KEY, b INTEGER, ' +
           'c INTEGER GENERATED ALWAYS AS (b * 2) STORED)');
         sq2.Exec('INSERT INTO g(a,b) VALUES (1,5)');
@@ -11130,24 +11131,34 @@ begin
       finally
         sq2.Free;
       end;
-    finally
-      tb2.Close;
-      tb2.Free;
-    end;
   finally
-    kv2.Close;
-    kv2.Free;
+    tb2.Close;
+    tb2.Free;
+    if kv2 <> nil then
+    begin
+      kv2.Close;
+      kv2.Free;
+    end;
+    be2 := nil;
   end;
 
   // Sema 6. alan (hex ifade) ile yeniden acilista korunur.
-  kv2 := TVDb.Create;
-  try
+  if gV3 then
+  begin
+    be2 := TVdbBackendV3.Create(D + PathDelim + 'gen' + PathDelim +
+      'veritabani.odb', False, 64);
+    tb2 := TVTableDb.CreateBackend(be2);
+  end
+  else
+  begin
+    kv2 := TVDb.Create;
     kv2.Open(D + PathDelim + 'gen');
     tb2 := TVTableDb.Create(kv2);
+  end;
+  try
+    tb2.Open(D + PathDelim + 'gen');
+    sq2 := TVSql.Create(tb2);
     try
-      tb2.Open(D + PathDelim + 'gen');
-      sq2 := TVSql.Create(tb2);
-      try
         r := sq2.Exec('SELECT c FROM g WHERE a=2');
         Dogrula('generated yeniden acilis (c=14)',
           (Length(r.Rows) = 1) and (r.Rows[0][0] = '14'),
@@ -11178,13 +11189,15 @@ begin
       finally
         sq2.Free;
       end;
-    finally
-      tb2.Close;
-      tb2.Free;
-    end;
   finally
-    kv2.Close;
-    kv2.Free;
+    tb2.Close;
+    tb2.Free;
+    if kv2 <> nil then
+    begin
+      kv2.Close;
+      kv2.Free;
+    end;
+    be2 := nil;
   end;
 end;
 
@@ -16065,13 +16078,13 @@ const
     yonetim komutlarini sinayan testler. (BACKUP/VACUUM/VERIFY artik
     v3'te backend uzerinden calisir; T15_Bakim bu yuzden listede degil.)
 
-    2026-10-25: T64 ve T65 ARTIK KOSAR (tek engelleri reopen'in elle
-    TVDb.Create ile yapilmasiydi; backend-farkinda `NewDb` ile degistirildi).
-    Ayni desen digerlerinde de var; sirayla tasinacak. }
-  V2_ONLY: array[0..55] of string = (
+    2026-10-25: T64, T65, T94, T94c ve T117 ARTIK KOSAR (tek engelleri
+    reopen'in elle TVDb.Create ile yapilmasiydi; backend-farkinda `NewDb`
+    ya da `TVdbBackendV3` ile degistirildi). Ayni desen digerlerinde de
+    var; sirayla tasinacak. }
+  V2_ONLY: array[0..52] of string = (
     'T101_TcpReplication',
     'T105_ShowStats',
-    'T117_Generated',
     'T122_KvStore',
     'T125_KolonSifreleme',
     'T126_F42_TxIsolation',
@@ -16121,8 +16134,6 @@ const
     'T78_AsofGecmis',
     'T79_Savepoint',
     'T92_MVCC_Isoaltion',
-    'T94_RBAC_Persist',
-    'T94c_RLS_Persist',
     'T95_WALArsiv',
     'T95b_Replication'
   );
