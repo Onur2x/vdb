@@ -120,6 +120,7 @@ tamamlandı:
 | `UYGULAMA_GELISTIRME.md` | tamam; uygulama geliştirici kılavuzu (12 bölüm) |
 | `SHOW STATS` + `/metrics` v3'te | tamam; v2 sayaçları yerine `engine`, `live_keys`, `.odb/.wal/.idx` boyutları |
 | `sqltest --backend=v3` | **2347 geçen / 0 kalan / 52 atlanan** (v2: 3116/0/0) |
+| **`v3.1.1` etiketi** | atıldı ve push edildi (`8bfca69`); CI run `40201040319` **18/18 adım yeşil** |
 
 Geçişte bulunan gerçek hatalar (hepsi veri bütünlüğü/dosya kilidi/erişim):
 
@@ -146,6 +147,34 @@ Geçişte bulunan gerçek hatalar (hepsi veri bütünlüğü/dosya kilidi/erişi
 Ayrıca beş test (T64, T65, T94, T94c, T105) v3 koşusuna taşındı; tek engelleri
 yeniden açılışı elle `TVDb.Create` ile yapmalarıydı. v3 atlanan sayısı
 **58 → 52**.
+
+### v3 "bitti" — kapanış kaydı (2026-10-25)
+
+v3 bu noktada uygulama geliştirmeye hazır ilan edildi:
+
+- Motorda bilinen veri kaybı/açık hata yok; 9 kapı + `sqltest` iki motorda
+  `kalan=0`.
+- CI 18/18 yeşil; **örnekler artık kapıda derleniyor** (12/12), yani
+  uygulama geliştiricinin belgesi sessizce çürüyemez.
+- `examples/build_all.bat` 14/14 (12 örnek + `sqltest` + `vdbapi`).
+- API yüzeyi sabit: yeni uygulamalar `VDbFactory` + `TVTableDb.CreateBackend`
+  kullanır, `TVDb`'yi tanımaz.
+- Kalan işler v3.2: `SAVEPOINT`/kısmi geri alma, PITR/WAL arşivi,
+  replikasyon, zone map, `ALTER DATABASE KEY`, TCP sunucusunda v3.
+  Hepsi bugün **açık hata** verir, sessiz yanlış sonuç üretmez.
+
+CI'da düzeltilen iki kusur (bu kapanışta bulundu):
+
+1. `sqltest --backend=v3` adımının son kontrolü `atlanan=[1-9]` idi; yani
+   hiç test atlanmazsa adım **kırmızı** oluyordu. Mantık tersti; kontrol
+   "atlanan sayısı raporlanmalı" (`atlanan=\d+`) yapıldı.
+2. `examples/` hiçbir kapıdan geçmiyordu. İlk denemede adım
+   `fpc.exe bulunamadi (lazRoot=C:\lazarus)` ile düştü: arama
+   `bin\i386-win32\fpc.exe` ile sabitlenmişti, CI'daki FPC paketi yalnız
+   win64 birimleriyle geliyor. Arama hedef dizininden bağımsız hale getirildi
+   (`i386-win32` varsa tercih edilir, yoksa ilk bulunan) ve adım artık
+   hatayı **annotation** olarak yayınlıyor — iş logları anonim okunamadığı
+   için teşhis bu yolla yapıldı.
 
 ### Sıradaki sürüme ertelenen (v3.2)
 - Sıralı anahtar düzeni + B+tree yaprakları → **BETWEEN / aralık sorguları**
