@@ -45,13 +45,13 @@ uses
   Interfaces, // LCL widgetset (win32) — bu olmadan WSRegister* linklenemez
   Classes, SysUtils, Forms, Controls, Graphics, Dialogs, StdCtrls,
   ExtCtrls, ComCtrls, DB, DBCtrls, DBGrids, Grids,
-  VDbCore, VDbTable, VDbSql, VDbAst, VDbDataSet;
+  VDbBackendApi, VDbFactory, VDbTable, VDbSql, VDbAst, VDbDataSet;
 
 type
   TfrmMain = class(TForm)
   private
     // VDB katmanlari / database layers
-    KV: TVDb;
+    Be: IVdbBackend;
     TB: TVTableDb;
     SQ: TVSql;
     // Veri bilesenleri / data components
@@ -317,10 +317,9 @@ begin
   if Assigned(SQ) then Exit;   // zaten acik / already open
 
   FDBPath := 'ornek11_db';
-  KV := TVDb.Create;
-  TB := TVTableDb.Create(KV);
+  VdbOpenOrCreate(FDBPath, Be);
+  TB := TVTableDb.CreateBackend(Be);
   SQ := TVSql.Create(TB);
-  KV.Open(FDBPath);
   TB.Open(FDBPath);
   Qry.SqlEngine := SQ;
 
@@ -540,7 +539,7 @@ begin
   FreeAndNil(Qry);
   FreeAndNil(SQ);
   FreeAndNil(TB);
-  FreeAndNil(KV);
+  Be := nil;
 end;
 
 { ===================================================================== }

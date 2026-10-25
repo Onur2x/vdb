@@ -9,10 +9,10 @@ program ornek05_join;
 {$mode delphi}{$H+}
 
 uses
-  SysUtils, VDbCore, VDbTable, VDbSql;
+  SysUtils, VDbBackendApi, VDbFactory, VDbTable, VDbSql;
 
 var
-  KV: TVDb;
+  Be: IVdbBackend;
   TB: TVTableDb;
   SQ: TVSql;
   R: TSqlResult;
@@ -40,11 +40,10 @@ begin
   WriteLn('=== VDB JOIN İşlemleri / JOIN Operations ===');
   WriteLn;
 
-  KV := TVDb.Create;
-  TB := TVTableDb.Create(KV);
+  VdbOpenOrCreate('ornek05_db', Be);
+  TB := TVTableDb.CreateBackend(Be);
   SQ := TVSql.Create(TB);
   try
-    KV.Open('ornek05_db');
     TB.Open('ornek05_db');
 
     SQ.Exec('CREATE TABLE departman (id INTEGER PRIMARY KEY, ad TEXT)');
@@ -71,7 +70,7 @@ begin
   finally
     SQ.Free;
     TB.Free;
-    KV.Free;
+    Be := nil;
   end;
 
   WriteLn;

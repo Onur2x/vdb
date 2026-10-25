@@ -9,10 +9,10 @@ program ornek03_crud;
 {$mode delphi}{$H+}
 
 uses
-  SysUtils, VDbCore, VDbTable, VDbSql;
+  SysUtils, VDbBackendApi, VDbFactory, VDbTable, VDbSql;
 
 var
-  KV: TVDb;
+  Be: IVdbBackend;
   TB: TVTableDb;
   SQ: TVSql;
   R: TSqlResult;
@@ -40,11 +40,10 @@ begin
   WriteLn('=== VDB CRUD İşlemleri / CRUD Operations ===');
   WriteLn;
 
-  KV := TVDb.Create;
-  TB := TVTableDb.Create(KV);
+  VdbOpenOrCreate('ornek03_db', Be);
+  TB := TVTableDb.CreateBackend(Be);
   SQ := TVSql.Create(TB);
   try
-    KV.Open('ornek03_db');
     TB.Open('ornek03_db');
 
     // CREATE
@@ -77,7 +76,7 @@ begin
   finally
     SQ.Free;
     TB.Free;
-    KV.Free;
+    Be := nil;
   end;
 
   WriteLn;

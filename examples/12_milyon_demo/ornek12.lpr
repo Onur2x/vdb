@@ -49,7 +49,7 @@ uses
   Interfaces, // LCL widgetset
   Classes, SysUtils, DateUtils, Forms, Controls, Graphics, Dialogs, StdCtrls,
   ExtCtrls, ComCtrls, DB, DBCtrls, DBGrids, Grids,
-  VDbCore, VDbTable, VDbSql, VDbAst, VDbDataSet;
+  VDbBackendApi, VDbFactory, VDbTable, VDbSql, VDbAst, VDbDataSet;
 
 const
   DEMO_TABLE = 'vdb_buyuk';
@@ -69,7 +69,7 @@ const
 type
   TDemoForm = class(TForm)
   private
-    KV: TVDb;
+    Be: IVdbBackend;
     TB: TVTableDb;
     SQ: TVSql;
     Qry: TVDbQuery;
@@ -562,10 +562,9 @@ begin
   if Assigned(SQ) then Exit;
 
   FDBPath := ExtractFilePath(ParamStr(0)) + 'milyon_demo_db';
-  KV := TVDb.Create;
-  TB := TVTableDb.Create(KV);
+  VdbOpenOrCreate(FDBPath, Be);
+  TB := TVTableDb.CreateBackend(Be);
   try
-    KV.Open(FDBPath);
     TB.Open(FDBPath);
     SQ := TVSql.Create(TB);
     Qry.SqlEngine := SQ;
@@ -574,7 +573,7 @@ begin
     begin
       FreeAndNil(SQ);
       FreeAndNil(TB);
-      FreeAndNil(KV);
+      Be := nil;
       SetStatus(L('Veritabani acilamadi: ', 'Cannot open database: ') + E.Message);
       Exit;
     end;
@@ -622,7 +621,7 @@ begin
   end;
   FreeAndNil(SQ);
   FreeAndNil(TB);
-  FreeAndNil(KV);
+  Be := nil;
 end;
 
 function TDemoForm.TableExists: Boolean;

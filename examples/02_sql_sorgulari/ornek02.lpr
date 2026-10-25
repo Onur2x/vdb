@@ -9,10 +9,10 @@ program ornek02_sql;
 {$mode delphi}{$H+}
 
 uses
-  SysUtils, VDbCore, VDbTable, VDbSql;
+  SysUtils, VDbBackendApi, VDbFactory, VDbTable, VDbSql;
 
 var
-  KV: TVDb;
+  Be: IVdbBackend;
   TB: TVTableDb;
   SQ: TVSql;
   R: TSqlResult;
@@ -40,11 +40,10 @@ begin
   WriteLn('=== VDB SQL Sorguları / SQL Queries ===');
   WriteLn;
 
-  KV := TVDb.Create;
-  TB := TVTableDb.Create(KV);
+  VdbOpenOrCreate('ornek02_db', Be);
+  TB := TVTableDb.CreateBackend(Be);
   SQ := TVSql.Create(TB);
   try
-    KV.Open('ornek02_db');
     TB.Open('ornek02_db');
 
     // TR: Test verisi oluştur / Create test data
@@ -74,7 +73,7 @@ begin
   finally
     SQ.Free;
     TB.Free;
-    KV.Free;
+    Be := nil;
   end;
 
   WriteLn;

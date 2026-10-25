@@ -9,10 +9,10 @@ program ornek01_basit;
 {$mode delphi}{$H+}
 
 uses
-  SysUtils, VDbCore, VDbTable, VDbSql;
+  SysUtils, VDbBackendApi, VDbFactory, VDbTable, VDbSql;
 
 var
-  KV: TVDb;
+  Be: IVdbBackend;
   TB: TVTableDb;
   SQ: TVSql;
   R: TSqlResult;
@@ -25,14 +25,13 @@ begin
   // TR: Veritabanı yolu / Database path
   DBPath := 'ornek01_db';
 
-  // TR: Veritabanı katmanlarını oluştur / Create database layers
-  KV := TVDb.Create;
-  TB := TVTableDb.Create(KV);
+  // TR: v3 veritabanını aç (yoksa oluştur) / Open v3 db (create if missing)
+  VdbOpenOrCreate(DBPath, Be);
+  TB := TVTableDb.CreateBackend(Be);
   SQ := TVSql.Create(TB);
   try
     // TR: Veritabanını aç / Open database
     WriteLn('1. Veritabanı açılıyor... / Opening database...');
-    KV.Open(DBPath);
     TB.Open(DBPath);
     WriteLn('   OK / Success');
 
@@ -74,7 +73,7 @@ begin
   finally
     SQ.Free;
     TB.Free;
-    KV.Free;
+    Be := nil;
   end;
 
   WriteLn;
