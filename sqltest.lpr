@@ -16766,8 +16766,28 @@ procedure T155_AsofV32;
        yazilmaz, gecici dosya silinir.
     3) Pencere bos (checkpoint gecmisi sildi) ise v2 ile ayni acik hata. }
 var
-  a1, a2, a3, a4, a5: Integer;
+  a1, a2, a3, a4, a5, e1: Integer;
   dir, bak: string;
+  beE: IVdbBackend;
+  tbE: TVTableDb;
+  sqE: TVSql;
+  rr: TSqlResult;
+
+  function AsOfLeftoverOf(const ADir: string): Integer;
+  var
+    sr: TSearchRec;
+    n: Integer;
+  begin
+    n := 0;
+    if FindFirst(ADir + PathDelim + '*.asof*', faAnyFile, sr) = 0 then
+    begin
+      repeat
+        if (sr.Name <> '.') and (sr.Name <> '..') then Inc(n);
+      until FindNext(sr) <> 0;
+      FindClose(sr);
+    end;
+    Result := n;
+  end;
 
   function AsOfSeq: Integer;
   begin
@@ -16780,19 +16800,8 @@ var
   end;
 
   function AsOfLeftover: Integer;
-  var
-    sr: TSearchRec;
-    n: Integer;
   begin
-    n := 0;
-    if FindFirst(dir + PathDelim + '*.asof*', faAnyFile, sr) = 0 then
-    begin
-      repeat
-        if (sr.Name <> '.') and (sr.Name <> '..') then Inc(n);
-      until FindNext(sr) <> 0;
-      FindClose(sr);
-    end;
-    Result := n;
+    Result := AsOfLeftoverOf(dir);
   end;
 
 begin
@@ -16898,6 +16907,36 @@ begin
   ChkErr('gecmis yokken AS OF reddedilir',
     'SELECT ad FROM k AS OF SEQUENCE 0');
   Chk('gecmis yokken normal sorgu calisir', 'SELECT ad FROM k', 1);
+
+  // ---- v3: sifreli dosyada da anlik goruntu (taban kopyasi ham sifreli
+  //      sayfalardir; motor ayni anahtarla acilir) ----
+  if gV3 then
+  begin
+    ForceDirectories(D + PathDelim + 't155_enc');
+    beE := TVdbBackendV3.CreateWithPassword(
+      D + PathDelim + 't155_enc' + PathDelim + 'veritabani.odb', 'gizli', True, 64);
+    tbE := TVTableDb.CreateBackend(beE);
+    sqE := TVSql.Create(tbE);
+    try
+      tbE.Open(D + PathDelim + 't155_enc');
+      sqE.Exec('CREATE TABLE k(id INTEGER PRIMARY KEY, ad TEXT)');
+      sqE.Exec('INSERT INTO k(id,ad) VALUES(1,''bir'')');
+      e1 := beE.AsOfMaxSequence;
+      sqE.Exec('INSERT INTO k(id,ad) VALUES(2,''iki'')');
+      rr := sqE.Exec('SELECT COUNT(*) FROM k AS OF SEQUENCE ' + IntToStr(e1));
+      Dogrula('sifreli dosyada AS OF gecmisi okur',
+        (Length(rr.Rows) = 1) and (rr.Rows[0][0] = '1'), rr.Msg);
+      rr := sqE.Exec('SELECT COUNT(*) FROM k');
+      Dogrula('sifreli dosyada guncel veri bozulmadi',
+        (Length(rr.Rows) = 1) and (rr.Rows[0][0] = '2'), rr.Msg);
+      ChkInt('sifreli AS OF gecici dosya birakmadi',
+        AsOfLeftoverOf(D + PathDelim + 't155_enc'), 0);
+    finally
+      sqE.Free;
+      tbE.Free;
+      beE := nil;
+    end;
+  end;
 end;
 
 { Sprint 2.9: test kosucusu. Her test kendi try/except'inde kosar;

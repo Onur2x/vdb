@@ -195,9 +195,9 @@ Aşağıdakiler **tamamlandı ve iki motorda da test edildi** (aynı test hem
 | Akışlı top-N | T132 v3'te koşuyor | T132 | v3 geçti |
 | Rasgele diferansiyel | 200 sabit tohumlu SELECT; indeksli vs saf tarama | T147 | v3: 200/200, **0 fark** |
 | Oturum yalitimi | `FWriteSession` + `BatchIsMine`/`RequireBatchWrite`; v2 ile aynı kural (başka oturum görmez, yazamaz, commit edemez) | T126 (iki backend) | v3 geçti |
-| `AS OF SEQUENCE` | Sayfa imajlı WAL'den N'inci commit'in tam görüntüsü: `TVdbPageWal.Recover(MaxCommits)`, `TVdbPageEngine.RecoverLimit`, `TVDbPageStore.CopyBaseImageTo`, `IVdbBackend.ScanAllAt/AsOfMaxSequence`, `TVTableDb.ScanRowsAt`, executor anlık görüntü dalı; geçici kopya, canlı dosyaya yazmaz | T155 (iki backend) + `v3sqlchk` | v3: 2.755/0/33 |
+| `AS OF SEQUENCE` | Sayfa imajlı WAL'den N'inci commit'in tam görüntüsü: `TVdbPageWal.Recover(MaxCommits)`, `TVdbPageEngine.RecoverLimit`, `TVDbPageStore.CopyBaseImageTo`, `IVdbBackend.ScanAllAt/AsOfMaxSequence`, `TVTableDb.ScanRowsAt`, executor anlık görüntü dalı; geçici kopya, canlı dosyaya yazmaz (şifreli dosyada da çalışır) | T155 (iki backend) + `v3sqlchk` | v3: 2.758/0/33 |
 
-Son ölçüm: `sqltest --backend=v3` **2755 geçen / 0 kalan / 33 atlanan**,
+Son ölçüm: `sqltest --backend=v3` **2758 geçen / 0 kalan / 33 atlanan**,
 `--backend=v2` **3196 / 0 / 0**. Atlanan 33'ün tamamı v2'nin iç
 mekanizmalarına (blok CRC, undo, in-place, WAL kayıt biçimi) bağlı
 testlerdir — bunlar v3'te **yok** ve v3'te açık hata verir.
