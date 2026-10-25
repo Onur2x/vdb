@@ -221,6 +221,36 @@ begin
 end;
 {$ENDIF}
 
+{ Alt surec konsolsuz oldugu icin hatasi gorunmuyordu; test "gecersiz"
+  dediginde NEDENINI de yaz. Gunluk yoksa bos dizge doner. }
+function ChildDiag(const MarkerPath: string): string;
+var
+  p: string;
+  sl: TStringList;
+  i: Integer;
+begin
+  Result := '';
+  p := MarkerPath + '.log';
+  if not FileExists(p) then Exit;
+  sl := TStringList.Create;
+  try
+    try
+      sl.LoadFromFile(p);
+    except
+      Exit;
+    end;
+    for i := 0 to sl.Count - 1 do
+      if Trim(sl[i]) <> '' then
+      begin
+        if Result <> '' then Result := Result + ' | ';
+        Result := Result + Trim(sl[i]);
+      end;
+  finally
+    sl.Free;
+  end;
+  if Result <> '' then Result := '. alt surec gunlugu: ' + Result;
+end;
+
 procedure TestKill9(D: string);
 var
   path, markerPath: string;
@@ -301,7 +331,8 @@ begin
   marker := ReadMarker;
   if marker <= 0 then
   begin
-    Fail('kill -9: alt surec hic commit edemedi (test gecersiz)');
+    Fail('kill -9: alt surec hic commit edemedi (test gecersiz)' +
+      ChildDiag(markerPath));
     Exit;
   end;
 
@@ -662,7 +693,6 @@ var
   eng: TVdbPageEngine;
   i: Integer;
   v: TBytes;
-  sl: TStringList;
 
   { 2026-10-25 (Sprint 3.10): alt surec sessizce olurse nedeni
     gorunmuyordu (konsolu yok). Tani bilgisini isaret dosyasinin
@@ -683,6 +713,37 @@ var
       { tani dosyasi yazilamazsa sessiz gec }
     end;
     {$ENDIF}
+  end;
+
+  { 2026-10-25 (v3.1): Commit artik islem basina yalniz degisen sayfalari
+    yaziyor; alt surec eskisinden ~2x hizli isaret yaziyor. Ana surec 50 ms'de
+    bir AYNI dosyayi okurken Windows'ta paylasim ihlali (sharing violation)
+    olasiligi artti ve cocuk ilk isareti yazarken olurse test "gecersiz"
+    sayiliyordu. Isaret yazimini kisa araliklarla YENIDEN DENE; sonunda da
+    olme — bir sonraki isaret zaten gelecek (test sozlesmesi bozulmaz). }
+  function SaveMarker(const P, S: string): Boolean;
+  var
+    attempt: Integer;
+    sl: TStringList;
+  begin
+    Result := False;
+    for attempt := 1 to 50 do
+    begin
+      sl := TStringList.Create;
+      try
+        try
+          sl.Text := S;
+          sl.SaveToFile(P);
+          Result := True;
+          Exit;
+        except
+          { paylasim ihlali: kisa bekle, tekrar dene }
+        end;
+      finally
+        sl.Free;
+      end;
+      Sleep(10);
+    end;
   end;
 
 begin
@@ -711,13 +772,9 @@ begin
           Halt(4);
         end;
         {$ELSE}
-        sl := TStringList.Create;
-        try
-          sl.Text := IntToStr(i) + LineEnding;
-          sl.SaveToFile(MarkerPath);
-        finally
-          sl.Free;
-        end;
+        { Paylasim ihlali cocugu OLDURMEZ (v3.1); yalniz tanı yazilir. }
+        if not SaveMarker(MarkerPath, IntToStr(i) + LineEnding) then
+          Log(Format('MARKER YAZILAMADI (paylasim): i=%d', [i]));
         {$ENDIF}
         { Checkpoint seyrek: WAL'de commit edilmis cerceve kalsin ki
           kill -9 sonrasi replay yolu gercekten calissin. 2026-10-24:
