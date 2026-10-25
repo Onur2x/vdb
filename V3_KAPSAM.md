@@ -154,29 +154,29 @@ v3 koşusu yalnız "kapsam" değil, **gerçek kusurlar** ortaya çıkardı:
 |---|---|---|
 | `VERIFY` (sayfa CRC + heap) | **var** (Sprint 3.1) | 3.1 ✔ |
 | `BACKUP` / `RESTORE` (tek `.odb`, checkpoint sonrası sayfa kopyası) | **var** (Sprint 3.2) | 3.2 ✔ |
-| PITR (`RECOVER TO`) / WAL arşivi / `AS OF` | **yok**; `ecUnsupported` + yol gösteren mesaj (Sprint 3.6) | 3.6 ✔ (gerçek PITR v3.1) |
+| PITR (`RECOVER TO`) / WAL arşivi / `AS OF` | `AS OF SEQUENCE` v3.2'de **çalışır** (sayfa imajlı WAL'den anlık görüntü); `AS OF TIMESTAMP/VERSION`, `RECOVER TO`, `ARCHIVE WAL` → `ecUnsupported` + yol gösteren mesaj | 3.6 ✔ (gerçek PITR sonraki sürüm) |
 | `VACUUM` / `Compact` (canlı kayıtlar yeni dosyaya, atomik değişim) | **var** (Sprint 3.3) | 3.3 ✔ |
-| `AutoCompact` | **yok** — v3'te "ölü bayt oranı" kavramı yok; sıkıştırma her zaman açık işlemdir (`VACUUM`). Yönetim GUI'si VACUUM'a yönlendirir | — |
+| `AutoCompact` | **var** (v3.2) — v2 ile aynı varsayılan (KAPALI, %35, 4 MB); ölü alan = freelist sayfası × 4096 | 3.3 ✔ |
 | Sayfa düzeyi **AES-256-GCM** şifreleme (zarf: nonce+şifre+tag = 4124 B) | **var** (Sprint 3.4) | 3.4 ✔ |
-| `ALTER DATABASE KEY` (v2 kolon anahtarı rotasyonu) | `ecUnsupported`; v3'te dosya parolası açılışta verilir (`VdbOpenWithPassword`) | — |
-| Kayıt/kolon düzeyi şifreleme (v2 tarzı) | yok; sayfa şifreleme tüm veriyi kapsar | — |
+| `ALTER DATABASE KEY` | **var** (v3.2): dosya bütünü yeni parola ile yeniden şifrelenir (tmp + `.bak`, hata→eski kimlik) | 3.2 ✔ |
+| Kolon düzeyi `ENCRYPTED` | **var** (v3.2): değerler dosya şifrelemesiyle korunur; şifresiz dosyada açık hata; `.colkey` biçimi v2 ile aynı | 3.2 ✔ |
 | `START REPLICATION` / `PUMP` / slot / `SHOW` / `STOP` | **yok**; hepsi `ecUnsupported` + "v3.1: mantıksal günlük" (Sprint 3.5) | 3.5 ✔ (gerçek replikasyon v3.2) |
 | Zone map (bölüm budama) | **kapalı**: v3 düz tam tarama yapar; sonuçlar birebir doğru (Sprint 3.7) | 3.7 ✔ (budama v3.2) |
-| `SAVEPOINT` | `ecUnsupported` (örnek 04 bunu çalışma anında bildirir) | v3.2 |
+| `SAVEPOINT` | **var** (v3.2) — v2 ile aynı sözleşme (yinelenen isim hata, hedef rollback sonrası kalır, RELEASE commit etmez) | 3.2 ✔ |
 | B+tree / BETWEEN hızlandırma / `.idx` varint | yok | v3.2 |
 
 ## 5. Yeniden üretme
 
 ```
 lazbuild -B sqltest.lpi
-sqltest.exe <dir> --backend=v2   # SONUC: gecen=3116 kalan=0 atlanan=0
-sqltest.exe <dir2> --backend=v3  # SONUC: gecen=2252 kalan=0 atlanan=58
+sqltest.exe <dir> --backend=v2   # SONUC: gecen=3196 kalan=0 atlanan=0
+sqltest.exe <dir2> --backend=v3  # SONUC: gecen=2755 kalan=0 atlanan=33
 ```
 
-Kapılar (yeniden koşuldu, hepsi yeşil):
+Kapılar (v3.2 sonrası yeniden koşuldu, hepsi yeşil):
 `pagechk 21/21`, `storechk 15/15`, `heapchk 20/20`, `idxchk 17/17`,
 `crashtest 11/11`, `backendchk 108/108` (v3.1: 19 sayaç kontrolü eklendi),
-`v3sqlchk 128/128`, `migchk 13/13`, `factorychk 13/13`.
+`v3sqlchk 132/132`, `migchk 13/13`, `factorychk 13/13`.
 
 ## 4b. Uygulama giriş noktası: `VDbFactory` (2026-10-25)
 
@@ -280,15 +280,19 @@ yerine **ölçülebilir bir sözleşme** verir:
 | Yetenek | v3.0 davranışı | Test |
 |---|---|---|
 | `START REPLICATION` (dosya/TCP), `PUMP`, `CREATE/DROP REPLICATION SLOT`, `SHOW REPLICATION STATUS/SLOTS`, `STOP REPLICATION` | `ecUnsupported`, mesaj `REPLICATION v3 sayfa motorunda yok (v3.1: mantiksal gunluk ile gelecek)` | `v3sqlchk` 9 kontrol: hiçbiri dosya bırakmaz, veri bozulmaz, yeniden açılış sağlam |
-| `AS OF SEQUENCE/VERSION/TIMESTAMP`, `ARCHIVE WAL SET/LIST`, `RECOVER TO NOW/TIMESTAMP` | `ecUnsupported`, mesaj `PITR / WAL arsivi ... (v3.1: ... mantiksal gunluk ...)` veya `AS OF v3 ... (v3.1: ...)` | `v3sqlchk` 8 kontrol: güncel okuma/PK erişimi etkilenmez, arşiv dizini oluşmaz, `VERIFY` geçer |
+| `AS OF SEQUENCE n` | **v3.2'de çalışır**: WAL penceresindeki n'inci commit'in tam görüntüsü geçici bir kopyada kurulur (canlı dosyaya yazılmaz); n = commit sayısı, sınır aşılırsa son commit'e kırpılır | `sqltest T155` (iki backend) + `v3sqlchk` AS OF SEQUENCE kontrolleri |
+| `AS OF TIMESTAMP/VERSION`, `ARCHIVE WAL SET/LIST`, `RECOVER TO NOW/TIMESTAMP` | `ecUnsupported` (mantıksal günlük / zaman damgası gerekir) | `v3sqlchk` TestPitrUnsupported: güncel okuma etkilenmez, arşiv dizini oluşmaz, `VERIFY` geçer |
 | Zone map | **budama yok**: `Kv = nil` olduğu için v3 genel tam tarama yolunu kullanır | `v3sqlchk` 22 kontrol: 3000 satırda 8 aralık + eşitlik/`IN`/`<>`/karma sorgular Pascal'da hesaplanan beklentiyle **birebir** |
 
-Gerekçe: v3 WAL'i **sayfa imajı** tutar (mantıksal kayıt yok), dolayısıyla
-zamansal sorgu ve mantıksal replikasyon için gereken anahtar/değer geçmişi
-yoktur. Zone map ise v2'nin ham kayıt ofsetlerine dayanır; v3 heap hücre
-biçiminde yeniden inşa edilmesi gerekir. Üçü de sıradaki sürüme (mantıksal
-günlük ve sayfa biçimine uyarlanmış bölüm haritası) bırakıldı; v3.0 ve v3.1
-kabul hedefleri performans olduğu için bu ödün bilinçlidir.
+Gerekçe: v3 WAL'i **sayfa imajı** tutar (mantıksal kayıt yok). Zamansal
+sorgu için bu yeterlidir: n'inci commit'in tam veritabanı görüntüsü, son
+checkpoint tabanı + o noktaya kadar WAL replay ile kurulur (`AS OF SEQUENCE`).
+Buna karşılık **satır düzeyinde eski değer** ve **zaman damgası** yoktur;
+bu yüzden `AS OF TIMESTAMP/VERSION`, `RECOVER TO` ve mantıksal replikasyon
+hâlâ `ecUnsupported`. Zone map ise v2'nin ham kayıt ofsetlerine dayanır; v3
+heap hücre biçiminde yeniden inşa edilmesi gerekir. İkisi de sıradaki
+sürüme (mantıksal günlük ve sayfa biçimine uyarlanmış bölüm haritası)
+bırakıldı.
 
 ### Sayfa şifreleme (Sprint 3.4)
 

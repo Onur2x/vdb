@@ -8859,6 +8859,7 @@ var
   vals: TStrArray;
   st: TAsOfSt;
   touched: Boolean;
+  seq, actual: Integer;
 
   procedure ResetSt(var S: TAsOfSt);
   begin
@@ -8884,6 +8885,32 @@ begin
   SetLength(Pks, 0);
   SetLength(Rows, 0);
   outn := 0;
+
+  { v3.2: v3 sayfa motoru — WAL'de mantiksal kayit yok, ama sayfa imajlari
+    N'inci commit'in TAM veritabani goruntusunu verir. Goruntu gecici bir
+    kopyada kurulur; satirlar oradan okunur ve WHERE/ORDER BY/GROUP BY/
+    LIMIT/OFFSET aynen guncel veri hattindan gecer. }
+  if FT.Kv = nil then
+  begin
+    if Stmt.AsOfValue > QWord(High(Integer)) then
+      seq := High(Integer)
+    else
+      seq := Integer(Stmt.AsOfValue);
+    if not FT.ScanRowsAt(Stmt.FromTable, seq, Pks, Rows, actual) then
+      raise EVDbException.Create(ecUnsupported,
+        'AS OF: bu backend anlik goruntu sunmuyor');
+    if actual < 0 then
+      raise EVDbException.Create(ecUnsupported,
+        'AS OF: WAL gecmisi yok (son checkpoint gecmisi sildi); ' +
+        'sorgulanacak an kayitli degil');
+    for i := 0 to High(Rows) do
+      if Length(Rows[i]) <> Length(ColNames) then
+        raise EVDbException.CreateFmt(ecUnsupported,
+          'AS OF: gecmis satir semasi (%d kolon) guncel semadan (%d kolon) ' +
+          'farkli; ALTER TABLE sonrasi gecmis okunamaz (pk=%s)',
+          [Length(Rows[i]), Length(ColNames), Pks[i]]);
+    Exit;
+  end;
 
   cnt := FT.Kv.WalRecordCount;
   if cnt <= 0 then
@@ -11925,13 +11952,10 @@ begin
   //  gecmis goruntusu yalnizca tek tablo taramasinda kurulabilir.)
   if Stmt.AsOf <> saoNone then
   begin
-    { Sprint 3.6: sayfa WAL'i mantiksal gunluk tutmaz (yalniz sayfa imaji),
-      bu yuzden v3'te zaman yolculugu/PITR yok. Kv = nil iken
-      BuildAsOfRows nil'e dokunur; acik hata verilir. }
-    if FT.Kv = nil then
-      raise EVDbException.Create(ecUnsupported,
-        'AS OF v3 sayfa motorunda yok (v3.1: sayfa WAL''i uzerinde ' +
-        'zaman yolculugu ile gelecek)');
+    { v3.2: v3'un sayfa WAL'i mantiksal gunluk TUTMAZ; ama sayfa imajlari
+      WAL penceresindeki herhangi bir commit'in TAM veritabani goruntusunu
+      yeniden kurmaya yeter. Bu yol BuildAsOfRows icinde, gecici bir kopya
+      uzerinde kurulur (v3.1'deki "v3'te AS OF yok" sinirlamasi kalkti). }
     if Stmt.HasJoin then
       raise EVDbException.Create(ecUnsupported,
         'AS OF ile JOIN desteklenmiyor (yalnizca tek tablo taranir)');
@@ -11941,11 +11965,13 @@ begin
     if Stmt.AsOf = saoTimestamp then
       raise EVDbException.Create(ecUnsupported,
         'AS OF TIMESTAMP desteklenmiyor: WAL kayitlarinda zaman damgasi yoktur; ' +
-        'AS OF SEQUENCE <n> kullanin (n = WAL kayit indeksi)');
+        'AS OF SEQUENCE <n> kullanin (v2: n = WAL kayit indeksi, ' +
+        'v3: n = WAL commit sayisi)');
     if Stmt.AsOf = saoVersion then
       raise EVDbException.Create(ecUnsupported,
         'AS OF VERSION desteklenmiyor: WAL kayitlarinda surum numarasi yoktur; ' +
-        'AS OF SEQUENCE <n> kullanin (n = WAL kayit indeksi)');
+        'AS OF SEQUENCE <n> kullanin (v2: n = WAL kayit indeksi, ' +
+        'v3: n = WAL commit sayisi)');
   end;
 
   // FROM'suz SELECT: SELECT 1, 'abc' AS x, NULL

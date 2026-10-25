@@ -916,15 +916,17 @@ begin
   end;
 end;
 
-  { Sprint 3.6: PITR / zaman yolculugu. Sayfa WAL'i yalniz sayfa imaji
-  tutar; mantiksal gunluk (zaman damgasi/surum) olmadigi icin v3'te
-  AS OF / RECOVER TO / WAL arsivi ACIKCA reddedilir. }
+  { Sprint 3.6 + v3.2: PITR / zaman yolculugu.
+    v3.1'de sayfa WAL'i yalniz sayfa imaji tuttugu icin AS OF/RECOVER TO/WAL
+    arsivi ACIKCA reddediliyordu. v3.2'de AS OF SEQUENCE artik CALISIR:
+    sayfa imajlari N'inci commit'in tam goruntusunu vermeye yeter, goruntu
+    gecici bir kopyada kurulur. Mantiksal gunluk gerektiren yollar
+    (AS OF TIMESTAMP/VERSION, RECOVER TO, ARCHIVE WAL) hala reddedilir. }
 procedure TestPitrUnsupported;
 var
   S: TV3Sql;
   r: TSqlResult;
-  code, msg, base: string;
-  sr: TSearchRec;
+  code, msg, base, sep: string;
   found: Boolean;
 
   procedure ExpectPitrUnsupported(const Sql: string);
@@ -933,15 +935,16 @@ var
       Fail('pitr: hata bekleniyordu: ' + Sql)
     else if code <> 'ecUnsupported' then
       Fail('pitr: kod ' + code + ' (ecUnsupported bekleniyordu): ' + Sql)
-    else if Pos('v3.1', msg) = 0 then
-      Fail('pitr: mesajda v3.1 yok: ' + msg)
+    else if (Pos('v3.1', msg) = 0) and (Pos('desteklenmiyor', msg) = 0) then
+      Fail('pitr: mesaj yol gostermiyor: ' + msg)
     else
       Ok('pitr: ecUnsupported -> ' + Sql);
   end;
 
 begin
   WriteLn;
-  WriteLn('Sprint 3.6 - v3''te PITR / zaman yolculugu: acik ecUnsupported');
+  WriteLn('Sprint 3.6/v3.2 - v3 PITR: AS OF SEQUENCE calisir, ' +
+    'mantiksal gunluk gerektiren yollar ecUnsupported');
   CleanDir;
   base := IncludeTrailingPathDelimiter(gDir);
   OpenV3(S, 'pitr.odb', True);
@@ -951,10 +954,29 @@ begin
     r := Exec(S, 'INSERT INTO t VALUES (1, ''Ali''), (2, ''Veli'')');
     if not gErr then Ok('pitr: 2 satir yazildi') else Fail('pitr: INSERT: ' + r.Msg);
 
-    ExpectPitrUnsupported('SELECT id FROM t AS OF SEQUENCE 0');
+    { v3.2: AS OF SEQUENCE artik gecmis okur (gecici kopya uzerinde).
+      N = WAL penceresindeki COMMIT sayisi: 0 = WAL tabani (bu dosyada
+      CREATE TABLE oncesi -> bos), en buyuk deger = guncel durum. }
+    r := Exec(S, 'SELECT COUNT(*) FROM t AS OF SEQUENCE ' +
+      IntToStr(S.Be.AsOfMaxSequence));
+    if (not gErr) and (Cel(r, 0, 0) = '2') then
+      Ok('pitr: AS OF SEQUENCE <son> guncel goruntuyu okur')
+    else
+      Fail('pitr: AS OF SEQUENCE <son>: ' + r.Msg);
+    r := Exec(S, 'SELECT COUNT(*) FROM t AS OF SEQUENCE 0');
+    if (not gErr) and (Cel(r, 0, 0) = '0') then
+      Ok('pitr: AS OF SEQUENCE 0 WAL tabanini okur (tablo henuz yok)')
+    else
+      Fail('pitr: AS OF SEQUENCE 0: ' + r.Msg);
+    r := Exec(S, 'SELECT id FROM t AS OF SEQUENCE 1');
+    if (not gErr) and (Length(r.Rows) = 0) then
+      Ok('pitr: AS OF SEQUENCE 1 tablo bos goruntusu')
+    else
+      Fail('pitr: AS OF SEQUENCE 1: ' + r.Msg);
+
+    { Mantiksal gunluk gerektiren yollar hala kapali. }
     ExpectPitrUnsupported('SELECT id FROM t AS OF VERSION 3');
     ExpectPitrUnsupported('SELECT id FROM t AS OF TIMESTAMP ''2026-10-25 12:00:00''');
-    ExpectPitrUnsupported('SELECT COUNT(*) FROM t AS OF SEQUENCE 0');
     ExpectPitrUnsupported('ARCHIVE WAL SET DIR=''' + base + 'arsiv''');
     ExpectPitrUnsupported('ARCHIVE WAL LIST');
     ExpectPitrUnsupported('RECOVER TO NOW');

@@ -43,6 +43,12 @@ type
     function ScanRawIterAll(TableFilter: Integer;
       Cb: TVDbRawCb; User: Pointer): Boolean;
     function CountTable(TableFilter: Integer): Int64;
+    { v3.2: v2'de AS OF mantiksal WAL kayitlari uzerinden VDbExecutor'da
+      kurulur; burada anlik kopya yolu YOKTUR (False). }
+    function ScanAllAt(TableFilter, Sequence: Integer;
+      out Keys: TQWordArray; out Vals: TValArray;
+      out ActualSequence: Integer): Boolean;
+    function AsOfMaxSequence: Integer;
 
     procedure BeginBatch;
     procedure CommitBatch;
@@ -169,6 +175,24 @@ begin
   { v2'de dogrulanmis COUNT onbellegi TVDb tarafindadir (KR-1B);
     burada O(1) bir kaynak yok. Cagiran tam tarama yapar. }
   Result := -1;
+end;
+
+function TVDbBackendV2.ScanAllAt(TableFilter, Sequence: Integer;
+  out Keys: TQWordArray; out Vals: TValArray;
+  out ActualSequence: Integer): Boolean;
+begin
+  { v2: mantiksal WAL gunlugu VDbExecutor.BuildAsOfRows'ta okunur; sayfa
+    imaji kopyasi gerekmez. Cagiran eski yolu kullanir. }
+  Keys := nil;
+  Vals := nil;
+  ActualSequence := 0;
+  Result := False;
+end;
+
+function TVDbBackendV2.AsOfMaxSequence: Integer;
+begin
+  { v2 AS OF SEQUENCE: 0 tabanli WAL kayit indeksi (WalRecordCount-1'e kirpilir). }
+  Result := FDb.WalRecordCount;
 end;
 
 procedure TVDbBackendV2.BeginBatch;

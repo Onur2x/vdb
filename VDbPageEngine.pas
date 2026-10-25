@@ -75,6 +75,9 @@ type
       FHasPassword: Boolean;
       { v3.1: `.idx`'e yazilacak etiket ozeti saglayicisi (backend atar). }
       FOnTagSummary: TVdbTagSummaryEvent;
+      { v3.2: acilista WAL'den yalnizca ilk N commit uygulanir (0 = hepsi).
+        AS OF anlik goruntusu kopya uzerinde acilirken kullanilir. }
+      FRecoverLimit: Integer;
     procedure InitEngine(const ADbPath: string; APoolPages: Integer);
     function GetEncrypted: Boolean;
     procedure OnSpill(PageNo: LongWord; P: PVdbPage);
@@ -98,6 +101,10 @@ type
     { Var olan dosyayi acar; ACreate=True ise yoksa olusturur. }
     procedure Open(ACreate: Boolean = False);
     procedure Close;
+
+    { v3.2: Open'dan ONCE ayarlanir. N > 0 ise acilista WAL'den yalnizca
+      ilk N commit uygulanir (AS OF anlik goruntusu). Varsayilan 0 = hepsi. }
+    property RecoverLimit: Integer read FRecoverLimit write FRecoverLimit;
 
     { Test: surec olumu simulasyonu. Commit edilmemis degisiklikler ve
       WAL tamponu diske yazilmadan atilir. }
@@ -182,6 +189,7 @@ begin
   { WAL yolu: <db>.wal. Boylece tek dosya adi sozlesmesi korunur. }
   FWal := TVdbPageWal.Create(ADbPath + '.wal');
   FInTxn := False;
+  FRecoverLimit := 0;
   FPendingIdx := TDictionary<LongWord, Integer>.Create;
   FPendingCount := 0;
   FPendingCap := 0;
@@ -251,7 +259,7 @@ begin
 
   if FWal.HasContent then
   begin
-    FWal.Recover(ApplyRecovered, st);
+    FWal.Recover(ApplyRecovered, st, FRecoverLimit);
     FWalStats := st;
     if st.Frames > 0 then
       FStore.Flush(True);

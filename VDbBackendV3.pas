@@ -144,6 +144,9 @@ type
     function PassFilter(Key: QWord; const Value: TBytes;
       TableFilter: Integer): Boolean;
     procedure ScanCb(Key: QWord; const Value: TBytes);
+    { v3.2: AS OF tarama geri cagirimi. Canli partinin kaplamasi BILEREK
+      karistirilmaz: anlik goruntu yalniz commit edilmis sayfalardan gelir. }
+    procedure AsOfCb(Key: QWord; const Value: TBytes);
     { v3.1: streaming tarama geri cagirimi (sifir-kopya: Data sayfa icindedir). }
     procedure StreamCbRaw(Key: QWord; Data: PByte; Len: Integer);
     { v3.1: etiket sayaci yardimcilari. }
@@ -200,6 +203,14 @@ type
     function CountTable(TableFilter: Integer): Int64;
     function ScanRawIterAll(TableFilter: Integer;
       Cb: TVDbRawCb; User: Pointer): Boolean;
+
+    { v3.2: AS OF — WAL penceresindeki ilk Sequence commit'in sonundaki
+      tutarli goruntuden (TableFilter'a uyan) satirlari okur. Anlik goruntu
+      gecici bir kopya uzerinde kurulur (canli dosyaya dokunulmaz). }
+    function ScanAllAt(TableFilter, Sequence: Integer;
+      out Keys: TQWordArray; out Vals: TValArray;
+      out ActualSequence: Integer): Boolean;
+    function AsOfMaxSequence: Integer;
 
     procedure BeginBatch;
     procedure CommitBatch;
@@ -260,6 +271,11 @@ type
   end;
 
 implementation
+
+var
+  { v3.2: AS OF gecici dosya adlari icin surec ici sayac (okuyucular PARALEL
+    calisir; sabit ad cakismaya ve yarisa yol acardi). }
+  GAsOfCounter: LongInt = 0;
 
 function TVdbBackendV3.GetEncrypted: Boolean;
 begin
@@ -680,6 +696,147 @@ begin
   FScanVals := nil;
   FScanN := 0;
   FScanCap := 0;
+end;
+
+procedure TVdbBackendV3.AsOfCb(Key: QWord; const Value: TBytes);
+begin
+  if not PassFilter(Key, Value, FScanFilter) then Exit;
+  if FScanN >= FScanCap then
+  begin
+    if FScanCap < 256 then FScanCap := 256 else FScanCap := FScanCap * 2;
+    SetLength(FScanKeys, FScanCap);
+    SetLength(FScanVals, FScanCap);
+  end;
+  FScanKeys[FScanN] := Key;
+  FScanVals[FScanN] := Value;
+  Inc(FScanN);
+end;
+
+{ Dosyayi bayt bayt kopyalar (hedef varsa silinir). }
+procedure AsOfCopyFile(const Src, Dest: string);
+var
+  a, b: TFileStream;
+begin
+  if FileExists(Dest) then
+    if not DeleteFile(Dest) then
+      raise EVdbBackendV3.Create('AS OF: gecici dosya silinemedi: ' + Dest);
+  a := TFileStream.Create(Src, fmOpenRead or fmShareDenyNone);
+  try
+    b := TFileStream.Create(Dest, fmCreate);
+    try
+      b.CopyFrom(a, 0);
+      VDbFlushStream(b);
+    finally
+      b.Free;
+    end;
+  finally
+    a.Free;
+  end;
+end;
+
+function TVdbBackendV3.AsOfMaxSequence: Integer;
+begin
+  { WAL penceresindeki onaylanmis commit sayisi (son checkpoint'ten beri). }
+  Result := FEng.Wal.CommitCount;
+end;
+
+function TVdbBackendV3.ScanAllAt(TableFilter, Sequence: Integer;
+  out Keys: TQWordArray; out Vals: TValArray;
+  out ActualSequence: Integer): Boolean;
+var
+  tmp, tmpWal, tmpIdx: string;
+  total, n: Integer;
+  eng: TVdbPageEngine;
+begin
+  Keys := nil;
+  Vals := nil;
+  ActualSequence := 0;
+  Result := False;
+  if FEng = nil then Exit;
+
+  { Taban = son checkpoint'teki dosya; WAL = tabandan beri commit edilmis
+    sayfa imajlari. Ikisinin kopyasi uzerinde sinirli kurtarma, N anindaki
+    TUTARLI goruntuyu verir. Canli dosyalar yalniz OKUNUR. }
+  total := FEng.Wal.CommitCount;
+  if total <= 0 then
+  begin
+    { Gecmis yok: cagiran (VDbExecutor) v2 ile ayni mesaji verir. }
+    ActualSequence := -1;
+    Exit(True);
+  end;
+  n := Sequence;
+  if n < 0 then n := 0;
+  if n > total then n := total;
+  ActualSequence := n;
+
+  tmp := FPath + '.asof' + IntToStr(GetProcessID) + '_' +
+    IntToStr(InterlockedIncrement(GAsOfCounter));
+  tmpWal := tmp + '.wal';
+  tmpIdx := tmp + '.idx';
+  if FileExists(tmpIdx) then DeleteFile(tmpIdx);
+  eng := nil;
+  try
+    { Taban kopyasi deponun KENDI handle'i uzerinden yapilir: dosya tam
+      aralik kilidiyle kilitlidir (VDbLockStream), baska bir handle'dan
+      okuma Windows'ta sessizce 0 bayt dondurur. }
+    FEng.Store.CopyBaseImageTo(tmp);
+    if n > 0 then
+      AsOfCopyFile(FPath + '.wal', tmpWal)
+    else if FileExists(tmpWal) then
+      DeleteFile(tmpWal);
+
+    eng := NewEngine(tmp);
+    eng.RecoverLimit := n;
+    try
+      eng.Open(False);
+    except
+      { Yarim acilmis gecici motor: dosya kilitlerini birak, dosyalar silinsin. }
+      try
+        eng.SimulateCrash;
+      except
+      end;
+      eng.Free;
+      eng := nil;
+      raise;
+    end;
+    try
+      FScanKeys := nil;
+      FScanVals := nil;
+      FScanN := 0;
+      FScanCap := 0;
+      FScanFilter := TableFilter;
+      eng.ScanAll(AsOfCb);
+      SetLength(FScanKeys, FScanN);
+      SetLength(FScanVals, FScanN);
+      Keys := FScanKeys;
+      Vals := FScanVals;
+      FScanKeys := nil;
+      FScanVals := nil;
+      FScanN := 0;
+      FScanCap := 0;
+      Result := True;
+    finally
+      try
+        eng.Close;
+      except
+        { gecici dosya: kapanis hatasi sonucu bozmaz }
+      end;
+      eng.Free;
+      eng := nil;
+    end;
+  finally
+    if eng <> nil then
+    begin
+      try
+        eng.SimulateCrash;
+      except
+      end;
+      eng.Free;
+    end;
+    if FileExists(tmpWal) then DeleteFile(tmpWal);
+    if FileExists(tmpIdx) then DeleteFile(tmpIdx);
+    if FileExists(tmp) then DeleteFile(tmp);
+  end;
 end;
 
 procedure TVdbBackendV3.StreamCbRaw(Key: QWord; Data: PByte; Len: Integer);

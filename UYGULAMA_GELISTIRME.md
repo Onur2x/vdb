@@ -283,7 +283,8 @@ veritabani.colkey      kolon anahtarı (yalnız kolon şifrelemesi kullanılırs
 
 | Özellik | Durum | Not |
 |---|---|---|
-| PITR (`RECOVER TO`), WAL arşivi | yok | günlük `BACKUP TO` ile yetinin; v3 WAL'i sayfa imgesidir, zaman ekseni yok |
+| `AS OF SEQUENCE n` | **var** (v3.2) | WAL penceresindeki n'inci commit'in tam görüntüsü geçici kopyada kurulur; yalnız son checkpoint'ten beri. n = commit sayısı |
+| PITR (`RECOVER TO`), WAL arşivi, `AS OF TIMESTAMP/VERSION` | yok | checkpoint öncesine gitmek/zaman ekseni mantıksal günlük ister; günlük `BACKUP TO` ile yetinin |
 | Replication (`START REPLICATION` vb.) | yok | mantıksal değişim günlüğü gerektirir; tek dosya, tek yazıcı |
 | Zone map / bölüm budama | yok | sonuçlar doğru, tam tarama |
 | MVCC (çok yazarlı) | yok | tek yazıcı + okuyucu snapshot |

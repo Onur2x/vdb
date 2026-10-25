@@ -16751,6 +16751,155 @@ begin
   end;
 end;
 
+procedure T155_AsofV32;
+{ v3.2 (2026-10-25): AS OF — v3 sayfa imajli WAL uzerinde.
+
+  v2 semantigi (T78) mantiksal WAL kayitlarini okur; v3'te mantiksal gunluk
+  YOKTUR, ama sayfa imajlari herhangi bir commit'in TAM veritabani
+  goruntusunu yeniden kurmaya yeter. v3 bu yuzden:
+
+    1) Sequence = WAL penceresindeki COMMIT sayisidir (0 = WAL tabani,
+       1 = ilk commit sonrasi). v2'de 0 tabanli kayit indeksidir; testte
+       her adimdan sonra `AsOfSeq` okunup iki backend'de de ayni an
+       sorgulanir (v2: n = kayit sayisi -> son kayda kirpilir).
+    2) Anlik goruntu GECICI bir kopya uzerinde kurulur; canli dosyaya
+       yazilmaz, gecici dosya silinir.
+    3) Pencere bos (checkpoint gecmisi sildi) ise v2 ile ayni acik hata. }
+var
+  a1, a2, a3, a4, a5: Integer;
+  dir, bak: string;
+
+  function AsOfSeq: Integer;
+  begin
+    { Iki backend AYNI ANI gosterir, ama numaralandirma farkli:
+      v2: 0 tabanli WAL KAYIT indeksi (son kayit = sayi-1)
+      v3: WAL penceresindeki COMMIT sayisi }
+    if gV3 then Result := gBe.AsOfMaxSequence
+    else Result := kv.WalRecordCount - 1;
+    if Result < 0 then Result := 0;
+  end;
+
+  function AsOfLeftover: Integer;
+  var
+    sr: TSearchRec;
+    n: Integer;
+  begin
+    n := 0;
+    if FindFirst(dir + PathDelim + '*.asof*', faAnyFile, sr) = 0 then
+    begin
+      repeat
+        if (sr.Name <> '.') and (sr.Name <> '..') then Inc(n);
+      until FindNext(sr) <> 0;
+      FindClose(sr);
+    end;
+    Result := n;
+  end;
+
+begin
+  Grp('T155 AS OF (sayfa imajli WAL, v3.2)');
+
+  dir := D + PathDelim + 't155_asof';
+  ForceDirectories(dir);
+  UseDir('t155_asof');
+  if not gV3 then
+    kv.WALEnabled := True;
+
+  sq.Exec('CREATE TABLE k(id INTEGER PRIMARY KEY, ad TEXT)');
+  sq.Exec('CREATE TABLE diger(id INTEGER PRIMARY KEY, ad TEXT)');
+  sq.Exec('INSERT INTO k(id,ad) VALUES(1,''bir'')');
+  a1 := AsOfSeq;
+  sq.Exec('INSERT INTO k(id,ad) VALUES(2,''iki'')');
+  a2 := AsOfSeq;
+  sq.Exec('UPDATE k SET ad = ''BIR-YENI'' WHERE id = 1');
+  a3 := AsOfSeq;
+  sq.Exec('DELETE FROM k WHERE id = 2');
+  a4 := AsOfSeq;
+  sq.Exec('INSERT INTO k(id,ad) VALUES(3,''uc'')');
+  a5 := AsOfSeq;
+  Dogrula('gecmis kayitlari birikti', a5 > a1,
+    'a1=' + IntToStr(a1) + ' a5=' + IntToStr(a5));
+
+  // ---- INSERT oncesi/sonrasi ----
+  Chk('INSERT oncesi anlik nokta (1 satir)',
+    'SELECT ad FROM k AS OF SEQUENCE ' + IntToStr(a1) + ' ORDER BY id', 1);
+  ChkVal('INSERT oncesi deger "bir"',
+    'SELECT ad FROM k AS OF SEQUENCE ' + IntToStr(a1) + ' ORDER BY id', 0, 0, 'bir');
+  Chk('INSERT sonrasi nokta (2 satir)',
+    'SELECT ad FROM k AS OF SEQUENCE ' + IntToStr(a2) + ' ORDER BY id', 2);
+  ChkVal('2. satir "iki"',
+    'SELECT ad FROM k AS OF SEQUENCE ' + IntToStr(a2) + ' ORDER BY id', 1, 0, 'iki');
+
+  // ---- UPDATE oncesi/sonrasi (geriye donuk okuma) ----
+  ChkVal('UPDATE oncesi eski deger "bir"',
+    'SELECT ad FROM k AS OF SEQUENCE ' + IntToStr(a2) + ' WHERE id = 1', 0, 0, 'bir');
+  ChkVal('UPDATE sonrasi yeni deger',
+    'SELECT ad FROM k AS OF SEQUENCE ' + IntToStr(a3) + ' WHERE id = 1', 0, 0, 'BIR-YENI');
+
+  // ---- DELETE: eski aninda gorunur, sonrasi yok ----
+  Chk('DELETE oncesi anlik nokta (2 satir)',
+    'SELECT ad FROM k AS OF SEQUENCE ' + IntToStr(a3) + ' ORDER BY id', 2);
+  ChkVal('...silinen satir o an hala var ("iki")',
+    'SELECT ad FROM k AS OF SEQUENCE ' + IntToStr(a3) + ' ORDER BY id', 1, 0, 'iki');
+  Chk('DELETE sonrasi anlik nokta (1 satir)',
+    'SELECT ad FROM k AS OF SEQUENCE ' + IntToStr(a4) + ' ORDER BY id', 1);
+  Chk('guncel veride silinen satir yok',
+    'SELECT ad FROM k WHERE id = 2', 0);
+
+  // ---- filtre / sirasi / LIMIT / COUNT / kirpma ----
+  Chk('son noktada guncel kume (2 satir)',
+    'SELECT ad FROM k AS OF SEQUENCE ' + IntToStr(a5) + ' ORDER BY id', 2);
+  ChkVal('2. satir "uc"',
+    'SELECT ad FROM k AS OF SEQUENCE ' + IntToStr(a5) + ' ORDER BY id', 1, 0, 'uc');
+  Chk('LIMIT gecmise uygulanir',
+    'SELECT ad FROM k AS OF SEQUENCE ' + IntToStr(a5) + ' ORDER BY id LIMIT 1', 1);
+  Chk('COUNT gecmis kumeyi sayar',
+    'SELECT COUNT(*) FROM k AS OF SEQUENCE ' + IntToStr(a2), 1);
+  ChkVal('COUNT degeri 2',
+    'SELECT COUNT(*) FROM k AS OF SEQUENCE ' + IntToStr(a2), 0, 0, '2');
+  Chk('sinir tasan seq guncel kumeyle ayni',
+    'SELECT ad FROM k AS OF SEQUENCE 999999 ORDER BY id', 2);
+
+  // ---- alias ----
+  Chk('alias (FROM k x AS OF ...)',
+    'SELECT ad FROM k x AS OF SEQUENCE ' + IntToStr(a1) + ' ORDER BY id', 1);
+  Chk('alias (FROM k AS x AS OF ...)',
+    'SELECT ad FROM k AS x AS OF SEQUENCE ' + IntToStr(a1) + ' ORDER BY id', 1);
+
+  // ---- yan etki yok: canli veri ve dosyalar ----
+  Chk('AS OF sonrasi canli tablo degismedi', 'SELECT COUNT(*) FROM k', 1);
+  if gV3 then
+    ChkInt('AS OF gecici dosya birakmadi', AsOfLeftover, 0);
+
+  // ---- acikca reddedilenler ----
+  ChkErr('AS OF TIMESTAMP reddedilir',
+    'SELECT id FROM k AS OF TIMESTAMP ' + Q + '2026-10-05 12:00:00' + Q);
+  ChkErr('AS OF VERSION reddedilir',
+    'SELECT id FROM k AS OF VERSION 3');
+  ChkErr('JOIN + AS OF reddedilir',
+    'SELECT k.ad FROM k AS OF SEQUENCE ' + IntToStr(a1) +
+    ' JOIN diger ON diger.id = k.id');
+  ChkErr('AS OF SEQUENCE sayi degil (syntax)',
+    'SELECT id FROM k AS OF SEQUENCE abc');
+  ChkErr('AS OF tanisiz tur (syntax)',
+    'SELECT id FROM k AS OF FOO 1');
+
+  // ---- gecmis yok: checkpoint WAL penceresini sildi ----
+  UseDir('t155_asof2');
+  if not gV3 then
+    kv.WALEnabled := True;
+  sq.Exec('CREATE TABLE k(id INTEGER PRIMARY KEY, ad TEXT)');
+  sq.Exec('INSERT INTO k(id,ad) VALUES(1,''bir'')');
+  bak := D + PathDelim + 't155_asof2_yedek.odb';
+  if gV3 then
+    gBe.BackupTo(bak)      // tam checkpoint + WAL budama
+  else
+    Dogrula('CheckpointWAL basarili', kv.CheckpointWAL);
+  ChkInt('checkpoint sonrasi gecmis silindi', AsOfSeq, 0);
+  ChkErr('gecmis yokken AS OF reddedilir',
+    'SELECT ad FROM k AS OF SEQUENCE 0');
+  Chk('gecmis yokken normal sorgu calisir', 'SELECT ad FROM k', 1);
+end;
+
 { Sprint 2.9: test kosucusu. Her test kendi try/except'inde kosar;
   boylece bir hata kalan testleri durdurmaz ve siniflandirma yapilabilir. }
 type
@@ -16760,7 +16909,7 @@ type
   end;
 
 const
-  TEST_SAYISI = 184;
+  TEST_SAYISI = 185;
 
   { v3 kosusunda ATLA: bu testler yalniz v2 motorunun (TVDb/WAL/arsiv/
     zone/indeks .idx) ozel yollarini kullanir; v3'te karsiligi yoktur.
@@ -17016,6 +17165,7 @@ begin
   TESTLER[181].Nm := 'T152_OtoSikistirmaV3'; TESTLER[181].P := T152_OtoSikistirmaV3;
   TESTLER[182].Nm := 'T153_KvStoreBackend'; TESTLER[182].P := T153_KvStoreBackend;
   TESTLER[183].Nm := 'T154_YonetimYollari'; TESTLER[183].P := T154_YonetimYollari;
+  TESTLER[184].Nm := 'T155_AsofV32'; TESTLER[184].P := T155_AsofV32;
 end;
 
 { ---------------------------------------------------------------------- main }

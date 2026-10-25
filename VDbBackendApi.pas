@@ -81,6 +81,21 @@ type
       tarama yapar). v2: -1 (dogrulanmis onbellek TVDb tarafindadir). }
     function CountTable(TableFilter: Integer): Int64;
 
+    { --- v3.2: AS OF (sayfa imajli WAL uzerinde anlik goruntu) ---
+      v3: Sequence = WAL penceresindeki COMMIT sayisi (0 = WAL tabani, yani
+      son checkpoint; 1 = ilk commit sonrasi). Sinir asilirsa son commit'e
+      kirpilir ve gercekte uygulanan sayi ActualSequence'dedir. Anlik
+      goruntu GECICI bir kopya uzerinde kurulur; canli dosyaya yazilmaz ve
+      gecici dosyalar is bitince silinir. v2: False doner (mantiksal WAL
+      yolu dogrudan VDbExecutor'dadir). }
+    function ScanAllAt(TableFilter, Sequence: Integer;
+      out Keys: TQWordArray; out Vals: TValArray;
+      out ActualSequence: Integer): Boolean;
+
+    { AS OF SEQUENCE icin ust sinir. v3: WAL penceresindeki commit sayisi.
+      v2: mantiksal WAL kayit sayisi (WalRecordCount). }
+    function AsOfMaxSequence: Integer;
+
     { --- islem / toplu yazim --- }
     procedure BeginBatch;
     procedure CommitBatch;

@@ -343,7 +343,7 @@ Rules:
 | `RLS politika ihlali` | The role's policy does not cover the written row |
 | `yetkisiz: ...` | Grant the privilege or `SET ROLE NONE` |
 | Keyless read error | Open the `.key` password with `OpenKeyFile` |
-| `AS OF ... desteklenmiyor` | WAL is off or a checkpoint removed the history |
+| `AS OF ... gecmisi yok` | WAL is off or a checkpoint removed the history (in v3 `AS OF SEQUENCE` only reaches back to the last checkpoint) |
 
 ---
 

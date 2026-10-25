@@ -343,7 +343,7 @@ Kurallar:
 | `RLS politika ihlali` | Rolün politikası yazılan satırı kapsamıyor |
 | `yetkisiz: ...` | `GRANT` ile izin verin veya `SET ROLE NONE` |
 | `anahtarsız okuma` | `.key` parolasını `OpenKeyFile` ile açın |
-| `AS OF ... desteklenmiyor` | WAL kapalı veya checkpoint geçmişi silmiş |
+| `AS OF ... gecmisi yok` | WAL kapalı veya checkpoint geçmişi silmiş (v3'te `AS OF SEQUENCE` yalnız son checkpoint'ten beri çalışır) |
 
 ---
 

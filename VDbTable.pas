@@ -635,6 +635,13 @@ type
     // (WHERE tum aday satirlarda yeniden dogrulanir - ust kume garantisi).
     function ScanRowsPart(const Table: string; out Pks: TStrArray;
       out Rows: TStrMatrix; const Targets: TPartTargets): Integer;
+    { v3.2: AS OF — sayfa imajli WAL'de Sequence commit'i sonundaki tutarli
+      goruntuden tabloyu okur. True: satirlar kuruldu; ActualSequence < 0 ise
+      WAL penceresi BOS (gecmis yok, cagiran acik hata verir). False: bu
+      backend anlik goruntu sunmuyor (v2 — mantiksal WAL yolu kullanilir). }
+    function ScanRowsAt(const Table: string; Sequence: Integer;
+      out Pks: TStrArray; out Rows: TStrMatrix;
+      out ActualSequence: Integer): Boolean;
     // R-13 Full: bolme anahtari DEGERININ dusecegi bolum (-1 = hesaplanamadi)
     function PartValueOf(const T: TTableDef; const Val: string): Integer;
     // R-13 Full: satirin bolum numarasi (-1 = bolunmemis/cozulemedi)
@@ -9353,6 +9360,59 @@ begin
   SetLength(Pks, n);
   SetLength(Rows, n);
   Result := n;
+end;
+
+function TVTableDb.ScanRowsAt(const Table: string; Sequence: Integer;
+  out Pks: TStrArray; out Rows: TStrMatrix;
+  out ActualSequence: Integer): Boolean;
+var
+  t: TTableDef;
+  keys: TQWordArray;
+  raw: TValArray;
+  i, n: Integer;
+  tid: Word;
+  pk: string;
+  vals: TStrArray;
+begin
+  SetLength(Pks, 0);
+  SetLength(Rows, 0);
+  ActualSequence := 0;
+  Result := False;
+  if FKvB = nil then Exit;
+  t := GetTable(Table);
+  if not FKvB.ScanAllAt(t.TableId, Sequence, keys, raw, ActualSequence) then
+    Exit;
+  if ActualSequence < 0 then
+  begin
+    { WAL penceresi bos: gecmis yok. Cagiran (VDbExecutor) acik hata verir. }
+    SetLength(Pks, 0);
+    SetLength(Rows, 0);
+    Exit(True);
+  end;
+  SetLength(Pks, Length(keys));
+  SetLength(Rows, Length(keys));
+  n := 0;
+  for i := 0 to High(keys) do
+  begin
+    if keys[i] = VDB_SCHEMA_KEY then Continue;
+    { F2-16/BT-3 ile ayni kurallar: cozulemeyen kayit ve hash carpismasi
+      SESSIZCE atlanmaz. Gecmis goruntu de ayni denetimlerden gecer. }
+    if not DecodeRow(raw[i], tid, pk, vals) then
+      raise EVDbException.CreateFmt(ecCorrupt,
+        'AS OF: kayit cozulemedi (tablo=%s, anahtar=%d). Anlik goruntu ' +
+        'bozuk; yedekten geri yukleyin.', [t.Name, keys[i]]);
+    if tid <> t.TableId then Continue;
+    if VDbHashKey(t.Name, pk) <> keys[i] then
+      raise EVDbException.CreateFmt(ecHashCollision,
+        'AS OF: HASH CARPISMASI (tablo %s, pk=%s): anlik goruntu bozuk; ' +
+        'yedekten geri yukleyin.', [t.Name, pk]);
+    Pks[n] := pk;
+    Rows[n] := vals;
+    Inc(n);
+  end;
+  SetLength(Pks, n);
+  SetLength(Rows, n);
+  Result := True;
 end;
 
 function TVTableDb.EvalSetExpr(const T: TTableDef; const E: TSetExpr;

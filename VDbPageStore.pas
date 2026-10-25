@@ -236,6 +236,12 @@ type
       gecer; yarim kalmis yedek olusmaz. Kaynak dosya ACILMADAN kopyalanir
       (paylasim kilidi sorunu yok). }
     procedure CopyCommittedTo(const DestPath: string);
+    { v3.2: son checkpoint tabaninin HAM kopyasi (AS OF anlik goruntusu icin).
+      CopyCommittedTo'dan farki: bellek onbellegini/gecerli durumu YAZMAZ,
+      WAL'i budamaz; diskteki taban imajini bayt bayt kopyalar. Kopya deponun
+      KENDI handle'i uzerinden yapilir (dosya tam aralik kilidiyle kilitli;
+      baska handle'dan okuma Windows'ta 0 bayt doner). }
+    procedure CopyBaseImageTo(const DestPath: string);
 
     { Sprint 3.4: sayfa sifreleme. Open cagrilmadan ONCE verilmelidir.
       Key 32 bayt AES-256 anahtaridir; Password verilirse PBKDF2-SHA256
@@ -1414,6 +1420,52 @@ begin
         raise EVdbPageStore.Create('kopya: eski hedef silinemedi: ' + DestPath);
     if not RenameFile(tmp, DestPath) then
       raise EVdbPageStore.Create('kopya: hedefe tasinamadi: ' + DestPath);
+    if dir <> '' then
+      VDbFlushDir(dir);
+  except
+    if FileExists(tmp) then DeleteFile(tmp);
+    raise;
+  end;
+end;
+
+procedure TVdbPageStore.CopyBaseImageTo(const DestPath: string);
+var
+  tmp, dir: string;
+  fs: TFileStream;
+  buf: array[0..65535] of Byte;
+  left: Int64;
+  n: Integer;
+begin
+  if FStream = nil then
+    raise EVdbPageStore.Create('depolama acik degil (CopyBaseImageTo)');
+  if DestPath = '' then
+    raise EVdbPageStore.Create('CopyBaseImageTo: hedef yol bos');
+  dir := ExtractFileDir(DestPath);
+  if dir <> '' then ForceDirectories(dir);
+  tmp := DestPath + '.tmp';
+  if FileExists(tmp) then DeleteFile(tmp);
+  fs := TFileStream.Create(tmp, fmCreate);
+  try
+    FStream.Position := 0;
+    left := FPhysSize;
+    while left > 0 do
+    begin
+      n := SizeOf(buf);
+      if left < n then n := left;
+      FStream.ReadBuffer(buf, n);
+      fs.WriteBuffer(buf, n);
+      Dec(left, n);
+    end;
+    VDbFlushStream(fs);
+  finally
+    fs.Free;
+  end;
+  try
+    if FileExists(DestPath) then
+      if not DeleteFile(DestPath) then
+        raise EVdbPageStore.Create('taban kopyasi: eski hedef silinemedi: ' + DestPath);
+    if not RenameFile(tmp, DestPath) then
+      raise EVdbPageStore.Create('taban kopyasi: hedefe tasinamadi: ' + DestPath);
     if dir <> '' then
       VDbFlushDir(dir);
   except

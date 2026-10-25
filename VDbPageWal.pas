@@ -119,8 +119,15 @@ type
     { Commit edilmemis cerceveleri atar. }
     procedure Rollback;
 
-    { WAL'i okuyup onaylanmis cerceveleri uygular. }
-    function Recover(Apply: TVdbWalApplyProc; out Stats: TVdbWalStats): Boolean;
+    { WAL'i okuyup onaylanmis cerceveleri uygular.
+      MaxCommits > 0 ise yalnizca ILK MaxCommits commit uygulanir (v3.2:
+      AS OF anlik goruntusu). Okuma orada kesilir; kuyruk "yirtik" sayilmaz. }
+    function Recover(Apply: TVdbWalApplyProc; out Stats: TVdbWalStats;
+      MaxCommits: Integer = 0): Boolean;
+
+    { WAL penceresindeki onaylanmis commit sayisi (uygulamaz, yalniz sayar).
+      AS OF SEQUENCE icin ust sinirdir. }
+    function CommitCount: Integer;
 
     { Checkpoint sonrasi WAL'i bosalt (yalniz baslik kalir). }
     procedure Truncate(CheckpointLSN: LongWord);
@@ -437,7 +444,7 @@ end;
 { ---------------------------------------------------------------- kurtarma }
 
 function TVdbPageWal.Recover(Apply: TVdbWalApplyProc;
-  out Stats: TVdbWalStats): Boolean;
+  out Stats: TVdbWalStats; MaxCommits: Integer): Boolean;
 var
   hdr: array[0..VDB_WAL_REC_HDR - 1] of Byte;
   magic, lsn, payLen, pageNo, crc: LongWord;
@@ -561,6 +568,10 @@ begin
       pendingCount := 0;
       Inc(Stats.Commits);
       FLSN := lsn;
+      { v3.2: AS OF icin sinirli kurtarma — pencere basi burada biter.
+        Okumayi kes; kalan kayitlar "yirtik kuyruk" DEGILDIR. }
+      if (MaxCommits > 0) and (Stats.Commits >= MaxCommits) then
+        Break;
     end;
   end;
 
@@ -575,6 +586,24 @@ begin
       Apply(applied[i].PageNo, @applied[i].Data);
   Stats.Frames := appliedCount;
   Result := True;
+end;
+
+function TVdbPageWal.CommitCount: Integer;
+var
+  st: TVdbWalStats;
+  oldLSN: LongWord;
+begin
+  if (FStream = nil) or (not FHasContent) then
+    Exit(0);
+  { Apply = nil: yalnizca dogrulanmis commit'ler sayilir. Recover FLSN'i
+    son commit'e ceker; canli WAL'de bu yan etki istenmez. }
+  oldLSN := FLSN;
+  try
+    Recover(nil, st);
+    Result := st.Commits;
+  finally
+    FLSN := oldLSN;
+  end;
 end;
 
 procedure TVdbPageWal.Truncate(CheckpointLSN: LongWord);
