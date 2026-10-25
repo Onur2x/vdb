@@ -11,20 +11,28 @@ uygulamalar için SQLite'a alternatif olarak geliştirilmiştir.
 
 ## Öne çıkanlar
 
+**Motor (v3 sayfa motoru, varsayılan):**
+
 - Tek dosya depolama (`.odb`), ayrı sunucu kurulumu gerekmez.
+- 4 KB sayfa, slotted heap, sayfa başına CRC32; çökme sonrası açılışta
+  WAL replay ile kurtarma (kill -9 testiyle doğrulanmış).
+- Commit başına yalnız değişen sayfalar WAL'e yazılır; açılışta `.odb.idx`
+  ile hızlı yükleme (bozuksa tam tarama).
+- Sayfa düzeyinde AES-256-GCM dosya şifreleme; parolasız açılış reddedilir.
+- `VERIFY`, `BACKUP TO`, `VACUUM` (atomik), `ANALYZE`, `SHOW STATS`.
 - Zengin SQL: JOIN, alt sorgu, CTE, pencere fonksiyonları, `UPSERT`,
   `RETURNING`, trigger, view, stored procedure.
-- MVCC / snapshot isolation, `SAVEPOINT`, `DEFERRABLE` kısıtlar.
-- WAL, otomatik WAL, checkpoint, PITR, streaming replication.
-- AES-256 kayıt seviyesi şifreleme, `.key` dosyası ve parola rotasyonu.
-- JSONB, XML/XPath, Spatial, Range tipleri.
-- HASH / RANGE / LIST bölümleme ve partition pruning.
-- Paralel sorgu, cost-based optimizer (`ANALYZE` + `EXPLAIN`).
-- H3 skiplist ikincil indeks; indeksli `COUNT(*)` O(log N).
-- TCP SQL sunucusu/istemcisi, connection pool.
-- RBAC, row level security, ICU uyumlu collation.
-- 57 exportlu C/Delphi DLL API'si (`vdbapi`).
-- `SHOW STATS`, `/metrics`, OpenTelemetry span kaydı.
+- JSONB, XML/XPath, Spatial, Range tipleri; HASH/RANGE/LIST bölümleme.
+- Paralel sorgu, cost-based optimizer; H3 skiplist ikincil indeks.
+- RBAC, row level security; 57 exportlu C/Delphi DLL API'si (`vdbapi`).
+
+**v3.1'de henüz yok** (açık `ecUnsupported` hatası verir, sessiz yanlış
+sonuç üretmez): `SAVEPOINT` ve kısmi geri alma, PITR/WAL arşivi,
+replikasyon, zone map, `ALTER DATABASE KEY`, TCP sunucusunda v3 motoru.
+Bunlar v3.2 kapsamındadır. v2 motoru (MVCC, `SAVEPOINT`, PITR,
+replikasyon) ağaçta **salt-okunur/göç** yolu olarak durur.
+
+Yeni uygulama yazıyorsanız: [UYGULAMA_GELISTIRME.md](UYGULAMA_GELISTIRME.md).
 
 ---
 
