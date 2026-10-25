@@ -11,20 +11,31 @@ desktop and embedded applications as an alternative to SQLite.
 
 ## Highlights
 
+**Engine (v3 page engine, the default):**
+
 - Single-file storage (`.odb`); no server installation required.
+- 4 KB pages, slotted heap, per-page CRC32; WAL replay recovers after a
+  crash (verified by a kill -9 gate).
+- Only dirty pages go to the WAL per commit; startup uses `.odb.idx` for a
+  fast load and falls back to a full scan when it is damaged.
+- Page-level AES-256-GCM file encryption; opening without the password is
+  refused.
+- `VERIFY`, `BACKUP TO`, `VACUUM` (atomic), `ANALYZE`, `SHOW STATS`.
 - Rich SQL: JOINs, subqueries, CTEs, window functions, `UPSERT`, `RETURNING`,
   triggers, views, stored procedures.
-- MVCC / snapshot isolation, `SAVEPOINT`, `DEFERRABLE` constraints.
-- WAL, automatic WAL, checkpointing, PITR, streaming replication.
-- AES-256 record-level encryption, `.key` file and password rotation.
-- JSONB, XML/XPath, Spatial and Range types.
-- HASH / RANGE / LIST partitioning with partition pruning.
-- Parallel query execution and a cost-based optimizer (`ANALYZE`, `EXPLAIN`).
-- H3 skiplist secondary index; indexed `COUNT(*)` in O(log N).
-- TCP SQL server/client and a connection pool.
-- RBAC, row level security, ICU-compatible collations.
-- C/Delphi DLL API with 57 exports (`vdbapi`).
-- `SHOW STATS`, `/metrics` and OpenTelemetry span recording.
+- JSONB, XML/XPath, Spatial and Range types; HASH/RANGE/LIST partitioning.
+- Parallel query execution, cost-based optimizer; H3 skiplist secondary index.
+- RBAC, row level security; C/Delphi DLL API with 57 exports (`vdbapi`).
+
+**Not in v3.1 yet** (each raises an explicit `ecUnsupported` error instead of
+returning silently wrong results): `SAVEPOINT` and partial rollback, PITR/WAL
+archiving, replication, zone maps, `ALTER DATABASE KEY`, and the v3 engine
+behind the TCP server. These belong to v3.2. The v2 engine (MVCC,
+`SAVEPOINT`, PITR, replication) stays in the tree as a **read-only/migration**
+path.
+
+Writing a new application? See [UYGULAMA_GELISTIRME.md](UYGULAMA_GELISTIRME.md)
+(Turkish).
 
 ---
 
