@@ -24,7 +24,7 @@ uses
   { FPC/Unix: TEvent/TThread icin cthreads programin EN BASINDA olmali. }
   {$IFDEF UNIX}cthreads,{$ENDIF}
   Classes, SysUtils, VDbBackendApi, VDbCore, VDbBackendV3, VDbTable, VDbSql,
-  VDbTypes, VDbErr, VDbPageEngine;
+  VDbTypes, VDbErr, VDbPageEngine, VDbChangeLog;
 
 var
   gPass, gFail: Int64;
@@ -848,8 +848,8 @@ var
       Fail('repl: hata bekleniyordu: ' + Sql)
     else if code <> 'ecUnsupported' then
       Fail('repl: kod ' + code + ' (ecUnsupported bekleniyordu): ' + Sql)
-    else if Pos('v3.1', msg) = 0 then
-      Fail('repl: mesajda v3.1 yok: ' + msg)
+    else if (Pos('v4', msg) = 0) and (Pos('v3.1', msg) = 0) then
+      Fail('repl: mesajda dilim bilgisi yok: ' + msg)
     else
       Ok('repl: ecUnsupported -> ' + Sql);
   end;
@@ -922,29 +922,19 @@ end;
     sayfa imajlari N'inci commit'in tam goruntusunu vermeye yeter, goruntu
     gecici bir kopyada kurulur. Mantiksal gunluk gerektiren yollar
     (AS OF TIMESTAMP/VERSION, RECOVER TO, ARCHIVE WAL) hala reddedilir. }
-procedure TestPitrUnsupported;
+procedure TestPitrSql;
 var
   S: TV3Sql;
+  S2: TV3Sql;
   r: TSqlResult;
-  code, msg, base, sep: string;
-  found: Boolean;
-
-  procedure ExpectPitrUnsupported(const Sql: string);
-  begin
-    if not ExecErr(S, Sql, code, msg) then
-      Fail('pitr: hata bekleniyordu: ' + Sql)
-    else if code <> 'ecUnsupported' then
-      Fail('pitr: kod ' + code + ' (ecUnsupported bekleniyordu): ' + Sql)
-    else if (Pos('v3.1', msg) = 0) and (Pos('desteklenmiyor', msg) = 0) then
-      Fail('pitr: mesaj yol gostermiyor: ' + msg)
-    else
-      Ok('pitr: ecUnsupported -> ' + Sql);
-  end;
-
+  code, msg, base, tstext: string;
+  seq1, ts1: Int64;
+  minSeq, maxSeq, minTs, maxTs: Int64;
+  baseCount: Integer;
 begin
   WriteLn;
-  WriteLn('Sprint 3.6/v3.2 - v3 PITR: AS OF SEQUENCE calisir, ' +
-    'mantiksal gunluk gerektiren yollar ecUnsupported');
+  WriteLn('Sprint 3.6/v4 - v3 PITR: AS OF SEQUENCE/VERSION/TIMESTAMP, ' +
+    'ARSIV + RECOVER');
   CleanDir;
   base := IncludeTrailingPathDelimiter(gDir);
   OpenV3(S, 'pitr.odb', True);
@@ -974,22 +964,131 @@ begin
     else
       Fail('pitr: AS OF SEQUENCE 1: ' + r.Msg);
 
-    { Mantiksal gunluk gerektiren yollar hala kapali. }
-    ExpectPitrUnsupported('SELECT id FROM t AS OF VERSION 3');
-    ExpectPitrUnsupported('SELECT id FROM t AS OF TIMESTAMP ''2026-10-25 12:00:00''');
-    ExpectPitrUnsupported('ARCHIVE WAL SET DIR=''' + base + 'arsiv''');
-    ExpectPitrUnsupported('ARCHIVE WAL LIST');
-    ExpectPitrUnsupported('RECOVER TO NOW');
-    { Zaman damgasi yerel bicimde uretilir: ayristirici TryStrToDateTime
-      kullanir; boylece test gercekten "gecerli damga + v3 kapisi" sinar. }
-    ExpectPitrUnsupported('RECOVER TO TIMESTAMP ''' + DateTimeToStr(Now) + '''');
+    { v4: mantiksal gunluk geldi — VERSION / TIMESTAMP / arsiv / kurtarma
+      artik CALISIR. Once birinci fazin sinirini (seq + ts) yakala. }
+    if not S.Be.LogRangeInfo(minSeq, maxSeq, minTs, maxTs, baseCount) then
+    begin
+      Fail('pitr: gunluk araligi okunamadi: ' + S.Be.LogStatus);
+      minSeq := 0; maxSeq := 0; minTs := 0; maxTs := 0;
+    end
+    else
+      Ok(Format('pitr: gunluk seq %d..%d', [minSeq, maxSeq]));
+    seq1 := maxSeq;
+    ts1 := maxTs;
+    tstext := VdbLogFormatTimestamp(ts1);
+
+    { Ikinci faz: ayri commit'ler -> ayri gruplar. }
+    Sleep(40);
+    r := Exec(S, 'UPDATE t SET ad = ''Ali2'' WHERE id = 1');
+    if not gErr then Ok('pitr: faz 2 guncelleme') else Fail('pitr: UPDATE: ' + r.Msg);
+    r := Exec(S, 'INSERT INTO t VALUES (3, ''Can'')');
+    if not gErr then Ok('pitr: faz 2 ekleme') else Fail('pitr: INSERT 3: ' + r.Msg);
+
+    { Guncel durum 3 satir, id=1 -> Ali2 }
+    r := Exec(S, 'SELECT COUNT(*) FROM t');
+    if (not gErr) and (Cel(r, 0, 0) = '3') then Ok('pitr: guncel COUNT 3')
+    else Fail('pitr: guncel COUNT: ' + Cel(r, 0, 0) + ' ' + r.Msg);
+
+    { AS OF VERSION: birinci fazin sonu -> 2 satir, id=1 -> Ali }
+    r := Exec(S, 'SELECT COUNT(*) FROM t AS OF VERSION ' + IntToStr(seq1));
+    if (not gErr) and (Cel(r, 0, 0) = '2') then
+      Ok('pitr: AS OF VERSION <faz1> COUNT 2')
+    else
+      Fail('pitr: AS OF VERSION COUNT: ' + Cel(r, 0, 0) + ' ' + r.Msg);
+    r := Exec(S, 'SELECT ad FROM t AS OF VERSION ' + IntToStr(seq1) +
+      ' WHERE id = 1');
+    if (not gErr) and (Cel(r, 0, 0) = 'Ali') then
+      Ok('pitr: AS OF VERSION eski degeri okur')
+    else
+      Fail('pitr: AS OF VERSION deger: ' + Cel(r, 0, 0) + ' ' + r.Msg);
+
+    { AS OF TIMESTAMP: ayni nokta, zamanla }
+    r := Exec(S, 'SELECT COUNT(*) FROM t AS OF TIMESTAMP ''' + tstext + '''');
+    if (not gErr) and (Cel(r, 0, 0) = '2') then
+      Ok('pitr: AS OF TIMESTAMP "' + tstext + '" COUNT 2')
+    else
+      Fail('pitr: AS OF TIMESTAMP COUNT: ' + Cel(r, 0, 0) + ' ' + r.Msg);
+    r := Exec(S, 'SELECT ad FROM t AS OF TIMESTAMP ''' + tstext +
+      ''' WHERE id = 1');
+    if (not gErr) and (Cel(r, 0, 0) = 'Ali') then
+      Ok('pitr: AS OF TIMESTAMP eski degeri okur')
+    else
+      Fail('pitr: AS OF TIMESTAMP deger: ' + Cel(r, 0, 0) + ' ' + r.Msg);
+
+    { Bozuk hedefler: sessiz 0 degil, ACIK sozdizimi hatasi. }
+    if ExecErr(S, 'SELECT id FROM t AS OF VERSION abc', code, msg) and
+      (code = 'ecSyntaxError') then
+      Ok('pitr: AS OF VERSION abc -> ecSyntaxError')
+    else
+      Fail('pitr: AS OF VERSION abc: ' + code + ' ' + msg);
+    if ExecErr(S, 'SELECT id FROM t AS OF TIMESTAMP ''gecersiz''',
+      code, msg) and (code = 'ecSyntaxError') then
+      Ok('pitr: AS OF TIMESTAMP gecersiz -> ecSyntaxError')
+    else
+      Fail('pitr: AS OF TIMESTAMP gecersiz: ' + code + ' ' + msg);
+
+    { Gecmis, tabandan ONCE: acik hata (sessiz bos kume yok). }
+    if ExecErr(S, 'SELECT id FROM t AS OF VERSION 0', code, msg) then
+      Ok('pitr: AS OF VERSION 0 reddedildi')
+    else
+      Fail('pitr: AS OF VERSION 0 kabul edildi');
+
+    { ARCHIVE WAL SET: gunlugun tam kopyasi }
+    r := Exec(S, 'ARCHIVE WAL SET DIR=''' + base + 'arsiv''');
+    if (not gErr) and DirectoryExists(base + 'arsiv') then
+      Ok('pitr: ARCHIVE WAL SET kopyaladi: ' + r.Msg)
+    else
+      Fail('pitr: ARCHIVE WAL SET: ' + r.Msg);
+
+    { ARCHIVE WAL LIST: gunluk kapsami }
+    r := Exec(S, 'ARCHIVE WAL LIST');
+    if (not gErr) and (r.Affected = 1) and (Cel(r, 0, 1) <> '<yok>') then
+      Ok('pitr: ARCHIVE WAL LIST kapsami: ' + r.Msg)
+    else
+      Fail('pitr: ARCHIVE WAL LIST: ' + r.Msg);
+
+    { RECOVER TO TIMESTAMP: canli dosyaya DOKUNMADAN kurtarma dosyasi }
+    r := Exec(S, 'RECOVER TO TIMESTAMP ''' + tstext + '''');
+    if (not gErr) and FileExists(base + 'pitr.odb.recovered') then
+      Ok('pitr: RECOVER TO TIMESTAMP dosyasi olustu: ' + r.Msg)
+    else
+      Fail('pitr: RECOVER TO TIMESTAMP: ' + r.Msg);
+
+    { Kurtarma dosyasi gercek bir veritabani: icerigi faz 1 ile ayni. }
+    OpenV3(S2, 'pitr.odb.recovered', False);
+    try
+      r := Exec(S2, 'SELECT COUNT(*) FROM t');
+      if (not gErr) and (Cel(r, 0, 0) = '2') then
+        Ok('pitr: kurtarma dosyasi COUNT 2 (faz 1)')
+      else
+        Fail('pitr: kurtarma dosyasi COUNT: ' + Cel(r, 0, 0) + ' ' + r.Msg);
+      r := Exec(S2, 'SELECT ad FROM t WHERE id = 1');
+      if (not gErr) and (Cel(r, 0, 0) = 'Ali') then
+        Ok('pitr: kurtarma dosyasinda eski deger')
+      else
+        Fail('pitr: kurtarma dosyasi deger: ' + Cel(r, 0, 0) + ' ' + r.Msg);
+      r := Exec(S2, 'VERIFY');
+      if (not gErr) and (r.Affected = 1) then
+        Ok('pitr: kurtarma dosyasi VERIFY TEMIZ')
+      else
+        Fail('pitr: kurtarma dosyasi VERIFY: ' + r.Msg);
+    finally
+      CloseV3(S2);
+    end;
+
+    { RECOVER TO NOW: son durum }
+    r := Exec(S, 'RECOVER TO NOW');
+    if not gErr then Ok('pitr: RECOVER TO NOW calisti: ' + r.Msg)
+    else Fail('pitr: RECOVER TO NOW: ' + r.Msg);
+
+    { Canli dosya DEGISMEDI: kurtarma ayri dosyaya yazildi. }
+    r := Exec(S, 'SELECT COUNT(*) FROM t');
+    if (not gErr) and (Cel(r, 0, 0) = '3') then
+      Ok('pitr: kurtarma sonrasi canli veri bozulmadi')
+    else
+      Fail('pitr: kurtarma sonrasi canli COUNT: ' + Cel(r, 0, 0) + ' ' + r.Msg);
 
     { Guncel okuma bozulmadi. }
-    r := Exec(S, 'SELECT COUNT(*) FROM t');
-    if (not gErr) and (Cel(r, 0, 0) = '2') then
-      Ok('pitr: guncel okuma etkilenmedi')
-    else
-      Fail('pitr: guncel okuma bozuldu: ' + r.Msg);
     r := Exec(S, 'SELECT ad FROM t WHERE id = 2');
     if (not gErr) and (Cel(r, 0, 0) = 'Veli') then
       Ok('pitr: anahtar erisimi etkilenmedi')
@@ -999,17 +1098,12 @@ begin
     CloseV3(S);
   end;
 
-  { Arsiv dizini olusmamis olmali. }
-  found := DirectoryExists(base + 'arsiv');
-  if not found then Ok('pitr: arsiv dizini olusmadi')
-  else Fail('pitr: v3''te arsiv dizini olustu');
-
   { Yeniden acilis: dosya saglam. }
   OpenV3(S, 'pitr.odb', False);
   try
     r := Exec(S, 'SELECT COUNT(*) FROM t');
-    if (not gErr) and (Cel(r, 0, 0) = '2') then
-      Ok('pitr: yeniden acilista veri yerinde')
+    if (not gErr) and (Cel(r, 0, 0) = '3') then
+      Ok('pitr: yeniden acilista veri yerinde (3 satir)')
     else
       Fail('pitr: yeniden acilis: ' + r.Msg);
     r := Exec(S, 'VERIFY');
@@ -1017,6 +1111,137 @@ begin
       Ok('pitr: VERIFY gecti: ' + r.Msg)
     else
       Fail('pitr: VERIFY: ' + r.Msg);
+  finally
+    CloseV3(S);
+  end;
+end;
+
+  { v4 DUZELTME (regresyon kapisi): negatif literalli IN listesi indeks
+    daraltmasinda sessizce kayboluyordu. AST'de `-3` bir
+    TSqlUnaryOpNode(suoNeg) dugumudur; daraltma kodu "literal degil"
+    diye ATLIYOR, dilim yalniz pozitiflerden hesaplaniyor ve negatif
+    grubun satirlari HIC OKUNMADAN sonuctan dusuyordu (hata yok, yanlis
+    sonuc). Hem indeksli satir yolu, hem PK IN yolu, hem de COUNT yolu
+    burada birebir denetlenir. }
+procedure TestIndexInNegative;
+const
+  N = 400;
+var
+  S: TV3Sql;
+  r: TSqlResult;
+  i, v, got: Integer;
+  gotIds: string;  j: Integer;
+
+  { Beklenen satir sayisi: n = (i*7) mod 53 - 3, i mod 17 = 0 -> NULL }
+  function Expect(const Vals: array of Integer): Integer;
+  var
+    a, b: Integer;
+    hit: Boolean;
+  begin
+    Result := 0;
+    for a := 1 to N do
+    begin
+      if a mod 17 = 0 then Continue;
+      v := (a * 7) mod 53 - 3;
+      hit := False;
+      for b := 0 to High(Vals) do
+        if v = Vals[b] then
+        begin
+          hit := True;
+          Break;
+        end;
+      if hit then Inc(Result);
+    end;
+  end;
+
+  procedure CheckIn(const Sql: string; Exp: Integer);
+  begin
+    r := Exec(S, Sql);
+    got := Length(r.Rows);
+    if gErr then
+      Fail('idxneg: ' + Sql + ' -> HATA: ' + r.Msg)
+    else if got = Exp then
+      Ok(Format('idxneg: %d satir -> %s', [got, Sql]))
+    else
+      Fail(Format('idxneg: %d satir (beklenen %d) -> %s', [got, Exp, Sql]));
+  end;
+
+begin
+  WriteLn;
+  WriteLn('v4 duzeltme - indeksli IN listesinde negatif degerler');
+  CleanDir;
+  OpenV3(S, 'idxneg.odb', True);
+  try
+    r := Exec(S, 'CREATE TABLE fz (id INTEGER PRIMARY KEY, n INTEGER, k TEXT)');
+    r := Exec(S, 'BEGIN');
+    for i := 1 to N do
+    begin
+      if i mod 17 = 0 then
+        r := Exec(S, Format('INSERT INTO fz VALUES (%d,NULL,%s)',
+          [i, QuotedStr('k' + IntToStr(i mod 10))]))
+      else
+        r := Exec(S, Format('INSERT INTO fz VALUES (%d,%d,%s)',
+          [i, (i * 7) mod 53 - 3, QuotedStr('k' + IntToStr(i mod 10))]));
+    end;
+    r := Exec(S, 'COMMIT');
+    if not gErr then Ok('idxneg: 400 satir yazildi')
+    else Fail('idxneg: INSERT: ' + r.Msg);
+    r := Exec(S, 'CREATE INDEX ix_fz_n ON fz(n)');
+    if not gErr then Ok('idxneg: indeks olustu')
+    else Fail('idxneg: CREATE INDEX: ' + r.Msg);
+
+    { Indeksli satir yolu (NarrowRows) - sikayet edilen yol. }
+    CheckIn('SELECT id FROM fz WHERE n IN (19,17,-3)', Expect([19, 17, -3]));
+    CheckIn('SELECT id FROM fz WHERE n IN (19,17,-3) ORDER BY id',
+      Expect([19, 17, -3]));
+    CheckIn('SELECT id FROM fz WHERE n IN (-3,5)', Expect([-3, 5]));
+    CheckIn('SELECT id FROM fz WHERE n IN (5,-3)', Expect([5, -3]));
+    CheckIn('SELECT id FROM fz WHERE n IN (-3)', Expect([-3]));
+    CheckIn('SELECT id FROM fz WHERE n IN (-1,44,34)', Expect([-1, 44, 34]));
+    CheckIn('SELECT id FROM fz WHERE n IN (-3,-1,-2)', Expect([-3, -1, -2]));
+    CheckIn('SELECT id FROM fz WHERE n IN (3,5,7)', Expect([3, 5, 7]));
+    CheckIn('SELECT id FROM fz WHERE n IN (-3,3)', Expect([-3, 3]));
+
+    { Ayni sorgularin COUNT(*) yolu da birebir olmali (tam tarama yolu). }
+    r := Exec(S, 'SELECT COUNT(*) FROM fz WHERE n IN (19,17,-3)');
+    if (not gErr) and (Cel(r, 0, 0) = IntToStr(Expect([19, 17, -3]))) then
+      Ok('idxneg: COUNT(*) IN (19,17,-3) birebir')
+    else
+      Fail('idxneg: COUNT(*) IN: ' + Cel(r, 0, 0) + ' ' + r.Msg);
+
+    { PK uzerinde IN: negatif pk degerleri de bulunmali. }
+    r := Exec(S, 'CREATE TABLE nk (id INTEGER PRIMARY KEY, v TEXT)');
+    r := Exec(S, 'INSERT INTO nk VALUES (-5,''a''),(-1,''b''),(1,''c''),(7,''d'')');
+    CheckIn('SELECT v FROM nk WHERE id IN (-5,1)', 2);
+    CheckIn('SELECT v FROM nk WHERE id IN (-5,-1)', 2);
+    CheckIn('SELECT v FROM nk WHERE id IN (-5,-1,1,7)', 4);
+    r := Exec(S, 'SELECT v FROM nk WHERE id IN (-5,1) ORDER BY id');
+    gotIds := '';
+    for j := 0 to High(r.Rows) do gotIds := gotIds + Cel(r, j, 0);
+    if (not gErr) and (gotIds = 'ac') then
+      Ok('idxneg: PK IN sirali degerler birebir (ac)')
+    else
+      Fail('idxneg: PK IN degerleri: ' + gotIds);
+
+    { NULL iceren liste: daraltma YAPILMAMALI (UNKNOWN semantigi). }
+    CheckIn('SELECT id FROM fz WHERE n IN (19, NULL, -3)',
+      Expect([19, -3]));
+
+    { Negatif sabitli esitlik/aralik: daraltma artik KABUL ediyor
+      (eskiden negatifler indekslenemiyor, tam taramaya dusuyordu).
+      Sonuclar yine birebir olmali. }
+    CheckIn('SELECT id FROM fz WHERE n = -3', Expect([-3]));
+    CheckIn('SELECT id FROM fz WHERE -3 = n', Expect([-3]));
+    CheckIn('SELECT id FROM fz WHERE n >= -3 AND n <= 3',
+      Expect([-3, -2, -1, 0, 1, 2, 3]));
+    CheckIn('SELECT id FROM fz WHERE n BETWEEN -3 AND 3',
+      Expect([-3, -2, -1, 0, 1, 2, 3]));
+    CheckIn('SELECT id FROM fz WHERE n BETWEEN -3 AND -1',
+      Expect([-3, -2, -1]));
+    CheckIn('SELECT id FROM fz WHERE n > -3 AND n < -1',
+      Expect([-2]));
+    CheckIn('SELECT id FROM fz WHERE n IN (19,17,-3) ORDER BY id DESC', 
+      Expect([19, 17, -3]));
   finally
     CloseV3(S);
   end;
@@ -1649,7 +1874,8 @@ begin
   TestVacuumSql;
   TestShowStats;
   TestReplicationUnsupported;
-  TestPitrUnsupported;
+  TestPitrSql;
+  TestIndexInNegative;
   TestZoneMapFallback;
   TestFuzzOracle;
   TestIntegrity(N);

@@ -100,6 +100,21 @@ type
     function GetLastAutoCompactError: string;
     function AutoCompact(out OldBytes, NewBytes: Int64;
       MaxDeadRatio: Double; MinBytes: Int64): Boolean;
+
+    { v4: v2 motorunda mantiksal degisim gunlugu YOK. Deger yalan
+      soylememek icin LogSupported=False; kapsam metotlari bos doner. }
+    function LogSupported: Boolean;
+    function LogStatus: string;
+    function LogRangeInfo(out MinSeq, MaxSeq: Int64;
+      out MinTsMs, MaxTsMs: Int64; out BaseCount: Integer): Boolean;
+    function BuildLogSnapshot(TimestampMs, Version: Int64;
+      const DestPath: string;
+      out ActualTsMs, ActualSeq: Int64): Boolean;
+    function ScanAllAtLogTime(TableFilter: Integer;
+      TimestampMs, Version: Int64;
+      out Keys: TQWordArray; out Vals: TValArray;
+      out ActualTsMs, ActualSeq: Int64): Boolean;
+    function ArchiveLogSet(const DestDir: string): Int64;
   end;
 
 implementation
@@ -370,6 +385,60 @@ function TVDbBackendV2.AutoCompact(out OldBytes, NewBytes: Int64;
   MaxDeadRatio: Double; MinBytes: Int64): Boolean;
 begin
   Result := FDb.AutoCompact(OldBytes, NewBytes, MaxDeadRatio, MinBytes);
+end;
+
+{ ---------------------------------------- v4: gunluk / PITR (v2: YOK) }
+
+function TVDbBackendV2.LogSupported: Boolean;
+begin
+  Result := False;
+end;
+
+function TVDbBackendV2.LogStatus: string;
+begin
+  Result := 'v2 motorunda mantiksal degisim gunlugu yok';
+end;
+
+function TVDbBackendV2.LogRangeInfo(out MinSeq, MaxSeq: Int64;
+  out MinTsMs, MaxTsMs: Int64; out BaseCount: Integer): Boolean;
+begin
+  MinSeq := 0;
+  MaxSeq := 0;
+  MinTsMs := 0;
+  MaxTsMs := 0;
+  BaseCount := 0;
+  Result := False;
+end;
+
+function TVDbBackendV2.BuildLogSnapshot(TimestampMs, Version: Int64;
+  const DestPath: string;
+  out ActualTsMs, ActualSeq: Int64): Boolean;
+begin
+  ActualTsMs := 0;
+  ActualSeq := 0;
+  Result := False;
+  raise EVdbBackendV2.Create(
+    'PITR: v2 motorunda mantiksal degisim gunlugu yok; ' +
+    'yalniz AS OF SEQUENCE desteklenir');
+end;
+
+function TVDbBackendV2.ScanAllAtLogTime(TableFilter: Integer;
+  TimestampMs, Version: Int64;
+  out Keys: TQWordArray; out Vals: TValArray;
+  out ActualTsMs, ActualSeq: Int64): Boolean;
+begin
+  Keys := nil;
+  Vals := nil;
+  ActualTsMs := 0;
+  ActualSeq := 0;
+  Result := False;
+end;
+
+function TVDbBackendV2.ArchiveLogSet(const DestDir: string): Int64;
+begin
+  Result := 0;
+  raise EVdbBackendV2.Create(
+    'ARCHIVE WAL: v2 motorunda mantiksal degisim gunlugu yok');
 end;
 
 end.

@@ -26,7 +26,7 @@ uses
   VDbCore, VDbTable, VDbAst, VDbJson, VDbErr, VDbText, VDbXml, VDbSpatial,
   VDbRange, VDbParser, VDbTypes, VDbReplication, VDbParallel, VDbMonitor,
   VDbPlatform, VDbCost, VDbExtension, VDbVector, VDbArrow, VDbParquet,
-  VDbTrace;
+  VDbTrace, VDbChangeLog;
 
 const
   // F2-18: DISTINCT / UNION tekilleÅŸtirme sonucu ve set-op birlestirme
@@ -3776,6 +3776,37 @@ begin
   end;
 end;
 
+{ IN listesindeki bir ogenin SABIT degerini metne cevirir. Yalnizca duz
+  literal ve negatif literal (-3 -> TSqlUnaryOpNode(suoNeg)) kabul edilir.
+  NEDEN: negatif sayilar AST'de unary dugumu olarak durur; eski daraltma
+  kodu bunlari "literal degil" diye sessizce ATLIYORDU. Sonuc: indeks
+  dilimi yalniz pozitif degerlerden hesaplaniyor ve negatif grubun
+  satirlari HIC OKUNMADAN kayboluyordu (yanlis sonuc, hata yok). }
+function VdbInConstText(E: TSqlExprNode; out Val: string): Boolean;
+var
+  lit: TSqlLiteralNode;
+begin
+  Val := '';
+  Result := False;
+  if E is TSqlLiteralNode then
+  begin
+    lit := TSqlLiteralNode(E);
+    if lit.LitType = sltNull then Exit;
+    Val := lit.AsString;
+    Exit(Val <> '');
+  end;
+  if (E is TSqlUnaryOpNode) and (TSqlUnaryOpNode(E).Op = suoNeg) and
+     (TSqlUnaryOpNode(E).Operand is TSqlLiteralNode) then
+  begin
+    lit := TSqlLiteralNode(TSqlUnaryOpNode(E).Operand);
+    if not (lit.LitType in [sltInt, sltFloat]) then Exit;
+    Val := lit.AsString;
+    if Val = '' then Exit;
+    Val := '-' + Val;
+    Exit(True);
+  end;
+end;
+
 function TVSqlExecutor.NarrowRows(const Td: TTableDef; WhereClause: TSqlExprNode;
   const ColNames: TStrArray; const ColTypes: TByteArray;
   out Pks: TStrArray; out Rows: TStrMatrix; out IsExact: Boolean): Boolean;
@@ -3793,6 +3824,7 @@ var
   hasIn: Boolean;          // katkida bulunan IN var mi (aralik tam degil)
   hasLower: Boolean;       // alt sinir var mi (NULL'lari disarida tutar)
   isIn: Boolean;
+  rangeAllConst: Boolean;   // IN listesinin TUM ogeleri sabit mi
   op: TSqlBinaryOp;
   cr: TSqlColumnRefNode;
   opName: string;
@@ -3841,30 +3873,27 @@ var
     a := nil; b := nil;
     if nn.Left  is TSqlColumnRefNode then a := TSqlColumnRefNode(nn.Left);
     if nn.Right is TSqlColumnRefNode then b := TSqlColumnRefNode(nn.Right);
-    if (a <> nil) and (nn.Right is TSqlLiteralNode) then
+    if (a <> nil) and VdbInConstText(nn.Right, Val) then
     begin
-      // `a = NULL` SQL'de UNKNOWN'dir; indeks araligi uretme, RowMatches
-      // (veya tam tarama) dogru sonucu versin.
-      if TSqlLiteralNode(nn.Right).LitType = sltNull then Exit;
+      // `a = NULL` SQL'de UNKNOWN'dir; VdbInConstText NULL'u reddeder ->
+      // indeks araligi uretilmez, RowMatches/tam tarama dogru sonucu verir.
+      // Negatif sayilar (unary neg) artik KABUL: eskiden indekslenemiyordu.
       ColI := -1;
       for q := 0 to High(Td.Cols) do
         if VDbNorm(Td.Cols[q].Name) = VDbNorm(a.ColumnName) then
         begin ColI := q; Break; end;
       if ColI < 0 then Exit;
-      Val := TSqlLiteralNode(nn.Right).AsString;
       Op := nn.Op;
       Exit(True);
     end;
-    if (b <> nil) and (nn.Left is TSqlLiteralNode) then
+    if (b <> nil) and VdbInConstText(nn.Left, Val) then
     begin
       // "5 = a" -> "a = 5" (yansitilmis operator)
-      if TSqlLiteralNode(nn.Left).LitType = sltNull then Exit;
       ColI := -1;
       for q := 0 to High(Td.Cols) do
         if VDbNorm(Td.Cols[q].Name) = VDbNorm(b.ColumnName) then
         begin ColI := q; Break; end;
       if ColI < 0 then Exit;
-      Val := TSqlLiteralNode(nn.Left).AsString;
       case nn.Op of
         sboEq:  Op := sboEq;
         sboNeq: Op := sboNeq;
@@ -3927,14 +3956,25 @@ begin
                 VDbNorm(TSqlColumnRefNode(TSqlInNode(conj[i]).Expr).ColumnName) then
             begin ci := n; Break; end;
           if ci <> Td.PkIndex then Continue;
+          { GUVENLIK: listedeki HER ogenin sabit degeri cozulebilmeli.
+            Cozulemeyen (alt sorgu/ifade/NULL) bir oge varsa bu IN ile
+            daraltma YAPILMAZ; aksi halde eksik satir kumesi "kesin"
+            sanilip sessizce yanlis sonuc donerdi. }
+          rangeAllConst := True;
+          for n := 0 to TSqlInNode(conj[i]).List.Count - 1 do
+            if not VdbInConstText(TSqlInNode(conj[i]).List[n], pkVal) then
+            begin
+              rangeAllConst := False;
+              Break;
+            end;
+          if not rangeAllConst then Continue;
           // KR-2: on-tahsis (List.Count ust sinir), sonunda budama.
           SetLength(Pks, TSqlInNode(conj[i]).List.Count);
           SetLength(Rows, TSqlInNode(conj[i]).List.Count);
           ci := 0;  // ci'yi sayac olarak yeniden kullan (PkIndex artik gerekmez)
           for n := 0 to TSqlInNode(conj[i]).List.Count - 1 do
           begin
-            if not (TSqlInNode(conj[i]).List[n] is TSqlLiteralNode) then Continue;
-            pkVal := TSqlLiteralNode(TSqlInNode(conj[i]).List[n]).AsString;
+            if not VdbInConstText(TSqlInNode(conj[i]).List[n], pkVal) then Continue;
             if FT.ReadRow(Td.Name, pkVal, oneRow) then
             begin
               Pks[ci] := pkVal;
@@ -3995,9 +4035,7 @@ begin
       // 2b) BETWEEN a AND b
       else if (conj[i] is TSqlBetweenNode) and
               (not TSqlBetweenNode(conj[i]).IsNot) and
-              (TSqlBetweenNode(conj[i]).Expr is TSqlColumnRefNode) and
-              (TSqlBetweenNode(conj[i]).LowBound  is TSqlLiteralNode) and
-              (TSqlBetweenNode(conj[i]).HighBound is TSqlLiteralNode) then
+              (TSqlBetweenNode(conj[i]).Expr is TSqlColumnRefNode) then
       begin
         cr := TSqlColumnRefNode(TSqlBetweenNode(conj[i]).Expr);
         ci := -1;
@@ -4005,10 +4043,16 @@ begin
           if VDbNorm(Td.Cols[n].Name) = VDbNorm(cr.ColumnName) then
           begin ci := n; Break; end;
         if ci < 0 then Continue;
+        // Sinirlar da sabit olmali (negatif sayilar dahil); cozulemezse
+        // daraltma YAPILMAZ — aksi halde dilim yanlis hesaplanirdi.
+        if not VdbInConstText(TSqlBetweenNode(conj[i]).LowBound, pkVal) then
+          Continue;
+        condLoVal := pkVal;
+        if not VdbInConstText(TSqlBetweenNode(conj[i]).HighBound, pkVal) then
+          Continue;
+        condHiVal := pkVal;
         condHasLo := True; condLoInc := True;
-        condLoVal := TSqlLiteralNode(TSqlBetweenNode(conj[i]).LowBound).AsString;
         condHasHi := True; condHiInc := True;
-        condHiVal := TSqlLiteralNode(TSqlBetweenNode(conj[i]).HighBound).AsString;
         hasLower := True;
       end
       // 2c) IN (a, b, c, ...)
@@ -4024,10 +4068,18 @@ begin
         if (ci < 0) or (TSqlInNode(conj[i]).List.Count = 0) then Continue;
         if (not FT.TryGetIdxSource(Td.TableId, ci, src)) then Continue;
         minVal := ''; maxVal := ''; n := 0;
+        rangeAllConst := True;
         for lo := 0 to TSqlInNode(conj[i]).List.Count - 1 do
         begin
-          if not (TSqlInNode(conj[i]).List[lo] is TSqlLiteralNode) then Continue;
-          pkVal := TSqlLiteralNode(TSqlInNode(conj[i]).List[lo]).AsString;
+          { Cozulemeyen oge (ifade/alt sorgu/NULL) -> dilimi DARALTMA.
+            Eskiden yalniz literal olanlar sayiliyordu; negatif sayilar
+            (unary neg) disarida kalinca dilim daraliyor ve o grubun
+            satirlari okunmadan kayboluyordu. }
+          if not VdbInConstText(TSqlInNode(conj[i]).List[lo], pkVal) then
+          begin
+            rangeAllConst := False;
+            Break;
+          end;
           if n = 0 then
           begin minVal := pkVal; maxVal := pkVal; end
           else
@@ -4037,7 +4089,7 @@ begin
           end;
           Inc(n);
         end;
-        if n = 0 then Continue;
+        if (not rangeAllConst) or (n = 0) then Continue;
         condHasLo := True; condLoInc := True; condLoVal := minVal;
         condHasHi := True; condHiInc := True; condHiVal := maxVal;
       end
@@ -8860,6 +8912,8 @@ var
   st: TAsOfSt;
   touched: Boolean;
   seq, actual: Integer;
+  { v4: gunluk (PITR) hedefi ve ulasilan nokta }
+  lts, lver, ats, aseq: Int64;
 
   procedure ResetSt(var S: TAsOfSt);
   begin
@@ -8892,6 +8946,37 @@ begin
     LIMIT/OFFSET aynen guncel veri hattindan gecer. }
   if FT.Kv = nil then
   begin
+    if (Stmt.AsOf = saoTimestamp) or (Stmt.AsOf = saoVersion) then
+    begin
+      { v4: kalici degisim gunlugu uzerinden anlik goruntu. }
+      lts := 0;
+      lver := 0;
+      if Stmt.AsOf = saoTimestamp then
+      begin
+        if not VdbLogParseTimestamp(Stmt.AsOfText, lts) then
+          raise EVDbException.CreateFmt(ecSyntaxError,
+            'AS OF TIMESTAMP: zaman cozulemedi: "%s" ' +
+            '(beklenen: YYYY-MM-DD HH:MM:SS[.mmm], UTC)', [Stmt.AsOfText]);
+      end
+      else
+      begin
+        if not TryStrToInt64(Trim(Stmt.AsOfText), lver) then
+          raise EVDbException.CreateFmt(ecSyntaxError,
+            'AS OF VERSION: gecerli bir tamsayi bekleniyor, "%s" bulundu',
+            [Stmt.AsOfText]);
+      end;
+      if not FT.ScanRowsAtLog(Stmt.FromTable, lts, lver, Pks, Rows,
+        ats, aseq) then
+        raise EVDbException.Create(ecUnsupported,
+          'AS OF: bu backend degisim gunlugu sunmuyor');
+      for i := 0 to High(Rows) do
+        if Length(Rows[i]) <> Length(ColNames) then
+          raise EVDbException.CreateFmt(ecUnsupported,
+            'AS OF: gecmis satir semasi (%d kolon) guncel semadan (%d kolon) ' +
+            'farkli; ALTER TABLE sonrasi gecmis okunamaz (pk=%s)',
+            [Length(Rows[i]), Length(ColNames), Pks[i]]);
+      Exit;
+    end;
     if Stmt.AsOfValue > QWord(High(Integer)) then
       seq := High(Integer)
     else
@@ -11895,6 +11980,9 @@ var
   ViewRes: TSqlResult;
   ViewTypes: TByteArray;
   cnt64: Int64;
+  { v4: AS OF TIMESTAMP/VERSION hedefi (v3 gunluk yolu). }
+  tsMs: Int64;
+  verNo: Int64;
 
   // 4.2 (2026-10-06): aggregate/GROUP BY sonrasi kuyruk â€” JOIN ve
   // tek-tablo yolu ORTAK kullanir (kod tekrari yok). ORDER BY cikti
@@ -11962,16 +12050,31 @@ begin
     if Stmt.WithQueries.Count > 0 then
       raise EVDbException.Create(ecUnsupported,
         'AS OF ile WITH/CTE desteklenmiyor');
-    if Stmt.AsOf = saoTimestamp then
+    if (Stmt.AsOf = saoTimestamp) and (FT.Kv <> nil) then
       raise EVDbException.Create(ecUnsupported,
-        'AS OF TIMESTAMP desteklenmiyor: WAL kayitlarinda zaman damgasi yoktur; ' +
-        'AS OF SEQUENCE <n> kullanin (v2: n = WAL kayit indeksi, ' +
-        'v3: n = WAL commit sayisi)');
-    if Stmt.AsOf = saoVersion then
+        'AS OF TIMESTAMP v2 motorunda desteklenmiyor (WAL kayitlarinda zaman ' +
+        'damgasi yok); AS OF SEQUENCE <n> kullanin ya da v3 sayfa motorunu secin');
+    if (Stmt.AsOf = saoVersion) and (FT.Kv <> nil) then
       raise EVDbException.Create(ecUnsupported,
-        'AS OF VERSION desteklenmiyor: WAL kayitlarinda surum numarasi yoktur; ' +
-        'AS OF SEQUENCE <n> kullanin (v2: n = WAL kayit indeksi, ' +
-        'v3: n = WAL commit sayisi)');
+        'AS OF VERSION v2 motorunda desteklenmiyor (kalici surum gunlugu yok); ' +
+        'AS OF SEQUENCE <n> kullanin ya da v3 sayfa motorunu secin');
+    if (Stmt.AsOf = saoTimestamp) and (FT.Kv = nil) then
+    begin
+      if not VdbLogParseTimestamp(Stmt.AsOfText, tsMs) then
+        raise EVDbException.CreateFmt(ecSyntaxError,
+          'AS OF TIMESTAMP: zaman cozulemedi: "%s" ' +
+          '(beklenen: YYYY-MM-DD HH:MM:SS[.mmm], UTC)', [Stmt.AsOfText]);
+    end;
+    if (Stmt.AsOf = saoVersion) and (FT.Kv = nil) then
+    begin
+      if not TryStrToInt64(Trim(Stmt.AsOfText), verNo) then
+        raise EVDbException.CreateFmt(ecSyntaxError,
+          'AS OF VERSION: gecerli bir tamsayi bekleniyor, "%s" bulundu',
+          [Stmt.AsOfText]);
+      if verNo <= 0 then
+        raise EVDbException.Create(ecSyntaxError,
+          'AS OF VERSION: surum 1 veya daha buyuk olmali');
+    end;
   end;
 
   // FROM'suz SELECT: SELECT 1, 'abc' AS x, NULL
@@ -16780,6 +16883,12 @@ var
   icols: TIntArray;
   lst: TStrArray;      // R-16: arsiv segment listesi
   bar, n16: Integer;   // R-16
+  { v4: PITR }
+  dest: string;
+  ats, aseq: Int64;
+  tgt: Int64;
+  minSeq, maxSeq, minTs, maxTs: Int64;
+  baseCount: Integer;
   st: TReplicationState; // R-17
   slots: TReplSlotArray; // R-17
   nRep, kRep: Integer;   // R-17
@@ -16800,26 +16909,22 @@ begin
     VERIFY ve VACUUM backend uzerinden eklendi; 3.5 replikasyon ve 3.6
     PITR/arsiv burada acikca reddedilir; kalanlar v3.1.) }
   if (FT.Kv = nil) and (Stmt.Kind in [
-      admRecoverTo,
-      admArchiveSet, admArchiveList, admSavepoint,
+      admSavepoint,
       admReleaseSavepoint, admRollbackToSavepoint,
       admReplicationStart, admReplicationStop, admCreateReplSlot,
       admDropReplSlot, admShowReplicationStatus, admReplicationPump,
       admShowReplSlots]) then
   begin
-    { Sprint 3.5/3.6: gruplara gore yol gosteren mesaj. }
+    { v4: PITR/arsiv artik v3'te de var (asagida). Replikasyon ve
+      SAVEPOINT hala yok. }
     if Stmt.Kind in [admReplicationStart, admReplicationStop,
       admCreateReplSlot, admDropReplSlot, admShowReplicationStatus,
       admReplicationPump, admShowReplSlots] then
       raise EVDbException.Create(ecUnsupported,
         'REPLICATION v3 sayfa motorunda yok ' +
-        '(v3.1: mantiksal gunluk ile gelecek)');
-    if Stmt.Kind in [admRecoverTo, admArchiveSet, admArchiveList] then
-      raise EVDbException.Create(ecUnsupported,
-        'PITR / WAL arsivi v3 sayfa motorunda yok ' +
-        '(v3.1: sayfa WAL''i uzerinde mantiksal gunluk ile gelecek)');
+        '(v4: mantiksal gunluk hazir; replikasyon sonraki dilim)');
     raise EVDbException.Create(ecUnsupported,
-      'Bu yonetim komutu v3 sayfa motorunda henuz desteklenmiyor (v3.1)');
+      'Bu yonetim komutu v3 sayfa motorunda henuz desteklenmiyor');
   end;
   case Stmt.Kind of
     admVerify:
@@ -16891,26 +16996,74 @@ begin
     // ---- R-16: WAL ARSIVLEME + PITR ----
     admArchiveSet:
       begin
-        if Stmt.ArchiveDir = '' then
-          FT.Kv.SetArchiveDir('')
+        if FT.Kv = nil then
+        begin
+          { v4: v3'te gunluk her zaman <db>.log altinda ve kalicidir.
+            ARCHIVE WAL SET DIR='x' o setin TAM kopyasini x'e cikarir;
+            komut tekrarlandikca kopya tazelenir (birincil gunluge
+            DOKUNULMAZ). }
+          if Stmt.ArchiveDir = '' then
+            raise EVDbException.Create(ecUnsupported,
+              'ARCHIVE WAL RESET v3''te yok: degisim gunlugu kalicidir, ' +
+              'kapatilamaz (PITR yetenegi kaybolmasin)');
+          n16 := FT.Backend.ArchiveLogSet(Stmt.ArchiveDir);
+          Res.Affected := 1;
+          Res.Msg := Format('gunluk arsivi: %s (%d bayt)',
+            [Stmt.ArchiveDir, n16]);
+        end
         else
         begin
-          FT.Kv.SetArchiveDir(Stmt.ArchiveDir);
-          FT.Kv.SetWalSegmentMax(Stmt.ArchiveSize);
+          if Stmt.ArchiveDir = '' then
+            FT.Kv.SetArchiveDir('')
+          else
+          begin
+            FT.Kv.SetArchiveDir(Stmt.ArchiveDir);
+            FT.Kv.SetWalSegmentMax(Stmt.ArchiveSize);
+          end;
+          Res.Affected := 1;
+          if FT.Kv.ArchiveEnabled then
+            Res.Msg := 'arsiv: ' + FT.Kv.GetArchiveDir +
+              ' segment=' + IntToStr(FT.Kv.GetWalSegmentMax)
+          else
+            Res.Msg := 'arsivleme kapali';
         end;
-        Res.Affected := 1;
-        if FT.Kv.ArchiveEnabled then
-          Res.Msg := 'arsiv: ' + FT.Kv.GetArchiveDir +
-            ' segment=' + IntToStr(FT.Kv.GetWalSegmentMax)
-        else
-          Res.Msg := 'arsivleme kapali';
       end;
     admArchiveList:
       begin
-        lst := FT.Kv.ListWalArchive;
-        SetLength(Res.Fields, 3);
-        Res.Fields[0] := 'segment';
-        Res.Fields[1] := 'bytes';
+        if FT.Kv = nil then
+        begin
+          { v4: v3'te arsiv bir dizin degil, gunlugun kendi kapsamidir. }
+          if not FT.Backend.LogRangeInfo(minSeq, maxSeq, minTs, maxTs, baseCount) then
+          begin
+            SetLength(Res.Fields, 0);
+            SetLength(Res.Rows, 0);
+            Res.Affected := 0;
+            Res.Msg := 'gunluk bos: ' + FT.Backend.LogStatus;
+          end
+          else
+          begin
+            SetLength(Res.Fields, 5);
+            Res.Fields[0] := 'min_seq';  Res.Fields[1] := 'max_seq';
+            Res.Fields[2] := 'min_time'; Res.Fields[3] := 'max_time';
+            Res.Fields[4] := 'bases';
+            SetLength(Res.Rows, 1);
+            SetLength(Res.Rows[0], 5);
+            Res.Rows[0][0] := IntToStr(minSeq);
+            Res.Rows[0][1] := IntToStr(maxSeq);
+            Res.Rows[0][2] := VdbLogFormatTimestamp(minTs);
+            Res.Rows[0][3] := VdbLogFormatTimestamp(maxTs);
+            Res.Rows[0][4] := IntToStr(baseCount);
+            Res.Affected := 1;
+            Res.Msg := Format('gunluk: seq %d..%d, %d taban',
+              [minSeq, maxSeq, baseCount]);
+          end;
+        end
+        else
+        begin
+          lst := FT.Kv.ListWalArchive;
+          SetLength(Res.Fields, 3);
+          Res.Fields[0] := 'segment';
+          Res.Fields[1] := 'bytes';
         SetLength(Res.Rows, Length(lst));
         for i := 0 to High(lst) do
         begin
@@ -16921,6 +17074,7 @@ begin
         end;
         Res.Affected := Length(lst);
         Res.Msg := IntToStr(Length(lst)) + ' arsiv segmenti';
+        end;
       end;
     admRestoreFrom:
       begin
@@ -16940,15 +17094,45 @@ begin
       end;
     admRecoverTo:
       begin
-        if not FT.Kv.ArchiveEnabled then
-          raise EVDbException.Create(ecInvalidState,
-            'RECOVER: WAL arsivleme kapali. Once "ARCHIVE WAL SET DIR=..." calistir.');
-        n16 := FT.Kv.RecoverFromArchive(Stmt.RecoverStamp);
-        Res.Affected := n16;
-        if Stmt.RecoverStamp = 0 then
-          Res.Msg := IntToStr(n16) + ' kayit uygulandi (arsivin tamami)'
+        if FT.Kv = nil then
+        begin
+          { v4: v3'te kurtarma CANLI dosyaya yazmaz. Taban + ileri replay
+            ile hedef noktadaki tutarli durum <db>.recovered dosyasina
+            yazilir; kullanici onu acip dogrular, sonra RESTORE FROM ile
+            (ya da dosyayi elle degistirerek) devreye alir. Boylece yanlis
+            hedefe kurtarma asla canli veriyi bozmaz. }
+          dest := FT.Backend.FilePath + '.recovered';
+          if FileExists(dest) then DeleteFile(dest);
+          { RECOVER TO TIMESTAMP metni v2 kuraliyla "duvar saati" epoch'una
+            cevrilir; gunluk ise UTC tutar. Burada gercek UTC'ye cevrilir. }
+          tgt := 0;
+          if Stmt.RecoverStamp <> 0 then
+            tgt := VdbLogWallMsToUtcMs(Int64(Stmt.RecoverStamp));
+          if not FT.Backend.BuildLogSnapshot(tgt, 0, dest,
+            ats, aseq) then
+            raise EVDbException.Create(ecInvalidState,
+              'RECOVER: kurtarma dosyasi olusturulamadi: ' + FT.Backend.LogStatus);
+          Res.Affected := 1;
+          if Stmt.RecoverStamp = 0 then
+            Res.Msg := Format('kurtarma dosyasi: %s (son durum, seq=%d)',
+              [dest, aseq])
+          else
+            Res.Msg := Format('kurtarma dosyasi: %s (hedef=%s, ulasilan=%s, seq=%d)',
+              [dest, VdbLogFormatTimestamp(tgt),
+               VdbLogFormatTimestamp(ats), aseq]);
+        end
         else
-          Res.Msg := IntToStr(n16) + ' kayit uygulandi (hedef zamana kadar)';
+        begin
+          if not FT.Kv.ArchiveEnabled then
+            raise EVDbException.Create(ecInvalidState,
+              'RECOVER: WAL arsivleme kapali. Once "ARCHIVE WAL SET DIR=..." calistir.');
+          n16 := FT.Kv.RecoverFromArchive(Stmt.RecoverStamp);
+          Res.Affected := n16;
+          if Stmt.RecoverStamp = 0 then
+            Res.Msg := IntToStr(n16) + ' kayit uygulandi (arsivin tamami)'
+          else
+            Res.Msg := IntToStr(n16) + ' kayit uygulandi (hedef zamana kadar)';
+        end;
       end;
     admAlterDbKey:
       begin

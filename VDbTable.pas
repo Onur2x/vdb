@@ -642,6 +642,12 @@ type
     function ScanRowsAt(const Table: string; Sequence: Integer;
       out Pks: TStrArray; out Rows: TStrMatrix;
       out ActualSequence: Integer): Boolean;
+    { v4: mantiksal degisim gunlugunden tablo goruntusu. Hedef zaman (UTC
+      ms) ve/veya kalici surum (gunluk seq) verilir; Actual* gercekte
+      ulasilan noktadir. False: backend gunlugu sunmuyor (v2). }
+    function ScanRowsAtLog(const Table: string; TimestampMs, Version: Int64;
+      out Pks: TStrArray; out Rows: TStrMatrix;
+      out ActualTsMs, ActualSeq: Int64): Boolean;
     // R-13 Full: bolme anahtari DEGERININ dusecegi bolum (-1 = hesaplanamadi)
     function PartValueOf(const T: TTableDef; const Val: string): Integer;
     // R-13 Full: satirin bolum numarasi (-1 = bolunmemis/cozulemedi)
@@ -9397,6 +9403,53 @@ begin
     if keys[i] = VDB_SCHEMA_KEY then Continue;
     { F2-16/BT-3 ile ayni kurallar: cozulemeyen kayit ve hash carpismasi
       SESSIZCE atlanmaz. Gecmis goruntu de ayni denetimlerden gecer. }
+    if not DecodeRow(raw[i], tid, pk, vals) then
+      raise EVDbException.CreateFmt(ecCorrupt,
+        'AS OF: kayit cozulemedi (tablo=%s, anahtar=%d). Anlik goruntu ' +
+        'bozuk; yedekten geri yukleyin.', [t.Name, keys[i]]);
+    if tid <> t.TableId then Continue;
+    if VDbHashKey(t.Name, pk) <> keys[i] then
+      raise EVDbException.CreateFmt(ecHashCollision,
+        'AS OF: HASH CARPISMASI (tablo %s, pk=%s): anlik goruntu bozuk; ' +
+        'yedekten geri yukleyin.', [t.Name, pk]);
+    Pks[n] := pk;
+    Rows[n] := vals;
+    Inc(n);
+  end;
+  SetLength(Pks, n);
+  SetLength(Rows, n);
+  Result := True;
+end;
+
+function TVTableDb.ScanRowsAtLog(const Table: string;
+  TimestampMs, Version: Int64;
+  out Pks: TStrArray; out Rows: TStrMatrix;
+  out ActualTsMs, ActualSeq: Int64): Boolean;
+var
+  t: TTableDef;
+  keys: TQWordArray;
+  raw: TValArray;
+  i, n: Integer;
+  tid: Word;
+  pk: string;
+  vals: TStrArray;
+begin
+  SetLength(Pks, 0);
+  SetLength(Rows, 0);
+  ActualTsMs := 0;
+  ActualSeq := 0;
+  Result := False;
+  if FKvB = nil then Exit;
+  t := GetTable(Table);
+  if not FKvB.ScanAllAtLogTime(t.TableId, TimestampMs, Version,
+    keys, raw, ActualTsMs, ActualSeq) then
+    Exit;
+  SetLength(Pks, Length(keys));
+  SetLength(Rows, Length(keys));
+  n := 0;
+  for i := 0 to High(keys) do
+  begin
+    if keys[i] = VDB_SCHEMA_KEY then Continue;
     if not DecodeRow(raw[i], tid, pk, vals) then
       raise EVDbException.CreateFmt(ecCorrupt,
         'AS OF: kayit cozulemedi (tablo=%s, anahtar=%d). Anlik goruntu ' +

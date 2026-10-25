@@ -616,19 +616,30 @@ end;
 
 function TVDbParser.ParseTimeStampMS(const S: string): QWord;
 // R-16: 'YYYY-MM-DD HH:MM:SS[.mmm]' -> Unix milisaniye.
-// Motorda NOW da NowUnixMS ile AYNI zaman kaynagini (yerel) kullanir,
-// boylece kullanici yazdigi saat ile motorun damgaladigi saat ayni
-// olculer. Bicim taninmazsa HATA veririz (sessizce 0 donmek, "tum
-// arsivi uygula" anlamina gelirdi -> HATALI KURTARMA).
+// Motorda NOW da NowUnixMS ile AYNI zaman kaynagini (yerel duvar saati)
+// kullanir, boylece kullanici yazdigi saat ile motorun damgaladigi saat ayni
+// olculer. Bicim taninmazsa HATA veririz (sessizce 0 donmek, "tum arsivi
+// uygula" anlamina gelirdi -> HATALI KURTARMA).
+//
+// 2026-10-26: COZUMLEME ARTIK BAGIMSIZDIR. Onceden TryStrToDateTime
+// kullaniliyordu; bu fonksiyon YEREL KISA TARIH BICIMINE bagimlidir
+// (TR Windows'ta 'dd.MM.yyyy'); 'YYYY-MM-DD' bu yuzden okunamiyordu ve
+// milisaniyeli damgalar sessizce reddediliyordu. Simdi alanlar tek tek
+// okunur; bicim dilden/locale'den bagimsizdir.
 var
-  raw: string;
-  frac: string;
+  raw, dpart, tpart, frac: string;
   ms: Integer;
   dt: TDateTime;
-  sp: Integer;
+  sp, p, y, mo, d, h, mi, se: Integer;
 begin
   Result := 0;
-  raw := VDbUnquote(S);
+  raw := Trim(VDbUnquote(S));
+  { Sondaki 'Z' (UTC isareti) ve 'T' ayirici kabul edilir. }
+  if (Length(raw) > 0) and ((raw[Length(raw)] = 'Z') or (raw[Length(raw)] = 'z')) then
+    Delete(raw, Length(raw), 1);
+  for p := 1 to Length(raw) do
+    if raw[p] = 'T' then raw[p] := ' ';
+
   ms := 0;
   sp := Pos('.', raw);
   if sp > 0 then
@@ -640,11 +651,55 @@ begin
     while Length(frac) < 3 do frac := frac + '0';
     ms := StrToIntDef(frac, 0);
   end;
-  if not TryStrToDateTime(raw, dt) then
+  raw := Trim(raw);
+
+  p := Pos(' ', raw);
+  if p > 0 then
+  begin
+    dpart := Copy(raw, 1, p - 1);
+    tpart := Trim(Copy(raw, p + 1, MaxInt));
+  end
+  else
+  begin
+    dpart := raw;
+    tpart := '00:00:00';
+  end;
+
+  y := -1; mo := -1; d := -1;
+  if (Length(dpart) = 10) and (dpart[5] = '-') and (dpart[8] = '-') then
+  begin
+    y := StrToIntDef(Copy(dpart, 1, 4), -1);
+    mo := StrToIntDef(Copy(dpart, 6, 2), -1);
+    d := StrToIntDef(Copy(dpart, 9, 2), -1);
+  end;
+  h := 0; mi := 0; se := 0;
+  if Length(tpart) >= 5 then
+  begin
+    if (Length(tpart) < 5) or (tpart[3] <> ':') then
+    begin
+      y := -1;
+    end
+    else
+    begin
+      h := StrToIntDef(Copy(tpart, 1, 2), -1);
+      mi := StrToIntDef(Copy(tpart, 4, 2), -1);
+      if (Length(tpart) >= 8) and (tpart[6] = ':') then
+        se := StrToIntDef(Copy(tpart, 7, 2), -1);
+    end;
+  end;
+  if (y < 1) or (mo < 1) or (mo > 12) or (d < 1) or (d > 31) or
+     (h < 0) or (h > 23) or (mi < 0) or (mi > 59) or (se < 0) or (se > 59) or
+     (ms < 0) or (ms > 999) then
     raise EVDbException.Create(ecSyntaxError,
       'RECOVER: zaman damgasi okunamadi: ' + S +
       ' (bicim: YYYY-MM-DD HH:MM:SS[.mmm])');
-  Result := QWord(Int64(DateTimeToUnix(dt)) * 1000 + ms);
+  try
+    dt := EncodeDateTime(y, mo, d, h, mi, se, ms);
+  except
+    raise EVDbException.Create(ecSyntaxError,
+      'RECOVER: zaman damgasi gecersiz: ' + S);
+  end;
+  Result := QWord(Int64(DateTimeToUnix(dt, True)) * 1000 + ms);
 end;
 
 function TVDbParser.PeekToken: string;

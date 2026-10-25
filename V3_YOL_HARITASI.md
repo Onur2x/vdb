@@ -163,6 +163,10 @@ v3 bu noktada uygulama geliştirmeye hazır ilan edildi:
   replikasyon, zone map, `ALTER DATABASE KEY`, TCP sunucusunda v3.
   Hepsi bugün **açık hata** verir, sessiz yanlış sonuç üretmez.
 
+> **Güncelleme (2026-10-26):** Bu paragraftaki PITR/WAL arşivi maddesi
+> **kapandı** (v4 dilimi). Bkz. aşağıdaki "v4 — mantıksal değişim günlüğü
+> ve PITR" bölümü. Kalanlar: `SAVEPOINT`, replikasyon, zone map.
+
 CI'da düzeltilen iki kusur (bu kapanışta bulundu):
 
 1. `sqltest --backend=v3` adımının son kontrolü `atlanan=[1-9]` idi; yani
@@ -202,26 +206,83 @@ Son ölçüm: `sqltest --backend=v3` **2758 geçen / 0 kalan / 33 atlanan**,
 mekanizmalarına (blok CRC, undo, in-place, WAL kayıt biçimi) bağlı
 testlerdir — bunlar v3'te **yok** ve v3'te açık hata verir.
 
-**v3.2'de kalanlar (henüz yapılmadı):**
+**v3.2'de kalanlar (2026-10-26 itibarıyla):**
 
-1. **Gerçek PITR (`RECOVER TO`) / WAL arşivi (T95).** `AS OF SEQUENCE`
-   artık çalışır, ama **yalnız son checkpoint'ten beri** (WAL penceresi).
-   Checkpoint öncesine gitmek için: checkpoint'te `.wal` dosyasını arşive
-   kopyalama (`ARCHIVE WAL`), taban yedek + ileri replay ve commit
-   kayıtlarına zaman damgası. Tasarım kararı verilmeden kod yazılmayacak.
-2. **Replikasyon (T95b, T101).** Mantıksal değişim günlüğüne (eski değer
-   dahil) bağlıdır; o olmadan "replikasyon" yalnız dosya kopyası olur
-   (yanlış güven).
-3. Zone map (sayfa düzeyi budama) ve dosya boyu optimizasyonları —
+1. ~~**Gerçek PITR (`RECOVER TO`) / WAL arşivi (T95).**~~ → **tamamlandı**
+   (aşağıdaki "v4" bölümü).
+2. **Replikasyon (T95b, T101).** Mantıksal değişim günlüğü artık **var**
+   (v4), yani önkoşul karşılandı; replikasyon protokolü sıradaki dilim.
+3. Zone map (sayfa düzeyinde budama) ve dosya boyu optimizasyonları —
    performans işi, doğruluk riski yok.
 
-### Sıradaki sürüme ertelenen (v3.2)
+### v4 — mantıksal değişim günlüğü ve PITR (2026-10-26)
+
+Tasarım ve sözleşme `VDbChangeLog.pas` başında yazılı. Özet:
+
+| Konu | Yapılan |
+|---|---|
+| Günlük biçimi | `<db>.log\seg-NNNNNN.vlog` (16 MB rotasyon, yalnız grup sınırında) + `<db>.log\base\b-<seq>-<lsn>.odb` taban imajları. Kayıt = anahtar + eski değer + yeni değer + UTC ms + grup seq. Magic: `VLG1`/`VLR1`/`VLB1`/`VLE1`. **Yarım grup replay edilmez.** |
+| Yazma yolu | Grup kapanışı **WAL commit'inden SONRA** yazılır. Günlük yazılamazsa veri kaybı olmaz; yalnız `FLogProblem` işaretlenir ve PITR/replikasyon istekleri net hata verir. Yazma yolu hiçbir durumda başarısız olmaz. |
+| Taban (base) | BASE kaydı yeni nesil açar. `Flags` bit0=1 → nesil kopması (`RESTORE`): replay orada **durur**. bit0=0 → saf checkpoint (`VACUUM`, `ALTER KEY`, ilk taban): replay **devam eder**. END kaydı motor LSN'ini taşır; açılışta uyuşmazlıkta nesil kopması yazılır ve öncesi için PITR açıkça reddedilir. |
+| `AS OF TIMESTAMP` | Metin **yerel saat** kabul edilir ve UTC'ye çevrilir; `YYYY-MM-DD[ HH:MM[:SS[.mmm]]]`, `T` ayırıcı ve sondaki `Z` kabul. Hedef en eski tabandan önceyse **açık hata**; son kayıttan ileriyse son duruma **kırpılır** ve `Actual*` ile bildirilir. |
+| `AS OF VERSION` | Günlük grup sırası (`seq`). Aynı sınır kuralları. |
+| `ARCHIVE WAL SET DIR=` | Günlüğün **tam kopyasını** dizine çıkarır (birincil günlüğe dokunmaz); tekrarlandıkça tazeler. `RESET` yok: günlük kalıcıdır, silinirse PITR yeteneği kaybolur. |
+| `ARCHIVE WAL LIST` | Günlük kapsamını tek satırda verir: `min_seq`, `max_seq`, `min_time`, `max_time`, `bases`. |
+| `RECOVER TO [TIMESTAMP\|NOW]` | **Canlı dosyaya yazmaz.** `<db>.recovered` üretir (taban + ileri replay). Kullanıcı dosyayı açıp doğrular, `RESTORE FROM` ile devreye alır. Yanlış hedefe kurtarma canlı veriyi bozamaz. |
+| v2 davranışı | v2'de bu dört komut **yoktur** → net `ecUnsupported`. `AS OF SEQUENCE` v2'de eskisi gibi çalışır. |
+
+Kapılar:
+
+| Kapı | Kontrol | Durum |
+|---|---|---|
+| `logchk` (10) | Günlük biçimi, yazıcı/okuyucu, CRC, kesik kuyruk, yarım grup, nesil kopması | **28/0** |
+| `pitrchk` (11) | 3 fazlı yazım, `AS OF TIMESTAMP/VERSION`, ileri hedef kırpma, `BuildLogSnapshot` → dosya açılıp `Verify` TEMİZ + içerik birebir, kalıcılık, `ArchiveLogSet`, `LogRangeInfo` | **21/0** |
+| `v3sqlchk` | SQL düzeyinde PITR: `AS OF TIMESTAMP/VERSION`, `ARCHIVE WAL SET/LIST`, `RECOVER TO`, kurtarma dosyasının gerçekten açılıp `VERIFY` geçmesi, canlı verinin bozulmaması | **160/0** |
+
+Ölçüm (`pitrbench`, 20.000 satır / 100 commit, tek koşu, QPC):
+
+| Ölçüm | Değer |
+|---|---|
+| Yazma (günlük açık) | 308 ms → **15,4 µs/satır**, 3,08 ms/commit |
+| Günlük boyu | 1.934.517 bayt → **96,5 bayt/satır** |
+| `AS OF TIMESTAMP` (tam sayım, 20k satır) | ortalama **556 ms** (3 koşu, 3/3 doğru) |
+| `BuildLogSnapshot` (son durum) | **516 ms**, 1.228.800 bayt çıktı |
+| `ArchiveLogSet` | **3 ms**, 1.934.517 bayt |
+
+Not: `AS OF TIMESTAMP` her çağrıda taban kopyası + ileri replay yapar; tam
+sayımda yüzlerce ms sürer. Hedefe en yakın taban seçimi zaten yapılıyor;
+kalan maliyet replay'in kendisi.
+
+### v4'te bulunan ve düzeltilen sessiz yanlış sonuç (indeksli `IN`)
+
+`sqltest` rasgele diferansiyel testi (T147) v4 sırasında **kararsız**
+kırmızı verdi: aynı sorgu indeksli tabloda daha az satır dönüyordu. Kök
+neden v4'ten önce de vardı, ama nadir tetikleniyordu:
+
+- `-3` gibi negatif sabitler AST'de `TSqlUnaryOpNode(suoNeg)` düğümüdür,
+  `TSqlLiteralNode` değil.
+- `NarrowRows` indeks dilimi hesabı yalnız `TSqlLiteralNode` arıyordu;
+  negatif öğeler **sessizce atlanıyordu**.
+- Sonuç: `WHERE n IN (19,17,-3)` dilimi yalnız `[17,19]` oluyor, `n=-3`
+  grubunun satırları **hiç okunmadan** sonuçtan düşüyordu. Hata yok,
+  uyarı yok — yalnız eksik satır.
+- Aynı hata PK üzerindeki `IN (-5, 1)` yolunda ve `= -3` biçiminde de
+  vardı (`AsSimple` de literal arıyordu).
+
+Düzeltme: tek bir yardımcı (`VdbInConstText`) hem düz hem negatif sabiti
+çözer; **çözemezse daraltma yapılmaz** (güvenli taraf). Kapsanan yollar:
+PK `IN`, ikincil indeks `IN` dilimi, `=`/`>`/`>=`/`<`/`<=` daraltması.
+Kapı: `v3sqlchk TestIndexInNegative` (17 kontrol) — indeksli satır yolu,
+PK yolu ve COUNT yolu birebir; NULL içeren liste daraltmaz.
+
+### Sıradaki sürüme ertelenen (v4 sonrası)
+- Replikasyon protokolü (T95b, T101) — mantıksal günlük artık hazır
 - Sıralı anahtar düzeni + B+tree yaprakları → **BETWEEN / aralık sorguları**
-- Replication (mantıksal değişim günlüğü)
 - Zone map'in sayfa düzeyinde yeniden ele alınması
 - Satır gövdesi varint/delta kodlama (F3-1'in kalanı)
 - Dosya boyutu (PK'nin ikinci kez yazılması, hücre başlığı sıkıştırma)
 - Bloom filtresi, merge JOIN, ifade bytecode
+- Çok yazarlı MVCC
 
 ### Kapsam dışı (değişmedi)
 - M3 WASM, M7 async sunucu

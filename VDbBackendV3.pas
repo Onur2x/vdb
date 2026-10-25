@@ -31,7 +31,7 @@ interface
 uses
   SysUtils, Classes, Generics.Collections,
   VDbBackendApi, VDbPage, VDbPageStore, VDbPageHeap, VDbPageWal, VDbPageEngine,
-  VDbIdxFile, VDbSync, VDbCrypt;
+  VDbIdxFile, VDbSync, VDbCrypt, VDbChangeLog;
 
 const
   { Bu boyuttan buyuk WAL'de commit sonrasi checkpoint yapilir. Cok kucuk
@@ -70,6 +70,20 @@ type
       FEng: TVdbPageEngine;
       FPath: string;
       FBatch: TDictionary<QWord, TBatchRec>;
+      { v4: MANTIKSAL DEGISIM GUNLUGU. Her commit'in satir duzeyi
+        kayitlarini <db>.log\ altina yazar; PITR (RECOVER TO TIMESTAMP,
+        AS OF TIMESTAMP/VERSION) ve replikasyon bunun uzerine kurulur.
+        Gunluk kapaliysa (dizin olusturulamadi) yazma yolu DEGISMEZ. }
+      FLog: TVdbChangeLog;
+      FLogInGroup: Boolean;
+      FLogProblem: string;
+      FLogBaseSeq: Int64;
+      { v4: PITR replay'i sirasinda hedef motor (gecici dosya) ve son
+        hata nedeni. Replay geri cagirimi bu alanlari kullanir. }
+      FReplayEng: TVdbPageEngine;
+      FReplayErr: string;
+      FReplayLastSeq: Int64;
+      FReplayLastTs: Int64;
       { Sprint 3.12: parti anahtarlarinin GELIS SIRASI. TDictionary
         dolasimi rastgele oldugu icin ApplyBatch sayfalara sicramali
         yaziyordu (olculen: 200k toplu yazim 8,0 us/satir; sirali
@@ -138,6 +152,18 @@ type
       APoolPages: Integer);
     function NewEngine(const APath: string): TVdbPageEngine;
     function GetEncrypted: Boolean;
+    { --- v4: mantiksal degisim gunlugu --- }
+    function LogTag(const V: TBytes): Integer;
+    procedure OpenChangeLog;
+    procedure EnsureLogBase(AFlags: LongWord; const AReason: string);
+    procedure LogPut(AKey: QWord; const AOld, ANew: TBytes);
+    procedure LogDel(AKey: QWord; const AOld: TBytes);
+    procedure LogFinish;
+    procedure LogAbort;
+    procedure LogReplayCb(const E: TVdbLogEntry);
+    function BuildLogSnapshotBody(TimestampMs, Version: Int64;
+      const DestPath: string;
+      out ActualTsMs, ActualSeq: Int64): Boolean;
     procedure ApplyBatch;
     function EffectiveCount: Integer;
     procedure MaybeCheckpoint;
@@ -235,6 +261,19 @@ type
     function GetLastAutoCompactError: string;
     function AutoCompact(out OldBytes, NewBytes: Int64;
       MaxDeadRatio: Double; MinBytes: Int64): Boolean;
+    { v4: gunluk / PITR }
+    function LogSupported: Boolean;
+    function LogStatus: string;
+    function LogRangeInfo(out MinSeq, MaxSeq: Int64;
+      out MinTsMs, MaxTsMs: Int64; out BaseCount: Integer): Boolean;
+    function BuildLogSnapshot(TimestampMs, Version: Int64;
+      const DestPath: string;
+      out ActualTsMs, ActualSeq: Int64): Boolean;
+    function ScanAllAtLogTime(TableFilter: Integer;
+      TimestampMs, Version: Int64;
+      out Keys: TQWordArray; out Vals: TValArray;
+      out ActualTsMs, ActualSeq: Int64): Boolean;
+    function ArchiveLogSet(const DestDir: string): Int64;
 
 
     { v3.2: SAVEPOINT. Parti kaplamasi UZERINDE calisir; motora hicbir sey
@@ -327,6 +366,14 @@ begin
     bir kez tam taramayla kurulur. }
   FTagCountsValid := False;
   FEng.OnTagSummary := GetTagSummary;
+  { v4: degisim gunlugu. FRowTag bu noktada atanmamis olabilir; etiket
+    cozucusu yoksa TableId -1 yazilir (replay KV duzeyinde oldugu icin
+    dogruluk ETKILENMEZ). }
+  FLog := nil;
+  FLogInGroup := False;
+  FLogProblem := '';
+  FLogBaseSeq := 0;
+  OpenChangeLog;
 end;
 
 function TVdbBackendV3.NewEngine(const APath: string): TVdbPageEngine;
@@ -338,6 +385,139 @@ begin
   else
     Result := TVdbPageEngine.Create(APath, FPoolPages);
 end;
+
+{ --------------------------------------------------- v4: degisim gunlugu }
+
+function TVdbBackendV3.LogTag(const V: TBytes): Integer;
+begin
+  if not Assigned(FRowTag) then Exit(-1);
+  if Length(V) = 0 then Exit(-1);
+  Result := FRowTag(@V[0], Length(V));
+end;
+
+procedure TVdbBackendV3.EnsureLogBase(AFlags: LongWord;
+  const AReason: string);
+var
+  name, dest, baseDir: string;
+  seq: Int64;
+begin
+  if (FLog = nil) or (not FLog.Enabled) then Exit;
+  { Taban imaj DURABIL olmali: once checkpoint (WAL veri dosyasina iner),
+    sonra depo handle'i uzerinden kopya. }
+  FEng.Checkpoint(True);
+  baseDir := IncludeTrailingPathDelimiter(FLog.Dir) + 'base';
+  ForceDirectories(baseDir);
+  seq := FLog.LastSeq + 1;
+  name := 'b-' + IntToStr(seq) + '-' + IntToStr(FEng.Store.LSN) + '.odb';
+  dest := IncludeTrailingPathDelimiter(baseDir) + name;
+  if FileExists(dest) then
+    if not DeleteFile(dest) then
+    begin
+      FLogProblem := 'gunluk taban dosyasi silinemedi: ' + dest;
+      Exit;
+    end;
+  FEng.Store.CopyCommittedTo(dest);
+  FLogBaseSeq := FLog.WriteBase(FEng.Store.LSN, VDbFileBytes(dest),
+    VdbLogNowMs, AFlags, name);
+  if FLogBaseSeq <= 0 then
+    FLogProblem := 'taban isareti yazilamadi (' + AReason + ')';
+end;
+
+procedure TVdbBackendV3.OpenChangeLog;
+var
+  rd: TVdbLogReader;
+  bases: TVdbLogBaseArray;
+  lastSeq: Int64;
+  lastLsn: LongWord;
+  hasGroup: Boolean;
+begin
+  FLog := TVdbChangeLog.Create;
+  try
+    FLog.Open(FPath, True);
+  except
+    on E: Exception do
+    begin
+      { Gunluk ACIKCA kapali: yazma yolu degismez, ama PITR/replikasyon
+        istekleri net hata verir (sessiz yalan yok). }
+      FLogProblem := 'degisim gunlugu acilamadi: ' + E.Message;
+      Exit;
+    end;
+  end;
+  if not FLog.Enabled then
+  begin
+    FLogProblem := FLog.LastError;
+    if FLogProblem = '' then FLogProblem := 'degisim gunlugu kapali';
+    Exit;
+  end;
+  FLogProblem := '';
+  rd := TVdbLogReader.Create(FPath);
+  try
+    bases := rd.ListBases;
+    if Length(bases) = 0 then
+    begin
+      { Bu dosya icin gunlugun baslangici: taban imajini SIMDI al. }
+      EnsureLogBase(0, 'ilk taban');
+      Exit;
+    end;
+    { Gunluk ile motor ayni noktada mi? Son grubun END kaydindaki motor
+      LSN'i ile canli LSN karsilastirilir. Farkli ise: ya commit ile gunluk
+      yazimi arasinda cokme oldu (BOSLUK) ya da dosya degistirildi
+      (VACUUM/RESTORE) ve isaret yazilamadi. Iki durumda da yeni bir NESIL
+      KOPMASI tabani yazilir: bu andan ONCESI icin PITR REDDEDILIR, sonrasi
+      icin tam calisir. }
+    hasGroup := rd.LastState(lastSeq, lastLsn);
+    if hasGroup and (lastLsn <> FEng.Store.LSN) then
+      EnsureLogBase(1, 'gunluk/motor LSN uyusmazligi: gunluk ' +
+        IntToStr(lastLsn) + ' motor ' + IntToStr(FEng.Store.LSN));
+  finally
+    rd.Free;
+  end;
+end;
+
+procedure TVdbBackendV3.LogPut(AKey: QWord; const AOld, ANew: TBytes);
+begin
+  if (FLog = nil) or (not FLog.Enabled) then Exit;
+  if not FLogInGroup then
+  begin
+    FLog.BeginGroup;
+    FLogInGroup := True;
+  end;
+  FLog.AddPut(LogTag(ANew), AKey, AOld, ANew);
+end;
+
+procedure TVdbBackendV3.LogDel(AKey: QWord; const AOld: TBytes);
+begin
+  if (FLog = nil) or (not FLog.Enabled) then Exit;
+  if not FLogInGroup then
+  begin
+    FLog.BeginGroup;
+    FLogInGroup := True;
+  end;
+  FLog.AddDel(LogTag(AOld), AKey, AOld);
+end;
+
+procedure TVdbBackendV3.LogFinish;
+var
+  seq, ts: Int64;
+begin
+  if (FLog = nil) or (not FLog.Enabled) or (not FLogInGroup) then Exit;
+  if not FLog.EndGroup(FEng.Store.LSN, seq, ts) then
+  begin
+    { Gunluk yazilamadi: VERI kaybi YOK (commit zaten durabil), yalniz
+      PITR/replikasyon bu noktadan sonra guvenilmez. Acikca isaretle. }
+    FLogProblem := FLog.LastError;
+    if FLogProblem = '' then FLogProblem := 'gunluk yazilamadi';
+  end;
+  FLogInGroup := False;
+end;
+
+procedure TVdbBackendV3.LogAbort;
+begin
+  if FLogInGroup and (FLog <> nil) then
+    FLog.AbortGroup;
+  FLogInGroup := False;
+end;
+
 
 constructor TVdbBackendV3.Create(const ADbPath: string; ACreate: Boolean;
   APoolPages: Integer);
@@ -380,6 +560,8 @@ begin
   end;
   ClearSavepoints;
   FreeAndNil(FSavepoints);
+  LogAbort;               // yarim grup yazilmaz
+  FreeAndNil(FLog);       // gunluk fsync + kapat
   FreeAndNil(FEng);       // Close: commit + checkpoint + idx
   FreeAndNil(FBatch);
   FreeAndNil(FOrder);
@@ -456,14 +638,17 @@ begin
         { v3.1: yeni satir -> etiket sayaci +1 }
         if Length(rec.Value) > 0 then
           TagAdd(TagOf(@rec.Value[0], Length(rec.Value)), 1);
+        LogPut(key, nil, rec.Value);
       end
       else
       begin
         { Var olan anahtar: etiket degismis olabilir; eski deger YALNIZCA
           bu yolda okunur (toplu eklemede hic okunmaz). }
+        oldVal := nil;
+        FEng.TryGet(key, oldVal);
         oldTag := -2;
         if Length(rec.Value) > 0 then
-          if FEng.TryGet(key, oldVal) then
+          if Length(oldVal) > 0 then
             oldTag := TagOf(@oldVal[0], Length(oldVal));
         ok := FEng.Update(key, rec.Value);
         if not ok then
@@ -479,19 +664,21 @@ begin
             TagAdd(newTag, 1);
           end;
         end;
+        LogPut(key, oldVal, rec.Value);
       end;
     end
     else
     begin
-      { Silmeden ONCE eski deger: yalnizca etiket sayaci icin. }
+      { Silmeden ONCE eski deger: etiket sayaci ve degisim gunlugu icin. }
       if FEng.TryGet(key, oldVal) then
       begin
         FEng.Delete(key);
         if Length(oldVal) > 0 then
           TagAdd(TagOf(@oldVal[0], Length(oldVal)), -1);
+        LogDel(key, oldVal);
       end
       else
-        FEng.Delete(key);    // yoksa da zararsiz
+        FEng.Delete(key);    // yoksa da zararsiz (gunluge YAZILMAZ)
     end;
   end;
   FBatch.Clear;
@@ -546,17 +733,17 @@ begin
     if Length(Value) > 0 then
       TagAdd(TagOf(@Value[0], Length(Value)), 1);
     FDirty := True;
+    LogPut(Key, nil, Value);
     Exit;
   end;
   { Anahtar zaten var: etiket DEGISEBILIR (DROP TABLE + ayni PK ile yeniden
-    CREATE -> ayni anahtar, farkli TableId). Eski etiket yalnizca bu yolda
-    okunur; toplu eklemede hicbir ek okuma yapilmaz. }
+    CREATE -> ayni anahtar, farkli TableId). Eski deger hem etiket hem de
+    degisim gunlugu icin okunur. }
+  oldVal := nil;
+  FEng.TryGet(Key, oldVal);
   oldTag := -2;
-  if Length(Value) > 0 then
-  begin
-    if FEng.TryGet(Key, oldVal) then
-      oldTag := TagOf(@oldVal[0], Length(oldVal));
-  end;
+  if (Length(Value) > 0) and (Length(oldVal) > 0) then
+    oldTag := TagOf(@oldVal[0], Length(oldVal));
   if not FEng.Update(Key, Value) then
     raise EVdbBackendV3.Create('ekleme/guncelleme basarisiz');
   if Length(Value) > 0 then
@@ -570,6 +757,7 @@ begin
     end;
   end;
   FDirty := True;
+  LogPut(Key, oldVal, Value);
 end;
 
 function TVdbBackendV3.Get(Key: QWord; out Value: TBytes): Boolean;
@@ -619,6 +807,8 @@ begin
     Result := FEng.Delete(Key);
     if Length(oldVal) > 0 then
       TagAdd(TagOf(@oldVal[0], Length(oldVal)), -1);
+    if Result then
+      LogDel(Key, oldVal);
   end
   else
     Result := FEng.Delete(Key);
@@ -1061,6 +1251,7 @@ begin
   begin
     FEng.Commit(True);
     FDirty := False;
+    LogFinish;
     MaybeCheckpoint;
     MaybeAutoCompact;     // v3.2 (H25)
   end;
@@ -1069,6 +1260,7 @@ end;
 procedure TVdbBackendV3.AbortBatch;
 begin
   RequireBatchWrite;
+  LogAbort;               // yarim islem gunluge SIZMAZ
   ClearSavepoints;
   FBatch.Clear;
   FOrder.Clear;
@@ -1092,6 +1284,7 @@ begin
   begin
     FEng.Commit(True);
     FDirty := False;
+    LogFinish;
     MaybeCheckpoint;
     MaybeAutoCompact;     // v3.2 (H25): autocommit yolu
   end;
@@ -1351,6 +1544,7 @@ begin
   begin
     FEng.Commit(True);
     FDirty := False;
+    LogFinish;
   end;
   { Checkpoint dosyayi tamamlar ve WAL'i budar: kopya kendi kendine yeter. }
   FEng.Checkpoint(True);
@@ -1406,6 +1600,7 @@ begin
   begin
     FEng.Commit(True);
     FDirty := False;
+    LogFinish;
   end;
   FEng.Checkpoint(True);
 
@@ -1425,6 +1620,9 @@ begin
   end;
 
   SwapDbFile(tmp);
+  { v4: RESTORE dosya icerigini BASTAN yazar: nesil kopmasi. Bu andan
+    onceki zamanlar icin PITR reddedilir; sonrasi tam calisir. }
+  EnsureLogBase(1, 'RESTORE');
 end;
 
 procedure TVdbBackendV3.CompactCb(Key: QWord; const Value: TBytes);
@@ -1447,6 +1645,7 @@ begin
   begin
     FEng.Commit(True);
     FDirty := False;
+    LogFinish;
   end;
   FEng.Checkpoint(True);
   { Sprint 3.10: CANLI dosyayi ikinci kez ACMA — Unix'te flock cakisir. }
@@ -1490,6 +1689,9 @@ begin
     gecerli kalir -> VACUUM sonrasi COUNT(*) yine O(1). }
   FTagCountsValid := tagsWere;
   NewBytes := VDbFileBytes(FPath);
+  { v4: VACUUM mantiksal icerigi KORUR (yukarida sayi dogrulandi); ayni
+    nesil icinde yeni bir checkpoint tabani yazilir, PITR zinciri kopmaz. }
+  EnsureLogBase(0, 'VACUUM');
 end;
 
 procedure TVdbBackendV3.Rekey(const NewPassword: string);
@@ -1510,6 +1712,7 @@ begin
   begin
     FEng.Commit(True);
     FDirty := False;
+    LogFinish;
   end;
   FEng.Checkpoint(True);
 
@@ -1551,6 +1754,9 @@ begin
   SwapDbFileWith(tmp, nil, NewPassword, True);
   { Anahtar kumesi KORUNDU (yukarida dogrulandi) -> sayac gecerli. }
   FTagCountsValid := tagsWere;
+  { v4: ALTER KEY yalniz sifreleme bicimini degistirir; mantiksal icerik
+    ayni -> ayni nesilde yeni taban. }
+  EnsureLogBase(0, 'ALTER DATABASE KEY');
 end;
 
 { --- v3.2: yonetim / otomatik sikistirma (H25 esdegeri) --- }
@@ -1755,6 +1961,360 @@ begin
         FreeAndNil(FEng);
       end;
     end;
+  end;
+end;
+
+{ ==================================================== v4: gunluk / PITR }
+
+type
+  { Bir gunluk araligini ozetleyen ziyaretci. }
+  TLogRangeVisit = class
+  public
+    Seen: Boolean;
+    FirstSeq: Int64;
+    FirstTs: Int64;
+    LastSeq: Int64;
+    LastTs: Int64;
+    Applied: Int64;
+    Reason: string;
+    procedure Visit(const E: TVdbLogEntry);
+  end;
+
+procedure TLogRangeVisit.Visit(const E: TVdbLogEntry);
+begin
+  if E.Kind = VDBLOG_KIND_BASE then Exit;
+  if not Seen then
+  begin
+    Seen := True;
+    FirstSeq := E.Seq;
+    FirstTs := E.TsMs;
+  end;
+  LastSeq := E.Seq;
+  LastTs := E.TsMs;
+end;
+
+procedure TVdbBackendV3.LogReplayCb(const E: TVdbLogEntry);
+begin
+  if FReplayEng = nil then Exit;
+  if E.Kind = VDBLOG_KIND_BASE then Exit;
+  try
+    if E.Kind = VDBLOG_KIND_DEL then
+    begin
+      FReplayEng.Delete(E.Key);
+      FReplayLastSeq := E.Seq;
+      FReplayLastTs := E.TsMs;
+      Exit;
+    end;
+    { PUT: anahtar varsa guncelle, yoksa ekle. Ayni anahtarin birden fazla
+      kaydi sirayla gelir (son kazanir). }
+    if FReplayEng.Contains(E.Key) then
+      FReplayEng.Update(E.Key, E.NewVal)
+    else
+      FReplayEng.Insert(E.Key, E.NewVal);
+    FReplayLastSeq := E.Seq;
+    FReplayLastTs := E.TsMs;
+  except
+    on Ex: Exception do
+      FReplayErr := Format('anahtar $%.16x: %s', [E.Key, Ex.Message]);
+  end;
+end;
+
+function TVdbBackendV3.LogSupported: Boolean;
+begin
+  Result := (FLog <> nil) and FLog.Enabled;
+end;
+
+function TVdbBackendV3.LogStatus: string;
+begin
+  if (FLog = nil) or (not FLog.Enabled) then
+  begin
+    Result := FLogProblem;
+    if Result = '' then Result := 'degisim gunlugu kapali';
+  end
+  else
+    Result := FLogProblem;   { bos = sorun yok }
+end;
+
+function TVdbBackendV3.LogRangeInfo(out MinSeq, MaxSeq: Int64;
+  out MinTsMs, MaxTsMs: Int64; out BaseCount: Integer): Boolean;
+var
+  rd: TVdbLogReader;
+  bases: TVdbLogBaseArray;
+  v: TLogRangeVisit;
+begin
+  MinSeq := 0;
+  MaxSeq := 0;
+  MinTsMs := 0;
+  MaxTsMs := 0;
+  BaseCount := 0;
+  Result := False;
+  if not LogSupported then Exit;
+  rd := TVdbLogReader.Create(FPath);
+  try
+    bases := rd.ListBases;
+    BaseCount := Length(bases);
+    if BaseCount > 0 then
+    begin
+      MinSeq := bases[0].Seq;
+      MinTsMs := bases[0].TsMs;
+      MaxSeq := bases[BaseCount - 1].Seq;
+      MaxTsMs := bases[BaseCount - 1].TsMs;
+    end;
+    if BaseCount > 0 then
+    begin
+      v := TLogRangeVisit.Create;
+      try
+        rd.Replay(bases[0].Seq, 0, 0, v.Visit, v.Applied, v.Reason);
+        if v.Seen then
+        begin
+          MaxSeq := v.LastSeq;
+          MaxTsMs := v.LastTs;
+        end;
+      finally
+        v.Free;
+      end;
+    end;
+    Result := (BaseCount > 0) or (MaxSeq > 0);
+  finally
+    rd.Free;
+  end;
+end;
+
+function TVdbBackendV3.BuildLogSnapshotBody(TimestampMs, Version: Int64;
+  const DestPath: string;
+  out ActualTsMs, ActualSeq: Int64): Boolean;
+var
+  rd: TVdbLogReader;
+  bases: TVdbLogBaseArray;
+  i, pick: Integer;
+  baseDir, srcBase: string;
+  eng: TVdbPageEngine;
+  early: Boolean;
+  reason: string;
+  applied: Int64;
+begin
+  ActualTsMs := 0;
+  ActualSeq := 0;
+  Result := False;
+  if not LogSupported then
+    raise EVdbBackendV3.Create('PITR: ' + LogStatus);
+  if DestPath = '' then
+    raise EVdbBackendV3.Create('PITR: hedef yol bos');
+  rd := TVdbLogReader.Create(FPath);
+  try
+    bases := rd.ListBases;
+    if Length(bases) = 0 then
+      raise EVdbBackendV3.Create(
+        'PITR: bu veritabani icin degisim gunlugu tabani yok ' +
+        '(ilk taban acilista olusur)');
+    { Hedefe uyan EN SON taban: zamani ve/veya surumu asmayan. }
+    pick := -1;
+    for i := 0 to Length(bases) - 1 do
+    begin
+      if (TimestampMs > 0) and (bases[i].TsMs > TimestampMs) then Continue;
+      if (Version > 0) and (bases[i].Seq > Version) then Continue;
+      pick := i;
+    end;
+    if pick < 0 then
+      raise EVdbBackendV3.CreateFmt(
+        'PITR: hedef (ts=%d, surum=%d) en eski tabandan once; ' +
+        'en erken taban ts=%d surum=%d',
+        [TimestampMs, Version, bases[0].TsMs, bases[0].Seq]);
+
+    baseDir := IncludeTrailingPathDelimiter(rd.Dir) + 'base';
+    srcBase := IncludeTrailingPathDelimiter(baseDir) + bases[pick].Name;
+    if not FileExists(srcBase) then
+      raise EVdbBackendV3.Create('PITR: taban imaji bulunamadi: ' + srcBase);
+    AsOfCopyFile(srcBase, DestPath);
+    { Hedef dosyanin ESKI yan dosyalari (wal/idx) yeni icerikle uyusmaz;
+      temizlenmezlerse motor bayat indeksle acabilir. }
+    if FileExists(DestPath + '.wal') then DeleteFile(DestPath + '.wal');
+    if FileExists(DestPath + '.idx') then DeleteFile(DestPath + '.idx');
+
+    eng := NewEngine(DestPath);
+    try
+      eng.Open(False);
+    except
+      eng.Free;
+      raise;
+    end;
+    FReplayEng := eng;
+    FReplayErr := '';
+    FReplayLastSeq := bases[pick].Seq;
+    FReplayLastTs := bases[pick].TsMs;
+    try
+      early := rd.Replay(bases[pick].Seq, Version, TimestampMs, LogReplayCb,
+        applied, reason);
+      if FReplayErr <> '' then
+        raise EVdbBackendV3.Create('PITR: ' + FReplayErr);
+      if early and (Pos('nesil', reason) > 0) then
+        raise EVdbBackendV3.CreateFmt(
+          'PITR: gunlukte nesil kopmasi var, bu noktadan sonrasi ' +
+          'kurtarilamaz (%s)', [reason]);
+      eng.Commit(True);
+      ActualTsMs := FReplayLastTs;
+      ActualSeq := FReplayLastSeq;
+      Result := True;
+    finally
+      FReplayEng := nil;
+      try
+        eng.Close;
+      except
+        { gecici hedef: kapanis hatasi sonucu bozmaz, dosya zaten yazildi }
+      end;
+      eng.Free;
+    end;
+  finally
+    rd.Free;
+  end;
+end;
+
+function TVdbBackendV3.BuildLogSnapshot(TimestampMs, Version: Int64;
+  const DestPath: string;
+  out ActualTsMs, ActualSeq: Int64): Boolean;
+begin
+  Result := BuildLogSnapshotBody(TimestampMs, Version, DestPath,
+    ActualTsMs, ActualSeq);
+end;
+
+function TVdbBackendV3.ScanAllAtLogTime(TableFilter: Integer;
+  TimestampMs, Version: Int64;
+  out Keys: TQWordArray; out Vals: TValArray;
+  out ActualTsMs, ActualSeq: Int64): Boolean;
+var
+  tmp, tmpWal, tmpIdx: string;
+  eng: TVdbPageEngine;
+begin
+  Keys := nil;
+  Vals := nil;
+  ActualTsMs := 0;
+  ActualSeq := 0;
+  Result := False;
+  tmp := FPath + '.pitr' + IntToStr(GetProcessID) + '_' +
+    IntToStr(InterlockedIncrement(GAsOfCounter));
+  tmpWal := tmp + '.wal';
+  tmpIdx := tmp + '.idx';
+  eng := nil;
+  try
+    BuildLogSnapshotBody(TimestampMs, Version, tmp, ActualTsMs, ActualSeq);
+    eng := NewEngine(tmp);
+    try
+      eng.Open(False);
+    except
+      try
+        eng.SimulateCrash;
+      except
+      end;
+      eng.Free;
+      eng := nil;
+      raise;
+    end;
+    FScanKeys := nil;
+    FScanVals := nil;
+    FScanN := 0;
+    FScanCap := 0;
+    FScanFilter := TableFilter;
+    eng.ScanAll(AsOfCb);
+    SetLength(FScanKeys, FScanN);
+    SetLength(FScanVals, FScanN);
+    Keys := FScanKeys;
+    Vals := FScanVals;
+    FScanKeys := nil;
+    FScanVals := nil;
+    FScanN := 0;
+    FScanCap := 0;
+    Result := True;
+  finally
+    if eng <> nil then
+    begin
+      try
+        eng.Close;
+      except
+      end;
+      eng.Free;
+    end;
+    if FileExists(tmpWal) then DeleteFile(tmpWal);
+    if FileExists(tmpIdx) then DeleteFile(tmpIdx);
+    if FileExists(tmp) then DeleteFile(tmp);
+  end;
+end;
+
+function TVdbBackendV3.ArchiveLogSet(const DestDir: string): Int64;
+var
+  rd: TVdbLogReader;
+  srcDir, dstDir, src, dst: string;
+  sr: TSearchRec;
+  n: Int64;
+  a, b: TFileStream;
+
+  procedure CopyOne(const ASrc, ADst: string);
+  var
+    x, y: TFileStream;
+  begin
+    if FileExists(ADst) then
+      if not DeleteFile(ADst) then
+        raise EVdbBackendV3.Create('ARCHIVE WAL: hedef silinemedi: ' + ADst);
+    x := TFileStream.Create(ASrc, fmOpenRead or fmShareDenyNone);
+    try
+      y := TFileStream.Create(ADst, fmCreate);
+      try
+        y.CopyFrom(x, 0);
+        VDbFlushStream(y);
+        Inc(n, y.Size);
+      finally
+        y.Free;
+      end;
+    finally
+      x.Free;
+    end;
+  end;
+
+begin
+  Result := 0;
+  if not LogSupported then
+    raise EVdbBackendV3.Create('ARCHIVE WAL: ' + LogStatus);
+  rd := TVdbLogReader.Create(FPath);
+  try
+    srcDir := rd.Dir;
+    if not DirectoryExists(srcDir) then
+      raise EVdbBackendV3.Create('ARCHIVE WAL: gunluk dizini yok: ' + srcDir);
+    dstDir := IncludeTrailingPathDelimiter(DestDir);
+    ForceDirectories(dstDir);
+    n := 0;
+    if DirectoryExists(IncludeTrailingPathDelimiter(srcDir) + 'base') then
+    begin
+      ForceDirectories(dstDir + 'base');
+      if FindFirst(IncludeTrailingPathDelimiter(srcDir) + 'base' + PathDelim +
+        '*.odb', faAnyFile, sr) = 0 then
+      begin
+        repeat
+          if (sr.Attr and faDirectory) = 0 then
+          begin
+            src := IncludeTrailingPathDelimiter(srcDir) + 'base' + PathDelim +
+              sr.Name;
+            dst := dstDir + 'base' + PathDelim + sr.Name;
+            CopyOne(src, dst);
+          end;
+        until FindNext(sr) <> 0;
+        FindClose(sr);
+      end;
+    end;
+    if FindFirst(IncludeTrailingPathDelimiter(srcDir) + '*.vlog',
+      faAnyFile, sr) = 0 then
+    begin
+      repeat
+        if (sr.Attr and faDirectory) = 0 then
+        begin
+          src := IncludeTrailingPathDelimiter(srcDir) + sr.Name;
+          dst := dstDir + sr.Name;
+          CopyOne(src, dst);
+        end;
+      until FindNext(sr) <> 0;
+      FindClose(sr);
+    end;
+    Result := n;
+  finally
+    rd.Free;
   end;
 end;
 

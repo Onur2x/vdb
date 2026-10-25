@@ -202,6 +202,37 @@ type
       write SetAutoCompactMinBytes;
     property AutoCompactCount: Int64 read GetAutoCompactCount;
     property LastAutoCompactError: string read GetLastAutoCompactError;
+
+    { --- v4: MANTIKSAL DEGISIM GUNLUGU + PITR ---
+      Gunluk, her commit'in satir duzeyi eski/yeni degerlerini
+      <db>.log\ altinda tutar (segmentler + taban imajlari). Boylece
+      "T anindaki / N surumundeki durum" yeniden kurulabilir.
+      v3: her veritabani icin acilista KENDILIGINDEN acilir.
+      v2: LogSupported=False; diger metotlar False doner ya da acik hata
+      verir (sessiz yalan yok). }
+    function LogSupported: Boolean;
+    { Gunluk kapaliysa/bozuksa NEDENI (bos = sorun yok). }
+    function LogStatus: string;
+    { Gunlugun kapsadigi aralik. False: gunluk yok ya da henuz kayit yok.
+      MinTsMs: en eski taban/grubun zamani; MaxTsMs: son grubun zamani.
+      MinSeq/MaxSeq: kalici surum numaralari (AS OF VERSION ile ayni uzay). }
+    function LogRangeInfo(out MinSeq, MaxSeq: Int64;
+      out MinTsMs, MaxTsMs: Int64; out BaseCount: Integer): Boolean;
+    { Hedef zamana/surume kadar olan TUTARLI durumu DestPath'e .odb olarak
+      yazar (canli dosyaya DOKUNMAZ). Actual*: gercekte ulasilan nokta
+      (hedef en son kayittan ileriyse kirpilir). }
+    function BuildLogSnapshot(TimestampMs, Version: Int64;
+      const DestPath: string;
+      out ActualTsMs, ActualSeq: Int64): Boolean;
+    { Gunlukteki hedef noktada tam tarama (anlik goruntu gecici dosyada
+      kurulur, is bitince silinir; canli dosya READ-ONLY). }
+    function ScanAllAtLogTime(TableFilter: Integer; TimestampMs, Version: Int64;
+      out Keys: TQWordArray; out Vals: TValArray;
+      out ActualTsMs, ActualSeq: Int64): Boolean;
+    { Gunlugun TAMAMINI (tum taban imajlari + segmentler) DestDir'e kopyalar;
+      kopyalanan bayt sayisini doner. Bu set tek basina arsivdir: baska bir
+      makinede ayni araliga PITR yapilabilir. }
+    function ArchiveLogSet(const DestDir: string): Int64;
   end;
 
   { v3.2: IVDbKvStore'un IVdbBackend uzerinden uygulanmasi. v2'de TVDb

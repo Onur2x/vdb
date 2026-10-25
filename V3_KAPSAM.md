@@ -154,7 +154,7 @@ v3 koşusu yalnız "kapsam" değil, **gerçek kusurlar** ortaya çıkardı:
 |---|---|---|
 | `VERIFY` (sayfa CRC + heap) | **var** (Sprint 3.1) | 3.1 ✔ |
 | `BACKUP` / `RESTORE` (tek `.odb`, checkpoint sonrası sayfa kopyası) | **var** (Sprint 3.2) | 3.2 ✔ |
-| PITR (`RECOVER TO`) / WAL arşivi / `AS OF` | `AS OF SEQUENCE` v3.2'de **çalışır** (sayfa imajlı WAL'den anlık görüntü); `AS OF TIMESTAMP/VERSION`, `RECOVER TO`, `ARCHIVE WAL` → `ecUnsupported` + yol gösteren mesaj | 3.6 ✔ (gerçek PITR sonraki sürüm) |
+| PITR (`RECOVER TO`) / WAL arşivi / `AS OF` | **Hepsi var (v4)**: mantıksal değişim günlüğü (`<db>.log`) + `AS OF TIMESTAMP/VERSION` + `ARCHIVE WAL SET/LIST` + `RECOVER TO` (canlıya yazmaz, `<db>.recovered` üretir). `AS OF SEQUENCE` de çalışır (sayfa imajlı WAL) | v4 ✔ |
 | `VACUUM` / `Compact` (canlı kayıtlar yeni dosyaya, atomik değişim) | **var** (Sprint 3.3) | 3.3 ✔ |
 | `AutoCompact` | **var** (v3.2) — v2 ile aynı varsayılan (KAPALI, %35, 4 MB); ölü alan = freelist sayfası × 4096 | 3.3 ✔ |
 | Sayfa düzeyi **AES-256-GCM** şifreleme (zarf: nonce+şifre+tag = 4124 B) | **var** (Sprint 3.4) | 3.4 ✔ |
@@ -272,27 +272,60 @@ kaynaklanır. Çekirdek v3 yollarında hiçbir kontrol eksilmemiştir.
    ve alt süreç tanı dosyası bırakır. Linux'ta da **11/11**.
 
 
-### Replikasyon, PITR ve zone map kararları (Sprint 3.5-3.7)
+### Replikasyon, PITR ve zone map kararları (Sprint 3.5-3.7 → v4 güncellemesi)
 
-Üç yetenek de v3.0'da **bilinçli olarak yoktur** ve hepsi sessiz no-op/çökme
-yerine **ölçülebilir bir sözleşme** verir:
+Durum **2026-10-26**: PITR dilimi tamamlandı (mantıksal değişim günlüğü);
+replikasyon ve zone map hâlâ sırada.
 
-| Yetenek | v3.0 davranışı | Test |
+| Yetenek | Bugünkü davranış | Test |
 |---|---|---|
-| `START REPLICATION` (dosya/TCP), `PUMP`, `CREATE/DROP REPLICATION SLOT`, `SHOW REPLICATION STATUS/SLOTS`, `STOP REPLICATION` | `ecUnsupported`, mesaj `REPLICATION v3 sayfa motorunda yok (v3.1: mantiksal gunluk ile gelecek)` | `v3sqlchk` 9 kontrol: hiçbiri dosya bırakmaz, veri bozulmaz, yeniden açılış sağlam |
-| `AS OF SEQUENCE n` | **v3.2'de çalışır**: WAL penceresindeki n'inci commit'in tam görüntüsü geçici bir kopyada kurulur (canlı dosyaya yazılmaz); n = commit sayısı, sınır aşılırsa son commit'e kırpılır | `sqltest T155` (iki backend) + `v3sqlchk` AS OF SEQUENCE kontrolleri |
-| `AS OF TIMESTAMP/VERSION`, `ARCHIVE WAL SET/LIST`, `RECOVER TO NOW/TIMESTAMP` | `ecUnsupported` (mantıksal günlük / zaman damgası gerekir) | `v3sqlchk` TestPitrUnsupported: güncel okuma etkilenmez, arşiv dizini oluşmaz, `VERIFY` geçer |
+| `AS OF SEQUENCE n` | **Çalışır** (v3.2): WAL penceresindeki n'inci commit'in tam görüntüsü geçici bir kopyada kurulur (canlı dosyaya yazılmaz); n = commit sayısı, sınır aşılırsa son commit'e kırpılır | `sqltest T155` (iki backend) + `v3sqlchk` AS OF SEQUENCE kontrolleri |
+| `AS OF TIMESTAMP t` / `AS OF VERSION v` | **Çalışır (v4)**: `<db>.log` mantıksal günlüğünden hedefe en yakın taban + ileri replay. `TIMESTAMP` metni yerel saat → UTC. Hedef en eski tabandan önceyse **açık hata**; son kayıttan ileriyse son duruma **kırpılır** (`Actual*` ile bildirilir) | `pitrchk` 21 kontrol, `v3sqlchk` TestPitrSql, `sqltest` T155 (v3 dalı) |
+| `ARCHIVE WAL SET DIR='x'` | **Çalışır (v4)**: günlük setinin tam kopyasını `x`'e çıkarır; birincil günlüğe dokunmaz, tekrarlandıkça tazeler. `RESET` **yoktur** — günlük kalıcıdır, silinirse PITR yeteneği kaybolur | `pitrchk` arşiv kontrolleri, `v3sqlchk` |
+| `ARCHIVE WAL LIST` | **Çalışır (v4)**: tek satır kapsam (`min_seq`, `max_seq`, `min_time`, `max_time`, `bases`) | `pitrchk`, `v3sqlchk` |
+| `RECOVER TO [TIMESTAMP\|NOW]` | **Çalışır (v4)**: canlı dosyaya **yazmaz**; `<db>.recovered` üretir (taban + ileri replay). Kullanıcı doğrular, `RESTORE FROM` ile devreye alır | `pitrchk` (dosya açılıp `Verify` TEMİZ), `v3sqlchk` |
+| Replikasyon komutları | `ecUnsupported` — mantıksal günlük artık var (v4), protokol sıradaki dilim | `v3sqlchk` 9 kontrol: hiçbiri dosya bırakmaz, veri bozulmaz, yeniden açılış sağlam |
 | Zone map | **budama yok**: `Kv = nil` olduğu için v3 genel tam tarama yolunu kullanır | `v3sqlchk` 22 kontrol: 3000 satırda 8 aralık + eşitlik/`IN`/`<>`/karma sorgular Pascal'da hesaplanan beklentiyle **birebir** |
 
-Gerekçe: v3 WAL'i **sayfa imajı** tutar (mantıksal kayıt yok). Zamansal
-sorgu için bu yeterlidir: n'inci commit'in tam veritabanı görüntüsü, son
-checkpoint tabanı + o noktaya kadar WAL replay ile kurulur (`AS OF SEQUENCE`).
-Buna karşılık **satır düzeyinde eski değer** ve **zaman damgası** yoktur;
-bu yüzden `AS OF TIMESTAMP/VERSION`, `RECOVER TO` ve mantıksal replikasyon
-hâlâ `ecUnsupported`. Zone map ise v2'nin ham kayıt ofsetlerine dayanır; v3
-heap hücre biçiminde yeniden inşa edilmesi gerekir. İkisi de sıradaki
-sürüme (mantıksal günlük ve sayfa biçimine uyarlanmış bölüm haritası)
-bırakıldı.
+v4 günlük tasarımı (ayrıntı `VDbChangeLog.pas` başında):
+
+- `<db>.log\seg-NNNNNN.vlog` segmentleri (16 MB, yalnız **grup sınırında**
+  rotasyon) + `<db>.log\base\b-<seq>-<lsn>.odb` taban imajları.
+- Kayıt: anahtar + **eski değer** + yeni değer + UTC ms + grup seq.
+  Magic: `VLG1`/`VLR1`/`VLB1`/`VLE1`. **Yarım grup replay edilmez.**
+- Replay KV düzeyindedir (ham bayt) — SQL yeniden kodlaması yok.
+- Yazım **WAL commit'inden SONRA**. Günlük yazılamazsa **veri kaybı olmaz**;
+  yalnız `FLogProblem` işaretlenir ve PITR/replikasyon istekleri net hata
+  verir. Günlük açılamazsa yazma yolu hiç değişmez.
+- `BASE` kaydı yeni nesil açar: `Flags` bit0=1 → nesil kopması (`RESTORE`),
+  replay **durur**; bit0=0 → saf checkpoint (`VACUUM`, `ALTER KEY`, ilk
+  taban), replay **devam eder**. `END` kaydı motor LSN'ini taşır; açılışta
+  uyuşmazlıkta nesil kopması yazılır ve öncesi için PITR açıkça reddedilir.
+- Günlük otomatik silinmez/kırpılmaz (silinirse PITR yeteneği kaybolur).
+
+Ölçülen maliyet (`pitrbench`, 20.000 satır / 100 commit, QPC, tek koşu):
+
+| Ölçüm | Değer |
+|---|---|
+| Yazma | 308 ms → 15,4 µs/satır, 3,08 ms/commit |
+| Günlük boyu | 1.934.517 bayt → 96,5 bayt/satır |
+| `AS OF TIMESTAMP` (tam sayım) | ortalama 556 ms (3/3 doğru) |
+| `BuildLogSnapshot` (son durum) | 516 ms, 1.228.800 bayt |
+| `ArchiveLogSet` | 3 ms, 1.934.517 bayt |
+
+Ayrıca v4 sırasında **sessiz yanlış sonuç** bulundu ve düzeltildi:
+indeksli `IN (…, negatif, …)` listesinde negatif öğe AST'de
+`TSqlUnaryOpNode(suoNeg)` olduğu için daraltma hesabından **sessizce
+atlanıyor**, indeks dilimi daralıyor ve o grubun satırları **okunmadan**
+düşüyordu (hata yok). Aynı hata PK `IN` ve `= -3` yolunda da vardı. Tek
+yardımcı (`VdbInConstText`) düz/negatif sabiti çözer, çözemezse daraltma
+yapılmaz (güvenli taraf). Kapı: `v3sqlchk TestIndexInNegative` (17 kontrol).
+
+Gerekçe: v3 WAL'i **sayfa imajı** tutar; `AS OF SEQUENCE` bununla çalışır.
+Satır düzeyinde eski değer ve zaman damgası **yoktu** — bu yüzden v4'te
+paralel bir **mantıksal** günlük eklendi. Zone map ise v2'nin ham kayıt
+ofsetlerine dayanır; v3 heap hücre biçiminde yeniden inşa edilmesi gerekir
+(sıradaki performans dilimi).
 
 ### Sayfa şifreleme (Sprint 3.4)
 

@@ -4166,11 +4166,26 @@ begin
   Chk('alias (FROM k AS x AS OF ...)',
     'SELECT ad FROM k AS x AS OF SEQUENCE ' + IntToStr(a1) + ' ORDER BY id', 1);
 
-  // ---- f) TIMESTAMP / VERSION acikca reddedilir ----
-  ChkErr('AS OF TIMESTAMP reddedilir',
-    'SELECT id FROM k AS OF TIMESTAMP ' + Q + '2026-10-05 12:00:00' + Q);
-  ChkErr('AS OF VERSION reddedilir',
-    'SELECT id FROM k AS OF VERSION 3');
+  // ---- f) TIMESTAMP / VERSION: v2'de reddedilir, v3'te CALISIR ----
+  if gV3 then
+  begin
+    { v4: mantiksal gunluk geldi. Ileri hedef son duruma KIRPILIR (sessiz
+      bos kume degil) — bu yuzden sonuclar guncel kumeyle birebir olmali. }
+    Chk('v3: AS OF TIMESTAMP (ileri hedef, kirpilir)',
+      'SELECT id FROM k AS OF TIMESTAMP ' + Q + '2099-01-01 00:00:00' + Q +
+      ' ORDER BY id', 2);
+    Chk('v3: AS OF VERSION (ileri hedef, kirpilir)',
+      'SELECT id FROM k AS OF VERSION 999999 ORDER BY id', 2);
+    ChkErr('v3: AS OF VERSION sayi degil (syntax)',
+      'SELECT id FROM k AS OF VERSION abc');
+  end
+  else
+  begin
+    ChkErr('AS OF TIMESTAMP reddedilir',
+      'SELECT id FROM k AS OF TIMESTAMP ' + Q + '2026-10-05 12:00:00' + Q);
+    ChkErr('AS OF VERSION reddedilir',
+      'SELECT id FROM k AS OF VERSION 3');
+  end;
 
   // ---- g) JOIN reddedilir ----
   ChkErr('JOIN + AS OF reddedilir',
@@ -16879,11 +16894,23 @@ begin
   if gV3 then
     ChkInt('AS OF gecici dosya birakmadi', AsOfLeftover, 0);
 
-  // ---- acikca reddedilenler ----
-  ChkErr('AS OF TIMESTAMP reddedilir',
-    'SELECT id FROM k AS OF TIMESTAMP ' + Q + '2026-10-05 12:00:00' + Q);
-  ChkErr('AS OF VERSION reddedilir',
-    'SELECT id FROM k AS OF VERSION 3');
+  // ---- TIMESTAMP/VERSION: v2'de reddedilir, v3'te CALISIR ----
+  if gV3 then
+  begin
+    { v4: ileri hedef son duruma kirpilir; canli tabloda 2 satir var
+      (yukaridaki COUNT(*) 1 satir dondurur, deger degil). }
+    Chk('v3: AS OF TIMESTAMP (ileri hedef, kirpilir)',
+      'SELECT id FROM k AS OF TIMESTAMP ' + Q + '2099-01-01 00:00:00' + Q, 2);
+    Chk('v3: AS OF VERSION (ileri hedef, kirpilir)',
+      'SELECT id FROM k AS OF VERSION 999999', 2);
+  end
+  else
+  begin
+    ChkErr('AS OF TIMESTAMP reddedilir',
+      'SELECT id FROM k AS OF TIMESTAMP ' + Q + '2026-10-05 12:00:00' + Q);
+    ChkErr('AS OF VERSION reddedilir',
+      'SELECT id FROM k AS OF VERSION 3');
+  end;
   ChkErr('JOIN + AS OF reddedilir',
     'SELECT k.ad FROM k AS OF SEQUENCE ' + IntToStr(a1) +
     ' JOIN diger ON diger.id = k.id');
