@@ -21,7 +21,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Lazarus/FPC kur
-        timeout-minutes: 12
+        # 12 dk iki kez yetmedi (#30, #34): choco indirmesi altyapi dalgalanmasiyla
+        # 12 dakikayi asiyor. Is kendi basina 45 dk sinirli; kurulum icin 30 dk.
+        timeout-minutes: 30
         run: choco install lazarus --no-progress -y
 
       - name: lazbuild yolunu bul
