@@ -906,6 +906,80 @@ begin
   v3 := nil;
 end;
 
+{ `.odb.idx` boyuta gore otomatik politika kapisi: kucuk dosyada yazilir,
+  esik asilinca yazilmaz ve daha once yazilmis dosya silinir. }
+procedure TestV3IdxPolicy;
+var
+  v3: TVdbBackendV3;
+  b: IVDbBackend;
+  v: TBytes;
+  i: Integer;
+  path, idxPath: string;
+begin
+  CleanDir;
+  path := DirOf('idxpol.odb');
+  idxPath := path + '.idx';
+
+  { 1) Esik 1 bayt: .idx YAZILMAMALI. }
+  v3 := TVdbBackendV3.Create(path, True, 64);
+  v3.Engine.IdxMaxBytes := 1;
+  b := v3;
+  b.BeginBatch;
+  for i := 1 to 500 do
+  begin
+    MakeVal(i, 32, 5, v);
+    b.Put(i, v);
+  end;
+  b.CommitBatch;
+  b := nil;                       { kapanis -> SaveIdx }
+  v3 := nil;
+  if FileExists(idxPath) then
+    Fail('idxpol) esik asildiginda .idx YAZILDI')
+  else
+    Ok('idxpol) esik asilinca .idx yazilmadi');
+
+  { 2) .idx varken esik asilirsa DOSYA SILINMELI. }
+  v3 := TVdbBackendV3.Create(path, False, 64);
+  v3.Engine.IdxMaxBytes := 0;     { sinir yok: simdi yaz }
+  b := v3;
+  b.Flush;
+  b := nil;
+  v3 := nil;
+  if FileExists(idxPath) then
+    Ok('idxpol) sinir yokken .idx yazildi')
+  else
+    Fail('idxpol) sinir yokken .idx yazilmadi');
+
+  v3 := TVdbBackendV3.Create(path, False, 64);
+  if v3.Engine.IdxUsed then
+    Ok('idxpol) .idx ile acildi (hizli yol)')
+  else
+    Fail('idxpol) .idx ile acilamadi: ' + v3.Engine.IdxErr);
+  v3.Engine.IdxMaxBytes := 1;     { esik asildi -> eski .idx silinmeli }
+  b := v3;
+  b.Flush;
+  b := nil;
+  v3 := nil;
+  if FileExists(idxPath) then
+    Fail('idxpol) esik asilinca eski .idx silinmedi')
+  else
+    Ok('idxpol) esik asilinca eski .idx silindi');
+
+  { 3) .idx yokken veri kaybi YOK; acilis tam tarama ile dogru. }
+  v3 := TVdbBackendV3.Create(path, False, 64);
+  if v3.Engine.IdxUsed then
+    Fail('idxpol) .idx yokken hizli yol kullanildi')
+  else
+    Ok('idxpol) .idx yokken tam tarama yapildi');
+  b := v3;
+  if (b.Count = 500) and b.Get(137, v) then
+    Ok('idxpol) .idx olmadan 500 kayit okundu')
+  else
+    Fail(Format('idxpol) .idx olmadan count=%d', [b.Count]));
+  b := nil;
+  v3 := nil;
+end;
+
 { Sprint 3.4: sayfa duzeyi AES-GCM sifreleme kapisi. }
 procedure TestV3Encryption(N: Integer);
 const
@@ -1217,6 +1291,7 @@ begin
   TestV3Verify(N);
   TestV3BackupRestore(N);
   TestV3Compact(N);
+  TestV3IdxPolicy;
   TestV3Encryption(N);
   TestEquivalence(1000);
 

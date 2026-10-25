@@ -170,7 +170,9 @@ H3 skiplist (100,000 rows): 100 × (`UPDATE` + indexed `COUNT(*)`) takes
 
 v3.0 opens the database **~31x** faster and shrinks the data file by **19.5 %**;
 together with the `.odb.idx` it writes next to it (deletable, derived cache) the
-total on disk shrinks by only **1.2 %**. PK and parse costs match v2. Bulk
+total on disk shrinks by only **1.2 %**. The `.idx` is **written automatically by
+size**: below 50 MB for a fast open, above 50 MB it is skipped (open falls back
+to a full scan, still well under target). PK and parse costs match v2. Bulk
 writes are ~1.5x, `COUNT(*)` 2x and single-row writes ~1.3x slower. Root causes
 (page-image WAL's 2x write volume, no per-table row counter) and the v3.1 plan:
 [speedtest.md](speedtest.md#9-v30-page-engine--v2-and-v3-on-the-same-scale-2026-10-25).

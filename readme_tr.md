@@ -5,7 +5,7 @@ tek dosyada (`.odb`) çalışan ilişkisel veritabanı motorudur. Masaüstü ve 
 uygulamalar için SQLite'a alternatif olarak geliştirilmiştir.
 
 > Bu dosya `dokuman/` klasöründedir ve bilerek Git'e eklenmez.
-> İngilizce sürüm: [readme_en.md](readme_en.md)
+> İngilizce sürüm: [readme.md](readme.md)
 
 ---
 
@@ -171,7 +171,10 @@ H3 skiplist (100.000 satır): 100 × (`UPDATE` + indeksli `COUNT(*)`)
 
 v3.0 açılışı **~31x** hızlandırıyor, veri dosyasını **%19,5** küçültüyor; ama
 yanına yazdığı `.odb.idx` (silinebilir, türetilmiş önbellek) ile birlikte
-diskteki toplam yalnız **%1,2** küçülüyor. PK ve parse maliyeti v2 ile aynı.
+diskteki toplam yalnız **%1,2** küçülüyor. `.idx` **boyuta göre otomatik**
+yazılır: 50 MB'ın altındaki veritabanlarında hızlı açılış için yazılır,
+üstünde yazılmaz (açılış tam taramaya düşer, hedefin çok altında kalır).
+PK ve parse maliyeti v2 ile aynı.
 Toplu yazım ~1,5x, `COUNT(*)` 2x ve tek satır yazım ~1,3x daha yavaş. Kök
 nedenler (sayfa imajlı WAL'in 2x yazma hacmi, tablo başına satır sayacının
 olmaması) ve v3.1 planı:

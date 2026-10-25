@@ -28,6 +28,15 @@ interface
 uses
   SysUtils, Generics.Collections, VDbPage, VDbPageStore, VDbPageHeap, VDbPageWal;
 
+const
+  { `.odb.idx` (anahtar -> sayfa/slot) turetilmis bir acilis onbellegidir;
+    silinirse veri kaybi olmaz, yalniz acilis tam taramaya duser.
+    Kucuk dosyalarda kazanc buyuk (32 ms / 79 ms), buyuk dosyalarda ise
+    dosya boyutuna ~%18-23 ek yuk bindirir. Bu yuzden varsayilan politika
+    BOYUTA GORE: veri dosyasi bu esigin altindaysa yazilir, ustundeyse
+    yazilmaz (varsa eskisi de silinir). }
+  VDB_V3_IDX_MAX_BYTES = 50 * 1024 * 1024;
+
 type
   EVdbPageEngine = class(Exception);
 
@@ -62,6 +71,8 @@ type
       FPath: string;
       FIdxUsed: Boolean;
       FIdxErr: string;
+      { `.idx` yazim esigi (boyuta gore otomatik politika). }
+      FIdxMaxBytes: Int64;
       { Sprint 3.4: acilis anahtari (Open'dan once). }
       FKey: TBytes;
       FPassword: string;
@@ -123,6 +134,11 @@ type
       tarama yapildi ve FIdxErr nedenini verir (veri kaybi soz konusu degil). }
     property IdxUsed: Boolean read FIdxUsed;
     property IdxErr: string read FIdxErr;
+    { `.idx` yazilacak en buyuk veri dosyasi boyutu. Varsayilan
+      VDB_V3_IDX_MAX_BYTES (50 MB) → daha buyuk dosyada .idx yazilmaz ve
+      varsa eskisi silinir. 0 = sinir yok (her zaman yaz). Testler kucuk
+      deger vererek politikayi sinar. }
+    property IdxMaxBytes: Int64 read FIdxMaxBytes write FIdxMaxBytes;
     { Sprint 3.4: dosya sifreli mi ve anahtar parmak izi (8 hex). }
     property Encrypted: Boolean read GetEncrypted;
     function KeyFingerprint: string;
@@ -164,6 +180,7 @@ begin
   { WAL yolu: <db>.wal. Boylece tek dosya adi sozlesmesi korunur. }
   FWal := TVdbPageWal.Create(ADbPath + '.wal');
   FInTxn := False;
+  FIdxMaxBytes := VDB_V3_IDX_MAX_BYTES;
   FPendingIdx := TDictionary<LongWord, Integer>.Create;
   FPendingCount := 0;
   FPendingCap := 0;
@@ -260,10 +277,31 @@ begin
 end;
 
 procedure TVdbPageEngine.SaveIdx;
+var
+  DataBytes: Int64;
+  IdxPath: string;
 begin
   if FHeap = nil then Exit;
+  { Boyuta gore otomatik: buyuk dosyada `.idx` yazmayiz (diskte ~%18-23
+    yer kaplar, karsiliginda acilis 79 -> 32 ms). Esik asildiysa DAHA ONCE
+    yazilmis bir .idx kalmissa silinir; aksi halde eski dosya diskte kalir
+    ve bir sonraki acilis onu (bayat oldugu icin reddedip) bosa okur. }
+  if FStore <> nil then
+    DataBytes := Int64(FStore.PageCount) * VDB_PAGE_SIZE
+  else
+    DataBytes := 0;
+  IdxPath := FPath + '.idx';
+  if (FIdxMaxBytes > 0) and (DataBytes > FIdxMaxBytes) then
+  begin
+    try
+      if FileExists(IdxPath) then DeleteFile(IdxPath);
+    except
+      { silinemezse zararsiz: acilista tazelik denetimi reddeder. }
+    end;
+    Exit;
+  end;
   try
-    FHeap.SaveIdx(FPath + '.idx');
+    FHeap.SaveIdx(IdxPath);
   except
     { idx istege bagli: yazilamazsa acilis yalniz yavaslar. }
   end;

@@ -175,7 +175,7 @@ sqltest.exe <dir2> --backend=v3  # SONUC: gecen=2252 kalan=0 atlanan=58
 
 Kapılar (yeniden koşuldu, hepsi yeşil):
 `pagechk 21/21`, `storechk 15/15`, `heapchk 20/20`, `idxchk 17/17`,
-`crashtest 11/11`, `backendchk 83/83`, `v3sqlchk 128/128`, `migchk 13/13`.
+`crashtest 11/11`, `backendchk 89/89`, `v3sqlchk 128/128`, `migchk 13/13`.
 
 ### Fuzz / diferansiyel oracle (Sprint 3.11)
 
@@ -204,7 +204,7 @@ Her satır gerçekten koşulmuş bir kapıdır; hiçbirinde `kalan > 0` yoktur.
 
 | Kapı | win32 | win64 `-O-` | win64 `-O1` | Linux/WSL x86_64 |
 |---|---|---|---|---|
-| `backendchk` | 82/82 | 82/82 | 82/82 | 82/82 |
+| `backendchk` | 89/89 | 89/89 | 89/89 | 89/89 |
 | `v3sqlchk` | 128/128 | 128/128 | 128/128 | 128/128 |
 | `pagechk` / `storechk` | 21/21 · 15/15 | 21/21 · 15/15 | 21/21 · 15/15 | 21/21 · 15/15 |
 | `heapchk` / `idxchk` | 20/20 · 17/17 | 20/20 · 17/17 | 20/20 · 17/17 | 20/20 · 17/17 |

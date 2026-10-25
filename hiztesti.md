@@ -313,6 +313,12 @@ sürer, hedef 150 ms). Diskte yer kapladığı için yukarıda **ayrı satırda 
 toplamda** gösterildi. Yalnız `.odb` sayıldığında kazanç %19,5; `.idx` ile
 birlikte %1,2'dir — iki sayı da yazılmalıdır, tek başına %19,5 yanıltıcıdır.
 
+**Varsayılan politika boyuta göre otomatiktir** (`TVdbPageEngine.IdxMaxBytes`,
+eşik **50 MB**): bu boyutun altındaki veritabanlarında `.idx` yazılır (açılış
+hızlı), üstünde yazılmaz ve daha önce yazılmış `.idx` silinir (diskte ~%18–23
+tasarruf, açılış tam tarama). Eşik `IdxMaxBytes := 0` ile kaldırılabilir.
+`backendchk` bu politikayı 6 kontrolle sınar (`idxpol)`).
+
 Not: `autocommit`, `toplu INSERT` ve `COUNT(*)` dışındaki satırlarda v3
 gerilemiyor. Bu tablodaki üç gerileme **ölçülmüş ve kabul edilmiş**
 maliyetlerdir (aşağıda kök nedenleriyle).

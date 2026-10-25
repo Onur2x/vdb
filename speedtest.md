@@ -314,6 +314,12 @@ source and deleting it loses nothing (open takes 79 ms instead of 16 ms, target
 Counting `.odb` alone the win is 19.5 %; with `.idx` it is 1.2 % — both numbers
 belong in the report, the 19.5 % alone is misleading.
 
+**The default policy is size-based automation** (`TVdbPageEngine.IdxMaxBytes`,
+threshold **50 MB**): below it the `.idx` is written (fast open), above it is
+not written and a previously written `.idx` is deleted (~18–23 % disk saving,
+open falls back to a full scan). Set `IdxMaxBytes := 0` to remove the limit.
+`backendchk` covers this with 6 checks (`idxpol)`).
+
 Everything except bulk insert, autocommit insert and `COUNT(*)` is on par with
 or better than v2. Those three regressions are **measured and accepted** costs
 (root causes below).
