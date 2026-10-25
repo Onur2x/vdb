@@ -12803,10 +12803,12 @@ begin
 end;
 
 procedure T126_F42_TxIsolation;
-// F-42: ayni TVDb uzerinde iki oturum kimligi. Acik transaction'in
-// commit edilmemis yazisi diger oturuma gorunmez; diger oturum yazamaz;
-// commit sonrasi herkes gorur.
+{ F-42 (v3.2: backend-farkinda): ayni veritabani uzerinde iki oturum
+  kimligi. Acik islemin commit edilmemis yazisi diger oturuma GORUNMEZ;
+  diger oturum YAZAMAZ ve COMMIT/ROLLBACK edemez; commit sonrasi herkes
+  gorur. v2 TVDb ile ayni kural, IVdbBackend uzerinden iki motorda. }
 var
+  be: IVdbBackend;
   db: TVDb;
   dir: string;
   k: QWord;
@@ -12816,40 +12818,65 @@ begin
   Grp('F-42 oturum yalitimi');
   dir := D + PathDelim + 'f42_iso';
   ForceDirectories(dir);
-  db := TVDb.Create;
-  try
+  be := nil;
+  db := nil;
+  if gV3 then
+    VdbOpenOrCreate(DbFileOf(dir), be)
+  else
+  begin
+    db := TVDb.Create;
     db.Open(dir);
+  end;
+  try
     k := 42;
     VDbSetTxnSession(1001);
-    db.BeginBatch;
-    db.Put(k, VDbStrToBytes('a'));
+    if gV3 then be.BeginBatch else db.BeginBatch;
+    if gV3 then be.Put(k, VDbStrToBytes('a'))
+    else db.Put(k, VDbStrToBytes('a'));
 
     VDbSetTxnSession(1002);
-    ok := db.Get(k, v);
+    if gV3 then ok := be.Get(k, v) else ok := db.Get(k, v);
     Dogrula('F42 diger oturum commit edilmemisi gormez', not ok, '');
 
     ok := False;
     try
-      db.Put(k, VDbStrToBytes('b'));
+      if gV3 then be.Put(k, VDbStrToBytes('b'))
+      else db.Put(k, VDbStrToBytes('b'));
     except
       on E: Exception do ok := Pos('baska bir oturum', E.Message) > 0;
     end;
     Dogrula('F42 diger oturum yazamaz', ok, '');
 
+    ok := False;
+    try
+      if gV3 then be.CommitBatch else db.CommitBatch;
+    except
+      on E: Exception do ok := Pos('baska bir oturum', E.Message) > 0;
+    end;
+    Dogrula('F42 diger oturum commit edemez', ok, '');
+
     VDbSetTxnSession(1001);
-    ok := db.Get(k, v);
+    if gV3 then ok := be.Get(k, v) else ok := db.Get(k, v);
     Dogrula('F42 sahibi kendi yazisini gorur',
       ok and (VDbBytesToStr(v) = 'a'), '');
 
-    db.CommitBatch;
+    if gV3 then be.CommitBatch else db.CommitBatch;
     VDbSetTxnSession(1002);
-    ok := db.Get(k, v);
+    if gV3 then ok := be.Get(k, v) else ok := db.Get(k, v);
     Dogrula('F42 commit sonrasi diger oturum gorur',
       ok and (VDbBytesToStr(v) = 'a'), '');
   finally
     VDbSetTxnSession(0);
-    db.Close;
-    db.Free;
+    if gV3 then
+    begin
+      be := nil;
+      db := nil;
+    end
+    else
+    begin
+      db.Close;
+      db.Free;
+    end;
   end;
 end;
 
@@ -16751,11 +16778,10 @@ const
     DISTINCT, HAVING, filtreli COUNT, float sirasi, coklu top-N, derin
     OFFSET, MCV) v2 tipleri yerine backend-farkinda `OpenAt`/`sq` uzerinden
     kosar. Bunlar motorun SQL yuzeyini iki backend'de de dogrular. }
-  V2_ONLY: array[0..33] of string = (
+  V2_ONLY: array[0..32] of string = (
     'T101_TcpReplication',
     'T122_KvStore',
     'T125_KolonSifreleme',
-    'T126_F42_TxIsolation',
     'T127_H5_BlockCrc',
     'T128_H11_Undo',
     'T129_H11_InPlace',

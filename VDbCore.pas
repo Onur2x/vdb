@@ -6608,5 +6608,8 @@ initialization
     ve Unicode veri (collation, UPPER/LOWER, XML, BLOB) bozuluyordu.
     Artik platformdan bagimsiz olarak motor kendisi UTF-8'e sabitler. }
   SetMultiByteConversionCodePage(CP_UTF8);
+  { v3.2: v3 backend'i de ayni oturum kimligini gorsun (VDbBackendApi
+    yalniz SysUtils'e bagimli kalsin diye sorucu isaretcisiyle). }
+  VdbSessionIdFunc := @VDbGetTxnSession;
 
 end.

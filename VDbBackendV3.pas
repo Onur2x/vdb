@@ -77,6 +77,8 @@ type
         yalniz uygulama sirasi giris sirasi olur. }
       FOrder: TList<QWord>;
       FBatchOpen: Boolean;
+      { v3.2: acik partiyi acan oturum (0 = sahipsiz/eski davranis). }
+      FWriteSession: Cardinal;
       FRowTag: TVDbRowTagFunc;
       FBeforeCommit: TDbCommitHook;
       FCheckpointBytes: Int64;
@@ -127,6 +129,10 @@ type
       procedure MaybeAutoCompact;
       function AutoCompactBody(out OldBytes, NewBytes: Int64;
         MaxDeadRatio: Double; MinBytes: Int64): Boolean;
+      { v3.2: oturum yalitimi (v2 TVDb.BatchIsMine/RequireBatchWrite esi).
+        Baska oturum acik partiyi ne gorur ne yazar. }
+      function BatchIsMine: Boolean;
+      procedure RequireBatchWrite;
 
     procedure InitBackend(const ADbPath: string; ACreate: Boolean;
       APoolPages: Integer);
@@ -283,6 +289,7 @@ begin
   FAutoCompactBusy := False;
   FLastAutoCompactError := '';
   FBatchOpen := False;
+  FWriteSession := 0;
   FDirty := False;
   FCheckpointBytes := VDB_V3_CHECKPOINT_BYTES;
   FPoolPages := APoolPages;
@@ -384,7 +391,8 @@ var
   n: Integer;
 begin
   n := FEng.Count;
-  if FBatchOpen then
+  if not BatchIsMine then Exit(n);
+  if BatchIsMine then
     for pair in FBatch do
     begin
       { Kaplamadaki her kayit: eskiden var miydi? }
@@ -477,12 +485,33 @@ end;
 
 { ------------------------------------------------------------------ kayit }
 
+{ --- v3.2: oturum yalitimi ---------------------------------------- }
+
+function TVdbBackendV3.BatchIsMine: Boolean;
+begin
+  { v2 TVDb.BatchIsMine ile AYNI kural: sahipsiz parti (0) ya da oturum
+    kimligi olmayan cagri eski global davranisi korur. Yalnizca kimligi
+    olan FARKLI oturumlar birbirinden yalitilir. }
+  Result := FBatchOpen and ((FWriteSession = 0) or
+    (VdbBackendSessionId = 0) or (FWriteSession = VdbBackendSessionId));
+end;
+
+procedure TVdbBackendV3.RequireBatchWrite;
+begin
+  if FBatchOpen and (FWriteSession <> 0) and
+     (VdbBackendSessionId <> 0) and
+     (FWriteSession <> VdbBackendSessionId) then
+    raise EVdbBackendV3.Create(
+      'VDb: baska bir oturumun acik islemi var; once COMMIT veya ROLLBACK');
+end;
+
 procedure TVdbBackendV3.Put(Key: QWord; const Value: TBytes);
 var
   rec: TBatchRec;
   oldTag, newTag: Integer;
   oldVal: TBytes;
 begin
+  RequireBatchWrite;
   if FBatchOpen then
   begin
     JournalKey(Key);
@@ -531,7 +560,7 @@ function TVdbBackendV3.Get(Key: QWord; out Value: TBytes): Boolean;
 var
   rec: TBatchRec;
 begin
-  if FBatchOpen and FBatch.TryGetValue(Key, rec) then
+  if BatchIsMine and FBatch.TryGetValue(Key, rec) then
   begin
     if rec.Present then
     begin
@@ -550,6 +579,7 @@ var
   had: Boolean;
   oldVal: TBytes;
 begin
+  RequireBatchWrite;
   if FBatchOpen then
   begin
     { ONCEDEN: `FBatch.AddOrSetValue(...)`'dan SONRA `FBatch.ContainsKey`
@@ -582,7 +612,7 @@ end;
 
 function TVdbBackendV3.Exists(Key: QWord): Boolean;
 begin
-  if FBatchOpen and FBatch.ContainsKey(Key) then
+  if BatchIsMine and FBatch.ContainsKey(Key) then
     Exit(FBatch[Key].Present);
   Result := FEng.Contains(Key);
 end;
@@ -596,7 +626,7 @@ end;
 
 procedure TVdbBackendV3.ScanCb(Key: QWord; const Value: TBytes);
 begin
-  if FBatchOpen and FBatch.ContainsKey(Key) then Exit;
+  if BatchIsMine and FBatch.ContainsKey(Key) then Exit;
   if not PassFilter(Key, Value, FScanFilter) then Exit;
   { v3.1: her satirda SetLength(+1) YAPILMAZ (200k satirda O(n^2) kopya
     ve yeniden tahsis). Kapasite ikiye katlanir. }
@@ -626,7 +656,7 @@ begin
   FEng.ScanAll(ScanCb);
 
   { Kaplama tarafi: en guncel deger. }
-  if FBatchOpen then
+  if BatchIsMine then
     for pair in FBatch do
     begin
       if not pair.Value.Present then Continue;
@@ -657,7 +687,7 @@ var
   tag, n: Integer;
 begin
   if FStreamAbort then Exit;
-  if FBatchOpen and FBatch.ContainsKey(Key) then Exit;
+  if BatchIsMine and FBatch.ContainsKey(Key) then Exit;
   { PassFilter'in sifir-kopya esdegeri: satir etiketi degerin ILK baytlarindan
     cikar; 8 baytlik sabit tampona kopyalanir (satir basina tahsis YOK). }
   if (FStreamFilter >= 0) and Assigned(FRowTag) then
@@ -832,7 +862,7 @@ var
 begin
   { Acik kaplama varsa bekleyen degisiklikler sayaca YANSIMAZ; cagiran
     (yurutucu) bu durumda tam tarama yapar. }
-  if FBatchOpen then Exit(-1);
+  if BatchIsMine then Exit(-1);
   if TableFilter < 0 then Exit(FEng.Count);
   if not Assigned(FRowTag) then Exit(-1);
   { Sayac .idx ozetinden geldiyse burada tarama YOK; yoksa bir kez kurulur. }
@@ -847,20 +877,24 @@ end;
 
 procedure TVdbBackendV3.BeginBatch;
 begin
+  RequireBatchWrite;       // v3.2: baskasi acik parti tutuyorsa reddet
   if FBatchOpen then Exit;
   ClearSavepoints;
   FBatch.Clear;
   FOrder.Clear;
   FBatchOpen := True;
+  FWriteSession := VdbBackendSessionId;
 end;
 
 procedure TVdbBackendV3.CommitBatch;
 begin
+  RequireBatchWrite;
   if not FBatchOpen then Exit;
   if Assigned(FBeforeCommit) then
     FBeforeCommit;          // kisit denetimi: hata firlatirsa kaplama durur
   ApplyBatch;
   FBatchOpen := False;
+  FWriteSession := 0;
   ClearSavepoints;
   { v3.1: parti ici etiket degisimleri simdi sayaca islenir. }
   MergeTagDeltas;
@@ -877,11 +911,13 @@ end;
 
 procedure TVdbBackendV3.AbortBatch;
 begin
+  RequireBatchWrite;
   ClearSavepoints;
   FBatch.Clear;
   FOrder.Clear;
   FBatchTagDelta.Clear;
   FBatchOpen := False;
+  FWriteSession := 0;
 end;
 
 procedure TVdbBackendV3.Flush;
@@ -965,6 +1001,7 @@ var
   sp: TSavepointRec;
   pair: TPair<Integer, Int64>;
 begin
+  RequireBatchWrite;
   if FindSavepoint(Name) >= 0 then
     raise EVdbBackendV3.CreateFmt('savepoint zaten var: %s', [Name]);
   { SQL standardi: SAVEPOINT acik islem yoksa ORTUK islem baslatir. }
@@ -985,6 +1022,7 @@ var
   pair: TPair<QWord, TSavepointKeyRec>;
   tp: TPair<Integer, Int64>;
 begin
+  RequireBatchWrite;
   ix := FindSavepoint(Name);
   if ix < 0 then Exit(False);
   sp := FSavepoints[ix];
@@ -1023,6 +1061,7 @@ var
   ix, i: Integer;
   sp: TSavepointRec;
 begin
+  RequireBatchWrite;
   ix := FindSavepoint(Name);
   if ix < 0 then Exit(False);
   { RELEASE veriyi COMMIT ETMEZ; yalnizca geri donme noktasini (ve

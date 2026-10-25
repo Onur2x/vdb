@@ -43,6 +43,12 @@ type
   { R-11: COMMIT oncesi geri-cagirim (deferrable kisit denetimi). }
   TDbCommitHook = procedure of object;
 
+  { v3.2: SQL oturum kimligi (thread yerel) SORUCUSU. VDbCore kendi
+    initialization'inda buraya VDbGetTxnSession'i baglar. Boylece v3
+    backend'i v2 motorunu link etmeden ayni oturum kimligini gorur.
+    Baglanmamissa 0 doner (= oturum yok; eski global davranis). }
+  TVdbSessionIdFunc = function: Cardinal;
+
   { M11: yalnizca temel KV islemleri (transaction/WAL/indeks disarida). }
   IVDbKvStore = interface
     ['{6D8B2E71-4C1A-4F6E-9E3B-7A5C0D2F1A44}']
@@ -200,8 +206,21 @@ type
       TableFilter: Integer);
   end;
 
+var
+  { VDbCore baglar; nil ise oturum kimligi 0 sayilir. }
+  VdbSessionIdFunc: TVdbSessionIdFunc = nil;
+
+{ Etkin SQL oturum kimligi (0 = yok). Butun backend'ler ayni kaynagi
+  kullanir; boylece v2/v3 davranisi ayni kalir. }
+function VdbBackendSessionId: Cardinal;
+
 implementation
 
+function VdbBackendSessionId: Cardinal;
+begin
+  if Assigned(VdbSessionIdFunc) then Result := VdbSessionIdFunc()
+  else Result := 0;
+end;
 { ------------------------------------------------- TVdbBackendKvStore }
 
 constructor TVdbBackendKvStore.Create(ABe: IVdbBackend);
