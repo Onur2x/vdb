@@ -335,7 +335,8 @@ Notlar:
 - [ ] Çok satırlı yazma tek işlemde
 - [ ] Kullanıcıya `BACKUP TO` (veya otomatik günlük yedek) sunuluyor
 - [ ] Şifreleme gerekiyorsa `VdbOpenWithPassword`, parola koddan gelmiyor
-- [ ] `SAVEPOINT` / PITR / replikasyon kullanılmıyor (§9)
+- [ ] Yalnız PITR/WAL arşivi/replikasyon kullanılmıyor (§9); `SAVEPOINT` ve
+      `AS OF SEQUENCE` v3.2'de var
 - [ ] Sürüm yükseltmesinde `VERIFY` çalıştırılıp raporu loglanıyor
 
 ---
