@@ -101,7 +101,7 @@ var
 begin
   WriteLn('2) v3 olusturma / acma');
   f := P('yeni.odb');
-  be := VdbOpen(f);
+  VdbOpen(f, be);
   try
     if be.Count = 0 then
       Ok('bos veritabani: Count=0')
@@ -121,7 +121,7 @@ begin
   else
     Fail('olusan dosya v3 degil');
   { Ayni dosyayi yeniden ac: yeni dosya olusturulmamali, icerik korunmali. }
-  be := VdbOpen(f, False);
+  VdbOpen(f, be, False);
   try
     if be.Count = 0 then
       Ok('yeniden acildi (v3, Count=0)')
@@ -159,7 +159,7 @@ begin
   refused := False;
   msg := '';
   try
-    be := VdbOpen(d, False);
+    VdbOpen(d, be, False);
     be := nil;
   except
     on E: EVdbFactory do
@@ -177,7 +177,7 @@ begin
   else
     Fail('hata mesaji yonlendirici degil: ' + msg);
 
-  be := VdbOpen(d, False, True);
+  VdbOpen(d, be, False, True);
   try
     if be.Count = 1 then
       Ok('AllowV2=True: v2 acildi (Count=1)')
@@ -214,7 +214,7 @@ var
 begin
   WriteLn('4) sifreli v3');
   f := P('sifreli.odb');
-  be := VdbOpenWithPassword(f, 'gizli-parola');
+  VdbOpenWithPassword(f, 'gizli-parola', be);
   be := nil;
   if VdbFamilyOfFile(f) = vdfV3 then
     Ok('sifreli dosya olustu (v3 imzali)')
@@ -223,7 +223,7 @@ begin
 
   refused := False;
   try
-    be := VdbOpen(f, False);
+    VdbOpen(f, be, False);
     be := nil;
   except
     on E: Exception do
@@ -234,7 +234,7 @@ begin
   else
     Fail('parolasiz acilis kabul edildi');
 
-  be := VdbOpenWithPassword(f, 'gizli-parola', False);
+  VdbOpenWithPassword(f, 'gizli-parola', be, False);
   try
     Ok('dogru parola ile acildi (Count=' + IntToStr(be.Count) + ')');
   finally
@@ -259,7 +259,7 @@ begin
   end;
   refused := False;
   try
-    be := VdbOpen(P('bozuk.odb'), False);
+    VdbOpen(P('bozuk.odb'), be, False);
     be := nil;
   except
     on E: EVdbFactory do

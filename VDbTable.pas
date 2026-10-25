@@ -3754,6 +3754,13 @@ begin
   FAutoInc.Free;   // P-17a
   FConcBuilders.Free;   // R-22 Full
   FLock.Free;
+  { 2026-10-25: MOTOR REFERANSI BIRAKILMALI. v3 backend dosyayi (bayt-araligi
+    kilidiyle) acik tutar. Yalnizca `Be := nil` yetmez: TVTableDb de arayuzu
+    tutuyordu ve serbest birakmadigi icin dosya kapanmiyor, ayni surecte
+    yeniden acma "dosya kullanimda" hatasi veriyordu. v2 adaptorunde de
+    ayni sekilde nesne sizintisi olusuyordu. FKv (v2 cekirdegi) SAHIPLI
+    DEGILDIR; burada serbest birakilmaz. }
+  FKvB := nil;
   inherited;
 end;
 

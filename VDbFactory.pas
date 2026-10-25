@@ -5,7 +5,7 @@ unit VDbFactory;
   Amac: uygulamalar (yonetim, ornekler, kullanici programlari) motorun SOMUT
   tipini (TVDb) tanimasin. Tek bir cagri ile veritabani acilir:
 
-      Be := VdbOpen('D:\veritabani\db');
+      VdbOpen('D:\veritabani\db', Be);
       Tb := TVTableDb.CreateBackend(Be);
 
   Varsayilan davranis V3'tur:
@@ -17,9 +17,17 @@ unit VDbFactory;
   AllowV2=True yalnizca goc araclarinda kullanilmalidir: o zaman v2 dosyasi
   salt-okunur mantikla acilir ve VdbMigrateToV3'e kaynak olur.
 
-  SAHIPLIK: donen arayuz motoru SAHIPLENIR. Degiskeni nil yapmak (veya
-  kapsamdan cikmasi) motoru kapatir; v2 durumunda TVDb de serbest birakilir.
-  Bu yuzden `Be := nil` cagrisi kapanis ile esdegerdir.
+  SAHIPLIK: verilen arayuz motoru SAHIPLENIR. Degiskeni nil yapmak motoru
+  kapatir; v2 durumunda TVDb de serbest birakilir. `Be := nil` kapanis ile
+  esdegerdir. TVTableDb de arayuzu tutar; Free edilince birakir.
+
+  NEDEN `out` PARAMETRE (olculmus FPC davranisi):
+  FPC 3.2.4'te `function ...: IVdbBackend` seklinde arayuz DONDUREN bir
+  fonksiyon, sonuca fazladan bir referans birakiyor: `Be := VdbOpen(...)` ve
+  ardindan `Be := nil` motoru KAPATMIYOR, dosya kilidi acik kaliyor, ayni
+  surecte yeniden acilis "dosya kullanimda" hatasi veriyor. Ayni is `out`
+  parametreyle yapildiginda referans tam birakiliyor. Probe (probe5/probe6)
+  ile dogrulandi; bu yuzden giris noktalari `out` kullanir.
 }
 
 {$mode delphi}{$H+}
@@ -52,17 +60,20 @@ function VdbFamilyName(F: TVdbFamily): string;
 
 { Veritabani acar. CreateIfMissing ise yoksa v3 olarak olusturur.
   AllowV2=False iken v2 dosyasi EVdbFactory ile reddedilir.
-  PoolPages<=0 ise motor varsayilani kullanilir (512 sayfa = 2 MB). }
-function VdbOpen(const Path: string; CreateIfMissing: Boolean = True;
-  AllowV2: Boolean = False; PoolPages: Integer = 0): IVDbBackend;
+  PoolPages<=0 ise motor varsayilani kullanilir (512 sayfa = 2 MB).
+  Sonuc `out`: bkz. yukarida "NEDEN out PARAMETRE". }
+procedure VdbOpen(const Path: string; out Be: IVdbBackend;
+  CreateIfMissing: Boolean = True; AllowV2: Boolean = False;
+  PoolPages: Integer = 0);
 
 { Kisa yol: VdbOpen(Path, True, False, PoolPages). Yeni uygulamalar bunu
   kullanir; dosya yoksa v3 olusturur, varsa acar. }
-function VdbOpenOrCreate(const Path: string; PoolPages: Integer = 0): IVDbBackend;
+procedure VdbOpenOrCreate(const Path: string; out Be: IVdbBackend;
+  PoolPages: Integer = 0);
 
 { Sifreli v3 dosyasi acar/olusturur. v2 dosyalari bu yoldan ACILMAZ. }
-function VdbOpenWithPassword(const Path, Password: string;
-  CreateIfMissing: Boolean = True; PoolPages: Integer = 0): IVDbBackend;
+procedure VdbOpenWithPassword(const Path, Password: string;
+  out Be: IVdbBackend; CreateIfMissing: Boolean = True; PoolPages: Integer = 0);
 
 implementation
 
@@ -139,14 +150,16 @@ begin
     Result := VDB_DEF_POOL;
 end;
 
-function VdbOpen(const Path: string; CreateIfMissing: Boolean = True;
-  AllowV2: Boolean = False; PoolPages: Integer = 0): IVDbBackend;
+procedure VdbOpen(const Path: string; out Be: IVdbBackend;
+  CreateIfMissing: Boolean = True; AllowV2: Boolean = False;
+  PoolPages: Integer = 0);
 var
   file_, dir: string;
   fam: TVdbFamily;
   kv: TVDb;
   pool: Integer;
 begin
+  Be := nil;
   file_ := VdbResolveFile(Path);
   dir := ExtractFileDir(file_);
   fam := VdbFamilyOfFile(file_);
@@ -156,7 +169,7 @@ begin
     vdfV3:
       begin
         { Var olan dosya: olusturma kapali; motor yalniz acar. }
-        Result := TVdbBackendV3.Create(file_, False, pool);
+        Be := TVdbBackendV3.Create(file_, False, pool);
       end;
 
     vdfV2:
@@ -170,7 +183,7 @@ begin
         kv := TVDb.Create;
         try
           kv.Open(file_);
-          Result := TVdbBackendV2.CreateOwned(kv);
+          Be := TVdbBackendV2.CreateOwned(kv);
         except
           kv.Free;
           raise;
@@ -183,7 +196,7 @@ begin
           raise EVdbFactory.CreateFmt('Veritabani yok: %s', [file_]);
         if dir <> '' then
           ForceDirectories(dir);
-        Result := TVdbBackendV3.Create(file_, True, pool);
+        Be := TVdbBackendV3.Create(file_, True, pool);
       end;
   else
     raise EVdbFactory.CreateFmt(
@@ -192,18 +205,21 @@ begin
   end;
 end;
 
-function VdbOpenOrCreate(const Path: string; PoolPages: Integer = 0): IVDbBackend;
+procedure VdbOpenOrCreate(const Path: string; out Be: IVdbBackend;
+  PoolPages: Integer = 0);
 begin
-  Result := VdbOpen(Path, True, False, PoolPages);
+  VdbOpen(Path, Be, True, False, PoolPages);
 end;
 
-function VdbOpenWithPassword(const Path, Password: string;
-  CreateIfMissing: Boolean = True; PoolPages: Integer = 0): IVDbBackend;
+procedure VdbOpenWithPassword(const Path, Password: string;
+  out Be: IVdbBackend; CreateIfMissing: Boolean = True;
+  PoolPages: Integer = 0);
 var
   file_: string;
   fam: TVdbFamily;
   pool: Integer;
 begin
+  Be := nil;
   file_ := VdbResolveFile(Path);
   fam := VdbFamilyOfFile(file_);
   if fam = vdfV2 then
@@ -214,7 +230,7 @@ begin
   if (fam = vdfMissing) and (ExtractFileDir(file_) <> '') then
     ForceDirectories(ExtractFileDir(file_));
   pool := EffectivePool(PoolPages);
-  Result := TVdbBackendV3.CreateWithPassword(file_, Password,
+  Be := TVdbBackendV3.CreateWithPassword(file_, Password,
     fam = vdfMissing, pool);
 end;
 
