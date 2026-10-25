@@ -20,6 +20,14 @@ function VDbFlushDir(const DirPath: string): Boolean;
 function VDbLockStream(S: TFileStream): Boolean;
 procedure VDbUnlockStream(S: TFileStream);
 
+// 2026-10-25 (Sprint 3.10): CANLI dosyanin boyunu KILIT ALMADAN ogrenir.
+// Neden: Unix'te FPC'nin TFileStream'i paylasim moduna gore flock() uygular;
+// motor dosyayi LOCK_EX ile tuttugu icin ayni dosyayi IKINCI kez acmak
+// (salt-okunur boy olcumu bile) EAGAIN/"Try again" verir. Windows'ta bu
+// sorun gorunmez (paylasimli okuma serbest). Bu yuzden boy olcumu acmaz,
+// stat() kullanir. Dosya yoksa -1 doner.
+function VDbFileBytes(const Path: string): Int64;
+
 // 2026-10-04: "dosya baska islemde acik" ayrimini yapar.
 // Windows'ta paylasim ihlali ERROR_SHARING_VIOLATION (32) veya
 // ERROR_LOCK_VIOLATION (33) kodunu verir; FPC bunu EFOpenError
@@ -133,6 +141,35 @@ begin
   {$ENDIF}
 end;
 
+function VDbFileBytes(const Path: string): Int64;
+{$IFDEF UNIX}
+var
+  st: Stat;
+begin
+  if FpStat(PChar(Path), st) <> 0 then
+    Result := -1
+  else
+    Result := st.st_size;
+end;
+{$ELSE}
+var
+  fs: TFileStream;
+begin
+  Result := -1;
+  if not FileExists(Path) then Exit;
+  try
+    fs := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+    try
+      Result := fs.Size;
+    finally
+      fs.Free;
+    end;
+  except
+    Result := -1;
+  end;
+end;
+{$ENDIF}
+
 function VDbIsSharingViolation(const E: TObject): Boolean;
 var
   Code: Integer;
@@ -146,9 +183,15 @@ begin
   Result := (Code = 32) or (Code = 33);   // SHARING_VIOLATION / LOCK_VIOLATION
   {$ELSE}
   {$IFDEF UNIX}
+  { FPC'nin Unix hata metni glibc'ten FARKLI: EAGAIN icin "Try again",
+    EACCES icin "Permission denied" yazar. flock cakismasi EAGAIN
+    ("Try again") olarak gelir; "Resource temporarily unavailable"
+    metnine guvenmek Linux'ta bu ayrimi kaciriyordu (2026-10-25). }
   if E is Exception then
     Result := Exception(E).Message.Contains('Resource temporarily unavailable') or
-              Exception(E).Message.Contains('Resource busy');
+              Exception(E).Message.Contains('Resource busy') or
+              Exception(E).Message.Contains('Try again') or
+              Exception(E).Message.Contains('Device or resource busy');
   {$ENDIF}
   {$ENDIF}
 end;

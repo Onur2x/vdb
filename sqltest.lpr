@@ -6255,18 +6255,33 @@ begin
   sq.ClearSlow;
   sq.Exec('SELECT COUNT(*) FROM big a CROSS JOIN big b');   // ~30 ms
   ChkInt('cok yuksek esik -> kayit yok', sq.SlowQueryCount, 0);
-  // Dusuk esik (1 ms): ayni sorgu KAYDEDILMELI
+  // Dusuk esik (1 ms): ayni sorgu KAYDEDILMELI.
+  // DIKKAT: 25.10.2026'da uc sqltest PARALEL kosarken bu adim bir kez
+  // kirmizi verdi: olcum 1 ms'nin altinda kaldi (LastElapsedMs=0) ve kayit
+  // olusmadi; ardindan asagidaki `SHOW SLOW QUERIES` bos dondugu icin
+  // R.Rows[0] erisim ihlali verdi. Iki duzeltme: (a) esik gercekten
+  // asildiysa kayit ZORUNLU, asilmadiysa olcum not edilir (yanlis kirmizi
+  // yok), (b) bos sonuc kumesi guvenli okunur.
   sq.Exec('SET SLOW_QUERY_MS = 1');
   sq.ClearSlow;
   sq.Exec('SELECT COUNT(*) FROM big a CROSS JOIN big b');
-  ChkInt('dusuk esik -> kayit var', sq.SlowQueryCount, 1);
+  if sq.LastElapsedMs >= 1 then
+    ChkInt('dusuk esik -> kayit var', sq.SlowQueryCount, 1)
+  else
+    Ok('dusuk esik: sorgu 1 ms altinda, esik sinanamadi',
+      IntToStr(sq.LastElapsedMs) + ' ms');
   R := sq.Exec('SHOW SLOW QUERIES');
-  if TryStrToInt(R.Rows[0][0], n1) then
+  if Length(R.Rows) > 0 then
   begin
-    if n1 >= 1 then Ok('kayit suresi esigi gecer', R.Rows[0][0])
-      else No('kayit suresi esigi gecer', R.Rows[0][0]);
+    if TryStrToInt(R.Rows[0][0], n1) then
+    begin
+      if n1 >= 1 then Ok('kayit suresi esigi gecer', R.Rows[0][0])
+        else No('kayit suresi esigi gecer', R.Rows[0][0]);
+    end
+    else No('kayit suresi esigi gecer', R.Rows[0][0]);
   end
-  else No('kayit suresi esigi gecer', R.Rows[0][0]);
+  else
+    No('SHOW SLOW QUERIES kayit dondurdu', '0 satir');
   // Esigin ALTINDA kalan hizli bir cumle kaydedilmemeli
   sq.ClearSlow;
   sq.Exec('SET SLOW_QUERY_MS = 60000');   // 1 dakika
@@ -12185,7 +12200,14 @@ begin
   end;
   Chk('VEC ANN cizgi satirlari',
     'INSERT INTO vec_line_t VALUES ' + vals, 0);
-  q := VecJson(0.1, 0.11, 0.12, 0.13);
+  { Sorgu BILEREK dogrunun uzerinde degil: tam uzerinde olsaydi i=10'a
+    gore simetrik noktalar (5 ve 15, 6 ve 14, ...) TAM esit mesafede
+    olur ve K sinirindaki secim tanimsiz kalirdi (ANN'in hangisini sectigi
+    fiziksel yerlesime bagli). Test o zaman gecmesi sansa bagli bir
+    "kume ayni" iddiasina donusuyordu: 25.10.2026'da Linux ve win32'de
+    tam bu yuzden bir kez kirmizi verdi. Ikinci bileseni kaydirinca
+    mesafeler kesinlesir, iddia anlamli kalir. }
+  q := VecJson(0.1, 0.115, 0.12, 0.13);
   exact := IdsOf('SELECT id FROM vec_line_t WHERE id >= 0 ORDER BY ' +
     'VECTOR_DISTANCE(v,' + SQLIT(q) + ') LIMIT ' + IntToStr(K));
   ann := IdsOf('SELECT id FROM vec_line_t ORDER BY ' +

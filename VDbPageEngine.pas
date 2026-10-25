@@ -36,13 +36,27 @@ type
     type
       TPending = record
         PageNo: LongWord;
-        Data: TVdbPageBuf;
+        Data: PByte;              // 4 KB imaj: ayri ayri ayrilir
       end;
     var
       FStore: TVDbPageStore;
       FHeap: TVdbHeap;
       FWal: TVdbPageWal;
+      { Sprint 3.12: ONCEDEN `array of TPending` idi ve her tahliyede
+        `SetLength(+1)` yapiliyordu. 200k x 64 B yazimda (havuz 512) pending
+        3488 sayfaya cikti ve olculen maliyet 75 us/tahliye (toplam ~265 ms)
+        idi — kopyalama degil, 4 KB'lik kayitli diziyi bire bir buyutmenin
+        bedeli. Artik imajlar ayri ayrilir, dizi yalniz isaretci tutar ve
+        kapasite ikiye katlanir. }
       FPending: array of TPending;
+      FPendingCount: Integer;
+      FPendingCap: Integer;
+      { Sprint 3.12: pending sayfa aramasi LINEER taramaydi. Toplu yazimda
+        havuz dolar ve pending binlerce sayfaya cikinca her tahliye
+        O(n) tarama yapiyordu (olculen: 200k x 64B yazim, havuz 512 ->
+        3,24 us/anahtar; havuz 8192 -> 1,24 us/anahtar). Artik hash ile
+        O(1). Dizi semantigi (swap-remove) korunur. }
+      FPendingIdx: TDictionary<LongWord, Integer>;
       FInTxn: Boolean;
       FWalStats: TVdbWalStats;
       FPath: string;
@@ -150,6 +164,10 @@ begin
   { WAL yolu: <db>.wal. Boylece tek dosya adi sozlesmesi korunur. }
   FWal := TVdbPageWal.Create(ADbPath + '.wal');
   FInTxn := False;
+  FPendingIdx := TDictionary<LongWord, Integer>.Create;
+  FPendingCount := 0;
+  FPendingCap := 0;
+  SetLength(FPending, 0);
   FWalStats.Frames := 0;
   FWalStats.Commits := 0;
   FWalStats.TornTail := False;
@@ -195,6 +213,10 @@ begin
   FreeAndNil(FHeap);
   FreeAndNil(FWal);
   FreeAndNil(FStore);
+  begin
+    ClearPending;          // ayri ayrilmis 4 KB imajlari birak
+  end;
+  FreeAndNil(FPendingIdx);
   inherited Destroy;
 end;
 
@@ -284,11 +306,9 @@ end;
 { ------------------------------------------------------------ WAL kancalari }
 
 function TVdbPageEngine.PendingIndex(PageNo: LongWord): Integer;
-var
-  i: Integer;
 begin
-  for i := 0 to High(FPending) do
-    if FPending[i].PageNo = PageNo then Exit(i);
+  if FPendingIdx.TryGetValue(PageNo, Result) then
+    Exit;
   Result := -1;
 end;
 
@@ -299,23 +319,40 @@ begin
   i := PendingIndex(PageNo);
   if i >= 0 then
   begin
-    Move(P^, FPending[i].Data, VDB_PAGE_SIZE);
-    PageSeal(@FPending[i].Data);
+    Move(P^, FPending[i].Data^, VDB_PAGE_SIZE);
+    PageSeal(PVdbPage(FPending[i].Data));
     Exit;
   end;
-  SetLength(FPending, Length(FPending) + 1);
-  i := High(FPending);
+  if FPendingCount >= FPendingCap then
+  begin
+    if FPendingCap = 0 then FPendingCap := 64 else FPendingCap := FPendingCap * 2;
+    SetLength(FPending, FPendingCap);
+  end;
+  i := FPendingCount;
   FPending[i].PageNo := PageNo;
-  Move(P^, FPending[i].Data, VDB_PAGE_SIZE);
+  GetMem(FPending[i].Data, VDB_PAGE_SIZE);
+  Move(P^, FPending[i].Data^, VDB_PAGE_SIZE);
   { Cerceveden tahliye aninda CRC BAYAT olabilir (sayfa henuz
     muhurlenmemis). Pending imaji sonradan OnMiss ile okunup
     dogrulanacagi icin burada muhurle. }
-  PageSeal(@FPending[i].Data);
+  PageSeal(PVdbPage(FPending[i].Data));
+  Inc(FPendingCount);
+  FPendingIdx.AddOrSetValue(PageNo, i);
 end;
 
 procedure TVdbPageEngine.ClearPending;
+var
+  i: Integer;
 begin
-  SetLength(FPending, 0);
+  for i := 0 to FPendingCount - 1 do
+    if FPending[i].Data <> nil then
+    begin
+      FreeMem(FPending[i].Data);
+      FPending[i].Data := nil;
+    end;
+  FPendingCount := 0;
+  if FPendingIdx <> nil then
+    FPendingIdx.Clear;
 end;
 
 procedure TVdbPageEngine.OnSpill(PageNo: LongWord; P: PVdbPage);
@@ -331,13 +368,21 @@ var
 begin
   i := PendingIndex(PageNo);
   if i < 0 then Exit(False);
-  Move(FPending[i].Data, P^, VDB_PAGE_SIZE);
+  Move(FPending[i].Data^, P^, VDB_PAGE_SIZE);
   { DIKKAT: imaj artik cercevede; pending'deki kopya BAYAT. Kalirsa
     Checkpoint onu daha yeni cerceve imajinin uzerine yazar (veri kaybi).
     Bu yuzden kaydi buradan dusur: pending ile cerceve asla ayni sayfayi
     ayni anda tutmaz. }
-  FPending[i] := FPending[High(FPending)];
-  SetLength(FPending, Length(FPending) - 1);
+  FreeMem(FPending[i].Data);
+  FPending[i].Data := nil;
+  FPendingIdx.Remove(PageNo);
+  Dec(FPendingCount);
+  if i <> FPendingCount then
+  begin
+    FPending[i] := FPending[FPendingCount];
+    { Swap-remove: tasinan kaydin indeksi degisti; hash'i duzelt. }
+    FPendingIdx.AddOrSetValue(FPending[i].PageNo, i);
+  end;
   Result := True;
 end;
 
@@ -409,8 +454,8 @@ begin
   LSN := FStore.NextLSN;
 
   { 1) Tahliye edilip WAL tamponunda bekleyen cerceveler. }
-  for i := 0 to High(FPending) do
-    FWal.AppendFrame(FPending[i].PageNo, @FPending[i].Data);
+  for i := 0 to FPendingCount - 1 do
+    FWal.AppendFrame(FPending[i].PageNo, PVdbPage(FPending[i].Data));
 
   { 2) Hala onbellekte kirli olan sayfalar (en guncel imaj). }
   dirty := FStore.DirtyPages;
@@ -446,9 +491,9 @@ begin
     HER ZAMAN daha yeni/esittir (yuklemede kirli isaretlenir). O yuzden
     pending yalnizca YERLESIK OLMAYAN sayfalar icin kurulur; aksi halde
     eski imaj yeni cercevenin uzerine yazilirdi. }
-  for i := 0 to High(FPending) do
+  for i := 0 to FPendingCount - 1 do
     if not FStore.IsResident(FPending[i].PageNo) then
-      FStore.InstallPage(FPending[i].PageNo, @FPending[i].Data);
+      FStore.InstallPage(FPending[i].PageNo, PVdbPage(FPending[i].Data));
   ClearPending;
   FStore.Flush(DoSync);
   if DoSync then
@@ -487,7 +532,7 @@ begin
   end;
   { Onaylanmis ama henuz dosyaya gecmemis cerceveler varsa once yaz.
     Boylece dogrulanan sey DISKTEKI gercek durumdur. }
-  if FWal.HasContent or (Length(FPending) > 0) then
+  if FWal.HasContent or (FPendingCount > 0) then
     if not Checkpoint(True) then
     begin
       Report := 'checkpoint basarisiz';

@@ -280,3 +280,107 @@ SQL'leri `sqltest`/kendi harness'ınız üzerinden çalıştırabilirsiniz.
   öndedir; bu, append-only KV katmanının tasarımının doğal sonucudur.
 - H3 skiplist, indeks bakımı ve indeksli `COUNT(*)` maliyetini O(log N)
   seviyesine indirerek en büyük kazancı sağlamıştır.
+
+---
+
+## 9. v3.0 sayfa motoru — aynı tartıda v2 karşılaştırması (2026-10-25)
+
+v3.0 yeni bir motor getiriyor: 4 KB SQLite tarzı sayfalar, sayfa imajlı WAL,
+slot indeksleri, O(1) silme. Aşağıdaki tablo **tek bir harness** ile, aynı
+makinede, art arda, üç tekrarın **medyanı** olarak üretildi
+(`tests/bench/benchcmp.pas`, `--backend=v2|v3`).
+
+Koşullar: Windows, FPC 3.2.4 i386-win32, tek süreç; 200.000 satır × 3 kolon
+(`id INTEGER PRIMARY KEY`, `a INTEGER`, `s TEXT(~24 B)`), 20.000 tek satırlık
+autocommit INSERT, varsayılan dayanıklılık (`SyncWrite=True`, her commit fsync).
+
+| Metrik | v2 | **v3** | Fark |
+|---|---:|---:|---|
+| Dosya boyutu (200k satır) | 19.278.424 B (96,4 B/satır) | **15.527.936 B (77,6 B/satır)** | **−19,5 %** |
+| Açılış | 984 ms | **32 ms** | **30,8x hızlı** |
+| Toplu INSERT (tek batch) | 4,455 µs/satır | 6,640 µs/satır | 1,49x yavaş |
+| Autocommit INSERT | 0,431 ms/satır | 0,557 ms/satır | 1,29x yavaş |
+| PK nokta araması | 6,25 µs | **6,25 µs** | eşit |
+| parse-only `SELECT 1` | 3,90 µs | **3,90 µs** | eşit |
+| `COUNT(*)` | 31 ms | 62 ms | 2,0x yavaş |
+
+Not: `autocommit`, `toplu INSERT` ve `COUNT(*)` dışındaki satırlarda v3
+gerilemiyor. Bu tablodaki üç gerileme **ölçülmüş ve kabul edilmiş**
+maliyetlerdir (aşağıda kök nedenleriyle).
+
+### Neden toplu INSERT 6,64 µs?
+
+Bileşenler ayrı ayrı ölçüldü (200k anahtar, 64 B değer, 512 çerçeveli havuz):
+
+| Aşama | Süre |
+|---|---:|
+| Parti kaplamasına yazma (`Put`) | 0,94 µs/anahtar |
+| Kaplamayı motora uygulama + commit + checkpoint | 4,72 µs/anahtar |
+| — bunun motor `Insert` payı | ~1,6 µs/anahtar |
+| — bunun WAL + checkpoint payı | ~1,3 µs/anahtar |
+
+v2'nin append-only KV yolu satır başına tek bir ekleme yapar. v3 sayfa
+imajlı WAL kullanır: aynı baytlar hem WAL'e hem checkpoint'te veri dosyasına
+yazılır (**2x yazma hacmi**). Rewrite'ın yarısı buradan gelir; kalanı sayfa
+içi hücre yerleştirme ve dizin bakımıdır.
+
+Bu sprintte ölçümle bulunan ve giderilen üç darboğaz (hepsi üretim kodunda):
+
+1. **`Flush` her autocommit sonrası tam checkpoint yapıyordu.** SQL katmanı
+   her satırdan sonra `Flush` çağırdığı için tek satırlık yazım WAL + tüm
+   kirli sayfaların dosyaya yazımı + WAL budama demekti. `Flush` artık yalnız
+   `Commit(True)` (WAL + fsync); checkpoint eşikte/açık çağrıda/kapanışta.
+   **1,168 → 0,557 ms/satır.**
+2. **Pending sayfa imajları 4 KB'lik kayıt dizisi olarak tutuluyor ve her
+   tahliyede `SetLength(+1)` yapılıyordu.** 200k × 64 B yazımda 3.488 tahliye
+   = ~265 ms yalnızca büyütme bedeliydi (tahliye başına ~75 µs). İmajlar artık
+   ayrı ayrılır, dizi yalnız gösterici tutar, kapasite ikiye katlanır; pending
+   araması da lineer tarama yerine hash. Motor `Insert`: 2,99 → 1,6 µs/anahtar.
+3. **Parti, `TDictionary` dolaşım sırasıyla (rastgele) uygulanıyordu.**
+   Sayfalara sıçramalı yazım, sıralı yazıma göre belirgin biçimde yavaştır.
+   Parti artık **giriş sırasında** uygulanır. Toplu INSERT
+   **8,045 → 6,64 µs/satır** (üç ayrı iyileştirmenin toplamı).
+
+### Neden `COUNT(*)` 62 ms?
+
+v2'de `COUNT(*)` tablo satır sayacından **O(1)** yanıtlanır
+(`TryGetTableRowCount`); 31 ms ölçülen değer sayaç + doğrulama yoludur.
+v3'te anahtarlar tablo+PK hash'i olduğu için **tablo başına sayaç yok**;
+sorgu tam tarama yapar. Tarama satır çözmeden (ham hücre) çalışır, yani
+maliyet CPU değil **okunacak bayt**tır: 15,5 MB / 62 ms ≈ 250 MB/s.
+Bu bir v3.1 işidir (tablo başına canlı satır sayacı).
+
+### v3.0 kabul hedefleriyle karşılaştırma
+
+| Hedef | Hedef değer | Ölçülen | Durum |
+|---|---:|---:|---|
+| Dosya boyutu (SQL harness, 3 kolon) | ≤ 11 MB | 15,5 MB | **karşılanmadı** |
+| Dosya boyutu (sayfa harness, 32 B değer) | ≤ 11 MB | **9,76 MB** | karşılandı |
+| Açılış | ≤ 150 ms | **32 ms** | karşılandı (4,7x pay) |
+| PK nokta | ≤ 7 µs | **6,25 µs** | karşılandı |
+| Toplu INSERT | ≤ 5 µs | 6,64 µs | **karşılanmadı** (v2: 4,46) |
+| Autocommit INSERT | ≤ 0,55 ms | 0,557 ms | **sınırda** (v2: 0,431) |
+| `COUNT(*)` | ≤ 16 ms | 62 ms | **karşılanmadı** |
+
+Dosya boyutu hedefi iki farklı harness'ı karıştırıyordu: `benchv3` (sayfa
+motoru, 32 B değer, 9.756.672 B = 48,8 B/satır) hedefi tutar; `benchcmp`
+(SQL katmanı, 3 kolon, ~24 B metin) tutmaz. Tabloda ikisi ayrı verildi.
+
+**Dürüst özet:** v3.0 dosya boyutunu ve özellikle açılışı kazanıyor, PK ve
+parse maliyeti v2 ile aynı; buna karşılık **toplu yazım ~1,5x, `COUNT(*)` 2x
+ve tek satır yazım ~1,3x daha yavaş**. v3.1'in konusu bu üç madde: mantıksal
+(küçük) WAL çerçevesi, tablo başına satır sayacı, dosya uzatmasını toplu
+yapma (ölçülen: sayfa başına 45–50 µs tek tek uzatma).
+
+### Sayfa motoru harness'ı (`benchv3`, 200k satır × 32 B değer)
+
+`benchcmp`'ten ayrı bir harness; sayılar karıştırılmamalıdır:
+
+| Metrik | Ölçülen |
+|---|---:|
+| Dosya | 9.756.672 B (48,8 B/satır) |
+| `.idx` | 3.200.064 B (16,0 B/satır) |
+| Yazım (commit + checkpoint dahil) | 1,88 µs/satır |
+| Açılış (`.idx` ile) | 16 ms |
+| Açılış (tam tarama) | 79 ms |
+| PK okuma | 0,47 µs/satır |

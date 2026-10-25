@@ -21,6 +21,9 @@ program backendchk;
 {$mode delphi}{$H+}
 
 uses
+  { FPC/Unix: TEvent/TThread icin cthreads programin EN BASINDA olmali;
+    yoksa TEvent.Create "Failed to create OS basic event" verir. }
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   Classes, SysUtils, VDbBackendApi, VDbCore, VDbBackendV2, VDbBackendV3,
   VDbPageEngine, VDbPage, VDbPageStore, VDbPageCrypto;
 
@@ -280,6 +283,12 @@ begin
 
   b.BeginBatch;
   for i := 1 to 50 do b.Delete(i);
+  { Sprint 3.12: parti icinde Delete'in DONUS DEGERI anlamli olmali
+    (eskiden her zaman True idi). }
+  if b.Delete(999999) then
+    Fail('v3: partide olmayan anahtarin silinmesi True dondu')
+  else
+    Ok('v3: partide olmayan anahtar Delete=False');
   b.CommitBatch;
   if b.Count = 150 then Ok('v3: partide toplu silme (150)')
   else Fail(Format('v3: toplu silme count=%d', [b.Count]));
@@ -429,7 +438,7 @@ begin
     b.Put(i, v);
   end;
   b.CommitBatch;
-  b.Flush;                                    // tam checkpoint + WAL budama
+  b.Flush;                                    // dayanikli commit (WAL + fsync)
   b := nil;
 
   b := TVdbBackendV3.Create(path, False, 4);

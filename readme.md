@@ -153,6 +153,25 @@ when enabled, attempted at commit time only if the threshold is crossed).
 H3 skiplist (100,000 rows): 100 × (`UPDATE` + indexed `COUNT(*)`) takes
 **0.39–0.42 ms per cycle**, down from 24.99 ms — about **60–64x** faster.
 
+### v3.0 page engine (200,000 rows, same harness, median)
+
+`benchcmp --backend=v2|v3`, 200k rows × 3 columns, same machine, back to back:
+
+| Metric | v2 | **v3.0** |
+|---|---:|---:|
+| File size | 19.3 MB (96.4 B/row) | **15.5 MB (77.6 B/row)** |
+| Open | 984 ms | **32 ms** |
+| PK point lookup | 6.25 µs | **6.25 µs** |
+| Bulk INSERT | 4.46 µs/row | 6.64 µs/row |
+| Autocommit INSERT | 0.431 ms/row | 0.557 ms/row |
+| `COUNT(*)` | 31 ms | 62 ms |
+
+v3.0 shrinks the file by **19.5 %** and opens it **~31x** faster; PK and parse
+costs match v2. Bulk writes are ~1.5x, `COUNT(*)` 2x and single-row writes
+~1.3x slower. Root causes (page-image WAL's 2x write volume, no per-table row
+counter) and the v3.1 plan:
+[speedtest.md](speedtest.md#9-v30-page-engine--v2-and-v3-on-the-same-scale-2026-10-25).
+
 ---
 
 ## Project layout

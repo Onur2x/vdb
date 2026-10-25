@@ -21,6 +21,8 @@ program v3sqlchk;
 {$mode delphi}{$H+}
 
 uses
+  { FPC/Unix: TEvent/TThread icin cthreads programin EN BASINDA olmali. }
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   Classes, SysUtils, VDbBackendApi, VDbCore, VDbBackendV3, VDbTable, VDbSql,
   VDbTypes, VDbErr, VDbPageEngine;
 
@@ -123,8 +125,74 @@ begin
   end;
 end;
 
-{ ============================================================ 1) temel DML }
+  { Sprint 3.10: ayni dosyayi ikinci kez ACMAK reddedilir ve hata ACIK
+    bir kilit mesajidir (ham "Try again"/paylasim ihlali degil). Unix'te
+    FPC'nin TFileStream'i flock uygular; Windows'ta paylasim ihlali olur. }
+procedure TestDoubleOpen;
+var
+  S, S2: TV3Sql;
+  r: TSqlResult;
+  msg: string;
+  caught: Boolean;
+begin
+  WriteLn;
+  WriteLn('Sprint 3.10 - ayni dosyayi ikinci kez acma: acik kilit hatasi');
+  CleanDir;
+  OpenV3(S, 'lock.odb', True);
+  try
+    r := Exec(S, 'CREATE TABLE k (id INTEGER PRIMARY KEY, ad TEXT)');
+    if not gErr then Ok('lock: tablo olustu') else Fail('lock: CREATE: ' + r.Msg);
+    r := Exec(S, 'INSERT INTO k VALUES (1, ''Ali'')');
+    if not gErr then Ok('lock: satir yazildi') else Fail('lock: INSERT: ' + r.Msg);
 
+    caught := False;
+    msg := '';
+    try
+      S2.Be := TVdbBackendV3.Create(DirOf('lock.odb'), False, 64);
+      S2.Be := nil;   // beklenmeyen basari: sizinti birakma
+    except
+      on E: Exception do
+      begin
+        caught := True;
+        msg := E.ClassName + ': ' + E.Message;
+      end;
+    end;
+    if not caught then
+      Fail('lock: ikinci acilis reddedilmedi')
+    else if Pos('kullanimda', msg) > 0 then
+      Ok('lock: ikinci acilis kilit hatasi verdi -> ' + msg)
+    else
+      Fail('lock: kilit mesaji bekleniyordu: ' + msg);
+
+    { Ilk motor etkilenmemis olmali. }
+    r := Exec(S, 'SELECT COUNT(*) FROM k');
+    if (not gErr) and (Cel(r, 0, 0) = '1') then
+      Ok('lock: ilk motor calismaya devam ediyor')
+    else
+      Fail('lock: ilk motor bozuldu: ' + r.Msg);
+    r := Exec(S, 'VERIFY');
+    if (not gErr) and (r.Affected = 1) then
+      Ok('lock: VERIFY gecti: ' + r.Msg)
+    else
+      Fail('lock: VERIFY: ' + r.Msg);
+  finally
+    CloseV3(S);
+  end;
+
+  { Kapanistan sonra acilis serbest. }
+  OpenV3(S, 'lock.odb', False);
+  try
+    r := Exec(S, 'SELECT COUNT(*) FROM k');
+    if (not gErr) and (Cel(r, 0, 0) = '1') then
+      Ok('lock: kapanistan sonra acilis serbest')
+    else
+      Fail('lock: yeniden acilis: ' + r.Msg);
+  finally
+    CloseV3(S);
+  end;
+end;
+
+{ ============================================================ 1) temel DML }
 procedure TestBasic;
 var
   S: TV3Sql;
@@ -1002,6 +1070,463 @@ begin
   end;
 end;
 
+  { Sprint 3.11: SQLancer tarzi RASGELE diferansiyel. v3'te ham/akisli yol
+  (Kv) olmadigi icin sqltest'in T111/T147 oracle'lari zayiflar: ayni yol
+  iki kez kosar. Burada BAGIMSIZ oracle Pascal'da UC-DEGERLI MANTIK
+  (TRUE/FALSE/UNKNOWN) ile hesaplanir ve SQL sonucu satir satir
+  karsilastirilir. Tohum sabittir: kosu tekrarlanabilir. }
+procedure TestFuzzOracle;
+const
+  NROW = 400;
+  NQ = 240;
+  NODE_MAX = 24;
+type
+  TTri = (trFalse, trTrue, trUnknown);
+  TNodeKind = (nkTrue, nkIntCmp, nkIsNull, nkIsNotNull, nkIntIn, nkIntNotIn,
+    nkBetween, nkNotBetween, nkTextEq, nkTextCmp, nkTextIsNull, nkTextIsNotNull,
+    nkAnd, nkOr, nkNot);
+  TNode = record
+    Kind: TNodeKind;
+    Op: Integer;        // int: 0 =, 1 <>, 2 <, 3 <=, 4 >, 5 >=
+    Val, Val2: Integer;
+    Run: array[0..3] of Integer;   // IN listesi
+    RunN: Integer;
+    HasNull: Boolean;              // IN listesinde NULL var mi
+    Txt: string;
+    TxtOp: Integer;                // metin: 0 =, 1 <>
+    A, B: Integer;                 // alt dugum indeksleri
+  end;
+var
+  S: TV3Sql;
+  r: TSqlResult;
+  nodes: array[0..NODE_MAX - 1] of TNode;
+  nNode: Integer;
+  hasA: array[0..NROW - 1] of Boolean;
+  valA: array[0..NROW - 1] of Integer;
+  hasS: array[0..NROW - 1] of Boolean;
+  valS: array[0..NROW - 1] of string;
+  i, q, root, bad, expN: Integer;
+  sql, got, pred: string;
+  okAll: Boolean;
+
+  function RandRange(Lo, Hi: Integer): Integer;
+  begin
+    Result := Lo + Random(Hi - Lo + 1);
+  end;
+
+  { ---- uc-degerli mantik ---- }
+  function TriNot(T: TTri): TTri;
+  begin
+    case T of
+      trTrue: Result := trFalse;
+      trFalse: Result := trTrue;
+    else
+      Result := trUnknown;
+    end;
+  end;
+
+  function TriAnd(X, Y: TTri): TTri;
+  begin
+    if (X = trFalse) or (Y = trFalse) then Result := trFalse
+    else if (X = trUnknown) or (Y = trUnknown) then Result := trUnknown
+    else Result := trTrue;
+  end;
+
+  function TriOr(X, Y: TTri): TTri;
+  begin
+    if (X = trTrue) or (Y = trTrue) then Result := trTrue
+    else if (X = trUnknown) or (Y = trUnknown) then Result := trUnknown
+    else Result := trFalse;
+  end;
+
+  function CmpTri(C: Boolean): TTri;
+  begin
+    if C then Result := trTrue else Result := trFalse;
+  end;
+
+  function IntCmp(Op, X, Y: Integer): TTri;
+  begin
+    case Op of
+      0: Result := CmpTri(X = Y);
+      1: Result := CmpTri(X <> Y);
+      2: Result := CmpTri(X < Y);
+      3: Result := CmpTri(X <= Y);
+      4: Result := CmpTri(X > Y);
+    else
+      Result := CmpTri(X >= Y);
+    end;
+  end;
+
+  function EvalNode(N: Integer; Row: Integer): TTri;
+  var
+    C: TNode;
+    Eq, HasEq, HasUnk: Boolean;
+    j: Integer;
+  begin
+    C := nodes[N];
+    case C.Kind of
+      nkTrue: Result := trTrue;
+      nkAnd: Result := TriAnd(EvalNode(C.A, Row), EvalNode(C.B, Row));
+      nkOr:  Result := TriOr(EvalNode(C.A, Row), EvalNode(C.B, Row));
+      nkNot: Result := TriNot(EvalNode(C.A, Row));
+      nkIsNull:    if hasA[Row] then Result := trFalse else Result := trTrue;
+      nkIsNotNull: if hasA[Row] then Result := trTrue else Result := trFalse;
+      nkTextIsNull:    if hasS[Row] then Result := trFalse else Result := trTrue;
+      nkTextIsNotNull: if hasS[Row] then Result := trTrue else Result := trFalse;
+      nkIntCmp:
+        if not hasA[Row] then Result := trUnknown
+        else Result := IntCmp(C.Op, valA[Row], C.Val);
+      nkBetween:
+        if not hasA[Row] then Result := trUnknown
+        else Result := TriAnd(IntCmp(5, valA[Row], C.Val), IntCmp(3, valA[Row], C.Val2));
+      nkNotBetween:
+        if not hasA[Row] then Result := trUnknown
+        else Result := TriNot(TriAnd(IntCmp(5, valA[Row], C.Val), IntCmp(3, valA[Row], C.Val2)));
+      nkIntIn, nkIntNotIn:
+        begin
+          if not hasA[Row] then
+          begin
+            Result := trUnknown;
+            Exit;
+          end;
+          Eq := False;
+          for j := 0 to C.RunN - 1 do
+            if valA[Row] = C.Run[j] then Eq := True;
+          if Eq then Result := trTrue
+          else if C.HasNull then Result := trUnknown
+          else Result := trFalse;
+          if C.Kind = nkIntNotIn then Result := TriNot(Result);
+        end;
+      nkTextEq, nkTextCmp:
+        begin
+          if not hasS[Row] then
+          begin
+            Result := trUnknown;
+            Exit;
+          end;
+          HasEq := (valS[Row] = C.Txt);
+          if (C.Kind = nkTextEq) or (C.TxtOp = 0) then
+            Result := CmpTri(HasEq)
+          else
+            Result := CmpTri(not HasEq);
+        end;
+    else
+      Result := trUnknown;
+    end;
+  end;
+
+  { ---- rasgele ifade uretimi ---- }
+  function NewNode(K: TNodeKind): Integer;
+  begin
+    Result := nNode;
+    nodes[Result].Kind := K;
+    nodes[Result].RunN := 0;
+    nodes[Result].HasNull := False;
+    Inc(nNode);
+  end;
+
+  function GenLeaf: Integer;
+  var
+    k, j, a, b: Integer;
+  begin
+    case RandRange(0, 8) of
+      0, 1:
+        begin
+          Result := NewNode(nkIntCmp);
+          nodes[Result].Op := RandRange(0, 5);
+          nodes[Result].Val := RandRange(-10, 70);
+        end;
+      2:
+        begin
+          Result := NewNode(nkBetween);
+          a := RandRange(-10, 40);
+          b := a + RandRange(0, 30);
+          nodes[Result].Val := a;
+          nodes[Result].Val2 := b;
+        end;
+      3:
+        begin
+          Result := NewNode(nkNotBetween);
+          a := RandRange(-10, 40);
+          b := a + RandRange(0, 30);
+          nodes[Result].Val := a;
+          nodes[Result].Val2 := b;
+        end;
+      4:
+        begin
+          { IN listesi; bazen NULL icerir (3VL sinamasi). }
+          if Random(2) = 0 then
+            Result := NewNode(nkIntIn)
+          else
+            Result := NewNode(nkIntNotIn);
+          nodes[Result].RunN := RandRange(1, 4);
+          for j := 0 to nodes[Result].RunN - 1 do
+            nodes[Result].Run[j] := RandRange(-10, 70);
+          nodes[Result].HasNull := Random(3) = 0;
+        end;
+      5:
+        begin
+          if Random(2) = 0 then Result := NewNode(nkIsNull)
+          else Result := NewNode(nkIsNotNull);
+        end;
+      6:
+        begin
+          Result := NewNode(nkTextEq);
+          nodes[Result].Txt := Chr(Ord('a') + Random(4));
+          nodes[Result].TxtOp := 0;
+        end;
+      7:
+        begin
+          Result := NewNode(nkTextCmp);
+          nodes[Result].Txt := Chr(Ord('a') + Random(4));
+          nodes[Result].TxtOp := Random(2);
+        end;
+    else
+      begin
+        if Random(2) = 0 then Result := NewNode(nkTextIsNull)
+        else Result := NewNode(nkTextIsNotNull);
+      end;
+    end;
+    k := 0;   { sessiz kalsin }
+    if k <> 0 then Exit;
+  end;
+
+  function GenExpr(Depth: Integer): Integer;
+  var
+    L, R: Integer;
+  begin
+    if (Depth <= 0) or (Random(100) < 40) then
+      Result := GenLeaf
+    else
+      case RandRange(0, 2) of
+        0:
+          begin
+            L := GenExpr(Depth - 1);
+            R := GenExpr(Depth - 1);
+            Result := NewNode(nkAnd);
+            nodes[Result].A := L;
+            nodes[Result].B := R;
+          end;
+        1:
+          begin
+            L := GenExpr(Depth - 1);
+            R := GenExpr(Depth - 1);
+            Result := NewNode(nkOr);
+            nodes[Result].A := L;
+            nodes[Result].B := R;
+          end;
+      else
+        begin
+          L := GenExpr(Depth - 1);
+          Result := NewNode(nkNot);
+          nodes[Result].A := L;
+        end;
+      end;
+  end;
+
+  function Render(N: Integer): string;
+  var
+    C: TNode;
+    j: Integer;
+    opS: string;
+  begin
+    C := nodes[N];
+    case C.Kind of
+      nkTrue: Result := '1 = 1';
+      nkAnd:  Result := '(' + Render(C.A) + ' AND ' + Render(C.B) + ')';
+      nkOr:   Result := '(' + Render(C.A) + ' OR ' + Render(C.B) + ')';
+      nkNot:  Result := '(NOT ' + Render(C.A) + ')';
+      nkIsNull:    Result := '(a IS NULL)';
+      nkIsNotNull: Result := '(a IS NOT NULL)';
+      nkTextIsNull:    Result := '(s IS NULL)';
+      nkTextIsNotNull: Result := '(s IS NOT NULL)';
+      nkIntCmp:
+        begin
+          case C.Op of
+            0: opS := '=';
+            1: opS := '<>';
+            2: opS := '<';
+            3: opS := '<=';
+            4: opS := '>';
+          else
+            opS := '>=';
+          end;
+          Result := Format('(a %s %d)', [opS, C.Val]);
+        end;
+      nkBetween:    Result := Format('(a BETWEEN %d AND %d)', [C.Val, C.Val2]);
+      nkNotBetween: Result := Format('(a NOT BETWEEN %d AND %d)', [C.Val, C.Val2]);
+      nkIntIn, nkIntNotIn:
+        begin
+          Result := '(a ';
+          if C.Kind = nkIntNotIn then Result := Result + 'NOT ';
+          Result := Result + 'IN (';
+          for j := 0 to C.RunN - 1 do
+          begin
+            if j > 0 then Result := Result + ', ';
+            Result := Result + IntToStr(C.Run[j]);
+          end;
+          if C.HasNull then
+          begin
+            if C.RunN > 0 then Result := Result + ', ';
+            Result := Result + 'NULL';
+          end;
+          Result := Result + '))';
+        end;
+      nkTextEq, nkTextCmp:
+        begin
+          if (C.Kind = nkTextCmp) and (C.TxtOp = 1) then
+            Result := Format('(s <> ''%s'')', [C.Txt])
+          else
+            Result := Format('(s = ''%s'')', [C.Txt]);
+        end;
+    else
+      Result := '1 = 1';
+    end;
+  end;
+
+  { ---- kosu ---- }
+  procedure RunOne;
+  var
+    j, expected: Integer;
+    ids: TStringList;
+    rr: TSqlResult;
+  begin
+    nNode := 0;
+    root := GenExpr(3);
+    pred := Render(root);
+
+    expected := 0;
+    for j := 0 to NROW - 1 do
+      if EvalNode(root, j) = trTrue then Inc(expected);
+
+    rr := Exec(S, 'SELECT COUNT(*) FROM f WHERE ' + pred);
+    if gErr then
+    begin
+      Fail('fuzz: SQL hatasi: ' + pred + ' -> ' + rr.Msg);
+      Exit;
+    end;
+    got := Cel(rr, 0, 0);
+    if StrToIntDef(got, -1) <> expected then
+    begin
+      Inc(bad);
+      Fail(Format('fuzz: COUNT uyusmadi (SQL %s, oracle %d): %s',
+        [got, expected, pred]));
+      Exit;
+    end;
+
+    { Yalniz sayi degil, SATIR KUMESI de karsilastirilir. }
+    ids := TStringList.Create;
+    try
+      for j := 0 to NROW - 1 do
+        if EvalNode(root, j) = trTrue then ids.Add(IntToStr(j + 1));
+      rr := Exec(S, 'SELECT id FROM f WHERE ' + pred + ' ORDER BY id');
+      if gErr then
+      begin
+        Fail('fuzz: SQL hatasi (satir): ' + pred + ' -> ' + rr.Msg);
+        Exit;
+      end;
+      if Length(rr.Rows) <> ids.Count then
+      begin
+        Inc(bad);
+        Fail(Format('fuzz: satir sayisi uyusmadi (SQL %d, oracle %d): %s',
+          [Length(rr.Rows), ids.Count, pred]));
+        Exit;
+      end;
+      for j := 0 to High(rr.Rows) do
+        if Cel(rr, j, 0) <> ids[j] then
+        begin
+          Inc(bad);
+          Fail(Format('fuzz: satir %d uyusmadi (SQL %s, oracle %s): %s',
+            [j, Cel(rr, j, 0), ids[j], pred]));
+          Exit;
+        end;
+    finally
+      ids.Free;
+    end;
+  end;
+
+begin
+  WriteLn;
+  WriteLn('Sprint 3.11 - SQLancer tarzi rasgele diferansiyel (bagimsiz 3VL oracle)');
+  CleanDir;
+  Randomize;
+  RandSeed := 20261025;
+  bad := 0;
+  OpenV3(S, 'fuzz.odb', True);
+  try
+    r := Exec(S, 'CREATE TABLE f (id INTEGER PRIMARY KEY, a INTEGER, s TEXT)');
+    if not gErr then Ok('fuzz: tablo olustu') else Fail('fuzz: CREATE: ' + r.Msg);
+
+    { Veri: a = NULL ya da -10..69, s = NULL ya da 'a'..'d'. }
+    okAll := True;
+    for i := 0 to NROW - 1 do
+    begin
+      hasA[i] := Random(100) >= 20;      // ~%20 NULL
+      valA[i] := RandRange(-10, 69);
+      hasS[i] := Random(100) >= 25;
+      valS[i] := Chr(Ord('a') + Random(4));
+      if hasA[i] and hasS[i] then
+        sql := Format('INSERT INTO f VALUES (%d, %d, ''%s'')', [i + 1, valA[i], valS[i]])
+      else if (not hasA[i]) and hasS[i] then
+        sql := Format('INSERT INTO f VALUES (%d, NULL, ''%s'')', [i + 1, valS[i]])
+      else if hasA[i] and (not hasS[i]) then
+        sql := Format('INSERT INTO f VALUES (%d, %d, NULL)', [i + 1, valA[i]])
+      else
+        sql := Format('INSERT INTO f VALUES (%d, NULL, NULL)', [i + 1]);
+      r := Exec(S, sql);
+      if gErr then
+      begin
+        Fail('fuzz: INSERT: ' + r.Msg);
+        okAll := False;
+        Break;
+      end;
+    end;
+    if okAll then
+      Ok(Format('fuzz: %d satir yazildi (a/s NULL dahil)', [NROW]));
+
+    r := Exec(S, 'SELECT COUNT(*) FROM f');
+    if (not gErr) and (Cel(r, 0, 0) = IntToStr(NROW)) then
+      Ok('fuzz: taban COUNT tam')
+    else
+      Fail('fuzz: taban COUNT: ' + r.Msg);
+
+    for q := 1 to NQ do
+      RunOne;
+
+    if bad = 0 then
+      Ok(Format('fuzz: %d rasgele sorgu oracle ile BIREBIR', [NQ]))
+    else
+      Fail(Format('fuzz: %d/%d sorgu uyusmadi', [bad, NQ]));
+
+    r := Exec(S, 'VERIFY');
+    if (not gErr) and (r.Affected = 1) then
+      Ok('fuzz: VERIFY gecti: ' + r.Msg)
+    else
+      Fail('fuzz: VERIFY: ' + r.Msg);
+  finally
+    CloseV3(S);
+  end;
+
+  { Yeniden acilis: ayni veri, ayni oracle sonuclari. }
+  OpenV3(S, 'fuzz.odb', False);
+  try
+    r := Exec(S, 'SELECT COUNT(*) FROM f');
+    if (not gErr) and (Cel(r, 0, 0) = IntToStr(NROW)) then
+      Ok('fuzz: yeniden acilista COUNT tam')
+    else
+      Fail('fuzz: yeniden acilis: ' + r.Msg);
+    bad := 0;
+    for q := 1 to 40 do
+      RunOne;
+    if bad = 0 then
+      Ok('fuzz: yeniden acilis sonrasi 40 sorgu BIREBIR')
+    else
+      Fail(Format('fuzz: yeniden acilis sonrasi %d/40 uyusmadi', [bad]));
+  finally
+    CloseV3(S);
+  end;
+end;
+
 { ================================================================== ana }
 
 var
@@ -1019,6 +1544,7 @@ begin
   WriteLn;
 
   TestBasic;
+  TestDoubleOpen;
   TestBulkInsert(N);
   TestTxn;
   TestConstraints;
@@ -1030,6 +1556,7 @@ begin
   TestReplicationUnsupported;
   TestPitrUnsupported;
   TestZoneMapFallback;
+  TestFuzzOracle;
   TestIntegrity(N);
 
   WriteLn;

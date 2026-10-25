@@ -18,6 +18,8 @@ program idxchk;
 {$mode delphi}{$H+}
 
 uses
+  { FPC/Unix: cthreads programin EN BASINDA olmali (TEvent/TThread). }
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   Classes, SysUtils, DateUtils, VDbPage, VDbPageStore, VDbPageHeap,
   VDbPageEngine, VDbPageWal;
 

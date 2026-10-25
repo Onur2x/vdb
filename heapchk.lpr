@@ -19,6 +19,8 @@ program heapchk;
 {$mode delphi}{$H+}
 
 uses
+  { FPC/Unix: cthreads programin EN BASINDA olmali (TEvent/TThread). }
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   Classes, SysUtils, VDbPage, VDbPageStore, VDbPageHeap;
 
 var

@@ -163,14 +163,96 @@ Sayfa motorunu yazmak kolay; asıl maliyet şu 4 dosyada. Plan bunları hesaba k
 - [x] 3.5 Replikasyon v3'te **açıkça yok**: `START REPLICATION` (dosya + TCP), `PUMP`, `CREATE/DROP REPLICATION SLOT`, `SHOW REPLICATION STATUS/SLOTS`, `STOP REPLICATION` → `ecUnsupported` + `REPLICATION v3 sayfa motorunda yok (v3.1: mantiksal gunluk ile gelecek)`. Tek kaynak: `ExecAdmin` başındaki `Kv = nil` kapısı (2.9'da eklendi); 3.5'te mesaj replikasyon için özelleştirildi, satır içi yinelenen guard'lar kaldırıldı. Test `v3sqlchk` `TestReplicationUnsupported` **17/17**: 9 cumle `ecUnsupported` + `v3.1` mesajı, `.replslots`/status dosyası oluşmaz, veri bozulmaz, yeniden açılış sağlam.
 - [x] 3.6 PITR / zaman yolculuğu v3'te **açıkça devre dışı** (karar: v3 WAL'i sayfa imajı tutar, mantıksal günlük yok). `AS OF SEQUENCE/VERSION/TIMESTAMP` → `ecUnsupported` (nil `Kv` üzerinden `BuildAsOfRows` AV'si de böylece kapandı); `RECOVER TO NOW/TIMESTAMP` + `ARCHIVE WAL SET/LIST` → `PITR / WAL arsivi v3 sayfa motorunda yok (v3.1: ... mantiksal gunluk ...)`. Test `v3sqlchk` `TestPitrUnsupported` **15/15**: 8 cumle reddedilir, güncel okuma/PK erişimi etkilenmez, arşiv dizini oluşmaz, `VERIFY` geçer.
 - [x] 3.7 Zone map v3'te **kapalı** (düz tam tarama). Budama yalnız v2'nin ham kayıt yolu (`PrepareRawScan`) ile mümkündür; v3 heap hücre biçiminde yeniden inşa v3.1'e bırakıldı. Doğrulama `v3sqlchk` `TestZoneMapFallback` **22/22**: 3000 satır, 8 aralık + eşitlik/`IN`/`<>`/karma sorgular Pascal'da hesaplanan beklentiyle birebir; yeniden açılışta aynı sonuç + `VERIFY`. Belgelendi: `V3_KAPSAM.md` §4/§5.
-- [ ] 3.8 win32 tam kapı: **`kalan=0`**
-- [ ] 3.9 win64 (-O1 ve optimizasyonsuz) tam kapı: **`kalan=0`**
-- [ ] 3.10 Linux/WSL tam kapı: **`kalan=0`**
-- [ ] 3.11 `crashtest` 11/11, fuzz (T111, 3VL, T147 SQLancer) v3'te temiz
-- [ ] 3.12 Ölçüm tablosu `hiztesti.md` + `speedtest.md` + `readme*.md` güncellenir — **yalnız ölçülmüş sayılar**
+- [x] 3.8 win32 tam kapı: **`kalan=0`**. `backendchk 82/82`, `v3sqlchk 128/128`, `pagechk 21/21`, `storechk 15/15`, `heapchk 20/20`, `idxchk 17/17`, `migchk 13/13`, `crashtest 11/11`; `sqltest` v2 **3116/0/0**, v3 **2252/0/58**.
+- [x] 3.9 win64 tam kapı: **`kalan=0`**, iki optimizasyon düzeyinde de (`-O-` ve `-O1`, `ppcrossx64 -Px86_64 -Twin64`). Sekiz kapı win32 ile **aynı** sayılarda yeşil. `sqltest` v2 **3081/0/0**, v3 **2217/0/58** — win32'den **35 kontrol eksik**; eksikliğin tamamı DLL/OpenSSL'e bağlı alt dallardır ve **hata değildir**: `130. Extension/Plugin` (25→8), `179. pgwire TLS/OpenSSL` (10→0), `128. Cross-Platform DLL/C API` (16→13), `131. paralel ABI` (58→53). `sqltest` bu dallarda "vdbapi.dll yok → atlandı" / "TLS testi (OpenSSL DLL bulunamadı)" yazar; bu ortamda yalnız **32 bit** eklenti/OpenSSL ikilileri var. Linux de aynı sayıları verir (3081/2217), yani fark platformdan değil **ikili (binary) yokluğundan** kaynaklanır.
+- [x] 3.10 Linux/WSL tam kapı: **`kalan=0`** (Ubuntu 22.04, FPC 3.2.2 x86_64, `/mnt/d` = DrvFs). Sekiz kapı da yeşil; `sqltest` v2 **3081/0/0**, v3 **2217/0/58**. Bu kapı **üç gerçek taşınabilirlik kusuru** ortaya çıkardı ve hepsi düzeltildi (aşağıda).
+- [x] 3.11 `crashtest` 11/11 (üç platform), fuzz (T111, 3VL, T147 SQLancer) v3'te temiz — `crashtest` 11/11 (Linux dahil). `T111` v3'te koşar, ama v3'te ham/akışlı yol (`Kv`) olmadığı için oracle'ı zayıflar (aynı yol iki kez). `T147` yalnız v2 yolu sınadığı için ATLA. Bu boşluğu kapatmak için **bağımsız oracle'lı yeni fuzz** eklendi: `v3sqlchk TestFuzzOracle` **8/8** — 400 satır (`a`/`s` NULL dahil), **240 rasgele 3VL yüklemi** (`= <> < <= > >=`, `IS [NOT] NULL`, `IN`/`NOT IN` (listede NULL), `BETWEEN`/`NOT BETWEEN`, `AND`/`OR`/`NOT`, parantez), beklenen küme Pascal'da TRUE/FALSE/UNKNOWN ile hesaplanır; `COUNT(*)` **ve** `ORDER BY id` satır kümesi birebir karşılaştırılır, tohum sabit (tekrarlanabilir). Yeniden açılış sonrası 40 sorgu yine birebir + `VERIFY`.
+- [x] 3.12 Ölçüm tablosu `hiztesti.md` + `speedtest.md` + `readme*.md` güncellenir — **yalnız ölçülmüş sayılar**. Üç performans düzeltmesi (aşağıdaki bölüm) ve aynı harness'lı v2↔v3 tablosu (`benchcmp --backend=`, 200k × 3 kolon, üç tekrarın medyanı, art arda aynı makine): dosya **19.278.424 → 15.527.936 B (−%19,5)**, açılış **984 → 32 ms (31x)**, PK **6,25 µs (eşit)**, parse **3,90 µs (eşit)**, toplu INSERT **4,455 → 6,640 µs**, autocommit **0,431 → 0,557 ms**, `COUNT(*)` **31 → 62 ms**. Dürüst sonuç: **üç metrik geriliyor** (toplu yazım ~1,5x, `COUNT(*)` 2x, tek satır ~1,3x); kök nedenler ve v3.1 planı ölçümle birlikte yazıldı. Sayfa harness'ı (`benchv3`, 32 B değer) ayrı tablo: 9.756.672 B (48,8 B/satır), açılış 16 ms (`.idx`) / 79 ms (tam), yazım 1,88 µs.
 - [ ] 3.13 `git tag v3.0` + push; CI yeşil
 
+### Sprint 3.12: performans düzeltmeleri (ölçümle bulunan üç darboğaz)
+
+Kabul hedeflerinin üçü tutmuyordu (`toplu INSERT 8,045 µs`, `autocommit 1,168 ms`,
+`COUNT(*) 63 ms`). Üçü de ölçümle kök nedene indirildi; ikisi üretim kodunda
+düzeltildi, üçüncüsü tasarım maliyeti olarak belgelendi:
+
+1. **`Flush` her autocommit sonrası tam checkpoint yapıyordu** (WAL + tüm kirli
+   sayfaların dosyaya yazımı + budama). SQL katmanı `Flush`'ı her satırdan sonra
+   çağırıyor. Artık `Flush` = yalnız `Commit(True)`; checkpoint eşikte/açık
+   çağrıda/kapanışta/yedekte/VACUUM'da. **1,168 → 0,557 ms/satır.**
+2. **Pending sayfa imajları `array of TPending` (kayıt başına 4 KB) idi ve her
+   tahliyede `SetLength(+1)` yapılıyordu.** 200k × 64 B yazımda 3.488 tahliye
+   = tahliye başına ~75 µs, toplam ~265 ms yalnızca büyütme. İmajlar artık ayrı
+   ayrılır, dizi yalnız gösterici tutar, kapasite ikiye katlanır; pending araması
+   lineer tarama yerine hash. Motor `Insert` **2,99 → 1,6 µs/anahtar**
+   (benchv3 yazımı 2,34 → 1,88 µs/satır).
+3. **Parti `TDictionary` dolaşım sırasıyla (rastgele) uygulanıyordu.** Sayfalara
+   sıçramalı yazım sıralı yazımdan yavaş. Parti artık **giriş sırasında**
+   uygulanır (`FOrder`). Toplu INSERT **8,045 → 6,64 µs/satır**.
+
+Yan bulgu (düzeltildi): parti içinde `Backend.Delete`, `AddOrSetValue`'dan
+**sonra** `ContainsKey` sorduğu için hiç olmayan anahtar için de `True`
+dönüyordu. `backendchk`'e bu sözleşme için kontrol eklendi (**83/83**).
+
+Ayrıca iki **test kusuru** düzeltildi (üretim kodu değil):
+`VEC ANN cizgi kesin kume ile ayni` sorgu noktasını doğrunun tam üzerine
+koyuyordu; simetrik noktalar (5/15, 6/14) **tam eşit mesafede** olduğu için K
+sınırındaki seçim tanımsızdı ve iki platformda bir kez kırmızı verdi — ikinci
+bileşen kaydırıldı. `T09p_SlowQuery` düşük eşik adımında 1 ms'lik ölçüm
+kaçarsa kayıt oluşmuyor, test de boş sonuç kümesinde `Rows[0]` okuyup AV
+veriyordu — ikisi de koşula bağlandı.
+
+**Gerileme olarak kalan:** `COUNT(*)` v3'te tam tarama (15,5 MB / 62 ms ≈
+250 MB/s); v2'de tablo başına sayaçtan O(1). v3.1'de tablo başına canlı satır
+sayacı, mantıksal (küçük) WAL çerçevesi ve toplu dosya uzatma (ölçülen:
+sayfa başına 45–50 µs tek tek uzatma) hedefleniyor.
+
+### Sprint 3.8-3.10: Linux kapısının bulduğu üç taşınabilirlik kusuru
+
+Bu kapılar yalnız "testleri koşturmak" değildi; Linux'ta (WSL/DrvFs) hiç
+görünmeyen üç **gerçek** kusur çıktı. Üçü de ölçümle kök nedene indirildi ve
+düzeltildi — Windows davranışı değişmedi (kapılar aynı sayılarda yeşil):
+
+1. **`cthreads` eksikliği (kapıların çoğu daha ilk satırda ölüyordu).**
+   FPC/Unix'te `TEvent`/`TThread` kullanan bir programın ilk `uses` birimi
+   `cthreads` olmazsa `TEvent.Create` → `ESyncObjectException: Failed to
+   create OS basic event with name ""` atıyor. `backendchk`, `migchk`,
+   `v3sqlchk`, `pagechk`, `storechk`, `heapchk`, `idxchk`, `crashtest`
+   programlarına `{$IFDEF UNIX}cthreads,{$ENDIF}` ilk sıraya eklendi
+   (`sqltest`'te zaten vardı). Bu bir test hilesi değil, FPC'nin Unix
+   sözleşmesidir: `vdbapi.lpr` de aynı satırı taşır.
+
+2. **Unix'te `TFileStream` = `flock`: canlı dosyayı ikinci kez açmak
+   `EAGAIN` veriyordu.** Ölçülen: `VACUUM` (ve `sqltest` T15/T19) Linux'ta
+   `EFOpenError: Unable to open file "...odf": Try again` ile düşüyordu.
+   `locktest`/`locktest2` repro'ları kesin ayırımı verdi: FPC'nin Unix
+   `TFileStream`'i paylaşım moduna göre **flock** uygular; motor dosyayı
+   `LOCK_EX` ile tuttuğu için **salt-okunur boy ölçümü bile** ikinci açılışta
+   çakışır. Windows'ta paylaşımlı okuma serbest olduğundan kusur görünmez.
+   Düzeltme: yeni `VDbSync.VDbFileBytes` — boy ölçümü **açmaz**, `stat()`
+   kullanır (Unix) / paylaşımlı okur (Windows). `VACUUM`'un iki boy ölçümü ve
+   WAL'in "dosya var mı / yeterince büyük mü" keşfi buna geçti. Ayrıca
+   `VDbPageStore.Open` artık ham işletim sistemi hatası yerine **açık kilit
+   hatası** verir (`VDbIsSharingViolation` Unix'te FPC'nin `Try again`
+   metnini de tanır — glibc metni `Resource temporarily unavailable`).
+   Regresyon kapısı: `v3sqlchk` `TestDoubleOpen` **6/6** (ikinci açılış
+   reddedilir + açık mesaj, ilk motor çalışmaya devam eder, `VERIFY` geçer,
+   kapanıştan sonra açılış serbest).
+
+3. **`crashtest` kill -9 alt süreci ölüyordu (test "geçersiz" sayılıyordu).**
+   Ölçülen: Linux'ta `kill -9: alt surec hic commit edemedi (test
+   gecersiz)`. Alt sürecin tanı dosyası kök nedeni tek satırda verdi:
+   `EXC EFCreateError: Unable to create file "...kill9.marker": Try again`.
+   Yani **işaret dosyası** (`TStringList.SaveToFile`/`LoadFromFile`, yine
+   flock) yüzünden ölüyordu — motor verisiyle ilgisi yoktu. Düzeltme: işaret
+   dosyası motor verisi değildir, kilit gerekmez; Unix'te ham
+   `fpOpen/fpRead/fpWrite` (`MarkerRead`/`MarkerWrite`) kullanılır, alt
+   süreç ayrıca tanı dosyası bırakır (sessiz ölüm bir daha "gizem" olmaz).
+   Sonuç Linux'ta da **11/11**, ölçülen: `commit edilmis 2025 satirin
+   TAMAMI yerinde`.
+
 ---
+
 
 ## Sayfa formatı (Gün 1'de sabitlendi — `VDbPage.pas`)
 

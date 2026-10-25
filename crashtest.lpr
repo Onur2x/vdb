@@ -20,6 +20,9 @@ program crashtest;
 {$mode delphi}{$H+}
 
 uses
+  { FPC/Unix: cthreads programin EN BASINDA olmali (TEvent/TThread). }
+  {$IFDEF UNIX}cthreads,{$ENDIF}
+  {$IFDEF UNIX}BaseUnix,{$ENDIF}
   {$IFDEF MSWINDOWS}Windows,{$ENDIF}
   SysUtils, Classes, Process,
   VDbPage, VDbPageStore, VDbPageHeap, VDbPageWal, VDbPageEngine, VDbSync;
@@ -162,6 +165,62 @@ end;
 
 { ================================================== 3) gercek kill -9 }
 
+{ 2026-10-25 (Sprint 3.10): Unix'te FPC'nin TStringList.LoadFromFile /
+  SaveToFile cagrilari paylasim modu yuzunden flock() alir. Ebeveyn
+  isaret dosyasini 50 ms'de bir okurken cocuk ayni dosyayi yazinca
+  EAGAIN ("Try again") alip oluyordu; test "cocuk hic commit edemedi"
+  diye gecersiz sayiliyordu (Windows'ta gorunmez). Isaret dosyasi
+  MOTOR VERISI degildir: kilit gerekmez. Unix'te ham fpOpen/fpRead/
+  fpWrite kullanilir. }
+
+{$IFDEF UNIX}
+function MarkerRead(const P: string; out S: string): Boolean;
+var
+  fd: cint;
+  buf: array[0..255] of Char;
+  n: ssize_t;
+begin
+  Result := False;
+  S := '';
+  fd := fpOpen(P, O_RDONLY);
+  if fd < 0 then Exit;
+  try
+    repeat
+      n := fpRead(fd, buf, SizeOf(buf));
+      if n > 0 then
+        S := S + Copy(buf, 1, n);
+    until n <= 0;
+    Result := True;
+  finally
+    fpClose(fd);
+  end;
+end;
+
+function MarkerWrite(const P, S: string): Boolean;
+var
+  fd: cint;
+  b: RawByteString;
+  wrote, n: ssize_t;
+begin
+  Result := False;
+  fd := fpOpen(P, O_WRONLY or O_CREAT or O_TRUNC, 438);
+  if fd < 0 then Exit;
+  try
+    b := S;
+    wrote := 0;
+    while wrote < Length(b) do
+    begin
+      n := fpWrite(fd, b[wrote + 1], Length(b) - wrote);
+      if n <= 0 then Exit;
+      Inc(wrote, n);
+    end;
+    Result := True;
+  finally
+    fpClose(fd);
+  end;
+end;
+{$ENDIF}
+
 procedure TestKill9(D: string);
 var
   path, markerPath: string;
@@ -174,6 +233,15 @@ var
   st: TVdbWalStats;
 
   function ReadMarker: Integer;
+  {$IFDEF UNIX}
+  var
+    txt: string;
+  begin
+    Result := 0;
+    if not MarkerRead(markerPath, txt) then Exit;
+    Result := StrToIntDef(Trim(txt), 0);
+  end;
+  {$ELSE}
   var
     sl: TStringList;
   begin
@@ -195,6 +263,7 @@ var
       sl.Free;
     end;
   end;
+  {$ENDIF}
 
 begin
   path := FreshDir(D, 'kill9.odb');
@@ -594,9 +663,32 @@ var
   i: Integer;
   v: TBytes;
   sl: TStringList;
+
+  { 2026-10-25 (Sprint 3.10): alt surec sessizce olurse nedeni
+    gorunmuyordu (konsolu yok). Tani bilgisini isaret dosyasinin
+    yanina yaz; test yine ayni sozlesmeyle degerlendirilir. }
+  procedure Log(const S: string);
+  begin
+    {$IFDEF UNIX}
+    MarkerWrite(MarkerPath + '.log', S + LineEnding);
+    {$ELSE}
+    try
+      with TFileStream.Create(MarkerPath + '.log', fmCreate) do
+      try
+        WriteBuffer(PChar(S + LineEnding)^, Length(S + LineEnding));
+      finally
+        Free;
+      end;
+    except
+      { tani dosyasi yazilamazsa sessiz gec }
+    end;
+    {$ENDIF}
+  end;
+
 begin
-  eng := TVdbPageEngine.Create(Path, 8);
+  eng := nil;
   try
+    eng := TVdbPageEngine.Create(Path, 8);
     eng.Open(True);
     i := eng.Count;   // devam et
     while True do
@@ -607,8 +699,18 @@ begin
       if (i mod 25) = 0 then
       begin
         if not eng.Commit(True) then
+        begin
+          Log(Format('COMMIT FALSE: i=%d', [i]));
           Halt(2);
+        end;
         { Commit dondukten sonra isaretle: fsync edilmis son anahtar. }
+        {$IFDEF UNIX}
+        if not MarkerWrite(MarkerPath, IntToStr(i) + LineEnding) then
+        begin
+          Log(Format('MARKER YAZILAMADI: i=%d', [i]));
+          Halt(4);
+        end;
+        {$ELSE}
         sl := TStringList.Create;
         try
           sl.Text := IntToStr(i) + LineEnding;
@@ -616,6 +718,7 @@ begin
         finally
           sl.Free;
         end;
+        {$ENDIF}
         { Checkpoint seyrek: WAL'de commit edilmis cerceve kalsin ki
           kill -9 sonrasi replay yolu gercekten calissin. 2026-10-24:
           500 -> 5000. Cok sik checkpoint, olum anini checkpoint'le
@@ -624,9 +727,15 @@ begin
           eng.Checkpoint(True);
       end;
     end;
-  finally
-    eng.Free;
+  except
+    on E: Exception do
+    begin
+      Log('EXC ' + E.ClassName + ': ' + E.Message);
+      FreeAndNil(eng);
+      Halt(3);
+    end;
   end;
+  eng.Free;
 end;
 
 var

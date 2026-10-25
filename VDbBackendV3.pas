@@ -53,6 +53,12 @@ type
       FEng: TVdbPageEngine;
       FPath: string;
       FBatch: TDictionary<QWord, TBatchRec>;
+      { Sprint 3.12: parti anahtarlarinin GELIS SIRASI. TDictionary
+        dolasimi rastgele oldugu icin ApplyBatch sayfalara sicramali
+        yaziyordu (olculen: 200k toplu yazim 8,0 us/satir; sirali
+        yazimda motor 1,7 us/satir). Ayni veri, ayni atomiklik;
+        yalniz uygulama sirasi giris sirasi olur. }
+      FOrder: TList<QWord>;
       FBatchOpen: Boolean;
       FRowTag: TVDbRowTagFunc;
       FBeforeCommit: TDbCommitHook;
@@ -165,6 +171,7 @@ procedure TVdbBackendV3.InitBackend(const ADbPath: string; ACreate: Boolean;
 begin
   FPath := ADbPath;
   FBatch := TDictionary<QWord, TBatchRec>.Create;
+  FOrder := TList<QWord>.Create;
   FBatchOpen := False;
   FDirty := False;
   FCheckpointBytes := VDB_V3_CHECKPOINT_BYTES;
@@ -229,10 +236,12 @@ begin
   begin
     { Kapanista yarim islem yazilmaz: kaplama atilir. }
     FBatch.Clear;
+    FOrder.Clear;
     FBatchOpen := False;
   end;
   FreeAndNil(FEng);       // Close: commit + checkpoint + idx
   FreeAndNil(FBatch);
+  FreeAndNil(FOrder);
   inherited Destroy;
 end;
 
@@ -278,26 +287,35 @@ end;
 
 procedure TVdbBackendV3.ApplyBatch;
 var
-  pair: TPair<QWord, TBatchRec>;
+  i: Integer;
+  key: QWord;
+  rec: TBatchRec;
   ok: Boolean;
 begin
   if FBatch.Count = 0 then Exit;
-  for pair in FBatch do
+  { Giris sirasi: sayfalara ARDISIK yazilir (rastgele dolasim = sayfa
+    sicramasi = yavas toplu yazim). }
+  for i := 0 to FOrder.Count - 1 do
   begin
-    if pair.Value.Present then
+    key := FOrder[i];
+    if not FBatch.TryGetValue(key, rec) then Continue;
+    if rec.Present then
     begin
-      if FEng.Contains(pair.Key) then
-        ok := FEng.Update(pair.Key, pair.Value.Value)
-      else
-        ok := FEng.Insert(pair.Key, pair.Value.Value);
+      { ONCEDEN her anahtar icin ayrica `Contains` cagriliyordu; `Insert`
+        zaten "anahtar var mi" diye bakiyor. Once eklemeyi dene, yalniz
+        cakismada guncelle: toplu eklemede bir hash aramasi eksilir. }
+      ok := FEng.Insert(key, rec.Value);
+      if not ok then
+        ok := FEng.Update(key, rec.Value);
       if not ok then
         raise EVdbBackendV3.Create(Format(
-          'toplu yazim basarisiz: anahtar $%.16x', [pair.Key]));
+          'toplu yazim basarisiz: anahtar $%.16x', [key]));
     end
     else
-      FEng.Delete(pair.Key);    // yoksa da zararsiz
+      FEng.Delete(key);    // yoksa da zararsiz
   end;
   FBatch.Clear;
+  FOrder.Clear;
   FDirty := True;
 end;
 
@@ -311,16 +329,21 @@ begin
   begin
     rec.Present := True;
     rec.Value := Copy(Value, 0, Length(Value));
+    if not FBatch.ContainsKey(Key) then
+      FOrder.Add(Key);
     FBatch.AddOrSetValue(Key, rec);
     Exit;
   end;
-  if FEng.Contains(Key) then
+  { Tek anahtar yolu: once eklemeyi dene (Insert zaten varlik denetimi
+    yapar), yalniz cakismada guncelle. Boylece anahtar basina bir hash
+    aramasi eksilir. }
+  if FEng.Insert(Key, Value) then
   begin
-    if not FEng.Update(Key, Value) then
-      raise EVdbBackendV3.Create('guncelleme basarisiz');
-  end
-  else if not FEng.Insert(Key, Value) then
-    raise EVdbBackendV3.Create('ekleme basarisiz');
+    FDirty := True;
+    Exit;
+  end;
+  if not FEng.Update(Key, Value) then
+    raise EVdbBackendV3.Create('ekleme/guncelleme basarisiz');
   FDirty := True;
 end;
 
@@ -344,13 +367,23 @@ end;
 function TVdbBackendV3.Delete(Key: QWord): Boolean;
 var
   rec: TBatchRec;
+  had: Boolean;
 begin
   if FBatchOpen then
   begin
+    { ONCEDEN: `FBatch.AddOrSetValue(...)`'dan SONRA `FBatch.ContainsKey`
+      soruluyordu; bu her zaman True oldugu icin parti icinde Delete
+      HIC OLMAYAN anahtar icin de True donuyordu. Dogru yanit: silmeden
+      ONCE var miydi? }
+    had := FEng.Contains(Key);
+    if FBatch.ContainsKey(Key) then
+      had := FBatch[Key].Present;
     rec.Present := False;
     rec.Value := nil;
+    if not FBatch.ContainsKey(Key) then
+      FOrder.Add(Key);
     FBatch.AddOrSetValue(Key, rec);
-    Exit(FEng.Contains(Key) or (FBatch.ContainsKey(Key)));
+    Exit(had);
   end;
   Result := FEng.Delete(Key);
   if Result then
@@ -443,6 +476,7 @@ procedure TVdbBackendV3.BeginBatch;
 begin
   if FBatchOpen then Exit;
   FBatch.Clear;
+  FOrder.Clear;
   FBatchOpen := True;
 end;
 
@@ -454,6 +488,7 @@ begin
   ApplyBatch;
   FBatchOpen := False;
   FBatch.Clear;
+  FOrder.Clear;
   if FDirty then
   begin
     FEng.Commit(True);
@@ -465,18 +500,27 @@ end;
 procedure TVdbBackendV3.AbortBatch;
 begin
   FBatch.Clear;
+  FOrder.Clear;
   FBatchOpen := False;
 end;
 
 procedure TVdbBackendV3.Flush;
 begin
   if FBatchOpen then Exit;
+  { P-DUR sozlesmesi yalniz DAYANIKLILIK ister: commit WAL'e yazilip fsync
+    edilir. 2026-10-25 (Sprint 3.12): ONCEDEN burada tam `Checkpoint` de
+    yapiliyordu; SQL katmani her autocommit yazimdan sonra Flush cagirdigi
+    icin tek satirlik INSERT tum sayfalari veri dosyasina geri yaziyordu.
+    Olculen bedel: autocommit INSERT 0,42 ms (v2) -> 1,17 ms (v3) — kabul
+    hedefi 0,55 ms asiliyordu. Artik checkpoint YALNIZ esik asilinca
+    (`MaybeCheckpoint`), acik cagrida, kapanista, yedekte ve VACUUM'da
+    yapilir; veri dosyasi motor acikken bayat olabilir, dogru kaynak WAL'dir. }
   if FDirty then
   begin
     FEng.Commit(True);
     FDirty := False;
+    MaybeCheckpoint;
   end;
-  FEng.Checkpoint(True);
 end;
 
 function TVdbBackendV3.GetInBatch: Boolean;
@@ -687,7 +731,6 @@ procedure TVdbBackendV3.Compact(out OldBytes, NewBytes: Int64);
 var
   tmp: string;
   newEng: TVdbPageEngine;
-  fs: TFileStream;
 begin
   if FBatchOpen then
     raise EVdbBackendV3.Create('acik parti varken VACUUM yapilamaz');
@@ -697,12 +740,8 @@ begin
     FDirty := False;
   end;
   FEng.Checkpoint(True);
-  fs := TFileStream.Create(FPath, fmOpenRead or fmShareDenyNone);
-  try
-    OldBytes := fs.Size;
-  finally
-    fs.Free;
-  end;
+  { Sprint 3.10: CANLI dosyayi ikinci kez ACMA — Unix'te flock cakisir. }
+  OldBytes := VDbFileBytes(FPath);
 
   tmp := FPath + '.compact.tmp';
   if FileExists(tmp) then DeleteFile(tmp);
@@ -737,12 +776,7 @@ begin
   end;
 
   SwapDbFile(tmp);
-  fs := TFileStream.Create(FPath, fmOpenRead or fmShareDenyNone);
-  try
-    NewBytes := fs.Size;
-  finally
-    fs.Free;
-  end;
+  NewBytes := VDbFileBytes(FPath);
 end;
 
 procedure TVdbBackendV3.SwapDbFile(const NewFilePath: string);

@@ -291,20 +291,14 @@ end;
 
 procedure TVdbPageWal.Open;
 var
-  probe: TFileStream;
   hasFile: Boolean;
 begin
   if FStream <> nil then Exit;
   hasFile := False;
   if FileExists(FPath) then
   begin
-    { Sadece boyut kesfi; akis hemen kapatilir (dosya kilidi birakilsin). }
-    probe := TFileStream.Create(FPath, fmOpenRead or fmShareDenyNone);
-    try
-      hasFile := probe.Size >= VDB_PAGE_SIZE;
-    finally
-      probe.Free;
-    end;
+    { Sadece boyut kesfi; dosya ACILMAZ (Unix'te flock cakismasin). }
+    hasFile := VDbFileBytes(FPath) >= VDB_PAGE_SIZE;
   end;
   if hasFile then
   begin

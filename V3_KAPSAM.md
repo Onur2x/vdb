@@ -175,7 +175,70 @@ sqltest.exe <dir2> --backend=v3  # SONUC: gecen=2252 kalan=0 atlanan=58
 
 Kapılar (yeniden koşuldu, hepsi yeşil):
 `pagechk 21/21`, `storechk 15/15`, `heapchk 20/20`, `idxchk 17/17`,
-`crashtest 11/11`, `backendchk 82/82`, `v3sqlchk 115/115`, `migchk 13/13`.
+`crashtest 11/11`, `backendchk 83/83`, `v3sqlchk 128/128`, `migchk 13/13`.
+
+### Fuzz / diferansiyel oracle (Sprint 3.11)
+
+v3'te ham kayıt yolu (`Kv`) olmadığı için `sqltest`'in mevcut diferansiyel
+testleri zayıflar: `T111` aynı yolu iki kez koşar, `T147` (SQLancer stili)
+zaten yalnız v2 yolunu sınadığı için ATLA listesindedir. Bunun yerine
+depolama yolundan **tamamen bağımsız** bir oracle eklendi:
+
+`v3sqlchk TestFuzzOracle` — **8/8**:
+- 400 satır; `a INTEGER` ve `s TEXT` sütunlarında ~%20/%25 **NULL**.
+- **240 rasgele 3VL yüklemi**: `= <> < <= > >=`, `IS [NOT] NULL`,
+  `IN` / `NOT IN` (liste bilerek NULL içerir), `BETWEEN`/`NOT BETWEEN`,
+  `AND`/`OR`/`NOT`, parantez; derinlik 3.
+- Beklenen küme Pascal'da üç değerli mantıkla hesaplanır ve SQL ile
+  **`COUNT(*)` + `ORDER BY id` satır kümesi** olarak birebir karşılaştırılır
+  (sayı tutup satırın yanlış olması yakalanır).
+- Tohum sabittir (`RandSeed := 20261025`) → koşu tekrarlanabilir.
+- Yeniden açılıştan sonra 40 sorgu aynı sonucu verir + `VERIFY` geçer.
+
+`crashtest` üç platformda da **11/11**; ölçülen kill -9 sonucu: commit
+edilmiş **2025 satırın tamamı** yerinde.
+
+### Platform kapıları (Sprint 3.8-3.10)
+
+Her satır gerçekten koşulmuş bir kapıdır; hiçbirinde `kalan > 0` yoktur.
+
+| Kapı | win32 | win64 `-O-` | win64 `-O1` | Linux/WSL x86_64 |
+|---|---|---|---|---|
+| `backendchk` | 82/82 | 82/82 | 82/82 | 82/82 |
+| `v3sqlchk` | 128/128 | 128/128 | 128/128 | 128/128 |
+| `pagechk` / `storechk` | 21/21 · 15/15 | 21/21 · 15/15 | 21/21 · 15/15 | 21/21 · 15/15 |
+| `heapchk` / `idxchk` | 20/20 · 17/17 | 20/20 · 17/17 | 20/20 · 17/17 | 20/20 · 17/17 |
+| `migchk` / `crashtest` | 13/13 · 11/11 | 13/13 · 11/11 | 13/13 · 11/11 | 13/13 · 11/11 |
+| `sqltest --backend=v2` | 3116/0/0 | 3081/0/0 | 3081/0/0 | 3081/0/0 |
+| `sqltest --backend=v3` | 2252/0/58 | 2217/0/58 | 2217/0/58 | 2217/0/58 |
+
+**win32'deki 35 fazla kontrol hata değil, ortam farkıdır.** Tamamı DLL/OpenSSL
+yükleyen alt dallardır: `130. Extension/Plugin` (25→8),
+`179. pgwire TLS/OpenSSL` (10→0), `128. Cross-Platform DLL / C API` (16→13),
+`131. paralel ABI` (58→53). Bu dallar ikili bulamayınca "vdbapi.dll yok →
+atlandı" / "TLS testi (OpenSSL DLL bulunamadı)" yazar. Bu ortamda eklenti ve
+OpenSSL ikilileri yalnız **32 bit** olduğu için win64 ve Linux aynı sayıyı
+(3081/2217) verir — yani fark platformdan değil, **64 bit ikili yokluğundan**
+kaynaklanır. Çekirdek v3 yollarında hiçbir kontrol eksilmemiştir.
+
+#### Linux kapısının bulduğu üç gerçek kusur (düzeltildi)
+
+1. **`cthreads`**: FPC/Unix'te `TEvent`/`TThread` kullanan programın ilk
+   `uses` birimi `cthreads` olmazsa `ESyncObjectException: Failed to create
+   OS basic event` atar. Sekiz kapı programına `{$IFDEF UNIX}cthreads,{$ENDIF}`
+   eklendi (kütüphane tüketicisi `vdbapi.lpr`'de zaten vardı).
+2. **Unix'te `TFileStream` = `flock`**: motor dosyayı `LOCK_EX` ile tuttuğu
+   için canlı `.odb`'yi ikinci kez açmak (salt-okunur **boy ölçümü bile**)
+   `EAGAIN` veriyordu; `VACUUM` bu yüzden Linux'ta düşüyordu. Yeni
+   `VDbSync.VDbFileBytes` boyu `stat()` ile **açmadan** ölçer; `VACUUM` ve WAL
+   boyut keşfi buna geçti. `VDbPageStore.Open` ayrıca ham OS hatası yerine
+   açık kilit hatası verir (`VDbIsSharingViolation` FPC'nin `Try again`
+   metnini de tanır). Kapı: `v3sqlchk TestDoubleOpen` **6/6**.
+3. **`crashtest` kill -9**: alt süreç, **işaret dosyası** (yine flock'lu
+   `TStringList.SaveToFile`) yüzünden ölüyordu; motor verisiyle ilgisi yoktu.
+   İşaret dosyası artık Unix'te ham `fpOpen/fpRead/fpWrite` ile yazılır/okunur
+   ve alt süreç tanı dosyası bırakır. Linux'ta da **11/11**.
+
 
 ### Replikasyon, PITR ve zone map kararları (Sprint 3.5-3.7)
 

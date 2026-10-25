@@ -585,10 +585,25 @@ begin
   exists := FileExists(FPath);
   if not exists and not ACreate then
     raise EVdbPageStore.Create('veritabani dosyasi yok: ' + FPath);
-  if exists then
-    FStream := TFileStream.Create(FPath, fmOpenReadWrite or fmShareDenyWrite)
-  else
-    FStream := TFileStream.Create(FPath, fmCreate or fmShareDenyWrite);
+  try
+    if exists then
+      FStream := TFileStream.Create(FPath, fmOpenReadWrite or fmShareDenyWrite)
+    else
+      FStream := TFileStream.Create(FPath, fmCreate or fmShareDenyWrite);
+  except
+    on E: Exception do
+    begin
+      { 2026-10-25 (Sprint 3.10): baska bir islem/akis dosyayi tutuyorsa
+        ham isletim sistemi hatasi yerine ACIK bir kilit hatasi ver.
+        Windows'ta paylasim ihlali (32/33), Unix'te flock cakismasi
+        EAGAIN ("Try again") olarak gelir. }
+      if VDbIsSharingViolation(E) then
+        raise EVdbPageStore.Create(
+          'veritabani dosyasi kullanimda (baska islem acik): ' + FPath)
+      else
+        raise;
+    end;
+  end;
   try
     FLocked := VDbLockStream(FStream);
     if exists then

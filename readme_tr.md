@@ -154,6 +154,25 @@ bunu **isteğe bağlı otomatik sıkıştırma** ile toparlayabilir
 H3 skiplist (100.000 satır): 100 × (`UPDATE` + indeksli `COUNT(*)`)
 **0,39–0,42 ms/döngü** — önceki 24,99 ms'e göre **~60–64x**.
 
+### v3.0 sayfa motoru (200.000 satır, aynı harness, medyan)
+
+`benchcmp --backend=v2|v3`, 3 kolonlu 200k satır, aynı makine, art arda:
+
+| Metrik | v2 | **v3.0** |
+|---|---:|---:|
+| Dosya boyutu | 19,3 MB (96,4 B/satır) | **15,5 MB (77,6 B/satır)** |
+| Açılış | 984 ms | **32 ms** |
+| PK nokta araması | 6,25 µs | **6,25 µs** |
+| Toplu INSERT | 4,46 µs/satır | 6,64 µs/satır |
+| Autocommit INSERT | 0,431 ms/satır | 0,557 ms/satır |
+| `COUNT(*)` | 31 ms | 62 ms |
+
+v3.0 dosya boyutunu **%19,5** küçültüyor ve açılışı **~31x** hızlandırıyor;
+PK ve parse maliyeti v2 ile aynı. Buna karşılık toplu yazım ~1,5x, `COUNT(*)`
+2x ve tek satır yazım ~1,3x daha yavaş. Kök nedenler (sayfa imajlı WAL'in 2x
+yazma hacmi, tablo başına satır sayacının olmaması) ve v3.1 planı:
+[hiztesti.md](hiztesti.md#9-v30-sayfa-motoru--aynı-tartıda-v2-karşılaştırması-2026-10-25).
+
 ---
 
 ## Proje yapısı

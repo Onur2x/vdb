@@ -119,3 +119,8 @@ startup_error.txt
 # Yerel deneme dosyalari (v3 hazirligi, 2026-10-24) — !*.pas kuralindan SONRA
 # gelmeli, aksi halde yeniden izlenir.
 /bench_live.pas
+
+# Yerel calisma dizinleri (v3 olcum/test artiklari) — Git disinda kalir
+/tmp64/
+/tmpv/
+/tasks/
