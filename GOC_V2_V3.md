@@ -66,6 +66,17 @@ Windows, FPC 3.2.4 i386-win32, tek koşu (`vdbmig`, varsayılan havuz 256):
 Aynı 200k göçü `migchk` kapısı içinde: 531 ms kopya, 203 ms doğrulama
 (`migchk 13/13`, `kalan=0`). Sayılar arasındaki fark normal koşu gürültüsüdür.
 
+**Uçtan uca kontrol:** araçla üretilen 200k dosyası, v3 motoru + SQL katmanı
+(`TVdbBackendV3` → `TVTableDb` → `TVSql`) ile ayrıca açıldı:
+
+| Sorgu | Sonuç |
+|---|---|
+| `be.Count` | 200001 |
+| `SELECT COUNT(*) FROM t` | 200000 |
+| `SELECT SUM(s) FROM t` | 900000 |
+| `SELECT v FROM t WHERE id = 100000` | `val-100000` |
+| `SELECT COUNT(*) FROM t WHERE s = 7` | 20000 |
+
 ## Sınırlar (dürüst liste)
 
 - **Şifreli / kolon anahtarlı v2 veritabanları** bu sürümde desteklenmez;
