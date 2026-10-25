@@ -186,6 +186,11 @@ v2'deki okuma önbelleği sayaçları (`cache_hits` vb.) v3'te yoktur; yerine
 gerçek dosya boyutları verilir. `SHOW STATS TABLE t` (ANALYZE sonrası)
 aynı biçimde çalışır.
 
+Prometheus için aynı metrikler `Sq.GetMetricsText` ile alınır; v3'te
+`vdb_engine_info{engine="v3"}`, `vdb_live_keys`, `vdb_wal_file_bytes`,
+`vdb_idx_file_bytes` satırları bulunur (v2'ye özgü `vdb_read_cache_*`
+satırları v3'te yoktur).
+
 ---
 
 ## 7. Şifreleme

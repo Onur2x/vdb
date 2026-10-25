@@ -113,11 +113,15 @@ tamamlandı:
 |---|---|
 | `VDbFactory.pas` — tek giriş noktası (`VdbOpen`, `VdbOpenOrCreate`, `VdbOpenWithPassword`) | tamam; v3 varsayılan, v2 reddedilir (`AllowV2` yalnız göç) |
 | `examples/` 01–06, 09–12 | tamam; hepsi `VdbOpenOrCreate` + `TVTableDb.CreateBackend` |
+| `examples/build_all.bat` | tamam; **14/14** derleniyor (yol hatası düzeltildi) |
 | `examples/07`, `08` (TCP sunucu/istemci) | **v2'de kalıyor**: `VDbSqlServer` hâlâ `TVDb` kullanıyor; M7 sunucu kapsam dışı (v3.2) |
 | `yonetim/` (GUI) | tamam; `FBe: IVdbBackend`, v2 dosyasında `vdbmig` yönlendirmesi |
 | `factorychk` kapısı (13 kontrol) + CI adımı | tamam |
+| `UYGULAMA_GELISTIRME.md` | tamam; uygulama geliştirici kılavuzu (12 bölüm) |
+| `SHOW STATS` + `/metrics` v3'te | tamam; v2 sayaçları yerine `engine`, `live_keys`, `.odb/.wal/.idx` boyutları |
+| `sqltest --backend=v3` | **2347 geçen / 0 kalan / 52 atlanan** (v2: 3116/0/0) |
 
-Geçişte bulunan iki gerçek hata (ikisi de veri bütünlüğü/dosya kilidi ile ilgili):
+Geçişte bulunan gerçek hatalar (hepsi veri bütünlüğü/dosya kilidi/erişim):
 
 1. **Boş v3 dosyası açılamıyordu.** `VDbPageHeap.TryLoadIdx` döngü değişkeni
    `LongWord`'dü; `.idx` içinde 0 kayıt varken `High(entries) = -1` →
@@ -126,6 +130,22 @@ Geçişte bulunan iki gerçek hata (ikisi de veri bütünlüğü/dosya kilidi il
    fonksiyon fazladan referans bırakıyor (`Be := nil` dosyayı kapatmıyordu);
    ayrıca `TVTableDb.Destroy` `FKvB`'yi serbest bırakmıyordu. Giriş noktaları
    `out` parametreye geçti, yıkıcıya `FKvB := nil` eklendi. Ölçüm: probe5/probe6.
+3. **`GetMetricsText` v3'te AV veriyordu.** Prometheus `/metrics` ucu koşulsuz
+   `FT.Kv.GetReadCacheStats` okuyordu; v3'te `Kv = nil`. Artık motora göre
+   dallanıyor; v3'te `engine_info`, `live_keys`, `.wal`/`.idx` boyutu.
+4. **`SHOW STATS` v3'te tümden reddediliyordu.** Yönetim komutu topluca
+   `Kv = nil` dalında `ecUnsupported`'a düşüyordu; v3 için gerçek metrik yolu
+   eklendi (12 satır).
+5. **`examples/build_all.bat` 10 örneği derlemiyordu.** `%~dp0` zaten
+   `examples\` ile bitiyor, yol `examples\examples\...` oluyordu; `cd`
+   başarısız olunca fpc yanlış dizinde koşuyordu (eski `compile.log`'lar
+   hatayı gizliyordu).
+6. **`sqltest` T117 v3'te AV veriyordu** (yalnız test): v3 dalında `kv2` hiç
+   atanmadığı için `finally` içindeki `kv2 <> nil` çöp değere bakıyordu.
+
+Ayrıca beş test (T64, T65, T94, T94c, T105) v3 koşusuna taşındı; tek engelleri
+yeniden açılışı elle `TVDb.Create` ile yapmalarıydı. v3 atlanan sayısı
+**58 → 52**.
 
 ### Sıradaki sürüme ertelenen (v3.2)
 - Sıralı anahtar düzeni + B+tree yaprakları → **BETWEEN / aralık sorguları**
