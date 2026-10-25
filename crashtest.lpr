@@ -261,6 +261,7 @@ var
   v, got: TBytes;
   t0: TDateTime;
   st: TVdbWalStats;
+  attempt, exitCode: Integer;
 
   function ReadMarker: Integer;
   {$IFDEF UNIX}
@@ -296,42 +297,61 @@ var
   {$ENDIF}
 
 begin
-  path := FreshDir(D, 'kill9.odb');
-  markerPath := D + PathDelim + 'kill9.marker';
-  if FileExists(markerPath) then DeleteFile(markerPath);
+  { 2026-10-25 (CI #36): yavas/garip kosucuda alt surec 30 sn icinde HIC
+    commit etmedi ve kapi "test gecersiz" diye kirmizi oldu (yerelde ayni
+    kod 11/11 gecti). Sozlesme degismedi - commit edilmis satirlarin TAMAMI
+    hala tek tek dogrulanir - ama gecici bir kosucu sorununda testi
+    bosa dusurmemek icin: bekleme 90 sn, cocuk erken olurse beklemeden
+    cik, en fazla 2 deneme, basarisizlikta cocuk cikis kodu da raporlanir. }
+  marker := 0;
+  exitCode := -1;
+  attempt := 0;
+  repeat
+    Inc(attempt);
+    path := FreshDir(D, 'kill9.odb');
+    markerPath := D + PathDelim + 'kill9.marker';
+    if FileExists(markerPath) then DeleteFile(markerPath);
 
-  proc := TProcess.Create(nil);
-  try
-    proc.Executable := ParamStr(0);
-    proc.Parameters.Add('child');
-    proc.Parameters.Add(path);
-    proc.Parameters.Add(markerPath);
-    proc.Options := [poNoConsole];
-    proc.Execute;
-    { 2026-10-24: sabit Sleep yarisa bagliydi; yavas CI kosucusunda alt
-      surec henuz ilk commit'i yazmadan olduruluyor ve test "gecersiz"
-      sayiliyordu. Artik isaret dosyasi BEKLENIYOR (en fazla 30 sn) ve
-      en az 2000 satir (80 commit) gorulmeden oldurulmuyor; boylece
-      replay yolu her kosuda gercekten sinanir. }
-    t0 := Now;
-    marker := 0;
-    while (marker < 2000) and (Now - t0 < 30 / 86400) do
-    begin
-      Sleep(50);
-      marker := ReadMarker;
+    proc := TProcess.Create(nil);
+    try
+      proc.Executable := ParamStr(0);
+      proc.Parameters.Add('child');
+      proc.Parameters.Add(path);
+      proc.Parameters.Add(markerPath);
+      proc.Options := [poNoConsole];
+      proc.Execute;
+      { 2026-10-24: sabit Sleep yarisa bagliydi; yavas CI kosucusunda alt
+        surec henuz ilk commit'i yazmadan olduruluyor ve test "gecersiz"
+        sayiliyordu. Artik isaret dosyasi BEKLENIYOR ve en az 2000 satir
+        (80 commit) gorulmeden oldurulmuyor; boylece replay yolu her kosuda
+        gercekten sinanir. }
+      t0 := Now;
+      marker := 0;
+      while (marker < 2000) and (Now - t0 < 90 / 86400) do
+      begin
+        Sleep(50);
+        marker := ReadMarker;
+        { Cocuk kendi kendine olduyse 90 sn beklemek anlamsiz. }
+        if (marker <= 0) and (not proc.Running) then
+          Break;
+      end;
+      { kill -9 esdegeri: TerminateProcess }
+      if proc.Running then
+        proc.Terminate(1);
+      proc.WaitOnExit;
+      exitCode := proc.ExitStatus;
+    finally
+      proc.Free;
     end;
-    { kill -9 esdegeri: TerminateProcess }
-    proc.Terminate(1);
-    proc.WaitOnExit;
-  finally
-    proc.Free;
-  end;
-  Sleep(200);
+    Sleep(200);
 
-  marker := ReadMarker;
+    marker := ReadMarker;
+  until (marker > 0) or (attempt >= 2);
+
   if marker <= 0 then
   begin
-    Fail('kill -9: alt surec hic commit edemedi (test gecersiz)' +
+    Fail(Format('kill -9: alt surec hic commit edemedi (test gecersiz; ' +
+      'deneme=%d, cocuk cikis kodu=%d)', [attempt, exitCode]) +
       ChildDiag(markerPath));
     Exit;
   end;
