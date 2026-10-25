@@ -13,7 +13,7 @@ kökten düzelir; SQL katmanı ve API değişmez.
 |---|---|---|
 | A | Dosya adı/uzantısı | **Aynı `.odb` adı korunur.** Dosya başında `VDB3` magic + sürüm baytı. v2 dosyası açılırsa net hata: `v2 formatı — MIGRATE TO v3 çalıştır`. `.odb3` uzantısı YOK. |
 | B | Aralık sorgusu / sıralı anahtar | **v3.0'a girmez.** v3.0 = hash anahtarlı sayfa yığını (dosya boyutu + açılış kazanır). B+tree / BETWEEN **v3.1**. |
-| C | Replication | **v3.0'da kapalı.** `START REPLICATION` çağrısı `ecNotSupported` + açıklayıcı mesaj verir. v3.1'de mantıksal değişim günlüğü ile yeniden yazılır. |
+| C | Replication | **v3.0'da kapalı.** `START REPLICATION` çağrısı `ecNotSupported` + açıklayıcı mesaj verir. v3.1'de kapsam dışı bırakıldı; mantıksal değişim günlüğü ile yeniden yazılması sıradaki sürüme ertelendi. |
 | D | v2 uyumu | v2 dosyaları **okunmaz, yazılmaz**. Tek yönlü `MIGRATE TO v3` aracı; kaynak dosya `.v2bak` olarak korunur. |
 | E | Otomatik sıkıştırma | v3.0'da `AutoCompactEnabled` **varsayılan False** kalır (H25 kararı korunur). Sayfa motorunda boş sayfa geri kazanımı zaten var. |
 | F | P-DUR sözleşmesi | Korunur. SQL commit ve açık `Flush`, `SyncWrite=False` olsa bile fsync eder. |
@@ -69,13 +69,15 @@ Kök nedenler, ölçümler ve koşular arası sapma `hiztesti.md` §9'da.
 **Boyut konusunda dikkat (dürüstlük):** v3 veri dosyası v2'den %19,5 küçük, ama
 yanına **`.odb.idx`** (3,52 MB; anahtar → sayfa/slot açılış önbelleği) yazıyor.
 `.idx` silinebilir (açılış 79 ms, hedef 150 ms) fakat yok sayılırsa toplam
-diskteki kazanç %19,5 değil **%1,2** olur. Asıl boyut kazancı için v3.1'de
-(a) PK dizisinin heap ile aynı anahtarı ikinci kez yazması (hücre başına
-12 B başlık + 4 B slot + ayrı PK girdisi) ve (b) hücre başlığının sıkıştırılması
-incelenecek; `.idx` için varsayılan açık/kapalı kararı da bekliyor.
+diskteki kazanç %19,5 değil **%1,2** olur. v3.1 boyut işi **değildir** (dosya
+boyutu değişmedi: 15.527.936 B / 77,6 B/satır). Asıl boyut kazancı için sıradaki
+sürümde (a) PK dizisinin heap ile aynı anahtarı ikinci kez yazması (hücre
+başına 12 B başlık + 4 B slot + ayrı PK girdisi) ve (b) hücre başlığının
+sıkıştırılması incelenecek; `.idx` için varsayılan açık/kapalı kararı da
+bekliyor (şimdilik: her zaman yazılır).
 
-Not: `COUNT(*)` hedefi 16 ms çünkü ölçüm gösterdi ki fark CPU değil **okunacak bayt**;
-dosya yarıya inince tarama da yaklaşık yarıya iner.
+Not: v3.1'de `COUNT(*)` artık tarama yapmıyor (canlı sayaç, 0,1 ms); hedefin
+16 ms olması v3.0'da farkın CPU değil **okunacak bayt** olmasındandı.
 
 ---
 
@@ -92,11 +94,20 @@ dosya yarıya inince tarama da yaklaşık yarıya iner.
 - Şifreleme: sayfa düzeyinde AES-GCM (`VDBCrypt` yeniden kullanılır)
 - `Verify`, `BACKUP`, `Compact` (boş sayfa geri kazanımı)
 
-### v3.1'e ertelenen
+### v3.1'de yapılanlar (kısa)
+- `COUNT(*)` O(1) canlı sayaç + `.idx` özeti
+- `.idx` koşulsuz yazılır (50 MB eşiği kaldırıldı)
+- İşlem başına WAL çerçevesi (`TxnMark`) + yapısal meta ayrımı
+- Toplu dosya büyütme (256 KB) + kapanışta kırpma
+- Akışlı / sıfır-kopya tarama; QPC ölçüm altyapısı
+- Ayrıntı: "Sprint 4 (v3.1)" bölümü
+
+### Sıradaki sürüme ertelenen (v3.2)
 - Sıralı anahtar düzeni + B+tree yaprakları → **BETWEEN / aralık sorguları**
 - Replication (mantıksal değişim günlüğü)
 - Zone map'in sayfa düzeyinde yeniden ele alınması
 - Satır gövdesi varint/delta kodlama (F3-1'in kalanı)
+- Dosya boyutu (PK'nin ikinci kez yazılması, hücre başlığı sıkıştırma)
 - Bloom filtresi, merge JOIN, ifade bytecode
 
 ### Kapsam dışı (değişmedi)
@@ -176,7 +187,7 @@ Sayfa motorunu yazmak kolay; asıl maliyet şu 4 dosyada. Plan bunları hesaba k
 - [x] 3.4 Şifreleme: sayfa düzeyinde AES-GCM — sıra sabit: sayfa imajı → `PageSeal` (CRC32) → **AES-256-GCM zarfı** (`nonce 12 | şifre 4096 | tag 16` = 4124 bayt). AAD = `'VDB3PG' | sayfaNo(4) | tuz(16)`; böylece zarf başka sayfaya/dosyaya taşınamaz ve etiket doğrulanmadan hiçbir düz metin açığa çıkmaz. Meta sayfa 0 **düz metin** kalır (sır tutmaz): bayrak, tuz, PBKDF2 iterasyonu ve 16 baytlık HMAC anahtar doğrulayıcı orada durur. `VDbPageCrypto.pas` eklendi (zarf + tuz + parola türetme + parmak izi). Depo: şifreli dosyada sayfa 1..N `4096 + (no-1)*4124` adresinde; yeni uzatılan sayfa sıfır kabul edilir (şifreli zarf yok). WAL çerçeveleri de aynı zarfla yazılır (başlıkta bayrak/anahtar doğrulayıcı/tuz); çökme sonrası kurtarma anahtarla çözer. API: `TVdbPageEngine.CreateWithKey/CreateWithPassword`, `TVDbBackendV3.CreateWithKey/CreateWithPassword`, `Encrypted`, `KeyFingerprint`; `RESTORE` kaynak/hedef şifreleme biçimi ve anahtar doğrulayıcı eşleşmezse reddeder; `VACUUM` aynı anahtarla yeni dosya üretir. `backendchk` `TestV3Encryption` **21/21** (düz metin sızıntısı yok, anahtarsız/yanlış anahtar net hata, bozuk zarf reddi, şifreli yedek, farklı anahtarlı RESTORE reddi, şifreli WAL + çökme kurtarma, parola modu). Kapılar: `backendchk` **82/82**.
 - [x] 3.5 Replikasyon v3'te **açıkça yok**: `START REPLICATION` (dosya + TCP), `PUMP`, `CREATE/DROP REPLICATION SLOT`, `SHOW REPLICATION STATUS/SLOTS`, `STOP REPLICATION` → `ecUnsupported` + `REPLICATION v3 sayfa motorunda yok (v3.1: mantiksal gunluk ile gelecek)`. Tek kaynak: `ExecAdmin` başındaki `Kv = nil` kapısı (2.9'da eklendi); 3.5'te mesaj replikasyon için özelleştirildi, satır içi yinelenen guard'lar kaldırıldı. Test `v3sqlchk` `TestReplicationUnsupported` **17/17**: 9 cumle `ecUnsupported` + `v3.1` mesajı, `.replslots`/status dosyası oluşmaz, veri bozulmaz, yeniden açılış sağlam.
 - [x] 3.6 PITR / zaman yolculuğu v3'te **açıkça devre dışı** (karar: v3 WAL'i sayfa imajı tutar, mantıksal günlük yok). `AS OF SEQUENCE/VERSION/TIMESTAMP` → `ecUnsupported` (nil `Kv` üzerinden `BuildAsOfRows` AV'si de böylece kapandı); `RECOVER TO NOW/TIMESTAMP` + `ARCHIVE WAL SET/LIST` → `PITR / WAL arsivi v3 sayfa motorunda yok (v3.1: ... mantiksal gunluk ...)`. Test `v3sqlchk` `TestPitrUnsupported` **15/15**: 8 cumle reddedilir, güncel okuma/PK erişimi etkilenmez, arşiv dizini oluşmaz, `VERIFY` geçer.
-- [x] 3.7 Zone map v3'te **kapalı** (düz tam tarama). Budama yalnız v2'nin ham kayıt yolu (`PrepareRawScan`) ile mümkündür; v3 heap hücre biçiminde yeniden inşa v3.1'e bırakıldı. Doğrulama `v3sqlchk` `TestZoneMapFallback` **22/22**: 3000 satır, 8 aralık + eşitlik/`IN`/`<>`/karma sorgular Pascal'da hesaplanan beklentiyle birebir; yeniden açılışta aynı sonuç + `VERIFY`. Belgelendi: `V3_KAPSAM.md` §4/§5.
+- [x] 3.7 Zone map v3'te **kapalı** (düz tam tarama). Budama yalnız v2'nin ham kayıt yolu (`PrepareRawScan`) ile mümkündür; v3 heap hücre biçiminde yeniden inşa v3.2'ye bırakıldı. Doğrulama `v3sqlchk` `TestZoneMapFallback` **22/22**: 3000 satır, 8 aralık + eşitlik/`IN`/`<>`/karma sorgular Pascal'da hesaplanan beklentiyle birebir; yeniden açılışta aynı sonuç + `VERIFY`. Belgelendi: `V3_KAPSAM.md` §4/§5.
 - [x] 3.8 win32 tam kapı: **`kalan=0`**. `backendchk 82/82`, `v3sqlchk 128/128`, `pagechk 21/21`, `storechk 15/15`, `heapchk 20/20`, `idxchk 17/17`, `migchk 13/13`, `crashtest 11/11`; `sqltest` v2 **3116/0/0**, v3 **2252/0/58**.
 - [x] 3.9 win64 tam kapı: **`kalan=0`**, iki optimizasyon düzeyinde de (`-O-` ve `-O1`, `ppcrossx64 -Px86_64 -Twin64`). Sekiz kapı win32 ile **aynı** sayılarda yeşil. `sqltest` v2 **3081/0/0**, v3 **2217/0/58** — win32'den **35 kontrol eksik**; eksikliğin tamamı DLL/OpenSSL'e bağlı alt dallardır ve **hata değildir**: `130. Extension/Plugin` (25→8), `179. pgwire TLS/OpenSSL` (10→0), `128. Cross-Platform DLL/C API` (16→13), `131. paralel ABI` (58→53). `sqltest` bu dallarda "vdbapi.dll yok → atlandı" / "TLS testi (OpenSSL DLL bulunamadı)" yazar; bu ortamda yalnız **32 bit** eklenti/OpenSSL ikilileri var. Linux de aynı sayıları verir (3081/2217), yani fark platformdan değil **ikili (binary) yokluğundan** kaynaklanır.
 - [x] 3.10 Linux/WSL tam kapı: **`kalan=0`** (Ubuntu 22.04, FPC 3.2.2 x86_64, `/mnt/d` = DrvFs). Sekiz kapı da yeşil; `sqltest` v2 **3081/0/0**, v3 **2217/0/58**. Bu kapı **üç gerçek taşınabilirlik kusuru** ortaya çıkardı ve hepsi düzeltildi (aşağıda).
@@ -474,7 +485,7 @@ kaynağı değildir**:
   başlık ve kayıt CRC'leri. Biri tutmazsa dosya sessizce yok sayılır ve tam
   tarama yapılır. Veri kaybı mümkün değil, sadece açılış yavaşlar.
 - Kayıt 16 B (`Key 8 | PageNo 4 | Slot 2 | Pad 2`) → 200k satırda 3,2 MB.
-  Sıkıştırma (varint) v3.1'e bırakıldı.
+  Sıkıştırma (varint) v3.2'ye bırakıldı.
 
 `idxchk` 17/17: temel yaz/kapat/aç, bozuk idx, kesik idx, bayat idx (eski LSN),
 idx yok, sil/güncelle sonrası kapat-aç; her senaryoda **tüm değerler birebir**.

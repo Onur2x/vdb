@@ -34,7 +34,7 @@ sayaca eklenir.
 
 Üç grup vardır. Gruplama test gövdesinin gerçekten dokunduğu yüzeye göre
 otomatik tarandı (`kv.`, `pkv.`, `myKv`, `TVDb.Create`); `T79_Savepoint` elle
-eklendi (v3.1'e ertelenen yönetim komutu).
+eklendi (kapsam dışı bırakılan `SAVEPOINT` komutu).
 
 ### (a) Gövdesi doğrudan v2 veri dosyası / WAL / arşiv API'sine dokunur — 33
 
@@ -95,7 +95,7 @@ SQL testleriyle kapsanır.
 `T143_H21_RawTreeSelectPaths`, `T144_H22_DeepOffsetLive`, `T145_H8_MCV`,
 `T147_M8_SqlancerStil`, `T148_H25_AutoCompact`
 
-### (c) v3.1'e ertelenen yönetim komutunu sınar (elle eklendi) - 1
+### (c) kapsam dışı bırakılan yönetim komutunu sınar (elle eklendi) - 1
 
 | Test | Komut | v3 karşılığı |
 |---|---|---|
@@ -255,9 +255,9 @@ yerine **ölçülebilir bir sözleşme** verir:
 Gerekçe: v3 WAL'i **sayfa imajı** tutar (mantıksal kayıt yok), dolayısıyla
 zamansal sorgu ve mantıksal replikasyon için gereken anahtar/değer geçmişi
 yoktur. Zone map ise v2'nin ham kayıt ofsetlerine dayanır; v3 heap hücre
-biçiminde yeniden inşa edilmesi gerekir. Üçü de v3.1'e (mantıksal günlük ve
-sayfa biçimine uyarlanmış bölüm haritası) bırakıldı; v3.0 kabul hedefleri
-dosya boyutu ve açılış hızı olduğu için bu ödün bilinçlidir.
+biçiminde yeniden inşa edilmesi gerekir. Üçü de sıradaki sürüme (mantıksal
+günlük ve sayfa biçimine uyarlanmış bölüm haritası) bırakıldı; v3.0 ve v3.1
+kabul hedefleri performans olduğu için bu ödün bilinçlidir.
 
 ### Sayfa şifreleme (Sprint 3.4)
 
