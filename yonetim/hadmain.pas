@@ -11,7 +11,7 @@ interface
 uses
   Classes, SysUtils, Forms, Controls, Graphics, Dialogs, StdCtrls, Grids,
   ComCtrls, Menus, ExtCtrls, FileUtil, Clipbrd, LCLType,
-  VDbCore, VDbTable, VDbSql, VDbJson, VDbTypes, haddlg, hadtools,
+  VDbBackendApi, VDbFactory, VDbTable, VDbSql, VDbJson, VDbTypes, haddlg, hadtools,
   uLang, TypInfo;
 
 type
@@ -63,7 +63,10 @@ procedure UIStyleDark;
 type
   TfrmMain = class(TForm)
   private
-    FKv: TVDb;
+    { 2026-10-25 (v3): yonetim uygulamasi yalnizca v3 motorunu kullanir.
+      Somut TVDb tipi GECMEZ; giris noktasi VDbFactory'dir. v2 dosyasi
+      secilirse net bir mesajla yonlendirilir (goc: vdbmig). }
+    FBe: IVdbBackend;
     FTb: TVTableDb;
     FSq: TVSql;
     FCurrentDBDir: string;
@@ -158,7 +161,7 @@ type
     procedure btnDataSaveCSVClick(Sender: TObject);
     // veritabani / agac
     procedure EnsureOpen;
-    procedure OpenDB(const FilePath: string);
+    procedure OpenDB(const FilePath: string; ASilent: Boolean = False);
     procedure CloseDB;
     procedure RefreshTree;
     function SelectedDbPath(Node: TTreeNode): string;
@@ -379,7 +382,7 @@ begin
   begin
     RefreshTree;
     if FileExists(FCurrentDBDir + '\veritabani.odb') then
-      OpenDB(FCurrentDBDir + '\veritabani.odb');
+      OpenDB(FCurrentDBDir + '\veritabani.odb', True);
   end;
 
   // 2026-10-14: Arayuzu aktif dile cevir (varsayilan: Ingilizce).
@@ -1326,46 +1329,80 @@ end;
 
 procedure TfrmMain.EnsureOpen;
 begin
-  if Assigned(FKv) then Exit;
+  if Assigned(FBe) then Exit;
   OpenDB(FCurrentDBDir + '\veritabani.odb');
 end;
 
 function TfrmMain.DBInfoText: string;
 // 2026-10-04 (M8): DB bilgi paneli metni tek yerde uretilir; VACUUM /
-// otomatik sikistirma sonrasi da tazelenir.
-// 2026-10-04 (M9): bekleyen WAL varsa KIRMIZI vurguyla gosterilir; WAL
-// varken dosya "saglam" gorunse de kayitlar henuz uygulanmamistir.
+// sikistirma sonrasi da tazelenir.
+// 2026-10-25 (v3): motor v3; "olu bayt" kavrami yok. Onun yerine .idx
+// yan dosyasi ve (varsa) sayfa motorunun .wal dosyasi gosterilir.
 var
-  walTxt: string;
+  walTxt, idxTxt: string;
+  wp: string;
 begin
-  if (not Assigned(FKv)) or (FDBPath = '') then
+  if (not Assigned(FBe)) or (FDBPath = '') then
     Exit(L('Veritabani acik degil', 'No database open'));
-  walTxt := '';
-  if FKv.HasWAL then
-    walTxt := sLineBreak + L('!! WAL BEKLIYOR: ', '!! WAL PENDING: ') +
-      DbSizeStr(FKv.WalPath) +
-      L(' (Araclar > WAL Replay)', ' (Tools > WAL Replay)');
+  wp := FDBPath + '.wal';
+  if FileExists(wp) then
+    walTxt := L('WAL (otomatik): ', 'WAL (automatic): ') + DbSizeStr(wp)
+  else
+    walTxt := L('WAL (otomatik): bos', 'WAL (automatic): empty');
+  if FileExists(FDBPath + '.idx') then
+    idxTxt := L('Dizin (.idx): ', 'Index (.idx): ') + DbSizeStr(FDBPath + '.idx')
+  else
+    idxTxt := L('Dizin (.idx): yok', 'Index (.idx): none');
   Result := L('Dosya: ', 'File: ') + FDBPath + sLineBreak +
+    L('Motor: v3 (VDB3)', 'Engine: v3 (VDB3)') + sLineBreak +
     L('Boyut: ', 'Size: ') + DbSizeStr(FDBPath) + sLineBreak +
     L('Kayit (canli): ', 'Records (live): ') + IntToStr(FTb.DataKeyCount) + sLineBreak +
-    L('Olu bayt: ', 'Dead bytes: ') + IntToStr(FKv.DeadBytes) + walTxt;
+    idxTxt + sLineBreak + walTxt;
 end;
 
-procedure TfrmMain.OpenDB(const FilePath: string);
+procedure TfrmMain.OpenDB(const FilePath: string; ASilent: Boolean);
 var
   rep: string;
   ok: Boolean;
   n: Integer;
+  fam: TVdbFamily;
 begin
   CloseDB;
-  FKv := TVDb.Create;
-  FKv.SyncWrite := False;
-  FKv.Open(FilePath);
-  FTb := TVTableDb.Create(FKv);
+  // 2026-10-25 (v3): v2 dosyasi ACILMAZ. Goc tek yonludur ve ayri bir
+  // araçla (vdbmig) yapilir; kullanici net bicimde yonlendirilir.
+  // ASilent=True (acilistaki otomatik deneme) ise pencere ACILMAZ.
+  fam := VdbFamilyOfFile(FilePath);
+  if fam = vdfV2 then
+  begin
+    SetStatus('v2 dosyasi - v3 gerekli');
+    Log('REDDEDILDI (v2 bicimi): ' + FilePath);
+    if not ASilent then
+      ShowMessage(
+        'Bu dosya v2 (VODB) biciminde:' + sLineBreak +
+        FilePath + sLineBreak + sLineBreak +
+        'Yonetim programi v3 kullanir. Tasimak icin:' + sLineBreak +
+        '  vdbmig copy "' + ExtractFileDir(FilePath) + '" "<yeni>.odb"' + sLineBreak + sLineBreak +
+        'Kaynak dosyaya dokunulmaz; yeni v3 dosyasi olusur.');
+    Exit;
+  end;
+  try
+    VdbOpen(FilePath, FBe);
+  except
+    on E: Exception do
+    begin
+      FBe := nil;
+      SetStatus('Acilamadi');
+      Log('ACILAMADI: ' + E.Message);
+      if not ASilent then
+        ShowMessage('Veritabani acilamadi:' + sLineBreak + E.Message);
+      Exit;
+    end;
+  end;
+  FTb := TVTableDb.CreateBackend(FBe);
   FTb.Open(ExtractFileDir(FilePath));
   FSq := TVSql.Create(FTb);
   FSq.AutoTransaction := True;
-  FDBPath := FKv.FilePath;
+  FDBPath := FBe.FilePath;
   FCurrentDBDir := ExtractFileDir(FDBPath);
   FPage := 0;
   n := FTb.DataKeyCount;
@@ -1373,36 +1410,17 @@ begin
   SetStatus('Acik: ' + FDBPath);
   lblBannerSub.Caption := FDBPath;
   SetHealth('');
-  ok := FKv.Verify(rep);
+  ok := FBe.Verify(rep);
   if ok then
     SetHealth('SAGLAM')
   else
     SetHealth('SORUN: ' + rep);
-  // 2026-10-04 (M6): DAYANIKLILIK ALARMLARI. Motor bu iki durumu
-  // yalnizca property olarak tutuyordu; yonetim hic bakmiyordu.
-  //  - RestoredFromBak: dosya .bak'tan GERI YUKLENDI (yarim kalmis
-  //    compact/replace). Kritik: eski surumdeki veri olabilir.
-  //  - DirSyncFailed: dizin girdisi fsync edilemedi; yeni dosya/rename
-  //    kalici OLMAYABILIR (F2-2).
-  if FKv.RestoredFromBak then
-  begin
-    SetHealth('DIKKAT: .bak geri yuklendi');
-    Log('UYARI: veritabani .bak dosyasindan geri yuklendi (' + FDBPath + ')');
-    Log('      eski surumdeki veri olabilir; yedek kontrol edin.');
-  end;
-  if FKv.DirSyncFailed then
-  begin
-    SetHealth('DIKKAT: dizin yazimi kalici degil');
-    Log('UYARI: dizin fsync edilemedi (DirSyncFailed). Yeni dosya/rename');
-    Log('      crash sonrasi kaybolabilir. Dosya sistemi izinlerini kontrol edin.');
-  end;
-  // 2026-10-04 (M9): acilista bekleyen WAL var mi diye bak.
   RefreshWalUI;
   Log('Acildi: ' + FDBPath);
   if chkAutoBak.Checked then
   begin
     try
-      FKv.BackupTo(FDBPath + '.onceki');
+      FBe.BackupTo(FDBPath + '.onceki');
       Log('Otomatik yedek: ' + FDBPath + '.onceki');
     except
       on E: Exception do
@@ -1420,7 +1438,9 @@ procedure TfrmMain.CloseDB;
 begin
   if Assigned(FSq) then FreeAndNil(FSq);
   if Assigned(FTb) then FreeAndNil(FTb);
-  if Assigned(FKv) then FreeAndNil(FKv);
+  { Motor referansi: TVTableDb de tutar, ama acik kalirsa dosya kilidi
+    birakilmaz; burada acikca birakilir. }
+  FBe := nil;
   FDBPath := '';
   FCurrentTable := '';
   SetLength(FDataPks, 0);
@@ -2206,7 +2226,7 @@ procedure TfrmMain.btnBackupClick(Sender: TObject);
 var
   sd: TSaveDialog;
 begin
-  if not Assigned(FKv) then
+  if not Assigned(FBe) then
   begin
     ShowMessage('Once bir veritabani acin.');
     Exit;
@@ -2219,7 +2239,7 @@ begin
     sd.Filter := 'VDb yedek|*.odb';
     if not sd.Execute then Exit;
     try
-      FKv.BackupTo(sd.FileName);
+      FBe.BackupTo(sd.FileName);
       SetStatus('Yedek alindi');
       Log('Yedek: ' + sd.FileName);
       ShowMessage('Yedek alindi:' + sLineBreak + sd.FileName);
@@ -2237,12 +2257,12 @@ var
   rep: string;
   ok: Boolean;
 begin
-  if not Assigned(FKv) then
+  if not Assigned(FBe) then
   begin
     ShowMessage('Once bir veritabani acin.');
     Exit;
   end;
-  ok := FKv.Verify(rep);
+  ok := FBe.Verify(rep);
   if ok then
   begin
     SetHealth('SAGLAM');
@@ -2271,41 +2291,18 @@ begin
 end;
 
 procedure TfrmMain.btnAutoCompactClick(Sender: TObject);
-// 2026-10-04 (M8): GEREKTIGINDE SIKISTIR. VACUUM her zaman tam sikistirma
-// yapar; AutoCompact yalniz olu bayt orani esigi asildiginda calisir
-// (MaxDeadRatio) ve kucuk veritabanlarinda hic elleşmez (MinBytes).
-var
-  vOld, vNew: Int64;
-  did: Boolean;
+// 2026-10-25 (v3): v2'nin "olu bayt orani esigi" kavrami v3 sayfa motorunda
+// YOKTUR; v3'te sikistirma her zaman acik bir islemdir (VACUUM). Boylece
+// kullanici "elle sikistirmali miyim" kararini vermek zorunda kalmaz.
 begin
-  if not Assigned(FKv) then Exit;
-  try
-    did := FKv.AutoCompact(vOld, vNew);
-    // Compact -> ReplaceWith -> atomik rename + YENIDEN ACIS. Bu yuzden
-    // dosya degistigi halde TVTableDb'nin BELLEKTEKI semasi ve indeks
-    // onbellegi bayat kalir. VACUUM butonu da bu yuzden OpenDB ile
-    // yeniden aciyor; AutoCompact icin de aynisi sart (yoksa
-    // sonraki sorgularda "tablo yok" gorulur).
-    if did then
-    begin
-      Log(Format('OTOMATIK SIKISTIRMA: %d -> %d bayt (%d bayt kazanc)',
-        [vOld, vNew, vOld - vNew]));
-      OpenDB(FDBPath);
-      SetStatus('Sikistirildi: ' + IntToStr(vOld - vNew) + ' bayt kazanc');
-    end
-    else
-    begin
-      Log('OTOMATIK SIKISTIRMA: gerek yok (olu bayt: ' +
-        IntToStr(FKv.DeadBytes) + ')');
-      SetStatus('Sikistirma gerekmiyor');
-    end;
-  except
-    on E: Exception do
-    begin
-      ShowMessage('Sikistirma hatasi: ' + E.Message);
-      Log('Sikistirma hatasi: ' + E.Message);
-    end;
-  end;
+  if not Assigned(FBe) then Exit;
+  ShowMessage('v3 sayfa motorunda olu-bayt esigi yok.' + sLineBreak +
+    sLineBreak +
+    'Sikistirma her zaman acik bir islemdir:' + sLineBreak +
+    '  Araclar > VACUUM' + sLineBreak + sLineBreak +
+    'Otomatik sikistirma (v2 davranisi) kaldirildi; boylece arka planda' +
+    sLineBreak + 'istenmeyen dosya degisimi olmaz.');
+  Log('Gerektiginde Sikistir: v3''te VACUUM kullanilir');
 end;
 
 procedure TfrmMain.btnReindexClick(Sender: TObject);
@@ -2323,266 +2320,98 @@ begin
   end;
 end;
 
-{ ---------------- WAL (yazma oncesi gunluk) ---------------- }
-// 2026-10-04 (M9): Motorun WAL'i gercek bir dosyaya yaziyor, replay
-// ediyor ve checkpoint ile temizliyor; yonetimde HICBIR arac yoktu.
-// Asagidaki uc arac durumu gorunur kilar ve islemleri tek tikla
-// calistirir.
+{ ---------------- WAL (v3: sayfa motorunun gunlugu) ---------------- }
+// 2026-10-04 (M9): v2'de WAL ayri bir dosyaydi ve elle replay/checkpoint
+// gerekiyordu. 2026-10-25 (v3): sayfa motoru gunlugu KENDISI yonetir:
+//   - her commit once .wal'a yazilir, sonra ana dosyaya gecer,
+//   - acilista yarim kalan kayitlar otomatik kurtarilir/atilir,
+//   - gunluk esik asilinca otomatik checkpoint yapilir.
+// Bu yuzden ELLE mudahale yoktur. Menude kalan araclar bilgi verir; boylece
+// "bekleyen kayit var mi" sorusu yonetimden yanitlanabilir.
 
 procedure TfrmMain.RefreshWalUI;
-// 2026-10-04 (M9): Bekleyen WAL varsa dugmeler vurgulanir ve bilgi
-// paneli yenilenir. Her veritabani acilisinda ve WAL araclarindan
-// sonra cagrilir.
 var
-  waiting: Boolean;
+  wp: string;
 begin
-  if not Assigned(FKv) then Exit;
-  waiting := FKv.HasWAL;
   if Assigned(bWalStatus) then
   begin
-    if waiting then
-    begin
-      bWalStatus.Font.Color := clRed;
-      bWalStatus.Font.Style := [fsBold];
-    end
-    else
-    begin
-      bWalStatus.Font.Style := [];
-      bWalStatus.Font.Color := clBtnText;
-    end;
+    bWalStatus.Font.Style := [];
+    bWalStatus.Font.Color := clBtnText;
   end;
-  if Assigned(bWalReplay) then
-    bWalReplay.Enabled := waiting;
-  if Assigned(bWalCkpt) then
-    bWalCkpt.Enabled := waiting;
-  { 2026-10-04 (M10): otomatik WAL anahtari motorun gercek durumuyla
-    esitlenmeli. Close/Open durumu sifirladigi icin eski bir Down
-    degeri yeni acilista yaniltici olurdu. }
+  { v3'te elle replay/checkpoint/anahtar yok: araclar kapali. }
+  if Assigned(bWalReplay) then bWalReplay.Enabled := False;
+  if Assigned(bWalCkpt) then bWalCkpt.Enabled := False;
   if Assigned(bWalAuto) then
   begin
-    bWalAuto.Down := FKv.WALEnabled;
-    bWalAuto.Enabled := True;
+    bWalAuto.Down := True;      // v3: gunluk her zaman acik
+    bWalAuto.Enabled := False;
   end;
-  if waiting then
-  begin
-    SetHealth('DIKKAT: WAL bekliyor');
-    Log('WAL durumu: ' + DbSizeStr(FKv.WalPath) + ' bekleyen kayit var');
-  end
-  else if FHealthTxt = 'DIKKAT: WAL bekliyor' then
-    SetHealth('');
   if Assigned(lblDBInfo) then
     lblDBInfo.Caption := DBInfoText;
+  if FDBPath = '' then Exit;
+  wp := FDBPath + '.wal';
+  if FileExists(wp) then
+    Log('WAL: ' + DbSizeStr(wp) + ' (v3 otomatik yonetir)');
 end;
 
 procedure TfrmMain.btnWalAutoClick(Sender: TObject);
-{ 2026-10-04 (M10): otomatik WAL (write-ahead) anahtarı.
-  ACIK: her yazma once .wal'a, sonra ana dosyaya. Boylece sistem
-  yazma aninda cokerse kayit .wal'da kalir ve Replay ile kurtarilir.
-  KAPALI (varsayilan): yazma dogrudan ana dosyaya (eski davranis).
-  Durum Close/Open ile sifirlanir; bu yuzden dugme her acilista
-  RefreshWalUI ile esitlenir. }
-var
-  yeni: Boolean;
-  n: Integer;
 begin
-  if not Assigned(FKv) then
-  begin
-    ShowMessage('Once bir veritabani acin.');
-    if Assigned(bWalAuto) then bWalAuto.Down := False;
-    Exit;
-  end;
-  yeni := not FKv.WALEnabled;
-  try
-    FKv.WALEnabled := yeni;
-  except
-    on E: Exception do
-    begin
-      Log('Otomatik WAL acilamadi: ' + E.Message);
-      ShowMessage('Otomatik WAL acilamadi:' + sLineBreak + E.Message);
-      if Assigned(bWalAuto) then bWalAuto.Down := FKv.WALEnabled;
-      Exit;
-    end;
-  end;
-  if Assigned(bWalAuto) then bWalAuto.Down := FKv.WALEnabled;
-  if FKv.WALEnabled then
-  begin
-    SetHealth('Otomatik WAL ACIK (yazma once .wal''a)');
-    Log('Otomatik WAL ACIK: yazma once .wal''a, sonra ana dosyaya');
-  end
-  else
-  begin
-    if FHealthTxt = 'Otomatik WAL ACIK (yazma once .wal''a)' then SetHealth('');
-    Log('Otomatik WAL KAPALI: yazma dogrudan ana dosyaya');
-  end;
-  n := FKv.WalAutoCount;
-  Log('Otomatik yazma sayaci: ' + IntToStr(n));
-  RefreshWalUI;
+  if Assigned(bWalAuto) then bWalAuto.Down := True;
+  ShowMessage('v3 sayfa motorunda WAL HER ZAMAN aciktir.' + sLineBreak +
+    sLineBreak +
+    'Her commit once gunluge yazilir; sistem yazma aninda cokse bile' +
+    sLineBreak + 'kayit acilista otomatik kurtarilir.' + sLineBreak +
+    sLineBreak + 'Kapatma anahtari yoktur.');
+  Log('Otomatik WAL: v3''te her zaman acik');
 end;
 
 procedure TfrmMain.btnWalStatusClick(Sender: TObject);
-// WAL dosyasi var mi, boyutu ne, ne zaman degismis.
 var
   wp: string;
-  info: string;
-  age: string;
-  oto: string;
 begin
-  if not Assigned(FKv) then
+  if not Assigned(FBe) then
   begin
     ShowMessage('Once bir veritabani acin.');
     Exit;
   end;
-  // 2026-10-04 (M10): otomatik WAL durumu her iki pencerede de gorunsun.
-  if FKv.WALEnabled then
-    oto := 'Otomatik WAL: ACIK (yazma once .wal''a, sonra ana dosyaya)' + sLineBreak +
-      'Bu oturumda otomatik yazilan kayit: ' + IntToStr(FKv.WalAutoCount)
-  else
-    oto := 'Otomatik WAL: KAPALI (yazma dogrudan ana dosyaya)';
-  wp := FKv.WalPath;
-  if not FileExists(wp) then
-  begin
-    info := 'WAL dosyasi YOK' + sLineBreak + sLineBreak +
+  wp := FDBPath + '.wal';
+  if FileExists(wp) then
+    ShowMessage('WAL (v3, otomatik)' + sLineBreak + sLineBreak +
       'Yol: ' + wp + sLineBreak +
-      oto + sLineBreak +
-      'Kayitlanmamis degisiklik bulunmuyor.';
-    Log('WAL durumu: dosya yok');
-    SetStatus('WAL: dosya yok');
-    ShowMessage(info);
-    Exit;
-  end;
-  if FKv.WALEnabled then
-  begin
-    { OTOMATIK WAL ACIK: kayitlar ana dosyaya DA yazildi. Replay
-      kayitlari TEKRAR uygular. PUT/DEL ayni sonucu verdiginden veri
-      bozulmaz, ama zaten kaydedilmis veri yeniden yazilir; bu yuzden
-      burada varsayilan olarak Checkpoint onerilir. }
-    info := 'WAL (write-ahead gunlugu) BEKLIYOR' + sLineBreak +
-      sLineBreak + 'Yol: ' + wp + sLineBreak +
-      'Boyut: ' + DbSizeStr(wp) + sLineBreak +
-      'Kayit sayisi: ' + IntToStr(FKv.WalRecordCount) + sLineBreak +
-      oto + sLineBreak + sLineBreak +
-      'OTOMATIK WAL ACIK oldugu icin bu kayitlar ANA DOSYAYA DA zaten' + sLineBreak +
-      'yazildi. Replay kayitlari IKI KEZ uygular: veri bozulmaz' + sLineBreak +
-      '(PUT/DEL ayni sonucu verir) ama ayni kayit yeniden yazilir.' + sLineBreak +
-      'Bu durumda daha dogru islem Checkpoint (gunlugu temizle).' + sLineBreak + sLineBreak +
-      'Yine de Replay (uygula) edilsin mi?';
-  end
+      'Boyut: ' + DbSizeStr(wp) + sLineBreak + sLineBreak +
+      'Gunluk motor tarafindan yonetilir: acilista kurtarma, esik asilinca' +
+      sLineBreak + 'otomatik checkpoint. Elle islem GEREKMEZ.')
   else
-  begin
-    info := 'WAL BEKLIYOR - kayitlar ana dosyaya yazilmadi' + sLineBreak +
-      sLineBreak + 'Yol: ' + wp + sLineBreak +
-      'Boyut: ' + DbSizeStr(wp) + sLineBreak +
-      'Kayit sayisi: ' + IntToStr(FKv.WalRecordCount) + sLineBreak +
-      oto + sLineBreak +
-      'Durum: kayitlar henuz veritabanina YAZILMADI';
-  end;
-  Log('WAL durumu: ' + DbSizeStr(wp) + ' bekliyor (' + wp + ')');
-  SetStatus('WAL: ' + DbSizeStr(wp) + ' bekliyor');
-  if MessageDlg('WAL dosyasi bekliyor:' + sLineBreak + sLineBreak + info +
-    sLineBreak + sLineBreak + 'Simdi Replay (uygula) edilsin mi?',
-    mtConfirmation, [mbYes, mbNo], 0) = mrYes then
-    btnWalReplayClick(Sender);
+    ShowMessage('WAL (v3, otomatik)' + sLineBreak + sLineBreak +
+      'Su anda gunluk dosyasi yok: bekleyen kayit bulunmuyor.' + sLineBreak +
+      'Yol: ' + wp);
+  Log('WAL durumu sorgulandi: ' + wp);
 end;
 
 procedure TfrmMain.btnWalReplayClick(Sender: TObject);
-// Replay: .wal icerigi ana dosyaya yazilir, sonra .wal silinir.
-// Kayitlar ONCEDEN ana dosyaya yazilmadigi icin bu islem veri kaybi
-// degil, tam tersi kazanadir. Yine de onay istenir.
-var
-  wp: string;
-  rep: string;
 begin
-  if not Assigned(FKv) then
+  if not Assigned(FBe) then
   begin
     ShowMessage('Once bir veritabani acin.');
     Exit;
   end;
-  wp := FKv.WalPath;
-  if not FileExists(wp) then
-  begin
-    SetStatus('WAL: dosya yok, replay yapilacak is yok');
-    Log('WAL replay: dosya yok, atlandi');
-    Exit;
-  end;
-  if MessageDlg('WAL kayitlari veritabanina uygulansin mi?' + sLineBreak +
-    sLineBreak + 'Kayit: ' + wp + sLineBreak +
-    'Boyut: ' + DbSizeStr(wp) + sLineBreak + sLineBreak +
-    'Bozuk/yirtik kayitlar atlanir; gecerli olanlar tek islemde yazilir.',
-    mtConfirmation, [mbYes, mbNo], 0) <> mrYes then
-  begin
-    SetStatus('WAL replay: iptal edildi');
-    Exit;
-  end;
-  try
-    if FKv.ReplayWAL then
-    begin
-      Log(Format('WAL REPLAY: kayitlar uygulandi, %s gunluk %s olarak silindi',
-        [DbSizeStr(wp), DbSizeStr(FKv.FilePath)]));
-      SetStatus('WAL replay: kayitlar uygulandi');
-      // Replay ana dosyayi degistirdi: bilgi panelini tazele
-      lblDBInfo.Caption := DBInfoText;
-      rep := '';
-      if FKv.Verify(rep) then
-        SetHealth('SAGLAM')
-      else
-        SetHealth('SORUN: ' + rep);
-    end
-    else
-    begin
-      Log('WAL replay BASARISIZ');
-      SetStatus('WAL replay basarisiz');
-      ShowMessage('WAL replay basarisiz. .wal dosyasi korundu; ' +
-        'dosyayi inceleyip tekrar deneyin.');
-    end;
-  except
-    on E: Exception do
-    begin
-      Log('WAL replay hatasi: ' + E.Message);
-      ShowMessage('WAL replay hatasi: ' + E.Message);
-    end;
-  end;
+  ShowMessage('v3''te elle WAL replay YOKTUR.' + sLineBreak + sLineBreak +
+    'Yarim kalan islemler veritabani ACILIRKEN otomatik uygulanir veya' +
+    sLineBreak + 'atilir (CRC ile dogrulanir).');
+  Log('WAL replay: v3 otomatik - elle islem yok');
 end;
 
 procedure TfrmMain.btnWalCheckpointClick(Sender: TObject);
-// Checkpoint = replay + .wal silme. Kayitlar varsa ONCE uygulanir.
 begin
-  if not Assigned(FKv) then
+  if not Assigned(FBe) then
   begin
     ShowMessage('Once bir veritabani acin.');
     Exit;
   end;
-  if not FKv.HasWAL then
-  begin
-    SetStatus('WAL checkpoint: bekleyen kayit yok');
-    Log('WAL checkpoint: bekleyen kayit yok');
-    Exit;
-  end;
-  if MessageDlg('WAL checkpoint yapilsin mi?' + sLineBreak + sLineBreak +
-    'Bekleyen kayitlar veritabanina yazilir ve gunluk dosyasi silinir.',
-    mtConfirmation, [mbYes, mbNo], 0) <> mrYes then
-  begin
-    SetStatus('WAL checkpoint: iptal edildi');
-    Exit;
-  end;
-  try
-    if FKv.CheckpointWAL then
-    begin
-      Log('WAL CHECKPOINT: kayitlar uygulandi, gunluk silindi');
-      SetStatus('WAL checkpoint tamamlandi');
-      lblDBInfo.Caption := DBInfoText;
-    end
-    else
-    begin
-      Log('WAL CHECKPOINT basarisiz');
-      ShowMessage('Checkpoint basarisiz. Gunluk dosyasi SILINMEDI.');
-    end;
-  except
-    on E: Exception do
-    begin
-      Log('WAL checkpoint hatasi: ' + E.Message);
-      ShowMessage('WAL checkpoint hatasi: ' + E.Message);
-    end;
-  end;
+  ShowMessage('v3''te checkpoint OTOMATIKTIR.' + sLineBreak + sLineBreak +
+    'Gunluk esik boyutunu asinca sayfalar ana dosyaya yazilir ve gunluk' +
+    sLineBreak + 'temizlenir. Elle mudahale gerekmez.');
+  Log('WAL checkpoint: v3 otomatik');
 end;
 
 procedure TfrmMain.btnRefreshAllClick(Sender: TObject);
@@ -3460,7 +3289,7 @@ end;
 
 procedure TfrmMain.UpdateTx;
 begin
-  if Assigned(FKv) and FKv.InBatch then
+  if Assigned(FBe) and FBe.InBatch then
     lblTx.Caption := '  TX: ACIK'
   else
     lblTx.Caption := '  TX: kapali';
@@ -3580,7 +3409,7 @@ begin
       end;
     end;
     if (db <> '') and FileExists(db) then
-      OpenDB(db);
+      OpenDB(db, True);
   finally
     sl.Free;
   end;
