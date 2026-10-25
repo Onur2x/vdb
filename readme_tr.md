@@ -31,18 +31,27 @@ uygulamalar için SQLite'a alternatif olarak geliştirilmiştir.
 ## Mimari
 
 ```
-SQL metni → VDbParser → VDbAst → VDbExecutor → VDbTable → VDbCore → .odb
+SQL metni → VDbParser → VDbAst → VDbExecutor → VDbTable → IVDbBackend → .odb
+                                                            ├─ VDbBackendV3 → VDbPageEngine (v3, varsayılan)
+                                                            └─ VDbBackendV2 → VDbCore (v2, salt-okunur/göç)
 ```
 
 | Birim | Görev |
 |---|---|
-| `VDbCore.pas` | Append-only anahtar/değer motoru, kilitler, dosya G/Ç |
+| `VDbFactory.pas` | **Uygulama giriş noktası**: `VdbOpen` / `VdbOpenOrCreate` / `VdbOpenWithPassword` |
+| `VDbBackendApi.pas` | `IVdbBackend` sözleşmesi (SQL katmanı motorun somut tipini bilmez) |
+| `VDbPageEngine.pas` | v3 sayfa motoru (4 KB sayfa, WAL, kurtarma, `.idx` önbelleği) |
+| `VDbPageStore.pas` | Sayfa deposu, dosya büyütme, bayt-aralığı kilidi |
+| `VDbBackendV3.pas` | `IVdbBackend`'in v3 gerçeklemesi |
+| `VDbBackendV2.pas` | `IVdbBackend`'in v2 adaptörü (göç/legacy) |
+| `VDbCore.pas` | v2 append-only anahtar/değer motoru — **legacy, salt-okunur** |
 | `VDbTable.pas` | Şema, indeks, FK, kısıtlar, bölümleme |
 | `VDbAst.pas` | Tip güvenli AST modeli |
 | `VDbParser.pas` | Tokenizer + recursive-descent parser |
 | `VDbExecutor.pas` | Filtre, JOIN, gruplama, sıralama, pencere fonksiyonları |
 | `VDbSql.pas` | Dış cephe: `TVSql.Exec` |
-| `VDbWal.pas` | Write-ahead log, replay, checkpoint |
+| `VDbMigrate.pas` | v2 → v3 kopyalama + bayt-bayt doğrulama |
+| `VDbWal.pas` | v2 write-ahead log (legacy) |
 | `VDbSkipList.pas` | H3 skiplist indeksi (rank/span destekli) |
 | `VDbCrypt.pas` | AES-256, GCM, anahtar yönetimi |
 | `VDbNet.pas` | VDBS TCP protokolü |
@@ -68,24 +77,45 @@ lazbuild -B vdbapi.lpi
 
 ### İlk sorgu (Pascal)
 
+Yeni uygulamalar motorun somut tipini bilmez; giriş noktası `VDbFactory`'dir.
+`VdbOpenOrCreate` dosya yoksa **v3** olarak oluşturur, varsa açar. Var olan
+**v2** dosyası varsayılan olarak reddedilir (göç: `vdbmig`, bkz.
+[GOC_V2_V3.md](GOC_V2_V3.md)).
+
 ```pascal
-uses VDbSql;
+uses VDbBackendApi, VDbFactory, VDbTable, VDbSql;
 
 var
-  DB: TVSql;
+  Be: IVdbBackend;
+  Tb: TVTableDb;
+  Db: TVSql;
   R: TSqlResult;
 begin
-  DB := TVSql.Create('veritabani.odb');
+  VdbOpenOrCreate('veritabani.odb', Be);   // out parametre (bkz. not)
+  Tb := TVTableDb.CreateBackend(Be);
+  Db := TVSql.Create(Tb);
   try
-    DB.Exec('CREATE TABLE urun (id INTEGER PRIMARY KEY, ad TEXT, fiyat FLOAT)', R);
-    DB.Exec('INSERT INTO urun (ad, fiyat) VALUES (''Laptop'', 15000)', R);
-    DB.Exec('SELECT ad, fiyat FROM urun WHERE fiyat > 1000', R);
+    Tb.Open('.');
+    R := Db.Exec('CREATE TABLE urun (id INTEGER PRIMARY KEY, ad TEXT, fiyat FLOAT)');
+    R := Db.Exec('INSERT INTO urun (ad, fiyat) VALUES (''Laptop'', 15000)');
+    R := Db.Exec('SELECT ad, fiyat FROM urun WHERE fiyat > 1000');
     // R.Cols, R.Rows, R.Data
   finally
-    DB.Free;
+    Db.Free;
+    Tb.Free;
+    Be := nil;                             // motoru kapatır (dosya kilidi bırakılır)
   end;
 end;
 ```
+
+> **Neden `out` parametre?** FPC 3.2.4'te `function ...: IVdbBackend` biçiminde
+> arayüz **döndüren** bir fonksiyon, sonuca fazladan bir referans bırakıyor;
+> `Be := nil` motoru kapatmıyor ve aynı süreçte dosya yeniden açılamıyor
+> ("dosya kullanımda"). Aynı iş `out` parametreyle yapıldığında referans tam
+> bırakılıyor. Ölçüm: `probe5`/`probe6`; ayrıntı `VDbFactory.pas` başlığında.
+
+Şifreli dosya: `VdbOpenWithPassword(Path, Parola, Be)`. Parolasız veya yanlış
+parolayla açılış reddedilir.
 
 API ayrıntıları ve SQL kullanımı: [kullanim.md](kullanim.md)
 
@@ -93,29 +123,29 @@ API ayrıntıları ve SQL kullanımı: [kullanim.md](kullanim.md)
 
 ## Test durumu
 
-Son doğrulanan durum (2026-10-19):
+Son doğrulanan durum (2026-10-25, `v3` dalı):
 
 | Kapı | Sonuç |
 |---|---|
-| `sqltest` | 2527 / 2527 |
-| `crashtest` | 8 / 8 (veri kaybı yok) |
-| `rawchk` | 29 / 29 |
-| `mrowchk` | 0 hata |
-| `fuzzchk` | 3000 / 3000 |
-| `sqlite_diff` | 4000 / 4000 |
-| `hashchk` | 80 / 80 |
-| `copychk` | 17 / 17 |
-| `zonechk` | 0 hata |
-| `skipchk` | 0 hata |
-| `countchk` | 120 / 120 |
+| `sqltest` (v2 motoru) | **3116 / 0 / 0** |
+| `sqltest --backend=v3` | **2252 / 0 / 58** (58 atla: v2'ye özgü yollar) |
+| `crashtest` | 11 / 11 (veri kaybı yok) |
+| `pagechk` | 21 / 21 |
+| `storechk` | 15 / 15 |
+| `heapchk` | 20 / 20 |
+| `idxchk` | 17 / 17 |
+| `backendchk` | 108 / 108 |
+| `v3sqlchk` | 128 / 128 |
+| `migchk` | 13 / 13 |
+| `factorychk` | 13 / 13 |
 
-Depoda artık yalnızca `sqltest` paketi bulunur; diğer kapılar tek seferlik
-doğrulama araçlarıydı ve temizlik sırasında kaldırıldı. Sonuçlar yukarıdaki
-gibi kayıt altına alınmıştır.
+`atlanan=58` sessiz yeşil değildir: yalnız v2 motorunun veri dosyası / WAL /
+arşiv / SAVEPOINT yollarını kullanan testler sayılır ve raporlanır.
 
 ```bash
 lazbuild -B sqltest.lpi
-sqltest.exe C:\temp\vdbtest
+sqltest.exe C:\temp\vdbtest                  # v2 motoru
+sqltest.exe C:\temp\vdbtest --backend=v3     # v3 sayfa motoru
 ```
 
 ---
@@ -149,7 +179,8 @@ Tek satırlık yazım dosyaya ekleme yaptığı için ölü bölgeler birikir; m
 bunu **isteğe bağlı otomatik sıkıştırma** ile toparlayabilir
 (`AutoCompactEnabled`, varsayılan **kapalı**; eşik `AutoCompactRatio=0,35`,
 `AutoCompactMinBytes=4 MB`; açıkken commit sonunda yalnızca eşik aşıldığında
-çalışır).
+çalışır). Bu davranış **v2 motoruna** aittir; **v3 sayfa motorunda ölü-bayt
+eşiği yoktur** — v3'te sıkıştırma her zaman açık bir işlemdir (`VACUUM`).
 
 H3 skiplist (100.000 satır): 100 × (`UPDATE` + indeksli `COUNT(*)`)
 **0,39–0,42 ms/döngü** — önceki 24,99 ms'e göre **~60–64x**.
@@ -188,12 +219,13 @@ Kök nedenler ve tüm ölçümler:
 ## Proje yapısı
 
 ```
-VDb*.pas            Motor birimleri
-sqltest.lpi/lpr     SQL test paketi
+VDb*.pas            Motor birimleri (giriş noktası: VDbFactory.pas)
+sqltest.lpi/lpr     SQL test paketi (v2 + --backend=v3)
+factorychk.lpi/lpr  Uygulama giriş noktası kapısı (v3/v2 politikası)
 vdbmig.lpi/lpr      v2 -> v3 göç aracı (bkz. GOC_V2_V3.md)
 vdbapi.*            DLL / C API projesi
-examples/           Örnek projeler
-yonetim/            GUI yönetici
+examples/           Örnek projeler (hepsi VDbFactory ile v3 açar)
+yonetim/            GUI yönetici (v3; v2 dosyasında vdbmig yönlendirir)
 dcpcrypt/           Şifreleme bağımlılığı
 dokuman/            Bu dokümanlar (Git dışı)
 ```

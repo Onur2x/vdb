@@ -104,6 +104,28 @@ Not: v3.1'de `COUNT(*)` artık tarama yapmıyor (canlı sayaç, 0,1 ms); hedefin
 - Akışlı / sıfır-kopya tarama; QPC ölçüm altyapısı
 - Ayrıntı: "Sprint 4 (v3.1)" bölümü
 
+### v3.1 sonrası: uygulamaların v3'e geçişi (2026-10-25)
+
+Motor hazırdı ama uygulamalar hâlâ `TVDb` somut tipini kullanıyordu. Geçiş
+tamamlandı:
+
+| Ne | Durum |
+|---|---|
+| `VDbFactory.pas` — tek giriş noktası (`VdbOpen`, `VdbOpenOrCreate`, `VdbOpenWithPassword`) | tamam; v3 varsayılan, v2 reddedilir (`AllowV2` yalnız göç) |
+| `examples/` 01–06, 09–12 | tamam; hepsi `VdbOpenOrCreate` + `TVTableDb.CreateBackend` |
+| `yonetim/` (GUI) | tamam; `FBe: IVdbBackend`, v2 dosyasında `vdbmig` yönlendirmesi |
+| `factorychk` kapısı (13 kontrol) + CI adımı | tamam |
+
+Geçişte bulunan iki gerçek hata (ikisi de veri bütünlüğü/dosya kilidi ile ilgili):
+
+1. **Boş v3 dosyası açılamıyordu.** `VDbPageHeap.TryLoadIdx` döngü değişkeni
+   `LongWord`'dü; `.idx` içinde 0 kayıt varken `High(entries) = -1` →
+   `$FFFFFFFF` taşması ve AV. `Integer` yapıldı.
+2. **Motor referansı bırakılmıyordu.** FPC 3.2.4'te arayüz **döndüren**
+   fonksiyon fazladan referans bırakıyor (`Be := nil` dosyayı kapatmıyordu);
+   ayrıca `TVTableDb.Destroy` `FKvB`'yi serbest bırakmıyordu. Giriş noktaları
+   `out` parametreye geçti, yıkıcıya `FKvB := nil` eklendi. Ölçüm: probe5/probe6.
+
 ### Sıradaki sürüme ertelenen (v3.2)
 - Sıralı anahtar düzeni + B+tree yaprakları → **BETWEEN / aralık sorguları**
 - Replication (mantıksal değişim günlüğü)

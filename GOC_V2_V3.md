@@ -17,6 +17,20 @@ kontrollerini, raporu ve çıkış kodlarını ekler.
   doğrulama tutmazsa hedef `.bad` sonekiyle **karantinaya** alınır, böylece
   bir sonraki açılış onu geçerli veritabanı sanmaz.
 
+## Uygulamalar neden v2 dosyasını açmıyor
+
+`VDbFactory` (uygulama giriş noktası) **v3 varsayılandır**: `VdbOpen` /
+`VdbOpenOrCreate` var olan bir v2 dosyasını `EVdbFactory` ile reddeder ve
+şunu önerir:
+
+```text
+vdbmig copy "<v2_dizin>" "<yeni>.odb"
+```
+
+Yönetim GUI'si de aynı politikayı uygular (açılışta sessiz, kullanıcı dosya
+seçtiğinde mesajlı). v2 yalnızca `AllowV2=True` ile açılır; bu yol göç
+araçları içindir. Kaynak dosyaya hiçbir durumda yazılmaz.
+
 ## Derleme
 
 ```bash

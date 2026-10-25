@@ -156,14 +156,14 @@ v3 koşusu yalnız "kapsam" değil, **gerçek kusurlar** ortaya çıkardı:
 | `BACKUP` / `RESTORE` (tek `.odb`, checkpoint sonrası sayfa kopyası) | **var** (Sprint 3.2) | 3.2 ✔ |
 | PITR (`RECOVER TO`) / WAL arşivi / `AS OF` | **yok**; `ecUnsupported` + yol gösteren mesaj (Sprint 3.6) | 3.6 ✔ (gerçek PITR v3.1) |
 | `VACUUM` / `Compact` (canlı kayıtlar yeni dosyaya, atomik değişim) | **var** (Sprint 3.3) | 3.3 ✔ |
-| `AutoCompact` | yok (v2'de de varsayılan **kapalı**) | v3.1 |
+| `AutoCompact` | **yok** — v3'te "ölü bayt oranı" kavramı yok; sıkıştırma her zaman açık işlemdir (`VACUUM`). Yönetim GUI'si VACUUM'a yönlendirir | — |
 | Sayfa düzeyi **AES-256-GCM** şifreleme (zarf: nonce+şifre+tag = 4124 B) | **var** (Sprint 3.4) | 3.4 ✔ |
-| `ALTER DATABASE KEY` (v3 dosya rekey) | `ecUnsupported` | 3.4b / v3.1 |
+| `ALTER DATABASE KEY` (v2 kolon anahtarı rotasyonu) | `ecUnsupported`; v3'te dosya parolası açılışta verilir (`VdbOpenWithPassword`) | — |
 | Kayıt/kolon düzeyi şifreleme (v2 tarzı) | yok; sayfa şifreleme tüm veriyi kapsar | — |
-| `START REPLICATION` / `PUMP` / slot / `SHOW` / `STOP` | **yok**; hepsi `ecUnsupported` + "v3.1: mantıksal günlük" (Sprint 3.5) | 3.5 ✔ (gerçek replikasyon v3.1) |
-| Zone map (bölüm budama) | **kapalı**: v3 düz tam tarama yapar; sonuçlar birebir doğru (Sprint 3.7) | 3.7 ✔ (budama v3.1) |
-| `SAVEPOINT` | `ecUnsupported` | v3.1 |
-| B+tree / BETWEEN hızlandırma / `.idx` varint | yok | v3.1 |
+| `START REPLICATION` / `PUMP` / slot / `SHOW` / `STOP` | **yok**; hepsi `ecUnsupported` + "v3.1: mantıksal günlük" (Sprint 3.5) | 3.5 ✔ (gerçek replikasyon v3.2) |
+| Zone map (bölüm budama) | **kapalı**: v3 düz tam tarama yapar; sonuçlar birebir doğru (Sprint 3.7) | 3.7 ✔ (budama v3.2) |
+| `SAVEPOINT` | `ecUnsupported` (örnek 04 bunu çalışma anında bildirir) | v3.2 |
+| B+tree / BETWEEN hızlandırma / `.idx` varint | yok | v3.2 |
 
 ## 5. Yeniden üretme
 
@@ -176,7 +176,28 @@ sqltest.exe <dir2> --backend=v3  # SONUC: gecen=2252 kalan=0 atlanan=58
 Kapılar (yeniden koşuldu, hepsi yeşil):
 `pagechk 21/21`, `storechk 15/15`, `heapchk 20/20`, `idxchk 17/17`,
 `crashtest 11/11`, `backendchk 108/108` (v3.1: 19 sayaç kontrolü eklendi),
-`v3sqlchk 128/128`, `migchk 13/13`.
+`v3sqlchk 128/128`, `migchk 13/13`, `factorychk 13/13`.
+
+## 4b. Uygulama giriş noktası: `VDbFactory` (2026-10-25)
+
+Uygulamalar motorun somut tipini bilmez; tek giriş noktası `VDbFactory`'dir:
+
+```pascal
+VdbOpenOrCreate(Path, Be);             // v3; dosya yoksa oluşturur
+VdbOpen(Path, Be);                     // v3; v2 dosyasını REDDEDER
+VdbOpen(Path, Be, True, True);         // yalnız göç araçları: v2'ye izin
+VdbOpenWithPassword(Path, Parola, Be); // şifreli v3
+```
+
+- Varsayılan **v3**'tür; v2 dosyası `EVdbFactory` ile reddedilir ve
+  `vdbmig copy` komutu gösterilir.
+- Giriş noktaları arayüzü **`out` parametreyle** verir: FPC 3.2.4'te arayüz
+  döndüren fonksiyon fazladan bir referans bırakıyor, motor (dolayısıyla dosya
+  kilidi) kapanmıyordu. `probe5`/`probe6` ile ölçüldü.
+- `TVTableDb.Destroy` artık `FKvB`'yi bırakır; `tbl.Free` tek başına da
+  dosyayı kapatır.
+- `examples/` (01–06, 09–12) ve `yonetim/` bu giriş noktasına geçirildi;
+  `factorychk` kapısı politikayı CI'da doğrular (13/13).
 
 **Göç aracı (`vdbmig`, 2026-10-25):** `migchk` motoru doğrular; `vdbmig` CLI'si
 de gerçek bir v2 dosyasıyla sınandı ve CI'ya kapı olarak eklendi —
