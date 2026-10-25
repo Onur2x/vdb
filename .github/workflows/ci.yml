@@ -74,6 +74,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:LAZBUILD -B pitrchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:LAZBUILD -B btreechk.lpi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Sayfa deposu kapisi (storechk)
         shell: pwsh
@@ -298,6 +300,24 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'pitrchk kalan > 0'
+            exit 1
+          }
+
+      - name: B+tree sirali indeks kapisi (btreechk)
+        shell: pwsh
+        run: |
+          # v4: sirali indeksin veri yapisi. Bagimsiz oracle'a karsi tam
+          # dogrulama + skiplist ile PARITE. Kapı yalniz karsilastirmayi
+          # degil, yapi degismezlerini de denetler (SubCount, ayirici
+          # anahtar, yaprak zinciri sirasi).
+          $out = & .\btreechk.exe 50000 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'B\+TREE INDEKS DOGRULANDI') {
+            Write-Error 'btreechk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'btreechk kalan > 0'
             exit 1
           }
 

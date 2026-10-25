@@ -328,6 +328,44 @@ paralel bir **mantıksal** günlük eklendi. Zone map ise v2'nin ham kayıt
 ofsetlerine dayanır; v3 heap hücre biçiminde yeniden inşa edilmesi gerekir
 (sıradaki performans dilimi).
 
+### Sıralı indeks: bellek içi B+tree (v4, 2026-10-26)
+
+Sıralı indeks skiplist'ten **B+tree**'ye taşındı: `VDbBTree.pas`
+(`TVDbBTree`), `TVDbSkipList` ile aynı sözleşmeyi uygular ve `TIdxSkip`
+içinde damla yerine geçer. `.idx` dosya biçimi, WAL, checkpoint, PITR ve göç
+**değişmedi** — indeks türetilmiş veridir.
+
+- Yaprakta 96 anahtar; dolunca 48/48 bölünür. İç düğümde 96 ayırıcı + 97
+  çocuk. Yapraklar zincirli; aralık taraması zincirden akar.
+- **Silme yeniden dengelenmez** (birleştirme/ödünç alma yok): boşalan yaprak
+  ağaçta kalır, taramada atlanır. Arama değişmezleri bozulmaz (ayırıcı yalnız
+  aşağı çekilir) ve veri kaybı riski düşük kalır.
+- Her düğümde `SubCount`; `RankBefore`/`CountRange` O(log N). Eş anlamlı
+  anahtarlar (aynı `Key`, farklı PK) toplam sırada durur; aralık sınırları
+  anahtar karşılaştırıcısıyla ölçülür (skiplist ile birebir).
+
+| Ölçüm (`btreechk`, QPC) | B+tree | skiplist |
+|---|---|---|
+| `LoadSorted` 10.100 girdi | **0,5 ms** | 1,1 ms |
+| 100.000 dar aralık (21 anahtar) | 588,8 ms | **503,4 ms** |
+| 10.000 geniş aralık (401 anahtar) | **278,1 ms** | 306,9 ms |
+| 10.100 rastgele ekleme | 8,8 ms | 8,2 ms |
+
+Dürüst sonuç: toplu yükleme ~2x hızlı, geniş aralık ~%9 hızlı, **dar aralık
+~%17 yavaş** (düğüm inişinde daha çok anahtar karşılaştırması). Motor
+düzeyinde fark görünmüyor: 1071 satırlık aralık iki yapıda da **2,3 ms**
+(sorgu, satır okuma/kopyalama ile sınırlı).
+
+Ek düzeltme: `WHERE <indeksli kolon> <op> sabit ORDER BY <aynı kolon> LIMIT k`
+sorgusunda koşulsuz "akışlı top-N" (tam tarama) seçiliyordu. Artık WHERE
+sıralama kolonunu sınırlıyorsa önce indeks dilimi denenir. Ölçülen
+(`idxbench`, 50.000 satır): **16,6 → 3,0 ms**.
+
+Kapı: `btreechk` (12. kapı) **30/0** — bağımsız oracle'a karşı `LoadSorted`,
+ekleme/silme/`All`, 64 sınır kombinasyonu, `CountRange` = `CollectRange`
+uzunluğu, `RankBefore`, eş anlamlı anahtarlar, sayısal karşılaştırıcı,
+**yapı değişmezleri** (`CheckInvariants`) ve **skiplist paritesi**.
+
 ### Sayfa şifreleme (Sprint 3.4)
 
 Varsayılan **kapalı**; v3 dosyası eskisi gibi düz metindir. Şifreli dosya

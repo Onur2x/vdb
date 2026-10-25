@@ -253,6 +253,74 @@ Not: `AS OF TIMESTAMP` her çağrıda taban kopyası + ileri replay yapar; tam
 sayımda yüzlerce ms sürer. Hedefe en yakın taban seçimi zaten yapılıyor;
 kalan maliyet replay'in kendisi.
 
+### v4 — B+tree sıralı indeks ve aralık sorguları (2026-10-26)
+
+Sıralı indeks artık **bellek içi B+tree**. `VDbBTree.pas` (`TVDbBTree`),
+`TVDbSkipList` ile **aynı sözleşmeyi** uygular (aynı metot imzaları, aynı
+karşılaştırıcı tipleri) ve `TIdxSkip` içinde damla yerine geçer; motor
+tarafında başka hiçbir şey değişmedi.
+
+| Konu | Yapılan |
+|---|---|
+| Düğüm | Yaprakta 96 anahtar (dolunca 48/48 bölünür), iç düğümde 96 ayırıcı + 97 çocuk. Yapraklar `Next` ile zincirli; aralık taraması zincir üzerinden akar. |
+| Ayırıcı | `Entries[i]` = sağ çocuğun (`Children[i+1]`) alt sınır girdisi. Ekleme "E >= ayırıcı → sağa" kuralıyla iner, böylece ayırıcı hep **geçerli bir alt sınır** kalır. |
+| Silme | **Yeniden dengelenmez** (birleştirme/ödünç alma yok): girdi yapraktan çıkar, boşalan yaprak ağaçta kalır ve taramada atlanır. Bu "lazy delete" B+tree arama değişmezlerini bozmaz (ayırıcı yalnız aşağı çekilir); veri kaybı riski düşük tutuldu. |
+| Rank/sayım | Her düğümde `SubCount`; `RankBefore`/`CountRange` O(log N). `SubCount` bakımı kapıda ayrıca denetlenir. |
+| Eş anlamlı | Aynı `Key` + farklı PK girdileri `FullCompare` ile toplam sırada; aralık sınırları anahtar karşılaştırıcısıyla (skiplist ile birebir). |
+| Motor bağlantısı | `TIdxSkip.List: TVDbBTree`, `Create(Cmp.FullCompare, 96)`. `.idx` biçimi, WAL, checkpoint, PITR ve göç **değişmedi** (indeks türetilmiş veridir). |
+
+**Ayrıca düzeltilen sorgu tercihi:** `WHERE <indeksli kolon> <op> sabit
+ORDER BY <aynı kolon> LIMIT k` sorgusunda eski kod koşulsuz "akışlı top-N"
+(full scan) seçiyordu. Artık WHERE sıralama kolonunu sınırlıyorsa önce indeks
+dilimi denenir (`VdbSelBoundsCol`; OR/bilinmeyen düğümde eski davranış).
+Ölçülen (50.000 satır, `tests/bench/idxbench`): `WHERE n >= 500 ORDER BY n
+LIMIT 10` **16,6 → 3,0 ms**.
+
+Kapı — `btreechk` (12), bağımsız oracle + skiplist paritesi:
+
+| Kontrol | Durum |
+|---|---|
+| `LoadSorted`, rastgele ekleme, mükerrer reddi, `All()` sırası | 30/0 |
+| `CollectRange` **64 sınır kombinasyonu** (HasLo/HasHi/LoInc/HiInc), `CountRange` (`= CollectRange uzunluğu`), `RankBefore` 400+400 sorgu | birebir |
+| Silme (yarısı + tamamı), eş anlamlı anahtarlar, sayısal karşılaştırıcı (`"9" < "10"` bayt sırası ters) | birebir |
+| **Yapı değişmezleri** (`CheckInvariants`): `SubCount`, ayırıcı ≤ sağ alt ağaç alt sınırı, sol alt ağaç < ayırıcı, yaprak zinciri sırası ve toplam sayı | sağlam |
+| **Parite**: aynı işlem dizisi skiplist üzerinde; her adımda `All`/aralık/sayım aynı | aynı |
+
+Ölçüm (`btreechk`, 50.000 girdilik kapı koşusu, QPC, tek koşu — 10.100
+girdilik yapı üzerinde):
+
+| İşlem | B+tree | skiplist |
+|---|---|---|
+| `LoadSorted` 10.100 girdi | **0,5 ms** | 1,1 ms |
+| 100.000 dar aralık (21 anahtar) | 588,8 ms (5,9 µs/sorgu) | 503,4 ms (5,0 µs/sorgu) |
+| 10.000 geniş aralık (401 anahtar) | **278,1 ms** | 306,9 ms |
+| 10.100 rastgele ekleme | 8,8 ms | 8,2 ms |
+
+Dürüst sonuç: **toplu yükleme ~2x hızlı, geniş aralık ~%9 hızlı, dar aralık
+~%17 yavaş** (düğüm inişinde ~20 anahtar karşılaştırması; skiplist ~12).
+Motor düzeyinde fark görünmüyor, çünkü SQL aralık sorgusu satır okuma/kopyalama
+ile sınırlı (`idxbench`: `n BETWEEN 100 AND 120`, 1071 satır **2,3 ms** — iki
+yapıda da aynı).
+
+`idxbench` (50.000 satır, indeks `ix_n`, QPC, 3 koşu medyanı):
+
+| Sorgu | Süre | Satır |
+|---|---|---|
+| `WHERE n BETWEEN 100 AND 120` (indekssiz tam tarama) | 60,9 ms | 1071 |
+| `WHERE n BETWEEN 100 AND 120` (indeks) | **2,3 ms** | 1071 |
+| `WHERE n = 42` | **0,1 ms** | 51 |
+| `COUNT(*) WHERE n BETWEEN 100 AND 120` | **0,0 ms** (~0,1 ms) | 1 |
+| `ORDER BY n LIMIT 20` | 13,9 ms | 20 |
+| `ORDER BY n` (LIMIT yok, 50k satır çıkışı) | 101,8 ms | 50000 |
+| `WHERE n >= 500 ORDER BY n LIMIT 10` | **3,0 ms** | 10 |
+| `SELECT s ... BETWEEN` kapsayan indeks (`n INCLUDE s`) | **0,6 ms** | 1071 |
+| `SELECT s ... BETWEEN` kapsamasız (satır okuma) | 2,1 ms | 1071 |
+
+Not (dürüst sınır): `ORDER BY <indeksli kolon>` **LIMIT yokken** hâlâ tam
+tarama + sıralama yapar (101,8 ms). İndeks sırasıyla 50.000 satırı tek tek
+okumak rastgele seek ürettiği için daha yavaş kalıyor; bu yol bilinçli olarak
+kapalı (`TryIndexOrder` LIMIT/OFFSET yoksa devreye girmez).
+
 ### v4'te bulunan ve düzeltilen sessiz yanlış sonuç (indeksli `IN`)
 
 `sqltest` rasgele diferansiyel testi (T147) v4 sırasında **kararsız**
@@ -278,7 +346,6 @@ PK yolu ve COUNT yolu birebir; NULL içeren liste daraltmaz.
 
 ### Sıradaki sürüme ertelenen (v4 sonrası)
 - Replikasyon protokolü (T95b, T101) — mantıksal günlük artık hazır
-- Sıralı anahtar düzeni + B+tree yaprakları → **BETWEEN / aralık sorguları**
 - Zone map'in sayfa düzeyinde yeniden ele alınması
 - Satır gövdesi varint/delta kodlama (F3-1'in kalanı)
 - Dosya boyutu (PK'nin ikinci kez yazılması, hücre başlığı sıkıştırma)
@@ -690,6 +757,8 @@ En yavaş tek ölçüm 32 ms; ilk turda `.idx` soğuk önbellekten okunduğu iç
 4. Göç hiçbir senaryoda kaynak `.odb`'yi değiştirmez; `.v2bak` üretir.
 5. Bozuk `.idx` hiçbir zaman veri kaybına yol açmaz — yalnız yavaşlar.
 6. Rakamlar yalnız aynı ortamda ölçülerek raporlanır.
+7. Sıralı indeks veri yapısı (`btreechk`, 12. kapı) bağımsız oracle'a karşı ve
+   skiplist paritesiyle doğrulanır; yapı değişmezleri her koşuda denetlenir.
 
 ---
 

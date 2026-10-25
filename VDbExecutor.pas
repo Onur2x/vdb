@@ -10721,6 +10721,48 @@ begin
   Result := True;   // bilinmeyen / alt sorgu / pencere: guvenli taraf
 end;
 
+function VdbSelBoundsCol(E: TSqlExprNode; const Name: string): Boolean;
+// WHERE icinde Name kolonunu SINIRLAYAN bir karsilastirma var mi?
+// Yalniz AND ile bagli kosullar incelenir; OR/bilinmeyen dugum -> False.
+// Amac: "WHERE indeksli >= x ORDER BY indeksli LIMIT k" sorgusunu akisli
+// top-N yerine indeks dilimine vermek (indeks alt sinirdan baslar, k satir
+// okur). Yanlis pozitif sonucu degistirmez (TryIndexOrder basarisiz olursa
+// akisli yola donulur), yalnizca hiz tercihini etkiler.
+var
+  b: TSqlBinaryOpNode;
+  u: TSqlUnaryOpNode;
+  C: TSqlExprNode;
+begin
+  Result := False;
+  if E = nil then Exit;
+  if E is TSqlBinaryOpNode then
+  begin
+    b := TSqlBinaryOpNode(E);
+    if b.Op = sboAnd then
+      Exit(VdbSelBoundsCol(b.Left, Name) or VdbSelBoundsCol(b.Right, Name));
+    if not (b.Op in [sboEq, sboLt, sboLte, sboGt, sboGte]) then Exit;
+    if (b.Left is TSqlColumnRefNode) and (b.Right is TSqlLiteralNode) then
+      Exit(VDbNorm(TSqlColumnRefNode(b.Left).ColumnName) = VDbNorm(Name));
+    if (b.Right is TSqlColumnRefNode) and (b.Left is TSqlLiteralNode) then
+      Exit(VDbNorm(TSqlColumnRefNode(b.Right).ColumnName) = VDbNorm(Name));
+    Exit;
+  end;
+  if E is TSqlBetweenNode then
+  begin
+    C := TSqlBetweenNode(E).Expr;
+    Exit((C is TSqlColumnRefNode) and
+         (VDbNorm(TSqlColumnRefNode(C).ColumnName) = VDbNorm(Name)) and
+         (TSqlBetweenNode(E).LowBound is TSqlLiteralNode) and
+         (TSqlBetweenNode(E).HighBound is TSqlLiteralNode));
+  end;
+  if E is TSqlUnaryOpNode then
+  begin
+    u := TSqlUnaryOpNode(E);
+    if u.Op = suoNot then Exit;
+    Exit(VdbSelBoundsCol(u.Operand, Name));
+  end;
+end;
+
 function VdbStreamSelCb(Key: QWord; Buf: PByte; Len: Integer;
   User: Pointer): Boolean;
 var
@@ -12318,7 +12360,11 @@ begin
             if (Stmt.WhereClause = nil) or (td.PkIndex < 0) or
                (not VdbStreamSelRefersCol(Stmt.WhereClause,
                  td.Cols[td.PkIndex].Name)) then
-              preferStream := True;
+              // v4: WHERE siralama kolonunu sinirliyorsa indeks dilimi
+              // (alt sinirdan basla, k satir oku) akisli top-N'den cok daha
+              // hizlidir. Sinir yoksa eski tercih korunur.
+              if not VdbSelBoundsCol(Stmt.WhereClause, orderName) then
+                preferStream := True;
         end;
         if preferStream then
         begin

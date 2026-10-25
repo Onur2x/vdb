@@ -14,7 +14,7 @@ interface
 uses
   Classes, SysUtils, SyncObjs, Generics.Collections, VDbCore, VDbCrypt, VDbErr,
   VDbBackendApi, VDbBackendV2,
-  VDbText, VDbTypes, VDbSkipList;
+  VDbText, VDbTypes, VDbSkipList, VDbBTree;
 
 type
   // Use Pointer for TSqlSelectStmt parameters to avoid circular dependency with VDbAst
@@ -116,7 +116,7 @@ type
 
   TIdxSkip = class
   public
-    List: TVDbSkipList;
+    List: TVDbBTree;
     Cmp: TIdxSkipCmp;
     constructor Create(ACtype: Byte; const ACtypes: TByteArray);
     destructor Destroy; override;
@@ -2799,7 +2799,7 @@ begin
   Cmp.Ctype := ACtype;
   Cmp.Ctypes := Copy(ACtypes, 0, Length(ACtypes));
   Cmp.IsMulti := Length(ACtypes) > 1;
-  List := TVDbSkipList.Create(Cmp.FullCompare, 32, 1);
+  List := TVDbBTree.Create(Cmp.FullCompare, 96);
 end;
 
 destructor TIdxSkip.Destroy;
