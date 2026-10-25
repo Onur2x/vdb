@@ -23,9 +23,13 @@ echo   All examples, tests and DLLs
 echo ============================================
 echo.
 
-REM TR: FPC yolu / FPC path
+REM TR: FPC yolu / FPC path (bulunamazsa PATH'ten)
 set FPC=C:\lazarus\fpc\3.2.4\bin\i386-win32\fpc.exe
+if not exist "%FPC%" for /f "delims=" %%i in ('where fpc 2^>nul') do set "FPC=%%i"
 set LAZBUILD=C:\lazarus\lazbuild.exe
+if not exist "%LAZBUILD%" for /f "delims=" %%i in ('where lazbuild 2^>nul') do set "LAZBUILD=%%i"
+if not exist "%FPC%" echo UYARI: fpc.exe bulunamadi - PATH'e ekleyin veya FPC degiskenini duzeltin.
+if not exist "%LAZBUILD%" echo UYARI: lazbuild.exe bulunamadi - PATH'e ekleyin veya LAZBUILD degiskenini duzeltin.
 
 REM TR: Birim yollari (ornekler icin) / Unit paths (for examples)
 set UNITS=-Fu.. -Fu..\..\ -Fu..\..\dcpcrypt -Fu..\..\dcpcrypt\Ciphers -Fu..\..\dcpcrypt\Hashes
@@ -47,7 +51,7 @@ call :build_example "9" "Ornek 09 - JSON" "09_json_veri" "ornek09"
 call :build_example "10" "Ornek 10 - Ileri Ozellikler / Advanced Features" "10_ileri_ozellikler" "ornek10"
 
 echo [11/%TOTAL%] Ornek 11 - GUI (DBGrid)...
-cd /d "%~dp0examples\11_gui_ornek"
+cd /d "%~dp011_gui_ornek"
 del *.o *.ppu 2>nul
 %LAZBUILD% -B ornek11.lpi > compile.log 2>&1
 if exist ornek11.exe (
@@ -59,7 +63,7 @@ if exist ornek11.exe (
 )
 
 echo [12/%TOTAL%] Ornek 12 - 1M Kayitli GUI Demo / 1M-row GUI demo...
-cd /d "%~dp0examples\12_milyon_demo"
+cd /d "%~dp012_milyon_demo"
 del *.o *.ppu 2>nul
 %LAZBUILD% -B ornek12.lpi > compile.log 2>&1
 if exist ornek12.exe (
@@ -71,7 +75,7 @@ if exist ornek12.exe (
 )
 
 echo [13/%TOTAL%] Test Paketi / Test Suite (sqltest)...
-cd /d "%~dp0"
+cd /d "%~dp0.."
 del *.o *.ppu 2>nul
 %LAZBUILD% -B sqltest.lpi > compile.log 2>&1
 if exist sqltest.exe (
@@ -83,7 +87,7 @@ if exist sqltest.exe (
 )
 
 echo [14/%TOTAL%] DLL API (vdbapi)...
-cd /d "%~dp0"
+cd /d "%~dp0.."
 del *.o *.ppu 2>nul
 %LAZBUILD% -B vdbapi.lpi > compile.log 2>&1
 if exist vdbapi.dll (
@@ -132,7 +136,7 @@ REM   %4 = kaynak govdesi / source base name
 REM --------------------------------------------
 :build_example
 echo [%~1/%TOTAL%] %~2...
-cd /d "%~dp0examples\%~3"
+cd /d "%~dp0%~3"
 del *.o *.ppu 2>nul
 %FPC% %UNITS% %~4.lpr > compile.log 2>&1
 if exist %~4.exe (
