@@ -48,22 +48,23 @@ Bunlar v3'ün kıyaslanacağı gerçek taban çizgisi. Tüm sayılar benim ölç
 | Toplu INSERT | 4,300 µs/satır | 0,942 µs/satır |
 | Autocommit INSERT | 0,435 ms/satır | 1,876 ms/satır |
 
-**v3.0 kabul hedefleri (200k satır):**
+**v3.0 kabul hedefleri (200k satır) — v3.1 sonucu:**
 
-| Metrik | Hedef | Ölçüm yöntemi | v3.0 ölçülen (2026-10-25) | Durum |
-|---|---|---|---|---|
-| Dosya boyutu | **≤ 11 MB** (≤ 55 B/satır) | `DataFileSize` | sayfa harness **9,76 MB** (48,8 B/satır) + `.idx` 3,20; SQL harness 15,5 MB (77,6) + `.idx` 3,52 → **diskte toplam 19,0 MB** | kısmen |
-| Açılış | **≤ 150 ms** | `kv.Open` süresi (3 tekrarın medyanı) | **32 ms** (v2: 984) | ✔ |
-| `COUNT(*)` | **≤ 16 ms** | tam tarama | 62 ms (v2: 31) | ✘ v3.1 |
-| PK nokta | **≤ 7 µs** (gerilemez) | `WHERE id=` | **6,25 µs** (v2: 6,25) | ✔ |
-| Toplu INSERT | **≤ 5 µs/satır** (gerilemez) | 200k tek batch | 6,64 µs (v2: 4,46) | ✘ v3.1 |
-| Autocommit INSERT | **≤ 0,55 ms** (gerilemez) | 20k tek satır | 0,557 ms (v2: 0,431) | sınırda |
-| UPDATE/DELETE sonrası şişme | **≤ %5** | 100k UPDATE sonrası dosya artışı | ölçülmedi (VACUUM geri kazanıyor) | — |
+| Metrik | Hedef | Ölçüm yöntemi | v3.0 | v3.1 (2026-10-25) | Durum |
+|---|---|---|---|---|---|
+| Dosya boyutu | **≤ 11 MB** (≤ 55 B/satır) | `DataFileSize` | sayfa harness **9,76 MB** (48,8 B/satır) + `.idx` 3,20; SQL harness 15,5 MB (77,6) + `.idx` 3,52 → **diskte toplam 19,0 MB** | değişmedi | kısmen |
+| Açılış | **≤ 150 ms** | `kv.Open` süresi (3 tekrarın medyanı) | 32 ms (v2: 984) | **27,8 ms** | ✔ |
+| `COUNT(*)` | **≤ 16 ms** | sayaç | 62 ms (v2: 31) | **0,1 ms** (canlı sayaç) | ✔ |
+| PK nokta | **≤ 7 µs** (gerilemez) | `WHERE id=` | 6,25 µs (v2: 6,25) | **5,13 µs** | ✔ |
+| Toplu INSERT | **≤ 5 µs/satır** (gerilemez) | 200k tek batch | 6,64 µs (v2: 4,46) | **5,79 µs** (256 KB'lık uzatma) | sınırda |
+| Autocommit INSERT | **≤ 0,55 ms** (gerilemez) | 20k tek satır | 0,557 ms (v2: 0,431) | **0,449 ms** (işlem başına WAL) | ✔ |
+| UPDATE/DELETE sonrası şişme | **≤ %5** | 100k UPDATE sonrası dosya artışı | ölçülmedi (VACUUM geri kazanıyor) | ölçülmedi | — |
 
-Başarısız üç metrik **kabul edilmiş tasarım maliyetidir** (sayfa imajlı WAL'in 2x
-yazma hacmi; tablo başına satır sayacının olmaması). Kök nedenler ve ölçümler
-`hiztesti.md` §9'da. v3.1 hedefleri: mantıksal (küçük) WAL çerçevesi, tablo
-başına canlı satır sayacı, toplu dosya uzatma (ölçülen: sayfa başına 45–50 µs).
+v3.0'da tutmayan üç metrik v3.1'de kapandı; kalan tek sınır **toplu INSERT**tir
+(5,79 µs, hedef 5). Kök neden sayfa imajlı WAL'in 2x yazma hacmidir — tasarım
+maliyeti. Autocommit'te kalan fark **dayanıklılık tabanıdır**: tek fsync
+0,330 ms (ayrı `fsyncbench` ölçümü), commit başına WAL 63.373 → 8.252 B.
+Kök nedenler, ölçümler ve koşular arası sapma `hiztesti.md` §9'da.
 
 **Boyut konusunda dikkat (dürüstlük):** v3 veri dosyası v2'den %19,5 küçük, ama
 yanına **`.odb.idx`** (3,52 MB; anahtar → sayfa/slot açılış önbelleği) yazıyor.
@@ -225,7 +226,7 @@ kapatıldı; dördüncü iş (dosya uzatma) ölçülen bir maliyetti.
   256 KB'lık parça (`VDB_GROW_BYTES`), kapanışta mantıksal boya kırpma
   (`TrimToLogical`). `Stats.FileBytes` artık **mantıksal** boyu verir; ölçüm
   araçları dosya boyunu kapanıştan sonra okur. **Ölçülen (benchv3, 32 B):
-  yazım 1,88 → 1,35 µs/satır** (benchcmp toplu: 6,64 → 5,80 µs).
+  yazım 1,88 → 1,32 µs/satır** (benchcmp toplu: 6,64 → 5,79 µs).
 - [x] 4.5 **Tarama hattı** — `ScanRawIterAll` artık sonuç kümesi biriktirmez,
   satırları doğrudan akıtır (eski yol her satırda `SetLength(+1)`), `ScanAll`
   kapasite ikiye katlar, sıfır-kopya `ScanAllRaw` eklendi (sayfa pinli, hücre

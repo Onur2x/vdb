@@ -162,10 +162,10 @@ H3 skiplist (100,000 rows): 100 × (`UPDATE` + indexed `COUNT(*)`) takes
 | Data file (`.odb`) | 19.3 MB (96.4 B/row) | **15.5 MB (77.6 B/row)** | **15.5 MB (77.6 B/row)** |
 | `+.odb.idx` (derived open cache) | — | +3.5 MB | +3.5 MB |
 | **Total on disk** | **19.3 MB** | **19.0 MB** | **19.0 MB** |
-| Open | 984 ms | **32 ms** | **28.1 ms** |
+| Open | 984 ms | **32 ms** | **27.8 ms** |
 | PK point lookup | 6.25 µs | 6.25 µs | **5.13 µs** |
-| Bulk INSERT | 4.46 µs/row | 6.64 µs/row | **5.80 µs/row** |
-| Autocommit INSERT | 0.431 ms/row | 0.557 ms/row | **0.458 ms/row** |
+| Bulk INSERT | 4.46 µs/row | 6.64 µs/row | **5.79 µs/row** |
+| Autocommit INSERT | 0.431 ms/row | 0.557 ms/row | **0.449 ms/row** |
 | `COUNT(*)` | 31 ms | 62 ms | **0.1 ms** |
 
 v3.0 opens the database **~31x** faster and shrinks the data file by **19.5 %**;
@@ -176,10 +176,10 @@ so the size limit bought nothing while forcing a full scan on large databases
 at open). PK and parse costs match v2.
 
 v3.1 closed v3.0's three regressions: `COUNT(*)` **62 → 0.1 ms** (live per-table
-counter), autocommit **0.557 → 0.458 ms** (only the pages changed by the
+counter), autocommit **0.557 → 0.449 ms** (only the pages changed by the
 transaction go to the WAL; measured 63,373 → 8,252 B per commit), bulk INSERT
-**6.64 → 5.80 µs** (256 KB file-growth chunks; page-engine writes 1.88 →
-1.35 µs). What is left on autocommit is the durability floor: a single fsync
+**6.64 → 5.79 µs** (256 KB file-growth chunks; page-engine writes 1.88 →
+1.32 µs). What is left on autocommit is the durability floor: a single fsync
 measures **0.330 ms**. File size did not change. Measurements and root causes:
 [speedtest.md](speedtest.md#9-v30-page-engine--v2-and-v3-on-the-same-scale-2026-10-25).
 

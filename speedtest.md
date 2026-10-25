@@ -300,9 +300,9 @@ every commit).
 | Data file (`.odb`) | 19,278,424 B (96.4 B/row) | **15,527,936 B (77.6 B/row)** | **15,527,936 B (77.6 B/row)** |
 | Open index (`.odb.idx`) | — | 3,520,080 B (17.6 B/row) | 3,520,080 B (17.6 B/row) |
 | **Total on disk** | **19,278,555 B** | **19,048,016 B** | **19,048,016 B** |
-| Open | 984 ms | 32 ms | **28.1 ms** |
-| Bulk INSERT (one batch) | 4.455 µs/row | 6.640 µs/row | **5.796 µs/row** |
-| Autocommit INSERT | 0.431 ms/row | 0.557 ms/row | **0.458 ms/row** |
+| Open | 984 ms | 32 ms | **27.8 ms** |
+| Bulk INSERT (one batch) | 4.455 µs/row | 6.640 µs/row | **5.787 µs/row** |
+| Autocommit INSERT | 0.431 ms/row | 0.557 ms/row | **0.449 ms/row** |
 | PK point lookup | 6.25 µs | 6.25 µs | **5.13 µs** |
 | parse-only `SELECT 1` | 3.90 µs | 3.90 µs | **3.55 µs** |
 | `COUNT(*)` | 31 ms | 62 ms | **0.1 ms** |
@@ -324,11 +324,11 @@ limit bought no safety while forcing a full scan on large databases at open.
 `backendchk` covers this with 6 checks (`idxpol`, `TestV3IdxPolicy`).
 
 v3.1 closed all three regressions: `COUNT(*)` **0.1 ms** (live per-table
-counter), autocommit **0.458 ms** (only the pages changed by the transaction go
-to the WAL), bulk INSERT **5.796 µs** (256 KB file-growth chunks). The "why"
+counter), autocommit **0.449 ms** (only the pages changed by the transaction go
+to the WAL), bulk INSERT **5.787 µs** (256 KB file-growth chunks). The "why"
 sections below are v3.0's measured root causes; each carries its v3.1 fix.
 
-### Why bulk INSERT cost 6.64 µs (5.796 µs in v3.1)
+### Why bulk INSERT cost 6.64 µs (5.787 µs in v3.1)
 
 Components measured separately (200k keys, 64 B values, 512-frame pool):
 
@@ -346,8 +346,8 @@ index maintenance.
 
 **v3.1 fix:** the file was extended with a separate `SetSize` per new page
 (measured ~45–50 µs/page). It is now extended in 256 KB chunks and trimmed back
-to the logical size at close: page-harness writes **1.88 → 1.35 µs/row**, SQL
-harness bulk INSERT **6.64 → 5.796 µs/row**.
+to the logical size at close: page-harness writes **1.88 → 1.32 µs/row**, SQL
+harness bulk INSERT **6.64 → 5.787 µs/row**.
 
 Three bottlenecks found by measurement this sprint, all fixed in production
 code:
@@ -389,10 +389,10 @@ by RESTORE. The fast path applies to pure `COUNT(*)` only: `WHERE` / `HAVING` /
 | File size (SQL harness, `.odb` only) | ≤ 11 MB | 15.5 MB | 15.5 MB | **missed** |
 | File size (SQL harness, `.odb` + `.idx`) | ≤ 11 MB | 19.0 MB | 19.0 MB | **missed** |
 | File size (page harness, 32 B values) | ≤ 11 MB | **9.76 MB** (+3.20 MB `.idx`) | **9.76 MB** (+3.20 MB `.idx`) | met (`.odb` only) |
-| Open | ≤ 150 ms | **32 ms** | **28.1 ms** | met |
+| Open | ≤ 150 ms | **32 ms** | **27.8 ms** | met |
 | PK point | ≤ 7 µs | **6.25 µs** | **5.13 µs** | met |
-| Bulk INSERT | ≤ 5 µs | 6.64 µs | 5.796 µs | borderline (v2: 4.46) |
-| Autocommit INSERT | ≤ 0.55 ms | 0.557 ms | **0.458 ms** | met (v2: 0.431) |
+| Bulk INSERT | ≤ 5 µs | 6.64 µs | 5.787 µs | borderline (v2: 4.46) |
+| Autocommit INSERT | ≤ 0.55 ms | 0.557 ms | **0.449 ms** | met (v2: 0.431) |
 | `COUNT(*)` | ≤ 16 ms | 62 ms | **0.1 ms** | met |
 
 The file-size target mixed two harnesses: `benchv3` (page engine, 32 B values,
@@ -405,11 +405,16 @@ but it does occupy disk, so both figures are given.
 **Honest summary:** v3.0 won on file size and especially open time; PK and parse
 costs were identical to v2; bulk writes were ~1.5x, `COUNT(*)` 2x and single-row
 writes ~1.3x slower. v3.1 closed all three: `COUNT(*)` **0.1 ms**, autocommit
-**0.458 ms** (18 % under v3.0, 6 % over v2), bulk **5.796 µs** (13 % under v3.0,
+**0.449 ms** (19 % under v3.0, 4 % over v2), bulk **5.79 µs** (13 % under v3.0,
 30 % over v2). What is left on autocommit is the **durability floor**: the
 separate `fsyncbench` tool measures a single fsync at **0.330 ms**, and WAL
 bytes per commit dropped from 63,373 to **8,252**. What is left on bulk is the
 2x write volume of page-image WAL, a design cost.
+
+**Measurement noise:** on this machine run-to-run spread was 5.76–6.64 µs for
+bulk, 0.449–0.458 ms for autocommit and 3.53–4.59 µs for parse. The table holds
+the **median of three consecutive runs**; do not report a single out-of-range
+run.
 
 ### Page-engine harness (`benchv3`, 200k rows × 32 B values)
 
@@ -419,9 +424,9 @@ A separate harness from `benchcmp`; do not mix the numbers:
 |---|---:|---:|
 | File | 9,756,672 B (48.8 B/row) | 9,756,672 B (48.8 B/row) |
 | `.idx` | 3,200,064 B (16.0 B/row) | 3,200,064 B (16.0 B/row) |
-| Write (commit + checkpoint included) | 1.88 µs/row | **1.35 µs/row** |
-| Open (with `.idx`) | 16 ms | 23 ms (16–31 range, load sensitive) |
-| Open (full scan) | 79 ms | 79 ms |
-| PK read | 0.47 µs/row | 0.43 µs/row |
-| Raw scan (copying) | — | 12.0 ms |
-| Raw scan (zero-copy) | — | **9.6 ms** |
+| Write (commit + checkpoint included) | 1.88 µs/row | **1.32 µs/row** |
+| Open (with `.idx`) | 16 ms | 21 ms (16–31 range, load sensitive) |
+| Open (full scan) | 79 ms | 63 ms (63–79 range) |
+| PK read | 0.47 µs/row | 0.40 µs/row |
+| Raw scan (copying) | — | 11.3 ms |
+| Raw scan (zero-copy) | — | **9.1 ms** |
