@@ -15451,6 +15451,7 @@ const
   FZ_QUERIES = 200;
 var
   dirA, dirB: string;
+  beA, beB: IVdbBackend;
   dbA, dbB: TVDb;
   tbA, tbB: TVTableDb;
   qa, qb: TVSql;
@@ -15552,10 +15553,26 @@ begin
   dirB := D + PathDelim + 't147_fz_seq_' + IntToStr(GetTickCount64);
   ForceDirectories(dirA);
   ForceDirectories(dirB);
-  dbA := TVDb.Create;
-  dbB := TVDb.Create;
-  tbA := TVTableDb.Create(dbA);
-  tbB := TVTableDb.Create(dbB);
+  beA := nil;
+  beB := nil;
+  dbA := nil;
+  dbB := nil;
+  tbA := nil;
+  tbB := nil;
+  if gV3 then
+  begin
+    VdbOpenOrCreate(DbFileOf(dirA), beA);
+    VdbOpenOrCreate(DbFileOf(dirB), beB);
+    tbA := TVTableDb.CreateBackend(beA);
+    tbB := TVTableDb.CreateBackend(beB);
+  end
+  else
+  begin
+    dbA := TVDb.Create;
+    dbB := TVDb.Create;
+    tbA := TVTableDb.Create(dbA);
+    tbB := TVTableDb.Create(dbB);
+  end;
   qa := nil;
   qb := nil;
   ran := 0;
@@ -15564,8 +15581,11 @@ begin
   firstDiff := '';
   firstErr := '';
   try
-    dbA.Open(dirA);
-    dbB.Open(dirB);
+    if not gV3 then
+    begin
+      dbA.Open(dirA);
+      dbB.Open(dirB);
+    end;
     tbA.Open(dirA);
     tbB.Open(dirB);
     qa := TVSql.Create(tbA);
@@ -15625,6 +15645,8 @@ begin
   finally
     tbB.Free;
     tbA.Free;
+    beA := nil;
+    beB := nil;
     dbB.Free;
     dbA.Free;
   end;
@@ -16729,7 +16751,7 @@ const
     DISTINCT, HAVING, filtreli COUNT, float sirasi, coklu top-N, derin
     OFFSET, MCV) v2 tipleri yerine backend-farkinda `OpenAt`/`sq` uzerinden
     kosar. Bunlar motorun SQL yuzeyini iki backend'de de dogrular. }
-  V2_ONLY: array[0..34] of string = (
+  V2_ONLY: array[0..33] of string = (
     'T101_TcpReplication',
     'T122_KvStore',
     'T125_KolonSifreleme',
@@ -16737,7 +16759,6 @@ const
     'T127_H5_BlockCrc',
     'T128_H11_Undo',
     'T129_H11_InPlace',
-    'T147_M8_SqlancerStil',
     'T148_H25_AutoCompact',
     'T21_KritikHataDogrulama',
     'T24_Dayaniklilik',
