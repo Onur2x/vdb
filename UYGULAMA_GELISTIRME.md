@@ -285,9 +285,13 @@ veritabani.colkey      kolon anahtarı (yalnız kolon şifrelemesi kullanılırs
 |---|---|---|
 | PITR (`RECOVER TO`), WAL arşivi | yok | günlük `BACKUP TO` ile yetinin; v3 WAL'i sayfa imgesidir, zaman ekseni yok |
 | Replication (`START REPLICATION` vb.) | yok | mantıksal değişim günlüğü gerektirir; tek dosya, tek yazıcı |
-| Oturum yalitimi (aynı açık veritabanında ikinci oturum) | yok | SQL sunucusu istekleri sıraya sokar; API düzeyinde çok oturum için oturum sahipliği gerekir |
 | Zone map / bölüm budama | yok | sonuçlar doğru, tam tarama |
 | MVCC (çok yazarlı) | yok | tek yazıcı + okuyucu snapshot |
+
+Aynı açık veritabanında **oturum yalitimi** vardır: `VDbSetTxnSession`
+(v2) / `VdbBackendSessionId` ile kimliği olan iki oturumdan biri açık
+işlem tutarken diğeri o işlemin yazdıklarını görmez, yazamaz ve
+commit/rollback edemez (v2 ile aynı mesaj ve kural).
 
 v3.2'de **çözülenler**: `SAVEPOINT`/`ROLLBACK TO` (§5.1),
 `ALTER DATABASE KEY`, kolon şifreleme (`.colkey`), `IVdbBackend` üzerinde

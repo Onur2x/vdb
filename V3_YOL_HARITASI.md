@@ -194,11 +194,12 @@ Aşağıdakiler **tamamlandı ve iki motorda da test edildi** (aynı test hem
 | Yönetim aracı yolları | PK'siz tablo, sentetik anahtar, `UpdateRowInPlace`, çok kolonlu UNIQUE indeks, `AutoCompact`, `ExecAll`, `VACUUM`, `REINDEX` | T154 | v3 geçti |
 | Akışlı top-N | T132 v3'te koşuyor | T132 | v3 geçti |
 | Rasgele diferansiyel | 200 sabit tohumlu SELECT; indeksli vs saf tarama | T147 | v3: 200/200, **0 fark** |
+| Oturum yalitimi | `FWriteSession` + `BatchIsMine`/`RequireBatchWrite`; v2 ile aynı kural (başka oturum görmez, yazamaz, commit edemez) | T126 (iki backend) | v3 geçti |
 
-Son ölçüm: `sqltest --backend=v3` **2721 geçen / 0 kalan / 34 atlanan**,
-`--backend=v2` **3166 / 0 / 0**. Atlanan 34'ün tamamı v2'nin iç
-mekanizmalarına (blok CRC, undo, in-place, WAL kayıt biçimi, oturum
-yalitimi) bağlı testlerdir — bunlar v3'te **yok** ve v3'te açık hata verir.
+Son ölçüm: `sqltest --backend=v3` **2726 geçen / 0 kalan / 33 atlanan**,
+`--backend=v2` **3167 / 0 / 0**. Atlanan 33'ün tamamı v2'nin iç
+mekanizmalarına (blok CRC, undo, in-place, WAL kayıt biçimi) bağlı
+testlerdir — bunlar v3'te **yok** ve v3'te açık hata verir.
 
 **v3.2'de kalanlar (henüz yapılmadı):**
 
@@ -209,11 +210,7 @@ yalitimi) bağlı testlerdir — bunlar v3'te **yok** ve v3'te açık hata verir
    canlı dosyada geriye undo). Tasarım kararı verilmeden kod yazılmayacak.
 2. **Replikasyon (T95b, T101).** Yukarıdaki mantıksal günlüğe bağlıdır;
    o olmadan "replikasyon" yalnız dosya kopyası olur (yanlış güven).
-3. **Oturum yalitimi (T126).** v3 tek yazar/tek parti kullanır; ikinci
-   oturum açık partiyi görmemeli. Bugün SQL sunucusu istekleri
-   sıraya soktuğu için sessiz hata yok; API düzeyinde çok oturum
-   kullanılacaksa önce oturum sahipliği eklenmeli.
-4. Zone map (sayfa düzeyi budama) ve dosya boyu optimizasyonları —
+3. Zone map (sayfa düzeyi budama) ve dosya boyu optimizasyonları —
    performans işi, doğruluk riski yok.
 
 ### Sıradaki sürüme ertelenen (v3.2)
