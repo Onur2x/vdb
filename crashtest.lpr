@@ -296,13 +296,34 @@ var
   end;
   {$ENDIF}
 
+  { Tani: cocuk hang ettiginde dosyada ne kadar ilerledigi gorunsun.
+    -1 = dosya yok, -2 = acilamadi. }
+  function SizeOr0(const P: string): Int64;
+  var
+    fs: TFileStream;
+  begin
+    Result := -1;
+    if not FileExists(P) then Exit;
+    try
+      fs := TFileStream.Create(P, fmOpenRead or fmShareDenyNone);
+      try
+        Result := fs.Size;
+      finally
+        fs.Free;
+      end;
+    except
+      Result := -2;
+    end;
+  end;
+
 begin
-  { 2026-10-25 (CI #36): yavas/garip kosucuda alt surec 30 sn icinde HIC
-    commit etmedi ve kapi "test gecersiz" diye kirmizi oldu (yerelde ayni
-    kod 11/11 gecti). Sozlesme degismedi - commit edilmis satirlarin TAMAMI
-    hala tek tek dogrulanir - ama gecici bir kosucu sorununda testi
-    bosa dusurmemek icin: bekleme 90 sn, cocuk erken olurse beklemeden
-    cik, en fazla 2 deneme, basarisizlikta cocuk cikis kodu da raporlanir. }
+  { 2026-10-25 (CI #36/#37): yavas/garip kosucuda alt surec HIC commit
+    etmedi ve kapi "test gecersiz" diye kirmizi oldu (yerelde ayni kod
+    11/11 gecti). CI #37'de cikis kodu 1 (biz oldurduk) geldi: yani cocuk
+    YASIYOR ama 90 sn'de tek commit yazmiyor -> yavaslik degil, takilma.
+    Sozlesme degismedi (commit edilen satirlarin TAMAMI dogrulanir);
+    ek olarak: bekleme 40 sn, cocuk erken olurse beklemeden cik, 2 deneme,
+    ve basarisizlikta cocugun STAGE gunlugu + dosya boyutlari raporlanir. }
   marker := 0;
   exitCode := -1;
   attempt := 0;
@@ -311,6 +332,8 @@ begin
     path := FreshDir(D, 'kill9.odb');
     markerPath := D + PathDelim + 'kill9.marker';
     if FileExists(markerPath) then DeleteFile(markerPath);
+    { Onceki denemeden kalan turetilmis dosyalar YENI dosyaya ait degildir. }
+    if FileExists(path + '.idx') then DeleteFile(path + '.idx');
 
     proc := TProcess.Create(nil);
     try
@@ -327,11 +350,11 @@ begin
         gercekten sinanir. }
       t0 := Now;
       marker := 0;
-      while (marker < 2000) and (Now - t0 < 90 / 86400) do
+      while (marker < 2000) and (Now - t0 < 40 / 86400) do
       begin
         Sleep(50);
         marker := ReadMarker;
-        { Cocuk kendi kendine olduyse 90 sn beklemek anlamsiz. }
+        { Cocuk kendi kendine olduyse 40 sn beklemek anlamsiz. }
         if (marker <= 0) and (not proc.Running) then
           Break;
       end;
@@ -351,7 +374,8 @@ begin
   if marker <= 0 then
   begin
     Fail(Format('kill -9: alt surec hic commit edemedi (test gecersiz; ' +
-      'deneme=%d, cocuk cikis kodu=%d)', [attempt, exitCode]) +
+      'deneme=%d, cocuk cikis kodu=%d, odb=%d B, wal=%d B)',
+      [attempt, exitCode, SizeOr0(path), SizeOr0(path + '.wal')]) +
       ChildDiag(markerPath));
     Exit;
   end;
@@ -768,10 +792,18 @@ var
 
 begin
   eng := nil;
+  { 2026-10-25 (CI tani): cocuk hang ettiginde HANGI asamada oldugu
+    gorunmuyordu (isaret yok, gunluk yok, cikis kodu 1 = olduruldu).
+    Asama izleri birak: son satir hang'in yerini gosterir. }
+  Log('START path=' + Path);
+  SaveMarker(MarkerPath, '0' + LineEnding);
   try
     eng := TVdbPageEngine.Create(Path, 8);
+    Log('CREATE ok');
     eng.Open(True);
+    Log('OPEN ok');
     i := eng.Count;   // devam et
+    Log('COUNT=' + IntToStr(i));
     while True do
     begin
       Inc(i);
@@ -801,7 +833,11 @@ begin
           500 -> 5000. Cok sik checkpoint, olum anini checkpoint'le
           cakistirip testi sessizce "replay yok" durumuna dusuruyordu. }
         if (i mod 5000) = 0 then
+        begin
+          Log(Format('CHECKPOINT oncesi i=%d', [i]));
           eng.Checkpoint(True);
+          Log(Format('CHECKPOINT sonrasi i=%d', [i]));
+        end;
       end;
     end;
   except
