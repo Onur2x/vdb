@@ -5693,6 +5693,29 @@ end;
     3) Sonuc hangi tampondaysa Idx ona baglanir (referans atamasi).
   Cagiran on kosullari saglar: N >= VDB_PAR_SORT_MIN_ROWS, havuz acik
   ve >= 2 isci. Satir deposu (Rows) ve kolon bilgileri salt-okunur. }
+{ Tamsayi hizli siralama yolunun anahtar cozucusu.
+
+  2026-10-25 (v3.2, T133 bulgusu): ONCEDEN anahtar her zaman VDbParseInt
+  ile cozuluyordu. VCT_BOOL da tamsayi yoluna kabul edildigi icin
+  'True'/'False' metinleri parse EDILEMIYOR, hepsi Low(Int64) oluyor ve
+  siralama hic yapilmiyordu (ASC ve DESC ayni sonuc). Artik BOOL icin
+  ayri esleme var: False=0, True=1. v2'nin '-1'/'0' gosterimi de ayni
+  anahtara iner. Donus False = deger cozulemedi (NULL sayilir). }
+function VdbSortIntKey(const S: string; CType: Byte; out Key: Int64): Boolean;
+begin
+  if CType = VCT_BOOL then
+  begin
+    Key := Low(Int64);
+    if S = '' then Exit(False);
+    if SameText(S, 'True') or (S = '1') or (S = '-1') then Key := 1
+    else if SameText(S, 'False') or (S = '0') then Key := 0
+    else Exit(False);
+    Result := True;
+  end
+  else
+    Result := VDbParseInt(S, Key);
+end;
+
 procedure VdbParallelSortIdx(var Idx: TIntArray; N: Integer;
   const Rows: TStrMatrix; const Cols: TVdbSortCols; UseInt, IntDesc: Boolean;
   const Plan: TSortFloatPlan);
@@ -5721,7 +5744,8 @@ begin
     SetLength(T.IntKeys, N);
     for i := 0 to N - 1 do
     begin
-      if (c <= High(Rows[i])) and VDbParseInt(Rows[i][c], vInt) then
+      if (c <= High(Rows[i])) and
+         VdbSortIntKey(Rows[i][c], Cols[0].CType, vInt) then
         T.IntKeys[i] := vInt
       else
         T.IntKeys[i] := Low(Int64);   // NULL en kucuk (seri yol ile ayni)
@@ -6189,7 +6213,8 @@ begin
     SetLength(intKeys, Length(Rows));
     for i := 0 to High(Rows) do
     begin
-      if (c <= High(Rows[i])) and VDbParseInt(Rows[i][c], vInt) then
+      if (c <= High(Rows[i])) and
+         VdbSortIntKey(Rows[i][c], sortCols[0].CType, vInt) then
         intKeys[i] := vInt
       else
         intKeys[i] := Low(Int64);
@@ -15556,27 +15581,13 @@ begin
     txBegin:           FT.BeginBatch;
     txCommit:          begin FT.CommitBatch; FT.UnlockRows(FSessionId); end;
     txRollback:        begin FT.AbortBatch; FT.UnlockRows(FSessionId); end;
-    { Sprint 2.7: SAVEPOINT v2'nin WAL geri-alma noktalarina dayanir. v3
-      backend'inde (Kv = nil) henuz yok; sessizce yutmak yerine acik hata.
-      v3.1'de sayfa-duzeyi undo ile gelecek. }
-    txSavepoint:
-      if FT.Kv = nil then
-        raise EVDbException.Create(ecUnsupported,
-          'SAVEPOINT v3 sayfa motorunda henuz desteklenmiyor (v3.1)')
-      else
-        FT.Kv.Savepoint(Stmt.SavepointName);
-    txRollbackTo:
-      if FT.Kv = nil then
-        raise EVDbException.Create(ecUnsupported,
-          'ROLLBACK TO SAVEPOINT v3 sayfa motorunda henuz desteklenmiyor (v3.1)')
-      else
-        FT.Kv.RollbackToSavepoint(Stmt.SavepointName);
-    txReleaseSavepoint:
-      if FT.Kv = nil then
-        raise EVDbException.Create(ecUnsupported,
-          'RELEASE SAVEPOINT v3 sayfa motorunda henuz desteklenmiyor (v3.1)')
-      else
-        FT.Kv.ReleaseSavepoint(Stmt.SavepointName);
+    { v3.2 (2026-10-25): SAVEPOINT artik iki backend'de de calisir.
+      TVTableDb seviyesinde: backend'in KV gunlugu + bellekteki sema
+      yedegi birlikte geri alinir. Boylece v3'te (Kv = nil) de DDL dahil
+      ayni noktaya donulur; v2'de TVDb'nin WAL savepoint'i kullanilir. }
+    txSavepoint:       FT.Savepoint(Stmt.SavepointName);
+    txRollbackTo:      FT.RollbackToSavepoint(Stmt.SavepointName);
+    txReleaseSavepoint: FT.ReleaseSavepoint(Stmt.SavepointName);
   end;
   Res.Affected := 0; Res.Msg := 'OK';
 end;
@@ -16764,7 +16775,7 @@ begin
     PITR/arsiv burada acikca reddedilir; kalanlar v3.1.) }
   if (FT.Kv = nil) and (Stmt.Kind in [
       admRecoverTo,
-      admArchiveSet, admArchiveList, admAlterDbKey, admSavepoint,
+      admArchiveSet, admArchiveList, admSavepoint,
       admReleaseSavepoint, admRollbackToSavepoint,
       admReplicationStart, admReplicationStop, admCreateReplSlot,
       admDropReplSlot, admShowReplicationStatus, admReplicationPump,
@@ -16915,7 +16926,10 @@ begin
       end;
     admAlterDbKey:
       begin
-        FT.Kv.RekeyWithPassword(Stmt.NewKeyPassword);
+        { v3.2: artik backend sozlesmesi uzerinden — v3 sayfa motorunda da
+          calisir (dosya butunu yeniden sifrelenir). }
+        FT.Backend.Rekey(Stmt.NewKeyPassword);
+        FT.ReloadSchema;
         Res.Affected := 1; Res.Msg := 'OK';
       end;
     // ---- 2026-10-04: SEMA SORGULARI ----

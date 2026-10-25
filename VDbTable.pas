@@ -288,6 +288,20 @@ type
     Builder: TVdbConcIdxBuilder;
   end;
 
+  { v3.2: TVTableDb seviyesinde SAVEPOINT sema yedegi. Backend yalnizca
+    KV kaplamasini geri alir; CREATE/DROP/ALTER TABLE sonrasi BELLEKTEKI
+    sema (FTables/FById/FAutoInc/FNextId) de geri gelmelidir. v2'de bunu
+    TVDb'nin WAL tabanli savepoint'i yapar; burada ayni noktaya sema
+    kopyasiyla inilir (iki backend de ayni gorunur duruma doner). }
+  TVTableSavepoint = record
+    Name: string;
+    SnapDirty: Boolean;
+    SnapNextId: Word;
+    SnapTables: TDictionary<string, TTableDef>;
+    SnapById: TDictionary<Word, string>;
+    SnapAutoInc: TDictionary<Word, Int64>;
+  end;
+
   TVTableDb = class
   private
     FKv: TVDb;
@@ -355,6 +369,9 @@ type
     FSnapNextId: Word;
     FSnapDirty: Boolean;
     FSnapAutoInc: TDictionary<Word, Int64>; // P-17a: sayac sozlugunun batch yedegi
+    { v3.2: SAVEPOINT sema yedekleri (en sona eklenir). Backend kendi KV
+      gunlugunu tutar; burada yalnizca bellekteki sema katmani yedeklenir. }
+    FSavepoints: TList<TVTableSavepoint>;
     // F-35: kullanici tanimli fonksiyon/prosedur kataloglari.
     // DIKKAT: sema ile birlikte diske yazilmaz; oturum ici kayit.
     FFunctions: TDictionary<string, TFunctionDef>;
@@ -409,6 +426,12 @@ type
     procedure SnapshotSchema;
     procedure RestoreSchemaSnapshot;
     procedure ClearSchemaSnapshot;
+    { v3.2: savepoint sema yedegi yardimcilari. }
+    function FindSavepoint(const Name: string): Integer;
+    procedure PushSchemaSavepoint(const Name: string);
+    procedure RestoreSavepointSchema(Index: Integer);
+    procedure DropSavepointSnaps(FromIndex: Integer);
+    procedure ClearSavepoints;
     function FindCol(const T: TTableDef; const Col: string): Integer;
     function MaxPkInt(const T: TTableDef): Int64;
     procedure CheckConstraints(const T: TTableDef; var Vals: TStrArray; const ExcludePk: string);
@@ -568,6 +591,12 @@ type
     procedure BeginBatch;
     procedure CommitBatch;
     procedure AbortBatch; // FKv abort + index onarimi
+    { v3.2: SAVEPOINT / ROLLBACK TO / RELEASE SAVEPOINT (R-02).
+      Parti yoksa ortuk islem baslar. Istisnalar: ecDuplicateSavepoint,
+      ecSavepointNotFound (v2 TVDb ile ayni kod ve mesaj duzeni). }
+    procedure Savepoint(const Name: string);
+    procedure RollbackToSavepoint(const Name: string);
+    procedure ReleaseSavepoint(const Name: string);
     // KR-7: Kilit API.
     // TVSql uzerinden calisanlar Exec/ExecAll/ExecAll zaten kilit alir.
     // Lock/Unlock = yazma kilidi (INSERT/UPDATE/DELETE/DDL).
@@ -3722,6 +3751,7 @@ begin
   FSnapAutoInc := nil;   // P-17a
   FSnapNextId := 1;
   FSnapDirty := False;
+  FSavepoints := TList<TVTableSavepoint>.Create;   // v3.2
   ResetBatchTableCache;
 end;
 
@@ -3729,6 +3759,8 @@ destructor TVTableDb.Destroy;
 begin
   StopConcBuilders;   // R-22: surmekte olan insalar durdurulur (INVALID kalir)
   ClearSchemaSnapshot;
+  ClearSavepoints;    // v3.2
+  FSavepoints.Free;
   FreeAllTriggers;   // F-36: govde AST'leri serbest birakilir
   FDeferredRows.Free;   // R-11
   FRowLocks.Free;       // F-41
@@ -4678,6 +4710,148 @@ begin
   FreeAndNil(FSnapAutoInc);   // P-17a
 end;
 
+{ --------------------------------------------------- v3.2: SAVEPOINT }
+
+function TVTableDb.FindSavepoint(const Name: string): Integer;
+var
+  i: Integer;
+begin
+  Result := -1;
+  for i := FSavepoints.Count - 1 downto 0 do
+    if SameText(FSavepoints[i].Name, Name) then
+      Exit(i);
+end;
+
+procedure TVTableDb.ClearSavepoints;
+var
+  i: Integer;
+  sp: TVTableSavepoint;
+begin
+  if FSavepoints = nil then Exit;
+  for i := 0 to FSavepoints.Count - 1 do
+  begin
+    sp := FSavepoints[i];
+    sp.SnapTables.Free;
+    sp.SnapById.Free;
+    sp.SnapAutoInc.Free;
+  end;
+  FSavepoints.Clear;
+end;
+
+{ Index'ten itibaren (DAHIL) savepoint sema yedeklerini atar. }
+procedure TVTableDb.DropSavepointSnaps(FromIndex: Integer);
+var
+  i: Integer;
+  sp: TVTableSavepoint;
+begin
+  if FromIndex > FSavepoints.Count - 1 then Exit;
+  for i := FSavepoints.Count - 1 downto FromIndex do
+  begin
+    sp := FSavepoints[i];
+    sp.SnapTables.Free;
+    sp.SnapById.Free;
+    sp.SnapAutoInc.Free;
+    FSavepoints.Delete(i);
+  end;
+end;
+
+procedure TVTableDb.PushSchemaSavepoint(const Name: string);
+var
+  sp: TVTableSavepoint;
+  kvT: TPair<string, TTableDef>;
+  kvI: TPair<Word, string>;
+  kvA: TPair<Word, Int64>;
+begin
+  sp.Name := Name;
+  sp.SnapDirty := FSchemaDirty;
+  sp.SnapNextId := FNextId;
+  sp.SnapTables := TDictionary<string, TTableDef>.Create;
+  for kvT in FTables do
+    sp.SnapTables.AddOrSetValue(kvT.Key, kvT.Value);
+  sp.SnapById := TDictionary<Word, string>.Create;
+  for kvI in FById do
+    sp.SnapById.AddOrSetValue(kvI.Key, kvI.Value);
+  sp.SnapAutoInc := TDictionary<Word, Int64>.Create;
+  for kvA in FAutoInc do
+    sp.SnapAutoInc.AddOrSetValue(kvA.Key, kvA.Value);
+  FSavepoints.Add(sp);
+end;
+
+procedure TVTableDb.RestoreSavepointSchema(Index: Integer);
+var
+  sp: TVTableSavepoint;
+  kvT: TPair<string, TTableDef>;
+  kvI: TPair<Word, string>;
+  kvA: TPair<Word, Int64>;
+begin
+  sp := FSavepoints[Index];
+  FTables.Clear;
+  for kvT in sp.SnapTables do
+    FTables.AddOrSetValue(kvT.Key, kvT.Value);
+  FById.Clear;
+  for kvI in sp.SnapById do
+    FById.AddOrSetValue(kvI.Key, kvI.Value);
+  FAutoInc.Clear;
+  for kvA in sp.SnapAutoInc do
+    FAutoInc.AddOrSetValue(kvA.Key, kvA.Value);
+  FNextId := sp.SnapNextId;
+  FSchemaDirty := sp.SnapDirty;
+  { Geri alinan DDL'in "kasitli silme" isaretleri de gecersizdir. }
+  SetLength(FIntentDrop, 0);
+  { Hedef savepoint KALIR (SQLite davranisi: ayni noktaya tekrar
+    donulebilir ve RELEASE edilebilir); yalniz SONRAKILER atilir. }
+  DropSavepointSnaps(Index + 1);
+end;
+
+procedure TVTableDb.Savepoint(const Name: string);
+begin
+  { v2 TVDb ile ayni kural: ayni isimde savepoint hata. }
+  if FindSavepoint(Name) >= 0 then
+    raise EVDbException.CreateFmt(ecDuplicateSavepoint,
+      'savepoint zaten var: %s', [Name]);
+  { SQL standardi: acik islem yoksa SAVEPOINT ortuk islem acar. }
+  if not FKvB.InBatch then
+    BeginBatch;
+  FKvB.Savepoint(Name);
+  PushSchemaSavepoint(Name);
+end;
+
+procedure TVTableDb.RollbackToSavepoint(const Name: string);
+var
+  ix: Integer;
+  kvT: TPair<string, TTableDef>;
+begin
+  ix := FindSavepoint(Name);
+  if ix < 0 then
+    raise EVDbException.CreateFmt(ecSavepointNotFound,
+      'savepoint bulunamadi: %s', [Name]);
+  { 1) KV kaplamasi: backend gunlugu (v2'de TVDb WAL tabanli geri alir). }
+  FKvB.RollbackToSavepoint(Name);
+  { 2) Bellekteki sema (DDL geri alinmasi). }
+  ResetBatchTableCache;
+  RestoreSavepointSchema(ix);
+  { 3) Indeksler VERIDEN yeniden kurulur: geri alinan yazmalarin bekleyen
+    indeks islemleri ve bellek dizileri artik veriyle uyusmaz. }
+  RebuildIndexes;
+  for kvT in FTables do
+    FPkIdxDirty.AddOrSetValue(kvT.Value.TableId, True);
+end;
+
+procedure TVTableDb.ReleaseSavepoint(const Name: string);
+var
+  ix: Integer;
+begin
+  ix := FindSavepoint(Name);
+  if ix < 0 then
+    raise EVDbException.CreateFmt(ecSavepointNotFound,
+      'savepoint bulunamadi: %s', [Name]);
+  { RELEASE veriyi COMMIT ETMEZ; yalniz geri donme noktasini (ve
+    sonrakileri) dusurur. Onceki savepoint'lerin gunlugu etkilenmez. }
+  FKvB.ReleaseSavepoint(Name);
+  DropSavepointSnaps(ix);
+end;
+
+
 procedure TVTableDb.Open(const Dir: string);
 begin
   FDir := IncludeTrailingPathDelimiter(Dir);
@@ -4714,6 +4888,7 @@ begin
   // yedegi alinir; AbortBatch bunu geri yukler. Aksi halde ROLLBACK
   // sonrasi tablo hem diskte hem bellekte kalirdi.
   SnapshotSchema;
+  ClearSavepoints;   // v3.2: yeni islem -> eski savepoint'ler gecersiz
   ResetBatchTableCache;
   FKvB.BeginBatch;
 end;
@@ -4724,6 +4899,7 @@ begin
   if FSchemaDirty then
     SaveSchema; // batch icine yazilir, tek fsync commit'te
   FKvB.CommitBatch;
+  ClearSavepoints;   // v3.2
   ClearSchemaSnapshot;
   // F2-7: Sema kalici olarak yazildi; "kasitli silindi" isaretleri artik
   // gerekli degil. Temizlenmezse GuardSchemaLoss sonraki gercek kayiplari
@@ -4746,6 +4922,7 @@ begin
   // olmadigindan ayirt edilemez; iptal tek GUVENLI secenektir.
   StopConcBuilders;
   FKvB.AbortBatch;
+  ClearSavepoints;   // v3.2
   // R-11: geri alinan islemde ertelenen satirlar da gecerlidir artik;
   // COMMIT'e kadar bekleyen liste TEMIZLENMEZSE sonraki gercek
   // COMMIT'te "satir kayboldu" hatasi verir (rollback edilmis bir

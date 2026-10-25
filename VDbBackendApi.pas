@@ -83,6 +83,28 @@ type
     function GetInBatch: Boolean;
     property InBatch: Boolean read GetInBatch;
 
+    { --- v3.2: SAVEPOINT / ROLLBACK TO / RELEASE SAVEPOINT ---
+      Sozlesme (v2 TVDb ile AYNI, R-02):
+        * Acik parti yoksa UYGULAMA baslatilir (SQL standardi: SAVEPOINT
+          ortuk islem acar); sonraki COMMIT/ROLLBACK onu kapatir.
+        * Ayni isimde ikinci SAVEPOINT hata verir (EVDbException
+          ecDuplicateSavepoint); backend bunu Boolean ile degil istisna
+          ile bildirir, cunku cagiran SQL katmani mesaji aynen gecirir.
+        * ROLLBACK TO hedef savepoint'i KORUR (SQLite davranisi; ayni
+          noktaya tekrar donulebilir), ondan SONRAKI savepoint'leri atar.
+        * RELEASE hedefi ve sonrakileri atar; veriyi COMMIT ETMEZ.
+        * Islem Commit/Abort edilince tum savepoint'ler dusurulur. }
+    procedure Savepoint(const Name: string);
+    function RollbackToSavepoint(const Name: string): Boolean;  // False: yok
+    function ReleaseSavepoint(const Name: string): Boolean;     // False: yok
+
+    { --- v3.2: ALTER DATABASE KEY (anahtar/parola rotasyonu) ---
+      v3: dosya butunu yeni parola ile yeniden sifrelenir (eski kayitlar
+      cozulur, yeni anahtarla yazilir; gecici dosya + atomik degistirme).
+      v2: kayit duzeyi anahtar (.key) yeniden uretilir.
+      Dosya sifresizse / parti acikken hata verir. }
+    procedure Rekey(const NewPassword: string);
+
     { --- sema / sifreleme kancalari --- }
     function EnsureColumnKey: QWord;
     function ColumnKeyId: QWord;

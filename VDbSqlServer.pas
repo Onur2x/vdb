@@ -34,8 +34,8 @@ unit VDbSqlServer;
 interface
 
 uses
-  SysUtils, Classes, SyncObjs, VDbTypes, VDbCore, VDbTable, VDbSql, VDbAst,
-  VDbNet;
+  SysUtils, Classes, SyncObjs, VDbTypes, VDbBackendApi, VDbFactory, VDbTable,
+  VDbSql, VDbAst, VDbNet;
 
 { Protokol sabitleri (VDBS_*) VDbNet birimindedir: tasima katmaniyla
   paylasildigi icin hem sunucu hem istemci oradan okur. }
@@ -79,7 +79,10 @@ type
     FDir: string;
     FPort: Word;
     FListen: TVdbSocket;
-    Fkv: TVDb;
+    { Sprint 3.2 (v3.2): motor SOMUT tipi (TVDb) yerine arayuz. Boylece
+      sunucu v3 sayfa motorunda da calisir; v2 dosyasi icin VdbOpen'un
+      AllowV2 secenegi kullanilir (varsayilan: v3). }
+    FBe: IVdbBackend;
     Ftb: TVTableDb;
     // KR-7: Fsq ve FLock kaldirildi. Her baglanti kendi TVSql ornegini
     // kullanir (TVdbServerConn.FSql). Ftb'nin MREW kilidi serilestirir.
@@ -389,8 +392,10 @@ end;
 
 procedure TVdbSqlServer.CloseEngine;
 begin
+  { Kapanis sirasi (olculmus): SQL -> tablo -> arayuz. Arayuz en son
+    birakilir; v3 backend dosyayi o ana kadar acik tutar. }
   if Ftb <> nil then begin Ftb.Close; Ftb.Free; Ftb := nil; end;
-  if Fkv <> nil then begin Fkv.Close; Fkv.Free; Fkv := nil; end;
+  FBe := nil;
 end;
 
 function TVdbSqlServer.Start(out AErr: string): Boolean;
@@ -402,11 +407,12 @@ begin
     AErr := 'sunucu zaten aktif';
     Exit;
   end;
-  { 1) motor }
+  { 1) motor: SOMUT TIP YOK. VdbOpenOrCreate v3 dosyasini acar/olusturur.
+    (v2 dosyasi icin VdbOpen(... AllowV2=True) gerekir; sunucu
+    varsayilan olarak v3 kullanir - v3 standarttir.) }
   try
-    Fkv := TVDb.Create;
-    Fkv.Open(FDir);
-    Ftb := TVTableDb.Create(Fkv);
+    VdbOpenOrCreate(FDir, FBe);
+    Ftb := TVTableDb.CreateBackend(FBe);
     Ftb.Open(FDir);
   except
     on E: Exception do

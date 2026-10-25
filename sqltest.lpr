@@ -17,7 +17,8 @@ uses
   SysUtils, Classes, Math, StrUtils, VDbCore, VDbTypes, VDbTable, VDbSql, VDbSync, VDbCrc32,
   VDbBackendApi, VDbBackendV3, VDbCrypt, VDbKdf, VDbSpatial, VDbRange, VDbMonitor, VDbPlatform, VDbCost,
   VDbExtension, VDbText, VDbParallel, VDbReplication, VDbNet, VDbSqlServer,
-  VDbClientNet, VDbMetricsHttp, VDbPgWire, VDbTls, VDbTrace, dynlibs, VDbUndo;
+  VDbClientNet, VDbMetricsHttp, VDbPgWire, VDbTls, VDbTrace, dynlibs, VDbUndo,
+  VDbFactory;
 { VDbTypes: TStrArray / TStrMatrix gibi paylasilan tipler artik tek
   kaynaktan geliyor (ayri birimde ikinci tanim FPC'de sessizce
   FARKLI tip uretip derleme hatasi veriyordu). }
@@ -480,6 +481,14 @@ begin
   p := D + PathDelim + Nm;
   ForceDirectories(p);
   NewDb(p);
+end;
+
+{ v3 portu: tam yol verilen klasoru acar (testlerin `dir` degiskeni
+  zaten D + PathDelim ile kurulmustur). }
+procedure OpenAt(const P: string);
+begin
+  ForceDirectories(P);
+  NewDb(P);
 end;
 
 procedure CorruptLastByte(const P: string);
@@ -13899,46 +13908,39 @@ begin
   Grp('T130 PK aralik indeksi tipi');
   dir := D + PathDelim + 't130_pk_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
-  db := TVDb.Create;
-  tdb := TVTableDb.Create(db);
   try
-    db.Open(dir);
-    tdb.Open(dir);
-    q := TVSql.Create(tdb);
+  OpenAt(dir);
     try
-      q.Exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
-      q.Exec('BEGIN');
+      sq.Exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+      sq.Exec('BEGIN');
       for i := 1 to 1000 do
-        q.Exec(Format('INSERT INTO t (id,v) VALUES (%d,%s)',
+        sq.Exec(Format('INSERT INTO t (id,v) VALUES (%d,%s)',
           [i, QuotedStr('v' + IntToStr(i))]));
-      q.Exec('COMMIT');
+      sq.Exec('COMMIT');
 
-      r := q.Exec('SELECT COUNT(*) FROM t WHERE id < 101');
+      r := sq.Exec('SELECT COUNT(*) FROM t WHERE id < 101');
       Dogrula('T130 id < 101 -> 100',
         (Length(r.Rows) = 1) and (r.Rows[0][0] = '100'),
         r.Rows[0][0]);
 
-      r := q.Exec('SELECT COUNT(*) FROM t WHERE id >= 101 AND id < 201');
+      r := sq.Exec('SELECT COUNT(*) FROM t WHERE id >= 101 AND id < 201');
       Dogrula('T130 id >= 101 AND id < 201 -> 100',
         (Length(r.Rows) = 1) and (r.Rows[0][0] = '100'),
         r.Rows[0][0]);
 
-      r := q.Exec('SELECT COUNT(*) FROM t WHERE id BETWEEN 101 AND 200');
+      r := sq.Exec('SELECT COUNT(*) FROM t WHERE id BETWEEN 101 AND 200');
       Dogrula('T130 id BETWEEN 101 AND 200 -> 100',
         (Length(r.Rows) = 1) and (r.Rows[0][0] = '100'),
         r.Rows[0][0]);
 
-      r := q.Exec('SELECT id FROM t WHERE id >= 101 AND id < 201 ORDER BY id');
+      r := sq.Exec('SELECT id FROM t WHERE id >= 101 AND id < 201 ORDER BY id');
       Dogrula('T130 aralik ilk/son id 101/200',
         (Length(r.Rows) = 100) and (r.Rows[0][0] = '101') and
         (r.Rows[99][0] = '200'),
         IntToStr(Length(r.Rows)));
     finally
-      q.Free;
     end;
   finally
-    tdb.Free;
-    db.Free;
   end;
 end;
 
@@ -13959,68 +13961,61 @@ begin
   fs.DecimalSeparator := '.';
   dir := D + PathDelim + 't131_topn_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
-  db := TVDb.Create;
-  tdb := TVTableDb.Create(db);
   try
-    db.Open(dir);
-    tdb.Open(dir);
-    q := TVSql.Create(tdb);
+  OpenAt(dir);
     try
-      q.Exec('CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, f FLOAT, s TEXT)');
-      q.Exec('BEGIN');
+      sq.Exec('CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, f FLOAT, s TEXT)');
+      sq.Exec('BEGIN');
       for i := 1 to 200 do
-        q.Exec(Format('INSERT INTO t (id,n,f,s) VALUES (%d,%d,%s,%s)',
+        sq.Exec(Format('INSERT INTO t (id,n,f,s) VALUES (%d,%d,%s,%s)',
           [i, 200 - i, FloatToStr(i * 1.25, fs), QuotedStr(Format('s%.4d', [201 - i]))]));
-      q.Exec('COMMIT');
+      sq.Exec('COMMIT');
 
-      r := q.Exec('SELECT id FROM t ORDER BY n DESC LIMIT 3 OFFSET 4');
+      r := sq.Exec('SELECT id FROM t ORDER BY n DESC LIMIT 3 OFFSET 4');
       Dogrula('T131 int DESC LIMIT/OFFSET',
         (Length(r.Rows) = 3) and (r.Rows[0][0] = '5') and
         (r.Rows[1][0] = '6') and (r.Rows[2][0] = '7'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT id FROM t ORDER BY f ASC LIMIT 2 OFFSET 10');
+      r := sq.Exec('SELECT id FROM t ORDER BY f ASC LIMIT 2 OFFSET 10');
       Dogrula('T131 float ASC LIMIT/OFFSET',
         (Length(r.Rows) = 2) and (r.Rows[0][0] = '11') and
         (r.Rows[1][0] = '12'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT id FROM t ORDER BY s ASC LIMIT 2 OFFSET 10');
+      r := sq.Exec('SELECT id FROM t ORDER BY s ASC LIMIT 2 OFFSET 10');
       Dogrula('T131 text ASC LIMIT/OFFSET',
         (Length(r.Rows) = 2) and (r.Rows[0][0] = '190') and
         (r.Rows[1][0] = '189'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT id FROM t ORDER BY id LIMIT 3 OFFSET 100');
+      r := sq.Exec('SELECT id FROM t ORDER BY id LIMIT 3 OFFSET 100');
       Dogrula('T131 PK sirasi OFFSET atlama',
         (Length(r.Rows) = 3) and (r.Rows[0][0] = '101') and
         (r.Rows[1][0] = '102') and (r.Rows[2][0] = '103'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT id FROM t ORDER BY id DESC LIMIT 3');
+      r := sq.Exec('SELECT id FROM t ORDER BY id DESC LIMIT 3');
       Dogrula('T131 PK DESC LIMIT',
         (Length(r.Rows) = 3) and (r.Rows[0][0] = '200') and
         (r.Rows[1][0] = '199') and (r.Rows[2][0] = '198'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT id FROM t WHERE id >= 50 AND id < 150 ' +
+      r := sq.Exec('SELECT id FROM t WHERE id >= 50 AND id < 150 ' +
         'ORDER BY id LIMIT 2 OFFSET 10');
       Dogrula('T131 WHERE + PK sirasi OFFSET',
         (Length(r.Rows) = 2) and (r.Rows[0][0] = '60') and
         (r.Rows[1][0] = '61'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT id FROM t ORDER BY n DESC LIMIT 4 OFFSET 196');
+      r := sq.Exec('SELECT id FROM t ORDER BY n DESC LIMIT 4 OFFSET 196');
       Dogrula('T131 int DESC derin OFFSET',
         (Length(r.Rows) = 4) and (r.Rows[0][0] = '197') and
         (r.Rows[3][0] = '200'),
         IntToStr(Length(r.Rows)));
     finally
-      q.Free;
     end;
   finally
-    tdb.Free;
-    db.Free;
   end;
 end;
 
@@ -14044,28 +14039,24 @@ begin
   fs.DecimalSeparator := '.';
   dir := D + PathDelim + 't133_group_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
-  db := TVDb.Create;
-  tdb := TVTableDb.Create(db);
   try
-    db.Open(dir);
-    tdb.Open(dir);
-    q := TVSql.Create(tdb);
+  OpenAt(dir);
     try
-      q.Exec('CREATE TABLE g (id INTEGER PRIMARY KEY, sehir TEXT, ' +
+      sq.Exec('CREATE TABLE g (id INTEGER PRIMARY KEY, sehir TEXT, ' +
         'yas INTEGER, bakiye FLOAT, aktif BOOLEAN)');
-      q.Exec('BEGIN');
+      sq.Exec('BEGIN');
       for i := 1 to 30 do
       begin
         if i mod 3 = 0 then city := 'Ankara'
         else if i mod 3 = 1 then city := 'Izmir'
         else city := 'Bursa';
         if i mod 2 = 0 then b := 'TRUE' else b := 'FALSE';
-        q.Exec(Format('INSERT INTO g (id,sehir,yas,bakiye,aktif) VALUES (%d,%s,%d,%s,%s)',
+        sq.Exec(Format('INSERT INTO g (id,sehir,yas,bakiye,aktif) VALUES (%d,%s,%d,%s,%s)',
           [i, QuotedStr(city), i, FloatToStr(i * 1.5, fs), b]));
       end;
-      q.Exec('COMMIT');
+      sq.Exec('COMMIT');
 
-      r := q.Exec('SELECT sehir, COUNT(*) AS n, SUM(yas) AS sy, ' +
+      r := sq.Exec('SELECT sehir, COUNT(*) AS n, SUM(yas) AS sy, ' +
         'MIN(yas) AS mn, MAX(yas) AS mx, AVG(bakiye) AS ab ' +
         'FROM g GROUP BY sehir ORDER BY sehir');
       Dogrula('T133 tek kolon COUNT/SUM/MIN/MAX/AVG',
@@ -14079,7 +14070,7 @@ begin
         (r.Rows[2][2] = '145') and (r.Rows[2][5] = '21.75'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT sehir, aktif, COUNT(*) AS n, SUM(yas) AS sy ' +
+      r := sq.Exec('SELECT sehir, aktif, COUNT(*) AS n, SUM(yas) AS sy ' +
         'FROM g GROUP BY sehir, aktif ORDER BY sehir, aktif');
       Dogrula('T133 cok kolonlu GROUP BY',
         (Length(r.Rows) = 6) and
@@ -14089,7 +14080,7 @@ begin
         (r.Rows[1][2] = '5') and (r.Rows[1][3] = '90'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT aktif, COUNT(*) AS n, SUM(yas) AS sy ' +
+      r := sq.Exec('SELECT aktif, COUNT(*) AS n, SUM(yas) AS sy ' +
         'FROM g WHERE sehir = ''Ankara'' GROUP BY aktif ORDER BY aktif');
       Dogrula('T133 WHERE TEXT + GROUP BY',
         (Length(r.Rows) = 2) and
@@ -14099,7 +14090,7 @@ begin
         (r.Rows[1][2] = '90'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g WHERE yas > 20 ' +
+      r := sq.Exec('SELECT sehir, COUNT(*) AS n FROM g WHERE yas > 20 ' +
         'GROUP BY sehir ORDER BY sehir');
       Dogrula('T133 WHERE sayisal + GROUP BY',
         (Length(r.Rows) = 3) and
@@ -14108,14 +14099,14 @@ begin
         (r.Rows[2][0] = 'Izmir') and (r.Rows[2][1] = '3'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g WHERE yas >= 10 ' +
+      r := sq.Exec('SELECT sehir, COUNT(*) AS n FROM g WHERE yas >= 10 ' +
         'AND yas <= 12 GROUP BY sehir ORDER BY sehir');
       Dogrula('T133 WHERE AND zinciri + GROUP BY',
         (Length(r.Rows) = 3) and (r.Rows[0][1] = '1') and
         (r.Rows[1][1] = '1') and (r.Rows[2][1] = '1'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g ' +
+      r := sq.Exec('SELECT sehir, COUNT(*) AS n FROM g ' +
         'WHERE sehir <> ''Ankara'' GROUP BY sehir ORDER BY sehir');
       Dogrula('T133 WHERE TEXT <> + GROUP BY',
         (Length(r.Rows) = 2) and
@@ -14123,7 +14114,7 @@ begin
         (r.Rows[1][0] = 'Izmir') and (r.Rows[1][1] = '10'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g ' +
+      r := sq.Exec('SELECT sehir, COUNT(*) AS n FROM g ' +
         'WHERE sehir = ''Ankara'' OR sehir = ''Izmir'' GROUP BY sehir ORDER BY sehir');
       Dogrula('T133 WHERE OR (ham on-eleme yok)',
         (Length(r.Rows) = 2) and
@@ -14131,7 +14122,7 @@ begin
         (r.Rows[1][0] = 'Izmir') and (r.Rows[1][1] = '10'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g ' +
+      r := sq.Exec('SELECT sehir, COUNT(*) AS n FROM g ' +
         'WHERE yas > 20 OR yas < 5 GROUP BY sehir ORDER BY sehir');
       Dogrula('T133 WHERE OR farkli kolon (tam satir)',
         (Length(r.Rows) = 3) and
@@ -14140,31 +14131,31 @@ begin
         (r.Rows[2][0] = 'Izmir') and (r.Rows[2][1] = '5'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g ' +
+      r := sq.Exec('SELECT sehir, COUNT(*) AS n FROM g ' +
         'WHERE sehir = ''Yok'' GROUP BY sehir');
       Dogrula('T133 WHERE sonuc yok', Length(r.Rows) = 0,
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT sehir FROM g GROUP BY sehir ORDER BY sehir');
+      r := sq.Exec('SELECT sehir FROM g GROUP BY sehir ORDER BY sehir');
       Dogrula('T133 aggregate olmadan GROUP BY',
         (Length(r.Rows) = 3) and (r.Rows[0][0] = 'Ankara') and
         (r.Rows[1][0] = 'Bursa') and (r.Rows[2][0] = 'Izmir'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g GROUP BY sehir ' +
+      r := sq.Exec('SELECT sehir, COUNT(*) AS n FROM g GROUP BY sehir ' +
         'ORDER BY sehir LIMIT 2 OFFSET 1');
       Dogrula('T133 GROUP BY LIMIT/OFFSET',
         (Length(r.Rows) = 2) and (r.Rows[0][0] = 'Bursa') and
         (r.Rows[1][0] = 'Izmir'), IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g GROUP BY sehir LIMIT 0');
+      r := sq.Exec('SELECT sehir, COUNT(*) AS n FROM g GROUP BY sehir LIMIT 0');
       Dogrula('T133 GROUP BY LIMIT 0', Length(r.Rows) = 0,
         IntToStr(Length(r.Rows)));
 
-      q.Exec('CREATE TABLE gn (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)');
-      q.Exec('INSERT INTO gn (id,v,s) VALUES ' +
+      sq.Exec('CREATE TABLE gn (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)');
+      sq.Exec('INSERT INTO gn (id,v,s) VALUES ' +
         '(1,NULL,NULL),(2,NULL,NULL),(3,5,''a''),(4,5,''a''),(5,7,''b'')');
-      r := q.Exec('SELECT v, COUNT(*) AS n, COUNT(v) AS cv, SUM(v) AS sv ' +
+      r := sq.Exec('SELECT v, COUNT(*) AS n, COUNT(v) AS cv, SUM(v) AS sv ' +
         'FROM gn GROUP BY v ORDER BY v');
       Dogrula('T133 NULL grup + COUNT(kolon)',
         (Length(r.Rows) = 3) and
@@ -14175,38 +14166,35 @@ begin
         (r.Rows[2][0] = '7') and (r.Rows[2][1] = '1'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT s, COUNT(*) AS n FROM gn GROUP BY s ORDER BY s');
+      r := sq.Exec('SELECT s, COUNT(*) AS n FROM gn GROUP BY s ORDER BY s');
       Dogrula('T133 NULL/empty metin grubu',
         (Length(r.Rows) = 3) and (r.Rows[0][1] = '2') and
         (r.Rows[1][1] = '2') and (r.Rows[2][1] = '1'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT sehir, COUNT(*) AS n FROM g GROUP BY sehir ' +
+      r := sq.Exec('SELECT sehir, COUNT(*) AS n FROM g GROUP BY sehir ' +
         'HAVING COUNT(*) >= 10 ORDER BY sehir');
       Dogrula('T133 HAVING genel yol',
         (Length(r.Rows) = 3) and (r.Rows[0][1] = '10') and
         (r.Rows[1][1] = '10') and (r.Rows[2][1] = '10'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT DISTINCT sehir FROM g GROUP BY sehir ORDER BY sehir');
+      r := sq.Exec('SELECT DISTINCT sehir FROM g GROUP BY sehir ORDER BY sehir');
       Dogrula('T133 DISTINCT + GROUP BY genel yol',
         (Length(r.Rows) = 3) and (r.Rows[0][0] = 'Ankara'),
         IntToStr(Length(r.Rows)));
 
-      q.Exec('CREATE TABLE gu (id INTEGER PRIMARY KEY, s TEXT)');
-      q.Exec('INSERT INTO gu (id,s) VALUES (1,''İzmir''),(2,''Izmir''),(3,''İzmir'')');
-      r := q.Exec('SELECT s, COUNT(*) AS n FROM gu GROUP BY s ORDER BY s');
+      sq.Exec('CREATE TABLE gu (id INTEGER PRIMARY KEY, s TEXT)');
+      sq.Exec('INSERT INTO gu (id,s) VALUES (1,''İzmir''),(2,''Izmir''),(3,''İzmir'')');
+      r := sq.Exec('SELECT s, COUNT(*) AS n FROM gu GROUP BY s ORDER BY s');
       Dogrula('T133 UTF-8 grup anahtari',
         (Length(r.Rows) = 2) and
         (((r.Rows[0][1] = '2') and (r.Rows[1][1] = '1')) or
          ((r.Rows[0][1] = '1') and (r.Rows[1][1] = '2'))),
         IntToStr(Length(r.Rows)));
     finally
-      q.Free;
     end;
   finally
-    tdb.Free;
-    db.Free;
   end;
 end;
 
@@ -14233,51 +14221,47 @@ begin
   Grp('T134 H12c cok kolonlu akisli top-N');
   dir := D + PathDelim + 't134_multi_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
-  db := TVDb.Create;
-  tdb := TVTableDb.Create(db);
   try
-    db.Open(dir);
-    tdb.Open(dir);
-    q := TVSql.Create(tdb);
+  OpenAt(dir);
     try
-      q.Exec('CREATE TABLE tm (id INTEGER PRIMARY KEY, g TEXT, n INTEGER, ' +
+      sq.Exec('CREATE TABLE tm (id INTEGER PRIMARY KEY, g TEXT, n INTEGER, ' +
         'f FLOAT, b BOOLEAN)');
-      q.Exec('INSERT INTO tm (id,g,n,f,b) VALUES ' +
+      sq.Exec('INSERT INTO tm (id,g,n,f,b) VALUES ' +
         '(1,''b'',2,2.5,TRUE),(2,''a'',1,1.5,TRUE),(3,''a'',3,3.5,FALSE),' +
         '(4,''a'',2,2.0,TRUE),(5,''b'',NULL,9.0,TRUE),' +
         '(6,''b'',1,0.5,FALSE),(7,NULL,5,5.0,TRUE),(8,NULL,4,4.0,FALSE),' +
         '(9,''c'',3,NULL,TRUE),(10,''c'',2,1.0,NULL),' +
         '(11,''a'',NULL,8.0,FALSE),(12,''b'',1,NULL,TRUE)');
 
-      r := q.Exec('SELECT id FROM tm ORDER BY g ASC, n DESC LIMIT 3');
+      r := sq.Exec('SELECT id FROM tm ORDER BY g ASC, n DESC LIMIT 3');
       Dogrula('T134 metin + sayisal, LIMIT',
         (Length(r.Rows) = 3) and
         (r.Rows[0][0] = '7') and (r.Rows[1][0] = '8') and
         (r.Rows[2][0] = '3'),
         Ids(r));
 
-      r := q.Exec('SELECT id FROM tm ORDER BY g ASC NULLS LAST, n DESC LIMIT 3');
+      r := sq.Exec('SELECT id FROM tm ORDER BY g ASC NULLS LAST, n DESC LIMIT 3');
       Dogrula('T134 NULLS LAST + LIMIT',
         (Length(r.Rows) = 3) and
         (r.Rows[0][0] = '3') and (r.Rows[1][0] = '4') and
         (r.Rows[2][0] = '2'),
         Ids(r));
 
-      r := q.Exec('SELECT id FROM tm ORDER BY n ASC, f DESC LIMIT 3');
+      r := sq.Exec('SELECT id FROM tm ORDER BY n ASC, f DESC LIMIT 3');
       Dogrula('T134 sayisal + float, karma icerik',
         (Length(r.Rows) = 3) and
         (r.Rows[0][0] = '5') and (r.Rows[1][0] = '11') and
         (r.Rows[2][0] = '2'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT id FROM tm ORDER BY g DESC NULLS FIRST, n ASC ' +
+      r := sq.Exec('SELECT id FROM tm ORDER BY g DESC NULLS FIRST, n ASC ' +
         'LIMIT 2 OFFSET 1');
       Dogrula('T134 DESC + NULLS FIRST + OFFSET',
         (Length(r.Rows) = 2) and
         (r.Rows[0][0] = '7') and (r.Rows[1][0] = '10'),
         Ids(r));
 
-      r := q.Exec('SELECT id FROM tm WHERE g = ''b'' ORDER BY n DESC, f ASC ' +
+      r := sq.Exec('SELECT id FROM tm WHERE g = ''b'' ORDER BY n DESC, f ASC ' +
         'LIMIT 3');
       Dogrula('T134 WHERE on-elemesi + cok kolon',
         (Length(r.Rows) = 3) and
@@ -14285,14 +14269,14 @@ begin
         (r.Rows[2][0] = '6'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT id FROM tm ORDER BY b ASC, n DESC LIMIT 3');
+      r := sq.Exec('SELECT id FROM tm ORDER BY b ASC, n DESC LIMIT 3');
       Dogrula('T134 BOOL + sayisal',
         (Length(r.Rows) = 3) and
         (r.Rows[0][0] = '10') and (r.Rows[1][0] = '8') and
         (r.Rows[2][0] = '3'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT id FROM tm WHERE g = ''b'' ' +
+      r := sq.Exec('SELECT id FROM tm WHERE g = ''b'' ' +
         'ORDER BY g ASC, n DESC, f ASC LIMIT 4');
       Dogrula('T134 uc kolon, son anahtar',
         (Length(r.Rows) = 4) and
@@ -14300,33 +14284,30 @@ begin
         (r.Rows[2][0] = '6') and (r.Rows[3][0] = '5'),
         Ids(r));
 
-      r := q.Exec('SELECT id FROM tm WHERE n >= 0 ' +
+      r := sq.Exec('SELECT id FROM tm WHERE n >= 0 ' +
         'ORDER BY n + 0 DESC LIMIT 1');
       Dogrula('T134 ifade anahtari genel yola duser',
         (Length(r.Rows) = 1) and (r.Rows[0][0] = '7'),
         Ids(r));
 
-      r := q.Exec('SELECT id FROM tm WHERE g = ''b'' ' +
+      r := sq.Exec('SELECT id FROM tm WHERE g = ''b'' ' +
         'ORDER BY LENGTH(g) DESC, n DESC, id ASC LIMIT 2');
       Dogrula('T134 ifade + LIMIT top-N',
         (Length(r.Rows) = 2) and
         (r.Rows[0][0] = '1') and (r.Rows[1][0] = '6'),
         Ids(r));
 
-      r := q.Exec('SELECT id, n AS nn FROM tm ORDER BY g, nn LIMIT 1');
+      r := sq.Exec('SELECT id, n AS nn FROM tm ORDER BY g, nn LIMIT 1');
       Dogrula('T134 alias anahtari genel yola duser',
         (Length(r.Rows) = 1) and (r.Rows[0][0] = '8'),
         Ids(r));
 
-      r := q.Exec('SELECT id FROM tm ORDER BY g ASC, n DESC LIMIT 0');
+      r := sq.Exec('SELECT id FROM tm ORDER BY g ASC, n DESC LIMIT 0');
       Dogrula('T134 cok kolon LIMIT 0 bos', Length(r.Rows) = 0,
         IntToStr(Length(r.Rows)));
     finally
-      q.Free;
     end;
   finally
-    tdb.Free;
-    db.Free;
   end;
 end;
 
@@ -14347,19 +14328,15 @@ begin
   fs.DecimalSeparator := '.';
   dir := D + PathDelim + 't135_fsort_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
-  db := TVDb.Create;
-  tdb := TVTableDb.Create(db);
   try
-    db.Open(dir);
-    tdb.Open(dir);
-    q := TVSql.Create(tdb);
+  OpenAt(dir);
     try
-      q.Exec('CREATE TABLE tf (id INTEGER PRIMARY KEY, f FLOAT)');
-      q.Exec('INSERT INTO tf (id,f) VALUES ' +
+      sq.Exec('CREATE TABLE tf (id INTEGER PRIMARY KEY, f FLOAT)');
+      sq.Exec('INSERT INTO tf (id,f) VALUES ' +
         '(1,2.5),(2,NULL),(3,-1.75),(4,2.5),(5,0),(6,10.125),(7,-3.5),(8,1)');
 
       // WHERE PK'ya referans verir -> genel yol (bellek ici siralama).
-      r := q.Exec('SELECT id FROM tf WHERE id >= 0 ORDER BY f ASC');
+      r := sq.Exec('SELECT id FROM tf WHERE id >= 0 ORDER BY f ASC');
       Dogrula('T135 FLOAT ASC siralama',
         (Length(r.Rows) = 8) and
         (r.Rows[0][0] = '2') and    // NULL en kucuk
@@ -14372,7 +14349,7 @@ begin
         (r.Rows[7][0] = '6'),       // 10.125
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT id FROM tf WHERE id >= 0 ORDER BY f DESC');
+      r := sq.Exec('SELECT id FROM tf WHERE id >= 0 ORDER BY f DESC');
       Dogrula('T135 FLOAT DESC siralama',
         (Length(r.Rows) = 8) and
         (r.Rows[0][0] = '6') and
@@ -14385,14 +14362,14 @@ begin
         (r.Rows[7][0] = '2'),        // NULL en buyuk
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT id FROM tf WHERE id >= 0 ORDER BY f ASC LIMIT 3');
+      r := sq.Exec('SELECT id FROM tf WHERE id >= 0 ORDER BY f ASC LIMIT 3');
       Dogrula('T135 FLOAT ASC LIMIT',
         (Length(r.Rows) = 3) and
         (r.Rows[0][0] = '2') and (r.Rows[1][0] = '7') and
         (r.Rows[2][0] = '3'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT id FROM tf WHERE id >= 0 ORDER BY f DESC ' +
+      r := sq.Exec('SELECT id FROM tf WHERE id >= 0 ORDER BY f DESC ' +
         'LIMIT 2 OFFSET 1');
       Dogrula('T135 FLOAT DESC LIMIT/OFFSET',
         (Length(r.Rows) = 2) and
@@ -14401,20 +14378,20 @@ begin
         IntToStr(Length(r.Rows)));
 
       // NULLS FIRST/LAST acik yazildiginda genel yola dusulur.
-      r := q.Exec('SELECT id FROM tf WHERE id >= 0 ' +
+      r := sq.Exec('SELECT id FROM tf WHERE id >= 0 ' +
         'ORDER BY f ASC NULLS LAST LIMIT 1');
       Dogrula('T135 FLOAT NULLS LAST',
         (Length(r.Rows) = 1) and (r.Rows[0][0] = '7'),
         IntToStr(Length(r.Rows)));
 
-      r := q.Exec('SELECT id FROM tf WHERE id >= 0 ' +
+      r := sq.Exec('SELECT id FROM tf WHERE id >= 0 ' +
         'ORDER BY f DESC NULLS FIRST LIMIT 1');
       Dogrula('T135 FLOAT NULLS FIRST',
         (Length(r.Rows) = 1) and (r.Rows[0][0] = '2'),
         IntToStr(Length(r.Rows)));
 
       // Cok kolonlu siralamada float kolonu ikinci srada.
-      r := q.Exec('SELECT id FROM tf WHERE id >= 0 ORDER BY f ASC, id DESC ' +
+      r := sq.Exec('SELECT id FROM tf WHERE id >= 0 ORDER BY f ASC, id DESC ' +
         'LIMIT 2');
       Dogrula('T135 FLOAT + kolon siralama',
         (Length(r.Rows) = 2) and
@@ -14422,44 +14399,41 @@ begin
         IntToStr(Length(r.Rows)));
 
       // Paralel yol esigi (>= 2048 satir) uzerinde siralama dogru mu?
-      q.Exec('CREATE TABLE tp (id INTEGER PRIMARY KEY, f FLOAT)');
-      q.Exec('BEGIN');
+      sq.Exec('CREATE TABLE tp (id INTEGER PRIMARY KEY, f FLOAT)');
+      sq.Exec('BEGIN');
       for i := 1 to 3000 do
-        q.Exec(Format('INSERT INTO tp (id,f) VALUES (%d,%s)',
+        sq.Exec(Format('INSERT INTO tp (id,f) VALUES (%d,%s)',
           [i, FloatToStr((3000 - i) * 0.5, fs)]));
-      q.Exec('COMMIT');
-      r := q.Exec('SELECT id, f FROM tp WHERE id >= 0 ORDER BY f ASC LIMIT 3');
+      sq.Exec('COMMIT');
+      r := sq.Exec('SELECT id, f FROM tp WHERE id >= 0 ORDER BY f ASC LIMIT 3');
       Dogrula('T135 paralel yol siralama',
         (Length(r.Rows) = 3) and
         (r.Rows[0][0] = '3000') and (r.Rows[1][0] = '2999') and
         (r.Rows[2][0] = '2998'),
         IntToStr(Length(r.Rows)));
-      r := q.Exec('SELECT id, f FROM tp WHERE id >= 0 ORDER BY f DESC LIMIT 3');
+      r := sq.Exec('SELECT id, f FROM tp WHERE id >= 0 ORDER BY f DESC LIMIT 3');
       Dogrula('T135 paralel yol DESC',
         (Length(r.Rows) = 3) and
         (r.Rows[0][0] = '1') and (r.Rows[1][0] = '2') and
         (r.Rows[2][0] = '3'),
         IntToStr(Length(r.Rows)));
       // LIMIT'siz tam siralama -> paralel dagitim yolu.
-      r := q.Exec('SELECT id, f FROM tp WHERE id >= 0 ORDER BY f ASC');
+      r := sq.Exec('SELECT id, f FROM tp WHERE id >= 0 ORDER BY f ASC');
       Dogrula('T135 tam siralama (paralel yol)',
         (Length(r.Rows) = 3000) and
         (r.Rows[0][0] = '3000') and
         (r.Rows[1499][0] = '1501') and
         (r.Rows[2999][0] = '1'),
         IntToStr(Length(r.Rows)));
-      r := q.Exec('SELECT id, f FROM tp WHERE id >= 0 ORDER BY f DESC');
+      r := sq.Exec('SELECT id, f FROM tp WHERE id >= 0 ORDER BY f DESC');
       Dogrula('T135 tam siralama DESC (paralel yol)',
         (Length(r.Rows) = 3000) and
         (r.Rows[0][0] = '1') and
         (r.Rows[2999][0] = '3000'),
         IntToStr(Length(r.Rows)));
     finally
-      q.Free;
     end;
   finally
-    tdb.Free;
-    db.Free;
   end;
 end;
 
@@ -14490,8 +14464,8 @@ var
 
   procedure Cmp(const A, B: string);
   begin
-    r1 := q.Exec(A);
-    r2 := q.Exec(B);
+    r1 := sq.Exec(A);
+    r2 := sq.Exec(B);
     s1 := RowSet(r1);
     s2 := RowSet(r2);
     if s1 = s2 then
@@ -14505,16 +14479,12 @@ begin
   Grp('T136 H13 akisli GROUP BY / genel yol farki');
   dir := D + PathDelim + 't136_gdiff_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
-  db := TVDb.Create;
-  tdb := TVTableDb.Create(db);
   try
-    db.Open(dir);
-    tdb.Open(dir);
-    q := TVSql.Create(tdb);
+  OpenAt(dir);
     try
-      q.Exec('CREATE TABLE d (id INTEGER PRIMARY KEY, s TEXT, n INTEGER, ' +
+      sq.Exec('CREATE TABLE d (id INTEGER PRIMARY KEY, s TEXT, n INTEGER, ' +
         'f FLOAT, b BOOLEAN)');
-      q.Exec('INSERT INTO d (id,s,n,f,b) VALUES ' +
+      sq.Exec('INSERT INTO d (id,s,n,f,b) VALUES ' +
         '(1,''a'',10,1.5,TRUE),(2,''a'',20,2.5,TRUE),(3,''b'',30,3.5,FALSE),' +
         '(4,''b'',5,0.5,FALSE),(5,''c'',NULL,NULL,NULL),(6,NULL,7,7.0,TRUE),' +
         '(7,''a'',20,2.5,NULL),(8,''b'',NULL,1.25,TRUE)');
@@ -14544,11 +14514,8 @@ begin
           'SELECT s, COUNT(*) AS c FROM d GROUP BY s HAVING COUNT(*) > 1 ' +
           'ORDER BY s');
     finally
-      q.Free;
     end;
   finally
-    tdb.Free;
-    db.Free;
   end;
 end;
 
@@ -14591,8 +14558,8 @@ var
   var
     s1, s2: string;
   begin
-    r1 := q.Exec(A);
-    r2 := q.Exec(B);
+    r1 := sq.Exec(A);
+    r2 := sq.Exec(B);
     s1 := FirstCol(r1, Sorted);
     s2 := FirstCol(r2, Sorted);
     if s1 = s2 then
@@ -14606,16 +14573,12 @@ begin
   Grp('T138 H16 akisli DISTINCT / genel yol farki');
   dir := D + PathDelim + 't138_distinct_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
-  db := TVDb.Create;
-  tdb := TVTableDb.Create(db);
   try
-    db.Open(dir);
-    tdb.Open(dir);
-    q := TVSql.Create(tdb);
+  OpenAt(dir);
     try
-      q.Exec('CREATE TABLE d (id INTEGER PRIMARY KEY, s TEXT, n INTEGER, ' +
+      sq.Exec('CREATE TABLE d (id INTEGER PRIMARY KEY, s TEXT, n INTEGER, ' +
         'f FLOAT, b BOOLEAN)');
-      q.Exec('INSERT INTO d (id,s,n,f,b) VALUES ' +
+      sq.Exec('INSERT INTO d (id,s,n,f,b) VALUES ' +
         '(1,''a'',10,1.5,TRUE),(2,''a'',20,2.5,TRUE),(3,''b'',30,3.5,FALSE),' +
         '(4,''b'',5,0.5,FALSE),(5,''c'',NULL,NULL,NULL),(6,NULL,7,7.0,TRUE),' +
         '(7,''a'',20,2.5,NULL),(8,''b'',NULL,1.25,TRUE),(9,'''',99,9.9,FALSE)');
@@ -14648,11 +14611,8 @@ begin
       Cmp('SELECT DISTINCT n FROM d', 'SELECT DISTINCT n, n FROM d', True);
       Cmp('SELECT DISTINCT f FROM d', 'SELECT DISTINCT f, f FROM d', True);
     finally
-      q.Free;
     end;
   finally
-    tdb.Free;
-    db.Free;
   end;
 end;
 
@@ -14671,8 +14631,8 @@ var
   var
     s1, s2: string;
   begin
-    r1 := q.Exec(A);
-    r2 := q.Exec(B);
+    r1 := sq.Exec(A);
+    r2 := sq.Exec(B);
     if (Length(r1.Rows) > 0) and (Length(r1.Rows[0]) > 0) then
       s1 := r1.Rows[0][0] else s1 := '<yok>';
     if (Length(r2.Rows) > 0) and (Length(r2.Rows[0]) > 0) then
@@ -14687,16 +14647,12 @@ begin
   Grp('T139 H17 akisli WHERE''li COUNT(*) / genel yol farki');
   dir := D + PathDelim + 't139_fcount_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
-  db := TVDb.Create;
-  tdb := TVTableDb.Create(db);
   try
-    db.Open(dir);
-    tdb.Open(dir);
-    q := TVSql.Create(tdb);
+  OpenAt(dir);
     try
-      q.Exec('CREATE TABLE d (id INTEGER PRIMARY KEY, s TEXT, n INTEGER, ' +
+      sq.Exec('CREATE TABLE d (id INTEGER PRIMARY KEY, s TEXT, n INTEGER, ' +
         'f FLOAT, b BOOLEAN)');
-      q.Exec('INSERT INTO d (id,s,n,f,b) VALUES ' +
+      sq.Exec('INSERT INTO d (id,s,n,f,b) VALUES ' +
         '(1,''a'',10,1.5,TRUE),(2,''a'',20,2.5,TRUE),(3,''b'',30,3.5,FALSE),' +
         '(4,''b'',5,0.5,FALSE),(5,''c'',NULL,NULL,NULL),(6,NULL,7,7.0,TRUE),' +
         '(7,''a'',20,2.5,NULL),(8,''b'',NULL,1.25,TRUE),(9,'''',99,9.9,FALSE),' +
@@ -14768,7 +14724,7 @@ begin
           'SELECT COUNT(id) FROM d WHERE n > 5 LIMIT 1');
       Cmp('SELECT COUNT(*) AS c FROM d WHERE n > 5',
           'SELECT COUNT(id) FROM d WHERE n > 5');
-      r1 := q.Exec('SELECT COUNT(*) AS c FROM d WHERE n > 5');
+      r1 := sq.Exec('SELECT COUNT(*) AS c FROM d WHERE n > 5');
       if (Length(r1.Fields) = 1) and (r1.Fields[0] = 'c') and
          (Length(r1.Rows) = 1) and (r1.Rows[0][0] = '7') then
         Dogrula('T139 alias/alan adi', True, '')
@@ -14777,29 +14733,26 @@ begin
       else
         Dogrula('T139 alias/alan adi', False, 'alan yok');
       // Pending batch gorunurlugu: akisli tarama bekleyen satirlari da gormeli.
-      db.BeginBatch;
+    sq.Exec('BEGIN');
       try
-        q.Exec('INSERT INTO d (id,s,n,f,b) VALUES (12,''z'',50,1.0,TRUE)');
+        sq.Exec('INSERT INTO d (id,s,n,f,b) VALUES (12,''z'',50,1.0,TRUE)');
         Cmp('SELECT COUNT(*) FROM d WHERE n > 5',
             'SELECT COUNT(id) FROM d WHERE n > 5');
         Cmp('SELECT COUNT(*) FROM d WHERE s LIKE ''z%''',
             'SELECT COUNT(id) FROM d WHERE s LIKE ''z%''');
       finally
-        db.AbortBatch;
+    sq.Exec('ROLLBACK');
       end;
       // Guncelleme/silme sonrasi akisli tarama guncel veriyi gormeli.
-      q.Exec('UPDATE d SET n = 60 WHERE id = 1');
-      q.Exec('DELETE FROM d WHERE id = 2');
+      sq.Exec('UPDATE d SET n = 60 WHERE id = 1');
+      sq.Exec('DELETE FROM d WHERE id = 2');
       Cmp('SELECT COUNT(*) FROM d WHERE n > 5',
           'SELECT COUNT(id) FROM d WHERE n > 5');
       Cmp('SELECT COUNT(*) FROM d WHERE s = ''a''',
           'SELECT COUNT(id) FROM d WHERE s = ''a''');
     finally
-      q.Free;
     end;
   finally
-    tdb.Free;
-    db.Free;
   end;
 end;
 
@@ -14819,8 +14772,8 @@ var
   var
     s1, s2: string;
   begin
-    r1 := q.Exec(A);
-    r2 := q.Exec(B);
+    r1 := sq.Exec(A);
+    r2 := sq.Exec(B);
     if (Length(r1.Rows) > 0) and (Length(r1.Rows[0]) > 0) then
       s1 := r1.Rows[0][0] else s1 := '<yok>';
     if (Length(r2.Rows) > 0) and (Length(r2.Rows[0]) > 0) then
@@ -14835,16 +14788,12 @@ begin
   Grp('T140 H18 ham kesin COUNT(*) / genel yol farki');
   dir := D + PathDelim + 't140_rawcount_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
-  db := TVDb.Create;
-  tdb := TVTableDb.Create(db);
   try
-    db.Open(dir);
-    tdb.Open(dir);
-    q := TVSql.Create(tdb);
+  OpenAt(dir);
     try
-      q.Exec('CREATE TABLE h (id INTEGER PRIMARY KEY, i INTEGER, f FLOAT, ' +
+      sq.Exec('CREATE TABLE h (id INTEGER PRIMARY KEY, i INTEGER, f FLOAT, ' +
         's TEXT, b BOOLEAN, m TEXT)');
-      q.Exec('INSERT INTO h (id,i,f,s,b,m) VALUES ' +
+      sq.Exec('INSERT INTO h (id,i,f,s,b,m) VALUES ' +
         '(1,42,2.5,''a'',TRUE,''x''),' +
         '(2,-7,1.25,''b'',FALSE,123),' +
         '(3,0,2.5,NULL,NULL,''x''),' +
@@ -14906,11 +14855,8 @@ begin
       Cmp('SELECT COUNT(*) FROM h WHERE id >= 2 AND id < 5',
           'SELECT COUNT(id) FROM h WHERE id >= 2 AND id < 5');
     finally
-      q.Free;
     end;
   finally
-    tdb.Free;
-    db.Free;
   end;
 end;
 
@@ -14928,8 +14874,8 @@ var
   var
     s1, s2, aa, bb: string;
   begin
-    r1 := q.Exec(A);
-    r2 := q.Exec(B);
+    r1 := sq.Exec(A);
+    r2 := sq.Exec(B);
     aa := A; bb := B;
     aa := StringReplace(aa, 'COUNT(*)', 'COUNT(id)', []);
     bb := StringReplace(bb, 'COUNT(*)', 'COUNT(id)', []);
@@ -14953,19 +14899,15 @@ begin
   Grp('T141 H19 ham LIKE/ILIKE COUNT(*) / genel yol farki');
   dir := D + PathDelim + 't141_rawlike_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
-  db := TVDb.Create;
-  tdb := TVTableDb.Create(db);
   try
-    db.Open(dir);
-    tdb.Open(dir);
-    q := TVSql.Create(tdb);
+  OpenAt(dir);
     try
-      q.Exec('CREATE TABLE l (id INTEGER PRIMARY KEY, s TEXT)');
-      q.Exec('INSERT INTO l (id,s) VALUES ' +
+      sq.Exec('CREATE TABLE l (id INTEGER PRIMARY KEY, s TEXT)');
+      sq.Exec('INSERT INTO l (id,s) VALUES ' +
         '(1,''Ali''),(2,''ali''),(3,''Irmak''),(4,''irmak''),' +
         '(5,''Ayşe''),(6,''IŞIL''),(7,''i''),(8,''I''),' +
         '(9,''''),(10,NULL),(11,''a_b''),(12,''aXb''),(13,''a%b'')');
-      q.Exec('INSERT INTO l (id,s) VALUES (14,''' +
+      sq.Exec('INSERT INTO l (id,s) VALUES (14,''' +
         StringOfChar('a', 5000) + ''')');
 
       C('s LIKE ''A%''');
@@ -14995,11 +14937,8 @@ begin
       C('s ILIKE ''%a%'' AND id > 0');
       C('id > 0 AND s ILIKE ''%a%''');
     finally
-      q.Free;
     end;
   finally
-    tdb.Free;
-    db.Free;
   end;
 end;
 
@@ -15019,8 +14958,8 @@ var
   var
     s1, s2, aa: string;
   begin
-    r1 := q.Exec(A);
-    r2 := q.Exec(B);
+    r1 := sq.Exec(A);
+    r2 := sq.Exec(B);
     aa := A;
     aa := StringReplace(aa, 'COUNT(*)', 'COUNT(id)', []);
     if (Length(r1.Rows) > 0) and (Length(r1.Rows[0]) > 0) then
@@ -15043,16 +14982,12 @@ begin
   Grp('T142 H20 ham boolean agaci / genel yol farki');
   dir := D + PathDelim + 't142_rawtree_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
-  db := TVDb.Create;
-  tdb := TVTableDb.Create(db);
   try
-    db.Open(dir);
-    tdb.Open(dir);
-    q := TVSql.Create(tdb);
+  OpenAt(dir);
     try
-      q.Exec('CREATE TABLE p (id INTEGER PRIMARY KEY, i INTEGER, ' +
+      sq.Exec('CREATE TABLE p (id INTEGER PRIMARY KEY, i INTEGER, ' +
         'f FLOAT, s TEXT, b BOOLEAN)');
-      q.Exec('INSERT INTO p (id,i,f,s,b) VALUES ' +
+      sq.Exec('INSERT INTO p (id,i,f,s,b) VALUES ' +
         '(1,1,1.5,''Ali'',TRUE),' +
         '(2,2,2.5,''ali'',FALSE),' +
         '(3,NULL,NULL,NULL,NULL),' +
@@ -15127,11 +15062,8 @@ begin
       C('b = TRUE OR i = 1');
       C('s > ''Ali'' OR i = 1');
     finally
-      q.Free;
     end;
   finally
-    tdb.Free;
-    db.Free;
   end;
 end;
 
@@ -15174,8 +15106,8 @@ var
   var
     s1, s2: string;
   begin
-    r1 := q.Exec(A);
-    r2 := q.Exec(B);
+    r1 := sq.Exec(A);
+    r2 := sq.Exec(B);
     s1 := RowSet(r1);
     s2 := RowSet(r2);
     if s1 = s2 then
@@ -15214,16 +15146,12 @@ begin
   Grp('T143 H21 ham boolean agaci / SELECT yollari');
   dir := D + PathDelim + 't143_rawtree_sel_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
-  db := TVDb.Create;
-  tdb := TVTableDb.Create(db);
   try
-    db.Open(dir);
-    tdb.Open(dir);
-    q := TVSql.Create(tdb);
+  OpenAt(dir);
     try
-      q.Exec('CREATE TABLE p (id INTEGER PRIMARY KEY, i INTEGER, ' +
+      sq.Exec('CREATE TABLE p (id INTEGER PRIMARY KEY, i INTEGER, ' +
         'f FLOAT, s TEXT, b BOOLEAN)');
-      q.Exec('INSERT INTO p (id,i,f,s,b) VALUES ' +
+      sq.Exec('INSERT INTO p (id,i,f,s,b) VALUES ' +
         '(1,1,1.5,''Ali'',TRUE),' +
         '(2,2,2.5,''ali'',FALSE),' +
         '(3,NULL,NULL,NULL,NULL),' +
@@ -15244,11 +15172,8 @@ begin
       C('f > 0.0 OR f < -1.0');
       C('s LIKE ''A%'' OR i = 42');
     finally
-      q.Free;
     end;
   finally
-    tdb.Free;
-    db.Free;
   end;
 end;
 
@@ -15278,8 +15203,8 @@ var
     r1, r2: TSqlResult;
     s1, s2: string;
   begin
-    r1 := q.Exec(A);
-    r2 := q.Exec(B);
+    r1 := sq.Exec(A);
+    r2 := sq.Exec(B);
     s1 := Ids(r1);
     s2 := Ids(r2);
     if s1 = s2 then
@@ -15301,20 +15226,16 @@ begin
   Grp('T144 H22 derin OFFSET canlilik denetimi');
   dir := D + PathDelim + 't144_offset_live_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
-  db := TVDb.Create;
-  tdb := TVTableDb.Create(db);
   try
-    db.Open(dir);
-    tdb.Open(dir);
-    q := TVSql.Create(tdb);
+  OpenAt(dir);
     try
-      q.Exec('CREATE TABLE p (id INTEGER PRIMARY KEY, g TEXT, n INTEGER)');
-      q.Exec('BEGIN');
+      sq.Exec('CREATE TABLE p (id INTEGER PRIMARY KEY, g TEXT, n INTEGER)');
+      sq.Exec('BEGIN');
       for i := 1 to 12000 do
-        q.Exec(Format('INSERT INTO p (id,g,n) VALUES (%d,%s,%d)',
+        sq.Exec(Format('INSERT INTO p (id,g,n) VALUES (%d,%s,%d)',
           [i, QuotedStr(Format('g%.2d', [i mod 20])), i]));
-      q.Exec('COMMIT');
-      q.Exec('CREATE INDEX ix_p_g ON p (g)');
+      sq.Exec('COMMIT');
+      sq.Exec('CREATE INDEX ix_p_g ON p (g)');
       // Derin OFFSET bolgesinde olu indeks girdileri olustur. Tek DELETE
       // cumlesi kullanilir; 400+ ayri Exec testi yavaslatirdi.
       delSql := 'DELETE FROM p WHERE id IN (';
@@ -15322,7 +15243,7 @@ begin
         if i mod 7 = 3 then
           delSql := delSql + IntToStr(i) + ',';
       delSql[Length(delSql)] := ')';
-      q.Exec(delSql);
+      sq.Exec(delSql);
 
       // LIMIT+OFFSET > 10000: H12b yerine indeks sirasi yolu kullanilir.
       C('ASC', '10001');
@@ -15338,11 +15259,8 @@ begin
       C('DESC', '11000');
       C('DESC', '11400');
     finally
-      q.Free;
     end;
   finally
-    tdb.Free;
-    db.Free;
   end;
 end;
 
@@ -15366,7 +15284,7 @@ var
   var
     p: Integer;
   begin
-    R := q.Exec(S);
+    R := sq.Exec(S);
     Result := '';
     for p := 0 to High(R.Rows) do
       Result := Result + R.Rows[p][0] + ' | ';
@@ -15376,33 +15294,29 @@ begin
   Grp('T145 H8 MCV skew esitlik');
   dir := D + PathDelim + 't145_mcv_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
-  db := TVDb.Create;
-  tdb := TVTableDb.Create(db);
   try
-    db.Open(dir);
-    tdb.Open(dir);
-    q := TVSql.Create(tdb);
+  OpenAt(dir);
     try
-      q.Exec('CREATE TABLE mcv (id INTEGER PRIMARY KEY, k TEXT, n INTEGER)');
-      q.Exec('BEGIN');
+      sq.Exec('CREATE TABLE mcv (id INTEGER PRIMARY KEY, k TEXT, n INTEGER)');
+      sq.Exec('BEGIN');
       for i := 1 to 100 do
       begin
         if i <= 90 then
         begin
           kk := 'A';
-          q.Exec(Format('INSERT INTO mcv VALUES (%d,%s,0)', [i, QuotedStr(kk)]));
+          sq.Exec(Format('INSERT INTO mcv VALUES (%d,%s,0)', [i, QuotedStr(kk)]));
         end
         else
         begin
           kk := 'B' + IntToStr(i - 90);
-          q.Exec(Format('INSERT INTO mcv VALUES (%d,%s,%d)',
+          sq.Exec(Format('INSERT INTO mcv VALUES (%d,%s,%d)',
             [i, QuotedStr(kk), i]));
         end;
       end;
-      q.Exec('COMMIT');
-      q.Exec('CREATE INDEX ix_mcv_k ON mcv(k)');
-      q.Exec('CREATE INDEX ix_mcv_n ON mcv(n)');
-      q.Exec('ANALYZE mcv');
+      sq.Exec('COMMIT');
+      sq.Exec('CREATE INDEX ix_mcv_k ON mcv(k)');
+      sq.Exec('CREATE INDEX ix_mcv_n ON mcv(n)');
+      sq.Exec('ANALYZE mcv');
 
       // MCV gercekten okunuyor mu?
       Dogrula('MCV istatistigi okundu', GetTableStats('mcv', st), '');
@@ -15429,21 +15343,18 @@ begin
         Pos('Index Scan using ix_mcv_n', all) > 0, all);
 
       // CBO yalnizca plan secer; sonuc kumeleri degismez.
-      R := q.Exec('SELECT COUNT(*) FROM mcv WHERE k = ' + QuotedStr('A'));
+      R := sq.Exec('SELECT COUNT(*) FROM mcv WHERE k = ' + QuotedStr('A'));
       Dogrula('MCV A sayimi 90', (Length(R.Rows) = 1) and
         (R.Rows[0][0] = '90'), R.Rows[0][0]);
-      R := q.Exec('SELECT COUNT(*) FROM mcv WHERE k = ' + QuotedStr('B3'));
+      R := sq.Exec('SELECT COUNT(*) FROM mcv WHERE k = ' + QuotedStr('B3'));
       Dogrula('MCV B3 sayimi 1', (Length(R.Rows) = 1) and
         (R.Rows[0][0] = '1'), R.Rows[0][0]);
-      R := q.Exec('SELECT COUNT(*) FROM mcv WHERE n = 0');
+      R := sq.Exec('SELECT COUNT(*) FROM mcv WHERE n = 0');
       Dogrula('MCV n=0 sayimi 90', (Length(R.Rows) = 1) and
         (R.Rows[0][0] = '90'), R.Rows[0][0]);
     finally
-      q.Free;
     end;
   finally
-    tdb.Free;
-    db.Free;
   end;
 end;
 
@@ -15902,8 +15813,8 @@ var
   var
     s1, s2: string;
   begin
-    r1 := q.Exec(A);
-    r2 := q.Exec(B);
+    r1 := sq.Exec(A);
+    r2 := sq.Exec(B);
     s1 := RowSet(r1);
     s2 := RowSet(r2);
     if s1 = s2 then
@@ -15917,16 +15828,12 @@ begin
   Grp('T137 H15 akisli GROUP BY + HAVING');
   dir := D + PathDelim + 't137_having_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
-  db := TVDb.Create;
-  tdb := TVTableDb.Create(db);
   try
-    db.Open(dir);
-    tdb.Open(dir);
-    q := TVSql.Create(tdb);
+  OpenAt(dir);
     try
-      q.Exec('CREATE TABLE d (id INTEGER PRIMARY KEY, s TEXT, n INTEGER, ' +
+      sq.Exec('CREATE TABLE d (id INTEGER PRIMARY KEY, s TEXT, n INTEGER, ' +
         'f FLOAT, b BOOLEAN)');
-      q.Exec('INSERT INTO d (id,s,n,f,b) VALUES ' +
+      sq.Exec('INSERT INTO d (id,s,n,f,b) VALUES ' +
         '(1,''a'',10,1.5,TRUE),(2,''a'',20,2.5,TRUE),(3,''b'',30,3.5,FALSE),' +
         '(4,''b'',5,0.5,FALSE),(5,''c'',NULL,NULL,NULL),(6,NULL,7,7.0,TRUE),' +
         '(7,''a'',20,2.5,NULL),(8,''b'',NULL,1.25,TRUE)');
@@ -15997,11 +15904,8 @@ begin
           'SELECT s, COUNT(*) AS c FROM d GROUP BY s ' +
           'HAVING COUNT(DISTINCT n) >= 0 ORDER BY s');
     finally
-      q.Free;
     end;
   finally
-    tdb.Free;
-    db.Free;
   end;
 end;
 
@@ -16113,6 +16017,188 @@ begin
   end;
 end;
 
+procedure T149_SavepointV32;
+{ v3.2 (2026-10-25): SAVEPOINT'in iki backend'de AYNI davranmasi gereken
+  kenar durumlari. T79 yalnizca mutlu yolu sinar; burada:
+    (a) yinelenen isim reddedilir (ecDuplicateSavepoint),
+    (b) olmayan savepoint reddedilir (ecSavepointNotFound),
+    (c) savepoint icinde DDL geri alinir (sema + KV birlikte),
+    (d) SAVEPOINT ortuk islem acar; RELEASE commit ETMEZ,
+    (e) ROLLBACK TO hedefi KORUR: ayni noktaya iki kez donulebilir. }
+begin
+  Grp('T149 SAVEPOINT kenar durumlari (v3.2)');
+  UseDir('sp_v32');
+  sq.Exec('CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)');
+  sq.Exec('INSERT INTO t(id,v) VALUES(1,10)');
+
+  // (a) yinelenen isim
+  sq.Exec('SAVEPOINT a');
+  ChkErr('ayni isimde ikinci savepoint reddedilir', 'SAVEPOINT a');
+  sq.Exec('RELEASE SAVEPOINT a');
+  sq.Exec('COMMIT');
+
+  // (b) olmayan savepoint
+  sq.Exec('BEGIN');
+  ChkErr('olmayan savepoint ROLLBACK TO reddedilir',
+    'ROLLBACK TO SAVEPOINT yok');
+  ChkErr('olmayan savepoint RELEASE reddedilir',
+    'RELEASE SAVEPOINT yok');
+  sq.Exec('ROLLBACK');
+
+  // (c) DDL geri alma
+  sq.Exec('SAVEPOINT d1');
+  sq.Exec('CREATE TABLE yeni(a INTEGER PRIMARY KEY)');
+  sq.Exec('INSERT INTO yeni(a) VALUES(1)');
+  ChkVal('DDL savepoint icinde gorunur', 'SELECT COUNT(*) FROM yeni', 0, 0, '1');
+  sq.Exec('ROLLBACK TO SAVEPOINT d1');
+  ChkErr('ROLLBACK TO sonrasi tablo yok', 'SELECT COUNT(*) FROM yeni');
+  sq.Exec('RELEASE SAVEPOINT d1');
+  sq.Exec('COMMIT');
+
+  // (d) ortuk islem + RELEASE commit etmez
+  sq.Exec('SAVEPOINT imp');
+  sq.Exec('INSERT INTO t(id,v) VALUES(2,20)');
+  sq.Exec('RELEASE SAVEPOINT imp');
+  ChkVal('RELEASE commit etmez: islem icinde gorunur',
+    'SELECT COUNT(*) FROM t', 0, 0, '2');
+  sq.Exec('ROLLBACK');
+  ChkVal('ortuk islem ROLLBACK ile geri alindi',
+    'SELECT COUNT(*) FROM t', 0, 0, '1');
+
+  // (e) hedef savepoint korunur
+  sq.Exec('SAVEPOINT p');
+  sq.Exec('INSERT INTO t(id,v) VALUES(3,30)');
+  sq.Exec('ROLLBACK TO SAVEPOINT p');
+  sq.Exec('INSERT INTO t(id,v) VALUES(4,40)');
+  sq.Exec('ROLLBACK TO SAVEPOINT p');
+  ChkVal('hedef korunur: 1 satir', 'SELECT COUNT(*) FROM t', 0, 0, '1');
+  sq.Exec('INSERT INTO t(id,v) VALUES(5,50)');
+  ChkVal('hedefe donuldukten sonra yazma', 'SELECT COUNT(*) FROM t', 0, 0, '2');
+  sq.Exec('COMMIT');
+  ChkVal('commit sonrasi 2 satir', 'SELECT COUNT(*) FROM t', 0, 0, '2');
+  ChkVal('id=5 kalici', 'SELECT v FROM t WHERE id=5', 0, 0, '50');
+end;
+
+procedure T150_AlterDbKeyV3;
+{ v3.2 (2026-10-25): ALTER DATABASE KEY — v3 sayfa motorunda dosya butunu
+  yeni parola ile yeniden sifrelenir. Dogrulananlar:
+    (a) sifresiz dosyada komut temiz hata verir,
+    (b) sifreli dosyada rekey sonrasi ESKI parola reddedilir,
+    (c) yeni parola ile acilir ve satirlar/sema BIREBIR korunur,
+    (d) yanlis parola hicbir asamada dosyayi bozmaz. }
+var
+  dir, f: string;
+  be, be2: IVdbBackend;
+  tb2: TVTableDb;
+  q2: TVSql;
+  n: Integer;
+  oldRed, newOk: Boolean;
+  msg: string;
+begin
+  Grp('T150 ALTER DATABASE KEY (v3 dosya sifreleme)');
+  dir := D + PathDelim + 't150_rekey_' + IntToStr(GetTickCount64);
+  ForceDirectories(dir);
+  f := dir + PathDelim + 'veritabani.odb';
+
+  // (a) sifresiz dosyada reddedilir
+  be := nil;
+  VdbOpenOrCreate(f, be);
+  tb2 := TVTableDb.CreateBackend(be);
+  q2 := TVSql.Create(tb2);
+  try
+    tb2.Open(dir);
+    q2.Exec('CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)');
+    oldRed := False;
+    msg := '';
+    try
+      q2.Exec('ALTER DATABASE KEY ' + Q + 'yeni' + Q);
+    except
+      on E: Exception do
+      begin
+        oldRed := True;
+        msg := E.Message;
+      end;
+    end;
+    Dogrula('sifresiz dosyada ALTER DATABASE KEY reddedilir', oldRed, msg);
+  finally
+    q2.Free;
+    tb2.Free;
+    be := nil;
+  end;
+  { Sifresiz denemeden kalan yan dosyalar (.wal/.idx) sifreli dosyaya
+    AIT DEGILDIR; birakilirsa "WAL sifresiz ama veritabani sifreli" hatasi
+    verir. Test hijyeni: hepsini sil. }
+  DeleteFile(f);
+  DeleteFile(f + '.wal');
+  DeleteFile(f + '.idx');
+
+  // (b)-(d) sifreli dosya
+  be := nil;
+  VdbOpenWithPassword(f, 'ilk-parola', be);
+  tb2 := TVTableDb.CreateBackend(be);
+  q2 := TVSql.Create(tb2);
+  try
+    tb2.Open(dir);
+    q2.Exec('CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)');
+    q2.Exec('BEGIN');
+    for n := 1 to 50 do
+      q2.Exec(Format('INSERT INTO t(id,v) VALUES(%d,%s)',
+        [n, QuotedStr('satir-' + IntToStr(n))]));
+    q2.Exec('COMMIT');
+    q2.Exec('ALTER DATABASE KEY ' + Q + 'ikinci-parola' + Q);
+  finally
+    q2.Free;
+    tb2.Free;
+    be := nil;
+  end;
+
+  oldRed := False;
+  msg := '';
+  be2 := nil;
+  try
+    VdbOpenWithPassword(f, 'ilk-parola', be2);
+  except
+    on E: Exception do
+    begin
+      oldRed := True;
+      msg := E.Message;
+    end;
+  end;
+  be2 := nil;
+  Dogrula('eski parola rekey sonrasi reddedilir', oldRed, msg);
+
+  newOk := False;
+  msg := '';
+  be2 := nil;
+  try
+    VdbOpenWithPassword(f, 'ikinci-parola', be2);
+    newOk := be2 <> nil;
+  except
+    on E: Exception do msg := E.Message;
+  end;
+  Dogrula('yeni parola ile acilir', newOk, msg);
+  if newOk then
+  begin
+    tb2 := TVTableDb.CreateBackend(be2);
+    q2 := TVSql.Create(tb2);
+    try
+      tb2.Open(dir);
+      R := q2.Exec('SELECT COUNT(*) FROM t');
+      Dogrula('rekey sonrasi 50 satir korundu',
+        (Length(R.Rows) = 1) and (R.Rows[0][0] = '50'),
+        IntToStr(Length(R.Rows)));
+      R := q2.Exec('SELECT v FROM t WHERE id=50');
+      Dogrula('rekey sonrasi hucre birebir',
+        (Length(R.Rows) = 1) and (R.Rows[0][0] = 'satir-50'),
+        IntToStr(Length(R.Rows)));
+    finally
+      q2.Free;
+      tb2.Free;
+      be2 := nil;
+    end;
+  end;
+end;
+
 { Sprint 2.9: test kosucusu. Her test kendi try/except'inde kosar;
   boylece bir hata kalan testleri durdurmaz ve siniflandirma yapilabilir. }
 type
@@ -16122,7 +16208,7 @@ type
   end;
 
 const
-  TEST_SAYISI = 178;
+  TEST_SAYISI = 180;
 
   { v3 kosusunda ATLA: bu testler yalniz v2 motorunun (TVDb/WAL/arsiv/
     zone/indeks .idx) ozel yollarini kullanir; v3'te karsiligi yoktur.
@@ -16134,8 +16220,13 @@ const
     2026-10-25: T64, T65, T94, T94c, T105 ve T117 ARTIK KOSAR (tek
     engelleri reopen'in elle TVDb.Create ile yapilmasi ya da SHOW STATS /
     GetMetricsText'in kosulsuz `kv` erisimi olmasiydi; backend-farkinda
-    hale getirildi). Ayni desen digerlerinde de var; sirayla tasinacak. }
-  V2_ONLY: array[0..51] of string = (
+    hale getirildi).
+
+    2026-10-25 (v3.2): 15 saf-SQL testi (T130-T145: top-N, akis GROUP BY,
+    DISTINCT, HAVING, filtreli COUNT, float sirasi, coklu top-N, derin
+    OFFSET, MCV) v2 tipleri yerine backend-farkinda `OpenAt`/`sq` uzerinden
+    kosar. Bunlar motorun SQL yuzeyini iki backend'de de dogrular. }
+  V2_ONLY: array[0..35] of string = (
     'T101_TcpReplication',
     'T122_KvStore',
     'T125_KolonSifreleme',
@@ -16143,22 +16234,7 @@ const
     'T127_H5_BlockCrc',
     'T128_H11_Undo',
     'T129_H11_InPlace',
-    'T130_PkRangeCtype',
-    'T131_H12_TopN',
     'T132_H12_StreamTopN',
-    'T133_H13_StreamGroupBy',
-    'T134_H12c_MultiTopN',
-    'T135_H14_FloatSort',
-    'T136_H13_GroupDiff',
-    'T137_H15_StreamHaving',
-    'T138_H16_StreamDistinct',
-    'T139_H17_StreamFilteredCount',
-    'T140_H18_RawExactCount',
-    'T141_H19_RawLikeCount',
-    'T142_H20_RawBoolTree',
-    'T143_H21_RawTreeSelectPaths',
-    'T144_H22_DeepOffsetLive',
-    'T145_H8_MCV',
     'T147_M8_SqlancerStil',
     'T148_H25_AutoCompact',
     'T21_KritikHataDogrulama',
@@ -16184,7 +16260,6 @@ const
     'T76_ReplayWALSifreleme',
     'T77_AlterDatabaseKey',
     'T78_AsofGecmis',
-    'T79_Savepoint',
     'T92_MVCC_Isoaltion',
     'T95_WALArsiv',
     'T95b_Replication'
@@ -16386,6 +16461,8 @@ begin
   TESTLER[175].Nm := 'T146_M9_OTLP'; TESTLER[175].P := T146_M9_OTLP;
   TESTLER[176].Nm := 'T147_M8_SqlancerStil'; TESTLER[176].P := T147_M8_SqlancerStil;
   TESTLER[177].Nm := 'T148_H25_AutoCompact'; TESTLER[177].P := T148_H25_AutoCompact;
+  TESTLER[178].Nm := 'T149_SavepointV32'; TESTLER[178].P := T149_SavepointV32;
+  TESTLER[179].Nm := 'T150_AlterDbKeyV3'; TESTLER[179].P := T150_AlterDbKeyV3;
 end;
 
 { ---------------------------------------------------------------------- main }

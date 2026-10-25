@@ -49,6 +49,23 @@ type
         Present: Boolean;
         Value: TBytes;
       end;
+      { v3.2 savepoint gunlugu: bir anahtarin savepoint'ten ONCEKI hali.
+        HadBefore=False ise anahtar FBatch'te hic yoktu; geri almada
+        FBatch'ten SILINIR (bos bir "Present=False" kaydi birakmak
+        Delete'in "once var miydi" yanitini bozardi). }
+      TSavepointKeyRec = record
+        HadBefore: Boolean;
+        Rec: TBatchRec;
+      end;
+      { v3.2: tek bir savepoint. Journal yalnizca O savepoint'ten sonra
+        DEGISEN anahtarlari tutar (tum partiyi kopyalamak 200k satirlik
+        partide her SAVEPOINT'te O(n) bellek demekti). }
+      TSavepointRec = record
+        Name: string;
+        OrderLen: Integer;                 // FOrder'in savepoint anindaki uzunlugu
+        Journal: TDictionary<QWord, TSavepointKeyRec>;
+        TagDelta: TDictionary<Integer, Int64>;  // FBatchTagDelta kopyasi
+      end;
     var
       FEng: TVdbPageEngine;
       FPath: string;
@@ -96,6 +113,8 @@ type
       { Sayac kuruldu mu? False ise tutulan harita guvenilmez; ilk COUNT
         isteginde tam taramayla kurulur. }
       FTagCountsValid: Boolean;
+      { v3.2: SAVEPOINT yigini (en sona eklenir). }
+      FSavepoints: TList<TSavepointRec>;
 
     procedure InitBackend(const ADbPath: string; ACreate: Boolean;
       APoolPages: Integer);
@@ -120,6 +139,15 @@ type
     { Sprint 3.3: VACUUM/Compact yardimcilari. }
     procedure CompactCb(Key: QWord; const Value: TBytes);
     procedure SwapDbFile(const NewFilePath: string);
+    { v3.2: ALTER DATABASE KEY. Yeni dosya yeni anahtar/parola ile yazilir;
+      basarisizlikta ESKI kimlik bilgileri geri kurulur (dosya .bak'tan
+      donerken yeni parolayla acmaya calismak backend'i kilitsiz birakirdi). }
+    procedure SwapDbFileWith(const NewFilePath: string;
+      const AKey: TBytes; const APassword: string; AHasPassword: Boolean);
+    { v3.2: savepoint yardimcilari. }
+    procedure JournalKey(Key: QWord);
+    procedure ClearSavepoints;
+    function FindSavepoint(const Name: string): Integer;
   public
     { ADbPath: .odb dosya yolu. ACreate=True ise yoksa olusturur. }
     constructor Create(const ADbPath: string; ACreate: Boolean = True;
@@ -160,6 +188,17 @@ type
     procedure AbortBatch;
     procedure Flush;
     function GetInBatch: Boolean;
+
+    { v3.2: ALTER DATABASE KEY — dosya yeni parola ile yeniden sifrelenir.
+      Acik parti varken reddedilir; islem atomiktir (tmp + .bak). }
+    procedure Rekey(const NewPassword: string);
+
+
+    { v3.2: SAVEPOINT. Parti kaplamasi UZERINDE calisir; motora hicbir sey
+      yazilmadigi icin geri alma yalnizca kaplama gunlugu ile yapilir. }
+    procedure Savepoint(const Name: string);
+    function RollbackToSavepoint(const Name: string): Boolean;
+    function ReleaseSavepoint(const Name: string): Boolean;
 
     function EnsureColumnKey: QWord;
     function ColumnKeyId: QWord;
@@ -208,6 +247,7 @@ begin
   FOrder := TList<QWord>.Create;
   FTagCounts := TDictionary<Integer, Int64>.Create;
   FBatchTagDelta := TDictionary<Integer, Int64>.Create;
+  FSavepoints := TList<TSavepointRec>.Create;
   FBatchOpen := False;
   FDirty := False;
   FCheckpointBytes := VDB_V3_CHECKPOINT_BYTES;
@@ -281,6 +321,8 @@ begin
     FOrder.Clear;
     FBatchOpen := False;
   end;
+  ClearSavepoints;
+  FreeAndNil(FSavepoints);
   FreeAndNil(FEng);       // Close: commit + checkpoint + idx
   FreeAndNil(FBatch);
   FreeAndNil(FOrder);
@@ -409,6 +451,7 @@ var
 begin
   if FBatchOpen then
   begin
+    JournalKey(Key);
     rec.Present := True;
     rec.Value := Copy(Value, 0, Length(Value));
     if not FBatch.ContainsKey(Key) then
@@ -479,6 +522,7 @@ begin
       soruluyordu; bu her zaman True oldugu icin parti icinde Delete
       HIC OLMAYAN anahtar icin de True donuyordu. Dogru yanit: silmeden
       ONCE var miydi? }
+    JournalKey(Key);
     had := FEng.Contains(Key);
     if FBatch.ContainsKey(Key) then
       had := FBatch[Key].Present;
@@ -770,6 +814,7 @@ end;
 procedure TVdbBackendV3.BeginBatch;
 begin
   if FBatchOpen then Exit;
+  ClearSavepoints;
   FBatch.Clear;
   FOrder.Clear;
   FBatchOpen := True;
@@ -782,6 +827,7 @@ begin
     FBeforeCommit;          // kisit denetimi: hata firlatirsa kaplama durur
   ApplyBatch;
   FBatchOpen := False;
+  ClearSavepoints;
   { v3.1: parti ici etiket degisimleri simdi sayaca islenir. }
   MergeTagDeltas;
   FBatch.Clear;
@@ -796,6 +842,7 @@ end;
 
 procedure TVdbBackendV3.AbortBatch;
 begin
+  ClearSavepoints;
   FBatch.Clear;
   FOrder.Clear;
   FBatchTagDelta.Clear;
@@ -824,6 +871,134 @@ end;
 function TVdbBackendV3.GetInBatch: Boolean;
 begin
   Result := FBatchOpen;
+end;
+
+{ --------------------------------------------------- v3.2: SAVEPOINT }
+
+function TVdbBackendV3.FindSavepoint(const Name: string): Integer;
+var
+  i: Integer;
+begin
+  Result := -1;
+  for i := FSavepoints.Count - 1 downto 0 do
+    if SameText(FSavepoints[i].Name, Name) then
+      Exit(i);
+end;
+
+procedure TVdbBackendV3.ClearSavepoints;
+var
+  i: Integer;
+  sp: TSavepointRec;
+begin
+  if FSavepoints = nil then Exit;
+  for i := 0 to FSavepoints.Count - 1 do
+  begin
+    sp := FSavepoints[i];
+    sp.Journal.Free;
+    sp.TagDelta.Free;
+  end;
+  FSavepoints.Clear;
+end;
+
+{ Key ilk kez (bu savepoint'ten sonra) degistirilmeden ONCE cagrilir:
+  her aktif savepoint icin anahtarin o andaki halini bir kez saklar.
+  Maliyet yalnizca savepoint VARKEN ve anahtar basina BIR kez olur. }
+procedure TVdbBackendV3.JournalKey(Key: QWord);
+var
+  i: Integer;
+  sp: TSavepointRec;
+  je: TSavepointKeyRec;
+begin
+  if (FSavepoints = nil) or (FSavepoints.Count = 0) then Exit;
+  for i := 0 to FSavepoints.Count - 1 do
+  begin
+    sp := FSavepoints[i];
+    if sp.Journal.ContainsKey(Key) then Continue;
+    je.HadBefore := FBatch.TryGetValue(Key, je.Rec);
+    if not je.HadBefore then
+    begin
+      je.Rec.Present := False;
+      je.Rec.Value := nil;
+    end;
+    sp.Journal.AddOrSetValue(Key, je);
+  end;
+end;
+
+procedure TVdbBackendV3.Savepoint(const Name: string);
+var
+  sp: TSavepointRec;
+  pair: TPair<Integer, Int64>;
+begin
+  if FindSavepoint(Name) >= 0 then
+    raise EVdbBackendV3.CreateFmt('savepoint zaten var: %s', [Name]);
+  { SQL standardi: SAVEPOINT acik islem yoksa ORTUK islem baslatir. }
+  if not FBatchOpen then BeginBatch;
+  sp.Name := Name;
+  sp.OrderLen := FOrder.Count;
+  sp.Journal := TDictionary<QWord, TSavepointKeyRec>.Create;
+  sp.TagDelta := TDictionary<Integer, Int64>.Create;
+  for pair in FBatchTagDelta do
+    sp.TagDelta.AddOrSetValue(pair.Key, pair.Value);
+  FSavepoints.Add(sp);
+end;
+
+function TVdbBackendV3.RollbackToSavepoint(const Name: string): Boolean;
+var
+  ix, i: Integer;
+  sp: TSavepointRec;
+  pair: TPair<QWord, TSavepointKeyRec>;
+  tp: TPair<Integer, Int64>;
+begin
+  ix := FindSavepoint(Name);
+  if ix < 0 then Exit(False);
+  sp := FSavepoints[ix];
+  { 1) Savepoint'ten sonra degisen anahtarlari o andaki haline dondur.
+    HadBefore=False olanlar FBatch'te hic yoktu -> kaydi da silinir. }
+  for pair in sp.Journal do
+  begin
+    if pair.Value.HadBefore then
+      FBatch.AddOrSetValue(pair.Key, pair.Value.Rec)
+    else
+      FBatch.Remove(pair.Key);
+  end;
+  { 2) FOrder'i savepoint uzunluguna kirp. Girisler yalnizca "FBatch'te
+    yokken" eklendigi ve savepoint disinda silinmedigi icin kirpma tam
+    olarak sonradan eklenen girisleri atar. }
+  while FOrder.Count > sp.OrderLen do
+    FOrder.Delete(FOrder.Count - 1);
+  { 3) Etiket deltalari da savepoint haline doner. }
+  FBatchTagDelta.Clear;
+  for tp in sp.TagDelta do
+    FBatchTagDelta.AddOrSetValue(tp.Key, tp.Value);
+  { 4) SONRAKI savepoint'ler atilir; HEDEF kalir (SQLite davranisi:
+    ayni noktaya tekrar donulebilir ve RELEASE edilebilir). }
+  for i := FSavepoints.Count - 1 downto ix + 1 do
+  begin
+    sp := FSavepoints[i];
+    sp.Journal.Free;
+    sp.TagDelta.Free;
+    FSavepoints.Delete(i);
+  end;
+  Result := True;
+end;
+
+function TVdbBackendV3.ReleaseSavepoint(const Name: string): Boolean;
+var
+  ix, i: Integer;
+  sp: TSavepointRec;
+begin
+  ix := FindSavepoint(Name);
+  if ix < 0 then Exit(False);
+  { RELEASE veriyi COMMIT ETMEZ; yalnizca geri donme noktasini (ve
+    sonrakileri) dusurur. }
+  for i := FSavepoints.Count - 1 downto ix do
+  begin
+    sp := FSavepoints[i];
+    sp.Journal.Free;
+    sp.TagDelta.Free;
+    FSavepoints.Delete(i);
+  end;
+  Result := True;
 end;
 
 { ------------------------------------------------------ sema / sifreleme }
@@ -1096,15 +1271,94 @@ begin
   NewBytes := VDbFileBytes(FPath);
 end;
 
+procedure TVdbBackendV3.Rekey(const NewPassword: string);
+var
+  tmp: string;
+  newEng: TVdbPageEngine;
+  n: Int64;
+  tagsWere: Boolean;
+begin
+  if FBatchOpen then
+    raise EVdbBackendV3.Create('acik parti varken ALTER DATABASE KEY yapilamaz');
+  if not FEng.Store.Encrypted then
+    raise EVdbBackendV3.Create(
+      'dosya sifresiz: ALTER DATABASE KEY icin once sifreli dosya gerekir');
+  if Trim(NewPassword) = '' then
+    raise EVdbBackendV3.Create('ALTER DATABASE KEY: yeni parola bos olamaz');
+  if FDirty then
+  begin
+    FEng.Commit(True);
+    FDirty := False;
+  end;
+  FEng.Checkpoint(True);
+
+  tmp := FPath + '.rekey.tmp';
+  if FileExists(tmp) then DeleteFile(tmp);
+  { Yeni dosya YENI parola ile olusturulur: kayitlar cozulmus halde
+    taramadan gelir, yazarken yeni anahtarla sifrelenir. }
+  newEng := TVdbPageEngine.CreateWithPassword(tmp, NewPassword, FPoolPages);
+  try
+    try
+      newEng.Open(True);
+      FCompactEng := newEng;
+      FCompactN := 0;
+      n := 0;
+      try
+        FEng.ScanAll(CompactCb);
+      finally
+        FCompactEng := nil;
+      end;
+      n := FCompactN;
+      newEng.Close;   // checkpoint + idx
+    finally
+      FreeAndNil(newEng);
+    end;
+  except
+    if FileExists(tmp) then DeleteFile(tmp);
+    raise;
+  end;
+
+  if n <> FEng.Count then
+  begin
+    if FileExists(tmp) then DeleteFile(tmp);
+    raise EVdbBackendV3.Create(Format(
+      'ALTER DATABASE KEY: anahtar sayisi tutmuyor (yazilan %d, kaynak %d)',
+      [n, FEng.Count]));
+  end;
+
+  tagsWere := FTagCountsValid;
+  SwapDbFileWith(tmp, nil, NewPassword, True);
+  { Anahtar kumesi KORUNDU (yukarida dogrulandi) -> sayac gecerli. }
+  FTagCountsValid := tagsWere;
+end;
+
 procedure TVdbBackendV3.SwapDbFile(const NewFilePath: string);
+begin
+  SwapDbFileWith(NewFilePath, FKey, FPassword, FHasPassword);
+end;
+
+{ v3.2: yeni kimlik bilgileriyle dosya degistirme. Basarisizlikta ESKI
+  kimlik geri kurulur; aksi halde .bak'tan donen ESKI dosya yeni parolayla
+  acilmaya calisilir ve backend FEng=nil ile kilitsiz kalirdi. }
+procedure TVdbBackendV3.SwapDbFileWith(const NewFilePath: string;
+  const AKey: TBytes; const APassword: string; AHasPassword: Boolean);
 var
   bak, wal, idx: string;
+  oldKey: TBytes;
+  oldPass: string;
+  oldHas: Boolean;
 begin
+  oldKey := FKey;
+  oldPass := FPassword;
+  oldHas := FHasPassword;
   bak := FPath + '.bak';
   wal := FPath + '.wal';
   idx := FPath + '.idx';
   FreeAndNil(FEng);
   FEng := nil;
+  FKey := Copy(AKey, 0, Length(AKey));
+  FPassword := APassword;
+  FHasPassword := AHasPassword;
   try
     if FileExists(bak) then DeleteFile(bak);
     if not RenameFile(FPath, bak) then
@@ -1119,6 +1373,10 @@ begin
     { Yeni dosyanin WAL'i ve dizini ESKI dosyaya aittir; asla kullanilmaz. }
     if FileExists(wal) then DeleteFile(wal);
     if FileExists(idx) then DeleteFile(idx);
+    { Uretim sirasinda yeni dosyanin yaninda olusan gecici WAL/.idx de
+      kalici olmamali: yoksa sonraki acilis onlari bu dosyaya ait sanar. }
+    if FileExists(NewFilePath + '.wal') then DeleteFile(NewFilePath + '.wal');
+    if FileExists(NewFilePath + '.idx') then DeleteFile(NewFilePath + '.idx');
     FEng := NewEngine(FPath);
     try
       FEng.Open(False);
@@ -1126,16 +1384,21 @@ begin
       FreeAndNil(FEng);
       raise;
     end;
-    { v3.1: icerik degismis olabilir (RESTORE) -> sayac guvenilmez.
+    { Turetilmis ham anahtar (parola modunda da) yeni dosyaya aittir. }
+    FKey := Copy(FEng.Store.Key, 0, Length(FEng.Store.Key));
+    { v3.1: icerik degismis olabilir (RESTORE/REKEY) -> sayac guvenilmez.
       VACUUM cagirani (Compact) anahtar kumesinin AYNI oldugunu dogrular ve
       bayragi geri kurar. Harita SILINMEZ: bayrak False iken yazma yolu onu
       kirletmez, ilk COUNT isteginde tam taramayla yeniden kurulur. }
     FEng.OnTagSummary := GetTagSummary;
     FTagCountsValid := False;
   except
-    { Yarim kalan degistirmede .bak'tan don. }
+    { Yarim kalan degistirmede .bak'tan ve ESKI kimlikle don. }
     if FEng = nil then
     begin
+      FKey := oldKey;
+      FPassword := oldPass;
+      FHasPassword := oldHas;
       try
         if FileExists(bak) then
         begin
@@ -1153,7 +1416,6 @@ begin
         FreeAndNil(FEng);
       end;
     end;
-    raise;
   end;
 end;
 

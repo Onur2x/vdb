@@ -50,6 +50,16 @@ type
     procedure Flush;
     function GetInBatch: Boolean;
 
+    { v3.2: v2'de R-02 savepoint'leri TVDb'de WAL tabanlidir; aynen
+      devredilir. Istisna mesajlari (ecDuplicateSavepoint /
+      ecSavepointNotFound) yukari gecer. }
+    procedure Savepoint(const Name: string);
+    function RollbackToSavepoint(const Name: string): Boolean;
+    function ReleaseSavepoint(const Name: string): Boolean;
+
+    { v3.2: v2 kayit duzeyi anahtar rotasyonu (TVDb.RekeyWithPassword). }
+    procedure Rekey(const NewPassword: string);
+
     function EnsureColumnKey: QWord;
     function ColumnKeyId: QWord;
     function ColumnKeyPath: string;
@@ -169,6 +179,30 @@ end;
 function TVDbBackendV2.GetInBatch: Boolean;
 begin
   Result := FDb.InBatch;
+end;
+
+procedure TVDbBackendV2.Savepoint(const Name: string);
+begin
+  FDb.Savepoint(Name);
+end;
+
+function TVDbBackendV2.RollbackToSavepoint(const Name: string): Boolean;
+begin
+  { v2 TVDb bulunamayan savepoint icin istisna firlatir; burada da
+    istisna YUKARI GECER (sozlesme: ayni davranis). }
+  FDb.RollbackToSavepoint(Name);
+  Result := True;
+end;
+
+function TVDbBackendV2.ReleaseSavepoint(const Name: string): Boolean;
+begin
+  FDb.ReleaseSavepoint(Name);
+  Result := True;
+end;
+
+procedure TVDbBackendV2.Rekey(const NewPassword: string);
+begin
+  FDb.RekeyWithPassword(NewPassword);
 end;
 
 function TVDbBackendV2.EnsureColumnKey: QWord;
