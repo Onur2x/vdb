@@ -319,7 +319,8 @@ indeksli `IN (…, negatif, …)` listesinde negatif öğe AST'de
 atlanıyor**, indeks dilimi daralıyor ve o grubun satırları **okunmadan**
 düşüyordu (hata yok). Aynı hata PK `IN` ve `= -3` yolunda da vardı. Tek
 yardımcı (`VdbInConstText`) düz/negatif sabiti çözer, çözemezse daraltma
-yapılmaz (güvenli taraf). Kapı: `v3sqlchk TestIndexInNegative` (17 kontrol).
+yapılmaz (güvenli taraf). Kapı: `v3sqlchk TestIndexInNegative` (indeksli
+satır, PK ve COUNT yolları + negatif sabitli `=`/aralık/`BETWEEN`).
 
 Gerekçe: v3 WAL'i **sayfa imajı** tutar; `AS OF SEQUENCE` bununla çalışır.
 Satır düzeyinde eski değer ve zaman damgası **yoktu** — bu yüzden v4'te

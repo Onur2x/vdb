@@ -237,7 +237,7 @@ Kapılar:
 |---|---|---|
 | `logchk` (10) | Günlük biçimi, yazıcı/okuyucu, CRC, kesik kuyruk, yarım grup, nesil kopması | **28/0** |
 | `pitrchk` (11) | 3 fazlı yazım, `AS OF TIMESTAMP/VERSION`, ileri hedef kırpma, `BuildLogSnapshot` → dosya açılıp `Verify` TEMİZ + içerik birebir, kalıcılık, `ArchiveLogSet`, `LogRangeInfo` | **21/0** |
-| `v3sqlchk` | SQL düzeyinde PITR: `AS OF TIMESTAMP/VERSION`, `ARCHIVE WAL SET/LIST`, `RECOVER TO`, kurtarma dosyasının gerçekten açılıp `VERIFY` geçmesi, canlı verinin bozulmaması | **160/0** |
+| `v3sqlchk` | SQL düzeyinde PITR: `AS OF TIMESTAMP/VERSION`, `ARCHIVE WAL SET/LIST`, `RECOVER TO`, kurtarma dosyasının gerçekten açılıp `VERIFY` geçmesi, canlı verinin bozulmaması; ayrıca `TestIndexInNegative` regresyonu | **167/0** |
 
 Ölçüm (`pitrbench`, 20.000 satır / 100 commit, tek koşu, QPC):
 
@@ -271,8 +271,9 @@ neden v4'ten önce de vardı, ama nadir tetikleniyordu:
 
 Düzeltme: tek bir yardımcı (`VdbInConstText`) hem düz hem negatif sabiti
 çözer; **çözemezse daraltma yapılmaz** (güvenli taraf). Kapsanan yollar:
-PK `IN`, ikincil indeks `IN` dilimi, `=`/`>`/`>=`/`<`/`<=` daraltması.
-Kapı: `v3sqlchk TestIndexInNegative` (17 kontrol) — indeksli satır yolu,
+PK `IN`, ikincil indeks `IN` dilimi, `BETWEEN` ve
+`=`/`>`/`>=`/`<`/`<=` daraltması.
+Kapı: `v3sqlchk TestIndexInNegative` — indeksli satır yolu,
 PK yolu ve COUNT yolu birebir; NULL içeren liste daraltmaz.
 
 ### Sıradaki sürüme ertelenen (v4 sonrası)
