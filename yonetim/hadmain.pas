@@ -1399,10 +1399,12 @@ begin
     end;
   end;
   FTb := TVTableDb.CreateBackend(FBe);
-  FTb.Open(ExtractFileDir(FilePath));
+  { Dizin, kullanicinin verdigi ham yoldan DEGIL, motorun cozdugu dosya
+    yolundan turetilir: kullanici bir DIZIN sectiginde de dogru olur. }
+  FDBPath := FBe.FilePath;
+  FTb.Open(ExtractFileDir(FDBPath));
   FSq := TVSql.Create(FTb);
   FSq.AutoTransaction := True;
-  FDBPath := FBe.FilePath;
   FCurrentDBDir := ExtractFileDir(FDBPath);
   FPage := 0;
   n := FTb.DataKeyCount;
