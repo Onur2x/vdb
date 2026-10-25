@@ -50,15 +50,20 @@ Bunlar v3'ün kıyaslanacağı gerçek taban çizgisi. Tüm sayılar benim ölç
 
 **v3.0 kabul hedefleri (200k satır):**
 
-| Metrik | Hedef | Ölçüm yöntemi |
-|---|---|---|
-| Dosya boyutu | **≤ 11 MB** (≤ 55 B/satır) | `DataFileSize` |
-| Açılış | **≤ 150 ms** | `kv.Open` süresi (3 tekrarın medyanı) |
-| `COUNT(*)` | **≤ 16 ms** | tam tarama |
-| PK nokta | **≤ 7 µs** (gerilemez) | `WHERE id=` |
-| Toplu INSERT | **≤ 5 µs/satır** (gerilemez) | 200k tek batch |
-| Autocommit INSERT | **≤ 0,55 ms** (gerilemez) | 20k tek satır |
-| UPDATE/DELETE sonrası şişme | **≤ %5** | 100k UPDATE sonrası dosya artışı |
+| Metrik | Hedef | Ölçüm yöntemi | v3.0 ölçülen (2026-10-25) | Durum |
+|---|---|---|---|---|
+| Dosya boyutu | **≤ 11 MB** (≤ 55 B/satır) | `DataFileSize` | sayfa harness **9,76 MB** (48,8 B/satır); SQL harness 15,5 MB (77,6) | kısmen |
+| Açılış | **≤ 150 ms** | `kv.Open` süresi (3 tekrarın medyanı) | **32 ms** (v2: 984) | ✔ |
+| `COUNT(*)` | **≤ 16 ms** | tam tarama | 62 ms (v2: 31) | ✘ v3.1 |
+| PK nokta | **≤ 7 µs** (gerilemez) | `WHERE id=` | **6,25 µs** (v2: 6,25) | ✔ |
+| Toplu INSERT | **≤ 5 µs/satır** (gerilemez) | 200k tek batch | 6,64 µs (v2: 4,46) | ✘ v3.1 |
+| Autocommit INSERT | **≤ 0,55 ms** (gerilemez) | 20k tek satır | 0,557 ms (v2: 0,431) | sınırda |
+| UPDATE/DELETE sonrası şişme | **≤ %5** | 100k UPDATE sonrası dosya artışı | ölçülmedi (VACUUM geri kazanıyor) | — |
+
+Başarısız üç metrik **kabul edilmiş tasarım maliyetidir** (sayfa imajlı WAL'in 2x
+yazma hacmi; tablo başına satır sayacının olmaması). Kök nedenler ve ölçümler
+`hiztesti.md` §9'da. v3.1 hedefleri: mantıksal (küçük) WAL çerçevesi, tablo
+başına canlı satır sayacı, toplu dosya uzatma (ölçülen: sayfa başına 45–50 µs).
 
 Not: `COUNT(*)` hedefi 16 ms çünkü ölçüm gösterdi ki fark CPU değil **okunacak bayt**;
 dosya yarıya inince tarama da yaklaşık yarıya iner.
