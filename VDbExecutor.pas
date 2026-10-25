@@ -16768,7 +16768,7 @@ begin
       admReleaseSavepoint, admRollbackToSavepoint,
       admReplicationStart, admReplicationStop, admCreateReplSlot,
       admDropReplSlot, admShowReplicationStatus, admReplicationPump,
-      admShowReplSlots, admShowStats]) then
+      admShowReplSlots]) then
   begin
     { Sprint 3.5/3.6: gruplara gore yol gosteren mesaj. }
     if Stmt.Kind in [admReplicationStart, admReplicationStop,
@@ -17407,6 +17407,37 @@ var
   hits, misses: Int64;
   usedB, maxB: Integer;
   ratio: Double;
+
+  { v3 yolu: satirlari tek tek ekle (satir sayisi motorun gerceklerine gore
+    degisir; sabit 13 satir varsayimi v2'ye aittir). }
+  procedure AddRow(const N, V: string);
+  begin
+    SetLength(Res.Rows, Length(Res.Rows) + 1);
+    SetLength(Res.Rows[High(Res.Rows)], 2);
+    Res.Rows[High(Res.Rows)][0] := N;
+    Res.Rows[High(Res.Rows)][1] := V;
+  end;
+
+  { Yan dosya boyutu; dosya yoksa 0. Okuma icin acmak, yazicinin
+    fmShareDenyWrite kilidiyle CAKISMAZ (okuyuculara izin var). }
+  function SizeOfFile(const P: string): Int64;
+  var
+    fs: TFileStream;
+  begin
+    Result := 0;
+    if not FileExists(P) then Exit;
+    try
+      fs := TFileStream.Create(P, fmOpenRead or fmShareDenyNone);
+      try
+        Result := fs.Size;
+      finally
+        fs.Free;
+      end;
+    except
+      Result := 0;
+    end;
+  end;
+
 begin
   if Stmt.TableName <> '' then
   begin
@@ -17461,6 +17492,33 @@ begin
   SetLength(Res.Fields, 2);
   Res.Fields[0] := 'name';
   Res.Fields[1] := 'value';
+
+  { 2026-10-25 (v3): v3 sayfa motorunda `Kv = nil`; v2'ye ozgu okuma
+    onbellegi sayaclari yoktur. Bunlari SIFIR gibi gostermek yanlis olur:
+    yerine v3'te GERCEK olarak olculebilen seyler (motor adi, dosya
+    boyutlari, canli anahtar sayisi) raporlanir. v2 yolu asagida AYNEN
+    korunur; iki motor da ayni kolon bicimini (name|value) dondurur. }
+  if FT.Kv = nil then
+  begin
+    Res.Rows := nil;
+    AddRow('engine', 'v3');
+    AddRow('commands', IntToStr(ms.CommandCount));
+    AddRow('total_us', IntToStr(ms.TotalDurationUs));
+    AddRow('max_us', IntToStr(ms.MaxDurationUs));
+    AddRow('avg_us', IntToStr(avg));
+    AddRow('tables', IntToStr(Length(FT.TableNames)));
+    AddRow('tables_analyzed', IntToStr(AnalyzedTableCount));
+    AddRow('batch_active', BoolToStr(FT.Backend.InBatch, True));
+    AddRow('live_keys', IntToStr(FT.Backend.Count));
+    AddRow('data_file_bytes', IntToStr(SizeOfFile(FT.Backend.FilePath)));
+    AddRow('wal_file_bytes', IntToStr(SizeOfFile(FT.Backend.FilePath + '.wal')));
+    AddRow('idx_file_bytes', IntToStr(SizeOfFile(FT.Backend.FilePath + '.idx')));
+
+    Res.Affected := Length(Res.Rows);
+    Res.Msg := IntToStr(ms.CommandCount) + ' komut (v3)';
+    Exit;
+  end;
+
   FT.Kv.GetReadCacheStats(hits, misses, usedB, maxB);
   ratio := 0;
   if (hits + misses) > 0 then

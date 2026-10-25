@@ -758,6 +758,78 @@ begin
   end;
 end;
 
+{ Sprint 3.10: v3'te SHOW STATS. v2'ye ozgu okuma-onbellegi sayaclari
+  yoktur; bunlari 0 gostermek yerine v3'te GERCEK olan metrikler doner
+  (engine, live_keys, dosya boyutlari). SHOW STATS TABLE <t> ANALYZE
+  istatistiklerini dondurmeye devam eder. }
+procedure TestShowStats;
+var
+  S: TV3Sql;
+  r: TSqlResult;
+  i: Integer;
+  val: string;
+  sawEngine, sawLive, sawData, sawWal: Boolean;
+begin
+  WriteLn;
+  WriteLn('SHOW STATS - v3 sayfa motoru metrikleri');
+  CleanDir;
+  OpenV3(S, 'stats.odb', True);
+  try
+    Exec(S, 'CREATE TABLE st (id INTEGER PRIMARY KEY, ad TEXT)');
+    for i := 1 to 20 do
+      Exec(S, Format('INSERT INTO st VALUES (%d, ''a%d'')', [i, i]));
+
+    r := Exec(S, 'SHOW STATS');
+    if gErr then
+    begin
+      Fail('SHOW STATS: ' + r.Msg);
+      Exit;
+    end;
+    Ok('SHOW STATS calisti (' + IntToStr(Length(r.Rows)) + ' satir)');
+
+    sawEngine := False; sawLive := False; sawData := False; sawWal := False;
+    val := '';
+    for i := 0 to High(r.Rows) do
+    begin
+      if Cel(r, i, 0) = 'engine' then
+      begin
+        sawEngine := True;
+        if Cel(r, i, 1) <> 'v3' then Fail('SHOW STATS: engine=' + Cel(r, i, 1));
+      end
+      else if Cel(r, i, 0) = 'live_keys' then
+      begin
+        sawLive := True;
+        val := Cel(r, i, 1);
+      end
+      else if Cel(r, i, 0) = 'data_file_bytes' then
+      begin
+        sawData := True;
+        if StrToInt64Def(Cel(r, i, 1), 0) <= 0 then
+          Fail('SHOW STATS: data_file_bytes=' + Cel(r, i, 1));
+      end
+      else if Cel(r, i, 0) = 'wal_file_bytes' then
+        sawWal := True;
+    end;
+    if sawEngine and sawLive and sawData and sawWal then
+      Ok('SHOW STATS: engine/live_keys/dosya boyutlari var (canli anahtar=' + val + ')')
+    else
+      Fail(Format('SHOW STATS eksik alan (engine=%s live=%s data=%s wal=%s)',
+        [BoolToStr(sawEngine, True), BoolToStr(sawLive, True),
+         BoolToStr(sawData, True), BoolToStr(sawWal, True)]));
+
+    { Tablo bicimi ANALYZE sonrasi calisir, oncesinde yol gosteren hata. }
+    r := Exec(S, 'ANALYZE st');
+    if gErr then Fail('ANALYZE st: ' + r.Msg);
+    r := Exec(S, 'SHOW STATS TABLE st');
+    if (not gErr) and (Length(r.Rows) >= 1) and (Cel(r, 0, 0) = 'st') then
+      Ok('SHOW STATS TABLE st: ANALYZE ozeti dondu')
+    else
+      Fail('SHOW STATS TABLE st: ' + r.Msg);
+  finally
+    CloseV3(S);
+  end;
+end;
+
 { Sprint 3.5: v3 sayfa motorunda replikasyon yok. Her replikasyon cumlesi
   sessiz no-op ya da nil erisimi DEGIL, ecUnsupported + v3.1 mesaji vermeli.
   Durum/slot sorgulari ise hata degil durust cevap dondurur; STOP idempotent. }
@@ -1553,6 +1625,7 @@ begin
   TestVerifySql;
   TestBackupRestoreSql;
   TestVacuumSql;
+  TestShowStats;
   TestReplicationUnsupported;
   TestPitrUnsupported;
   TestZoneMapFallback;
