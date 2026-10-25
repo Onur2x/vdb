@@ -183,6 +183,54 @@ type
     property LastAutoCompactError: string read GetLastAutoCompactError;
   end;
 
+  { v3.2: IVDbKvStore'un IVdbBackend uzerinden uygulanmasi. v2'de TVDb
+    adaptoru (VDbCore.TVDbKvStore) vardi; artik motor SOMUT tipi taninmadan
+    da ayni arayuz kullanilabilir. Nesne backend'i SAHIPLENMEZ. }
+  EVdbBackendApi = class(Exception);
+
+  TVdbBackendKvStore = class(TInterfacedObject, IVDbKvStore)
+  private
+    FBe: IVdbBackend;
+  public
+    constructor Create(ABe: IVdbBackend);
+    procedure Put(Key: QWord; const Value: TBytes);
+    function Get(Key: QWord; out Value: TBytes): Boolean;
+    function Delete(Key: QWord): Boolean;
+    procedure ScanAll(out Keys: TQWordArray; out Vals: TValArray;
+      TableFilter: Integer);
+  end;
+
 implementation
+
+{ ------------------------------------------------- TVdbBackendKvStore }
+
+constructor TVdbBackendKvStore.Create(ABe: IVdbBackend);
+begin
+  inherited Create;
+  if ABe = nil then
+    raise EVdbBackendApi.Create('TVdbBackendKvStore: backend nil');
+  FBe := ABe;
+end;
+
+procedure TVdbBackendKvStore.Put(Key: QWord; const Value: TBytes);
+begin
+  FBe.Put(Key, Value);
+end;
+
+function TVdbBackendKvStore.Get(Key: QWord; out Value: TBytes): Boolean;
+begin
+  Result := FBe.Get(Key, Value);
+end;
+
+function TVdbBackendKvStore.Delete(Key: QWord): Boolean;
+begin
+  Result := FBe.Delete(Key);
+end;
+
+procedure TVdbBackendKvStore.ScanAll(out Keys: TQWordArray;
+  out Vals: TValArray; TableFilter: Integer);
+begin
+  FBe.ScanAll(Keys, Vals, TableFilter);
+end;
 
 end.

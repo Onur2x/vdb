@@ -16479,6 +16479,39 @@ begin
     'sayac=' + IntToStr(CountB));
 end;
 
+procedure T153_KvStoreBackend;
+{ v3.2 (2026-10-25): M11 depolama arayuzu artik motor SOMUT tipi olmadan.
+  T122 `TVDbKvStore` (v2 adaptoru) kullanir; burada ayni sozlesme
+  `TVdbBackendKvStore` uzerinden iki backend'de de sinanir. }
+var
+  st: IVDbKvStore;
+  b: TBytes;
+  keys: TQWordArray;
+  vals: TValArray;
+begin
+  Grp('T153 KV depolama arayuzu (backend)');
+  UseDir('t153_kv');
+  if gV3 then
+    st := TVdbBackendKvStore.Create(gBe)
+  else
+    st := TVDbKvStore.Create(kv);
+
+  st.Put(1001, VDbStrToBytes('aaa'));
+  st.Put(1002, VDbStrToBytes('bbb'));
+  Dogrula('Put/Get', st.Get(1001, b) and (VDbBytesToStr(b) = 'aaa'),
+    VDbBytesToStr(b));
+  Dogrula('Get olmayan anahtar', not st.Get(9999, b), '');
+  st.ScanAll(keys, vals, -1);
+  Dogrula('ScanAll iki kayit', Length(keys) = 2, IntToStr(Length(keys)));
+  st.Put(1001, VDbStrToBytes('aaa2'));
+  Dogrula('Put guncelleme', st.Get(1001, b) and (VDbBytesToStr(b) = 'aaa2'),
+    VDbBytesToStr(b));
+  Dogrula('Delete', st.Delete(1002) and (not st.Get(1002, b)), '');
+  st.ScanAll(keys, vals, -1);
+  Dogrula('Delete sonrasi tek kayit', Length(keys) = 1, IntToStr(Length(keys)));
+  st := nil;
+end;
+
 { Sprint 2.9: test kosucusu. Her test kendi try/except'inde kosar;
   boylece bir hata kalan testleri durdurmaz ve siniflandirma yapilabilir. }
 type
@@ -16488,7 +16521,7 @@ type
   end;
 
 const
-  TEST_SAYISI = 182;
+  TEST_SAYISI = 183;
 
   { v3 kosusunda ATLA: bu testler yalniz v2 motorunun (TVDb/WAL/arsiv/
     zone/indeks .idx) ozel yollarini kullanir; v3'te karsiligi yoktur.
@@ -16745,6 +16778,7 @@ begin
   TESTLER[179].Nm := 'T150_AlterDbKeyV3'; TESTLER[179].P := T150_AlterDbKeyV3;
   TESTLER[180].Nm := 'T151_KolonSifrelemeV3'; TESTLER[180].P := T151_KolonSifrelemeV3;
   TESTLER[181].Nm := 'T152_OtoSikistirmaV3'; TESTLER[181].P := T152_OtoSikistirmaV3;
+  TESTLER[182].Nm := 'T153_KvStoreBackend'; TESTLER[182].P := T153_KvStoreBackend;
 end;
 
 { ---------------------------------------------------------------------- main }
