@@ -4,7 +4,6 @@ VDB (VeriTabanı), Free Pascal ile yazılmış, harici bir DLL gerektirmeyen,
 tek dosyada (`.odb`) çalışan ilişkisel veritabanı motorudur. Masaüstü ve gömülü
 uygulamalar için SQLite'a alternatif olarak geliştirilmiştir.
 
-> Bu dosya `dokuman/` klasöründedir ve bilerek Git'e eklenmez.
 > İngilizce sürüm: [readme.md](readme.md)
 
 ---
@@ -136,19 +135,21 @@ Son doğrulanan durum (2026-10-25, `v3` dalı):
 | Kapı | Sonuç |
 |---|---|
 | `sqltest` (v2 motoru) | **3116 / 0 / 0** |
-| `sqltest --backend=v3` | **2252 / 0 / 58** (58 atla: v2'ye özgü yollar) |
+| `sqltest --backend=v3` | **2347 / 0 / 52** (52 atla: v2'ye özgü yollar) |
 | `crashtest` | 11 / 11 (veri kaybı yok) |
 | `pagechk` | 21 / 21 |
 | `storechk` | 15 / 15 |
 | `heapchk` | 20 / 20 |
 | `idxchk` | 17 / 17 |
 | `backendchk` | 108 / 108 |
-| `v3sqlchk` | 128 / 128 |
+| `v3sqlchk` | 131 / 131 |
 | `migchk` | 13 / 13 |
 | `factorychk` | 13 / 13 |
 
-`atlanan=58` sessiz yeşil değildir: yalnız v2 motorunun veri dosyası / WAL /
-arşiv / SAVEPOINT yollarını kullanan testler sayılır ve raporlanır.
+`atlanan=52` sessiz yeşil değildir: yalnız v2 motorunun veri dosyası / WAL /
+arşiv / SAVEPOINT yollarını kullanan testler sayılır ve raporlanır. v3'te de
+koşan beş test (PK'siz tablo, UNIQUE indeks, RBAC kalıcılığı, RLS kalıcılığı,
+GENERATED/IDENTITY, `SHOW STATS`) 2026-10-25'te bu listeye taşındı.
 
 ```bash
 lazbuild -B sqltest.lpi
