@@ -16356,6 +16356,129 @@ begin
   Dogrula('yanlis parola ile acilmaz', ok, msg);
 end;
 
+procedure T152_OtoSikistirmaV3;
+{ v3.2 (2026-10-25): H25 otomatik sikistirmanin BACKEND-FARKINDA karsiligi.
+  T148 v2'nin TVDb API'sini dogrudan kullanir; burada ayni sozlesme
+  IVdbBackend uzerinden iki motorda da sinanir:
+    v2: DeadBytes = olu kayit baytlari, DataFileSize = dosya boyu
+    v3: DeadBytes = freelist sayfalari * 4096, DataFileSize = sayfa*4096
+  Dogrulananlar: varsayilan KAPALI; kucuk dosyada esik yok sayilir; esik
+  asilinca commit sonunda BIR kez calisir; dosya kuculur, olu sifirlanir,
+  veri korunur. }
+const
+  NROW = 300;
+  NFREE = 200;
+var
+  r: TSqlResult;
+  i: Integer;
+  sz0, sz1, dead0, cnt0: Int64;
+
+  function DeadB: Int64;
+  begin
+    if gV3 then Result := gBe.DeadBytes else Result := kv.DeadBytes;
+  end;
+  function SizeB: Int64;
+  begin
+    if gV3 then Result := gBe.DataFileSize else Result := kv.DataFileSize;
+  end;
+  function OnB: Boolean;
+  begin
+    if gV3 then Result := gBe.AutoCompactEnabled
+    else Result := kv.AutoCompactEnabled;
+  end;
+  procedure SetOnB(const V: Boolean);
+  begin
+    if gV3 then gBe.AutoCompactEnabled := V else kv.AutoCompactEnabled := V;
+  end;
+  function RatioB: Double;
+  begin
+    if gV3 then Result := gBe.AutoCompactRatio else Result := kv.AutoCompactRatio;
+  end;
+  procedure SetRatioB(const V: Double);
+  begin
+    if gV3 then gBe.AutoCompactRatio := V else kv.AutoCompactRatio := V;
+  end;
+  function MinB: Int64;
+  begin
+    if gV3 then Result := gBe.AutoCompactMinBytes else Result := kv.AutoCompactMinBytes;
+  end;
+  procedure SetMinB(const V: Int64);
+  begin
+    if gV3 then gBe.AutoCompactMinBytes := V else kv.AutoCompactMinBytes := V;
+  end;
+  function CountB: Int64;
+  begin
+    if gV3 then Result := gBe.AutoCompactCount else Result := kv.AutoCompactCount;
+  end;
+  function ErrB: string;
+  begin
+    if gV3 then Result := gBe.LastAutoCompactError
+    else Result := kv.LastAutoCompactError;
+  end;
+
+begin
+  Grp('T152 otomatik sikistirma (backend-farkinda)');
+  UseDir('t152_ac');
+  // 1) Veri + bol olu alan
+  sq.Exec('CREATE TABLE ac(id INTEGER PRIMARY KEY, t TEXT)');
+  sq.Exec('BEGIN');
+  for i := 1 to NROW do
+    sq.Exec(Format('INSERT INTO ac(id,t) VALUES(%d,%s)',
+      [i, QuotedStr('satir-' + IntToStr(i) + '-abcabcabcabcabcabcabcabc')]));
+  sq.Exec('COMMIT');
+  // Sayfa bosaltan silme: satirlarin cogu gider.
+  sq.Exec(Format('DELETE FROM ac WHERE id > %d', [NROW - NFREE]));
+  sq.Exec('CREATE INDEX ix_ac_t ON ac(t)');
+
+  // 2) Varsayilan KAPALI
+  Dogrula('varsayilan ayar kapali', not OnB, '');
+  Dogrula('kapaliyken otomatik sikistirma yok', CountB = 0,
+    'sayac=' + IntToStr(CountB));
+  dead0 := DeadB;
+  Dogrula('kapaliyken olu alan birikti', dead0 > 0,
+    'olu=' + IntToStr(dead0) + ' boyut=' + IntToStr(SizeB));
+
+  // 3) Acilinca varsayilan MinBytes (4 MB) altinda calismaz.
+  SetOnB(True);
+  sq.Exec(Format('DELETE FROM ac WHERE id = %d', [3]));
+  Dogrula('kucuk dosyada esik yok sayilir', CountB = 0,
+    'sayac=' + IntToStr(CountB));
+
+  // 4) Esik dusurulunce BIR SONRAKI commit'te tam bir kez calisir.
+  SetMinB(4096);
+  SetRatioB(0.20);
+  cnt0 := CountB;
+  sz0 := SizeB;
+  Dogrula('esik dusuk ayarli', (MinB = 4096) and
+    (Abs(RatioB - 0.20) < 1e-9), 'oran=' + FloatToStr(RatioB));
+  sq.Exec(Format('DELETE FROM ac WHERE id = %d', [4]));
+  Dogrula('esik asilinca sikistirildi', CountB = cnt0 + 1,
+    'sayac=' + IntToStr(CountB) + ' oluOnce=' + IntToStr(dead0));
+  sz1 := SizeB;
+  Dogrula('dosya kuculdu', (sz1 > 0) and (sz1 <= sz0),
+    IntToStr(sz0) + ' -> ' + IntToStr(sz1));
+  Dogrula('sikistirma sonrasi olu alan sifir', DeadB = 0,
+    'olu=' + IntToStr(DeadB));
+  Dogrula('otomatik sikistirma hatasiz', ErrB = '', ErrB);
+
+  // 5) Veri butunlugu
+  r := sq.Exec('SELECT COUNT(*) FROM ac');
+  Dogrula('sikistirma sonrasi satir sayisi',
+    r.Rows[0][0] = IntToStr(NROW - NFREE - 2), r.Rows[0][0]);
+  r := sq.Exec('SELECT t FROM ac WHERE id = 1');
+  Dogrula('sikistirma sonrasi satir icerigi',
+    r.Rows[0][0] = 'satir-1-abcabcabcabcabcabcabcabc', r.Rows[0][0]);
+  r := sq.Exec('SELECT COUNT(*) FROM ac WHERE t LIKE ' +
+    QuotedStr('satir-1%'));
+  Dogrula('sikistirma sonrasi indeks yolu', r.Rows[0][0] = '12', r.Rows[0][0]);
+
+  // 6) Kapatilinca calismaz
+  SetOnB(False);
+  sq.Exec(Format('DELETE FROM ac WHERE id = %d', [5]));
+  Dogrula('kapatinca calismaz', CountB = cnt0 + 1,
+    'sayac=' + IntToStr(CountB));
+end;
+
 { Sprint 2.9: test kosucusu. Her test kendi try/except'inde kosar;
   boylece bir hata kalan testleri durdurmaz ve siniflandirma yapilabilir. }
 type
@@ -16365,7 +16488,7 @@ type
   end;
 
 const
-  TEST_SAYISI = 181;
+  TEST_SAYISI = 182;
 
   { v3 kosusunda ATLA: bu testler yalniz v2 motorunun (TVDb/WAL/arsiv/
     zone/indeks .idx) ozel yollarini kullanir; v3'te karsiligi yoktur.
@@ -16621,6 +16744,7 @@ begin
   TESTLER[178].Nm := 'T149_SavepointV32'; TESTLER[178].P := T149_SavepointV32;
   TESTLER[179].Nm := 'T150_AlterDbKeyV3'; TESTLER[179].P := T150_AlterDbKeyV3;
   TESTLER[180].Nm := 'T151_KolonSifrelemeV3'; TESTLER[180].P := T151_KolonSifrelemeV3;
+  TESTLER[181].Nm := 'T152_OtoSikistirmaV3'; TESTLER[181].P := T152_OtoSikistirmaV3;
 end;
 
 { ---------------------------------------------------------------------- main }

@@ -80,6 +80,20 @@ type
 
     { Sprint 3.3: v2 TVDb.Compact'a devreder. }
     procedure Compact(out OldBytes, NewBytes: Int64);
+
+    { v3.2: v2 yonetim API'leri (H25 / olcum). }
+    function GetDeadBytes: Int64;
+    function GetDataFileSize: Int64;
+    function GetAutoCompactEnabled: Boolean;
+    procedure SetAutoCompactEnabled(AValue: Boolean);
+    function GetAutoCompactRatio: Double;
+    procedure SetAutoCompactRatio(AValue: Double);
+    function GetAutoCompactMinBytes: Int64;
+    procedure SetAutoCompactMinBytes(AValue: Int64);
+    function GetAutoCompactCount: Int64;
+    function GetLastAutoCompactError: string;
+    function AutoCompact(out OldBytes, NewBytes: Int64;
+      MaxDeadRatio: Double; MinBytes: Int64): Boolean;
   end;
 
 implementation
@@ -275,6 +289,63 @@ end;
 procedure TVDbBackendV2.Compact(out OldBytes, NewBytes: Int64);
 begin
   FDb.Compact(OldBytes, NewBytes);
+end;
+
+{ --- v3.2: v2 yonetim API'leri --- }
+
+function TVDbBackendV2.GetDeadBytes: Int64;
+begin
+  Result := FDb.DeadBytes;
+end;
+
+function TVDbBackendV2.GetDataFileSize: Int64;
+begin
+  Result := FDb.DataFileSize;
+end;
+
+function TVDbBackendV2.GetAutoCompactEnabled: Boolean;
+begin
+  Result := FDb.AutoCompactEnabled;
+end;
+
+procedure TVDbBackendV2.SetAutoCompactEnabled(AValue: Boolean);
+begin
+  FDb.AutoCompactEnabled := AValue;
+end;
+
+function TVDbBackendV2.GetAutoCompactRatio: Double;
+begin
+  Result := FDb.AutoCompactRatio;
+end;
+
+procedure TVDbBackendV2.SetAutoCompactRatio(AValue: Double);
+begin
+  FDb.AutoCompactRatio := AValue;
+end;
+
+function TVDbBackendV2.GetAutoCompactMinBytes: Int64;
+begin
+  Result := FDb.AutoCompactMinBytes;
+end;
+
+procedure TVDbBackendV2.SetAutoCompactMinBytes(AValue: Int64);
+begin
+  FDb.AutoCompactMinBytes := AValue;
+end;
+
+function TVDbBackendV2.GetAutoCompactCount: Int64;
+begin
+  Result := FDb.AutoCompactCount;
+end;
+
+function TVDbBackendV2.GetLastAutoCompactError: string;
+begin
+  Result := FDb.LastAutoCompactError;
+end;
+function TVDbBackendV2.AutoCompact(out OldBytes, NewBytes: Int64;
+  MaxDeadRatio: Double; MinBytes: Int64): Boolean;
+begin
+  Result := FDb.AutoCompact(OldBytes, NewBytes, MaxDeadRatio, MinBytes);
 end;
 
 end.

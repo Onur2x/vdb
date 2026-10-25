@@ -149,6 +149,38 @@ type
       ve atomik olarak yerine koyar. Bos sayfalar/olu baytlar dosyadan
       gercekten dusulur. Eski dosya .bak kalir. }
     procedure Compact(out OldBytes, NewBytes: Int64);
+
+    { --- v3.2: v2 yonetim API esdegeri (H25 otomatik sikistirma) ---
+      v2'de TVDb uzerinde bulunan ayarlar artik backend sozlesmesindedir;
+      boylece v3 sayfa motorunda da ayni isimlerle calisir.
+        DeadBytes      : geri kazanilabilir olu bayt (v3: serbest sayfa*4096)
+        DataFileSize   : veri dosyasinin bayt boyutu
+      Otomatik sikistirma commit'ten SONRA, yalniz esik asildiginda ve
+      AutoCompactEnabled=True iken calisir (VARSAYILAN KAPALI). }
+    function GetDeadBytes: Int64;
+    function GetDataFileSize: Int64;
+    function GetAutoCompactEnabled: Boolean;
+    procedure SetAutoCompactEnabled(AValue: Boolean);
+    function GetAutoCompactRatio: Double;
+    procedure SetAutoCompactRatio(AValue: Double);
+    function GetAutoCompactMinBytes: Int64;
+    procedure SetAutoCompactMinBytes(AValue: Int64);
+    function GetAutoCompactCount: Int64;
+    function GetLastAutoCompactError: string;
+    { Esik asilmissa Compact calistirir; calistiysa True. }
+    function AutoCompact(out OldBytes, NewBytes: Int64;
+      MaxDeadRatio: Double; MinBytes: Int64): Boolean;
+
+    property DeadBytes: Int64 read GetDeadBytes;
+    property DataFileSize: Int64 read GetDataFileSize;
+    property AutoCompactEnabled: Boolean read GetAutoCompactEnabled
+      write SetAutoCompactEnabled;
+    property AutoCompactRatio: Double read GetAutoCompactRatio
+      write SetAutoCompactRatio;
+    property AutoCompactMinBytes: Int64 read GetAutoCompactMinBytes
+      write SetAutoCompactMinBytes;
+    property AutoCompactCount: Int64 read GetAutoCompactCount;
+    property LastAutoCompactError: string read GetLastAutoCompactError;
   end;
 
 implementation

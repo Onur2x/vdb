@@ -115,6 +115,18 @@ type
       FTagCountsValid: Boolean;
       { v3.2: SAVEPOINT yigini (en sona eklenir). }
       FSavepoints: TList<TSavepointRec>;
+      { v3.2: otomatik sikistirma (H25). Varsayilan KAPALI; commit'ten SONRA
+        yalniz esik asilinca calisir. Hata commit'i bozmaz. }
+      FAutoCompactOn: Boolean;
+      FAutoCompactRatio: Double;
+      FAutoCompactMinBytes: Int64;
+      FAutoCompactCount: Int64;
+      FAutoCompactBusy: Boolean;
+      FLastAutoCompactError: string;
+      function ValBytes: Int64;
+      procedure MaybeAutoCompact;
+      function AutoCompactBody(out OldBytes, NewBytes: Int64;
+        MaxDeadRatio: Double; MinBytes: Int64): Boolean;
 
     procedure InitBackend(const ADbPath: string; ACreate: Boolean;
       APoolPages: Integer);
@@ -193,6 +205,20 @@ type
       Acik parti varken reddedilir; islem atomiktir (tmp + .bak). }
     procedure Rekey(const NewPassword: string);
 
+    { --- v3.2: yonetim / olcum (v2 TVDb API esdegeri) --- }
+    function GetDeadBytes: Int64;
+    function GetDataFileSize: Int64;
+    function GetAutoCompactEnabled: Boolean;
+    procedure SetAutoCompactEnabled(AValue: Boolean);
+    function GetAutoCompactRatio: Double;
+    procedure SetAutoCompactRatio(AValue: Double);
+    function GetAutoCompactMinBytes: Int64;
+    procedure SetAutoCompactMinBytes(AValue: Int64);
+    function GetAutoCompactCount: Int64;
+    function GetLastAutoCompactError: string;
+    function AutoCompact(out OldBytes, NewBytes: Int64;
+      MaxDeadRatio: Double; MinBytes: Int64): Boolean;
+
 
     { v3.2: SAVEPOINT. Parti kaplamasi UZERINDE calisir; motora hicbir sey
       yazilmadigi icin geri alma yalnizca kaplama gunlugu ile yapilir. }
@@ -249,6 +275,13 @@ begin
   FTagCounts := TDictionary<Integer, Int64>.Create;
   FBatchTagDelta := TDictionary<Integer, Int64>.Create;
   FSavepoints := TList<TSavepointRec>.Create;
+  { v3.2: otomatik sikistirma v2 ile AYNI varsayilanlar (KAPALI). }
+  FAutoCompactOn := False;
+  FAutoCompactRatio := 0.35;
+  FAutoCompactMinBytes := 4 * 1024 * 1024;
+  FAutoCompactCount := 0;
+  FAutoCompactBusy := False;
+  FLastAutoCompactError := '';
   FBatchOpen := False;
   FDirty := False;
   FCheckpointBytes := VDB_V3_CHECKPOINT_BYTES;
@@ -838,6 +871,7 @@ begin
     FEng.Commit(True);
     FDirty := False;
     MaybeCheckpoint;
+    MaybeAutoCompact;     // v3.2 (H25)
   end;
 end;
 
@@ -866,6 +900,7 @@ begin
     FEng.Commit(True);
     FDirty := False;
     MaybeCheckpoint;
+    MaybeAutoCompact;     // v3.2 (H25): autocommit yolu
   end;
 end;
 
@@ -1320,6 +1355,124 @@ begin
   SwapDbFileWith(tmp, nil, NewPassword, True);
   { Anahtar kumesi KORUNDU (yukarida dogrulandi) -> sayac gecerli. }
   FTagCountsValid := tagsWere;
+end;
+
+{ --- v3.2: yonetim / otomatik sikistirma (H25 esdegeri) --- }
+
+function TVdbBackendV3.ValBytes: Int64;
+begin
+  if FEng = nil then Exit(0);
+  Result := Int64(FEng.Store.PageCount) * Int64(FEng.Store.PageSize);
+end;
+
+function TVdbBackendV3.GetDeadBytes: Int64;
+begin
+  if FEng = nil then Exit(0);
+  { v3'te "olu" alan = freelist'teki sayfalar: silinen/guncellenen satirin
+    bosalttigi sayfa yeniden kullanilabilir, ama VACUUM'a kadar dosyada
+    durur. (Heap ici bosluk freelist'e donustugu anda burada sayilir.) }
+  Result := Int64(FEng.Store.FreeCount) * Int64(FEng.Store.PageSize);
+end;
+
+function TVdbBackendV3.GetDataFileSize: Int64;
+begin
+  Result := ValBytes;
+end;
+
+function TVdbBackendV3.GetAutoCompactEnabled: Boolean;
+begin
+  Result := FAutoCompactOn;
+end;
+
+procedure TVdbBackendV3.SetAutoCompactEnabled(AValue: Boolean);
+begin
+  FAutoCompactOn := AValue;
+end;
+
+function TVdbBackendV3.GetAutoCompactRatio: Double;
+begin
+  Result := FAutoCompactRatio;
+end;
+
+procedure TVdbBackendV3.SetAutoCompactRatio(AValue: Double);
+begin
+  if AValue <= 0 then AValue := 0.35;
+  if AValue > 1 then AValue := 1;
+  FAutoCompactRatio := AValue;
+end;
+
+function TVdbBackendV3.GetAutoCompactMinBytes: Int64;
+begin
+  Result := FAutoCompactMinBytes;
+end;
+
+procedure TVdbBackendV3.SetAutoCompactMinBytes(AValue: Int64);
+begin
+  if AValue < 0 then AValue := 0;
+  FAutoCompactMinBytes := AValue;
+end;
+
+function TVdbBackendV3.GetAutoCompactCount: Int64;
+begin
+  Result := FAutoCompactCount;
+end;
+
+function TVdbBackendV3.GetLastAutoCompactError: string;
+begin
+  Result := FLastAutoCompactError;
+end;
+
+function TVdbBackendV3.AutoCompactBody(out OldBytes, NewBytes: Int64;
+  MaxDeadRatio: Double; MinBytes: Int64): Boolean;
+var
+  sz, dead: Int64;
+begin
+  Result := False;
+  OldBytes := 0;
+  NewBytes := 0;
+  if FEng = nil then Exit;
+  if FBatchOpen then Exit;      // parti icinde VACUUM olmaz (veri kaplamada)
+  sz := ValBytes;
+  if sz <= 0 then Exit;
+  if sz < MinBytes then Exit;
+  dead := GetDeadBytes;
+  if dead <= 0 then Exit;
+  if (Double(dead) / Double(sz)) < MaxDeadRatio then Exit;
+  Compact(OldBytes, NewBytes);
+  Result := True;
+end;
+
+function TVdbBackendV3.AutoCompact(out OldBytes, NewBytes: Int64;
+  MaxDeadRatio: Double; MinBytes: Int64): Boolean;
+begin
+  Result := AutoCompactBody(OldBytes, NewBytes, MaxDeadRatio, MinBytes);
+end;
+
+procedure TVdbBackendV3.MaybeAutoCompact;
+// H25: commit tamamlandiktan SONRA. Karar O(1); yalniz esik asilirsa dosya
+// bir kez bastan yazilir. Hata commit'i BOZMAZ (veri zaten fsync'li);
+// yalnizca LastAutoCompactError'a yazilir.
+var
+  o, n: Int64;
+begin
+  if (not FAutoCompactOn) or FAutoCompactBusy then Exit;
+  if FBatchOpen or (FEng = nil) then Exit;
+  if GetDeadBytes <= 0 then Exit;
+  if ValBytes < FAutoCompactMinBytes then Exit;
+  if (Double(GetDeadBytes) / Double(ValBytes)) < FAutoCompactRatio then Exit;
+  FAutoCompactBusy := True;
+  try
+    try
+      AutoCompactBody(o, n, FAutoCompactRatio, FAutoCompactMinBytes);
+      Inc(FAutoCompactCount);
+      FLastAutoCompactError := '';
+    except
+      on E: Exception do
+        FLastAutoCompactError := E.Message;
+    end;
+  finally
+    FAutoCompactBusy := False;
+  end;
 end;
 
 procedure TVdbBackendV3.SwapDbFile(const NewFilePath: string);
