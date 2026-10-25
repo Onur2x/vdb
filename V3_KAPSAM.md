@@ -198,6 +198,10 @@ VdbOpenWithPassword(Path, Parola, Be); // şifreli v3
   dosyayı kapatır.
 - `examples/` (01–06, 09–12) ve `yonetim/` bu giriş noktasına geçirildi;
   `factorychk` kapısı politikayı CI'da doğrular (13/13).
+- `examples/07` ve `08` (TCP sunucu/istemci) **v2 motorunda kalır**:
+  `VDbSqlServer` hâlâ `TVDb` kullanıyor; sunucunun `IVdbBackend`'e taşınması
+  M7 kapsamındadır (v3.2). İstemci (08) protokolü değişmediği için v2
+  sunucuyla çalışmaya devam eder.
 
 **Göç aracı (`vdbmig`, 2026-10-25):** `migchk` motoru doğrular; `vdbmig` CLI'si
 de gerçek bir v2 dosyasıyla sınandı ve CI'ya kapı olarak eklendi —

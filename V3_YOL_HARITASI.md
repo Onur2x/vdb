@@ -113,6 +113,7 @@ tamamlandı:
 |---|---|
 | `VDbFactory.pas` — tek giriş noktası (`VdbOpen`, `VdbOpenOrCreate`, `VdbOpenWithPassword`) | tamam; v3 varsayılan, v2 reddedilir (`AllowV2` yalnız göç) |
 | `examples/` 01–06, 09–12 | tamam; hepsi `VdbOpenOrCreate` + `TVTableDb.CreateBackend` |
+| `examples/07`, `08` (TCP sunucu/istemci) | **v2'de kalıyor**: `VDbSqlServer` hâlâ `TVDb` kullanıyor; M7 sunucu kapsam dışı (v3.2) |
 | `yonetim/` (GUI) | tamam; `FBe: IVdbBackend`, v2 dosyasında `vdbmig` yönlendirmesi |
 | `factorychk` kapısı (13 kontrol) + CI adımı | tamam |
 
