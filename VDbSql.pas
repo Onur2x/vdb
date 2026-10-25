@@ -363,9 +363,36 @@ var
   avgUs: UInt64;
   ratio: Double;
   sl: TStringList;
+  v2: Boolean;
+  fs: TFileStream;
+  dataB: Int64;
+
+  function FileBytes(const P: string): Int64;
+  begin
+    Result := 0;
+    if not FileExists(P) then Exit;
+    try
+      fs := TFileStream.Create(P, fmOpenRead or fmShareDenyNone);
+      try
+        Result := fs.Size;
+      finally
+        fs.Free;
+      end;
+    except
+      Result := 0;
+    end;
+  end;
+
 begin
   GetStats(ms);
-  FT.Kv.GetReadCacheStats(hits, misses, usedB, maxB);
+  { 2026-10-25 (v3): v3 sayfa motorunda `Kv = nil`. Okuma onbellegi
+    sayaclari yoktur; eskiden burada kosulsuz `FT.Kv.GetReadCacheStats`
+    cagriliyordu ve v3'te AV olurdu. Artik motor-farkinda: v2 satirlari
+    AYNEN korunur, v3'te yalniz gercekten olculen metrikler yazilir. }
+  v2 := FT.Kv <> nil;
+  hits := 0; misses := 0; usedB := 0; maxB := 0;
+  if v2 then
+    FT.Kv.GetReadCacheStats(hits, misses, usedB, maxB);
   if ms.CommandCount > 0 then
     avgUs := ms.TotalDurationUs div ms.CommandCount
   else
@@ -374,6 +401,10 @@ begin
     ratio := hits * 100.0 / (hits + misses)
   else
     ratio := 0;
+  if v2 then
+    dataB := FT.Kv.DataFileSize
+  else
+    dataB := FileBytes(FT.Backend.FilePath);
   sl := TStringList.Create;
   try
     sl.Add('# HELP vdb_up Database open (1) or closed (0).');
@@ -395,18 +426,33 @@ begin
     sl.Add('vdb_plan_cache_misses_total ' + IntToStr(FPlanMiss));
     sl.Add('# TYPE vdb_plan_cache_size gauge');
     sl.Add('vdb_plan_cache_size ' + IntToStr(FPlanCache.Count));
-    sl.Add('# TYPE vdb_read_cache_hits_total counter');
-    sl.Add('vdb_read_cache_hits_total ' + IntToStr(hits));
-    sl.Add('# TYPE vdb_read_cache_misses_total counter');
-    sl.Add('vdb_read_cache_misses_total ' + IntToStr(misses));
-    sl.Add('# TYPE vdb_read_cache_blocks_used gauge');
-    sl.Add('vdb_read_cache_blocks_used ' + IntToStr(usedB));
-    sl.Add('# TYPE vdb_read_cache_blocks_max gauge');
-    sl.Add('vdb_read_cache_blocks_max ' + IntToStr(maxB));
-    sl.Add('# TYPE vdb_read_cache_hit_ratio gauge');
-    sl.Add('vdb_read_cache_hit_ratio ' + FormatFloat('0.0000', ratio / 100.0));
+    if v2 then
+    begin
+      sl.Add('# TYPE vdb_read_cache_hits_total counter');
+      sl.Add('vdb_read_cache_hits_total ' + IntToStr(hits));
+      sl.Add('# TYPE vdb_read_cache_misses_total counter');
+      sl.Add('vdb_read_cache_misses_total ' + IntToStr(misses));
+      sl.Add('# TYPE vdb_read_cache_blocks_used gauge');
+      sl.Add('vdb_read_cache_blocks_used ' + IntToStr(usedB));
+      sl.Add('# TYPE vdb_read_cache_blocks_max gauge');
+      sl.Add('vdb_read_cache_blocks_max ' + IntToStr(maxB));
+      sl.Add('# TYPE vdb_read_cache_hit_ratio gauge');
+      sl.Add('vdb_read_cache_hit_ratio ' + FormatFloat('0.0000', ratio / 100.0));
+    end
+    else
+    begin
+      { v3: sayfa motorunda olculen gercek degerler. }
+      sl.Add('# TYPE vdb_engine_info gauge');
+      sl.Add('vdb_engine_info{engine="v3"} 1');
+      sl.Add('# TYPE vdb_live_keys gauge');
+      sl.Add('vdb_live_keys ' + IntToStr(FT.Backend.Count));
+      sl.Add('# TYPE vdb_wal_file_bytes gauge');
+      sl.Add('vdb_wal_file_bytes ' + IntToStr(FileBytes(FT.Backend.FilePath + '.wal')));
+      sl.Add('# TYPE vdb_idx_file_bytes gauge');
+      sl.Add('vdb_idx_file_bytes ' + IntToStr(FileBytes(FT.Backend.FilePath + '.idx')));
+    end;
     sl.Add('# TYPE vdb_data_file_bytes gauge');
-    sl.Add('vdb_data_file_bytes ' + IntToStr(FT.Kv.DataFileSize));
+    sl.Add('vdb_data_file_bytes ' + IntToStr(dataB));
     sl.Add('# TYPE vdb_batch_active gauge');
     if FT.Backend.InBatch then
       sl.Add('vdb_batch_active 1')

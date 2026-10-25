@@ -3094,10 +3094,20 @@ begin
   Dogrula('SHOW STATS 2 kolon (name,value)',
     (Length(R.Fields) = 2) and (R.Fields[0] = 'name') and
     (R.Fields[1] = 'value'), R.Msg);
-  Dogrula('SHOW STATS 13 metrik satiri', Length(R.Rows) = 13,
-    IntToStr(Length(R.Rows)));
-  Dogrula('ilk metrik commands',
-    (Length(R.Rows) >= 1) and (R.Rows[0][0] = 'commands'), '');
+  { 2026-10-25 (v3): v3'te okuma-onbellegi sayaclari yok; satir sayisi
+    13 degil 12'dir (engine/live_keys/.wal/.idx ile). }
+  if gV3 then
+    Dogrula('SHOW STATS 12 metrik satiri (v3)', Length(R.Rows) = 12,
+      IntToStr(Length(R.Rows)))
+  else
+    Dogrula('SHOW STATS 13 metrik satiri', Length(R.Rows) = 13,
+      IntToStr(Length(R.Rows)));
+  if gV3 then
+    Dogrula('ilk metrik engine (v3)',
+      (Length(R.Rows) >= 1) and (R.Rows[0][0] = 'engine'), '')
+  else
+    Dogrula('ilk metrik commands',
+      (Length(R.Rows) >= 1) and (R.Rows[0][0] = 'commands'), '');
 
   // ---- a2) M9 ek metrikler ----
   Dogrula('data_file_bytes > 0',
@@ -3106,26 +3116,53 @@ begin
     StatOf('tables'));
   Dogrula('batch_active False', StatOf('batch_active') = 'False',
     StatOf('batch_active'));
-  Dogrula('read_cache_blocks bicimi used/max',
-    Pos('/', StatOf('read_cache_blocks')) > 0, StatOf('read_cache_blocks'));
-  Dogrula('cache_hits >= 0', StrToInt64Def(StatOf('cache_hits'), -1) >= 0,
-    StatOf('cache_hits'));
-  Dogrula('cache_misses >= 0', StrToInt64Def(StatOf('cache_misses'), -1) >= 0,
-    StatOf('cache_misses'));
-  Dogrula('cache_hit_ratio_pct 0..100',
-    (StrToFloatDef(StatOf('cache_hit_ratio_pct'), -1) >= 0) and
-    (StrToFloatDef(StatOf('cache_hit_ratio_pct'), 101) <= 100),
-    StatOf('cache_hit_ratio_pct'));
+  if gV3 then
+  begin
+    Dogrula('v3: engine = v3', StatOf('engine') = 'v3', StatOf('engine'));
+    Dogrula('v3: live_keys okunur', StrToInt64Def(StatOf('live_keys'), -1) >= 0,
+      StatOf('live_keys'));
+    Dogrula('v3: idx_file_bytes okunur',
+      StrToInt64Def(StatOf('idx_file_bytes'), -1) >= 0, StatOf('idx_file_bytes'));
+    Dogrula('v3: wal_file_bytes okunur',
+      StrToInt64Def(StatOf('wal_file_bytes'), -1) >= 0, StatOf('wal_file_bytes'));
+  end
+  else
+  begin
+    Dogrula('read_cache_blocks bicimi used/max',
+      Pos('/', StatOf('read_cache_blocks')) > 0, StatOf('read_cache_blocks'));
+    Dogrula('cache_hits >= 0', StrToInt64Def(StatOf('cache_hits'), -1) >= 0,
+      StatOf('cache_hits'));
+    Dogrula('cache_misses >= 0', StrToInt64Def(StatOf('cache_misses'), -1) >= 0,
+      StatOf('cache_misses'));
+    Dogrula('cache_hit_ratio_pct 0..100',
+      (StrToFloatDef(StatOf('cache_hit_ratio_pct'), -1) >= 0) and
+      (StrToFloatDef(StatOf('cache_hit_ratio_pct'), 101) <= 100),
+      StatOf('cache_hit_ratio_pct'));
+  end;
 
   // ---- a3) M9 Prometheus metin ciktisi ----
+  { 2026-10-25: v3'te GetMetricsText eskiden `FT.Kv` uzerinden okuma
+    onbellegi sayaci okuyordu ve AV olurdu; artik motor-farkinda. }
   mt := sq.GetMetricsText;
   Dogrula('metrics vdb_up=1', Pos('vdb_up 1', mt) > 0, '');
   Dogrula('metrics commands_total', Pos('vdb_commands_total ', mt) > 0, '');
   Dogrula('metrics plan cache', Pos('vdb_plan_cache_size ', mt) > 0, '');
-  Dogrula('metrics read cache', Pos('vdb_read_cache_hits_total ', mt) > 0, '');
   Dogrula('metrics data file', Pos('vdb_data_file_bytes ', mt) > 0, '');
   Dogrula('metrics batch_active', Pos('vdb_batch_active 0', mt) > 0, '');
   Dogrula('metrics TYPE satiri', Pos('# TYPE vdb_up gauge', mt) > 0, '');
+  if gV3 then
+  begin
+    Dogrula('metrics v3 engine etiketi',
+      Pos('vdb_engine_info{engine="v3"} 1', mt) > 0, '');
+    Dogrula('metrics v3 live_keys', Pos('vdb_live_keys ', mt) > 0, '');
+    Dogrula('metrics v3 idx dosyasi', Pos('vdb_idx_file_bytes ', mt) > 0, '');
+    Dogrula('metrics v3 read_cache YOK',
+      Pos('vdb_read_cache_hits_total ', mt) = 0, '');
+  end
+  else
+  begin
+    Dogrula('metrics read cache', Pos('vdb_read_cache_hits_total ', mt) > 0, '');
+  end;
 
   // ---- b) commands delta ----
   v0 := StrToInt64Def(StatOf('commands'), -1);
@@ -3149,14 +3186,27 @@ begin
   Dogrula('total_us >= max_us', tot >= mx, IntToStr(tot) + '/' + IntToStr(mx));
   Dogrula('0 <= avg_us <= max_us', (av >= 0) and (av <= mx), IntToStr(av));
 
-  // ---- d) wal_records ----
-  kv.WALEnabled := True;
-  w0 := StrToInt64Def(StatOf('wal_records'), -1);
-  sq.Exec('INSERT INTO st VALUES (3, ' + SQLIT('c') + ')');
-  w1 := StrToInt64Def(StatOf('wal_records'), -1);
-  Dogrula('wal_records WALEnabled + INSERT ile artar', w1 > w0,
-    IntToStr(w0) + ' -> ' + IntToStr(w1));
-  kv.WALEnabled := False;
+  // ---- d) wal_records (yalniz v2: v3'te WAL sayfa duzeyinde) ----
+  if not gV3 then
+  begin
+    kv.WALEnabled := True;
+    w0 := StrToInt64Def(StatOf('wal_records'), -1);
+    sq.Exec('INSERT INTO st VALUES (3, ' + SQLIT('c') + ')');
+    w1 := StrToInt64Def(StatOf('wal_records'), -1);
+    Dogrula('wal_records WALEnabled + INSERT ile artar', w1 > w0,
+      IntToStr(w0) + ' -> ' + IntToStr(w1));
+    kv.WALEnabled := False;
+  end
+  else
+  begin
+    { v3: WAL sayfa duzeyinde; kayit sayaci yerine .wal dosya boyutu
+      anlamli. INSERT sonrasi canli anahtar sayisi artmalidir. }
+    w0 := StrToInt64Def(StatOf('live_keys'), -1);
+    sq.Exec('INSERT INTO st VALUES (3, ' + SQLIT('c') + ')');
+    w1 := StrToInt64Def(StatOf('live_keys'), -1);
+    Dogrula('v3: live_keys INSERT ile artar', w1 > w0,
+      IntToStr(w0) + ' -> ' + IntToStr(w1));
+  end;
 
   // ---- e) tables_analyzed ----
   ta0 := StrToInt64Def(StatOf('tables_analyzed'), -1);
@@ -3205,7 +3255,10 @@ begin
   ChkErr('SHOW STATS TABLE isimsiz hata', 'SHOW STATS TABLE');
 
   // ---- h) LIST STATS takma adi ----
-  ChkVal('LIST STATS ayni sonucu verir', 'LIST STATS', 0, 0, 'commands');
+  if gV3 then
+    ChkVal('LIST STATS ayni sonucu verir', 'LIST STATS', 0, 0, 'engine')
+  else
+    ChkVal('LIST STATS ayni sonucu verir', 'LIST STATS', 0, 0, 'commands');
 end;
 
 procedure T106_TcpSqlServer;
@@ -16078,13 +16131,12 @@ const
     yonetim komutlarini sinayan testler. (BACKUP/VACUUM/VERIFY artik
     v3'te backend uzerinden calisir; T15_Bakim bu yuzden listede degil.)
 
-    2026-10-25: T64, T65, T94, T94c ve T117 ARTIK KOSAR (tek engelleri
-    reopen'in elle TVDb.Create ile yapilmasiydi; backend-farkinda `NewDb`
-    ya da `TVdbBackendV3` ile degistirildi). Ayni desen digerlerinde de
-    var; sirayla tasinacak. }
-  V2_ONLY: array[0..52] of string = (
+    2026-10-25: T64, T65, T94, T94c, T105 ve T117 ARTIK KOSAR (tek
+    engelleri reopen'in elle TVDb.Create ile yapilmasi ya da SHOW STATS /
+    GetMetricsText'in kosulsuz `kv` erisimi olmasiydi; backend-farkinda
+    hale getirildi). Ayni desen digerlerinde de var; sirayla tasinacak. }
+  V2_ONLY: array[0..51] of string = (
     'T101_TcpReplication',
-    'T105_ShowStats',
     'T122_KvStore',
     'T125_KolonSifreleme',
     'T126_F42_TxIsolation',
