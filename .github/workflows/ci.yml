@@ -64,6 +64,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:LAZBUILD -B migchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:LAZBUILD -B vdbmig.lpi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Sayfa deposu kapisi (storechk)
         shell: pwsh
@@ -201,6 +203,43 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'migchk kalan > 0'
+            exit 1
+          }
+
+      - name: Goc araci kapisi (vdbmig)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbmigchk'
+          $src = Join-Path $dir 'mig_src'
+          $dst = Join-Path $dir 'cli_dst.odb'
+          if (-not (Test-Path (Join-Path $src 'veritabani.odb'))) {
+            Write-Error "kaynak yok: $src (migchk adimi once kosmali)"
+            exit 1
+          }
+          $out = & .\vdbmig.exe copy $src $dst 2>&1 | Out-String
+          $out | Write-Host
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "vdbmig copy cikis=$LASTEXITCODE"
+            exit 1
+          }
+          if ($out -notmatch 'TAMAM') {
+            Write-Error 'vdbmig copy TAMAM demedi'
+            exit 1
+          }
+          $again = & .\vdbmig.exe copy $src $dst 2>&1 | Out-String
+          $again | Write-Host
+          if ($LASTEXITCODE -ne 2) {
+            Write-Error "var olan hedef reddedilmedi (cikis=$LASTEXITCODE)"
+            exit 1
+          }
+          $vout = & .\vdbmig.exe verify $src $dst 2>&1 | Out-String
+          $vout | Write-Host
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "vdbmig verify cikis=$LASTEXITCODE"
+            exit 1
+          }
+          if ($vout -notmatch 'TAMAM') {
+            Write-Error 'vdbmig verify TAMAM demedi'
             exit 1
           }
 

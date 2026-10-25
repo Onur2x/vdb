@@ -190,6 +190,7 @@ Kök nedenler ve tüm ölçümler:
 ```
 VDb*.pas            Motor birimleri
 sqltest.lpi/lpr     SQL test paketi
+vdbmig.lpi/lpr      v2 -> v3 göç aracı (bkz. GOC_V2_V3.md)
 vdbapi.*            DLL / C API projesi
 examples/           Örnek projeler
 yonetim/            GUI yönetici

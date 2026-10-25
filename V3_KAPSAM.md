@@ -178,6 +178,12 @@ Kapılar (yeniden koşuldu, hepsi yeşil):
 `crashtest 11/11`, `backendchk 108/108` (v3.1: 19 sayaç kontrolü eklendi),
 `v3sqlchk 128/128`, `migchk 13/13`.
 
+**Göç aracı (`vdbmig`, 2026-10-25):** `migchk` motoru doğrular; `vdbmig` CLI'si
+de gerçek bir v2 dosyasıyla sınandı ve CI'ya kapı olarak eklendi —
+`copy` → 0, aynı hedefe ikinci `copy` → 2 (üzerine yazmaz), `verify` → 0.
+Ölçüm: 5.031 kayıt 31 ms, 200.001 kayıt 547 ms kopya + 219 ms doğrulama
+(v3 dosya v2'nin %85,5'i). Ayrıntı: `GOC_V2_V3.md`.
+
 ### Fuzz / diferansiyel oracle (Sprint 3.11)
 
 v3'te ham kayıt yolu (`Kv`) olmadığı için `sqltest`'in mevcut diferansiyel
