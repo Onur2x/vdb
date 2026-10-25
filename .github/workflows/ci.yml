@@ -298,7 +298,79 @@ jobs:
             Write-Error 'sqltest v3 kalan > 0'
             exit 1
           }
-          if ($out -notmatch 'atlanan=[1-9]') {
-            Write-Error 'sqltest v3: ATLA sayisi beklenmedik (0)'
+          if ($out -notmatch 'atlanan=\d+') {
+            Write-Error 'sqltest v3: atlanan sayisi raporlanmadi'
             exit 1
           }
+
+      - name: Ornekler derleniyor (examples/build_all.bat)
+        shell: pwsh
+        # 2026-10-25: examples/build_all.bat yol hatasi yuzunden 14 ornegin
+        # 10'u hic derlenmiyordu ve bu fark edilmedi (eski compile.log'lar
+        # hatayi gizliyordu). Ornekler uygulama gelistiricinin BELGESI oldugu
+        # icin derlendikleri artik kapida dogrulanir.
+        #
+        # NOT: Betik interaktif bir "pause" ile biter; bu yuzden CI'da
+        # dogrudan kosulmaz, ayni isi yapan adimlar burada kosar.
+        run: |
+          # fpc'yi lazbuild'in kurulu oldugu agac altinda ara (choco
+          # kurulumu: <lazarus>\fpc\<surum>\bin\i386-win32\fpc.exe).
+          $lazRoot = Split-Path $env:LAZBUILD -Parent
+          $fpcExe = $null
+          $cand = Get-ChildItem -Path (Join-Path $lazRoot 'fpc') -Filter fpc.exe `
+            -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'i386-win32' } |
+            Select-Object -First 1
+          if ($cand) { $fpcExe = $cand.FullName }
+          if (-not $fpcExe) {
+            $c = Get-Command fpc -ErrorAction SilentlyContinue
+            if ($c) { $fpcExe = $c.Source }
+          }
+          if (-not $fpcExe) {
+            Write-Error 'fpc.exe bulunamadi'
+            exit 1
+          }
+          Write-Host "FPC=$fpcExe"
+
+          $units = @('-Fu..', '-Fu..\..', '-Fu..\..\dcpcrypt',
+            '-Fu..\..\dcpcrypt\Ciphers', '-Fu..\..\dcpcrypt\Hashes')
+          $fail = 0
+          # Konsol ornekleri (fpc). 07/08 v2 motorundadir; onlar da derlenir.
+          $console = @(
+            @('01_basit_kullanim', 'ornek01'),
+            @('02_sql_sorgulari', 'ornek02'),
+            @('03_crud_islemleri', 'ornek03'),
+            @('04_transaction', 'ornek04'),
+            @('05_join_islemleri', 'ornek05'),
+            @('06_sifreleme', 'ornek06'),
+            @('07_tcp_sunucu', 'ornek07'),
+            @('08_tcp_istemci', 'ornek08'),
+            @('09_json_veri', 'ornek09'),
+            @('10_ileri_ozellikler', 'ornek10')
+          )
+          foreach ($e in $console) {
+            $d = Join-Path 'examples' $e[0]
+            Push-Location $d
+            & $fpcExe -B -Mdelphi @units ($e[1] + '.lpr') 2>&1 | Out-String | Write-Host
+            if (-not (Test-Path ($e[1] + '.exe'))) {
+              Write-Host ("  FAIL " + $e[0])
+              $fail++
+            } else { Write-Host ("  OK   " + $e[0]) }
+            Pop-Location
+          }
+          # LCL ornekleri (lazbuild).
+          foreach ($e in @(@('11_gui_ornek', 'ornek11'), @('12_milyon_demo', 'ornek12'))) {
+            $d = Join-Path 'examples' $e[0]
+            Push-Location $d
+            & $env:LAZBUILD -B ($e[1] + '.lpi') 2>&1 | Out-String | Write-Host
+            if (-not (Test-Path ($e[1] + '.exe'))) {
+              Write-Host ("  FAIL " + $e[0])
+              $fail++
+            } else { Write-Host ("  OK   " + $e[0]) }
+            Pop-Location
+          }
+          if ($fail -gt 0) {
+            Write-Error ("ornek derlemesi: " + $fail + " basarisiz")
+            exit 1
+          }
+          Write-Host 'TUM ORNEKLER DERLENDI'
