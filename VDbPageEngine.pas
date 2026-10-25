@@ -41,6 +41,9 @@ type
       TPending = record
         PageNo: LongWord;
         Data: PByte;              // 4 KB imaj: ayri ayri ayrilir
+        { v3.1: imajin ait oldugu islem (depo FTxnId'si). Commit yalnizca
+          guncel islem isaretli pending imajlarini yazar. }
+        Mark: LongWord;
       end;
     var
       FStore: TVDbPageStore;
@@ -353,6 +356,7 @@ begin
   begin
     Move(P^, FPending[i].Data^, VDB_PAGE_SIZE);
     PageSeal(PVdbPage(FPending[i].Data));
+    FPending[i].Mark := FStore.TxnMarkOf(PageNo);
     Exit;
   end;
   if FPendingCount >= FPendingCap then
@@ -362,6 +366,8 @@ begin
   end;
   i := FPendingCount;
   FPending[i].PageNo := PageNo;
+  { Cerceve henuz tahliye edilmedi: islem isaretini oradan al. }
+  FPending[i].Mark := FStore.TxnMarkOf(PageNo);
   GetMem(FPending[i].Data, VDB_PAGE_SIZE);
   Move(P^, FPending[i].Data^, VDB_PAGE_SIZE);
   { Cerceveden tahliye aninda CRC BAYAT olabilir (sayfa henuz
@@ -490,12 +496,14 @@ begin
 
   LSN := FStore.NextLSN;
 
-  { 1) Tahliye edilip WAL tamponunda bekleyen cerceveler. }
-  for i := 0 to FPendingCount - 1 do
-    FWal.AppendFrame(FPending[i].PageNo, PVdbPage(FPending[i].Data));
+  { v3.1: YALNIZCA bu islemde degisen sayfalar yazilir.
+    Eski davranis "tum kirli sayfalar" idi; autocommit'te her INSERT bir
+    onceki commit'ten beri kirletilmis TUM sayfalari yeniden WAL'e yaziyordu
+    (olculen: 64 sayfalik havuzda 63 KB/commit; havuz buyudukce daha da
+    kotu). Dogru kume, islem basina kirletme isaretidir (FFrame.TxnMark).
 
-  { 2) Hala onbellekte kirli olan sayfalar (en guncel imaj). }
-  dirty := FStore.DirtyPages;
+    1) Bu islemde degisen YERLESIK sayfalar (en guncel imaj). }
+  dirty := FStore.TxnPages;
   for i := 0 to High(dirty) do
     if FStore.GetPage(dirty[i], P) then
     begin
@@ -503,14 +511,39 @@ begin
       FStore.Release(dirty[i], False);
     end;
 
-  { 3) Meta sayfa imaji (sayfa sayisi, freelist, LSN). }
-  FStore.BuildMetaImage(meta);
-  FWal.AppendFrame(VDB_HDR_PAGE, @meta);
+  { 2) Tahliye edilmis (yerlesik olmayan) ve BU islemde degisen sayfalar.
+        Daha eski bir islemde yazilmis pending imajlari tekrar yazilmaz;
+        sayfa okuma icin geri yuklendiginde OnMiss kaydi dusurur ve cerceve
+        guncel islem isaretiyle kirli kalir, yani yukaridaki 1. adim kapsar. }
+  for i := 0 to FPendingCount - 1 do
+    if FPending[i].Mark = FStore.TxnId then
+      FWal.AppendFrame(FPending[i].PageNo, PVdbPage(FPending[i].Data));
 
-  { 4) WAL commit + fsync: artik durabil. Veritabani dosyasina bu noktada
+  { 3) Meta sayfa imaji. Yalnizca meta YAPISAL olarak degistiyse (sayfa
+        sayisi / freelist). LSN commit kaydinda tasinir ve kurtarma FLSN'i
+        oradan alir; degismemis meta imajini her commit'te yazmak 4 KB'lik
+        bos bir cerceve demekti (autocommit'te WAL hacminin yarisi). }
+  if FStore.MetaStructDirty then
+  begin
+    FStore.BuildMetaImage(meta);
+    FWal.AppendFrame(VDB_HDR_PAGE, @meta);
+  end;
+
+  { 4) GUVENLIK AGI: tampon bossa commit kaydi yazilmaz ve LSN ilerlemezdi.
+        Islem sirasinda bir sayfa degistiyse buraya dusmemeli; yine de
+        olusursa commit'i gorunur kilmak icin meta imaji yazilir. }
+  if FWal.BufferedCount = 0 then
+  begin
+    FStore.BuildMetaImage(meta);
+    FWal.AppendFrame(VDB_HDR_PAGE, @meta);
+  end;
+
+  { 5) WAL commit + fsync: artik durabil. Veritabani dosyasina bu noktada
         HICBIR SEY yazilmaz (checkpoint'e kadar). }
-  FWal.Commit(DoSync, LSN);
+  if not FWal.Commit(DoSync, LSN) then
+    Exit(False);
 
+  FStore.EndTxn;
   FInTxn := False;
   Result := True;
 end;

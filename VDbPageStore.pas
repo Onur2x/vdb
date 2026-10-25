@@ -95,6 +95,10 @@ type
         Pins: Integer;
         Dirty: Boolean;
         Ref: Boolean;
+        { v3.1: cercevenin en son hangi islemde kirletildigi. Commit yalnizca
+          BU islemde degisen sayfalari WAL'e yazar (eskiden tum kirli sayfalar
+          yaziliyordu => autocommit'te O(kirli sayfa) maliyet). }
+        TxnMark: LongWord;
       end;
     var
       FPath: string;
@@ -114,6 +118,12 @@ type
       FWrites: Int64;
       FEvictions: Int64;
       FMetaDirty: Boolean;
+      { v3.1: meta sayfanin YAPISAL icerigi (sayfa sayisi / freelist) diskte
+        bayat mi? Commit yalnizca bu True iken meta cercevesi yazar; yalniz
+        LSN degismisse cerceve gereksiz (4 KB). }
+      FStructDirty: Boolean;
+      { v3.1: islem (commit) kimligi; FFrame.TxnMark ile karsilastirilir. }
+      FTxnId: LongWord;
       FLocked: Boolean;
       FReadOnly: Boolean;
       FOnSpill: TVdbPageSpillProc;
@@ -204,6 +214,15 @@ type
       sirasinda WAL'e yazilacak cerceveleri belirlemek icin. }
     function DirtyPages: TVdbPageNoArray;
 
+    { v3.1: YALNIZCA bu islemde kirletilmis (yerlesik) sayfalar. Commit bunlari
+      WAL'e yazar; onceki islemlerde yazilmis sayfalari tekrar yazmaz. }
+    function TxnPages: TVdbPageNoArray;
+    { v3.1: sayfanin cercevesindeki islem isareti (yerlesik degilse 0). }
+    function TxnMarkOf(PageNo: LongWord): LongWord;
+    { v3.1: islemi kapat: sonraki kirletmeler yeni islem kimligi alir. }
+    procedure EndTxn;
+    property TxnId: LongWord read FTxnId;
+
     { Checkpoint LSN'ini ayarlar; sonraki SaveMeta bu degeri yazar. }
     procedure SetLSN(Value: LongWord);
 
@@ -263,6 +282,13 @@ type
     property PageCount: LongWord read FPageCount;
     property FreeCount: LongWord read FFreeCount;
     property LSN: LongWord read FLSN;
+    { v3.1: meta sayfa diskte bayat mi (sayfa sayisi/freelist degisti)?
+      Commit yalnizca True iken meta cercevesi yazar; commit LSN'i WAL commit
+      kaydinda tasindigi icin degismemis meta imaji gereksizdi. }
+    property MetaDirty: Boolean read FMetaDirty;
+    { v3.1: meta sayfanin YAPISAL alanlari (sayfa sayisi, freelist) degisti
+      mi? Commit karari bunu kullanir. }
+    property MetaStructDirty: Boolean read FStructDirty;
 
     { Sprint 3.4: dosya sifreli mi, anahtar ve tuz (WAL ayni anahtari ve
       tuzu kullanir). }
@@ -406,6 +432,7 @@ begin
   HashReset;
   FClock := 0;
   FLSN := 0;
+  FTxnId := 1;
   FIterations := VDB_ENC_ITER;
 end;
 
@@ -586,6 +613,7 @@ begin
   FStream.Position := 0;
   FStream.WriteBuffer(buf, VDB_PAGE_SIZE);
   FMetaDirty := False;
+  FStructDirty := False;
 end;
 
 procedure TVDbPageStore.Open(ACreate: Boolean);
@@ -793,6 +821,11 @@ begin
   FFrames[idx].PageNo := PageNo;
   FFrames[idx].Pins := 0;
   FFrames[idx].Dirty := fromPending;
+  { v3.1: pending'den gelen imaj WAL'de olmayabilir (tahliye commit'ten
+    ONCE olduysa). Mark'i guncel islem yap ki bir sonraki Commit onu yazsin;
+    gereksiz yazim zararsiz, atlanan yazim VERI KAYBI olurdu. }
+  if fromPending then FFrames[idx].TxnMark := FTxnId
+  else FFrames[idx].TxnMark := 0;
   FFrames[idx].Ref := True;
   HashPut(PageNo, idx);
   Result := idx;
@@ -846,7 +879,12 @@ begin
     raise EVdbPageStore.Create(Format('Release: sayfa %d onbellekte degil', [PageNo]));
   if FFrames[idx].Pins <= 0 then
     raise EVdbPageStore.Create(Format('Release: sayfa %d pinli degil', [PageNo]));
-  if Dirty then FFrames[idx].Dirty := True;
+  if Dirty then
+  begin
+    FFrames[idx].Dirty := True;
+    { v3.1: bu islemde degisti -> bir sonraki Commit bu cerceveyi WAL'e yazar. }
+    FFrames[idx].TxnMark := FTxnId;
+  end;
   Dec(FFrames[idx].Pins);
 end;
 
@@ -857,6 +895,7 @@ begin
   GrowTo(RequiredFileSize(FPageCount));
   FFreshPage := NewPageNo;
   FMetaDirty := True;
+  FStructDirty := True;
 end;
 
 procedure TVDbPageStore.GrowTo(Required: Int64);
@@ -1098,8 +1137,7 @@ begin
     trunk := newTrunk;
   end;
 
-  { Trunk sayfalari VDbPage formati kullanmaz; dogrulamayi TrunkCheck yapar. }
-  if not GetPageInternal(trunk, False, P) then
+  { Trunk sayfalari VDbPage formati kullanmaz; dogrulamayi TrunkCheck yapar. }  if not GetPageInternal(trunk, False, P) then
     raise EVdbPageStore.Create('FreePage: trunk okunamadi');
   if not TrunkCheck(P, e) then
   begin
@@ -1130,6 +1168,7 @@ begin
   Release(trunk, True);
   Inc(FFreeCount);
   FMetaDirty := True;
+  FStructDirty := True;
 end;
 
 function TVDbPageStore.AllocPage(PageType: Byte; out PageNo: LongWord;
@@ -1164,6 +1203,7 @@ begin
       PageNo := trunk;
       FFreeTrunk := nextTrunk;
       FMetaDirty := True;
+      FStructDirty := True;
       Break;
     end;
     Dec(cnt);
@@ -1173,6 +1213,7 @@ begin
     Release(trunk, True);
     Dec(FFreeCount);
     FMetaDirty := True;
+    FStructDirty := True;
     Break;
   end;
 
@@ -1240,6 +1281,44 @@ begin
       Result[n] := FFrames[i].PageNo;
       Inc(n);
     end;
+end;
+
+function TVDbPageStore.TxnPages: TVdbPageNoArray;
+var
+  i, n, cap: Integer;
+begin
+  SetLength(Result, 0);
+  n := 0;
+  cap := 0;
+  for i := 0 to FPoolPages - 1 do
+    if (FFrames[i].PageNo <> 0) and FFrames[i].Dirty and
+       (FFrames[i].TxnMark = FTxnId) and
+       (FFrames[i].PageNo <> VDB_HDR_PAGE) then
+    begin
+      if n >= cap then
+      begin
+        if cap = 0 then cap := 8 else cap := cap * 2;
+        SetLength(Result, cap);
+      end;
+      Result[n] := FFrames[i].PageNo;
+      Inc(n);
+    end;
+  SetLength(Result, n);
+end;
+
+function TVDbPageStore.TxnMarkOf(PageNo: LongWord): LongWord;
+var
+  idx: Integer;
+begin
+  idx := FindFrame(PageNo);
+  if idx < 0 then Exit(0);
+  Result := FFrames[idx].TxnMark;
+end;
+
+procedure TVDbPageStore.EndTxn;
+begin
+  Inc(FTxnId);
+  if FTxnId = 0 then FTxnId := 1;
 end;
 
 procedure TVDbPageStore.SetLSN(Value: LongWord);
@@ -1360,12 +1439,15 @@ begin
         'InstallPage: sayfa %d pinli (kurtarma sirasinda beklenmiyordu)', [PageNo]));
     Move(P^, FFrames[idx].Data, VDB_PAGE_SIZE);
     FFrames[idx].Dirty := True;
+    FFrames[idx].TxnMark := FTxnId;
     Exit;
   end;
   if PageNo >= FPageCount then
   begin
     FPageCount := PageNo + 1;
     GrowTo(RequiredFileSize(FPageCount));
+    FMetaDirty := True;
+    FStructDirty := True;
   end;
   if PageNo = VDB_HDR_PAGE then
   begin
