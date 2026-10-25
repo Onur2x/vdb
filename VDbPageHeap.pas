@@ -68,7 +68,10 @@ type
         Slot: Word;
       end;
       TScanProc = procedure(Key: QWord; const Value: TBytes) of object;
-  private
+      { v3.1: sifir-kopya tarama. Data yalnizca geri cagirim SURESI boyunca
+        gecerlidir (sayfa ici hucreye isaret eder; tasma hucrelerinde gecici
+        tampona). Geri cagirim motoru yeniden cagirmamalidir. }
+      TScanRawProc = procedure(Key: QWord; Data: PByte; Len: Integer) of object;  private
     FStore: TVDbPageStore;
     FKey: array of QWord;
     FLoc: array of TLoc;
@@ -79,6 +82,9 @@ type
     FHeapPages: LongWord;
     FOvfPages: LongWord;
     FLastErr: string;
+    { v3.1: `.idx` etiket ozeti (tablo satir sayimi). Turetilmis veri. }
+    FIdxTags: TVdbIdxTagArray;
+    FIdxTagsValid: Boolean;
     function DirHash(K: QWord): LongWord;
     function DirFind(K: QWord; out Idx: LongWord): Boolean;
     procedure DirGrow;
@@ -107,7 +113,11 @@ type
     function TryLoadIdx(const FileName: string; out Err: string): Boolean;
 
     { Dizinin o anki kopyasini `.odb.idx` olarak yazar (checkpoint sonrasi). }
-    procedure SaveIdx(const FileName: string);
+    procedure SaveIdx(const FileName: string); overload;
+    { v3.1: etiket (tablo satir sayimi) ozetiyle birlikte yazar. Ozet,
+      dizinle AYNI LSN'de yazildigi icin tazeligi ayni dogrulamaya tabidir. }
+    procedure SaveIdx(const FileName: string;
+      const Tags: TVdbIdxTagArray); overload;
 
     { Yeni anahtar ekler. Anahtar zaten varsa False. }
     function Insert(Key: QWord; const Value: TBytes): Boolean;
@@ -119,12 +129,17 @@ type
 
     { Tum kayitlari gezer (sayfa sirasi; anahtar sirasi garantisi YOK). }
     procedure ScanAll(Cb: TScanProc);
+    { v3.1: satir basina deger KOPYALAMAZ (tahsis yok). }
+    procedure ScanAllRaw(Cb: TScanRawProc);
 
     procedure Flush(DoSync: Boolean = True);
     function Stats: TVdbHeapStats;
 
     property Count: Integer read FCount;
     property Store: TVDbPageStore read FStore;
+    { v3.1: `.idx`'ten okunan etiket ozeti (bossa/gecersizse boş dizi). }
+    property IdxTags: TVdbIdxTagArray read FIdxTags;
+    property IdxTagsValid: Boolean read FIdxTagsValid;
     { Son basarisiz okumanin nedeni (tanilama icin). }
     property LastError: string read FLastErr;
   end;
@@ -642,6 +657,7 @@ end;
 function TVdbHeap.TryLoadIdx(const FileName: string; out Err: string): Boolean;
 var
   entries: TVdbIdxEntryArray;
+  tags: TVdbIdxTagArray;
   hdr: TVdbIdxHeader;
   i: LongWord;
   L: TLoc;
@@ -649,7 +665,9 @@ var
   size: Int64;
 begin
   Result := False;
-  if not VDbIdxLoad(FileName, entries, hdr, Err) then
+  FIdxTagsValid := False;
+  SetLength(FIdxTags, 0);
+  if not VDbIdxLoadEx(FileName, entries, hdr, tags, Err) then
     Exit;
   size := Int64(FStore.PageCount) * VDB_PAGE_SIZE;
   if hdr.DbLSN <> FStore.LSN then
@@ -695,10 +713,22 @@ begin
     end;
   Move(hdr.Reserved[0], FHeapPages, 4);
   Move(hdr.Reserved[4], FOvfPages, 4);
+  { v3.1: etiket ozeti. Bos ozet yalnizca bos veritabaninda guvenilirdir. }
+  FIdxTags := tags;
+  FIdxTagsValid := (Length(tags) > 0) or (hdr.Count = 0);
   Result := True;
 end;
 
 procedure TVdbHeap.SaveIdx(const FileName: string);
+var
+  empty: TVdbIdxTagArray;
+begin
+  SetLength(empty, 0);
+  SaveIdx(FileName, empty);
+end;
+
+procedure TVdbHeap.SaveIdx(const FileName: string;
+  const Tags: TVdbIdxTagArray);
 var
   entries: TVdbIdxEntryArray;
   i, n: LongWord;
@@ -715,7 +745,7 @@ begin
       Inc(n);
     end;
   SetLength(entries, n);
-  VDbIdxSave(FileName, entries, FStore.LSN, FStore.PageCount,
+  VDbIdxSaveEx(FileName, entries, Tags, FStore.LSN, FStore.PageCount,
     Int64(FStore.PageCount) * VDB_PAGE_SIZE, FHeapPages, FOvfPages);
 end;
 
@@ -912,6 +942,67 @@ begin
     for j := 0 to High(ogKey) do
       if ReadOverflow(ogOvf[j], ogLen[j], v) then
         Cb(ogKey[j], v);
+  end;
+end;
+
+procedure TVdbHeap.ScanAllRaw(Cb: TScanRawProc);
+var
+  pno: LongWord;
+  P: PVdbPage;
+  i, n, j: Integer;
+  magic: Word;
+  key: QWord;
+  len: LongWord;
+  d: PByte;
+  dl: Integer;
+  ogKey: array of QWord;
+  ogOvf: array of LongWord;
+  ogLen: array of Integer;
+  v: TBytes;
+begin
+  if not Assigned(Cb) then Exit;
+  for pno := 1 to FStore.PageCount - 1 do
+  begin
+    SetLength(ogKey, 0);
+    SetLength(ogOvf, 0);
+    SetLength(ogLen, 0);
+    if not FStore.GetRawPage(pno, P) then Continue;
+    try
+      Move(P^[0], magic, SizeOf(magic));
+      if magic <> VDB_PAGE_MAGIC then Continue;
+      if PageTypeOf(P) <> VDB_PAGE_HEAP then Continue;
+      n := PageSlotCount(P);
+      for i := 0 to n - 1 do
+      begin
+        if not PageGetCell(P, i, d, dl) then Continue;
+        if dl < VDB_CELL_HDR then Continue;
+        Move(d^, key, 8);
+        Move((d + 8)^, len, 4);
+        if (len and VDB_OVF_FLAG) <> 0 then
+        begin
+          if dl < VDB_CELL_HDR + 4 then Continue;
+          j := Length(ogKey);
+          SetLength(ogKey, j + 1);
+          SetLength(ogOvf, j + 1);
+          SetLength(ogLen, j + 1);
+          ogKey[j] := key;
+          ogLen[j] := Integer(len and VDB_LEN_MASK);
+          Move((d + VDB_CELL_HDR)^, ogOvf[j], 4);
+          Continue;
+        end;
+        { Sayfa bu dongu boyunca PINLI: isaretci dogrudan sayfa icindeki
+          hucreye bakar, kopya/tahsis YOK. }
+        Cb(key, d + VDB_CELL_HDR, Integer(len));
+      end;
+    finally
+      FStore.Release(pno, False);
+    end;
+    for j := 0 to High(ogKey) do
+      if ReadOverflow(ogOvf[j], ogLen[j], v) then
+      begin
+        if Length(v) > 0 then Cb(ogKey[j], @v[0], Length(v))
+        else Cb(ogKey[j], nil, 0);
+      end;
   end;
 end;
 

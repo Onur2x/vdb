@@ -171,10 +171,8 @@ H3 skiplist (100.000 satır): 100 × (`UPDATE` + indeksli `COUNT(*)`)
 
 v3.0 açılışı **~31x** hızlandırıyor, veri dosyasını **%19,5** küçültüyor; ama
 yanına yazdığı `.odb.idx` (silinebilir, türetilmiş önbellek) ile birlikte
-diskteki toplam yalnız **%1,2** küçülüyor. `.idx` **boyuta göre otomatik**
-yazılır: 50 MB'ın altındaki veritabanlarında hızlı açılış için yazılır,
-üstünde yazılmaz (açılış tam taramaya düşer, hedefin çok altında kalır).
-PK ve parse maliyeti v2 ile aynı.
+diskteki toplam yalnız **%1,2** küçülüyor. `.idx` **her zaman yazılır** (v3.1,
+boyut eşiği kaldırıldı). PK ve parse maliyeti v2 ile aynı.
 Toplu yazım ~1,5x, `COUNT(*)` 2x ve tek satır yazım ~1,3x daha yavaş. Kök
 nedenler (sayfa imajlı WAL'in 2x yazma hacmi, tablo başına satır sayacının
 olmaması) ve v3.1 planı:

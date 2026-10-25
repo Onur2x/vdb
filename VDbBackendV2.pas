@@ -37,6 +37,7 @@ type
       TableFilter: Integer = -1);
     function ScanRawIterAll(TableFilter: Integer;
       Cb: TVDbRawCb; User: Pointer): Boolean;
+    function CountTable(TableFilter: Integer): Int64;
 
     procedure BeginBatch;
     procedure CommitBatch;
@@ -110,6 +111,13 @@ function TVDbBackendV2.ScanRawIterAll(TableFilter: Integer;
   Cb: TVDbRawCb; User: Pointer): Boolean;
 begin
   Result := FDb.ScanRawIterAll(TableFilter, Cb, User);
+end;
+
+function TVDbBackendV2.CountTable(TableFilter: Integer): Int64;
+begin
+  { v2'de dogrulanmis COUNT onbellegi TVDb tarafindadir (KR-1B);
+    burada O(1) bir kaynak yok. Cagiran tam tarama yapar. }
+  Result := -1;
 end;
 
 procedure TVDbBackendV2.BeginBatch;

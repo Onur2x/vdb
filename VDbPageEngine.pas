@@ -26,19 +26,14 @@ unit VDbPageEngine;
 interface
 
 uses
-  SysUtils, Generics.Collections, VDbPage, VDbPageStore, VDbPageHeap, VDbPageWal;
-
-const
-  { `.odb.idx` (anahtar -> sayfa/slot) turetilmis bir acilis onbellegidir;
-    silinirse veri kaybi olmaz, yalniz acilis tam taramaya duser.
-    Kucuk dosyalarda kazanc buyuk (32 ms / 79 ms), buyuk dosyalarda ise
-    dosya boyutuna ~%18-23 ek yuk bindirir. Bu yuzden varsayilan politika
-    BOYUTA GORE: veri dosyasi bu esigin altindaysa yazilir, ustundeyse
-    yazilmaz (varsa eskisi de silinir). }
-  VDB_V3_IDX_MAX_BYTES = 50 * 1024 * 1024;
+  SysUtils, Generics.Collections, VDbPage, VDbPageStore, VDbPageHeap,
+  VDbPageWal, VDbIdxFile;
 
 type
   EVdbPageEngine = class(Exception);
+
+  { v3.1: `.idx` etiket ozeti saglayicisi (backend tablo sayimlarini verir). }
+  TVdbTagSummaryEvent = procedure(out Tags: TVdbIdxTagArray) of object;
 
   TVdbPageEngine = class
   private
@@ -71,12 +66,12 @@ type
       FPath: string;
       FIdxUsed: Boolean;
       FIdxErr: string;
-      { `.idx` yazim esigi (boyuta gore otomatik politika). }
-      FIdxMaxBytes: Int64;
       { Sprint 3.4: acilis anahtari (Open'dan once). }
       FKey: TBytes;
       FPassword: string;
       FHasPassword: Boolean;
+      { v3.1: `.idx`'e yazilacak etiket ozeti saglayicisi (backend atar). }
+      FOnTagSummary: TVdbTagSummaryEvent;
     procedure InitEngine(const ADbPath: string; APoolPages: Integer);
     function GetEncrypted: Boolean;
     procedure OnSpill(PageNo: LongWord; P: PVdbPage);
@@ -85,6 +80,7 @@ type
     function PendingIndex(PageNo: LongWord): Integer;
     procedure AddPending(PageNo: LongWord; P: PVdbPage);
     procedure ClearPending;
+    function GetIdxTagsValid: Boolean;
   public
     constructor Create(const ADbPath: string; APoolPages: Integer = VDB_DEF_POOL);
     { Sprint 3.4: sifreli dosya. Anahtar 32 bayt AES-256'dir; parola
@@ -110,6 +106,8 @@ type
     function TryGet(Key: QWord; out Value: TBytes): Boolean;
     function Contains(Key: QWord): Boolean;
     procedure ScanAll(Cb: TVdbHeap.TScanProc);
+    { v3.1: sifir-kopya tarama (satir basina tahsis yok). }
+    procedure ScanAllRaw(Cb: TVdbHeap.TScanRawProc);
     function Stats: TVdbHeapStats;
 
     { Bekleyen degisiklikleri WAL'e yazip fsync eder. Veritabani dosyasina
@@ -134,11 +132,12 @@ type
       tarama yapildi ve FIdxErr nedenini verir (veri kaybi soz konusu degil). }
     property IdxUsed: Boolean read FIdxUsed;
     property IdxErr: string read FIdxErr;
-    { `.idx` yazilacak en buyuk veri dosyasi boyutu. Varsayilan
-      VDB_V3_IDX_MAX_BYTES (50 MB) → daha buyuk dosyada .idx yazilmaz ve
-      varsa eskisi silinir. 0 = sinir yok (her zaman yaz). Testler kucuk
-      deger vererek politikayi sinar. }
-    property IdxMaxBytes: Int64 read FIdxMaxBytes write FIdxMaxBytes;
+    { v3.1: `.idx`'teki etiket ozeti (boş = guvenilmez; tam tarama gerekir). }
+    property IdxTagsValid: Boolean read GetIdxTagsValid;
+    function IdxTags: TVdbIdxTagArray;
+    { v3.1: SaveIdx sirasinda etiket ozeti (tablo satir sayimi) ister. }
+    property OnTagSummary: TVdbTagSummaryEvent
+      read FOnTagSummary write FOnTagSummary;
     { Sprint 3.4: dosya sifreli mi ve anahtar parmak izi (8 hex). }
     property Encrypted: Boolean read GetEncrypted;
     function KeyFingerprint: string;
@@ -180,7 +179,6 @@ begin
   { WAL yolu: <db>.wal. Boylece tek dosya adi sozlesmesi korunur. }
   FWal := TVdbPageWal.Create(ADbPath + '.wal');
   FInTxn := False;
-  FIdxMaxBytes := VDB_V3_IDX_MAX_BYTES;
   FPendingIdx := TDictionary<LongWord, Integer>.Create;
   FPendingCount := 0;
   FPendingCap := 0;
@@ -278,33 +276,29 @@ end;
 
 procedure TVdbPageEngine.SaveIdx;
 var
-  DataBytes: Int64;
-  IdxPath: string;
+  tags: TVdbIdxTagArray;
 begin
   if FHeap = nil then Exit;
-  { Boyuta gore otomatik: buyuk dosyada `.idx` yazmayiz (diskte ~%18-23
-    yer kaplar, karsiliginda acilis 79 -> 32 ms). Esik asildiysa DAHA ONCE
-    yazilmis bir .idx kalmissa silinir; aksi halde eski dosya diskte kalir
-    ve bir sonraki acilis onu (bayat oldugu icin reddedip) bosa okur. }
-  if FStore <> nil then
-    DataBytes := Int64(FStore.PageCount) * VDB_PAGE_SIZE
-  else
-    DataBytes := 0;
-  IdxPath := FPath + '.idx';
-  if (FIdxMaxBytes > 0) and (DataBytes > FIdxMaxBytes) then
-  begin
-    try
-      if FileExists(IdxPath) then DeleteFile(IdxPath);
-    except
-      { silinemezse zararsiz: acilista tazelik denetimi reddeder. }
-    end;
-    Exit;
-  end;
+  SetLength(tags, 0);
+  if Assigned(FOnTagSummary) then
+    FOnTagSummary(tags);
   try
-    FHeap.SaveIdx(IdxPath);
+    FHeap.SaveIdx(FPath + '.idx', tags);
   except
     { idx istege bagli: yazilamazsa acilis yalniz yavaslar. }
   end;
+end;
+
+function TVdbPageEngine.GetIdxTagsValid: Boolean;
+begin
+  if FHeap = nil then Result := False
+  else Result := FHeap.IdxTagsValid;
+end;
+
+function TVdbPageEngine.IdxTags: TVdbIdxTagArray;
+begin
+  if FHeap = nil then SetLength(Result, 0)
+  else Result := FHeap.IdxTags;
 end;
 
 procedure TVdbPageEngine.Close;
@@ -462,6 +456,11 @@ end;
 procedure TVdbPageEngine.ScanAll(Cb: TVdbHeap.TScanProc);
 begin
   FHeap.ScanAll(Cb);
+end;
+
+procedure TVdbPageEngine.ScanAllRaw(Cb: TVdbHeap.TScanRawProc);
+begin
+  FHeap.ScanAllRaw(Cb);
 end;
 
 function TVdbPageEngine.GetCount: Integer;

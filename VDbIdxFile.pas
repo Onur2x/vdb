@@ -16,6 +16,11 @@ unit VDbIdxFile;
   Bicim (little endian):
     0   ..  63    baslik (64 B)
     64  ..  ...   kayitlar: Key(8) | PageNo(4) | Slot(2) | Pad(2) = 16 B
+    ... ..  ...   (v3.1, istege bagli) etiket ozeti: Tag(4) | Count(8) = 12 B
+
+  v3.1: satir sayaci ozeti. `.idx` ile AYNI LSN'de yazilir; bu yuzden
+  tazeligi idx dogrulamasiyla aynidir. Bolum yoksa/bozuksa idx yine
+  kullanilabilir; yalnizca sayac tam taramayla yeniden kurulur.
 }
 
 {$mode delphi}{$H+}
@@ -33,6 +38,8 @@ const
     (HdrCrc 36..39'da; sonrasindaki Reserved kapsam disi). }
   VDB_IDX_CRC_LEN  = 36;
   VDB_IDX_ENT_SIZE = 16;
+  { v3.1: etiket ozeti kaydi. }
+  VDB_IDX_TAG_SIZE = 12;
 
 type
   EVdbIdxFile = class(Exception);
@@ -44,6 +51,15 @@ type
     Pad: Word;
   end;
   TVdbIdxEntryArray = array of TVdbIdxEntry;
+
+  { v3.1: tablo basina satir sayimi (turetilmis onbellek, veri kaynagi
+    DEGIL). Yalnizca .idx ile ayni LSN'de yazildigi icin tazeligi
+    .idx dogrulamasiyla birlikte gelir. }
+  TVdbIdxTagEntry = packed record
+    Tag: LongInt;
+    Count: Int64;
+  end;
+  TVdbIdxTagArray = array of TVdbIdxTagEntry;
 
   { 64 bayt; alanlar acikca hizalanir. }
   TVdbIdxHeader = packed record
@@ -63,10 +79,21 @@ type
   function VDbIdxLoad(const FileName: string; out Entries: TVdbIdxEntryArray;
     out Hdr: TVdbIdxHeader; out Err: string): Boolean;
 
+  { v3.1: etiket ozetini de dondurur. }
+  function VDbIdxLoadEx(const FileName: string; out Entries: TVdbIdxEntryArray;
+    out Hdr: TVdbIdxHeader; out Tags: TVdbIdxTagArray;
+    out Err: string): Boolean;
+
   { Once `.tmp` dosyasina yazip yeniden adlandirir: kesik idx olusmaz. }
   procedure VDbIdxSave(const FileName: string;
     const Entries: TVdbIdxEntryArray; DbLSN, DbPageCount: LongWord;
     DbSize: Int64; HeapPages: LongWord = 0; OvfPages: LongWord = 0);
+
+  { v3.1: etiket ozetiyle birlikte yazar. }
+  procedure VDbIdxSaveEx(const FileName: string;
+    const Entries: TVdbIdxEntryArray; const Tags: TVdbIdxTagArray;
+    DbLSN, DbPageCount: LongWord; DbSize: Int64;
+    HeapPages: LongWord = 0; OvfPages: LongWord = 0);
 
   procedure VDbIdxDelete(const FileName: string);
 
@@ -82,16 +109,38 @@ begin
   Result := VDbCrc32Final(Result);
 end;
 
+function TagCrc(const T: TVdbIdxTagArray): LongWord;
+var
+  i: Integer;
+begin
+  Result := VDbCrc32Init;
+  for i := 0 to High(T) do
+    Result := VDbCrc32Update(Result, T[i], VDB_IDX_TAG_SIZE);
+  Result := VDbCrc32Final(Result);
+end;
+
 function VDbIdxLoad(const FileName: string; out Entries: TVdbIdxEntryArray;
   out Hdr: TVdbIdxHeader; out Err: string): Boolean;
+var
+  tags: TVdbIdxTagArray;
+begin
+  Result := VDbIdxLoadEx(FileName, Entries, Hdr, tags, Err);
+end;
+
+function VDbIdxLoadEx(const FileName: string; out Entries: TVdbIdxEntryArray;
+  out Hdr: TVdbIdxHeader; out Tags: TVdbIdxTagArray;
+  out Err: string): Boolean;
 var
   f: TFileStream;
   n: Int64;
   crc: LongWord;
   want: Int64;
+  tagCount: LongWord;
+  tagCrc_: LongWord;
 begin
   Result := False;
   SetLength(Entries, 0);
+  SetLength(Tags, 0);
   FillChar(Hdr, SizeOf(Hdr), 0);
   Err := '';
   if not FileExists(FileName) then
@@ -129,7 +178,11 @@ begin
       Err := 'idx basligi bozuk (CRC)';
       Exit;
     end;
-    want := VDB_IDX_HDR_SIZE + Int64(Hdr.Count) * VDB_IDX_ENT_SIZE;
+    { v3.1: etiket ozeti baslikta Reserved[8..15]'te. }
+    Move(Hdr.Reserved[8], tagCount, 4);
+    Move(Hdr.Reserved[12], tagCrc_, 4);
+    want := VDB_IDX_HDR_SIZE + Int64(Hdr.Count) * VDB_IDX_ENT_SIZE +
+      Int64(tagCount) * VDB_IDX_TAG_SIZE;
     if n <> want then
     begin
       Err := Format('idx boyu %d (beklenen %d)', [n, want]);
@@ -144,6 +197,18 @@ begin
       SetLength(Entries, 0);
       Exit;
     end;
+    if tagCount > 0 then
+    begin
+      SetLength(Tags, tagCount);
+      f.ReadBuffer(Tags[0], tagCount * VDB_IDX_TAG_SIZE);
+      if TagCrc(Tags) <> tagCrc_ then
+      begin
+        { Dizin gecerli; yalnizca sayac ozeti guvenilmez. Cagiran tam
+          taramayla sayari yeniden kurar. }
+        SetLength(Tags, 0);
+        Err := 'idx etiket ozeti bozuk (CRC)';
+      end;
+    end;
     Result := True;
   finally
     f.Free;
@@ -154,10 +219,24 @@ procedure VDbIdxSave(const FileName: string;
   const Entries: TVdbIdxEntryArray; DbLSN, DbPageCount: LongWord;
   DbSize: Int64; HeapPages: LongWord = 0; OvfPages: LongWord = 0);
 var
+  tags: TVdbIdxTagArray;
+begin
+  SetLength(tags, 0);
+  VDbIdxSaveEx(FileName, Entries, tags, DbLSN, DbPageCount, DbSize,
+    HeapPages, OvfPages);
+end;
+
+procedure VDbIdxSaveEx(const FileName: string;
+  const Entries: TVdbIdxEntryArray; const Tags: TVdbIdxTagArray;
+  DbLSN, DbPageCount: LongWord; DbSize: Int64;
+  HeapPages: LongWord = 0; OvfPages: LongWord = 0);
+var
   f: TFileStream;
   h: TVdbIdxHeader;
   tmp: string;
   done: Boolean;
+  tagCount: LongWord;
+  tagCrc_: LongWord;
 begin
   FillChar(h, SizeOf(h), 0);
   h.Magic := VDB_IDX_MAGIC;
@@ -169,6 +248,10 @@ begin
   h.DbSize := DbSize;
   Move(HeapPages, h.Reserved[0], 4);
   Move(OvfPages, h.Reserved[4], 4);
+  tagCount := Length(Tags);
+  Move(tagCount, h.Reserved[8], 4);
+  tagCrc_ := TagCrc(Tags);
+  Move(tagCrc_, h.Reserved[12], 4);
   h.EntriesCrc := EntryCrc(Entries);
   h.HdrCrc := VDbCrc32Of(h, VDB_IDX_CRC_LEN);
 
@@ -178,6 +261,8 @@ begin
     f.WriteBuffer(h, VDB_IDX_HDR_SIZE);
     if Length(Entries) > 0 then
       f.WriteBuffer(Entries[0], Length(Entries) * VDB_IDX_ENT_SIZE);
+    if tagCount > 0 then
+      f.WriteBuffer(Tags[0], tagCount * VDB_IDX_TAG_SIZE);
   finally
     f.Free;
   end;

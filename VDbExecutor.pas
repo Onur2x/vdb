@@ -7861,14 +7861,27 @@ begin
         Break;
       end;
     { Sprint 2.7: satir-sayisi onbellegi ve zone-map/paralel tarama v2'ye
-      ozgu yollardir. v3'te (Kv = nil) bunlar atlanir; COUNT(*) tam
-      taramayla dogrulanir, paralel yol seri yola duser. v3.1 konusu. }
+      ozgu yollardir; v3'te (Kv = nil) bunlar atlanir. v3.1'de v3 icin tablo
+      basina canli sayac eklendi (asagidaki dal): COUNT(*) O(1). }
     if allStar and (FT.Kv <> nil) and
        FT.Kv.TryGetTableRowCount(td.TableId, ncnt) then
     begin
       for j := 0 to High(plans) do
         plans[j].Cnt := ncnt;
       useCounter := True;
+    end
+    else if allStar and (FT.Kv = nil) and (FT.Backend <> nil) then
+    begin
+      { v3.1: sayfa motoru tablo basina canli satir sayacini O(1) verir
+        (acilista bir kez tam taramayla kurulur, yazmada artimli guncellenir;
+        TAM TARAMAYLA AYNI yuklem). Acik kaplama/etiket yoksa -1 -> tarama. }
+      ncnt := FT.Backend.CountTable(td.TableId);
+      if ncnt >= 0 then
+      begin
+        for j := 0 to High(plans) do
+          plans[j].Cnt := ncnt;
+        useCounter := True;
+      end;
     end;
   end;
 

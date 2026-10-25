@@ -906,13 +906,15 @@ begin
   v3 := nil;
 end;
 
-{ `.odb.idx` boyuta gore otomatik politika kapisi: kucuk dosyada yazilir,
-  esik asilinca yazilmaz ve daha once yazilmis dosya silinir. }
+{ `.odb.idx` (anahtar -> sayfa/slot) sozlesmesi: HER KAPANISTA yazilir.
+  Kullanici karari (2026-10-25): "idx her zaman yazilsin". Buyuk dosyada
+  diskte ~%18-23 yer kaplar ama acilisi 79 ms'den 16 ms'ye indirir.
+  Silinirse/bayat kalirsa veri kaybi YOK: acilis tam taramaya duser. }
 procedure TestV3IdxPolicy;
 var
   v3: TVdbBackendV3;
   b: IVDbBackend;
-  v: TBytes;
+  v, v2: TBytes;
   i: Integer;
   path, idxPath: string;
 begin
@@ -920,9 +922,8 @@ begin
   path := DirOf('idxpol.odb');
   idxPath := path + '.idx';
 
-  { 1) Esik 1 bayt: .idx YAZILMAMALI. }
+  { 1) Kapanista .idx HER ZAMAN yazilir. }
   v3 := TVdbBackendV3.Create(path, True, 64);
-  v3.Engine.IdxMaxBytes := 1;
   b := v3;
   b.BeginBatch;
   for i := 1 to 500 do
@@ -934,38 +935,26 @@ begin
   b := nil;                       { kapanis -> SaveIdx }
   v3 := nil;
   if FileExists(idxPath) then
-    Fail('idxpol) esik asildiginda .idx YAZILDI')
+    Ok('idxpol) kapanista .idx yazildi')
   else
-    Ok('idxpol) esik asilinca .idx yazilmadi');
+    Fail('idxpol) kapanista .idx YAZILMADI');
 
-  { 2) .idx varken esik asilirsa DOSYA SILINMELI. }
-  v3 := TVdbBackendV3.Create(path, False, 64);
-  v3.Engine.IdxMaxBytes := 0;     { sinir yok: simdi yaz }
-  b := v3;
-  b.Flush;
-  b := nil;
-  v3 := nil;
-  if FileExists(idxPath) then
-    Ok('idxpol) sinir yokken .idx yazildi')
-  else
-    Fail('idxpol) sinir yokken .idx yazilmadi');
-
+  { 2) Yazilan .idx acilista kullanilir (hizli yol) ve veri dogru. }
   v3 := TVdbBackendV3.Create(path, False, 64);
   if v3.Engine.IdxUsed then
     Ok('idxpol) .idx ile acildi (hizli yol)')
   else
     Fail('idxpol) .idx ile acilamadi: ' + v3.Engine.IdxErr);
-  v3.Engine.IdxMaxBytes := 1;     { esik asildi -> eski .idx silinmeli }
   b := v3;
-  b.Flush;
+  if (b.Count = 500) and b.Get(137, v) then
+    Ok('idxpol) .idx ile 500 kayit okundu')
+  else
+    Fail(Format('idxpol) .idx ile count=%d', [b.Count]));
   b := nil;
   v3 := nil;
-  if FileExists(idxPath) then
-    Fail('idxpol) esik asilinca eski .idx silinmedi')
-  else
-    Ok('idxpol) esik asilinca eski .idx silindi');
 
-  { 3) .idx yokken veri kaybi YOK; acilis tam tarama ile dogru. }
+  { 3) .idx SILINIRSE veri kaybi yok; acilis tam tarama yapar. }
+  if FileExists(idxPath) then DeleteFile(idxPath);
   v3 := TVdbBackendV3.Create(path, False, 64);
   if v3.Engine.IdxUsed then
     Fail('idxpol) .idx yokken hizli yol kullanildi')
@@ -976,13 +965,219 @@ begin
     Ok('idxpol) .idx olmadan 500 kayit okundu')
   else
     Fail(Format('idxpol) .idx olmadan count=%d', [b.Count]));
+
+  { 4) Veri degistikten SONRA kapanis .idx'i tazeler: yeni deger kalici. }
+  MakeVal(137, 48, 9, v2);
+  b.Put(137, v2);
+  b.Flush;
+  b := nil;
+  v3 := nil;
+  if not FileExists(idxPath) then
+    Fail('idxpol) guncelleme sonrasi .idx yok')
+  else
+  begin
+    v3 := TVdbBackendV3.Create(path, False, 64);
+    b := v3;
+    if b.Get(137, v) and ValEq(v, v2) then
+      Ok('idxpol) tazelenen .idx ile yeni deger okundu')
+    else
+      Fail('idxpol) tazelenen .idx eski degeri dondurdu');
+    b := nil;
+    v3 := nil;
+  end;
+end;
+
+{ v3.1: tablo satir sayaci (COUNT(*) O(1)) davranis kapisi.
+  Sayac TURETILMIS veridir: acilista .idx ozetinden (ya da bos veritabaninda
+  sifirdan) kurulur, yazmada artimli guncellenir; ozet yoksa/bayatsa bir kez
+  tam taramayla yeniden kurulur. Veri kaybi riski YOKTUR. }
+function TestTagOf(const PlainValue: TBytes; ValueLen: Integer): Integer;
+begin
+  Result := -1;
+  if (ValueLen < 2) or (Length(PlainValue) < 2) then Exit;
+  Result := Integer(PlainValue[0]) or (Integer(PlainValue[1]) shl 8);
+end;
+
+procedure MakeRow(Tag: Word; Key: QWord; Len: Integer; out V: TBytes);
+begin
+  MakeVal(Key, Len, 3, V);
+  V[0] := Byte(Tag);
+  V[1] := Byte(Tag shr 8);
+end;
+
+procedure TestV3TagCount;
+var
+  v3: TVdbBackendV3;
+  b: IVDbBackend;
+  v: TBytes;
+  i: Integer;
+  path, idxPath: string;
+  savedIdx: TBytes;
+  fs: TFileStream;
+  oldB, newB: Int64;
+
+  procedure Chk(const What: string; Got, Want: Int64);
+  begin
+    if Got = Want then
+      Ok(Format('tagcnt) %s = %d', [What, Got]))
+    else
+      Fail(Format('tagcnt) %s = %d (beklenen %d)', [What, Got, Want]));
+  end;
+
+begin
+  CleanDir;
+  path := DirOf('tagcnt.odb');
+  idxPath := path + '.idx';
+  WriteLn;
+  WriteLn('v3.1 - tablo satir sayaci (COUNT(*) O(1))');
+
+  { 1) Bos veritabaninda sayac sifirdan gecerli; yazmalar artimli islenir. }
+  v3 := TVdbBackendV3.Create(path, True, 128);
+  v3.SetRowTagFunc(@TestTagOf);
+  b := v3;
+  b.BeginBatch;
+  for i := 1 to 300 do
+  begin
+    MakeRow(1, i, 40, v);
+    b.Put(i, v);
+  end;
+  for i := 1001 to 1200 do
+  begin
+    MakeRow(2, i, 40, v);
+    b.Put(i, v);
+  end;
+  b.CommitBatch;
+  Chk('toplu ekleme t1 (300)', b.CountTable(1), 300);
+  Chk('toplu ekleme t2 (200)', b.CountTable(2), 200);
+
+  { 2) Tek tek silme. }
+  for i := 1 to 50 do
+    b.Delete(i);
+  Chk('50 silme sonrasi t1', b.CountTable(1), 250);
+
+  { 3) Parti geri alinirsa sayac DEGISMEZ. }
+  b.BeginBatch;
+  for i := 5000 to 5009 do
+  begin
+    MakeRow(1, i, 40, v);
+    b.Put(i, v);
+  end;
+  for i := 51 to 60 do
+    b.Delete(i);
+  b.AbortBatch;
+  Chk('AbortBatch sonrasi t1', b.CountTable(1), 250);
+
+  { 4) Parti commit edilirse islenir (+10/-10 => ayni). Var olmayan anahtar
+       silmek sayaci bozmaz. }
+  b.BeginBatch;
+  for i := 5000 to 5009 do
+  begin
+    MakeRow(1, i, 40, v);
+    b.Put(i, v);
+  end;
+  for i := 51 to 60 do
+    b.Delete(i);
+  b.Delete(999999);
+  b.CommitBatch;
+  Chk('CommitBatch (+10/-10) sonrasi t1', b.CountTable(1), 250);
+
+  { 5) Ayni anahtarin guncellenmesi sayaci degistirmez. }
+  MakeRow(1, 61, 64, v);
+  b.Put(61, v);
+  Chk('yerinde guncelleme sonrasi t1', b.CountTable(1), 250);
+
+  { 6) Anahtarin tablo etiketi degisirse sayac IKI tarafta da duzelir
+       (DROP/CREATE + ayni PK senaryosu). }
+  MakeRow(1, 1001, 40, v);
+  b.Put(1001, v);
+  Chk('etiket degisimi sonrasi t1', b.CountTable(1), 251);
+  Chk('etiket degisimi sonrasi t2', b.CountTable(2), 199);
+
+  { 7) Temiz kapanis -> .idx ozeti yazilir; eski idx'i sakla (bayat testi). }
+  b.Flush;
+  b := nil;
+  v3 := nil;
+  if not FileExists(idxPath) then
+  begin
+    Fail('tagcnt) .idx yazilmadi');
+    Exit;
+  end;
+  fs := TFileStream.Create(idxPath, fmOpenRead or fmShareDenyWrite);
+  try
+    SetLength(savedIdx, fs.Size);
+    if Length(savedIdx) > 0 then fs.ReadBuffer(savedIdx[0], Length(savedIdx));
+  finally
+    fs.Free;
+  end;
+
+  { 8) Yeniden acilis: sayac .idx ozetinden (TARAMA YAPMADAN) gelir. }
+  v3 := TVdbBackendV3.Create(path, False, 128);
+  v3.SetRowTagFunc(@TestTagOf);
+  b := v3;
+  if v3.Engine.IdxUsed then
+    Ok('tagcnt) acilis .idx hizli yolunu kullandi')
+  else
+    Fail('tagcnt) acilis .idx kullanmadi: ' + v3.Engine.IdxErr);
+  Chk('yeniden acilis t1 (.idx ozeti)', b.CountTable(1), 251);
+  Chk('yeniden acilis t2 (.idx ozeti)', b.CountTable(2), 199);
+
+  { 9) Ayni oturumda yazmaya devam: sayac artimli dogru. }
+  for i := 2001 to 2020 do
+  begin
+    MakeRow(1, i, 40, v);
+    b.Put(i, v);
+  end;
+  Chk('oturum ici 20 ekleme t1', b.CountTable(1), 271);
+  b.Flush;
+  b := nil;
+  v3 := nil;
+
+  { 10) .idx BAYAT (eski LSN): dizin reddedilir, sayac tam taramayla kurulur
+        ve YINE DOGRU olur. }
+  fs := TFileStream.Create(idxPath, fmCreate);
+  try
+    if Length(savedIdx) > 0 then fs.WriteBuffer(savedIdx[0], Length(savedIdx));
+  finally
+    fs.Free;
+  end;
+  v3 := TVdbBackendV3.Create(path, False, 128);
+  v3.SetRowTagFunc(@TestTagOf);
+  b := v3;
+  if v3.Engine.IdxUsed then
+    Fail('tagcnt) bayat .idx kabul edildi')
+  else
+    Ok('tagcnt) bayat .idx reddedildi (tam tarama)');
+  Chk('bayat .idx sonrasi t1', b.CountTable(1), 271);
+  b.Flush;
+  b := nil;
+  v3 := nil;
+
+  { 11) .idx SILINIRSE de sayac dogru (tarama ile yeniden kurulur). }
+  if FileExists(idxPath) then DeleteFile(idxPath);
+  v3 := TVdbBackendV3.Create(path, False, 128);
+  v3.SetRowTagFunc(@TestTagOf);
+  b := v3;
+  Chk('idx yokken t1', b.CountTable(1), 271);
+
+  { 12) VACUUM sonrasi sayac dogru (yeni motor, yeni icerik). }
+  b.Compact(oldB, newB);
+  Chk('VACUUM sonrasi t1', b.CountTable(1), 271);
+  Chk('VACUUM sonrasi t2', b.CountTable(2), 199);
+  b := nil;
+  v3 := nil;
+
+  { 13) Kapanis+acilis: sayac yine .idx ozetinden gelir ve dogru. }
+  v3 := TVdbBackendV3.Create(path, False, 128);
+  v3.SetRowTagFunc(@TestTagOf);
+  b := v3;
+  Chk('son acilis t1', b.CountTable(1), 271);
+  Chk('son acilis t2', b.CountTable(2), 199);
   b := nil;
   v3 := nil;
 end;
 
 { Sprint 3.4: sayfa duzeyi AES-GCM sifreleme kapisi. }
-procedure TestV3Encryption(N: Integer);
-const
+procedure TestV3Encryption(N: Integer);const
   MARK: array[0..15] of AnsiChar = 'V3GIZLI-MARKER01';
 var
   v3: TVdbBackendV3;
@@ -1292,6 +1487,7 @@ begin
   TestV3BackupRestore(N);
   TestV3Compact(N);
   TestV3IdxPolicy;
+  TestV3TagCount;
   TestV3Encryption(N);
   TestEquivalence(1000);
 

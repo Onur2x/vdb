@@ -70,6 +70,10 @@ type
       TableFilter: Integer = -1);
     function ScanRawIterAll(TableFilter: Integer;
       Cb: TVDbRawCb; User: Pointer): Boolean;
+    { v3.1: tablo basina canli satir sayisi (O(1) olabilir). Tam tarama ile
+      AYNI yuklem. Acik kaplama veya desteklenmeyen yol -> -1 (cagiran
+      tarama yapar). v2: -1 (dogrulanmis onbellek TVDb tarafindadir). }
+    function CountTable(TableFilter: Integer): Int64;
 
     { --- islem / toplu yazim --- }
     procedure BeginBatch;

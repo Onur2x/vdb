@@ -42,6 +42,12 @@ const
   VDB_DEF_POOL     = 512;         // 512 x 4 KB = 2 MB
   VDB_MAX_POOL     = 65536;
 
+  { v3.1: dosya buyutme parcasi. Her yeni sayfada ayri SetSize cagrisi
+    ~45-50 us suruyordu (200k satirlik yazimda ~200 ms). Artik dosya
+    64 sayfalik (256 KB) parcalarla uzatilir; kapanista mantiksal boya
+    kirpilir. Kayipsiz: fazla baytlar sayfa sayacinin otesindedir. }
+  VDB_GROW_BYTES   = 262144;
+
   { Sprint 3.4: meta sayfa alanlari (duz metin; sir tutmaz). }
   VDB_META_SALT     = 36;   // 16 bayt
   VDB_META_ITER     = 52;   // LongWord
@@ -122,6 +128,9 @@ type
       FHasPassword: Boolean;
       FIterations: Integer;
       FFreshPage: LongWord;
+      { v3.1: dosyanin FIZIKSEL boyu (onceden ayrilmis parca dahil).
+        Mantiksal boy = RequiredFileSize(FPageCount); kapanista kirpilir. }
+      FPhysSize: Int64;
     function HashOf(PageNo: LongWord): LongWord;
     function FindFrame(PageNo: LongWord): Integer;
     procedure HashPut(PageNo: LongWord; Idx: Integer);
@@ -138,6 +147,8 @@ type
     procedure ReadPageAt(PageNo: LongWord; P: PVdbPage);
     procedure WritePageAt(PageNo: LongWord; P: PVdbPage);
     procedure ExtendFile(out NewPageNo: LongWord);
+    procedure GrowTo(Required: Int64);
+    procedure TrimToLogical;
     procedure LoadMeta;
     procedure SaveMeta;
     function TrunkGet(var P: PVdbPage): LongWord;   // count
@@ -606,6 +617,7 @@ begin
   end;
   try
     FLocked := VDbLockStream(FStream);
+    FPhysSize := FStream.Size;
     if exists then
       LoadMeta
     else
@@ -617,6 +629,7 @@ begin
       FLSN := 1;
       FCreated := DateTimeToUnix(Now, False);
       FStream.Size := RequiredFileSize(1);
+      FPhysSize := FStream.Size;
       SaveMeta;
       VDbFlushStream(FStream);
     end;
@@ -633,7 +646,11 @@ begin
   try
     try
       if not FReadOnly then
+      begin
         Flush(True);
+        { v3.1: onceden ayrilmis parcayi kirp: dosya boyu = mantiksal boy. }
+        TrimToLogical;
+      end;
     finally
       if FLocked then VDbUnlockStream(FStream);
       FreeAndNil(FStream);
@@ -837,9 +854,32 @@ procedure TVDbPageStore.ExtendFile(out NewPageNo: LongWord);
 begin
   NewPageNo := FPageCount;
   Inc(FPageCount);
-  FStream.Size := RequiredFileSize(FPageCount);
+  GrowTo(RequiredFileSize(FPageCount));
   FFreshPage := NewPageNo;
   FMetaDirty := True;
+end;
+
+procedure TVDbPageStore.GrowTo(Required: Int64);
+var
+  want: Int64;
+begin
+  if Required <= FPhysSize then Exit;
+  { Parca halinde uzat: her sayfa icin ayri SetSize cagrisi yapilmaz. }
+  want := Required + VDB_GROW_BYTES;
+  FStream.Size := want;
+  FPhysSize := want;
+end;
+
+procedure TVDbPageStore.TrimToLogical;
+var
+  want: Int64;
+begin
+  if FStream = nil then Exit;
+  if FReadOnly then Exit;
+  want := RequiredFileSize(FPageCount);
+  if FPhysSize <= want then Exit;
+  FStream.Size := want;
+  FPhysSize := want;
 end;
 
 { ================================================================= freelist }
@@ -1325,7 +1365,7 @@ begin
   if PageNo >= FPageCount then
   begin
     FPageCount := PageNo + 1;
-    FStream.Size := RequiredFileSize(FPageCount);
+    GrowTo(RequiredFileSize(FPageCount));
   end;
   if PageNo = VDB_HDR_PAGE then
   begin
@@ -1368,7 +1408,9 @@ begin
   Result.Reads := FReads;
   Result.Writes := FWrites;
   Result.Evictions := FEvictions;
-  if FStream <> nil then Result.FileBytes := FStream.Size
+  { v3.1: MANTIKSAL boy (FPageCount x 4096). Dosya onceden ayrilmis parca
+    tasiyabilir; o fazlalik veriye dahil degildir ve kapanista kirpilir. }
+  if FStream <> nil then Result.FileBytes := RequiredFileSize(FPageCount)
   else Result.FileBytes := 0;
 end;
 

@@ -31,7 +31,7 @@ interface
 uses
   SysUtils, Classes, Generics.Collections,
   VDbBackendApi, VDbPage, VDbPageStore, VDbPageHeap, VDbPageWal, VDbPageEngine,
-  VDbSync;
+  VDbIdxFile, VDbSync;
 
 const
   { Bu boyuttan buyuk WAL'de commit sonrasi checkpoint yapilir. Cok kucuk
@@ -68,7 +68,17 @@ type
       FScanKeys: TQWordArray;
       FScanVals: TValArray;
       FScanN: Integer;
+      FScanCap: Integer;
       FScanFilter: Integer;
+      { v3.1: ScanRawIterAll dogrudan akitilir (satir basina dizi buyutmesi
+        ve toplu kopyalama YOK). }
+      FStreamCb: TVDbRawCb;
+      FStreamUser: Pointer;
+      FStreamAbort: Boolean;
+      FStreamFilter: Integer;
+      { v3.1: satir etiketi icin tarama basina BIR kez ayrilan kucuk tampon
+        (satir basina tahsis YOK). }
+      FStreamTagBuf: TBytes;
       FCompactEng: TVdbPageEngine;
       FCompactN: Int64;
       { Sprint 3.4: acilis anahtari (parola Open'da turetilir, sonra
@@ -76,6 +86,17 @@ type
       FKey: TBytes;
       FPassword: string;
       FHasPassword: Boolean;
+      { v3.1: tablo basina canli satir sayaci. TAM TARAMAYLA AYNI YUKLEMI
+        kullanir (FRowTag), kalici DEGILDIR: acilista bir kez tam taramayla
+        kurulur, yazma yolunda artimli guncellenir. Bayatlama/cokme riski
+        yoktur (dogru kaynak her zaman motorun kendisidir). }
+      FTagCounts: TDictionary<Integer, Int64>;
+      FBatchTagDelta: TDictionary<Integer, Int64>;
+      FTagBuf: TBytes;
+      { Sayac kuruldu mu? False ise tutulan harita guvenilmez; ilk COUNT
+        isteginde tam taramayla kurulur. }
+      FTagCountsValid: Boolean;
+
     procedure InitBackend(const ADbPath: string; ACreate: Boolean;
       APoolPages: Integer);
     function NewEngine(const APath: string): TVdbPageEngine;
@@ -86,6 +107,16 @@ type
     function PassFilter(Key: QWord; const Value: TBytes;
       TableFilter: Integer): Boolean;
     procedure ScanCb(Key: QWord; const Value: TBytes);
+    { v3.1: streaming tarama geri cagirimi (sifir-kopya: Data sayfa icindedir). }
+    procedure StreamCbRaw(Key: QWord; Data: PByte; Len: Integer);
+    { v3.1: etiket sayaci yardimcilari. }
+    function TagOf(Data: PByte; Len: Integer): Integer;
+    procedure TagAdd(Tag: Integer; Delta: Int64);
+    procedure TagBuildCb(Key: QWord; Data: PByte; Len: Integer);
+    procedure RebuildTagCounts;
+    function LoadTagCountsFromIdx: Boolean;
+    procedure GetTagSummary(out Tags: TVdbIdxTagArray);
+    procedure MergeTagDeltas;
     { Sprint 3.3: VACUUM/Compact yardimcilari. }
     procedure CompactCb(Key: QWord; const Value: TBytes);
     procedure SwapDbFile(const NewFilePath: string);
@@ -118,6 +149,9 @@ type
 
     procedure ScanAll(out Keys: TQWordArray; out Vals: TValArray;
       TableFilter: Integer = -1);
+    { v3.1: tablo basina canli satir sayisi (O(1)). Tam taramayla AYNI
+      yuklem: TableFilter<0 ise tum anahtarlar. Etiket cozucusu yoksa -1. }
+    function CountTable(TableFilter: Integer): Int64;
     function ScanRawIterAll(TableFilter: Integer;
       Cb: TVDbRawCb; User: Pointer): Boolean;
 
@@ -172,6 +206,8 @@ begin
   FPath := ADbPath;
   FBatch := TDictionary<QWord, TBatchRec>.Create;
   FOrder := TList<QWord>.Create;
+  FTagCounts := TDictionary<Integer, Int64>.Create;
+  FBatchTagDelta := TDictionary<Integer, Int64>.Create;
   FBatchOpen := False;
   FDirty := False;
   FCheckpointBytes := VDB_V3_CHECKPOINT_BYTES;
@@ -188,6 +224,12 @@ begin
   FKey := Copy(FEng.Store.Key, 0, Length(FEng.Store.Key));
   FPassword := '';
   FHasPassword := False;
+  { v3.1: satir sayaci. FRowTag bu noktada henuz atanmamis olabilir;
+    TVTableDb.CreateBackend hemen ardindan atar ve SetRowTagFunc sayaci
+    .idx ozetinden (tarama YAPMADAN) yukler. Ozet yoksa ilk COUNT isteginde
+    bir kez tam taramayla kurulur. }
+  FTagCountsValid := False;
+  FEng.OnTagSummary := GetTagSummary;
 end;
 
 function TVdbBackendV3.NewEngine(const APath: string): TVdbPageEngine;
@@ -242,6 +284,8 @@ begin
   FreeAndNil(FEng);       // Close: commit + checkpoint + idx
   FreeAndNil(FBatch);
   FreeAndNil(FOrder);
+  FreeAndNil(FTagCounts);
+  FreeAndNil(FBatchTagDelta);
   inherited Destroy;
 end;
 
@@ -291,6 +335,8 @@ var
   key: QWord;
   rec: TBatchRec;
   ok: Boolean;
+  oldTag, newTag: Integer;
+  oldVal: TBytes;
 begin
   if FBatch.Count = 0 then Exit;
   { Giris sirasi: sayfalara ARDISIK yazilir (rastgele dolasim = sayfa
@@ -305,14 +351,48 @@ begin
         zaten "anahtar var mi" diye bakiyor. Once eklemeyi dene, yalniz
         cakismada guncelle: toplu eklemede bir hash aramasi eksilir. }
       ok := FEng.Insert(key, rec.Value);
-      if not ok then
+      if ok then
+      begin
+        { v3.1: yeni satir -> etiket sayaci +1 }
+        if Length(rec.Value) > 0 then
+          TagAdd(TagOf(@rec.Value[0], Length(rec.Value)), 1);
+      end
+      else
+      begin
+        { Var olan anahtar: etiket degismis olabilir; eski deger YALNIZCA
+          bu yolda okunur (toplu eklemede hic okunmaz). }
+        oldTag := -2;
+        if Length(rec.Value) > 0 then
+          if FEng.TryGet(key, oldVal) then
+            oldTag := TagOf(@oldVal[0], Length(oldVal));
         ok := FEng.Update(key, rec.Value);
-      if not ok then
-        raise EVdbBackendV3.Create(Format(
-          'toplu yazim basarisiz: anahtar $%.16x', [key]));
+        if not ok then
+          raise EVdbBackendV3.Create(Format(
+            'toplu yazim basarisiz: anahtar $%.16x', [key]));
+        if Length(rec.Value) > 0 then
+        begin
+          newTag := TagOf(@rec.Value[0], Length(rec.Value));
+          if oldTag = -2 then TagAdd(newTag, 1)
+          else if oldTag <> newTag then
+          begin
+            TagAdd(oldTag, -1);
+            TagAdd(newTag, 1);
+          end;
+        end;
+      end;
     end
     else
-      FEng.Delete(key);    // yoksa da zararsiz
+    begin
+      { Silmeden ONCE eski deger: yalnizca etiket sayaci icin. }
+      if FEng.TryGet(key, oldVal) then
+      begin
+        FEng.Delete(key);
+        if Length(oldVal) > 0 then
+          TagAdd(TagOf(@oldVal[0], Length(oldVal)), -1);
+      end
+      else
+        FEng.Delete(key);    // yoksa da zararsiz
+    end;
   end;
   FBatch.Clear;
   FOrder.Clear;
@@ -324,6 +404,8 @@ end;
 procedure TVdbBackendV3.Put(Key: QWord; const Value: TBytes);
 var
   rec: TBatchRec;
+  oldTag, newTag: Integer;
+  oldVal: TBytes;
 begin
   if FBatchOpen then
   begin
@@ -339,11 +421,32 @@ begin
     aramasi eksilir. }
   if FEng.Insert(Key, Value) then
   begin
+    if Length(Value) > 0 then
+      TagAdd(TagOf(@Value[0], Length(Value)), 1);
     FDirty := True;
     Exit;
   end;
+  { Anahtar zaten var: etiket DEGISEBILIR (DROP TABLE + ayni PK ile yeniden
+    CREATE -> ayni anahtar, farkli TableId). Eski etiket yalnizca bu yolda
+    okunur; toplu eklemede hicbir ek okuma yapilmaz. }
+  oldTag := -2;
+  if Length(Value) > 0 then
+  begin
+    if FEng.TryGet(Key, oldVal) then
+      oldTag := TagOf(@oldVal[0], Length(oldVal));
+  end;
   if not FEng.Update(Key, Value) then
     raise EVdbBackendV3.Create('ekleme/guncelleme basarisiz');
+  if Length(Value) > 0 then
+  begin
+    newTag := TagOf(@Value[0], Length(Value));
+    if oldTag = -2 then TagAdd(newTag, 1)
+    else if oldTag <> newTag then
+    begin
+      TagAdd(oldTag, -1);
+      TagAdd(newTag, 1);
+    end;
+  end;
   FDirty := True;
 end;
 
@@ -368,6 +471,7 @@ function TVdbBackendV3.Delete(Key: QWord): Boolean;
 var
   rec: TBatchRec;
   had: Boolean;
+  oldVal: TBytes;
 begin
   if FBatchOpen then
   begin
@@ -385,7 +489,15 @@ begin
     FBatch.AddOrSetValue(Key, rec);
     Exit(had);
   end;
-  Result := FEng.Delete(Key);
+  { v3.1: etiket sayaci icin once eski deger (yalnizca silinen anahtar). }
+  if FEng.TryGet(Key, oldVal) then
+  begin
+    Result := FEng.Delete(Key);
+    if Length(oldVal) > 0 then
+      TagAdd(TagOf(@oldVal[0], Length(oldVal)), -1);
+  end
+  else
+    Result := FEng.Delete(Key);
   if Result then
     FDirty := True;
 end;
@@ -408,8 +520,14 @@ procedure TVdbBackendV3.ScanCb(Key: QWord; const Value: TBytes);
 begin
   if FBatchOpen and FBatch.ContainsKey(Key) then Exit;
   if not PassFilter(Key, Value, FScanFilter) then Exit;
-  SetLength(FScanKeys, FScanN + 1);
-  SetLength(FScanVals, FScanN + 1);
+  { v3.1: her satirda SetLength(+1) YAPILMAZ (200k satirda O(n^2) kopya
+    ve yeniden tahsis). Kapasite ikiye katlanir. }
+  if FScanN >= FScanCap then
+  begin
+    if FScanCap < 256 then FScanCap := 256 else FScanCap := FScanCap * 2;
+    SetLength(FScanKeys, FScanCap);
+    SetLength(FScanVals, FScanCap);
+  end;
   FScanKeys[FScanN] := Key;
   FScanVals[FScanN] := Value;
   Inc(FScanN);
@@ -423,6 +541,7 @@ begin
   FScanKeys := nil;
   FScanVals := nil;
   FScanN := 0;
+  FScanCap := 0;
   FScanFilter := TableFilter;
 
   { Motor tarafi: kaplamada islem gormus anahtarlar atlanir. }
@@ -434,40 +553,216 @@ begin
     begin
       if not pair.Value.Present then Continue;
       if not PassFilter(pair.Key, pair.Value.Value, TableFilter) then Continue;
-      SetLength(FScanKeys, FScanN + 1);
-      SetLength(FScanVals, FScanN + 1);
+      if FScanN >= FScanCap then
+      begin
+        if FScanCap < 256 then FScanCap := 256 else FScanCap := FScanCap * 2;
+        SetLength(FScanKeys, FScanCap);
+        SetLength(FScanVals, FScanCap);
+      end;
       FScanKeys[FScanN] := pair.Key;
       FScanVals[FScanN] := Copy(pair.Value.Value, 0, Length(pair.Value.Value));
       Inc(FScanN);
     end;
 
+  SetLength(FScanKeys, FScanN);
+  SetLength(FScanVals, FScanN);
   Keys := FScanKeys;
   Vals := FScanVals;
   FScanKeys := nil;
   FScanVals := nil;
   FScanN := 0;
+  FScanCap := 0;
+end;
+
+procedure TVdbBackendV3.StreamCbRaw(Key: QWord; Data: PByte; Len: Integer);
+var
+  tag, n: Integer;
+begin
+  if FStreamAbort then Exit;
+  if FBatchOpen and FBatch.ContainsKey(Key) then Exit;
+  { PassFilter'in sifir-kopya esdegeri: satir etiketi degerin ILK baytlarindan
+    cikar; 8 baytlik sabit tampona kopyalanir (satir basina tahsis YOK). }
+  if (FStreamFilter >= 0) and Assigned(FRowTag) then
+  begin
+    n := Len;
+    if n > Length(FStreamTagBuf) then n := Length(FStreamTagBuf);
+    if n > 0 then Move(Data^, FStreamTagBuf[0], n);
+    tag := FRowTag(FStreamTagBuf, Len);
+    if (tag >= 0) and (tag <> FStreamFilter) then Exit;
+  end;
+  if not FStreamCb(Key, Data, Len, FStreamUser) then
+    FStreamAbort := True;
 end;
 
 function TVdbBackendV3.ScanRawIterAll(TableFilter: Integer;
   Cb: TVDbRawCb; User: Pointer): Boolean;
 var
-  keys: TQWordArray;
-  vals: TValArray;
+  pair: TPair<QWord, TBatchRec>;
+  n: Integer;
+begin
+  { v3.1: sonuc kumesi ARTIK BIRIKTIRILMEZ; satirlar dogrudan geri cagirima
+    akitilir ve sayfa ici hucre KOPYALANMAZ. Eski yol her satirda iki dinamik
+    diziyi SetLength(+1) ile buyutuyor (200k satirda O(n^2) kopya + 200k
+    yeniden tahsis), ayrica satir basina deger icin bir TBytes ayiriyordu.
+    Gorunurluk/eleme kurallari AYNI: once motor (kaplamada islem gormus
+    anahtarlar atlanir), sonra kaplama. }
+  FStreamCb := Cb;
+  FStreamUser := User;
+  FStreamAbort := False;
+  FStreamFilter := TableFilter;
+  if Length(FStreamTagBuf) < 8 then SetLength(FStreamTagBuf, 8);
+  FEng.ScanAllRaw(StreamCbRaw);
+  if FStreamAbort then Exit(False);
+
+  if FBatchOpen then
+    for pair in FBatch do
+    begin
+      if not pair.Value.Present then Continue;
+      if not PassFilter(pair.Key, pair.Value.Value, TableFilter) then Continue;
+      n := Length(pair.Value.Value);
+      if n > 0 then
+      begin
+        if not Cb(pair.Key, @pair.Value.Value[0], n, User) then Exit(False);
+      end
+      else if not Cb(pair.Key, nil, 0, User) then Exit(False);
+    end;
+  Result := True;
+end;
+
+{ ------------------------------------------------- v3.1: etiket sayaci }
+
+function TVdbBackendV3.TagOf(Data: PByte; Len: Integer): Integer;
+{ Satir etiketi = degerin ilk baytlari (FRowTag). Sema kaydi -1 doner.
+  Sabit tampona en fazla 16 bayt kopyalanir; satir basina tahsis YOK. }
+var
+  n: Integer;
+begin
+  if not Assigned(FRowTag) then Exit(-1);
+  if (Data = nil) or (Len <= 0) then Exit(-1);
+  if Length(FTagBuf) < 16 then SetLength(FTagBuf, 16);
+  n := Len;
+  if n > 16 then n := 16;
+  Move(Data^, FTagBuf[0], n);
+  Result := FRowTag(FTagBuf, Len);
+end;
+
+procedure TVdbBackendV3.TagAdd(Tag: Integer; Delta: Int64);
+var
+  cur: Int64;
+begin
+  if Delta = 0 then Exit;
+  { Sayac henuz kurulmadiysa yazma yolu haritayi KIRLETMEZ. }
+  if not FTagCountsValid then Exit;
+  if FBatchOpen then
+  begin
+    if not FBatchTagDelta.TryGetValue(Tag, cur) then cur := 0;
+    FBatchTagDelta.AddOrSetValue(Tag, cur + Delta);
+    Exit;
+  end;
+  if not FTagCounts.TryGetValue(Tag, cur) then cur := 0;
+  cur := cur + Delta;
+  if cur <= 0 then FTagCounts.Remove(Tag)
+  else FTagCounts.AddOrSetValue(Tag, cur);
+end;
+
+procedure TVdbBackendV3.TagBuildCb(Key: QWord; Data: PByte; Len: Integer);
+var
+  tag: Integer;
+  cur: Int64;
+begin
+  tag := TagOf(Data, Len);
+  if not FTagCounts.TryGetValue(tag, cur) then cur := 0;
+  FTagCounts.AddOrSetValue(tag, cur + 1);
+end;
+
+procedure TVdbBackendV3.RebuildTagCounts;
+{ Sayaci motorun GERCEK iceriginden yeniden kurar. Kalici bir kayit yoktur;
+  bu yuzden cokme/bayatlik kaynakli yanlis sayim mumkun degildir. Pahali
+  (tam tarama); yalnizca .idx ozeti yoksa/guvenilmezse cagrilir. }
+begin
+  FTagCounts.Clear;
+  FTagCountsValid := False;
+  if FEng = nil then Exit;
+  if not Assigned(FRowTag) then Exit;
+  FEng.ScanAllRaw(TagBuildCb);
+  FTagCountsValid := True;
+end;
+
+function TVdbBackendV3.LoadTagCountsFromIdx: Boolean;
+{ `.idx` ozeti dizinle AYNI LSN'de yazildi; idx taze ise ozet de tutarlidir.
+  Bos ozet yalnizca bos veritabaninda guvenilirdir (bkz. IdxTagsValid). }
+var
+  tags: TVdbIdxTagArray;
   i: Integer;
 begin
-  { Sifir-kopya yol v3'te henuz yok (sayfa ici hucre dogrudan verilemez,
-    cunku deger tasma zincirinde parcali olabilir). Bellek maliyeti icin
-    tarama basina bir kez toplanir. }
-  ScanAll(keys, vals, TableFilter);
+  Result := False;
+  FTagCounts.Clear;
+  FTagCountsValid := False;
+  if (FEng = nil) or (not Assigned(FRowTag)) then Exit;
+  if not FEng.IdxTagsValid then Exit;
+  tags := FEng.IdxTags;
+  for i := 0 to High(tags) do
+    if tags[i].Count > 0 then
+      FTagCounts.AddOrSetValue(tags[i].Tag, tags[i].Count);
+  FTagCountsValid := True;
   Result := True;
-  for i := 0 to High(keys) do
-    if Length(vals[i]) > 0 then
-    begin
-      if not Cb(keys[i], @vals[i][0], Length(vals[i]), User) then
-        Exit(False);
-    end
-    else if not Cb(keys[i], nil, 0, User) then
-      Exit(False);
+end;
+
+procedure TVdbBackendV3.GetTagSummary(out Tags: TVdbIdxTagArray);
+var
+  pair: TPair<Integer, Int64>;
+  n: Integer;
+begin
+  SetLength(Tags, 0);
+  if not FTagCountsValid then Exit;   // guvenilmez ozet YAZILMAZ
+  SetLength(Tags, FTagCounts.Count);
+  n := 0;
+  for pair in FTagCounts do
+  begin
+    if pair.Value <= 0 then Continue;
+    Tags[n].Tag := pair.Key;
+    Tags[n].Count := pair.Value;
+    Inc(n);
+  end;
+  SetLength(Tags, n);
+end;
+
+procedure TVdbBackendV3.MergeTagDeltas;
+var
+  pair: TPair<Integer, Int64>;
+  cur: Int64;
+begin
+  if FBatchTagDelta.Count = 0 then Exit;
+  if not FTagCountsValid then
+  begin
+    FBatchTagDelta.Clear;
+    Exit;
+  end;
+  for pair in FBatchTagDelta do
+  begin
+    if not FTagCounts.TryGetValue(pair.Key, cur) then cur := 0;
+    cur := cur + pair.Value;
+    if cur <= 0 then FTagCounts.Remove(pair.Key)
+    else FTagCounts.AddOrSetValue(pair.Key, cur);
+  end;
+  FBatchTagDelta.Clear;
+end;
+
+function TVdbBackendV3.CountTable(TableFilter: Integer): Int64;
+var
+  cur: Int64;
+begin
+  { Acik kaplama varsa bekleyen degisiklikler sayaca YANSIMAZ; cagiran
+    (yurutucu) bu durumda tam tarama yapar. }
+  if FBatchOpen then Exit(-1);
+  if TableFilter < 0 then Exit(FEng.Count);
+  if not Assigned(FRowTag) then Exit(-1);
+  { Sayac .idx ozetinden geldiyse burada tarama YOK; yoksa bir kez kurulur. }
+  if not FTagCountsValid then
+    RebuildTagCounts;
+  if not FTagCountsValid then Exit(-1);
+  if FTagCounts.TryGetValue(TableFilter, cur) then Result := cur
+  else Result := 0;
 end;
 
 { ------------------------------------------------------------------ islem }
@@ -487,6 +782,8 @@ begin
     FBeforeCommit;          // kisit denetimi: hata firlatirsa kaplama durur
   ApplyBatch;
   FBatchOpen := False;
+  { v3.1: parti ici etiket degisimleri simdi sayaca islenir. }
+  MergeTagDeltas;
   FBatch.Clear;
   FOrder.Clear;
   if FDirty then
@@ -501,6 +798,7 @@ procedure TVdbBackendV3.AbortBatch;
 begin
   FBatch.Clear;
   FOrder.Clear;
+  FBatchTagDelta.Clear;
   FBatchOpen := False;
 end;
 
@@ -599,6 +897,20 @@ end;
 procedure TVdbBackendV3.SetRowTagFunc(AValue: TVDbRowTagFunc);
 begin
   FRowTag := AValue;
+  if FEng = nil then Exit;
+  { v3.1: sayac kaynagi, en iyiden en pahaliya:
+      1) `.idx` ozeti (dizinle ayni LSN) -> tarama YOK
+      2) bos veritabani (0 anahtar)     -> dogru taban 0, tarama YOK
+      3) aksi halde                     -> ilk COUNT isteginde bir kez tarama }
+  if FEng.IdxTagsValid then
+    LoadTagCountsFromIdx
+  else if FEng.Count = 0 then
+  begin
+    FTagCounts.Clear;
+    FTagCountsValid := True;
+  end
+  else
+    FTagCountsValid := False;
 end;
 
 function TVdbBackendV3.GetDirty: Boolean;
@@ -731,6 +1043,7 @@ procedure TVdbBackendV3.Compact(out OldBytes, NewBytes: Int64);
 var
   tmp: string;
   newEng: TVdbPageEngine;
+  tagsWere: Boolean;
 begin
   if FBatchOpen then
     raise EVdbBackendV3.Create('acik parti varken VACUUM yapilamaz');
@@ -767,6 +1080,7 @@ begin
   end;
 
   { Kaynak dosya ve yeni dosya ayni canli anahtar kumesini tasimali. }
+  tagsWere := FTagCountsValid;
   if FCompactN <> FEng.Count then
   begin
     if FileExists(tmp) then DeleteFile(tmp);
@@ -776,6 +1090,9 @@ begin
   end;
 
   SwapDbFile(tmp);
+  { v3.1: VACUUM anahtar kumesini KORUR (yukarida dogrulandi); sayac da
+    gecerli kalir -> VACUUM sonrasi COUNT(*) yine O(1). }
+  FTagCountsValid := tagsWere;
   NewBytes := VDbFileBytes(FPath);
 end;
 
@@ -809,6 +1126,12 @@ begin
       FreeAndNil(FEng);
       raise;
     end;
+    { v3.1: icerik degismis olabilir (RESTORE) -> sayac guvenilmez.
+      VACUUM cagirani (Compact) anahtar kumesinin AYNI oldugunu dogrular ve
+      bayragi geri kurar. Harita SILINMEZ: bayrak False iken yazma yolu onu
+      kirletmez, ilk COUNT isteginde tam taramayla yeniden kurulur. }
+    FEng.OnTagSummary := GetTagSummary;
+    FTagCountsValid := False;
   except
     { Yarim kalan degistirmede .bak'tan don. }
     if FEng = nil then
@@ -823,6 +1146,8 @@ begin
         begin
           FEng := NewEngine(FPath);
           FEng.Open(False);
+          FEng.OnTagSummary := GetTagSummary;
+          FTagCountsValid := False;
         end;
       except
         FreeAndNil(FEng);
