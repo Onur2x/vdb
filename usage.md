@@ -110,6 +110,21 @@ except
 end;
 ```
 
+### Multi-session writes (v3.4)
+
+Several `TVSql` sessions on the same `TVTableDb` may **write concurrently**:
+
+- Reads are **READ COMMITTED**: another session's uncommitted writes are
+  invisible, your own are visible.
+- If two sessions write the same key, the **first commit wins**; the second
+  fails with `yazma cakismasi: … (islem geri alindi)` and applies nothing.
+  Call `ROLLBACK` afterwards to clear your write set.
+- `CREATE/DROP/ALTER`, `SAVEPOINT`/`ROLLBACK TO`/`RELEASE` and `DEFERRABLE`
+  constraints are **rejected while more than one session writes**
+  (`ecLockConflict`); they work with a single writer.
+- Concurrent writers across **processes** are not supported: a second process
+  is rejected by the file lock.
+
 ### WAL
 
 ```pascal

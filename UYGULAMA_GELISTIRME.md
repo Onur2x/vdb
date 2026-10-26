@@ -287,12 +287,15 @@ veritabani.colkey      kolon anahtarı (yalnız kolon şifrelemesi kullanılırs
 | PITR (`RECOVER TO`), WAL arşivi, `AS OF TIMESTAMP/VERSION` | yok | checkpoint öncesine gitmek/zaman ekseni mantıksal günlük ister; günlük `BACKUP TO` ile yetinin |
 | Replication (`START REPLICATION` vb.) | yok | mantıksal değişim günlüğü gerektirir; tek dosya, tek yazıcı |
 | Zone map / bölüm budama | yok | sonuçlar doğru, tam tarama |
-| MVCC (çok yazarlı) | yok | tek yazıcı + okuyucu snapshot |
+| MVCC (süreç içi çok oturum) | **var** (v3.4) | READ COMMITTED; her oturum kendi yazma kümesinde yazar, **ilk commit kazanır**, kaybeden `yazma cakismasi` ile durur. DDL/`SAVEPOINT`/`DEFERRABLE` çoklu yazmada reddedilir. Snapshot isolation yok |
+| MVCC (süreçler arası) | yok | dosya kilidi ikinci süreci reddeder |
 
 Aynı açık veritabanında **oturum yalitimi** vardır: `VDbSetTxnSession`
-(v2) / `VdbBackendSessionId` ile kimliği olan iki oturumdan biri açık
-işlem tutarken diğeri o işlemin yazdıklarını görmez, yazamaz ve
-commit/rollback edemez (v2 ile aynı mesaj ve kural).
+(v2) / `VdbBackendSessionId` ile kimliği olan iki oturum birbirinin **commit
+edilmemiş** yazısını görmez. v3.4'ten itibaren ikinci oturum da **yazabilir**;
+aynı anahtarı iki oturum yazarsa ilk commit uygulanır, ikincisi
+`yazma cakismasi: … (islem geri alindi)` ile durur (kayıp güncelleme yok).
+v2'de kural eskisi gibi tek yazıcıdır (ikinci oturum yazamaz).
 
 v3.2'de **çözülenler**: `SAVEPOINT`/`ROLLBACK TO` (§5.1),
 `ALTER DATABASE KEY`, kolon şifreleme (`.colkey`), `IVdbBackend` üzerinde

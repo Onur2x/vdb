@@ -436,6 +436,12 @@ type
     procedure RestoreSavepointSchema(Index: Integer);
     procedure DropSavepointSnaps(FromIndex: Integer);
     procedure ClearSavepoints;
+    { v3.4: DDL ve SAVEPOINT TVTableDb'de GLOBAL sema durumuna dokunur
+      (FTables/FSchemaDirty/FSavepoints/FSnap*). Baska bir oturumun acik
+      yazma islemi varken bunlar sessizce karisirdi; bu yuzden ACIK hatayla
+      reddedilir. Tek yazma islemi varsa sema yedegi TAZELENIR (baska bir
+      oturumun commit'i snapshot'i dusurmus olabilir). }
+    procedure RequireSoleTxn(const What: string);
     function FindCol(const T: TTableDef; const Col: string): Integer;
     function MaxPkInt(const T: TTableDef): Int64;
     procedure CheckConstraints(const T: TTableDef; var Vals: TStrArray; const ExcludePk: string);
@@ -4682,10 +4688,25 @@ end;
 
 procedure TVTableDb.MarkSchema;
 begin
+  { v3.4: sema tek kayitlik GLOBAL durumdur; coklu yazmada DDL reddedilir. }
+  RequireSoleTxn('DDL');
   if FKvB.InBatch then
     FSchemaDirty := True
   else
     SaveSchema;
+end;
+
+procedure TVTableDb.RequireSoleTxn(const What: string);
+begin
+  if not FKvB.SoleWriter then
+    raise EVDbException.CreateFmt(ecLockConflict,
+      '%s: baska bir oturumun acik islemi var; once COMMIT/ROLLBACK ' +
+      '(coklu yazmada sema/savepoint degisikligi desteklenmez)', [What]);
+  { Baska bir oturumun commit/abort'u sema yedegini dusurmus olabilir.
+    Yalniz ACIK ISLEM icinde taze yedek alinir: otomatik (batch'siz) DDL
+    geri alinamaz, orada yedek birakmak yalnizca BAYAT bir yedek uretir ve
+    sonraki bir ROLLBACK yanlislikla bu semayi geri yuklerdi. }
+  if FKvB.InBatch and (not FSnapActive) then SnapshotSchema;
 end;
 
 function TVTableDb.AutoIncOf(const T: TTableDef): Int64;
@@ -4931,6 +4952,8 @@ end;
 
 procedure TVTableDb.Savepoint(const Name: string);
 begin
+  { v3.4: savepoint sema yedegi GLOBAL yiginda; coklu yazmada reddedilir. }
+  RequireSoleTxn('SAVEPOINT');
   { v2 TVDb ile ayni kural: ayni isimde savepoint hata. }
   if FindSavepoint(Name) >= 0 then
     raise EVDbException.CreateFmt(ecDuplicateSavepoint,
@@ -4947,6 +4970,7 @@ var
   ix: Integer;
   kvT: TPair<string, TTableDef>;
 begin
+  RequireSoleTxn('ROLLBACK TO SAVEPOINT');
   ix := FindSavepoint(Name);
   if ix < 0 then
     raise EVDbException.CreateFmt(ecSavepointNotFound,
@@ -4967,6 +4991,7 @@ procedure TVTableDb.ReleaseSavepoint(const Name: string);
 var
   ix: Integer;
 begin
+  RequireSoleTxn('RELEASE SAVEPOINT');
   ix := FindSavepoint(Name);
   if ix < 0 then
     raise EVDbException.CreateFmt(ecSavepointNotFound,
@@ -5595,6 +5620,13 @@ var
   saved: Boolean;
   dup: TStringList;
 begin
+  { v3.4: liste GLOBAL. Baska bir oturum acikken bu listeyi denetlemek ve
+    temizlemek o oturumun ertelenen satirlarini SESSIZCE kaybettirirdi;
+    bunun yerine ACIK hata (veri kaybi yok). }
+  if (FDeferredRows.Count > 0) and (not FKvB.SoleWriter) then
+    raise EVDbException.Create(ecLockConflict,
+      'DEFERRABLE FK: ertelenen satirlar varken baska bir oturumun acik ' +
+      'islemi var; once onu COMMIT/ROLLBACK edin');
   if FDeferredRows.Count = 0 then Exit;
   saved := FDeferred;
   FDeferred := False;     // yeniden denetimde tekrar erteleme
@@ -5647,6 +5679,13 @@ begin
   // erteleme anlamsizdir: COMMIT yok, denetim ne zaman yapilacagi bilinmez.
   if FDeferred and FKvB.InBatch and DeferrableFk(T) and (T.PkIndex >= 0) then
   begin
+    { v3.4: ertelenen satir listesi GLOBALDIR. Coklu yazmada A'nin COMMIT'i
+      B'nin ertelenen satirlarini denetleyip listeyi silerdi (sessiz
+      butunluk kaybi). Erteleme yalniz TEK yazma islemi varken kullanilir. }
+    if not FKvB.SoleWriter then
+      raise EVDbException.Create(ecLockConflict,
+        'DEFERRABLE FK: baska bir oturumun acik islemi var; ' +
+        'tek yazma isleminde calisin veya SET CONSTRAINTS ... IMMEDIATE kullanin');
     pk := Vals[T.PkIndex];
     FDeferredRows.Add(T.Name + #1 + pk);
     Exit;

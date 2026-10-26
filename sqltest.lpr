@@ -12818,10 +12818,12 @@ begin
 end;
 
 procedure T126_F42_TxIsolation;
-{ F-42 (v3.2: backend-farkinda): ayni veritabani uzerinde iki oturum
-  kimligi. Acik islemin commit edilmemis yazisi diger oturuma GORUNMEZ;
-  diger oturum YAZAMAZ ve COMMIT/ROLLBACK edemez; commit sonrasi herkes
-  gorur. v2 TVDb ile ayni kural, IVdbBackend uzerinden iki motorda. }
+{ F-42 (v3.4: backend-farkinda): ayni veritabani uzerinde iki oturum
+  kimligi. Acik islemin commit edilmemis yazisi diger oturuma GORUNMEZ.
+  * v2: tek yazici — ikinci oturum YAZAMAZ ve COMMIT/ROLLBACK edemez.
+  * v3: her oturum KENDI yazma kumesinde yazar; ayni anahtari iki oturum
+    yazarsa ILK commit kazanir, ikincisi "yazma cakismasi" ile DURUR
+    (kayip guncelleme yok). Commit sonrasi herkes kalici degeri gorur. }
 var
   be: IVdbBackend;
   db: TVDb;
@@ -12853,33 +12855,73 @@ begin
     if gV3 then ok := be.Get(k, v) else ok := db.Get(k, v);
     Dogrula('F42 diger oturum commit edilmemisi gormez', not ok, '');
 
-    ok := False;
-    try
-      if gV3 then be.Put(k, VDbStrToBytes('b'))
-      else db.Put(k, VDbStrToBytes('b'));
-    except
-      on E: Exception do ok := Pos('baska bir oturum', E.Message) > 0;
+    if gV3 then
+    begin
+      { v3.4: ikinci oturum da YAZABILIR (kendi kumesi). }
+      ok := False;
+      try
+        be.BeginBatch;
+        be.Put(k, VDbStrToBytes('b'));
+        ok := True;
+      except
+        on E: Exception do ok := False;
+      end;
+      Dogrula('F42 v3 diger oturum kendi kumesinde yazar', ok, '');
+
+      ok := be.Get(k, v);
+      Dogrula('F42 v3 yazan oturum kendi degerini gorur',
+        ok and (VDbBytesToStr(v) = 'b'), '');
+
+      VDbSetTxnSession(1001);
+      ok := be.Get(k, v);
+      Dogrula('F42 v3 sahibi kendi degerini gorur',
+        ok and (VDbBytesToStr(v) = 'a'), '');
+
+      { Ilk commit kazanir; ikinci commit CAKISMA ile durur. }
+      be.CommitBatch;
+      VDbSetTxnSession(1002);
+      ok := False;
+      try
+        be.CommitBatch;
+      except
+        on E: Exception do ok := Pos('yazma cakismasi', E.Message) > 0;
+      end;
+      Dogrula('F42 v3 ikinci commit yazma cakismasi ile durdu', ok, '');
+      be.AbortBatch;
+
+      ok := be.Get(k, v);
+      Dogrula('F42 v3 commit sonrasi kazanan deger gorulur',
+        ok and (VDbBytesToStr(v) = 'a'), '');
+    end
+    else
+    begin
+      ok := False;
+      try
+        db.Put(k, VDbStrToBytes('b'));
+      except
+        on E: Exception do ok := Pos('baska bir oturum', E.Message) > 0;
+      end;
+      Dogrula('F42 diger oturum yazamaz', ok, '');
+
+      ok := False;
+      try
+        db.CommitBatch;
+      except
+        on E: Exception do ok := Pos('baska bir oturum', E.Message) > 0;
+      end;
+      Dogrula('F42 diger oturum commit edemez', ok, '');
+
+      VDbSetTxnSession(1001);
+      ok := db.Get(k, v);
+      Dogrula('F42 sahibi kendi yazisini gorur',
+        ok and (VDbBytesToStr(v) = 'a'), '');
+
+      db.CommitBatch;
+      VDbSetTxnSession(1002);
+      ok := db.Get(k, v);
+      Dogrula('F42 commit sonrasi diger oturum gorur',
+        ok and (VDbBytesToStr(v) = 'a'), '');
     end;
-    Dogrula('F42 diger oturum yazamaz', ok, '');
-
-    ok := False;
-    try
-      if gV3 then be.CommitBatch else db.CommitBatch;
-    except
-      on E: Exception do ok := Pos('baska bir oturum', E.Message) > 0;
-    end;
-    Dogrula('F42 diger oturum commit edemez', ok, '');
-
-    VDbSetTxnSession(1001);
-    if gV3 then ok := be.Get(k, v) else ok := db.Get(k, v);
-    Dogrula('F42 sahibi kendi yazisini gorur',
-      ok and (VDbBytesToStr(v) = 'a'), '');
-
-    if gV3 then be.CommitBatch else db.CommitBatch;
-    VDbSetTxnSession(1002);
-    if gV3 then ok := be.Get(k, v) else ok := db.Get(k, v);
-    Dogrula('F42 commit sonrasi diger oturum gorur',
-      ok and (VDbBytesToStr(v) = 'a'), '');
   finally
     VDbSetTxnSession(0);
     if gV3 then

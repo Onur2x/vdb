@@ -117,6 +117,10 @@ type
     procedure Flush;
     function GetInBatch: Boolean;
     property InBatch: Boolean read GetInBatch;
+    { v3.4: bu backend'de acik yazma islemi TEK mi? (0 veya 1 islem).
+      Sema/DDL/SAVEPOINT gibi GLOBAL duruma dokunan islemler bunu ister.
+      v2 tek yazici oldugu icin her zaman True doner. }
+    function SoleWriter: Boolean;
 
     { --- v3.2: SAVEPOINT / ROLLBACK TO / RELEASE SAVEPOINT ---
       Sozlesme (v2 TVDb ile AYNI, R-02):

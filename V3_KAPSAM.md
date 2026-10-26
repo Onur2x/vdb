@@ -275,9 +275,10 @@ kaynaklanır. Çekirdek v3 yollarında hiçbir kontrol eksilmemiştir.
 
 ### Replikasyon, PITR ve zone map kararları (Sprint 3.5-3.7 → v4 güncellemesi)
 
-Durum **2026-10-26**: PITR, B+tree ve replikasyon dilimleri tamamlandı;
-zone map (sayfa düzeyi), `.idx` varint, satır varint/delta ve çok yazarlı
-MVCC sırada.
+Durum **2026-10-26**: PITR, B+tree, replikasyon, sayfa düzeyi zone map, `.idx`
+varint, satır INT varint ve **çok oturumlu yazma (MVCC, v3.4)** dilimleri
+tamamlandı; yol haritasında açık madde kalmadı. Kalan bilinçli sınırlar
+snapshot isolation ve süreçler arası çok yazarlılıktır (aşağıda).
 
 | Yetenek | Bugünkü davranış | Test |
 |---|---|---|
@@ -385,7 +386,9 @@ v2/önceki v3 ile aynı; beklemek isteyen çağıran açıkça süre verir.
 - Yazma denemesi salt-okunur oturumda açık hata verir; `VERIFY` çalışır.
 - Busy beklemesi gerçek süreyle ölçülür (`GetTickCount64`): ölçülen
   `busy=400 → 397 ms`, `busy=350 → 356 ms`, `busy=0 → 1–2 ms`.
-- Çok yazarlı MVCC kapsam dışı kaldı (sıradaki dilim).
+- Çok **oturumlu** yazma v3.4'te geldi (aynı backend, READ COMMITTED, ilk commit
+  kazanır). Süreçler arası çok yazarlılık kapsam dışıdır: ikinci süreç dosya
+  kilidiyle reddedilir.
 
 Kapı: `lockchk` (14. kapı) **17/0**. Gerçek **çocuk süreçler** kullanılır, yani
 kilit gerçek işletim sistemi kilididir: aynı anda iki okuyucu, okuyucu varken
@@ -508,6 +511,67 @@ Kapı: `v3sqlchk` **196/0** — `TestPageZoneMap`: harita inşasında budama yok
 ikinci koşuda budama var (268 sayfa), sonuç birebir aynı, tam aralıkta yalnızca
 boş sayfalar atlanır, NULL satır budamayı bozmaz, **commit edilmemiş işlemde
 harita kullanılmaz**, commit sonrası yeni satırlar doğru sayılır.
+
+### Çok oturumlu yazma / MVCC (v3.4, 2026-10-26)
+
+Kapsam **süreç içi çok oturumlu yazma**dır: aynı `IVdbBackend` üzerinde birden
+çok `TVSql` (veya `VDbSetTxnSession`) oturumu **aynı anda yazabilir**.
+
+- **Okuma: READ COMMITTED.** Her oturum kendi yazma kümesinde (`TWriteSet`)
+  yazar; commit edilmemiş yazı başka oturuma görünmez, kendi oturumuna görünür.
+- **İlk commit kazanır.** Commit anında, uygulamadan **önce**, yazılan her
+  anahtarın *before-image*'ı (ilk yazma anındaki motor değeri) güncel motor
+  değeriyle karşılaştırılır (`VerifyNoConflict`). Değişmişse commit
+  `EVdbBackendV3` ile durur — `yazma cakismasi: $… baska bir oturum tarafindan
+  degistirildi (islem geri alindi)`; **yarım uygulama olmaz**. Kaybeden oturum
+  `ROLLBACK` ile kümesini temizler.
+- **GLOBAL duruma dokunan işlemler çoklu yazmada reddedilir:** DDL
+  (`MarkSchema`), `SAVEPOINT`/`ROLLBACK TO`/`RELEASE`, `DEFERRABLE` FK ertelemesi
+  ve bekleyen erteleme denetimi `RequireSoleTxn` / `IVdbBackend.SoleWriter`
+  üzerinden açık `ecLockConflict` verir (sessiz karışıklık yerine).
+- **Kilit:** tek backend içinde yeniden girişli `FEngCs` (TCriticalSection)
+  motoru ve `FSets`'i serileştirir; **işlem boyunca tutulmaz**. Dosya düzeyi
+  kilit (paylaşımlı okuyucu / tam yazıcı) değişmedi.
+- **Bilinçli sınırlar:** snapshot isolation yok; süreçler arası çok yazarlılık
+  yok (ikinci süreç dosya kilidiyle reddedilir).
+
+| Ölçüm (`benchcmp`, 200k × 3 kolon, 3 koşu medyanı, 32 bit) | Değer |
+|---|---|
+| toplu INSERT — before-image **kapalı** (A/B) | 6,532 µs/satır |
+| toplu INSERT — before-image **açık** | **7,466 µs/satır** (+%14,3) |
+| autocommit INSERT | 1,024 ms |
+| açılış (200k satır) | 39,0 ms |
+
+Yorum: çakışma denetiminin bedeli satır başına **0,93 µs**'dir; yeni anahtarda
+`TryGet` boşa gider ama *var olan* anahtarı ayırt etmek için zorunludur
+(vazgeçilirse kayıp güncelleme koruması kalkar). Tek oturumlu yüklerde de
+ödenir; doğruluk önceliği nedeniyle bilinçli kabul edildi.
+
+Kapı: `v3sqlchk` **228/0** — `TestMultiSession` (32 kontrol): izolasyon, READ
+COMMITTED, ilk-commit-kazanır çakışma reddi, DDL reddi, motor düzeyi `Delete`
+çakışması. `sqltest` v3 **2759/0/33**, v2 **3196/0/0**, 14 kapı yeşil.
+
+### Açılış yolunda ölçülen 20 s darboğazı (v3.5, 2026-10-26)
+
+200.000 satırlık veritabanı + 57 MB değişim günlüğü (600k kayıt) ile **açılış
+20.043 ms** ölçüldü. Nedenleri ve düzeltmeleri:
+
+| Yer | Önce | Sonra |
+|---|---|---|
+| `TVdbChangeLog.ScanTail` — tüm segment geçmişi | 20.043 ms (açılış) | — |
+| `TVdbLogReader.ListBases` — her kaydı okuyup CRC | 5.967 ms | **21 ms** |
+| `TVdbLogReader.LastState` — her kaydı okuyup CRC | 7.080 ms | **0 ms** |
+| **toplam açılış** (200k satır) | **20.043 ms** | **39–46 ms** |
+
+- `LogTailState`: segment kuyruğundaki son kayıt **O(1)** okunur (END veya BASE;
+  toplam uzunluk dosya sonuna tam oturmalı ve CRC tutmalı). Tutmazsa — yarım
+  grup/çökme — o segment **eskisi gibi tam taranır**; güvenli yol korunur.
+- `ListBases`: segment **tek okumada** belleğe alınır, kayıt yükleri atlanır;
+  yalnız BASE kaydı CRC ile doğrulanır.
+- Davranış değişmedi: bozuk/yarım kuyruk tam taramaya düşer, CRC'siz BASE
+  kabul edilmez.
+
+Kapı: değişim günlüğü 28/0, PITR 21/0, replikasyon 37/0, çökme kurtarma 11/0.
 
 ### Sayfa şifreleme (Sprint 3.4)
 

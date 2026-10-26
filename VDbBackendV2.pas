@@ -61,6 +61,7 @@ type
     procedure AbortBatch;
     procedure Flush;
     function GetInBatch: Boolean;
+    function SoleWriter: Boolean;
 
     { v3.2: v2'de R-02 savepoint'leri TVDb'de WAL tabanlidir; aynen
       devredilir. Istisna mesajlari (ecDuplicateSavepoint /
@@ -260,6 +261,12 @@ end;
 function TVDbBackendV2.GetInBatch: Boolean;
 begin
   Result := FDb.InBatch;
+end;
+
+function TVDbBackendV2.SoleWriter: Boolean;
+begin
+  { v2 tek yazicidir (dosya kilidi); coklu yazma islemi yoktur. }
+  Result := True;
 end;
 
 procedure TVDbBackendV2.Savepoint(const Name: string);

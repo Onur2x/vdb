@@ -29,7 +29,7 @@ unit VDbBackendV3;
 interface
 
 uses
-  SysUtils, Classes, Generics.Collections,
+  SysUtils, Classes, SyncObjs, Generics.Collections,
   VDbBackendApi, VDbPage, VDbPageStore, VDbPageHeap, VDbPageWal, VDbPageEngine,
   VDbIdxFile, VDbSync, VDbCrypt, VDbChangeLog;
 
@@ -66,13 +66,38 @@ type
         Journal: TDictionary<QWord, TSavepointKeyRec>;
         TagDelta: TDictionary<Integer, Int64>;  // FBatchTagDelta kopyasi
       end;
+      { v3.4: OTURUM BASINA YAZMA KUMESI (cok oturumlu yazma).
+        Once tek bir global parti tamponu vardi ve ikinci oturum yazmaya
+        kalkinca "baska bir oturumun acik islemi var" hatasi aliyordu. Artik
+        her oturum KENDI kumesinde biriktirir; motor ancak COMMIT'te
+        degisir. Boylece iki oturum birbirinin commit edilmemis yazisini
+        gormez ve birbirini islem suresi boyunca BLOKLAMAZ.
+
+        Before: anahtarin ILK yazimdan onceki MOTOR degeri. Commit'te motor
+        degeri hala ayni mi diye karsilastirilir; degistiyse kayip guncelleme
+        riski vardir ve commit ACIK hatayla durur (veri kaybi yok). }
+      TWriteSet = class
+        Session: Cardinal;
+        Map: TDictionary<QWord, TBatchRec>;
+        Order: TList<QWord>;
+        Before: TDictionary<QWord, TBatchRec>;
+        TagDelta: TDictionary<Integer, Int64>;
+        Savepoints: TList<TSavepointRec>;
+        constructor Create(ASession: Cardinal);
+        destructor Destroy; override;
+      end;
     var
       FEng: TVdbPageEngine;
       FPath: string;
       { v3.2: cok okuyucu / tek yazici. }
       FReadOnly: Boolean;
       FBusyMs: Integer;
-      FBatch: TDictionary<QWord, TBatchRec>;
+      { v3.4: oturum kimligi -> o oturumun acik yazma kumesi. }
+      FSets: TDictionary<Cardinal, TWriteSet>;
+      { Motor erisimini (ve FSets'i) serilestiren ic kilit. TEK backend
+        birden fazla is parcacigi tarafindan paylasilabilsin diye; islemler
+        ARASINDA tutulmaz (uzun islem baska oturumu kilitlemez). }
+      FEngCs: TCriticalSection;
       { v4: MANTIKSAL DEGISIM GUNLUGU. Her commit'in satir duzeyi
         kayitlarini <db>.log\ altina yazar; PITR (RECOVER TO TIMESTAMP,
         AS OF TIMESTAMP/VERSION) ve replikasyon bunun uzerine kurulur.
@@ -93,11 +118,9 @@ type
         dolasimi rastgele oldugu icin ApplyBatch sayfalara sicramali
         yaziyordu (olculen: 200k toplu yazim 8,0 us/satir; sirali
         yazimda motor 1,7 us/satir). Ayni veri, ayni atomiklik;
-        yalniz uygulama sirasi giris sirasi olur. }
-      FOrder: TList<QWord>;
-      FBatchOpen: Boolean;
-      { v3.2: acik partiyi acan oturum (0 = sahipsiz/eski davranis). }
-      FWriteSession: Cardinal;
+        yalniz uygulama sirasi giris sirasi olur.
+        v3.4: bu alanlar artik OTURUM BASINA yazma kumesindedir; asagidaki
+        ozellikler cagiran oturumun kumesine cozulur (yoksa nil/False). }
       FRowTag: TVDbRowTagFunc;
       FBeforeCommit: TDbCommitHook;
       FCheckpointBytes: Int64;
@@ -132,13 +155,10 @@ type
         kurulur, yazma yolunda artimli guncellenir. Bayatlama/cokme riski
         yoktur (dogru kaynak her zaman motorun kendisidir). }
       FTagCounts: TDictionary<Integer, Int64>;
-      FBatchTagDelta: TDictionary<Integer, Int64>;
       FTagBuf: TBytes;
       { Sayac kuruldu mu? False ise tutulan harita guvenilmez; ilk COUNT
         isteginde tam taramayla kurulur. }
       FTagCountsValid: Boolean;
-      { v3.2: SAVEPOINT yigini (en sona eklenir). }
-      FSavepoints: TList<TSavepointRec>;
       { v3.2: otomatik sikistirma (H25). Varsayilan KAPALI; commit'ten SONRA
         yalniz esik asilinca calisir. Hata commit'i bozmaz. }
       FAutoCompactOn: Boolean;
@@ -151,10 +171,23 @@ type
       procedure MaybeAutoCompact;
       function AutoCompactBody(out OldBytes, NewBytes: Int64;
         MaxDeadRatio: Double; MinBytes: Int64): Boolean;
-      { v3.2: oturum yalitimi (v2 TVDb.BatchIsMine/RequireBatchWrite esi).
-        Baska oturum acik partiyi ne gorur ne yazar. }
+      { v3.4: cagiran oturumun yazma kumesi var mi? (eski BatchIsMine) }
       function BatchIsMine: Boolean;
+      { v3.4: artik baska oturumun acik islemi HATA degildir; her oturum
+        kendi kumesinde calisir. Yalniz salt-okunur denetimi kalir. }
       procedure RequireBatchWrite;
+      { v3.4: oturum basina yazma kumesine cozulen erisimciler. }
+      function OwnSet: TWriteSet;
+      function GetBatchMap: TDictionary<QWord, TBatchRec>;
+      function GetBatchOrder: TList<QWord>;
+      function GetBatchTagDelta: TDictionary<Integer, Int64>;
+      function GetSavepoints: TList<TSavepointRec>;
+      function GetBatchOpen: Boolean;
+      property BatchMap: TDictionary<QWord, TBatchRec> read GetBatchMap;
+      property BatchOrder: TList<QWord> read GetBatchOrder;
+      property BatchTagDelta: TDictionary<Integer, Int64> read GetBatchTagDelta;
+      property Savepoints: TList<TSavepointRec> read GetSavepoints;
+      property BatchOpen: Boolean read GetBatchOpen;
 
     procedure InitBackend(const ADbPath: string; ACreate: Boolean;
       APoolPages: Integer; AReadOnly: Boolean = False;
@@ -178,6 +211,12 @@ type
       const DestPath: string;
       out ActualTsMs, ActualSeq: Int64): Boolean;
     procedure ApplyBatch;
+    { v3.4: anahtarin ILK yazimdan onceki motor degerini saklar (cakisma
+      denetimi icin). }
+    procedure NoteBefore(S: TWriteSet; Key: QWord);
+    { v3.4: commit ONCESI cakisma denetimi. Hicbir sey uygulanmadan once
+      tum anahtarlar karsilastirilir; boylece yarim uygulama olmaz. }
+    procedure VerifyNoConflict(S: TWriteSet);
     function EffectiveCount: Integer;
     procedure MaybeCheckpoint;
     function PassFilter(Key: QWord; const Value: TBytes;
@@ -278,6 +317,8 @@ type
     procedure AbortBatch;
     procedure Flush;
     function GetInBatch: Boolean;
+    { v3.4: acik yazma islemi 0 veya 1 tane mi? (DDL/SAVEPOINT kosulu) }
+    function SoleWriter: Boolean;
 
     { v3.2: ALTER DATABASE KEY — dosya yeni parola ile yeniden sifrelenir.
       Acik parti varken reddedilir; islem atomiktir (tmp + .bak). }
@@ -372,11 +413,9 @@ begin
   FPath := ADbPath;
   FReadOnly := AReadOnly;
   FBusyMs := ABusyMs;
-  FBatch := TDictionary<QWord, TBatchRec>.Create;
-  FOrder := TList<QWord>.Create;
+  FSets := TDictionary<Cardinal, TWriteSet>.Create;
+  FEngCs := TCriticalSection.Create;
   FTagCounts := TDictionary<Integer, Int64>.Create;
-  FBatchTagDelta := TDictionary<Integer, Int64>.Create;
-  FSavepoints := TList<TSavepointRec>.Create;
   { v3.2: otomatik sikistirma v2 ile AYNI varsayilanlar (KAPALI). }
   FAutoCompactOn := False;
   FAutoCompactRatio := 0.35;
@@ -384,8 +423,6 @@ begin
   FAutoCompactCount := 0;
   FAutoCompactBusy := False;
   FLastAutoCompactError := '';
-  FBatchOpen := False;
-  FWriteSession := 0;
   FDirty := False;
   FCheckpointBytes := VDB_V3_CHECKPOINT_BYTES;
   FPoolPages := APoolPages;
@@ -629,24 +666,102 @@ begin
 end;
 
 destructor TVdbBackendV3.Destroy;
+var
+  pair: TPair<Cardinal, TWriteSet>;
 begin
-  if FBatchOpen then
-  begin
-    { Kapanista yarim islem yazilmaz: kaplama atilir. }
-    FBatch.Clear;
-    FOrder.Clear;
-    FBatchOpen := False;
-  end;
-  ClearSavepoints;
-  FreeAndNil(FSavepoints);
+  { v3.4: kapanista yarim islemler YAZILMAZ; acik yazma kumeleri atilir. }
+  if FSets <> nil then
+    for pair in FSets do
+      pair.Value.Free;
+  FreeAndNil(FSets);
+  FEngCs.Free;
   LogAbort;               // yarim grup yazilmaz
   FreeAndNil(FLog);       // gunluk fsync + kapat
   FreeAndNil(FEng);       // Close: commit + checkpoint + idx
-  FreeAndNil(FBatch);
-  FreeAndNil(FOrder);
   FreeAndNil(FTagCounts);
-  FreeAndNil(FBatchTagDelta);
   inherited Destroy;
+end;
+
+{ ------------------------------------------------ v3.4: oturum yazma kumesi }
+
+constructor TVdbBackendV3.TWriteSet.Create(ASession: Cardinal);
+begin
+  inherited Create;
+  Session := ASession;
+  Map := TDictionary<QWord, TBatchRec>.Create;
+  Order := TList<QWord>.Create;
+  Before := TDictionary<QWord, TBatchRec>.Create;
+  TagDelta := TDictionary<Integer, Int64>.Create;
+  Savepoints := TList<TSavepointRec>.Create;
+end;
+
+destructor TVdbBackendV3.TWriteSet.Destroy;
+var
+  i: Integer;
+begin
+  for i := 0 to Savepoints.Count - 1 do
+  begin
+    Savepoints[i].Journal.Free;
+    Savepoints[i].TagDelta.Free;
+  end;
+  Savepoints.Free;
+  TagDelta.Free;
+  Before.Free;
+  Order.Free;
+  Map.Free;
+  inherited Destroy;
+end;
+
+function TVdbBackendV3.OwnSet: TWriteSet;
+var
+  sid: Cardinal;
+begin
+  Result := nil;
+  if FSets = nil then Exit;
+  sid := VdbBackendSessionId;
+  FEngCs.Enter;
+  try
+    FSets.TryGetValue(sid, Result);
+  finally
+    FEngCs.Leave;
+  end;
+end;
+
+function TVdbBackendV3.GetBatchMap: TDictionary<QWord, TBatchRec>;
+var
+  s: TWriteSet;
+begin
+  s := OwnSet;
+  if s = nil then Result := nil else Result := s.Map;
+end;
+
+function TVdbBackendV3.GetBatchOrder: TList<QWord>;
+var
+  s: TWriteSet;
+begin
+  s := OwnSet;
+  if s = nil then Result := nil else Result := s.Order;
+end;
+
+function TVdbBackendV3.GetBatchTagDelta: TDictionary<Integer, Int64>;
+var
+  s: TWriteSet;
+begin
+  s := OwnSet;
+  if s = nil then Result := nil else Result := s.TagDelta;
+end;
+
+function TVdbBackendV3.GetSavepoints: TList<TSavepointRec>;
+var
+  s: TWriteSet;
+begin
+  s := OwnSet;
+  if s = nil then Result := nil else Result := s.Savepoints;
+end;
+
+function TVdbBackendV3.GetBatchOpen: Boolean;
+begin
+  Result := OwnSet <> nil;
 end;
 
 { --------------------------------------------------------------- yardimci }
@@ -667,20 +782,24 @@ var
   pair: TPair<QWord, TBatchRec>;
   n: Integer;
 begin
-  n := FEng.Count;
-  if not BatchIsMine then Exit(n);
-  if BatchIsMine then
-    for pair in FBatch do
-    begin
-      { Kaplamadaki her kayit: eskiden var miydi? }
-      if pair.Value.Present then
+  FEngCs.Enter;
+  try
+    n := FEng.Count;
+    if BatchIsMine then
+      for pair in BatchMap do
       begin
-        if not FEng.Contains(pair.Key) then Inc(n);
-      end
-      else if FEng.Contains(pair.Key) then
-        Dec(n);
-    end;
-  Result := n;
+        { Kaplamadaki her kayit: eskiden var miydi? }
+        if pair.Value.Present then
+        begin
+          if not FEng.Contains(pair.Key) then Inc(n);
+        end
+        else if FEng.Contains(pair.Key) then
+          Dec(n);
+      end;
+    Result := n;
+  finally
+    FEngCs.Leave;
+  end;
 end;
 
 procedure TVdbBackendV3.MaybeCheckpoint;
@@ -699,13 +818,13 @@ var
   oldTag, newTag: Integer;
   oldVal: TBytes;
 begin
-  if FBatch.Count = 0 then Exit;
+  if BatchMap.Count = 0 then Exit;
   { Giris sirasi: sayfalara ARDISIK yazilir (rastgele dolasim = sayfa
     sicramasi = yavas toplu yazim). }
-  for i := 0 to FOrder.Count - 1 do
+  for i := 0 to BatchOrder.Count - 1 do
   begin
-    key := FOrder[i];
-    if not FBatch.TryGetValue(key, rec) then Continue;
+    key := BatchOrder[i];
+    if not BatchMap.TryGetValue(key, rec) then Continue;
     if rec.Present then
     begin
       { ONCEDEN her anahtar icin ayrica `Contains` cagriliyordu; `Insert`
@@ -760,8 +879,8 @@ begin
         FEng.Delete(key);    // yoksa da zararsiz (gunluge YAZILMAZ)
     end;
   end;
-  FBatch.Clear;
-  FOrder.Clear;
+  BatchMap.Clear;
+  BatchOrder.Clear;
   FDirty := True;
 end;
 
@@ -771,20 +890,74 @@ end;
 
 function TVdbBackendV3.BatchIsMine: Boolean;
 begin
-  { v2 TVDb.BatchIsMine ile AYNI kural: sahipsiz parti (0) ya da oturum
-    kimligi olmayan cagri eski global davranisi korur. Yalnizca kimligi
-    olan FARKLI oturumlar birbirinden yalitilir. }
-  Result := FBatchOpen and ((FWriteSession = 0) or
-    (VdbBackendSessionId = 0) or (FWriteSession = VdbBackendSessionId));
+  { v3.4: artik "benim acik yazma kumem var mi" demektir. Baska oturumun
+    acik islemi beni ilgilendirmez: onun yazma kumesi motora YANSIMADI. }
+  Result := OwnSet <> nil;
 end;
 
 procedure TVdbBackendV3.RequireBatchWrite;
 begin
-  if FBatchOpen and (FWriteSession <> 0) and
-     (VdbBackendSessionId <> 0) and
-     (FWriteSession <> VdbBackendSessionId) then
-    raise EVdbBackendV3.Create(
-      'VDb: baska bir oturumun acik islemi var; once COMMIT veya ROLLBACK');
+  { v3.4: baska oturumun acik islemi HATA DEGIL (her oturum kendi kumesinde
+    calisir). Burada yalnizca salt-okunur denetimi kalir. }
+  RequireWritable;
+end;
+
+procedure TVdbBackendV3.NoteBefore(S: TWriteSet; Key: QWord);
+var
+  rec: TBatchRec;
+  v: TBytes;
+begin
+  if S = nil then Exit;
+  if S.Before.TryGetValue(Key, rec) then Exit;
+  v := nil;
+  FEngCs.Enter;
+  try
+    rec.Present := FEng.TryGet(Key, v);
+  finally
+    FEngCs.Leave;
+  end;
+  rec.Value := v;
+  S.Before.AddOrSetValue(Key, rec);
+end;
+
+procedure TVdbBackendV3.VerifyNoConflict(S: TWriteSet);
+var
+  i: Integer;
+  key: QWord;
+  b, cur: TBatchRec;
+  curVal: TBytes;
+  same: Boolean;
+begin
+  if S = nil then Exit;
+  for i := 0 to S.Order.Count - 1 do
+  begin
+    key := S.Order[i];
+    if not S.Before.TryGetValue(key, b) then Continue;
+    curVal := nil;
+    FEngCs.Enter;
+    try
+      cur.Present := FEng.TryGet(key, curVal);
+    finally
+      FEngCs.Leave;
+    end;
+    cur.Value := curVal;
+    if cur.Present <> b.Present then
+      raise EVdbBackendV3.CreateFmt(
+        'yazma cakismasi: $%.16x baska bir oturum tarafindan degistirildi ' +
+        '(islem geri alindi)', [key]);
+    if not b.Present then Continue;
+    if Length(cur.Value) <> Length(b.Value) then
+      raise EVdbBackendV3.CreateFmt(
+        'yazma cakismasi: $%.16x baska bir oturum tarafindan degistirildi ' +
+        '(islem geri alindi)', [key]);
+    same := True;
+    if Length(b.Value) > 0 then
+      same := CompareMem(@cur.Value[0], @b.Value[0], Length(b.Value));
+    if not same then
+      raise EVdbBackendV3.CreateFmt(
+        'yazma cakismasi: $%.16x baska bir oturum tarafindan degistirildi ' +
+        '(islem geri alindi)', [key]);
+  end;
 end;
 
 procedure TVdbBackendV3.Put(Key: QWord; const Value: TBytes);
@@ -795,56 +968,63 @@ var
 begin
   RequireWritable;
   RequireBatchWrite;
-  if FBatchOpen then
+  if BatchOpen then
   begin
+    { v3.4: cakisma denetimi icin ILK yazimdan onceki motor degeri. }
+    NoteBefore(OwnSet, Key);
     JournalKey(Key);
     rec.Present := True;
     rec.Value := Copy(Value, 0, Length(Value));
-    if not FBatch.ContainsKey(Key) then
-      FOrder.Add(Key);
-    FBatch.AddOrSetValue(Key, rec);
+    if not BatchMap.ContainsKey(Key) then
+      BatchOrder.Add(Key);
+    BatchMap.AddOrSetValue(Key, rec);
     Exit;
   end;
-  { Tek anahtar yolu: once eklemeyi dene (Insert zaten varlik denetimi
-    yapar), yalniz cakismada guncelle. Boylece anahtar basina bir hash
-    aramasi eksilir. }
-  if FEng.Insert(Key, Value) then
-  begin
-    if Length(Value) > 0 then
-      TagAdd(TagOf(@Value[0], Length(Value)), 1);
-    FDirty := True;
-    LogPut(Key, nil, Value);
-    Exit;
-  end;
-  { Anahtar zaten var: etiket DEGISEBILIR (DROP TABLE + ayni PK ile yeniden
-    CREATE -> ayni anahtar, farkli TableId). Eski deger hem etiket hem de
-    degisim gunlugu icin okunur. }
-  oldVal := nil;
-  FEng.TryGet(Key, oldVal);
-  oldTag := -2;
-  if (Length(Value) > 0) and (Length(oldVal) > 0) then
-    oldTag := TagOf(@oldVal[0], Length(oldVal));
-  if not FEng.Update(Key, Value) then
-    raise EVdbBackendV3.Create('ekleme/guncelleme basarisiz');
-  if Length(Value) > 0 then
-  begin
-    newTag := TagOf(@Value[0], Length(Value));
-    if oldTag = -2 then TagAdd(newTag, 1)
-    else if oldTag <> newTag then
+  FEngCs.Enter;
+  try
+    { Tek anahtar yolu: once eklemeyi dene (Insert zaten varlik denetimi
+      yapar), yalniz cakismada guncelle. Boylece anahtar basina bir hash
+      aramasi eksilir. }
+    if FEng.Insert(Key, Value) then
     begin
-      TagAdd(oldTag, -1);
-      TagAdd(newTag, 1);
+      if Length(Value) > 0 then
+        TagAdd(TagOf(@Value[0], Length(Value)), 1);
+      FDirty := True;
+      LogPut(Key, nil, Value);
+      Exit;
     end;
+    { Anahtar zaten var: etiket DEGISEBILIR (DROP TABLE + ayni PK ile yeniden
+      CREATE -> ayni anahtar, farkli TableId). Eski deger hem etiket hem de
+      degisim gunlugu icin okunur. }
+    oldVal := nil;
+    FEng.TryGet(Key, oldVal);
+    oldTag := -2;
+    if (Length(Value) > 0) and (Length(oldVal) > 0) then
+      oldTag := TagOf(@oldVal[0], Length(oldVal));
+    if not FEng.Update(Key, Value) then
+      raise EVdbBackendV3.Create('ekleme/guncelleme basarisiz');
+    if Length(Value) > 0 then
+    begin
+      newTag := TagOf(@Value[0], Length(Value));
+      if oldTag = -2 then TagAdd(newTag, 1)
+      else if oldTag <> newTag then
+      begin
+        TagAdd(oldTag, -1);
+        TagAdd(newTag, 1);
+      end;
+    end;
+    FDirty := True;
+    LogPut(Key, oldVal, Value);
+  finally
+    FEngCs.Leave;
   end;
-  FDirty := True;
-  LogPut(Key, oldVal, Value);
 end;
 
 function TVdbBackendV3.Get(Key: QWord; out Value: TBytes): Boolean;
 var
   rec: TBatchRec;
 begin
-  if BatchIsMine and FBatch.TryGetValue(Key, rec) then
+  if BatchIsMine and BatchMap.TryGetValue(Key, rec) then
   begin
     if rec.Present then
     begin
@@ -854,7 +1034,12 @@ begin
     Value := nil;
     Exit(False);
   end;
-  Result := FEng.TryGet(Key, Value);
+  FEngCs.Enter;
+  try
+    Result := FEng.TryGet(Key, Value);
+  finally
+    FEngCs.Leave;
+  end;
 end;
 
 function TVdbBackendV3.Delete(Key: QWord): Boolean;
@@ -864,43 +1049,54 @@ var
   oldVal: TBytes;
 begin
   RequireBatchWrite;
-  if FBatchOpen then
+  if BatchOpen then
   begin
-    { ONCEDEN: `FBatch.AddOrSetValue(...)`'dan SONRA `FBatch.ContainsKey`
+    { ONCEDEN: `BatchMap.AddOrSetValue(...)`'dan SONRA `BatchMap.ContainsKey`
       soruluyordu; bu her zaman True oldugu icin parti icinde Delete
       HIC OLMAYAN anahtar icin de True donuyordu. Dogru yanit: silmeden
       ONCE var miydi? }
+    NoteBefore(OwnSet, Key);
     JournalKey(Key);
     had := FEng.Contains(Key);
-    if FBatch.ContainsKey(Key) then
-      had := FBatch[Key].Present;
+    if BatchMap.ContainsKey(Key) then
+      had := BatchMap[Key].Present;
     rec.Present := False;
     rec.Value := nil;
-    if not FBatch.ContainsKey(Key) then
-      FOrder.Add(Key);
-    FBatch.AddOrSetValue(Key, rec);
+    if not BatchMap.ContainsKey(Key) then
+      BatchOrder.Add(Key);
+    BatchMap.AddOrSetValue(Key, rec);
     Exit(had);
   end;
-  { v3.1: etiket sayaci icin once eski deger (yalnizca silinen anahtar). }
-  if FEng.TryGet(Key, oldVal) then
-  begin
-    Result := FEng.Delete(Key);
-    if Length(oldVal) > 0 then
-      TagAdd(TagOf(@oldVal[0], Length(oldVal)), -1);
+  FEngCs.Enter;
+  try
+    { v3.1: etiket sayaci icin once eski deger (yalnizca silinen anahtar). }
+    if FEng.TryGet(Key, oldVal) then
+    begin
+      Result := FEng.Delete(Key);
+      if Length(oldVal) > 0 then
+        TagAdd(TagOf(@oldVal[0], Length(oldVal)), -1);
+      if Result then
+        LogDel(Key, oldVal);
+    end
+    else
+      Result := FEng.Delete(Key);
     if Result then
-      LogDel(Key, oldVal);
-  end
-  else
-    Result := FEng.Delete(Key);
-  if Result then
-    FDirty := True;
+      FDirty := True;
+  finally
+    FEngCs.Leave;
+  end;
 end;
 
 function TVdbBackendV3.Exists(Key: QWord): Boolean;
 begin
-  if BatchIsMine and FBatch.ContainsKey(Key) then
-    Exit(FBatch[Key].Present);
-  Result := FEng.Contains(Key);
+  if BatchIsMine and BatchMap.ContainsKey(Key) then
+    Exit(BatchMap[Key].Present);
+  FEngCs.Enter;
+  try
+    Result := FEng.Contains(Key);
+  finally
+    FEngCs.Leave;
+  end;
 end;
 
 function TVdbBackendV3.Count: Integer;
@@ -912,7 +1108,7 @@ end;
 
 procedure TVdbBackendV3.ScanCb(Key: QWord; const Value: TBytes);
 begin
-  if BatchIsMine and FBatch.ContainsKey(Key) then Exit;
+  if BatchIsMine and BatchMap.ContainsKey(Key) then Exit;
   if not PassFilter(Key, Value, FScanFilter) then Exit;
   { v3.1: her satirda SetLength(+1) YAPILMAZ (200k satirda O(n^2) kopya
     ve yeniden tahsis). Kapasite ikiye katlanir. }
@@ -932,40 +1128,49 @@ procedure TVdbBackendV3.ScanAll(out Keys: TQWordArray; out Vals: TValArray;
 var
   pair: TPair<QWord, TBatchRec>;
 begin
-  FScanKeys := nil;
-  FScanVals := nil;
-  FScanN := 0;
-  FScanCap := 0;
-  FScanFilter := TableFilter;
+  { v3.4: tarama tamponlari (FScanKeys/FScanN) BACKEND alanidir; ayni
+    backend'i paylasan oturumlar ayni anda tararsa birbirini bozardi.
+    Kilit tarama boyunca tutulur (geri cagirim ayni is parcacigindadir,
+    kilit yeniden girisli). }
+  FEngCs.Enter;
+  try
+    FScanKeys := nil;
+    FScanVals := nil;
+    FScanN := 0;
+    FScanCap := 0;
+    FScanFilter := TableFilter;
 
-  { Motor tarafi: kaplamada islem gormus anahtarlar atlanir. }
-  FEng.ScanAll(ScanCb);
+    { Motor tarafi: kaplamada islem gormus anahtarlar atlanir. }
+    FEng.ScanAll(ScanCb);
 
-  { Kaplama tarafi: en guncel deger. }
-  if BatchIsMine then
-    for pair in FBatch do
-    begin
-      if not pair.Value.Present then Continue;
-      if not PassFilter(pair.Key, pair.Value.Value, TableFilter) then Continue;
-      if FScanN >= FScanCap then
+    { Kaplama tarafi: en guncel deger. }
+    if BatchIsMine then
+      for pair in BatchMap do
       begin
-        if FScanCap < 256 then FScanCap := 256 else FScanCap := FScanCap * 2;
-        SetLength(FScanKeys, FScanCap);
-        SetLength(FScanVals, FScanCap);
+        if not pair.Value.Present then Continue;
+        if not PassFilter(pair.Key, pair.Value.Value, TableFilter) then Continue;
+        if FScanN >= FScanCap then
+        begin
+          if FScanCap < 256 then FScanCap := 256 else FScanCap := FScanCap * 2;
+          SetLength(FScanKeys, FScanCap);
+          SetLength(FScanVals, FScanCap);
+        end;
+        FScanKeys[FScanN] := pair.Key;
+        FScanVals[FScanN] := Copy(pair.Value.Value, 0, Length(pair.Value.Value));
+        Inc(FScanN);
       end;
-      FScanKeys[FScanN] := pair.Key;
-      FScanVals[FScanN] := Copy(pair.Value.Value, 0, Length(pair.Value.Value));
-      Inc(FScanN);
-    end;
 
-  SetLength(FScanKeys, FScanN);
-  SetLength(FScanVals, FScanN);
-  Keys := FScanKeys;
-  Vals := FScanVals;
-  FScanKeys := nil;
-  FScanVals := nil;
-  FScanN := 0;
-  FScanCap := 0;
+    SetLength(FScanKeys, FScanN);
+    SetLength(FScanVals, FScanN);
+    Keys := FScanKeys;
+    Vals := FScanVals;
+    FScanKeys := nil;
+    FScanVals := nil;
+    FScanN := 0;
+    FScanCap := 0;
+  finally
+    FEngCs.Leave;
+  end;
 end;
 
 procedure TVdbBackendV3.AsOfCb(Key: QWord; const Value: TBytes);
@@ -1114,7 +1319,7 @@ var
   tag, n: Integer;
 begin
   if FStreamAbort then Exit;
-  if BatchIsMine and FBatch.ContainsKey(Key) then Exit;
+  if BatchIsMine and BatchMap.ContainsKey(Key) then Exit;
   { PassFilter'in sifir-kopya esdegeri: satir etiketi degerin ILK baytlarindan
     cikar; 8 baytlik sabit tampona kopyalanir (satir basina tahsis YOK). }
   if (FStreamFilter >= 0) and Assigned(FRowTag) then
@@ -1145,23 +1350,30 @@ begin
   FStreamUser := User;
   FStreamAbort := False;
   FStreamFilter := TableFilter;
-  if Length(FStreamTagBuf) < 8 then SetLength(FStreamTagBuf, 8);
-  FEng.ScanAllRaw(StreamCbRaw);
-  if FStreamAbort then Exit(False);
+  { v3.4: akitma durumu BACKEND alanidir; ayni backend'i paylasan oturumlar
+    ayni anda tararsa birbirini bozardi -> tarama boyunca kilit. }
+  FEngCs.Enter;
+  try
+    if Length(FStreamTagBuf) < 8 then SetLength(FStreamTagBuf, 8);
+    FEng.ScanAllRaw(StreamCbRaw);
+    if FStreamAbort then Exit(False);
 
-  if FBatchOpen then
-    for pair in FBatch do
-    begin
-      if not pair.Value.Present then Continue;
-      if not PassFilter(pair.Key, pair.Value.Value, TableFilter) then Continue;
-      n := Length(pair.Value.Value);
-      if n > 0 then
+    if BatchOpen then
+      for pair in BatchMap do
       begin
-        if not Cb(pair.Key, @pair.Value.Value[0], n, User) then Exit(False);
-      end
-      else if not Cb(pair.Key, nil, 0, User) then Exit(False);
-    end;
-  Result := True;
+        if not pair.Value.Present then Continue;
+        if not PassFilter(pair.Key, pair.Value.Value, TableFilter) then Continue;
+        n := Length(pair.Value.Value);
+        if n > 0 then
+        begin
+          if not Cb(pair.Key, @pair.Value.Value[0], n, User) then Exit(False);
+        end
+        else if not Cb(pair.Key, nil, 0, User) then Exit(False);
+      end;
+    Result := True;
+  finally
+    FEngCs.Leave;
+  end;
 end;
 
 { ------------------------------------------------- v3.3: sayfa zone map }
@@ -1172,7 +1384,7 @@ var
   tag, n: Integer;
 begin
   if FStreamAbort then Exit;
-  if BatchIsMine and FBatch.ContainsKey(Key) then Exit;
+  if BatchIsMine and BatchMap.ContainsKey(Key) then Exit;
   if (FStreamFilter >= 0) and Assigned(FRowTag) then
   begin
     n := Len;
@@ -1191,14 +1403,19 @@ function TVdbBackendV3.ScanRawIterAllPaged(TableFilter: Integer;
 begin
   { Toplu yazim acikken bekleyen kayitlarin sayfasi YOKTUR ve harita da
     guvenilmez; cagiran tam taramaya duser. }
-  if FBatchOpen then Exit(False);
+  if BatchOpen then Exit(False);
   FStreamPageCb := Cb;
   FStreamPageUser := User;
   FStreamAbort := False;
   FStreamFilter := TableFilter;
-  if Length(FStreamTagBuf) < 8 then SetLength(FStreamTagBuf, 8);
-  FEng.ScanAllRawPaged(StreamCbRawPaged, Skip, SkipCount);
-  Result := not FStreamAbort;
+  FEngCs.Enter;
+  try
+    if Length(FStreamTagBuf) < 8 then SetLength(FStreamTagBuf, 8);
+    FEng.ScanAllRawPaged(StreamCbRawPaged, Skip, SkipCount);
+    Result := not FStreamAbort;
+  finally
+    FEngCs.Leave;
+  end;
 end;
 
 function TVdbBackendV3.DataStamp: QWord;
@@ -1234,10 +1451,10 @@ begin
   if Delta = 0 then Exit;
   { Sayac henuz kurulmadiysa yazma yolu haritayi KIRLETMEZ. }
   if not FTagCountsValid then Exit;
-  if FBatchOpen then
+  if BatchOpen then
   begin
-    if not FBatchTagDelta.TryGetValue(Tag, cur) then cur := 0;
-    FBatchTagDelta.AddOrSetValue(Tag, cur + Delta);
+    if not BatchTagDelta.TryGetValue(Tag, cur) then cur := 0;
+    BatchTagDelta.AddOrSetValue(Tag, cur + Delta);
     Exit;
   end;
   if not FTagCounts.TryGetValue(Tag, cur) then cur := 0;
@@ -1313,92 +1530,117 @@ var
   pair: TPair<Integer, Int64>;
   cur: Int64;
 begin
-  if FBatchTagDelta.Count = 0 then Exit;
+  if (BatchTagDelta = nil) or (BatchTagDelta.Count = 0) then Exit;
   if not FTagCountsValid then
   begin
-    FBatchTagDelta.Clear;
+    BatchTagDelta.Clear;
     Exit;
   end;
-  for pair in FBatchTagDelta do
+  for pair in BatchTagDelta do
   begin
     if not FTagCounts.TryGetValue(pair.Key, cur) then cur := 0;
     cur := cur + pair.Value;
     if cur <= 0 then FTagCounts.Remove(pair.Key)
     else FTagCounts.AddOrSetValue(pair.Key, cur);
   end;
-  FBatchTagDelta.Clear;
+  BatchTagDelta.Clear;
 end;
 
 function TVdbBackendV3.CountTable(TableFilter: Integer): Int64;
 var
   cur: Int64;
 begin
+  Result := -1;
   { Acik kaplama varsa bekleyen degisiklikler sayaca YANSIMAZ; cagiran
     (yurutucu) bu durumda tam tarama yapar. }
-  if BatchIsMine then Exit(-1);
-  if TableFilter < 0 then Exit(FEng.Count);
-  if not Assigned(FRowTag) then Exit(-1);
-  { Sayac .idx ozetinden geldiyse burada tarama YOK; yoksa bir kez kurulur. }
-  if not FTagCountsValid then
-    RebuildTagCounts;
-  if not FTagCountsValid then Exit(-1);
-  if FTagCounts.TryGetValue(TableFilter, cur) then Result := cur
-  else Result := 0;
+  if BatchIsMine then Exit;
+  FEngCs.Enter;
+  try
+    if TableFilter < 0 then Exit(FEng.Count);
+    if not Assigned(FRowTag) then Exit;
+    { Sayac .idx ozetinden geldiyse burada tarama YOK; yoksa bir kez kurulur. }
+    if not FTagCountsValid then
+      RebuildTagCounts;
+    if not FTagCountsValid then Exit;
+    if FTagCounts.TryGetValue(TableFilter, cur) then Result := cur
+    else Result := 0;
+  finally
+    FEngCs.Leave;
+  end;
 end;
 
 { ------------------------------------------------------------------ islem }
 
 procedure TVdbBackendV3.BeginBatch;
+var
+  s: TWriteSet;
+  sid: Cardinal;
 begin
   RequireWritable;
-  RequireBatchWrite;       // v3.2: baskasi acik parti tutuyorsa reddet
-  if FBatchOpen then Exit;
-  ClearSavepoints;
-  FBatch.Clear;
-  FOrder.Clear;
-  FBatchOpen := True;
-  FWriteSession := VdbBackendSessionId;
-end;
-
-procedure TVdbBackendV3.CommitBatch;
-begin
-  RequireBatchWrite;
-  if not FBatchOpen then Exit;
-  if Assigned(FBeforeCommit) then
-    FBeforeCommit;          // kisit denetimi: hata firlatirsa kaplama durur
-  ApplyBatch;
-  FBatchOpen := False;
-  FWriteSession := 0;
-  ClearSavepoints;
-  { v3.1: parti ici etiket degisimleri simdi sayaca islenir. }
-  MergeTagDeltas;
-  FBatch.Clear;
-  FOrder.Clear;
-  if FDirty then
-  begin
-    FEng.Commit(True);
-    FDirty := False;
-    LogFinish;
-    MaybeCheckpoint;
-    MaybeAutoCompact;     // v3.2 (H25)
+  sid := VdbBackendSessionId;
+  FEngCs.Enter;
+  try
+    if FSets.TryGetValue(sid, s) then Exit;   // zaten acik
+    s := TWriteSet.Create(sid);
+    FSets.AddOrSetValue(sid, s);
+  finally
+    FEngCs.Leave;
   end;
 end;
 
-procedure TVdbBackendV3.AbortBatch;
+procedure TVdbBackendV3.CommitBatch;
+var
+  s: TWriteSet;
 begin
-  RequireBatchWrite;
-  LogAbort;               // yarim islem gunluge SIZMAZ
-  ClearSavepoints;
-  FBatch.Clear;
-  FOrder.Clear;
-  FBatchTagDelta.Clear;
-  FBatchOpen := False;
-  FWriteSession := 0;
+  RequireWritable;
+  s := OwnSet;
+  if s = nil then Exit;
+  FEngCs.Enter;
+  try
+    if Assigned(FBeforeCommit) then
+      FBeforeCommit;        // kisit denetimi: hata firlatirsa kaplama durur
+    { v3.4: cakisma denetimi UYGULAMADAN ONCE yapilir: yarim uygulama yok. }
+    VerifyNoConflict(s);
+    ApplyBatch;
+    { v3.1: parti ici etiket degisimleri simdi sayaca islenir. }
+    MergeTagDeltas;
+    { v3.4: yazma kumesi commit ile KAPANIR (eski kodda BatchOpen:=False
+      bu noktadaydi; otomatik sikistirma acik parti gormemeli). }
+    FSets.Remove(s.Session);
+    if FDirty then
+    begin
+      FEng.Commit(True);
+      FDirty := False;
+      LogFinish;
+      MaybeCheckpoint;
+      MaybeAutoCompact;     // v3.2 (H25)
+    end;
+  finally
+    FEngCs.Leave;
+  end;
+  s.Free;
+end;
+
+procedure TVdbBackendV3.AbortBatch;
+var
+  s: TWriteSet;
+begin
+  RequireWritable;
+  s := OwnSet;
+  if s = nil then Exit;
+  FEngCs.Enter;
+  try
+    LogAbort;               // yarim islem gunluge SIZMAZ
+    FSets.Remove(s.Session);
+  finally
+    FEngCs.Leave;
+  end;
+  s.Free;
 end;
 
 procedure TVdbBackendV3.Flush;
 begin
-  if FBatchOpen then Exit;
+  if BatchOpen then Exit;
   { P-DUR sozlesmesi yalniz DAYANIKLILIK ister: commit WAL'e yazilip fsync
     edilir. 2026-10-25 (Sprint 3.12): ONCEDEN burada tam `Checkpoint` de
     yapiliyordu; SQL katmani her autocommit yazimdan sonra Flush cagirdigi
@@ -1409,17 +1651,40 @@ begin
     yapilir; veri dosyasi motor acikken bayat olabilir, dogru kaynak WAL'dir. }
   if FDirty then
   begin
-    FEng.Commit(True);
-    FDirty := False;
-    LogFinish;
-    MaybeCheckpoint;
-    MaybeAutoCompact;     // v3.2 (H25): autocommit yolu
+    FEngCs.Enter;
+    try
+      if FDirty then
+      begin
+        FEng.Commit(True);
+        FDirty := False;
+        LogFinish;
+        MaybeCheckpoint;
+        MaybeAutoCompact;     // v3.2 (H25): autocommit yolu
+      end;
+    finally
+      FEngCs.Leave;
+    end;
   end;
 end;
 
 function TVdbBackendV3.GetInBatch: Boolean;
 begin
-  Result := FBatchOpen;
+  Result := BatchOpen;
+end;
+
+function TVdbBackendV3.SoleWriter: Boolean;
+begin
+  { v3.4: sema (FTables/FSchemaDirty) ve savepoint yiginlari TVTableDb'de
+    GLOBALDIR. Bu yuzden DDL / SAVEPOINT yalnizca tek yazma islemi varken
+    yapilir; coklu yazmada bunlar ACIK hatayla reddedilir (sessiz karisiklik
+    yerine). }
+  if FSets = nil then Exit(True);
+  FEngCs.Enter;
+  try
+    Result := FSets.Count <= 1;
+  finally
+    FEngCs.Leave;
+  end;
 end;
 
 { --------------------------------------------------- v3.2: SAVEPOINT }
@@ -1429,8 +1694,9 @@ var
   i: Integer;
 begin
   Result := -1;
-  for i := FSavepoints.Count - 1 downto 0 do
-    if SameText(FSavepoints[i].Name, Name) then
+  if Savepoints = nil then Exit;
+  for i := Savepoints.Count - 1 downto 0 do
+    if SameText(Savepoints[i].Name, Name) then
       Exit(i);
 end;
 
@@ -1439,14 +1705,14 @@ var
   i: Integer;
   sp: TSavepointRec;
 begin
-  if FSavepoints = nil then Exit;
-  for i := 0 to FSavepoints.Count - 1 do
+  if Savepoints = nil then Exit;
+  for i := 0 to Savepoints.Count - 1 do
   begin
-    sp := FSavepoints[i];
+    sp := Savepoints[i];
     sp.Journal.Free;
     sp.TagDelta.Free;
   end;
-  FSavepoints.Clear;
+  Savepoints.Clear;
 end;
 
 { Key ilk kez (bu savepoint'ten sonra) degistirilmeden ONCE cagrilir:
@@ -1458,12 +1724,12 @@ var
   sp: TSavepointRec;
   je: TSavepointKeyRec;
 begin
-  if (FSavepoints = nil) or (FSavepoints.Count = 0) then Exit;
-  for i := 0 to FSavepoints.Count - 1 do
+  if (Savepoints = nil) or (Savepoints.Count = 0) then Exit;
+  for i := 0 to Savepoints.Count - 1 do
   begin
-    sp := FSavepoints[i];
+    sp := Savepoints[i];
     if sp.Journal.ContainsKey(Key) then Continue;
-    je.HadBefore := FBatch.TryGetValue(Key, je.Rec);
+    je.HadBefore := BatchMap.TryGetValue(Key, je.Rec);
     if not je.HadBefore then
     begin
       je.Rec.Present := False;
@@ -1482,53 +1748,60 @@ begin
   if FindSavepoint(Name) >= 0 then
     raise EVdbBackendV3.CreateFmt('savepoint zaten var: %s', [Name]);
   { SQL standardi: SAVEPOINT acik islem yoksa ORTUK islem baslatir. }
-  if not FBatchOpen then BeginBatch;
+  if not BatchOpen then BeginBatch;
   sp.Name := Name;
-  sp.OrderLen := FOrder.Count;
+  sp.OrderLen := BatchOrder.Count;
   sp.Journal := TDictionary<QWord, TSavepointKeyRec>.Create;
   sp.TagDelta := TDictionary<Integer, Int64>.Create;
-  for pair in FBatchTagDelta do
+  for pair in BatchTagDelta do
     sp.TagDelta.AddOrSetValue(pair.Key, pair.Value);
-  FSavepoints.Add(sp);
+  Savepoints.Add(sp);
 end;
 
 function TVdbBackendV3.RollbackToSavepoint(const Name: string): Boolean;
 var
   ix, i: Integer;
   sp: TSavepointRec;
+  st: TWriteSet;
   pair: TPair<QWord, TSavepointKeyRec>;
   tp: TPair<Integer, Int64>;
 begin
   RequireBatchWrite;
   ix := FindSavepoint(Name);
   if ix < 0 then Exit(False);
-  sp := FSavepoints[ix];
+  sp := Savepoints[ix];
+  st := OwnSet;
   { 1) Savepoint'ten sonra degisen anahtarlari o andaki haline dondur.
-    HadBefore=False olanlar FBatch'te hic yoktu -> kaydi da silinir. }
+    HadBefore=False olanlar BatchMap'te hic yoktu -> kaydi da silinir ve
+    cakisma denetimindeki "onceki deger" kaydi da unutulur (aksi halde
+    artik yazmadigim bir anahtar icin bosuna cakisma gorunurdu). }
   for pair in sp.Journal do
   begin
     if pair.Value.HadBefore then
-      FBatch.AddOrSetValue(pair.Key, pair.Value.Rec)
+      BatchMap.AddOrSetValue(pair.Key, pair.Value.Rec)
     else
-      FBatch.Remove(pair.Key);
+    begin
+      BatchMap.Remove(pair.Key);
+      if st <> nil then st.Before.Remove(pair.Key);
+    end;
   end;
-  { 2) FOrder'i savepoint uzunluguna kirp. Girisler yalnizca "FBatch'te
+  { 2) BatchOrder'i savepoint uzunluguna kirp. Girisler yalnizca "BatchMap'te
     yokken" eklendigi ve savepoint disinda silinmedigi icin kirpma tam
     olarak sonradan eklenen girisleri atar. }
-  while FOrder.Count > sp.OrderLen do
-    FOrder.Delete(FOrder.Count - 1);
+  while BatchOrder.Count > sp.OrderLen do
+    BatchOrder.Delete(BatchOrder.Count - 1);
   { 3) Etiket deltalari da savepoint haline doner. }
-  FBatchTagDelta.Clear;
+  BatchTagDelta.Clear;
   for tp in sp.TagDelta do
-    FBatchTagDelta.AddOrSetValue(tp.Key, tp.Value);
+    BatchTagDelta.AddOrSetValue(tp.Key, tp.Value);
   { 4) SONRAKI savepoint'ler atilir; HEDEF kalir (SQLite davranisi:
     ayni noktaya tekrar donulebilir ve RELEASE edilebilir). }
-  for i := FSavepoints.Count - 1 downto ix + 1 do
+  for i := Savepoints.Count - 1 downto ix + 1 do
   begin
-    sp := FSavepoints[i];
+    sp := Savepoints[i];
     sp.Journal.Free;
     sp.TagDelta.Free;
-    FSavepoints.Delete(i);
+    Savepoints.Delete(i);
   end;
   Result := True;
 end;
@@ -1543,12 +1816,12 @@ begin
   if ix < 0 then Exit(False);
   { RELEASE veriyi COMMIT ETMEZ; yalnizca geri donme noktasini (ve
     sonrakileri) dusurur. }
-  for i := FSavepoints.Count - 1 downto ix do
+  for i := Savepoints.Count - 1 downto ix do
   begin
-    sp := FSavepoints[i];
+    sp := Savepoints[i];
     sp.Journal.Free;
     sp.TagDelta.Free;
-    FSavepoints.Delete(i);
+    Savepoints.Delete(i);
   end;
   Result := True;
 end;
@@ -1631,7 +1904,7 @@ end;
 
 function TVdbBackendV3.GetDirty: Boolean;
 begin
-  Result := FDirty or (FBatchOpen and (FBatch.Count > 0));
+  Result := FDirty or (BatchOpen and (BatchMap.Count > 0));
 end;
 
 procedure TVdbBackendV3.WaitForeignTxn(ASessionId: Cardinal);
@@ -1654,28 +1927,38 @@ function TVdbBackendV3.Verify(out Report: string): Boolean;
 begin
   { Acik partideki degisiklikler henuz durabil degil; denetim yalnizca
     onaylanmis durumu kapsar. Sessizce commit etmek yerine acikca reddet. }
-  if FBatchOpen then
+  if BatchOpen then
   begin
     Report := 'acik parti varken VERIFY yapilamaz (once COMMIT/ROLLBACK)';
     Exit(False);
   end;
-  Result := FEng.Verify(Report);
+  FEngCs.Enter;
+  try
+    Result := FEng.Verify(Report);
+  finally
+    FEngCs.Leave;
+  end;
 end;
 
 procedure TVdbBackendV3.BackupTo(const DestPath: string);
 begin
-  if FBatchOpen then
+  if BatchOpen then
     raise EVdbBackendV3.Create('acik parti varken yedek alinamaz (once COMMIT/ROLLBACK)');
   { Bellekte commit edilmemis degisiklik varsa once durabil hale getir. }
-  if FDirty then
-  begin
-    FEng.Commit(True);
-    FDirty := False;
-    LogFinish;
+  FEngCs.Enter;
+  try
+    if FDirty then
+    begin
+      FEng.Commit(True);
+      FDirty := False;
+      LogFinish;
+    end;
+    { Checkpoint dosyayi tamamlar ve WAL'i budar: kopya kendi kendine yeter. }
+    FEng.Checkpoint(True);
+    FEng.Store.CopyCommittedTo(DestPath);
+  finally
+    FEngCs.Leave;
   end;
-  { Checkpoint dosyayi tamamlar ve WAL'i budar: kopya kendi kendine yeter. }
-  FEng.Checkpoint(True);
-  FEng.Store.CopyCommittedTo(DestPath);
 end;
 
 procedure TVdbBackendV3.RestoreFrom(const SrcPath: string);
@@ -1687,7 +1970,7 @@ var
   i: Integer;
 begin
   RequireWritable;
-  if FBatchOpen then
+  if BatchOpen then
     raise EVdbBackendV3.Create('acik parti varken geri yukleme yapilamaz');
   if not FileExists(SrcPath) then
     raise EVdbBackendV3.Create('RESTORE: yedek dosyasi bulunamadi: ' + SrcPath);
@@ -1724,30 +2007,35 @@ begin
       'RESTORE: kaynak sifresiz, hedef sifreli');
 
   { Calisan durumu diske indir; sonra motoru kapat. }
-  if FDirty then
-  begin
-    FEng.Commit(True);
-    FDirty := False;
-    LogFinish;
-  end;
-  FEng.Checkpoint(True);
-
-  tmp := FPath + '.restore.tmp';
-  if FileExists(tmp) then DeleteFile(tmp);
-  src := TFileStream.Create(SrcPath, fmOpenRead or fmShareDenyNone);
+  FEngCs.Enter;
   try
-    dst := TFileStream.Create(tmp, fmCreate);
-    try
-      dst.CopyFrom(src, 0);
-      VDbFlushStream(dst);
-    finally
-      dst.Free;
+    if FDirty then
+    begin
+      FEng.Commit(True);
+      FDirty := False;
+      LogFinish;
     end;
-  finally
-    src.Free;
-  end;
+    FEng.Checkpoint(True);
 
-  SwapDbFile(tmp);
+    tmp := FPath + '.restore.tmp';
+    if FileExists(tmp) then DeleteFile(tmp);
+    src := TFileStream.Create(SrcPath, fmOpenRead or fmShareDenyNone);
+    try
+      dst := TFileStream.Create(tmp, fmCreate);
+      try
+        dst.CopyFrom(src, 0);
+        VDbFlushStream(dst);
+      finally
+        dst.Free;
+      end;
+    finally
+      src.Free;
+    end;
+
+    SwapDbFile(tmp);
+  finally
+    FEngCs.Leave;
+  end;
   { v4: RESTORE dosya icerigini BASTAN yazar: nesil kopmasi. Bu andan
     onceki zamanlar icin PITR reddedilir; sonrasi tam calisir. }
   EnsureLogBase(1, 'RESTORE');
@@ -1768,8 +2056,10 @@ var
   tagsWere: Boolean;
 begin
   RequireWritable;
-  if FBatchOpen then
+  if BatchOpen then
     raise EVdbBackendV3.Create('acik parti varken VACUUM yapilamaz');
+  FEngCs.Enter;
+  try
   if FDirty then
   begin
     FEng.Commit(True);
@@ -1821,6 +2111,9 @@ begin
   { v4: VACUUM mantiksal icerigi KORUR (yukarida sayi dogrulandi); ayni
     nesil icinde yeni bir checkpoint tabani yazilir, PITR zinciri kopmaz. }
   EnsureLogBase(0, 'VACUUM');
+  finally
+    FEngCs.Leave;
+  end;
 end;
 
 procedure TVdbBackendV3.Rekey(const NewPassword: string);
@@ -1831,8 +2124,10 @@ var
   tagsWere: Boolean;
 begin
   RequireWritable;
-  if FBatchOpen then
+  if BatchOpen then
     raise EVdbBackendV3.Create('acik parti varken ALTER DATABASE KEY yapilamaz');
+  FEngCs.Enter;
+  try
   if not FEng.Store.Encrypted then
     raise EVdbBackendV3.Create(
       'dosya sifresiz: ALTER DATABASE KEY icin once sifreli dosya gerekir');
@@ -1887,6 +2182,9 @@ begin
   { v4: ALTER KEY yalniz sifreleme bicimini degistirir; mantiksal icerik
     ayni -> ayni nesilde yeni taban. }
   EnsureLogBase(0, 'ALTER DATABASE KEY');
+  finally
+    FEngCs.Leave;
+  end;
 end;
 
 { --- v3.2: yonetim / otomatik sikistirma (H25 esdegeri) --- }
@@ -1963,7 +2261,7 @@ begin
   OldBytes := 0;
   NewBytes := 0;
   if FEng = nil then Exit;
-  if FBatchOpen then Exit;      // parti icinde VACUUM olmaz (veri kaplamada)
+  if BatchOpen then Exit;      // parti icinde VACUUM olmaz (veri kaplamada)
   sz := ValBytes;
   if sz <= 0 then Exit;
   if sz < MinBytes then Exit;
@@ -1988,7 +2286,7 @@ var
   o, n: Int64;
 begin
   if (not FAutoCompactOn) or FAutoCompactBusy then Exit;
-  if FBatchOpen or (FEng = nil) then Exit;
+  if BatchOpen or (FEng = nil) then Exit;
   if GetDeadBytes <= 0 then Exit;
   if ValBytes < FAutoCompactMinBytes then Exit;
   if (Double(GetDeadBytes) / Double(ValBytes)) < FAutoCompactRatio then Exit;
@@ -2486,7 +2784,7 @@ begin
     if AErr = '' then AErr := 'degisim gunlugu kapali';
     Exit;
   end;
-  if FBatchOpen then
+  if BatchOpen then
   begin
     AErr := 'acik parti varken replika grubu eklenemez';
     Exit;

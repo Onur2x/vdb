@@ -2273,6 +2273,183 @@ begin
   end;
 end;
 
+procedure TestMultiSession;
+var
+  S: TV3Sql;
+  Sq2: TVSql;
+  r: TSqlResult;
+  function Exec2(const Sql: string): TSqlResult;
+  begin
+    gErr := False;
+    try
+      Result := Sq2.Exec(Sql);
+    except
+      on E: Exception do
+      begin
+        gErr := True;
+        Result.Fields := nil;
+        Result.Rows := nil;
+        Result.Affected := 0;
+        Result.Stmts := 0;
+        Result.Msg := E.ClassName + ': ' + E.Message;
+      end;
+    end;
+  end;
+  function One(const R: TSqlResult): string;
+  begin
+    Result := Cel(R, 0, 0);
+  end;
+  procedure Chk(const Cond: Boolean; const S1, S2: string);
+  begin
+    if Cond then Ok(S1) else Fail(S1 + ' | ' + S2);
+  end;
+var
+  k: QWord;
+  caught: Boolean;
+  msg: string;
+  cntA, cntB: string;
+begin
+  WriteLn;
+  WriteLn('v3.4 - cok oturumlu yazma: ozel yazma kumesi + cakisma denetimi');
+  CleanDir;
+  OpenV3(S, 'ms.odb', True);
+  Sq2 := TVSql.Create(S.Tb);
+  try
+    r := Exec(S, 'CREATE TABLE m (id INTEGER PRIMARY KEY, v INTEGER)');
+    if gErr then
+    begin
+      Fail('ms: CREATE: ' + r.Msg);
+      Exit;
+    end;
+    r := Exec(S, 'INSERT INTO m VALUES (1, 10), (2, 20)');
+    if gErr then
+    begin
+      Fail('ms: INSERT taban: ' + r.Msg);
+      Exit;
+    end;
+
+    { 1) IKI oturum AYNI ANDA yazma islemi acabilir (eski surumde ikincisi
+         "baska bir oturumun acik islemi var" hatasi aliyordu). }
+    r := Exec(S, 'BEGIN');
+    Chk(not gErr, 'ms: A BEGIN', r.Msg);
+    r := Exec(S, 'INSERT INTO m VALUES (3, 30)');
+    Chk(not gErr, 'ms: A INSERT (3,30)', r.Msg);
+
+    r := Exec2('BEGIN');
+    Chk(not gErr, 'ms: B BEGIN (A acikken)', r.Msg);
+    r := Exec2('INSERT INTO m VALUES (4, 40)');
+    Chk(not gErr, 'ms: B INSERT (4,40)', r.Msg);
+
+    { 2) Her oturum YALNIZ kendi yazisini + onaylanmis veriyi gorur. }
+    r := Exec(S, 'SELECT COUNT(*) FROM m');
+    cntA := One(r);
+    Chk((not gErr) and (cntA = '3'), 'ms: A 3 satir gorur (2 taban + kendi)',
+      cntA + ' ' + r.Msg);
+    r := Exec2('SELECT COUNT(*) FROM m');
+    cntB := One(r);
+    Chk((not gErr) and (cntB = '3'), 'ms: B 3 satir gorur (2 taban + kendi)',
+      cntB + ' ' + r.Msg);
+
+    r := Exec(S, 'SELECT COUNT(*) FROM m WHERE id = 3');
+    Chk((not gErr) and (One(r) = '1'), 'ms: A kendi satirini gorur', One(r));
+    r := Exec2('SELECT COUNT(*) FROM m WHERE id = 3');
+    Chk((not gErr) and (One(r) = '0'), 'ms: B A''nin commit edilmemis satirini GORMEZ',
+      One(r) + ' ' + r.Msg);
+    r := Exec2('SELECT COUNT(*) FROM m WHERE id = 4');
+    Chk((not gErr) and (One(r) = '1'), 'ms: B kendi satirini gorur', One(r));
+    r := Exec(S, 'SELECT COUNT(*) FROM m WHERE id = 4');
+    Chk((not gErr) and (One(r) = '0'), 'ms: A B''nin commit edilmemis satirini GORMEZ',
+      One(r) + ' ' + r.Msg);
+
+    { 3) A commit eder: B bunu READ COMMITTED olarak gorur, kendi yazisi durur. }
+    r := Exec(S, 'COMMIT');
+    Chk(not gErr, 'ms: A COMMIT', r.Msg);
+    r := Exec2('SELECT COUNT(*) FROM m');
+    Chk((not gErr) and (One(r) = '4'), 'ms: B A commit''inden sonra 4 satir gorur',
+      One(r) + ' ' + r.Msg);
+    r := Exec2('SELECT COUNT(*) FROM m WHERE id = 3');
+    Chk((not gErr) and (One(r) = '1'), 'ms: B A''nin commit edilmis satirini okur', One(r));
+    r := Exec2('COMMIT');
+    Chk(not gErr, 'ms: B COMMIT', r.Msg);
+    r := Exec(S, 'SELECT COUNT(*) FROM m');
+    Chk((not gErr) and (One(r) = '4'), 'ms: iki commit sonrasi 4 satir', One(r));
+
+    { 4) Ayni satiri iki oturum guncellerse KAYIP GUNCELLEME olmaz: ilk
+         commit gecer, ikincisi commit ANINDA "yazma cakismasi" ile durur. }
+    r := Exec(S, 'BEGIN');
+    Chk(not gErr, 'ms: A BEGIN (cakisma)', r.Msg);
+    r := Exec(S, 'UPDATE m SET v = 11 WHERE id = 1');
+    Chk(not gErr, 'ms: A id=1 -> 11', r.Msg);
+    r := Exec2('BEGIN');
+    Chk(not gErr, 'ms: B BEGIN (cakisma)', r.Msg);
+    r := Exec2('UPDATE m SET v = 99 WHERE id = 1');
+    Chk(not gErr, 'ms: B kendi kumesinde id=1 -> 99', r.Msg);
+    r := Exec(S, 'COMMIT');
+    Chk(not gErr, 'ms: A COMMIT gecti (ilk commit kazanir)', r.Msg);
+    r := Exec2('COMMIT');
+    Chk(gErr, 'ms: B COMMIT kayip guncelleme nedeniyle DURDU',
+      'beklenen hata, gelen: ' + r.Msg);
+    r := Exec2('ROLLBACK');
+    Chk(not gErr, 'ms: B cakisma sonrasi ROLLBACK temiz', r.Msg);
+    r := Exec(S, 'SELECT v FROM m WHERE id = 1');
+    Chk((not gErr) and (One(r) = '11'), 'ms: id=1 degeri 11 (B''nin 99''u yazilmadi)',
+      One(r) + ' ' + r.Msg);
+
+    { 5) DDL coklu yazmada ACIKCA reddedilir (global sema durumu korunur). }
+    r := Exec(S, 'BEGIN');
+    Chk(not gErr, 'ms: A BEGIN (DDL)', r.Msg);
+    r := Exec2('BEGIN');
+    Chk(not gErr, 'ms: B BEGIN (DDL)', r.Msg);
+    r := Exec2('CREATE TABLE ikinci (id INTEGER PRIMARY KEY)');
+    Chk(gErr, 'ms: B coklu yazmada DDL reddedildi', 'beklenen hata, gelen: ' + r.Msg);
+    r := Exec2('ROLLBACK');
+    r := Exec(S, 'ROLLBACK');
+    Chk(not gErr, 'ms: DDL denemesinden sonra iki ROLLBACK temiz', r.Msg);
+
+    { 6) MOTOR duzeyi kayip-guncelleme denetimi: satir kilidi devrede
+         olmasa bile (dogrudan KV yazimi) ikinci commit DURUR. }
+    r := Exec(S, 'INSERT INTO m VALUES (9, 90)');
+    Chk(not gErr, 'ms: kilit testi icin id=9 eklendi', r.Msg);
+    k := VDbHashKey('m', '9');
+    VDbSetTxnSession(1001);
+    S.Be.BeginBatch;
+    S.Be.Delete(k);
+    VDbSetTxnSession(1002);
+    S.Be.BeginBatch;
+    S.Be.Delete(k);
+    VDbSetTxnSession(1002);
+    caught := False;
+    msg := '';
+    S.Be.CommitBatch;               // ilk commit gecer
+    try
+      VDbSetTxnSession(1001);
+      S.Be.CommitBatch;             // ikinci commit cakisma gormeli
+    except
+      on E: Exception do
+      begin
+        caught := True;
+        msg := E.Message;
+      end;
+    end;
+    Chk(caught, 'ms: ikinci commit yazma cakismasi ile DURDU', msg);
+    VDbSetTxnSession(1001);
+    S.Be.AbortBatch;
+    VDbSetTxnSession(0);
+
+    { 7) Son durum tutarli: id=9 silindi, digerleri yerinde. }
+    r := Exec(S, 'SELECT COUNT(*) FROM m');
+    Chk((not gErr) and (One(r) = '4'), 'ms: son satir sayisi 4 (id=9 silindi)', One(r));
+    r := Exec(S, 'SELECT v FROM m WHERE id = 1');
+    Chk((not gErr) and (One(r) = '11'), 'ms: son deger tutarli', One(r));
+    r := Exec(S, 'VERIFY');
+    Chk((not gErr) and (r.Affected = 1), 'ms: VERIFY temiz', r.Msg);
+  finally
+    VDbSetTxnSession(0);
+    Sq2.Free;
+    CloseV3(S);
+  end;
+end;
+
 { ================================================================== ana }
 
 var
@@ -2306,6 +2483,7 @@ begin
   TestZoneMapFallback;
   TestRowIntVarint;
   TestPageZoneMap;
+  TestMultiSession;
   TestFuzzOracle;
   TestIntegrity(N);
 

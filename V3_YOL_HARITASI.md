@@ -408,7 +408,7 @@ bilinçli olarak yok):
 | Salt-okunur oturum | `VdbOpenReadOnly` / `TVdbBackendV3.CreateReadOnly`: **hiç yazmaz**. `IsReadOnly=True`; `Put/BeginBatch/CommitBatch/Compact/RestoreFrom/Rekey` açık hata verir. `<db>.log` **açılmaz** (okuyucu günlük dizini oluşturmaz). |
 | WAL ve okuyucu | `TVDbPageWal.Open(AReadOnly)` dosyayı `fmOpenRead` açar, **yaratmaz**. Onaylanmış çerçeveler `InstallReadOnlyPage` ile **bellek katmanına** alınır (`FRoPages`); `LoadFrame` önce bu katmana bakar. Checkpoint/truncate yok. |
 | Çökme sonrası okuma | Salt-okunur oturum, WAL'de duran onaylanmış çerçeveleri disk belleğine yazmadan uygular: `.odb` ve `.wal` **bayt bayt değişmez** (kapıda ölçülür). |
-| Çok yazarlı | Hâlâ **tek yazıcı**. Çok yazarlı MVCC ayrı (son) dilimdir. |
+| Çok yazarlı | **Süreç içi** çok oturum yazabilir (v3.4: READ COMMITTED, ilk commit kazanır, çakışan commit `yazma cakismasi` ile durur). **Süreçler arası** hâlâ tek yazıcı: dosya kilidi ikinci süreci reddeder. |
 
 Kapı — `lockchk` (14): gerçek **çocuk süreçler** (kendini farklı argümanlarla
 çalıştırır), yani kilit gerçek işletim sistemi kilididir.
@@ -509,16 +509,58 @@ tam tarama bedelini öder. Geniş yüklemlerde satır üretimi baskın olduğu i
 Kapı: `v3sqlchk` **196/0** (`TestPageZoneMap` 10 kontrol; kirli işlem ve NULL
 dahil), diğer 13 kapı yeşil, sqltest v3 2758/0/33, v2 3196/0/0.
 
+### v3.4 — çok oturumlu yazma / MVCC (2026-10-26)
+
+Aynı backend üzerinde **birden çok oturum aynı anda yazabilir**. Okuma READ
+COMMITTED; her oturum kendi `TWriteSet`'inde yazar (Map/Order/Before/TagDelta/
+Savepoints). Commit'te, **uygulamadan önce**, yazılan anahtarların before-image'ı
+güncel motor değeriyle karşılaştırılır: **ilk commit kazanır**, kaybeden
+`yazma cakismasi: … (islem geri alindi)` ile durur ve yarım uygulama olmaz.
+
+- GLOBAL duruma dokunan işlemler (`MarkSchema`, `SAVEPOINT`/`ROLLBACK TO`/
+  `RELEASE`, `DEFERRABLE` ertelemesi ve bekleyen denetim) çoklu yazmada
+  `RequireSoleTxn`/`SoleWriter` ile açık `ecLockConflict` verir.
+- Kilit: yeniden girişli `FEngCs` motoru ve `FSets`'i serileştirir; işlem
+  boyunca tutulmaz. Dosya düzeyi kilit değişmedi.
+- Sınır: snapshot isolation yok; süreçler arası çok yazarlılık yok.
+
+| Ölçüm (`benchcmp`, 200k × 3 kolon, 3 koşu medyanı) | Değer |
+|---|---|
+| toplu INSERT, before-image kapalı (A/B) | 6,532 µs/satır |
+| toplu INSERT, before-image açık | **7,466 µs/satır** (+%14,3) |
+| autocommit INSERT | 1,024 ms |
+| açılış | 39,0 ms |
+
+Kapı: `v3sqlchk` **228/0** (`TestMultiSession` 32 kontrol), `sqltest` v3
+**2759/0/33**, v2 **3196/0/0**, 14 kapı yeşil.
+
+### v3.5 — açılış darboğazı: 20 s → 39 ms (2026-10-26)
+
+200k satır + 57 MB günlük (600k kayıt) ile açılış **20.043 ms** ölçüldü:
+`ScanTail` tüm geçmişi, `LastState` ve `ListBases` her kaydı okuyup CRC'liyordu.
+Düzeltme: segment kuyruğu `LogTailState` ile **O(1)** (CRC doğrulamalı; bozuk/
+yarım kuyrukta tam tarama), `ListBases` segmenti tek okumada bellek içi tarayıp
+yükleri atlıyor (yalnız BASE CRC'li).
+
+| Yer | Önce | Sonra |
+|---|---|---|
+| `ListBases` | 5.967 ms | 21 ms |
+| `LastState` | 7.080 ms | 0 ms |
+| toplam açılış | 20.043 ms | **39–46 ms** |
+
+Davranış korunur: bozuk kuyruk tam taramaya düşer, CRC'siz BASE kabul edilmez.
+Kapı: günlük 28/0, PITR 21/0, replikasyon 37/0, çökme kurtarma 11/0.
+
 ### Sıradaki sürüme ertelenen (v4 sonrası)
-- Zone map'in sayfa düzeyinde yeniden ele alınması
 - Satır gövdesi varint/delta kodlama (F3-1'in kalanı)
 - Dosya boyutu (PK'nin ikinci kez yazılması, hücre başlığı sıkıştırma)
 - Bloom filtresi, merge JOIN, ifade bytecode
-- Çok yazarlı MVCC
+- Snapshot isolation (MVCC okuma izolasyonu) ve süreçler arası çok yazarlılık
+- Değişim günlüğü saklama politikası (log budama / arşiv ömrü)
 
 ### Kapsam dışı (değişmedi)
 - M3 WASM, M7 async sunucu
-- WASM/edge, çok yazarlı MVCC
+- WASM/edge
 
 ---
 

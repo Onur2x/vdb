@@ -113,6 +113,21 @@ except
 end;
 ```
 
+### Çok oturumlu yazma (v3.4)
+
+Aynı `TVTableDb` üzerinde birden çok `TVSql` oturumu **aynı anda yazabilir**:
+
+- Okuma **READ COMMITTED**: başka oturumun commit edilmemiş yazısı görünmez,
+  kendi yazınız görünür.
+- Aynı anahtarı iki oturum yazarsa **ilk commit kazanır**; ikincisi
+  `yazma cakismasi: … (islem geri alindi)` hatası verir ve hiçbir satırı
+  uygulamaz. Sonrasında `ROLLBACK` ile kümenizi temizleyin.
+- `CREATE/DROP/ALTER`, `SAVEPOINT`/`ROLLBACK TO`/`RELEASE` ve `DEFERRABLE`
+  kısıtlar **çoklu yazmada reddedilir** (`ecLockConflict`) — tek yazarken
+  çalışır.
+- Süreçler arası çok yazarlılık yoktur: ikinci **süreç** dosya kilidiyle
+  reddedilir.
+
 ### WAL
 
 ```pascal

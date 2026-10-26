@@ -448,6 +448,54 @@ end;
 
 { Var olan segmentlerin sonunu okur: son grup sirasi, Gen ve segment no.
   Bozuk/kesik kuyruk sessizce atlanir (yalniz TAM gruplar gecerlidir). }
+function LogTailState(S: TFileStream; out ASeq: Int64; out ALsn: LongWord;
+  out AIsEnd: Boolean): Boolean;
+const
+  { Kuyruk penceresi: BASE yuku taban dosya adini da tasir; 2 KB fazlasiyla
+    yeter (tipik taban adi < 40 bayt). }
+  WINMAX = 2048;
+var
+  b, rec: TBytes;
+  avail, win, off, rl: Integer;
+  magic: LongWord;
+  total: Int64;
+begin
+  Result := False;
+  ASeq := 0;
+  ALsn := 0;
+  AIsEnd := False;
+  total := S.Size;
+  if total < VDBLOG_SEG_HDR + VDBLOG_REC_HDR + 8 then Exit;
+  avail := Integer(total - VDBLOG_SEG_HDR);
+  if avail > WINMAX then win := WINMAX else win := avail;
+  S.Position := total - win;
+  SetLength(b, win);
+  if S.Read(b[0], win) <> win then Exit;
+  { Kuyruktaki son kayit END (grup sonu) ya da BASE (checkpoint tabani)
+    olabilir; ikisi de sira numarasini ve motor LSN'ini tasir. Aday baslangic
+    ancak toplam uzunlugu dosya sonuna TAM oturuyorsa ve CRC tutuyorsa kabul
+    edilir; aksi halde False -> cagiran tam tarama yapar (guvenli yol). }
+  for off := win - (VDBLOG_REC_HDR + 8) downto 0 do
+  begin
+    magic := ReadU32(b, off);
+    if (magic <> VDBLOG_MAGIC_END) and
+       (magic <> VDBLOG_MAGIC_BASE) then Continue;
+    rl := Integer(ReadU32(b, off + 4));
+    if (rl < 0) or (off + VDBLOG_REC_HDR + rl + 4 <> win) then Continue;
+    SetLength(rec, VDBLOG_REC_HDR + rl + 4);
+    Move(b[off], rec[0], Length(rec));
+    if ReadU32(rec, VDBLOG_REC_HDR + rl) <> VDbCrc32OfBytes(rec,
+      VDBLOG_REC_HDR + rl) then Continue;
+    ASeq := ReadI64(rec, 8);
+    AIsEnd := (magic = VDBLOG_MAGIC_END);
+    if AIsEnd then
+      ALsn := LongWord(ReadU64(rec, 32))     { END: Key = motor LSN }
+    else
+      ALsn := ReadU32(rec, VDBLOG_REC_HDR + 4);  { BASE: yukte DbLsn }
+    Exit(True);
+  end;
+end;
+
 function TVdbChangeLog.ScanTail(out ALastSeq: Int64; out ALastGen: LongWord;
   out ALastSeg: LongWord): Boolean;
 var
@@ -460,6 +508,8 @@ var
   rl: Integer;
   kind: Integer;
   seq: Int64;
+  tailLsn: LongWord;
+  tailEnd: Boolean;
 
   procedure NoteSeg(const FileName: string);
   var
@@ -499,6 +549,15 @@ begin
         if ReadU32(hdr, 0) <> VDBLOG_MAGIC_SEG then Continue;
         ALastGen := ReadU32(hdr, 8);
         FGuid := ReadU64(hdr, 16);
+        { v3.5: KAPALI segment ise son sira numarasi O(1) okunur. Eskiden
+          TUM gecmis her acilista bastan sona taraniyordu: 57 MB gunluk
+          (600k kayit) acilisi 20 s'ye cikariyordu. Aktif segment (henuz
+          END yazilmamis) tam taranir; boyutu tek segmentle sinirlidir. }
+        if LogTailState(S, seq, tailLsn, tailEnd) then
+        begin
+          if seq > ALastSeq then ALastSeq := seq;
+          Continue;
+        end;
         SetLength(hdr, VDBLOG_REC_HDR);
         while S.Position + VDBLOG_REC_HDR <= S.Size do
         begin
@@ -969,6 +1028,9 @@ var
   E: TVdbLogEntry;
   isEnd: Boolean;
   cnt: LongWord;
+  tailSeq: Int64;
+  tailLsn: LongWord;
+  tailEnd: Boolean;
 begin
   Result := False;
   ALastSeq := 0;
@@ -982,6 +1044,21 @@ begin
       SetLength(hdr, VDBLOG_SEG_HDR);
       if S.Read(hdr[0], VDBLOG_SEG_HDR) <> VDBLOG_SEG_HDR then Continue;
       if ReadU32(hdr, 0) <> VDBLOG_MAGIC_SEG then Continue;
+      { v3.5: son kayit O(1) okunur. Eskiden her ACILISTA tum gunluk
+        (600k kayit / 57 MB) bastan sona CRC'lenerek okunuyordu: acilis
+        20 s'ye cikiyordu. Kuyruk END ise durum odur; BASE ise ya da kuyruk
+        bozuksa o segment tam taranir (davranis eskisiyle AYNI). }
+      if LogTailState(S, tailSeq, tailLsn, tailEnd) then
+      begin
+        if tailEnd then
+        begin
+          ALastSeq := tailSeq;
+          ALastEndLsn := tailLsn;
+          Result := True;
+          Continue;
+        end;
+      end;
+      S.Position := VDBLOG_SEG_HDR;
       while ReadOneRecord(S, E, isEnd, cnt) do
       begin
         if not isEnd then Continue;
@@ -1122,13 +1199,11 @@ end;
 
 function TVdbLogReader.ListBases: TVdbLogBaseArray;
 var
-  i, n: Integer;
+  i, n, rl, pos, segSize, nb: Integer;
   S: TFileStream;
-  hdr: TBytes;
-  E: TVdbLogEntry;
+  buf, rec: TBytes;
   b: TVdbLogBase;
-  isEnd: Boolean;
-  cnt: LongWord;
+  magic: LongWord;
 begin
   Result := nil;
   n := 0;
@@ -1138,23 +1213,52 @@ begin
     if not FileExists(SegPath(FSegs[i])) then Continue;
     S := TFileStream.Create(SegPath(FSegs[i]), fmOpenRead or fmShareDenyNone);
     try
-      SetLength(hdr, VDBLOG_SEG_HDR);
-      if S.Read(hdr[0], VDBLOG_SEG_HDR) <> VDBLOG_SEG_HDR then Continue;
-      if ReadU32(hdr, 0) <> VDBLOG_MAGIC_SEG then Continue;
-      while ReadOneRecord(S, E, isEnd, cnt) do
+      segSize := Integer(S.Size);
+      if (segSize < VDBLOG_SEG_HDR) or (segSize > 256 * 1024 * 1024) then
+        Continue;
+      { v3.5: segment TEK okumada bellege alinir ve kayitlar bellekte
+        atlanir. Eskiden her kayit icin ayri Read/Seek (3 sistem cagrisi)
+        yapiliyordu: 600k kayitli 57 MB gunlukte acilis ~6 s. }
+      SetLength(buf, segSize);
+      S.Position := 0;
+      if S.Read(buf[0], segSize) <> segSize then Continue;
+      if ReadU32(buf, 0) <> VDBLOG_MAGIC_SEG then Continue;
+      pos := VDBLOG_SEG_HDR;
+      while pos + VDBLOG_REC_HDR <= segSize do
       begin
-        if isEnd then Continue;
-        if E.Kind <> VDBLOG_KIND_BASE then Continue;
-        b.Seq := E.Seq;
-        b.TsMs := E.TsMs;
-        b.Gen := E.Gen;
-        b.DbLsn := E.DbLsn;
-        b.DbBytes := E.DbBytes;
-        b.Name := E.BaseName;
-        b.Flags := E.Flags;
-        SetLength(Result, n + 1);
-        Result[n] := b;
-        Inc(n);
+        magic := ReadU32(buf, pos);
+        if (magic <> VDBLOG_MAGIC_REC) and (magic <> VDBLOG_MAGIC_END) and
+           (magic <> VDBLOG_MAGIC_BASE) then
+          Break;
+        rl := Integer(ReadU32(buf, pos + 4));
+        if (rl < 0) or (pos + VDBLOG_REC_HDR + rl + 4 > segSize) then Break;
+        if magic = VDBLOG_MAGIC_BASE then
+        begin
+          { Taban kaydi TAM (CRC dahil) dogrulanir. }
+          SetLength(rec, VDBLOG_REC_HDR + rl + 4);
+          Move(buf[pos], rec[0], Length(rec));
+          if ReadU32(rec, Length(rec) - 4) = VDbCrc32OfBytes(rec,
+            Length(rec) - 4) then
+          begin
+            b.Seq := ReadI64(rec, 8);
+            b.TsMs := ReadI64(rec, 16);
+            b.Gen := ReadU32(rec, VDBLOG_REC_HDR);
+            b.DbLsn := ReadU32(rec, VDBLOG_REC_HDR + 4);
+            b.DbBytes := Int64(ReadU64(rec, VDBLOG_REC_HDR + 8));
+            b.Flags := ReadU32(rec, VDBLOG_REC_HDR + 16);
+            nb := Integer(ReadU32(rec, VDBLOG_REC_HDR + 20));
+            b.Name := '';
+            if (nb > 0) and (24 + nb <= rl) then
+            begin
+              SetLength(b.Name, nb);
+              Move(rec[VDBLOG_REC_HDR + 24], b.Name[1], nb);
+            end;
+            SetLength(Result, n + 1);
+            Result[n] := b;
+            Inc(n);
+          end;
+        end;
+        pos := pos + VDBLOG_REC_HDR + rl + 4;
       end;
     finally
       S.Free;
