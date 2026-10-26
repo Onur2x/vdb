@@ -967,6 +967,77 @@ yığın tamponu, MinInt64 ve negatif doğru) ile 0,45 → **0,40 µs**. Kalan
 fark gerçek iş: pk metni artık kolondan türetiliyor. Gerçek iş yüklerinde
 (metin kolonu okunan tarama) fark ölçüm gürültüsünde.
 
+### v3.14 — İfade değerlendirme: bytecode REDDEDİLDİ, tip-duyarlı tam sayı yolu
+
+**Hipotez ve ölçüm.** Yol haritasındaki "ifade bytecode" maddesi, ağaç
+yorumlayıcısının dağıtım (dispatch) maliyetinin baskın olduğu varsayımına
+dayanıyordu. Motoru değiştirmeden önce tavan kazanç ölçüldü
+(`tmp64/vmhead`, aynı 5 işlemlik zincir, 50k satır, QPC, 5 koşu):
+
+| yol | µs/satır | fark |
+|---|---|---|
+| ağaç yorumlayıcı (bugünkü) | 0,80 | — |
+| yığın bytecode (string değerler) | 1,07 | **+%34 (daha yavaş)** |
+| tip-duyarlı Int64 yığını | 0,30 | **−%63** |
+
+Sonuç: maliyet dağıtımda değil, **ara düğümlerde üretilen metinde**. String
+tutan bir bytecode bu yüzden kazandırmıyor; kazancı veren şey sayısal
+zinciri Int64'te yürütüp metne **yalnız sonda** dönmek.
+
+İkinci şüphe de ölçümle çürütüldü: `FindColIdx` (doğrusal `SameText` araması)
+sanıldığı kadar pahalı değil — `SELECT a+a+a+a` 3,35 µs/satır,
+`SELECT 1+1+1+1` 3,28 µs/satır; dört kolon referansının payı ~0,02 µs/işlem.
+Bu yüzden kolon indeksi önbelleği (bayat indeks riski taşıyan bir kestirme)
+**yapılmadı**.
+
+**Uygulanan.** `VDbExecutor.pas`:
+
+- `BinaryOpCtype(bin, ColNames, ColTypes)`: ikili işlemin tip kararı
+  `EvalExpr` içinden tek yere alındı (F1-17, 4.3, F-24, H-ek kuralları
+  aynen). Amaç: hızlı yol ile ağaç yolu **aynı** tip kararını versin.
+- `TryIntEval(...)`: yalnız **INT kolon** ve **tam sayı literali** ile
+  kurulmuş `+`, `-`, `*` zincirlerini (ve tekli `-`) Int64'te yürütür; ara
+  düğümde metin üretmez. Uygun olmayan her durumda `False` döner ve
+  `EvalExpr` ağaç yolunu **aynen** kullanır.
+- `EvalExpr` başında yalnız bu üç işlem için hızlı yol denenir.
+
+**Birebir eşdeğerlik gerekçesi:** her düğümde tip kararı `BinaryOpCtype` ile
+aynı (VCT_INT dışı hiçbir düğüm yola girmiyor); INT kolon değerleri ve
+literaller ağaç yolunun da kullandığı `VDbParseInt` ile çözülüyor;
+aritmetik Int64'te (taşma davranışı aynı); NULL/sayısal olmayan değer,
+FLOAT/BOOL/metin, bölme/modulo, fonksiyon, CAST, CASE → ağaç yolu.
+
+**Diferansiyel kanıt.** `tmp64/exprdiff`: 200 sözde-rastgele ifade
+(1–3 derinlik, `+ - * / %`, tekli eksi, negatif ve büyük değerler,
+`'007'`, `''`, NULL, sayısal olmayan metin) × 40 satır. Hızlı yol açık ve
+kapalı iki ikilinin çıktısı `fc /b` ile karşılaştırıldı: **fark yok**.
+
+**Ölçüm (`tmp64/exprbench`, 50k satır, QPC, 5 koşu medyanı):**
+
+| sorgu | önce | sonra | fark |
+|---|---|---|---|
+| `SELECT a` (taban, ifade yok) | 1,88 | 1,84 | nötr |
+| `SELECT a+1` | 2,74 | 2,33 | −%15 |
+| `SELECT (a*2+1)*3-7` | 4,53 | **2,85** | **−%37** |
+| `SELECT ((((a+1)*2)+3)*4)+5` | 5,14 | **3,16** | **−%39** |
+| `SELECT a+a+a+a` | 3,35 | 2,33 | −%30 |
+| `SELECT 1+1+1+1` | 3,28 | 2,44 | −%26 |
+| `SELECT a+0+0+0` | 3,73 | 2,69 | −%28 |
+| `COUNT(*) WHERE a*2+1 > 50000` | 3,86 | **3,30** | −%15 |
+| `SELECT a WHERE a*2+1 > 50000` | 5,46 | 4,96 | −%9 |
+| `COUNT(*) WHERE a > 25000` (ham yol) | 0,44 | 0,46 | nötr |
+| `SELECT a,t WHERE a>100 AND a<40000` | 1,70 | 1,71 | nötr |
+| `WHERE t LIKE 'kayit-4%'` | 1,02 | 1,06 | nötr |
+| `CASE WHEN a>25000 ...` (dal hızlı yola girmiyor) | 4,84 | 4,96 | nötr |
+
+İfade içermeyen sorgular değişmedi (beklenen); kazanç tam sayı zinciri olan
+projeksiyon ve yüklemlerde.
+
+Testler: `sqltest` v3 **2874/0/33**, v2 **3305/0/0**; yeni `T160_TamSayiZinciri`
+(16 kontrol: öncelik, iç içe zincir, tekli/çift eksi, büyük sayı, NULL
+zinciri, sayısal metin, `'007'`, Int64 taşması, FLOAT yolunun değişmediği,
+ifadeli WHERE/SUM/CASE). 14/14 kapı yeşil.
+
 ### Sürüm çizgisi kararı (2026-10-26): alpha hattı → **v1.0.0**
 
 Kullanıcı kararı, önceki "v4'e ertele" planını geçersiz kılar:
@@ -1024,8 +1095,12 @@ kendi kapıları ve ölçümüyle):
    iki ikili). Hücre başlığı sıkıştırma (`ctype` baytını atmak) **reddedildi**:
    o bayt `ALTER COLUMN TYPE` sonrası karışık şemayı doğru çözen güvenlik
    ağıdır. Ayrıntı: §v3.13.
-4. **İfade bytecode** — derin/tekrarlı ifadelerde ağaç yorumlayıcısı yerine
-   derlenmiş küçük program; `WHERE`/`SELECT` ifadeleri.
+4. ~~**İfade bytecode**~~ **ÖLÇÜMLE YENİDEN ÇERÇEVELENDİ (v3.14)** —
+   string tutan yığın bytecode ağaç yorumlayıcısından **%34 daha yavaş**
+   (maliyet dağıtımda değil, ara metin üretiminde). Yerine **tip-duyarlı tam
+   sayı yolu** yapıldı: INT kolon/tam sayı literali `+ - *` zincirleri
+   Int64'te, ara metin yok (zincirlerde −%26…%39, ifadeli COUNT'ta −%15;
+   ağaç yoluyla birebir aynı, diferansiyel kanıtlı). Ayrıntı: §v3.14.
 5. **Snapshot isolation** — MVCC okuma izolasyonu (oturum kendi anlık
    görüntüsünü görür). En büyük iş, en sona: commit sırası, günlük budama ve
    zone map ile etkileşimi ayrı ayrı sınanmalı.

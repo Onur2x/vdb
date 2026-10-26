@@ -211,6 +211,19 @@ type
     function EvalBinary(AOp: TSqlBinaryOp; const LeftVal, RightVal: string;
       Ctype: Byte): string;
     function EvalUnary(AOp: TSqlUnaryOp; const Val: string): string;
+    { v3.14: ikili islemin karsilastirma/aritmetik tipini cozer. Eskiden bu
+      blok EvalExpr icinde satir basina calisiyordu; tip-duyarli tam sayi
+      yolunun AYNI karari vermesi icin tek yere alindi. }
+    function BinaryOpCtype(bin: TSqlBinaryOpNode; const ColNames: TStrArray;
+      const ColTypes: TByteArray): Byte;
+    { v3.14: TAM SAYI zinciri hizli yolu. Yalniz INT kolonlar ve tam sayi
+      literalleriyle kurulmus +,-,* zincirlerinde kullanilir; ara dugumlerde
+      METIN uretmez. Semantik agac yoluyla BIREBIR aynidir (ayni Int64
+      aritmetigi, ayni tip karari); uygun olmayan her durumda False doner ve
+      cagrici eski yolu kullanir. }
+    function TryIntEval(Expr: TSqlExprNode; const Row: TStrArray;
+      const ColNames: TStrArray; const ColTypes: TByteArray;
+      out V: Int64): Boolean;
     // 4.3: aggregate'i verilen grup satir kumesi uzerinden hesaplar
     // (SELECT listesi ve HAVING icin TEK uygulama â€” kod tekrari yok).
     function EvalAggregateValue(fn: TSqlFuncCallNode;
@@ -1480,6 +1493,134 @@ end;
 { ------------------------------------------------------------
   EvalExpr
   //---------------------------------------------------------- }
+function TVSqlExecutor.BinaryOpCtype(bin: TSqlBinaryOpNode;
+  const ColNames: TStrArray; const ColTypes: TByteArray): Byte;
+{ Ikili islemin tip cozumlemesi. v3.14'te EvalExpr icinden BURAYA alindi:
+  hem agac yolu hem tip-duyarli tam sayi yolu AYNI karari verir. Mantik
+  degismedi (F1-17, 4.3, F-24, H-ek kurallari aynen). }
+var
+  colRef: TSqlColumnRefNode;
+  ci: Integer;
+begin
+  Result := VCT_STR;
+  // F1-17: tip cozumlesmesi nitelemeli adi da gorur, aksi halde
+  // JOIN sonrasi WHERE'te karsilastirma metin sirasiyla yapilir.
+  if bin.Left is TSqlColumnRefNode then
+  begin
+    colRef := TSqlColumnRefNode(bin.Left);
+    ci := FindColIdx(colRef.ColumnName, colRef.TableQualifier, ColNames);
+    if (ci >= 0) and (ci < Length(ColTypes)) then Result := ColTypes[ci];
+  end;
+  if (Result = VCT_STR) and (bin.Right is TSqlColumnRefNode) then
+  begin
+    colRef := TSqlColumnRefNode(bin.Right);
+    ci := FindColIdx(colRef.ColumnName, colRef.TableQualifier, ColNames);
+    if (ci >= 0) and (ci < Length(ColTypes)) then Result := ColTypes[ci];
+  end;
+  // 4.3: HAVING'de aggregate ifade kolon referansi olmadigi icin tipi
+  // burada cozulur. Yapilmazsa VCT_STR ile metin sirasi kiyasla
+  // yapilir ve '10' > '9' (false) gibi yanlis HAVING sonuclari dogar.
+  if (Result = VCT_STR) and (FAggIdx <> nil) then
+  begin
+    if bin.Left is TSqlFuncCallNode then
+      Result := AggFuncCtype(TSqlFuncCallNode(bin.Left));
+    if (Result = VCT_STR) and (bin.Right is TSqlFuncCallNode) then
+      Result := AggFuncCtype(TSqlFuncCallNode(bin.Right));
+  end;
+  // F-24: WHERE'de fonksiyon donusu de tip-bilgili karsilastirilmalidir.
+  // DISTANCE(x,y,0,0) <= 5 ifadesi aksi halde metin sirasiyla kiyaslanir:
+  // '14.141356' <= '5' -> TRUE olur ve (10,10) noktasi yanlis girer.
+  if Result = VCT_STR then
+  begin
+    if bin.Left is TSqlFuncCallNode then
+      Result := ScalarFuncCtype(TSqlFuncCallNode(bin.Left));
+    if (Result = VCT_STR) and (bin.Right is TSqlFuncCallNode) then
+      Result := ScalarFuncCtype(TSqlFuncCallNode(bin.Right));
+  end;
+  // H-ek: IKI taraf da kolon referansi DEGILSE (yani tip hicbir kolondan
+  // gelmiyorsa) ifade sonuc tipini cikar. `(a+0) > 198` aksi halde metin
+  // sirasiyla kiyaslanip '1990' < '198' gibi yanlis sonuc veriyordu.
+  // Bir taraf kolon ise kolon tipi (ustteki mantik) korunur — metin
+  // kolonunun sayisal literalle kiyasi DEGISMEZ.
+  if (Result = VCT_STR) and (not (bin.Left is TSqlColumnRefNode)) and
+     (not (bin.Right is TSqlColumnRefNode)) then
+  begin
+    Result := ExprResultCtype(bin.Left, ColNames, ColTypes);
+    if Result = VCT_STR then
+      Result := ExprResultCtype(bin.Right, ColNames, ColTypes);
+  end;
+end;
+
+function TVSqlExecutor.TryIntEval(Expr: TSqlExprNode; const Row: TStrArray;
+  const ColNames: TStrArray; const ColTypes: TByteArray;
+  out V: Int64): Boolean;
+{ TAM SAYI zinciri: +,-,* icinde ara METIN uretmez. Birebir esdegerlik
+  gerekcesi:
+   - her dugumde tip karari BinaryOpCtype ile AYNI (agac yolu da onu
+     kullaniyor), yani VCT_INT disi hicbir dugum bu yola girmez;
+   - INT kolon degerleri ve tam sayi literalleri VDbParseInt ile ayni
+     sekilde cozulur (agac yolu da ayni islevi kullaniyor);
+   - aritmetik Int64'te yapilir; agac yolu da Int64 yapar (tasmasiz
+     derleme varsayimi ayni).
+  Herhangi bir kosul tutmazsa False doner ve cagrici agac yolunu kullanir. }
+var
+  bin: TSqlBinaryOpNode;
+  un: TSqlUnaryOpNode;
+  colRef: TSqlColumnRefNode;
+  lit: TSqlLiteralNode;
+  ci: Integer;
+  a, b: Int64;
+begin
+  Result := False;
+  if Expr = nil then Exit;
+
+  if Expr is TSqlLiteralNode then
+  begin
+    lit := TSqlLiteralNode(Expr);
+    case lit.LitType of
+      sltInt: begin V := lit.IntVal; Exit(True); end;
+      sltString: Exit(VDbParseInt(lit.StrVal, V));
+    end;
+    Exit;                                  // NULL / FLOAT / BOOL: agac yolu
+  end;
+
+  if Expr is TSqlColumnRefNode then
+  begin
+    colRef := TSqlColumnRefNode(Expr);
+    ci := FindColIdx(colRef.ColumnName, colRef.TableQualifier, ColNames);
+    if (ci < 0) or (ci >= Length(Row)) or (ci >= Length(ColTypes)) then Exit;
+    if ColTypes[ci] <> VCT_INT then Exit;
+    // NULL (bos metin) veya sayisal olmayan deger -> agac yolu
+    Exit(VDbParseInt(Row[ci], V));
+  end;
+
+  if Expr is TSqlUnaryOpNode then
+  begin
+    un := TSqlUnaryOpNode(Expr);
+    if un.Op <> suoNeg then Exit;           // NOT / IS NULL agac yolunda
+    if not TryIntEval(un.Operand, Row, ColNames, ColTypes, a) then Exit;
+    V := -a;
+    Exit(True);
+  end;
+
+  if Expr is TSqlBinaryOpNode then
+  begin
+    bin := TSqlBinaryOpNode(Expr);
+    if (bin.Op <> sboAdd) and (bin.Op <> sboSub) and (bin.Op <> sboMul) then Exit;
+    // Tip karari agac yoluyla AYNI olmak zorunda; FLOAT/STR ise buradan cik.
+    if BinaryOpCtype(bin, ColNames, ColTypes) <> VCT_INT then Exit;
+    if not TryIntEval(bin.Left, Row, ColNames, ColTypes, a) then Exit;
+    if not TryIntEval(bin.Right, Row, ColNames, ColTypes, b) then Exit;
+    case bin.Op of
+      sboAdd: V := a + b;
+      sboSub: V := a - b;
+    else
+      V := a * b;
+    end;
+    Exit(True);
+  end;
+end;
+
 function TVSqlExecutor.EvalExpr(Expr: TSqlExprNode; const Row: TStrArray;
   const ColNames: TStrArray; const ColTypes: TByteArray): string;
 var
@@ -1538,6 +1679,17 @@ begin
     dize isaretcisi tasiyabilir; atama onu finalize edip yigini bozar. }
   FillChar(Result, SizeOf(Result), 0);
   if Expr = nil then Exit('');
+
+  { v3.14: TAM SAYI zinciri hizli yolu. Yalniz +,-,* ve INT kolon/tam sayi
+    literali zincirlerinde devreye girer; uygun degilse asagidaki agac yolu
+    AYNEN calisir (davranis degismez). }
+  if Expr is TSqlBinaryOpNode then
+  begin
+    bin := TSqlBinaryOpNode(Expr);
+    if (bin.Op = sboAdd) or (bin.Op = sboSub) or (bin.Op = sboMul) then
+      if TryIntEval(Expr, Row, ColNames, ColTypes, ia) then
+        Exit(IntToStr(ia));
+  end;
 
   if Expr is TSqlLiteralNode then
   begin
@@ -1660,53 +1812,7 @@ begin
     bin := TSqlBinaryOpNode(Expr);
     lv := EvalExpr(bin.Left, Row, ColNames, ColTypes);
     rv := EvalExpr(bin.Right, Row, ColNames, ColTypes);
-    ct := VCT_STR;
-    // F1-17: tip cozumlesmesi nitelemeli adi da gorur, aksi halde
-    // JOIN sonrasi WHERE'te karsilastirma metin sirasiyla yapilir.
-    if bin.Left is TSqlColumnRefNode then
-    begin
-      colRef := TSqlColumnRefNode(bin.Left);
-      ci := FindColIdx(colRef.ColumnName, colRef.TableQualifier, ColNames);
-      if (ci >= 0) and (ci < Length(ColTypes)) then ct := ColTypes[ci];
-    end;
-    if (ct = VCT_STR) and (bin.Right is TSqlColumnRefNode) then
-    begin
-      colRef := TSqlColumnRefNode(bin.Right);
-      ci := FindColIdx(colRef.ColumnName, colRef.TableQualifier, ColNames);
-      if (ci >= 0) and (ci < Length(ColTypes)) then ct := ColTypes[ci];
-    end;
-    // 4.3: HAVING'de aggregate ifade kolon referansi olmadigi icin tipi
-    // burada cozulur. Yapilmazsa VCT_STR ile metin sirasi kiyasla
-    // yapilir ve '10' > '9' (false) gibi yanlis HAVING sonuclari dogar.
-    if (ct = VCT_STR) and (FAggIdx <> nil) then
-    begin
-      if bin.Left is TSqlFuncCallNode then
-        ct := AggFuncCtype(TSqlFuncCallNode(bin.Left));
-      if (ct = VCT_STR) and (bin.Right is TSqlFuncCallNode) then
-        ct := AggFuncCtype(TSqlFuncCallNode(bin.Right));
-    end;
-    // F-24: WHERE'de fonksiyon donusu de tip-bilgili karsilastirilmalidir.
-    // DISTANCE(x,y,0,0) <= 5 ifadesi aksi halde metin sirasiyla kiyaslanir:
-    // '14.141356' <= '5' -> TRUE olur ve (10,10) noktasi yanlis girer.
-    if ct = VCT_STR then
-    begin
-      if bin.Left is TSqlFuncCallNode then
-        ct := ScalarFuncCtype(TSqlFuncCallNode(bin.Left));
-      if (ct = VCT_STR) and (bin.Right is TSqlFuncCallNode) then
-        ct := ScalarFuncCtype(TSqlFuncCallNode(bin.Right));
-    end;
-    // H-ek: IKI taraf da kolon referansi DEGILSE (yani tip hicbir kolondan
-    // gelmiyorsa) ifade sonuc tipini cikar. `(a+0) > 198` aksi halde metin
-    // sirasiyla kiyaslanip '1990' < '198' gibi yanlis sonuc veriyordu.
-    // Bir taraf kolon ise kolon tipi (ustteki mantik) korunur — metin
-    // kolonunun sayisal literalle kiyasi DEGISMEZ.
-    if (ct = VCT_STR) and (not (bin.Left is TSqlColumnRefNode)) and
-       (not (bin.Right is TSqlColumnRefNode)) then
-    begin
-      ct := ExprResultCtype(bin.Left, ColNames, ColTypes);
-      if ct = VCT_STR then
-        ct := ExprResultCtype(bin.Right, ColNames, ColTypes);
-    end;
+    ct := BinaryOpCtype(bin, ColNames, ColTypes);
     // R-20: metin kolonu ve karsilastirma tarafi bir kolon referansi ise
     // o kolonun varsayilan collation'i uygulanir. ACIK COLLATE yazilmissa
     // ustune yazilmaz (FExplicitColl).

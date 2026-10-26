@@ -733,13 +733,51 @@ Okuma bedeli (aynı veri, iki ikili, QPC 9 koşu medyanı): `SUM(a)` INT pk
 0,34 → 0,35. (İlk turda `SUM(a)` 0,45 idi; KeyHash yolundaki satır başına
 `IntToStr` ayırması `VdbIntToDecBuf` ile kaldırıldı.)
 
+### İfade değerlendirme: bytecode reddedildi, tip-duyarlı tam sayı yolu (v3.14)
+
+**Ölçülen hipotez çürütmesi.** `tmp64/vmhead` (aynı 5 işlemlik zincir, 50k
+satır, QPC 5 koşu): ağaç yorumlayıcı 0,80 µs/satır, **string yığın bytecode
+1,07 (+%34, daha yavaş)**, tip-duyarlı Int64 yığını 0,30 (−%63). Maliyet
+dağıtımda değil, ara düğümlerde üretilen metinde. `FindColIdx` şüphesi de
+çürütüldü: `a+a+a+a` 3,35 vs `1+1+1+1` 3,28 µs/satır (kolon payı ~0,02/işlem)
+— bu yüzden indeks önbelleği yapılmadı.
+
+**Yapılan.** `BinaryOpCtype` (tip kararı tek yere alındı, davranış aynı) +
+`TryIntEval`: yalnız INT kolon/tam sayı literali `+ - *` (ve tekli `-`)
+zincirleri Int64'te yürür, ara metin üretilmez; uygun olmayan her durumda
+(NULL, FLOAT/BOOL/metin, bölme/modulo, fonksiyon, CAST, CASE) ağaç yolu
+aynen çalışır. Birebir eşdeğerlik: aynı tip kararı, aynı `VDbParseInt`,
+aynı Int64 aritmetiği.
+
+**Diferansiyel kanıt.** `tmp64/exprdiff`: 200 sözde-rastgele ifade × 40 satır
+(1–3 derinlik, `+ - * / %`, tekli eksi, negatif/büyük değer, `'007'`, `''`,
+NULL, sayısal olmayan metin); hızlı yol açık/kapalı iki ikilinin çıktısı
+`fc /b` ile **farksız**.
+
+Ölçüm (`tmp64/exprbench`, 50k satır, QPC 5 koşu medyanı):
+
+| sorgu | önce | sonra | fark |
+|---|---|---|---|
+| `SELECT a` (taban) | 1,88 | 1,84 | nötr |
+| `SELECT a+1` | 2,74 | 2,33 | −%15 |
+| `SELECT (a*2+1)*3-7` | 4,53 | **2,85** | **−%37** |
+| `SELECT ((((a+1)*2)+3)*4)+5` | 5,14 | **3,16** | **−%39** |
+| `SELECT a+a+a+a` | 3,35 | 2,33 | −%30 |
+| `COUNT(*) WHERE a*2+1 > 50000` | 3,86 | **3,30** | −%15 |
+| `COUNT(*) WHERE a > 25000` (ham yol) | 0,44 | 0,46 | nötr |
+| `WHERE t LIKE 'kayit-4%'` | 1,02 | 1,06 | nötr |
+
+Kapı: `sqltest` v3 **2874/0/33**, v2 **3305/0/0** (yeni `T160_TamSayiZinciri`,
+16 kontrol); 14/14 kapı yeşil.
+
 ### Sürüm çizgisi (2026-10-26)
 
 Bu hat **alpha**'dır: `v3.x` adları yayın sürümü değil çalışma dilimidir.
 Kalan kapsam — Bloom filtresi (ölçümle reddedildi), merge JOIN (ölçümle
 reddedildi, yerine ON eşitlik+ek koşul hash düzeltmesi yapıldı), dosya
 boyutu (**yapıldı**: PK tekrarı kaldırıldı, hücre başlığı gerekçeli
-reddedildi), ifade bytecode, snapshot isolation —
+reddedildi), ifade bytecode (**ölçümle reddedildi**; yerine tip-duyarlı tam
+sayı yolu yapıldı — bkz. §v3.14), snapshot isolation —
 bu hatta yapılır ve hepsi bitince ürün **v1.0.0** olarak etiketlenir.
 `main` = `v3` (84 commit fast-forward); iş `v3`te yürür ve her push'ta
 `main` de ilerletilir. Süreçler arası çok yazarlılık (aynı dosyaya iki

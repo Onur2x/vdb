@@ -17671,6 +17671,43 @@ begin
   ChkVal('yeniden acma: ham COUNT', 'SELECT COUNT(*) FROM p1', 0, 0, '201');
 end;
 
+procedure T160_TamSayiZinciri;
+{ v3.14: tip-duyarli tam sayi yolu (+,-,*). Sonuclar agac yoluyla
+  BIREBIR ayni olmali; beklenen degerler agac yolundan alinmistir ve
+  iki ikili karsilastirmasiyla (hizli yol acik/kapali, 200 rastgele
+  ifade x 40 satir) bayt bayt dogrulanmistir. }
+begin
+  Grp('T160: tam sayi zinciri hizli yolu (v3.14)');
+  Fresh('tzincir');
+  sq.Exec('CREATE TABLE ei(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, s TEXT)');
+  sq.Exec('INSERT INTO ei(id,a,b,s) VALUES(1,7,2,''12'')');
+  sq.Exec('INSERT INTO ei(id,a,b,s) VALUES(2,-5,3,''x'')');
+  sq.Exec('INSERT INTO ei(id,a,b,s) VALUES(3,NULL,0,NULL)');
+  sq.Exec('INSERT INTO ei(id,a,b,s) VALUES(4,1000000007,1,''007'')');
+  sq.Exec('INSERT INTO ei(id,a,b,s) VALUES(5,9223372036854775807,1,'''')');
+
+  ChkVal('tek islem', 'SELECT a+1 FROM ei WHERE id=1', 0, 0, '8');
+  ChkVal('oncelik: a+b*2', 'SELECT a+b*2 FROM ei WHERE id=1', 0, 0, '11');
+  ChkVal('ic ice: (a+b)*3', 'SELECT (a+b)*3 FROM ei WHERE id=1', 0, 0, '27');
+  ChkVal('carpma', 'SELECT a*a FROM ei WHERE id=1', 0, 0, '49');
+  ChkVal('tekli eksi', 'SELECT -a+1 FROM ei WHERE id=2', 0, 0, '6');
+  ChkVal('cift eksi', 'SELECT -(-a) FROM ei WHERE id=2', 0, 0, '-5');
+  ChkVal('buyuk sayi', 'SELECT a*2+1 FROM ei WHERE id=4', 0, 0, '2000000015');
+  ChkVal('NULL zinciri', 'SELECT a+1 FROM ei WHERE id=3', 0, 0, '');
+  ChkVal('sayisal metin (agac yolu)', 'SELECT s+1 FROM ei WHERE id=1', 0, 0, '13');
+  ChkVal('sayisal olmayan metin', 'SELECT s+1 FROM ei WHERE id=2', 0, 0, '');
+  ChkVal('bastaki sifirlar', 'SELECT s+1 FROM ei WHERE id=4', 0, 0, '8');
+  ChkVal('Int64 tasmasi (iki yol ayni)',
+    'SELECT a+1 FROM ei WHERE id=5', 0, 0, '-9223372036854775808');
+  ChkVal('FLOAT yolu degismedi', 'SELECT a+1.5 FROM ei WHERE id=1', 0, 0, '8.5');
+  ChkVal('ifadeli WHERE', 'SELECT COUNT(*) FROM ei WHERE a*2+1 > 10',
+    0, 0, '2');
+  ChkVal('toplam', 'SELECT SUM(a*2+1) FROM ei WHERE id <= 2', 0, 0, '6');
+  ChkVal('CASE icinde',
+    'SELECT CASE WHEN a*2+1 > 10 THEN ''b'' ELSE ''k'' END FROM ei WHERE id=1',
+    0, 0, 'b');
+end;
+
 type
   TTestRec = record
     Nm: string;
@@ -17678,7 +17715,7 @@ type
   end;
 
 const
-  TEST_SAYISI = 189;
+  TEST_SAYISI = 190;
 
   { v3 kosusunda ATLA: bu testler yalniz v2 motorunun (TVDb/WAL/arsiv/
     zone/indeks .idx) ozel yollarini kullanir; v3'te karsiligi yoktur.
@@ -17939,6 +17976,7 @@ begin
   TESTLER[186].Nm := 'T157_SatirGovdesi'; TESTLER[186].P := T157_SatirGovdesi;
   TESTLER[187].Nm := 'T158_OnEkKosulHash'; TESTLER[187].P := T158_OnEkKosulHash;
   TESTLER[188].Nm := 'T159_PkTekKez'; TESTLER[188].P := T159_PkTekKez;
+  TESTLER[189].Nm := 'T160_TamSayiZinciri'; TESTLER[189].P := T160_TamSayiZinciri;
 end;
 
 { ---------------------------------------------------------------------- main }
