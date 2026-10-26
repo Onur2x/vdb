@@ -881,6 +881,92 @@ Testler: `sqltest` v3 **2832/0/33**, v2 **3266/0/0**; yeni
 `T158_OnEkKosulHash` (INNER / LEFT / FULL / PK / OR kökü / NULL ve
 imkânsız ek koşul yolları). 14/14 kapı yeşil.
 
+### v3.13 — PK satır gövdesinde tek kez: satır −%13…%29 (2026-10-26)
+
+**Bulgu (ölçümle doğrulandı).** Satır içi PK tanımında (`id INTEGER
+PRIMARY KEY`) PK değeri **iki kez** yazılıyordu: bir kez gövde başlığında
+(`varint pkLen + pk baytları`), bir kez de PK kolonunun yükünde. `.idx`
+anahtarı `VDbHashKey` olduğu için PK metni anahtardan geri türetilemez;
+yani başlıktaki kopya gereksiz **değil** — gereksiz olan *ikinci* kopya.
+
+Ölçüm (`tmp64/rowbytes`, 3000–5000 satır, 3 kolon):
+
+| tablo | ort. satır | PK baytları | PK payı |
+|---|---|---|---|
+| küçük INT PK (1…5000) | 21,8 B | 3,8 B | %17,4 |
+| büyük INT PK (×1.000.003) | 30,7 B | 9,9 B | %32,1 |
+| TEXT PK (`SIP-100001`) | 36,0 B | 10,0 B | %27,8 |
+
+**Yeni biçim (dosya sürümü 5).** `pkLen = 0` ise PK gövdede yoktur ve
+hemen bir `varint v` gelir: `v = 0` → boş PK, `v ≥ 1` → `v-1`. kolonun
+değeri. `pkLen > 0` eski davranıştır (satır içi). Ayırt edicilik
+kanıtlandı: boş PK reddedilir ("PK bos olamaz") ve PK'siz tabloda
+üretilmiş anahtar yazılır (ölçüldü: `pkLen = 2`), yani **eski dosyalarda
+`pkLen = 0` hiç görülmez**. Bu yüzden yeni bir gövde işareti gerekmedi;
+`$FFFE` bilinçli olarak kullanılmadı (CreateTable `>= $FFFF` reddettiği
+için `$FFFE` geçerli bir **tablo kimliği** olabilir).
+
+**Kayıpsızlık koşulu.** Kodlayıcı bu yolu yalnız PK metni, PK kolonunun
+**kanonik** metniyle birebir aynıysa kullanır (INT → `IntToStr`, FLOAT →
+`VDbFloatToStr`, BOOL → `BoolToStr`, metin/BLOB → değerin kendisi).
+Tutmayan her durumda (ör. NOCASE ile küçültülmüş anahtar, PK olmayan
+sentetik anahtar) PK eskisi gibi satır içi yazılır. Çözücü `VdbRowPkOf`
+kolon tipini satırın **kendi** `ctype` baytından okur, sema gerekmez.
+
+**Ölçüm — aynı veri, iki ikili (`tmp64/sizebench`, 50k + 50k satır,
+kapanmış dosya):**
+
+| veri kümesi | v3.12 `.odb` | v3.13 `.odb` | fark |
+|---|---|---|---|
+| geniş metin (`kayit-NNNNN`) | 5.406.720 B | 4.874.240 B | **−%9,9** |
+| dar satır (`t='x'`) | 4.435.968 B | 3.866.624 B | **−%12,8** |
+
+Satır düzeyinde kazanç daha büyük (PK baytları satırdan düşer, sayfa/
+meta veri yükü düşmez): küçük INT PK 21,8 → **19,0 B** (−%12,8), büyük
+INT PK 30,7 → **21,9 B** (−%28,7), TEXT PK 36,0 → **27,0 B** (−%25,0).
+`.idx` değişmedi (1.089.063 → 1.088.347 B, gürültü).
+
+**Geriye dönük okuma kanıtı (`oldtree` = `c02ac06` ikilisi + `mixedchk`).**
+Eski ikiliyle (sürüm 4) yazılan dosya yenide açıldı: başlık **4 → 5**
+yükseldi, 100 eski satır `inline=100` olarak aynen okundu, aynı dosyaya
+yazılan 10 yeni satır `col=10` oldu (iki biçim yan yana), `UPDATE` ile
+yeniden kodlanan satır PK'sını korudu, `VACUUM` satırları **ham kopyalar**
+(yeniden kodlamaz: 99 inline + 11 yeni biçim korunur), yeniden açılışta
+tüm PK'lar birebir. Eski ikili aynı dosyayı **`desteklenmeyen surum: 5`**
+ile reddediyor (sessiz yanlış çözme yok). Salt-okunur açılış yükseltme
+**yapmıyor** (sürüm 4 olarak kalır).
+
+**Hücre başlığı sıkıştırma — GEREKÇELİ REDDEDİLDİ.** Kolon başına 1 bayt
+`ctype` satırda duruyor (dar satırda 3 bayt ≈ %11–16). Bu bayt, satırın
+kendi tipini taşıdığı için `ALTER COLUMN TYPE` sonrası eski satırların
+doğru çözülmesini ve karışık şema okumasını sağlıyor (`DecodeRow`
+sözleşmesi: "alanlar eski şemaya göre yazılmış olabilir"). Şemaya
+güvenmek bu garantiyi bozar; 3 baytlık kazanç için veri kaybı riski
+alınmaz (öncelik 1). Aynı gerekçeyle `colCount` varint'i de korundu
+(`ALTER ADD COLUMN` sonrası eski satırlarda daha az kolon var).
+
+Testler: `sqltest` v3 **2858/0/33**, v2 **3289/0/0**; yeni `T159_PkTekKez`
+(INT/TEXT/unicode PK, PK ilk kolon değil, tablo kısıtı, `INSERT OR
+REPLACE`, PK güncellemenin reddi, silme, `ALTER ADD COLUMN`, ikincil
+indeks, `VACUUM`, yeniden açma, negatif/büyük Int64 pk, ham biçim
+taraması). 14/14 kapı yeşil.
+
+**Okuma yolu (bedeli ölçüldü).** PK artık kolondan çözüldüğü için satır
+başına bir ek başlık adımı var. Aynı veri, iki ikili (`tmp64/scantime`,
+50k+50k satır, QPC, 9 koşu medyanı):
+
+| sorgu | v3.12 | v3.13 |
+|---|---|---|
+| `SUM(a)` (INT pk, en hafif yol) | 0,31 µs/satır | **0,40 µs/satır** |
+| `SUM(LENGTH(t))` (metin kolonu) | 2,80 µs/satır | 2,83 µs/satır |
+| `SUM(n)` (TEXT pk) | 0,34 µs/satır | 0,35 µs/satır |
+
+İlk ölçümde `SUM(a)` 0,45 µs idi: KeyHash hızlı yolu INT pk metnini
+`IntToStr` ile satır başına **ayırıyordu**. `VdbIntToDecBuf` (tahsissiz,
+yığın tamponu, MinInt64 ve negatif doğru) ile 0,45 → **0,40 µs**. Kalan
+fark gerçek iş: pk metni artık kolondan türetiliyor. Gerçek iş yüklerinde
+(metin kolonu okunan tarama) fark ölçüm gürültüsünde.
+
 ### Sürüm çizgisi kararı (2026-10-26): alpha hattı → **v1.0.0**
 
 Kullanıcı kararı, önceki "v4'e ertele" planını geçersiz kılar:
@@ -931,10 +1017,13 @@ kendi kapıları ve ölçümüyle):
    koşulun çift başına değerlendirilmesidir; bir sonraki kazanç ON/WHERE
    yüklemlerinin ilgili tarafa **itilmesidir** (ölçülmüş fırsat, ayrı
    madde).
-3. **Dosya boyutu** — PK'nin satır gövdesinde ikinci kez yazılmasının
-   kaldırılması + hücre başlığı sıkıştırma. Satır biçimine dokunur;
-   v3.11'deki `$FFFF` + varint düzeni ve sürüm yükseltme yolu yeniden
-   kullanılır (dosya sürümü 5).
+3. ~~**Dosya boyutu**~~ — **YAPILDI (v3.13, 2026-10-26).** PK'nin satır
+   gövdesinde ikinci kez yazılması kaldırıldı (`pkLen = 0` + kolon
+   indeksi; dosya sürümü 5, eski dosyalar okunur ve ilk yazmada yükseltilir).
+   Ölçüm: satır **−%13…%29**, kapanmış `.odb` **−%9,9…%12,8** (aynı veri,
+   iki ikili). Hücre başlığı sıkıştırma (`ctype` baytını atmak) **reddedildi**:
+   o bayt `ALTER COLUMN TYPE` sonrası karışık şemayı doğru çözen güvenlik
+   ağıdır. Ayrıntı: §v3.13.
 4. **İfade bytecode** — derin/tekrarlı ifadelerde ağaç yorumlayıcısı yerine
    derlenmiş küçük program; `WHERE`/`SELECT` ifadeleri.
 5. **Snapshot isolation** — MVCC okuma izolasyonu (oturum kendi anlık

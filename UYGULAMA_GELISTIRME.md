@@ -279,7 +279,7 @@ veritabani.colkey      kolon anahtarı (yalnız kolon şifrelemesi kullanılırs
 
 ---
 
-## 9. Bugünkü sınırlar (v3.12)
+## 9. Bugünkü sınırlar (v3.13)
 
 | Özellik | Durum | Not |
 |---|---|---|
@@ -290,7 +290,7 @@ veritabani.colkey      kolon anahtarı (yalnız kolon şifrelemesi kullanılırs
 | MVCC (süreç içi çok oturum) | **var** (v3.4) | READ COMMITTED; her oturum kendi yazma kümesinde yazar, **ilk commit kazanır**, kaybeden `yazma cakismasi` ile durur. DDL/`SAVEPOINT`/`DEFERRABLE` çoklu yazmada reddedilir. Snapshot isolation yok |
 | MVCC (süreçler arası) | yok | dosya kilidi ikinci süreci reddeder |
 | Toplu INSERT hızı | v2'nin **~1,5 katı** yavaş | v3 5,77 / v2 3,82 µs satır (200k×3 kolon, commit dâhil; aynı sonda, 3 koşu medyanı). v3.10: 6,63 → 6,12 µs (günlük kodlaması yerinde, etiket farkı ara sözlüksüz, `Put` tek arama). v3.11: **5,77 µs** (eşleşmiş ölçüm 6,16 → 5,77 = −%6,3; satır gövdesi varint, daha az bayt). Kalan fark: satır başına 4 kez çözülen oturum kümesi + WAL commit/günlük bedeli |
-| Satır gövdesi / dosya biçimi (v3.11) | **var** | Satır gövdesi v2: `$FFFF` işareti + varint pk/kolon sayısı + kolon başına varint uzunluk (`0` = NULL). **Dosya sürümü 4**; sürüm 3 dosyalar açılır (aynı dosyada v1/v2 satır bir arada), ilk yazılabilir açılışta başlık 4'e yükseltilir. Eski ikili sürüm 4'ü açık hatayla reddeder. Ölçülen: `.odb` −%15,7 (200k×3), sabit 3 kolonlu satır 39 → 30 bayt |
+| Satır gövdesi / dosya biçimi (v3.13) | **var** | Satır gövdesi: `$FFFF` işareti + varint kolon sayısı + kolon başına `ctype` + varint uzunluk (`0` = NULL). PK **satır gövdesinde ikinci kez yazılmaz**: `varint pkLen = 0` ise hemen `varint v` gelir (`0` = boş PK, `v ≥ 1` → PK `v-1`. kolonun değeri); `pkLen > 0` eski satır içi biçim. **Dosya sürümü 5**; sürüm 3 ve 4 dosyalar açılır (aynı dosyada eski/yeni satır bir arada), ilk yazılabilir açılışta başlık 5'e yükseltilir; salt-okunur açılış yazmaz. Eski ikili sürüm 5'i açık hatayla reddeder. Ölçülen: satır −%13…%29 (küçük INT PK 21,8 → 19,0 B; büyük INT PK 30,7 → 21,9 B; TEXT PK 36,0 → 27,0 B), kapanmış `.odb` −%9,9…%12,8 (aynı veri, iki ikili). Okuma bedeli: `SUM(a)` 0,31 → 0,40 µs/satır (pk artık kolondan çözülüyor), metin taraması değişmedi (2,80 → 2,83 µs/satır) |
 | JOIN yöntemi (v3.12) | **hash + indeks** | İndekssiz eşitlik join'i hash join (10k×10k, 0 satır sonuç: 42 ms). ON'da eşitlik **+ ek koşul** da hash yolunu kullanır; ek koşullar eşleşen çiftlerde `JoinOnOk` ile uygulanır. Merge JOIN yok — ölçümle gereksiz (sıralı girdi yok). Sonuç satırı kopyalama ~3,2 µs/satır (1M satır 3,2 s); ON/WHERE yüklemi join'e itilmez (ölçülmüş sonraki fırsat) |
 | `ScanAll` hızı (v3.9) | iyileşti | 200k satır + **açık yazma kümesi**: 45,00 → **32,00 ms** (son üç koşu 31–32 ms, aynı makine/sonda). Satır başına 3 kilit alma kaldırıldı: yazma kümesi tarama başında bir kez çözülür |
 | Motor kilidi (v3.9) | `TVdbGate` | Her iş parçacığı tuttuğu kilitlerin `threadvar` yığınını taşır; **iç içe giriş kritik bölüme hiç girmez** (yeniden giriş varsayımı kalktı), paylaşılan alanlar kilit dışında okunmaz. `Leave` sahipsiz çıkışta açık hata verir. `ScanAllAt` / PITR taraması paylaşılan `FScan*` tamponunu artık kilit altında kullanır (eşzamanlı `ScanAll` ile bozulma giderildi) |

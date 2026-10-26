@@ -681,12 +681,65 @@ Kapı: `sqltest` v3 **2832/0/33**, v2 **3266/0/0** (yeni
 `T158_OnEkKosulHash`: INNER/LEFT/FULL/PK/OR kökü/NULL/imkânsız ek koşul);
 14/14 kapı yeşil.
 
+### Dosya boyutu: PK satır gövdesinde tek kez (v3.13, 2026-10-26)
+
+Satır içi PK tanımında PK **iki kez** yazılıyordu: gövde başlığında
+(`varint pkLen + pk`) ve PK kolonunun yükünde. `.idx` anahtarı
+`VDbHashKey` olduğu için PK anahtardan türetilemez; gereksiz olan ikinci
+kopyadır.
+
+Ölçüm (`tmp64/rowbytes`, 3 kolon):
+
+| tablo | ort. satır (v3.12) | PK baytları | PK payı |
+|---|---|---|---|
+| küçük INT PK | 21,8 B | 3,8 B | %17,4 |
+| büyük INT PK | 30,7 B | 9,9 B | %32,1 |
+| TEXT PK | 36,0 B | 10,0 B | %27,8 |
+
+Yeni biçim (dosya sürümü **5**): `pkLen = 0` + `varint v` → `v = 0` boş
+PK, `v ≥ 1` ise PK `v-1`. kolonun değeridir; `pkLen > 0` eski satır içi
+biçimdir. Eski dosyalarda `pkLen = 0` **hiç görülmez** (boş PK reddedilir,
+PK'siz tablo üretilmiş anahtar taşır → ölçüldü `pkLen = 2`), bu yüzden
+ayırt edicidir. Kodlayıcı bu yolu yalnız PK metni kolonun **kanonik**
+metniyle birebir aynıysa kullanır; aksi halde satır içi yazar (kayıpsız).
+
+Aynı veri, iki ikili (`tmp64/sizebench`, 50k + 50k satır, kapanmış dosya):
+
+| veri kümesi | v3.12 `.odb` | v3.13 `.odb` | fark |
+|---|---|---|---|
+| geniş metin (`kayit-NNNNN`) | 5.406.720 B | 4.874.240 B | **−%9,9** |
+| dar satır (`t='x'`) | 4.435.968 B | 3.866.624 B | **−%12,8** |
+
+Satır düzeyi: küçük INT PK **21,8 → 19,0 B** (−%12,8), büyük INT PK
+**30,7 → 21,9 B** (−%28,7), TEXT PK **36,0 → 27,0 B** (−%25,0). `.idx`
+değişmedi (1.089.063 → 1.088.347 B).
+
+**Hücre başlığı sıkıştırma reddedildi:** kolon başına 1 bayt `ctype`,
+`ALTER COLUMN TYPE` sonrası eski satırların doğru çözülmesini sağlayan
+güvenlik ağıdır; 3 bayt/row için bu garanti bozulmaz (öncelik 1).
+
+Geriye dönük okuma kanıtı: `c02ac06` ikilisiyle (sürüm 4) yazılan dosya
+yenide açıldı → başlık **4 → 5**, 100 eski satır satır içi PK ile aynen
+okundu, aynı dosyaya 10 yeni satır pk'sız yazıldı (iki biçim yan yana),
+`UPDATE` PK'yı korudu, `VACUUM` satırları ham kopyaladı, yeniden açılışta
+tüm PK'lar birebir. Eski ikili aynı dosyayı `desteklenmeyen surum: 5`
+ile reddetti; salt-okunur açılış yükseltme yapmadı (sürüm 4 kaldı).
+
+Kapı: `sqltest` v3 **2858/0/33**, v2 **3289/0/0** (yeni `T159_PkTekKez`,
+26 kontrol); 14/14 kapı yeşil.
+
+Okuma bedeli (aynı veri, iki ikili, QPC 9 koşu medyanı): `SUM(a)` INT pk
+0,31 → **0,40 µs/satır**, `SUM(LENGTH(t))` 2,80 → 2,83, `SUM(n)` TEXT pk
+0,34 → 0,35. (İlk turda `SUM(a)` 0,45 idi; KeyHash yolundaki satır başına
+`IntToStr` ayırması `VdbIntToDecBuf` ile kaldırıldı.)
+
 ### Sürüm çizgisi (2026-10-26)
 
 Bu hat **alpha**'dır: `v3.x` adları yayın sürümü değil çalışma dilimidir.
 Kalan kapsam — Bloom filtresi (ölçümle reddedildi), merge JOIN (ölçümle
 reddedildi, yerine ON eşitlik+ek koşul hash düzeltmesi yapıldı), dosya
-boyutu (PK tekrarı + hücre başlığı), ifade bytecode, snapshot isolation —
+boyutu (**yapıldı**: PK tekrarı kaldırıldı, hücre başlığı gerekçeli
+reddedildi), ifade bytecode, snapshot isolation —
 bu hatta yapılır ve hepsi bitince ürün **v1.0.0** olarak etiketlenir.
 `main` = `v3` (84 commit fast-forward); iş `v3`te yürür ve her push'ta
 `main` de ilerletilir. Süreçler arası çok yazarlılık (aynı dosyaya iki

@@ -17325,6 +17325,55 @@ begin
   Result := True;
 end;
 
+{ v3.13: pk'nin govdede tek kez yazildigi bicim. Yeni satirlarda pkLen = 0
+  ve ardindan 1 tabanli kolon indeksi gelir; eski (v3.11/v3.12) satirlarda
+  pkLen > 0 olur. }
+type
+  TRowPkStat = record
+    N, ColPk, InlinePk, EmptyPk, FirstRef, MaxLen: Integer;
+  end;
+
+function PkFmtScanCb(Key: QWord; Buf: PByte; Len: Integer;
+  User: Pointer): Boolean;
+var
+  st: ^TRowPkStat;
+  p, u, sh: Integer;
+  by: Byte;
+begin
+  st := User;
+  Result := True;
+  if Key = 0 then Exit;                       // sema kaydi
+  if (Len < 6) or (Buf[0] <> $FF) or (Buf[1] <> $FF) then Exit;
+  Inc(st^.N);
+  p := 4;
+  u := 0; sh := 0;
+  repeat
+    if p >= Len then Exit;
+    by := Buf[p]; Inc(p);
+    u := u or ((Integer(by and $7F)) shl sh);
+    Inc(sh, 7);
+  until (by and $80) = 0;
+  if u = 0 then
+  begin
+    u := 0; sh := 0;
+    repeat
+      if p >= Len then Exit;
+      by := Buf[p]; Inc(p);
+      u := u or ((Integer(by and $7F)) shl sh);
+      Inc(sh, 7);
+    until (by and $80) = 0;
+    if u = 0 then Inc(st^.EmptyPk)
+    else
+    begin
+      Inc(st^.ColPk);
+      if st^.FirstRef < 0 then st^.FirstRef := u - 1;
+    end;
+  end
+  else
+    Inc(st^.InlinePk);
+  if Len > st^.MaxLen then st^.MaxLen := Len;
+end;
+
 procedure T157_SatirGovdesi;
 var
   v1, v2: TBytes;
@@ -17423,7 +17472,9 @@ begin
       IntToStr(st.BadExt));
     Dogrula('ham: tablo kimligi dogru yerde', st.BadTid = 0,
       IntToStr(st.BadTid));
-    Dogrula('ham: satir boyu 30 (v1 ayni satir 39 baytti)', st.MaxLen = 30,
+    { v3.13: pk govdede ikinci kez yazilmiyor (pk "42" = 2 bayt + uzunluk
+      bayti 3 bayt idi); ayni satir v3.11'de 30, v1 govdede 39 baytti. }
+    Dogrula('ham: satir boyu 27 (v3.11 30, v1 39 bayt)', st.MaxLen = 27,
       IntToStr(st.MaxLen));
   end
   else
@@ -17496,6 +17547,130 @@ begin
     'SELECT COUNT(*) FROM ja FULL JOIN jb ON ja.k=jb.k AND ja.k>1', 0, 0, '10');
 end;
 
+procedure T159_PkTekKez;
+{ v3.13: pk govdede IKINCI kez yazilmaz. Davranis ayni kalmali: pk
+  degeri, pk ile arama, guncelleme/silme, indeks yolu, VACUUM ve yeniden
+  acma. Ham kontrolde yeni satirlarin pkLen=0 (kolon referansi) oldugu
+  dogrulanir. }
+var
+  st: TRowPkStat;
+  td: TTableDef;
+  p: string;
+  i: Integer;
+begin
+  Grp('T159: PK satir govdesinde tek kez (v3.13)');
+  p := D + PathDelim + 'pktek';
+  Fresh('pktek');
+
+  sq.Exec('CREATE TABLE p1(id INTEGER PRIMARY KEY, a INTEGER, t TEXT)');
+  sq.Exec('BEGIN');
+  for i := 1 to 200 do
+    sq.Exec('INSERT INTO p1(id,a,t) VALUES(' + IntToStr(i * 1000003) + ',' +
+      IntToStr(i) + ',''v' + IntToStr(i) + ''')');
+  sq.Exec('COMMIT');
+  ChkVal('INT PK sayimi', 'SELECT COUNT(*) FROM p1', 0, 0, '200');
+  ChkVal('INT PK degeri (a=42)', 'SELECT id FROM p1 WHERE a = 42', 0, 0,
+    '42000126');
+  ChkVal('INT PK metni (a=7)', 'SELECT id FROM p1 WHERE a = 7', 0, 0, '7000021');
+
+  if gV3 and (gBe <> nil) then
+  begin
+    td := tb.GetTable('p1');
+    FillChar(st, SizeOf(st), 0);
+    st.FirstRef := -1;
+    gBe.ScanRawIterAll(td.TableId, @PkFmtScanCb, @st);
+    Dogrula('ham: 200 satir pk''siz govde',
+      (st.N = 200) and (st.ColPk = 200) and (st.InlinePk = 0),
+      Format('n=%d col=%d inline=%d', [st.N, st.ColPk, st.InlinePk]));
+    Dogrula('ham: pk = kolon 0', st.FirstRef = 0, IntToStr(st.FirstRef));
+  end;
+
+  // TEXT PK (unicode dahil)
+  sq.Exec('CREATE TABLE p2(kod TEXT PRIMARY KEY, n INTEGER)');
+  sq.Exec('BEGIN');
+  for i := 1 to 50 do
+    sq.Exec('INSERT INTO p2(kod,n) VALUES(''SIP-' + IntToStr(1000 + i) + ''',' +
+      IntToStr(i) + ')');
+  sq.Exec('COMMIT');
+  sq.Exec('INSERT INTO p2(kod,n) VALUES(''Ayşe-9'',999)');
+  ChkVal('TEXT PK arama', 'SELECT n FROM p2 WHERE kod = ''SIP-1042''', 0, 0,
+    '42');
+  ChkVal('unicode PK arama', 'SELECT kod FROM p2 WHERE n = 999', 0, 0, 'Ayşe-9');
+
+  // PK ilk kolon DEGIL
+  sq.Exec('CREATE TABLE p3(v TEXT, id INTEGER PRIMARY KEY, n INTEGER)');
+  sq.Exec('INSERT INTO p3(v,id,n) VALUES(''a'',7,70)');
+  sq.Exec('INSERT INTO p3(v,id,n) VALUES(''b'',8,80)');
+  ChkVal('PK ilk kolon degil', 'SELECT v FROM p3 WHERE id = 8', 0, 0, 'b');
+  if gV3 and (gBe <> nil) then
+  begin
+    td := tb.GetTable('p3');
+    FillChar(st, SizeOf(st), 0);
+    st.FirstRef := -1;
+    gBe.ScanRawIterAll(td.TableId, @PkFmtScanCb, @st);
+    Dogrula('ham: pk = kolon 1', (st.N = 2) and (st.FirstRef = 1),
+      Format('n=%d ref=%d inline=%d', [st.N, st.FirstRef, st.InlinePk]));
+  end;
+
+  // Tablo kisiti olarak PK
+  sq.Exec('CREATE TABLE p5(id INTEGER, n INTEGER, PRIMARY KEY(id))');
+  sq.Exec('INSERT INTO p5(id,n) VALUES(3,30)');
+  ChkVal('tablo kisiti PK', 'SELECT n FROM p5 WHERE id = 3', 0, 0, '30');
+  sq.Exec('INSERT OR REPLACE INTO p5(id,n) VALUES(3,33)');
+  ChkVal('OR REPLACE PK yolu', 'SELECT n FROM p5 WHERE id = 3', 0, 0, '33');
+
+  // PK guncelleme motor kurali geregi REDDEDILIR; silme PK anahtariyla
+  try
+    sq.Exec('UPDATE p1 SET id = 1 WHERE a = 7');
+    No('PK guncelleme reddedilir', 'hata beklenirken basarili oldu');
+  except
+    on E: Exception do Ok('PK guncelleme reddedilir', E.Message);
+  end;
+  sq.Exec('DELETE FROM p1 WHERE id = 7000021');
+  ChkVal('PK ile silindi', 'SELECT COUNT(*) FROM p1 WHERE a = 7', 0, 0, '0');
+
+  // Negatif / Int64 pk: KeyHash hizli yolu metni tampona tahsissiz yazar
+  sq.Exec('INSERT INTO p1(id,a,t) VALUES(-1234567890123,900,''neg'')');
+  sq.Exec('INSERT INTO p1(id,a,t) VALUES(1234567890123,901,''pos'')');
+  ChkVal('negatif Int64 pk', 'SELECT id FROM p1 WHERE a = 900', 0, 0,
+    '-1234567890123');
+  ChkVal('buyuk Int64 pk', 'SELECT id FROM p1 WHERE a = 901', 0, 0,
+    '1234567890123');
+  ChkVal('Int64 pk sayimi (ham yol)', 'SELECT COUNT(*) FROM p1', 0, 0, '201');
+
+  // ALTER TABLE ADD COLUMN: eski satirlarin kolon sayisi daha az
+  sq.Exec('ALTER TABLE p3 ADD COLUMN ek TEXT');
+  sq.Exec('INSERT INTO p3(v,id,n,ek) VALUES(''c'',9,90,''e9'')');
+  ChkVal('ALTER sonrasi eski satir PK', 'SELECT v FROM p3 WHERE id = 7',
+    0, 0, 'a');
+  ChkVal('ALTER sonrasi yeni satir', 'SELECT ek FROM p3 WHERE id = 9',
+    0, 0, 'e9');
+
+  // Ikincil indeks -> pk cozumu
+  sq.Exec('CREATE INDEX ix_p1_a ON p1(a)');
+  ChkVal('ikincil indeks -> PK', 'SELECT id FROM p1 WHERE a = 42', 0, 0,
+    '42000126');
+
+  // VACUUM satirlari yeniden kodlar
+  sq.Exec('VACUUM');
+  ChkVal('VACUUM sonrasi INT PK', 'SELECT id FROM p1 WHERE a = 42', 0, 0,
+    '42000126');
+  ChkVal('VACUUM sonrasi TEXT PK', 'SELECT n FROM p2 WHERE kod = ''SIP-1042''',
+    0, 0, '42');
+
+  // Yeniden acma
+  NewDb(p);
+  ChkVal('yeniden acma: INT PK', 'SELECT id FROM p1 WHERE a = 42', 0, 0,
+    '42000126');
+  ChkVal('yeniden acma: TEXT PK', 'SELECT n FROM p2 WHERE kod = ''SIP-1042''',
+    0, 0, '42');
+  ChkVal('yeniden acma: unicode PK', 'SELECT n FROM p2 WHERE kod = ''Ayşe-9''',
+    0, 0, '999');
+  ChkVal('yeniden acma: PK ilk kolon degil', 'SELECT v FROM p3 WHERE id = 9',
+    0, 0, 'c');
+  ChkVal('yeniden acma: ham COUNT', 'SELECT COUNT(*) FROM p1', 0, 0, '201');
+end;
+
 type
   TTestRec = record
     Nm: string;
@@ -17503,7 +17678,7 @@ type
   end;
 
 const
-  TEST_SAYISI = 188;
+  TEST_SAYISI = 189;
 
   { v3 kosusunda ATLA: bu testler yalniz v2 motorunun (TVDb/WAL/arsiv/
     zone/indeks .idx) ozel yollarini kullanir; v3'te karsiligi yoktur.
@@ -17763,6 +17938,7 @@ begin
   TESTLER[185].Nm := 'T156_SqliteParity'; TESTLER[185].P := T156_SqliteParity;
   TESTLER[186].Nm := 'T157_SatirGovdesi'; TESTLER[186].P := T157_SatirGovdesi;
   TESTLER[187].Nm := 'T158_OnEkKosulHash'; TESTLER[187].P := T158_OnEkKosulHash;
+  TESTLER[188].Nm := 'T159_PkTekKez'; TESTLER[188].P := T159_PkTekKez;
 end;
 
 { ---------------------------------------------------------------------- main }

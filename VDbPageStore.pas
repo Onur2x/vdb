@@ -36,10 +36,14 @@ uses
 
 const
   VDB_FILE_MAGIC   = $33424456;   // 'VDB3' (little endian)
-  VDB_FILE_VER     = 4;
+  VDB_FILE_VER     = 5;
   { v3.11: satir govdesi v1 yazmis olabilecek onceki surum; okunur ve ilk
-    yazmada 4'e yukseltilir. }
+    yazmada guncel surume yukseltilir. }
   VDB_FILE_VER_V3  = 3;
+  { v3.13: pk'nin satir govdesinde ikinci kez yazilmadigi bicim. Bu
+    surumden ONCEKI dosyalar pk'yi satir ici tasir; okunur ve ilk yazmada
+    5'e yukseltilir. }
+  VDB_FILE_VER_V4  = 4;
   VDB_V2_MAGIC     = $56444231;   // v2 'VDB1' — net goc hatasi icin
   VDB_HDR_PAGE     = 0;
   VDB_DEF_POOL     = 512;         // 512 x 4 KB = 2 MB
@@ -595,7 +599,8 @@ begin
   if magic <> VDB_FILE_MAGIC then
     raise EVdbPageStore.Create(Format('gecersiz dosya sihirli sayisi: $%.8x', [magic]));
   Move(buf[4], ver, SizeOf(ver));
-  if (ver <> VDB_FILE_VER) and (ver <> VDB_FILE_VER_V3) then
+  if (ver <> VDB_FILE_VER) and (ver <> VDB_FILE_VER_V3) and
+     (ver <> VDB_FILE_VER_V4) then
     raise EVdbPageStore.Create(Format('desteklenmeyen surum: %d (beklenen %d)',
       [ver, VDB_FILE_VER]));
   Move(buf[8], ps, SizeOf(ps));
@@ -619,11 +624,12 @@ begin
       [fileLen, FPageCount]));
   if FPageCount < 1 then
     raise EVdbPageStore.Create('baslikta sayfa sayisi 0');
-  { v3.11: eski (surum 3) baslik, YAZILABILIR oturumda HEMEN 4'e
-    yukseltilir. Aksi halde bu dosyaya v2 govdeli satir yazildiktan sonra
-    eski bir ikili dosyayi acip satirlari sessizce yanlis cozebilirdi.
-    Salt-okunur oturum yazmadigi icin yukseltme gerekmez. }
-  if (ver = VDB_FILE_VER_V3) and not FReadOnly then SaveMeta;
+  { v3.11/v3.13: eski (surum 3 veya 4) baslik, YAZILABILIR oturumda HEMEN
+    guncel surume yukseltilir. Aksi halde bu dosyaya yeni govdeli satir
+    yazildiktan sonra eski bir ikili dosyayi acip satirlari sessizce yanlis
+    cozebilirdi. Salt-okunur oturum yazmadigi icin yukseltme gerekmez. }
+  if ((ver = VDB_FILE_VER_V3) or (ver = VDB_FILE_VER_V4)) and not FReadOnly then
+    SaveMeta;
 end;
 
 procedure TVDbPageStore.SaveMeta;

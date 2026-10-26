@@ -3158,6 +3158,24 @@ end;
   `>= $FFFE` reddeder; sema yuklemede de acik hata), bu yuzden eski bir
   satirin yanlislikla v2 sanilmasi MUMKUN DEGIL.
 
+  v3.13 (dosya surumu 5) - PK TEKRARI KALDIRILDI. PK hem govde basliginda
+  hem de (satir ici PK taniminda) kolon degerinde yaziliyordu; olcum
+  (tmp64/rowbytes, 3000 satir) pk baytlarinin satirin **%17-32'si**
+  oldugunu gosterdi. Yeni bicim pk'yi bir kez yazar:
+
+    [u16 $FFFF][u16 tid][varint pkLen] ...
+       pkLen = 0  -> pk satirda YOK; hemen bir varint gelir:
+                     v = 0  => pk bos string
+                     v >= 1 => pk = (v-1). kolonun degeri
+       pkLen > 0  -> pkLen bayt pk (eski davranis, aynen korunur)
+
+  `pkLen = 0` eski dosyalarda GORULMEZ: bos PK reddedilir ("PK bos
+  olamaz"), PK'siz tabloda uretilmis anahtar yazilir (olculdu: pkLen=2).
+  Bu yuzden bicim ayirt edicidir ve eski dosyalar aynen okunur. Yeni
+  satirlar yalnizca pk kolonunun KANONIK metni pk ile birebir ayniysa
+  bu yolu kullanir; aksi halde pk satir ici yazilir (kayip riski yok).
+  Eski ikili v5 dosyayi surum denetiminde reddeder.
+
   DOSYA SURUMU (VDB_FILE_VER) 3 -> 4 YUKSELDI. Ayni dosyada eski (v1) ve
   yeni (v2) satirlar bir arada bulunabilir: eski satirlar oldugu gibi
   okunur, guncellenince v2 yazilir. Surum yukseltmesinin tek amaci ESKI
@@ -3169,6 +3187,8 @@ end;
 
 const
   VDB_ROW_EXT = Word($FFFF);
+  { v3.13: govdede pk yok; pk bir kolonun degerinden uretilir. }
+  VDB_ROW_PK_EMPTY = -100;
 
 function VdbVarUGet(B: PByte; Len: Integer; var P: Integer;
   out U: LongWord): Boolean;
@@ -3194,6 +3214,8 @@ type
     Ext: Boolean;
     TableId: Word;
     PkOff, PkLen: Integer;
+    PkFromCol: Integer;   // -1 = pk satir ici, >=0 = kolon indeksi,
+                          // VDB_ROW_PK_EMPTY = bos pk (v3.13)
     ColOff, ColCount: Integer;
   end;
 
@@ -3205,6 +3227,7 @@ var
 begin
   Result := False;
   FillChar(H, SizeOf(H), 0);
+  H.PkFromCol := -1;
   if (B = nil) or (Len < 2) then Exit;
   p := 0;
   w := B[0] or (Word(B[1]) shl 8);
@@ -3212,6 +3235,9 @@ begin
   H.Ext := (w = VDB_ROW_EXT);
   if H.Ext then
   begin
+    { v3.13: govdeye tablo kimligi YERINE yeni bicim isareti konmadi;
+      $FFFE gecerli bir tablo kimligi olabildigi icin (CreateTable
+      `>= $FFFF` reddeder) o yol guvenli degildi. Ayirt edici pkLen=0. }
     if p + 2 > Len then Exit;
     H.TableId := B[p] or (Word(B[p + 1]) shl 8);
     Inc(p, 2);
@@ -3225,9 +3251,22 @@ begin
     H.PkLen := B[p] or (Word(B[p + 1]) shl 8);
     Inc(p, 2);
   end;
-  if (H.PkLen < 0) or (p + H.PkLen > Len) then Exit;
-  H.PkOff := p;
-  Inc(p, H.PkLen);
+  if H.PkLen < 0 then Exit;
+  if H.Ext and (H.PkLen = 0) then
+  begin
+    { v3.13: pk satirda yok. v=0 -> bos pk; v>=1 -> (v-1). kolon. }
+    if not VdbVarUGet(B, Len, p, u) then Exit;
+    if u = 0 then H.PkFromCol := VDB_ROW_PK_EMPTY
+    else H.PkFromCol := Integer(u) - 1;
+    H.PkOff := p;
+    H.PkLen := 0;
+  end
+  else
+  begin
+    if p + H.PkLen > Len then Exit;
+    H.PkOff := p;
+    Inc(p, H.PkLen);
+  end;
   if H.Ext then
   begin
     if not VdbVarUGet(B, Len, p, u) then Exit;
@@ -3260,6 +3299,107 @@ begin
   begin
     Result := P + 4 <= Len;
     if Result then begin Move(B[P], Vl, 4); Inc(P, 4); end;
+  end;
+end;
+
+function VdbIntToDecBuf(V: Int64; var Buf: array of AnsiChar): Integer;
+{ v3.13: INT pk'nin kanonik ondalik metnini TAHSISSIZ yazar (KeyHash hizli
+  yolu satir basina string ayirmasin). Negatif ve MinInt64 dogru.
+  Yer yetersizse 0 doner. }
+var
+  i, n: Integer;
+  neg: Boolean;
+  u: QWord;
+begin
+  Result := 0;
+  neg := V < 0;
+  if neg then u := QWord(-(V + 1)) + 1 else u := QWord(V);
+  i := High(Buf);
+  n := 0;
+  repeat
+    if i < 0 then Exit;
+    Buf[i] := AnsiChar(Ord('0') + Integer(u mod 10));
+    u := u div 10;
+    Inc(n);
+    Dec(i);
+  until u = 0;
+  if neg then
+  begin
+    if i < 0 then Exit;
+    Buf[i] := '-';
+    Inc(n);
+    Dec(i);
+  end;
+  if n > 0 then Move(Buf[i + 1], Buf[0], n);
+  Result := n;
+end;
+
+function VdbRowPkOf(B: PByte; Len: Integer; const H: TVdbRowHdr;
+  out Pk: string): Boolean;
+{ v3.13: satirdan pk metnini uretir. PK govdede satir ici ise oradan;
+  degilse ilgili kolonun KANONIK metninden (kodlayici bunu birebir
+  dogruladigi icin kayipsiz). Kolon tipi satirin kendi ctype baytindan
+  okunur, sema gerekmez. }
+var
+  p, i, j: Integer;
+  vl: LongInt;
+  ct: Byte;
+  iv: Int64;
+  fv: Double;
+  rs: RawByteString;
+begin
+  Result := False;
+  Pk := '';
+  if H.PkFromCol = VDB_ROW_PK_EMPTY then Exit(True);
+  if H.PkFromCol < 0 then
+  begin
+    if (H.PkLen < 0) or (H.PkOff < 0) or (H.PkOff + H.PkLen > Len) then Exit;
+    if H.PkLen = 0 then Exit(True);
+    SetString(rs, PAnsiChar(NativeUInt(B) + NativeUInt(H.PkOff)), H.PkLen);
+    Pk := UTF8Decode(rs);
+    Exit(True);
+  end;
+  j := H.PkFromCol;
+  if (j < 0) or (j >= H.ColCount) then Exit;
+  p := H.ColOff;
+  for i := 0 to j do
+  begin
+    if p >= Len then Exit;
+    ct := B[p]; Inc(p);
+    if not VdbRowColLen(B, Len, p, H.Ext, vl) then Exit;
+    if vl = -1 then
+    begin
+      if i = j then Exit(True);      // pk NULL olamaz: bos kabul
+      Continue;                      // NULL: yuk yok
+    end;
+    if (vl < 0) or (p + vl > Len) then Exit;
+    if i < j then
+    begin
+      Inc(p, vl);
+      Continue;
+    end;
+    case ct of
+      VCT_INT:
+        begin
+          if not VDbIntFromPayload(@B[p], vl, iv) then Exit;
+          Pk := IntToStr(iv);
+        end;
+      VCT_FLOAT:
+        begin
+          if vl <> 8 then Exit;
+          Move(B[p], fv, 8);
+          Pk := VDbFloatToStr(fv);
+        end;
+      VCT_BOOL:
+        Pk := BoolToStr(B[p] <> 0, True);
+    else
+      begin
+        SetString(rs, PAnsiChar(NativeUInt(B) + NativeUInt(p)), vl);
+        if ct = VCT_BLOB then Pk := string(rs)
+        else Pk := UTF8Decode(rs);
+      end;
+    end;
+    Exit(True);
   end;
 end;
 
@@ -3408,6 +3548,64 @@ var
     end;
   end;
 
+  { v3.13: PK alanini yazar. pk, pk kolonunun KANONIK metniyle birebir
+    ayniysa govdeye YAZILMAZ; yalnizca kolon indeksi yazilir (1 tabanli,
+    0 = bos pk). Aksi halde eski bicimde satir ici yazilir.
+    Bu, pk'nin satirda iki kez durmasini onler (satirin %17-32'si). }
+  procedure PutPkField(const S: string);
+  var
+    j: Integer;
+    canon: string;
+    iv: Int64;
+    fv: Double;
+    bv: Byte;
+  begin
+    j := -1;
+    if (T.PkIndex >= 0) and (T.PkIndex < Length(T.Cols)) and
+       (T.PkIndex < Length(Vals)) and (Vals[T.PkIndex] <> '') then
+    begin
+      // Kolonun cozucunun uretecegi metin (kanonik) pk ile ayni mi?
+      case T.Cols[T.PkIndex].Ctype of
+        VCT_INT:
+          begin
+            if VDbParseInt(Vals[T.PkIndex], iv) then
+              canon := IntToStr(iv)
+            else
+              canon := #1;                 // eslesmez
+          end;
+        VCT_FLOAT:
+          begin
+            if VDbParseFloat(Vals[T.PkIndex], fv) then
+              canon := VDbFloatToStr(fv)
+            else
+              canon := #1;
+          end;
+        VCT_BOOL:
+          begin
+            if SameText(Trim(Vals[T.PkIndex]), 'true') or
+               (Trim(Vals[T.PkIndex]) = '1') then bv := 1
+            else bv := 0;
+            canon := BoolToStr(bv <> 0, True);
+          end;
+      else
+        canon := Vals[T.PkIndex];
+      end;
+      if canon = S then j := T.PkIndex;
+    end;
+    if j >= 0 then
+    begin
+      PutVarU(0);                      // pk satirda yok
+      PutVarU(LongWord(j) + 1);        // pk = j. kolon
+    end
+    else if S = '' then
+    begin
+      PutVarU(0);
+      PutVarU(0);                      // bos pk
+    end
+    else
+      PutPkU8(S);
+  end;
+
   procedure PutTextU8(const S: string);
   // lenCode + UTF-8 baytlar (metin kolonu).
   var sb: TBytes;
@@ -3438,7 +3636,7 @@ begin
   { v3.11: uzatilmis govde isareti + tablo kimligi. }
   PutU16(VDB_ROW_EXT);
   PutU16(TableId);
-  PutPkU8(Pk);
+  PutPkField(Pk);
   PutVarU(LongWord(Length(T.Cols)));
   for i := 0 to High(T.Cols) do
   begin
@@ -3578,7 +3776,7 @@ begin
   if Length(B) < 2 then Exit;
   if not VdbRowHdrOf(@B[0], Length(B), H) then Exit;
   TableId := H.TableId;
-  Pk := UTF8Decode(VDbB2S(B, H.PkOff, H.PkLen));
+  if not VdbRowPkOf(@B[0], Length(B), H, Pk) then Exit;
   cc := H.ColCount;
   SetLength(Vals, cc);
   p := H.ColOff;
@@ -3632,7 +3830,7 @@ begin
   if Length(B) < 2 then Exit;
   if not VdbRowHdrOf(@B[0], Length(B), H) then Exit;
   TableId := H.TableId;
-  Pk := UTF8Decode(VDbB2S(B, H.PkOff, H.PkLen));
+  if not VdbRowPkOf(@B[0], Length(B), H, Pk) then Exit;
   if H.ColCount <> ColCount then Exit;
   p := H.ColOff;
   for i := 0 to ColCount - 1 do
@@ -3670,13 +3868,7 @@ begin
   if (B = nil) or (Length(FType) < ColCount) then Exit;
   if not VdbRowHdrOf(B, Len, H) then Exit;
   TableId := H.TableId;
-  if H.PkLen > 0 then
-  begin
-    SetString(s, PAnsiChar(NativeUInt(B) + NativeUInt(H.PkOff)), H.PkLen);
-    Pk := UTF8Decode(s);
-  end
-  else
-    Pk := '';
+  if not VdbRowPkOf(B, Len, H, Pk) then Exit;
   if H.ColCount <> ColCount then Exit;
   p := H.ColOff;
   for i := 0 to ColCount - 1 do
@@ -3806,13 +3998,7 @@ begin
   if B = nil then Exit;
   if not VdbRowHdrOf(B, Len, H) then Exit;
   TableId := H.TableId;
-  if H.PkLen > 0 then
-  begin
-    s := SliceStr(H.PkOff, H.PkLen);
-    Pk := UTF8Decode(s);
-  end
-  else
-    Pk := '';
+  if not VdbRowPkOf(B, Len, H, Pk) then Exit;
   cc := H.ColCount;
   SetLength(Vals, cc);
   p := H.ColOff;
@@ -3873,16 +4059,34 @@ var
   k: Integer;
   vl: LongInt;
   pkPtr: PByte;
+  pkLen: Integer;
+  pkCol: Integer;
+  pkBuf: array[0..27] of AnsiChar;   // INT pk metni (v3.13, tahsissiz)
+  iv: Int64;
 begin
   Result := False;
   KeyHash := 0;
   if (B = nil) or (Length(FType) < ColCount) then Exit;
   if not VdbRowHdrOf(B, Len, H) then Exit;
   TableId := H.TableId;
-  if H.PkLen > 0 then
-    pkPtr := B + H.PkOff             // pk UTF-8 baytlari: kopya YOK, string YOK
+  pkPtr := nil;
+  pkLen := H.PkLen;
+  pkCol := -1;
+  if H.PkFromCol >= 0 then
+  begin
+    { v3.13: pk satirda yok; pk kolonunu da coz (MaxCol'u genislet).
+      Metin/bayt pk'da yuk baytlari pk'nin UTF-8'i ile AYNI oldugu icin
+      string kurmadan gosterilir; INT'te kanonik ondalik metin kucuk
+      yigin tamponuna yazilir. Diger tiplerde genel yola dusulur. }
+    if H.PkFromCol >= ColCount then Exit;
+    pkCol := H.PkFromCol;
+    if pkCol > MaxCol then MaxCol := pkCol;
+  end
   else
-    pkPtr := B;
+  begin
+    if H.PkLen > 0 then pkPtr := B + H.PkOff
+    else pkPtr := B;
+  end;
   if H.ColCount <> ColCount then Exit;
   if MaxCol > ColCount - 1 then MaxCol := ColCount - 1;
   p := H.ColOff;
@@ -3900,7 +4104,27 @@ begin
     FOff[k] := p; FLen[k] := vl;
     Inc(p, vl);
   end;
-  KeyHash := VDbHashKeyBytes(HashPrefix, pkPtr, H.PkLen);
+  if pkCol >= 0 then
+  begin
+    if (pkCol > MaxCol) or (FOff[pkCol] < 0) then Exit;   // pk NULL olamaz
+    case FType[pkCol] of
+      VCT_INT:
+        begin
+          if not VDbIntFromPayload(B + FOff[pkCol], FLen[pkCol], iv) then Exit;
+          pkLen := VdbIntToDecBuf(iv, pkBuf);
+          if pkLen <= 0 then Exit;
+          pkPtr := @pkBuf[0];
+        end;
+      VCT_FLOAT, VCT_BOOL:
+        Exit;                       // genel yol (nadir pk tipi)
+    else
+      begin
+        pkPtr := B + FOff[pkCol];
+        pkLen := FLen[pkCol];
+      end;
+    end;
+  end;
+  KeyHash := VDbHashKeyBytes(HashPrefix, pkPtr, pkLen);
   Result := True;
 end;
 
