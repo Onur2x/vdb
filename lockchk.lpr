@@ -317,6 +317,165 @@ begin
   end;
 end;
 
+{ v3.9: motor kilidi (TVdbGate) - derinlik defteri.
+  ONCEDEN FEngCs duz bir TCriticalSection'di ve ic ice cagrilar (ScanAll ->
+  ScanCb -> OwnSet, ApplyBatch -> BatchMap ...) yalnizca "kritik bolum
+  yeniden girisli" VARSAYIMINA dayaniyordu. Artik gate sahibi is parcacigini
+  ve derinligi izler: ayni parcacikdan giris kritik bolume HIC girmez.
+  Bu test: (a) her genel islemden sonra derinlik 0'a doner, (b) ic ice yol
+  gercekten kullaniliyor (MaxDepth >= 2), (c) 3 is parcacigi ayni backend'de
+  karisik okuma/yazma yaparken hata ve derinlik sizintisi olmaz. }
+type
+  TGateWorker = class(TThread)
+  public
+    Be: IVDbBackend;
+    Mode: Integer;        // 0 = okuyucu, 1 = yazici
+    Iters: Integer;
+    Err: string;
+    procedure Execute; override;
+  end;
+
+procedure TGateWorker.Execute;
+var
+  i: Integer;
+  v: TBytes;
+  keys: TQWordArray;
+  vals: TValArray;
+begin
+  try
+    for i := 1 to Iters do
+    begin
+      if Mode = 1 then
+      begin
+        SetLength(v, 12);
+        PInt64(@v[0])^ := i;
+        PInteger(@v[8])^ := Mode;
+        Be.Put(QWord(100000 + i), v);
+      end
+      else
+        case (i mod 4) of
+          0: Be.ScanAll(keys, vals, -1);
+          1: Be.Count;
+          2: Be.Exists(1);
+        else
+          Be.Get(1, v);
+        end;
+    end;
+  except
+    on E: Exception do Err := E.Message;
+  end;
+end;
+
+procedure TestGateDepth(const Dir: string);
+var
+  be: TVdbBackendV3;
+  ib: IVDbBackend;
+  v: TBytes;
+  i, ds, dbf: Integer;
+  freed: Int64;
+  err: string;
+  keys: TQWordArray;
+  vals: TValArray;
+  bad: Integer;
+  w1, w2, wr: TGateWorker;
+  seqMax: Integer;
+begin
+  WriteLn;
+  WriteLn('7) motor kilidi: derinlik defteri + es zamanli erisim');
+
+  WipeDb(Dir + 'gate.odb');
+  be := TVdbBackendV3.Create(Dir + 'gate.odb', True, VDB_DEF_POOL, 0);
+  ib := be;
+  bad := 0;
+  if be.DebugLockDepth <> 0 then
+    Fail(Format('acilistan sonra derinlik %d (beklenen 0)', [be.DebugLockDepth]));
+
+  { 200 satir TEK commit'te yazilir: WAL'de gecmis olussun ki ScanAllAt'in
+    gercek (taban + WAL) yolu calissin. }
+  ib.BeginBatch;
+  for i := 1 to 200 do
+    ib.Put(i, MakeVal(i));
+  ib.CommitBatch;
+  if be.DebugLockDepth = 0 then Ok('200 Put + CommitBatch sonrasi derinlik 0')
+  else begin Inc(bad); Fail(Format('Put sonrasi derinlik %d', [be.DebugLockDepth])); end;
+
+  if ib.Exists(100) and (ib.Count = 200) then
+    Ok('Exists/Count dogru')
+  else begin Inc(bad); Fail('Exists/Count yanlis'); end;
+  if be.DebugLockDepth = 0 then Ok('okuma sonrasi derinlik 0')
+  else begin Inc(bad); Fail(Format('okuma sonrasi derinlik %d', [be.DebugLockDepth])); end;
+
+  { ic ice yol: ScanAll kilit altinda OwnSet cagirir -> derinlik 2 }
+  ib.BeginBatch;
+  for i := 1 to 50 do
+    ib.Put(QWord(500 + i), MakeVal(i));
+  ib.ScanAll(keys, vals, -1);
+  if Length(keys) = 250 then
+    Ok('acik islemde tarama 250 satir (kaplama dahil)')
+  else begin Inc(bad); Fail(Format('tarama %d satir (beklenen 250)', [Length(keys)])); end;
+  if (be.DebugLockMaxDepth >= 2) and (be.DebugLockDepth = 0) then
+    Ok(Format('ic ice giris izlendi (en yuksek derinlik %d), sonra 0',
+      [be.DebugLockMaxDepth]))
+  else begin Inc(bad); Fail(Format('derinlik defteri yanlis: max=%d anlik=%d',
+    [be.DebugLockMaxDepth, be.DebugLockDepth])); end;
+  ib.AbortBatch;
+  if (be.DebugLockDepth = 0) and (ib.Count = 200) then
+    Ok('AbortBatch sonrasi derinlik 0, 200 satir')
+  else begin Inc(bad); Fail('AbortBatch sonrasi durum yanlis'); end;
+
+  { v3.9: ScanAllAt ayni FScan* tamponlarini kullanir; artik kilit altinda.
+    LogPrune'dan ONCE cagrilir: budama checkpoint tetikleyip WAL gecmisini
+    bosaltabilir; o durumda ScanAllAt'in "gecmis yok" yolu calisirdi. }
+  seqMax := ib.AsOfMaxSequence;
+  if ib.ScanAllAt(-1, seqMax, keys, vals, ds) then
+  begin
+    if (seqMax > 0) and (ds = seqMax) and (Length(keys) = 200) then
+      Ok(Format('ScanAllAt (seq %d/%d): 200 satir birebir', [ds, seqMax]))
+    else begin Inc(bad); Fail(Format('ScanAllAt yanlis: seq=%d/%d satir=%d',
+      [ds, seqMax, Length(keys)])); end;
+  end
+  else begin Inc(bad); Fail('ScanAllAt basarisiz'); end;
+  if be.DebugLockDepth = 0 then
+    Ok('ScanAllAt sonrasi derinlik 0')
+  else begin Inc(bad); Fail(Format('ScanAllAt sonrasi derinlik %d', [be.DebugLockDepth])); end;
+
+  { budama ve dogrulama da gate'i kullanir }
+  ib.LogPrune(ds, dbf, freed, err);
+  if (be.DebugLockDepth = 0) and (err = '') then
+    Ok('LogPrune sonrasi derinlik 0, hata yok')
+  else begin Inc(bad); Fail(Format('LogPrune sonrasi derinlik %d err=%s',
+    [be.DebugLockDepth, err])); end;
+
+  { 2 okuyucu + 1 yazici AYNI backend uzerinde }
+  w1 := TGateWorker.Create(True);
+  w2 := TGateWorker.Create(True);
+  wr := TGateWorker.Create(True);
+  try
+    w1.Be := ib; w1.Mode := 0; w1.Iters := 300; w1.Err := '';
+    w2.Be := ib; w2.Mode := 0; w2.Iters := 300; w2.Err := '';
+    wr.Be := ib; wr.Mode := 1; wr.Iters := 300; wr.Err := '';
+    w1.Start; w2.Start; wr.Start;
+    w1.WaitFor; w2.WaitFor; wr.WaitFor;
+    if (w1.Err = '') and (w2.Err = '') and (wr.Err = '') then
+      Ok('3 is parcacigi karisik okuma/yazma hatasiz')
+    else begin Inc(bad); Fail('is parcacigi hatasi: ' + w1.Err + w2.Err + wr.Err); end;
+    if be.DebugLockDepth = 0 then
+      Ok(Format('es zamanli erisim sonrasi derinlik 0 (en yuksek %d)',
+        [be.DebugLockMaxDepth]))
+    else begin Inc(bad); Fail(Format('derinlik sizintisi: %d', [be.DebugLockDepth])); end;
+    if ib.Count = 500 then
+      Ok('es zamanli yazim: 200 + 300 satir')
+    else begin Inc(bad); Fail(Format('es zamanli yazim sonrasi count=%d (beklenen 500)',
+      [ib.Count])); end;
+  finally
+    w1.Free; w2.Free; wr.Free;
+  end;
+
+  ib := nil;
+  if bad = 0 then
+    Ok('kilit defteri tutarli');
+end;
+
 { ------------------------------------------------------------------- ebeveyn }
 
 function TryWriterOpen(const Db: string; BusyMs: Integer;
@@ -549,6 +708,9 @@ begin
   else
     Fail(Format('salt-okunur oturum diski degistirdi: odb %d->%d, wal %d->%d',
       [sz0, sz1, wal0, wal1]));
+
+  { 7) v3.9: motor kilidi defteri + es zamanli erisim. }
+  TestGateDepth(dir);
 
   WriteLn;
   WriteLn('================================================');

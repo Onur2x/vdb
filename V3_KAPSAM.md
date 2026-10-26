@@ -529,9 +529,11 @@ Kapsam **süreç içi çok oturumlu yazma**dır: aynı `IVdbBackend` üzerinde b
   (`MarkSchema`), `SAVEPOINT`/`ROLLBACK TO`/`RELEASE`, `DEFERRABLE` FK ertelemesi
   ve bekleyen erteleme denetimi `RequireSoleTxn` / `IVdbBackend.SoleWriter`
   üzerinden açık `ecLockConflict` verir (sessiz karışıklık yerine).
-- **Kilit:** tek backend içinde yeniden girişli `FEngCs` (TCriticalSection)
-  motoru ve `FSets`'i serileştirir; **işlem boyunca tutulmaz**. Dosya düzeyi
-  kilit (paylaşımlı okuyucu / tam yazıcı) değişmedi.
+- **Kilit:** tek backend içinde `FEngCs` (`TVdbGate`, v3.9) motoru ve `FSets`'i
+  serileştirir; **işlem boyunca tutulmaz**. Dosya düzeyi kilit (paylaşımlı
+  okuyucu / tam yazıcı) değişmedi. Kilit sahibi iş parçacığını ve derinliği
+  izler: aynı iş parçacığından iç içe giriş kritik bölüme hiç girmez, başka
+  iş parçacığından giriş normal karşılıklı dışlamadır.
 - **Bilinçli sınırlar:** snapshot isolation yok; süreçler arası çok yazarlılık
   yok (ikinci süreç dosya kilidiyle reddedilir).
 

@@ -525,8 +525,9 @@ güncel motor değeriyle karşılaştırılır: **ilk commit kazanır**, kaybede
 - GLOBAL duruma dokunan işlemler (`MarkSchema`, `SAVEPOINT`/`ROLLBACK TO`/
   `RELEASE`, `DEFERRABLE` ertelemesi ve bekleyen denetim) çoklu yazmada
   `RequireSoleTxn`/`SoleWriter` ile açık `ecLockConflict` verir.
-- Kilit: yeniden girişli `FEngCs` motoru ve `FSets`'i serileştirir; işlem
-  boyunca tutulmaz. Dosya düzeyi kilit değişmedi.
+- Kilit: `FEngCs` motoru ve `FSets`'i serileştirir; işlem
+  boyunca tutulmaz. Dosya düzeyi kilit değişmedi. (v3.9: `FEngCs` artık
+  `TVdbGate` — sahip/derinlik izler, yeniden giriş varsayıma dayanmaz.)
 - Sınır: snapshot isolation yok; süreçler arası çok yazarlılık yok.
 
 | Ölçüm (`benchcmp`, 200k × 3 kolon, 3 koşu medyanı) | Değer |
@@ -664,6 +665,59 @@ Bilinçli sınırlar: segment içi yeniden yazma yok (tek bir dev segment
 budanamaz); budama sonrası kalan en eski tabandan önceki bir ana `AS OF` /
 `RECOVER TO` hedefi **açık hatayla** reddedilir; her budama turu bir tam
 dosya kopyası (taban imajı) maliyeti taşır.
+
+### v3.9 — motor notları: negatif budama, kilit defteri, tarama hızı (2026-10-26)
+
+Yol haritasında kalan üç motor notu kapatıldı. Üçü de **davranış aynı,
+ölçüm/kanıt farklı** türündendi; hiçbiri veri biçimini değiştirmedi.
+
+**1) Bölüm eleme (partition pruning) negatif sabitleri de kapsıyor.**
+AST'de `-5` düz literal değil, `TSqlUnaryOpNode(suoNeg)` düğümüdür. Eski
+`PartTargetsOf` yalnız `TSqlLiteralNode` kabul ettiği için `k = -5` ve
+`k IN (-1,-2)` hiç daraltılmıyordu (sonuç doğru, tarama tüm bölümler).
+Artık sabit çözümü tek bir yardımcıdan (`VdbInConstText`) geçiyor — indeks
+daraltması da aynı yardımcıyı kullanır, böylece iki yol ayrışamaz.
+Ek güvenlik: bölüm numarası hesaplanamazsa (`PartValueOf < 0`) koşul
+**katkı vermez**; `-1`'i hedef kümeye koymak hiçbir bölümü taramamak
+(satır kaybı) olurdu.
+
+**2) `FEngCs` yeniden girişliliği artık varsayım değil.**
+Kilit düz `TCriticalSection`'dı ve iç içe çağrılar (ScanAll → ScanCb →
+OwnSet, ApplyBatch → BatchMap) yalnız "kritik bölüm yeniden girişlidir"
+varsayımına dayanıyordu. Yeni `TVdbGate`: her iş parçacığı **kendi tuttuğu
+kilitlerin yığınını** (`threadvar`) tutar; aynı iş parçacığından giriş
+kritik bölüme hiç girmez, başka iş parçacığından giriş normal karşılıklı
+dışlamadır. Paylaşılan alanlar (`FDepth`, `FOwner`) kritik bölüm dışında
+**hiç okunmaz** — böylece zayıf bellek sıralı platformlarda eski sahip
+değerini görüp yanlışlıkla "yeniden giriş" sayma riski de yoktur. `Leave`
+sahipsiz çıkışta açık hata verir; iç içe kilit yığını dolarsa yine açık
+hata (sessiz kilitlenme yok). `DebugLockDepth` / `DebugLockMaxDepth` ile
+test edilebilir hale geldi.
+
+**3) Tarama yolunda satır başına 3 kilit alma kaldırıldı.**
+`ScanCb` her satırda `BatchIsMine` + `BatchMap` çağırıyordu; ikisi de
+`OwnSet` üzerinden kilit + oturum sözlüğü araması yapıyordu. Artık yazma
+kümesi tarama başında **bir kez** çözülür (`FScanSet`), satır başına tek
+sözlük araması kalır — kilit hiç alınmaz.
+
+Aynı turda bulunan gerçek eşzamanlılık hatası düzeltildi: `ScanAllAt` ve
+PITR taraması **paylaşılan** `FScan*` tamponlarını kilit altında
+kullanmıyordu; aynı backend'de eşzamanlı `ScanAll` + `ScanAllAt` (veya iki
+`ScanAllAt`) birbirinin sonucunu bozabiliyordu. Tampon bölgesi artık
+`FEngCs` altında (geçici motorun kurulum/kapanışı dışarıda).
+
+Ölçüm (`tmp64/scanbench`, 200k satır + açık yazma kümesi, QPC, 3 koşu
+medyanı): **45,00 ms → 32,00 ms** (son üç koşu 31–32 ms; önce/sonra aynı
+makine, aynı sonda).
+
+Testler: `sqltest` v3 **2801/0/33** (önce 2784) ve v2 **3238/0/0** (önce
+3221) — 17 yeni kontrol: HASH'te `k = -3`, yansıtılmış `-3 = k`,
+`k IN (-5,-1)`, karışık negatif liste, `EXPLAIN` hedef bölüm sayıları
+(1/4, 2/4), RANGE'te negatif değer (1/3). `lockchk` **30/0** (önce 17):
+her genel işlemden sonra derinlik 0, iç içe girişin gerçekten kullanıldığı
+(`MaxDepth=2`), `ScanAllAt` gerçek taban+WAL yolu, 3 iş parçacığı aynı
+backend'de karışık okuma/yazma, `LogPrune` sonrası derinlik.
+14/14 kapı yeşil; `lockchk` 64-bit derlemede de **30/0**.
 
 ### Sıradaki sürüme ertelenen (v4 sonrası)
 - Satır gövdesi varint/delta kodlama (F3-1'in kalanı)

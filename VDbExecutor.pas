@@ -3634,6 +3634,37 @@ end;
    sorusunun cevabi degismez - sadece okunacak satir sayisi azalir.
    ============================================================ }
 
+{ IN listesindeki bir ogenin SABIT degerini metne cevirir. Yalnizca duz
+  literal ve negatif literal (-3 -> TSqlUnaryOpNode(suoNeg)) kabul edilir.
+  NEDEN: negatif sayilar AST'de unary dugumu olarak durur; eski daraltma
+  kodu bunlari "literal degil" diye sessizce ATLIYORDU. Sonuc: indeks
+  dilimi yalniz pozitif degerlerden hesaplaniyor ve negatif grubun
+  satirlari HIC OKUNMADAN kayboluyordu (yanlis sonuc, hata yok). }
+function VdbInConstText(E: TSqlExprNode; out Val: string): Boolean;
+var
+  lit: TSqlLiteralNode;
+begin
+  Val := '';
+  Result := False;
+  if E is TSqlLiteralNode then
+  begin
+    lit := TSqlLiteralNode(E);
+    if lit.LitType = sltNull then Exit;
+    Val := lit.AsString;
+    Exit(Val <> '');
+  end;
+  if (E is TSqlUnaryOpNode) and (TSqlUnaryOpNode(E).Op = suoNeg) and
+     (TSqlUnaryOpNode(E).Operand is TSqlLiteralNode) then
+  begin
+    lit := TSqlLiteralNode(TSqlUnaryOpNode(E).Operand);
+    if not (lit.LitType in [sltInt, sltFloat]) then Exit;
+    Val := lit.AsString;
+    if Val = '' then Exit;
+    Val := '-' + Val;
+    Exit(True);
+  end;
+end;
+
 function TVSqlExecutor.PartTargetsOf(const Td: TTableDef;
   WhereClause: TSqlExprNode): TPartTargets;
 { R-13 Full: partition pruning hedef kumesi.
@@ -3641,6 +3672,10 @@ function TVSqlExecutor.PartTargetsOf(const Td: TTableDef;
     - bolme kolonu = literal  (veya literal = bolme kolonu)
     - bolme kolonu IN (literal, ...)  [NOT IN katki vermez]
     - bunlarin AND ile zinciri (kesisim)
+  Literal, NEGATIF sabitleri de kapsar (-5 AST'de unary neg dugumudur;
+  ONCEDEN yalniz duz literal kabul edildigi icin `k IN (-1,-2)` ve
+  `k = -5` hic daraltilmiyordu). Bolum numarasi hesaplanamazsa kosul
+  katki VERMEZ (-1'i hedef kumeye koymak satir kaybi olurdu).
   OR iceren kosul tek parca olarak degerlendirilir ve anlasilmazsa
   filtre YOK olur (guvenli taraf). INT kolonlarda literal IntToStr ile
   canonicallestirilir ('05' -> '5'); STRING kolonlarda aynen; diger
@@ -3652,6 +3687,7 @@ var
   pno: Integer;
   nn: TSqlBinaryOpNode;
   lit: string;
+  cst: string;
   iv: Int64;
   started: Boolean;
   tgt, one, ins, keep: TIntArray;
@@ -3744,29 +3780,35 @@ begin
       begin
         nn := TSqlBinaryOpNode(conj[i]);
         if nn.Op <> sboEq then Continue;
-        // kolon = literal
+        // kolon = literal  (negatif literal dahil: -5 -> unary neg dugumu)
         if (nn.Left is TSqlColumnRefNode) and
-           (nn.Right is TSqlLiteralNode) and
            (VDbNorm(TSqlColumnRefNode(nn.Left).ColumnName) = Td.PartCol) then
         begin
-          lit := CanonLit(TSqlLiteralNode(nn.Right).AsString);
+          lit := '';
+          if VdbInConstText(nn.Right, cst) then lit := CanonLit(cst);
           if lit <> '' then
           begin
+            pno := FT.PartValueOf(Td, lit);
+            { Bolum hesaplanamadiysa (-1) bu kosul KATKI VERMEZ: -1'i hedef
+              kumeye koymak hicbir bolumu taramamak (satir kaybi) olurdu. }
+            if pno < 0 then Continue;
             SetLength(one, 1);
-            one[0] := FT.PartValueOf(Td, lit);
+            one[0] := pno;
             Intersect(one);
           end;
         end
         // literal = kolon (yansitilmis)
         else if (nn.Right is TSqlColumnRefNode) and
-                (nn.Left is TSqlLiteralNode) and
                 (VDbNorm(TSqlColumnRefNode(nn.Right).ColumnName) = Td.PartCol) then
         begin
-          lit := CanonLit(TSqlLiteralNode(nn.Left).AsString);
+          lit := '';
+          if VdbInConstText(nn.Left, cst) then lit := CanonLit(cst);
           if lit <> '' then
           begin
+            pno := FT.PartValueOf(Td, lit);
+            if pno < 0 then Continue;
             SetLength(one, 1);
-            one[0] := FT.PartValueOf(Td, lit);
+            one[0] := pno;
             Intersect(one);
           end;
         end;
@@ -3787,10 +3829,11 @@ begin
             bad := False;
             for j := 0 to List.Count - 1 do
             begin
-              if not (List[j] is TSqlLiteralNode) then begin bad := True; Break; end;
-              lit := CanonLit(TSqlLiteralNode(List[j]).AsString);
+              if not VdbInConstText(List[j], cst) then begin bad := True; Break; end;
+              lit := CanonLit(cst);
               if lit = '' then begin bad := True; Break; end;
               pno := FT.PartValueOf(Td, lit);
+              if pno < 0 then begin bad := True; Break; end;
               f := False;
               for q := 0 to High(ins) do
                 if ins[q] = pno then begin f := True; Break; end;
@@ -3814,37 +3857,6 @@ begin
     Result := pt;
   finally
     conj.Free;
-  end;
-end;
-
-{ IN listesindeki bir ogenin SABIT degerini metne cevirir. Yalnizca duz
-  literal ve negatif literal (-3 -> TSqlUnaryOpNode(suoNeg)) kabul edilir.
-  NEDEN: negatif sayilar AST'de unary dugumu olarak durur; eski daraltma
-  kodu bunlari "literal degil" diye sessizce ATLIYORDU. Sonuc: indeks
-  dilimi yalniz pozitif degerlerden hesaplaniyor ve negatif grubun
-  satirlari HIC OKUNMADAN kayboluyordu (yanlis sonuc, hata yok). }
-function VdbInConstText(E: TSqlExprNode; out Val: string): Boolean;
-var
-  lit: TSqlLiteralNode;
-begin
-  Val := '';
-  Result := False;
-  if E is TSqlLiteralNode then
-  begin
-    lit := TSqlLiteralNode(E);
-    if lit.LitType = sltNull then Exit;
-    Val := lit.AsString;
-    Exit(Val <> '');
-  end;
-  if (E is TSqlUnaryOpNode) and (TSqlUnaryOpNode(E).Op = suoNeg) and
-     (TSqlUnaryOpNode(E).Operand is TSqlLiteralNode) then
-  begin
-    lit := TSqlLiteralNode(TSqlUnaryOpNode(E).Operand);
-    if not (lit.LitType in [sltInt, sltFloat]) then Exit;
-    Val := lit.AsString;
-    if Val = '' then Exit;
-    Val := '-' + Val;
-    Exit(True);
   end;
 end;
 

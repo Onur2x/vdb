@@ -42,6 +42,32 @@ const
 type
   EVdbBackendV3 = class(Exception);
 
+  { v3.9: motor kilidi. ONCEDEN duz `TCriticalSection` idi ve ic ice
+    cagrilar (ScanAll -> ScanCb -> OwnSet gibi) yalnizca kritik bolumun
+    YENIDEN GIRISLI olmasi VARSAYIMINA dayaniyordu. Artik her is parcacigi
+    TUTTUGU kilitlerin yiginini (threadvar) tasir:
+      - Ayni is parcacigindan giris: derinlik artar, kritik bolume HIC
+        girilmez -> "kritik bolum yeniden girisli" varsayimi KALMADI.
+      - Baska is parcacigindan giris: normal karsilikli dislama (bekler).
+      - Paylasilan alanlar (FDepth/FMaxDepth) yeniden giris KARARINDA
+        okunmaz (yalnizca sahibi ve test erisimcileri okur); boylece zayif
+        bellek sirali platformlarda eski sahip degerini gorup yanlislikla
+        "yeniden giris" sayma riski de yoktur.
+      - Derinlik sifira donmezse Leave eksiktir; `Depth` testte yakalar. }
+  TVdbGate = class
+  private
+    FCs: TCriticalSection;
+    FDepth: Integer;
+    FMaxDepth: Integer;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Enter;
+    procedure Leave;
+    function Depth: Integer;
+    function MaxDepth: Integer;
+  end;
+
   TVdbBackendV3 = class(TInterfacedObject, IVDbBackend)
   private
     type
@@ -117,7 +143,7 @@ type
       { Motor erisimini (ve FSets'i) serilestiren ic kilit. TEK backend
         birden fazla is parcacigi tarafindan paylasilabilsin diye; islemler
         ARASINDA tutulmaz (uzun islem baska oturumu kilitlemez). }
-      FEngCs: TCriticalSection;
+      FEngCs: TVdbGate;
       { v4: MANTIKSAL DEGISIM GUNLUGU. Her commit'in satir duzeyi
         kayitlarini <db>.log\ altina yazar; PITR (RECOVER TO TIMESTAMP,
         AS OF TIMESTAMP/VERSION) ve replikasyon bunun uzerine kurulur.
@@ -151,6 +177,10 @@ type
       FScanN: Integer;
       FScanCap: Integer;
       FScanFilter: Integer;
+      { v3.9: tarama boyunca cagiran oturumun yazma kumesi BIR kez cozulur.
+        ONCEDEN ScanCb her satirda BatchIsMine + BatchMap cagirip 3 kez
+        OwnSet (kilit + oturum sozlugu aramasi) yapiyordu. }
+      FScanSet: TWriteSet;
       { v3.1: ScanRawIterAll dogrudan akitilir (satir basina dizi buyutmesi
         ve toplu kopyalama YOK). }
       FStreamCb: TVDbRawCb;
@@ -412,6 +442,11 @@ type
     { Sprint 3.1: sayfa motorunun tam butunluk denetimi (CRC + freelist
       + heap + tasma zincirleri). Acik parti varsa denetim yapilmaz. }
     function Verify(out Report: string): Boolean;
+    { v3.9: kilit gozlemi (test/teshis). Normalde 0; her genel islemden
+      sonra 0 olmali. MaxDepth, ic ice girislerin ulastigi en yuksek
+      derinligi gosterir (orn. ScanAll -> ScanCb -> OwnSet = 2). }
+    function DebugLockDepth: Integer;
+    function DebugLockMaxDepth: Integer;
 
     { Sprint 3.2: checkpoint sonrasi bayt-bayt yedek; geri yukleme dosyayi
       atomik degistirir (eski dosya .bak kalir), WAL/idx temizlenir, motor
@@ -452,7 +487,7 @@ begin
   FSets := TDictionary<Cardinal, TWriteSet>.Create;
   FAlien := TDictionary<QWord, Int64>.Create;
   FCommitGen := 0;
-  FEngCs := TCriticalSection.Create;
+  FEngCs := TVdbGate.Create;
   FTagCounts := TDictionary<Integer, Int64>.Create;
   { v3.2: otomatik sikistirma v2 ile AYNI varsayilanlar (KAPALI). }
   FAutoCompactOn := False;
@@ -649,6 +684,96 @@ begin
   FLogInGroup := False;
 end;
 
+
+{ ==================================================== v3.9: motor kilidi }
+
+{ Bu is parcaciginin O AN tuttugu kilitler (ic ice girisler icin yigin).
+  Yalnizca SAHIP is parcacigi okur/yazar: paylasilan alanlar kritik bolum
+  DISINDA hic okunmaz. Boylece "kritik bolum yeniden girisli" varsayimi da,
+  zayif bellek sirali platformlarda eski sahip degerini gorup yanlislikla
+  yeniden giris sayma riski de ortadan kalkar. }
+threadvar
+  VdbGateHeld: array[0..7] of TVdbGate;
+  VdbGateHeldN: Integer;
+
+constructor TVdbGate.Create;
+begin
+  inherited Create;
+  FCs := TCriticalSection.Create;
+  FDepth := 0;
+  FMaxDepth := 0;
+end;
+
+destructor TVdbGate.Destroy;
+begin
+  FCs.Free;
+  inherited Destroy;
+end;
+
+function TVdbGate.Depth: Integer;
+begin
+  Result := FDepth;
+end;
+
+function TVdbGate.MaxDepth: Integer;
+begin
+  Result := FMaxDepth;
+end;
+
+procedure TVdbGate.Enter;
+var
+  i: Integer;
+begin
+  { Yeniden giris: AYNI is parcacigi bu kilidi zaten tutuyor. Yalnizca
+    KENDI threadvar yiginimiza bakariz; kritik bolume girilmez. }
+  for i := 0 to VdbGateHeldN - 1 do
+    if VdbGateHeld[i] = Self then
+    begin
+      Inc(FDepth);
+      if FDepth > FMaxDepth then FMaxDepth := FDepth;
+      Exit;
+    end;
+  FCs.Enter;
+  FDepth := 1;
+  if FDepth > FMaxDepth then FMaxDepth := FDepth;
+  if VdbGateHeldN > High(VdbGateHeld) then
+  begin
+    { Beklenmeyen derinlik: kilitlenmektense acik hata. }
+    FDepth := 0;
+    FCs.Leave;
+    raise EVdbBackendV3.Create(
+      'kilit hatasi: ic ice kilit yigini doldu (>' +
+      IntToStr(High(VdbGateHeld) + 1) + ')');
+  end;
+  VdbGateHeld[VdbGateHeldN] := Self;
+  Inc(VdbGateHeldN);
+end;
+
+procedure TVdbGate.Leave;
+begin
+  if FDepth <= 0 then
+    raise EVdbBackendV3.Create('kilit hatasi: sahip olunmayan kilitten cikis');
+  Dec(FDepth);
+  if FDepth = 0 then
+  begin
+    if (VdbGateHeldN > 0) and (VdbGateHeld[VdbGateHeldN - 1] = Self) then
+    begin
+      Dec(VdbGateHeldN);
+      VdbGateHeld[VdbGateHeldN] := nil;
+    end;
+    FCs.Leave;
+  end;
+end;
+
+function TVdbBackendV3.DebugLockDepth: Integer;
+begin
+  Result := FEngCs.Depth;
+end;
+
+function TVdbBackendV3.DebugLockMaxDepth: Integer;
+begin
+  Result := FEngCs.MaxDepth;
+end;
 
 constructor TVdbBackendV3.Create(const ADbPath: string; ACreate: Boolean;
   APoolPages: Integer; ABusyMs: Integer);
@@ -1224,7 +1349,10 @@ end;
 
 procedure TVdbBackendV3.ScanCb(Key: QWord; const Value: TBytes);
 begin
-  if BatchIsMine and BatchMap.ContainsKey(Key) then Exit;
+  { v3.9: yazma kumesi tarama basinda BIR kez cozuldu (FScanSet). ONCEDEN
+    her satirda BatchIsMine + BatchMap cagriliyordu; ikisi de OwnSet
+    uzerinden kilit + oturum sozlugu aramasi yapiyordu (satir basina 3). }
+  if (FScanSet <> nil) and FScanSet.Map.ContainsKey(Key) then Exit;
   if not PassFilter(Key, Value, FScanFilter) then Exit;
   { v3.1: her satirda SetLength(+1) YAPILMAZ (200k satirda O(n^2) kopya
     ve yeniden tahsis). Kapasite ikiye katlanir. }
@@ -1246,8 +1374,9 @@ var
 begin
   { v3.4: tarama tamponlari (FScanKeys/FScanN) BACKEND alanidir; ayni
     backend'i paylasan oturumlar ayni anda tararsa birbirini bozardi.
-    Kilit tarama boyunca tutulur (geri cagirim ayni is parcacigindadir,
-    kilit yeniden girisli). }
+    Kilit tarama boyunca tutulur. v3.9: geri cagirim ayni is parcaciginda
+    oldugu icin TVdbGate bunu ACIKCA yeniden giris sayar (derinlik 2);
+    kritik bolumun kendisi yeniden girisli olmak zorunda degildir. }
   FEngCs.Enter;
   try
     FScanKeys := nil;
@@ -1255,13 +1384,15 @@ begin
     FScanN := 0;
     FScanCap := 0;
     FScanFilter := TableFilter;
+    { v3.9: oturumun yazma kumesi tarama boyunca sabit (kilit zaten bizde). }
+    FScanSet := OwnSet;
 
     { Motor tarafi: kaplamada islem gormus anahtarlar atlanir. }
     FEng.ScanAll(ScanCb);
 
     { Kaplama tarafi: en guncel deger. }
-    if BatchIsMine then
-      for pair in BatchMap do
+    if FScanSet <> nil then
+      for pair in FScanSet.Map do
       begin
         if not pair.Value.Present then Continue;
         if not PassFilter(pair.Key, pair.Value.Value, TableFilter) then Continue;
@@ -1284,6 +1415,7 @@ begin
     FScanVals := nil;
     FScanN := 0;
     FScanCap := 0;
+    FScanSet := nil;
   finally
     FEngCs.Leave;
   end;
@@ -1391,21 +1523,31 @@ begin
       raise;
     end;
     try
-      FScanKeys := nil;
-      FScanVals := nil;
-      FScanN := 0;
-      FScanCap := 0;
-      FScanFilter := TableFilter;
-      eng.ScanAll(AsOfCb);
-      SetLength(FScanKeys, FScanN);
-      SetLength(FScanVals, FScanN);
-      Keys := FScanKeys;
-      Vals := FScanVals;
-      FScanKeys := nil;
-      FScanVals := nil;
-      FScanN := 0;
-      FScanCap := 0;
-      Result := True;
+      { v3.9: FScan* alanlari BACKEND genelindedir ve ScanAll de ayni
+        alanlari kullanir. ONCEDEN bu bolge kilitsizdi: ayni backend'de
+        es zamanli ScanAllAt + ScanAll (ya da iki ScanAllAt) birbirinin
+        tamponunu bozabiliyordu. Kilit yalniz tamponun kullanildigi
+        bolgede tutulur; gecici motorun kurulumu/kapanisi disaridadir. }
+      FEngCs.Enter;
+      try
+        FScanKeys := nil;
+        FScanVals := nil;
+        FScanN := 0;
+        FScanCap := 0;
+        FScanFilter := TableFilter;
+        eng.ScanAll(AsOfCb);
+        SetLength(FScanKeys, FScanN);
+        SetLength(FScanVals, FScanN);
+        Keys := FScanKeys;
+        Vals := FScanVals;
+        FScanKeys := nil;
+        FScanVals := nil;
+        FScanN := 0;
+        FScanCap := 0;
+        Result := True;
+      finally
+        FEngCs.Leave;
+      end;
     finally
       try
         eng.Close;
@@ -2781,20 +2923,27 @@ begin
       eng := nil;
       raise;
     end;
-    FScanKeys := nil;
-    FScanVals := nil;
-    FScanN := 0;
-    FScanCap := 0;
-    FScanFilter := TableFilter;
-    eng.ScanAll(AsOfCb);
-    SetLength(FScanKeys, FScanN);
-    SetLength(FScanVals, FScanN);
-    Keys := FScanKeys;
-    Vals := FScanVals;
-    FScanKeys := nil;
-    FScanVals := nil;
-    FScanN := 0;
-    FScanCap := 0;
+    { v3.9: FScan* backend genelinde; ScanAll/ScanAllAt ile ayni alanlar.
+      Paylasilan tampon kilit altinda doldurulur (onceden kilitsizdi). }
+    FEngCs.Enter;
+    try
+      FScanKeys := nil;
+      FScanVals := nil;
+      FScanN := 0;
+      FScanCap := 0;
+      FScanFilter := TableFilter;
+      eng.ScanAll(AsOfCb);
+      SetLength(FScanKeys, FScanN);
+      SetLength(FScanVals, FScanN);
+      Keys := FScanKeys;
+      Vals := FScanVals;
+      FScanKeys := nil;
+      FScanVals := nil;
+      FScanN := 0;
+      FScanCap := 0;
+    finally
+      FEngCs.Leave;
+    end;
     Result := True;
   finally
     if eng <> nil then

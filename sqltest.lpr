@@ -3043,6 +3043,57 @@ begin
   Dogrula('reopen: RANGE tanimi korunur', R.Affected = 3, R.Msg);
   R := sq.Exec('SHOW PARTITIONS lp');
   Dogrula('reopen: LIST tanimi korunur', R.Affected = 3, R.Msg);
+
+  // ---- 12) NEGATIF sabitler de daraltir (v3.9) ----
+  // AST'de -5 bir unary neg dugumudur; eskiden "literal degil" sayilip
+  // kosul tamamen atiliyordu (pruning yok). Sonuc dogruydu ama tarama
+  // tum bolumlere gidiyordu. Simdi hem dogru hem daraltilmis olmali.
+  sq.Exec('CREATE TABLE hp2(id INTEGER PRIMARY KEY, k INTEGER, v TEXT) ' +
+    'PARTITION BY HASH (k) PARTITIONS 4');
+  for i := 1 to 10 do
+  begin
+    // k = -5..-1, her deger 2 satir
+    R := sq.Exec('INSERT INTO hp2(id, k, v) VALUES(' + IntToStr(i) + ', ' +
+      IntToStr(-(((i - 1) div 2) + 1)) + ', ' + SQLIT('n' + IntToStr(i)) + ')');
+    if R.Affected <> 1 then
+      Dogrula('negatif satir ' + IntToStr(i) + ' eklendi', False, R.Msg);
+  end;
+  ChkVal('negatif: toplam 10', 'SELECT COUNT(*) FROM hp2', 0, 0, '10');
+  ChkVal('negatif: k = -3 (2 satir)', 'SELECT COUNT(*) FROM hp2 WHERE k = -3', 0, 0, '2');
+  ChkVal('negatif: yansitik -3 = k', 'SELECT COUNT(*) FROM hp2 WHERE -3 = k', 0, 0, '2');
+  ChkVal('negatif: k IN (-1,-2) (4 satir)',
+    'SELECT COUNT(*) FROM hp2 WHERE k IN (-1, -2)', 0, 0, '4');
+  ChkVal('negatif: k IN (-5,-1) (4 satir)',
+    'SELECT COUNT(*) FROM hp2 WHERE k IN (-5, -1)', 0, 0, '4');
+  ChkVal('negatif: karisik k IN (-5, -3, -1) (6 satir)',
+    'SELECT COUNT(*) FROM hp2 WHERE k IN (-5, -3, -1)', 0, 0, '6');
+  ChkVal('negatif: k = -99 (0 satir)', 'SELECT COUNT(*) FROM hp2 WHERE k = -99', 0, 0, '0');
+  // Daraltmanin KANITI: EXPLAIN hedef bolum sayisi.
+  ChkHas('negatif EXPLAIN k = -3 (1/4)',
+    'EXPLAIN SELECT id FROM hp2 WHERE k = -3',
+    'partitions scanned: 1/4 (HASH pruning)');
+  ChkHas('negatif EXPLAIN k IN (-1,-2) (2/4)',
+    'EXPLAIN SELECT id FROM hp2 WHERE k IN (-1, -2)',
+    'partitions scanned: 2/4 (HASH pruning)');
+  ChkHas('negatif EXPLAIN yansitik (1/4)',
+    'EXPLAIN SELECT id FROM hp2 WHERE -3 = k',
+    'partitions scanned: 1/4 (HASH pruning)');
+  // Ayni AND icinde pozitif + negatif: kesisim bos -> 0 satir, hata yok.
+  ChkVal('negatif: k = -3 AND k = -1 (0 satir)',
+    'SELECT COUNT(*) FROM hp2 WHERE k = -3 AND k = -1', 0, 0, '0');
+  // RANGE bolumlemede de negatif deger dogru bolume gider.
+  sq.Exec('CREATE TABLE rn(id INTEGER PRIMARY KEY, v INTEGER) ' +
+    'PARTITION BY RANGE (v) (VALUES BETWEEN 0 AND 100)');
+  R := sq.Exec('INSERT INTO rn(id, v) VALUES(1, -5)');
+  Dogrula('RANGE alt negatif satiri', R.Affected = 1, R.Msg);
+  R := sq.Exec('INSERT INTO rn(id, v) VALUES(2, 50)');
+  Dogrula('RANGE ici satiri (rn)', R.Affected = 1, R.Msg);
+  R := sq.Exec('INSERT INTO rn(id, v) VALUES(3, 105)');
+  Dogrula('RANGE ust satiri (rn)', R.Affected = 1, R.Msg);
+  ChkVal('RANGE negatif: v = -5 (1 satir)', 'SELECT COUNT(*) FROM rn WHERE v = -5', 0, 0, '1');
+  ChkHas('RANGE negatif EXPLAIN (1/3)', 'EXPLAIN SELECT id FROM rn WHERE v = -5',
+    'partitions scanned: 1/3 (RANGE pruning)');
+  ChkVal('RANGE negatif: toplam 3', 'SELECT COUNT(*) FROM rn', 0, 0, '3');
 end;
 
 procedure T105_ShowStats;

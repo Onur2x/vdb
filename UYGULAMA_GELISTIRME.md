@@ -279,17 +279,19 @@ veritabani.colkey      kolon anahtarı (yalnız kolon şifrelemesi kullanılırs
 
 ---
 
-## 9. Bugünkü sınırlar (v3.8)
+## 9. Bugünkü sınırlar (v3.9)
 
 | Özellik | Durum | Not |
 |---|---|---|
 | `AS OF SEQUENCE n` | **var** (v3.2) | WAL penceresindeki n'inci commit'in tam görüntüsü geçici kopyada kurulur; yalnız son checkpoint'ten beri. n = commit sayısı |
 | PITR (`RECOVER TO`), WAL arşivi, `AS OF TIMESTAMP/VERSION` | **var** (v4) | Mantıksal değişim günlüğü (`<db>.log`): `AS OF TIMESTAMP/VERSION`, `ARCHIVE WAL SET DIR=`, `RECOVER TO`. Günlük **varsayılan olarak budanmaz**. v3.8'den itibaren isteğe bağlı budama: `LogPruneEnabled` + `LogPruneKeepDays` (varsayılan 30) + `LogPruneKeepBases` (varsayılan 2); checkpoint sonrası otomatik veya elle `LogPrune` |
 | Replication (`START REPLICATION` vb.) | **var** (v4) | Mantıksal grup taşıma; **dosya tabanlı** (paylaşımlı dizin). TCP ile replikasyon açıkça reddedilir |
-| Zone map / bölüm budama | **var** (v3.3) | Sayfa düzeyi; kazanç **seçici** yüklemlerde. Orta seçicilikte ölçülebilir kazanç yok |
+| Zone map / bölüm budama | **var** (v3.3) | Sayfa düzeyi; kazanç **seçici** yüklemlerde. Orta seçicilikte ölçülebilir kazanç yok. v3.9: `=` ve `IN` listelerinde **negatif sabitler** de daraltır (`k IN (-1,-2)`); bölüm numarası hesaplanamazsa koşul katkı vermez (satır kaybı yok) |
 | MVCC (süreç içi çok oturum) | **var** (v3.4) | READ COMMITTED; her oturum kendi yazma kümesinde yazar, **ilk commit kazanır**, kaybeden `yazma cakismasi` ile durur. DDL/`SAVEPOINT`/`DEFERRABLE` çoklu yazmada reddedilir. Snapshot isolation yok |
 | MVCC (süreçler arası) | yok | dosya kilidi ikinci süreci reddeder |
 | Toplu INSERT hızı | v2'nin **~1,6 katı** yavaş | v3 6,04 / v2 3,85 µs satır (200k×3 kolon, commit dâhil). Fark: commit'teki değişim günlüğü (~0,61 µs) + sayfa motoru uygulaması/checkpoint |
+| `ScanAll` hızı (v3.9) | iyileşti | 200k satır + **açık yazma kümesi**: 45,00 → **32,00 ms** (son üç koşu 31–32 ms, aynı makine/sonda). Satır başına 3 kilit alma kaldırıldı: yazma kümesi tarama başında bir kez çözülür |
+| Motor kilidi (v3.9) | `TVdbGate` | Her iş parçacığı tuttuğu kilitlerin `threadvar` yığınını taşır; **iç içe giriş kritik bölüme hiç girmez** (yeniden giriş varsayımı kalktı), paylaşılan alanlar kilit dışında okunmaz. `Leave` sahipsiz çıkışta açık hata verir. `ScanAllAt` / PITR taraması paylaşılan `FScan*` tamponunu artık kilit altında kullanır (eşzamanlı `ScanAll` ile bozulma giderildi) |
 | SQLite yazımları (v3.7) | **var** | `BEGIN [TRANSACTION|WORK] [IMMEDIATE|DEFERRED|EXCLUSIVE]`, `CREATE INDEX IF NOT EXISTS`, `INSERT OR REPLACE/IGNORE/ABORT/FAIL/ROLLBACK`, `CREATE TEMP[ORARY] TABLE`, `CREATE TABLE ... AS SELECT`, `UPDATE ... SET ... FROM`, `WITH x AS (INSERT/UPDATE/DELETE ...)`, `AS`'siz `CREATE TRIGGER` |
 | `TEMP` tablo ömrü | sınır | Kabul edilir ama tablo **kalıcıdır**: oturum kapanınca silinmez (gerçek geçici tablo altyapısı yok) |
 | `UPDATE ... FROM` kapsamı | sınır | Tek kaynak (tablo veya parantezli SELECT) + alias; `FROM` içinde **JOIN reddedilir**. Çoklu eşleşmede ilk kaynak satırı kullanılır (SQLite da tek satır seçer) |
@@ -317,6 +319,13 @@ eksik yazımlar (`BEGIN` varyantları, `CREATE INDEX IF NOT EXISTS`,
 `INSERT OR ...`, `CREATE TEMP TABLE`, CTAS, `UPDATE ... FROM`,
 `WITH x AS (DML)`, `AS`'siz trigger). Ayrıntı ve ölçülen kapı sayıları:
 `V3_YOL_HARITASI.md` §v3.7.
+
+v3.9'da **çözülenler** (kalan üç motor notu): negatif sabitlerle bölüm
+budama; kilit yeniden girişliliğinin varsayım olmaktan çıkması
+(`TVdbGate` — sahip + derinlik); taramada satır başına 3 kilit almanın
+kaldırılması (200k satır: 45,00 → 32,00 ms). Ayrıca `ScanAllAt`/PITR
+taramasının paylaşılan tamponu kilitsiz kullanması (eşzamanlı `ScanAll`
+ile sonuç bozulması) düzeltildi. Ayrıntı: `V3_YOL_HARITASI.md` §v3.9.
 
 Yukarıdaki olmayanlar **sessizce yanlış sonuç vermez**: her biri açık bir
 `ecUnsupported` hatası ve yol gösteren mesaj döndürür.
