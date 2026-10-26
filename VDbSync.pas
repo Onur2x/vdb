@@ -17,7 +17,10 @@ procedure VDbFlushStream(S: TFileStream);
 function VDbFlushDir(const DirPath: string): Boolean;
 // Ayni dosyayi ikinci kez acmayi engeller (cift-yazma bozulmasina karsi).
 // Unix'te flock, Windows'ta LockFileEx. Kilit alinamazsa False.
-function VDbLockStream(S: TFileStream): Boolean;
+// AShared=True ise PAYLASIMLI kilit alinir: birden cok salt-okunur okuyucu
+// ayni anda tutabilir, yazar (tam kilit) hepsinin bitmesini bekler.
+// v3.2: cok okuyucu / tek yazici.
+function VDbLockStream(S: TFileStream; AShared: Boolean = False): Boolean;
 procedure VDbUnlockStream(S: TFileStream);
 
 // 2026-10-25 (Sprint 3.10): CANLI dosyanin boyunu KILIT ALMADAN ogrenir.
@@ -44,6 +47,7 @@ function VDbIsSharingViolation(const E: TObject): Boolean;
 const
   { F3-3: POSIX flock bayraklari. Once dogrudan sayi yaziliyordu
     (2 or 4 ve 8); yanlislari sessizce "kilit alinamadi" gibi gorunuyordu. }
+  VDB_LOCK_SH  = 1;   // LOCK_SH  - paylasimli kilit (cok okuyucu)
   VDB_LOCK_EX  = 2;   // LOCK_EX  - tam kilit
   VDB_LOCK_NB  = 4;   // LOCK_NB  - bekleme, hemen sonuc
   VDB_LOCK_UN  = 8;   // LOCK_UN  - kilidi birak
@@ -102,22 +106,27 @@ begin
   {$ENDIF}
 end;
 
-function VDbLockStream(S: TFileStream): Boolean;
+function VDbLockStream(S: TFileStream; AShared: Boolean): Boolean;
 {$IFDEF WINDOWS}
 var
   ov: TOverlapped;
+  flags: LongWord;
 {$ENDIF}
 begin
   Result := False;
   if S = nil then Exit;
   {$IFDEF WINDOWS}
   FillChar(ov, SizeOf(ov), 0);
-  Result := Windows.LockFileEx(S.Handle,
-    LOCKFILE_EXCLUSIVE_LOCK or LOCKFILE_FAIL_IMMEDIATELY, 0,
+  if AShared then flags := LOCKFILE_FAIL_IMMEDIATELY
+  else flags := LOCKFILE_EXCLUSIVE_LOCK or LOCKFILE_FAIL_IMMEDIATELY;
+  Result := Windows.LockFileEx(S.Handle, flags, 0,
     $FFFFFFFF, $FFFFFFFF, @ov);
   {$ELSE}
     {$IFDEF UNIX}
-    Result := FpFlock(S.Handle, VDB_LOCK_EX or VDB_LOCK_NB) = 0;
+    if AShared then
+      Result := FpFlock(S.Handle, VDB_LOCK_SH or VDB_LOCK_NB) = 0
+    else
+      Result := FpFlock(S.Handle, VDB_LOCK_EX or VDB_LOCK_NB) = 0;
     {$ELSE}
     Result := True;
     {$ENDIF}

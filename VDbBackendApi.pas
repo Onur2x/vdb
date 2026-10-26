@@ -152,6 +152,15 @@ type
     function GetFilePath: string;
     property FilePath: string read GetFilePath;
 
+    { v3.2: cok okuyucu / tek yazici.
+      IsReadOnly: oturum salt-okunur acildi (paylasimli kilit); yazma
+      cagrilari acik hata verir.
+      BusyTimeoutMs: yazar kilidi icin bekleme (ms); 0 = bekleme yok. }
+    function GetIsReadOnly: Boolean;
+    property IsReadOnly: Boolean read GetIsReadOnly;
+    function GetBusyTimeoutMs: Integer;
+    property BusyTimeoutMs: Integer read GetBusyTimeoutMs;
+
     { Satir icindeki tablo kimligini cozen fonksiyon (R-26 filtresi). }
     procedure SetRowTagFunc(AValue: TVDbRowTagFunc);
 

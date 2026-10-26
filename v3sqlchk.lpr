@@ -159,7 +159,7 @@ begin
     end;
     if not caught then
       Fail('lock: ikinci acilis reddedilmedi')
-    else if Pos('kullanimda', msg) > 0 then
+    else if (Pos('kullanimda', msg) > 0) or (Pos('mesgul', msg) > 0) then
       Ok('lock: ikinci acilis kilit hatasi verdi -> ' + msg)
     else
       Fail('lock: kilit mesaji bekleniyordu: ' + msg);

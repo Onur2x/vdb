@@ -71,6 +71,20 @@ procedure VdbOpen(const Path: string; out Be: IVdbBackend;
 procedure VdbOpenOrCreate(const Path: string; out Be: IVdbBackend;
   PoolPages: Integer = 0);
 
+{ v3.2: SALT-OKUNUR acilis (cok okuyucu / tek yazici).
+  Dosya PAYLASIMLI kilit ile acilir: ayni anda birden cok okuyucu calisir,
+  yazar (tam kilit) okuyucular bitene kadar bekler. Bu oturum HICBIR yazma
+  yapmaz (WAL imajlari bellekten okunur, <db>.log acilmaz) ve yazma cagrilari
+  acik hata verir. v2 dosyasi bu yoldan ACILMAZ.
+  BusyMs: okuyucu icin kayit amacli; paylasimli kilit hemen alinir. }
+procedure VdbOpenReadOnly(const Path: string; out Be: IVdbBackend;
+  PoolPages: Integer = 0; BusyMs: Integer = 0);
+
+{ v3.2: yazar kilidi bekleme suresi (ms) ile acilis. 0 = bekleme yok.
+  Kilit alinamazsa acik "veritabani mesgul" hatasi verilir. }
+procedure VdbOpenWithBusyTimeout(const Path: string; out Be: IVdbBackend;
+  BusyMs: Integer; CreateIfMissing: Boolean = True; PoolPages: Integer = 0);
+
 { Sifreli v3 dosyasi acar/olusturur. v2 dosyalari bu yoldan ACILMAZ. }
 procedure VdbOpenWithPassword(const Path, Password: string;
   out Be: IVdbBackend; CreateIfMissing: Boolean = True; PoolPages: Integer = 0);
@@ -209,6 +223,46 @@ procedure VdbOpenOrCreate(const Path: string; out Be: IVdbBackend;
   PoolPages: Integer = 0);
 begin
   VdbOpen(Path, Be, True, False, PoolPages);
+end;
+
+procedure VdbOpenReadOnly(const Path: string; out Be: IVdbBackend;
+  PoolPages: Integer; BusyMs: Integer);
+var
+  file_: string;
+  pool: Integer;
+begin
+  Be := nil;
+  file_ := VdbResolveFile(Path);
+  { DIKKAT: burada VdbFamilyOfFile KULLANILMAZ. O yardimci bicim kesfi icin
+    dosyanin ilk 4 baytini okur; yazar tam aralik kilidi tuttugunda bu okuma
+    basarisiz olur ve "Veritabani yok" gibi YANLIS bir teshis uretir.
+    Bicim dogrulamasi zaten motorun kendi acilisinda yapilir ve kilit
+    hatasi orada ACIK mesajla doner. }
+  if not FileExists(file_) then
+    raise EVdbFactory.CreateFmt('Veritabani yok: %s', [file_]);
+  pool := EffectivePool(PoolPages);
+  Be := TVdbBackendV3.CreateReadOnly(file_, pool, BusyMs);
+end;
+
+procedure VdbOpenWithBusyTimeout(const Path: string; out Be: IVdbBackend;
+  BusyMs: Integer; CreateIfMissing: Boolean; PoolPages: Integer);
+var
+  file_: string;
+  fam: TVdbFamily;
+  pool: Integer;
+begin
+  Be := nil;
+  file_ := VdbResolveFile(Path);
+  fam := VdbFamilyOfFile(file_);
+  if fam = vdfV2 then
+    raise EVdbFactory.CreateFmt(
+      'Bu dosya v2 (VODB) biciminde: %s', [file_]);
+  if (fam = vdfMissing) and (not CreateIfMissing) then
+    raise EVdbFactory.CreateFmt('Veritabani yok: %s', [file_]);
+  if (fam = vdfMissing) and (ExtractFileDir(file_) <> '') then
+    ForceDirectories(ExtractFileDir(file_));
+  pool := EffectivePool(PoolPages);
+  Be := TVdbBackendV3.Create(file_, fam = vdfMissing, pool, BusyMs);
 end;
 
 procedure VdbOpenWithPassword(const Path, Password: string;

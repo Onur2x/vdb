@@ -75,6 +75,8 @@ type
     procedure WaitForeignTxn(ASessionId: Cardinal);
     procedure RefreshBatchSnapshot;
     function GetFilePath: string;
+    function GetIsReadOnly: Boolean;
+    function GetBusyTimeoutMs: Integer;
     procedure SetRowTagFunc(AValue: TVDbRowTagFunc);
 
     { Sprint 3.1: v2 dosya butunlugu denetimi (TVDb.Verify'e devreder). }
@@ -312,6 +314,18 @@ end;
 function TVDbBackendV2.GetFilePath: string;
 begin
   Result := FDb.FilePath;
+end;
+
+{ v3.2: v2 motorunda salt-okunur / busy timeout kavrami bu sozlesmede yok.
+  v2 zaten yalniz goc ve eski dosya okumasi icin kullanilir. }
+function TVDbBackendV2.GetIsReadOnly: Boolean;
+begin
+  Result := False;
+end;
+
+function TVDbBackendV2.GetBusyTimeoutMs: Integer;
+begin
+  Result := 0;
 end;
 
 function TVDbBackendV2.Verify(out Report: string): Boolean;

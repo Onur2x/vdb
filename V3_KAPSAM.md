@@ -368,6 +368,38 @@ ekleme/silme/`All`, 64 sınır kombinasyonu, `CountRange` = `CollectRange`
 uzunluğu, `RankBefore`, eş anlamlı anahtarlar, sayısal karşılaştırıcı,
 **yapı değişmezleri** (`CheckInvariants`) ve **skiplist paritesi**.
 
+### Çok okuyucu / tek yazıcı + busy timeout (v3.2, 2026-10-26)
+
+Kilitleme artık **paylaşımlı okuyucu / tam yazıcı**: N salt-okunur oturum aynı
+anda okur, yazar tam kilit ister; kilit alınamazsa `ABusyMs` bekler ve net
+"veritabani mesgul" hatası verir. Varsayılan bekleme **0** (hemen hata) —
+v2/önceki v3 ile aynı; beklemek isteyen çağıran açıkça süre verir.
+
+- Karar veren kilit `LockFileEx`/`flock`'tur; dosya iki tarafta da
+  `fmShareDenyNone` açılır (eski `fmShareDenyWrite` OS düzeyinde ikinci açılışı
+  engelliyor, busy timeout'a yer bırakmıyordu).
+- `VdbOpenReadOnly` / `TVdbBackendV3.CreateReadOnly`: hiç yazmaz, `<db>.log`
+  açmaz, WAL'i `fmOpenRead` açar. Onaylanmış WAL çerçeveleri `InstallReadOnlyPage`
+  ile bellek katmanına alınır; `LoadFrame` önce oraya bakar. Çökme sonrası bile
+  `.odb`/`.wal` **bayt bayt** değişmez.
+- Yazma denemesi salt-okunur oturumda açık hata verir; `VERIFY` çalışır.
+- Busy beklemesi gerçek süreyle ölçülür (`GetTickCount64`): ölçülen
+  `busy=400 → 397 ms`, `busy=350 → 356 ms`, `busy=0 → 1–2 ms`.
+- Çok yazarlı MVCC kapsam dışı kaldı (sıradaki dilim).
+
+Kapı: `lockchk` (14. kapı) **17/0**. Gerçek **çocuk süreçler** kullanılır, yani
+kilit gerçek işletim sistemi kilididir: aynı anda iki okuyucu, okuyucu varken
+yazarın beklemesi, iki yazar, yazar varken okuyucunun reddi, salt-okunur yazma
+reddi + `VERIFY`, `<db>.log` oluşmaması, çökme sonrası WAL'den okuma ve diskte
+sıfır bayt değişim. 32 ve 64 bit yeşil.
+
+Yol boyunca bulunan iki gerçek kusur: (1) `VdbOpenReadOnly` biçim keşfi için
+dosyanın ilk 4 baytını okuyordu; yazar tam aralık kilidi tutarken bu okuma
+başarısız olup **yanlış** "Veritabani yok" hatası veriyordu — biçim doğrulaması
+motorun açılışına bırakıldı, kilit hatası doğru mesajla dönüyor. (2) busy
+beklemesi sabit `Sleep(20)` sayımıyla ölçülüyordu; Windows zamanlayıcı
+çözünürlüğü hedefi %50'den fazla aşırtıyordu.
+
 ### Sayfa şifreleme (Sprint 3.4)
 
 Varsayılan **kapalı**; v3 dosyası eskisi gibi düz metindir. Şifreli dosya

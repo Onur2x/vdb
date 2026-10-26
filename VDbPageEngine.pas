@@ -80,9 +80,12 @@ type
       FRecoverLimit: Integer;
     procedure InitEngine(const ADbPath: string; APoolPages: Integer);
     function GetEncrypted: Boolean;
+    function GetReadOnly: Boolean;
     procedure OnSpill(PageNo: LongWord; P: PVdbPage);
     function OnMiss(PageNo: LongWord; P: PVdbPage): Boolean;
     procedure ApplyRecovered(PageNo: LongWord; P: PVdbPage);
+    procedure ApplyReadOnly(PageNo: LongWord; P: PVdbPage);
+    procedure RequireWritable;
     function PendingIndex(PageNo: LongWord): Integer;
     procedure AddPending(PageNo: LongWord; P: PVdbPage);
     procedure ClearPending;
@@ -98,8 +101,12 @@ type
       APoolPages: Integer = VDB_DEF_POOL);
     destructor Destroy; override;
 
-    { Var olan dosyayi acar; ACreate=True ise yoksa olusturur. }
-    procedure Open(ACreate: Boolean = False);
+    { Var olan dosyayi acar; ACreate=True ise yoksa olusturur.
+      v3.2: AReadOnly=True ile SALT-OKUNUR acilir (paylasimli kilit, cok
+      okuyucu). WAL imajlari diske yazilmadan bellek katmanindan okunur. }
+    procedure Open(ACreate: Boolean = False; AReadOnly: Boolean = False;
+      ABusyMs: Integer = VDB_DEF_BUSY_MS);
+    property ReadOnly: Boolean read GetReadOnly;
     procedure Close;
 
     { v3.2: Open'dan ONCE ayarlanir. N > 0 ise acilista WAL'den yalnizca
@@ -170,6 +177,11 @@ implementation
 function TVdbPageEngine.GetEncrypted: Boolean;
 begin
   Result := (FStore <> nil) and FStore.Encrypted;
+end;
+
+function TVdbPageEngine.GetReadOnly: Boolean;
+begin
+  Result := (FStore <> nil) and FStore.ReadOnly;
 end;
 
 function TVdbPageEngine.KeyFingerprint: string;
@@ -246,19 +258,37 @@ begin
   inherited Destroy;
 end;
 
-procedure TVdbPageEngine.Open(ACreate: Boolean);
+procedure TVdbPageEngine.Open(ACreate: Boolean; AReadOnly: Boolean;
+  ABusyMs: Integer);
 var
   st: TVdbWalStats;
 begin
-  FStore.Open(ACreate);
+  FStore.OpenEx(ACreate, AReadOnly, ABusyMs);
   if FStore.Encrypted then
     FWal.SetEncryptionKey(FStore.Key, FStore.Salt);
-  FWal.Open;
+  FWal.Open(AReadOnly);
   FStore.OnSpill := OnSpill;
   FStore.OnMiss := OnMiss;
 
   if FWal.HasContent then
   begin
+    if AReadOnly then
+    begin
+      { v3.2: salt-okunur kurtarma. Cerceveler DISKE YAZILMAZ; depo
+        katmaninda bellek imaji olarak tutulur ve okuma oradan karsilanir. }
+      FWal.Recover(ApplyReadOnly, st, FRecoverLimit);
+      FWalStats := st;
+      FHeap := TVdbHeap.Create(FStore);
+      FIdxUsed := False;
+      FIdxErr := '';
+      if not FHeap.TryLoadIdx(FPath + '.idx', FIdxErr) then
+        FHeap.Open
+      else
+        FIdxUsed := True;
+      FInTxn := False;
+      ClearPending;
+      Exit;
+    end;
     FWal.Recover(ApplyRecovered, st, FRecoverLimit);
     FWalStats := st;
     if st.Frames > 0 then
@@ -317,10 +347,14 @@ begin
   if FHeap = nil then Exit;
   if FInTxn then
     Commit(True);
-  { Kapanista tam checkpoint: veri dosyasi guncel, WAL bos. }
-  Checkpoint(True);
-  { Checkpoint sonrasi dizin taze: acilis taramasi atlanabilir. }
-  SaveIdx;
+  { Kapanista tam checkpoint: veri dosyasi guncel, WAL bos.
+    v3.2: salt-okunur oturum checkpoint YAPMAZ (yazma yok). }
+  if not ReadOnly then
+  begin
+    Checkpoint(True);
+    { Checkpoint sonrasi dizin taze: acilis taramasi atlanabilir. }
+    SaveIdx;
+  end;
   FStore.OnSpill := nil;
   FStore.OnMiss := nil;
   ClearPending;
@@ -437,22 +471,40 @@ begin
   FStore.InstallPage(PageNo, P);
 end;
 
+{ v3.2 salt-okunur: WAL cercevesini DISKE YAZMADAN bellek katmanina alir. }
+procedure TVdbPageEngine.ApplyReadOnly(PageNo: LongWord; P: PVdbPage);
+begin
+  FStore.InstallReadOnlyPage(PageNo, P);
+end;
+
 { ------------------------------------------------------------------- islem }
+
+procedure TVdbPageEngine.RequireWritable;
+begin
+  if FStore = nil then
+    raise EVdbPageEngine.Create('motor acik degil');
+  if FStore.ReadOnly then
+    raise EVdbPageEngine.Create(
+      'salt-okunur veritabani: yazma yapilamaz (READONLY acilis)');
+end;
 
 function TVdbPageEngine.Insert(Key: QWord; const Value: TBytes): Boolean;
 begin
+  RequireWritable;
   Result := FHeap.Insert(Key, Value);
   if Result then FInTxn := True;
 end;
 
 function TVdbPageEngine.Update(Key: QWord; const Value: TBytes): Boolean;
 begin
+  RequireWritable;
   Result := FHeap.Update(Key, Value);
   if Result then FInTxn := True;
 end;
 
 function TVdbPageEngine.Delete(Key: QWord): Boolean;
 begin
+  RequireWritable;
   Result := FHeap.Delete(Key);
   if Result then FInTxn := True;
 end;
@@ -563,6 +615,8 @@ begin
   Result := False;
   if FStore = nil then
     raise EVdbPageEngine.Create('motor acik degil');
+  { v3.2: salt-okunur oturumda checkpoint yok; disk zaten yazilamaz. }
+  if FStore.ReadOnly then Exit(True);
   { Tahliye edilmis sayfalar once dosyaya, sonra onbellekteki kirli
     sayfalar yazilir. InstallPage tahliye tetiklemez.
     Onemli: bir sayfa onbellekte varsa cerceve imaji pending kopyasindan
@@ -609,8 +663,10 @@ begin
     Exit(False);
   end;
   { Onaylanmis ama henuz dosyaya gecmemis cerceveler varsa once yaz.
-    Boylece dogrulanan sey DISKTEKI gercek durumdur. }
-  if FWal.HasContent or (FPendingCount > 0) then
+    Boylece dogrulanan sey DISKTEKI gercek durumdur.
+    v3.2: salt-okunur oturumda WAL diske YAZILMAZ; dogrulama, WAL imajlari
+    bellek katmaninda dururken depo/heap uzerinden yapilir. }
+  if (not FStore.ReadOnly) and (FWal.HasContent or (FPendingCount > 0)) then
     if not Checkpoint(True) then
     begin
       Report := 'checkpoint basarisiz';

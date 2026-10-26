@@ -48,6 +48,13 @@ const
     kirpilir. Kayipsiz: fazla baytlar sayfa sayacinin otesindedir. }
   VDB_GROW_BYTES   = 262144;
 
+  { v3.2: yazar kilidi icin VARSAYILAN bekleme (ms). 0 = bekleme yok:
+    kilit alinamazsa hemen "veritabani mesgul" hatasi verilir (v2 ve onceki
+    v3 davranisi ile ayni; SQLite'in varsayilan busy handler'i gibi).
+    Beklemek isteyen uygulama VdbOpenWithBusyTimeout / Create(..., ABusyMs)
+    ile acikca sure verir. }
+  VDB_DEF_BUSY_MS  = 0;
+
   { Sprint 3.4: meta sayfa alanlari (duz metin; sir tutmaz). }
   VDB_META_SALT     = 36;   // 16 bayt
   VDB_META_ITER     = 52;   // LongWord
@@ -126,6 +133,12 @@ type
       FTxnId: LongWord;
       FLocked: Boolean;
       FReadOnly: Boolean;
+      { v3.2: salt-okunur oturumda WAL'den gelen sayfa imajlari. Dosyaya
+        YAZILMAZ; okuma bu katmandan karsilanir (crash sonrasi okuma ve
+        yazarsiz ikinci surec icin). }
+      FRoPages: TDictionary<LongWord, PVdbPage>;
+      FRoCount: Integer;
+      FBusyMs: Integer;
       FOnSpill: TVdbPageSpillProc;
       FOnMiss: TVdbPageMissProc;
       FSpillActive: Boolean;
@@ -178,6 +191,20 @@ type
       VDB3 dosyasi olusturur, varsa acar. }
     procedure Open(ACreate: Boolean = False);
     procedure Close;
+
+    { v3.2: cok okuyucu / tek yazici.
+      AReadOnly=True: dosya salt-okunur acilir ve PAYLASIMLI kilit alinir
+      (birden cok okuyucu ayni anda). Yazma denenirse acik hata verir.
+      AReadOnly=False: tam kilit; alinamazsa ABusyMs boyunca denenir. }
+    procedure OpenEx(ACreate: Boolean; AReadOnly: Boolean;
+      ABusyMs: Integer = VDB_DEF_BUSY_MS);
+    property ReadOnly: Boolean read FReadOnly;
+    property BusyTimeoutMs: Integer read FBusyMs;
+
+    { Salt-okunur oturumda WAL'den gelen imaji bellek katmanina alir.
+      Diske YAZMAZ; meta sayfa (0) ise mantiksal alanlari tazeler. }
+    procedure InstallReadOnlyPage(PageNo: LongWord; P: PVdbPage);
+    function ReadOnlyPageCount: Integer;
 
     { Test/kurtarma: diske HICBIR SEY yazmadan kapat (surec olumu
       simulasyonu). Bellekteki kirli sayfalar ve WAL tamponu atilir. }
@@ -443,12 +470,21 @@ begin
 end;
 
 destructor TVDbPageStore.Destroy;
+var
+  p: PVdbPage;
 begin
   try
     Close;
   except
     { yikici hata firlatmaz }
   end;
+  if FRoPages <> nil then
+  begin
+    for p in FRoPages.Values do
+      FreeMem(p);
+    FreeAndNil(FRoPages);
+  end;
+  FRoCount := 0;
   inherited Destroy;
 end;
 
@@ -591,6 +627,8 @@ var
   ps: Word;
   flags: LongWord;
 begin
+  { v3.2: salt-okunur oturum meta sayfayi YAZMAZ. }
+  if FReadOnly then Exit;
   FillChar(buf, SizeOf(buf), 0);
   magic := VDB_FILE_MAGIC;
   ver := VDB_FILE_VER;
@@ -623,18 +661,31 @@ begin
 end;
 
 procedure TVDbPageStore.Open(ACreate: Boolean);
+begin
+  OpenEx(ACreate, False, VDB_DEF_BUSY_MS);
+end;
+
+procedure TVDbPageStore.OpenEx(ACreate: Boolean; AReadOnly: Boolean;
+  ABusyMs: Integer);
 var
   exists: Boolean;
+  t0: QWord;
 begin
   if FStream <> nil then Exit;
   exists := FileExists(FPath);
   if not exists and not ACreate then
     raise EVdbPageStore.Create('veritabani dosyasi yok: ' + FPath);
+  if AReadOnly and not exists then
+    raise EVdbPageStore.Create('salt-okunur acilis: dosya yok: ' + FPath);
+  FBusyMs := ABusyMs;
   try
-    if exists then
-      FStream := TFileStream.Create(FPath, fmOpenReadWrite or fmShareDenyWrite)
+    if AReadOnly then
+      { Paylasim: yazar da acabilmeli (fmShareDenyNone). Kilit PAYLASIMLI. }
+      FStream := TFileStream.Create(FPath, fmOpenRead or fmShareDenyNone)
+    else if exists then
+      FStream := TFileStream.Create(FPath, fmOpenReadWrite or fmShareDenyNone)
     else
-      FStream := TFileStream.Create(FPath, fmCreate or fmShareDenyWrite);
+      FStream := TFileStream.Create(FPath, fmCreate or fmShareDenyNone);
   except
     on E: Exception do
     begin
@@ -650,24 +701,63 @@ begin
     end;
   end;
   try
-    FLocked := VDbLockStream(FStream);
-    FPhysSize := FStream.Size;
-    if exists then
-      LoadMeta
+    { v3.2: kilit. Okuyucu PAYLASIMLI (cok okuyucu), yazar TAM kilit.
+      Yazar, kilit alinamazsa busy timeout boyunca bekler.
+      Bekleme GERCEK gecen sureye gore olculur: Sleep(20) Windows'ta
+      zamanlayici cozunurlugu yuzunden 31 ms'ye kadar cikabiliyor; sabit
+      sayim hedefi asiyordu (olculen: busy=400 -> 630 ms). }
+    FLocked := False;
+    if AReadOnly then
+      FLocked := VDbLockStream(FStream, True)
     else
     begin
-      SetupEncryptionForCreate;
-      FPageCount := 1;
-      FFreeTrunk := 0;
-      FFreeCount := 0;
-      FLSN := 1;
-      FCreated := DateTimeToUnix(Now, False);
-      FStream.Size := RequiredFileSize(1);
-      FPhysSize := FStream.Size;
-      SaveMeta;
-      VDbFlushStream(FStream);
+      t0 := GetTickCount64;
+      repeat
+        FLocked := VDbLockStream(FStream, False);
+        if FLocked then Break;
+        if GetTickCount64 - t0 >= QWord(ABusyMs) then Break;
+        Sleep(10);
+      until False;
     end;
-    FReadOnly := False;
+    if AReadOnly and (not FLocked) then
+      raise EVdbPageStore.Create(
+        'veritabani mesgul: salt-okunur acilis icin paylasimli kilit ' +
+        'alinamadi (yazan oturum tam kilitli): ' + FPath);
+    if (not AReadOnly) and (not FLocked) then
+    begin
+      if ABusyMs > 0 then
+        raise EVdbPageStore.Create(Format(
+          'veritabani mesgul: yazar kilidi %d ms icinde alinamadi ' +
+          '(baska bir yazma oturumu acik): %s', [ABusyMs, FPath]))
+      else
+        raise EVdbPageStore.Create(
+          'veritabani mesgul: yazar kilidi alinamadi ' +
+          '(baska bir yazma oturumu acik): ' + FPath);
+    end;
+    try
+      FPhysSize := FStream.Size;
+      FReadOnly := AReadOnly;
+      if exists then
+        LoadMeta
+      else
+        begin
+          SetupEncryptionForCreate;
+          FPageCount := 1;
+          FFreeTrunk := 0;
+          FFreeCount := 0;
+          FLSN := 1;
+          FCreated := DateTimeToUnix(Now, False);
+          FStream.Size := RequiredFileSize(1);
+          FPhysSize := FStream.Size;
+          SaveMeta;
+          VDbFlushStream(FStream);
+        end;
+    except
+      if FLocked then VDbUnlockStream(FStream);
+      FLocked := False;
+      FreeAndNil(FStream);
+      raise;
+    end;
   except
     FreeAndNil(FStream);
     raise;
@@ -703,6 +793,46 @@ begin
   FLocked := False;
   FMetaDirty := False;
   DropCache;
+end;
+
+{ ==================================================== v3.2 salt-okunur katman }
+
+procedure TVDbPageStore.InstallReadOnlyPage(PageNo: LongWord; P: PVdbPage);
+var
+  q: PVdbPage;
+  buf: TVDbPageBuf;
+  dl: LongWord;
+begin
+  if not FReadOnly then Exit;
+  if FRoPages = nil then
+    FRoPages := TDictionary<LongWord, PVdbPage>.Create;
+  if FRoPages.TryGetValue(PageNo, q) then
+    Move(P^, q^, VDB_PAGE_SIZE)
+  else
+  begin
+    GetMem(q, VDB_PAGE_SIZE);
+    Move(P^, q^, VDB_PAGE_SIZE);
+    FRoPages.Add(PageNo, q);
+    Inc(FRoCount);
+  end;
+  if PageNo = VDB_HDR_PAGE then
+  begin
+    { Meta imaji WAL'den geldi: mantiksal alanlari tazele, DISKE YAZMA.
+      Boylece WAL'de buyuyen dosya bu oturumda tam gorunur. }
+    Move(q^, buf, VDB_PAGE_SIZE);
+    Move(buf[12], dl, 4);
+    if dl >= 1 then FPageCount := dl;
+    Move(buf[16], FFreeTrunk, 4);
+    Move(buf[20], FFreeCount, 4);
+    Move(buf[24], FLSN, 4);
+  end
+  else if PageNo >= FPageCount then
+    FPageCount := PageNo + 1;
+end;
+
+function TVDbPageStore.ReadOnlyPageCount: Integer;
+begin
+  Result := FRoCount;
 end;
 
 { ============================================================ okuma/yazma }
@@ -745,6 +875,9 @@ var
   env: TBytes;
   plain: TBytes;
 begin
+  if FReadOnly then
+    raise EVdbPageStore.Create(Format(
+      'salt-okunur veritabani: sayfa %d yazilamaz', [PageNo]));
   FStream.Position := OffsetOf(PageNo);
   if FEncrypted then
   begin
@@ -793,6 +926,7 @@ function TVDbPageStore.LoadFrame(PageNo: LongWord): Integer;
 var
   idx: Integer;
   fromPending: Boolean;
+  roP: PVdbPage;
 begin
   idx := PickVictim;
   if FFrames[idx].PageNo <> 0 then
@@ -815,7 +949,13 @@ begin
     Inc(FEvictions);
   end;
   fromPending := False;
-  if Assigned(FOnMiss) and FOnMiss(PageNo, @FFrames[idx].Data) then
+  if (FRoPages <> nil) and FRoPages.TryGetValue(PageNo, roP) then
+  begin
+    { v3.2 salt-okunur: imaj WAL'den geldi, diskte olmayabilir. }
+    Move(roP^, FFrames[idx].Data, VDB_PAGE_SIZE);
+    fromPending := True;
+  end
+  else if Assigned(FOnMiss) and FOnMiss(PageNo, @FFrames[idx].Data) then
   begin
     { imaj WAL tamponundan geldi; diskten okumaya gerek yok. Bu imaj
       veri dosyasinda HENUZ yok: cerceve kirli isaretlenmezse checkpoint
@@ -826,11 +966,17 @@ begin
     ReadPageAt(PageNo, @FFrames[idx].Data);
   FFrames[idx].PageNo := PageNo;
   FFrames[idx].Pins := 0;
-  FFrames[idx].Dirty := fromPending;
+  { Salt-okunurda HICBIR sey kirli degildir; aksi halde Flush yazmaya
+    calisirdi. Yazma modunda pending imaji kirli isaretlenir. }
+  if FReadOnly then
+    FFrames[idx].Dirty := False
+  else
+    FFrames[idx].Dirty := fromPending;
   { v3.1: pending'den gelen imaj WAL'de olmayabilir (tahliye commit'ten
     ONCE olduysa). Mark'i guncel islem yap ki bir sonraki Commit onu yazsin;
     gereksiz yazim zararsiz, atlanan yazim VERI KAYBI olurdu. }
-  if fromPending then FFrames[idx].TxnMark := FTxnId
+  if FReadOnly then FFrames[idx].TxnMark := 0
+  else if fromPending then FFrames[idx].TxnMark := FTxnId
   else FFrames[idx].TxnMark := 0;
   FFrames[idx].Ref := True;
   HashPut(PageNo, idx);
@@ -909,6 +1055,13 @@ var
   want: Int64;
 begin
   if Required <= FPhysSize then Exit;
+  { v3.2: salt-okunur oturumda dosya BUYUTULMEZ. WAL ile buyuyen sayfalar
+    yalnizca bellek katmaninda yasar. }
+  if FReadOnly then
+  begin
+    FPhysSize := Required;
+    Exit;
+  end;
   { Parca halinde uzat: her sayfa icin ayri SetSize cagrisi yapilmaz. }
   want := Required + VDB_GROW_BYTES;
   FStream.Size := want;

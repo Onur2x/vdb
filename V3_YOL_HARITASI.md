@@ -392,6 +392,47 @@ KV karşılaştırması.
 Ayrıca `v3sqlchk TestReplicationV3` (SQL düzeyi: slot, birincil/ikincil,
 artımlı, boş `PUMP`, TCP reddi, yeniden açılış, `DROP`) — **179/0**.
 
+### v3.2 — çok okuyucu / tek yazıcı + busy timeout (2026-10-26)
+
+Kilitleme modeli artık **paylaşımlı okuyucu / tam yazıcı** üzerine kurulu
+(rollback-journal kipinin SQLite karşılığı; WAL okuyucu eşzamanlılığı
+bilinçli olarak yok):
+
+| Öğe | Karar |
+|---|---|
+| Dosya açılışı | İki taraf da `fmShareDenyNone` ile açar; **karar veren kilit** `LockFileEx`/`flock`'tur. Önceki `fmShareDenyWrite` OS düzeyinde ikinci açılışı engelliyordu ve busy timeout'a yer bırakmıyordu. |
+| Okuyucu | `VDbLockStream(S, AShared=True)` — paylaşımlı kilit. **N okuyucu aynı anda** açılır. |
+| Yazar | Tam kilit. Alınamazsa `ABusyMs` boyunca beklenir; sonunda `veritabani mesgul: yazar kilidi ... alinamadi (baska bir yazma oturumu acik)` hatası. |
+| Varsayılan busy | **0** (hemen hata) — v2 ve önceki v3 davranışıyla aynı, SQLite'ın varsayılan busy handler'ı gibi. Beklemek isteyen `VdbOpenWithBusyTimeout` / `TVdbBackendV3.Create(..., ABusyMs)` kullanır. |
+| Bekleme ölçümü | Gerçek geçen süre (`GetTickCount64`), sabit sayım değil: `Sleep(20)` Windows'ta 31 ms'ye çıktığı için eski sabit sayım `busy=400` isteğini 630 ms'ye uzatıyordu. Ölçülen: `busy=400 → 397 ms`, `busy=350 → 356 ms`, `busy=0 → 1–2 ms`. |
+| Salt-okunur oturum | `VdbOpenReadOnly` / `TVdbBackendV3.CreateReadOnly`: **hiç yazmaz**. `IsReadOnly=True`; `Put/BeginBatch/CommitBatch/Compact/RestoreFrom/Rekey` açık hata verir. `<db>.log` **açılmaz** (okuyucu günlük dizini oluşturmaz). |
+| WAL ve okuyucu | `TVDbPageWal.Open(AReadOnly)` dosyayı `fmOpenRead` açar, **yaratmaz**. Onaylanmış çerçeveler `InstallReadOnlyPage` ile **bellek katmanına** alınır (`FRoPages`); `LoadFrame` önce bu katmana bakar. Checkpoint/truncate yok. |
+| Çökme sonrası okuma | Salt-okunur oturum, WAL'de duran onaylanmış çerçeveleri disk belleğine yazmadan uygular: `.odb` ve `.wal` **bayt bayt değişmez** (kapıda ölçülür). |
+| Çok yazarlı | Hâlâ **tek yazıcı**. Çok yazarlı MVCC ayrı (son) dilimdir. |
+
+Kapı — `lockchk` (14): gerçek **çocuk süreçler** (kendini farklı argümanlarla
+çalıştırır), yani kilit gerçek işletim sistemi kilididir.
+
+| Kontrol | Durum |
+|---|---|
+| Aynı anda 2 salt-okunur oturum, 500 satır birebir | 17/0 |
+| Okuyucu varken yazar: busy=400 → 397 ms sonra "meşgul" | ✔ |
+| İki yazar: busy=0 → 2 ms, busy=350 → 356 ms | ✔ |
+| Yazar varken salt-okunur oturum: "meşgul" (paylaşımlı kilit yok) | ✔ |
+| Salt-okunur `Put` reddi, `VERIFY` geçer, `<db>.log` oluşmaz | ✔ |
+| Yazıcı kapanınca okuyucu 501 satır + son anahtarı görür | ✔ |
+| Çökme sonrası WAL katmanından 200 satır, diskte 0 bayt değişim | ✔ |
+| 32 bit + 64 bit | yeşil |
+
+**Bulunan ve düzeltilen gerçek kusur (iki tane):**
+1. `VdbOpenReadOnly` önce `VdbFamilyOfFile` ile biçim keşfi yapıyordu; o
+   yardımcı dosyanın ilk 4 baytını okur. Yazar tam aralık kilidi tutarken bu
+   okuma başarısız oluyor ve kullanıcı **yanlış** bir "Veritabani yok" hatası
+   alıyordu. Artık biçim doğrulaması motorun kendi açılışında yapılır ve kilit
+   hatası doğru mesajla döner.
+2. Busy beklemesi sabit `Sleep(20)` sayımıyla ölçülüyordu; Windows zamanlayıcı
+   çözünürlüğü hedefi %50'den fazla aşırtıyordu. Gerçek süreye çevrildi.
+
 ### Sıradaki sürüme ertelenen (v4 sonrası)
 - Zone map'in sayfa düzeyinde yeniden ele alınması
 - Satır gövdesi varint/delta kodlama (F3-1'in kalanı)

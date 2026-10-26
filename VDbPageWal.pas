@@ -85,6 +85,8 @@ type
       FKey: TBytes;
       FSalt: TBytes;
       FKeyCheck: TBytes;
+      { v3.2: salt-okunur WAL (okuyucu oturum). }
+      FReadOnlyMode: Boolean;
     procedure WriteHeader;
     procedure ReadHeader;
     function WriteRecord(Magic, PageNo, PayloadLen: LongWord;
@@ -95,8 +97,10 @@ type
     constructor Create(const APath: string);
     destructor Destroy; override;
 
-    { WAL dosyasini kesif/olustur (yoksa baslik yazar). }
-    procedure Open;
+    { WAL dosyasini kesif/olustur (yoksa baslik yazar).
+      v3.2: AReadOnly=True ise dosya OLUSTURULMAZ ve yalnizca okunur
+      (fmOpenRead); yoksa "icerik yok" kabul edilir. }
+    procedure Open(AReadOnly: Boolean = False);
     procedure Close;
 
     { Sprint 3.4: Open'dan ONCE cagrilir. Anahtar 32 bayt; tuz depodan
@@ -296,11 +300,12 @@ begin
   inherited Destroy;
 end;
 
-procedure TVdbPageWal.Open;
+procedure TVdbPageWal.Open(AReadOnly: Boolean);
 var
   hasFile: Boolean;
 begin
   if FStream <> nil then Exit;
+  FReadOnlyMode := AReadOnly;
   hasFile := False;
   if FileExists(FPath) then
   begin
@@ -309,7 +314,10 @@ begin
   end;
   if hasFile then
   begin
-    FStream := TFileStream.Create(FPath, fmOpenReadWrite or fmShareDenyWrite);
+    if AReadOnly then
+      FStream := TFileStream.Create(FPath, fmOpenRead or fmShareDenyNone)
+    else
+      FStream := TFileStream.Create(FPath, fmOpenReadWrite or fmShareDenyNone);
     try
       ReadHeader;
       FHasContent := FStream.Size > VDB_PAGE_SIZE;
@@ -317,6 +325,12 @@ begin
       FreeAndNil(FStream);
       raise;
     end;
+  end
+  else if AReadOnly then
+  begin
+    { Salt-okunur: WAL yok -> icerik yok. Dosya OLUSTURULMAZ. }
+    FLSN := 0;
+    FHasContent := False;
   end
   else
   begin
@@ -374,6 +388,8 @@ procedure TVdbPageWal.AppendFrame(PageNo: LongWord; P: PVdbPage);
 begin
   if FStream = nil then
     raise EVdbWal.Create('WAL acik degil');
+  if FReadOnlyMode then
+    raise EVdbWal.Create('salt-okunur WAL: cerceve eklenemez');
   { Cerceve DISKE YAZILACAK bir imajdir: CRC'si simdi hesaplanir. Boylece
     kurtarma sirasinda yazilan sayfa PageVerify'dan gecer. }
   PageSeal(P);
@@ -608,6 +624,7 @@ end;
 
 procedure TVdbPageWal.Truncate(CheckpointLSN: LongWord);
 begin
+  if FReadOnlyMode then Exit;
   if FStream = nil then
     raise EVdbWal.Create('WAL acik degil');
   FLSN := CheckpointLSN;

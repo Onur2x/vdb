@@ -69,6 +69,9 @@ type
     var
       FEng: TVdbPageEngine;
       FPath: string;
+      { v3.2: cok okuyucu / tek yazici. }
+      FReadOnly: Boolean;
+      FBusyMs: Integer;
       FBatch: TDictionary<QWord, TBatchRec>;
       { v4: MANTIKSAL DEGISIM GUNLUGU. Her commit'in satir duzeyi
         kayitlarini <db>.log\ altina yazar; PITR (RECOVER TO TIMESTAMP,
@@ -151,9 +154,14 @@ type
       procedure RequireBatchWrite;
 
     procedure InitBackend(const ADbPath: string; ACreate: Boolean;
-      APoolPages: Integer);
+      APoolPages: Integer; AReadOnly: Boolean = False;
+      ABusyMs: Integer = VDB_DEF_BUSY_MS);
+    { v3.2: salt-okunur oturumda yazma denemelerini acik hataya cevirir. }
+    procedure RequireWritable;
     function NewEngine(const APath: string): TVdbPageEngine;
     function GetEncrypted: Boolean;
+    function GetIsReadOnly: Boolean;
+    function GetBusyTimeoutMs: Integer;
     { --- v4: mantiksal degisim gunlugu --- }
     function LogTag(const V: TBytes): Integer;
     procedure OpenChangeLog;
@@ -198,9 +206,12 @@ type
     procedure ClearSavepoints;
     function FindSavepoint(const Name: string): Integer;
   public
-    { ADbPath: .odb dosya yolu. ACreate=True ise yoksa olusturur. }
+    { ADbPath: .odb dosya yolu. ACreate=True ise yoksa olusturur.
+      ABusyMs: yazar kilidi icin bekleme (ms); 0 = bekleme yok.
+      v3.2: cok okuyucu / tek yazici. }
     constructor Create(const ADbPath: string; ACreate: Boolean = True;
-      APoolPages: Integer = VDB_DEF_POOL);
+      APoolPages: Integer = VDB_DEF_POOL;
+      ABusyMs: Integer = VDB_DEF_BUSY_MS);
 
     { Sprint 3.4: sifreli v3 dosyasi. Anahtar 32 baytlık AES-256'dir;
       parola verilirse PBKDF2-SHA256 ile turetilir. Sifresiz dosyaya
@@ -209,9 +220,19 @@ type
       ACreate: Boolean = True; APoolPages: Integer = VDB_DEF_POOL);
     constructor CreateWithPassword(const ADbPath, APassword: string;
       ACreate: Boolean = True; APoolPages: Integer = VDB_DEF_POOL);
+
+    { v3.2: SALT-OKUNUR acilis. Dosya paylasimli kilit ile acilir: birden cok
+      okuyucu ayni anda calisabilir, yazar (tam kilit) bekler. Hicbir yazma
+      yapilmaz; WAL imajlari bellek katmanindan okunur, degisim gunlugu
+      ACILMAZ (okuyucu <db>.log'a yazmaz).
+      ABusyMs yalnizca kayit amaclidir (okuyucu kilidi beklemez). }
+    constructor CreateReadOnly(const ADbPath: string;
+      APoolPages: Integer = VDB_DEF_POOL; ABusyMs: Integer = VDB_DEF_BUSY_MS);
     destructor Destroy; override;
 
     property Engine: TVdbPageEngine read FEng;
+    property IsReadOnly: Boolean read FReadOnly;
+    property BusyMs: Integer read FBusyMs;
     { Sprint 3.4: sayfa sifreleme durumu ve anahtar parmak izi (8 hex). }
     property Encrypted: Boolean read GetEncrypted;
     function KeyFingerprint: string;
@@ -334,9 +355,11 @@ begin
 end;
 
 procedure TVdbBackendV3.InitBackend(const ADbPath: string; ACreate: Boolean;
-  APoolPages: Integer);
+  APoolPages: Integer; AReadOnly: Boolean; ABusyMs: Integer);
 begin
   FPath := ADbPath;
+  FReadOnly := AReadOnly;
+  FBusyMs := ABusyMs;
   FBatch := TDictionary<QWord, TBatchRec>.Create;
   FOrder := TList<QWord>.Create;
   FTagCounts := TDictionary<Integer, Int64>.Create;
@@ -356,7 +379,7 @@ begin
   FPoolPages := APoolPages;
   FEng := NewEngine(ADbPath);
   try
-    FEng.Open(ACreate);
+    FEng.Open(ACreate, AReadOnly, ABusyMs);
   except
     FreeAndNil(FEng);
     raise;
@@ -377,8 +400,16 @@ begin
     dogruluk ETKILENMEZ). }
   FLog := nil;
   FLogInGroup := False;
+  FLogSuspended := False;
   FLogProblem := '';
   FLogBaseSeq := 0;
+  { v3.2: salt-okunur okuyucu degisim gunlugune YAZMAZ ve taban imaji
+    uretmez; <db>.log dizini okuyucu tarafindan olusturulmaz. }
+  if FReadOnly then
+  begin
+    FLogProblem := 'salt-okunur oturum: degisim gunlugu kapali';
+    Exit;
+  end;
   OpenChangeLog;
 end;
 
@@ -529,13 +560,13 @@ end;
 
 
 constructor TVdbBackendV3.Create(const ADbPath: string; ACreate: Boolean;
-  APoolPages: Integer);
+  APoolPages: Integer; ABusyMs: Integer);
 begin
   inherited Create;
   FKey := nil;
   FPassword := '';
   FHasPassword := False;
-  InitBackend(ADbPath, ACreate, APoolPages);
+  InitBackend(ADbPath, ACreate, APoolPages, False, ABusyMs);
 end;
 
 constructor TVdbBackendV3.CreateWithKey(const ADbPath: string;
@@ -556,6 +587,33 @@ begin
   FPassword := APassword;
   FHasPassword := True;
   InitBackend(ADbPath, ACreate, APoolPages);
+end;
+
+constructor TVdbBackendV3.CreateReadOnly(const ADbPath: string;
+  APoolPages: Integer; ABusyMs: Integer);
+begin
+  inherited Create;
+  FKey := nil;
+  FPassword := '';
+  FHasPassword := False;
+  InitBackend(ADbPath, False, APoolPages, True, ABusyMs);
+end;
+
+function TVdbBackendV3.GetIsReadOnly: Boolean;
+begin
+  Result := FReadOnly;
+end;
+
+function TVdbBackendV3.GetBusyTimeoutMs: Integer;
+begin
+  Result := FBusyMs;
+end;
+
+procedure TVdbBackendV3.RequireWritable;
+begin
+  if FReadOnly then
+    raise EVdbBackendV3.Create(
+      'salt-okunur veritabani: yazma yapilamaz (READONLY acilis)');
 end;
 
 destructor TVdbBackendV3.Destroy;
@@ -723,6 +781,7 @@ var
   oldTag, newTag: Integer;
   oldVal: TBytes;
 begin
+  RequireWritable;
   RequireBatchWrite;
   if FBatchOpen then
   begin
@@ -1233,6 +1292,7 @@ end;
 
 procedure TVdbBackendV3.BeginBatch;
 begin
+  RequireWritable;
   RequireBatchWrite;       // v3.2: baskasi acik parti tutuyorsa reddet
   if FBatchOpen then Exit;
   ClearSavepoints;
@@ -1568,6 +1628,7 @@ var
   magic, ver, flags: LongWord;
   i: Integer;
 begin
+  RequireWritable;
   if FBatchOpen then
     raise EVdbBackendV3.Create('acik parti varken geri yukleme yapilamaz');
   if not FileExists(SrcPath) then
@@ -1648,6 +1709,7 @@ var
   newEng: TVdbPageEngine;
   tagsWere: Boolean;
 begin
+  RequireWritable;
   if FBatchOpen then
     raise EVdbBackendV3.Create('acik parti varken VACUUM yapilamaz');
   if FDirty then
@@ -1710,6 +1772,7 @@ var
   n: Int64;
   tagsWere: Boolean;
 begin
+  RequireWritable;
   if FBatchOpen then
     raise EVdbBackendV3.Create('acik parti varken ALTER DATABASE KEY yapilamaz');
   if not FEng.Store.Encrypted then

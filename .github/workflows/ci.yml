@@ -78,6 +78,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:LAZBUILD -B replchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:LAZBUILD -B lockchk.lpi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Sayfa deposu kapisi (storechk)
         shell: pwsh
@@ -339,6 +341,25 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'replchk kalan > 0'
+            exit 1
+          }
+
+      - name: Cok okuyucu / tek yazici kapisi (lockchk)
+        shell: pwsh
+        run: |
+          # v3.2: iki salt-okunur oturum AYNI ANDA okur; yazar paylasimli
+          # kilidi bekler (busy timeout) ve acik "mesgul" hatasi alir;
+          # salt-okunur oturum yazamaz, <db>.log olusturmaz, cokme sonrasi
+          # WAL katmanindan okur ve diskte HICBIR bayt degistirmez.
+          $dir = Join-Path $env:RUNNER_TEMP 'vdblockchk'
+          $out = & .\lockchk.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'COK OKUYUCU / TEK YAZICI DOGRULANDI') {
+            Write-Error 'lockchk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'lockchk kalan > 0'
             exit 1
           }
 
