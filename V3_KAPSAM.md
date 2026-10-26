@@ -160,10 +160,11 @@ v3 koşusu yalnız "kapsam" değil, **gerçek kusurlar** ortaya çıkardı:
 | Sayfa düzeyi **AES-256-GCM** şifreleme (zarf: nonce+şifre+tag = 4124 B) | **var** (Sprint 3.4) | 3.4 ✔ |
 | `ALTER DATABASE KEY` | **var** (v3.2): dosya bütünü yeni parola ile yeniden şifrelenir (tmp + `.bak`, hata→eski kimlik) | 3.2 ✔ |
 | Kolon düzeyi `ENCRYPTED` | **var** (v3.2): değerler dosya şifrelemesiyle korunur; şifresiz dosyada açık hata; `.colkey` biçimi v2 ile aynı | 3.2 ✔ |
-| `START REPLICATION` / `PUMP` / slot / `SHOW` / `STOP` | **yok**; hepsi `ecUnsupported` + "v3.1: mantıksal günlük" (Sprint 3.5) | 3.5 ✔ (gerçek replikasyon v3.2) |
-| Zone map (bölüm budama) | **kapalı**: v3 düz tam tarama yapar; sonuçlar birebir doğru (Sprint 3.7) | 3.7 ✔ (budama v3.2) |
+| `START REPLICATION` / `PUMP` / slot / `SHOW` / `STOP` | **var (v4)**: mantıksal grup taşıma (sayfa imajı değil), dosya tabanlı slot + `PUMP`; boşluk/bozukluk/nesil kopması reddedilir, ikincil kendi seq uzayına yeniden numaralar | v4 ✔ |
+| Zone map (bölüm budama) | **kapalı**: v3 düz tam tarama yapar; sonuçlar birebir doğru (Sprint 3.7) | sayfa düzeyinde v4 sonrası |
 | `SAVEPOINT` | **var** (v3.2) — v2 ile aynı sözleşme (yinelenen isim hata, hedef rollback sonrası kalır, RELEASE commit etmez) | 3.2 ✔ |
-| B+tree / BETWEEN hızlandırma / `.idx` varint | yok | v3.2 |
+| B+tree / BETWEEN hızlandırma | **var (v4)**: bellek içi gerçek B+tree (`VDbBTree.pas`) `TIdxSkip` içinde; disk biçimi/WAL/PITR/göç değişmedi. `WHERE kolon op sabit ORDER BY kolon LIMIT k` → önce indeks dilimi | v4 ✔ |
+| `.idx` varint | yok | sırada |
 
 ## 5. Yeniden üretme
 
@@ -274,8 +275,9 @@ kaynaklanır. Çekirdek v3 yollarında hiçbir kontrol eksilmemiştir.
 
 ### Replikasyon, PITR ve zone map kararları (Sprint 3.5-3.7 → v4 güncellemesi)
 
-Durum **2026-10-26**: PITR dilimi tamamlandı (mantıksal değişim günlüğü);
-replikasyon ve zone map hâlâ sırada.
+Durum **2026-10-26**: PITR, B+tree ve replikasyon dilimleri tamamlandı;
+zone map (sayfa düzeyi), `.idx` varint, satır varint/delta ve çok yazarlı
+MVCC sırada.
 
 | Yetenek | Bugünkü davranış | Test |
 |---|---|---|
@@ -284,7 +286,7 @@ replikasyon ve zone map hâlâ sırada.
 | `ARCHIVE WAL SET DIR='x'` | **Çalışır (v4)**: günlük setinin tam kopyasını `x`'e çıkarır; birincil günlüğe dokunmaz, tekrarlandıkça tazeler. `RESET` **yoktur** — günlük kalıcıdır, silinirse PITR yeteneği kaybolur | `pitrchk` arşiv kontrolleri, `v3sqlchk` |
 | `ARCHIVE WAL LIST` | **Çalışır (v4)**: tek satır kapsam (`min_seq`, `max_seq`, `min_time`, `max_time`, `bases`) | `pitrchk`, `v3sqlchk` |
 | `RECOVER TO [TIMESTAMP\|NOW]` | **Çalışır (v4)**: canlı dosyaya **yazmaz**; `<db>.recovered` üretir (taban + ileri replay). Kullanıcı doğrular, `RESTORE FROM` ile devreye alır | `pitrchk` (dosya açılıp `Verify` TEMİZ), `v3sqlchk` |
-| Replikasyon komutları | `ecUnsupported` — mantıksal günlük artık var (v4), protokol sıradaki dilim | `v3sqlchk` 9 kontrol: hiçbiri dosya bırakmaz, veri bozulmaz, yeniden açılış sağlam |
+| Replikasyon komutları | **Çalışır (v4)**: sayfa imajı değil **mantıksal grup** taşınır — `<dest>\<slot>\g-<seq>.vrgp` (64 B `VRG1` başlık + CRC'li gövde, tmp+rename atomik), taban imajı `<dest>\<slot>\bases\` (ilk taşımada). İkincil tabanı `RestoreFrom` ile kurar, grupları **tek işlem** uygular ve gelen grubu **kendi** seq uzayına yeniden numaralar. Konum `<db>.repl\<slot>.slot` (`last_seq`) — kalıcı. Taşıma dosya tabanlıdır (`SHIP_DIR`); TCP reddedilir. Retler: bozuk dosya, **sırada boşluk** (atlanmaz), nesil kopması (`Flags bit0=1`) | `replchk` 13 grup **37/0** (iki gerçek DB, ham KV birebir, artımlı, idempotent tekrar, bozukluk/boşluk/nesil), `v3sqlchk TestReplicationV3` **179/0** |
 | Zone map | **budama yok**: `Kv = nil` olduğu için v3 genel tam tarama yolunu kullanır | `v3sqlchk` 22 kontrol: 3000 satırda 8 aralık + eşitlik/`IN`/`<>`/karma sorgular Pascal'da hesaplanan beklentiyle **birebir** |
 
 v4 günlük tasarımı (ayrıntı `VDbChangeLog.pas` başında):

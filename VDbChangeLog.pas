@@ -104,6 +104,21 @@ type
 
   TVdbLogBaseArray = array of TVdbLogBase;
 
+  { v4 replikasyon: bir grubun HAM baytlari. Kayitlar yeniden kodlanmaz;
+    tasima bayt bayt yapilir (goc ile ayni guvence). }
+  TVdbLogRawGroup = record
+    Seq: Int64;
+    TsMs: Int64;
+    Kind: Byte;             // VDBLOG_KIND_BASE = taban isareti; 0 = veri grubu
+    Gen: LongWord;
+    Flags: LongWord;
+    BaseName: string;
+    Data: TBytes;           // cerceveler (kayitlar [+ END]); taban icin tek BASE
+  end;
+
+  TVdbLogRawGroupArray = array of TVdbLogRawGroup;
+  TVdbLogEntryArray = array of TVdbLogEntry;
+
   { ------------------------------------------------------------- yazici }
   TVdbChangeLog = class
   private
@@ -160,6 +175,13 @@ type
       AFlags bit0=1 = NESIL KOPMASI (RESTORE): replay bu tabanda DURUR. }
     function WriteBase(ADbLsn: LongWord; ADbBytes: Int64; ATsMs: Int64;
       AFlags: LongWord; const ABaseName: string): Int64;
+    { REPLIKA: baska bir dugumun veri grubunu AYNEN ekler. Seq alanlari
+      YEREL siraya cevrilir, END kaydinin motor LSN'i AEngineLsn yapilir ve
+      her cercevenin CRC'si yeniden hesaplanir. Taban (BASE) kaydi KABUL
+      EDILMEZ (taban kurulumu RESTORE ile yapilir).
+      Basarida yeni yerel seq, hatada 0 + FError. }
+    function AppendForeignGroup(const ARaw: TBytes;
+      AEngineLsn: LongWord): Int64;
     procedure Flush;
   end;
 
@@ -192,6 +214,14 @@ type
       durdu (Reason anlatir); False = gunlugun sonuna kadar temiz okundu. }
     function Replay(FromSeq, ToSeq, ToTsMs: Int64; Cb: TVdbLogVisit;
       out AppliedGroups: Int64; out StoppedReason: string): Boolean;
+
+    { v4 replikasyon: mevcut sira araligi (taban + tam gruplar). Yoksa False. }
+    function SeqRange(out AMinSeq, AMaxSeq: Int64): Boolean;
+    { FromSeq'ten BUYUK ilk AMaxGroups grubu HAM baytlariyla dondurur.
+      Yalniz TAM gruplar doner (kesik kuyruk asla). Bellek siniri icin
+      parti parti cagrilir; AMore = kesme sinirina takildik (daha olabilir). }
+    function ExtractGroups(FromSeq: Int64; AMaxGroups: Integer;
+      out AMore: Boolean): TVdbLogRawGroupArray;
   end;
 
 function VdbLogNowMs: Int64;
@@ -207,9 +237,18 @@ function VdbLogFormatTimestamp(Ms: Int64): string;
   yerel UTC farki (yaz saati dahil) uygulanir. }
 function VdbLogWallMsToUtcMs(WallMs: Int64): Int64;
 
+{ REPLIKASYON: ham grup baytlarini kayitlara cozer (END atilir; taban
+  kaydi cozulmez -> False). Basarida True. }
+function VdbLogDecodeGroup(const AData: TBytes;
+  out AEntries: TVdbLogEntryArray): Boolean;
+
 implementation
 
-function ReadOneRecord(S: TFileStream; out E: TVdbLogEntry;
+function ReadOneRecordRaw(S: TStream; out E: TVdbLogEntry;
+  out AIsEnd: Boolean; out EndCount: LongWord; out ARaw: TBytes): Boolean;
+  forward;
+
+function ReadOneRecord(S: TStream; out E: TVdbLogEntry;
   out AIsEnd: Boolean; out EndCount: LongWord): Boolean; forward;
 
 function VdbLogNowMs: Int64;
@@ -663,6 +702,7 @@ var
   i, total, pos: Integer;
   all, rec, payload: TBytes;
   seq, ts: Int64;
+  posBefore: Int64;
 begin
   ASeq := FSeq;
   ATsMs := 0;
@@ -704,6 +744,7 @@ begin
   try
     if FSeg = nil then
       OpenNewSeg(FSegNo + 1);
+    posBefore := FSeg.Size;
     FSeg.WriteBuffer(all[0], total);
     VDbFlushStream(FSeg);
     if FSeg.Size >= FSegMax then
@@ -712,6 +753,12 @@ begin
     on E: Exception do
     begin
       FError := 'degisim gunlugu yazilamadi: ' + E.Message;
+      { Yarim grup birakma: kuyruk kesilirse sonraki gruplar da okunamaz. }
+      try
+        if (FSeg <> nil) and (FSeg.Size > posBefore) then
+          FSeg.Size := posBefore;
+      except
+      end;
       AbortGroup;
       Exit(False);
     end;
@@ -753,6 +800,107 @@ begin
   VDbFlushStream(FSeg);
   FSeq := seq;
   Result := seq;
+end;
+
+{ REPLIKA: yabanci grubu yerel siraya cevirerek yaz.
+  Cerceve duzeni: 40 B baslik | yuk (RecLen) | Crc32
+  Baslikta: Magic u32 @0, RecLen u32 @4, Seq i64 @8, TsMs i64 @16.
+  END kaydinda Key (u64 @32) = motor LSN. }
+function TVdbChangeLog.AppendForeignGroup(const ARaw: TBytes;
+  AEngineLsn: LongWord): Int64;
+var
+  ms: TMemoryStream;
+  frame: TBytes;
+  pos, fl, rl, n: Integer;
+  magic: LongWord;
+  newSeq: Int64;
+  crc: LongWord;
+  total: Int64;
+  posBefore: Int64;
+begin
+  Result := 0;
+  FError := '';
+  if not FEnabled then
+  begin
+    FError := 'degisim gunlugu kapali';
+    Exit;
+  end;
+  if FInGroup then
+  begin
+    FError := 'acik grup varken replika grubu eklenemez';
+    Exit;
+  end;
+  n := Length(ARaw);
+  if n < VDBLOG_REC_HDR + 4 then
+  begin
+    FError := 'replika grubu cok kisa';
+    Exit;
+  end;
+  if ReadU32(ARaw, 0) = VDBLOG_MAGIC_BASE then
+  begin
+    FError := 'taban kaydi replika gunlugune eklenemez (RESTORE kullanin)';
+    Exit;
+  end;
+  newSeq := FSeq + 1;
+  ms := TMemoryStream.Create;
+  try
+    pos := 0;
+    while pos + VDBLOG_REC_HDR + 4 <= n do
+    begin
+      magic := ReadU32(ARaw, pos);
+      if (magic <> VDBLOG_MAGIC_REC) and (magic <> VDBLOG_MAGIC_END) then
+      begin
+        FError := Format('replika grubunda gecersiz cerceve (offset %d)', [pos]);
+        Exit;
+      end;
+      rl := Integer(ReadU32(ARaw, pos + 4));
+      fl := VDBLOG_REC_HDR + rl + 4;
+      if (rl < 0) or (pos + fl > n) then
+      begin
+        FError := Format('replika grubunda kirik cerceve (offset %d)', [pos]);
+        Exit;
+      end;
+      frame := Copy(ARaw, pos, fl);
+      PutU64(frame, 8, QWord(newSeq));
+      if magic = VDBLOG_MAGIC_END then
+        PutU64(frame, 32, QWord(AEngineLsn));
+      crc := VDbCrc32OfBytes(frame, fl - 4);
+      PutU32(frame, fl - 4, crc);
+      ms.WriteBuffer(frame[0], fl);
+      pos := pos + fl;
+    end;
+    if pos <> n then
+    begin
+      FError := 'replika grubunda artik bayt var';
+      Exit;
+    end;
+    total := ms.Size;
+    try
+      if FSeg = nil then
+        OpenNewSeg(FSegNo + 1);
+      posBefore := FSeg.Size;
+      ms.Position := 0;
+      FSeg.CopyFrom(ms, total);
+      VDbFlushStream(FSeg);
+      if FSeg.Size >= FSegMax then
+        OpenNewSeg(FSegNo + 1);
+    except
+      on E: Exception do
+      begin
+        FError := 'gunluk yazilamadi: ' + E.Message;
+        try
+          if (FSeg <> nil) and (FSeg.Size > posBefore) then
+            FSeg.Size := posBefore;
+        except
+        end;
+        Exit;
+      end;
+    end;
+  finally
+    ms.Free;
+  end;
+  FSeq := newSeq;
+  Result := newSeq;
 end;
 
 { =============================================================== okuyucu }
@@ -850,8 +998,8 @@ end;
 { Segment akisindan TEK bir kaydi okur (baslik + yuk + crc dogrulamasi).
   End=True ise kayit grup sonudur (END); EndCount grup kayit sayisidir.
   Kesik/bozuk kuyrukta False doner. }
-function ReadOneRecord(S: TFileStream; out E: TVdbLogEntry;
-  out AIsEnd: Boolean; out EndCount: LongWord): Boolean;
+function ReadOneRecordRaw(S: TStream; out E: TVdbLogEntry;
+  out AIsEnd: Boolean; out EndCount: LongWord; out ARaw: TBytes): Boolean;
 var
   hdr, payload, all: TBytes;
   rl, oldLen, newLen, nb: Integer;
@@ -860,6 +1008,7 @@ begin
   Result := False;
   AIsEnd := False;
   EndCount := 0;
+  ARaw := nil;
   FillChar(E, SizeOf(E), 0);
   SetLength(hdr, VDBLOG_REC_HDR);
   if S.Position + VDBLOG_REC_HDR > S.Size then Exit;
@@ -877,6 +1026,7 @@ begin
   crcCalc := VDbCrc32OfBytes(all, Length(all) - 4);
   crcStored := ReadU32(all, Length(all) - 4);
   if crcCalc <> crcStored then Exit;
+  ARaw := all;
 
   E.Seq := ReadI64(hdr, 8);
   E.TsMs := ReadI64(hdr, 16);
@@ -926,6 +1076,50 @@ begin
   Result := True;
 end;
 
+{ Geriye uyumlu sarmalayici: ham baytlari istemeyen cagirilar. }
+function ReadOneRecord(S: TStream; out E: TVdbLogEntry;
+  out AIsEnd: Boolean; out EndCount: LongWord): Boolean;
+var
+  dummy: TBytes;
+begin
+  Result := ReadOneRecordRaw(S, E, AIsEnd, EndCount, dummy);
+end;
+
+function VdbLogDecodeGroup(const AData: TBytes;
+  out AEntries: TVdbLogEntryArray): Boolean;
+var
+  ms: TMemoryStream;
+  E: TVdbLogEntry;
+  isEnd: Boolean;
+  cnt: LongWord;
+  raw: TBytes;
+  n: Integer;
+begin
+  AEntries := nil;
+  Result := False;
+  n := 0;
+  ms := TMemoryStream.Create;
+  try
+    if Length(AData) > 0 then
+      ms.WriteBuffer(AData[0], Length(AData));
+    ms.Position := 0;
+    while ReadOneRecordRaw(ms, E, isEnd, cnt, raw) do
+    begin
+      if isEnd then
+      begin
+        Result := True;
+        Break;
+      end;
+      if E.Kind = VDBLOG_KIND_BASE then Exit;
+      SetLength(AEntries, n + 1);
+      AEntries[n] := E;
+      Inc(n);
+    end;
+  finally
+    ms.Free;
+  end;
+end;
+
 function TVdbLogReader.ListBases: TVdbLogBaseArray;
 var
   i, n: Integer;
@@ -965,6 +1159,140 @@ begin
     finally
       S.Free;
     end;
+  end;
+end;
+
+function TVdbLogReader.SeqRange(out AMinSeq, AMaxSeq: Int64): Boolean;
+var
+  i: Integer;
+  S: TFileStream;
+  hdr: TBytes;
+  E: TVdbLogEntry;
+  isEnd: Boolean;
+  cnt: LongWord;
+begin
+  AMinSeq := 0;
+  AMaxSeq := 0;
+  Result := False;
+  CollectSegs;
+  for i := 0 to FSegs.Count - 1 do
+  begin
+    if not FileExists(SegPath(FSegs[i])) then Continue;
+    S := TFileStream.Create(SegPath(FSegs[i]), fmOpenRead or fmShareDenyNone);
+    try
+      SetLength(hdr, VDBLOG_SEG_HDR);
+      if S.Read(hdr[0], VDBLOG_SEG_HDR) <> VDBLOG_SEG_HDR then Continue;
+      if ReadU32(hdr, 0) <> VDBLOG_MAGIC_SEG then Continue;
+      while ReadOneRecord(S, E, isEnd, cnt) do
+      begin
+        { Yalniz TAM noktalar sayilir: grup sonu (END) ve taban isareti. }
+        if (not isEnd) and (E.Kind <> VDBLOG_KIND_BASE) then Continue;
+        if (not Result) or (E.Seq < AMinSeq) then AMinSeq := E.Seq;
+        if (not Result) or (E.Seq > AMaxSeq) then AMaxSeq := E.Seq;
+        Result := True;
+      end;
+    finally
+      S.Free;
+    end;
+  end;
+end;
+
+function TVdbLogReader.ExtractGroups(FromSeq: Int64; AMaxGroups: Integer;
+  out AMore: Boolean): TVdbLogRawGroupArray;
+var
+  i: Integer;
+  S: TFileStream;
+  hdr, raw: TBytes;
+  E: TVdbLogEntry;
+  isEnd: Boolean;
+  cnt: LongWord;
+  ms: TMemoryStream;
+  g: TVdbLogRawGroup;
+  done, open: Boolean;
+begin
+  Result := nil;
+  AMore := False;
+  if AMaxGroups <= 0 then AMaxGroups := MaxInt;
+  CollectSegs;
+  ms := TMemoryStream.Create;
+  open := False;
+  done := False;
+  try
+    for i := 0 to FSegs.Count - 1 do
+    begin
+      if done then Break;
+      if not FileExists(SegPath(FSegs[i])) then Continue;
+      S := TFileStream.Create(SegPath(FSegs[i]), fmOpenRead or fmShareDenyNone);
+      try
+        SetLength(hdr, VDBLOG_SEG_HDR);
+        if S.Read(hdr[0], VDBLOG_SEG_HDR) <> VDBLOG_SEG_HDR then Continue;
+        if ReadU32(hdr, 0) <> VDBLOG_MAGIC_SEG then Continue;
+        while ReadOneRecordRaw(S, E, isEnd, cnt, raw) do
+        begin
+          if E.Seq <= FromSeq then Continue;
+          if E.Kind = VDBLOG_KIND_BASE then
+          begin
+            { Taban isareti tek kayittir; yarim veri grubu varsa atilir. }
+            ms.Clear;
+            open := False;
+            g.Kind := VDBLOG_KIND_BASE;
+            g.Seq := E.Seq;
+            g.TsMs := E.TsMs;
+            g.Gen := E.Gen;
+            g.Flags := E.Flags;
+            g.BaseName := E.BaseName;
+            g.Data := raw;
+            SetLength(Result, Length(Result) + 1);
+            Result[High(Result)] := g;
+            if Length(Result) >= AMaxGroups then
+            begin
+              done := True;
+              AMore := True;
+              Break;
+            end;
+            Continue;
+          end;
+          if not open then
+          begin
+            ms.Clear;
+            open := True;
+          end;
+          ms.WriteBuffer(raw[0], Length(raw));
+          if isEnd then
+          begin
+            g.Kind := 0;
+            g.Seq := E.Seq;
+            g.TsMs := E.TsMs;
+            g.Gen := 0;
+            g.Flags := 0;
+            g.BaseName := '';
+            SetLength(g.Data, ms.Size);
+            if ms.Size > 0 then
+            begin
+              ms.Position := 0;
+              ms.ReadBuffer(g.Data[0], ms.Size);
+            end;
+            SetLength(Result, Length(Result) + 1);
+            Result[High(Result)] := g;
+            ms.Clear;
+            open := False;
+            if Length(Result) >= AMaxGroups then
+            begin
+              done := True;
+              AMore := True;
+              Break;
+            end;
+          end;
+        end;
+      finally
+        S.Free;
+      end;
+      { Segment sonu: END gormemis yarim grup ASLA tasinmaz. }
+      ms.Clear;
+      open := False;
+    end;
+  finally
+    ms.Free;
   end;
 end;
 

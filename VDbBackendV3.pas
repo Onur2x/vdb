@@ -78,6 +78,8 @@ type
       FLogInGroup: Boolean;
       FLogProblem: string;
       FLogBaseSeq: Int64;
+      { v4 replikasyon: uygulama penceresinde yerel gunluge yazim kapali. }
+      FLogSuspended: Boolean;
       { v4: PITR replay'i sirasinda hedef motor (gecici dosya) ve son
         hata nedeni. Replay geri cagirimi bu alanlari kullanir. }
       FReplayEng: TVdbPageEngine;
@@ -274,6 +276,10 @@ type
       out Keys: TQWordArray; out Vals: TValArray;
       out ActualTsMs, ActualSeq: Int64): Boolean;
     function ArchiveLogSet(const DestDir: string): Int64;
+    { v4: replikasyon }
+    function ReplSupported: Boolean;
+    procedure ReplSuspendLog(ASuspend: Boolean);
+    function ReplAppendGroup(const ARaw: TBytes; out AErr: string): Boolean;
 
 
     { v3.2: SAVEPOINT. Parti kaplamasi UZERINDE calisir; motora hicbir sey
@@ -476,6 +482,7 @@ end;
 
 procedure TVdbBackendV3.LogPut(AKey: QWord; const AOld, ANew: TBytes);
 begin
+  if FLogSuspended then Exit;
   if (FLog = nil) or (not FLog.Enabled) then Exit;
   if not FLogInGroup then
   begin
@@ -487,6 +494,7 @@ end;
 
 procedure TVdbBackendV3.LogDel(AKey: QWord; const AOld: TBytes);
 begin
+  if FLogSuspended then Exit;
   if (FLog = nil) or (not FLog.Enabled) then Exit;
   if not FLogInGroup then
   begin
@@ -500,6 +508,7 @@ procedure TVdbBackendV3.LogFinish;
 var
   seq, ts: Int64;
 begin
+  if FLogSuspended then Exit;
   if (FLog = nil) or (not FLog.Enabled) or (not FLogInGroup) then Exit;
   if not FLog.EndGroup(FEng.Store.LSN, seq, ts) then
   begin
@@ -2062,9 +2071,13 @@ begin
     end;
     if BaseCount > 0 then
     begin
+      { En son surumu bulmak icin SON tabandan ileri replay edilir. Ilk
+        tabandan baslamak, arada olusan bir nesil kopmasinda (RESTORE /
+        replika taban kurulumu) DURUR ve MaxSeq'i oldugundan kucuk
+        bildirirdi; oysa kopmadan SONRAKI gruplar tam okunabilir. }
       v := TLogRangeVisit.Create;
       try
-        rd.Replay(bases[0].Seq, 0, 0, v.Visit, v.Applied, v.Reason);
+        rd.Replay(bases[BaseCount - 1].Seq, 0, 0, v.Visit, v.Applied, v.Reason);
         if v.Seen then
         begin
           MaxSeq := v.LastSeq;
@@ -2316,6 +2329,55 @@ begin
   finally
     rd.Free;
   end;
+end;
+
+{ ===================================================== v4: REPLIKASYON }
+
+function TVdbBackendV3.ReplSupported: Boolean;
+begin
+  Result := (FLog <> nil) and FLog.Enabled;
+end;
+
+procedure TVdbBackendV3.ReplSuspendLog(ASuspend: Boolean);
+begin
+  if ASuspend then
+  begin
+    { Yarim kalmis bir yerel grup varsa kapatilmaz: iptal edilir. }
+    if FLogInGroup then
+    begin
+      if FLog <> nil then FLog.AbortGroup;
+      FLogInGroup := False;
+    end;
+  end;
+  FLogSuspended := ASuspend;
+end;
+
+function TVdbBackendV3.ReplAppendGroup(const ARaw: TBytes;
+  out AErr: string): Boolean;
+var
+  seq: Int64;
+begin
+  AErr := '';
+  Result := False;
+  if not ReplSupported then
+  begin
+    AErr := LogStatus;
+    if AErr = '' then AErr := 'degisim gunlugu kapali';
+    Exit;
+  end;
+  if FBatchOpen then
+  begin
+    AErr := 'acik parti varken replika grubu eklenemez';
+    Exit;
+  end;
+  seq := FLog.AppendForeignGroup(ARaw, FEng.Store.LSN);
+  if seq <= 0 then
+  begin
+    AErr := FLog.LastError;
+    if AErr = '' then AErr := 'gunluge eklenemedi';
+    Exit;
+  end;
+  Result := True;
 end;
 
 end.

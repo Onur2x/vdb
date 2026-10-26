@@ -76,6 +76,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:LAZBUILD -B btreechk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:LAZBUILD -B replchk.lpi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Sayfa deposu kapisi (storechk)
         shell: pwsh
@@ -318,6 +320,25 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'btreechk kalan > 0'
+            exit 1
+          }
+
+      - name: Replikasyon kapisi (replchk)
+        shell: pwsh
+        run: |
+          # v4: mantiksal gunluk tasima. Iki GERCEK veritabani: birincil
+          # (commit'ler) + ikincil (uygulama). KV duzeyinde birebir
+          # karsilastirma; bozuk/kesik/bosluklu tasima REDDEDILIR,
+          # nesil kopmasi tasinmaz, tekrar uygulama idempotenttir.
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbreplchk'
+          $out = & .\replchk.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'REPLIKASYON DOGRULANDI') {
+            Write-Error 'replchk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'replchk kalan > 0'
             exit 1
           }
 

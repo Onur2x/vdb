@@ -13,7 +13,7 @@ kökten düzelir; SQL katmanı ve API değişmez.
 |---|---|---|
 | A | Dosya adı/uzantısı | **Aynı `.odb` adı korunur.** Dosya başında `VDB3` magic + sürüm baytı. v2 dosyası açılırsa net hata: `v2 formatı — MIGRATE TO v3 çalıştır`. `.odb3` uzantısı YOK. |
 | B | Aralık sorgusu / sıralı anahtar | **v3.0'a girmez.** v3.0 = hash anahtarlı sayfa yığını (dosya boyutu + açılış kazanır). B+tree / BETWEEN **v3.1**. |
-| C | Replication | **v3.0'da kapalı.** `START REPLICATION` çağrısı `ecNotSupported` + açıklayıcı mesaj verir. v3.1'de kapsam dışı bırakıldı; mantıksal değişim günlüğü ile yeniden yazılması sıradaki sürüme ertelendi. |
+| C | Replication | **v4'te açık.** Sayfa imajı değil **mantıksal grup** taşınır (`VDbReplV3.pas`); dosya tabanlı (`SHIP_DIR`) slot + `PUMP`, `CREATE/DROP REPLICATION SLOT`, `SHOW REPLICATION STATUS/SLOTS`, `START/STOP REPLICATION`. TCP ile replikasyon hâlâ reddedilir. |
 | D | v2 uyumu | v2 dosyaları **okunmaz, yazılmaz**. Tek yönlü `MIGRATE TO v3` aracı; kaynak dosya `.v2bak` olarak korunur. |
 | E | Otomatik sıkıştırma | v3.0'da `AutoCompactEnabled` **varsayılan False** kalır (H25 kararı korunur). Sayfa motorunda boş sayfa geri kazanımı zaten var. |
 | F | P-DUR sözleşmesi | Korunur. SQL commit ve açık `Flush`, `SyncWrite=False` olsa bile fsync eder. |
@@ -210,8 +210,9 @@ testlerdir — bunlar v3'te **yok** ve v3'te açık hata verir.
 
 1. ~~**Gerçek PITR (`RECOVER TO`) / WAL arşivi (T95).**~~ → **tamamlandı**
    (aşağıdaki "v4" bölümü).
-2. **Replikasyon (T95b, T101).** Mantıksal değişim günlüğü artık **var**
-   (v4), yani önkoşul karşılandı; replikasyon protokolü sıradaki dilim.
+2. ~~**Replikasyon (T95b, T101).**~~ → **tamamlandı** (aşağıdaki v4
+   replikasyon bölümü): mantıksal grup taşıma, taban kurulumu, kendi seq
+   uzayına yeniden numaralandırma, boşluk/bozukluk/nesil kopması retleri.
 3. Zone map (sayfa düzeyinde budama) ve dosya boyu optimizasyonları —
    performans işi, doğruluk riski yok.
 
@@ -344,8 +345,54 @@ PK `IN`, ikincil indeks `IN` dilimi, `BETWEEN` ve
 Kapı: `v3sqlchk TestIndexInNegative` — indeksli satır yolu,
 PK yolu ve COUNT yolu birebir; NULL içeren liste daraltmaz.
 
+### v4 — replikasyon: mantıksal grup taşıma (2026-10-26)
+
+Sayfa imajı **taşınmaz**; `<db>.log` mantıksal günlüğünün **tam grupları**
+taşınır. Böylece taşınan birim, birincilin commit sınırıdır ve ikincil onu
+**tek işlem** olarak uygular: yarım grup hiçbir zaman görünmez.
+
+| Öğe | Karar |
+|---|---|
+| Taşıma dosyası | `<dest>\<slot>\g-<seq:020d>.vrgp` — 64 baytlık `VRG1` başlık (magic, sürüm, seq, tür, bayrak, veri boyu, CRC) + CRC'li gövde (kayıt çerçeveleri). `.tmp` + rename ile atomik. |
+| Taban imajı | `<dest>\<slot>\bases\<ad>` — slotun **ilk** taşımasında birincilin en yeni tabanı kopyalanır ve bir BASE işareti bırakılır. |
+| Konum | Yalnız `<db>.repl\<slot>.slot` dosyasında (`last_seq`). Yeniden başlatmada kaybolmaz. |
+| Seq uzayı | İkincil gelen grubu **kendi** seq uzayına yeniden numaralandırır (her çerçevenin `Seq` alanı + `END` LSN'i yeniden yazılır, CRC yeniden hesaplanır). İki düğümün seq uzayı çakışmaz; ikincilin kendi PITR'ı tutarlı kalır. |
+| Uygulama atomikliği | Grup = tek `BeginBatch`/`CommitBatch`. Uygulama sırasında yerel günlük yazımı `ReplSuspendLog(True)` ile kapalı, sonra `ReplAppendGroup` ile yeniden numaralanmış kayıtlar eklenir. Tekrar uygulama **idempotenttir** (değerler mutlaktır). |
+| Retler | Bozuk/eksik dosya (CRC), **sırada boşluk** (grup dosyası silinmiş), nesil kopması taşıyan taban (`Flags bit0=1` → RESTORE) ve TCP ile replikasyon açıkça reddedilir. Boşluk **atlanmaz**: bitişik gruplar uygulanır, boşluktaki ve sonraki gruplar uygulanmaz, çağıran net hata alır. |
+| Yazma hatası | `EndGroup` ve `AppendForeignGroup` yazma hatasında segment boyunu geri keser; yırtık kuyruk sonraki grupları gizlemez. |
+| v2 | `ReplSupported = False`; `ReplAppendGroup` açık hata verir. Protokol v3 sayfa motorunundur. |
+
+**Bulunan ve düzeltilen gerçek kusur:** ikincil taban kurulumu `RestoreFrom`
+kullandığı için günlüğünde **nesil kopması** (`bit0=1`) oluşuyordu.
+`LogRangeInfo` en son sürümü **ilk** tabandan replay ederek hesapladığı için
+kopmada duruyor ve ikincilin `maxSeq`'ini olduğundan **küçük** bildiriyordu →
+`AS OF VERSION` ikincilde taban anını (boş/az veri) döndürüyordu. Düzeltme:
+en son sürüm **son** tabandan ileri replay edilerek bulunur (`LogRangeInfo`).
+Kopmadan öncesi için PITR yine açıkça reddedilir — bu doğru davranıştır,
+ikincil o geçmişe sahip değildir.
+
+Kapı — `replchk` (13): iki **gerçek** veritabanı, SQL katmanı karışmadan ham
+KV karşılaştırması.
+
+| Kontrol | Durum |
+|---|---|
+| Slot yaşam döngüsü (oluştur/tekrar etkisiz/iki etkin slot yok) | 37/0 |
+| Taban + grup taşıma, ikincil RESTORE + tek işlem uygulama | ✔ |
+| KV düzeyinde birebir (`ScanAll` anahtar **ve** değer) | 200 → 220 anahtar |
+| Artımlı devam (2 yeni grup: 50 güncelleme + 10 silme, 30 ekleme) | ✔ |
+| Boş PUMP etkisiz (0 grup) | ✔ |
+| Yeniden başlatmada konum kalıcı | ✔ |
+| Idempotent tekrar (konum 1 geri alınır, veri değişmez) | ✔ |
+| Bozuk taşıma dosyası reddi + veri bozulmaz + onarım sonrası devam | ✔ |
+| Sırada boşluk reddi (yalnız bitişik grup uygulanır, boşluk atlanmaz) | ✔ |
+| Nesil kopması taşınmaz | ✔ |
+| İkincil PITR kendi seq uzayında, içerik birincille birebir | ✔ |
+| Durdur / durum / sil (olmayan slot reddi) | ✔ |
+
+Ayrıca `v3sqlchk TestReplicationV3` (SQL düzeyi: slot, birincil/ikincil,
+artımlı, boş `PUMP`, TCP reddi, yeniden açılış, `DROP`) — **179/0**.
+
 ### Sıradaki sürüme ertelenen (v4 sonrası)
-- Replikasyon protokolü (T95b, T101) — mantıksal günlük artık hazır
 - Zone map'in sayfa düzeyinde yeniden ele alınması
 - Satır gövdesi varint/delta kodlama (F3-1'in kalanı)
 - Dosya boyutu (PK'nin ikinci kez yazılması, hücre başlığı sıkıştırma)
@@ -427,7 +474,7 @@ Sayfa motorunu yazmak kolay; asıl maliyet şu 4 dosyada. Plan bunları hesaba k
 - [x] 3.2 `BACKUP` / `RESTORE` v3'te — yedek = checkpoint sonrası **sayfa imajlarının bayt-bayt kopyası** (tek `.odb`; `.idx`/`.wal` kopyalanmaz). `TVDbPageStore.CopyCommittedTo` meta sayfasını yeniden üretir, `.tmp` + fsync + rename ile yarım yedek bırakmaz; kaynak dosya ikinci kez açılmaz (Windows paylaşım kilidi sorunu yok). `RESTORE`: kaynak `VDB3`/sürüm 3 doğrulanır, motor kapatılır, mevcut dosya `.bak`a taşınır, yeni dosya atomik yerine konur, eski `WAL`/`.idx` silinir, motor yeniden açılır; hata olursa `.bak`tan geri dönülür. SQL katmanı `TVTableDb.ReloadSchema` ile şemayı/indeksleri yeni dosyadan yükler. Kapılar: `backendchk` **52/52** (bağımsız motorla yedek doğrulama, taşma değeri, restore sonrası VERIFY, açık parti reddi, v3 olmayan kaynak reddi), `v3sqlchk` **55/55** (`BACKUP TO` / `RESTORE FROM` + restore sonrası şema/veri/VERIFY). `crashtest` işaret dosyası yarışı da giderildi (**11/11**).
 - [x] 3.3 `Compact` (boş sayfa/ölü bayt geri kazanımı); `AutoCompact` varsayılan **False** kalır — v3'te `VACUUM`, canlı kayıtları **yeni ve sıkışık bir dosyaya** yazar (`TVdbPageEngine.ScanAll` → yeni motor `Insert`), `Close` ile checkpoint+`.idx`, sonra dosya **atomik** değiştirilir (eski dosya `.bak`, eski `WAL`/`.idx` silinir, motor yeniden açılır, `TVTableDb.ReloadSchema`). `IVDbBackend.Compact` eklendi (v2 `TVDb.Compact`'a devreder); RESTORE ile ortak `SwapDbFile` (yarım değişimde `.bak`'tan geri dönüş). `VACUUM`/`RESTORE` açık partide reddedilir; yazılan anahtar sayısı kaynakla karşılaştırılır. Ölçülen: 2.500 canlı / 2.000 silinmiş kayıt + 200×6 KB taşma değeri olan dosya **2.039.808 → 200.704 bayt**. `AutoCompact` v3'te yok (v2'de de varsayılan kapalı). Kapılar: `backendchk` **61/61** (boş veritabanı VACUUM'u 4096 bayt), `v3sqlchk` **60/60**, `sqltest` v3 **2252/0/58** (`T15_Bakim` ve `T19` VACUUM bölümü artık v3'te koşar), v2 **3116/3116**; `pagechk`/`storechk`/`heapchk`/`idxchk`/`migchk`/`crashtest` yeşil.
 - [x] 3.4 Şifreleme: sayfa düzeyinde AES-GCM — sıra sabit: sayfa imajı → `PageSeal` (CRC32) → **AES-256-GCM zarfı** (`nonce 12 | şifre 4096 | tag 16` = 4124 bayt). AAD = `'VDB3PG' | sayfaNo(4) | tuz(16)`; böylece zarf başka sayfaya/dosyaya taşınamaz ve etiket doğrulanmadan hiçbir düz metin açığa çıkmaz. Meta sayfa 0 **düz metin** kalır (sır tutmaz): bayrak, tuz, PBKDF2 iterasyonu ve 16 baytlık HMAC anahtar doğrulayıcı orada durur. `VDbPageCrypto.pas` eklendi (zarf + tuz + parola türetme + parmak izi). Depo: şifreli dosyada sayfa 1..N `4096 + (no-1)*4124` adresinde; yeni uzatılan sayfa sıfır kabul edilir (şifreli zarf yok). WAL çerçeveleri de aynı zarfla yazılır (başlıkta bayrak/anahtar doğrulayıcı/tuz); çökme sonrası kurtarma anahtarla çözer. API: `TVdbPageEngine.CreateWithKey/CreateWithPassword`, `TVDbBackendV3.CreateWithKey/CreateWithPassword`, `Encrypted`, `KeyFingerprint`; `RESTORE` kaynak/hedef şifreleme biçimi ve anahtar doğrulayıcı eşleşmezse reddeder; `VACUUM` aynı anahtarla yeni dosya üretir. `backendchk` `TestV3Encryption` **21/21** (düz metin sızıntısı yok, anahtarsız/yanlış anahtar net hata, bozuk zarf reddi, şifreli yedek, farklı anahtarlı RESTORE reddi, şifreli WAL + çökme kurtarma, parola modu). Kapılar: `backendchk` **82/82**.
-- [x] 3.5 Replikasyon v3'te **açıkça yok**: `START REPLICATION` (dosya + TCP), `PUMP`, `CREATE/DROP REPLICATION SLOT`, `SHOW REPLICATION STATUS/SLOTS`, `STOP REPLICATION` → `ecUnsupported` + `REPLICATION v3 sayfa motorunda yok (v3.1: mantiksal gunluk ile gelecek)`. Tek kaynak: `ExecAdmin` başındaki `Kv = nil` kapısı (2.9'da eklendi); 3.5'te mesaj replikasyon için özelleştirildi, satır içi yinelenen guard'lar kaldırıldı. Test `v3sqlchk` `TestReplicationUnsupported` **17/17**: 9 cumle `ecUnsupported` + `v3.1` mesajı, `.replslots`/status dosyası oluşmaz, veri bozulmaz, yeniden açılış sağlam.
+- [x] 3.5 Replikasyon — **v4'te açıldı** (3.5'te bilinçli olarak kapalıydı: `ecUnsupported` + "v3.1: mantiksal gunluk ile gelecek"). Bugünkü davranış: sayfa imajı değil **mantıksal grup** taşınır (`<dest>\<slot>\g-<seq>.vrgp`, 64 B `VRG1` başlık + CRC'li gövde, `.tmp`+rename atomik); slotun ilk taşımasında taban imajı kopyalanır (`bases\`), ikincil onu `RestoreFrom` ile kurar ve grupları **tek işlem** olarak uygular. Konum yalnız `<db>.repl\<slot>.slot` dosyasında (`last_seq`) — yeniden başlatmada kalıcı. İkincil gelen grubu **kendi seq uzayına** yeniden numaralandırır (Seq + END LSN + CRC), böylece kendi PITR'ı tutarlı kalır. Retler: bozuk/eksik dosya, **sırada boşluk** (atlanmaz), nesil kopması (`Flags bit0=1`), TCP. v2'de `ReplSupported=False` + `ReplAppendGroup` açık hata. **Bulunan kusur:** ikincil taban kurulumunun nesil kopması `LogRangeInfo`'yu erken durdurup `maxSeq`'i küçük bildiriyordu → `AS OF VERSION` ikincilde yanlış (taban anı) sonuç. Düzeltme: en son sürüm **son** tabandan replay edilerek bulunur. Kapılar: `replchk` **37/0** (13 grup; iki gerçek DB, ham KV birebir, bozukluk/boşluk/nesil/tekrar senaryoları) + `v3sqlchk TestReplicationV3` **179/0**.
 - [x] 3.6 PITR / zaman yolculuğu — **v3.2'de `AS OF SEQUENCE` açıldı.** Sayfa WAL'i mantıksal günlük tutmaz, ama sayfa imajları WAL penceresindeki **herhangi bir commit'in tam veritabanı görüntüsünü** yeniden kurmaya yeter. Uygulama: `TVdbPageWal.Recover(..., MaxCommits)` (ilk N commit'te okumayı keser), `TVdbPageEngine.RecoverLimit` (Open'da sınırlı kurtarma), `TVDbPageStore.CopyBaseImageTo` (son checkpoint tabanının **ham** kopyası; deponun kendi handle'ı üzerinden — dosya tam aralık kilidiyle kilitli olduğu için başka handle'dan okuma Windows'ta 0 bayt döner), `IVdbBackend.ScanAllAt`/`AsOfMaxSequence`, `TVTableDb.ScanRowsAt`, `VDbExecutor.BuildAsOfRows` (nil `Kv` → anlık görüntü yolu). Anlık görüntü **geçici** bir kopyada (`<db>.asof<pid>_<n>`) kurulur; canlı dosyaya yazılmaz, geçici dosyalar silinir. **Sıra numarası anlamı v3'te farklıdır:** v3'te N = WAL penceresindeki **commit** sayısı (v2'de 0 tabanlı kayıt indeksi); sınır aşılırsa son commit'e kırpılır. `AS OF TIMESTAMP/VERSION`, `RECOVER TO`, `ARCHIVE WAL` mantıksal günlük gerektirdiği için hâlâ `ecUnsupported`. Test: `sqltest T155` (iki backend; INSERT/UPDATE/DELETE öncesi-sonrası, filtre/sıra/LIMIT/COUNT, sınır kırpma, alias, yan etkisizlik + geçici dosya artığı yok, checkpoint sonrası açık hata), `v3sqlchk TestPitrUnsupported` (AS OF SEQUENCE okur; VERSION/TIMESTAMP/ARCHIVE/RECOVER reddedilir).
 - [x] 3.7 Zone map v3'te **kapalı** (düz tam tarama). Budama yalnız v2'nin ham kayıt yolu (`PrepareRawScan`) ile mümkündür; v3 heap hücre biçiminde yeniden inşa v3.2'ye bırakıldı. Doğrulama `v3sqlchk` `TestZoneMapFallback` **22/22**: 3000 satır, 8 aralık + eşitlik/`IN`/`<>`/karma sorgular Pascal'da hesaplanan beklentiyle birebir; yeniden açılışta aynı sonuç + `VERIFY`. Belgelendi: `V3_KAPSAM.md` §4/§5.
 - [x] 3.8 win32 tam kapı: **`kalan=0`**. `backendchk 82/82`, `v3sqlchk 128/128`, `pagechk 21/21`, `storechk 15/15`, `heapchk 20/20`, `idxchk 17/17`, `migchk 13/13`, `crashtest 11/11`; `sqltest` v2 **3116/0/0**, v3 **2252/0/58**.

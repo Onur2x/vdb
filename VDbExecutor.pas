@@ -26,7 +26,7 @@ uses
   VDbCore, VDbTable, VDbAst, VDbJson, VDbErr, VDbText, VDbXml, VDbSpatial,
   VDbRange, VDbParser, VDbTypes, VDbReplication, VDbParallel, VDbMonitor,
   VDbPlatform, VDbCost, VDbExtension, VDbVector, VDbArrow, VDbParquet,
-  VDbTrace, VDbChangeLog;
+  VDbTrace, VDbChangeLog, VDbReplV3;
 
 const
   // F2-18: DISTINCT / UNION tekilleÅŸtirme sonucu ve set-op birlestirme
@@ -16938,6 +16938,11 @@ var
   st: TReplicationState; // R-17
   slots: TReplSlotArray; // R-17
   nRep, kRep: Integer;   // R-17
+  // v4: v3 replikasyon (mantiksal gunluk tasima)
+  slotsV: TVdbReplSlotArray;
+  rsV: TVdbReplSlotInfo;
+  nRepV: Int64;
+  baseInstV: Boolean;
   pmsg: string;          // R-17
   // R-17 Full: TCP akisi
   tcpErr: string;          // StartTcpSender/Receiver hata mesaji
@@ -16954,21 +16959,141 @@ begin
     sessiz AV yerine NET bir "desteklenmiyor" hatasi verilir. (BACKUP ve
     VERIFY ve VACUUM backend uzerinden eklendi; 3.5 replikasyon ve 3.6
     PITR/arsiv burada acikca reddedilir; kalanlar v3.1.) }
+  { v4: v3 sayfa motorunda replikasyon = MANTIKSAL GUNLUK TASIMA.
+    v2 yolu (Kv <> nil) asagida aynen korunur. }
   if (FT.Kv = nil) and (Stmt.Kind in [
-      admSavepoint,
-      admReleaseSavepoint, admRollbackToSavepoint,
       admReplicationStart, admReplicationStop, admCreateReplSlot,
       admDropReplSlot, admShowReplicationStatus, admReplicationPump,
       admShowReplSlots]) then
   begin
-    { v4: PITR/arsiv artik v3'te de var (asagida). Replikasyon ve
-      SAVEPOINT hala yok. }
-    if Stmt.Kind in [admReplicationStart, admReplicationStop,
-      admCreateReplSlot, admDropReplSlot, admShowReplicationStatus,
-      admReplicationPump, admShowReplSlots] then
-      raise EVDbException.Create(ecUnsupported,
-        'REPLICATION v3 sayfa motorunda yok ' +
-        '(v4: mantiksal gunluk hazir; replikasyon sonraki dilim)');
+    case Stmt.Kind of
+      admCreateReplSlot:
+        begin
+          if VdbReplCreate(FT.Backend, Stmt.ReplSlot, pmsg) then
+          begin Res.Affected := 1; Res.Msg := pmsg; end
+          else
+          begin Res.Affected := 0; Res.Msg := 'CREATE REPLICATION SLOT: ' + pmsg; end;
+        end;
+      admDropReplSlot:
+        begin
+          if VdbReplDrop(FT.Backend, Stmt.ReplSlot, pmsg) then
+          begin Res.Affected := 1; Res.Msg := pmsg; end
+          else
+          begin Res.Affected := 0; Res.Msg := 'DROP REPLICATION SLOT: ' + pmsg; end;
+        end;
+      admShowReplSlots:
+        begin
+          slotsV := VdbReplList(FT.Backend);
+          SetLength(Res.Fields, 6);
+          Res.Fields[0] := 'slot';
+          Res.Fields[1] := 'role';
+          Res.Fields[2] := 'dest';
+          Res.Fields[3] := 'last_seq';
+          Res.Fields[4] := 'shipped';
+          Res.Fields[5] := 'applied';
+          SetLength(Res.Rows, Length(slotsV));
+          for kRep := 0 to High(slotsV) do
+          begin
+            SetLength(Res.Rows[kRep], 6);
+            Res.Rows[kRep][0] := slotsV[kRep].Name;
+            case slotsV[kRep].Role of
+              vrrPrimary: Res.Rows[kRep][1] := 'primary';
+              vrrStandby: Res.Rows[kRep][1] := 'standby';
+            else
+              Res.Rows[kRep][1] := 'none';
+            end;
+            Res.Rows[kRep][2] := slotsV[kRep].Dest;
+            Res.Rows[kRep][3] := IntToStr(slotsV[kRep].LastSeq);
+            Res.Rows[kRep][4] := IntToStr(slotsV[kRep].Shipped);
+            Res.Rows[kRep][5] := IntToStr(slotsV[kRep].Applied);
+          end;
+          Res.Affected := Length(slotsV);
+          Res.Msg := IntToStr(Length(slotsV)) + ' slot';
+        end;
+      admShowReplicationStatus:
+        begin
+          SetLength(Res.Fields, 6);
+          Res.Fields[0] := 'role';
+          Res.Fields[1] := 'slot';
+          Res.Fields[2] := 'dest';
+          Res.Fields[3] := 'last_seq';
+          Res.Fields[4] := 'running';
+          Res.Fields[5] := 'msg';
+          SetLength(Res.Rows, 1);
+          SetLength(Res.Rows[0], 6);
+          if VdbReplStatus(FT.Backend, rsV) then
+          begin
+            case rsV.Role of
+              vrrPrimary: Res.Rows[0][0] := 'primary';
+              vrrStandby: Res.Rows[0][0] := 'standby';
+            else
+              Res.Rows[0][0] := 'none';
+            end;
+            Res.Rows[0][1] := rsV.Name;
+            Res.Rows[0][2] := rsV.Dest;
+            Res.Rows[0][3] := IntToStr(rsV.LastSeq);
+            Res.Rows[0][4] := 'True';
+            Res.Rows[0][5] := rsV.LastMsg;
+            Res.Affected := 1;
+            Res.Msg := 'OK';
+          end
+          else
+          begin
+            Res.Rows[0][0] := 'none';
+            Res.Rows[0][1] := '';
+            Res.Rows[0][2] := '';
+            Res.Rows[0][3] := '';
+            Res.Rows[0][4] := 'False';
+            Res.Rows[0][5] := 'etkin slot yok';
+            Res.Affected := 0;
+            Res.Msg := 'status: etkin replikasyon slotu yok';
+          end;
+        end;
+      admReplicationStart:
+        begin
+          if Stmt.ReplTcp then
+          begin
+            Res.Affected := 0;
+            Res.Msg := 'REPLICATION: v3 sayfa motorunda TCP akisi yok; ' +
+              'dosya modu kullanin: START REPLICATION [AS PRIMARY|AS STANDBY] ' +
+              'SLOT=''x'' DEST=''dizin''';
+          end
+          else if VdbReplStart(FT.Backend, Stmt.ReplIsPrimary, Stmt.ReplSlot,
+            Stmt.ReplConnInfo, pmsg) then
+          begin
+            Res.Affected := 1; Res.Msg := pmsg;
+          end
+          else
+          begin
+            Res.Affected := 0; Res.Msg := 'START REPLICATION: ' + pmsg;
+          end;
+        end;
+      admReplicationStop:
+        begin
+          if VdbReplStop(FT.Backend, pmsg) then
+          begin Res.Affected := 1; Res.Msg := pmsg; end
+          else
+          begin Res.Affected := 0; Res.Msg := 'STOP REPLICATION: ' + pmsg; end;
+        end;
+      admReplicationPump:
+        begin
+          if VdbReplPump(FT.Backend, nRepV, baseInstV, pmsg) then
+          begin
+            if baseInstV then FT.ReloadSchema;
+            Res.Affected := nRepV; Res.Msg := pmsg;
+          end
+          else
+          begin Res.Affected := 0; Res.Msg := 'PUMP REPLICATION: ' + pmsg; end;
+        end;
+    end;
+    Exit;
+  end;
+
+  if (FT.Kv = nil) and (Stmt.Kind in [
+      admSavepoint,
+      admReleaseSavepoint, admRollbackToSavepoint]) then
+  begin
+    { v4: PITR/arsiv/replikasyon artik v3'te de var (yukarida/asagida). }
     raise EVDbException.Create(ecUnsupported,
       'Bu yonetim komutu v3 sayfa motorunda henuz desteklenmiyor');
   end;

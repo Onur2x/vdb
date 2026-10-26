@@ -115,6 +115,10 @@ type
       out Keys: TQWordArray; out Vals: TValArray;
       out ActualTsMs, ActualSeq: Int64): Boolean;
     function ArchiveLogSet(const DestDir: string): Int64;
+    { v4 replikasyon: v2'de mantiksal gunluk yok. }
+    function ReplSupported: Boolean;
+    procedure ReplSuspendLog(ASuspend: Boolean);
+    function ReplAppendGroup(const ARaw: TBytes; out AErr: string): Boolean;
   end;
 
 implementation
@@ -439,6 +443,25 @@ begin
   Result := 0;
   raise EVdbBackendV2.Create(
     'ARCHIVE WAL: v2 motorunda mantiksal degisim gunlugu yok');
+end;
+
+{ v4 replikasyon: v2'de mantiksal gunluk yok; v2 kendi WAL-tasima
+  replikasyonunu (VDbReplication) kullanmaya devam eder. }
+function TVDbBackendV2.ReplSupported: Boolean;
+begin
+  Result := False;
+end;
+
+procedure TVDbBackendV2.ReplSuspendLog(ASuspend: Boolean);
+begin
+  { Etkisiz: v2'nin gunlugu yok. }
+end;
+
+function TVDbBackendV2.ReplAppendGroup(const ARaw: TBytes;
+  out AErr: string): Boolean;
+begin
+  AErr := 'REPLICATION: v2 motorunda mantiksal gunluk yok';
+  Result := False;
 end;
 
 end.

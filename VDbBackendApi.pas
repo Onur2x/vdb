@@ -233,6 +233,21 @@ type
       kopyalanan bayt sayisini doner. Bu set tek basina arsivdir: baska bir
       makinede ayni araliga PITR yapilabilir. }
     function ArchiveLogSet(const DestDir: string): Int64;
+
+    { --- v4: REPLIKASYON (mantiksal gunluk tasima) ---
+      Model: birincil (primary) her commit'in mantiksal grubunu tasima
+      dizinine yazar; ikincil (standby) bu gruplari KENDI motoruna uygular.
+      Uygulama grup basina TEK motordur (atomik): yarim grup sizmaz.
+      Replika uzerinde uygulanan degisiklikler yerel gunluge YENIDEN
+      numaralandirilarak eklenir (her dugumun kendi seq uzayi).
+      v2: ReplSupported=False; diger metotlar acik hata verir. }
+    function ReplSupported: Boolean;
+    { Yerel gunluge yazimi gecici kapatir (replika uygulama penceresi). }
+    procedure ReplSuspendLog(ASuspend: Boolean);
+    { Yabanci bir veri grubunu (ham baytlar) yerel gunluge ekler.
+      Seq alanlari yerel siraya cevrilir; END kaydinin motor LSN'i canli
+      LSN'dir. AErr: hata nedeni. Basarida True. }
+    function ReplAppendGroup(const ARaw: TBytes; out AErr: string): Boolean;
   end;
 
   { v3.2: IVDbKvStore'un IVdbBackend uzerinden uygulanmasi. v2'de TVDb

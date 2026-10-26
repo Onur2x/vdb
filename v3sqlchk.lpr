@@ -830,34 +830,24 @@ begin
   end;
 end;
 
-{ Sprint 3.5: v3 sayfa motorunda replikasyon yok. Her replikasyon cumlesi
-  sessiz no-op ya da nil erisimi DEGIL, ecUnsupported + v3.1 mesaji vermeli.
-  Durum/slot sorgulari ise hata degil durust cevap dondurur; STOP idempotent. }
-procedure TestReplicationUnsupported;
+  { v4: v3 sayfa motorunda replikasyon = MANTIKSAL GUNLUK TASIMA.
+    Burada SQL yuzeyi denenir: slot olusturma, birincil tasima, ikincil
+    uygulama, artimli devam, bos PUMP ve TCP reddi. Derin protokol
+    (bozuk dosya, bosluk, yeniden baslatma) ayri kapi: replchk. }
+procedure TestReplicationV3;
 var
   S: TV3Sql;
+  S2: TV3Sql;
   r: TSqlResult;
-  code, msg: string;
-  base: string;
-  sr: TSearchRec;
-  found: Boolean;
-
-  procedure ExpectUnsupported(const Sql: string);
-  begin
-    if not ExecErr(S, Sql, code, msg) then
-      Fail('repl: hata bekleniyordu: ' + Sql)
-    else if code <> 'ecUnsupported' then
-      Fail('repl: kod ' + code + ' (ecUnsupported bekleniyordu): ' + Sql)
-    else if (Pos('v4', msg) = 0) and (Pos('v3.1', msg) = 0) then
-      Fail('repl: mesajda dilim bilgisi yok: ' + msg)
-    else
-      Ok('repl: ecUnsupported -> ' + Sql);
-  end;
-
+  ship: string;
+  n1: Integer;
+  minSeq2, maxSeq2, minTs2, maxTs2: Int64;
+  baseCount2: Integer;
 begin
   WriteLn;
-  WriteLn('Sprint 3.5 - v3''te replikasyon: acik ecUnsupported');
+  WriteLn('v4 - v3 replikasyon: slot + mantiksal gunluk tasima (birincil/ikincil)');
   CleanDir;
+  ship := IncludeTrailingPathDelimiter(gDir) + 'ship';
   OpenV3(S, 'repl.odb', True);
   try
     r := Exec(S, 'CREATE TABLE t (id INTEGER PRIMARY KEY, ad TEXT)');
@@ -867,52 +857,174 @@ begin
     if not gErr then Ok('repl: baslangic satiri yazildi')
     else Fail('repl: INSERT: ' + r.Msg);
 
-    ExpectUnsupported('START REPLICATION PRIMARY DEST ''ship1'' SLOT ''s1''');
-    ExpectUnsupported('START REPLICATION STANDBY ''ship1'' SLOT ''s2''');
-    ExpectUnsupported('START REPLICATION PRIMARY TCP PORT 5599 SLOT ''s3''');
-    ExpectUnsupported('PUMP REPLICATION');
-    ExpectUnsupported('CREATE REPLICATION SLOT ''x1''');
-    ExpectUnsupported('DROP REPLICATION SLOT ''x1''');
-
-    { Durum/slot/stop da ayni kapiya takilir: v3'te replikasyon durumu
-      yoktur, sessiz "none" yerine acik ecUnsupported. }
-    ExpectUnsupported('SHOW REPLICATION STATUS');
-    ExpectUnsupported('SHOW REPLICATION SLOTS');
-    ExpectUnsupported('STOP REPLICATION');
-
-    { Reddedilen cumleler veriye/semaya dokunmamali. }
-    r := Exec(S, 'SELECT COUNT(*) FROM t');
-    if (not gErr) and (Cel(r, 0, 0) = '1') then
-      Ok('repl: reddedilen cumleler veriyi bozmadi')
+    r := Exec(S, 'CREATE REPLICATION SLOT ''S1''');
+    if (not gErr) and (Pos('s1', r.Msg) > 0) then
+      Ok('repl: slot olustu')
     else
-      Fail('repl: veri bozuldu: ' + r.Msg);
+      Fail('repl: CREATE SLOT: ' + r.Msg);
+
+    r := Exec(S, 'SHOW REPLICATION SLOTS');
+    if (not gErr) and (Length(r.Rows) = 1) and (Cel(r, 0, 0) = 's1') and
+      (Cel(r, 0, 1) = 'none') then
+      Ok('repl: SHOW SLOTS 1 satir, rol none')
+    else
+      Fail('repl: SHOW SLOTS: ' + r.Msg);
+
+    r := Exec(S, 'START REPLICATION PRIMARY DEST ''' + ship + ''' SLOT ''S1''');
+    if (not gErr) and (Pos('PRIMARY', r.Msg) > 0) then
+      Ok('repl: birincil basladi')
+    else
+      Fail('repl: START PRIMARY: ' + r.Msg);
+
+    { TCP akisi v3'te yok: sessiz no-op degil, ACIK cevap (hata degil). }
+    r := Exec(S, 'START REPLICATION PRIMARY TCP PORT 5599 SLOT ''S1''');
+    if (not gErr) and (r.Affected = 0) and (Pos('TCP', r.Msg) > 0) then
+      Ok('repl: TCP acik sekilde reddedildi')
+    else
+      Fail('repl: TCP: ' + r.Msg);
+
+    r := Exec(S, 'PUMP REPLICATION');
+    n1 := r.Affected;
+    if (not gErr) and (n1 >= 2) then
+      Ok('repl: PUMP taban + veri grubunu tasidi (' + IntToStr(n1) + ' grup)')
+    else
+      Fail('repl: PUMP: ' + r.Msg);
+
+    r := Exec(S, 'SHOW REPLICATION STATUS');
+    if (not gErr) and (Length(r.Rows) = 1) and (Cel(r, 0, 0) = 'primary') and
+      (Cel(r, 0, 4) = 'True') then
+      Ok('repl: SHOW STATUS birincil')
+    else
+      Fail('repl: SHOW STATUS: ' + r.Msg);
   finally
     CloseV3(S);
   end;
 
-  { Slot/status dosyasi olusmamis olmali (v2 yollari hic calismadi). }
-  base := IncludeTrailingPathDelimiter(gDir);
-  found := False;
-  if FindFirst(base + '.repl*', faAnyFile, sr) = 0 then
-  begin
-    found := True;
-    FindClose(sr);
-  end;
-  if not found then
-    Ok('repl: .replslots/status dosyasi olusmadi')
-  else
-    Fail('repl: v3''te replikasyon dosyasi olustu');
+  { Ikincil: bos veritabani; taban imaji RESTORE edilir, gruplar uygulanir. }
+  OpenV3(S2, 'repl_std.odb', True);
+  try
+    r := Exec(S2, 'START REPLICATION STANDBY ''' + ship + ''' SLOT ''S1''');
+    if not gErr then Ok('repl: ikincil basladi')
+    else Fail('repl: START STANDBY: ' + r.Msg);
 
-  { Yeniden acilis: dosya saglam, sema yerinde. }
+    r := Exec(S2, 'PUMP REPLICATION');
+    if (not gErr) and (r.Affected >= 2) then
+      Ok('repl: ikincil taban + grubu uyguladi (' + IntToStr(r.Affected) + ' grup)')
+    else
+      Fail('repl: STANDBY PUMP: ' + r.Msg);
+
+    r := Exec(S2, 'SELECT COUNT(*) FROM t');
+    if (not gErr) and (Cel(r, 0, 0) = '1') then
+      Ok('repl: ikincilde 1 satir (bayt bayt kopya)')
+    else
+      Fail('repl: ikincil veri: ' + r.Msg);
+    r := Exec(S2, 'SELECT ad FROM t WHERE id = 1');
+    if (not gErr) and (Cel(r, 0, 0) = 'Ali') then
+      Ok('repl: ikincil deger dogru')
+    else
+      Fail('repl: ikincil deger: ' + r.Msg);
+
+    { Yeni grup yoksa PUMP etkisiz ve hatasiz. }
+    r := Exec(S2, 'PUMP REPLICATION');
+    if (not gErr) and (r.Affected = 0) then
+      Ok('repl: bos PUMP etkisiz')
+    else
+      Fail('repl: bos PUMP: ' + r.Msg);
+  finally
+    CloseV3(S2);
+  end;
+
+  { Artimli devam: birincilde yeni commit, iki PUMP. }
   OpenV3(S, 'repl.odb', False);
   try
-    r := Exec(S, 'SELECT ad FROM t WHERE id = 1');
-    if (not gErr) and (Cel(r, 0, 0) = 'Ali') then
-      Ok('repl: yeniden acilista veri yerinde')
+    r := Exec(S, 'START REPLICATION PRIMARY DEST ''' + ship + ''' SLOT ''S1''');
+    if gErr then Fail('repl: birincil yeniden: ' + r.Msg);
+    r := Exec(S, 'INSERT INTO t VALUES (2, ''Veli'')');
+    if not gErr then Ok('repl: birincilde yeni satir')
+    else Fail('repl: INSERT 2: ' + r.Msg);
+    r := Exec(S, 'UPDATE t SET ad = ''Ali2'' WHERE id = 1');
+    if not gErr then Ok('repl: birincilde guncelleme')
+    else Fail('repl: UPDATE: ' + r.Msg);
+    r := Exec(S, 'PUMP REPLICATION');
+    if (not gErr) and (r.Affected >= 2) then
+      Ok('repl: artimli tasima')
     else
-      Fail('repl: yeniden acilis: ' + r.Msg);
+      Fail('repl: artimli PUMP: ' + r.Msg);
   finally
     CloseV3(S);
+  end;
+
+  OpenV3(S2, 'repl_std.odb', False);
+  try
+    r := Exec(S2, 'START REPLICATION STANDBY ''' + ship + ''' SLOT ''S1''');
+    if gErr then Fail('repl: ikincil yeniden: ' + r.Msg);
+    r := Exec(S2, 'PUMP REPLICATION');
+    if (not gErr) and (r.Affected >= 2) then
+      Ok('repl: artimli uygulama')
+    else
+      Fail('repl: artimli uygulama: ' + r.Msg);
+    r := Exec(S2, 'SELECT COUNT(*) FROM t');
+    if (not gErr) and (Cel(r, 0, 0) = '2') then
+      Ok('repl: ikincil 2 satir')
+    else
+      Fail('repl: ikincil count: ' + r.Msg);
+    r := Exec(S2, 'SELECT ad FROM t WHERE id = 1');
+    if (not gErr) and (Cel(r, 0, 0) = 'Ali2') then
+      Ok('repl: ikincil guncel deger')
+    else
+      Fail('repl: ikincil guncel deger: ' + r.Msg);
+
+    { Ikincil kendi gunlugune yeniden numaralandirir: PITR yetenegi korunur. }
+    if S2.Be.LogSupported then
+      Ok('repl: ikincil degisim gunlugu acik')
+    else
+      Fail('repl: ikincil gunluk: ' + S2.Be.LogStatus);
+
+    { Ikincil kendi gunlugune YENIDEN NUMARALANDIRIR: kendi seq uzayi
+      olusur (birincilin 5'i ikincilde 3 olabilir). Gunluk kapsami artar ve
+      son surum noktasi okunabilir. Taban kurulumu nesil kopmasi yazar;
+      ondan SONRASI tam calisir (onceki gecmis birincile aittir). }
+    if S2.Be.LogRangeInfo(minSeq2, maxSeq2, minTs2, maxTs2, baseCount2) and
+      (maxSeq2 > 1) then
+      Ok(Format('repl: ikincil gunluk seq %d..%d (%d taban)',
+        [minSeq2, maxSeq2, baseCount2]))
+    else
+      Fail('repl: ikincil gunluk araligi: ' + S2.Be.LogStatus);
+    r := Exec(S2, 'SELECT COUNT(*) FROM t AS OF VERSION ' + IntToStr(maxSeq2));
+    if (not gErr) and (Cel(r, 0, 0) = '2') then
+      Ok('repl: ikincil AS OF VERSION (son) 2 satir')
+    else
+      Fail('repl: ikincil AS OF: ' + Cel(r, 0, 0) + ' ' + r.Msg);
+
+    r := Exec(S2, 'STOP REPLICATION');
+    if (not gErr) and (r.Affected = 1) then
+      Ok('repl: ikincil durduruldu')
+    else
+      Fail('repl: STOP: ' + r.Msg);
+    r := Exec(S2, 'SHOW REPLICATION STATUS');
+    if (not gErr) and (Cel(r, 0, 0) = 'none') then
+      Ok('repl: durdurulunca rol none')
+    else
+      Fail('repl: durdurulunca rol: ' + r.Msg);
+  finally
+    CloseV3(S2);
+  end;
+
+  { Kalicilik: ikincil yeniden acilir, veri yerinde ve rol none. }
+  OpenV3(S2, 'repl_std.odb', False);
+  try
+    r := Exec(S2, 'SELECT COUNT(*) FROM t');
+    if (not gErr) and (Cel(r, 0, 0) = '2') then
+      Ok('repl: ikincil veri kalici')
+    else
+      Fail('repl: ikincil kalicilik: ' + r.Msg);
+    r := Exec(S2, 'DROP REPLICATION SLOT ''S1''');
+    if (not gErr) and (r.Affected = 1) then
+      Ok('repl: slot silindi')
+    else
+      Fail('repl: DROP SLOT: ' + r.Msg);
+  finally
+    CloseV3(S2);
   end;
 end;
 
@@ -1873,7 +1985,7 @@ begin
   TestBackupRestoreSql;
   TestVacuumSql;
   TestShowStats;
-  TestReplicationUnsupported;
+  TestReplicationV3;
   TestPitrSql;
   TestIndexInNegative;
   TestZoneMapFallback;
