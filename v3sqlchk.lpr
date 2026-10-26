@@ -2395,6 +2395,29 @@ begin
     Chk((not gErr) and (One(r) = '11'), 'ms: id=1 degeri 11 (B''nin 99''u yazilmadi)',
       One(r) + ' ' + r.Msg);
 
+    { 4b) v3.6 HIZLI YOL SEMANTIGI: B commit ettikten SONRA A ayni satiri
+         yazarsa cakisma YOKTUR (A yeni degeri gordu ve ona gore yazdi).
+         Before-image seyrek tutulunca bu yolun bozulmadigi burada kilitlenir. }
+    r := Exec(S, 'BEGIN');
+    Chk(not gErr, 'ms: A BEGIN (4b)', r.Msg);
+    r := Exec2('BEGIN');
+    Chk(not gErr, 'ms: B BEGIN (4b)', r.Msg);
+    r := Exec2('UPDATE m SET v = 200 WHERE id = 1');
+    Chk(not gErr, 'ms: B id=1 -> 200 (4b)', r.Msg);
+    r := Exec2('COMMIT');
+    Chk(not gErr, 'ms: B COMMIT gecti (4b)', r.Msg);
+    r := Exec2('SELECT v FROM m WHERE id = 1');
+    Chk((not gErr) and (One(r) = '200'), 'ms: A 200 gorur (4b)', One(r) + ' ' + r.Msg);
+    r := Exec(S, 'UPDATE m SET v = 300 WHERE id = 1');
+    Chk(not gErr, 'ms: A id=1 -> 300 (4b, yeni deger uzerine)', r.Msg);
+    r := Exec(S, 'COMMIT');
+    Chk(not gErr, 'ms: A COMMIT cakismasiz gecti (4b)', 'beklenmedik hata: ' + r.Msg);
+    r := Exec2('SELECT v FROM m WHERE id = 1');
+    Chk((not gErr) and (One(r) = '300'), 'ms: son deger 300 (4b)', One(r) + ' ' + r.Msg);
+    { 7. senaryo id=1 icin 11 bekledigi icin taban duruma geri donulur. }
+    r := Exec(S, 'UPDATE m SET v = 11 WHERE id = 1');
+    Chk(not gErr, 'ms: id=1 -> 11 (4b temizlik)', r.Msg);
+
     { 5) DDL coklu yazmada ACIKCA reddedilir (global sema durumu korunur). }
     r := Exec(S, 'BEGIN');
     Chk(not gErr, 'ms: A BEGIN (DDL)', r.Msg);

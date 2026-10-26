@@ -83,6 +83,17 @@ type
         Before: TDictionary<QWord, TBatchRec>;
         TagDelta: TDictionary<Integer, Int64>;
         Savepoints: TList<TSavepointRec>;
+        { v3.6: BeginBatch anindaki global commit sayaci. Before-image
+          SEYREK tutulur (bkz. NoteBefore): yalnizca cakismanin MUMKUN
+          oldugu durumda kaydedilir. Bu alan, "ben basladiktan sonra baska
+          oturum commit etti mi" sorusunu yanitlar. }
+        StartGen: Int64;
+        { v3.6: "artik before-image GEREKLI" bayragi. Yalnizca biz acikken
+          BASKA bir oturum commit ederse True olur (o commit'ten sonra motor
+          degerleri degismis olabilir). Bayrak True olana kadar satir basina
+          ne kilit ne motor okumasi yapilir; boylece tek yazarli toplu
+          INSERT'te MVCC maliyeti SIFIRA iner. }
+        NeedBefore: Boolean;
         constructor Create(ASession: Cardinal);
         destructor Destroy; override;
       end;
@@ -94,6 +105,15 @@ type
       FBusyMs: Integer;
       { v3.4: oturum kimligi -> o oturumun acik yazma kumesi. }
       FSets: TDictionary<Cardinal, TWriteSet>;
+      { v3.6: commit sayaci + "baskasi dokundu" defteri.
+        FCommitGen her basarili commit'te artar. FAlien, baska bir yazma
+        kumesi ACIKKEN commit edilen anahtarlari (anahtar -> o commit'in
+        gen degeri) tutar. Before-image seyrek tutuldugu icin, hizli yolda
+        yazilmis bir anahtarin cakismasi bu defterden anlasilir. Defter
+        yalnizca ortada acik kume varken dolar ve hic kume kalmayinca
+        temizlenir. }
+      FCommitGen: Int64;
+      FAlien: TDictionary<QWord, Int64>;
       { Motor erisimini (ve FSets'i) serilestiren ic kilit. TEK backend
         birden fazla is parcacigi tarafindan paylasilabilsin diye; islemler
         ARASINDA tutulmaz (uzun islem baska oturumu kilitlemez). }
@@ -414,6 +434,8 @@ begin
   FReadOnly := AReadOnly;
   FBusyMs := ABusyMs;
   FSets := TDictionary<Cardinal, TWriteSet>.Create;
+  FAlien := TDictionary<QWord, Int64>.Create;
+  FCommitGen := 0;
   FEngCs := TCriticalSection.Create;
   FTagCounts := TDictionary<Integer, Int64>.Create;
   { v3.2: otomatik sikistirma v2 ile AYNI varsayilanlar (KAPALI). }
@@ -674,6 +696,7 @@ begin
     for pair in FSets do
       pair.Value.Free;
   FreeAndNil(FSets);
+  FreeAndNil(FAlien);
   FEngCs.Free;
   LogAbort;               // yarim grup yazilmaz
   FreeAndNil(FLog);       // gunluk fsync + kapat
@@ -693,6 +716,7 @@ begin
   Before := TDictionary<QWord, TBatchRec>.Create;
   TagDelta := TDictionary<Integer, Int64>.Create;
   Savepoints := TList<TSavepointRec>.Create;
+  StartGen := 0;
 end;
 
 destructor TVdbBackendV3.TWriteSet.Destroy;
@@ -908,16 +932,21 @@ var
   v: TBytes;
 begin
   if S = nil then Exit;
-  if S.Before.TryGetValue(Key, rec) then Exit;
-  v := nil;
+  { v3.6 HIZLI YOL: biz acikken BASKA bir oturum commit etmediyse, motor
+    degeri BeginBatch anindaki degerle AYNIDIR; before-image gereksiz.
+    Bu bir kilit/sozluk islemi bile yapmaz (bayrak yalnizca yabanci commit
+    tarafindan, FEngCs altinda True yapilir). 200k satirlik partide 200k
+    gereksiz motor okumasi + 200k sozluk kaydi kalkar. }
+  if not S.NeedBefore then Exit;
   FEngCs.Enter;
   try
+    if S.Before.ContainsKey(Key) then Exit;
     rec.Present := FEng.TryGet(Key, v);
+    rec.Value := v;
+    S.Before.AddOrSetValue(Key, rec);
   finally
     FEngCs.Leave;
   end;
-  rec.Value := v;
-  S.Before.AddOrSetValue(Key, rec);
 end;
 
 procedure TVdbBackendV3.VerifyNoConflict(S: TWriteSet);
@@ -926,13 +955,28 @@ var
   key: QWord;
   b, cur: TBatchRec;
   curVal: TBytes;
+  gen: Int64;
   same: Boolean;
 begin
   if S = nil then Exit;
+  { v3.6: ne before-image ne yabanci commit varsa yapacak is yok. }
+  if (S.Before.Count = 0) and (FAlien.Count = 0) then Exit;
   for i := 0 to S.Order.Count - 1 do
   begin
     key := S.Order[i];
-    if not S.Before.TryGetValue(key, b) then Continue;
+    if not S.Before.TryGetValue(key, b) then
+    begin
+      { v3.6: HIZLI YOLDA yazilan anahtar (before-image yok). Biz
+        basladiktan sonra baska bir oturum bu anahtari commit ettiyse
+        cakisma vardir; etmediyse yoktur. Bu, "ilk commit kazanir"
+        kuralinin birebir aynisidir: o commit bizim yazimizdan sonra
+        geldigi icin before-image karsilastirmasi da farkli cikardi. }
+      if FAlien.TryGetValue(key, gen) and (gen > S.StartGen) then
+        raise EVdbBackendV3.CreateFmt(
+          'yazma cakismasi: $%.16x baska bir oturum tarafindan degistirildi ' +
+          '(islem geri alindi)', [key]);
+      Continue;
+    end;
     curVal := nil;
     FEngCs.Enter;
     try
@@ -965,19 +1009,24 @@ var
   rec: TBatchRec;
   oldTag, newTag: Integer;
   oldVal: TBytes;
+  s: TWriteSet;
 begin
   RequireWritable;
   RequireBatchWrite;
-  if BatchOpen then
+  { v3.6: OwnSet tek kez alinir (ONCEDEN BatchOpen + NoteBefore(OwnSet,..)
+    satir basina IKI kilit + IKI sozluk aramasi yapiyordu). }
+  s := OwnSet;
+  if s <> nil then
   begin
-    { v3.4: cakisma denetimi icin ILK yazimdan onceki motor degeri. }
-    NoteBefore(OwnSet, Key);
+    { v3.4: cakisma denetimi icin ILK yazimdan onceki motor degeri (v3.6:
+      yalnizca gerektiginde, bkz. NoteBefore). }
+    NoteBefore(s, Key);
     JournalKey(Key);
     rec.Present := True;
     rec.Value := Copy(Value, 0, Length(Value));
-    if not BatchMap.ContainsKey(Key) then
-      BatchOrder.Add(Key);
-    BatchMap.AddOrSetValue(Key, rec);
+    if not s.Map.ContainsKey(Key) then
+      s.Order.Add(Key);
+    s.Map.AddOrSetValue(Key, rec);
     Exit;
   end;
   FEngCs.Enter;
@@ -1023,8 +1072,10 @@ end;
 function TVdbBackendV3.Get(Key: QWord; out Value: TBytes): Boolean;
 var
   rec: TBatchRec;
+  s: TWriteSet;
 begin
-  if BatchIsMine and BatchMap.TryGetValue(Key, rec) then
+  s := OwnSet;
+  if (s <> nil) and s.Map.TryGetValue(Key, rec) then
   begin
     if rec.Present then
     begin
@@ -1047,24 +1098,26 @@ var
   rec: TBatchRec;
   had: Boolean;
   oldVal: TBytes;
+  s: TWriteSet;
 begin
   RequireBatchWrite;
-  if BatchOpen then
+  s := OwnSet;
+  if s <> nil then
   begin
     { ONCEDEN: `BatchMap.AddOrSetValue(...)`'dan SONRA `BatchMap.ContainsKey`
       soruluyordu; bu her zaman True oldugu icin parti icinde Delete
       HIC OLMAYAN anahtar icin de True donuyordu. Dogru yanit: silmeden
       ONCE var miydi? }
-    NoteBefore(OwnSet, Key);
+    NoteBefore(s, Key);
     JournalKey(Key);
     had := FEng.Contains(Key);
-    if BatchMap.ContainsKey(Key) then
-      had := BatchMap[Key].Present;
+    if s.Map.ContainsKey(Key) then
+      had := s.Map[Key].Present;
     rec.Present := False;
     rec.Value := nil;
-    if not BatchMap.ContainsKey(Key) then
-      BatchOrder.Add(Key);
-    BatchMap.AddOrSetValue(Key, rec);
+    if not s.Map.ContainsKey(Key) then
+      s.Order.Add(Key);
+    s.Map.AddOrSetValue(Key, rec);
     Exit(had);
   end;
   FEngCs.Enter;
@@ -1088,9 +1141,16 @@ begin
 end;
 
 function TVdbBackendV3.Exists(Key: QWord): Boolean;
+var
+  s: TWriteSet;
+  rec: TBatchRec;
 begin
-  if BatchIsMine and BatchMap.ContainsKey(Key) then
-    Exit(BatchMap[Key].Present);
+  { v3.6: ONCEDEN satir basina BatchIsMine + BatchMap.ContainsKey + BatchMap[]
+    uc ayri OwnSet (kilit + oturum sozlugu aramasi) yapiyordu; INSERT yolu her
+    satirda Exists cagirir. Tek OwnSet + tek sozluk aramasi yeterli. }
+  s := OwnSet;
+  if (s <> nil) and s.Map.TryGetValue(Key, rec) then
+    Exit(rec.Present);
   FEngCs.Enter;
   try
     Result := FEng.Contains(Key);
@@ -1582,6 +1642,7 @@ begin
   try
     if FSets.TryGetValue(sid, s) then Exit;   // zaten acik
     s := TWriteSet.Create(sid);
+    s.StartGen := FCommitGen;
     FSets.AddOrSetValue(sid, s);
   finally
     FEngCs.Leave;
@@ -1591,6 +1652,8 @@ end;
 procedure TVdbBackendV3.CommitBatch;
 var
   s: TWriteSet;
+  i: Integer;
+  fpair: TPair<Cardinal, TWriteSet>;
 begin
   RequireWritable;
   s := OwnSet;
@@ -1601,12 +1664,33 @@ begin
       FBeforeCommit;        // kisit denetimi: hata firlatirsa kaplama durur
     { v3.4: cakisma denetimi UYGULAMADAN ONCE yapilir: yarim uygulama yok. }
     VerifyNoConflict(s);
+    { v3.6: yabanci anahtar defteri. ONEMLI: ApplyBatch yazma kumesini
+      TEMIZLER (Map/Order), bu yuzden kayit ONDAN ONCE alinir. Biz commit
+      ederken BASKA bir kume hala aciksa, o kume hizli yolda yazmis olabilir
+      (before-image yok); dokundugumuz anahtarlar gen degeriyle deftere
+      birakilir. Gen bir sonraki degere yazilir; sayac ancak uygulama
+      basarili olursa artar (basarisizlikta yalnizca FAZLA cakisma gorunur,
+      veri kaybi degil). }
+    if FSets.Count > 1 then
+    begin
+      { v3.6: acik kumeler artik before-image kaydetmek ZORUNDA (motor
+        degerleri bu commit ile degisti). Bayrak kilit altinda yazilir;
+        kume sahibi kilitsiz okudugu icin en kotu ihtimalle tek satir gec
+        fark edilir, o satiri da FAlien defteri yakalar. }
+      for fpair in FSets do
+        if fpair.Value <> s then
+          fpair.Value.NeedBefore := True;
+      for i := 0 to s.Order.Count - 1 do
+        FAlien.AddOrSetValue(s.Order[i], FCommitGen + 1);
+    end;
     ApplyBatch;
     { v3.1: parti ici etiket degisimleri simdi sayaca islenir. }
     MergeTagDeltas;
+    Inc(FCommitGen);
     { v3.4: yazma kumesi commit ile KAPANIR (eski kodda BatchOpen:=False
       bu noktadaydi; otomatik sikistirma acik parti gormemeli). }
     FSets.Remove(s.Session);
+    if FSets.Count = 0 then FAlien.Clear;
     if FDirty then
     begin
       FEng.Commit(True);

@@ -556,6 +556,42 @@ yükleri atlıyor (yalnız BASE CRC'li).
 Davranış korunur: bozuk kuyruk tam taramaya düşer, CRC'siz BASE kabul edilmez.
 Kapı: günlük 28/0, PITR 21/0, replikasyon 37/0, çökme kurtarma 11/0.
 
+### v3.6 — toplu INSERT: 7,47 → 6,04 µs/satır (2026-10-26)
+
+MVCC çekirdeğinin (v3.4) bedeli ölçüldü: her yazımda before-image için
+**motor okuması** ve **üç ayrı sözlüğe** (Map + Order + Before) satır başına
+kayıt. Oysa tek yazarlı toplu INSERT'te çakışma **imkânsızdır**.
+
+Ölçülen katman profili (200k satır, 512 sayfa havuz, aynı makine):
+
+| Katman | Önce | Sonra |
+|---|---|---|
+| backend `Put` (hazırlama) | 2,366 µs | **1,344 µs** |
+| `tb.Insert` tam satır yolu | 4,896 µs | **3,748 µs** |
+| benchcmp toplu INSERT (commit dâhil) | 7,466 µs | **6,038 µs** |
+| v2 (aynı koşu) | 3,877 µs | 3,853 µs |
+
+Fark (v3 − v2) 3,59 → **2,19 µs**.
+
+Düzeltmeler:
+1. **Seyrek before-image.** Yazma kümesine `NeedBefore` bayrağı eklendi. Bayrak
+   ancak *biz açıkken başka bir oturum commit ederse* (FEngCs altında) True olur;
+   o ana kadar satır başına ne motor okuması ne `Before` sözlüğü vardır.
+2. **Yabancı anahtar defteri (`FAlien`).** Hızlı yolda yazılan anahtar için
+   çakışma, "biz başladıktan sonra başka oturum bu anahtara dokundu mu"
+   sorusuna indirgenir; defter bunu commit gen'iyle tutar. Anlam **birebir aynı**:
+   commit sonrası yazım (yeni değeri görmüş yazım) hâlâ çakışma sayılmaz —
+   `v3sqlchk` 4b senaryosu bunu kilitler.
+3. **`OwnSet` tekrarı kaldırıldı.** `Put`, `Get`, `Delete`, `Exists` satır başına
+   3–4 kez kilit + oturum sözlüğü arıyordu; artık bir kez.
+
+Kalan fark nerede: hazırlama 3,70 µs (v2: ~3,12) ve commit 2,34 µs (v2: ~0,76).
+Commit'in 0,61 µs'si **değişim günlüğü** (PITR/replikasyon özelliğinin bedeli);
+kalanı sayfa motoru uygulaması + checkpoint (dayanıklılık).
+
+Kapılar: 14/14 yeşil, `v3sqlchk` **237/0** (9 yeni çok oturum kontrolü),
+`sqltest` v3 2759/0/33, v2 3196/0/0.
+
 ### Sıradaki sürüme ertelenen (v4 sonrası)
 - Satır gövdesi varint/delta kodlama (F3-1'in kalanı)
 - Dosya boyutu (PK'nin ikinci kez yazılması, hücre başlığı sıkıştırma)

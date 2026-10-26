@@ -279,16 +279,17 @@ veritabani.colkey      kolon anahtarı (yalnız kolon şifrelemesi kullanılırs
 
 ---
 
-## 9. v3.2'de hâlâ olmayanlar (planlı sınırlar)
+## 9. Bugünkü sınırlar (v3.6)
 
 | Özellik | Durum | Not |
 |---|---|---|
 | `AS OF SEQUENCE n` | **var** (v3.2) | WAL penceresindeki n'inci commit'in tam görüntüsü geçici kopyada kurulur; yalnız son checkpoint'ten beri. n = commit sayısı |
-| PITR (`RECOVER TO`), WAL arşivi, `AS OF TIMESTAMP/VERSION` | yok | checkpoint öncesine gitmek/zaman ekseni mantıksal günlük ister; günlük `BACKUP TO` ile yetinin |
-| Replication (`START REPLICATION` vb.) | yok | mantıksal değişim günlüğü gerektirir; tek dosya, tek yazıcı |
-| Zone map / bölüm budama | yok | sonuçlar doğru, tam tarama |
+| PITR (`RECOVER TO`), WAL arşivi, `AS OF TIMESTAMP/VERSION` | **var** (v4) | Mantıksal değişim günlüğü (`<db>.log`): `AS OF TIMESTAMP/VERSION`, `ARCHIVE WAL SET DIR=`, `RECOVER TO`. Günlük kalıcıdır ve **budanmaz**; geçmiş sınırsız büyür |
+| Replication (`START REPLICATION` vb.) | **var** (v4) | Mantıksal grup taşıma; **dosya tabanlı** (paylaşımlı dizin). TCP ile replikasyon açıkça reddedilir |
+| Zone map / bölüm budama | **var** (v3.3) | Sayfa düzeyi; kazanç **seçici** yüklemlerde. Orta seçicilikte ölçülebilir kazanç yok |
 | MVCC (süreç içi çok oturum) | **var** (v3.4) | READ COMMITTED; her oturum kendi yazma kümesinde yazar, **ilk commit kazanır**, kaybeden `yazma cakismasi` ile durur. DDL/`SAVEPOINT`/`DEFERRABLE` çoklu yazmada reddedilir. Snapshot isolation yok |
 | MVCC (süreçler arası) | yok | dosya kilidi ikinci süreci reddeder |
+| Toplu INSERT hızı | v2'nin **~1,6 katı** yavaş | v3 6,04 / v2 3,85 µs satır (200k×3 kolon, commit dâhil). Fark: commit'teki değişim günlüğü (~0,61 µs) + sayfa motoru uygulaması/checkpoint |
 
 Aynı açık veritabanında **oturum yalitimi** vardır: `VDbSetTxnSession`
 (v2) / `VdbBackendSessionId` ile kimliği olan iki oturum birbirinin **commit
