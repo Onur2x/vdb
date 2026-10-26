@@ -129,6 +129,9 @@ type
     FCteTables: TDictionary<string, TCteTable>;
     { H3: tablo id -> zone map (VERI DEGISINCE (Seq/Epoch) gecersiz). }
     FZoneMaps: TDictionary<Integer, TVDbZoneMap>;
+    { v3.3: son taramada zone map'in budadigi (disk okumasindan once atlanan)
+      SAYFA sayisi. Yalnizca olcum/teshis icin; sorgu sonucunu etkilemez. }
+    FZonePrunedPages: Integer;
     { M5: tablo id + kolon -> inverted FTS index; Seq degisince yeniden kurulur. }
     FFtsIndexes: TDictionary<string, TVdbFtsIndex>;
     FFtsSeqs: TDictionary<string, QWord>;
@@ -559,6 +562,8 @@ type
     destructor Destroy; override;
     function Execute(Stmt: TSqlStmtNode): TSqlResult;
     property TableDb: TVTableDb read FT;
+    { v3.3: son taramada zone map'in atladigi sayfa sayisi (olcum). }
+    property ZonePrunedPages: Integer read FZonePrunedPages;
     // F-40/F-41: TVSql tarafindan atanan oturum kimligi ve yalitim.
     property SessionId: Cardinal read FSessionId write FSessionId;
     property Isolation: TIsolationLevel read FIsolation write FIsolation;
@@ -10623,8 +10628,12 @@ begin
     if not ctx^.ZoneMap.ColUsable[k] then Continue;
     c := ctx^.ZoneCols[k];
     if (c < 0) or (c > High(ctx^.FType)) then Continue;
-    if ctx^.FOff[c] < 0 then Continue;                    // NULL: kiyas FALSE
-    if ctx^.FOff[c] + 8 > Len then
+    if (ctx^.FOff[c] < 0) then Continue;                  // NULL: kiyas FALSE
+    { v3.3: yuk artik varint olabilir; uzunluk kontrolu FLen'e gore yapilir
+      (eski kod FOff+8 bakiyordu ve kisa INT yuklerinde budamayi bosuna
+      kapatiyordu). }
+    if (ctx^.FLen[c] <= 0) or
+       (ctx^.FOff[c] + ctx^.FLen[c] > Len) then
     begin
       ctx^.ZoneMap.ColUsable[k] := False; Continue;       // bozuk satir: budama yok
     end;
@@ -10776,6 +10785,20 @@ begin
     if u.Op = suoNot then Exit;
     Exit(VdbSelBoundsCol(u.Operand, Name));
   end;
+end;
+
+function VdbStreamSelCb(Key: QWord; Buf: PByte; Len: Integer;
+  User: Pointer): Boolean; forward;
+
+function VdbStreamSelPageCb(Key: QWord; Buf: PByte; Len: Integer;
+  PageNo: LongWord; User: Pointer): Boolean;
+{ v3.3: sayfa numarali sarmalayici. Zone map bucket'i = heap sayfa numarasi. }
+var
+  ctx: ^TStreamSelCtx;
+begin
+  ctx := User;
+  ctx^.CurBucket := Integer(PageNo);
+  Result := VdbStreamSelCb(Key, Buf, Len, User);
 end;
 
 function VdbStreamSelCb(Key: QWord; Buf: PByte; Len: Integer;
@@ -11073,7 +11096,7 @@ var
   zMap, zOld: TVDbZoneMap;
   zN, zB, zIdx, zK, zBCount: Integer;
   zGenSeq, zGenEpoch: QWord;
-  zUsable, zScanOk: Boolean;
+  zUsable, zScanOk, zV3: Boolean;
 
   procedure CollectAnd(E: TSqlExprNode);
   begin
@@ -11413,13 +11436,28 @@ begin
   SetLength(ctx.ZoneCols, 0);
   SetLength(ctx.ZoneIsFloat, 0);
   zBCount := 0;
-  { Sprint 2.9: zone map v2 motorunun veri dosyasi surumune baglidir;
-    v3'te (Kv = nil) ne kullanilir ne insa edilir — duz tam tarama. }
-  if (Length(zCols) > 0) and (FT.Kv <> nil) then
+  FZonePrunedPages := 0;
+  { Sprint 2.9: zone map v2 veri dosyasi surumune baglidir. v3.3: v3 icin
+    SAYFA duzeyi zone map (bucket = heap sayfa numarasi). Kirli (commit
+    edilmemis) icerikte harita ne KULLANILIR ne INSA EDILIR: aksi halde
+    ayni islemde yazilan satirlar haritada gorunmez ve budama yanlis olur. }
+  zV3 := (FT.Kv = nil) and (not FT.Backend.Dirty) and
+    (not FT.Backend.InBatch);
+  if zV3 then
+    zBCount := Integer(FT.Backend.DataFileSize div 4096) + 64;
+  if (Length(zCols) > 0) and ((FT.Kv <> nil) or zV3) then
   begin
-    zGenSeq := FT.Kv.DataSeqValue;
-    zGenEpoch := FT.Kv.DataEpochValue;
-    zBCount := TVDb.RawScanBucketCount(FT.Kv.DataFileSize);
+    if zV3 then
+    begin
+      zGenSeq := FT.Backend.DataStamp;
+      zGenEpoch := 0;
+    end
+    else
+    begin
+      zGenSeq := FT.Kv.DataSeqValue;
+      zGenEpoch := FT.Kv.DataEpochValue;
+      zBCount := TVDb.RawScanBucketCount(FT.Kv.DataFileSize);
+    end;
     zUsable := FZoneMaps.TryGetValue(td.TableId, zMap) and
       (zMap.GenSeq = zGenSeq) and (zMap.GenEpoch = zGenEpoch) and
       (zMap.BucketCount = zBCount);
@@ -11453,6 +11491,9 @@ begin
         end;
       end;
       if Length(zSkip) > 0 then zSkipPtr := @zSkip[0];
+      FZonePrunedPages := 0;
+      for zB := 0 to High(zSkip) do
+        if zSkip[zB] <> 0 then Inc(FZonePrunedPages);
     end
     else
     begin
@@ -11491,9 +11532,17 @@ begin
   if FT.Kv <> nil then
     zScanOk := FT.Kv.ScanRawIterAllZoned(td.TableId, zSkipPtr, Length(zSkip),
       @ctx.CurBucket, VdbStreamSelCb, @ctx)
+  else if zV3 then
+  begin
+    { v3.3: sayfa duzeyi zone map. zSkip = sayfa numarasi -> atla bayragi. }
+    zScanOk := FT.Backend.ScanRawIterAllPaged(td.TableId, zSkipPtr,
+      Length(zSkip), VdbStreamSelPageCb, @ctx);
+    { Paged yol desteklenmediyse (ör. toplu yazim) hicbir satir akitilmadi;
+      tam taramaya dusulur. }
+    if (not zScanOk) and (ctx.Seen = 0) then
+      zScanOk := FT.Backend.ScanRawIterAll(td.TableId, VdbStreamSelCb, @ctx);
+  end
   else
-    { Sprint 2.7: v3'te zone map yok; ayni secim geri cagrisi filtresiz
-      tam tarama uzerinde calisir (sonuc ayni, yalniz budama yok). }
     zScanOk := FT.Backend.ScanRawIterAll(td.TableId, VdbStreamSelCb, @ctx);
 
   // H3: insa edilen haritayi yayinla (yalnizca veri hala ayni surumdeyse).
@@ -11505,8 +11554,9 @@ begin
       for zB := ctx.ZoneLastBucket to zBCount - 1 do
         ctx.ZoneMap.Complete[zB] := 1;
     if (not ctx.Failed) and
-       (FT.Kv.DataSeqValue = zGenSeq) and
-       (FT.Kv.DataEpochValue = zGenEpoch) then
+       (((FT.Kv <> nil) and (FT.Kv.DataSeqValue = zGenSeq) and
+         (FT.Kv.DataEpochValue = zGenEpoch)) or
+        (zV3 and (FT.Backend.DataStamp = zGenSeq))) then
     begin
       if FZoneMaps.TryGetValue(td.TableId, zOld) then
       begin
@@ -17923,6 +17973,8 @@ begin
     AddRow('data_file_bytes', IntToStr(SizeOfFile(FT.Backend.FilePath)));
     AddRow('wal_file_bytes', IntToStr(SizeOfFile(FT.Backend.FilePath + '.wal')));
     AddRow('idx_file_bytes', IntToStr(SizeOfFile(FT.Backend.FilePath + '.idx')));
+    { v3.3: son taramada sayfa duzeyi zone map'in budadigi sayfa sayisi. }
+    AddRow('zone_pruned_pages', IntToStr(FZonePrunedPages));
 
     Res.Affected := Length(Res.Rows);
     Res.Msg := IntToStr(ms.CommandCount) + ' komut (v3)';

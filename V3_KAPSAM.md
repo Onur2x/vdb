@@ -463,6 +463,52 @@ ham dönüşü), `ORDER BY` sırası, `WHERE` ön elemesi, `VERIFY`, depoda alan
 gerçekten 1 bayt olduğu, elle kurulmuş **eski biçim** satırın çözülmesi ve bozuk
 varint reddi.
 
+### Sayfa düzeyi zone map (v3.3, 2026-10-26)
+
+v2'deki zone map v2'nin **ekleme sıralı** veri dosyasına bağlıydı; v3'te
+(`Kv = nil`) hiç kullanılmıyordu. v3.3'te v3 için **sayfa düzeyi** zone map
+eklendi: bucket = **heap sayfa numarası**, her (sayfa, kolon) için min/max.
+
+- Kapsam: yalnızca `AND` ile bağlanmış INT/FLOAT karşılaştırmaları
+  (`= <> < <= > >=`, `IN`) ve `BETWEEN`. `OR`/`NOT`/ifade içeren koşullar
+  haritaya girmez (güvenli taraf).
+- **NULL**: satır min/max'a katılmaz (NULL için karşılaştırma FALSE'tur);
+  bir sayfada o kolonun **tüm** değerleri NULL ise sayfa elenebilir.
+- Harita tablo başına önbelleklenir. Geçerlilik **içerik damgası** iledir:
+  her motor örneği benzersiz bir taban alır, damga **yalnızca veri
+  değiştiren commit**'te ilerler. Salt-okunur işlemin commit'i (WAL'e meta
+  çerçevesi yazsa bile) damgayı ilerletmez; böylece harita boşa gitmez.
+- **Kritik güvenlik kuralı**: oturumda commit edilmemiş değişiklik varsa
+  (`Backend.Dirty`) veya toplu yazım açıksa harita **ne kullanılır ne inşa
+  edilir** — aksi halde aynı işlemde yazılan satırlar haritada görünmez ve
+  budama satır kaybettirirdi. Kapı testi bunu ayrıca sınar.
+- Atlama, disk okumasından **önce** olur: `Skip[pageNo] <> 0` olan sayfa hiç
+  açılmaz (`TVdbHeap.ScanAllRawPaged` → `ScanRawIterAllPaged`).
+- v2 tarafı değişmedi: `TVdbBackendV2.ScanRawIterAllPaged` `False` döner ve
+  çağıran tam taramaya düşer.
+
+| Ölçüm (`zmbench`, 100.000 satır × 3 kolon, 32 bit) | Değer |
+|---|---|
+| toplu ekleme (tek işlem) | 1056 ms |
+| seçici sorgu — **ilk** koşu (harita inşası + tam tarama) | 72,2 ms |
+| seçici sorgu — harita hazır (3 koşu medyanı) | **0,17 ms** |
+| atlanan sayfa | **1525 / 1527** |
+| orta seçicilik (`a > 150000`, 50.000 satır) | 73,7 → 73,1 ms (**kazanç yok**) |
+| filtresiz (100.000 satır) | 144,9 ms |
+
+Yorum: kazanç **seçici** yüklemlerde ve harita **kurulduktan sonra** gelir;
+haritanın kurulduğu ilk sorgu tam tarama bedelini öder. Yarısını seçen bir
+yüklemede satır üretimi baskın olduğu için ölçülebilir kazanç yoktur — bu
+yüzden iddia yalnızca seçici yüklemler için geçerlidir.
+
+`SHOW STATS` v3 çıktısına `zone_pruned_pages` (son taramada atlanan sayfa
+sayısı) eklendi; v3 metrik satırı 12 → **13** oldu.
+
+Kapı: `v3sqlchk` **196/0** — `TestPageZoneMap`: harita inşasında budama yok,
+ikinci koşuda budama var (268 sayfa), sonuç birebir aynı, tam aralıkta yalnızca
+boş sayfalar atlanır, NULL satır budamayı bozmaz, **commit edilmemiş işlemde
+harita kullanılmaz**, commit sonrası yeni satırlar doğru sayılır.
+
 ### Sayfa şifreleme (Sprint 3.4)
 
 Varsayılan **kapalı**; v3 dosyası eskisi gibi düz metindir. Şifreli dosya

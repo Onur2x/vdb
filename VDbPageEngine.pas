@@ -65,6 +65,9 @@ type
         O(1). Dizi semantigi (swap-remove) korunur. }
       FPendingIdx: TDictionary<LongWord, Integer>;
       FInTxn: Boolean;
+      { v3.3: ICERIK damgasi (zone map onbellegi). Yalnizca veri degistiren
+        commit'lerde artar; salt-okunur islem commit'i artirmaz. }
+      FDataStamp: QWord;
       FWalStats: TVdbWalStats;
       FPath: string;
       FIdxUsed: Boolean;
@@ -90,6 +93,8 @@ type
     procedure AddPending(PageNo: LongWord; P: PVdbPage);
     procedure ClearPending;
     function GetIdxTagsValid: Boolean;
+    { v3.3: veri degistiren commit'te damgayi ilerletir. }
+    function NextDataStamp: QWord;
   public
     constructor Create(const ADbPath: string; APoolPages: Integer = VDB_DEF_POOL);
     { Sprint 3.4: sifreli dosya. Anahtar 32 bayt AES-256'dir; parola
@@ -125,6 +130,9 @@ type
     procedure ScanAll(Cb: TVdbHeap.TScanProc);
     { v3.1: sifir-kopya tarama (satir basina tahsis yok). }
     procedure ScanAllRaw(Cb: TVdbHeap.TScanRawProc);
+    { v3.2: sayfa numarali + sayfa atlayabilen tarama. }
+    procedure ScanAllRawPaged(Cb: TVdbHeap.TScanRawPageProc;
+      Skip: PByte; SkipCount: Integer);
     function Stats: TVdbHeapStats;
 
     { Bekleyen degisiklikleri WAL'e yazip fsync eder. Veritabani dosyasina
@@ -143,6 +151,9 @@ type
     property Heap: TVdbHeap read FHeap;
     property Wal: TVdbPageWal read FWal;
     property InTxn: Boolean read FInTxn;
+    { v3.3: ICERIK damgasi — sayfa duzeyi zone map onbellegi buna baglidir.
+      Ayni damga = ayni satir icerigi. }
+    property DataStamp: QWord read FDataStamp;
     { Son acilista kurtarma istatistigi. }
     property RecoveryStats: TVdbWalStats read FWalStats;
     { Acilista `.odb.idx` hizli yolu kullanildi mi? Kullanilmadiysa tam
@@ -173,6 +184,10 @@ type
   end;
 
 implementation
+
+var
+  { v3.3: her motor ornegine essiz bir damga tabani vermek icin. }
+  GEngineSerial: LongInt = 0;
 
 function TVdbPageEngine.GetEncrypted: Boolean;
 begin
@@ -210,6 +225,20 @@ begin
   FWalStats.Commits := 0;
   FWalStats.TornTail := False;
   FWalStats.Bytes := 0;
+  { v3.3: ICERIK damgasi. Her motor ornegi farkli bir ust 32 bit tabani alir,
+    boylece yeni bir motor (or. VACUUM/RESTORE sonrasi) eski bir zone map
+    damgasiyla CAKISAMAZ. Alt 32 bit yalnizca VERI DEGISTIREN commit'lerde
+    artar; salt-okunur islem commit'i (meta cercevesi yazsa bile) artirmaz. }
+  FDataStamp := QWord(InterLockedIncrement(GEngineSerial)) shl 32 or 1;
+end;
+
+function TVdbPageEngine.NextDataStamp: QWord;
+begin
+  Inc(FDataStamp);
+  { Alt 32 bit tasarsa ust taban yenilenir (pratikte ulasilmaz). }
+  if (FDataStamp and $FFFFFFFF) = 0 then
+    FDataStamp := QWord(InterLockedIncrement(GEngineSerial)) shl 32 or 1;
+  Result := FDataStamp;
 end;
 
 constructor TVdbPageEngine.Create(const ADbPath: string; APoolPages: Integer);
@@ -529,6 +558,12 @@ begin
   FHeap.ScanAllRaw(Cb);
 end;
 
+procedure TVdbPageEngine.ScanAllRawPaged(Cb: TVdbHeap.TScanRawPageProc;
+  Skip: PByte; SkipCount: Integer);
+begin
+  FHeap.ScanAllRawPaged(Cb, Skip, SkipCount);
+end;
+
 function TVdbPageEngine.GetCount: Integer;
 begin
   if FHeap = nil then Result := 0 else Result := FHeap.Count;
@@ -546,6 +581,7 @@ var
   dirty: TVdbPageNoArray;
   P: PVdbPage;
   meta: TVdbPageBuf;
+  changed: Boolean;
 begin
   Result := False;
   if FStore = nil then
@@ -583,6 +619,14 @@ begin
         sayisi / freelist). LSN commit kaydinda tasinir ve kurtarma FLSN'i
         oradan alir; degismemis meta imajini her commit'te yazmak 4 KB'lik
         bos bir cerceve demekti (autocommit'te WAL hacminin yarisi). }
+  changed := (Length(dirty) > 0) or FStore.MetaStructDirty;
+  if not changed then
+    for i := 0 to FPendingCount - 1 do
+      if FPending[i].Mark = FStore.TxnId then
+      begin
+        changed := True;
+        Break;
+      end;
   if FStore.MetaStructDirty then
   begin
     FStore.BuildMetaImage(meta);
@@ -605,6 +649,8 @@ begin
 
   FStore.EndTxn;
   FInTxn := False;
+  { v3.3: yalnizca VERI degistiren commit zone map damgasini ilerletir. }
+  if changed then NextDataStamp;
   Result := True;
 end;
 

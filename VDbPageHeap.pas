@@ -71,7 +71,10 @@ type
       { v3.1: sifir-kopya tarama. Data yalnizca geri cagirim SURESI boyunca
         gecerlidir (sayfa ici hucreye isaret eder; tasma hucrelerinde gecici
         tampona). Geri cagirim motoru yeniden cagirmamalidir. }
-      TScanRawProc = procedure(Key: QWord; Data: PByte; Len: Integer) of object;  private
+      TScanRawProc = procedure(Key: QWord; Data: PByte; Len: Integer) of object;
+      { v3.2: sayfa numarali tarama (bkz. ScanAllRawPaged). }
+      TScanRawPageProc = procedure(Key: QWord; Data: PByte; Len: Integer;
+        PageNo: LongWord) of object;  private
     FStore: TVDbPageStore;
     FKey: array of QWord;
     FLoc: array of TLoc;
@@ -131,6 +134,12 @@ type
     procedure ScanAll(Cb: TScanProc);
     { v3.1: satir basina deger KOPYALAMAZ (tahsis yok). }
     procedure ScanAllRaw(Cb: TScanRawProc);
+    { v3.2: sayfa numarasini da veren tarama. `Skip[i] <> 0` olan sayfa HIC
+      acilmaz (disk okumasindan once atlanir); `SkipCount` Skip dizisinin
+      boyudur, `Skip = nil` ise budama yoktur. Kayitlar sayfa numarasi ARTAN
+      sirada gelir. }
+    procedure ScanAllRawPaged(Cb: TScanRawPageProc; Skip: PByte;
+      SkipCount: Integer);
 
     procedure Flush(DoSync: Boolean = True);
     function Stats: TVdbHeapStats;
@@ -1006,6 +1015,71 @@ begin
       begin
         if Length(v) > 0 then Cb(ogKey[j], @v[0], Length(v))
         else Cb(ogKey[j], nil, 0);
+      end;
+  end;
+end;
+
+procedure TVdbHeap.ScanAllRawPaged(Cb: TScanRawPageProc; Skip: PByte;
+  SkipCount: Integer);
+var
+  pno: LongWord;
+  P: PVdbPage;
+  i, n, j: Integer;
+  magic: Word;
+  key: QWord;
+  len: LongWord;
+  d: PByte;
+  dl: Integer;
+  ogKey: array of QWord;
+  ogOvf: array of LongWord;
+  ogLen: array of Integer;
+  v: TBytes;
+begin
+  if not Assigned(Cb) then Exit;
+  for pno := 1 to FStore.PageCount - 1 do
+  begin
+    { Budama: sayfa hic ACILMAZ (WCACHE/disk erisimi yok). }
+    if (Skip <> nil) and (pno < LongWord(SkipCount)) and (Skip[pno] <> 0) then
+      Continue;
+    SetLength(ogKey, 0);
+    SetLength(ogOvf, 0);
+    SetLength(ogLen, 0);
+    if not FStore.GetRawPage(pno, P) then Continue;
+    try
+      Move(P^[0], magic, SizeOf(magic));
+      if magic <> VDB_PAGE_MAGIC then Continue;
+      if PageTypeOf(P) <> VDB_PAGE_HEAP then Continue;
+      n := PageSlotCount(P);
+      for i := 0 to n - 1 do
+      begin
+        if not PageGetCell(P, i, d, dl) then Continue;
+        if dl < VDB_CELL_HDR then Continue;
+        Move(d^, key, 8);
+        Move((d + 8)^, len, 4);
+        if (len and VDB_OVF_FLAG) <> 0 then
+        begin
+          if dl < VDB_CELL_HDR + 4 then Continue;
+          j := Length(ogKey);
+          SetLength(ogKey, j + 1);
+          SetLength(ogOvf, j + 1);
+          SetLength(ogLen, j + 1);
+          ogKey[j] := key;
+          ogLen[j] := Integer(len and VDB_LEN_MASK);
+          Move((d + VDB_CELL_HDR)^, ogOvf[j], 4);
+          Continue;
+        end;
+        Cb(key, d + VDB_CELL_HDR, Integer(len), pno);
+      end;
+    finally
+      FStore.Release(pno, False);
+    end;
+    for j := 0 to High(ogKey) do
+      if ReadOverflow(ogOvf[j], ogLen[j], v) then
+      begin
+        if Length(v) > 0 then
+          Cb(ogKey[j], @v[0], Length(v), pno)
+        else
+          Cb(ogKey[j], nil, 0, pno);
       end;
   end;
 end;

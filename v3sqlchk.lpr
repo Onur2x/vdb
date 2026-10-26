@@ -1506,6 +1506,160 @@ end;
   iki kez kosar. Burada BAGIMSIZ oracle Pascal'da UC-DEGERLI MANTIK
   (TRUE/FALSE/UNKNOWN) ile hesaplanir ve SQL sonucu satir satir
   karsilastirilir. Tohum sabittir: kosu tekrarlanabilir. }
+{ v3.3: SAYFA duzeyi zone map. v3 heap'i satirlari ekleme sirasina gore
+  sayfalara yerlestirdigi icin monoton artan bir kolonda her sayfa DAR bir
+  aralik tasir; harita sayfalarin buyuk cogunlugunu budayabilir. Sinanan:
+  (a) budama sonrasi sonuc AYNI, (b) budama gercekten oluyor
+  (zone_pruned_pages), (c) NULL'lu satir budamayi bozmuyor,
+  (d) commit edilmemis (kirli) islemde harita KULLANILMIYOR. }
+procedure TestPageZoneMap;
+const
+  N = 20000;
+  THRESH = 59000;      { a = 3*id; a > 59000 -> id >= 19667 -> 334 satir }
+  EXPECT = 334;
+var
+  S: TV3Sql;
+  r: TSqlResult;
+  i, pruned1, pruned2, pruned3: Integer;
+  okAll: Boolean;
+  function Stat(const Name: string): Integer;
+  var
+    k: Integer;
+  begin
+    Result := -1;
+    for k := 0 to High(r.Rows) do
+      if Cel(r, k, 0) = Name then
+      begin
+        Result := StrToIntDef(Cel(r, k, 1), -1);
+        Exit;
+      end;
+  end;
+begin
+  WriteLn;
+  WriteLn('v3.3 - sayfa duzeyi zone map (budama + dogruluk)');
+  CleanDir;
+  OpenV3(S, 'zm.odb', True);
+  try
+    r := Exec(S, 'CREATE TABLE zm (id INTEGER PRIMARY KEY, a INTEGER)');
+    if gErr then
+    begin
+      Fail('zm: CREATE: ' + r.Msg);
+      Exit;
+    end;
+    okAll := True;
+    for i := 1 to N do
+    begin
+      r := Exec(S, Format('INSERT INTO zm VALUES (%d, %d)', [i, i * 3]));
+      if gErr then
+      begin
+        okAll := False;
+        Fail('zm: INSERT: ' + r.Msg);
+        Break;
+      end;
+    end;
+    if not okAll then Exit;
+
+    { 1) Ilk sorgu haritayi INSA eder: budama yok. NOT: COUNT(*) yolu
+      indeks/sayac hizli yolunu kullanabilir; zone map yalnizca AKISLI
+      (streaming) satir seciminde devreye girer. }
+    r := Exec(S, Format('SELECT a FROM zm WHERE a > %d', [THRESH]));
+    if (not gErr) and (Length(r.Rows) = EXPECT) then
+      Ok(Format('zm: harita insasi sirasinda sonuc dogru (%d)', [EXPECT]))
+    else
+      Fail(Format('zm: ilk SELECT: %d satir %s', [Length(r.Rows), r.Msg]));
+    r := Exec(S, 'SHOW STATS');
+    pruned1 := Stat('zone_pruned_pages');
+    if pruned1 = 0 then
+      Ok('zm: harita insasinda budama yok (0 sayfa)')
+    else
+      Fail(Format('zm: ilk taramada beklenmedik budama: %d', [pruned1]));
+
+    { 2) Ayni sorgu: harita hazir -> sayfalarin cogu atlanir. }
+    r := Exec(S, Format('SELECT a FROM zm WHERE a > %d', [THRESH]));
+    if (not gErr) and (Length(r.Rows) = EXPECT) then
+      Ok('zm: budanmis taramada sonuc AYNI')
+    else
+      Fail(Format('zm: budanmis SELECT: %d satir %s',
+        [Length(r.Rows), r.Msg]));
+    r := Exec(S, 'SHOW STATS');
+    pruned2 := Stat('zone_pruned_pages');
+    if pruned2 >= 50 then
+      Ok(Format('zm: zone map %d sayfayi diskten okumadan atladi', [pruned2]))
+    else
+      Fail(Format('zm: budama beklenenin altinda (%d sayfa)', [pruned2]));
+
+    { 3) Tum aralik: budanacak sayfa YOK, sonuc tam. }
+    r := Exec(S, 'SELECT a FROM zm WHERE a >= 0');
+    if (not gErr) and (Length(r.Rows) = N) then
+      Ok(Format('zm: tum aralik sorgusu %d satir', [N]))
+    else
+      Fail(Format('zm: tum aralik SELECT: %d satir %s',
+        [Length(r.Rows), r.Msg]));
+    r := Exec(S, 'SHOW STATS');
+    pruned3 := Stat('zone_pruned_pages');
+    { Tum aralikta hicbir DOLU sayfa budanamaz; yalnizca tabloya ait satir
+      tasimayan (bos/preallocated) sayfalar atlanir. }
+    if pruned3 < pruned2 then
+      Ok(Format('zm: tum aralikta yalnizca bos sayfalar atlandi (%d < %d)',
+        [pruned3, pruned2]))
+    else
+      Fail(Format('zm: tum aralikta beklenmedik budama: %d', [pruned3]));
+
+    { 4) NULL'lu satir: harita NULL'u atlar (kiyas FALSE), budama surer. }
+    r := Exec(S, Format('INSERT INTO zm VALUES (%d, NULL)', [N + 1]));
+    if gErr then
+    begin
+      Fail('zm: NULL INSERT: ' + r.Msg);
+      Exit;
+    end;
+    { Damga degisti: bu sorgu haritayi YENIDEN insa eder. }
+    r := Exec(S, Format('SELECT a FROM zm WHERE a > %d', [THRESH]));
+    if (not gErr) and (Length(r.Rows) = EXPECT) then
+      Ok('zm: NULL satirdan sonra sonuc dogru')
+    else
+      Fail(Format('zm: NULL sonrasi SELECT: %d satir %s',
+        [Length(r.Rows), r.Msg]));
+    { Ikinci kosu: budama yine calisir (NULL kolonu kilitlemedi). }
+    r := Exec(S, Format('SELECT a FROM zm WHERE a > %d', [THRESH]));
+    r := Exec(S, 'SHOW STATS');
+    pruned3 := Stat('zone_pruned_pages');
+    if pruned3 >= 50 then
+      Ok(Format('zm: NULL satirdan sonra budama suruyor (%d sayfa)', [pruned3]))
+    else
+      Fail(Format('zm: NULL sonrasi budama yok (%d)', [pruned3]));
+
+    { 5) KRITIK: commit edilmemis islemde harita KULLANILMAMALI. }
+    Exec(S, 'BEGIN');
+    r := Exec(S, Format('INSERT INTO zm VALUES (%d, %d)', [N + 2, 999999]));
+    { Bu satir henuz sayfaya yazilmadi; eski harita onu goremez. Budama
+      kapali olmali, yoksa satir kaybolur. }
+    r := Exec(S, Format('SELECT a FROM zm WHERE a > %d', [THRESH]));
+    if (not gErr) and (Length(r.Rows) = EXPECT + 1) then
+      Ok('zm: kirli islemde yeni satir goruldu (harita kullanilmadi)')
+    else
+      Fail(Format('zm: kirli islem SELECT: %d satir %s',
+        [Length(r.Rows), r.Msg]));
+    r := Exec(S, 'ROLLBACK');
+    if gErr then Fail('zm: ROLLBACK: ' + r.Msg);
+
+    { 6) COMMIT'li 500 satir sonrasi budama yine dogru. }
+    Exec(S, 'BEGIN');
+    for i := N + 10 to N + 509 do
+      Exec(S, Format('INSERT INTO zm VALUES (%d, %d)', [i, i * 3]));
+    r := Exec(S, 'COMMIT');
+    if gErr then Fail('zm: COMMIT: ' + r.Msg);
+    r := Exec(S, Format('SELECT a FROM zm WHERE a > %d', [THRESH]));
+    { 334 eski + 500 yeni (hepsi esik ustunde) + 1 NULL (a NULL, sayilmaz) }
+    if (not gErr) and (Length(r.Rows) = EXPECT + 500) then
+      Ok('zm: COMMIT sonrasi 500 yeni satir dogru sayildi')
+    else
+      Fail(Format('zm: COMMIT sonrasi SELECT: %d satir %s',
+        [Length(r.Rows), r.Msg]));
+  finally
+    CloseV3(S);
+  end;
+end;
+
 procedure TestRowIntVarint;
 const
   NV = 12;
@@ -2151,6 +2305,7 @@ begin
   TestIndexInNegative;
   TestZoneMapFallback;
   TestRowIntVarint;
+  TestPageZoneMap;
   TestFuzzOracle;
   TestIntegrity(N);
 

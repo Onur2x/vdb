@@ -478,6 +478,37 @@ ile aynı FNV-1a özetini verdi (`1DF4A420FF9A2488`).
 Kapı: `v3sqlchk` **186/0** (`rowint`: 12 uç değer, `ORDER BY`, `WHERE`,
 `VERIFY`, 1 baytlık alan, elle kurulmuş eski satır, bozuk varint reddi).
 
+### v3.3 — sayfa düzeyi zone map (2026-10-26)
+
+v3'te zone map yoktu (v2'ninki ekleme sıralı veri dosyasına bağlıydı). Artık
+bucket = **heap sayfa numarası**: her (sayfa, kolon) için min/max tutulur ve
+uygun olmayan sayfa **disk okumasından önce** atlanır
+(`ScanAllRawPaged` / `ScanRawIterAllPaged`).
+
+- Yalnızca `AND` ile bağlı INT/FLOAT karşılaştırmaları ve `IN`/`BETWEEN`.
+- NULL satır min/max'a girmez; hepsi NULL olan sayfa elenebilir.
+- Geçerlilik **içerik damgası** ile: damga her motor örneğinde benzersiz
+  taban alır ve yalnızca **veri değiştiren commit**'te ilerler (salt-okunur
+  commit haritayı boşa çıkarmaz).
+- **Commit edilmemiş değişiklik varken harita ne kullanılır ne inşa edilir**
+  (aksi halde aynı işlemde yazılan satır kaybolurdu).
+- v2 değişmedi: `ScanRawIterAllPaged` `False` döner, tam taramaya düşülür.
+
+| Ölçüm (`zmbench`, 100k satır × 3 kolon) | Değer |
+|---|---|
+| seçici sorgu, ilk koşu (harita inşası dahil) | 72,2 ms |
+| seçici sorgu, harita hazır (medyan) | **0,17 ms** (1525/1527 sayfa atlandı) |
+| orta seçicilik (`a > 150000`, 50k satır) | 73,7 → 73,1 ms (kazanç yok) |
+| filtresiz (100k satır) | 144,9 ms |
+
+Kazanç yalnızca **seçici** yüklemlerde ve harita kurulduktan sonra; ilk sorgu
+tam tarama bedelini öder. Geniş yüklemlerde satır üretimi baskın olduğu için
+ölçülebilir kazanç yoktur.
+
+`SHOW STATS` v3'e `zone_pruned_pages` eklendi (metrik satırı 12 → 13).
+Kapı: `v3sqlchk` **196/0** (`TestPageZoneMap` 10 kontrol; kirli işlem ve NULL
+dahil), diğer 13 kapı yeşil, sqltest v3 2758/0/33, v2 3196/0/0.
+
 ### Sıradaki sürüme ertelenen (v4 sonrası)
 - Zone map'in sayfa düzeyinde yeniden ele alınması
 - Satır gövdesi varint/delta kodlama (F3-1'in kalanı)

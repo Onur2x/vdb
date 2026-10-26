@@ -40,6 +40,11 @@ type
   TVDbRawCb = function(Key: QWord; Buf: PByte; Len: Integer;
     User: Pointer): Boolean;
 
+  { v3.3: sayfa numarasi veren ham tarama geri cagirimi (sayfa duzeyi zone
+    map). v3: PageNo = satirin bulundugu heap sayfasi. }
+  TVDbRawPageCb = function(Key: QWord; Buf: PByte; Len: Integer;
+    PageNo: LongWord; User: Pointer): Boolean;
+
   { R-11: COMMIT oncesi geri-cagirim (deferrable kisit denetimi). }
   TDbCommitHook = procedure of object;
 
@@ -76,6 +81,15 @@ type
       TableFilter: Integer = -1);
     function ScanRawIterAll(TableFilter: Integer;
       Cb: TVDbRawCb; User: Pointer): Boolean;
+    { v3.3: sayfa numarali ham tarama. `Skip[i] <> 0` olan sayfalar hic
+      acilmaz (sayfa duzeyi zone map budamasi). v3: desteklenir; v2:
+      False doner (cagiran tam taramaya duser). }
+    function ScanRawIterAllPaged(TableFilter: Integer;
+      Skip: PByte; SkipCount: Integer;
+      Cb: TVDbRawPageCb; User: Pointer): Boolean;
+    { v3.3: veri iceriginin surum damgasi. Zone map onbellegi bu damgaya
+      baglidir: damga degistiyse harita gecersizdir. v2: DataSeqValue. }
+    function DataStamp: QWord;
     { v3.1: tablo basina canli satir sayisi (O(1) olabilir). Tam tarama ile
       AYNI yuklem. Acik kaplama veya desteklenmeyen yol -> -1 (cagiran
       tarama yapar). v2: -1 (dogrulanmis onbellek TVDb tarafindadir). }

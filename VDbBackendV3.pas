@@ -112,6 +112,9 @@ type
         ve toplu kopyalama YOK). }
       FStreamCb: TVDbRawCb;
       FStreamUser: Pointer;
+      { v3.3: sayfa numarali akitma (sayfa duzeyi zone map). }
+      FStreamPageCb: TVDbRawPageCb;
+      FStreamPageUser: Pointer;
       FStreamAbort: Boolean;
       FStreamFilter: Integer;
       { v3.1: satir etiketi icin tarama basina BIR kez ayrilan kucuk tampon
@@ -185,6 +188,9 @@ type
     procedure AsOfCb(Key: QWord; const Value: TBytes);
     { v3.1: streaming tarama geri cagirimi (sifir-kopya: Data sayfa icindedir). }
     procedure StreamCbRaw(Key: QWord; Data: PByte; Len: Integer);
+    { v3.3: sayfa numarali akitma (sayfa duzeyi zone map budamasi). }
+    procedure StreamCbRawPaged(Key: QWord; Data: PByte; Len: Integer;
+      PageNo: LongWord);
     { v3.1: etiket sayaci yardimcilari. }
     function TagOf(Data: PByte; Len: Integer): Integer;
     procedure TagAdd(Tag: Integer; Delta: Int64);
@@ -252,6 +258,12 @@ type
     function CountTable(TableFilter: Integer): Int64;
     function ScanRawIterAll(TableFilter: Integer;
       Cb: TVDbRawCb; User: Pointer): Boolean;
+    { v3.3: sayfa numarali ham tarama; `Skip[i] <> 0` sayfalar hic acilmaz. }
+    function ScanRawIterAllPaged(TableFilter: Integer;
+      Skip: PByte; SkipCount: Integer;
+      Cb: TVDbRawPageCb; User: Pointer): Boolean;
+    { v3.3: veri surum damgasi (zone map onbellegi icin). }
+    function DataStamp: QWord;
 
     { v3.2: AS OF — WAL penceresindeki ilk Sequence commit'in sonundaki
       tutarli goruntuden (TableFilter'a uyan) satirlari okur. Anlik goruntu
@@ -1150,6 +1162,52 @@ begin
       else if not Cb(pair.Key, nil, 0, User) then Exit(False);
     end;
   Result := True;
+end;
+
+{ ------------------------------------------------- v3.3: sayfa zone map }
+
+procedure TVdbBackendV3.StreamCbRawPaged(Key: QWord; Data: PByte;
+  Len: Integer; PageNo: LongWord);
+var
+  tag, n: Integer;
+begin
+  if FStreamAbort then Exit;
+  if BatchIsMine and FBatch.ContainsKey(Key) then Exit;
+  if (FStreamFilter >= 0) and Assigned(FRowTag) then
+  begin
+    n := Len;
+    if n > Length(FStreamTagBuf) then n := Length(FStreamTagBuf);
+    if n > 0 then Move(Data^, FStreamTagBuf[0], n);
+    tag := FRowTag(FStreamTagBuf, Len);
+    if (tag >= 0) and (tag <> FStreamFilter) then Exit;
+  end;
+  if not FStreamPageCb(Key, Data, Len, PageNo, FStreamPageUser) then
+    FStreamAbort := True;
+end;
+
+function TVdbBackendV3.ScanRawIterAllPaged(TableFilter: Integer;
+  Skip: PByte; SkipCount: Integer;
+  Cb: TVDbRawPageCb; User: Pointer): Boolean;
+begin
+  { Toplu yazim acikken bekleyen kayitlarin sayfasi YOKTUR ve harita da
+    guvenilmez; cagiran tam taramaya duser. }
+  if FBatchOpen then Exit(False);
+  FStreamPageCb := Cb;
+  FStreamPageUser := User;
+  FStreamAbort := False;
+  FStreamFilter := TableFilter;
+  if Length(FStreamTagBuf) < 8 then SetLength(FStreamTagBuf, 8);
+  FEng.ScanAllRawPaged(StreamCbRawPaged, Skip, SkipCount);
+  Result := not FStreamAbort;
+end;
+
+function TVdbBackendV3.DataStamp: QWord;
+begin
+  if FEng = nil then Exit(0);
+  { v3.3: motorun ICERIK damgasi. Her motor ornegi essiz taban alir; damga
+    yalnizca veri degistiren commit'te ilerler (salt-okunur islem commit'i
+    haritayi bosa cikarmaz). }
+  Result := FEng.DataStamp;
 end;
 
 { ------------------------------------------------- v3.1: etiket sayaci }

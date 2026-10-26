@@ -42,6 +42,12 @@ type
       TableFilter: Integer = -1);
     function ScanRawIterAll(TableFilter: Integer;
       Cb: TVDbRawCb; User: Pointer): Boolean;
+    { v3.3: v2'de sayfa numarali tarama yoktur; False = tam tarama. }
+    function ScanRawIterAllPaged(TableFilter: Integer;
+      Skip: PByte; SkipCount: Integer;
+      Cb: TVDbRawPageCb; User: Pointer): Boolean;
+    { v3.3: v2 zone map'i DataSeqValue/DataEpochValue ile calisir. }
+    function DataStamp: QWord;
     function CountTable(TableFilter: Integer): Int64;
     { v3.2: v2'de AS OF mantiksal WAL kayitlari uzerinden VDbExecutor'da
       kurulur; burada anlik kopya yolu YOKTUR (False). }
@@ -189,6 +195,21 @@ function TVDbBackendV2.ScanRawIterAll(TableFilter: Integer;
   Cb: TVDbRawCb; User: Pointer): Boolean;
 begin
   Result := FDb.ScanRawIterAll(TableFilter, Cb, User);
+end;
+
+function TVDbBackendV2.ScanRawIterAllPaged(TableFilter: Integer;
+  Skip: PByte; SkipCount: Integer;
+  Cb: TVDbRawPageCb; User: Pointer): Boolean;
+begin
+  { v2 veri dosyasi sayfa numarasi sunmaz; cagiran tam taramaya duser. }
+  Result := False;
+end;
+
+function TVDbBackendV2.DataStamp: QWord;
+begin
+  { v2 zone map damgasi: veri seq + epoch. }
+  Result := (QWord(FDb.DataEpochValue) shl 32) or
+    QWord(FDb.DataSeqValue);
 end;
 
 function TVDbBackendV2.CountTable(TableFilter: Integer): Int64;

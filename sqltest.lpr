@@ -3106,7 +3106,7 @@ begin
   { 2026-10-25 (v3): v3'te okuma-onbellegi sayaclari yok; satir sayisi
     13 degil 12'dir (engine/live_keys/.wal/.idx ile). }
   if gV3 then
-    Dogrula('SHOW STATS 12 metrik satiri (v3)', Length(R.Rows) = 12,
+    Dogrula('SHOW STATS 13 metrik satiri (v3)', Length(R.Rows) = 13,
       IntToStr(Length(R.Rows)))
   else
     Dogrula('SHOW STATS 13 metrik satiri', Length(R.Rows) = 13,
