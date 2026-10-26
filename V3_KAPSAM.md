@@ -391,8 +391,12 @@ v2/önceki v3 ile aynı; beklemek isteyen çağıran açıkça süre verir.
 - Çok **oturumlu** yazma v3.4'te geldi (aynı backend, READ COMMITTED, ilk commit
   kazanır). **Süreçler arası çok yazarlılık v3.16'da geldi:** ikinci süreç artık
   reddedilmez; kilit **işlem kapsamlı** alınır (oturum boyu değil), önbellek
-  `<db>.gen` değişiklik sayacıyla tazelenir. Yazarlar **sıralıdır**: bir yazma
-  işlemi açıkken diğer süreçler `ABusyMs` bekler, sonra net hata alır.
+  `<db>.gen` değişiklik sayacıyla tazelenir; tazeleme **heap dizinini de**
+  yeniden kurar (tam tarama, yalnız başka süreç commit ettiğinde; 200.000
+  satırda ~63 ms) — yalnız önbelleği tazelemek bayat dizinle sayfa yeniden
+  tahsisine ve **veri kaybına** yol açıyordu (v3.17'de CI yakaladı). Yazarlar
+  **sıralıdır**: bir yazma işlemi açıkken diğer süreçler `ABusyMs` bekler,
+  sonra net hata alır.
 
 Kapı: `lockchk` (14. kapı) **29/0** ve `prochk` (16. kapı) **8/0**. Gerçek
 **çocuk süreçler** kullanılır, yani kilit gerçek işletim sistemi kilididir: aynı

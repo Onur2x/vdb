@@ -310,6 +310,19 @@ begin
     FStore.Flush(True);
     FWal.Truncate(FStore.LSN);
   end;
+  { v3.17 DUZELTME — VERI KAYBI: yalnizca sayfa onbellegini tazelemek
+    YETMEZ. Heap'in bellek ici dizini (Anahtar -> sayfa/slot) hala ESKI;
+    bayat dizinle yazmak, baska surecin kullandigi sayfalari yeniden tahsis
+    edip SATIRLARINI EZER. prochk bunu CI'da yakaladi (A'nin 40 satiri
+    tamamen kayboldu, B'nin commit'i uzerine yazdi). Dizini yeniden kur. }
+  if FHeap <> nil then
+  begin
+    if FInTxn or (FPendingCount > 0) then
+      raise EVdbPageEngine.Create(
+        'baska bir surec commit etti; acik islem varken onbellek ' +
+        'tazelenemez (islem kilidi tutulmamis)');
+    FHeap.Open;
+  end;
 end;
 
 procedure TVdbPageEngine.Open(ACreate: Boolean; AReadOnly: Boolean;

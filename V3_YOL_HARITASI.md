@@ -1163,8 +1163,15 @@ boyu** tutulur.
   paylaşımlıyı bıraktığı için **kilitlenme yok**.
 - Önbellek tazeliği: her işlem girişinde `<db>.gen` **8 baytlık değişiklik
   sayacı** okunur. Sayaç değişmediyse hiçbir şey yapılmaz (~2 µs). Değiştiyse
-  `DropCache` + meta yeniden yüklenir ve motor WAL görünümünü tazeler
-  (`FWal.Close/Open`, varsa çerçeveleri uygula — sayfa imajları idempotent).
+  `DropCache` + meta yeniden yüklenir, motor WAL görünümünü tazeler
+  (`FWal.Close/Open`, varsa çerçeveleri uygula — sayfa imajları idempotent) ve
+  **heap'in bellek içi dizini yeniden kurulur** (`FHeap.Open`: tüm sayfalar
+  taranır). Bu son adım zorunludur: dizin eskimişken yazmak, başka sürecin
+  kullandığı sayfaları yeniden tahsis edip **satırlarını ezip veri kaybı**
+  üretiyordu (v3.17'de `prochk` CI'da yakaladı: A'nın 40 satırı kayboldu).
+  Maliyet yalnız **başka süreç commit ettiğinde** ödenir: tam tarama
+  (200.000 satırda ~63 ms). Açık işlem varken tazeleme gerekirse sessiz
+  bozulma yerine **açık hata** verilir.
 - Sayaç **meta sayfaya değil ayrı dosyaya** yazılır: meta sayfaya commit LSN'i
   yazmak taban dosyanın kendi kendine tutarlılığını bozuyordu (sayfalar hâlâ
   WAL'de olabilir; `pitr`/`AS OF SEQUENCE 0` bunu yakaladı).
