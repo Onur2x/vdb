@@ -21,7 +21,7 @@ uses
   { FPC/Unix: cthreads programin EN BASINDA olmali (TEvent/TThread). }
   {$IFDEF UNIX}cthreads,{$ENDIF}
   Classes, SysUtils, DateUtils, VDbPage, VDbPageStore, VDbPageHeap,
-  VDbPageEngine, VDbPageWal;
+  VDbPageEngine, VDbPageWal, VDbIdxFile, VDbCrc32;
 
 var
   gPass, gFail: Int64;
@@ -435,6 +435,128 @@ begin
   end;
 end;
 
+{ ==================================================== 6) VER 1 uyumu }
+
+{ v3.2: `.idx` VER 2 varint akisina gecti. Eski (VER 1, sabit 16 bayt)
+  dosyalar okunmaya devam etmeli; yeni kod yalniz VER 2 urettigi icin eski
+  bicimi ancak elle yazarak sinayabiliriz. }
+procedure TestLegacyIdx;
+const
+  N = 500;
+var
+  f: TFileStream;
+  h: TVdbIdxHeader;
+  rec: TVdbIdxEntryArray;
+  i: Integer;
+  crc: LongWord;
+  p, err: string;
+  got: TVdbIdxEntryArray;
+  gh: TVdbIdxHeader;
+  tags: TVdbIdxTagArray;
+  okAll: Boolean;
+begin
+  p := IncludeTrailingPathDelimiter(gDir) + 'legacy.idx';
+  SetLength(rec, N);
+  FillChar(h, SizeOf(h), 0);
+  h.Magic := VDB_IDX_MAGIC;
+  h.Ver := 1;                     { ESKI SURUM }
+  h.PageSize := 4096;
+  h.DbLSN := 42;
+  h.DbPageCount := 100;
+  h.Count := N;
+  h.DbSize := Int64(100) * 4096;
+  crc := VDbCrc32Init;
+  for i := 0 to N - 1 do
+  begin
+    rec[i].Key := QWord(i + 1) * 7919;
+    rec[i].PageNo := i div 20 + 1;
+    rec[i].Slot := (i mod 20) + 1;
+    rec[i].Pad := 0;
+    crc := VDbCrc32Update(crc, rec[i], SizeOf(TVdbIdxEntry));
+  end;
+  h.EntriesCrc := VDbCrc32Final(crc);
+  h.HdrCrc := VDbCrc32Of(h, VDB_IDX_CRC_LEN);
+  f := TFileStream.Create(p, fmCreate);
+  try
+    f.WriteBuffer(h, VDB_IDX_HDR_SIZE);
+    f.WriteBuffer(rec[0], N * VDB_IDX_ENT_SIZE);
+  finally
+    f.Free;
+  end;
+
+  if not VDbIdxLoadEx(p, got, gh, tags, err) then
+    Fail('VER 1 (eski bicim) dosyasi okunamadi: ' + err)
+  else
+  begin
+    okAll := (Length(got) = N) and (gh.Ver = 1);
+    if okAll then
+      for i := 0 to N - 1 do
+        if (got[i].Key <> rec[i].Key) or (got[i].PageNo <> rec[i].PageNo) or
+           (got[i].Slot <> rec[i].Slot) then
+        begin
+          okAll := False;
+          Break;
+        end;
+    if okAll then
+      Ok(Format('VER 1 (eski bicim) dosyasi okundu: %d kayit birebir', [N]))
+    else
+      Fail('VER 1 dosyasi yanlis cozuldu');
+  end;
+  if FileExists(p) then DeleteFile(p);
+end;
+
+{ ============================================ 7) varint sinir degerleri }
+
+procedure TestVarintBounds;
+const
+  N = 8;
+  PAGES: array[0..N - 1] of LongWord =
+    (1, 127, 128, 16383, 16384, 2097151, 2097152, $7FFFFFFF);
+  SLOTS: array[0..N - 1] of LongWord =
+    (1, 127, 128, 255, 256, 16383, 16384, 65535);
+var
+  p, err: string;
+  e, got: TVdbIdxEntryArray;
+  h: TVdbIdxHeader;
+  tags: TVdbIdxTagArray;
+  i: Integer;
+  okAll: Boolean;
+  sz: Int64;
+begin
+  p := IncludeTrailingPathDelimiter(gDir) + 'varint.idx';
+  SetLength(e, N);
+  SetLength(tags, 0);
+  for i := 0 to N - 1 do
+  begin
+    e[i].Key := QWord($FEDCBA9876543210) - QWord(i) * 12345;
+    e[i].PageNo := PAGES[i];
+    e[i].Slot := Word(SLOTS[i]);
+    e[i].Pad := 0;
+  end;
+  VDbIdxSaveEx(p, e, tags, 7, 99, Int64(99) * 4096);
+  sz := FileSizeOf(p);
+  if not VDbIdxLoadEx(p, got, h, tags, err) then
+    Fail('varint idx okunamadi: ' + err)
+  else
+  begin
+    okAll := Length(got) = N;
+    if okAll then
+      for i := 0 to N - 1 do
+        if (got[i].Key <> e[i].Key) or (got[i].PageNo <> e[i].PageNo) or
+           (got[i].Slot <> e[i].Slot) then
+        begin
+          okAll := False;
+          Break;
+        end;
+    if okAll then
+      Ok(Format('varint sinirlari (1..2^31-1 sayfa, 1..65535 slot) birebir ' +
+        '(%d bayt, %d kayit)', [sz, N]))
+    else
+      Fail('varint sinir degeri yanlis cozuldu');
+  end;
+  if FileExists(p) then DeleteFile(p);
+end;
+
 { ================================================================== ana }
 
 var
@@ -456,6 +578,8 @@ begin
   TestShortIdx(N);
   TestStaleIdx(N);
   TestMutations(N);
+  TestLegacyIdx;
+  TestVarintBounds;
 
   WriteLn;
   WriteLn('================================================');

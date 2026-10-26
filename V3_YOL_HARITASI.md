@@ -433,6 +433,24 @@ Kapı — `lockchk` (14): gerçek **çocuk süreçler** (kendini farklı argüma
 2. Busy beklemesi sabit `Sleep(20)` sayımıyla ölçülüyordu; Windows zamanlayıcı
    çözünürlüğü hedefi %50'den fazla aşırtıyordu. Gerçek süreye çevrildi.
 
+### v3.2 — `.idx` varint (VER 2) (2026-10-26)
+
+`.idx` kaydı 16 bayttan **değişken uzunluğa** indi: `Key(8) | PageNo(varint) |
+Slot(varint)`. Satır anahtarı `VDbHashKey` ile üretilen sanki-rastgele 64 bit
+olduğu için anahtar **ham** kalır (varint onu büyütürdü) ve **sıralama
+yapılmaz** — heap hash sırası korunur, checkpoint'te ek maliyet yok.
+
+| Ölçüm (`idxchk`, 50.000 satır) | Sonuç |
+|---|---|
+| `.idx` boyu | 800.064 B → **539.396 B** (−32,6%) |
+| satır başına | 16,0 B → **10,8 B** |
+| idx ile açılış / tam tarama | 6 ms / 18 ms |
+| Kapı | idxchk **19/0** (VER 1 uyumu + varint sınırları) |
+
+Yazan yalnız VER 2 üretir; okuyan VER 1'i de okur. Eski ikili VER 2'yi
+reddedip tam tarama yapar (`.idx` türetilmiş veridir; kayıp yok). CRC kodlanmış
+bayt akışı üzerinde hesaplanır.
+
 ### Sıradaki sürüme ertelenen (v4 sonrası)
 - Zone map'in sayfa düzeyinde yeniden ele alınması
 - Satır gövdesi varint/delta kodlama (F3-1'in kalanı)

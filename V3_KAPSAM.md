@@ -400,6 +400,28 @@ motorun açılışına bırakıldı, kilit hatası doğru mesajla dönüyor. (2)
 beklemesi sabit `Sleep(20)` sayımıyla ölçülüyordu; Windows zamanlayıcı
 çözünürlüğü hedefi %50'den fazla aşırtıyordu.
 
+### `.idx` varint (v3.2, 2026-10-26)
+
+Kalıcı anahtar dizini **VER 2**: kayıtlar `Key(8) | PageNo(varint) | Slot(varint)`.
+Satır anahtarı `VDbHashKey` ile üretilen **sanki-rastgele 64 bit** değerdir;
+varint/delta onu büyütürdü, bu yüzden anahtar **ham 8 bayt** kalır. Kayıtlar
+sıralanmaz (heap hash sırası korunur) — yükleyici sıraya zaten bağımlı değil,
+böylece checkpoint'te sıralama maliyeti ödenmez.
+
+| Ölçüm (`idxchk`, 50.000 satır) | VER 1 | VER 2 |
+|---|---|---|
+| `.idx` boyu | 800.064 B | **539.396 B** (−32,6%) |
+| satır başına | 16,0 B | **10,8 B** |
+| idx ile açılış | — | 6 ms (tam tarama 18 ms) |
+
+- Yazıcı **yalnız VER 2** üretir; okuyucu VER 1'i de okur (eski dosyalar
+  çalışmaya devam eder). Eski bir ikili VER 2 dosyasını görürse onu reddeder ve
+  **tam tarama** yapar — `.idx` hiçbir zaman veri kaynağı değildir, kayıp yok.
+- CRC artık kodlanmış **bayt akışı** üzerinde hesaplanır (kayıt dizisi
+  üzerinden yeniden kodlamaya gerek yok); bozuk/kesik dosya sessizce atlanır.
+- Kapı: `idxchk` **19/0** — VER 1 uyumu (elle yazılmış eski biçim, 500 kayıt
+  birebir) ve varint sınırları (1…2³¹−1 sayfa, 1…65535 slot) ayrıca sınanır.
+
 ### Sayfa şifreleme (Sprint 3.4)
 
 Varsayılan **kapalı**; v3 dosyası eskisi gibi düz metindir. Şifreli dosya
