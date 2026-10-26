@@ -1210,6 +1210,13 @@ güvenliğin bilinçli bedelidir.
   kalabilir).
 - Canlı bir veritabanının **sürüm yükseltmesi** (dosya biçimi değişimi) çok
   süreçli kullanımda desteklenmez; yükseltme tek süreçle yapılmalıdır.
+- **Süreçler arası DDL** (başka bir süreç açıkken `CREATE/DROP/ALTER`)
+  sınanmadı ve desteklenmez: şema bilgisi oturum açılışında yüklenir; sayfa
+  önbelleği tazelense de başka sürecin şema değişikliği o oturuma yansımaz.
+  Şema değişikliklerini tek süreçle yapın (`prochk` yalnız satır yazar).
+- Şifreli veritabanında çok süreçli yazma kod yolunda desteklenir
+  (`StoreRefreshed` WAL'i anahtar/tuzla yeniden açar) ama ayrı bir kapıyla
+  sınanmadı; `prochk` şifresiz dosya kullanır.
 - Aynı süreç içindeki çok oturumlu davranış (v3.15 MVCC, ilk commit kazanır)
   değişmedi.
 

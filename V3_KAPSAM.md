@@ -546,8 +546,11 @@ Kapsam **süreç içi çok oturumlu yazma**dır: aynı `IVdbBackend` üzerinde b
   okuyucularını da bekletir); **açık bir salt-okunur oturum** paylaşımlı kilidi
   oturum boyu tuttuğu için yazarları bloklar (`lockchk` bölüm 3); adil kuyruk
   yoktur; canlı veritabanının **sürüm yükseltmesi** çok süreçli kullanımda
-  desteklenmez. Snapshot isolation süreç **içinde** var (v3.15), süreçler
-  arasında görünürlük "son commit" düzeyindedir.
+  desteklenmez. **Süreçler arası DDL** (başka süreç açıkken `CREATE/DROP/ALTER`)
+  sınanmadı ve desteklenmez: şema oturum açılışında yüklenir. Şifreli dosyada
+  çok süreçli yazma kod yolunda var ama ayrı bir kapıyla sınanmadı. Snapshot
+  isolation süreç **içinde** var (v3.15), süreçler arasında görünürlük "son
+  commit" düzeyindedir.
 
 | Ölçüm (`benchcmp`, 200k × 3 kolon, 3 koşu medyanı, 32 bit) | Değer |
 |---|---|
