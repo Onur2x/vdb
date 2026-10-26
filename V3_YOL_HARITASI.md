@@ -868,10 +868,18 @@ Kullanıcı kararı, önceki "v4'e ertele" planını geçersiz kılar:
 Sıra (risk ve ölçülebilir kazanç sırasına göre; her madde ayrı dilim,
 kendi kapıları ve ölçümüyle):
 
-1. **Bloom filtresi** — `.idx` üzerinde **türetilmiş** yapı, dosya biçimine
-   dokunmaz (en güvenli biçim değişikliği). `=` / `IN` nokta aramalarında
-   olmayan anahtarı disk erişimi olmadan eler. Yanlış negatif **olamaz**;
-   yanlış pozitif oranı ölçülerek raporlanır.
+1. ~~**Bloom filtresi**~~ — **ÖLÇÜMLE REDDEDİLDİ (2026-10-26).** Gerekçe:
+   bu motorda anahtar dizini (`.odb.idx`) açılışta **tamamen belleğe**
+   yüklenip açık adresleme tablosuna dönüşüyor; olmayan anahtar araması
+   hiç disk erişimi yapmıyor. Ölçüm (`tmp64/pointchk`, 200k satır, 50k
+   sorgu): taban `SELECT 1` 3,574 µs, **olmayan** anahtar 3,984 µs →
+   probe payı **0,41 µs**; var olan anahtar 19,787 µs (probe + satır
+   çözme). Disk erişimi olsaydı 50–100 µs beklenirdi. Bloom en iyi
+   durumda bu 0,41 µs'yi atlatır, kendi hash/bit testi maliyeti ~0,05–0,1
+   µs + ek bellek ve `.idx` kaydı getirir: net kazanç gürültü altında.
+   Nötr karmaşıklık eklememek için yapılmadı. Bloom'un gerçekten
+   gerekeceği senaryo, anahtar dizinin **diskte** tutulduğu (bellek içi
+   hash yerine B-tree) bir mimaridir; o ayrı bir tasarım kararıdır.
 2. **Merge JOIN** — iki tarafın sıralı akışını tek geçişte birleştirir;
    `HASH` ve `NESTED` yanında üçüncü yöntem, maliyet modeliyle seçilir.
 3. **Dosya boyutu** — PK'nin satır gövdesinde ikinci kez yazılmasının
