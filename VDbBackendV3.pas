@@ -206,6 +206,12 @@ type
         yoktur (dogru kaynak her zaman motorun kendisidir). }
       FTagCounts: TDictionary<Integer, Int64>;
       FTagBuf: TBytes;
+      { v3.10: ApplyBatch sirasinda etiket farki ARA SOZLUKTE degil, dogrudan
+        FTagCounts'a yazilir. Ara sozluk (BatchTagDelta) yalnizca parti
+        surerken (yazma kumesi acikken) gerekliydi; uygulama aninda zaten
+        FEngCs altindayiz ve MergeTagDeltas hemen ardindan geliyordu —
+        satir basina iki ek sozluk islemi bosa gidiyordu. }
+      FInApply: Boolean;
       { Sayac kuruldu mu? False ise tutulan harita guvenilmez; ilk COUNT
         isteginde tam taramayla kurulur. }
       FTagCountsValid: Boolean;
@@ -1191,6 +1197,7 @@ var
   oldTag, newTag: Integer;
   oldVal: TBytes;
   s: TWriteSet;
+  n0: Integer;
 begin
   RequireWritable;
   RequireBatchWrite;
@@ -1205,9 +1212,13 @@ begin
     JournalKey(Key);
     rec.Present := True;
     rec.Value := Copy(Value, 0, Length(Value));
-    if not s.Map.ContainsKey(Key) then
-      s.Order.Add(Key);
+    { v3.10: ONCEDEN `ContainsKey` + `AddOrSetValue` = anahtar basina IKI tam
+      arama (200k satirda olculen: 0,719 us; tek arama 0,595 us). Count
+      degisimi "yeni anahtar mi" sorusunu bedava yanitlar. }
+    n0 := s.Map.Count;
     s.Map.AddOrSetValue(Key, rec);
+    if s.Map.Count <> n0 then
+      s.Order.Add(Key);
     Exit;
   end;
   FEngCs.Enter;
@@ -1709,7 +1720,7 @@ begin
   if Delta = 0 then Exit;
   { Sayac henuz kurulmadiysa yazma yolu haritayi KIRLETMEZ. }
   if not FTagCountsValid then Exit;
-  if BatchOpen then
+  if BatchOpen and (not FInApply) then
   begin
     if not BatchTagDelta.TryGetValue(Tag, cur) then cur := 0;
     BatchTagDelta.AddOrSetValue(Tag, cur + Delta);
@@ -1881,7 +1892,12 @@ begin
       for i := 0 to s.Order.Count - 1 do
         FAlien.AddOrSetValue(s.Order[i], FCommitGen + 1);
     end;
-    ApplyBatch;
+    FInApply := True;
+    try
+      ApplyBatch;
+    finally
+      FInApply := False;
+    end;
     { v3.1: parti ici etiket degisimleri simdi sayaca islenir. }
     MergeTagDeltas;
     Inc(FCommitGen);

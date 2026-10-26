@@ -541,6 +541,7 @@ Kapsam **süreç içi çok oturumlu yazma**dır: aynı `IVdbBackend` üzerinde b
 |---|---|
 | toplu INSERT — before-image **kapalı** (A/B) | 6,532 µs/satır |
 | toplu INSERT — before-image **açık** | **7,466 µs/satır** (+%14,3) |
+| toplu INSERT — v3.10 sonrası (aynı iş) | **6,115 µs/satır** (v2 3,822 → 1,60x) |
 | autocommit INSERT | 1,024 ms |
 | açılış (200k satır) | 39,0 ms |
 

@@ -719,6 +719,64 @@ her genel işlemden sonra derinlik 0, iç içe girişin gerçekten kullanıldı�
 backend'de karışık okuma/yazma, `LogPrune` sonrası derinlik.
 14/14 kapı yeşil; `lockchk` 64-bit derlemede de **30/0**.
 
+### v3.10 — toplu INSERT: 6,63 → 6,12 µs/satır (2026-10-26)
+
+§9'daki tek ölçülmüş **hız gerilemesi** kapatıldı: v3 toplu INSERT v2'nin
+~1,6 katı yavaştı. Bu turda **dosya biçimi değişmedi** — düzeltmeler yazma
+yolundaki gereksiz kopya ve sözlük işlemlerini kaldırır; üretilen baytlar
+birebir aynıdır.
+
+Kalan fark önce katman katman ölçüldü (200k satır, `tmp64/insprof`,
+`tmp64/cmtprof`, 3 koşu medyanı):
+
+| Katman | Ölçüm |
+|---|---|
+| Sayfa motoru `Insert` döngüsü | 0,484 µs/satır |
+| Sayfa motoru `Commit` | 0,545 µs/satır |
+| `Checkpoint` | 0,072 µs/satır |
+| backend `Put` (hazırlama) | 1,520 µs/satır |
+| `tb.Insert` tam satır yolu | 4,277 µs/satır |
+
+Yani fark sayfa motorunda değil, **backend sarmalayıcısında** birikiyordu.
+Üç düzeltme:
+
+1. **Değişim günlüğü yerinde kodlanıyor.** `EndGroup` her kayıt için
+   `TakePayload` (1 ayırma + 2 kopya) ve `BuildRec` (1 ayırma + kopya)
+   çağırıp sonucu üçüncü kez grup tamponuna kopyalıyordu: satır başına
+   2 ayırma + 3 kopya. Yeni `PutChangeRecAt` kaydı doğrudan grup tamponuna
+   yazar; alan sırası, uzunluklar ve CRC **birebir aynı** kalır. Grup boyutu
+   da artık `FGroupBytes`'ten gelir (eskiden grup bir kez daha toplanıyordu).
+2. **Etiket farkı ara sözlükten geçmiyor.** `ApplyBatch` sırasında
+   `BatchTagDelta`'ya yazılıp hemen ardından `MergeTagDeltas` ile
+   `FTagCounts`'a aktarılıyordu — zaten `FEngCs` altındayız, ara durak
+   gereksizdi. `FInApply` bayrağıyla fark doğrudan sayaca yazılır; parti
+   dışı yollar (autocommit `Put`) davranışını korur.
+3. **`Put`'ta tek sözlük araması.** `ContainsKey` + `AddOrSetValue` anahtar
+   başına iki tam arama yapıyordu (ölçülen: 0,719 vs 0,595 µs). "Yeni
+   anahtar mı" sorusu artık `Count` değişiminden bedava yanıtlanır.
+
+Ölçüm (`tmp64/insprof2`, 200k satır × 3 kolon, commit dâhil, QPC, 3 koşu
+medyanı):
+
+| | Önce | Sonra |
+|---|---|---|
+| hazırlama | 4,269 µs | **4,046 µs** |
+| commit | 2,383 µs | **2,076 µs** |
+| **TOPLAM** | **6,632 µs** | **6,115 µs** (−%7,8) |
+| günlüğün commit içindeki payı | 0,51 µs | **0,21 µs** |
+
+v2 ile aynı süreçte kıyas (`tmp64/inscmp`, 3 koşu medyanı): v3 **6,093** /
+v2 **3,822** = **1,60x**. Yani v3 hâlâ v2'den yavaş; kalan farkın büyük
+kısmı satır başına **dört kez** çözülen oturum kümesi (`OwnSet`: kilit +
+sözlük araması; `InBatch`/`Exists`/`Get`/`Put`) ve v3'ün dayanıklılık
+bedelidir (WAL commit + değişim günlüğü). Oturum kümesini kilitsiz
+önbelleğe almak ölçülebilir kazanç verirdi, ancak yarış koşulu riski
+taşıdığı için **veri güvenliği önceliğine aykırı** bulunup yapılmadı.
+
+Doğrulama: 14/14 kapı yeşil (`logchk` 43/0, `pitrchk` 21/0, `replchk`
+37/0 — günlük baytlarının birebir aynı kaldığını bunlar kilitler),
+`sqltest` v3 **2801/0/33**, v2 **3238/0/0**, `lockchk` 64-bit **30/0**.
+
 ### Sıradaki sürüme ertelenen (v4 sonrası)
 - Satır gövdesi varint/delta kodlama (F3-1'in kalanı)
 - Dosya boyutu (PK'nin ikinci kez yazılması, hücre başlığı sıkıştırma)

@@ -736,6 +736,50 @@ begin
     Move(ANew[0], Result[8 + Length(AOld)], Length(ANew));
 end;
 
+{ v3.10 (2026-10-26): grup kodlamasi YERINDE. ONCEDEN her satir icin
+  TakePayload (1 bellek ayirma + 2 kopya) ve BuildRec (1 bellek ayirma +
+  kopya) cagriliyor, sonra ucuncu kez grup tamponuna kopyalaniyordu:
+  satir basina 2 ayirma + 3 kopya. Bu yardimci kaydi dogrudan grup
+  tamponuna yazar; uretilen baytlar BuildRec+TakePayload ile BIREBIR
+  aynidir (alan alan ayni sira, ayni CRC). }
+function PutChangeRecAt(var Buf: TBytes; Pos: Integer; AMagic: LongWord;
+  AKind: Byte; ASeq, ATsMs: Int64; ATableId: Integer; AKey: QWord;
+  const AOld, ANew: TBytes): Integer;
+var
+  payloadLen, recLen, p: Integer;
+begin
+  payloadLen := 8 + Length(AOld);
+  if AKind = VDBLOG_KIND_PUT then Inc(payloadLen, Length(ANew));
+  recLen := VDBLOG_REC_HDR + payloadLen + 4;
+  FillChar(Buf[Pos], VDBLOG_REC_HDR, 0);
+  PutU32(Buf, Pos, AMagic);
+  PutU32(Buf, Pos + 4, LongWord(payloadLen));
+  Move(ASeq, Buf[Pos + 8], 8);
+  Move(ATsMs, Buf[Pos + 16], 8);
+  Buf[Pos + 24] := AKind;
+  PutU32(Buf, Pos + 28, LongWord(ATableId));
+  PutU64(Buf, Pos + 32, AKey);
+  p := Pos + VDBLOG_REC_HDR;
+  PutU32(Buf, p, LongWord(Length(AOld)));
+  if AKind = VDBLOG_KIND_PUT then
+    PutU32(Buf, p + 4, LongWord(Length(ANew)))
+  else
+    PutU32(Buf, p + 4, 0);
+  Inc(p, 8);
+  if Length(AOld) > 0 then
+  begin
+    Move(AOld[0], Buf[p], Length(AOld));
+    Inc(p, Length(AOld));
+  end;
+  if (AKind = VDBLOG_KIND_PUT) and (Length(ANew) > 0) then
+  begin
+    Move(ANew[0], Buf[p], Length(ANew));
+    Inc(p, Length(ANew));
+  end;
+  PutU32(Buf, Pos + recLen - 4, VDbCrc32Of(Buf[Pos], recLen - 4));
+  Result := Pos + recLen;
+end;
+
 procedure TVdbChangeLog.BeginGroup;
 begin
   if not FEnabled then Exit;
@@ -793,6 +837,7 @@ var
   all, rec, payload: TBytes;
   seq, ts: Int64;
   posBefore: Int64;
+  r: TVdbLogChange;
 begin
   ASeq := FSeq;
   ATsMs := 0;
@@ -806,20 +851,16 @@ begin
   end;
   seq := FSeq + 1;
   ts := VdbLogNowMs;
-  total := 0;
-  for i := 0 to FGroup.Count - 1 do
-    total := total + VDBLOG_REC_HDR + 4 +
-      RecPayloadLen(FGroup[i].OldVal, FGroup[i].NewVal);
-  total := total + VDBLOG_REC_HDR + 4 + 4;   // END + sayi
+  { v3.10: toplam boyut FGroupBytes'ten gelir (Add* zaten tam sayiyor);
+    ONCEDEN tum grup bir kez daha dolasilip toplaniyordu. }
+  total := Integer(FGroupBytes) + VDBLOG_REC_HDR + 4 + 4;   // END + sayi
   SetLength(all, total);
   pos := 0;
   for i := 0 to FGroup.Count - 1 do
   begin
-    payload := TakePayload(FGroup[i].Kind, FGroup[i].OldVal, FGroup[i].NewVal);
-    rec := BuildRec(VDBLOG_MAGIC_REC, FGroup[i].Kind, seq, ts,
-      FGroup[i].TableId, FGroup[i].Key, payload);
-    Move(rec[0], all[pos], Length(rec));
-    pos := pos + Length(rec);
+    r := FGroup[i];
+    pos := PutChangeRecAt(all, pos, VDBLOG_MAGIC_REC, r.Kind, seq, ts,
+      r.TableId, r.Key, r.OldVal, r.NewVal);
   end;
   SetLength(payload, 4);
   PutU32(payload, 0, LongWord(FGroup.Count));
