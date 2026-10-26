@@ -777,8 +777,74 @@ Doğrulama: 14/14 kapı yeşil (`logchk` 43/0, `pitrchk` 21/0, `replchk`
 37/0 — günlük baytlarının birebir aynı kaldığını bunlar kilitler),
 `sqltest` v3 **2801/0/33**, v2 **3238/0/0**, `lockchk` 64-bit **30/0**.
 
+### v3.11 — satır gövdesi varint: dosya −%16, INSERT −%6 (2026-10-26)
+
+Ertelenen listenin ilk maddesi (satır gövdesi varint). Bugüne kadar her
+satırda **kolon başına sabit 4 baytlık** uzunluk alanı, pk ve kolon sayısı
+için de 2 baytlık alan vardı; 5 kolonlu bir satırda yalnızca uzunluk
+alanları 22 bayt tutuyordu. Yeni gövde:
+
+```
+v1: [u16 tableId][u16 pkLen][pk][u16 colCount]
+    + her kolon: [u8 ctype][i32 vlen][payload]        (vlen = -1 => NULL)
+v2: [u16 $FFFF][u16 tableId][varint pkLen][pk][varint colCount]
+    + her kolon: [u8 ctype][varint lenCode][payload]  (0 => NULL, aksi
+                                                        halde len+1)
+```
+
+**Ayırt edici neden `$FFFF` ve neden güvenli:** satırın ilk iki baytı
+`$FFFF` ise gövde v2'dir. `$FFFF` bu motorda **hiçbir zaman** geçerli bir
+tablo kimliği olamaz (`CreateTable` `FNextId >= $FFFF` reddeder); bu turda
+aynı sınır `CreateMaterializedView` için de eklendi (eskiden `Inc(FNextId)`
+sonrası atama yüzünden `$FFFF`'e ulaşabiliyordu) ve şema yüklemesi böyle
+bir kaydı **açık hatayla** reddediyor. Yani eski bir satırın yanlışlıkla
+v2 sanılması mümkün değil — "sessiz yanlış sonuç" yolu kapalı.
+
+**Dosya sürümü 3 → 4.** Bu, ilk planda düşünülmeyen ama zorunlu olan
+karar: satır biçimi değiştiği hâlde başlık 3 kalsaydı, **eski bir ikili**
+(yeni motorun yazdığı dosyayı) açıp v2 gövdeyi v1 sanarak ya satırları
+düşürür ya da yanlış değer üretirdi. Sürüm 4 bu yolu kapatır:
+- sürüm 3 dosyalar **açılır**; aynı dosyada v1 ve v2 satırlar bir arada
+  okunur (eski satır güncellenince v2 yazılır), ilk **yazılabilir** açılışta
+  başlık 4'e yükseltilir (`SaveMeta`);
+- salt-okunur açılış yazmadığı için yükseltme yapmaz;
+- eski ikili sürüm 4 dosyayı `desteklenmeyen surum: 4` hatasıyla reddeder
+  (ölçüldü: v3.10 ikilisi `Check` çağrısında tam bu hatayı verdi);
+- `RESTORE` ve `VERIFY` yolları da sürüm 3'ü kabul eder.
+
+Ölçüm (QPC, 3 koşu medyanı, `tmp64/insprof2`, 200k satır × 3 kolon,
+commit dâhil):
+
+| | v3.10 | v3.11 |
+|---|---|---|
+| hazırlama | 4,003 µs | **3,933 µs** |
+| commit | 2,128 µs | **1,863 µs** |
+| **TOPLAM (log=on)** | **6,157 µs** | **5,771 µs** (−%6,3) |
+| TOPLAM (log=off) | 5,673 µs | **5,388 µs** |
+| `.odb` boyu | 11.912 KB | **10.040 KB** (−%15,7) |
+
+Tarama hızı değişmedi (`tmp64/scanbench`, 200k satır, 3 koşu medyanı:
+32,0 ms → 30–33 ms bandı; fark gürültü içinde). Satır başına kazanç
+kolon sayısıyla artar; sabit genişlikli 3 kolonlu satırda 39 → **30 bayt**
+(−%23), 7 kolonlu karışık tabloda fiilen 69.632 → 61.440 bayt (−%11,8,
+`tmp64/rowfmt`, 500 satır).
+
+Geriye dönük okuma **gerçek bir eski dosyayla** kanıtlandı: `caeb619`
+(v3.10) sürümünden ayrı bir worktree'de derlenen ikili 500 satırlık DB
+yazdı, yeni ikili aynı dosyada `COUNT=500` ve tüm değerlerin FNV özetinde
+**birebir** aynı sonucu verdi. Sonra 250 satır `UPDATE` edilip dosya
+karışık biçime (v1 + v2) getirildi: dokunulmayan 250 satırın özeti yine
+birebir aynı kaldı.
+
+Testler: `sqltest` v3 **2822/0/33** (önce 2801), v2 **3256/0/0** (önce
+3238) — yeni `T157_SatirGovdesi`: elle kurulmuş v1 ve v2 gövdenin aynı
+`tid/pk/kolon` değerlerini vermesi, `$FFFF` işaretinin ham taramada
+görülmesi, sabit genişlikli satırın **tam 30 bayt** olması, NULL / büyük
+negatif INT / 127 bayttan uzun metin (2 baytlık varint) yolları.
+14/14 kapı yeşil; `sqltest` ve `lockchk` 64-bit derlemede de yeşil
+(2812/0/33 ve 30/0).
+
 ### Sıradaki sürüme ertelenen (v4 sonrası)
-- Satır gövdesi varint/delta kodlama (F3-1'in kalanı)
 - Dosya boyutu (PK'nin ikinci kez yazılması, hücre başlığı sıkıştırma)
 - Bloom filtresi, merge JOIN, ifade bytecode
 - Snapshot isolation (MVCC okuma izolasyonu) ve süreçler arası çok yazarlılık

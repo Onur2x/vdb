@@ -61,9 +61,14 @@ const
 
   // File header
   VDB_FILE_MAGIC = $42444F56; // 'VODB' little-endian
-  VDB_FILE_VER = 3;
+  VDB_FILE_VER = 4;
   VDB_FILE_VER_OLD = 1;
   VDB_FILE_VER_V2 = 2;
+  { v3.11: 3 = satir govdesi v1 (sabit 4 baytlik kolon uzunlugu) yazmis
+    olabilecek surum. Okuma icin kabul edilir, ilk yazmada baslik 4'e
+    yukseltilir; boylece ESKI bir ikili bu dosyayi acmayi REDDEDER
+    (sessizce yanlis satir cozmez). }
+  VDB_FILE_VER_V3 = 3;
   VDB_HDR_SIZE = 16;
   VDB_HFLAG_HAS_ENCRYPTED = 1;
 

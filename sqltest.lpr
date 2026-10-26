@@ -17299,6 +17299,140 @@ end;
 
 { Sprint 2.9: test kosucusu. Her test kendi try/except'inde kosar;
   boylece bir hata kalan testleri durdurmaz ve siniflandirma yapilabilir. }
+{ v3.11: satir govdesi v2 (varint) SOZLESMESI.
+  Iki govde de AYNI anlama gelmeli; yeni satirlar $FFFF isaretiyle
+  yazilmali ve dosya surumu 4 olmali (eski ikili dosyayi acmaz). }
+type
+  TRowFmtStat = record
+    N, OkExt, BadExt, BadTid, MaxLen, Tid: Integer;
+  end;
+
+function RowFmtScanCb(Key: QWord; Buf: PByte; Len: Integer;
+  User: Pointer): Boolean;
+var
+  st: ^TRowFmtStat;
+begin
+  st := User;
+  { Sema kaydi (anahtar 0) satir degildir ve tablo filtresinden bagimsiz
+    olarak taramaya dahil edilir; sayilmaz. }
+  if Key = 0 then Exit(True);
+  Inc(st^.N);
+  if (Len >= 4) and (Buf[0] = $FF) and (Buf[1] = $FF) then
+    Inc(st^.OkExt)
+  else
+    Inc(st^.BadExt);
+  if Len >= 4 then
+    if (Integer(Buf[2]) or (Integer(Buf[3]) shl 8)) <> st^.Tid then
+      Inc(st^.BadTid);
+  if Len > st^.MaxLen then st^.MaxLen := Len;
+  Result := True;
+end;
+
+procedure T157_SatirGovdesi;
+var
+  v1, v2: TBytes;
+  tid: Word;
+  pks: string;
+  vals1, vals2: TStrArray;
+  ft: array[0..2] of Byte;
+  fo, fl: array[0..2] of Integer;
+  ok1, ok2: Boolean;
+  st: TRowFmtStat;
+  td: TTableDef;
+  i: Integer;
+  uzun: string;
+  res: TSqlResult;
+begin
+  Grp('T157: satir govdesi v2 (varint) ve geriye donuk okuma');
+  Fresh('govde');
+
+  { Elle kurulmus ESKI (v1) govde: tid=7, pk='ab', kolonlar
+    [INT 42, TEXT 'xy', NULL].  v1: sabit 4 baytlik uzunluk alanlari. }
+  v1 := TBytes.Create(
+    $07, $00, $02, $00, Ord('a'), Ord('b'), $03, $00,
+    $00, $01, $00, $00, $00, $54,                    // INT 42 (zigzag 84)
+    $02, $02, $00, $00, $00, Ord('x'), Ord('y'),     // TEXT 'xy'
+    $00, $FF, $FF, $FF, $FF);                        // NULL
+
+  { AYNI satirin YENI (v2) govdesi: isaret + varint uzunluklar. }
+  v2 := TBytes.Create(
+    $FF, $FF, $07, $00, $02, Ord('a'), Ord('b'), $03,
+    $00, $02, $54,
+    $02, $03, Ord('x'), Ord('y'),
+    $00, $00);
+
+  ok1 := VDbPeekRawRow(v1, 3, tid, pks, ft, fo, fl);
+  Dogrula('v1 govde okunur (tid/pk)', ok1 and (tid = 7) and (pks = 'ab'));
+  ok2 := VDbPeekRawRow(v2, 3, tid, pks, ft, fo, fl);
+  Dogrula('v2 govde okunur (tid/pk)', ok2 and (tid = 7) and (pks = 'ab'));
+
+  ok1 := tb.DecodeRowDataPublic(v1, tid, pks, vals1);
+  ok2 := tb.DecodeRowDataPublic(v2, tid, pks, vals2);
+  Dogrula('iki govde ayni kolon sayisini verir',
+    ok1 and ok2 and (Length(vals1) = 3) and (Length(vals2) = 3),
+    IntToStr(Length(vals1)) + '/' + IntToStr(Length(vals2)));
+  Dogrula('iki govde ayni degerleri verir',
+    (Length(vals1) = 3) and (Length(vals2) = 3) and
+    (vals1[0] = vals2[0]) and (vals1[1] = vals2[1]) and
+    (vals1[2] = vals2[2]));
+  Dogrula('v2: INT 42 (zigzag varint)', vals2[0] = '42', vals2[0]);
+  Dogrula('v2: TEXT xy', vals2[1] = 'xy', vals2[1]);
+  Dogrula('v2: NULL', vals2[2] = '');
+  Dogrula('v2 govde daha kucuk', Length(v2) < Length(v1),
+    IntToStr(Length(v1)) + ' -> ' + IntToStr(Length(v2)));
+
+  { Gercek SQL yolu: sinir degerler (NULL, buyuk negatif, 127 bayttan uzun
+    metin) yazilip ayni oturumda dogru okunmali. }
+  sq.Exec('CREATE TABLE rfy(id INTEGER PRIMARY KEY, n INTEGER, t TEXT, b BOOL)');
+  uzun := StringOfChar('U', 130) + #$C5#$9F + 'g';   // 130+ bayt: 2 baytlik varint
+  sq.Exec('INSERT INTO rfy(id,n,t,b) VALUES(1,42,''xy'',1)');
+  sq.Exec(Format('INSERT INTO rfy(id,n,t,b) VALUES(2,-9007199254740993,''%s'',0)',
+    [uzun]));
+  sq.Exec('INSERT INTO rfy(id,n,t,b) VALUES(3,NULL,NULL,NULL)');
+
+  ChkVal('govde: INT degeri', 'SELECT n FROM rfy WHERE id=1', 0, 0, '42');
+  ChkVal('govde: buyuk negatif INT', 'SELECT n FROM rfy WHERE id=2',
+    0, 0, '-9007199254740993');
+  ChkVal('govde: NULL sayisi', 'SELECT COUNT(*) FROM rfy WHERE n IS NULL',
+    0, 0, '1');
+  ChkVal('govde: BOOL', 'SELECT COUNT(*) FROM rfy WHERE b', 0, 0, '1');
+  res := sq.Exec('SELECT t FROM rfy WHERE id=2');
+  Dogrula('govde: 130 bayttan uzun metin (2 baytlik varint)',
+    (Length(res.Rows) = 1) and (res.Rows[0][0] = uzun),
+    IntToStr(Length(res.Rows)));
+  sq.Exec('UPDATE rfy SET n = 7, t = ''guncel'' WHERE id = 1');
+  ChkVal('govde: UPDATE sonrasi', 'SELECT n FROM rfy WHERE id=1', 0, 0, '7');
+  ChkVal('govde: UPDATE metin', 'SELECT t FROM rfy WHERE id=1',
+    0, 0, 'guncel');
+  sq.Exec('DELETE FROM rfy WHERE id = 3');
+  ChkVal('govde: DELETE sonrasi sayi', 'SELECT COUNT(*) FROM rfy', 0, 0, '2');
+
+  { Sabit genislikli satirlar: ham govde TAM 30 bayt olmali (v1: 39).
+    pk 4 bayt, her INT 2 baytlik zigzag varint, metin 10 bayt:
+    v2 = 2+2+1+4+1 + (1+1+2)*2 + (1+1+10) = 30. }
+  sq.Exec('CREATE TABLE rfx(id INTEGER PRIMARY KEY, a INTEGER, t TEXT)');
+  for i := 1000 to 1009 do
+    sq.Exec(Format('INSERT INTO rfx(id,a,t) VALUES(%d,%d,''abcdefghij'')',
+      [i, i]));
+  ChkVal('ham: rfx sayisi', 'SELECT COUNT(*) FROM rfx', 0, 0, '10');
+  if gV3 and (gBe <> nil) then
+  begin
+    td := tb.GetTable('rfx');
+    st.N := 0; st.OkExt := 0; st.BadExt := 0; st.BadTid := 0;
+    st.MaxLen := 0; st.Tid := td.TableId;
+    gBe.ScanRawIterAll(td.TableId, @RowFmtScanCb, @st);
+    Dogrula('ham: 10 satir tarandi', st.N = 10, IntToStr(st.N));
+    Dogrula('ham: her satir $FFFF isaretli', (st.N > 0) and (st.BadExt = 0),
+      IntToStr(st.BadExt));
+    Dogrula('ham: tablo kimligi dogru yerde', st.BadTid = 0,
+      IntToStr(st.BadTid));
+    Dogrula('ham: satir boyu 30 (v1 ayni satir 39 baytti)', st.MaxLen = 30,
+      IntToStr(st.MaxLen));
+  end
+  else
+    Ok('ham govde taramasi atlandi (v2 motorunda ham API yok)', '');
+end;
+
 type
   TTestRec = record
     Nm: string;
@@ -17306,7 +17440,7 @@ type
   end;
 
 const
-  TEST_SAYISI = 186;
+  TEST_SAYISI = 187;
 
   { v3 kosusunda ATLA: bu testler yalniz v2 motorunun (TVDb/WAL/arsiv/
     zone/indeks .idx) ozel yollarini kullanir; v3'te karsiligi yoktur.
@@ -17564,6 +17698,7 @@ begin
   TESTLER[183].Nm := 'T154_YonetimYollari'; TESTLER[183].P := T154_YonetimYollari;
   TESTLER[184].Nm := 'T155_AsofV32'; TESTLER[184].P := T155_AsofV32;
   TESTLER[185].Nm := 'T156_SqliteParity'; TESTLER[185].P := T156_SqliteParity;
+  TESTLER[186].Nm := 'T157_SatirGovdesi'; TESTLER[186].P := T157_SatirGovdesi;
 end;
 
 { ---------------------------------------------------------------------- main }

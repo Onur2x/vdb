@@ -3141,6 +3141,137 @@ begin
   Move(D[0], B[P], Length(D)); Inc(P, Length(D));
 end;
 
+{ ---------------------------------------------------------------- v3.11
+  SATIR GOVDESI v2 (varint). Gerekce: eski govdede her kolonun uzunlugu
+  sabit 4 bayt ve pk/kolon sayisi 2 bayt yaziliyordu; 5 kolonlu bir satirda
+  yalnizca uzunluk alanlari 22 bayt tutuyordu (satir govdesinin ~%30'u).
+
+  Bicim:
+    v1: [u16 tableId][u16 pkLen][pk][u16 colCount] + her kolon:
+        [u8 ctype][i32 vlen][payload]      (vlen = -1 => NULL)
+    v2: [u16 $FFFF][u16 tableId][varint pkLen][pk][varint colCount] + her
+        kolon: [u8 ctype][varint lenCode][payload]   (lenCode = 0 => NULL,
+        aksi halde lenCode = payload uzunlugu + 1)
+
+  AYIRT EDICI: govdenin ilk iki bayti $FFFF ise v2'dir. $FFFF bir TABLO
+  KIMLIGI OLAMAZ (CreateTable `FNextId >= $FFFF`, CreateMaterializedView
+  `>= $FFFE` reddeder; sema yuklemede de acik hata), bu yuzden eski bir
+  satirin yanlislikla v2 sanilmasi MUMKUN DEGIL.
+
+  DOSYA SURUMU (VDB_FILE_VER) 3 -> 4 YUKSELDI. Ayni dosyada eski (v1) ve
+  yeni (v2) satirlar bir arada bulunabilir: eski satirlar oldugu gibi
+  okunur, guncellenince v2 yazilir. Surum yukseltmesinin tek amaci ESKI
+  IKLININ dosyayi acmayi REDDETMESIDIR; eski ikili v2 govdeyi v1 sanip
+  sessizce yanlis veri uretirdi. Surum 3 dosyalar acilir ve ilk yazilabilir
+  acilista baslik 4'e yukseltilir. Veri kaybi riski yoktur.
+  Maliyet: satir basina 2 bayt fazla baslik, buna karsilik her kolonda
+  3 bayt ve pk/kolon sayisinda 1'er bayt kazanc. }
+
+const
+  VDB_ROW_EXT = Word($FFFF);
+
+function VdbVarUGet(B: PByte; Len: Integer; var P: Integer;
+  out U: LongWord): Boolean;
+{ Isaretsiz LEB128; en fazla 5 bayt (32 bit). }
+var
+  sh: Integer;
+  by: Byte;
+begin
+  Result := False;
+  U := 0;
+  sh := 0;
+  while (P < Len) and (sh <= 28) do
+  begin
+    by := B[P]; Inc(P);
+    U := U or (LongWord(by and $7F) shl sh);
+    if (by and $80) = 0 then Exit(True);
+    Inc(sh, 7);
+  end;
+end;
+
+type
+  TVdbRowHdr = record
+    Ext: Boolean;
+    TableId: Word;
+    PkOff, PkLen: Integer;
+    ColOff, ColCount: Integer;
+  end;
+
+function VdbRowHdrOf(B: PByte; Len: Integer; out H: TVdbRowHdr): Boolean;
+var
+  p: Integer;
+  w: Word;
+  u: LongWord;
+begin
+  Result := False;
+  FillChar(H, SizeOf(H), 0);
+  if (B = nil) or (Len < 2) then Exit;
+  p := 0;
+  w := B[0] or (Word(B[1]) shl 8);
+  Inc(p, 2);
+  H.Ext := (w = VDB_ROW_EXT);
+  if H.Ext then
+  begin
+    if p + 2 > Len then Exit;
+    H.TableId := B[p] or (Word(B[p + 1]) shl 8);
+    Inc(p, 2);
+    if not VdbVarUGet(B, Len, p, u) then Exit;
+    H.PkLen := Integer(u);
+  end
+  else
+  begin
+    H.TableId := w;
+    if p + 2 > Len then Exit;   // kisa/bozuk govde: tasma okuma yok
+    H.PkLen := B[p] or (Word(B[p + 1]) shl 8);
+    Inc(p, 2);
+  end;
+  if (H.PkLen < 0) or (p + H.PkLen > Len) then Exit;
+  H.PkOff := p;
+  Inc(p, H.PkLen);
+  if H.Ext then
+  begin
+    if not VdbVarUGet(B, Len, p, u) then Exit;
+    H.ColCount := Integer(u);
+  end
+  else
+  begin
+    if p + 2 > Len then Exit;
+    H.ColCount := B[p] or (Word(B[p + 1]) shl 8);
+    Inc(p, 2);
+  end;
+  H.ColOff := p;
+  Result := True;
+end;
+
+function VdbRowColLen(B: PByte; Len: Integer; var P: Integer; Ext: Boolean;
+  out Vl: LongInt): Boolean;
+{ KOLON UZUNLUGU. cikis: -1 = NULL, aksi halde yuk uzunlugu. }
+var
+  u: LongWord;
+begin
+  if Ext then
+  begin
+    Result := VdbVarUGet(B, Len, P, u);
+    if not Result then Exit;
+    if u = 0 then Vl := -1
+    else Vl := LongInt(u - 1);
+  end
+  else
+  begin
+    Result := P + 4 <= Len;
+    if Result then begin Move(B[P], Vl, 4); Inc(P, 4); end;
+  end;
+end;
+
+function VdbRowTableIdAt(B: PByte): Word;
+{ Uzunluk BILINMEYEN baglamlar icin (ofset tabanli yardimcilar): isaret
+  gorulduyse govde v2'dir ve en az 4 bayt baslik vardir. }
+begin
+  Result := B[0] or (Word(B[1]) shl 8);
+  if Result = VDB_ROW_EXT then
+    Result := B[2] or (Word(B[3]) shl 8);
+end;
+
 function EncodeRow(TableId: Word; const Pk: string; const T: TTableDef; const Vals: TStrArray): TBytes;
 // P-17b (2026-10-16): WIRE FORMAT BIREBIR ayni (DecodeRow/PeekRawRow/CRC
 // yeni durumu bilmiyor); tahsis baskisi azaltildi. ONCE: INT/FLOAT alan
@@ -3182,6 +3313,23 @@ var
     Move(V, b[p], 4); Inc(p, 4);
   end;
 
+  procedure PutVarU(V: LongWord);
+  begin
+    Grow(5);
+    while V >= $80 do
+    begin
+      b[p] := Byte(V and $7F) or $80; Inc(p);
+      V := V shr 7;
+    end;
+    b[p] := Byte(V); Inc(p);
+  end;
+
+  procedure PutLenCode(N: Integer);
+  { v3.11: 0 = NULL, aksi halde N + 1. }
+  begin
+    if N < 0 then PutVarU(0) else PutVarU(LongWord(N) + 1);
+  end;
+
   { v3.2: INT kolonu zigzag LEB128. Kucuk degerler (0, 1, 42, 1000000)
     1-3 bayt tutar; eski bicimde her INT 4 (vlen) + 8 = 12 baytti.
     Varint 8 bayt veya daha uzun gerekiyorsa ESKI ham bicime (vlen=8)
@@ -3209,10 +3357,10 @@ var
     end;
     if n >= 8 then
     begin
-      PutI32(8); Grow(8); Move(V, b[p], 8); Inc(p, 8);
+      PutLenCode(8); Grow(8); Move(V, b[p], 8); Inc(p, 8);
       Exit;
     end;
-    PutI32(n);
+    PutLenCode(n);
     Grow(n);
     for j := 0 to n - 1 do
     begin
@@ -3234,13 +3382,18 @@ var
     Result := True;
   end;
 
+  procedure PutPkU8Len(N: Integer);
+  begin
+    PutVarU(LongWord(N));
+  end;
+
   procedure PutPkU8(const S: string);
-  // u16 uzunluk + UTF-8 baytlar (pk). Eski: VDbS2B(UTF8Encode(S)).
+  // varint uzunluk + UTF-8 baytlar (pk).
   var sb: TBytes;
   begin
     if IsPureAscii(S) then
     begin
-      PutU16(Word(Length(S)));
+      PutPkU8Len(Length(S));
       Grow(Length(S));
       if Length(S) > 0 then Move(S[1], b[p], Length(S));
       Inc(p, Length(S));
@@ -3248,7 +3401,7 @@ var
     else
     begin
       sb := VDbS2B(UTF8Encode(S));
-      PutU16(Word(Length(sb)));
+      PutPkU8Len(Length(sb));
       Grow(Length(sb));
       if Length(sb) > 0 then Move(sb[0], b[p], Length(sb));
       Inc(p, Length(sb));
@@ -3256,12 +3409,12 @@ var
   end;
 
   procedure PutTextU8(const S: string);
-  // i32 uzunluk + UTF-8 baytlar (metin kolonu). Eski: VDbS2B(UTF8Encode(S)).
+  // lenCode + UTF-8 baytlar (metin kolonu).
   var sb: TBytes;
   begin
     if IsPureAscii(S) then
     begin
-      PutI32(Length(S));
+      PutLenCode(Length(S));
       Grow(Length(S));
       if Length(S) > 0 then Move(S[1], b[p], Length(S));
       Inc(p, Length(S));
@@ -3269,7 +3422,7 @@ var
     else
     begin
       sb := VDbS2B(UTF8Encode(S));
-      PutI32(Length(sb));
+      PutLenCode(Length(sb));
       Grow(Length(sb));
       if Length(sb) > 0 then Move(sb[0], b[p], Length(sb));
       Inc(p, Length(sb));
@@ -3282,9 +3435,11 @@ begin
   initCap := 16 + Length(Pk) * 2 + Length(T.Cols) * 24;
   if initCap < 128 then initCap := 128;
   SetLength(b, initCap); p := 0;
+  { v3.11: uzatilmis govde isareti + tablo kimligi. }
+  PutU16(VDB_ROW_EXT);
   PutU16(TableId);
   PutPkU8(Pk);
-  PutU16(Word(Length(T.Cols)));
+  PutVarU(LongWord(Length(T.Cols)));
   for i := 0 to High(T.Cols) do
   begin
     Grow(2);
@@ -3300,35 +3455,35 @@ begin
         else
           raw := VDbS2B(UTF8Encode(Vals[i]));
         sealed := VDbColumnSeal(T.Cols[i].ColKeyId, TableId, i, raw);
-        PutI32(Length(sealed));
+        PutLenCode(Length(sealed));
         Grow(Length(sealed));
         if Length(sealed) > 0 then Move(sealed[0], b[p], Length(sealed));
         Inc(p, Length(sealed));
       end
       else
-        PutI32(-1);
+        PutLenCode(-1);
       Continue;
     end;
     case T.Cols[i].Ctype of
       VCT_INT:
         if (i < Length(Vals)) and (Vals[i] <> '') and VDbParseInt(Vals[i], iv) then
           PutIntCompact(iv)
-        else PutI32(-1);
+        else PutLenCode(-1);
       VCT_FLOAT:
         if (i < Length(Vals)) and (Vals[i] <> '') and VDbParseFloat(Vals[i], fv) then
-        begin PutI32(8); Grow(8); Move(fv, b[p], 8); Inc(p, 8); end
-        else PutI32(-1);
+        begin PutLenCode(8); Grow(8); Move(fv, b[p], 8); Inc(p, 8); end
+        else PutLenCode(-1);
       VCT_BOOL:
         begin
           // BOS DEGER = NULL (vlen = -1). Once kontrol etmek gerekiyor:
           // aksi halde NULL satiri 'False' olarak kalici yazilirdi.
           if (i >= Length(Vals)) or (Vals[i] = '') then
-            PutI32(-1)
+            PutLenCode(-1)
           else
           begin
             if SameText(Trim(Vals[i]), 'true') or (Trim(Vals[i]) = '1') then bv := 1
             else bv := 0;
-            PutI32(1);
+            PutLenCode(1);
             Grow(1); b[p] := bv; Inc(p);
           end;
         end;
@@ -3342,7 +3497,7 @@ begin
         if T.Cols[i].Ctype = VCT_BLOB then
         begin
           sv := VDbS2B(Vals[i]);
-          PutI32(Length(sv));
+          PutLenCode(Length(sv));
           Grow(Length(sv));
           if Length(sv) > 0 then Move(sv[0], b[p], Length(sv));
           Inc(p, Length(sv));
@@ -3350,7 +3505,7 @@ begin
         else
           PutTextU8(Vals[i]);
       end
-      else PutI32(-1);
+      else PutLenCode(-1);
     end;
   end;
   SetLength(b, p);
@@ -3409,8 +3564,9 @@ function DecodeRow(const B: TBytes; out TableId: Word; out Pk: string; out Vals:
 // olabilir; ALTER TABLE sirasinda cagricilar SrcCts ile kesisim
 // dondurum yapar.
 var
+  H: TVdbRowHdr;
   p: Integer;
-  pkL, cc, i: Word;
+  cc, i: Integer;
   ct: Byte;
   vl: LongInt;
   iv: Int64;
@@ -3419,18 +3575,18 @@ var
   plain: TBytes;
 begin
   Result := False;
-  p := 0;
-  if not ReadU16(B, p, TableId) then Exit;
-  if not ReadU16(B, p, pkL) then Exit;
-  if p + pkL > Length(B) then Exit;
-  Pk := UTF8Decode(VDbB2S(B, p, pkL)); Inc(p, pkL);
-  if not ReadU16(B, p, cc) then Exit;
+  if Length(B) < 2 then Exit;
+  if not VdbRowHdrOf(@B[0], Length(B), H) then Exit;
+  TableId := H.TableId;
+  Pk := UTF8Decode(VDbB2S(B, H.PkOff, H.PkLen));
+  cc := H.ColCount;
   SetLength(Vals, cc);
+  p := H.ColOff;
   for i := 0 to cc - 1 do
   begin
     if p >= Length(B) then Exit;
     ct := B[p]; Inc(p);
-    if not ReadI32(B, p, vl) then Exit;
+    if not VdbRowColLen(@B[0], Length(B), p, H.Ext, vl) then Exit;
     if vl = -1 then begin Vals[i] := ''; Continue; end;
     if (vl < 0) or (p + vl > Length(B)) then Exit;
     case ct of
@@ -3466,24 +3622,24 @@ function VDbPeekRawRow(const B: TBytes; ColCount: Integer;
   AYNI sinir kontrolleri; tek fark: alan degerleri cozulmez, ofsetleri
   verilir; alan sayisi beklenenden farkli ise (eski sema satiri) False. }
 var
+  H: TVdbRowHdr;
   p: Integer;
-  pkL, cc, i: Word;
+  i: Integer;
   vl: LongInt;
 begin
   Result := False;
   if Length(FType) < ColCount then Exit;
-  p := 0;
-  if not ReadU16(B, p, TableId) then Exit;
-  if not ReadU16(B, p, pkL) then Exit;
-  if p + pkL > Length(B) then Exit;
-  Pk := UTF8Decode(VDbB2S(B, p, pkL)); Inc(p, pkL);
-  if not ReadU16(B, p, cc) then Exit;
-  if Integer(cc) <> ColCount then Exit;
-  for i := 0 to cc - 1 do
+  if Length(B) < 2 then Exit;
+  if not VdbRowHdrOf(@B[0], Length(B), H) then Exit;
+  TableId := H.TableId;
+  Pk := UTF8Decode(VDbB2S(B, H.PkOff, H.PkLen));
+  if H.ColCount <> ColCount then Exit;
+  p := H.ColOff;
+  for i := 0 to ColCount - 1 do
   begin
     if p >= Length(B) then Exit;
     FType[i] := B[p]; Inc(p);
-    if not ReadI32(B, p, vl) then Exit;
+    if not VdbRowColLen(@B[0], Length(B), p, H.Ext, vl) then Exit;
     if vl = -1 then
     begin
       FOff[i] := -1; FLen[i] := 0;   // NULL: DecodeRow gibi ilerlemez
@@ -3504,40 +3660,30 @@ function VDbPeekRawRowP(B: PByte; Len, ColCount: Integer;
   Not: pk yalnizca KISA bir stringe cevrilir (VDbHashKey denetimi icin
   sart) — 120 baytlik deger govdesi hicbir yere kopyalanmaz. }
 var
+  H: TVdbRowHdr;
   p: Integer;
-  pkL, cc, i: Word;
+  i: Integer;
   vl: LongInt;
   s: AnsiString;
-
-  function RdU16(out V: Word): Boolean;
-  begin
-    Result := p + 2 <= Len;
-    if Result then begin V := B[p] or (Word(B[p + 1]) shl 8); Inc(p, 2); end;
-  end;
-
-  function RdI32(out V: LongInt): Boolean;
-  begin
-    Result := p + 4 <= Len;
-    if Result then begin Move(B[p], V, 4); Inc(p, 4); end;
-  end;
-
 begin
   Result := False;
   if (B = nil) or (Length(FType) < ColCount) then Exit;
-  p := 0;
-  if not RdU16(TableId) then Exit;
-  if not RdU16(pkL) then Exit;
-  if p + pkL > Len then Exit;
-  SetString(s, PAnsiChar(NativeUInt(B) + NativeUInt(p)), pkL);
-  Pk := UTF8Decode(s);
-  Inc(p, pkL);
-  if not RdU16(cc) then Exit;
-  if Integer(cc) <> ColCount then Exit;
-  for i := 0 to cc - 1 do
+  if not VdbRowHdrOf(B, Len, H) then Exit;
+  TableId := H.TableId;
+  if H.PkLen > 0 then
+  begin
+    SetString(s, PAnsiChar(NativeUInt(B) + NativeUInt(H.PkOff)), H.PkLen);
+    Pk := UTF8Decode(s);
+  end
+  else
+    Pk := '';
+  if H.ColCount <> ColCount then Exit;
+  p := H.ColOff;
+  for i := 0 to ColCount - 1 do
   begin
     if p >= Len then Exit;
     FType[i] := B[p]; Inc(p);
-    if not RdI32(vl) then Exit;
+    if not VdbRowColLen(B, Len, p, H.Ext, vl) then Exit;
     if vl = -1 then
     begin
       FOff[i] := -1; FLen[i] := 0;   // NULL: DecodeRow gibi ilerlemez
@@ -3562,8 +3708,7 @@ var
   tid: Word;
   plain: TBytes;
 begin
-  tid := 0;
-  if B <> nil then tid := Word(B[0]) or (Word(B[1]) shl 8);
+  if B <> nil then tid := VdbRowTableIdAt(B) else tid := 0;
   SetLength(Vals, ColCount);
   for i := 0 to ColCount - 1 do
   begin
@@ -3609,7 +3754,7 @@ begin
   if (B = nil) or (Col < 0) or (Col >= ColCount) or
      (Col > High(FType)) or (Col > High(FOff)) or (Col > High(FLen)) then Exit;
   if (FOff[Col] < 0) or (FLen[Col] = 0) then Exit;
-  tid := Word(B[0]) or (Word(B[1]) shl 8);
+  tid := VdbRowTableIdAt(B);
   case FType[Col] of
     VCT_INT:
       begin
@@ -3641,26 +3786,15 @@ function VDbDecodeRawRowP(B: PByte; Len: Integer;
   out TableId: Word; out Pk: string; out Vals: TStrArray): Boolean;
 // H1: DecodeRow'un PByte+Len surumu; chunktan TStrArray'e dogrudan cozer.
 var
+  H: TVdbRowHdr;
   p: Integer;
-  pkL, cc, i: Word;
+  cc, i: Integer;
   ct: Byte;
   vl: LongInt;
   iv: Int64;
   fv: Double;
   s: AnsiString;
   plain: TBytes;
-
-  function RdU16(out V: Word): Boolean;
-  begin
-    Result := p + 2 <= Len;
-    if Result then begin V := B[p] or (Word(B[p + 1]) shl 8); Inc(p, 2); end;
-  end;
-
-  function RdI32(out V: LongInt): Boolean;
-  begin
-    Result := p + 4 <= Len;
-    if Result then begin Move(B[p], V, 4); Inc(p, 4); end;
-  end;
 
   function SliceStr(Off, L: Integer): RawByteString;
   begin
@@ -3670,20 +3804,23 @@ var
 begin
   Result := False;
   if B = nil then Exit;
-  p := 0;
-  if not RdU16(TableId) then Exit;
-  if not RdU16(pkL) then Exit;
-  if p + pkL > Len then Exit;
-  s := SliceStr(p, pkL);
-  Pk := UTF8Decode(s);
-  Inc(p, pkL);
-  if not RdU16(cc) then Exit;
+  if not VdbRowHdrOf(B, Len, H) then Exit;
+  TableId := H.TableId;
+  if H.PkLen > 0 then
+  begin
+    s := SliceStr(H.PkOff, H.PkLen);
+    Pk := UTF8Decode(s);
+  end
+  else
+    Pk := '';
+  cc := H.ColCount;
   SetLength(Vals, cc);
+  p := H.ColOff;
   for i := 0 to cc - 1 do
   begin
     if p >= Len then Exit;
     ct := B[p]; Inc(p);
-    if not RdI32(vl) then Exit;
+    if not VdbRowColLen(B, Len, p, H.Ext, vl) then Exit;
     if vl = -1 then begin Vals[i] := ''; Continue; end;
     if (vl < 0) or (p + vl > Len) then Exit;
     case ct of
@@ -3731,42 +3868,29 @@ function VDbPeekRawRowKeyHashTo(B: PByte; Len, ColCount: Integer;
   yakalanmaz. Deger dogrulugu ETKILENMEZ. MaxCol<0 => hic kolon cozulmez
   (COUNT(*) tumu: yalniz baslik + pk + cc kontrolu). }
 var
+  H: TVdbRowHdr;
   p: Integer;
-  pkL, cc: Word;
   k: Integer;
   vl: LongInt;
   pkPtr: PByte;
-
-  function RdU16(out V: Word): Boolean;
-  begin
-    Result := p + 2 <= Len;
-    if Result then begin V := B[p] or (Word(B[p + 1]) shl 8); Inc(p, 2); end;
-  end;
-
-  function RdI32(out V: LongInt): Boolean;
-  begin
-    Result := p + 4 <= Len;
-    if Result then begin Move(B[p], V, 4); Inc(p, 4); end;
-  end;
-
 begin
   Result := False;
   KeyHash := 0;
   if (B = nil) or (Length(FType) < ColCount) then Exit;
-  p := 0;
-  if not RdU16(TableId) then Exit;
-  if not RdU16(pkL) then Exit;
-  if p + pkL > Len then Exit;
-  pkPtr := B + p;                 // pk UTF-8 baytlari: kopya YOK, string YOK
-  Inc(p, pkL);
-  if not RdU16(cc) then Exit;
-  if Integer(cc) <> ColCount then Exit;
+  if not VdbRowHdrOf(B, Len, H) then Exit;
+  TableId := H.TableId;
+  if H.PkLen > 0 then
+    pkPtr := B + H.PkOff             // pk UTF-8 baytlari: kopya YOK, string YOK
+  else
+    pkPtr := B;
+  if H.ColCount <> ColCount then Exit;
   if MaxCol > ColCount - 1 then MaxCol := ColCount - 1;
+  p := H.ColOff;
   for k := 0 to MaxCol do          // erken dur: MaxCol son cozulen kolon
   begin
     if p >= Len then Exit;
     FType[k] := B[p]; Inc(p);
-    if not RdI32(vl) then Exit;
+    if not VdbRowColLen(B, Len, p, H.Ext, vl) then Exit;
     if vl = -1 then
     begin
       FOff[k] := -1; FLen[k] := 0;  // NULL: DecodeRow gibi ilerlemez
@@ -3776,7 +3900,7 @@ begin
     FOff[k] := p; FLen[k] := vl;
     Inc(p, vl);
   end;
-  KeyHash := VDbHashKeyBytes(HashPrefix, pkPtr, pkL);
+  KeyHash := VDbHashKeyBytes(HashPrefix, pkPtr, H.PkLen);
   Result := True;
 end;
 
@@ -3801,8 +3925,10 @@ begin
      (Length(PlainValue) >= Length(VDB_SCHEMA_TAG)) and
      CompareMem(@PlainValue[0], @VDB_SCHEMA_TAG[1], Length(VDB_SCHEMA_TAG)) then
     Exit;
-  // ReadU16 ile birebir ayni hesap
-  Result := Integer(PlainValue[0]) or (Integer(PlainValue[1]) shl 8);
+  // ReadU16 ile birebir ayni hesap; v3.11: v2 govdede tablo kimligi 2. sozcukte
+  if ((Integer(PlainValue[0]) or (Integer(PlainValue[1]) shl 8)) = Integer(VDB_ROW_EXT)) and
+     (ValueLen < 4) then Exit;   // isaret var ama basligin devami yok: satir degil
+  Result := Integer(VdbRowTableIdAt(@PlainValue[0]));
 end;
 
 { TVTableDb }
@@ -4089,6 +4215,12 @@ procedure ParseLines(Lines: TStrings);
       // "view" sayilir ("view tanimi ayristirilamadi veya bos: <tablo>").
       t := Default(TTableDef);
       t.TableId := Word(StrToIntDef(parts[0], 0));
+      // v3.11: $FFFF satir govdesi isaretidir; boyle bir tablo kimligi
+      // varsa satirlar yanlis cozulur. Sessiz yanlis sonuc yerine acik hata.
+      if t.TableId = VDB_ROW_EXT then
+        raise EVDbException.CreateFmt(ecSchemaCorrupt,
+          'VDb: sema kaydi gecersiz tablo kimligi (satir %d): %d',
+          [li + 1, t.TableId]);
       t.Name := VDbNorm(parts[1]);
       t.PkIndex := StrToIntDef(parts[2], -1);
       t.AutoInc := StrToInt64Def(parts[3], 0);
@@ -9932,6 +10064,10 @@ begin
   // DIKKAT (F-34): TableId 0 OLAMAZ. ScanRows kayitlari tid ile ayirir;
   // 0 verilirse MV'ler birbirinin satirlarini gorur ve hash denetimi
   // "HASH CARPISMASI" ile patlar (iki MV ayni @mv0 anahtarini paylasir).
+  // v3.11: $FFFF satir govdesi ISARETIDIR (bkz. EncodeRow) ve tablo
+  // kimligi olamaz; Inc'ten SONRA atanacak deger <= $FFFE olmali.
+  if FNextId >= $FFFE then
+    raise EVDbException.Create(ecLimit, 'tablo limit (65534)');
   Inc(FNextId);
   v.TableId := Word(FNextId);
   v.Cols := [];

@@ -279,7 +279,7 @@ veritabani.colkey      kolon anahtarı (yalnız kolon şifrelemesi kullanılırs
 
 ---
 
-## 9. Bugünkü sınırlar (v3.9)
+## 9. Bugünkü sınırlar (v3.11)
 
 | Özellik | Durum | Not |
 |---|---|---|
@@ -289,7 +289,8 @@ veritabani.colkey      kolon anahtarı (yalnız kolon şifrelemesi kullanılırs
 | Zone map / bölüm budama | **var** (v3.3) | Sayfa düzeyi; kazanç **seçici** yüklemlerde. Orta seçicilikte ölçülebilir kazanç yok. v3.9: `=` ve `IN` listelerinde **negatif sabitler** de daraltır (`k IN (-1,-2)`); bölüm numarası hesaplanamazsa koşul katkı vermez (satır kaybı yok) |
 | MVCC (süreç içi çok oturum) | **var** (v3.4) | READ COMMITTED; her oturum kendi yazma kümesinde yazar, **ilk commit kazanır**, kaybeden `yazma cakismasi` ile durur. DDL/`SAVEPOINT`/`DEFERRABLE` çoklu yazmada reddedilir. Snapshot isolation yok |
 | MVCC (süreçler arası) | yok | dosya kilidi ikinci süreci reddeder |
-| Toplu INSERT hızı | v2'nin **~1,6 katı** yavaş | v3 6,12 / v2 3,82 µs satır (200k×3 kolon, commit dâhil; aynı sonda, 3 koşu medyanı). v3.10: 6,63 → **6,12 µs** (günlük kodlaması yerinde, etiket farkı ara sözlüksüz, `Put` tek arama). Kalan fark: satır başına 4 kez çözülen oturum kümesi + WAL commit/günlük bedeli |
+| Toplu INSERT hızı | v2'nin **~1,5 katı** yavaş | v3 5,77 / v2 3,82 µs satır (200k×3 kolon, commit dâhil; aynı sonda, 3 koşu medyanı). v3.10: 6,63 → 6,12 µs (günlük kodlaması yerinde, etiket farkı ara sözlüksüz, `Put` tek arama). v3.11: **5,77 µs** (eşleşmiş ölçüm 6,16 → 5,77 = −%6,3; satır gövdesi varint, daha az bayt). Kalan fark: satır başına 4 kez çözülen oturum kümesi + WAL commit/günlük bedeli |
+| Satır gövdesi / dosya biçimi (v3.11) | **var** | Satır gövdesi v2: `$FFFF` işareti + varint pk/kolon sayısı + kolon başına varint uzunluk (`0` = NULL). **Dosya sürümü 4**; sürüm 3 dosyalar açılır (aynı dosyada v1/v2 satır bir arada), ilk yazılabilir açılışta başlık 4'e yükseltilir. Eski ikili sürüm 4'ü açık hatayla reddeder. Ölçülen: `.odb` −%15,7 (200k×3), sabit 3 kolonlu satır 39 → 30 bayt |
 | `ScanAll` hızı (v3.9) | iyileşti | 200k satır + **açık yazma kümesi**: 45,00 → **32,00 ms** (son üç koşu 31–32 ms, aynı makine/sonda). Satır başına 3 kilit alma kaldırıldı: yazma kümesi tarama başında bir kez çözülür |
 | Motor kilidi (v3.9) | `TVdbGate` | Her iş parçacığı tuttuğu kilitlerin `threadvar` yığınını taşır; **iç içe giriş kritik bölüme hiç girmez** (yeniden giriş varsayımı kalktı), paylaşılan alanlar kilit dışında okunmaz. `Leave` sahipsiz çıkışta açık hata verir. `ScanAllAt` / PITR taraması paylaşılan `FScan*` tamponunu artık kilit altında kullanır (eşzamanlı `ScanAll` ile bozulma giderildi) |
 | SQLite yazımları (v3.7) | **var** | `BEGIN [TRANSACTION|WORK] [IMMEDIATE|DEFERRED|EXCLUSIVE]`, `CREATE INDEX IF NOT EXISTS`, `INSERT OR REPLACE/IGNORE/ABORT/FAIL/ROLLBACK`, `CREATE TEMP[ORARY] TABLE`, `CREATE TABLE ... AS SELECT`, `UPDATE ... SET ... FROM`, `WITH x AS (INSERT/UPDATE/DELETE ...)`, `AS`'siz `CREATE TRIGGER` |
@@ -335,6 +336,14 @@ sözlük yerine doğrudan sayaca işlenir, `Put` anahtar başına tek sözlük
 araması yapar. v3 hâlâ v2'nin ~1,6 katı yavaştır; kalan farkın büyük kısmı
 satır başına 4 kez çözülen oturum kümesi ile WAL/günlük dayanıklılık
 bedelidir. Ayrıntı ve ölçümler: `V3_YOL_HARITASI.md` §v3.10.
+
+v3.11'de **çözülenler**: satır gövdesi varint kodlaması (ertelenen listenin
+ilk maddesi) — dosya **−%15,7** (200k×3 kolon), toplu INSERT 6,16 → **5,77
+µs/satır** (−%6,3), tarama hızı değişmedi. Biçim değiştiği için **dosya
+sürümü 4** oldu: sürüm 3 dosyalar okunur ve ilk yazılabilir açılışta
+yükseltilir; eski ikili sürüm 4'ü açık hatayla reddeder (sessiz yanlış
+sonuç yok). Ayrıntı ve geriye dönük okuma kanıtı: `V3_YOL_HARITASI.md`
+§v3.11.
 
 Yukarıdaki olmayanlar **sessizce yanlış sonuç vermez**: her biri açık bir
 `ecUnsupported` hatası ve yol gösteren mesaj döndürür.

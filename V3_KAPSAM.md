@@ -542,6 +542,8 @@ Kapsam **süreç içi çok oturumlu yazma**dır: aynı `IVdbBackend` üzerinde b
 | toplu INSERT — before-image **kapalı** (A/B) | 6,532 µs/satır |
 | toplu INSERT — before-image **açık** | **7,466 µs/satır** (+%14,3) |
 | toplu INSERT — v3.10 sonrası (aynı iş) | **6,115 µs/satır** (v2 3,822 → 1,60x) |
+| toplu INSERT — v3.11 sonrası (satır gövdesi varint) | **5,771 µs/satır** (v2 3,822 → 1,51x) |
+| `.odb` boyu (200k × 3 kolon) — v3.11 | 11.912 KB → **10.040 KB** (−%15,7) |
 | autocommit INSERT | 1,024 ms |
 | açılış (200k satır) | 39,0 ms |
 
@@ -599,3 +601,53 @@ veri dönmez. `VACUUM` aynı anahtarla yeni dosya üretir.
 Bilinçli sınır: `ALTER DATABASE KEY` (mevcut v3 dosyasını yeniden
 şifreleme) bu sürümde yoktur (`ecUnsupported`); anahtar dosya oluştururken
 seçilir.
+
+### Satır gövdesi varint ve dosya sürümü 4 (v3.11, 2026-10-26)
+
+Satır gövdesi v1 her kolonda **sabit 4 baytlık** uzunluk, pk ve kolon sayısı
+için 2 baytlık alan taşıyordu. v2 gövde bunları varint'e çevirir:
+
+```
+v1: [u16 tableId][u16 pkLen][pk][u16 colCount]
+    + her kolon: [u8 ctype][i32 vlen][payload]        (vlen = -1 => NULL)
+v2: [u16 $FFFF][u16 tableId][varint pkLen][pk][varint colCount]
+    + her kolon: [u8 ctype][varint lenCode][payload]  (0 => NULL, aksi
+                                                        halde len+1)
+```
+
+Ayırt edici `$FFFF`, bu motorda **hiçbir zaman** geçerli bir tablo kimliği
+değildir (`CreateTable` ve `CreateMaterializedView` sınırı; şema yüklemesi
+böyle bir kaydı açık hatayla reddeder). Bu yüzden eski bir satırın v2
+sanılması mümkün değil.
+
+**Dosya sürümü 3 → 4.** Satır biçimi değiştiği hâlde başlık 3 kalsaydı eski
+bir ikili v2 gövdeyi v1 sanıp satırı düşürebilir ya da yanlış değer
+üretebilirdi. Sürüm 4 bunu kapatır:
+
+- sürüm 3 dosyalar **açılır**; aynı dosyada v1 ve v2 satır bir arada okunur
+  (eski satır güncellenince v2 yazılır), ilk **yazılabilir** açılışta başlık
+  4'e yükseltilir; salt-okunur açılış yazmaz;
+- eski ikili `desteklenmeyen surum: 4` ile **açık hata** verir (ölçüldü:
+  v3.10 ikilisi yeni dosyada tam bu hatayı verdi);
+- `RESTORE` ve `VERIFY` yolları sürüm 3'ü kabul eder.
+
+| Ölçüm (200k × 3 kolon, 3 koşu medyanı, 32 bit) | v3.10 | v3.11 |
+|---|---|---|
+| hazırlama | 4,003 µs/satır | **3,933 µs/satır** |
+| commit | 2,128 µs/satır | **1,863 µs/satır** |
+| **TOPLAM** (log=on) | 6,157 µs/satır | **5,771 µs/satır** (−%6,3) |
+| `.odb` boyu | 11.912 KB | **10.040 KB** (−%15,7) |
+| tam tarama (200k satır) | 32,00 ms | 30–33 ms (fark yok) |
+| sabit 3 kolonlu satır | 39 bayt | **30 bayt** |
+
+**Geriye dönük okuma kanıtı (gerçek eski dosya):** v3.10 kaynağından ayrı bir
+worktree'de derlenen ikili 500 satırlık DB yazdı; yeni ikili aynı dosyada
+`COUNT=500` ve tüm değerlerin FNV özetinde **birebir** aynı sonucu verdi.
+Ardından 250 satır `UPDATE` edilip dosya karışık biçime getirildi:
+dokunulmayan 250 satırın özeti yine birebir aynı kaldı.
+
+Kapı: `sqltest` v3 **2822/0/33**, v2 **3256/0/0** (yeni `T157_SatirGovdesi`
+19 kontrol: elle kurulmuş v1/v2 gövdenin aynı değerleri vermesi, `$FFFF`
+işaretinin ham taramada görülmesi, satırın **tam 30 bayt** olması, NULL /
+büyük negatif INT / 127 bayttan uzun metin); 14/14 kapı yeşil; `sqltest` ve
+`lockchk` 64-bit derlemede de yeşil.

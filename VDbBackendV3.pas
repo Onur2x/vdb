@@ -2284,7 +2284,8 @@ begin
   end;
   Move(hdr[0], magic, SizeOf(magic));
   Move(hdr[4], ver, SizeOf(ver));
-  if (magic <> VDB_FILE_MAGIC) or (ver <> VDB_FILE_VER) then
+  if (magic <> VDB_FILE_MAGIC) or
+     ((ver <> VDB_FILE_VER) and (ver <> VDB_FILE_VER_V3)) then
     raise EVdbBackendV3.Create('RESTORE: kaynak v3 sayfa motoru dosyasi degil');
 
   { Sifreleme bicimi ve anahtar kaynakla AYNI olmali; aksi halde geri

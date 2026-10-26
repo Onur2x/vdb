@@ -64,9 +64,12 @@ const
   // SURUM 3 (H5): blok-grup CRC footer'lari eklendi. Kayit duzeni ayni;
   // V1/V2 dosyalari acilirken V3'e yukseltilir. Eski build'ler V3'u
   // acamaz (temiz hata) ama dosyayi KIRPMAZ.
-  VDB_FILE_VER = 3;
+  VDB_FILE_VER = 4;
   VDB_FILE_VER_OLD = 1;
   VDB_FILE_VER_V2 = 2;
+  { v3.11: satir govdesi v1 yazmis olabilecek onceki surum; acilirken
+    4'e yukseltilir (eski ikili 4'u reddeder, satirlari yanlis cozmez). }
+  VDB_FILE_VER_V3 = 3;
   VDB_HDR_SIZE = 16;
   VDB_HFLAG_HAS_ENCRYPTED = 1;
   { H11: dosyada en az bir yerinde (in-place) yazim yapildi. Boyle bir
@@ -1169,11 +1172,13 @@ begin
       if h.Crc <> HeadCrc(h) then
         raise EVDbException.Create(ecCorrupt, 'VDb: dosya basligi CRC hatasi (bozuk)');
       FEncFlags := h.Flags and (VDB_HFLAG_HAS_ENCRYPTED or VDB_HFLAG_INPLACE);
-      if (h.Ver = VDB_FILE_VER_OLD) or (h.Ver = VDB_FILE_VER_V2) then
+      if (h.Ver = VDB_FILE_VER_OLD) or (h.Ver = VDB_FILE_VER_V2) or
+         (h.Ver = VDB_FILE_VER_V3) then
       begin
-        // V1/V2 -> V3 yukseltme. Kayit duzeni ayni; V3'te blok CRC
-        // footer'lari eklenir. Basligi yerinde yeniden yazip fsync ->
-        // dosya artik eski buildler tarafindan guvenle reddedilir.
+        // V1/V2/V3 -> V4 yukseltme. Kayit duzeni ayni; v3.11'de satir
+        // govdesi varint'e gecti, 4 = "bu dosyada v2 govde olabilir".
+        // Basligi yerinde yeniden yazip fsync -> dosya artik eski
+        // buildler tarafindan guvenle reddedilir.
         h.Ver := VDB_FILE_VER;
         h.Crc := HeadCrc(h);
         FS.Position := 0;
@@ -6394,7 +6399,8 @@ begin
     FS.ReadBuffer(buf[0], VDB_HDR_SIZE);
     Move(buf[0], fh, SizeOf(fh));
     if fh.Magic <> VDB_FILE_MAGIC then begin Report := 'BOZUK: VODB imzasi yok'; Exit; end;
-    if fh.Ver <> VDB_FILE_VER then begin Report := 'BOZUK: desteklenmeyen surum'; Exit; end;
+    if (fh.Ver <> VDB_FILE_VER) and (fh.Ver <> VDB_FILE_VER_V3) then
+      begin Report := 'BOZUK: desteklenmeyen surum'; Exit; end;
     if fh.Crc <> HeadCrc(fh) then begin Report := 'BOZUK: baslik CRC'; Exit; end;
     hasInPlace := (fh.Flags and VDB_HFLAG_INPLACE) <> 0;
     pos := VDB_HDR_SIZE;
