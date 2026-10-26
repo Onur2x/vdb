@@ -652,12 +652,42 @@ işaretinin ham taramada görülmesi, satırın **tam 30 bayt** olması, NULL /
 büyük negatif INT / 127 bayttan uzun metin); 14/14 kapı yeşil; `sqltest` ve
 `lockchk` 64-bit derlemede de yeşil.
 
+### JOIN: ON eşitlik + ek koşul (v3.12, 2026-10-26)
+
+İndekssiz eşitlik join'i bu motorda **hash join**'dir; merge JOIN ölçümle
+reddedildi (iki taraf sıralı değil, anahtarlar hash tabanlı, `ORDER BY`
+join'den sonra gelir → merge sıralama bedeli öder ve yavaş kalır).
+
+Ölçüm (`tmp64/joinbench`, 10k × 10k satır, 100 farklı anahtar):
+
+| Sorgu | Süre |
+|---|---|
+| hiç eşleşmeyen join, 0 satır sonuç | **42 ms** (nested loop olsaydı ~6 s) |
+| PK `a.id = b.id` | **46 ms** |
+| `a.k = b.k`, 1M satır sonuç | 3,2 s (maliyet satır kopyalamada) |
+| `ON a.k=b.k AND a.k>1000000` — **eski** kod | **300 s'de bitmedi** |
+| `ON a.k=b.k AND a.k>1000000` — **yeni** kod | **5.926 ms** |
+
+Eski kodda hash yolu yalnız ON **tek** `kolon = kolon` iken açılıyordu; kök
+`AND` olunca 100M çift üzerinde ifade yorumlanıyordu. Düzeltme: `AND`
+ağacının içindeki kolon=kolon eşitliği hash anahtarı olur, ek koşullar
+`JoinOnOk`'ta uygulanır (sonuç değişmez). Ek koşul varsa indeks/PK hızlı
+yolu kapatılır (o yol `JoinOnOk` çağırmaz → ek koşulu atlardı).
+
+Kalan ölçülmüş fırsat: ON/WHERE yüklemlerinin ilgili tarafa itilmesi
+(`a.k > 1000000` solda 0 satır bırakır). Bu ayrı bir maddedir.
+
+Kapı: `sqltest` v3 **2832/0/33**, v2 **3266/0/0** (yeni
+`T158_OnEkKosulHash`: INNER/LEFT/FULL/PK/OR kökü/NULL/imkânsız ek koşul);
+14/14 kapı yeşil.
+
 ### Sürüm çizgisi (2026-10-26)
 
 Bu hat **alpha**'dır: `v3.x` adları yayın sürümü değil çalışma dilimidir.
-Kalan kapsam — Bloom filtresi, merge JOIN, dosya boyutu (PK tekrarı + hücre
-başlığı), ifade bytecode, snapshot isolation — bu hatta yapılır ve hepsi
-bitince ürün **v1.0.0** olarak etiketlenir. `main` = `v3` (84 commit
-fast-forward); iş `v3`te yürür ve her push'ta `main` de ilerletilir.
-Süreçler arası çok yazarlılık (aynı dosyaya iki süreç yazması) kapsam
-dışıdır; snapshot isolation tek süreç içinde kalır.
+Kalan kapsam — Bloom filtresi (ölçümle reddedildi), merge JOIN (ölçümle
+reddedildi, yerine ON eşitlik+ek koşul hash düzeltmesi yapıldı), dosya
+boyutu (PK tekrarı + hücre başlığı), ifade bytecode, snapshot isolation —
+bu hatta yapılır ve hepsi bitince ürün **v1.0.0** olarak etiketlenir.
+`main` = `v3` (84 commit fast-forward); iş `v3`te yürür ve her push'ta
+`main` de ilerletilir. Süreçler arası çok yazarlılık (aynı dosyaya iki
+süreç yazması) kapsam dışıdır; snapshot isolation tek süreç içinde kalır.

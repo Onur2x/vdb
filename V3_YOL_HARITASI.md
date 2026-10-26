@@ -849,6 +849,38 @@ negatif INT / 127 bayttan uzun metin (2 baytlık varint) yolları.
 14/14 kapı yeşil; `sqltest` ve `lockchk` 64-bit derlemede de yeşil
 (2812/0/33 ve 30/0).
 
+### v3.12 — ON eşitlik + ek koşul artık hash yolunda (2026-10-26)
+
+**Bulgu.** İndekssiz eşitlik join'i bu motorda zaten hash join'dir
+(`joinbench`, 10k × 10k, hiç eşleşmeyen join 0 satır sonuç: **42 ms** —
+nested loop 100M çift olsaydı ~6 s). Ama hash yolu yalnız ON ifadesi
+**tek bir `kolon = kolon`** olduğunda açılıyordu. `ON a.k=b.k AND a.x>5`
+yazıldığında koşulun kökü `AND` olduğu için hash devre dışı kalıyor ve
+sorgu 10k × 10k = 100M çift üzerinde ifade yorumluyordu.
+
+**Ölçüm (izole, `onekchk`, 10k × 10k, 1M aday çift):**
+
+| | eski (cde813d) | yeni |
+|---|---|---|
+| `ON a.k=b.k AND a.k>1000000` | **300 s'de bitmedi** (araç zaman aşımı) | **5.926 ms** |
+
+**Düzeltme.** `OnEqNode` yardımcısı `AND` ağacının içindeki ilk
+`kolon = kolon` düğümünü bulur; bu eşitlik hash anahtarı olur. Ek koşullar
+`JoinOnOk` içinde aynen değerlendirilir (nihai eleyici), bu yüzden sonuç
+kümesi değişmez. Ek koşul varsa **indeks/PK hızlı yolu kapatılır**: o yol
+`JoinOnOk` çağırmadığı için ek koşulu atlardı (sessiz yanlış sonuç riski).
+
+**Kalan maliyet.** 5,9 s, 1M aday çift için ek koşulun çift başına
+değerlendirilmesidir; sonuç üretimi (1M satır × 6 kolon kopyası) ayrıca
+~3,2 s. Bir sonraki kazanç ON/WHERE yüklemlerinin ilgili tarafa
+**itilmesidir** (`a.k > 1000000` solda 0 satır bırakır → iş ~0). Bu,
+ölçümle belirlenmiş ayrı bir maddedir; merge JOIN bu iki darboğazın
+ikisini de çözmez (bkz. "Sürüm çizgisi kararı", madde 2).
+
+Testler: `sqltest` v3 **2832/0/33**, v2 **3266/0/0**; yeni
+`T158_OnEkKosulHash` (INNER / LEFT / FULL / PK / OR kökü / NULL ve
+imkânsız ek koşul yolları). 14/14 kapı yeşil.
+
 ### Sürüm çizgisi kararı (2026-10-26): alpha hattı → **v1.0.0**
 
 Kullanıcı kararı, önceki "v4'e ertele" planını geçersiz kılar:
@@ -880,8 +912,25 @@ kendi kapıları ve ölçümüyle):
    Nötr karmaşıklık eklememek için yapılmadı. Bloom'un gerçekten
    gerekeceği senaryo, anahtar dizinin **diskte** tutulduğu (bellek içi
    hash yerine B-tree) bir mimaridir; o ayrı bir tasarım kararıdır.
-2. **Merge JOIN** — iki tarafın sıralı akışını tek geçişte birleştirir;
-   `HASH` ve `NESTED` yanında üçüncü yöntem, maliyet modeliyle seçilir.
+2. ~~**Merge JOIN**~~ — **ÖLÇÜMLE REDDEDİLDİ (2026-10-26); yerine gerçek
+   darboğaz düzeltildi.** Ölçüm (`tmp64/joinbench`, 10k × 10k):
+   - Hiç eşleşmeyen join (0 satır sonuç) **42 ms** → indekssiz eşitlik
+     join'i zaten **hash** yolunda (nested loop 100M çift olsaydı ~6 s).
+   - PK üzerinden join **46 ms**, 1M satırlık sonuç üreten join 3,2 s
+     (maliyet sonuç satırı kopyalamada, join algoritmasında değil).
+   Merge JOIN yalnız "iki taraf da zaten sıralı" durumda O(n+m) sağlar; bu
+   motorda anahtarlar hash tabanlı, `ORDER BY` join'den sonra gelir, yani
+   merge sıralama bedeli ödemek zorunda kalır ve hash'ten yavaş olur.
+   Bunun yerine ölçümün gösterdiği **gerçek hata** düzeltildi (v3.12):
+   `ON a.k=b.k AND a.x>5` gibi **eşitlik + ek koşul** içeren ON ifadeleri
+   hash yolunu tamamen kapatıyordu; 10k × 10k'da sorgu **300 s'de
+   bitmiyordu** (araç zaman aşımı). Artık AND ağacının içindeki
+   kolon=kolon eşitliği hash anahtarı olur, ek koşullar `JoinOnOk`'ta
+   aynen uygulanır (semantik değişmez; LEFT/FULL/NULL testleri eklendi).
+   Aynı sorgu artık **5.926 ms**. Kalan maliyet, 1M aday çift için ek
+   koşulun çift başına değerlendirilmesidir; bir sonraki kazanç ON/WHERE
+   yüklemlerinin ilgili tarafa **itilmesidir** (ölçülmüş fırsat, ayrı
+   madde).
 3. **Dosya boyutu** — PK'nin satır gövdesinde ikinci kez yazılmasının
    kaldırılması + hücre başlığı sıkıştırma. Satır biçimine dokunur;
    v3.11'deki `$FFFF` + varint düzeni ve sürüm yükseltme yolu yeniden

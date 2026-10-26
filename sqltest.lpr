@@ -6335,30 +6335,27 @@ begin
     No('halka: en yeni kayitlar duruyor', n0t);
 
   // ---- yavas bir sorgu gercekten olculuyor mu? ----
-  // 400 satirlik tablo x kendisi = 160.000 satir; 1 ms esigini asar.
-  // (Kucuk tablolarla denendi: gercekten 0 ms okunuyor — yavas sorgu
-  //  tespitinin ise yaramaz olmamasi icin olcumun >0 ms gormesi gerekir.)
+  // 700 satirlik tablo x kendisi = 490.000 satir. Olcum VdbTickMs
+  // (Windows'ta GetTickCount64, ~15,6 ms cozunurluk) ile yapildigi icin
+  // is yuku BIR TIKTEN FAZLA surmelidir: 400x400 (~24 ms) sinirda
+  // kaliyordu ve olcum bazen 0 ms cikip testi kararsiz kiliyordu.
   sq.Exec('CREATE TABLE big(id INTEGER PRIMARY KEY, v INTEGER)');
-  // toplu ekleme: TEK transaction icinde 400 ayri INSERT (tek fsync)
-  SetLength(n0s, 402);
+  // toplu ekleme: TEK transaction icinde ayri INSERT'ler (tek fsync)
+  SetLength(n0s, 702);
   n0s[0] := 'BEGIN';
-  for n1 := 1 to 400 do
+  for n1 := 1 to 700 do
     n0s[n1] := 'INSERT INTO big VALUES(' + IntToStr(n1) + ',' + IntToStr(n1) + ')';
-  n0s[401] := 'COMMIT';
+  n0s[701] := 'COMMIT';
   sq.ExecAll(n0s);
-  ChkVal('400 satir eklendi', 'SELECT COUNT(*) FROM big', 0, 0, '400');
+  ChkVal('700 satir eklendi', 'SELECT COUNT(*) FROM big', 0, 0, '700');
   sq.Exec('SET MAX_SLOW_ENTRIES = 20');
   sq.Exec('SET SLOW_QUERY_MS = 0');
   sq.ClearSlow;
   sq.Exec('SELECT COUNT(*) FROM big a CROSS JOIN big b');
   Ok('agir sorgu olculdu', IntToStr(sq.LastElapsedMs) + ' ms');
-  // Windows'ta olcum ~1 ms duyarliliklidir; agir CROSS JOIN esigi asmali
-{$IFDEF MSWINDOWS}
+  // VdbTickMs ~15,6 ms tik: is yuku 2 tikten fazla surmeli (>= 31 ms).
   if sq.LastElapsedMs >= 1 then Ok('agir sorgu 1 ms+ olculdu', IntToStr(sq.LastElapsedMs) + ' ms')
     else No('agir sorgu 1 ms+ olculdu', 'olcum ' + IntToStr(sq.LastElapsedMs) + ' ms');
-{$ELSE}
-  Ok('agir sorgu 1 ms+ olculdu (diger platformda >= 0 yeterli)', IntToStr(sq.LastElapsedMs) + ' ms');
-{$ENDIF}
   ChkInt('agir sorgu kaydedildi', sq.SlowQueryCount, 1);
   R := sq.Exec('SHOW SLOW QUERIES');
   if TryStrToInt(R.Rows[0][0], n1) then Ok('kayit suresi sayisal', R.Rows[0][0])
@@ -17433,6 +17430,72 @@ begin
     Ok('ham govde taramasi atlandi (v2 motorunda ham API yok)', '');
 end;
 
+{ v3.12: ON kosulunda esitlik + EK KOSUL.
+  Eskiden hash join yalniz "ON tek esitlik" iken devreye giriyordu; `ON
+  a.k=b.k AND a.x>5` klasik cift donguye dusup 100M cift uzerinde ifade
+  yorumluyordu (10k x 10k olcumde 30+ dk / zaman asimi). Artik AND
+  agacinin icindeki kolon=kolon esitligi hash anahtari olur; ek kosullar
+  JoinOnOk'ta aynen uygulanir. Asagidaki kontroller sonucun INNER, LEFT,
+  FULL, PK ve OR durumlarinda degismedigini dogrular. }
+procedure T158_OnEkKosulHash;
+begin
+  Grp('T158: ON esitlik + ek kosul (hash join yolu)');
+  Fresh('onek');
+  sq.Exec('CREATE TABLE ja(id INTEGER PRIMARY KEY, k INTEGER, v TEXT)');
+  sq.Exec('CREATE TABLE jb(id INTEGER PRIMARY KEY, k INTEGER, w TEXT)');
+  // ja.k: 1,1,2,3,NULL,5   jb.k: 1,2,2,4,NULL
+  sq.Exec('INSERT INTO ja(id,k,v) VALUES(1,1,''a1'')');
+  sq.Exec('INSERT INTO ja(id,k,v) VALUES(2,1,''a2'')');
+  sq.Exec('INSERT INTO ja(id,k,v) VALUES(3,2,''a3'')');
+  sq.Exec('INSERT INTO ja(id,k,v) VALUES(4,3,''a4'')');
+  sq.Exec('INSERT INTO ja(id,k,v) VALUES(5,NULL,''a5'')');
+  sq.Exec('INSERT INTO ja(id,k,v) VALUES(6,5,''a6'')');
+  sq.Exec('INSERT INTO jb(id,k,w) VALUES(1,1,''b1'')');
+  sq.Exec('INSERT INTO jb(id,k,w) VALUES(2,2,''b2'')');
+  sq.Exec('INSERT INTO jb(id,k,w) VALUES(3,2,''b3'')');
+  sq.Exec('INSERT INTO jb(id,k,w) VALUES(4,4,''b4'')');
+  sq.Exec('INSERT INTO jb(id,k,w) VALUES(5,NULL,''b5'')');
+
+  // TabAN: duz esitlik (eski davranis, degismemeli)
+  ChkVal('duz ON: ic birlesim', 'SELECT COUNT(*) FROM ja JOIN jb ON ja.k=jb.k',
+    0, 0, '4');
+  // Ek kosul: yalniz ja.k>1 -> k=2 (1 satir) x jb k=2 (2 satir) = 2
+  ChkVal('ON + ja.k>1', 'SELECT COUNT(*) FROM ja JOIN jb ON ja.k=jb.k AND ja.k>1',
+    0, 0, '2');
+  // Imkansiz ek kosul: 0 satir (eskiden 30+ dk; hash ile hizli)
+  ChkVal('ON + imkansiz ek kosul',
+    'SELECT COUNT(*) FROM ja JOIN jb ON ja.k=jb.k AND ja.k>1000', 0, 0, '0');
+  // Sag tarafa ait ek kosul: jb.k>1 -> ja k=2 x jb k=2 (2) = 2
+  ChkVal('ON + jb.k>1 (sag taraf)',
+    'SELECT COUNT(*) FROM ja JOIN jb ON ja.k=jb.k AND jb.k>1', 0, 0, '2');
+
+  // LEFT JOIN: ek kosul eslesmeyenleri DUSURMEZ
+  ChkVal('LEFT duz ON', 'SELECT COUNT(*) FROM ja LEFT JOIN jb ON ja.k=jb.k',
+    0, 0, '7');
+  // k=1 iki sol satir eslesmez (jb.k>1), k=2 bir sol satir 2 eslesme,
+  // k=3/NULL/5 eslesmez -> 2 + 2 + 3 = 7
+  ChkVal('LEFT ON + jb.k>1', 'SELECT COUNT(*) FROM ja LEFT JOIN jb ON ja.k=jb.k AND jb.k>1',
+    0, 0, '7');
+  // LEFT'te eslesen satirin degeri gercekten sagdan geliyor mu?
+  ChkVal('LEFT ON + jb.k>1: eslesen deger',
+    'SELECT jb.w FROM ja LEFT JOIN jb ON ja.k=jb.k AND jb.k>1 WHERE ja.id=3' +
+    ' ORDER BY jb.id LIMIT 1', 0, 0, 'b2');
+
+  // PK uzerinden esitlik + ek esitlik: hash anahtari id, ek kosul k
+  ChkVal('PK + ek esitlik',
+    'SELECT COUNT(*) FROM ja JOIN jb ON ja.id=jb.id AND ja.k=jb.k', 0, 0, '2');
+
+  // OR koklu ON: esitlik AND icinde degil -> hash yok, sonuc yine dogru
+  ChkVal('OR koklu ON (hash yok)',
+    'SELECT COUNT(*) FROM ja JOIN jb ON ja.k=jb.k OR ja.k=99', 0, 0, '4');
+
+  // FULL JOIN: ek kosul ile de semantik korunur.
+  // eslesen 2 (ja id3 x jb id2,id3) + eslesmeyen ja 5 (id1,id2,id4,id5,id6)
+  // + eslesmeyen jb 3 (k=1, k=4, NULL) = 10
+  ChkVal('FULL ON + ja.k>1',
+    'SELECT COUNT(*) FROM ja FULL JOIN jb ON ja.k=jb.k AND ja.k>1', 0, 0, '10');
+end;
+
 type
   TTestRec = record
     Nm: string;
@@ -17440,7 +17503,7 @@ type
   end;
 
 const
-  TEST_SAYISI = 187;
+  TEST_SAYISI = 188;
 
   { v3 kosusunda ATLA: bu testler yalniz v2 motorunun (TVDb/WAL/arsiv/
     zone/indeks .idx) ozel yollarini kullanir; v3'te karsiligi yoktur.
@@ -17699,6 +17762,7 @@ begin
   TESTLER[184].Nm := 'T155_AsofV32'; TESTLER[184].P := T155_AsofV32;
   TESTLER[185].Nm := 'T156_SqliteParity'; TESTLER[185].P := T156_SqliteParity;
   TESTLER[186].Nm := 'T157_SatirGovdesi'; TESTLER[186].P := T157_SatirGovdesi;
+  TESTLER[187].Nm := 'T158_OnEkKosulHash'; TESTLER[187].P := T158_OnEkKosulHash;
 end;
 
 { ---------------------------------------------------------------------- main }

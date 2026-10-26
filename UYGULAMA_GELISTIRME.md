@@ -279,7 +279,7 @@ veritabani.colkey      kolon anahtarı (yalnız kolon şifrelemesi kullanılırs
 
 ---
 
-## 9. Bugünkü sınırlar (v3.11)
+## 9. Bugünkü sınırlar (v3.12)
 
 | Özellik | Durum | Not |
 |---|---|---|
@@ -291,6 +291,7 @@ veritabani.colkey      kolon anahtarı (yalnız kolon şifrelemesi kullanılırs
 | MVCC (süreçler arası) | yok | dosya kilidi ikinci süreci reddeder |
 | Toplu INSERT hızı | v2'nin **~1,5 katı** yavaş | v3 5,77 / v2 3,82 µs satır (200k×3 kolon, commit dâhil; aynı sonda, 3 koşu medyanı). v3.10: 6,63 → 6,12 µs (günlük kodlaması yerinde, etiket farkı ara sözlüksüz, `Put` tek arama). v3.11: **5,77 µs** (eşleşmiş ölçüm 6,16 → 5,77 = −%6,3; satır gövdesi varint, daha az bayt). Kalan fark: satır başına 4 kez çözülen oturum kümesi + WAL commit/günlük bedeli |
 | Satır gövdesi / dosya biçimi (v3.11) | **var** | Satır gövdesi v2: `$FFFF` işareti + varint pk/kolon sayısı + kolon başına varint uzunluk (`0` = NULL). **Dosya sürümü 4**; sürüm 3 dosyalar açılır (aynı dosyada v1/v2 satır bir arada), ilk yazılabilir açılışta başlık 4'e yükseltilir. Eski ikili sürüm 4'ü açık hatayla reddeder. Ölçülen: `.odb` −%15,7 (200k×3), sabit 3 kolonlu satır 39 → 30 bayt |
+| JOIN yöntemi (v3.12) | **hash + indeks** | İndekssiz eşitlik join'i hash join (10k×10k, 0 satır sonuç: 42 ms). ON'da eşitlik **+ ek koşul** da hash yolunu kullanır; ek koşullar eşleşen çiftlerde `JoinOnOk` ile uygulanır. Merge JOIN yok — ölçümle gereksiz (sıralı girdi yok). Sonuç satırı kopyalama ~3,2 µs/satır (1M satır 3,2 s); ON/WHERE yüklemi join'e itilmez (ölçülmüş sonraki fırsat) |
 | `ScanAll` hızı (v3.9) | iyileşti | 200k satır + **açık yazma kümesi**: 45,00 → **32,00 ms** (son üç koşu 31–32 ms, aynı makine/sonda). Satır başına 3 kilit alma kaldırıldı: yazma kümesi tarama başında bir kez çözülür |
 | Motor kilidi (v3.9) | `TVdbGate` | Her iş parçacığı tuttuğu kilitlerin `threadvar` yığınını taşır; **iç içe giriş kritik bölüme hiç girmez** (yeniden giriş varsayımı kalktı), paylaşılan alanlar kilit dışında okunmaz. `Leave` sahipsiz çıkışta açık hata verir. `ScanAllAt` / PITR taraması paylaşılan `FScan*` tamponunu artık kilit altında kullanır (eşzamanlı `ScanAll` ile bozulma giderildi) |
 | SQLite yazımları (v3.7) | **var** | `BEGIN [TRANSACTION|WORK] [IMMEDIATE|DEFERRED|EXCLUSIVE]`, `CREATE INDEX IF NOT EXISTS`, `INSERT OR REPLACE/IGNORE/ABORT/FAIL/ROLLBACK`, `CREATE TEMP[ORARY] TABLE`, `CREATE TABLE ... AS SELECT`, `UPDATE ... SET ... FROM`, `WITH x AS (INSERT/UPDATE/DELETE ...)`, `AS`'siz `CREATE TRIGGER` |
@@ -345,12 +346,23 @@ yükseltilir; eski ikili sürüm 4'ü açık hatayla reddeder (sessiz yanlış
 sonuç yok). Ayrıntı ve geriye dönük okuma kanıtı: `V3_YOL_HARITASI.md`
 §v3.11.
 
+v3.12'de **çözülenler**: `ON a.k=b.k AND a.x>5` gibi **eşitlik + ek koşul**
+içeren join'lerde hash yolu tamamen kapanıyordu; 10k × 10k'da sorgu **300
+s'de bitmiyordu** (klasik çift döngü, 100M ifade değerlendirmesi). Artık
+`AND` ağacının içindeki kolon=kolon eşitliği hash anahtarı olur, ek koşullar
+`JoinOnOk`'ta aynen uygulanır (sonuç değişmez); ek koşul varsa indeks/PK
+hızlı yolu kapatılır (o yol ek koşulu atlardı). Aynı sorgu **5.926 ms**.
+Merge JOIN ve Bloom filtresi **ölçümle reddedildi** (gerekçeler:
+`V3_YOL_HARITASI.md` §Sürüm çizgisi kararı). Kalan ölçülmüş fırsat: ON/WHERE
+yüklemlerinin ilgili tarafa itilmesi.
+
 **Sürüm çizgisi (2026-10-26):** Bu hat **alpha**'dır; `v3.x` numaraları
-yayın sürümü değil çalışma dilimi adıdır. Kalan maddeler (Bloom filtresi,
-merge JOIN, dosya boyutu, ifade bytecode, snapshot isolation) **bu hatta**
-yapılır; hepsi bitince ürün **v1.0.0** olarak yayınlanır. `main` = `v3`
-(aynı commit); iş `v3`te yürür, her push'ta `main` de ilerletilir.
-Süreçler arası çok yazarlılık kapsam dışı kalır (dosya kilidi mimarisi).
+yayın sürümü değil çalışma dilimi adıdır. Kalan maddeler (dosya boyutu,
+ifade bytecode, snapshot isolation; Bloom ve merge JOIN ölçümle reddedildi)
+**bu hatta** yapılır; hepsi bitince ürün **v1.0.0** olarak yayınlanır.
+`main` = `v3` (aynı commit); iş `v3`te yürür, her push'ta `main` de
+ilerletilir. Süreçler arası çok yazarlılık kapsam dışı kalır (dosya kilidi
+mimarisi).
 
 Yukarıdaki olmayanlar **sessizce yanlış sonuç vermez**: her biri açık bir
 `ecUnsupported` hatası ve yol gösteren mesaj döndürür.

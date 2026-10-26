@@ -6527,6 +6527,7 @@ var
     rv2: TStrArray;
     jv: string;
     eqn: TSqlBinaryOpNode;
+    OnHasExtra: Boolean;   // v3.12: ON kosulunda esitlikten baska kosul var
     latR: TSqlResult;   // F-29: LATERAL alt sorgu sonucu
     latSel: TSqlSelectStmt;   // F-29: LATERAL alt sorgu dugumu
     mr: TStrMatrix;        // kademeli buyume (O(n^2) SetLength onlemi)
@@ -6607,6 +6608,32 @@ var
         if hitTab = -2 then Result := 2 else Result := 1;
       end
       else Pos := -1;
+    end;
+
+    { v3.12: ON kosulu tek esitlik olmak zorunda DEGIL. `ON a.k=b.k AND
+      a.x>5` gibi bir AND agacinin icindeki kolon=kolon esitligini bulur.
+      Bu, indekssiz join'de hash yolunu acar: 100M cift yerine ~N+M is.
+      Ek kosullar JoinOnOk icinde aynen uygulanir (nihai eleyici), bu
+      yuzden semantik degismez. }
+    function OnEqNode(N: TSqlExprNode): TSqlBinaryOpNode;
+    var
+      B: TSqlBinaryOpNode;
+    begin
+      Result := nil;
+      if N = nil then Exit;
+      if not (N is TSqlBinaryOpNode) then Exit;
+      B := TSqlBinaryOpNode(N);
+      if (B.Op = sboEq) and (B.Left is TSqlColumnRefNode) and
+         (B.Right is TSqlColumnRefNode) then
+      begin
+        Result := B;
+        Exit;
+      end;
+      if B.Op = sboAnd then
+      begin
+        Result := OnEqNode(B.Left);
+        if Result = nil then Result := OnEqNode(B.Right);
+      end;
     end;
 
     procedure MrPush(const Row: TStrArray);
@@ -6883,31 +6910,40 @@ var
 
     JoinIdxCol1 := -1; JoinIdxCol2 := -1; JoinUsePk := False;
     HashL := -1; HashRrel := -1;
-    if (JC.OnCondition is TSqlBinaryOpNode) and
-       (TSqlBinaryOpNode(JC.OnCondition).Op = sboEq) and
-       (TSqlBinaryOpNode(JC.OnCondition).Left  is TSqlColumnRefNode) and
-       (TSqlBinaryOpNode(JC.OnCondition).Right is TSqlColumnRefNode) then
+    OnHasExtra := False;
+    if JC.OnCondition is TSqlBinaryOpNode then
     begin
-      eqn := TSqlBinaryOpNode(JC.OnCondition);
-      j := Taraf(TSqlColumnRefNode(eqn.Left), i);
-      k := Taraf(TSqlColumnRefNode(eqn.Right), q);
-      if (j = 1) and (k = 2) and (i >= 0) and (q >= 0) then
+      { v3.12: AND varsa ek kosul var demektir; esitligi agactan cikar.
+        Boyle bir durumda indeks/PK hizli yolu KULLANILMAZ (PK yolu
+        JoinOnOk cagirmaz -> ek kosul atlanirdi). Hash yolu JoinOnOk'u
+        cagirdigi icin guvenli. }
+      if TSqlBinaryOpNode(JC.OnCondition).Op = sboAnd then
+        OnHasExtra := True;
+      eqn := OnEqNode(JC.OnCondition);
+      if eqn <> nil then
       begin
-        JoinIdxCol1 := i; JoinIdxCol2 := q;
-      end
-      else if (j = 2) and (k = 1) and (i >= 0) and (q >= 0) then
-      begin
-        JoinIdxCol1 := q; JoinIdxCol2 := i;
-      end;
-      if (JoinIdxCol1 >= 0) and (JoinIdxCol2 >= 0) then
-      begin
-        HashL := JoinIdxCol1;
-        HashRrel := JoinIdxCol2 - n1;
+        j := Taraf(TSqlColumnRefNode(eqn.Left), i);
+        k := Taraf(TSqlColumnRefNode(eqn.Right), q);
+        if (j = 1) and (k = 2) and (i >= 0) and (q >= 0) then
+        begin
+          JoinIdxCol1 := i; JoinIdxCol2 := q;
+        end
+        else if (j = 2) and (k = 1) and (i >= 0) and (q >= 0) then
+        begin
+          JoinIdxCol1 := q; JoinIdxCol2 := i;
+        end;
+        if (JoinIdxCol1 >= 0) and (JoinIdxCol2 >= 0) then
+        begin
+          HashL := JoinIdxCol1;
+          HashRrel := JoinIdxCol2 - n1;
+        end;
       end;
     end;
     if JoinIdxCol2 >= 0 then
     begin
-      if rIsCte then
+      if OnHasExtra then
+        JoinIdxCol2 := -1   // ek ON kosulu var -> hash yolu (JoinOnOk uygular)
+      else if rIsCte then
         JoinIdxCol2 := -1   // CTE'de indeks/PK yok -> klasik yol
       else if (JC.JoinType = jtRight) or (JC.JoinType = jtFull) then
         JoinIdxCol2 := -1   // P5-RF: sag surucu klasik dongu kullanir
