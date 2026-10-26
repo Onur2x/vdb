@@ -543,9 +543,11 @@ Kapsam **süreç içi çok oturumlu yazma**dır: aynı `IVdbBackend` üzerinde b
   Güvenlik ağı: paylaşımlı kilit altında bir yazma ilkeli çağrılırsa kilit
   kendiliğinden tam kilide yükselir (`FAutoWrite`).
 - **Bilinçli sınırlar:** yazarlar **sıralıdır** (uzun işlem diğer süreçlerin
-  okuyucularını da bekletir); adil kuyruk yoktur; canlı veritabanının **sürüm
-  yükseltmesi** çok süreçli kullanımda desteklenmez. Snapshot isolation süreç
-  **içinde** var (v3.15), süreçler arasında görünürlük "son commit" düzeyindedir.
+  okuyucularını da bekletir); **açık bir salt-okunur oturum** paylaşımlı kilidi
+  oturum boyu tuttuğu için yazarları bloklar (`lockchk` bölüm 3); adil kuyruk
+  yoktur; canlı veritabanının **sürüm yükseltmesi** çok süreçli kullanımda
+  desteklenmez. Snapshot isolation süreç **içinde** var (v3.15), süreçler
+  arasında görünürlük "son commit" düzeyindedir.
 
 | Ölçüm (`benchcmp`, 200k × 3 kolon, 3 koşu medyanı, 32 bit) | Değer |
 |---|---|

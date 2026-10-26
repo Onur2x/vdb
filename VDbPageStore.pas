@@ -224,7 +224,6 @@ type
     procedure RefreshIfStale;
     { v3.16: yazma ilkelleri icin guvenlik agi (bkz. FAutoWrite). }
     procedure EnsureIoWrite;
-    procedure EndIoWrite;
     { v3.16: `<db>.gen` degisiklik sayaci. }
     function ReadGen: QWord;
     procedure BumpGen;
@@ -850,24 +849,6 @@ begin
   FLockedExcl := True;
   FLocked := True;
   FAutoWrite := True;
-end;
-
-procedure TVDbPageStore.EndIoWrite;
-begin
-  if not FAutoWrite then Exit;
-  FAutoWrite := False;
-  if FLockedExcl then
-  begin
-    VDbUnlockStream(FStream);
-    FLockedExcl := False;
-    FLocked := False;
-  end;
-  { Okuma islemi hala suruyorsa paylasimli kilide don. }
-  if (FReadDepth > 0) and (FStream <> nil) then
-  begin
-    FLockedShared := TakeSharedLock;
-    FLocked := FLockedShared;
-  end;
 end;
 
 { v3.16: `<db>.gen` — surecler arasi degisiklik sayaci. }

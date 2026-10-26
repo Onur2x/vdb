@@ -1196,6 +1196,10 @@ güvenliğin bilinçli bedelidir.
 **eksik=0**; B, A'nın commit'ini görür (`toplam=85`).
 
 **Bilinçli sınırlar (dokümante).**
+- Salt-okunur oturum, süreç içi görüntüsünü sabitlemek için paylaşımlı kilidi
+  **oturum boyu** tutar; bu yüzden **açık bir salt-okunur oturum yazarları
+  bloklar** (yazar `ABusyMs` sonunda hata alır — `lockchk` bölüm 3 bunu
+  doğrular). Uzun ömürlü GUI/rapor oturumları yazmayı geciktirir.
 - **Yazarlar sıralıdır**: bir yazma işlemi açıkken diğer süreçlerin yazma
   girişleri `ABusyMs` boyunca bekler, sonra
   `veritabani mesgul: yazar kilidi %d ms icinde alinamadi ...` hatası alır.
