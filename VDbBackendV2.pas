@@ -124,6 +124,16 @@ type
       out Keys: TQWordArray; out Vals: TValArray;
       out ActualTsMs, ActualSeq: Int64): Boolean;
     function ArchiveLogSet(const DestDir: string): Int64;
+    { v3.7: gunluk budama - v2'de mantiksal gunluk YOK. }
+    function GetLogPruneEnabled: Boolean;
+    procedure SetLogPruneEnabled(AValue: Boolean);
+    function GetLogPruneKeepDays: Integer;
+    procedure SetLogPruneKeepDays(AValue: Integer);
+    function GetLogPruneKeepBases: Integer;
+    procedure SetLogPruneKeepBases(AValue: Integer);
+    function LogPrune(out ADroppedSegments, ADroppedBaseFiles: Integer;
+      out ABytesFreed: Int64; out AErr: string): Boolean;
+    function GetLastLogPruneError: string;
     { v4 replikasyon: v2'de mantiksal gunluk yok. }
     function ReplSupported: Boolean;
     procedure ReplSuspendLog(ASuspend: Boolean);
@@ -485,6 +495,51 @@ begin
   Result := 0;
   raise EVdbBackendV2.Create(
     'ARCHIVE WAL: v2 motorunda mantiksal degisim gunlugu yok');
+end;
+
+{ v3.7: gunluk budama. v2'de mantiksal gunluk yok: ayarlar saklanir ama
+  islev yoktur; LogPrune sessizce "basarili" DEMEZ, acik hata doner. }
+function TVDbBackendV2.GetLogPruneEnabled: Boolean;
+begin
+  Result := False;
+end;
+
+procedure TVDbBackendV2.SetLogPruneEnabled(AValue: Boolean);
+begin
+end;
+
+function TVDbBackendV2.GetLogPruneKeepDays: Integer;
+begin
+  Result := 0;
+end;
+
+procedure TVDbBackendV2.SetLogPruneKeepDays(AValue: Integer);
+begin
+end;
+
+function TVDbBackendV2.GetLogPruneKeepBases: Integer;
+begin
+  Result := 0;
+end;
+
+procedure TVDbBackendV2.SetLogPruneKeepBases(AValue: Integer);
+begin
+end;
+
+function TVDbBackendV2.GetLastLogPruneError: string;
+begin
+  Result := 'v2 motorunda mantiksal degisim gunlugu yok';
+end;
+
+function TVDbBackendV2.LogPrune(out ADroppedSegments,
+  ADroppedBaseFiles: Integer; out ABytesFreed: Int64;
+  out AErr: string): Boolean;
+begin
+  ADroppedSegments := 0;
+  ADroppedBaseFiles := 0;
+  ABytesFreed := 0;
+  AErr := 'budama: v2 motorunda mantiksal degisim gunlugu yok';
+  Result := False;
 end;
 
 { v4 replikasyon: v2'de mantiksal gunluk yok; v2 kendi WAL-tasima

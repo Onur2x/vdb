@@ -261,6 +261,33 @@ type
       makinede ayni araliga PITR yapilabilir. }
     function ArchiveLogSet(const DestDir: string): Int64;
 
+    { --- v3.7: GUNLUK BUDAMA (retention) ---
+      Politika: "N gun VEYA K taban imaji — hangisi daha uzun bir gecmis
+      tutuyorsa". Sinir segment duzeyinde uygulanir: yalniz bastan kesintisiz
+      ONEK silinir; aktif (en yeni) segment, en yeni taban ve ondan sonraki
+      gruplar HER ZAMAN korunur. Bozuk/okunamayan segmentte budama durur.
+      LogPruneEnabled=True iken checkpoint SONRASI otomatik calisir; once
+      gerekliyse yeni taban imaji alinir (aksi halde eski segmentler
+      kapsamasiz kalirdi). Varsayilan KAPALI (AutoCompactEnabled gibi).
+      LogPrune: elle calistirir (bayragi beklemez).
+      v2: degisim gunlugu yok -> LogPrune False + acik hata metni. }
+    function GetLogPruneEnabled: Boolean;
+    procedure SetLogPruneEnabled(AValue: Boolean);
+    function GetLogPruneKeepDays: Integer;
+    procedure SetLogPruneKeepDays(AValue: Integer);
+    function GetLogPruneKeepBases: Integer;
+    procedure SetLogPruneKeepBases(AValue: Integer);
+    function LogPrune(out ADroppedSegments, ADroppedBaseFiles: Integer;
+      out ABytesFreed: Int64; out AErr: string): Boolean;
+    function GetLastLogPruneError: string;
+    property LogPruneEnabled: Boolean read GetLogPruneEnabled
+      write SetLogPruneEnabled;
+    property LogPruneKeepDays: Integer read GetLogPruneKeepDays
+      write SetLogPruneKeepDays;
+    property LogPruneKeepBases: Integer read GetLogPruneKeepBases
+      write SetLogPruneKeepBases;
+    property LastLogPruneError: string read GetLastLogPruneError;
+
     { --- v4: REPLIKASYON (mantiksal gunluk tasima) ---
       Model: birincil (primary) her commit'in mantiksal grubunu tasima
       dizinine yazar; ikincil (standby) bu gruplari KENDI motoruna uygular.

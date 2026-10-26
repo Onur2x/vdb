@@ -104,6 +104,15 @@ type
 
   TVdbLogBaseArray = array of TVdbLogBase;
 
+  { v3.7: budama sonucu (olculen, tahmin degil). }
+  TVdbLogPruneResult = record
+    DroppedSegments: Integer;
+    DroppedBaseFiles: Integer;
+    BytesFreed: Int64;
+  end;
+
+  TVdbLogBaseNameArray = array of string;
+
   { v4 replikasyon: bir grubun HAM baytlari. Kayitlar yeniden kodlanmaz;
     tasima bayt bayt yapilir (goc ile ayni guvence). }
   TVdbLogRawGroup = record
@@ -193,6 +202,9 @@ type
     FSegs: TList<LongWord>;
     function SegPath(No: LongWord): string;
     procedure CollectSegs;
+    { v3.7: bir segmentin ozeti (budama karari icin). }
+    function SegSpan(const APath: string; out AMaxSeq, AMaxTs,
+      ABytes: Int64; out ANames: TVdbLogBaseNameArray): Boolean;
   public
     constructor Create(const ADbPath: string);
     destructor Destroy; override;
@@ -222,11 +234,30 @@ type
       parti parti cagrilir; AMore = kesme sinirina takildik (daha olabilir). }
     function ExtractGroups(FromSeq: Int64; AMaxGroups: Integer;
       out AMore: Boolean): TVdbLogRawGroupArray;
+
+    { v3.7: gunlukteki EN ESKI kaydin zamani (gunluk bos/okunamazsa False). }
+    function OldestGroupTsMs(out ATsMs: Int64): Boolean;
+    { v3.7: BUDAMA. Yalniz TAM segmentlerden olusan ONEK silinir; aktif
+      (en yeni) segment ve yeni tabanin kapsadigi aralik korunur.
+      CutoffMs : bu zamandan ESKI gruplar budanabilir; <=0 = zaman kurali kapali.
+      KeepBases: en az bu kadar taban imaji korunur (>=1; oneri 2).
+      Guvenlik: hic taban isareti yoksa HICBIR sey silinmez.
+      Donus False: AErr'de neden; kismi silme olmus olabilir (AR dolu). }
+    function Prune(CutoffMs: Int64; KeepBases: Integer;
+      out AR: TVdbLogPruneResult; out AErr: string): Boolean;
   end;
 
 function VdbLogNowMs: Int64;
 function VdbLogDirOf(const ADbPath: string): string;
-{ SQL 'AS OF TIMESTAMP' metnini gunluk zamanina (UTC unix ms) cevirir.
+
+{ v3.7: gunluk budama - politika "N gun VEYA K taban imaji, hangisi daha
+  uzun bir gecmis tutuyorsa". KeepDays <= 0 = zaman kurali kapali.
+  VdbLogPruneAt: kesim noktasi ACIKCA verilir (test/operasyon icin). }
+function VdbLogPruneAt(const ADbPath: string; CutoffMs: Int64;
+  KeepBases: Integer; out AR: TVdbLogPruneResult;
+  out AErr: string): Boolean;
+function VdbLogPrune(const ADbPath: string; KeepDays, KeepBases: Integer;
+  out AR: TVdbLogPruneResult; out AErr: string): Boolean;{ SQL 'AS OF TIMESTAMP' metnini gunluk zamanina (UTC unix ms) cevirir.
   Kabul: 'YYYY-MM-DD' | 'YYYY-MM-DD HH:MM' | 'YYYY-MM-DD HH:MM:SS[.mmm]'
   Ayirici olarak 'T' de olabilir, sonda 'Z' yok sayilir. }
 function VdbLogParseTimestamp(const S: string; out Ms: Int64): Boolean;
@@ -1519,6 +1550,219 @@ begin
   finally
     group.Free;
   end;
+end;
+
+function TVdbLogReader.OldestGroupTsMs(out ATsMs: Int64): Boolean;
+var
+  i: Integer;
+  S: TFileStream;
+  buf: TBytes;
+  segSize, pos, rl: Integer;
+  magic: LongWord;
+begin
+  ATsMs := 0;
+  Result := False;
+  CollectSegs;
+  for i := 0 to FSegs.Count - 1 do
+  begin
+    if not FileExists(SegPath(FSegs[i])) then Continue;
+    S := TFileStream.Create(SegPath(FSegs[i]), fmOpenRead or fmShareDenyNone);
+    try
+      segSize := Integer(S.Size);
+      if (segSize < VDBLOG_SEG_HDR) or (segSize > 256 * 1024 * 1024) then
+        Continue;
+      SetLength(buf, segSize);
+      S.Position := 0;
+      if S.Read(buf[0], segSize) <> segSize then Continue;
+      if ReadU32(buf, 0) <> VDBLOG_MAGIC_SEG then Continue;
+      pos := VDBLOG_SEG_HDR;
+      while pos + VDBLOG_REC_HDR <= segSize do
+      begin
+        magic := ReadU32(buf, pos);
+        if (magic <> VDBLOG_MAGIC_REC) and (magic <> VDBLOG_MAGIC_END) and
+           (magic <> VDBLOG_MAGIC_BASE) then Break;
+        rl := Integer(ReadU32(buf, pos + 4));
+        if (rl < 0) or (pos + VDBLOG_REC_HDR + rl + 4 > segSize) then Break;
+        { Ilk gecerli kaydin zamani = gunlugun en eski noktasi. }
+        ATsMs := ReadI64(buf, pos + 16);
+        Exit(True);
+      end;
+    finally
+      S.Free;
+    end;
+  end;
+end;
+
+function TVdbLogReader.SegSpan(const APath: string;
+  out AMaxSeq, AMaxTs, ABytes: Int64;
+  out ANames: TVdbLogBaseNameArray): Boolean;
+var
+  S: TFileStream;
+  buf, rec: TBytes;
+  segSize, pos, rl, nb, n: Integer;
+  magic: LongWord;
+  sq, tsm: Int64;
+begin
+  Result := False;
+  AMaxSeq := 0;
+  AMaxTs := 0;
+  ABytes := 0;
+  ANames := nil;
+  if not FileExists(APath) then Exit;
+  S := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  try
+    segSize := Integer(S.Size);
+    if (segSize < VDBLOG_SEG_HDR) or (segSize > 256 * 1024 * 1024) then Exit;
+    ABytes := segSize;
+    SetLength(buf, segSize);
+    S.Position := 0;
+    if S.Read(buf[0], segSize) <> segSize then Exit;
+    if ReadU32(buf, 0) <> VDBLOG_MAGIC_SEG then Exit;
+    pos := VDBLOG_SEG_HDR;
+    n := 0;
+    while pos + VDBLOG_REC_HDR <= segSize do
+    begin
+      magic := ReadU32(buf, pos);
+      if (magic <> VDBLOG_MAGIC_REC) and (magic <> VDBLOG_MAGIC_END) and
+         (magic <> VDBLOG_MAGIC_BASE) then Break;
+      rl := Integer(ReadU32(buf, pos + 4));
+      if (rl < 0) or (pos + VDBLOG_REC_HDR + rl + 4 > segSize) then Break;
+      sq := ReadI64(buf, pos + 8);
+      tsm := ReadI64(buf, pos + 16);
+      if sq > AMaxSeq then AMaxSeq := sq;
+      if tsm > AMaxTs then AMaxTs := tsm;
+      if magic = VDBLOG_MAGIC_BASE then
+      begin
+        { Taban adi yalniz CRC'si TUTAN kayittan alinir: bozuk bir kaydin
+          adi yuzunden saglam imaj silinmesin. }
+        SetLength(rec, VDBLOG_REC_HDR + rl + 4);
+        Move(buf[pos], rec[0], Length(rec));
+        if ReadU32(rec, Length(rec) - 4) = VDbCrc32OfBytes(rec,
+          Length(rec) - 4) then
+        begin
+          nb := Integer(ReadU32(rec, VDBLOG_REC_HDR + 20));
+          if (nb > 0) and (24 + nb <= rl) then
+          begin
+            SetLength(ANames, n + 1);
+            SetLength(ANames[n], nb);
+            Move(rec[VDBLOG_REC_HDR + 24], ANames[n][1], nb);
+            Inc(n);
+          end;
+        end;
+      end;
+      pos := pos + VDBLOG_REC_HDR + rl + 4;
+    end;
+    Result := True;
+  finally
+    S.Free;
+  end;
+end;
+
+function TVdbLogReader.Prune(CutoffMs: Int64; KeepBases: Integer;
+  out AR: TVdbLogPruneResult; out AErr: string): Boolean;
+var
+  bases: TVdbLogBaseArray;
+  i, j: Integer;
+  keepFrom, baseFloor, maxSeq, maxTs, size: Int64;
+  names, doomed: TVdbLogBaseNameArray;
+  p, bp: string;
+begin
+  AR.DroppedSegments := 0;
+  AR.DroppedBaseFiles := 0;
+  AR.BytesFreed := 0;
+  AErr := '';
+  Result := False;
+  if KeepBases < 1 then KeepBases := 1;
+  CollectSegs;
+  if FSegs.Count = 0 then Exit(True);
+  bases := ListBases;
+  { Taban yoksa "silinen gruplar bir tabanla kapsaniyor" KANITLANAMAZ:
+    hicbir sey silinmez (veri kaybi riski sifir). }
+  if Length(bases) = 0 then Exit(True);
+
+  { Zorunlu alt sinir: EN YENI tabanin sirasi. Bu siradan itibaren her grup
+    (taban + ileri replay) canli durum icin gerekli. }
+  keepFrom := bases[0].Seq;
+  for i := 1 to High(bases) do
+    if bases[i].Seq > keepFrom then keepFrom := bases[i].Seq;
+  { "En az KeepBases taban imaji" kurali daha ESKI bir sinir koyar: bu,
+    zaman kurali ne derse desin o tabanin kapsadigi gecmisi KORUR
+    (yani iki kuraldan HANGISI DAHA UZUN tutuyorsa o kazanir). }
+  if Length(bases) >= KeepBases then
+  begin
+    baseFloor := bases[Length(bases) - KeepBases].Seq;
+    if baseFloor < keepFrom then keepFrom := baseFloor;
+  end;
+
+  doomed := nil;
+  { ONEK: yalniz bastan kesintisiz silinir. Aktif (en yeni) segment her
+    zaman korunur: yazici ona ekleme yapiyor olabilir. }
+  for i := 0 to FSegs.Count - 2 do
+  begin
+    p := SegPath(FSegs[i]);
+    if not FileExists(p) then Continue;
+    if not SegSpan(p, maxSeq, maxTs, size, names) then
+    begin
+      AErr := 'segment okunamadi: ' + ExtractFileName(p);
+      Exit;                       { onek kurali: buradan ileriye dokunma }
+    end;
+    if maxSeq >= keepFrom then Break;
+    if (CutoffMs > 0) and (maxTs >= CutoffMs) then Break;
+    if not DeleteFile(p) then
+    begin
+      AErr := 'segment silinemedi: ' + ExtractFileName(p);
+      Exit;
+    end;
+    Inc(AR.DroppedSegments);
+    Inc(AR.BytesFreed, size);
+    for j := 0 to High(names) do
+    begin
+      SetLength(doomed, Length(doomed) + 1);
+      doomed[High(doomed)] := names[j];
+    end;
+  end;
+
+  { Silinen segmentlerdeki BASE isaretleri artik okunamaz: imaj dosyalari
+    da erisilemez durumdadir, birlikte silinir. }
+  for i := 0 to High(doomed) do
+  begin
+    if doomed[i] = '' then Continue;
+    bp := IncludeTrailingPathDelimiter(FDir) + 'base' + PathDelim + doomed[i];
+    if not FileExists(bp) then Continue;
+    if DeleteFile(bp) then Inc(AR.DroppedBaseFiles)
+    else
+    begin
+      AErr := 'taban imaji silinemedi: ' + doomed[i];
+      Exit;
+    end;
+  end;
+  Result := True;
+end;
+
+function VdbLogPruneAt(const ADbPath: string; CutoffMs: Int64;
+  KeepBases: Integer; out AR: TVdbLogPruneResult;
+  out AErr: string): Boolean;
+var
+  r: TVdbLogReader;
+begin
+  r := TVdbLogReader.Create(ADbPath);
+  try
+    Result := r.Prune(CutoffMs, KeepBases, AR, AErr);
+  finally
+    r.Free;
+  end;
+end;
+
+function VdbLogPrune(const ADbPath: string; KeepDays, KeepBases: Integer;
+  out AR: TVdbLogPruneResult; out AErr: string): Boolean;
+var
+  cut: Int64;
+begin
+  if KeepDays > 0 then
+    cut := VdbLogNowMs - Int64(KeepDays) * Int64(86400000)
+  else
+    cut := 0;
+  Result := VdbLogPruneAt(ADbPath, cut, KeepBases, AR, AErr);
 end;
 
 end.

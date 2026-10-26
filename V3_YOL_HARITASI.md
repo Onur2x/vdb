@@ -624,12 +624,52 @@ Kapılar: 14/14 yeşil, `v3sqlchk` **237/0**, `sqltest` v3 **2784/0/33**
 (önce 2759), v2 **3221/0/0** (önce 3196) — yeni `T156_SqliteParity` 25 kontrol,
 iki backend'de de koşar.
 
+### v3.8 — değişim günlüğü budama (2026-10-26)
+
+Ürün kararı: **"30 gün VEYA 2 taban imajı — hangisi daha uzun geçmiş
+tutuyorsa"**, tetikleme **checkpoint sonrası otomatik** (ayrı bayrakla,
+varsayılan kapalı). Bugüne kadar günlük sınırsız büyüyordu (~100 B/satır).
+
+Kesim noktası iki sınırın **daha eskisidir** (yani daha çok geçmiş korunur):
+
+| Sınır | Anlamı |
+|---|---|
+| zaman | Grup zamanı `now − KeepDays`'ten eskiyse budanabilir (`KeepDays=0` → kural kapalı) |
+| taban | En yeni `KeepBases` taban imajının **en eskisinden** öncesi budanabilir |
+
+Zorunlu alt sınır her zaman **en yeni taban imajının sırasıdır**: ondan
+sonraki gruplar canlı durum için gereklidir, silinemez.
+
+Uygulama kuralları (hepsi ölçülmüş, varsayım değil):
+1. Silme yalnız **segment düzeyinde önek**: baştan kesintisiz tam segmentler.
+2. **Aktif (en son) segment** her zaman korunur (yazıcı ona ekliyor olabilir).
+3. **Taban işareti yoksa hiçbir şey silinmez** — kapsama kanıtlanamaz.
+4. Okunamayan/bozuk segmentte budama **durur** (o noktadan ileriye dokunulmaz).
+5. Silinen segmentlerdeki `BASE` kayıtlarının **imaj dosyaları da** silinir.
+6. Otomatik kanca (`LogPruneEnabled=True`) yalnız **süresi dolmuş önek
+   varsa** çalışır ve önce o öneği kapsayan **yeni taban imajı** yazar; yoksa
+   her checkpoint'te tam dosya kopyası üretmez.
+
+Arayüz (`IVdbBackend`, v2'de açık hata): `LogPruneEnabled` (varsayılan
+False), `LogPruneKeepDays` (30), `LogPruneKeepBases` (2),
+`LastLogPruneError`, elle `LogPrune(out Segment, TabanDosya, Bayt, Hata)`.
+Açık yazma işlemi varken budama reddedilir.
+
+Kapılar: `logchk` **43/0** (önce 28; yeni `TestPrune` 15 kontrol: kesim
+noktası, taban koruma, aktif segment, tabansız güvenlik, idempotens, budama
+sonrası replay), `backendchk` **115/0** (önce 108; varsayılanlar, elle
+budama, açık işlem reddi, checkpoint kancası, v2 stub).
+
+Bilinçli sınırlar: segment içi yeniden yazma yok (tek bir dev segment
+budanamaz); budama sonrası kalan en eski tabandan önceki bir ana `AS OF` /
+`RECOVER TO` hedefi **açık hatayla** reddedilir; her budama turu bir tam
+dosya kopyası (taban imajı) maliyeti taşır.
+
 ### Sıradaki sürüme ertelenen (v4 sonrası)
 - Satır gövdesi varint/delta kodlama (F3-1'in kalanı)
 - Dosya boyutu (PK'nin ikinci kez yazılması, hücre başlığı sıkıştırma)
 - Bloom filtresi, merge JOIN, ifade bytecode
 - Snapshot isolation (MVCC okuma izolasyonu) ve süreçler arası çok yazarlılık
-- Değişim günlüğü saklama politikası (log budama / arşiv ömrü)
 
 ### Kapsam dışı (değişmedi)
 - M3 WASM, M7 async sunucu

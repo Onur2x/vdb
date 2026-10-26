@@ -187,6 +187,12 @@ type
       FAutoCompactCount: Int64;
       FAutoCompactBusy: Boolean;
       FLastAutoCompactError: string;
+      { v3.7: gunluk budama (retention). Varsayilan KAPALI; AutoCompact gibi. }
+      FLogPruneOn: Boolean;
+      FLogPruneDays: Integer;
+      FLogPruneBases: Integer;
+      FLogPruneErr: string;
+      procedure MaybeLogPrune;
       function ValBytes: Int64;
       procedure MaybeAutoCompact;
       function AutoCompactBody(out OldBytes, NewBytes: Int64;
@@ -370,6 +376,16 @@ type
       out Keys: TQWordArray; out Vals: TValArray;
       out ActualTsMs, ActualSeq: Int64): Boolean;
     function ArchiveLogSet(const DestDir: string): Int64;
+    { v3.7: gunluk budama }
+    function GetLogPruneEnabled: Boolean;
+    procedure SetLogPruneEnabled(AValue: Boolean);
+    function GetLogPruneKeepDays: Integer;
+    procedure SetLogPruneKeepDays(AValue: Integer);
+    function GetLogPruneKeepBases: Integer;
+    procedure SetLogPruneKeepBases(AValue: Integer);
+    function LogPrune(out ADroppedSegments, ADroppedBaseFiles: Integer;
+      out ABytesFreed: Int64; out AErr: string): Boolean;
+    function GetLastLogPruneError: string;
     { v4: replikasyon }
     function ReplSupported: Boolean;
     procedure ReplSuspendLog(ASuspend: Boolean);
@@ -445,6 +461,10 @@ begin
   FAutoCompactCount := 0;
   FAutoCompactBusy := False;
   FLastAutoCompactError := '';
+  FLogPruneOn := False;
+  FLogPruneDays := 30;
+  FLogPruneBases := 2;
+  FLogPruneErr := '';
   FDirty := False;
   FCheckpointBytes := VDB_V3_CHECKPOINT_BYTES;
   FPoolPages := APoolPages;
@@ -830,7 +850,43 @@ procedure TVdbBackendV3.MaybeCheckpoint;
 begin
   if FCheckpointBytes <= 0 then Exit;
   if FEng.Wal.Bytes >= FCheckpointBytes then
+  begin
     FEng.Checkpoint(True);
+    { v3.7: "checkpoint sonrasi otomatik budama". Hata commit'i BOZMAZ;
+      LastLogPruneError'da gorunur. }
+    MaybeLogPrune;
+  end;
+end;
+
+procedure TVdbBackendV3.MaybeLogPrune;
+var
+  rd: TVdbLogReader;
+  oldest, cut: Int64;
+  pr: TVdbLogPruneResult;
+  err: string;
+  hadOld: Boolean;
+begin
+  if not FLogPruneOn then Exit;
+  if FReadOnly then Exit;
+  if (FLog = nil) or (not FLog.Enabled) then Exit;
+  if FLogPruneDays <= 0 then Exit;         { zaman kurali yoksa onek sinirsiz }
+  cut := VdbLogNowMs - Int64(FLogPruneDays) * Int64(86400000);
+  hadOld := False;
+  oldest := 0;
+  rd := TVdbLogReader.Create(FPath);
+  try
+    hadOld := rd.OldestGroupTsMs(oldest);
+  finally
+    rd.Free;
+  end;
+  if (not hadOld) or (oldest >= cut) then Exit;
+  { Suresi dolmus bir ONEK var: once onu KAPSAYAN yeni taban imaji alinir,
+    sonra onek silinir. Taban olmadan silmek PITR'i kirardi. }
+  EnsureLogBase(0, 'budama tabani');
+  if VdbLogPruneAt(FPath, cut, FLogPruneBases, pr, err) then
+    FLogPruneErr := ''
+  else
+    FLogPruneErr := err;
 end;
 
 procedure TVdbBackendV3.ApplyBatch;
@@ -2831,6 +2887,106 @@ begin
     Result := n;
   finally
     rd.Free;
+  end;
+end;
+
+{ ===================================================== v3.7: GUNLUK BUDAMA }
+
+function TVdbBackendV3.GetLogPruneEnabled: Boolean;
+begin
+  Result := FLogPruneOn;
+end;
+
+procedure TVdbBackendV3.SetLogPruneEnabled(AValue: Boolean);
+begin
+  FLogPruneOn := AValue;
+end;
+
+function TVdbBackendV3.GetLogPruneKeepDays: Integer;
+begin
+  Result := FLogPruneDays;
+end;
+
+procedure TVdbBackendV3.SetLogPruneKeepDays(AValue: Integer);
+begin
+  if AValue < 0 then AValue := 0;
+  FLogPruneDays := AValue;
+end;
+
+function TVdbBackendV3.GetLogPruneKeepBases: Integer;
+begin
+  Result := FLogPruneBases;
+end;
+
+procedure TVdbBackendV3.SetLogPruneKeepBases(AValue: Integer);
+begin
+  if AValue < 1 then AValue := 1;
+  FLogPruneBases := AValue;
+end;
+
+function TVdbBackendV3.GetLastLogPruneError: string;
+begin
+  Result := FLogPruneErr;
+end;
+
+function TVdbBackendV3.LogPrune(out ADroppedSegments,
+  ADroppedBaseFiles: Integer; out ABytesFreed: Int64;
+  out AErr: string): Boolean;
+var
+  rd: TVdbLogReader;
+  oldest, cut: Int64;
+  pr: TVdbLogPruneResult;
+  needBase: Boolean;
+begin
+  ADroppedSegments := 0;
+  ADroppedBaseFiles := 0;
+  ABytesFreed := 0;
+  AErr := '';
+  if not LogSupported then
+  begin
+    AErr := 'budama: ' + LogStatus;
+    Result := False;
+    Exit;
+  end;
+  if FReadOnly then
+  begin
+    AErr := 'budama: salt-okunur oturum';
+    Result := False;
+    Exit;
+  end;
+  FEngCs.Enter;
+  try
+    { Acik yazma islemi varken checkpoint/taban alinmaz: once bitirilmeli. }
+    if BatchIsMine then
+    begin
+      AErr := 'budama: acik islem varken calistirilamaz';
+      Result := False;
+      Exit;
+    end;
+    if FLogPruneDays > 0 then
+      cut := VdbLogNowMs - Int64(FLogPruneDays) * Int64(86400000)
+    else
+      cut := 0;
+    needBase := False;
+    if cut > 0 then
+    begin
+      oldest := 0;
+      rd := TVdbLogReader.Create(FPath);
+      try
+        if rd.OldestGroupTsMs(oldest) and (oldest < cut) then
+          needBase := True;
+      finally
+        rd.Free;
+      end;
+    end;
+    if needBase then EnsureLogBase(0, 'budama tabani');
+    Result := VdbLogPruneAt(FPath, cut, FLogPruneBases, pr, AErr);
+    ADroppedSegments := pr.DroppedSegments;
+    ADroppedBaseFiles := pr.DroppedBaseFiles;
+    ABytesFreed := pr.BytesFreed;
+    FLogPruneErr := AErr;
+  finally
+    FEngCs.Leave;
   end;
 end;
 

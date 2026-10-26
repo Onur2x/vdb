@@ -279,12 +279,12 @@ veritabani.colkey      kolon anahtarı (yalnız kolon şifrelemesi kullanılırs
 
 ---
 
-## 9. Bugünkü sınırlar (v3.7)
+## 9. Bugünkü sınırlar (v3.8)
 
 | Özellik | Durum | Not |
 |---|---|---|
 | `AS OF SEQUENCE n` | **var** (v3.2) | WAL penceresindeki n'inci commit'in tam görüntüsü geçici kopyada kurulur; yalnız son checkpoint'ten beri. n = commit sayısı |
-| PITR (`RECOVER TO`), WAL arşivi, `AS OF TIMESTAMP/VERSION` | **var** (v4) | Mantıksal değişim günlüğü (`<db>.log`): `AS OF TIMESTAMP/VERSION`, `ARCHIVE WAL SET DIR=`, `RECOVER TO`. Günlük kalıcıdır ve **budanmaz**; geçmiş sınırsız büyür |
+| PITR (`RECOVER TO`), WAL arşivi, `AS OF TIMESTAMP/VERSION` | **var** (v4) | Mantıksal değişim günlüğü (`<db>.log`): `AS OF TIMESTAMP/VERSION`, `ARCHIVE WAL SET DIR=`, `RECOVER TO`. Günlük **varsayılan olarak budanmaz**. v3.8'den itibaren isteğe bağlı budama: `LogPruneEnabled` + `LogPruneKeepDays` (varsayılan 30) + `LogPruneKeepBases` (varsayılan 2); checkpoint sonrası otomatik veya elle `LogPrune` |
 | Replication (`START REPLICATION` vb.) | **var** (v4) | Mantıksal grup taşıma; **dosya tabanlı** (paylaşımlı dizin). TCP ile replikasyon açıkça reddedilir |
 | Zone map / bölüm budama | **var** (v3.3) | Sayfa düzeyi; kazanç **seçici** yüklemlerde. Orta seçicilikte ölçülebilir kazanç yok |
 | MVCC (süreç içi çok oturum) | **var** (v3.4) | READ COMMITTED; her oturum kendi yazma kümesinde yazar, **ilk commit kazanır**, kaybeden `yazma cakismasi` ile durur. DDL/`SAVEPOINT`/`DEFERRABLE` çoklu yazmada reddedilir. Snapshot isolation yok |
@@ -295,6 +295,10 @@ veritabani.colkey      kolon anahtarı (yalnız kolon şifrelemesi kullanılırs
 | `UPDATE ... FROM` kapsamı | sınır | Tek kaynak (tablo veya parantezli SELECT) + alias; `FROM` içinde **JOIN reddedilir**. Çoklu eşleşmede ilk kaynak satırı kullanılır (SQLite da tek satır seçer) |
 | `INSERT OR FAIL/ROLLBACK` | sınır | Çakışmada hata verir; `ROLLBACK`'ın "tüm işlemi geri al" ayrımı uygulanmaz (varsayılan ABORT davranışı) |
 | `INSERT OR ...` + `ON CONFLICT` | sınır | Aynı cümlede birlikte reddedilir (açık hata) |
+| Günlük budama (v3.8) | **var**, varsayılan KAPALI | Segment düzeyinde **önek** silme: yalnız baştan kesintisiz tam segmentler. Aktif (son) segment, en yeni taban ve sonrası her zaman korunur. Hiç taban yoksa hiçbir şey silinmez |
+| Budama kesim noktası | politika | "30 gün VEYA 2 taban imajı — hangisi daha uzun geçmiş tutuyorsa". Zaman kuralı `LogPruneKeepDays=0` ile kapatılır (yalnız taban kuralı). |
+| Budama sonrası PITR | sınır | Kalan en eski tabandan **önceki** bir ana `AS OF`/`RECOVER TO` hedefi artık kurulamaz; açık hata döner (sessiz yanlış sonuç yok) |
+| Budama maliyeti | sınır | Süresi dolmuş önek varsa checkpoint **yeni bir taban imajı** yazar (tam dosya kopyası). Sonra önek silinir; pencere dolunca tekrarlanır. Segment içi yeniden yazma yok |
 
 Aynı açık veritabanında **oturum yalitimi** vardır: `VDbSetTxnSession`
 (v2) / `VdbBackendSessionId` ile kimliği olan iki oturum birbirinin **commit

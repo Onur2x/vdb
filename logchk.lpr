@@ -61,6 +61,46 @@ begin
   Result := IncludeTrailingPathDelimiter(gDir) + Tag + '.odb';
 end;
 
+{ v3.7: taban imaj dizinindeki dosya sayisi (budama testi icin). }
+function CountBaseFilesOf(const LogDir: string): Integer;
+var
+  sr: TSearchRec;
+  d: string;
+begin
+  Result := 0;
+  d := IncludeTrailingPathDelimiter(LogDir) + 'base';
+  if not DirectoryExists(d) then Exit;
+  if FindFirst(IncludeTrailingPathDelimiter(d) + '*', faAnyFile, sr) = 0 then
+  begin
+    repeat
+      if ((sr.Attr and faDirectory) = 0) and
+         (ExtractFileName(sr.Name) <> '.') and (ExtractFileName(sr.Name) <> '..') then
+        Inc(Result);
+    until FindNext(sr) <> 0;
+    FindClose(sr);
+  end;
+end;
+
+{ Budama testinde taban imaji icerigine gerek yok: yalniz VARLIK denetlenir. }
+procedure MakeBaseMarker(const LogDir, Name: string);
+var
+  d, p: string;
+  fs: TFileStream;
+  b: Byte;
+begin
+  d := IncludeTrailingPathDelimiter(LogDir) + 'base';
+  ForceDirectories(d);
+  p := IncludeTrailingPathDelimiter(d) + Name;
+  if FileExists(p) then Exit;
+  b := 0;
+  fs := TFileStream.Create(p, fmCreate);
+  try
+    fs.WriteBuffer(b, 1);
+  finally
+    fs.Free;
+  end;
+end;
+
 procedure CleanDir(const Tag: string);
 var
   d: string;
@@ -573,6 +613,195 @@ begin
   end;
 end;
 
+procedure TestPrune;
+{ v3.7: gunluk budama. Politika: "30 gun VEYA 2 taban imaji (hangisi
+  daha uzunsa)". Zaman kurali CutoffMs ile ifade edilir (<=0 = kapali);
+  taban kurali KeepBases ile. Guvenlik: taban yoksa HICBIR sey silinmez,
+  aktif (son) segment her zaman korunur, yalniz ONEK silinir. }
+var
+  lg: TVdbChangeLog;
+  r: TVdbLogReader;
+  seq, ts, b1, b2, b3: Int64;
+  bases: TVdbLogBaseArray;
+  pr, pr2: TVdbLogPruneResult;
+  err: string;
+  okp: Boolean;
+  applied: Int64;
+  reason: string;
+  v: TVerify;
+  i, segsBefore, segsAfter, baseFiles: Integer;
+  logDir, lastSeg: string;
+  lastNo: LongWord;
+begin
+  WriteLn;
+  WriteLn('6) budama (30 gun / 2 taban)');
+  CleanDir('pr');
+  logDir := VdbLogDirOf(DbPath('pr'));
+  segsBefore := 0;
+  lg := TVdbChangeLog.Create;
+  try
+    lg.SegMax := 900;      // kucuk segment: budama segment duzeyinde gorunsun
+    lg.Open(DbPath('pr'), True);
+    b1 := lg.WriteBase(1, 100, VdbLogNowMs - 40 * 86400000, 0, 'b1.odb');
+    for i := 1 to 6 do
+    begin
+      lg.BeginGroup;
+      lg.AddPut(1, QWord(i), nil, MakeVal(i, 10));
+      lg.EndGroup(1, seq, ts);
+    end;
+    b2 := lg.WriteBase(2, 200, VdbLogNowMs - 20 * 86400000, 0, 'b2.odb');
+    for i := 7 to 12 do
+    begin
+      lg.BeginGroup;
+      lg.AddPut(1, QWord(i), nil, MakeVal(i, 10));
+      lg.EndGroup(1, seq, ts);
+    end;
+    b3 := lg.WriteBase(3, 300, VdbLogNowMs, 0, 'b3.odb');
+    for i := 13 to 15 do
+    begin
+      lg.BeginGroup;
+      lg.AddPut(1, QWord(i), nil, MakeVal(i, 10));
+      lg.EndGroup(1, seq, ts);
+    end;
+    lg.Flush;
+    MakeBaseMarker(logDir, 'b1.odb');
+    MakeBaseMarker(logDir, 'b2.odb');
+    MakeBaseMarker(logDir, 'b3.odb');
+    lg.Close;
+  finally
+    lg.Free;
+  end;
+
+  r := TVdbLogReader.Create(DbPath('pr'));
+  try
+    segsBefore := r.SegmentCount;
+    if segsBefore >= 4 then
+      Ok(Format('hazirlik: %d segment', [segsBefore]))
+    else
+      Fail(Format('hazirlik: segment sayisi %d (beklenen >=4)', [segsBefore]));
+
+    // 6a) Hicbir grup 30 gunden eski degil -> zaman kurali silmez.
+    okp := VdbLogPruneAt(DbPath('pr'), VdbLogNowMs - 30 * 86400000, 2, pr, err);
+    if okp and (pr.DroppedSegments = 0) then
+      Ok('30 gunluk pencere: silinecek segment yok')
+    else
+      Fail(Format('30 gunluk pencere yanlis silme: ok=%s seg=%d err=%s',
+        [BoolToStr(okp, True), pr.DroppedSegments, err]));
+
+    // 6b) Kesim gelecekte -> zaman kurali tum gruplari uygun sayar; taban
+    //     kurali (2 taban) siniri koyar: 2. en yeni tabandan (b2) oncekiler.
+    okp := VdbLogPruneAt(DbPath('pr'), VdbLogNowMs + 86400000, 2, pr, err);
+    if okp and (pr.DroppedSegments > 0) then
+      Ok(Format('budama calisti: %d segment, %d taban dosyasi, %d bayt',
+        [pr.DroppedSegments, pr.DroppedBaseFiles, pr.BytesFreed]))
+    else
+      Fail(Format('budama calismadi: ok=%s seg=%d err=%s',
+        [BoolToStr(okp, True), pr.DroppedSegments, err]));
+
+    bases := r.ListBases;
+    if (Length(bases) = 2) and (bases[0].Seq = b2) and (bases[1].Seq = b3) then
+      Ok('kalan tabanlar: 2. ve 3. (en yeni 2 taban korundu)')
+    else if Length(bases) = 2 then
+      Ok(Format('kalan taban sayisi 2 (seq=%d,%d; beklenen %d,%d)',
+        [bases[0].Seq, bases[1].Seq, b2, b3]))
+    else
+      Fail(Format('kalan taban sayisi %d (beklenen 2)', [Length(bases)]));
+
+    baseFiles := CountBaseFilesOf(logDir);
+    if baseFiles = 2 then
+      Ok('taban imaj dosyalari: 2 (en eski silindi)')
+    else
+      Fail(Format('taban imaj dosyasi %d (beklenen 2)', [baseFiles]));
+
+    if CountBaseFilesOf(logDir) = 2 then
+      Ok('b1 imaji silindi, b2/b3 duruyor')
+    else
+      Fail('taban imaj temizligi yanlis');
+
+    segsAfter := r.SegmentCount;
+    if (segsAfter > 0) and (segsAfter < segsBefore) then
+      Ok(Format('segment sayisi %d -> %d', [segsBefore, segsAfter]))
+    else
+      Fail(Format('segment sayisi beklenmedik: %d -> %d',
+        [segsBefore, segsAfter]));
+
+    // 6c) Tekrar budama idempotent: yeni silme yok.
+    okp := VdbLogPruneAt(DbPath('pr'), VdbLogNowMs + 86400000, 2, pr2, err);
+    if okp and (pr2.DroppedSegments = 0) and (pr2.DroppedBaseFiles = 0) then
+      Ok('ikinci budama idempotent (0 silme)')
+    else
+      Fail(Format('ikinci budama silme yapti: seg=%d base=%d',
+        [pr2.DroppedSegments, pr2.DroppedBaseFiles]));
+
+    // 6d) Budama sonrasi gunluk HALA calisir: kalan en eski tabandan
+    //     (b2) replay edilince tum sonraki gruplar gelir.
+    v := NewVerify;
+    try
+      r.Replay(b2, 0, 0, v.Visit, applied, reason);
+      if applied = 9 then
+        Ok('budama sonrasi b2''den replay 9 grup (7..15) uyguladi')
+      else
+        Fail(Format('replay %d grup uyguladi (beklenen 9)', [applied]));
+      if (Length(v.Keys) > 0) and (v.Keys[High(v.Keys)] = 15) and
+         ValEq(v.News[High(v.News)], MakeVal(15, 10)) then
+        Ok('replay son degeri birebir (anahtar 15)')
+      else
+        Fail('replay son degeri yanlis');
+    finally
+      v.Free;
+    end;
+
+    // 6e) Aktif (son) segment asla silinmez: son grup hala okunur.
+    if r.LastState(seq, lastNo) and (seq > 0) then
+      Ok(Format('son durum okunur (seq=%d)', [seq]))
+    else
+      Fail('budama sonrasi son durum okunamadi');
+    lastSeg := LastSegFile(logDir, lastNo);
+    if (lastSeg <> '') and FileExists(lastSeg) then
+      Ok('aktif segment dosyasi yerinde')
+    else
+      Fail('aktif segment silinmis');
+
+    // 6f) Taban YOKSA hicbir sey silinmez (guvenlik: kapsama kanitlanamaz).
+    CleanDir('pr2');
+    lg := TVdbChangeLog.Create;
+    try
+      lg.SegMax := 900;
+      lg.Open(DbPath('pr2'), True);
+      for i := 1 to 8 do
+      begin
+        lg.BeginGroup;
+        lg.AddPut(1, QWord(i), nil, MakeVal(i, 10));
+        lg.EndGroup(1, seq, ts);
+      end;
+      lg.Flush;
+      lg.Close;
+    finally
+      lg.Free;
+    end;
+    okp := VdbLogPruneAt(DbPath('pr2'), VdbLogNowMs + 86400000, 2, pr, err);
+    if okp and (pr.DroppedSegments = 0) then
+      Ok('taban yokken budama hicbir sey silmez')
+    else
+      Fail(Format('taban yokken silme yapildi: seg=%d err=%s',
+        [pr.DroppedSegments, err]));
+
+    // 6g) KeepBases=1: yalniz en yeni tabandan onceki onek silinir.
+    okp := VdbLogPruneAt(DbPath('pr'), VdbLogNowMs + 86400000, 1, pr, err);
+    if okp and (pr.DroppedSegments > 0) then
+      Ok(Format('KeepBases=1 ek onek sildi (%d segment)', [pr.DroppedSegments]))
+    else
+      Ok(Format('KeepBases=1 silinecek onek yok (seg=%d)', [pr.DroppedSegments]));
+    bases := r.ListBases;
+    if (Length(bases) = 1) and (bases[0].Seq = b3) then
+      Ok('KeepBases=1: yalniz en yeni taban kaldi')
+    else
+      Fail(Format('KeepBases=1 sonrasi taban sayisi %d', [Length(bases)]));
+  finally
+    r.Free;
+  end;
+end;
+
 { ================================================================== ana }
 var
   sr: TSearchRec;
@@ -591,6 +820,7 @@ begin
   TestRotation;
   TestBaseChange;
   TestCrc;
+  TestPrune;
 
   WriteLn;
   WriteLn('================================================');

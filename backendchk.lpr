@@ -113,6 +113,10 @@ var
   i: Integer;
   keys: TQWordArray;
   vals: TValArray;
+  ds, dbf: Integer;
+  freed: Int64;
+  err: string;
+  pok: Boolean;
 begin
   CleanDir;
   db := TVDb.Create;
@@ -168,6 +172,17 @@ begin
       Ok('v2 adaptor: AbortBatch geri aldi')
     else
       Fail(Format('v2 adaptor: AbortBatch sonrasi count=%d', [b.Count]));
+
+    { v3.7: v2'de mantiksal gunluk yok -> budama sessizce "basarili" demez. }
+    if (not b.LogPruneEnabled) and (not b.LogSupported) then
+      Ok('v2: budama varsayilan KAPALI, gunluk yok')
+    else
+      Fail('v2: budama varsayilanlari yanlis');
+    pok := b.LogPrune(ds, dbf, freed, err);
+    if (not pok) and (err <> '') then
+      Ok('v2: LogPrune False + acik hata: ' + err)
+    else
+      Fail('v2: LogPrune sessizce basarili gorundu');
 
     b := nil;
   finally
@@ -405,8 +420,84 @@ begin
   b := nil;
 end;
 
-{ ================================================== 6) kucuk havuz + N }
+{ v3.7: gunluk budama ARABIRIMI. Cekirdek politika (kesim noktasi, taban
+  koruma, onek silme) logchk'ta birebir olculur; burada backend sozlesmesi:
+  varsayilanlar, elle budama, acik islem reddi ve checkpoint kancasi. }
+procedure TestV3LogPrune;
+var
+  be: TVdbBackendV3;
+  b: IVDbBackend;
+  v: TBytes;
+  i, ds, dbf: Integer;
+  freed: Int64;
+  err, path: string;
+  pok, bad: Boolean;
+begin
+  WriteLn;
+  WriteLn('--- v3 gunluk budama (arayuz) ---');
+  CleanDir;
+  path := DirOf('prune.odb');
+  be := TVdbBackendV3.Create(path, True, 64);
+  b := be;
+  be.CheckpointBytes := 96 * 1024;   // checkpoint kancasi sik calissin
+  for i := 1 to 600 do
+  begin
+    MakeVal(i, 32, 4, v);
+    b.Put(i, v);
+    if (i mod 50) = 0 then b.Flush;
+  end;
+  b.Flush;
 
+  if (not b.LogPruneEnabled) and (b.LogPruneKeepDays = 30) and
+     (b.LogPruneKeepBases = 2) then
+    Ok('v3 budama: varsayilan KAPALI / 30 gun / 2 taban')
+  else
+    Fail(Format('v3 budama: varsayilanlar yanlis (%s/%d/%d)',
+      [BoolToStr(b.LogPruneEnabled, True), b.LogPruneKeepDays,
+       b.LogPruneKeepBases]));
+
+  { Taze gunlukte suresi dolmus onek YOK: silme olmamali, hata da. }
+  pok := b.LogPrune(ds, dbf, freed, err);
+  if pok and (ds = 0) and (dbf = 0) and (err = '') and
+     (b.LastLogPruneError = '') then
+    Ok('v3 budama: taze gunlukte 0 silme, hata yok')
+  else
+    Fail(Format('v3 budama: beklenmedik (ok=%s seg=%d base=%d err=%s)',
+      [BoolToStr(pok, True), ds, dbf, err]));
+
+  { Acik yazma islemi varken taban/checkpoint alinmaz. }
+  b.BeginBatch;
+  b.Put(999999, v);
+  pok := b.LogPrune(ds, dbf, freed, err);
+  bad := pok or (Pos('acik islem', err) = 0);
+  b.AbortBatch;
+  if not bad then Ok('v3 budama: acik islem varken reddedildi')
+  else Fail(Format('v3 budama: acik islemde kabul (err=%s)', [err]));
+
+  { Budama cagrisi veriyi bozmaz. }
+  b.Flush;
+  if b.Count = 600 then Ok('v3 budama: 600 kayit yerinde')
+  else Fail(Format('v3 budama: count=%d (beklenen 600)', [b.Count]));
+
+  { Bayrak acikken checkpoint kancasi calisir; taze veride silme yok. }
+  b.LogPruneEnabled := True;
+  for i := 601 to 1200 do
+  begin
+    MakeVal(i, 32, 4, v);
+    b.Put(i, v);
+    if (i mod 50) = 0 then b.Flush;
+  end;
+  b.Flush;
+  if (b.LastLogPruneError = '') and (b.Count = 1200) then
+    Ok('v3 budama: checkpoint sonrasi otomatik kanca sessiz ve veri tam')
+  else
+    Fail(Format('v3 budama: kanca sonrasi count=%d err=%s',
+      [b.Count, b.LastLogPruneError]));
+
+  b := nil;
+end;
+
+{ ================================================== 6) kucuk havuz + N }
 { Regresyon: sayfa tahliye edilip WAL tamponuna (pending) girdikten SONRA
   yeniden okunup degistirilirse, checkpoint ESKI pending imajini yeni
   cercevenin uzerine yazmamalidir. Bu hata sema kaydinin ve/veya
@@ -1481,6 +1572,7 @@ begin
   TestV3Batch;
   TestV3Filter;
   TestV3Checkpoint;
+  TestV3LogPrune;
   TestV3SpillReread(N);
   TestV3SmallPool(N);
   TestV3Verify(N);
