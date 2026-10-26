@@ -529,7 +529,7 @@ gantt
 | Bağımlılık | DCPcrypt | Yok | Yok | DCPcrypt |
 | 1M satır dosya | 119 MB | ~50 MB | ~30 MB | **~50-60 MB** |
 | Max DB boyutu | ~2 GB (32-bit) | 281 TB | Sınırsız | **Sınırsız** (64-bit) |
-| Eşzamanlı yazma | Tek yazar | Tek yazar (WAL: çok okuyucu) | MVCC | Tek yazar (mevcut) |
+| Eşzamanlı yazma | Çok oturum (süreç içi, v3.4) | Tek yazar (WAL: çok okuyucu) | MVCC | Çok oturum (süreç içi) |
 | SQL uyumluluk | ~%70 | ~%85 | ~%90 (PG uyumlu) | **~%80** |
 
 ---

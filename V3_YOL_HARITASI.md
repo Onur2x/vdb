@@ -165,7 +165,12 @@ v3 bu noktada uygulama geliştirmeye hazır ilan edildi:
 
 > **Güncelleme (2026-10-26):** Bu paragraftaki PITR/WAL arşivi maddesi
 > **kapandı** (v4 dilimi). Bkz. aşağıdaki "v4 — mantıksal değişim günlüğü
-> ve PITR" bölümü. Kalanlar: `SAVEPOINT`, replikasyon, zone map.
+> ve PITR" bölümü.
+>
+> **Güncelleme 2 (2026-10-26):** `SAVEPOINT`, replikasyon, zone map ve çok
+> oturumlu yazma (MVCC, v3.4) de kapandı; ayrıca açılışta ölçülen 20 s'lik
+> değişim günlüğü darboğazı giderildi (v3.5: 39–46 ms). Yol haritasında açık
+> madde kalmadı; bilinçli sınırlar "Sıradaki sürüme ertelenen" bölümünde.
 
 CI'da düzeltilen iki kusur (bu kapanışta bulundu):
 
