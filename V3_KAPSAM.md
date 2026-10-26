@@ -422,6 +422,47 @@ böylece checkpoint'te sıralama maliyeti ödenmez.
 - Kapı: `idxchk` **19/0** — VER 1 uyumu (elle yazılmış eski biçim, 500 kayıt
   birebir) ve varint sınırları (1…2³¹−1 sayfa, 1…65535 slot) ayrıca sınanır.
 
+### Satır INT varint (v3.2, 2026-10-26)
+
+Satır yükü şeması **değişmedi** (`ctype(1) | vlen(i32) | payload`); yalnız INT
+kolonunun yükü sıkıştı: **zigzag LEB128**. `vlen = 1..7` → varint, `vlen = 8` →
+**eski biçim** (ham little-endian Int64). Varint 8 bayttan fazla gerektiren
+büyük değerler (|v| ≥ 2⁵⁵) yine `vlen = 8` ile ham yazılır; böylece 8 baytlık
+yük hiçbir zaman "varint mi ham mı" belirsizliği taşımaz.
+
+- **Eski satırlar okunur** (sahadaki dosyalar bozulmaz). Eski bir ikili yeni
+  satır görürse INT alanında `vlen ≠ 8` ile karşılaşıp satırı **açıkça
+  reddeder**; sessizce yanlış sayı üretmez. (İleri uyumluluk yok: eski ikili
+  yeni dosyada INT içeren satırları okuyamaz.)
+- Kanonik olmayan varint (kesik, uzatılmış, > 7 bayt) reddedilir.
+- `VDbIntFromPayload` tek çözüm noktasıdır: `DecodeRow`, `VDbDecodeRawRowP`,
+  `VDbRowFromOffsetsP`, `VDbColFromOffsetsP` ve `VDbExecutor`'ın 8 ham-okuma
+  hızlı yolu (toplam/filtre/sıralama/zone map) bunu kullanır.
+
+| Ölçüm (`rowmeas`, 100.000 satır: 6 INT + 2 TEXT, 32 bit) | Önce | Sonra |
+|---|---|---|
+| `.odb` boyu | 14.131.200 B | **10.752.000 B** (−23,9%) |
+| satır başına | 141,3 B | **107,5 B** |
+| toplu ekleme (500'lük gruplar) | 1167 ms | 1133 ms |
+| `SUM(a)` (100k satır) | 20 ms | 19 ms |
+| yeniden açılış | 3398 ms | 3372 ms |
+
+**Bulunan ve düzeltilen hata:** zigzag kodlamada `V shr 63` kullanılmıştı;
+Pascal'da `shr` **mantıksal** kaydırdığı için negatif değerlerde sonuç −1 değil 1
+oluyordu ve `-9223372036854775807` **−2** olarak saklanıyordu. Kapı testi
+(v3sqlchk `rowint`) bunu yakaladı; kodlama dallanmaya çevrildi
+(`V<0 → 2|V|−1`, `−(V+1)` ile taşma yok).
+
+**Gerçek veri kanıtı:** 6399 satırlık canlı `mtakip.odb` (eski biçimde yazılmış)
+kopyası, **eski** ve **yeni** ikili ile satır satır çözülüp FNV-1a özeti
+alındı: ikisi de `1DF4A420FF9A2488` (6399 satır; çözülemeyen 1 kayıt ikisinde de
+şema meta satırı). Yani eski dosyalar birebir aynı değerlerle okunuyor.
+
+Kapı: `v3sqlchk` **186/0** — 12 uç Int64 değeri (1…6 baytlık varintler + 8 bayt
+ham dönüşü), `ORDER BY` sırası, `WHERE` ön elemesi, `VERIFY`, depoda alanın
+gerçekten 1 bayt olduğu, elle kurulmuş **eski biçim** satırın çözülmesi ve bozuk
+varint reddi.
+
 ### Sayfa şifreleme (Sprint 3.4)
 
 Varsayılan **kapalı**; v3 dosyası eskisi gibi düz metindir. Şifreli dosya

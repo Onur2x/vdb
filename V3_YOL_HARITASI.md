@@ -451,6 +451,33 @@ Yazan yalnız VER 2 üretir; okuyan VER 1'i de okur. Eski ikili VER 2'yi
 reddedip tam tarama yapar (`.idx` türetilmiş veridir; kayıp yok). CRC kodlanmış
 bayt akışı üzerinde hesaplanır.
 
+### v3.2 — satır INT varint (2026-10-26)
+
+Satır yükü şeması korundu (`ctype | vlen(i32) | payload`); INT yükü **zigzag
+LEB128** oldu. `vlen = 1..7` varint, `vlen = 8` **eski biçim** (ham LE Int64) —
+hem okunur hem de 8 bayttan fazla gereken değerler için yazılır, böylece
+belirsizlik yok. Eski satırlar okunur; eski ikili yeni satırda INT alanını
+görünce satırı açıkça reddeder (sessiz yanlış veri yok).
+
+| Ölçüm (`rowmeas`, 100.000 satır, 6 INT + 2 TEXT) | Önce | Sonra |
+|---|---|---|
+| `.odb` | 14.131.200 B | **10.752.000 B** (−23,9%) |
+| satır başına | 141,3 B | **107,5 B** |
+| toplu ekleme / `SUM(a)` / açılış | 1167 / 20 / 3398 ms | 1133 / 19 / 3372 ms |
+
+Tek çözüm noktası `VDbIntFromPayload` (`DecodeRow`, `VDbDecodeRawRowP`,
+`VDbRowFromOffsetsP`, `VDbColFromOffsetsP` ve `VDbExecutor`'ın 8 ham-okuma hızlı
+yolu). Kanonik olmayan varint reddedilir.
+
+Düzeltilen hata: `V shr 63` Pascal'da **mantıksal** kaydırma olduğu için zigzag
+negatiflerde bozuktu (`-9223372036854775807` → −2). Kapı testi yakaladı.
+
+Gerçek veri: 6399 satırlık eski biçimli `mtakip.odb` kopyası eski ve yeni ikili
+ile aynı FNV-1a özetini verdi (`1DF4A420FF9A2488`).
+
+Kapı: `v3sqlchk` **186/0** (`rowint`: 12 uç değer, `ORDER BY`, `WHERE`,
+`VERIFY`, 1 baytlık alan, elle kurulmuş eski satır, bozuk varint reddi).
+
 ### Sıradaki sürüme ertelenen (v4 sonrası)
 - Zone map'in sayfa düzeyinde yeniden ele alınması
 - Satır gövdesi varint/delta kodlama (F3-1'in kalanı)

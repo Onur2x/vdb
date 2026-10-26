@@ -1506,6 +1506,167 @@ end;
   iki kez kosar. Burada BAGIMSIZ oracle Pascal'da UC-DEGERLI MANTIK
   (TRUE/FALSE/UNKNOWN) ile hesaplanir ve SQL sonucu satir satir
   karsilastirilir. Tohum sabittir: kosu tekrarlanabilir. }
+procedure TestRowIntVarint;
+const
+  NV = 12;
+  { 1..6 baytlik varintler + 8 baytlik HAM'a geri donen degerler (>= 2^55
+    zigzag 8 bayttan fazla tutar) + Int64 sinirlari. }
+  IVALS: array[0..NV - 1] of Int64 = (
+    0, 1, -1, 127, -128, 1000000,
+    1099511627776, -1099511627776,
+    1152921504606846976, -1152921504606846976,
+    9223372036854775807, -9223372036854775807);
+  SORTED = '-9223372036854775807,-1152921504606846976,-1099511627776,' +
+    '-128,-1,0,1,127,1000000,1099511627776,1152921504606846976,' +
+    '9223372036854775807';
+var
+  S: TV3Sql;
+  r: TSqlResult;
+  i, p: Integer;
+  l32: LongInt;
+  okAll: Boolean;
+  got: string;
+  raw, ob: TBytes;
+  eng: TVdbPageEngine;
+  tid: Word;
+  pkS: string;
+  vals: TStrArray;
+  v: Int64;
+  ftype: array[0..1] of Byte;
+  foff, flen: array[0..1] of Integer;
+begin
+  WriteLn;
+  WriteLn('v3.2 - satir INT kodlamasi (zigzag varint + eski ham bicim uyumu)');
+  CleanDir;
+  OpenV3(S, 'rowint.odb', True);
+  try
+    r := Exec(S, 'CREATE TABLE r (id INTEGER PRIMARY KEY, v INTEGER)');
+    if gErr then
+    begin
+      Fail('rowint: CREATE: ' + r.Msg);
+      Exit;
+    end;
+    for i := 0 to NV - 1 do
+    begin
+      r := Exec(S, Format('INSERT INTO r VALUES (%d, %d)', [i + 1, IVALS[i]]));
+      if gErr then
+      begin
+        Fail('rowint: INSERT: ' + r.Msg);
+        Exit;
+      end;
+    end;
+
+    okAll := True;
+    for i := 0 to NV - 1 do
+    begin
+      r := Exec(S, Format('SELECT v FROM r WHERE id = %d', [i + 1]));
+      if gErr or (Cel(r, 0, 0) <> IntToStr(IVALS[i])) then
+      begin
+        okAll := False;
+        Fail(Format('rowint: %s -> %s (%s)',
+          [IntToStr(IVALS[i]), Cel(r, 0, 0), r.Msg]));
+      end;
+    end;
+    { Ayni degerler LITERAL olarak da dogru mu? (satir kodlamasindan bagimsiz
+      kontrol: hata buradaysa kaynak SQL sabiti, kodlama degil.) }
+    for i := 0 to NV - 1 do
+    begin
+      r := Exec(S, Format('SELECT %d', [IVALS[i]]));
+      if gErr or (Cel(r, 0, 0) <> IntToStr(IVALS[i])) then
+        Fail(Format('rowint: LITERAL %s -> %s (%s)',
+          [IntToStr(IVALS[i]), Cel(r, 0, 0), r.Msg]));
+    end;
+    if okAll then
+      Ok(Format('rowint: %d Int64 degeri birebir (varint + ham 8 bayt donusu)',
+        [NV]));
+
+    { ORDER BY: kucuk degerler artik 1-6 bayt; 8 bayt okuyan yol KOMSU
+      baytlari okuyup siralamayi bozardi. }
+    r := Exec(S, 'SELECT v FROM r ORDER BY v');
+    got := '';
+    if not gErr then
+      for i := 0 to High(r.Rows) do
+      begin
+        if i > 0 then got := got + ',';
+        got := got + Cel(r, i, 0);
+      end;
+    if (not gErr) and (got = SORTED) then
+      Ok('rowint: ORDER BY INT sirasi dogru')
+    else
+      Fail('rowint: ORDER BY: ' + got + ' ' + r.Msg);
+
+    r := Exec(S, 'SELECT COUNT(*) FROM r WHERE v >= 0');
+    if (not gErr) and (Cel(r, 0, 0) = '7') then
+      Ok('rowint: WHERE v >= 0 on-elemesi dogru (7 satir)')
+    else
+      Fail('rowint: WHERE v >= 0: ' + Cel(r, 0, 0) + ' ' + r.Msg);
+
+    r := Exec(S, 'VERIFY');
+    if (not gErr) and (r.Affected = 1) then
+      Ok('rowint: VERIFY gecti')
+    else
+      Fail('rowint: VERIFY: ' + r.Msg);
+  finally
+    CloseV3(S);
+  end;
+
+  { Kucuk deger GERCEKTEN varint mi? Satiri motordan ham okuyup bakilir. }
+  eng := TVdbPageEngine.Create(DirOf('rowint.odb'), 64);
+  try
+    eng.Open(False);
+    if eng.TryGet(VDbHashKey('r', '1'), raw) then
+    begin
+      if VDbPeekRawRow(raw, 2, tid, pkS, ftype, foff, flen) and
+         (flen[1] >= 1) and (flen[1] <= 7) then
+        Ok(Format('rowint: id=1 satiri v alani %d bayt (eski bicim 8 bayt)',
+          [flen[1]]))
+      else
+        Fail(Format('rowint: v alani beklenen varint degil (flen=%d)', [flen[1]]));
+    end
+    else
+      Fail('rowint: satir motordan okunamadi');
+  finally
+    eng.Free;
+  end;
+
+  { ESKI bicim (vlen=8 + ham little-endian Int64) HALA cozulmeli: sahadaki
+    dosyalar bu bicimle yazildi. Satir elle kurulur. }
+  l32 := 8;
+  SetLength(ob, 7 + 1 + 4 + 8 + 1 + 4 + 2);
+  ob[0] := 7; ob[1] := 0;                 { TableId }
+  ob[2] := 1; ob[3] := 0;                 { pk uzunlugu }
+  ob[4] := Ord('1');
+  ob[5] := 2; ob[6] := 0;                 { kolon sayisi }
+  p := 7;
+  ob[p] := VCT_INT; Inc(p);
+  Move(l32, ob[p], 4); Inc(p, 4);
+  v := -123456789;
+  Move(v, ob[p], 8); Inc(p, 8);
+  ob[p] := VCT_STR; Inc(p);
+  l32 := 2;
+  Move(l32, ob[p], 4); Inc(p, 4);
+  ob[p] := Ord('a'); ob[p + 1] := Ord('b');
+  if VDbDecodeRawRowP(@ob[0], Length(ob), tid, pkS, vals) and (tid = 7) and
+     (pkS = '1') and (Length(vals) = 2) and (vals[0] = '-123456789') and
+     (vals[1] = 'ab') then
+    Ok('rowint: ESKI bicim satir (vlen=8 ham Int64) birebir cozuldu')
+  else
+    Fail('rowint: ESKI bicim satir cozulemedi');
+
+  { Bozuk/kisa yuk reddedilir (sessiz yanlis sayi uretilmez). }
+  SetLength(ob, 9);
+  ob[0] := $85; ob[1] := $00;             { kanonik olmayan 2 baytlik 5 }
+  okAll := not VDbIntFromPayload(@ob[0], 2, v);
+  SetLength(ob, 9);
+  ob[0] := $85;                            { kesik varint }
+  okAll := okAll and (not VDbIntFromPayload(@ob[0], 1, v));
+  okAll := okAll and (not VDbIntFromPayload(@ob[0], 9, v));
+  if okAll then
+    Ok('rowint: bozuk varint (kanonik degil/kesik/uzun) reddedildi')
+  else
+    Fail('rowint: bozuk varint kabul edildi');
+end;
+
 procedure TestFuzzOracle;
 const
   NROW = 400;
@@ -1989,6 +2150,7 @@ begin
   TestPitrSql;
   TestIndexInNegative;
   TestZoneMapFallback;
+  TestRowIntVarint;
   TestFuzzOracle;
   TestIntegrity(N);
 

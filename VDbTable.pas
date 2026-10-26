@@ -825,6 +825,13 @@ function VDbNorm(const S: string): string;
   kurmadan, satirdaki ham UTF-8 pk baytlari uzerinde ayni hash'i uretmek. }
 function VDbHashKeyPrefix(const Table: string): QWord;
 function VDbHashKeyBytes(h: QWord; PkUtf8: PByte; PkLen: Integer): QWord;
+{ v3.2 "satir varint": INT kolon yuku.
+  vlen = 8 -> ESKI bicim: ham little-endian Int64 (okunmaya devam eder).
+  vlen = 1..7 -> zigzag LEB128 (kucuk degerler 1-3 bayt).
+  Baska vlen gecersizdir; kanonik olmayan (kesik/uzatilmis) varint de
+  reddedilir. Boylece eski dosyalar okunur, yeni satirlar eski ikilide
+  sessizce YANLIS deger uretmez (o ikili vl<>8 gorup satiri reddeder). }
+function VDbIntFromPayload(B: PByte; Len: Integer; out V: Int64): Boolean;
 { H1 (2026-10-18): DecodeRow'un PByte+Len surumu (TBytes ayirmaz).
   Filtered SELECT'in AKISLI taramasinda kaydi TStrArray'e cozmek icin;
   DecodeRow ile BIREBIR ayni deger bicimlerini uretir. }
@@ -3169,6 +3176,50 @@ var
     Move(V, b[p], 4); Inc(p, 4);
   end;
 
+  { v3.2: INT kolonu zigzag LEB128. Kucuk degerler (0, 1, 42, 1000000)
+    1-3 bayt tutar; eski bicimde her INT 4 (vlen) + 8 = 12 baytti.
+    Varint 8 bayt veya daha uzun gerekiyorsa ESKI ham bicime (vlen=8)
+    donulur: vlen=8 her zaman "ham little-endian Int64" demektir, boylece
+    eski dosyalar hala okunur ve karisiklik olmaz. }
+  procedure PutIntCompact(V: Int64);
+  var
+    u: QWord;
+    tmp: array[0..9] of Byte;
+    n, j: Integer;
+  begin
+    { DIKKAT: Pascal'da `shr` MANTIKSAL kaydirir (isaret biti tasinmaz), bu
+      yuzden `V shr 63` -1 degil 1 verir. Zigzag bu yuzden dallanarak
+      kurulur: V<0 -> 2*|V|-1. Int64'in en kucuk degeri de tasmaz
+      (-(V+1) <= 2^63-1). }
+    if V < 0 then
+      u := (QWord(-(V + 1)) shl 1) or 1
+    else
+      u := QWord(V) shl 1;
+    n := 1;
+    while n < 10 do
+    begin
+      if (u shr (7 * n)) = 0 then Break;
+      Inc(n);
+    end;
+    if n >= 8 then
+    begin
+      PutI32(8); Grow(8); Move(V, b[p], 8); Inc(p, 8);
+      Exit;
+    end;
+    PutI32(n);
+    Grow(n);
+    for j := 0 to n - 1 do
+    begin
+      tmp[j] := Byte(u and $7F);
+      u := u shr 7;
+    end;
+    for j := 0 to n - 1 do
+    begin
+      if j < n - 1 then b[p] := tmp[j] or $80 else b[p] := tmp[j];
+      Inc(p);
+    end;
+  end;
+
   function IsPureAscii(const S: string): Boolean;
   var j: Integer;
   begin
@@ -3255,7 +3306,7 @@ begin
     case T.Cols[i].Ctype of
       VCT_INT:
         if (i < Length(Vals)) and (Vals[i] <> '') and VDbParseInt(Vals[i], iv) then
-        begin PutI32(8); Grow(8); Move(iv, b[p], 8); Inc(p, 8); end
+          PutIntCompact(iv)
         else PutI32(-1);
       VCT_FLOAT:
         if (i < Length(Vals)) and (Vals[i] <> '') and VDbParseFloat(Vals[i], fv) then
@@ -3312,6 +3363,41 @@ begin
   if Result then begin Move(B[P], V, 4); Inc(P, 4); end;
 end;
 
+function VDbIntFromPayload(B: PByte; Len: Integer; out V: Int64): Boolean;
+var
+  j: Integer;
+  u: QWord;
+  by: Byte;
+begin
+  Result := False;
+  V := 0;
+  if B = nil then Exit;
+  if Len = 8 then
+  begin
+    Move(B^, V, 8);
+    Exit(True);
+  end;
+  if (Len < 1) or (Len > 7) then Exit;
+  u := 0;
+  for j := 0 to Len - 1 do
+  begin
+    by := (B + j)^;
+    if j < Len - 1 then
+    begin
+      { devam eden grup: uzatma biti ZORUNLU }
+      if (by and $80) = 0 then Exit;
+    end
+    else if (by and $80) <> 0 then
+      Exit;                        { son grupta uzatma biti olmaz }
+    u := u or (QWord(by and $7F) shl (7 * j));
+  end;
+  { kanonik bicim: son grup 0 olamaz (yoksa ayni deger daha kisa yazilirdi) }
+  if (Len > 1) and ((B + Len - 1)^ = 0) then Exit;
+  { zigzag: son bit isaret, kalanlar buyukluk }
+  V := Int64(u shr 1) xor -Int64(u and 1);
+  Result := True;
+end;
+
 function DecodeRow(const B: TBytes; out TableId: Word; out Pk: string; out Vals: TStrArray): Boolean;
 // Satiri kayitli sira ile cozer. Alanlar eski semaya gore yazilmis
 // olabilir; ALTER TABLE sirasinda cagricilar SrcCts ile kesisim
@@ -3342,7 +3428,7 @@ begin
     if vl = -1 then begin Vals[i] := ''; Continue; end;
     if (vl < 0) or (p + vl > Length(B)) then Exit;
     case ct of
-      VCT_INT: begin if vl <> 8 then Exit; Move(B[p], iv, 8); Vals[i] := IntToStr(iv); end;
+      VCT_INT: begin if not VDbIntFromPayload(@B[p], vl, iv) then Exit; Vals[i] := IntToStr(iv); end;
       VCT_FLOAT: begin if vl <> 8 then Exit; Move(B[p], fv, 8); Vals[i] := VDbFloatToStr(fv); end;
       VCT_BOOL: begin Vals[i] := BoolToStr(B[p] <> 0, True); end;
     else
@@ -3478,7 +3564,12 @@ begin
     if (FOff[i] < 0) or (FLen[i] = 0) then begin Vals[i] := ''; Continue; end;
     case FType[i] of
       VCT_INT:
-        begin Move(B[FOff[i]], iv, 8); Vals[i] := IntToStr(iv); end;
+        begin
+          if VDbIntFromPayload(B + FOff[i], FLen[i], iv) then
+            Vals[i] := IntToStr(iv)
+          else
+            Vals[i] := '';   { bozuk yuk: sessiz YANLIS sayi uretme }
+        end;
       VCT_FLOAT:
         begin Move(B[FOff[i]], fv, 8); Vals[i] := VDbFloatToStr(fv); end;
       VCT_BOOL:
@@ -3515,7 +3606,12 @@ begin
   tid := Word(B[0]) or (Word(B[1]) shl 8);
   case FType[Col] of
     VCT_INT:
-      begin Move(B[FOff[Col]], iv, 8); Result := IntToStr(iv); end;
+      begin
+        if VDbIntFromPayload(B + FOff[Col], FLen[Col], iv) then
+          Result := IntToStr(iv)
+        else
+          Result := '';
+      end;
     VCT_FLOAT:
       begin Move(B[FOff[Col]], fv, 8); Result := VDbFloatToStr(fv); end;
     VCT_BOOL:
@@ -3585,7 +3681,7 @@ begin
     if vl = -1 then begin Vals[i] := ''; Continue; end;
     if (vl < 0) or (p + vl > Len) then Exit;
     case ct of
-      VCT_INT: begin if vl <> 8 then Exit; Move(B[p], iv, 8); Vals[i] := IntToStr(iv); end;
+      VCT_INT: begin if not VDbIntFromPayload(@B[p], vl, iv) then Exit; Vals[i] := IntToStr(iv); end;
       VCT_FLOAT: begin if vl <> 8 then Exit; Move(B[p], fv, 8); Vals[i] := VDbFloatToStr(fv); end;
       VCT_BOOL: begin Vals[i] := BoolToStr(B[p] <> 0, True); end;
     else

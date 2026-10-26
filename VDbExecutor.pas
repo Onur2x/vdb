@@ -7727,8 +7727,8 @@ begin
     case ctx.Ct[c] of
       VCT_INT:
         begin
-          if ctx.FLen[c] <> 8 then Exit(False);   // DecodeRow gibi: 8 bayt sart
-          Move(Buf[ctx.FOff[c]], iv, 8);
+          if not VDbIntFromPayload(@Buf[ctx.FOff[c]], ctx.FLen[c], iv) then
+            Exit(False);
           // DIKKAT: Double(iv) mode-delphi'de BIT CAST'tir (denormal
           // cantan); deger donusumu atama/carpmayla olur (P-12 sqltest).
           fv := iv * 1.0;   // StrToFloat(IntToStr(iv)) ile birebir ayni
@@ -8320,8 +8320,10 @@ begin
     case C^.Ct[ci] of
       VCT_INT:
         begin
-          if C^.FLen[ci] <> 8 then begin C^.Failed := True; Exit(False); end;
-          Move(Buf[C^.FOff[ci]], iv, 8);
+          if not VDbIntFromPayload(@Buf[C^.FOff[ci]], C^.FLen[ci], iv) then
+          begin
+            C^.Failed := True; Exit(False);
+          end;
           fv := iv * 1.0;
         end;
       VCT_FLOAT:
@@ -9689,7 +9691,15 @@ begin
   begin
     case C^.SortType of
       VCT_INT:
-        begin Move(Buf[C^.FOff[C^.SortCol]], iv, 8); R.I := iv; end;
+        begin
+          { v3.2: yuk varint olabilir; 8 bayt okumak KOMSU baytlari da
+            okur ve siralamayi bozar. }
+          if VDbIntFromPayload(Buf + C^.FOff[C^.SortCol],
+            C^.FLen[C^.SortCol], iv) then
+            R.I := iv
+          else
+            R.IsNull := True;
+        end;
       VCT_BOOL:
         R.I := Ord(Buf[C^.FOff[C^.SortCol]] <> 0);
       VCT_FLOAT:
@@ -9934,7 +9944,12 @@ begin
     begin
       case C^.SortTypes[j] of
         VCT_INT:
-          begin Move(Buf[C^.FOff[ci]], iv, 8); C^.Scratch.Keys[j].I := iv; end;
+          begin
+            if VDbIntFromPayload(Buf + C^.FOff[ci], C^.FLen[ci], iv) then
+              C^.Scratch.Keys[j].I := iv
+            else
+              C^.Scratch.Keys[j].IsNull := True;
+          end;
         VCT_BOOL:
           C^.Scratch.Keys[j].I := Ord(Buf[C^.FOff[ci]] <> 0);
         VCT_FLOAT:
@@ -10229,12 +10244,12 @@ begin
       end
       else
       begin
-        if (FType[c.Col] <> VCT_INT) or (FLen[c.Col] <> 8) then
+        if (FType[c.Col] <> VCT_INT) or
+           (not VDbIntFromPayload(Buf + FOff[c.Col], FLen[c.Col], iv)) then
         begin
           AllDecided := False;
           Continue;
         end;
-        Move((Buf + FOff[c.Col])^, iv, 8);
         ok := False;
         for iv2 := 0 to High(c.InInts) do
           if iv = c.InInts[iv2] then begin ok := True; Break; end;
@@ -10292,12 +10307,12 @@ begin
     end
     else
     begin
-      if (FType[c.Col] <> VCT_INT) or (FLen[c.Col] <> 8) then
+      if (FType[c.Col] <> VCT_INT) or
+         (not VDbIntFromPayload(Buf + FOff[c.Col], FLen[c.Col], iv)) then
       begin
         AllDecided := False;
         Continue;
       end;
-      Move(Buf[FOff[c.Col]], iv, 8);
       // Genel yol INT'i Double ile kiyaslar. 2^53 disinda Int64 kiyasi
       // Double kiyasindan farkli olabilir; o satiri karara baglama.
       if (iv > SAFE_INT) or (iv < -SAFE_INT) or
@@ -10408,9 +10423,9 @@ begin
       begin
         if (n.Col < 0) or (n.Col > High(FOff)) then Exit(rvUndecided);
         if (FOff[n.Col] < 0) or (FLen[n.Col] = 0) then Exit(rvUnknown);
-        if (FType[n.Col] <> VCT_INT) or (FLen[n.Col] <> 8) then
+        if (FType[n.Col] <> VCT_INT) or
+           (not VDbIntFromPayload(Buf + FOff[n.Col], FLen[n.Col], iv)) then
           Exit(rvUndecided);
-        Move((Buf + FOff[n.Col])^, iv, 8);
         if (iv > SAFE_INT) or (iv < -SAFE_INT) then Exit(rvUndecided);
         ok := False;
         lo := 0; hi := High(n.Ints);
@@ -10476,8 +10491,8 @@ begin
         if n.LitNull then Exit(rvUnknown);
         if FType[n.Col] = VCT_INT then
         begin
-          if FLen[n.Col] <> 8 then Exit(rvUndecided);
-          Move((Buf + FOff[n.Col])^, iv, 8);
+          if not VDbIntFromPayload(Buf + FOff[n.Col], FLen[n.Col], iv) then
+            Exit(rvUndecided);
           if (iv > SAFE_INT) or (iv < -SAFE_INT) then Exit(rvUndecided);
           case n.Op of
             sboEq: ok := iv = n.I;
@@ -10635,9 +10650,9 @@ begin
     end
     else
     begin
-      if (ctx^.FType[c] <> VCT_INT) or (ctx^.FLen[c] <> 8) then
+      if (ctx^.FType[c] <> VCT_INT) or
+         (not VDbIntFromPayload(@Buf[ctx^.FOff[c]], ctx^.FLen[c], iv)) then
       begin ctx^.ZoneMap.ColUsable[k] := False; Continue; end;
-      Move(Buf[ctx^.FOff[c]], iv, 8);
       if ctx^.ZoneMap.HasVal[idx] = 0 then
       begin
         ctx^.ZoneMap.MinI[idx] := iv;
