@@ -2361,18 +2361,26 @@ begin
     Chk((not gErr) and (One(r) = '0'), 'ms: A B''nin commit edilmemis satirini GORMEZ',
       One(r) + ' ' + r.Msg);
 
-    { 3) A commit eder: B bunu READ COMMITTED olarak gorur, kendi yazisi durur. }
+    { 3) A commit eder: B hala KENDI anlik goruntusunu gorur (v3.15 snapshot
+         isolation, v2 semantigi); commit'ten sonra BASLAYAN okuma A'nin
+         satirini gorur. }
     r := Exec(S, 'COMMIT');
     Chk(not gErr, 'ms: A COMMIT', r.Msg);
     r := Exec2('SELECT COUNT(*) FROM m');
-    Chk((not gErr) and (One(r) = '4'), 'ms: B A commit''inden sonra 4 satir gorur',
+    Chk((not gErr) and (One(r) = '3'),
+      'ms: B A commit''inden sonra KENDI anlik goruntusunu gorur (3 satir)',
       One(r) + ' ' + r.Msg);
     r := Exec2('SELECT COUNT(*) FROM m WHERE id = 3');
-    Chk((not gErr) and (One(r) = '1'), 'ms: B A''nin commit edilmis satirini okur', One(r));
+    Chk((not gErr) and (One(r) = '0'),
+      'ms: B A''nin commit edilmis satirini GORMEZ (snapshot)',
+      One(r) + ' ' + r.Msg);
     r := Exec2('COMMIT');
     Chk(not gErr, 'ms: B COMMIT', r.Msg);
     r := Exec(S, 'SELECT COUNT(*) FROM m');
     Chk((not gErr) and (One(r) = '4'), 'ms: iki commit sonrasi 4 satir', One(r));
+    r := Exec2('SELECT COUNT(*) FROM m');
+    Chk((not gErr) and (One(r) = '4'),
+      'ms: commit sonrasi YENI okuma 4 satir', One(r) + ' ' + r.Msg);
 
     { 4) Ayni satiri iki oturum guncellerse KAYIP GUNCELLEME olmaz: ilk
          commit gecer, ikincisi commit ANINDA "yazma cakismasi" ile durur. }

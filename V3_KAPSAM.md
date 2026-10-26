@@ -277,8 +277,9 @@ kaynaklanır. Çekirdek v3 yollarında hiçbir kontrol eksilmemiştir.
 
 Durum **2026-10-26**: PITR, B+tree, replikasyon, sayfa düzeyi zone map, `.idx`
 varint, satır INT varint ve **çok oturumlu yazma (MVCC, v3.4)** dilimleri
-tamamlandı; yol haritasında açık madde kalmadı. Kalan bilinçli sınırlar
-snapshot isolation ve süreçler arası çok yazarlılıktır (aşağıda).
+tamamlandı; **snapshot isolation da tamamlandı (v3.15 — bkz. aşağıda)**;
+yol haritasında açık madde kalmadı. Kalan tek bilinçli sınır süreçler arası
+çok yazarlılıktır (aşağıda).
 
 | Yetenek | Bugünkü davranış | Test |
 |---|---|---|
@@ -534,8 +535,9 @@ Kapsam **süreç içi çok oturumlu yazma**dır: aynı `IVdbBackend` üzerinde b
   okuyucu / tam yazıcı) değişmedi. Kilit sahibi iş parçacığını ve derinliği
   izler: aynı iş parçacığından iç içe giriş kritik bölüme hiç girmez, başka
   iş parçacığından giriş normal karşılıklı dışlamadır.
-- **Bilinçli sınırlar:** snapshot isolation yok; süreçler arası çok yazarlılık
-  yok (ikinci süreç dosya kilidiyle reddedilir).
+- **Bilinçli sınırlar:** süreçler arası çok yazarlılık yok (ikinci süreç
+  dosya kilidiyle reddedilir); snapshot isolation tek süreç içinde **var**
+  (v3.15).
 
 | Ölçüm (`benchcmp`, 200k × 3 kolon, 3 koşu medyanı, 32 bit) | Değer |
 |---|---|
@@ -770,6 +772,54 @@ NULL, sayısal olmayan metin); hızlı yol açık/kapalı iki ikilinin çıktıs
 Kapı: `sqltest` v3 **2874/0/33**, v2 **3305/0/0** (yeni `T160_TamSayiZinciri`,
 16 kontrol); 14/14 kapı yeşil.
 
+### Snapshot isolation (v3.15)
+
+**Semantik.** Açık işlemi olan oturum, işlemi başlattığı andaki görüntüyü okur
+(v2 ile aynı: `BatchIsMine and Seq > 0`); başka oturumların sonraki commit'leri
+görünmez, kendi yazdıkları önceliklidir. Commit sonrası / parti dışı okuma
+güncel veriyi görür.
+
+**Yol.** Sayfa düzeyinde sürüm zinciri yerine **bellek içi post-image
+penceresi**: commit sırasında başka bir yazma kümesi açıksa, dokunulan
+anahtarların commit sonrası hali `(Gen, Present, Value)` olarak `FUndo`'ya;
+anahtarın ilk girişinde commit öncesi motor değeri `Base` olarak saklanır.
+Okuyucu `StartGen`'ine göre `Gen <= StartGen` olan son post'u, yoksa `Base`'i
+kullanır. Post'lar commit öncesi yerel listede toplanır → başarısız commit
+sahte geçmiş bırakmaz. `FUndo` yalnız hiç açık yazma kümesi kalmayınca
+temizlenir (bellek penceresi = en uzun ortak açık işlem).
+
+**Değişen yollar:** `Get`, `Exists`, `EffectiveCount`/`Count`, `ScanAll`,
+`ScanRawIterAll`. Taramada snapshot'ta farklı anahtarlar motor geri çağırımında
+atlanır, doğru halleri sonda eklenir. `ScanRawIterAllPaged` (açık partide
+`False`) ve `CountTable` (açık partide `-1` → tam tarama) değişmedi. v3'te
+zone map devrede değil (`FT.Kv` v2 motoruna bağlı); günlük budama mantıksal
+günlükte, `FUndo` bellek içi → etkileşim yok.
+
+**Kanıt.** Yeni kapı `snapchk` (21 kontrol): eski değer, silinen satırın geri
+gelmesi, yeni satırın görünmemesi, `Exists`, sabit `Count`, tarama, kendi
+yazısı, commit sonrası güncellik, çakışmanın hâlâ yakalanması, parti dışı
+okuma ve post zinciri orta durumu (arada başlayan okuyucu). Uygulama öncesi
+12/18, sonrası 21/21.
+
+**Eski test düzeltmesi.** `v3sqlchk` "v3.4 çok oturumlu yazma" bölümü A
+commit'inden sonra B'nin 4 satır görmesini bekliyordu (READ COMMITTED); yeni
+semantikte B kendi görüntüsünde kalır (3 satır), commit'ten sonra başlayan
+okuma 4 satır görür. Test güncellendi (`v3sqlchk` 238/0).
+
+**Ölçüm** (`tmp64/exprbench`, 50k satır, QPC 5 koşu medyanı): `SELECT a`
+1,84 → 1,84; `a+1` 2,33 → 2,34; `(a*2+1)*3-7` 2,85 → 2,89; 5'li zincir
+3,16 → 3,15; ifadeli `COUNT` 3,30 → 3,17; ham `COUNT` 0,46 → 0,44; aralık
+1,70 → 1,69; `LIKE` 1,02 → 1,02. Farklar gürültü sınırında (±%2).
+
+**Bilinçli sınırlar.** Yazma yolu değişmedi (ilk commit kazanır); bayat
+snapshot'a dayanan bir yazma, çakışan commit ilk yazmadan önce olmuşsa sessizce
+commit edilebilir (lost-update) — snapshot yalnız okumayı sabitler. `FUndo`
+belleği en uzun açık işlem boyunca büyür. Süreçler arası çok yazarlılık kapsam
+dışı.
+
+Kapı: `sqltest` v3 **2874/0/33**, v2 **3305/0/0**; `v3sqlchk` **238/0**;
+**15/15 kapı yeşil**.
+
 ### Sürüm çizgisi (2026-10-26)
 
 Bu hat **alpha**'dır: `v3.x` adları yayın sürümü değil çalışma dilimidir.
@@ -777,8 +827,8 @@ Kalan kapsam — Bloom filtresi (ölçümle reddedildi), merge JOIN (ölçümle
 reddedildi, yerine ON eşitlik+ek koşul hash düzeltmesi yapıldı), dosya
 boyutu (**yapıldı**: PK tekrarı kaldırıldı, hücre başlığı gerekçeli
 reddedildi), ifade bytecode (**ölçümle reddedildi**; yerine tip-duyarlı tam
-sayı yolu yapıldı — bkz. §v3.14), snapshot isolation —
-bu hatta yapılır ve hepsi bitince ürün **v1.0.0** olarak etiketlenir.
-`main` = `v3` (84 commit fast-forward); iş `v3`te yürür ve her push'ta
-`main` de ilerletilir. Süreçler arası çok yazarlılık (aynı dosyaya iki
-süreç yazması) kapsam dışıdır; snapshot isolation tek süreç içinde kalır.
+sayı yolu yapıldı — bkz. §v3.14), snapshot isolation (**yapıldı** — bkz.
+§v3.15) — hepsi tamamlandı ve ürün **v1.0.0** olarak etiketlendi.
+`main` = `v3`; iş `v3`te yürür ve her push'ta `main` de ilerletilir. Süreçler
+arası çok yazarlılık (aynı dosyaya iki süreç yazması) kapsam dışıdır;
+snapshot isolation tek süreç içinde **yapıldı**.

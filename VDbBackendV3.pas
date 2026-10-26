@@ -92,6 +92,36 @@ type
         Journal: TDictionary<QWord, TSavepointKeyRec>;
         TagDelta: TDictionary<Integer, Int64>;  // FBatchTagDelta kopyasi
       end;
+      { v3.15: SNAPSHOT ISOLATION (okuma gorunurlugu).
+        Acik islemi olan bir oturum, BASLADIGI andaki goruntuyu okumalidir.
+        Baska bir oturum commit ederken degisen anahtarlarin commit SONRASI
+        hali burada tutulur; okuyucu kendi StartGen'ine gore eski degeri
+        secer. Bellek penceresi = en uzun ortak acik islem (FSets bosalinca
+        temizlenir).
+
+        Base*: anahtarin ILK post-image'indan ONCEKI deger (FUndo'ya ilk kez
+        girerken motordan okunur). Bir okuyucunun StartGen'i ilk post'un
+        Gen'inden kucukse gordugu deger Base'tir; bu, "arada baska commit
+        olduysa onun da post'u vardir" degismezi sayesinde dogrudur. }
+      TSnapPost = record
+        Gen: Int64;              // post-image'i ureten commit'in gen'i
+        Present: Boolean;
+        Value: TBytes;
+      end;
+      TSnapRec = record
+        BaseGen: Int64;
+        BasePresent: Boolean;
+        BaseValue: TBytes;
+        Posts: array of TSnapPost;
+      end;
+      { Commit sirasinda toplanan bekleyen post-image'ler: uygulama
+        BASARISIZ olursa sahte gecmis yazilmaz. }
+      TSnapPend = record
+        Key: QWord;
+        Rec: TBatchRec;
+        BaseKnown: Boolean;
+        Base: TBatchRec;
+      end;
       { v3.4: OTURUM BASINA YAZMA KUMESI (cok oturumlu yazma).
         Once tek bir global parti tamponu vardi ve ikinci oturum yazmaya
         kalkinca "baska bir oturumun acik islemi var" hatasi aliyordu. Artik
@@ -120,6 +150,11 @@ type
           ne kilit ne motor okumasi yapilir; boylece tek yazarli toplu
           INSERT'te MVCC maliyeti SIFIRA iner. }
         NeedBefore: Boolean;
+        { v3.15: basladigimizdan beri BASKA bir oturum commit etti mi?
+          Oyleyse okumalar StartGen anindaki goruntuye sabitlenir. Alan
+          kilit altinda True yapilir, sahibi kilitsiz okur (Boolean yazimi
+          yirtilmaz). }
+        SnapDirty: Boolean;
         constructor Create(ASession: Cardinal);
         destructor Destroy; override;
       end;
@@ -140,6 +175,14 @@ type
         temizlenir. }
       FCommitGen: Int64;
       FAlien: TDictionary<QWord, Int64>;
+      { v3.15: snapshot gecmisi — anahtar basina post-image zinciri. }
+      FUndo: TDictionary<QWord, TSnapRec>;
+      { v3.15: tarama basina kurulan "snapshot'ta farkli olan anahtarlar"
+        haritasi; motor geri cagirimi bu anahtarlari atlar, tarama sonunda
+        snapshot hali eklenir. Tarama disinda nil. }
+      FSnapMap: TDictionary<QWord, TBatchRec>;
+      { v3.15: commit sirasinda toplanan bekleyen post-image'ler. }
+      FPendSnap: TList<TSnapPend>;
       { Motor erisimini (ve FSets'i) serilestiren ic kilit. TEK backend
         birden fazla is parcacigi tarafindan paylasilabilsin diye; islemler
         ARASINDA tutulmaz (uzun islem baska oturumu kilitlemez). }
@@ -279,6 +322,13 @@ type
     { v3.4: commit ONCESI cakisma denetimi. Hicbir sey uygulanmadan once
       tum anahtarlar karsilastirilir; boylece yarim uygulama olmaz. }
     procedure VerifyNoConflict(S: TWriteSet);
+    { --- v3.15: snapshot isolation (okuma gorunurlugu) --- }
+    function SnapActive: Boolean;
+    function SnapView(const S: TWriteSet; Key: QWord;
+      out Present: Boolean; out Value: TBytes): Boolean;
+    procedure SnapBuild(const S: TWriteSet);
+    procedure SnapCapture(const S: TWriteSet);
+    procedure SnapApplyPending;
     function EffectiveCount: Integer;
     procedure MaybeCheckpoint;
     function PassFilter(Key: QWord; const Value: TBytes;
@@ -492,6 +542,8 @@ begin
   FBusyMs := ABusyMs;
   FSets := TDictionary<Cardinal, TWriteSet>.Create;
   FAlien := TDictionary<QWord, Int64>.Create;
+  FUndo := TDictionary<QWord, TSnapRec>.Create;
+  FPendSnap := TList<TSnapPend>.Create;
   FCommitGen := 0;
   FEngCs := TVdbGate.Create;
   FTagCounts := TDictionary<Integer, Int64>.Create;
@@ -848,6 +900,9 @@ begin
       pair.Value.Free;
   FreeAndNil(FSets);
   FreeAndNil(FAlien);
+  FreeAndNil(FUndo);
+  FreeAndNil(FSnapMap);
+  FreeAndNil(FPendSnap);
   FEngCs.Free;
   LogAbort;               // yarim grup yazilmaz
   FreeAndNil(FLog);       // gunluk fsync + kapat
@@ -955,6 +1010,10 @@ end;
 function TVdbBackendV3.EffectiveCount: Integer;
 var
   pair: TPair<QWord, TBatchRec>;
+  spair: TPair<QWord, TSnapRec>;
+  s: TWriteSet;
+  sp: Boolean;
+  sv: TBytes;
   n: Integer;
 begin
   FEngCs.Enter;
@@ -970,6 +1029,20 @@ begin
         end
         else if FEng.Contains(pair.Key) then
           Dec(n);
+      end;
+    { v3.15: snapshot duzeltmesi. Kendi kaplamamizda olmayan, BASKA oturumun
+      snapshot'tan sonra degistirdigi anahtarlar icin motor durumu ile
+      snapshot durumunun gorunurluk farki sayilir. }
+    s := OwnSet;
+    if (s <> nil) and s.SnapDirty and (FUndo <> nil) then
+      for spair in FUndo do
+      begin
+        if s.Map.ContainsKey(spair.Key) then Continue;
+        if not SnapView(s, spair.Key, sp, sv) then Continue;
+        if sp <> FEng.Contains(spair.Key) then
+        begin
+          if sp then Inc(n) else Dec(n);
+        end;
       end;
     Result := n;
   finally
@@ -1261,6 +1334,137 @@ begin
   end;
 end;
 
+function TVdbBackendV3.SnapActive: Boolean;
+var
+  s: TWriteSet;
+begin
+  s := OwnSet;
+  Result := (s <> nil) and s.SnapDirty;
+end;
+
+function TVdbBackendV3.SnapView(const S: TWriteSet; Key: QWord;
+  out Present: Boolean; out Value: TBytes): Boolean;
+{ Anahtarin StartGen anindaki hali motordan FARKLI mi? Farkliysa True doner
+  ve Present/Value snapshot degerini tasir. Aksi halde False: motor degeri
+  (guncel) dogrudur ve cagiran normal okuma yolunu kullanir.
+
+  Uc durum:
+   - hic post yok / en yeni post bile StartGen'den eski -> motor = snapshot
+   - StartGen'den sonra post var, ondan once de post var -> o post
+   - StartGen ilk post'tan once -> Base (o commit'ten onceki deger) }
+var
+  sr: TSnapRec;
+  i: Integer;
+begin
+  Present := False;
+  Value := nil;
+  Result := False;
+  if (S = nil) or (not S.SnapDirty) then Exit;
+  FEngCs.Enter;
+  try
+    if (FUndo = nil) or (not FUndo.TryGetValue(Key, sr)) then Exit;
+    i := High(sr.Posts);
+    if i < 0 then Exit;
+    if sr.Posts[i].Gen <= S.StartGen then Exit;   // motor = snapshot
+    while (i >= 0) and (sr.Posts[i].Gen > S.StartGen) do Dec(i);
+    if i >= 0 then
+    begin
+      Present := sr.Posts[i].Present;
+      if Present then
+        Value := Copy(sr.Posts[i].Value, 0, Length(sr.Posts[i].Value));
+    end
+    else
+    begin
+      Present := sr.BasePresent;
+      if Present then
+        Value := Copy(sr.BaseValue, 0, Length(sr.BaseValue));
+    end;
+    Result := True;
+  finally
+    FEngCs.Leave;
+  end;
+end;
+
+procedure TVdbBackendV3.SnapBuild(const S: TWriteSet);
+{ Tarama icin: snapshot'i motordan farkli olan anahtarlarin listesi.
+  Cagiran FEngCs'i TUTUYOR olmali (tarama zaten kilit altinda). }
+var
+  pair: TPair<QWord, TSnapRec>;
+  present: Boolean;
+  v: TBytes;
+  rec: TBatchRec;
+begin
+  FreeAndNil(FSnapMap);
+  if (S = nil) or (not S.SnapDirty) then Exit;
+  FSnapMap := TDictionary<QWord, TBatchRec>.Create;
+  for pair in FUndo do
+    if SnapView(S, pair.Key, present, v) then
+    begin
+      rec.Present := present;
+      rec.Value := v;
+      FSnapMap.AddOrSetValue(pair.Key, rec);
+    end;
+end;
+
+procedure TVdbBackendV3.SnapCapture(const S: TWriteSet);
+{ Commit ONCESI: uygulanacak anahtarlarin post-image'i ve (gerekiyorsa)
+  commit oncesi motor degeri toplanir. FEng hala ESKI degeri tasir. }
+var
+  i: Integer;
+  rec: TBatchRec;
+  pend: TSnapPend;
+  v: TBytes;
+begin
+  FPendSnap.Clear;
+  for i := 0 to S.Order.Count - 1 do
+  begin
+    if not S.Map.TryGetValue(S.Order[i], rec) then Continue;
+    pend.Key := S.Order[i];
+    pend.Rec.Present := rec.Present;
+    pend.Rec.Value := Copy(rec.Value, 0, Length(rec.Value));
+    pend.BaseKnown := False;
+    pend.Base.Present := False;
+    pend.Base.Value := nil;
+    if (FUndo = nil) or (not FUndo.ContainsKey(pend.Key)) then
+    begin
+      pend.BaseKnown := True;
+      pend.Base.Present := FEng.TryGet(pend.Key, v);
+      if pend.Base.Present then
+        pend.Base.Value := Copy(v, 0, Length(v));
+    end;
+    FPendSnap.Add(pend);
+  end;
+end;
+
+procedure TVdbBackendV3.SnapApplyPending;
+{ Uygulama BASARILI olduktan sonra cagrilir (FCommitGen artmis durumda). }
+var
+  i, n: Integer;
+  pend: TSnapPend;
+  sr: TSnapRec;
+  post: TSnapPost;
+begin
+  for i := 0 to FPendSnap.Count - 1 do
+  begin
+    pend := FPendSnap[i];
+    if not FUndo.TryGetValue(pend.Key, sr) then
+    begin
+      sr.BaseGen := FCommitGen - 1;
+      sr.BasePresent := pend.Base.Present;
+      sr.BaseValue := pend.Base.Value;
+      SetLength(sr.Posts, 0);
+    end;
+    post.Gen := FCommitGen;
+    post.Present := pend.Rec.Present;
+    post.Value := pend.Rec.Value;
+    n := Length(sr.Posts);
+    SetLength(sr.Posts, n + 1);
+    sr.Posts[n] := post;
+    FUndo.AddOrSetValue(pend.Key, sr);
+  end;
+  FPendSnap.Clear;
+end;
+
 function TVdbBackendV3.Get(Key: QWord; out Value: TBytes): Boolean;
 var
   rec: TBatchRec;
@@ -1277,6 +1481,10 @@ begin
     Value := nil;
     Exit(False);
   end;
+  { v3.15: acik islemde BASKA oturum commit ettiyse kendi anlik goruntumuz
+    gecerlidir; motor degeri okunmaz. }
+  if (s <> nil) and s.SnapDirty and SnapView(s, Key, rec.Present, Value) then
+    Exit(rec.Present);
   FEngCs.Enter;
   try
     Result := FEng.TryGet(Key, Value);
@@ -1336,6 +1544,8 @@ function TVdbBackendV3.Exists(Key: QWord): Boolean;
 var
   s: TWriteSet;
   rec: TBatchRec;
+  tmp: TBytes;
+  pres: Boolean;
 begin
   { v3.6: ONCEDEN satir basina BatchIsMine + BatchMap.ContainsKey + BatchMap[]
     uc ayri OwnSet (kilit + oturum sozlugu aramasi) yapiyordu; INSERT yolu her
@@ -1343,6 +1553,13 @@ begin
   s := OwnSet;
   if (s <> nil) and s.Map.TryGetValue(Key, rec) then
     Exit(rec.Present);
+  { v3.15: snapshot gorunurlugu — Get ile ayni karar. }
+  if (s <> nil) and s.SnapDirty then
+  begin
+    tmp := nil;
+    if SnapView(s, Key, pres, tmp) then
+      Exit(pres);
+  end;
   FEngCs.Enter;
   try
     Result := FEng.Contains(Key);
@@ -1364,6 +1581,9 @@ begin
     her satirda BatchIsMine + BatchMap cagriliyordu; ikisi de OwnSet
     uzerinden kilit + oturum sozlugu aramasi yapiyordu (satir basina 3). }
   if (FScanSet <> nil) and FScanSet.Map.ContainsKey(Key) then Exit;
+  { v3.15: snapshot'ta motordan farkli olan anahtar motor tarafinda ATLANIR;
+    dogru hali tarama sonunda eklenir. }
+  if (FSnapMap <> nil) and FSnapMap.ContainsKey(Key) then Exit;
   if not PassFilter(Key, Value, FScanFilter) then Exit;
   { v3.1: her satirda SetLength(+1) YAPILMAZ (200k satirda O(n^2) kopya
     ve yeniden tahsis). Kapasite ikiye katlanir. }
@@ -1397,9 +1617,33 @@ begin
     FScanFilter := TableFilter;
     { v3.9: oturumun yazma kumesi tarama boyunca sabit (kilit zaten bizde). }
     FScanSet := OwnSet;
+    { v3.15: snapshot gorunurlugu — motordan farkli anahtarlar bir kez
+      hesaplanir (yalnizca baska oturum commit ettiyse). }
+    SnapBuild(FScanSet);
 
     { Motor tarafi: kaplamada islem gormus anahtarlar atlanir. }
     FEng.ScanAll(ScanCb);
+
+    { v3.15: snapshot tarafi: motorun atladigi anahtarlarin StartGen hali. }
+    if FSnapMap <> nil then
+    begin
+      for pair in FSnapMap do
+      begin
+        if not pair.Value.Present then Continue;
+        if (FScanSet <> nil) and FScanSet.Map.ContainsKey(pair.Key) then Continue;
+        if not PassFilter(pair.Key, pair.Value.Value, TableFilter) then Continue;
+        if FScanN >= FScanCap then
+        begin
+          if FScanCap < 256 then FScanCap := 256 else FScanCap := FScanCap * 2;
+          SetLength(FScanKeys, FScanCap);
+          SetLength(FScanVals, FScanCap);
+        end;
+        FScanKeys[FScanN] := pair.Key;
+        FScanVals[FScanN] := Copy(pair.Value.Value, 0, Length(pair.Value.Value));
+        Inc(FScanN);
+      end;
+      FreeAndNil(FSnapMap);
+    end;
 
     { Kaplama tarafi: en guncel deger. }
     if FScanSet <> nil then
@@ -1589,6 +1833,8 @@ var
 begin
   if FStreamAbort then Exit;
   if BatchIsMine and BatchMap.ContainsKey(Key) then Exit;
+  { v3.15: snapshot'ta motordan farkli anahtarlar motor tarafinda atlanir. }
+  if (FSnapMap <> nil) and FSnapMap.ContainsKey(Key) then Exit;
   { PassFilter'in sifir-kopya esdegeri: satir etiketi degerin ILK baytlarindan
     cikar; 8 baytlik sabit tampona kopyalanir (satir basina tahsis YOK). }
   if (FStreamFilter >= 0) and Assigned(FRowTag) then
@@ -1624,8 +1870,24 @@ begin
   FEngCs.Enter;
   try
     if Length(FStreamTagBuf) < 8 then SetLength(FStreamTagBuf, 8);
+    SnapBuild(OwnSet);
     FEng.ScanAllRaw(StreamCbRaw);
     if FStreamAbort then Exit(False);
+
+    { v3.15: snapshot tarafi: motorun atladigi anahtarlarin StartGen hali. }
+    if FSnapMap <> nil then
+      for pair in FSnapMap do
+      begin
+        if not pair.Value.Present then Continue;
+        if BatchIsMine and BatchMap.ContainsKey(pair.Key) then Continue;
+        if not PassFilter(pair.Key, pair.Value.Value, TableFilter) then Continue;
+        n := Length(pair.Value.Value);
+        if n > 0 then
+        begin
+          if not Cb(pair.Key, @pair.Value.Value[0], n, User) then Exit(False);
+        end
+        else if not Cb(pair.Key, nil, 0, User) then Exit(False);
+      end;
 
     if BatchOpen then
       for pair in BatchMap do
@@ -1641,6 +1903,7 @@ begin
       end;
     Result := True;
   finally
+    FreeAndNil(FSnapMap);
     FEngCs.Leave;
   end;
 end;
@@ -1888,9 +2151,16 @@ begin
         fark edilir, o satiri da FAlien defteri yakalar. }
       for fpair in FSets do
         if fpair.Value <> s then
+        begin
           fpair.Value.NeedBefore := True;
+          { v3.15: acik oturumlarin okuma goruntusu artik sabitlenmeli. }
+          fpair.Value.SnapDirty := True;
+        end;
       for i := 0 to s.Order.Count - 1 do
         FAlien.AddOrSetValue(s.Order[i], FCommitGen + 1);
+      { v3.15: post-image'ler ONCEDEN toplanir (FEng hala eski degeri
+        tasiyor), uygulama basarili olursa gecmise islenir. }
+      SnapCapture(s);
     end;
     FInApply := True;
     try
@@ -1901,10 +2171,17 @@ begin
     { v3.1: parti ici etiket degisimleri simdi sayaca islenir. }
     MergeTagDeltas;
     Inc(FCommitGen);
+    { v3.15: ancak uygulama basarili olduktan sonra snapshot gecmisine yaz. }
+    SnapApplyPending;
     { v3.4: yazma kumesi commit ile KAPANIR (eski kodda BatchOpen:=False
       bu noktadaydi; otomatik sikistirma acik parti gormemeli). }
     FSets.Remove(s.Session);
-    if FSets.Count = 0 then FAlien.Clear;
+    if FSets.Count = 0 then
+    begin
+      FAlien.Clear;
+      { v3.15: okuyucu kalmadi -> snapshot gecmisi de gerekmez. }
+      FUndo.Clear;
+    end;
     if FDirty then
     begin
       FEng.Commit(True);
@@ -1930,6 +2207,7 @@ begin
   try
     LogAbort;               // yarim islem gunluge SIZMAZ
     FSets.Remove(s.Session);
+    if FSets.Count = 0 then FUndo.Clear;
   finally
     FEngCs.Leave;
   end;

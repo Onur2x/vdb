@@ -1038,6 +1038,103 @@ Testler: `sqltest` v3 **2874/0/33**, v2 **3305/0/0**; yeni `T160_TamSayiZinciri`
 zinciri, sayısal metin, `'007'`, Int64 taşması, FLOAT yolunun değişmediği,
 ifadeli WHERE/SUM/CASE). 14/14 kapı yeşil.
 
+### v3.15 — Snapshot isolation (okuma izolasyonu)
+
+**Semantik.** Açık işlemi (`BeginBatch`) olan bir oturum, işlemi **başlattığı
+andaki** görüntüyü okur; başka oturumların sonradan commit ettiği değişiklikler
+o oturuma görünmez. Kendi yazdıkları her zaman önceliklidir. İşlem kapandıktan
+sonra (ya da hiç işlem yokken) okuma yine güncel veriyi görür. Bu, v2
+motorunun `FSnapshotSeq` davranışıyla aynıdır (`BatchIsMine and Seq > 0`).
+
+**Neden bu tasarım.** v3 sayfa motoru yerinde (in-place) yazar; sayfa düzeyinde
+sürüm zinciri kurmak (klasik MVCC) en pahalı yol olurdu. Bunun yerine
+**bellek içi post-image penceresi** kullanıldı:
+
+- `TWriteSet.StartGen` zaten vardı (v3.6, `BeginBatch` anındaki `FCommitGen`).
+- Bir oturum commit ederken **başka bir yazma kümesi açıksa**, o commit'in
+  dokunduğu anahtarların commit **sonrası** hali `FUndo` sözlüğüne
+  `(Gen, Present, Value)` olarak yazılır; anahtarın ilk kez girmesinde ayrıca
+  commit **öncesi** motor değeri `Base*` olarak saklanır.
+- Okuyucu kendi `StartGen`'ine göre seçer: `Gen <= StartGen` olan **son**
+  post; hiç yoksa `Base` (yani `StartGen` ilk değişiklikten önceyse, o
+  değişiklikten önceki değer).
+- `Base` yalnızca ilk post'ta bir kez okunur ve şu değişmez sayesinde her eski
+  okuyucu için doğrudur: `StartGen`'i ilk post'un `Gen`'inden küçük olan her
+  oturum, arada olan **tüm** commit'ler sırasında açıktı; dolayısıyla aradaki
+  her değişikliğin de bir post'u vardır.
+- `FUndo` yalnızca **hiç açık yazma kümesi kalmadığında** temizlenir; bellek
+  penceresi = en uzun ortak açık işlem.
+- Post-image'ler commit **öncesi** yerel bir listede toplanır, `FCommitGen`
+  ancak uygulama başarılı olduktan sonra arttığı için **başarısız commit
+  sahte geçmiş bırakmaz**.
+
+**Değişen okuma yolları** (`VDbBackendV3.pas`): `Get`, `Exists`,
+`EffectiveCount` (→ `Count`), `ScanAll`, `ScanRawIterAll` (+ akan geri
+çağırım). Tarama yolunda, snapshot'ta motordan farklı olan anahtarlar motor
+geri çağırımında atlanır ve doğru halleri tarama sonunda eklenir (kaplama
+mantığının aynısı). `ScanRawIterAllPaged` açık parti varken zaten `False`
+döndüğü için değişmedi. `CountTable` açık parti varken `-1` döndürüp tam
+taramaya düşürdüğü için değişmedi.
+
+**Hızlı yollar ve zone map.** SQL katmanının ham hızlı yolları
+(`COUNT`/agg/group) `ScanRawIterAll` üzerinden gittiği için ikame edilen
+satır baytlarını görür — doğru kalır, yalnız snapshot "kirli" iken yavaşlar.
+v3'te zone map **devrede değil** (`FT.Kv` v2 motoruna bağlı); bu yüzden
+budama ile snapshot etkileşimi v3 için söz konusu değil. Günlük budama
+mantıksal günlük üzerinde çalışır, `FUndo` bellek içidir; etkileşim yok.
+
+**Kanıt (yeni kapı `snapchk`, 21 kontrol — hepsi yeşil).**
+Tek süreçte `VdbSessionIdFunc` ile üç oturum simüle edilir:
+1. Oturum 1 açıkken oturum 2 günceller/siler/ekler → oturum 1 eski değeri,
+   silinen satırı ve sabit `Count`'u görür; yeni satır görünmez; tarama eski
+   değerleri verir (6 kontrol).
+2. Oturum 1 kendi yazdığını görür (2 kontrol).
+3. Commit sonrası güncel veri (4 kontrol).
+4. Yazma çakışması hâlâ yakalanır (1 kontrol).
+5. Parti dışı okuma güncel (1 kontrol).
+6. **Post zinciri orta durumu:** oturum 1 (en eski) açıkken aynı anahtar iki
+   kez commit edilir; arada başlayan oturum 3 orta değeri, oturum 1 ilk
+   değeri, parti dışı okuma son değeri görür (3 kontrol).
+
+Kırmızıdan yeşile: uygulama öncesi `snapchk` 12/18 (snapshot ile ilgili 6
+kontrol kırmızı), sonrası 18/18; orta-durum eklenince 21/21.
+
+**Eski test beklentisi düzeltildi.** `v3sqlchk` "v3.4 çok oturumlu yazma"
+bölümü A commit ettikten sonra B'nin 4 satır görmesini bekliyordu (READ
+COMMITTED). Snapshot isolation ile B kendi görüntüsünde kalır (3 satır) ve
+A'nın satırını görmez; commit'ten sonra **başlayan** okuma 4 satır görür.
+Test bu semantiğe göre güncellendi (`v3sqlchk` 238/0).
+
+**Ölçüm (`tmp64/exprbench`, 50k satır, QPC 5 koşu medyanı, µs/satır).**
+Snapshot temizken (tek yazma oturumu, başka commit yok) okuma yolu yalnız bir
+bayrak denetimi ekler:
+
+| sorgu | v3.14 | v3.15 |
+|---|---|---|
+| `SELECT a` | 1,84 | 1,84 |
+| `SELECT a+1` | 2,33 | 2,34 |
+| `SELECT (a*2+1)*3-7` | 2,85 | 2,89 |
+| 5 işlemlik zincir | 3,16 | 3,15 |
+| `COUNT(*) WHERE a*2+1 > 50000` | 3,30 | 3,17 |
+| `COUNT(*) WHERE a > 25000` (ham) | 0,46 | 0,44 |
+| `SELECT a,t WHERE aralık` | 1,70 | 1,69 |
+| `WHERE t LIKE` | 1,02 | 1,02 |
+
+Farklar gürültü sınırında (±%2); ölçülebilir bir yavaşlama yok.
+
+**Testler:** `sqltest` v3 **2874/0/33**, v2 **3305/0/0**; `v3sqlchk`
+**238/0**; **15/15 kapı yeşil** (14 eski + yeni `snapchk`).
+
+**Bilinçli sınırlar (dokümante).**
+- Yazma yolu değişmedi: **ilk commit kazanır** (`VerifyNoConflict` +
+  before-image + `FAlien`). Bir yazma, bayat bir snapshot'a dayanıyorsa ve
+  çakışan commit *ilk yazmadan önce* olmuşsa sessizce commit edilebilir
+  (klasik lost-update); snapshot yalnız **okuma** görüntüsünü sabitler.
+- `FUndo` belleği, en uzun açık işlem boyunca commit edilen satır sayısıyla
+  büyür (klasik undo saklama maliyeti). Uzun işlem + yoğun yazma belleği
+  şişirebilir; pencere tüm oturumlar kapanınca boşalır.
+- Süreçler arası çok yazarlılık kapsam dışı (değişmedi).
+
 ### Sürüm çizgisi kararı (2026-10-26): alpha hattı → **v1.0.0**
 
 Kullanıcı kararı, önceki "v4'e ertele" planını geçersiz kılar:
@@ -1101,9 +1198,11 @@ kendi kapıları ve ölçümüyle):
    sayı yolu** yapıldı: INT kolon/tam sayı literali `+ - *` zincirleri
    Int64'te, ara metin yok (zincirlerde −%26…%39, ifadeli COUNT'ta −%15;
    ağaç yoluyla birebir aynı, diferansiyel kanıtlı). Ayrıntı: §v3.14.
-5. **Snapshot isolation** — MVCC okuma izolasyonu (oturum kendi anlık
-   görüntüsünü görür). En büyük iş, en sona: commit sırası, günlük budama ve
-   zone map ile etkileşimi ayrı ayrı sınanmalı.
+5. ~~**Snapshot isolation**~~ **YAPILDI (v3.15)** — MVCC okuma izolasyonu:
+   açık işlemi olan oturum, `BeginBatch` anındaki görüntüyü okur (v2 ile aynı
+   semantik). Bellek içi post-image zinciri (`FUndo`), kendi yazıları öncelikli,
+   commit çakışma denetimi (ilk commit kazanır) değişmedi. Ölçülen okuma
+   maliyeti yok (snapshot temizken tek bayrak denetimi). Ayrıntı: §v3.15.
 
 ### Kapsam dışı (değişmedi)
 - M3 WASM, M7 async sunucu, WASM/edge
