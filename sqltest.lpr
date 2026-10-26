@@ -17008,6 +17008,244 @@ begin
   end;
 end;
 
+procedure T156_SqliteParity;
+{ v3.7: SQLite sozdizimi parity. Ayristirici ve yurutucu iki backend'de
+  ORTAK oldugu icin test her iki backend'de kosar (ATLA yok).
+  Kapsam: BEGIN varyantlari, CREATE INDEX IF NOT EXISTS,
+  INSERT OR REPLACE/IGNORE, CREATE TABLE AS SELECT, CREATE TEMP TABLE,
+  UPDATE ... FROM, WITH x AS (DML), CREATE TRIGGER ... BEGIN (AS'siz). }
+var
+  kv2: TVDb;
+  be2: IVdbBackend;
+  tb2: TVTableDb;
+  sq2: TVSql;
+  r: TSqlResult;
+  raised: Boolean;
+  s: string;
+  d2: string;
+begin
+  Grp('v3.7 SQLite sozdizimi parity');
+  d2 := D + PathDelim + 'parity';
+  ForceDirectories(d2);
+  kv2 := nil;
+  be2 := nil;
+  if gV3 then
+  begin
+    be2 := TVdbBackendV3.Create(d2 + PathDelim + 'veritabani.odb', True, 64);
+    tb2 := TVTableDb.CreateBackend(be2);
+  end
+  else
+  begin
+    kv2 := TVDb.Create;
+    kv2.Open(d2);
+    tb2 := TVTableDb.Create(kv2);
+  end;
+  try
+    tb2.Open(d2);
+    sq2 := TVSql.Create(tb2);
+    try
+      sq2.Exec('CREATE TABLE p(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)');
+
+      // ---- 1) BEGIN varyantlari (SQLite/PostgreSQL yazimi) ----
+      raised := False;
+      try
+        sq2.Exec('BEGIN TRANSACTION');
+        sq2.Exec('INSERT INTO p VALUES (1, 10, ''x'')');
+        sq2.Exec('COMMIT');
+      except
+        raised := True;
+      end;
+      Dogrula('BEGIN TRANSACTION kabul edildi', not raised, '');
+      r := sq2.Exec('SELECT COUNT(*) FROM p');
+      Dogrula('BEGIN TRANSACTION sonrasi satir yazildi',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '1'), r.Msg);
+
+      raised := False;
+      try
+        sq2.Exec('BEGIN IMMEDIATE');
+        sq2.Exec('ROLLBACK');
+      except
+        raised := True;
+      end;
+      Dogrula('BEGIN IMMEDIATE kabul edildi', not raised, '');
+
+      raised := False;
+      try
+        sq2.Exec('BEGIN DEFERRED TRANSACTION');
+        sq2.Exec('ROLLBACK');
+      except
+        raised := True;
+      end;
+      Dogrula('BEGIN DEFERRED TRANSACTION kabul edildi', not raised, '');
+
+      // ---- 2) CREATE INDEX IF NOT EXISTS ----
+      sq2.Exec('CREATE INDEX IF NOT EXISTS ix_p_a ON p(a)');
+      raised := False;
+      try
+        sq2.Exec('CREATE INDEX IF NOT EXISTS ix_p_a ON p(a)');
+      except
+        raised := True;
+      end;
+      Dogrula('CREATE INDEX IF NOT EXISTS ikinci kez sessiz', not raised, '');
+      raised := False;
+      try
+        sq2.Exec('CREATE INDEX ix_p_a ON p(a)');
+      except
+        raised := True;
+      end;
+      Dogrula('IF NOT EXISTS olmadan ayni indeks reddedilir', raised, '');
+
+      // ---- 3) INSERT OR IGNORE / OR REPLACE ----
+      sq2.Exec('INSERT OR IGNORE INTO p VALUES (1, 99, ''zzz'')');
+      r := sq2.Exec('SELECT a FROM p WHERE id = 1');
+      Dogrula('INSERT OR IGNORE cakisan satiri degistirmez',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '10'), r.Msg);
+
+      sq2.Exec('INSERT OR REPLACE INTO p VALUES (1, 20, ''y'')');
+      r := sq2.Exec('SELECT a, b FROM p WHERE id = 1');
+      Dogrula('INSERT OR REPLACE satiri gunceller',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '20') and
+        (r.Rows[0][1] = 'y'), r.Msg);
+
+      raised := False;
+      try
+        sq2.Exec('INSERT INTO p VALUES (1, 5, ''d'')');
+      except
+        raised := True;
+      end;
+      Dogrula('OR''suz INSERT cakismada hata verir', raised, '');
+
+      // REPLACE'te verilmeyen kolon varsayilana doner (SQLite: satir
+      // silinip yeniden eklenir).
+      sq2.Exec('CREATE TABLE q(id INTEGER PRIMARY KEY, a INTEGER DEFAULT 7, b TEXT)');
+      sq2.Exec('INSERT INTO q(id, b) VALUES (1, ''x'')');
+      sq2.Exec('INSERT OR REPLACE INTO q(id, b) VALUES (1, ''y'')');
+      r := sq2.Exec('SELECT a, b FROM q WHERE id = 1');
+      Dogrula('INSERT OR REPLACE verilmeyen kolona DEFAULT uygular',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '7') and
+        (r.Rows[0][1] = 'y'), r.Msg);
+
+      raised := False;
+      try
+        sq2.Exec('INSERT OR REPLACE INTO p VALUES (99, 1, ''a'') ' +
+                 'ON CONFLICT DO NOTHING');
+      except
+        raised := True;
+      end;
+      Dogrula('INSERT OR ... + ON CONFLICT reddedilir', raised, '');
+
+      // ---- 4) CREATE TABLE ... AS SELECT ----
+      sq2.Exec('CREATE TABLE p2 AS SELECT id, a FROM p');
+      r := sq2.Exec('SELECT COUNT(*) FROM p2');
+      Dogrula('CTAS satirlari kopyalar',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '1'), r.Msg);
+      sq2.Exec('CREATE TABLE p3 AS SELECT id * 10 AS onum, b || ''!'' AS bb FROM p');
+      r := sq2.Exec('SELECT onum, bb FROM p3');
+      Dogrula('CTAS ifade kolonlarini uretir',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '10') and
+        (r.Rows[0][1] = 'y!'), r.Msg);
+
+      // ---- 5) CREATE TEMP TABLE (kalici oldugu belgelenmistir) ----
+      raised := False;
+      try
+        sq2.Exec('CREATE TEMP TABLE t1(id INTEGER PRIMARY KEY, v TEXT)');
+        sq2.Exec('INSERT INTO t1 VALUES (1, ''t'')');
+      except
+        raised := True;
+      end;
+      Dogrula('CREATE TEMP TABLE kabul edildi', not raised, '');
+      r := sq2.Exec('SELECT v FROM t1 WHERE id = 1');
+      Dogrula('TEMP tabloya yazip okunur',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = 't'), r.Msg);
+      raised := False;
+      try
+        sq2.Exec('CREATE TEMPORARY TABLE t2(id INTEGER PRIMARY KEY)');
+      except
+        raised := True;
+      end;
+      Dogrula('CREATE TEMPORARY TABLE kabul edildi', not raised, '');
+
+      // ---- 6) UPDATE ... FROM (alt sorgu ve tablo kaynagi) ----
+      sq2.Exec('INSERT INTO p VALUES (10, 1, ''r10'')');
+      sq2.Exec('UPDATE p SET b = x.nb FROM ' +
+        '(SELECT 10 AS id, ''degisti'' AS nb) x WHERE x.id = p.id');
+      r := sq2.Exec('SELECT b FROM p WHERE id = 10');
+      Dogrula('UPDATE ... FROM alt sorgu yalniz eslesen satiri yazar',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = 'degisti'), r.Msg);
+      r := sq2.Exec('SELECT b FROM p WHERE id = 1');
+      Dogrula('UPDATE ... FROM eslesmeyen satiri korur',
+        (Length(r.Rows) = 1) and (r.Rows[0][1 - 1] = 'y'), r.Msg);
+
+      sq2.Exec('CREATE TABLE rr(id INTEGER PRIMARY KEY, b TEXT)');
+      sq2.Exec('INSERT INTO rr VALUES (10, ''R10'')');
+      sq2.Exec('UPDATE p SET b = z.b FROM rr z WHERE z.id = p.id');
+      r := sq2.Exec('SELECT b FROM p WHERE id = 10');
+      Dogrula('UPDATE ... FROM tablo kaynagi + alias',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = 'R10'), r.Msg);
+
+      raised := False;
+      try
+        sq2.Exec('UPDATE p SET b = ''x'' FROM rr z JOIN rr w ON w.id = z.id ' +
+                 'WHERE z.id = p.id');
+      except
+        raised := True;
+      end;
+      Dogrula('UPDATE ... FROM JOIN reddedilir (sessiz yanlis sonuc yok)',
+        raised, '');
+
+      // ---- 7) WITH x AS (INSERT ...) SELECT ----
+      sq2.Exec('WITH x AS (INSERT INTO p VALUES (20, 5, ''w'')) ' +
+               'SELECT COUNT(*) FROM p');
+      r := sq2.Exec('SELECT COUNT(*) FROM p WHERE id = 20');
+      Dogrula('WITH + INSERT govdesi calisir',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '1'), r.Msg);
+
+      r := sq2.Exec('WITH x AS (INSERT INTO p VALUES (30, 6, ''r'') ' +
+                    'RETURNING id, b) SELECT id, b FROM x');
+      Dogrula('WITH + INSERT RETURNING satirlari CTE olur',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '30') and
+        (r.Rows[0][1] = 'r'), r.Msg);
+
+      r := sq2.Exec('WITH d AS (DELETE FROM p WHERE id = 30) SELECT COUNT(*) FROM p');
+      r := sq2.Exec('SELECT COUNT(*) FROM p WHERE id = 30');
+      Dogrula('WITH + DELETE govdesi calisir',
+        (Length(r.Rows) = 1) and (r.Rows[0][0] = '0'), r.Msg);
+
+      // ---- 8) CREATE TRIGGER ... BEGIN (AS istege bagli) ----
+      raised := False;
+      try
+        sq2.Exec('CREATE TRIGGER tr1 AFTER INSERT ON p BEGIN ' +
+                 'UPDATE p SET a = a; END');
+        sq2.Exec('DROP TRIGGER tr1');
+      except
+        raised := True;
+      end;
+      Dogrula('CREATE TRIGGER ... BEGIN (AS''siz) kabul edildi', not raised, '');
+
+      // Regresyon: nitelikli referans niteliksiz ada baglanmamali
+      // (bkz. FindColIdx v3.7 duzeltmesi).
+      r := sq2.Exec('SELECT a.id, b.id FROM p a JOIN p b ON b.id = a.id ' +
+                    'ORDER BY a.id');
+      s := '';
+      if Length(r.Rows) > 0 then
+        s := r.Rows[0][0] + ':' + r.Rows[0][1];
+      Dogrula('JOIN nitelikli referanslar dogru kolona baglanir',
+        (s <> '') and (r.Rows[0][0] = r.Rows[0][1]), s);
+    finally
+      sq2.Free;
+    end;
+  finally
+    tb2.Close;
+    tb2.Free;
+    if kv2 <> nil then
+    begin
+      kv2.Close;
+      kv2.Free;
+    end;
+    be2 := nil;
+  end;
+end;
+
 { Sprint 2.9: test kosucusu. Her test kendi try/except'inde kosar;
   boylece bir hata kalan testleri durdurmaz ve siniflandirma yapilabilir. }
 type
@@ -17017,7 +17255,7 @@ type
   end;
 
 const
-  TEST_SAYISI = 185;
+  TEST_SAYISI = 186;
 
   { v3 kosusunda ATLA: bu testler yalniz v2 motorunun (TVDb/WAL/arsiv/
     zone/indeks .idx) ozel yollarini kullanir; v3'te karsiligi yoktur.
@@ -17274,6 +17512,7 @@ begin
   TESTLER[182].Nm := 'T153_KvStoreBackend'; TESTLER[182].P := T153_KvStoreBackend;
   TESTLER[183].Nm := 'T154_YonetimYollari'; TESTLER[183].P := T154_YonetimYollari;
   TESTLER[184].Nm := 'T155_AsofV32'; TESTLER[184].P := T155_AsofV32;
+  TESTLER[185].Nm := 'T156_SqliteParity'; TESTLER[185].P := T156_SqliteParity;
 end;
 
 { ---------------------------------------------------------------------- main }

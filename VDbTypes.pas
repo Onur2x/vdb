@@ -143,6 +143,11 @@ type
   // R-03: ON CONFLICT action
   TOnConflictAction = (ocaNone, ocaDoNothing, ocaDoUpdate);
 
+  // SQLite uyumu: INSERT OR <action>. REPLACE/IGNORE yeniden yazilir
+  // (ON CONFLICT ... ile ayni yola gider); ABORT/FAIL/ROLLBACK
+  // varsayilan davranisi (cakismada hata) korur.
+  TInsertOrAction = (ioaNone, ioaReplace, ioaIgnore, ioaAbort, ioaFail, ioaRollback);
+
   // --- UPDATE ... SET ifadesi ---
   //   Kind = 0 : Duz deger (E.Lit)
   //   Kind = 1 : <kolon> Op <deger>   (orn. n = n + 1)

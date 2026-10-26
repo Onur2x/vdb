@@ -834,10 +834,18 @@ function TVSqlExecutor.FindColIdx(const ColumnName, TableQualifier: string;
 var
   i, dp: Integer;
 begin
-  // 1. Tam eslesme (nitelemeli veya nitelememisiz)
+  { v3.7: NITELIKLI referans once TAM nitelikli eslesmeyi arar.
+    ONCEDEN tam eslesme tek gecisde arandigi icin dizide hedefin
+    NITELIKSIZ adi one geldiginde "x.id" referansi niteliksiz "id"
+    kolonuna baglaniyordu (UPDATE ... FROM'da "x.id = p.id" ->
+    "p.id = p.id" olur, tum satirlar eslesirdi). }
+  if TableQualifier <> '' then
+    for i := 0 to High(ColNames) do
+      if SameText(ColNames[i], TableQualifier + '.' + ColumnName) then
+        Exit(i);
+  // 1. Tam eslesme (niteliksiz)
   for i := 0 to High(ColNames) do
-    if SameText(ColNames[i], ColumnName) or
-       ((TableQualifier <> '') and SameText(ColNames[i], TableQualifier + '.' + ColumnName)) then
+    if SameText(ColNames[i], ColumnName) then
       Exit(i);
   // 2. Nitelemesiz referans -> sonek eslestirmesi (ad -> alias.ad)
   if TableQualifier = '' then
@@ -2925,6 +2933,34 @@ begin
   for i := 0 to Stmt.WithQueries.Count - 1 do
   begin
     Nm := VDbNorm(Stmt.WithQueries[i].Name);
+    { v3.7: WITH x AS (INSERT/UPDATE/DELETE ...) — DML govdeli CTE.
+      DML burada BIR kez calistirilir; RETURNING varsa satirlari CTE'nin
+      icerigi olur, yoksa CTE bos kumedir (SQLite ile ayni). }
+    if Stmt.WithQueries[i].Dml <> nil then
+    begin
+      R := Default(TSqlResult);
+      if Stmt.WithQueries[i].Dml is TSqlInsertStmt then
+        ExecInsert(TSqlInsertStmt(Stmt.WithQueries[i].Dml), R)
+      else if Stmt.WithQueries[i].Dml is TSqlUpdateStmt then
+        ExecUpdate(TSqlUpdateStmt(Stmt.WithQueries[i].Dml), R)
+      else if Stmt.WithQueries[i].Dml is TSqlDeleteStmt then
+        ExecDelete(TSqlDeleteStmt(Stmt.WithQueries[i].Dml), R)
+      else
+        raise EVDbException.Create(ecUnsupported,
+          'WITH: desteklenmeyen DML govdesi: ' + Stmt.WithQueries[i].Name);
+      T.Names := R.Fields;
+      T.Rows := R.Rows;
+      SetLength(T.Types, Length(R.Fields));
+      for it := 0 to High(T.Types) do
+        T.Types[it] := VCT_STR;
+      if (Length(Stmt.WithQueries[i].ColAliases) > 0) and
+         (Length(Stmt.WithQueries[i].ColAliases) = Length(T.Names)) then
+        for it := 0 to High(T.Names) do
+          T.Names[it] := Stmt.WithQueries[i].ColAliases[it];
+      if FCteTables.ContainsKey(Nm) then FCteTables[Nm] := T
+      else FCteTables.Add(Nm, T);
+      Continue;
+    end;
     // R-10: gercek ozyineleme (anchor UNION ALL terim) varsa onu calistir
     // ve bu CTE icin ESKI sahte dongeden gec.
     if CteIsRecursive(Stmt.WithQueries[i]) then
@@ -12881,6 +12917,9 @@ var
   retRow: TStrArray;
   hasReturning: Boolean;
   setIdx: Integer;
+  // SQLite uyumu: INSERT OR REPLACE icin SET listesi kurulurken
+  Asgn2: TUpdateAssignment;
+  prov: Boolean;
   upsertSetExprs: array of TUpdateAssignment;
   upsertSetValues: TSetValuePairs;
   emptyArr1, emptyArr2: TStrArray;
@@ -13050,6 +13089,47 @@ begin
     end;
     SetLength(returningRows, 0);
   end;
+
+  // SQLite uyumu: INSERT OR REPLACE / OR IGNORE.
+  //   REPLACE: cakismada PK disi TUM kolonlar gelen satirdan yazilir.
+  //            SQLite satiri silip yeniden ekledigi icin VERILMEYEN
+  //            kolonlar varsayilan degerini (yoksa NULL) alir.
+  //   IGNORE : cakisan satir sessizce atlanir (= ON CONFLICT DO NOTHING).
+  //   ABORT/FAIL/ROLLBACK: varsayilan davranis (cakismada hata) korunur.
+  if Stmt.OrAction <> ioaNone then
+  begin
+    if Stmt.OnConflictAction <> ocaNone then
+      raise EVDbException.Create(ecSyntaxError,
+        'INSERT OR ... ile ON CONFLICT ... birlikte kullanilamaz');
+  end;
+  if Stmt.OrAction = ioaReplace then
+  begin
+    if Stmt.OnConflictSetExprs.Count > 0 then
+      raise EVDbException.Create(ecSyntaxError,
+        'INSERT OR REPLACE ile ON CONFLICT ... DO UPDATE birlikte kullanilamaz');
+    for i := 0 to High(td.Cols) do
+    begin
+      if (td.PkIndex >= 0) and (i = td.PkIndex) then Continue;
+      prov := False;
+      for j := 0 to High(cnames) do
+        if SameText(cnames[j], td.Cols[i].Name) then
+        begin
+          prov := True;
+          Break;
+        end;
+      Asgn2.ColName := td.Cols[i].Name;
+      if prov then
+        Asgn2.Expr := TSqlColumnRefNode.Create(td.Cols[i].Name, 'EXCLUDED')
+      else if td.Cols[i].HasDef then
+        Asgn2.Expr := TSqlLiteralNode.CreateStr(td.Cols[i].Def)
+      else
+        Asgn2.Expr := TSqlLiteralNode.CreateNull;
+      Stmt.OnConflictSetExprs.Add(Asgn2);
+    end;
+    Stmt.OnConflictAction := ocaDoUpdate;
+  end
+  else if Stmt.OrAction = ioaIgnore then
+    Stmt.OnConflictAction := ocaDoNothing;
 
   // R-03: ON CONFLICT action mapping
   onConflictAction := ocaNone;
@@ -14704,6 +14784,15 @@ var
   mappedAssignments: TList<TUpdateAssignment>;
   Asgn: TUpdateAssignment;
   originalAssignments: TList<TUpdateAssignment>;
+  // SQLite uyumu: UPDATE ... FROM
+  fromRows, joinedRows: TStrMatrix;
+  fromNames, fromPks, joinedPks, jNames: TStrArray;
+  fromTypes, jTypes: TByteArray;
+  subRes: TSqlResult;
+  tdF: TTableDef;
+  aliasEff: string;
+  n, fi: Integer;
+  jr: TStrArray;
 begin
   // F-33: View guncellenebilirlik kontrolü
   baseTable := '';
@@ -14788,6 +14877,95 @@ begin
 
   SetLength(allColNames, Length(td.Cols));
   for i := 0 to High(td.Cols) do allColNames[i] := td.Cols[i].Name;
+
+  { SQLite uyumu: UPDATE ... SET ... FROM <kaynak>.
+    Hedef satiri, kaynakta WHERE'i saglayan ILK satirla esler (SQLite de
+    coklu eslesmede tek satir secer). Birlesik satir once hedef kolonlari,
+    sonra kaynak kolonlarini tasir; WHERE/SET ifadeleri bu birlesik
+    kapsamda degerlendirilir. Nitelikli (alias.kolon) ve niteliksiz
+    adlar birlikte sunulur; cakismada hedef kolon kazanir. }
+  if (Stmt.FromTable <> '') or (Stmt.FromSelect <> nil) then
+  begin
+    if Stmt.FromSelect <> nil then
+    begin
+      ExecSelect(Stmt.FromSelect, subRes);
+      SetLength(fromNames, Length(subRes.Fields));
+      SetLength(fromTypes, Length(subRes.Fields));
+      for n := 0 to High(subRes.Fields) do
+      begin
+        fromNames[n] := VDbNorm(subRes.Fields[n]);
+        if (n < Length(subRes.FieldTypes)) and (subRes.FieldTypes[n] <> 0) then
+          fromTypes[n] := subRes.FieldTypes[n]
+        else
+          fromTypes[n] := VCT_STR;
+      end;
+      fromRows := subRes.Rows;
+    end
+    else
+    begin
+      tdF := FT.GetTable(Stmt.FromTable);
+      BuildColInfo(tdF, fromNames, fromTypes);
+      FT.ScanRows(Stmt.FromTable, fromPks, fromRows);
+    end;
+    aliasEff := Stmt.FromAlias;
+    if aliasEff = '' then aliasEff := Stmt.FromTable;
+
+    SetLength(jNames, 2 * Length(td.Cols) + Length(fromNames));
+    SetLength(jTypes, Length(jNames));
+    n := 0;
+    // 1) hedef niteliksiz adlar (newVals ile ayni sira)
+    for i := 0 to High(td.Cols) do
+    begin
+      jNames[n] := colNames[i]; jTypes[n] := colTypes[i]; Inc(n);
+    end;
+    // 2) hedef nitelikli adlar
+    // DIKKAT: FindColIdx tam eslesmeyi TEK gecisde aradigi icin hedefin
+    // niteliksiz adi 'x.kolon' referansini GOLGELERDI (x.id = p.id ->
+    // p.id = p.id olur, tum satirlar eslesirdi). Bu yuzden hedef
+    // degerleri satirda IKINCI kez tasinir: adlar ile degerler birebir
+    // ayni sirada kalir. Maliyet yalniz UPDATE ... FROM yolunda.
+    for i := 0 to High(td.Cols) do
+    begin
+      jNames[n] := Stmt.Table + '.' + colNames[i]; jTypes[n] := colTypes[i]; Inc(n);
+    end;
+    // 3) kaynak nitelikli adlar
+    for i := 0 to High(fromNames) do
+    begin
+      jNames[n] := aliasEff + '.' + fromNames[i]; jTypes[n] := fromTypes[i]; Inc(n);
+    end;
+
+    SetLength(joinedRows, 0);
+    SetLength(joinedPks, 0);
+    for i := 0 to High(allRows) do
+    begin
+      for fi := 0 to High(fromRows) do
+      begin
+        SetLength(jr, 2 * Length(td.Cols) + Length(fromNames));
+        for n := 0 to High(td.Cols) do
+        begin
+          if n <= High(allRows[i]) then jr[n] := allRows[i][n] else jr[n] := '';
+          jr[Length(td.Cols) + n] := jr[n];   // nitelikli adlar icin kopya
+        end;
+        for n := 0 to High(fromNames) do
+          if n <= High(fromRows[fi]) then
+            jr[2 * Length(td.Cols) + n] := fromRows[fi][n]
+          else
+            jr[2 * Length(td.Cols) + n] := '';
+        if RowMatches(Stmt.WhereClause, jr, jNames, jTypes) then
+        begin
+          SetLength(joinedRows, Length(joinedRows) + 1);
+          joinedRows[High(joinedRows)] := jr;
+          SetLength(joinedPks, Length(joinedPks) + 1);
+          joinedPks[High(joinedPks)] := pks[i];
+          Break;
+        end;
+      end;
+    end;
+    allRows := joinedRows;
+    pks := joinedPks;
+    colNames := jNames;
+    colTypes := jTypes;
+  end;
 
   rCount := 0;
   // F1-4 (tamamlayici): SQL UPDATE artik Delete+Insert YAPMIYOR.
@@ -15189,10 +15367,42 @@ begin
 end;
 
 procedure TVSqlExecutor.ExecCreateTable(Stmt: TSqlCreateTableStmt; out Res: TSqlResult);
-var i: Integer;
+var i: Integer; j: Integer; subRes: TSqlResult; ccols: TColArray; cnms: TStrArray; c: TColDef;
 begin
   if Stmt.IfNotExists and FT.TableExists(Stmt.Table) then
   begin Res.Affected := 0; Res.Msg := 'OK'; Exit; end;
+
+  { SQLite uyumu: CREATE TABLE ad AS SELECT ... (CTAS).
+    Kolonlar kaynak SELECT'in alanlarindan uretilir (ad + motor tipi);
+    PK/kisit/index YOKTUR ve satirlar tek tek yazilir. }
+  if Stmt.SelectSrc <> nil then
+  begin
+    ExecSelect(Stmt.SelectSrc, subRes);
+    if Length(subRes.Fields) = 0 then
+      raise EVDbException.Create(ecSyntaxError,
+        'CREATE TABLE AS SELECT: kaynak SELECT kolon uretmedi');
+    SetLength(ccols, Length(subRes.Fields));
+    SetLength(cnms, Length(subRes.Fields));
+    for i := 0 to High(subRes.Fields) do
+    begin
+      c := Default(TColDef);
+      c.Name := VDbNorm(subRes.Fields[i]);
+      if c.Name = '' then c.Name := 'col' + IntToStr(i + 1);
+      if (i < Length(subRes.FieldTypes)) and (subRes.FieldTypes[i] <> 0) then
+        c.Ctype := subRes.FieldTypes[i]
+      else
+        c.Ctype := VCT_STR;
+      ccols[i] := c;
+      cnms[i] := c.Name;
+    end;
+    FT.CreateTable(Stmt.Table, ccols, -1, [], [], '', '', nil);
+    for i := 0 to High(subRes.Rows) do
+      FT.Insert(Stmt.Table, cnms, subRes.Rows[i]);
+    Res.Affected := 1; Res.LastTable := Stmt.Table;
+    Res.Msg := 'OK (' + IntToStr(Length(subRes.Rows)) + ' satir kopyalandi)';
+    Exit;
+  end;
+
   if Stmt.CheckExprs <> nil then
   begin
     for i := 0 to Stmt.CheckExprs.Count - 1 do
@@ -15747,9 +15957,22 @@ begin
 end;
 
 procedure TVSqlExecutor.ExecCreateIndex(Stmt: TSqlCreateIndexStmt; out Res: TSqlResult);
-var msg: string;
+var msg: string; i: Integer; nms: TStrArray;
 begin
   msg := 'OK';
+  // SQLite uyumu: IF NOT EXISTS — ayni adli indeks zaten varsa cumle
+  // sessizce basarili olur (mevcut tanim KORUNUR, yeniden insa edilmez).
+  if Stmt.IfNotExists then
+  begin
+    nms := FT.IndexNames(Stmt.Table);
+    for i := 0 to High(nms) do
+      if SameText(nms[i], Stmt.IndexName) then
+      begin
+        Res.Affected := 0; Res.LastTable := Stmt.Table;
+        Res.Msg := 'OK (IF NOT EXISTS: indeks zaten var)';
+        Exit;
+      end;
+  end;
   if Stmt.Concurrently then msg := 'OK (CONCURRENTLY)';
   // F2-23: UNIQUE bayragi TEK KOLONLU yolda da tasinir. Once bu dal
   // CreateIndex'i cagirip Uniq'i yutuyordu.

@@ -592,6 +592,38 @@ kalanı sayfa motoru uygulaması + checkpoint (dayanıklılık).
 Kapılar: 14/14 yeşil, `v3sqlchk` **237/0** (9 yeni çok oturum kontrolü),
 `sqltest` v3 2759/0/33, v2 3196/0/0.
 
+### v3.7 — SQLite sözdizimi paritesi (2026-10-26)
+
+Eski bir SQLite uygulamasını değiştirmeden çalıştırabilmek için eksik yazımlar
+kapatıldı. Hepsi **ayrıştırıcı + yürütücü** katmanında; dosya biçimi değişmedi.
+
+| Yazım | Önce | Şimdi |
+|---|---|---|
+| `BEGIN TRANSACTION` / `BEGIN WORK` | `anlasilamayan ek: TRANSACTION` | kabul; davranış değişmez |
+| `BEGIN IMMEDIATE/DEFERRED/EXCLUSIVE` | sözdizimi hatası | kabul (kilit düzeyi yok sayılır; motor tek yazıcı) |
+| `CREATE INDEX IF NOT EXISTS ix ...` | `"ON" bekleniyor` | aynı adlı indeks varsa **sessiz** başarı, tanım korunur |
+| `INSERT OR IGNORE` | `"INTO" bekleniyor` | çakışan satır atlanır (= `ON CONFLICT DO NOTHING`) |
+| `INSERT OR REPLACE` | `"INTO" bekleniyor` | PK dışı tüm kolonlar yeni satırdan yazılır; verilmeyen kolon DEFAULT/NULL |
+| `INSERT OR ABORT/FAIL/ROLLBACK` | sözdizimi hatası | kabul; çakışmada hata (varsayılan davranış) |
+| `CREATE TEMP/TEMPORARY TABLE` | sözdizimi hatası | kabul; tablo **kalıcıdır** (§ sınırlar) |
+| `CREATE TABLE x AS SELECT ...` | `"(" bekleniyor` | kolonlar kaynak SELECT'ten türetilir, satırlar kopyalanır |
+| `UPDATE ... SET ... FROM ...` | `anlasilamayan ek: FROM` | alt sorgu veya tablo kaynağı; JOIN reddedilir |
+| `WITH x AS (INSERT/UPDATE/DELETE ...)` | `SELECT bekleniyor` | gövde çalıştırılır; `RETURNING` satırları CTE olur |
+| `CREATE TRIGGER ... BEGIN ... END` (`AS`'siz) | `"AS" bekleniyor` | `AS` isteğe bağlı |
+
+Yan düzeltme: `FindColIdx` nitelikli referansı artık **önce tam `alias.kolon`
+eşleşmesiyle** arıyor. Önceki tek geçişli arama, dizide niteliksiz ad önce
+geldiğinde `x.id` referansını `p.id`'ye bağlıyordu (`UPDATE ... FROM`'da
+`x.id = p.id` → `p.id = p.id` olur, **tüm satırlar** eşleşirdi).
+
+Bilinçli sınırlar (sessiz yanlış sonuç yok, açık hata/sınır):
+`TEMP` tablo oturum kapanınca **silinmez**; `UPDATE ... FROM` tek kaynak kabul
+eder (JOIN reddedilir); `INSERT OR REPLACE ... ON CONFLICT` birlikte reddedilir.
+
+Kapılar: 14/14 yeşil, `v3sqlchk` **237/0**, `sqltest` v3 **2784/0/33**
+(önce 2759), v2 **3221/0/0** (önce 3196) — yeni `T156_SqliteParity` 25 kontrol,
+iki backend'de de koşar.
+
 ### Sıradaki sürüme ertelenen (v4 sonrası)
 - Satır gövdesi varint/delta kodlama (F3-1'in kalanı)
 - Dosya boyutu (PK'nin ikinci kez yazılması, hücre başlığı sıkıştırma)

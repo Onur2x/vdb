@@ -353,6 +353,10 @@ type
   TWithQuery = record
     Name: string;
     Select: TSqlSelectStmt;
+    // v3.7: WITH x AS (INSERT/UPDATE/DELETE ...) — DML govdeli CTE.
+    // Select = nil ise bu alan kullanilir; RETURNING varsa satirlari
+    // CTE'nin icerigi olur, yoksa CTE bos kumedir.
+    Dml: TSqlStmtNode;
     IsRecursive: Boolean;
     ColAliases: TStrArray;
 	Materialize: Boolean;
@@ -427,6 +431,8 @@ type
     OnConflictAction: TOnConflictAction;
     OnConflictTarget: TStrArray;
     OnConflictSetExprs: TList<TUpdateAssignment>;
+    // SQLite uyumu: INSERT OR REPLACE / OR IGNORE (bkz. TInsertOrAction)
+    OrAction: TInsertOrAction;
     // R-04: RETURNING
     ReturningCols: TStrArray;
     ReturningExprs: TList<TSqlExprNode>;
@@ -443,6 +449,11 @@ type
     Assignments: TList<TUpdateAssignment>;
     WhereClause: TSqlExprNode;
     WithQueries: TList<TWithQuery>; // 4.5 mimari: WITH + UPDATE
+    // SQLite uyumu: UPDATE t SET ... FROM <kaynak> [alias]
+    // (kaynak: tablo veya parantezli SELECT; JOIN desteklenmez)
+    FromTable: string;
+    FromAlias: string;
+    FromSelect: TSqlSelectStmt;
     // R-04: RETURNING
     ReturningCols: TStrArray;
     ReturningExprs: TList<TSqlExprNode>;
@@ -478,6 +489,11 @@ type
       yani kisit SESSIZCE yok sayiliyordu (v2'de de). Simdi burada
       toplanir; CREATE TABLE bunlari UNIQUE indeks olarak kurar. }
     Uniques: array of TStrArray;
+    // SQLite uyumu: CREATE TEMP|TEMPORARY TABLE ve CREATE TABLE ... AS SELECT.
+    // NOT (v3.7): TEMP kabul edilir ama tablo KALICIDIR (oturum kapaninca
+    // silinmez); CTAS kaynak SELECT'in alanlarindan kolon uretir.
+    Temporary: Boolean;
+    SelectSrc: TSqlSelectStmt;
     // R-13: Table Partitioning
     PartitionType: string; // 'RANGE', 'LIST', 'HASH'
     PartitionCol: string;  // kolon adı
@@ -552,6 +568,9 @@ type
     // F2-23: CREATE UNIQUE INDEX. ONCEDEN bu bayrak Parse'da yutuluyor,
     // motora hic tasinmiyordu; sonuc UNIQUE tanimi HIC zorlanmiyordu.
     Uniq: Boolean;
+    // SQLite uyumu: "CREATE INDEX IF NOT EXISTS ix ON t(c)". Var olan
+    // ayni adli indeks sessizce korunur (hata verilmez).
+    IfNotExists: Boolean;
     // F-17: PARTIAL INDEX kosulu ("CREATE INDEX ix ON t(c) WHERE x > 0").
     // Bos = normal indeks (tum satirlar indekslenir).
     Predicate: string;
@@ -1444,8 +1463,10 @@ begin
   if WithQueries <> nil then
   begin
     for i := 0 to WithQueries.Count - 1 do
+    begin
       WithQueries[i].Select.Free;
-    WithQueries.Free;
+      WithQueries[i].Dml.Free;   // v3.7: WITH x AS (DML ...)
+    end;    WithQueries.Free;
   end;
   WhereClause.Free;
   GroupByCols.Free;
@@ -1526,6 +1547,7 @@ begin
     Assignments.Free;
   end;
   WhereClause.Free;
+  FromSelect.Free;
   ReturningExprs.Free;
   inherited Destroy;
 end;

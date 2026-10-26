@@ -2719,6 +2719,22 @@ var T: string; i: Integer; Row: TInsertValuesRow; Expr: TSqlExprNode;
 begin
   Result := TSqlInsertStmt.Create;
   try
+    { SQLite uyumu: INSERT OR REPLACE|IGNORE|ABORT|FAIL|ROLLBACK INTO ... }
+    if PeekToken = 'OR' then
+    begin
+      NextToken(T);   // OR
+      ExpectToken(T);
+      { FPC 3.2: string CASE yok; if zinciri kullanilir. }
+      if UpperCase(T) = 'REPLACE' then Result.OrAction := ioaReplace
+      else if UpperCase(T) = 'IGNORE' then Result.OrAction := ioaIgnore
+      else if UpperCase(T) = 'ABORT' then Result.OrAction := ioaAbort
+      else if UpperCase(T) = 'FAIL' then Result.OrAction := ioaFail
+      else if UpperCase(T) = 'ROLLBACK' then Result.OrAction := ioaRollback
+      else
+        raise EVDbException.CreateFmt(ecSyntaxError,
+          'INSERT OR sonrasi REPLACE / IGNORE / ABORT / FAIL / ROLLBACK bekleniyor, "%s" bulundu (%s)',
+          [T, CurPos]);
+    end;
     Expect('INTO');
     ExpectToken(T); Result.Table := VDbNorm(T);
 
@@ -2836,6 +2852,38 @@ begin
       Result.Assignments.Add(Asgn);
       if PeekToken = ',' then begin NextToken(T); Continue; end;
       Break;
+    end;
+    { SQLite uyumu: UPDATE t SET ... FROM <kaynak> [alias]
+      Kaynak: tablo adi veya parantezli SELECT. JOIN'li FROM kapsam disi
+      (acik hata verilir; sessizce yanlis sonuc uretilmez). }
+    if UpperCase(PeekToken) = 'FROM' then
+    begin
+      NextToken(T);   // FROM
+      if PeekToken = '(' then
+      begin
+        NextToken(T);
+        Expect('SELECT');
+        Result.FromSelect := ParseSelect;
+        Expect(')');
+      end
+      else
+      begin
+        ExpectToken(T);
+        Result.FromTable := VDbNorm(T);
+      end;
+      if UpperCase(PeekToken) = 'AS' then NextToken(T);
+      if (PeekToken <> 'WHERE') and (PeekToken <> 'RETURNING') and
+         (PeekToken <> ';') and (PeekToken <> '') and
+         (UpperCase(PeekToken) <> 'JOIN') then
+      begin
+        ExpectToken(T);
+        Result.FromAlias := VDbNorm(T);
+      end;
+      if (UpperCase(PeekToken) = 'JOIN') or (UpperCase(PeekToken) = 'INNER') or
+         (UpperCase(PeekToken) = 'LEFT') or (UpperCase(PeekToken) = 'RIGHT') or
+         (UpperCase(PeekToken) = 'FULL') or (UpperCase(PeekToken) = 'CROSS') then
+        raise EVDbException.Create(ecUnsupported,
+          'UPDATE ... FROM icinde JOIN desteklenmiyor (tek kaynak kullanin)');
     end;
     if PeekToken = 'WHERE' then begin NextToken(T); Result.WhereClause := ParseExpr; end;
     // R-04: RETURNING
@@ -3206,7 +3254,9 @@ begin
       Expect(')');
     end;
 
-    Expect('AS');
+    // --- govde: AS <govde> | BEGIN ... END (SQLite: AS istege bagli) ---
+    if PeekToken = 'AS' then
+      NextToken(T);
     Result.Body := ParseProcBody;
   except
     Result.Free;
@@ -3655,6 +3705,18 @@ begin
       Result.IfNotExists := True;
     end;
     ExpectToken(T); Result.Table := VDbNorm(T);
+
+    { SQLite uyumu: CREATE TABLE ad AS SELECT ... (CTAS).
+      Kolonlar kaynak SELECT'in alanlarindan turetilir; CTAS tablosunda
+      PK/kisit yoktur (SQLite ile ayni). }
+    if UpperCase(PeekToken) = 'AS' then
+    begin
+      NextToken(T);   // AS
+      Expect('SELECT');   // ParseSelect 'SELECT' yutulmus varsayar
+      Result.SelectSrc := ParseSelect;
+      Exit(Result);
+    end;
+
     Expect('(');
     i := 0;
 
@@ -4711,12 +4773,22 @@ begin
       Expect('AS');
       Expect('(');
       // 4.5: WITH + DML (SELECT, INSERT, UPDATE, DELETE).
-      if (PeekToken <> 'SELECT') and (PeekToken <> 'INSERT') and
-         (PeekToken <> 'UPDATE') and (PeekToken <> 'DELETE') then
+      if (UpperCase(PeekToken) <> 'SELECT') and (UpperCase(PeekToken) <> 'INSERT') and
+         (UpperCase(PeekToken) <> 'UPDATE') and (UpperCase(PeekToken) <> 'DELETE') then
         raise EVDbException.CreateFmt(ecSyntaxError,
           'AS sonrasi SELECT/INSERT/UPDATE/DELETE bekleniyor (%s)', [CurPos]);
-      NextToken(T); // SELECT
-      W.Select := ParseSelect;
+      NextToken(T); // SELECT/INSERT/UPDATE/DELETE
+      { v3.7: ONCEDEN govde her zaman ParseSelect'e gidiyordu; bu yuzden
+        "WITH x AS (INSERT ...)" sozdizimi hatasi veriyordu. Artik DML
+        govdesi ayri alanda (W.Dml) tutulur ve yurutucude calistirilir. }
+      if UpperCase(T) = 'INSERT' then
+        W.Dml := ParseInsert
+      else if UpperCase(T) = 'UPDATE' then
+        W.Dml := ParseUpdate
+      else if UpperCase(T) = 'DELETE' then
+        W.Dml := ParseDelete
+      else
+        W.Select := ParseSelect;
       // R-10: govde `anchor UNION ALL recursive` seklinde olabilir
       // (ParseSelect SET OP'u kendi icine alir; burada ek gerek yok).
       Expect(')');
@@ -4734,6 +4806,7 @@ begin
       end;
       Holder.WithQueries.Add(W);
       W.Select := nil; // sahiplik listede
+      W.Dml := nil;    // v3.7: ayni sekilde DML de listede
       if PeekToken <> ',' then Break;
       NextToken(T); // ','
     until False;
@@ -4774,6 +4847,7 @@ begin
     Result := Main;
   except
     if W.Select <> nil then W.Select.Free;
+    if W.Dml <> nil then W.Dml.Free;
     Holder.Free;
     raise;
   end;
@@ -4805,7 +4879,21 @@ begin
   Result := nil;
 
   // ----
-  if U = 'BEGIN'    then Result := TSqlTxStmt.Create(txBegin)
+  if U = 'BEGIN'    then
+  begin
+    Result := TSqlTxStmt.Create(txBegin);
+    { SQLite/PostgreSQL uyumu: BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE] [TRANSACTION|WORK].
+      Motor tek yazici oldugu icin kilitleme modu davranisi DEGISTIRMEZ;
+      mod yalnizca kabul edilir (aksi halde "anlasilamayan ek" hatasi). }
+    U2 := UpperCase(PeekToken);
+    if (U2 = 'DEFERRED') or (U2 = 'IMMEDIATE') or (U2 = 'EXCLUSIVE') then
+    begin
+      NextToken(T);
+      U2 := UpperCase(PeekToken);
+    end;
+    if (U2 = 'TRANSACTION') or (U2 = 'WORK') then
+      NextToken(T);
+  end
   else if U = 'COMMIT'   then Result := TSqlTxStmt.Create(txCommit)
   else if U = 'ROLLBACK' then
   begin
@@ -4887,7 +4975,16 @@ begin
   begin
   FLastMainToken := 'CREATE';
     ExpectToken(T); U2 := UpperCase(T);
-    if U2 = 'TABLE'    then Result := ParseCreateTable
+    if (U2 = 'TEMP') or (U2 = 'TEMPORARY') then
+    begin
+      { SQLite uyumu: CREATE TEMP[ORARY] TABLE. Semantik fark: tablo
+        KALICIDIR (oturum kapaninca silinmez) — bkz. UYGULAMA_GELISTIRME.md. }
+      Expect('TABLE');
+      Result := ParseCreateTable;
+      if Result is TSqlCreateTableStmt then
+        TSqlCreateTableStmt(Result).Temporary := True;
+    end
+    else if U2 = 'TABLE'    then Result := ParseCreateTable
     else if U2 = 'FUNCTION' then Result := ParseCreateFunction
     else if U2 = 'PROCEDURE' then Result := ParseCreateProcedure
     else if U2 = 'TRIGGER' then Result := ParseCreateTrigger
@@ -4917,12 +5014,24 @@ begin
       if U2 = 'UNIQUE' then Expect('INDEX');
       idxStmt := TSqlCreateIndexStmt.Create;
       idxStmt.Uniq := U2 = 'UNIQUE';
+      // SQLite uyumu: IF NOT EXISTS (ad'tan once de, CONCURRENTLY'den
+      // once de gelebilir; iki sira da kabul edilir).
+      if (PeekToken = 'IF') and (PeekToken2 = 'NOT') then
+      begin
+        NextToken(T); NextToken(T); Expect('EXISTS');
+        idxStmt.IfNotExists := True;
+      end;
       // R-22 Full: CREATE [UNIQUE] INDEX CONCURRENTLY — eszamanli insa
       // bayragi (burada tuketilmezse indeks ADI sanilirdi).
       if PeekToken = 'CONCURRENTLY' then
       begin
         NextToken(T);
         idxStmt.Concurrently := True;
+      end;
+      if (not idxStmt.IfNotExists) and (PeekToken = 'IF') and (PeekToken2 = 'NOT') then
+      begin
+        NextToken(T); NextToken(T); Expect('EXISTS');
+        idxStmt.IfNotExists := True;
       end;
       ExpectToken(T); idxStmt.IndexName := VDbNorm(T);
       Expect('ON');

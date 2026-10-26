@@ -279,7 +279,7 @@ veritabani.colkey      kolon anahtarı (yalnız kolon şifrelemesi kullanılırs
 
 ---
 
-## 9. Bugünkü sınırlar (v3.6)
+## 9. Bugünkü sınırlar (v3.7)
 
 | Özellik | Durum | Not |
 |---|---|---|
@@ -290,6 +290,11 @@ veritabani.colkey      kolon anahtarı (yalnız kolon şifrelemesi kullanılırs
 | MVCC (süreç içi çok oturum) | **var** (v3.4) | READ COMMITTED; her oturum kendi yazma kümesinde yazar, **ilk commit kazanır**, kaybeden `yazma cakismasi` ile durur. DDL/`SAVEPOINT`/`DEFERRABLE` çoklu yazmada reddedilir. Snapshot isolation yok |
 | MVCC (süreçler arası) | yok | dosya kilidi ikinci süreci reddeder |
 | Toplu INSERT hızı | v2'nin **~1,6 katı** yavaş | v3 6,04 / v2 3,85 µs satır (200k×3 kolon, commit dâhil). Fark: commit'teki değişim günlüğü (~0,61 µs) + sayfa motoru uygulaması/checkpoint |
+| SQLite yazımları (v3.7) | **var** | `BEGIN [TRANSACTION|WORK] [IMMEDIATE|DEFERRED|EXCLUSIVE]`, `CREATE INDEX IF NOT EXISTS`, `INSERT OR REPLACE/IGNORE/ABORT/FAIL/ROLLBACK`, `CREATE TEMP[ORARY] TABLE`, `CREATE TABLE ... AS SELECT`, `UPDATE ... SET ... FROM`, `WITH x AS (INSERT/UPDATE/DELETE ...)`, `AS`'siz `CREATE TRIGGER` |
+| `TEMP` tablo ömrü | sınır | Kabul edilir ama tablo **kalıcıdır**: oturum kapanınca silinmez (gerçek geçici tablo altyapısı yok) |
+| `UPDATE ... FROM` kapsamı | sınır | Tek kaynak (tablo veya parantezli SELECT) + alias; `FROM` içinde **JOIN reddedilir**. Çoklu eşleşmede ilk kaynak satırı kullanılır (SQLite da tek satır seçer) |
+| `INSERT OR FAIL/ROLLBACK` | sınır | Çakışmada hata verir; `ROLLBACK`'ın "tüm işlemi geri al" ayrımı uygulanmaz (varsayılan ABORT davranışı) |
+| `INSERT OR ...` + `ON CONFLICT` | sınır | Aynı cümlede birlikte reddedilir (açık hata) |
 
 Aynı açık veritabanında **oturum yalitimi** vardır: `VDbSetTxnSession`
 (v2) / `VdbBackendSessionId` ile kimliği olan iki oturum birbirinin **commit
@@ -302,6 +307,12 @@ v3.2'de **çözülenler**: `SAVEPOINT`/`ROLLBACK TO` (§5.1),
 `ALTER DATABASE KEY`, kolon şifreleme (`.colkey`), `IVdbBackend` üzerinde
 yönetim/ölçüm API'si ve otomatik sıkıştırma (§5.2), `TVdbBackendKvStore`
 (§5.3), `VDbSqlServer`'ın v3 motoruyla çalışması.
+
+v3.7'de **çözülenler**: SQLite uygulamalarının değiştirilmeden çalışması için
+eksik yazımlar (`BEGIN` varyantları, `CREATE INDEX IF NOT EXISTS`,
+`INSERT OR ...`, `CREATE TEMP TABLE`, CTAS, `UPDATE ... FROM`,
+`WITH x AS (DML)`, `AS`'siz trigger). Ayrıntı ve ölçülen kapı sayıları:
+`V3_YOL_HARITASI.md` §v3.7.
 
 Yukarıdaki olmayanlar **sessizce yanlış sonuç vermez**: her biri açık bir
 `ecUnsupported` hatası ve yol gösteren mesaj döndürür.
