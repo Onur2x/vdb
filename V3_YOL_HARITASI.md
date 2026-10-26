@@ -171,6 +171,11 @@ v3 bu noktada uygulama geliştirmeye hazır ilan edildi:
 > oturumlu yazma (MVCC, v3.4) de kapandı; ayrıca açılışta ölçülen 20 s'lik
 > değişim günlüğü darboğazı giderildi (v3.5: 39–46 ms). Yol haritasında açık
 > madde kalmadı; bilinçli sınırlar "Sıradaki sürüme ertelenen" bölümünde.
+>
+> **Güncelleme 3 (2026-10-26):** Karar değişti — ertelenen maddeler artık
+> **bu hattın kapsamı**. Hat alpha sayılıyor, hepsi bitince ürün
+> **v1.0.0** olarak yayınlanacak. `main` de bu hatla birleştirildi
+> (aynı commit). Bkz. aşağıdaki "Sürüm çizgisi kararı".
 
 CI'da düzeltilen iki kusur (bu kapanışta bulundu):
 
@@ -844,14 +849,47 @@ negatif INT / 127 bayttan uzun metin (2 baytlık varint) yolları.
 14/14 kapı yeşil; `sqltest` ve `lockchk` 64-bit derlemede de yeşil
 (2812/0/33 ve 30/0).
 
-### Sıradaki sürüme ertelenen (v4 sonrası)
-- Dosya boyutu (PK'nin ikinci kez yazılması, hücre başlığı sıkıştırma)
-- Bloom filtresi, merge JOIN, ifade bytecode
-- Snapshot isolation (MVCC okuma izolasyonu) ve süreçler arası çok yazarlılık
+### Sürüm çizgisi kararı (2026-10-26): alpha hattı → **v1.0.0**
+
+Kullanıcı kararı, önceki "v4'e ertele" planını geçersiz kılar:
+
+- **Ayrı bir v4 sürüm çizgisi açılmayacak.** Aşağıdaki maddeler bu hattın
+  kapsamıdır ve burada yapılır.
+- Bu hat bugün **alpha**'dır: `v3.x` numaraları yayın sürümü değil, çalışma
+  dilimi adıdır. Dışarıya sürüm vaadi verilmez.
+- Tüm maddeler bitince ürün **v1.0.0** olarak etiketlenir ve ilk yayın
+  odur. (Eski v2 kodu ağaçta yalnız **okunur legacy** olarak kalır; göç
+  aracı ve `migchk` onu derlemek zorunda.)
+- `main` artık `v3` ile **aynı commit**'tedir (fast-forward, 84 commit).
+  İş `v3` dalında yürür ve her push'ta `main` de ilerletilir:
+  `git push origin v3 v3:main` (tek komut, iki ref). İki dal arasında
+  ayrı iş yapılmaz; ayrışma riski bu şekilde sıfırlanır.
+
+Sıra (risk ve ölçülebilir kazanç sırasına göre; her madde ayrı dilim,
+kendi kapıları ve ölçümüyle):
+
+1. **Bloom filtresi** — `.idx` üzerinde **türetilmiş** yapı, dosya biçimine
+   dokunmaz (en güvenli biçim değişikliği). `=` / `IN` nokta aramalarında
+   olmayan anahtarı disk erişimi olmadan eler. Yanlış negatif **olamaz**;
+   yanlış pozitif oranı ölçülerek raporlanır.
+2. **Merge JOIN** — iki tarafın sıralı akışını tek geçişte birleştirir;
+   `HASH` ve `NESTED` yanında üçüncü yöntem, maliyet modeliyle seçilir.
+3. **Dosya boyutu** — PK'nin satır gövdesinde ikinci kez yazılmasının
+   kaldırılması + hücre başlığı sıkıştırma. Satır biçimine dokunur;
+   v3.11'deki `$FFFF` + varint düzeni ve sürüm yükseltme yolu yeniden
+   kullanılır (dosya sürümü 5).
+4. **İfade bytecode** — derin/tekrarlı ifadelerde ağaç yorumlayıcısı yerine
+   derlenmiş küçük program; `WHERE`/`SELECT` ifadeleri.
+5. **Snapshot isolation** — MVCC okuma izolasyonu (oturum kendi anlık
+   görüntüsünü görür). En büyük iş, en sona: commit sırası, günlük budama ve
+   zone map ile etkileşimi ayrı ayrı sınanmalı.
 
 ### Kapsam dışı (değişmedi)
-- M3 WASM, M7 async sunucu
-- WASM/edge
+- M3 WASM, M7 async sunucu, WASM/edge
+- **Süreçler arası çok yazarlılık** (aynı `.odb` dosyasına iki sürecin
+  yazması): dosya kilidi mimarisi ve süreçler arası görünürlük gerektirir;
+  bu hattın kapsamında değil. Snapshot isolation **tek süreç içinde**
+  kalacak. (Onay istendi: bu madde kapsam dışı kalıyor.)
 
 ---
 

@@ -345,6 +345,13 @@ yükseltilir; eski ikili sürüm 4'ü açık hatayla reddeder (sessiz yanlış
 sonuç yok). Ayrıntı ve geriye dönük okuma kanıtı: `V3_YOL_HARITASI.md`
 §v3.11.
 
+**Sürüm çizgisi (2026-10-26):** Bu hat **alpha**'dır; `v3.x` numaraları
+yayın sürümü değil çalışma dilimi adıdır. Kalan maddeler (Bloom filtresi,
+merge JOIN, dosya boyutu, ifade bytecode, snapshot isolation) **bu hatta**
+yapılır; hepsi bitince ürün **v1.0.0** olarak yayınlanır. `main` = `v3`
+(aynı commit); iş `v3`te yürür, her push'ta `main` de ilerletilir.
+Süreçler arası çok yazarlılık kapsam dışı kalır (dosya kilidi mimarisi).
+
 Yukarıdaki olmayanlar **sessizce yanlış sonuç vermez**: her biri açık bir
 `ecUnsupported` hatası ve yol gösteren mesaj döndürür.
 

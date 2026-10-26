@@ -651,3 +651,13 @@ Kapı: `sqltest` v3 **2822/0/33**, v2 **3256/0/0** (yeni `T157_SatirGovdesi`
 işaretinin ham taramada görülmesi, satırın **tam 30 bayt** olması, NULL /
 büyük negatif INT / 127 bayttan uzun metin); 14/14 kapı yeşil; `sqltest` ve
 `lockchk` 64-bit derlemede de yeşil.
+
+### Sürüm çizgisi (2026-10-26)
+
+Bu hat **alpha**'dır: `v3.x` adları yayın sürümü değil çalışma dilimidir.
+Kalan kapsam — Bloom filtresi, merge JOIN, dosya boyutu (PK tekrarı + hücre
+başlığı), ifade bytecode, snapshot isolation — bu hatta yapılır ve hepsi
+bitince ürün **v1.0.0** olarak etiketlenir. `main` = `v3` (84 commit
+fast-forward); iş `v3`te yürür ve her push'ta `main` de ilerletilir.
+Süreçler arası çok yazarlılık (aynı dosyaya iki süreç yazması) kapsam
+dışıdır; snapshot isolation tek süreç içinde kalır.
