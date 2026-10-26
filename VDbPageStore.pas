@@ -264,6 +264,12 @@ type
     procedure AcquireRead;
     procedure ReleaseRead;
     function WriteHeld: Boolean;
+    { v3.16: guvenlik agi ile ALINAN tam kilidi birakir. Yalnizca
+      `EnsureIoWrite` kilit yukseltmesi yaptiysa etkilidir (aksi halde
+      no-op). `TVdbPageEngine`'i dogrudan kullanan oturumlar bunu islem
+      sonunda CAGRMAK ZORUNDADIR; aksi halde tam kilit oturum boyu
+      tutulur ve diger surecler okuyamaz. }
+    procedure EndIoWrite;
     { v3.16: meta imzasi degistiginde (baska surec commit etti) cagrilir.
       Motor WAL gorunumunu tazelemek icin baglar. }
     property OnRefreshed: TNotifyEvent read FOnRefreshed write FOnRefreshed;
@@ -849,6 +855,26 @@ begin
   FLockedExcl := True;
   FLocked := True;
   FAutoWrite := True;
+end;
+
+{ v3.16: guvenlik agi kilidini birak (bkz. FAutoWrite). }
+procedure TVDbPageStore.EndIoWrite;
+begin
+  if FStream = nil then Exit;
+  if not FAutoWrite then Exit;
+  FAutoWrite := False;
+  if FLockedExcl then
+  begin
+    VDbUnlockStream(FStream);
+    FLockedExcl := False;
+    FLocked := False;
+  end;
+  { Islem kapsamli paylasimli kilide geri don. }
+  if (FReadDepth > 0) and (FStream <> nil) then
+  begin
+    FLockedShared := TakeSharedLock;
+    FLocked := FLockedShared;
+  end;
 end;
 
 { v3.16: `<db>.gen` — surecler arasi degisiklik sayaci. }

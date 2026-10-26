@@ -322,7 +322,7 @@ begin
     11/11 gecti). CI #37'de cikis kodu 1 (biz oldurduk) geldi: yani cocuk
     YASIYOR ama 90 sn'de tek commit yazmiyor -> yavaslik degil, takilma.
     Sozlesme degismedi (commit edilen satirlarin TAMAMI dogrulanir);
-    ek olarak: bekleme 40 sn, cocuk erken olurse beklemeden cik, 2 deneme,
+    ek olarak: bekleme 60 sn, cocuk erken olurse beklemeden cik, 3 deneme,
     ve basarisizlikta cocugun STAGE gunlugu + dosya boyutlari raporlanir. }
   marker := 0;
   exitCode := -1;
@@ -332,6 +332,9 @@ begin
     path := FreshDir(D, 'kill9.odb');
     markerPath := D + PathDelim + 'kill9.marker';
     if FileExists(markerPath) then DeleteFile(markerPath);
+    { v3.17: onceki denemenin gunlugu SILINIR; yoksa tani metni eski
+      denemeden kalir ve yanlis yeri isaret eder. }
+    if FileExists(markerPath + '.log') then DeleteFile(markerPath + '.log');
     { Onceki denemeden kalan turetilmis dosyalar YENI dosyaya ait degildir. }
     if FileExists(path + '.idx') then DeleteFile(path + '.idx');
 
@@ -350,7 +353,7 @@ begin
         gercekten sinanir. }
       t0 := Now;
       marker := 0;
-      while (marker < 2000) and (Now - t0 < 40 / 86400) do
+      while (marker < 2000) and (Now - t0 < 60 / 86400) do
       begin
         Sleep(50);
         marker := ReadMarker;
@@ -369,7 +372,7 @@ begin
     Sleep(200);
 
     marker := ReadMarker;
-  until (marker > 0) or (attempt >= 2);
+  until (marker > 0) or (attempt >= 3);
 
   if marker <= 0 then
   begin
@@ -742,16 +745,27 @@ var
     gorunmuyordu (konsolu yok). Tani bilgisini isaret dosyasinin
     yanina yaz; test yine ayni sozlesmeyle degerlendirilir. }
   procedure Log(const S: string);
+  var
+    data: RawByteString;
+    fs: TFileStream;
   begin
     {$IFDEF UNIX}
     MarkerWrite(MarkerPath + '.log', S + LineEnding);
     {$ELSE}
+    { v3.17: gunluk ARTIK EKLENIR. Onceden her cagri dosyayi sifirliyordu;
+      CI'da cocuk takildiginda yalnizca SON satir kaldigi icin hang'in yeri
+      bilinmiyordu ('COUNT=0' tek basina hicbir sey soylemiyordu). }
     try
-      with TFileStream.Create(MarkerPath + '.log', fmCreate) do
+      data := S + LineEnding;
+      if FileExists(MarkerPath + '.log') then
+        fs := TFileStream.Create(MarkerPath + '.log', fmOpenWrite or fmShareDenyNone)
+      else
+        fs := TFileStream.Create(MarkerPath + '.log', fmCreate);
       try
-        WriteBuffer(PChar(S + LineEnding)^, Length(S + LineEnding));
+        fs.Seek(0, soEnd);
+        fs.WriteBuffer(data[1], Length(data));
       finally
-        Free;
+        fs.Free;
       end;
     except
       { tani dosyasi yazilamazsa sessiz gec }
@@ -808,14 +822,20 @@ begin
     begin
       Inc(i);
       MakeVal(i, 48, 3, v);
+      { v3.17 tani: ilk satirlar icin HER adim yazilir; CI'da takilma
+        buradaysa son satir hang'in yerini tam olarak gosterir. }
+      if i <= 26 then Log(Format('INSERT oncesi i=%d', [i]));
       eng.Insert(i, v);
+      if i <= 26 then Log(Format('INSERT sonrasi i=%d', [i]));
       if (i mod 25) = 0 then
       begin
+        if i = 25 then Log('COMMIT oncesi i=25');
         if not eng.Commit(True) then
         begin
           Log(Format('COMMIT FALSE: i=%d', [i]));
           Halt(2);
         end;
+        if i = 25 then Log('COMMIT sonrasi i=25');
         { Commit dondukten sonra isaretle: fsync edilmis son anahtar. }
         {$IFDEF UNIX}
         if not MarkerWrite(MarkerPath, IntToStr(i) + LineEnding) then

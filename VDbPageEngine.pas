@@ -687,6 +687,10 @@ begin
 
   FStore.EndTxn;
   FInTxn := False;
+  { v3.16: motoru DOGRUDAN kullanan oturumlar islem kilidi acmaz; guvenlik
+    aginin aldigi tam kilit burada birakilir (backend yolunda FWriteDepth>0
+    oldugu icin no-op). }
+  FStore.EndIoWrite;
   { v3.3: yalnizca VERI degistiren commit zone map damgasini ilerletir. }
   if changed then NextDataStamp;
   Result := True;
@@ -714,6 +718,8 @@ begin
   FStore.Flush(DoSync);
   if DoSync then
     FWal.Truncate(FStore.LSN);
+  { v3.16: guvenlik agi kilidini birak (bkz. Commit). }
+  FStore.EndIoWrite;
   Result := True;
 end;
 

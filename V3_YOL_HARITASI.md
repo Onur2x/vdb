@@ -1173,6 +1173,13 @@ boyu** tutulur.
   **kendiliğinden tam kilide yükseltir** ve işlem sonunda bırakır. Unutulan bir
   yazma yolu `EWriteError` ya da veri kaybı üretmez (bu ağ olmadan `sqltest`
   T159'da `EWriteError` alınmıştı).
+  - Ağın bırakma ucu **`EndIoWrite`**'tur. `TVdbPageEngine`'i doğrudan kullanan
+    oturumlar (kapılar, `crashtest`) `AcquireRead`/`AcquireWrite` çağırmadığı
+    için `FReadDepth = FWriteDepth = 0` olur; kilidi yalnız `ReleaseRead`
+    bıraktığından ağ **oturum boyu tam kilit sızıntısına** yol açıyordu (başka
+    süreç `EReadError` alır). Bu yüzden `Commit` ve `Checkpoint` işlerinin
+    sonunda `EndIoWrite` çağrılır. Backend yolunda `FWriteDepth > 0` olduğu
+    için çağrı etkisizdir (no-op).
 - WAL dosyası da paylaşıma açıldı (`fmShareDenyNone`); yazma yine veritabanı
   kilidiyle sıralanır.
 
@@ -1219,6 +1226,19 @@ güvenliğin bilinçli bedelidir.
   sınanmadı; `prochk` şifresiz dosya kullanır.
 - Aynı süreç içindeki çok oturumlu davranış (v3.15 MVCC, ilk commit kazanır)
   değişmedi.
+
+**CI kapsamı (v3.17).** GitHub Actions artık yereldeki 16 kapının **tamamını**
+koşar: `snapchk` ve `prochk` derleme listesine ve adımlara eklendi (önceden CI
+15 kapı koşuyordu, bu iki kapı hiç derlenmiyordu — yerel yeşil ile CI yeşili
+arasında kapsam farkı vardı). Ayrıca `crashtest`'in kill -9 alt testi
+sağlamlaştırıldı:
+- Alt süreç günlüğü artık **append** yazıyor (önce her satırda dosyayı
+  sıfırlıyordu, geriye yalnız son satır kalıyordu ve tanı imkânsızdı); ilk 25
+  satır için `INSERT oncesi/sonrasi` ve `COMMIT oncesi/sonrasi` aşama izleri
+  eklendi.
+- Bekleme **40 → 60 sn**, deneme **2 → 3**; her denemede eski tanı günlüğü
+  siliniyor (yavaş CI koşucusunda alt sürecin ilk commit'e ulaşamaması
+  #36/#37'de de görülmüştü).
 
 
 ### Sürüm çizgisi kararı (2026-10-26): alpha hattı → **v1.0.0**

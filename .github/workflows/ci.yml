@@ -80,6 +80,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:LAZBUILD -B lockchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:LAZBUILD -B snapchk.lpi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:LAZBUILD -B prochk.lpi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Sayfa deposu kapisi (storechk)
         shell: pwsh
@@ -360,6 +364,31 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'lockchk kalan > 0'
+            exit 1
+          }
+
+      - name: Snapshot isolation kapisi (snapchk)
+        shell: pwsh
+        run: |
+          # v3.15: islem ici okuma goruntusu sabit.
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbsnapchk'
+          $out = & .\snapchk.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'snapchk kalan > 0'
+            exit 1
+          }
+
+      - name: Cok surecli cok yazarlilik kapisi (prochk)
+        shell: pwsh
+        run: |
+          # v3.16: iki GERCEK surec ayni dosyaya yazar;
+          # commit edilen satirlarin hicbiri kaybolmaz.
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbprochk'
+          $out = & .\prochk.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'prochk kalan > 0'
             exit 1
           }
 

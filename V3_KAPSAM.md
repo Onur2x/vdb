@@ -831,7 +831,8 @@ belleği en uzun açık işlem boyunca büyür. Süreçler arası çok yazarlıl
 yapıldı (kilit işlem kapsamlı); yazarlar sıralıdır.
 
 Kapı: `sqltest` v3 **2874/0/33**, v2 **3305/0/0**; `v3sqlchk` **238/0**;
-`lockchk` **29/0**; `prochk` **8/0**; **16/16 kapı yeşil**.
+`lockchk` **29/0**; `prochk` **8/0**; **16/16 kapı yeşil**. CI (GitHub Actions)
+de aynı **16** kapıyı koşar — `snapchk`/`prochk` v3.17'de eklendi.
 
 ### Sürüm çizgisi (2026-10-26)
 
