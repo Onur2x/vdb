@@ -88,6 +88,9 @@ type
     function OnMiss(PageNo: LongWord; P: PVdbPage): Boolean;
     procedure ApplyRecovered(PageNo: LongWord; P: PVdbPage);
     procedure ApplyReadOnly(PageNo: LongWord; P: PVdbPage);
+    { v3.16: sayfa deposu "baska surec commit etti" dediginde WAL
+      gorunumunu tazele. }
+    procedure StoreRefreshed(Sender: TObject);
     procedure RequireWritable;
     function PendingIndex(PageNo: LongWord): Integer;
     procedure AddPending(PageNo: LongWord; P: PVdbPage);
@@ -287,6 +290,28 @@ begin
   inherited Destroy;
 end;
 
+procedure TVdbPageEngine.StoreRefreshed(Sender: TObject);
+var
+  st: TVdbWalStats;
+begin
+  if (FWal = nil) or (FStore = nil) then Exit;
+  if FStore.ReadOnly then Exit;
+  { Baska bir surec commit etti: bizim WAL handle'i ve tanimligi bayat.
+    Yeniden ac; varsa cerceveleri uygula (WAL cerceveleri sayfa imajidir,
+    yeniden uygulamak idempotenttir) ve buda. }
+  FWal.Close;
+  if FStore.Encrypted then
+    FWal.SetEncryptionKey(FStore.Key, FStore.Salt);
+  FWal.Open(False);
+  if FWal.HasContent then
+  begin
+    FWal.Recover(ApplyRecovered, st, FRecoverLimit);
+    FWalStats := st;
+    FStore.Flush(True);
+    FWal.Truncate(FStore.LSN);
+  end;
+end;
+
 procedure TVdbPageEngine.Open(ACreate: Boolean; AReadOnly: Boolean;
   ABusyMs: Integer);
 var
@@ -298,11 +323,20 @@ begin
   FWal.Open(AReadOnly);
   FStore.OnSpill := OnSpill;
   FStore.OnMiss := OnMiss;
+  { v3.16: cok surec — baska bir surec commit edince WAL gorunumunu tazele. }
+  FStore.OnRefreshed := StoreRefreshed;
 
-  if FWal.HasContent then
-  begin
-    if AReadOnly then
+  { v3.16: SURECLER ARASI COK YAZARLILIK. Acilis islemleri (WAL kurtarma,
+    sayfa yazimi, fsync, WAL budama, yukseltme) YAZAR; Windows'ta paylasimli
+    kilit altinda yazma yapilamaz. Bu yuzden yazan oturumda acilis TAM kilit
+    altinda yapilir, sonunda paylasimliya inilir. }
+  if not AReadOnly then
+    FStore.AcquireWrite;
+  try
+    if FWal.HasContent then
     begin
+      if AReadOnly then
+      begin
       { v3.2: salt-okunur kurtarma. Cerceveler DISKE YAZILMAZ; depo
         katmaninda bellek imaji olarak tutulur ve okuma oradan karsilanir. }
       FWal.Recover(ApplyReadOnly, st, FRecoverLimit);
@@ -339,6 +373,10 @@ begin
   begin
     FStore.Flush(True);
     FWal.Truncate(FStore.LSN);
+  end;
+  finally
+    if not AReadOnly then
+      FStore.ReleaseWrite;
   end;
   FInTxn := False;
   ClearPending;

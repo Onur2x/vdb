@@ -334,7 +334,9 @@ begin
   end
   else
   begin
-    FStream := TFileStream.Create(FPath, fmCreate or fmShareDenyWrite);
+    { v3.16: WAL dosyasi da PAYLASIMA ACIK olmali; ayni veritabanina ikinci
+      bir surec/oturum acabilmeli. Yazma yine veritabani kilidiyle siralanir. }
+    FStream := TFileStream.Create(FPath, fmCreate or fmShareDenyNone);
     FLSN := 0;
     WriteHeader;
     VDbFlushStream(FStream);

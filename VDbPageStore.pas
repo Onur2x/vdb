@@ -139,6 +139,43 @@ type
       { v3.1: islem (commit) kimligi; FFrame.TxnMark ile karsilastirilir. }
       FTxnId: LongWord;
       FLocked: Boolean;
+      { v3.16: surecler arasi cok yazarlilik. Acilista HER oturum paylasimli
+        kilit alir (cok okuyucu + cok yazar adayi ayni anda acabilir).
+        Yazma girisinde paylasimli birakilir, tam kilit alinir; yazma
+        cikisinda tersi. FLocked = (FLockedShared or FLockedExcl). }
+      FLockedShared: Boolean;
+      FLockedExcl: Boolean;
+      { Ayni surecte ic ice yazma girisleri (oturum basina yazma kumesi +
+        otomatik commit). 0 -> 1 gecisinde kilit yukseltilir. }
+      FWriteDepth: Integer;
+      FWriteCs: TRTLCriticalSection;
+      { v3.16: islem kapsamli paylasimli kilit derinligi (yazan oturum). }
+      FReadDepth: Integer;
+      { v3.16: meta sayfanin (sayfa 0) son gorulen HAM 4 KB imaji. Tam
+        kilit alindiktan sonra diskteki imajla karsilastirilir; farkliysa
+        baska bir surec commit etmistir -> onbellek dusurulur + meta
+        yeniden yuklenir. Meta sayfa duz metindir (sifreleme yalniz
+        kullanici sayfalarinda), bu yuzden ham karsilastirma gecerlidir. }
+      FMetaSig: TBytes;
+      { v3.16: meta imzasinin temsil ettigi LSN. Commit (LSN artisi) her
+        zaman meta sayfaya yazilir; aksi halde yalniz sayfa degistiren bir
+        commit'i diger surecler FARK ETMEZ. }
+      FSigLSN: LongWord;
+      FOnRefreshed: TNotifyEvent;
+      { v3.16: SURECLER ARASI DEGISIKLIK DAMGASI. Meta sayfaya commit LSN'i
+        yazmak taban dosyanin kendi kendine tutarliligini BOZAR (sayfalar
+        hala WAL'de olabilir; AS OF/PITR testi bunu yakaladi). Bu yuzden
+        degisiklik, ayri ve kucuk bir `<db>.gen` sayac dosyasinda tutulur:
+        her yazma islemi sonunda 8 bayt artirilir. Baska bir surec bunu
+        gordugunde onbellegini tazeler. }
+      FSigGen: QWord;
+      FGenStream: TFileStream;
+      { v3.16 GUVENLIK AGI: paylasimli kilit altindayken bir yazma ilkeli
+        cagrilirsa (Windows'ta paylasimli kilit = yalniz okuma, ayni handle
+        bile yazamaz) kilit KENDILIGINDEN tam kilide yukseltilir ve
+        ReleaseRead'de geri birakilir. Boylece unutulan bir yazma yolu veri
+        kaybina ya da EWriteError'a yol acmaz. }
+      FAutoWrite: Boolean;
       FReadOnly: Boolean;
       { v3.2: salt-okunur oturumda WAL'den gelen sayfa imajlari. Dosyaya
         YAZILMAZ; okuma bu katmandan karsilanir (crash sonrasi okuma ve
@@ -181,6 +218,16 @@ type
     procedure TrimToLogical;
     procedure LoadMeta;
     procedure SaveMeta;
+    { v3.16: kilit gecisleri. }
+    function TakeSharedLock: Boolean;
+    procedure LockExclusive;
+    procedure RefreshIfStale;
+    { v3.16: yazma ilkelleri icin guvenlik agi (bkz. FAutoWrite). }
+    procedure EnsureIoWrite;
+    procedure EndIoWrite;
+    { v3.16: `<db>.gen` degisiklik sayaci. }
+    function ReadGen: QWord;
+    procedure BumpGen;
     function TrunkGet(var P: PVdbPage): LongWord;   // count
     procedure TrunkSetCount(P: PVdbPage; N: LongWord);
     function TrunkEntry(P: PVdbPage; I: Integer): LongWord;
@@ -207,6 +254,20 @@ type
       ABusyMs: Integer = VDB_DEF_BUSY_MS);
     property ReadOnly: Boolean read FReadOnly;
     property BusyTimeoutMs: Integer read FBusyMs;
+
+    { v3.16: surecler arasi cok yazarlilik.
+      Giris: paylasimli kilit birakilir, tam kilit ABusyMs boyunca denenir,
+      alininca meta imgasi karsilastirilir ve gerekirse onbellek tazelenir.
+      Cikis: tam kilit birakilir, paylasimli kilide donulur.
+      Ic ice cagri desteklidir: derinlik 0 -> 1 gecisinde kilit yukseltilir. }
+    procedure AcquireWrite;
+    procedure ReleaseWrite;
+    procedure AcquireRead;
+    procedure ReleaseRead;
+    function WriteHeld: Boolean;
+    { v3.16: meta imzasi degistiginde (baska surec commit etti) cagrilir.
+      Motor WAL gorunumunu tazelemek icin baglar. }
+    property OnRefreshed: TNotifyEvent read FOnRefreshed write FOnRefreshed;
 
     { Salt-okunur oturumda WAL'den gelen imaji bellek katmanina alir.
       Diske YAZMAZ; meta sayfa (0) ise mantiksal alanlari tazeler. }
@@ -474,6 +535,12 @@ begin
   FLSN := 0;
   FTxnId := 1;
   FIterations := VDB_ENC_ITER;
+  { v3.16: yazma kilidi yuvasi + kilit durumu. }
+  InitCriticalSection(FWriteCs);
+  FWriteDepth := 0;
+  FLockedShared := False;
+  FLockedExcl := False;
+  FAutoWrite := False;
 end;
 
 destructor TVDbPageStore.Destroy;
@@ -492,6 +559,7 @@ begin
     FreeAndNil(FRoPages);
   end;
   FRoCount := 0;
+  DoneCriticalSection(FWriteCs);
   inherited Destroy;
 end;
 
@@ -630,6 +698,16 @@ begin
     cozebilirdi. Salt-okunur oturum yazmadigi icin yukseltme gerekmez. }
   if ((ver = VDB_FILE_VER_V3) or (ver = VDB_FILE_VER_V4)) and not FReadOnly then
     SaveMeta;
+  { v3.16: tazeleme imkasi icin son gorulen HAM meta imaji. SaveMeta
+    yukarida cagrildiysa imza orada guncellenir; cagrilmadiysa burada. }
+  if Length(FMetaSig) <> VDB_PAGE_SIZE then
+  begin
+    SetLength(FMetaSig, VDB_PAGE_SIZE);
+    Move(buf[0], FMetaSig[0], VDB_PAGE_SIZE);
+  end
+  else
+    Move(buf[0], FMetaSig[0], VDB_PAGE_SIZE);
+  FSigLSN := FLSN;
 end;
 
 procedure TVDbPageStore.SaveMeta;
@@ -643,6 +721,9 @@ var
 begin
   { v3.2: salt-okunur oturum meta sayfayi YAZMAZ. }
   if FReadOnly then Exit;
+  { v3.16 guvenlik agi: paylasimli kilit altinda yazilamaz -> tam kilide
+    yukselt (acilis gibi zaten tam kilitli durumlarda dokunmaz). }
+  EnsureIoWrite;
   FillChar(buf, SizeOf(buf), 0);
   magic := VDB_FILE_MAGIC;
   ver := VDB_FILE_VER;
@@ -670,6 +751,11 @@ begin
   q^ := crc;
   FStream.Position := 0;
   FStream.WriteBuffer(buf, VDB_PAGE_SIZE);
+  { v3.16: yazdigimiz imaj artik "son gorulen" imajdir. }
+  if Length(FMetaSig) <> VDB_PAGE_SIZE then
+    SetLength(FMetaSig, VDB_PAGE_SIZE);
+  Move(buf[0], FMetaSig[0], VDB_PAGE_SIZE);
+  FSigLSN := FLSN;
   FMetaDirty := False;
   FStructDirty := False;
 end;
@@ -679,11 +765,305 @@ begin
   OpenEx(ACreate, False, VDB_DEF_BUSY_MS);
 end;
 
+{ ---------------------------------------------------------------- v3.16 }
+{ Paylasimli kilidi alir; alinamazsa FBusyMs boyunca bekler. }
+function TVDbPageStore.TakeSharedLock: Boolean;
+var
+  t0: QWord;
+begin
+  Result := VDbLockStream(FStream, True);
+  if Result then Exit;
+  t0 := GetTickCount64;
+  repeat
+    Sleep(10);
+    Result := VDbLockStream(FStream, True);
+    if Result then Exit;
+  until GetTickCount64 - t0 >= QWord(FBusyMs);
+end;
+
+{ Tam (yazma) kilidini alir; alinamazsa FBusyMs sonunda ACIK hata verir. }
+procedure TVDbPageStore.LockExclusive;
+var
+  t0: QWord;
+begin
+  t0 := GetTickCount64;
+  repeat
+    if VDbLockStream(FStream, False) then Exit;
+    if GetTickCount64 - t0 >= QWord(FBusyMs) then Break;
+    Sleep(10);
+  until False;
+  if FBusyMs > 0 then
+    raise EVdbPageStore.Create(Format(
+      'veritabani mesgul: yazar kilidi %d ms icinde alinamadi ' +
+      '(baska bir yazma oturumu acik): %s', [FBusyMs, FPath]))
+  else
+    raise EVdbPageStore.Create(
+      'veritabani mesgul: yazar kilidi alinamadi ' +
+      '(baska bir yazma oturumu acik): ' + FPath);
+end;
+
+{ Tam kilit ALTINDA cagrilir: diskteki meta sayfa son gorulen imajdan
+  farkliysa baska bir surec commit etmistir -> onbellek dusurulur ve meta
+  yeniden yuklenir. Meta sayfa duz metin oldugu icin ham karsilastirma
+  yeterlidir (sifreleme yalniz kullanici sayfalarinda). }
+procedure TVDbPageStore.RefreshIfStale;
+var
+  buf: TVdbPageBuf;
+  len: Int64;
+  g: QWord;
+begin
+  len := FStream.Size;
+  if len < VDB_PAGE_SIZE then Exit;
+  { v3.16: ONCE 8 baytlik degisiklik sayaci okunur. Degismediyse 4 KB meta
+    sayfayi okumaya GEREK YOK: islem basina maliyet ~11 us'den ~2 us'ye iner
+    (olculdu: lockcost). }
+  g := ReadGen;
+  if (FGenStream <> nil) and (g = FSigGen) then Exit;
+  FStream.Position := 0;
+  FStream.ReadBuffer(buf, VDB_PAGE_SIZE);
+  if (FGenStream = nil) and (Length(FMetaSig) = VDB_PAGE_SIZE) and
+     CompareMem(@buf[0], @FMetaSig[0], VDB_PAGE_SIZE) then Exit;
+  DropCache;
+  FPhysSize := len;
+  LoadMeta;
+  { v3.16: baska bir surec commit etti — WAL gorunumunu de tazele. }
+  FSigGen := ReadGen;
+  if Assigned(FOnRefreshed) then
+    FOnRefreshed(Self);
+end;
+
+procedure TVDbPageStore.EnsureIoWrite;
+begin
+  if FStream = nil then Exit;
+  if FReadOnly then Exit;              // salt-okunur zaten yazmaz
+  if FWriteDepth > 0 then Exit;        // tam kilit bizde
+  if FLockedExcl then Exit;            // acilis gibi ozel durumlar
+  { Paylasimli kilidi birak, tam kilidi al. Onbellek TAZE: paylasimli kilit
+    tutarken baska bir surec commit edemezdi, tazeleme gerekmez. }
+  if FLockedShared then
+  begin
+    VDbUnlockStream(FStream);
+    FLockedShared := False;
+    FLocked := False;
+  end;
+  LockExclusive;
+  FLockedExcl := True;
+  FLocked := True;
+  FAutoWrite := True;
+end;
+
+procedure TVDbPageStore.EndIoWrite;
+begin
+  if not FAutoWrite then Exit;
+  FAutoWrite := False;
+  if FLockedExcl then
+  begin
+    VDbUnlockStream(FStream);
+    FLockedExcl := False;
+    FLocked := False;
+  end;
+  { Okuma islemi hala suruyorsa paylasimli kilide don. }
+  if (FReadDepth > 0) and (FStream <> nil) then
+  begin
+    FLockedShared := TakeSharedLock;
+    FLocked := FLockedShared;
+  end;
+end;
+
+{ v3.16: `<db>.gen` — surecler arasi degisiklik sayaci. }
+function TVDbPageStore.ReadGen: QWord;
+begin
+  Result := 0;
+  if FGenStream = nil then Exit;
+  if FGenStream.Size < 8 then Exit;
+  FGenStream.Position := 0;
+  FGenStream.ReadBuffer(Result, 8);
+end;
+
+procedure TVDbPageStore.BumpGen;
+var
+  v: QWord;
+begin
+  if FGenStream = nil then Exit;
+  v := ReadGen + 1;
+  FGenStream.Position := 0;
+  FGenStream.WriteBuffer(v, 8);
+  FSigGen := v;
+end;
+
+procedure TVDbPageStore.AcquireWrite;
+begin
+  if FStream = nil then
+    raise EVdbPageStore.Create('kapali veritabani: yazma kilidi alinamaz');
+  if FReadOnly then
+    raise EVdbPageStore.Create('salt-okunur oturumda yazma yapilamaz');
+  EnterCriticalSection(FWriteCs);
+  try
+    { Ayni surecte ic ice giris: kilit zaten bizde. }
+    if FWriteDepth > 0 then
+    begin
+      Inc(FWriteDepth);
+      Exit;
+    end;
+    { Guvenlik agi tam kilidi zaten almissa (yazma ilkeli icinden cagri)
+      sahipligi acik yazmaya devret. }
+    if FAutoWrite and FLockedExcl then
+    begin
+      FAutoWrite := False;
+      FWriteDepth := 1;
+      Exit;
+    end;
+    { KILITLENMEYI ONLE: paylasimliyi BIRAK, sonra tam kilidi iste.
+      Iki surec de ayni anda yukseltmek isterse ikisi de beklemez. }
+    if FLockedShared then
+    begin
+      VDbUnlockStream(FStream);
+      FLockedShared := False;
+      FLocked := False;
+    end;
+    LockExclusive;
+    FLockedExcl := True;
+    FLocked := True;
+    try
+      RefreshIfStale;
+    except
+      VDbUnlockStream(FStream);
+      FLockedExcl := False;
+      FLocked := False;
+      if FReadDepth > 0 then
+      begin
+        FLockedShared := TakeSharedLock;
+        FLocked := FLockedShared;
+      end;
+      raise;
+    end;
+    FWriteDepth := 1;
+  finally
+    LeaveCriticalSection(FWriteCs);
+  end;
+end;
+
+{ v3.16: islem kapsamli PAYLASIMLI kilit. Yazan oturumda kilit artik oturum
+  boyu tutulmadigi icin her islem girisi kilit alir ve meta imgasini
+  dogrular; boylece baska bir surec commit ettiyse onbellek tazelenir.
+  Salt-okunur oturumda kilit zaten oturum boyu tutuldugu icin no-op'tur. }
+procedure TVDbPageStore.AcquireRead;
+begin
+  if FStream = nil then
+    raise EVdbPageStore.Create('kapali veritabani: okuma kilidi alinamaz');
+  if FReadOnly then Exit;
+  EnterCriticalSection(FWriteCs);
+  try
+    if FWriteDepth > 0 then
+    begin
+      Inc(FReadDepth);
+      Exit;
+    end;
+    if FReadDepth > 0 then
+    begin
+      Inc(FReadDepth);
+      Exit;
+    end;
+    if not FLockedShared then
+    begin
+      FLockedShared := TakeSharedLock;
+      if not FLockedShared then
+        raise EVdbPageStore.Create(
+          'veritabani mesgul: paylasimli kilit alinamadi (baska bir surec ' +
+          'tam kilitli): ' + FPath);
+      FLocked := True;
+      RefreshIfStale;
+    end;
+    FReadDepth := 1;
+  finally
+    LeaveCriticalSection(FWriteCs);
+  end;
+end;
+
+procedure TVDbPageStore.ReleaseRead;
+begin
+  if (FStream = nil) or FReadOnly then Exit;
+  EnterCriticalSection(FWriteCs);
+  try
+    if FReadDepth <= 0 then Exit;
+    Dec(FReadDepth);
+    if FReadDepth > 0 then Exit;
+    { v3.16 guvenlik agi: yazma sirasinda otomatik yukseltilen tam kilidi
+      islem sonunda birak (once tam, sonra paylasimli karari). }
+    if FAutoWrite then
+    begin
+      FAutoWrite := False;
+      if FLockedExcl then
+      begin
+        VDbUnlockStream(FStream);
+        FLockedExcl := False;
+        FLocked := False;
+      end;
+    end;
+    { Yazma kilidi acikken paylasimli kilit zaten birakilmistir. }
+    if FWriteDepth > 0 then Exit;
+    if FLockedShared then
+    begin
+      VDbUnlockStream(FStream);
+      FLockedShared := False;
+      FLocked := False;
+    end;
+  finally
+    LeaveCriticalSection(FWriteCs);
+  end;
+end;
+
+function TVDbPageStore.WriteHeld: Boolean;
+begin
+  Result := FWriteDepth > 0;
+end;
+
+procedure TVDbPageStore.ReleaseWrite;
+var
+  t0: QWord;
+begin
+  if FStream = nil then Exit;
+  EnterCriticalSection(FWriteCs);
+  try
+    if FWriteDepth <= 0 then Exit;
+    Dec(FWriteDepth);
+    if FWriteDepth > 0 then Exit;
+    { v3.16: ISLEM SONU — degisiklik sayacini artir. Baska bir surec bunu
+      gorunce onbellegini tazeler. Meta sayfaya DOKUNULMAZ: taban dosyanin
+      kendi kendine tutarliligi korunur (sayfalar hala WAL'de olabilir). }
+    if (FGenStream <> nil) and FLockedExcl and not FReadOnly then
+      BumpGen;
+    if FLockedExcl then
+    begin
+      VDbUnlockStream(FStream);
+      FLockedExcl := False;
+      FLocked := False;
+    end;
+    { Paylasimliya don YALNIZCA okuyucu kilidi hala acikken. Oturum kapsami
+      kilit modelinde (FReadDepth = 0) tam kilit tamamen birakilir. }
+    if FReadDepth > 0 then
+    begin
+      FLockedShared := VDbLockStream(FStream, True);
+      t0 := GetTickCount64;
+      while (not FLockedShared) and (GetTickCount64 - t0 < 5000) do
+      begin
+        Sleep(1);
+        FLockedShared := VDbLockStream(FStream, True);
+      end;
+      FLocked := FLockedShared;
+    end;
+  finally
+    LeaveCriticalSection(FWriteCs);
+  end;
+end;
+
 procedure TVDbPageStore.OpenEx(ACreate: Boolean; AReadOnly: Boolean;
   ABusyMs: Integer);
 var
   exists: Boolean;
   t0: QWord;
+  needUpgrade: Boolean;
+  ver32: LongWord;
 begin
   if FStream <> nil then Exit;
   exists := FileExists(FPath);
@@ -715,38 +1095,40 @@ begin
     end;
   end;
   try
-    { v3.2: kilit. Okuyucu PAYLASIMLI (cok okuyucu), yazar TAM kilit.
-      Yazar, kilit alinamazsa busy timeout boyunca bekler.
-      Bekleme GERCEK gecen sureye gore olculur: Sleep(20) Windows'ta
-      zamanlayici cozunurlugu yuzunden 31 ms'ye kadar cikabiliyor; sabit
-      sayim hedefi asiyordu (olculen: busy=400 -> 630 ms). }
+    { v3.16: SURECLER ARASI COK YAZARLILIK.
+      ONCEDEN acilista yazar oturum TAM kilit aliyordu: ayni dosyaya ikinci
+      surec hic acamiyordu. Artik HER oturum PAYLASIMLI kilit alir; yazma
+      girisinde (AcquireWrite) paylasimli birakilip tam kilit alinir, cikista
+      tersi yapilir. Iki surec ayni anda acabilir ve sirayla yazar.
+      Yeni dosyayi olusturan oturum, basligi yazarken TAM kilit tutar. }
+    FLockedShared := False;
+    FLockedExcl := False;
     FLocked := False;
-    if AReadOnly then
-      FLocked := VDbLockStream(FStream, True)
+    { v3.16: SURECLER ARASI COK YAZARLILIK — kilit semantigi OLCULEREK
+      belirlendi (lckprobe):
+        * PAYLASIMLI kilit = YALNIZ OKUMA. Ayni handle uzerinden bile yazma
+          EWriteError verir.
+        * TAM kilit = yalniz bu handle; BASKA handle'dan okuma da EReadError
+          verir.
+      Sonuc: kilit ALINMADAN dosyadan okumak guvenli degildir (baska surec
+      tam kilitliyken okuma patlar). Bu yuzden YAZAN oturum acilisi HER ZAMAN
+      tam kilit altinda yapar (WAL kurtarma, yukseltme, meta yazimi hep
+      yazma), isi bitince PAYLASIMLI kilit'e iner. Boylece iki surec ayni
+      anda ACIK olabilir; yazma aninda sirayla tam kilide yukselir. }
+    if not AReadOnly then
+    begin
+      LockExclusive;
+      FLockedExcl := True;
+      FLocked := True;
+    end
     else
     begin
-      t0 := GetTickCount64;
-      repeat
-        FLocked := VDbLockStream(FStream, False);
-        if FLocked then Break;
-        if GetTickCount64 - t0 >= QWord(ABusyMs) then Break;
-        Sleep(10);
-      until False;
-    end;
-    if AReadOnly and (not FLocked) then
-      raise EVdbPageStore.Create(
-        'veritabani mesgul: salt-okunur acilis icin paylasimli kilit ' +
-        'alinamadi (yazan oturum tam kilitli): ' + FPath);
-    if (not AReadOnly) and (not FLocked) then
-    begin
-      if ABusyMs > 0 then
-        raise EVdbPageStore.Create(Format(
-          'veritabani mesgul: yazar kilidi %d ms icinde alinamadi ' +
-          '(baska bir yazma oturumu acik): %s', [ABusyMs, FPath]))
-      else
+      if not TakeSharedLock then
         raise EVdbPageStore.Create(
-          'veritabani mesgul: yazar kilidi alinamadi ' +
-          '(baska bir yazma oturumu acik): ' + FPath);
+          'veritabani mesgul: paylasimli kilit alinamadi (baska bir surec ' +
+          'tam kilitli): ' + FPath);
+      FLockedShared := True;
+      FLocked := True;
     end;
     try
       FPhysSize := FStream.Size;
@@ -766,9 +1148,53 @@ begin
           SaveMeta;
           VDbFlushStream(FStream);
         end;
+      { v3.16: YAZAN oturumda kilit SAKLANMAZ. Oturum boyu paylasimli kilit
+        tutmak ikinci yazar surecin onunu tikiyordu (olculdu: prochk B 20 s
+        bekleyip acilamadi). Artik kilit ISLEM BASINA alinir: AcquireRead /
+        AcquireWrite. Salt-okunur oturum ise (bugun oldugu gibi) paylasimli
+        kilidi oturum boyu tutar. }
+      { v3.16: degisiklik sayaci (<db>.gen). Paylasima acik; her surec kendi
+        handle'i ile okur/yazar; yoksa olusturulur. Kilit BIRAKILMADAN once
+        acilir ki acilis artisi ile yaris olmasin. }
+      try
+        FGenStream := TFileStream.Create(FPath + '.gen',
+          fmOpenReadWrite or fmShareDenyNone);
+      except
+        try
+          FGenStream := TFileStream.Create(FPath + '.gen',
+            fmCreate or fmShareDenyNone);
+        except
+          FGenStream := nil;
+        end;
+      end;
+      if FGenStream <> nil then
+      begin
+        if FGenStream.Size < 8 then
+        begin
+          FSigGen := 0;
+          FGenStream.Position := 0;
+          FGenStream.WriteBuffer(FSigGen, 8);
+        end
+        else
+          FSigGen := ReadGen;
+        { v3.16: her YAZAR oturum acilisi sayaci bir kez ilerletir: acilis
+          sirasinda yazilan meta (surum yukseltmesi) boylece diger sureclere
+          de bildirilmis olur. Maliyet: oturum basina 8 bayt. }
+        if not AReadOnly then
+          BumpGen;
+      end;
+      if FLockedExcl then
+      begin
+        VDbUnlockStream(FStream);
+        FLockedExcl := False;
+        FLocked := False;
+      end;
     except
-      if FLocked then VDbUnlockStream(FStream);
+      if FLockedShared or FLockedExcl then VDbUnlockStream(FStream);
       FLocked := False;
+      FLockedShared := False;
+      FLockedExcl := False;
+      FreeAndNil(FGenStream);
       FreeAndNil(FStream);
       raise;
     end;
@@ -785,14 +1211,28 @@ begin
     try
       if not FReadOnly then
       begin
-        Flush(True);
-        { v3.1: onceden ayrilmis parcayi kirp: dosya boyu = mantiksal boy. }
-        TrimToLogical;
+        { v3.16: yazma basligi/sayfalari icin tam kilit gerekir. }
+        AcquireWrite;
+        try
+          Flush(True);
+          { v3.1: onceden ayrilmis parcayi kirp: dosya boyu = mantiksal boy. }
+          TrimToLogical;
+        finally
+          FWriteDepth := 0;
+          if FLockedExcl then VDbUnlockStream(FStream);
+          FLockedExcl := False;
+          FLocked := False;
+        end;
       end;
     finally
-      if FLocked then VDbUnlockStream(FStream);
+      if FLockedShared then VDbUnlockStream(FStream);
+      if FLockedExcl then VDbUnlockStream(FStream);
+      FreeAndNil(FGenStream);
       FreeAndNil(FStream);
       FLocked := False;
+      FLockedShared := False;
+      FLockedExcl := False;
+      FWriteDepth := 0;
     end;
   finally
     DropCache;
@@ -802,9 +1242,14 @@ end;
 procedure TVDbPageStore.CloseNoFlush;
 begin
   if FStream = nil then Exit;
-  if FLocked then VDbUnlockStream(FStream);
+  if FLockedShared then VDbUnlockStream(FStream);
+  if FLockedExcl then VDbUnlockStream(FStream);
+  FreeAndNil(FGenStream);
   FreeAndNil(FStream);
   FLocked := False;
+  FLockedShared := False;
+  FLockedExcl := False;
+  FWriteDepth := 0;
   FMetaDirty := False;
   DropCache;
 end;
@@ -892,6 +1337,8 @@ begin
   if FReadOnly then
     raise EVdbPageStore.Create(Format(
       'salt-okunur veritabani: sayfa %d yazilamaz', [PageNo]));
+  { v3.16 guvenlik agi: paylasimli kilit altinda yazma olmaz. }
+  EnsureIoWrite;
   FStream.Position := OffsetOf(PageNo);
   if FEncrypted then
   begin
@@ -1076,6 +1523,7 @@ begin
     FPhysSize := Required;
     Exit;
   end;
+  EnsureIoWrite;
   { Parca halinde uzat: her sayfa icin ayri SetSize cagrisi yapilmaz. }
   want := Required + VDB_GROW_BYTES;
   FStream.Size := want;
@@ -1090,6 +1538,7 @@ begin
   if FReadOnly then Exit;
   want := RequiredFileSize(FPageCount);
   if FPhysSize <= want then Exit;
+  EnsureIoWrite;
   FStream.Size := want;
   FPhysSize := want;
 end;

@@ -275,11 +275,12 @@ kaynaklanır. Çekirdek v3 yollarında hiçbir kontrol eksilmemiştir.
 
 ### Replikasyon, PITR ve zone map kararları (Sprint 3.5-3.7 → v4 güncellemesi)
 
-Durum **2026-10-26**: PITR, B+tree, replikasyon, sayfa düzeyi zone map, `.idx`
+Durum **2026-10-27**: PITR, B+tree, replikasyon, sayfa düzeyi zone map, `.idx`
 varint, satır INT varint ve **çok oturumlu yazma (MVCC, v3.4)** dilimleri
-tamamlandı; **snapshot isolation da tamamlandı (v3.15 — bkz. aşağıda)**;
-yol haritasında açık madde kalmadı. Kalan tek bilinçli sınır süreçler arası
-çok yazarlılıktır (aşağıda).
+tamamlandı; **snapshot isolation da tamamlandı (v3.15)**; **süreçler arası
+çok yazarlılık da tamamlandı (v3.16 — kilit işlem kapsamlı, `<db>.gen`
+sayacıyla önbellek tazeleme, `prochk` 8/8 gerçek iki süreç)**. Yol haritasında
+açık madde kalmadı.
 
 | Yetenek | Bugünkü davranış | Test |
 |---|---|---|
@@ -388,14 +389,18 @@ v2/önceki v3 ile aynı; beklemek isteyen çağıran açıkça süre verir.
 - Busy beklemesi gerçek süreyle ölçülür (`GetTickCount64`): ölçülen
   `busy=400 → 397 ms`, `busy=350 → 356 ms`, `busy=0 → 1–2 ms`.
 - Çok **oturumlu** yazma v3.4'te geldi (aynı backend, READ COMMITTED, ilk commit
-  kazanır). Süreçler arası çok yazarlılık kapsam dışıdır: ikinci süreç dosya
-  kilidiyle reddedilir.
+  kazanır). **Süreçler arası çok yazarlılık v3.16'da geldi:** ikinci süreç artık
+  reddedilmez; kilit **işlem kapsamlı** alınır (oturum boyu değil), önbellek
+  `<db>.gen` değişiklik sayacıyla tazelenir. Yazarlar **sıralıdır**: bir yazma
+  işlemi açıkken diğer süreçler `ABusyMs` bekler, sonra net hata alır.
 
-Kapı: `lockchk` (14. kapı) **17/0**. Gerçek **çocuk süreçler** kullanılır, yani
-kilit gerçek işletim sistemi kilididir: aynı anda iki okuyucu, okuyucu varken
-yazarın beklemesi, iki yazar, yazar varken okuyucunun reddi, salt-okunur yazma
-reddi + `VERIFY`, `<db>.log` oluşmaması, çökme sonrası WAL'den okuma ve diskte
-sıfır bayt değişim. 32 ve 64 bit yeşil.
+Kapı: `lockchk` (14. kapı) **29/0** ve `prochk` (16. kapı) **8/0**. Gerçek
+**çocuk süreçler** kullanılır, yani kilit gerçek işletim sistemi kilididir: aynı
+anda iki okuyucu, iki yazarın **sırayla** commit etmesi, yazar varken
+salt-okunur oturumun **açılabilmesi**, salt-okunur yazma reddi + `VERIFY`,
+`<db>.log` oluşmaması, çökme sonrası WAL'den okuma ve diskte sıfır bayt
+değişim. `prochk` iki süreç paralel yazar; **satır kaybı yok**
+(5 + 40 + 40 = 85). 32 ve 64 bit yeşil.
 
 Yol boyunca bulunan iki gerçek kusur: (1) `VdbOpenReadOnly` biçim keşfi için
 dosyanın ilk 4 baytını okuyordu; yazar tam aralık kilidi tutarken bu okuma
@@ -531,13 +536,16 @@ Kapsam **süreç içi çok oturumlu yazma**dır: aynı `IVdbBackend` üzerinde b
   ve bekleyen erteleme denetimi `RequireSoleTxn` / `IVdbBackend.SoleWriter`
   üzerinden açık `ecLockConflict` verir (sessiz karışıklık yerine).
 - **Kilit:** tek backend içinde `FEngCs` (`TVdbGate`, v3.9) motoru ve `FSets`'i
-  serileştirir; **işlem boyunca tutulmaz**. Dosya düzeyi kilit (paylaşımlı
-  okuyucu / tam yazıcı) değişmedi. Kilit sahibi iş parçacığını ve derinliği
-  izler: aynı iş parçacığından iç içe giriş kritik bölüme hiç girmez, başka
-  iş parçacığından giriş normal karşılıklı dışlamadır.
-- **Bilinçli sınırlar:** süreçler arası çok yazarlılık yok (ikinci süreç
-  dosya kilidiyle reddedilir); snapshot isolation tek süreç içinde **var**
-  (v3.15).
+  serileştirir; **işlem boyunca tutulmaz**. v3.16'dan beri `TVdbGate`'in
+  0→1 / 1→0 geçişleri dosya kilidini de sürer (`AcquireRead`/`ReleaseRead`);
+  yazma girişi paylaşımlıyı bırakıp tam kilidi alır (`AcquireWrite`), çıkışta
+  bırakır. Aynı iş parçacığından iç içe giriş kritik bölüme hiç girmez.
+  Güvenlik ağı: paylaşımlı kilit altında bir yazma ilkeli çağrılırsa kilit
+  kendiliğinden tam kilide yükselir (`FAutoWrite`).
+- **Bilinçli sınırlar:** yazarlar **sıralıdır** (uzun işlem diğer süreçlerin
+  okuyucularını da bekletir); adil kuyruk yoktur; canlı veritabanının **sürüm
+  yükseltmesi** çok süreçli kullanımda desteklenmez. Snapshot isolation süreç
+  **içinde** var (v3.15), süreçler arasında görünürlük "son commit" düzeyindedir.
 
 | Ölçüm (`benchcmp`, 200k × 3 kolon, 3 koşu medyanı, 32 bit) | Değer |
 |---|---|
@@ -814,11 +822,11 @@ okuma 4 satır görür. Test güncellendi (`v3sqlchk` 238/0).
 **Bilinçli sınırlar.** Yazma yolu değişmedi (ilk commit kazanır); bayat
 snapshot'a dayanan bir yazma, çakışan commit ilk yazmadan önce olmuşsa sessizce
 commit edilebilir (lost-update) — snapshot yalnız okumayı sabitler. `FUndo`
-belleği en uzun açık işlem boyunca büyür. Süreçler arası çok yazarlılık kapsam
-dışı.
+belleği en uzun açık işlem boyunca büyür. Süreçler arası çok yazarlılık v3.16'da
+yapıldı (kilit işlem kapsamlı); yazarlar sıralıdır.
 
 Kapı: `sqltest` v3 **2874/0/33**, v2 **3305/0/0**; `v3sqlchk` **238/0**;
-**15/15 kapı yeşil**.
+`lockchk` **29/0**; `prochk` **8/0**; **16/16 kapı yeşil**.
 
 ### Sürüm çizgisi (2026-10-26)
 

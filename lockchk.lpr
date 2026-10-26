@@ -163,12 +163,14 @@ begin
   expect := StrToIntDef(ParamStr(3), -1);
   holdMs := StrToIntDef(ParamStr(4), 0);
   try
-    VdbOpenReadOnly(db, be, VDB_DEF_POOL, 0);
+    VdbOpenReadOnly(db, be, VDB_DEF_POOL, StrToIntDef(ParamStr(5), 0));
     if not be.IsReadOnly then
     begin
       WriteLn('HATA IsReadOnly=False'); Exit(3);
     end;
-    if be.Count <> expect then
+    { v3.16: beklenen sayi < 0 ise sayi DOGRULANMAZ (yazar hala yaziyor
+      olabilir; bu cocuk yalnizca ACILABILMEYI kanitlar). }
+    if (expect >= 0) and (be.Count <> expect) then
     begin
       WriteLn(Format('HATA sayi %d (beklenen %d)', [be.Count, expect]));
       Exit(4);
@@ -593,24 +595,19 @@ begin
     Fail('yazar hazir isareti birakmadi')
   else
   begin
-    if TryWriterOpen(db, 0, msg, elapsed) then
-      Fail('busy=0 iken ikinci yazar ACILDI (beklenmiyordu)')
-    else if (Pos('mesgul', LowS(msg)) > 0) and (elapsed < 500) then
-      Ok(Format('busy=0: ikinci yazar hemen mesgul (%d ms)', [elapsed]))
+    { v3.16: SUREÇLER ARASI COK YAZARLILIK. Kilit artik OTURUM boyu degil
+      ISLEM boyu tutulur; bu yuzden ikinci bir yazar süreç de acilabilir ve
+      kendi islemini sirayla commit edebilir. }
+    if TryWriterOpen(db, 10000, msg, elapsed) then
+      Ok(Format('busy=10000: ikinci yazar acildi (%d ms)', [elapsed]))
     else
-      Fail(Format('busy=0: %d ms, %s', [elapsed, msg]));
+      Fail(Format('busy=10000: %d ms, %s', [elapsed, msg]));
 
-    if TryWriterOpen(db, 350, msg, elapsed) then
-      Fail('busy=350 iken ikinci yazar ACILDI (beklenmiyordu)')
-    else if (Pos('mesgul', LowS(msg)) > 0) and (elapsed >= 280) then
-      Ok(Format('busy=350: beklendi, mesgul (%d ms)', [elapsed]))
-    else
-      Fail(Format('busy=350: %d ms, %s', [elapsed, msg]));
-
-    { Yazar acikken salt-okunur oturum da acilamaz (paylasimli kilit yok). }
-    rc := RunChild(['--ro', db, '500'], aOut);
-    if (rc <> 0) and (Pos('mesgul', LowS(aOut)) > 0) then
-      Ok('yazar varken salt-okunur oturum mesgul: ' + Trim(aOut))
+    { Yazar kilidi islem disinda tutulmadigi icin salt-okunur oturum da
+      acilabilir. }
+    rc := RunChild(['--ro', db, '-1', '0', '2000'], aOut);
+    if rc = 0 then
+      Ok('yazar varken salt-okunur oturum acildi')
     else
       Fail('yazar varken salt-okunur oturum: cikis ' + IntToStr(rc) +
         ', ' + Trim(aOut));

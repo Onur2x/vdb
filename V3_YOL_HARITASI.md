@@ -533,7 +533,8 @@ güncel motor değeriyle karşılaştırılır: **ilk commit kazanır**, kaybede
 - Kilit: `FEngCs` motoru ve `FSets`'i serileştirir; işlem
   boyunca tutulmaz. Dosya düzeyi kilit değişmedi. (v3.9: `FEngCs` artık
   `TVdbGate` — sahip/derinlik izler, yeniden giriş varsayıma dayanmaz.)
-- Sınır: snapshot isolation yok; süreçler arası çok yazarlılık yok.
+- Sınır: v3.15'e kadar snapshot isolation ve süreçler arası çok yazarlılık
+  yoktu; ikisi de v3.15/v3.16'da yapıldı (bkz. §v3.15, §v3.16).
 
 | Ölçüm (`benchcmp`, 200k × 3 kolon, 3 koşu medyanı) | Değer |
 |---|---|
@@ -1133,7 +1134,81 @@ Farklar gürültü sınırında (±%2); ölçülebilir bir yavaşlama yok.
 - `FUndo` belleği, en uzun açık işlem boyunca commit edilen satır sayısıyla
   büyür (klasik undo saklama maliyeti). Uzun işlem + yoğun yazma belleği
   şişirebilir; pencere tüm oturumlar kapanınca boşalır.
-- Süreçler arası çok yazarlılık kapsam dışı (değişmedi).
+- Süreçler arası çok yazarlılık kapsam dışı (v3.16'da yapıldı — bkz. §v3.16).
+
+### v3.16 — Süreçler arası çok yazarlılık (tek yazar sırası, veri kaybı yok)
+
+**Hedef:** aynı `.odb` dosyasına birden çok süreç bağlanabilsin ve **sırayla**
+yazabilsin; hiçbir commit sessizce kaybolmasın. Model SQLite'a benzer: çok
+okuyucu / tek yazar.
+
+**Kilit semantiği ölçülerek belirlendi** (`tmp64/lckprobe`, win32, aynı handle):
+
+| Durum | Sonuç |
+|---|---|
+| Paylaşımlı bayt-aralığı kilidi tutarken yazma | **`EWriteError`** — paylaşımlı kilit yalnız okumadır, aynı handle bile yazamaz |
+| Tam (exclusive) kilit tutarken **başka** handle'dan okuma | **`EReadError`** |
+
+Bu iki gerçek tasarımı belirledi: kilit **oturum boyu değil, işlem (statement)
+boyu** tutulur.
+
+**Nasıl çalışır.**
+- Açılış: yazan oturum kısa süreliğine **tam kilit** alır (WAL kurtarma, sürüm
+  yükseltmesi, meta yazımı), işi bitince **bırakır**. Salt-okunur oturum
+  paylaşımlı kilidi oturum boyu tutar (okuma görüntüsü sabit kalır).
+- Her motor erişimi tek kapıdan (`FEngCs`) geçer; kapı derinliği 0→1 olduğunda
+  **paylaşımlı kilit** alınır, 1→0 olduğunda bırakılır. Yazma girişinde
+  paylaşımlı bırakılıp **tam kilit** alınır (`AcquireWrite`), çıkışta tersi
+  (`ReleaseWrite`). İki süreç aynı anda yükseltmek isterse ikisi de önce
+  paylaşımlıyı bıraktığı için **kilitlenme yok**.
+- Önbellek tazeliği: her işlem girişinde `<db>.gen` **8 baytlık değişiklik
+  sayacı** okunur. Sayaç değişmediyse hiçbir şey yapılmaz (~2 µs). Değiştiyse
+  `DropCache` + meta yeniden yüklenir ve motor WAL görünümünü tazeler
+  (`FWal.Close/Open`, varsa çerçeveleri uygula — sayfa imajları idempotent).
+- Sayaç **meta sayfaya değil ayrı dosyaya** yazılır: meta sayfaya commit LSN'i
+  yazmak taban dosyanın kendi kendine tutarlılığını bozuyordu (sayfalar hâlâ
+  WAL'de olabilir; `pitr`/`AS OF SEQUENCE 0` bunu yakaladı).
+- **Güvenlik ağı:** sayfa deposunun her yazma ilkeli (`WritePageAt`, `SaveMeta`,
+  `GrowTo`, `TrimToLogical`) paylaşımlı kilit altında çağrılırsa kilidi
+  **kendiliğinden tam kilide yükseltir** ve işlem sonunda bırakır. Unutulan bir
+  yazma yolu `EWriteError` ya da veri kaybı üretmez (bu ağ olmadan `sqltest`
+  T159'da `EWriteError` alınmıştı).
+- WAL dosyası da paylaşıma açıldı (`fmShareDenyNone`); yazma yine veritabanı
+  kilidiyle sıralanır.
+
+**Ölçüm (`tmp64/lockcost`, win32, QPC, 3 koşu en iyisi).**
+
+| İş | Ölçüm |
+|---|---|
+| `AcquireRead`/`ReleaseRead` (işlem kilidi) | **8,8 µs**/işlem (100.000 çift) |
+| `AcquireWrite`/`ReleaseWrite` (+ sayaç) | **15,5 µs**/işlem (2.000 çift) |
+| Otomatik commit `Put` (fsync dahil) | 25,5 µs/satır |
+| Parti içinde `Put` (200k) | **2,215 µs/satır** (v3.15: 2,34 — gürültü sınırında, **regresyon yok**) |
+
+Kilit maliyeti **işlem başına** ödenir: 50.000 satırlık tek bir `SELECT` bir
+kez kilit alır, satır başına ek yük yoktur. Satır başına API döngüsünde
+(`Get`/`Put`) işlem başına ~9–16 µs ek maliyet vardır; bu, çok süreçli
+güvenliğin bilinçli bedelidir.
+
+**Testler.** `sqltest` v3 **2874/0/33**, v2 **3305/0/0**; `v3sqlchk` **238/0**;
+`lockchk` **29/0**; **16/16 kapı yeşil** (15 eski + yeni `prochk`).
+`prochk` gerçek iki süreçle yarışır: tohum 5 satır + A 40 + B 40 = **85 satır**,
+**eksik=0**; B, A'nın commit'ini görür (`toplam=85`).
+
+**Bilinçli sınırlar (dokümante).**
+- **Yazarlar sıralıdır**: bir yazma işlemi açıkken diğer süreçlerin yazma
+  girişleri `ABusyMs` boyunca bekler, sonra
+  `veritabani mesgul: yazar kilidi %d ms icinde alinamadi ...` hatası alır.
+  Uzun bir işlem diğer süreçlerin **okuyucularını da** bekletir.
+- `ABusyMs` varsayılanı **0**'dır (hemen hata); çok süreçli kullanımda açıkça
+  büyütülmelidir (testte 20.000 ms).
+- Adil kuyruk yoktur (aç yazar, sürekli yazan bir sürecin arkasında
+  kalabilir).
+- Canlı bir veritabanının **sürüm yükseltmesi** (dosya biçimi değişimi) çok
+  süreçli kullanımda desteklenmez; yükseltme tek süreçle yapılmalıdır.
+- Aynı süreç içindeki çok oturumlu davranış (v3.15 MVCC, ilk commit kazanır)
+  değişmedi.
+
 
 ### Sürüm çizgisi kararı (2026-10-26): alpha hattı → **v1.0.0**
 
@@ -1204,12 +1279,17 @@ kendi kapıları ve ölçümüyle):
    commit çakışma denetimi (ilk commit kazanır) değişmedi. Ölçülen okuma
    maliyeti yok (snapshot temizken tek bayrak denetimi). Ayrıntı: §v3.15.
 
+6. ~~**Süreçler arası çok yazarlılık**~~ **YAPILDI (v3.16)** — aynı `.odb`
+   dosyasına birden çok süreç bağlanıp **sırayla** yazar; kilit işlem
+   kapsamlıdır, önbellek `<db>.gen` sayacıyla tazelenir, veri kaybı yok
+   (`prochk` 8/8, gerçek iki süreç). Yazarlar sıralıdır; uzun işlem diğer
+   süreçleri bekletir. Ayrıntı: §v3.16.
+
 ### Kapsam dışı (değişmedi)
 - M3 WASM, M7 async sunucu, WASM/edge
-- **Süreçler arası çok yazarlılık** (aynı `.odb` dosyasına iki sürecin
-  yazması): dosya kilidi mimarisi ve süreçler arası görünürlük gerektirir;
-  bu hattın kapsamında değil. Snapshot isolation **tek süreç içinde**
-  kalacak. (Onay istendi: bu madde kapsam dışı kalıyor.)
+- ~~**Süreçler arası çok yazarlılık**~~ **v3.16'da yapıldı** (bkz. §v3.16).
+  Snapshot isolation hâlâ **tek süreç içinde** çalışır; süreçler arasında
+  görünürlük "son commit" düzeyindedir.
 
 ---
 

@@ -136,7 +136,7 @@ var
   caught: Boolean;
 begin
   WriteLn;
-  WriteLn('Sprint 3.10 - ayni dosyayi ikinci kez acma: acik kilit hatasi');
+  WriteLn('Sprint 3.10/v3.16 - ayni dosyaya ikinci yazar oturumu: ACIK olmali');
   CleanDir;
   OpenV3(S, 'lock.odb', True);
   try
@@ -149,20 +149,24 @@ begin
     msg := '';
     try
       S2.Be := TVdbBackendV3.Create(DirOf('lock.odb'), False, 64);
-      S2.Be := nil;   // beklenmeyen basari: sizinti birakma
+      caught := True;
     except
       on E: Exception do
       begin
-        caught := True;
+        caught := False;
         msg := E.ClassName + ': ' + E.Message;
       end;
     end;
-    if not caught then
-      Fail('lock: ikinci acilis reddedilmedi')
-    else if (Pos('kullanimda', msg) > 0) or (Pos('mesgul', msg) > 0) then
-      Ok('lock: ikinci acilis kilit hatasi verdi -> ' + msg)
+    { v3.16: SURECLER ARASI COK YAZARLILIK. Kilit artik islem boyu tutulur;
+      bu yuzden ayni dosyaya ikinci bir YAZAR oturum ACILABILIR. Beklenen
+      davranis: hata DEGIL, acilis + bagimsiz yazma. }
+    if caught then
+    begin
+      Ok('lock: ikinci yazar oturumu acildi (v3.16 cok yazarlilik)');
+      S2.Be := nil;
+    end
     else
-      Fail('lock: kilit mesaji bekleniyordu: ' + msg);
+      Fail('lock: ikinci yazar acilamadi -> ' + msg);
 
     { Ilk motor etkilenmemis olmali. }
     r := Exec(S, 'SELECT COUNT(*) FROM k');

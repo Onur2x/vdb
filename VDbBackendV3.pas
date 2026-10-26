@@ -54,12 +54,19 @@ type
         bellek sirali platformlarda eski sahip degerini gorup yanlislikla
         "yeniden giris" sayma riski de yoktur.
       - Derinlik sifira donmezse Leave eksiktir; `Depth` testte yakalar. }
+  TVdbGateNotify = procedure of object;
+
   TVdbGate = class
   private
     FCs: TCriticalSection;
     FDepth: Integer;
     FMaxDepth: Integer;
   public
+    { v3.16: islem kapsamli sayfa deposu kilidi icin kancalar. Derinlik
+      0 -> 1 gecisinde OnFirstEnter, 1 -> 0 gecisinde OnLastLeave cagrilir.
+      Boylece kilit yonetimi TEK noktadan (FEngCs) yapilir. }
+    OnFirstEnter: TVdbGateNotify;
+    OnLastLeave: TVdbGateNotify;
     constructor Create;
     destructor Destroy; override;
     procedure Enter;
@@ -502,6 +509,9 @@ type
       sonra 0 olmali. MaxDepth, ic ice girislerin ulastigi en yuksek
       derinligi gosterir (orn. ScanAll -> ScanCb -> OwnSet = 2). }
     function DebugLockDepth: Integer;
+    { v3.16: FEngCs kancalari -> islem kapsamli sayfa deposu kilidi. }
+    procedure StoreReadEnter;
+    procedure StoreReadLeave;
     function DebugLockMaxDepth: Integer;
 
     { Sprint 3.2: checkpoint sonrasi bayt-bayt yedek; geri yukleme dosyayi
@@ -546,6 +556,8 @@ begin
   FPendSnap := TList<TSnapPend>.Create;
   FCommitGen := 0;
   FEngCs := TVdbGate.Create;
+  FEngCs.OnFirstEnter := StoreReadEnter;
+  FEngCs.OnLastLeave := StoreReadLeave;
   FTagCounts := TDictionary<Integer, Int64>.Create;
   { v3.2: otomatik sikistirma v2 ile AYNI varsayilanlar (KAPALI). }
   FAutoCompactOn := False;
@@ -805,6 +817,16 @@ begin
   end;
   VdbGateHeld[VdbGateHeldN] := Self;
   Inc(VdbGateHeldN);
+  if Assigned(OnFirstEnter) then
+  try
+    OnFirstEnter;
+  except
+    Dec(VdbGateHeldN);
+    VdbGateHeld[VdbGateHeldN] := nil;
+    FDepth := 0;
+    FCs.Leave;
+    raise;
+  end;
 end;
 
 procedure TVdbGate.Leave;
@@ -819,13 +841,29 @@ begin
       Dec(VdbGateHeldN);
       VdbGateHeld[VdbGateHeldN] := nil;
     end;
-    FCs.Leave;
+    try
+      if Assigned(OnLastLeave) then OnLastLeave;
+    finally
+      FCs.Leave;
+    end;
   end;
 end;
 
 function TVdbBackendV3.DebugLockDepth: Integer;
 begin
   Result := FEngCs.Depth;
+end;
+
+procedure TVdbBackendV3.StoreReadEnter;
+begin
+  if FEng <> nil then
+    FEng.Store.AcquireRead;
+end;
+
+procedure TVdbBackendV3.StoreReadLeave;
+begin
+  if FEng <> nil then
+    FEng.Store.ReleaseRead;
 end;
 
 function TVdbBackendV3.DebugLockMaxDepth: Integer;
@@ -1294,6 +1332,9 @@ begin
       s.Order.Add(Key);
     Exit;
   end;
+  { v3.16: otomatik commit yazimi — tam kilit (baska surecle sirayla). }
+  FEng.Store.AcquireWrite;
+  try
   FEngCs.Enter;
   try
     { Tek anahtar yolu: once eklemeyi dene (Insert zaten varlik denetimi
@@ -1331,6 +1372,9 @@ begin
     LogPut(Key, oldVal, Value);
   finally
     FEngCs.Leave;
+  end;
+  finally
+    FEng.Store.ReleaseWrite;
   end;
 end;
 
@@ -1520,6 +1564,9 @@ begin
     s.Map.AddOrSetValue(Key, rec);
     Exit(had);
   end;
+  { v3.16: otomatik commit silme — tam kilit. }
+  FEng.Store.AcquireWrite;
+  try
   FEngCs.Enter;
   try
     { v3.1: etiket sayaci icin once eski deger (yalnizca silinen anahtar). }
@@ -1537,6 +1584,9 @@ begin
       FDirty := True;
   finally
     FEngCs.Leave;
+  end;
+  finally
+    FEng.Store.ReleaseWrite;
   end;
 end;
 
@@ -1823,6 +1873,8 @@ begin
     end;
     if FileExists(tmpWal) then DeleteFile(tmpWal);
     if FileExists(tmpIdx) then DeleteFile(tmpIdx);
+    { v3.16: gecici motor da <db>.gen sayac dosyasi olusturur. }
+    if FileExists(tmp + '.gen') then DeleteFile(tmp + '.gen');
     if FileExists(tmp) then DeleteFile(tmp);
   end;
 end;
@@ -2113,9 +2165,19 @@ begin
   FEngCs.Enter;
   try
     if FSets.TryGetValue(sid, s) then Exit;   // zaten acik
-    s := TWriteSet.Create(sid);
-    s.StartGen := FCommitGen;
-    FSets.AddOrSetValue(sid, s);
+    { v3.16: SURELER ARASI COK YAZARLILIK. Islem boyunca TAM kilit tutulur:
+      ayni dosyaya baska bir surec yazacaksa busy timeout boyunca bekler,
+      biz commit edince kilidi devralir ve meta imgasindan onbellegini
+      tazeler. Boylece iki surec sirayla yazar, veri kaybi olmaz. }
+    FEng.Store.AcquireWrite;
+    try
+      s := TWriteSet.Create(sid);
+      s.StartGen := FCommitGen;
+      FSets.AddOrSetValue(sid, s);
+    except
+      FEng.Store.ReleaseWrite;
+      raise;
+    end;
   finally
     FEngCs.Leave;
   end;
@@ -2130,6 +2192,9 @@ begin
   RequireWritable;
   s := OwnSet;
   if s = nil then Exit;
+  { v3.16: yazma kilidi hata yolunda da birakilmali (kilit sizintisi =
+    dosyanin baska surecler icin kapanmasi). }
+  try
   FEngCs.Enter;
   try
     if Assigned(FBeforeCommit) then
@@ -2194,6 +2259,9 @@ begin
     FEngCs.Leave;
   end;
   s.Free;
+  finally
+    FEng.Store.ReleaseWrite;
+  end;
 end;
 
 procedure TVdbBackendV3.AbortBatch;
@@ -2203,6 +2271,7 @@ begin
   RequireWritable;
   s := OwnSet;
   if s = nil then Exit;
+  try
   FEngCs.Enter;
   try
     LogAbort;               // yarim islem gunluge SIZMAZ
@@ -2212,6 +2281,9 @@ begin
     FEngCs.Leave;
   end;
   s.Free;
+  finally
+    FEng.Store.ReleaseWrite;
+  end;
 end;
 
 procedure TVdbBackendV3.Flush;
@@ -2227,18 +2299,24 @@ begin
     yapilir; veri dosyasi motor acikken bayat olabilir, dogru kaynak WAL'dir. }
   if FDirty then
   begin
-    FEngCs.Enter;
+    { v3.16: motor commit'i sayfa yazar -> tam kilit gerekir. }
+    FEng.Store.AcquireWrite;
     try
-      if FDirty then
-      begin
-        FEng.Commit(True);
-        FDirty := False;
-        LogFinish;
-        MaybeCheckpoint;
-        MaybeAutoCompact;     // v3.2 (H25): autocommit yolu
+      FEngCs.Enter;
+      try
+        if FDirty then
+        begin
+          FEng.Commit(True);
+          FDirty := False;
+          LogFinish;
+          MaybeCheckpoint;
+          MaybeAutoCompact;     // v3.2 (H25): autocommit yolu
+        end;
+      finally
+        FEngCs.Leave;
       end;
     finally
-      FEngCs.Leave;
+      FEng.Store.ReleaseWrite;
     end;
   end;
 end;
@@ -3252,6 +3330,8 @@ begin
     end;
     if FileExists(tmpWal) then DeleteFile(tmpWal);
     if FileExists(tmpIdx) then DeleteFile(tmpIdx);
+    { v3.16: gecici motor da <db>.gen sayac dosyasi olusturur. }
+    if FileExists(tmp + '.gen') then DeleteFile(tmp + '.gen');
     if FileExists(tmp) then DeleteFile(tmp);
   end;
 end;
