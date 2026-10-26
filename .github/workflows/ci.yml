@@ -375,6 +375,12 @@ jobs:
           $out = & .\snapchk.exe $dir 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'kalan=0') {
+            # v3.17: is loglari anonim okunamadigi icin son satirlar ANOTASYON
+            # olarak yayinlanir (crashtest adimiyla ayni desen).
+            $tail = ($out -split "`r?`n" | Where-Object { $_.Trim() -ne '' } |
+              Select-Object -Last 25) -join ' || '
+            $tail = $tail -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+            Write-Host "::error title=snapchk::$tail"
             Write-Error 'snapchk kalan > 0'
             exit 1
           }
@@ -388,6 +394,10 @@ jobs:
           $out = & .\prochk.exe $dir 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'kalan=0') {
+            $tail = ($out -split "`r?`n" | Where-Object { $_.Trim() -ne '' } |
+              Select-Object -Last 25) -join ' || '
+            $tail = $tail -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+            Write-Host "::error title=prochk::$tail"
             Write-Error 'prochk kalan > 0'
             exit 1
           }
