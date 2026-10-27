@@ -227,6 +227,7 @@ type
     procedure SetupEncryptionForCreate;
     procedure CheckEncryptionOnOpen(const Meta: TVdbPageBuf);
     procedure ReadPageAt(PageNo: LongWord; P: PVdbPage);
+    procedure ReadBytesAt(Pos: Int64; var Buf; Len: Integer; PageNo: LongWord);
     procedure WritePageAt(PageNo: LongWord; P: PVdbPage);
     procedure ExtendFile(out NewPageNo: LongWord);
     procedure GrowTo(Required: Int64);
@@ -1732,6 +1733,69 @@ end;
 
 { ============================================================ okuma/yazma }
 
+{ v3.19 — KILIT CAKISMASI (olculdu: pcbench 4 surec, 8 kosuda 2 kez
+  "EReadError: Stream read error"; teshis eklendiginde ayrinti netlesti:
+  "sayfa 1 okunamadi (konum 4096, dosya boyu 282624, mantiksal sayfa 5)" —
+  yani dosya SAGLAM, EOF yok).
+
+  NEDEN: Windows'ta byte-araligi kilidi (LockFileEx) TUM dosyayi kapsiyor.
+  Bir surec TAM kilit tutarken baska surecin ReadFile'i ERROR_LOCK_VIOLATION
+  (33) ile duser; TFileStream bunu "Stream read error" yapar. Iyimser modda
+  islem ARASINDA kilit tutulmuyor (bilincli: okuyucular bloklanmasin), bu
+  yuzden bir islemin okuma sayfalari baska surecin TAM kilidi altinda
+  kalabiliyor.
+
+  COZUM: okuma kilit ihlaliyle duserse PAYLASIMLI kilidi ALAYIM yeniden
+  dene. Kilit tutmuyorken aldigimiz icin karsilikli kilitlenme yok; TAM
+  kilit tutan surec commit'ini bitirince okuma surer. Kilit zaten bizdeyse
+  yeniden denemek anlamsiz (gercek bozulma) -> hemen acik hata. }
+procedure TVDbPageStore.ReadBytesAt(Pos: Int64; var Buf; Len: Integer;
+  PageNo: LongWord);
+var
+  tries: Integer;
+  selfShared: Boolean;
+  ok: Boolean;
+  err: string;
+begin
+  tries := 0;
+  selfShared := False;
+  repeat
+    ok := True;
+    err := '';
+    try
+      FStream.Position := Pos;
+      FStream.ReadBuffer(Buf, Len);
+    except
+      on E: Exception do
+      begin
+        ok := False;
+        err := E.Message;
+      end;
+    end;
+    if ok then Break;
+    Inc(tries);
+    if (tries <= 8) and ((not FLockedExcl) and (not FLockedShared)) then
+    begin
+      { Kilidi al (yazar bitene kadar bekler), sonra tekrar dene. }
+      if TakeSharedLock then
+      begin
+        selfShared := True;
+        Continue;
+      end;
+    end;
+    raise EVdbPageStore.Create(Format(
+      'sayfa %d okunamadi (konum %d, dosya boyu %d, mantiksal sayfa %d,' +
+      ' kilit paylasimli=%d tam=%d, deneme %d): %s',
+      [PageNo, Pos, FStream.Size, FPageCount, Ord(FLockedShared),
+       Ord(FLockedExcl), tries, err]));
+  until False;
+  if selfShared then
+  begin
+    VDbUnlockStream(FStream);
+    selfShared := False;
+  end;
+end;
+
 procedure TVDbPageStore.ReadPageAt(PageNo: LongWord; P: PVdbPage);
 var
   env: TBytes;
@@ -1753,7 +1817,7 @@ begin
       Exit;
     end;
     SetLength(env, VDB_ENC_ENVELOPE);
-    FStream.ReadBuffer(env[0], VDB_ENC_ENVELOPE);
+    ReadBytesAt(OffsetOf(PageNo), env[0], VDB_ENC_ENVELOPE, PageNo);
     if not VDbPageOpen(FKey, FSalt, PageNo, env, plain) then
       raise EVdbPageStore.Create(Format(
         'sayfa %d: sifre cozulemedi (yanlis anahtar ya da bozuk zarf)',
@@ -1761,7 +1825,7 @@ begin
     Move(plain[0], P^, VDB_PAGE_SIZE);
   end
   else
-    FStream.ReadBuffer(P^, VDB_PAGE_SIZE);
+    ReadBytesAt(OffsetOf(PageNo), P^, VDB_PAGE_SIZE, PageNo);
   Inc(FReads);
 end;
 
