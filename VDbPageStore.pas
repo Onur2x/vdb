@@ -274,6 +274,11 @@ type
       Motor WAL gorunumunu tazelemek icin baglar. }
     property OnRefreshed: TNotifyEvent read FOnRefreshed write FOnRefreshed;
 
+    { v3.18: bu oturumun EN SON gordugu `<db>.gen` degeri. Yalnizca bellek
+      okumasidir (diskte yoklama yapmaz). Baska bir surec commit ettiginde
+      deger degisir; sema katmani bunu tazelik damgasi olarak kullanir. }
+    function GenStamp: QWord;
+
     { Salt-okunur oturumda WAL'den gelen imaji bellek katmanina alir.
       Diske YAZMAZ; meta sayfa (0) ise mantiksal alanlari tazeler. }
     procedure InstallReadOnlyPage(PageNo: LongWord; P: PVdbPage);
@@ -888,6 +893,14 @@ begin
 end;
 
 { v3.16: `<db>.gen` — surecler arasi degisiklik sayaci. }
+function TVDbPageStore.GenStamp: QWord;
+begin
+  { v3.18: BELLEK degeri. Diskteki sayaci okumak islem basina ~2 us
+    ek yuk getirirdi; tazelik zaten `RefreshIfStale` (yazma girisi) ile
+    senkronlanir. }
+  Result := FSigGen;
+end;
+
 function TVDbPageStore.ReadGen: QWord;
 begin
   Result := 0;

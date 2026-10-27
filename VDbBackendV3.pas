@@ -442,6 +442,7 @@ type
     function GetInBatch: Boolean;
     { v3.4: acik yazma islemi 0 veya 1 tane mi? (DDL/SAVEPOINT kosulu) }
     function SoleWriter: Boolean;
+    function StoreGenStamp: Int64;
 
     { v3.2: ALTER DATABASE KEY — dosya yeni parola ile yeniden sifrelenir.
       Acik parti varken reddedilir; islem atomiktir (tmp + .bak). }
@@ -2329,6 +2330,12 @@ end;
 function TVdbBackendV3.GetInBatch: Boolean;
 begin
   Result := BatchOpen;
+end;
+
+function TVdbBackendV3.StoreGenStamp: Int64;
+begin
+  { v3.18: yalnizca BELLEK okumasi (bkz. TVDbPageStore.GenStamp). }
+  Result := Int64(FEng.Store.GenStamp);
 end;
 
 function TVdbBackendV3.SoleWriter: Boolean;

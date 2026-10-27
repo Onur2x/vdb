@@ -35,7 +35,7 @@ unit VDbFactory;
 interface
 
 uses
-  SysUtils, VDbBackendApi;
+  SysUtils, VDbBackendApi, VDbPageStore;
 
 type
   EVdbFactory = class(Exception);
@@ -94,7 +94,7 @@ procedure VdbOpenWithPassword(const Path, Password: string;
 implementation
 
 uses
-  Classes, VDbCore, VDbBackendV2, VDbBackendV3, VDbPageStore;
+  Classes, VDbCore, VDbBackendV2, VDbBackendV3;
 
 function VdbResolveFile(const Path: string): string;
 var

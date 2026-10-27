@@ -121,6 +121,11 @@ type
       Sema/DDL/SAVEPOINT gibi GLOBAL duruma dokunan islemler bunu ister.
       v2 tek yazici oldugu icin her zaman True doner. }
     function SoleWriter: Boolean;
+    { v3.18: bu oturumun gordugu son commit sayaci (surecler arasi tazelik
+      damgasi). Baska bir surec commit ettiginde artar. Sema katmani bunu
+      kullanarak FTables'i yeniden yukler (v3.18: surecler arasi DDL).
+      v2: 0 (tek surec; damga yok). }
+    function StoreGenStamp: Int64;
 
     { --- v3.2: SAVEPOINT / ROLLBACK TO / RELEASE SAVEPOINT ---
       Sozlesme (v2 TVDb ile AYNI, R-02):

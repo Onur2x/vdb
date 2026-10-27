@@ -62,6 +62,7 @@ type
     procedure Flush;
     function GetInBatch: Boolean;
     function SoleWriter: Boolean;
+    function StoreGenStamp: Int64;
 
     { v3.2: v2'de R-02 savepoint'leri TVDb'de WAL tabanlidir; aynen
       devredilir. Istisna mesajlari (ecDuplicateSavepoint /
@@ -277,6 +278,12 @@ function TVDbBackendV2.SoleWriter: Boolean;
 begin
   { v2 tek yazicidir (dosya kilidi); coklu yazma islemi yoktur. }
   Result := True;
+end;
+
+function TVDbBackendV2.StoreGenStamp: Int64;
+begin
+  { v3.18: v2'de surecler arasi commit sayaci yok; damga sabittir. }
+  Result := 0;
 end;
 
 procedure TVDbBackendV2.Savepoint(const Name: string);
