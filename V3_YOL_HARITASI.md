@@ -1392,7 +1392,67 @@ kaldırmak. Her dilim ayrı kapı ve **ölçüm** ile doğrulandı.
    anahtara eşzamanlı yazan iki işlemden biri hata alır — bu, kayıp
    güncellemeye tercih edilen bilinçli seçimdir.
 
-Kapı durumu: **16/16 yeşil**, toplam **668 kontrol**.
+7. **Sayfa düzeyi işine hazırlık: iki VERİ KAYBI yolu ve bir kilit kusuru.**
+   Sayfa düzeyinde paralel commit'e geçmeden önce yapılan uzun koşu
+   doğrulaması, aralıklı (**~%1-5**) ve **sessiz** veri kaybını ortaya
+   çıkardı. Üç ayrı kök neden bulundu ve üçü de ölçümle kanıtlandı.
+
+   **7a. Kilit defteri ile işletim sistemi ayrışıyordu (öz-kilitlenme).**
+   `prochk` uzun döngüde, hata anında `[shared=0 readDepth=0 writeDepth=0
+   holdDepth=0 reserved=1]` alanlarıyla 20 000 ms kilitlenme veriyordu.
+   İzleme (`VDB_TRACE`) açıldığında **2697 kilit hatasının tamamı
+   `err=33`** (`ERROR_LOCK_VIOLATION`) çıktı: bir süreç `EX?` ile 20 703 ms
+   boyunca aynı handle'ı denedi ve aynı handle'da bir `UN-` çalıştığı **an**
+   `EX+` başarılı oldu. Kök neden: **Windows'ta bir süreç kendi paylaşımlı
+   kilidini tam kilide yükseltemez**; ayrıca motorun dağınık boolean defteri
+   (`FLockedShared` vb.) ile OS'in gerçek kilit durumu ayrışabiliyordu —
+   defter "kilit yok" derken OS'te paylaşımlı kilit kalıyor, yazar kendi
+   hayalet kilidi yüzünden busy süresini tüketiyordu.
+   Düzeltme: `VDbSync.pas` artık **handle başına gerçek kilit defteri**
+   tutuyor (`VDB_LOCK_SLOTS`, `VDbLockHeld`); OS kilit durumu defterle
+   birebir aynı. Yükseltmeden önce paylaşımlı kilit **açıkça** bırakılıyor;
+   defterde kilit yoksa `UnlockFileEx` **hiç** çağrılmıyor (eski kod
+   koşulsuz çağırıyordu). Ölçüm: 100 koşuda kilitlenme **0**.
+   Kapı: `lockchk` — `kilit defteri tutarli`, yazar açlığı **15 ms**
+   (eşik 2500), eşzamanlı yazım 200+300 satır.
+
+   **7b. Kapanış checkpoint'i tazeleme yapmıyordu.**
+   `TVdbPageEngine.Close` kapanışta checkpoint'i **kilitsiz ve tazelemesiz**
+   yapıyordu. İki yazar süreç varsa: A commit edip kapanırken B çoktan
+   commit etmişse, A'nın belleği hâlâ bayattır (B'nin çerçeveleri yalnız
+   WAL'de). A bayat sayfaları `.odb`'ye yazıp WAL'i **kendi bayat LSN'inde**
+   kesiyordu → B'nin **onaylanmış** commit'i yok oluyordu.
+   Düzeltme: kapanış checkpoint'i artık **tam kilit altında ve taze
+   önbellekle** yapılır (`AcquireDataWrite` içinde `RefreshIfStaleForce`).
+   Kilit alınamazsa **checkpoint atlanır** — veri WAL'de kalır ve açılışta
+   kurtarılır (veri kaybına tercih edilen bilinçli seçim). `.odb.idx` yalnız
+   checkpoint **gerçekten** yapıldıysa yazılır.
+   Deterministik kanıt: `prochk` yeni `TestKapanisTazeleme` kapısı —
+   düzeltmesiz `Close` **19/2** (5 satır kayıp), düzeltilmiş `Close`
+   **21/0**. (Not: bu kusur dilim 6'ya özgü değildi, önceden de vardı.)
+
+   **7c. Tazeleme, havuza sığmayan sayfaları yazmadan WAL'i kesiyordu.**
+   `StoreRefreshed` (başka süreç commit ettiğinde) WAL çerçevelerini
+   belleğe uyguluyor, sonra `FStore.Flush(True)` + `FWal.Truncate(...)`
+   yapıyordu. `Flush` yalnız **önbellekte yerleşik** kirli sayfaları yazar;
+   havuza sığmayıp **pending**'e düşen sayfalara dokunmaz. `Checkpoint` ise
+   önce pending'leri `InstallPage` ile yazar, sonra `Flush`, sonra
+   `Truncate` yapar. `StoreRefreshed` bu adımı atladığı için pending
+   sayfalar hiç diske yazılmıyor, ardından WAL kesiliyor ve **onaylanmış
+   veri kalıcı olarak yok oluyordu** (ölçüm: B commit'ten sonra `toplam=45`
+   gördü, taze açılışta `COUNT=45`; `.wal` yalnız 4096 bayt başlık).
+   Düzeltme: `StoreRefreshed` artık aynı adımları **`Checkpoint(True)`**
+   ile yapar.
+   Ölçüm: kapanış + tazeleme düzeltmelerinden sonra `prochk`
+   **100/100 temiz** (önceki taban ~%1-5 kayıp).
+
+   **7d. Test dosyaları `tests/` altına taşındı.** 16 kapı `tests/gates/`,
+   `sqltest` `tests/sql/`. Kökte yalnız motor (`VDb*.pas`), C API
+   (`vdbapi.*`), göç aracı (`vdbmig.*`), `examples/`, `yonetim/`, `dcpcrypt/`,
+   `tests/bench/` ve belgeler kalır. `.lpi` yolları (`..\..\`) ve
+   `.github/workflows/ci.yml` güncellendi; motorda tek satır değişmedi.
+
+Kapı durumu: **16/16 yeşil**, toplam **674 kontrol**.
 
 `sqltest` v3 **2874/0/33**, v2 **3305/0/0** (temel çizgiyle birebir).
 

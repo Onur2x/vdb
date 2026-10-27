@@ -878,9 +878,41 @@ anahtara eşzamanlı yazan ikinci işlem **açık hata** alır (sessiz kayıp yo
 Sayfa düzeyinde paralel commit kapsam dışıdır.
 
 Kapı: `sqltest` v3 **2874/0/33**, v2 **3305/0/0**; `v3sqlchk` **238/0**;
-`lockchk` **36/0**; `prochk` **15/0**; **16/16 kapı yeşil** (668 kontrol).
+`lockchk` **36/0**; `prochk` **21/0**; **16/16 kapı yeşil** (674 kontrol).
 CI (GitHub Actions) de aynı **16** kapıyı koşar — `snapchk`/`prochk`
-v3.17'de eklendi.
+v3.17'de eklendi. Test dosyaları `tests/gates/` ve `tests/sql/` altındadır;
+kökte yalnız motor, C API (`vdbapi.*`), göç aracı (`vdbmig.*`),
+`examples/`, `yonetim/`, `dcpcrypt/`, `tests/bench/` ve belgeler kalır.
+
+### Sayfa düzeyi çalışması öncesi bulunan üç kusur (v3.18 / madde 7)
+
+Sayfa düzeyinde paralel commit'e geçmeden önce yapılan uzun koşu
+doğrulaması (100+ koşu) **aralıklı ve sessiz veri kaybını** ortaya çıkardı
+(~%1-5). Üç ayrı kök neden bulundu; üçü de ölçümle kanıtlandı ve düzeltildi.
+
+- **Kilit defteri ile işletim sistemi ayrışıyordu.** Hata anında izleme
+  açıldığında **2697 kilit hatasının tamamı `err=33`**
+  (`ERROR_LOCK_VIOLATION`) çıktı; bir süreç aynı handle'ı 20 703 ms boyunca
+  `EX?` ile denedi ve aynı handle'da bir `UN-` çalıştığı **an** başarılı
+  oldu. Neden: **Windows'ta bir süreç kendi paylaşımlı kilidini tam kilide
+  yükseltemez** ve motorun dağınık boolean defteri OS'ten kopabiliyordu.
+  Düzeltme: `VDbSync.pas`'ta **handle başına gerçek kilit defteri**.
+  Ölçüm: 100 koşuda kilitlenme **0**.
+- **Kapanış checkpoint'i tazeleme yapmıyordu.** A kapanırken bayat belleğiyle
+  `.odb`'ye yazıp WAL'i **kendi bayat LSN'inde** kesiyor, B'nin onaylanmış
+  commit'ini yok ediyordu. Düzeltme: checkpoint **tam kilit altında ve taze
+  önbellekle**; kilit alınamazsa **checkpoint atlanır** ve veri WAL'de kalır.
+  Kanıt: yeni `TestKapanisTazeleme` kapısı — düzeltmesiz **19/2**,
+  düzeltilmiş **21/0**.
+- **Tazeleme, havuza sığmayan sayfaları yazmadan WAL'i kesiyordu.**
+  `StoreRefreshed` yalnız **yerleşik** kirli sayfaları `Flush` ediyor,
+  **pending** sayfaları atlıyor, sonra WAL'i kesiyordu. Düzeltme: aynı
+  adımlar artık `Checkpoint(True)` ile yapılır.
+  Ölçüm: `prochk` **100/100 temiz** (önceki taban ~%1-5 kayıp).
+
+**Dürüst kalan sınır:** commit'ler hâlâ **sıralı**; çakışma denetimi
+**anahtar** düzeyinde, sayfa düzeyinde değil. Sayfa düzeyinde paralel commit
+henüz yapılmadı.
 
 ### Sürüm çizgisi (2026-10-26)
 
@@ -892,5 +924,6 @@ reddedildi), ifade bytecode (**ölçümle reddedildi**; yerine tip-duyarlı tam
 sayı yolu yapıldı — bkz. §v3.14), snapshot isolation (**yapıldı** — bkz.
 §v3.15) — hepsi tamamlandı ve ürün **v1.0.0** olarak etiketlendi.
 `main` = `v3`; iş `v3`te yürür ve her push'ta `main` de ilerletilir. Süreçler
-arası çok yazarlılık (aynı dosyaya iki süreç yazması) kapsam dışıdır;
+arası çok yazarlılık (aynı dosyaya iki süreç yazması) **v3.16/v3.18'de
+yapıldı** — yazarlar paralel, commit'ler sıralı;
 snapshot isolation tek süreç içinde **yapıldı**.
