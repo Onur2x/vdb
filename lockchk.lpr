@@ -818,7 +818,7 @@ begin
     DIKKAT: 500000 bu noktada ARTIK COMMIT EDILMIS durumda (bolum 3 onu
     yazdi). O yuzden burada TAZE bir anahtar (777001) kullanilir; aksi
     halde "gorunmedi" kontrolu yanlislikla FAIL verir. }
-  p1 := StartChild(['--writer-txn-hold', db, ready, '2000', '777001']);
+  p1 := StartChild(['--writer-txn-hold', db, ready, '3000', '777001']);
   t0 := MsNow;
   while (not FileExists(ready)) and ((MsNow - t0) < 15000) do
     Sleep(10);
@@ -859,6 +859,22 @@ begin
       Fail('commit edilmemis satir RO oturumda GORUNDU (izolasyon bozuk)')
     else
       Ok('commit edilmemis satir RO oturumda gorunmedi');
+
+    { 3c) KALAN SINIR, OLCULEREK: yazarlar HALA SIRALI. Cocugun acik
+      islemi surerken ikinci bir yazar rezervasyonu alamaz. Bu bir kusur
+      degil, belgelenmis sinirdir; sayisi burada olculur ki belgede
+      "yazarlar sirali" ifadesi havada kalmasin. Rezervasyon islem
+      boyunca tutuldugu icin bekleme SURESI acik islemin suresi kadardir. }
+    if TryWriterPut(db, 700, 999001, msg, elapsed) then
+      Fail(Format('acik islem varken ikinci yazar GIRDI (%d ms) - ' +
+        'rezervasyon calismiyor', [elapsed]))
+    else if (Pos('mesgul', LowS(msg)) > 0) and (elapsed >= 600) then
+      Ok(Format('yazarlar sirali (belgelenmis sinir): ikinci yazar busy=700 ' +
+        'ms icinde giremedi; toplam bekleme %d ms (acilis ve islem girisi ' +
+        'ayri ayri bekler, ust sinir ~2 x ABusyMs)', [elapsed]))
+    else
+      Fail(Format('ikinci yazar beklenmedik sekilde reddedildi: %d ms, %s',
+        [elapsed, msg]));
   end;
   rc := FinishChild(p1, aOut);
   if rc = 0 then

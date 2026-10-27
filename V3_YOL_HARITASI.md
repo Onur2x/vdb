@@ -1339,15 +1339,24 @@ kaldırmak. Her dilim ayrı kapı ve **ölçüm** ile doğrulandı.
      anda açılınca ikincisi "meşgul" alıyordu (`prochk` kırmızı: 40 satır
      yazılamadı). Bekleme politikası `LockExclusive` ile birebir aynı yapıldı
      (`LockReserve`, `ABusyMs` boyunca 1 ms yoklama). Ölçüm: ikinci yazar
-     **27 ms**'de açıldı (busy 10000).
+     **23-27 ms**'de açıldı (busy 10000; koşular arası değişim).
    Ayrıca RO **açılışı** artık paylaşımlı kilit altında yapılır (WAL
    imajları, `.odb.idx`, heap dizini); RO kilidi ifade kapsamlı olduğu için
    açılış kilitsiz kalırsa commit eden bir yazarla yarışıp eski görüntü
    okuyabilirdi.
    Kapı: `lockchk` 3b (açık işlem tutan yazar + 20 okuma) ve 4 (ikinci
-   yazar); `prochk` 15/15 (şifreli dahil).
+   yazar); `prochk` 15/15 (şifreli dahil). **Kalan sınır ölçülerek
+   belgelendi:** aynı anda açık iki yazar hâlâ sıraya girer — `lockchk` 3c
+   çocuğun açık işlemi sürerken ikinci yazarı dener; busy=700 ms'de
+   **giremedi**, toplam bekleme **1414 ms** (açılış ve işlem girişi ayrı
+   beklediği için üst sınır ~2×`ABusyMs`). Paralel çok yazar (sayfa
+   düzeyinde çakışma yönetimi) **kapsam dışıdır**: iki sürecin aynı anda
+   serbest liste/sayfa tahsisi yapması, işlem başına ayrı WAL akışı ve
+   sayfa düzeyinde çakışma denetimi gerektirir; bu, Öncelik 1'i (veri
+   kaybı yok) koruyacak çok sayıda yeni kapı ister ve ayrı bir iş olarak
+   ele alınmalıdır.
 
-Kapı durumu: **16/16 yeşil**, toplam **665 kontrol**.
+Kapı durumu: **16/16 yeşil**, toplam **666 kontrol**.
 
 `sqltest` v3 **2874/0/33**, v2 **3305/0/0** (temel çizgiyle birebir).
 

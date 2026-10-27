@@ -282,7 +282,7 @@ tamamlandı; **snapshot isolation da tamamlandı (v3.15)**; **süreçler arası
 sayacıyla önbellek tazeleme, `prochk` 15/15 gerçek iki süreç; şifreli dosya
 dahil)**. v3.18: açık salt-okunur oturum artık yazarları bloklamaz, RO kilit de
 ifade kapsamlı; uzun yazma işlemi de okuyucuları bloklamaz (tam kilit commit
-penceresine indi, yalnız yazarlar sıralı). Kapılar: `lockchk` 33/33,
+penceresine indi, yalnız yazarlar sıralı). Kapılar: `lockchk` 34/34,
 `prochk` 15/15. Yol haritasında
 açık madde kalmadı.
 
@@ -402,7 +402,7 @@ v2/önceki v3 ile aynı; beklemek isteyen çağıran açıkça süre verir.
   **sıralıdır**: bir yazma işlemi açıkken diğer süreçler `ABusyMs` bekler,
   sonra net hata alır.
 
-Kapı: `lockchk` (14. kapı) **33/0** ve `prochk` (16. kapı) **15/0**. Gerçek
+Kapı: `lockchk` (14. kapı) **34/0** ve `prochk` (16. kapı) **15/0**. Gerçek
 **çocuk süreçler** kullanılır, yani kilit gerçek işletim sistemi kilididir: aynı
 anda iki okuyucu, iki yazarın **sırayla** commit etmesi, yazar varken
 salt-okunur oturumun **açılabilmesi**, açık **salt-okunur oturumun yazarı
@@ -866,7 +866,7 @@ tam kilit commit penceresinde), böylece okuyucular beklemez, ama iki yazar
 süreç aynı anda commit edemez. Paralel çok yazar kapsam dışıdır.
 
 Kapı: `sqltest` v3 **2874/0/33**, v2 **3305/0/0**; `v3sqlchk` **238/0**;
-`lockchk` **33/0**; `prochk` **15/0**; **16/16 kapı yeşil** (665 kontrol).
+`lockchk` **34/0**; `prochk` **15/0**; **16/16 kapı yeşil** (666 kontrol).
 CI (GitHub Actions) de aynı **16** kapıyı koşar — `snapchk`/`prochk`
 v3.17'de eklendi.
 
