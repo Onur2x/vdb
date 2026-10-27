@@ -1456,6 +1456,55 @@ Kapı durumu: **16/16 yeşil**, toplam **674 kontrol**.
 
 `sqltest` v3 **2874/0/33**, v2 **3305/0/0** (temel çizgiyle birebir).
 
+**7e. Paralel commit ölçümü (dilim 7 başlangıcı, 2026-10-27).**
+Amaç sayfa düzeyinde paralel commit'e geçmeden önce darboğazı ölçmek.
+Makine: AMD Ryzen 7 7730U, 16 mantıksal çekirdek, 32 bit derleme.
+Ölçüm aracı: `tmp64/pcbench` (P süreç × N autocommit; **açılış maliyeti
+ölçüm dışında** — her çocuk açılışı bitirince `ready.N` damgası bırakır,
+ebeveyn bütün damgaları görünce saati başlatır) ve `tmp64/pcbprof`
+(tek süreç, CommitBatch faz dağılımı).
+
+Tek süreç, commit başına (backend, günlük açık, `Commit(True)`):
+**0,84 ms** (1190 commit/s). Dağılım:
+`FEng.Commit(True)` **0,39 ms** (fsync payı ~0,32), değişim günlüğü
+`EndGroup`+fsync **0,35 ms**, kilit al/bırak ~0,02 ms, `ApplyBatch`
+~0,005 ms. Yani tek süreçte maliyetin **~%85'i iki fsync**.
+Günlük kapatılınca **0,523 ms**; günlük + senkron kapatılınca **0,142 ms**
+(7032 commit/s).
+
+Paralel (P=4, süreç başına 50 commit, açılış ölçüm dışında):
+
+| yapılandırma | duvar | toplam hız | hızlanma |
+|---|---|---|---|
+| günlük + fsync açık | 601–643 ms | 311–333 commit/s | 0,26–0,29x |
+| günlük kapalı | 567 ms | 353 commit/s | 0,18x |
+| günlük + fsync kapalı | 138,5 ms | 1444 commit/s | 0,21x |
+
+**Sonuç: paralel yazma hızlandırmıyor, 5 kata kadar YAVAŞLATIYOR** — ve
+sebep fsync değil (fsync tümden kapatıldığında da aynı). Tek süreç
+7032 commit/s iken dört süreç toplam 1444 commit/s. Kalan tek ortak nokta
+**süreçler arası rezervasyon kilidi (`.gen` üzerinde `LockFileEx` yoklaması)**:
+ölçülen tek kilit beklemesi `BeginBatch` 64,8 ms, `CommitBatch` 66,5 ms;
+çocukların bitiş sırası 58/73/95/118 ms (eşzamanlı iş yok).
+
+Denenip **ölçülen ve kazanç sağlamayan** üç yoklama değişikliği (hepsi geri
+alındı, ağaç temiz): dönme penceresi 2→20 ms, rastgele titreşimli geri
+çekilme, paylaşımlı kilit tavanı 50→5 ms. Üçünde de hızlanma 0,26–0,29x'te
+kaldı. Bu, kilit devrinin **yoklama** sorunu değil **protokol** sorunu
+olduğunu gösterir: commit boyunca tutulan tek rezervasyon kilidi, paralel
+yazmayı tanım gereği sıraya sokuyor.
+
+Karar (dilim 7'nin tasarımı): tek rezervasyon kilidi commit yolundan
+kaldırılacak; sıra şu üç adımda:
+1. WAL'e ekleme **kısa** bir mutex altında, fsync **grup** hâlinde
+   (bir fsync, birden çok commit) — tek süreçte ölçülen 0,32 ms'lik pay
+   yazarlar arasında bölüşülür,
+2. çakışma denetimi **sayfa LSN'i** düzeyinde (anahtar düzeyinden sayfaya),
+3. tazeleme **artımlı**: WAL'in tamamını yeniden oynatmak ve heap dizinini
+   baştan taramak yerine yalnız yeni çerçeveler.
+Her adım ayrı ölçülecek; yalnız ölçülen kazanç tutulacak, gerisi geri
+alınacak.
+
 ### Sürüm çizgisi kararı (2026-10-26): alpha hattı → **v1.0.0**
 
 Kullanıcı kararı, önceki "v4'e ertele" planını geçersiz kılar:
