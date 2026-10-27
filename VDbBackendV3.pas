@@ -212,6 +212,9 @@ type
       FLogBaseSeq: Int64;
       { v4 replikasyon: uygulama penceresinde yerel gunluge yazim kapali. }
       FLogSuspended: Boolean;
+      { v3.19: degisim gunlugu her commit'te fsync edilsin mi? (bkz. asagidaki
+        DurableChangeLog ozelligi ve VDbChangeLog.SyncGroups) }
+      FDurableChangeLog: Boolean;
       { v4: PITR replay'i sirasinda hedef motor (gecici dosya) ve son
         hata nedeni. Replay geri cagirimi bu alanlari kullanir. }
       FReplayEng: TVdbPageEngine;
@@ -611,6 +614,7 @@ begin
   FLog := nil;
   FLogInGroup := False;
   FLogSuspended := False;
+  FDurableChangeLog := False;
   FLogProblem := '';
   FLogBaseSeq := 0;
   { v3.2: salt-okunur okuyucu degisim gunlugune YAZMAZ ve taban imaji
@@ -686,6 +690,7 @@ var
   hasGroup: Boolean;
 begin
   FLog := TVdbChangeLog.Create;
+  FLog.SyncGroups := FDurableChangeLog;
   try
     FLog.Open(FPath, True);
   except

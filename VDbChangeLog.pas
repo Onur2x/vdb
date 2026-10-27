@@ -143,6 +143,7 @@ type
     FGuid: QWord;
     FInGroup: Boolean;
     FEnabled: Boolean;
+    FSyncGroups: Boolean;
     FError: string;
     FLocal: TVdbLogChange;      // Add* icin gecici
     function SegPath(No: LongWord): string;
@@ -168,6 +169,17 @@ type
     property Generation: LongWord read FGen;
     property Guid: QWord read FGuid;
     property LastError: string read FError;
+    { v3.19 — GRUP SONU fsync. VARSAYILAN False (hizli).
+      True:  her grup END kaydindan sonra fsync — gunlugun diske yazildigi
+             AN GARANTI. Bedeli: commit basina ~0,3 ms (olculdu).
+      False: grup yalniz isletim sistemine yazilir; fsync SEGMENT
+             ROTASYONUNDA (16 MB), Close'da ve acik Flush'ta yapilir.
+             Boylece SUREC cokmesinde kayip YOKTUR (OS tamponu yasar);
+             yalniz elektrik kesintisi/makine cokmesinde son segmentin
+             (en fazla 16 MB) kuyrugu kaybolabilir. VERITABANI VERISI
+             bundan ETKILENMEZ: WAL her commit'te fsync edilir; kayip
+             yalniz PITR/gunluk kuyrugudur. }
+    property SyncGroups: Boolean read FSyncGroups write FSyncGroups;
     property SegMax: Int64 read FSegMax write FSegMax;
 
     procedure BeginGroup;
@@ -175,7 +187,8 @@ type
       const AOld, ANew: TBytes);
     procedure AddDel(ATableId: Integer; AKey: QWord; const AOld: TBytes);
     procedure AbortGroup;
-    { Grubu diske yazar + fsync eder. Basarida ASeq/ATsMs dolar.
+    { Grubu diske yazar (SyncGroups=True ise fsync de eder). Basarida
+      ASeq/ATsMs dolar.
       Gunluk kapaliysa True doner ve hicbir sey yapmaz. AEngineLsn: commit
       sonrasi motor LSN'i (END kaydinda saklanir; acilista bosluk denetimi). }
     function EndGroup(AEngineLsn: LongWord; out ASeq, ATsMs: Int64): Boolean;
@@ -419,6 +432,7 @@ begin
   FSegNo := 0;
   FGroupBytes := 0;
   FSegMax := VDBLOG_SEG_MAX;
+  FSyncGroups := False;
 end;
 
 destructor TVdbChangeLog.Destroy;
@@ -877,7 +891,8 @@ begin
       OpenNewSeg(FSegNo + 1);
     posBefore := FSeg.Size;
     FSeg.WriteBuffer(all[0], total);
-    VDbFlushStream(FSeg);
+    if FSyncGroups then
+      VDbFlushStream(FSeg);
     if FSeg.Size >= FSegMax then
       OpenNewSeg(FSegNo + 1);
   except
