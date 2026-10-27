@@ -330,8 +330,15 @@ begin
   begin
     FWal.Recover(ApplyRecovered, st, FRecoverLimit);
     FWalStats := st;
-    FStore.Flush(True);
-    FWal.Truncate(FStore.LSN);
+    { v3.18 DUZELTME — VERI KAYBI (olculdu: prochk 1/100, B'nin 40 satiri).
+      ONCEDEN burada `FStore.Flush(True); FWal.Truncate(FStore.LSN);` vardi.
+      Flush YALNIZ onbellekteki (resident) kirli sayfalari yazar; havuzdan
+      tahliye edilip FPending'e dusmus cerceve imajlari DISKE YAZILMAZ.
+      Ardindan Truncate WAL'i kesiyordu -> uygulanmis ama yazilmamis sayfalar
+      hem bellekten hem diskten dusuyordu (sessiz veri kaybi).
+      Checkpoint bu isi DOGRU sirayla yapar: once pending -> InstallPage,
+      sonra Flush, sonra Truncate. Ayni govdeyi burada da kullaniyoruz. }
+    Checkpoint(True);
   end;
   { v3.17 DUZELTME — VERI KAYBI: yalnizca sayfa onbellegini tazelemek
     YETMEZ. Heap'in bellek ici dizini (Anahtar -> sayfa/slot) hala ESKI;
@@ -456,17 +463,48 @@ begin
 end;
 
 procedure TVdbPageEngine.Close;
+var
+  closeOk: Boolean;
 begin
   if FHeap = nil then Exit;
   if FInTxn then
     Commit(True);
   { Kapanista tam checkpoint: veri dosyasi guncel, WAL bos.
-    v3.2: salt-okunur oturum checkpoint YAPMAZ (yazma yok). }
+    v3.2: salt-okunur oturum checkpoint YAPMAZ (yazma yok).
+
+    v3.18 DUZELTME — VERI KAYBI (olculdu: prochk kosu 20, 40 satir kayboldu).
+    ONCEDEN burada kilitsiz ve TAZELEMESIZ checkpoint yapiliyordu. Iki yazar
+    surec varsa: A commit edip kapanirken once B commit etmisse, A'nin
+    BELLEGI hala bayat (B'nin cerceveleri yalniz WAL'de). A bayat sayfalari
+    .odb'ye yazip WAL'i KENDI bayat LSN'inde kesiyordu -> B'nin onaylanmis
+    commit'i yok oluyordu. Artik checkpoint TAM kilit altinda ve TAZE
+    onbellekle yapilir: AcquireDataWrite once RefreshIfStaleForce calistirir
+    (varsa WAL cerceveleri uygulanir, heap dizini yeniden kurulur), sonra
+    yazim + budama guvenli olur.
+    Kilit ALINAMAZSA checkpoint ATLANIR: veri WAL'de durur, acilista kurtarilir.
+    Veri kaybina tercih edilen bilincli secim (bkz. Oncelik 1). }
   if not ReadOnly then
   begin
-    Checkpoint(True);
-    { Checkpoint sonrasi dizin taze: acilis taramasi atlanabilir. }
-    SaveIdx;
+    closeOk := False;
+    try
+      FStore.AcquireDataWrite;
+      try
+        Checkpoint(True);
+        closeOk := True;
+      finally
+        FStore.ReleaseDataWrite;
+      end;
+    except
+      { Kapanis zinciri kirilmaz. Kilit alinamadiysa checkpoint ATLANIR:
+        onaylanmis veri WAL'de kalir ve bir sonraki acilista kurtarilir.
+        Veri kaybina tercih edilen bilincli secim (Oncelik 1). }
+      closeOk := False;
+    end;
+    { Checkpoint sonrasi dizin taze: acilis taramasi atlanabilir. Yalniz
+      checkpoint GERCEKTEN yapildiysa yaz (bayat dizin yazmak, bir sonraki
+      acilista eksik satir demektir). }
+    if closeOk then
+      SaveIdx;
   end;
   FStore.OnSpill := nil;
   FStore.OnMiss := nil;

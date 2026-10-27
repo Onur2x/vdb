@@ -58,19 +58,25 @@ var
   be: TVdbBackendV3;
   i: Integer;
   anahtar: QWord;
+  faz: string;
 begin
   Result := 0;
+  faz := 'acilis';
   try
     be := TVdbBackendV3.CreateWithPassword(DbYolu(Dizin), Parola, False, 256, 20000);
     try
+      faz := 'beginbatch';
       be.BeginBatch;
+      faz := 'sleep';
       Sleep(400);
+      faz := 'yazim';
       for i := 1 to Adet do
       begin
         if Onek = 'A' then anahtar := 3000 + QWord(i)
         else anahtar := 4000 + QWord(i);
         be.Put(anahtar, B(Onek + '-' + IntToStr(i)));
       end;
+      faz := 'commit';
       be.CommitBatch;
       WriteLn('cocuk-sifreli ', Onek, ': ', Adet, ' satir yazildi, toplam=', be.Count);
     finally
@@ -79,7 +85,7 @@ begin
   except
     on E: Exception do
     begin
-      WriteLn('cocuk-sifreli ', Onek, ' HATA: ', E.ClassName, ': ', E.Message);
+      WriteLn('cocuk-sifreli ', Onek, ' HATA [', faz, ']: ', E.ClassName, ': ', E.Message);
       Result := 4;
     end;
   end;
@@ -92,38 +98,189 @@ var
   i: Integer;
   anahtar: QWord;
   v: TBytes;
+  faz: string;
 begin
   Result := 0;
+  faz := 'acilis';
   try
     be := TVdbBackendV3.Create(DbYolu(Dizin), False, 256, 20000);
   except
     on E: Exception do
     begin
-      WriteLn('cocuk ', Onek, ' ACILAMADI: ', E.ClassName, ': ', E.Message);
+      WriteLn('cocuk ', Onek, ' ACILAMADI [', faz, ']: ', E.ClassName, ': ', E.Message);
       raise;
       Exit(3);
     end;
   end;
   try
+    faz := 'beginbatch';
     be.BeginBatch;
     { Gercek yaris: iki surec ayni anda acik islemde olsun. }
+    faz := 'sleep';
     Sleep(400);
+    faz := 'yazim';
     for i := 1 to Adet do
     begin
       if Onek = 'A' then anahtar := 1000 + QWord(i)
       else anahtar := 2000 + QWord(i);
       be.Put(anahtar, B(Onek + '-' + IntToStr(i)));
     end;
+    faz := 'commit';
     be.CommitBatch;
     WriteLn('cocuk ', Onek, ': ', Adet, ' satir yazildi, toplam=', be.Count);
   except
     on E: Exception do
     begin
-      WriteLn('cocuk ', Onek, ' HATA: ', E.ClassName, ': ', E.Message);
+      WriteLn('cocuk ', Onek, ' HATA [', faz, ']: ', E.ClassName, ': ', E.Message);
       Result := 4;
     end;
   end;
   be.Free;
+end;
+
+{ v3.18 DUZELTME KAPISI — KAPANIS CHECKPOINT'I TAZELEME YAPMALI.
+  Olculen kusur: A sureci commit edip ACIK kalirken B commit ederse, A
+  kapanirken BELLEKTEPI BAYAT sayfalari diske yazip WAL'i kendi bayat
+  LSN'inde kesiyordu -> B'nin onaylanmis commit'i yok oluyordu
+  (prochk kosu 20: 40 satir kayboldu). Bu cocuk o durumu KOSULLU degil,
+  SIRAYA bagli olarak uretir: commit eder, hazir isareti birakir, bekler.
+  Ana surec bu arada yazar ve kapanir. Sonra cocuk kapanir. }
+function Tut(const Dizin, HazirDosya: string; Ms: Integer): Integer;
+var
+  be: TVdbBackendV3;
+  i: Integer;
+  f: TFileStream;
+  faz: string;
+begin
+  Result := 0;
+  faz := 'acilis';
+  try
+    be := TVdbBackendV3.Create(DbYolu(Dizin), False, 256, 20000);
+    try
+      faz := 'beginbatch';
+      be.BeginBatch;
+      faz := 'yazim';
+      for i := 1 to 5 do
+        be.Put(QWord(5000 + i), B('tut-' + IntToStr(i)));
+      faz := 'commit';
+      be.CommitBatch;
+      faz := 'isaret';
+      f := TFileStream.Create(HazirDosya, fmCreate);
+      f.Free;
+      faz := 'sleep';
+      Sleep(Ms);
+      faz := 'kapanis';
+    finally
+      be.Free;      // <-- kusur BURADA: bayat bellekle checkpoint
+    end;
+    WriteLn('tut: 5 satir yazildi, bekledi, kapandi');
+  except
+    on E: Exception do
+    begin
+      WriteLn('tut HATA [', faz, ']: ', E.ClassName, ': ', E.Message);
+      Result := 4;
+    end;
+  end;
+end;
+
+procedure TestKapanisTazeleme(const Ust: string);
+var
+  dir, hazir: string;
+  be: TVdbBackendV3;
+  p: TProcess;
+  i, n, eksik: Integer;
+  v: TBytes;
+  t0: QWord;
+  geldi: Boolean;
+  ana: TVdbBackendV3;
+begin
+  WriteLn;
+  WriteLn('--- kapanis checkpoint''i tazeleme yapar (v3.18 veri kaybi)');
+  dir := IncludeTrailingPathDelimiter(Ust) + 'kapanis';
+  ForceDirectories(dir);
+  hazir := IncludeTrailingPathDelimiter(dir) + 'hazir.txt';
+
+  DeleteFile(DbYolu(dir));
+  DeleteFile(DbYolu(dir) + '.gen');
+  DeleteFile(DbYolu(dir) + '.wal');
+  DeleteFile(DbYolu(dir) + '.idx');
+  DeleteFile(DbYolu(dir) + '.log');
+  DeleteFile(hazir);
+
+  { Tohum: 5 satir, temiz kapanis. }
+  be := TVdbBackendV3.Create(DbYolu(dir), True, 256, 20000);
+  try
+    for i := 1 to 5 do be.Put(QWord(i), B('tohum-' + IntToStr(i)));
+  finally
+    be.Free;
+  end;
+
+  { Tutan cocuk: commit eder, isaret birakir, ACIK bekler. }
+  p := TProcess.Create(nil);
+  try
+    p.Executable := ParamStr(0);
+    p.Parameters.Add('--tut');
+    p.Parameters.Add(dir);
+    p.Parameters.Add(hazir);
+    p.Parameters.Add('1500');
+    p.Options := [];
+    p.Execute;
+
+    t0 := GetTickCount64;
+    while (not FileExists(hazir)) and ((GetTickCount64 - t0) < 15000) do
+      Sleep(10);
+    geldi := FileExists(hazir);
+    Ok('tutan cocuk commit etti ve bekliyor', geldi,
+      IntToStr(GetTickCount64 - t0) + ' ms');
+
+    { Cocuk ACIK ve beklemedeyken ANA surec yazar. ANA SUREC ACIK KALIR:
+      kaybin olustugu pencere tam olarak budur. Ana surec commit eder ve
+      cerceveleri WAL'de durur; sonra BAYAT oturum (tutan cocuk) kapanip
+      WAL'i kendi bayat LSN'inde keserse ana surecin onaylanmis commit'i
+      yok olur. Ana surec once kapansaydi veri .odb'ye tasinmis olurdu ve
+      kusur GORUNMEZDI (bu tuzak olculerek bulundu). }
+    ana := nil;
+    if geldi then
+    begin
+      ana := TVdbBackendV3.Create(DbYolu(dir), False, 256, 20000);
+      ana.BeginBatch;
+      for i := 1 to 5 do
+        ana.Put(QWord(6000 + i), B('ana-' + IntToStr(i)));
+      ana.CommitBatch;
+      Ok('ana surec yazdi ve ACIK kaliyor', True, '5 satir, WAL''de');
+    end;
+
+    { Bayat oturum simdi kapanir. }
+    while p.Running do Sleep(10);
+    Ok('tutan cocuk cikis kodu 0', p.ExitStatus = 0, IntToStr(p.ExitStatus));
+
+    { Ana surec en son kapanir. }
+    if ana <> nil then
+    begin
+      ana.Free;
+      Ok('ana surec kapandi', True, 'checkpoint + WAL budama');
+    end;
+  finally
+    p.Free;
+  end;
+  if FileExists(hazir) then DeleteFile(hazir);
+
+  { TAZE acilis: 5 tohum + 5 tutan + 5 ana = 15. }
+  be := TVdbBackendV3.Create(DbYolu(dir), False, 256, 20000);
+  try
+    n := be.Count;
+    Ok('kapanis sonrasi toplam satir 15', n = 15, IntToStr(n));
+    eksik := 0;
+    for i := 1 to 5 do
+    begin
+      if not be.Get(QWord(5000 + i), v) then Inc(eksik);
+      if not be.Get(QWord(6000 + i), v) then Inc(eksik);
+    end;
+    Ok('tutan ve ana surecin satirlari korundu', eksik = 0,
+      'eksik=' + IntToStr(eksik));
+  finally
+    be.Free;
+  end;
 end;
 
 procedure TestSifreliCokSurecli(const Ust: string);
@@ -232,6 +389,11 @@ var
   kume: string;
 
 begin
+  if (ParamCount >= 1) and (ParamStr(1) = '--tut') then
+  begin
+    ExitCode := Tut(ParamStr(2), ParamStr(3), StrToIntDef(ParamStr(4), 1500));
+    Exit;
+  end;
   if (ParamCount >= 1) and (ParamStr(1) = '--cocuk') then
   begin
     ExitCode := Cocuk(ParamStr(2), ParamStr(3), StrToIntDef(ParamStr(4), COCUK_ADET));
@@ -329,6 +491,9 @@ begin
   finally
     be.Free;
   end;
+
+  { v3.18 DUZELTME KAPISI: kapanis checkpoint'i tazeleme yapar. }
+  TestKapanisTazeleme(ParamStr(1));
 
   { v3.18: sifreli dosyada cok surecli yazma. }
   TestSifreliCokSurecli(ParamStr(1));
