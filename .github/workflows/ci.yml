@@ -48,48 +48,48 @@ jobs:
         timeout-minutes: 12
         shell: pwsh
         run: |
-          & $env:LAZBUILD -B sqltest.lpi
+          & $env:LAZBUILD -B tests/sql/sqltest.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B pagechk.lpi
+          & $env:LAZBUILD -B tests/gates/pagechk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B storechk.lpi
+          & $env:LAZBUILD -B tests/gates/storechk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B heapchk.lpi
+          & $env:LAZBUILD -B tests/gates/heapchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B crashtest.lpi
+          & $env:LAZBUILD -B tests/gates/crashtest.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B idxchk.lpi
+          & $env:LAZBUILD -B tests/gates/idxchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B backendchk.lpi
+          & $env:LAZBUILD -B tests/gates/backendchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B v3sqlchk.lpi
+          & $env:LAZBUILD -B tests/gates/v3sqlchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B migchk.lpi
+          & $env:LAZBUILD -B tests/gates/migchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $env:LAZBUILD -B vdbmig.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B factorychk.lpi
+          & $env:LAZBUILD -B tests/gates/factorychk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B logchk.lpi
+          & $env:LAZBUILD -B tests/gates/logchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B pitrchk.lpi
+          & $env:LAZBUILD -B tests/gates/pitrchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B btreechk.lpi
+          & $env:LAZBUILD -B tests/gates/btreechk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B replchk.lpi
+          & $env:LAZBUILD -B tests/gates/replchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B lockchk.lpi
+          & $env:LAZBUILD -B tests/gates/lockchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B snapchk.lpi
+          & $env:LAZBUILD -B tests/gates/snapchk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B prochk.lpi
+          & $env:LAZBUILD -B tests/gates/prochk.lpi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Sayfa deposu kapisi (storechk)
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'vdbstorechk'
-          $out = & .\storechk.exe $dir 2>&1 | Out-String
+          $out = & .\tests\gates\storechk.exe $dir 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'SAYFA DEPOSU DOGRULANDI') {
             Write-Error 'storechk basarisiz'
@@ -103,7 +103,7 @@ jobs:
       - name: Sayfa cekirdegi kapisi (pagechk)
         shell: pwsh
         run: |
-          $out = & .\pagechk.exe 2>&1 | Out-String
+          $out = & .\tests\gates\pagechk.exe 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'SAYFA CEKIRDEGI DOGRULANDI') {
             Write-Error 'pagechk basarisiz'
@@ -118,7 +118,7 @@ jobs:
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'vdbheapchk'
-          $out = & .\heapchk.exe $dir 2>&1 | Out-String
+          $out = & .\tests\gates\heapchk.exe $dir 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'HEAP DOGRULANDI') {
             Write-Error 'heapchk basarisiz'
@@ -138,7 +138,7 @@ jobs:
           # ayrica SERT bir sure siniri var ki asilma 45 dk'lik is sinirini
           # yemesin.
           $log = Join-Path $env:RUNNER_TEMP 'crashtest.out'
-          $p = Start-Process -FilePath '.\crashtest.exe' -ArgumentList @($dir) `
+          $p = Start-Process -FilePath '.\tests\gates\crashtest.exe' -ArgumentList @($dir) `
             -NoNewWindow -PassThru -RedirectStandardOutput $log
           if (-not $p.WaitForExit(300000)) {
             try { $p.Kill() } catch {}
@@ -168,7 +168,7 @@ jobs:
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'vdbidxchk'
-          $out = & .\idxchk.exe $dir 50000 2>&1 | Out-String
+          $out = & .\tests\gates\idxchk.exe $dir 50000 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'KALICI DIZIN DOGRULANDI') {
             Write-Error 'idxchk basarisiz'
@@ -183,7 +183,7 @@ jobs:
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'vdbbackendchk'
-          $out = & .\backendchk.exe $dir 5000 2>&1 | Out-String
+          $out = & .\tests\gates\backendchk.exe $dir 5000 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'BACKEND DIKISI DOGRULANDI') {
             Write-Error 'backendchk basarisiz'
@@ -198,7 +198,7 @@ jobs:
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'vdbv3sqlchk'
-          $out = & .\v3sqlchk.exe $dir 1200 2>&1 | Out-String
+          $out = & .\tests\gates\v3sqlchk.exe $dir 1200 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'V3 SQL KATMANI DOGRULANDI') {
             Write-Error 'v3sqlchk basarisiz'
@@ -213,7 +213,7 @@ jobs:
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'vdbmigchk'
-          $out = & .\migchk.exe $dir 5000 2>&1 | Out-String
+          $out = & .\tests\gates\migchk.exe $dir 5000 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'V2 -> V3 GOCU DOGRULANDI') {
             Write-Error 'migchk basarisiz'
@@ -265,7 +265,7 @@ jobs:
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'vdbfactorychk'
-          $out = & .\factorychk.exe $dir 2>&1 | Out-String
+          $out = & .\tests\gates\factorychk.exe $dir 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'FACTORY DOGRULANDI') {
             Write-Error 'factorychk basarisiz'
@@ -283,7 +283,7 @@ jobs:
           # bicimi/kayit alanlari bu kapida denetlenir; bozulma ve yarim grup
           # davranisi dahil.
           $dir = Join-Path $env:RUNNER_TEMP 'vdblogchk'
-          $out = & .\logchk.exe $dir 2>&1 | Out-String
+          $out = & .\tests\gates\logchk.exe $dir 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'DEGISIM GUNLUGU DOGRULANDI') {
             Write-Error 'logchk basarisiz'
@@ -300,7 +300,7 @@ jobs:
           # v4: taban + ileri replay ile zamana/surume geri okuma; kurtarma
           # dosyasi GERCEK bir veritabani olarak acilip VERIFY edilir.
           $dir = Join-Path $env:RUNNER_TEMP 'vdbpitrchk'
-          $out = & .\pitrchk.exe $dir 2>&1 | Out-String
+          $out = & .\tests\gates\pitrchk.exe $dir 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'PITR DOGRULANDI') {
             Write-Error 'pitrchk basarisiz'
@@ -318,7 +318,7 @@ jobs:
           # dogrulama + skiplist ile PARITE. Kapı yalniz karsilastirmayi
           # degil, yapi degismezlerini de denetler (SubCount, ayirici
           # anahtar, yaprak zinciri sirasi).
-          $out = & .\btreechk.exe 50000 2>&1 | Out-String
+          $out = & .\tests\gates\btreechk.exe 50000 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'B\+TREE INDEKS DOGRULANDI') {
             Write-Error 'btreechk basarisiz'
@@ -337,7 +337,7 @@ jobs:
           # karsilastirma; bozuk/kesik/bosluklu tasima REDDEDILIR,
           # nesil kopmasi tasinmaz, tekrar uygulama idempotenttir.
           $dir = Join-Path $env:RUNNER_TEMP 'vdbreplchk'
-          $out = & .\replchk.exe $dir 2>&1 | Out-String
+          $out = & .\tests\gates\replchk.exe $dir 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'REPLIKASYON DOGRULANDI') {
             Write-Error 'replchk basarisiz'
@@ -351,12 +351,14 @@ jobs:
       - name: Cok okuyucu / tek yazici kapisi (lockchk)
         shell: pwsh
         run: |
-          # v3.2: iki salt-okunur oturum AYNI ANDA okur; yazar paylasimli
-          # kilidi bekler (busy timeout) ve acik "mesgul" hatasi alir;
-          # salt-okunur oturum yazamaz, <db>.log olusturmaz, cokme sonrasi
-          # WAL katmanindan okur ve diskte HICBIR bayt degistirmez.
+          # v3.18: kilit islem kapsamli. Iki salt-okunur oturum AYNI ANDA
+          # okur; acik RO oturum yazari BLOKLAMAZ ve yazar commit edince RO
+          # oturum tazelenir; uzun yazma islemi okuyuculari bloklamaz;
+          # paralel iki yazar (farkli anahtar) ikisi de commit eder, ayni
+          # anahtarda ikinci commit ACIK hata alir; salt-okunur oturum
+          # yazamaz, <db>.log olusturmaz, diskte HICBIR bayt degistirmez.
           $dir = Join-Path $env:RUNNER_TEMP 'vdblockchk'
-          $out = & .\lockchk.exe $dir 2>&1 | Out-String
+          $out = & .\tests\gates\lockchk.exe $dir 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'COK OKUYUCU / TEK YAZICI DOGRULANDI') {
             Write-Error 'lockchk basarisiz'
@@ -372,7 +374,7 @@ jobs:
         run: |
           # v3.15: islem ici okuma goruntusu sabit.
           $dir = Join-Path $env:RUNNER_TEMP 'vdbsnapchk'
-          $out = & .\snapchk.exe $dir 2>&1 | Out-String
+          $out = & .\tests\gates\snapchk.exe $dir 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'kalan=0') {
             # v3.17: is loglari anonim okunamadigi icin son satirlar ANOTASYON
@@ -391,7 +393,7 @@ jobs:
           # v3.16: iki GERCEK surec ayni dosyaya yazar;
           # commit edilen satirlarin hicbiri kaybolmaz.
           $dir = Join-Path $env:RUNNER_TEMP 'vdbprochk'
-          $out = & .\prochk.exe $dir 2>&1 | Out-String
+          $out = & .\tests\gates\prochk.exe $dir 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'kalan=0') {
             $tail = ($out -split "`r?`n" | Where-Object { $_.Trim() -ne '' } |
@@ -406,7 +408,7 @@ jobs:
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP 'vdbtest'
-          $out = & .\sqltest.exe $dir 2>&1 | Out-String
+          $out = & .\tests\sql\sqltest.exe $dir 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'TUM SQL TESTLERI GECTI') {
             Write-Error 'sqltest basarisiz'
@@ -424,7 +426,7 @@ jobs:
           # v2 motorunun veri dosyasi/WAL/arsiv/SAVEPOINT yollarini kullanan
           # testler ATLA olarak sayilir (sessiz yesil yok: sayi raporlanir).
           $dir = Join-Path $env:RUNNER_TEMP 'vdbtestv3'
-          $out = & .\sqltest.exe $dir --backend=v3 2>&1 | Out-String
+          $out = & .\tests\sql\sqltest.exe $dir --backend=v3 2>&1 | Out-String
           $out | Write-Host
           if ($out -notmatch 'Backend: v3') {
             Write-Error 'sqltest v3: backend secilemedi'

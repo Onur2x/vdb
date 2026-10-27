@@ -5,7 +5,7 @@
     <PathDelim Value="\"/>
     <General>
       <SessionStorage Value="InProjectDir"/>
-      <Title Value="sqltest"/>
+      <Title Value="v3sqlchk"/>
       <Scaled Value="True"/>
       <ResourceType Value="res"/>
       <UseXPManifest Value="True"/>
@@ -28,27 +28,47 @@
     </RequiredPackages>
     <Units>
       <Unit>
-        <Filename Value="sqltest.lpr"/>
+        <Filename Value="v3sqlchk.lpr"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbCore.pas"/>
+        <Filename Value="..\..\VDbBackendApi.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbCrc32.pas"/>
+        <Filename Value="..\..\VDbBackendV3.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbSync.pas"/>
+        <Filename Value="..\..\VDbPageEngine.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbTable.pas"/>
+        <Filename Value="..\..\VDbPageWal.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbSql.pas"/>
+        <Filename Value="..\..\VDbPageHeap.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\..\VDbPageStore.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\..\VDbPage.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\..\VDbIdxFile.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\..\VDbCrc32.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\..\VDbSync.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
     </Units>
@@ -57,19 +77,14 @@
     <Version Value="11"/>
     <PathDelim Value="\"/>
     <Target>
-      <Filename Value="sqltest"/>
+      <Filename Value="v3sqlchk"/>
     </Target>
     <SearchPaths>
       <IncludeFiles Value="$(ProjOutDir)"/>
-      <UnitOutputDirectory Value="lib\sqltest"/>
+      <UnitOutputDirectory Value="lib\v3sqlchk"/>
     </SearchPaths>
     <Other>
-      <CustomOptions Value="-Fu.\dcpcrypt -Fu.\dcpcrypt\Ciphers -Fu.\dcpcrypt\Hashes -Fu.\dcpcrypt\lib\i386-win32"/>
+      <CustomOptions Value="-Fu..\..\dcpcrypt -Fu..\..\dcpcrypt\Ciphers -Fu..\..\dcpcrypt\Hashes -Fu..\..\dcpcrypt\lib\i386-win32"/>
     </Other>
-    <Linking>
-      <Debugging>
-        <DebugInfoType Value="dsDwarf3"/>
-      </Debugging>
-    </Linking>
   </CompilerOptions>
 </CONFIG>

@@ -5,7 +5,7 @@
     <PathDelim Value="\"/>
     <General>
       <SessionStorage Value="InProjectDir"/>
-      <Title Value="prochk"/>
+      <Title Value="heapchk"/>
       <Scaled Value="True"/>
       <ResourceType Value="res"/>
       <UseXPManifest Value="True"/>
@@ -28,23 +28,42 @@
     </RequiredPackages>
     <Units>
       <Unit>
-        <Filename Value="prochk.lpr"/>
+        <Filename Value="heapchk.lpr"/>
         <IsPartOfProject Value="True"/>
       </Unit>
-    </Units>
-  </ProjectOptions>
+      <Unit>
+        <Filename Value="..\..\VDbPageHeap.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\..\VDbPageStore.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\..\VDbPage.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\..\VDbCrc32.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\..\VDbSync.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+    </Units>  </ProjectOptions>
   <CompilerOptions>
     <Version Value="11"/>
     <PathDelim Value="\"/>
     <Target>
-      <Filename Value="prochk"/>
+      <Filename Value="heapchk"/>
     </Target>
     <SearchPaths>
       <IncludeFiles Value="$(ProjOutDir)"/>
-      <UnitOutputDirectory Value="lib\prochk"/>
+      <UnitOutputDirectory Value="lib\heapchk"/>
     </SearchPaths>
     <Other>
-      <CustomOptions Value="-Fu.\dcpcrypt -Fu.\dcpcrypt\Ciphers -Fu.\dcpcrypt\Hashes -Fu.\dcpcrypt\lib\i386-win32"/>
+      <CustomOptions Value="-Fu..\..\dcpcrypt -Fu..\..\dcpcrypt\Ciphers -Fu..\..\dcpcrypt\Hashes -Fu..\..\dcpcrypt\lib\i386-win32"/>
     </Other>
   </CompilerOptions>
 </CONFIG>

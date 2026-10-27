@@ -5,7 +5,7 @@
     <PathDelim Value="\"/>
     <General>
       <SessionStorage Value="InProjectDir"/>
-      <Title Value="v3sqlchk"/>
+      <Title Value="idxchk"/>
       <Scaled Value="True"/>
       <ResourceType Value="res"/>
       <UseXPManifest Value="True"/>
@@ -28,63 +28,54 @@
     </RequiredPackages>
     <Units>
       <Unit>
-        <Filename Value="v3sqlchk.lpr"/>
+        <Filename Value="idxchk.lpr"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbBackendApi.pas"/>
+        <Filename Value="..\..\VDbPageEngine.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbBackendV3.pas"/>
+        <Filename Value="..\..\VDbPageWal.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbPageEngine.pas"/>
+        <Filename Value="..\..\VDbPageHeap.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbPageWal.pas"/>
+        <Filename Value="..\..\VDbPageStore.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbPageHeap.pas"/>
+        <Filename Value="..\..\VDbPage.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbPageStore.pas"/>
+        <Filename Value="..\..\VDbIdxFile.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbPage.pas"/>
+        <Filename Value="..\..\VDbCrc32.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbIdxFile.pas"/>
+        <Filename Value="..\..\VDbSync.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
-      <Unit>
-        <Filename Value="VDbCrc32.pas"/>
-        <IsPartOfProject Value="True"/>
-      </Unit>
-      <Unit>
-        <Filename Value="VDbSync.pas"/>
-        <IsPartOfProject Value="True"/>
-      </Unit>
-    </Units>
-  </ProjectOptions>
+    </Units>  </ProjectOptions>
   <CompilerOptions>
     <Version Value="11"/>
     <PathDelim Value="\"/>
     <Target>
-      <Filename Value="v3sqlchk"/>
+      <Filename Value="idxchk"/>
     </Target>
     <SearchPaths>
       <IncludeFiles Value="$(ProjOutDir)"/>
-      <UnitOutputDirectory Value="lib\v3sqlchk"/>
+      <UnitOutputDirectory Value="lib\idxchk"/>
     </SearchPaths>
     <Other>
-      <CustomOptions Value="-Fu.\dcpcrypt -Fu.\dcpcrypt\Ciphers -Fu.\dcpcrypt\Hashes -Fu.\dcpcrypt\lib\i386-win32"/>
+      <CustomOptions Value="-Fu..\..\dcpcrypt -Fu..\..\dcpcrypt\Ciphers -Fu..\..\dcpcrypt\Hashes -Fu..\..\dcpcrypt\lib\i386-win32"/>
     </Other>
   </CompilerOptions>
 </CONFIG>

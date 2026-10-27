@@ -5,7 +5,7 @@
     <PathDelim Value="\"/>
     <General>
       <SessionStorage Value="InProjectDir"/>
-      <Title Value="idxchk"/>
+      <Title Value="storechk"/>
       <Scaled Value="True"/>
       <ResourceType Value="res"/>
       <UseXPManifest Value="True"/>
@@ -28,54 +28,39 @@
     </RequiredPackages>
     <Units>
       <Unit>
-        <Filename Value="idxchk.lpr"/>
+        <Filename Value="storechk.lpr"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbPageEngine.pas"/>
+        <Filename Value="..\..\VDbPageStore.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbPageWal.pas"/>
+        <Filename Value="..\..\VDbPage.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbPageHeap.pas"/>
+        <Filename Value="..\..\VDbCrc32.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbPageStore.pas"/>
+        <Filename Value="..\..\VDbSync.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
-      <Unit>
-        <Filename Value="VDbPage.pas"/>
-        <IsPartOfProject Value="True"/>
-      </Unit>
-      <Unit>
-        <Filename Value="VDbIdxFile.pas"/>
-        <IsPartOfProject Value="True"/>
-      </Unit>
-      <Unit>
-        <Filename Value="VDbCrc32.pas"/>
-        <IsPartOfProject Value="True"/>
-      </Unit>
-      <Unit>
-        <Filename Value="VDbSync.pas"/>
-        <IsPartOfProject Value="True"/>
-      </Unit>
-    </Units>  </ProjectOptions>
+    </Units>
+  </ProjectOptions>
   <CompilerOptions>
     <Version Value="11"/>
     <PathDelim Value="\"/>
     <Target>
-      <Filename Value="idxchk"/>
+      <Filename Value="storechk"/>
     </Target>
     <SearchPaths>
       <IncludeFiles Value="$(ProjOutDir)"/>
-      <UnitOutputDirectory Value="lib\idxchk"/>
+      <UnitOutputDirectory Value="lib\storechk"/>
     </SearchPaths>
     <Other>
-      <CustomOptions Value="-Fu.\dcpcrypt -Fu.\dcpcrypt\Ciphers -Fu.\dcpcrypt\Hashes -Fu.\dcpcrypt\lib\i386-win32"/>
+      <CustomOptions Value="-Fu..\..\dcpcrypt -Fu..\..\dcpcrypt\Ciphers -Fu..\..\dcpcrypt\Hashes -Fu..\..\dcpcrypt\lib\i386-win32"/>
     </Other>
   </CompilerOptions>
 </CONFIG>

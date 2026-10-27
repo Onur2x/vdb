@@ -32,51 +32,51 @@
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbBackendApi.pas"/>
+        <Filename Value="..\..\VDbBackendApi.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbBackendV2.pas"/>
+        <Filename Value="..\..\VDbBackendV2.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbBackendV3.pas"/>
+        <Filename Value="..\..\VDbBackendV3.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbCore.pas"/>
+        <Filename Value="..\..\VDbCore.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbPageEngine.pas"/>
+        <Filename Value="..\..\VDbPageEngine.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbPageWal.pas"/>
+        <Filename Value="..\..\VDbPageWal.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbPageHeap.pas"/>
+        <Filename Value="..\..\VDbPageHeap.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbPageStore.pas"/>
+        <Filename Value="..\..\VDbPageStore.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbPage.pas"/>
+        <Filename Value="..\..\VDbPage.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbIdxFile.pas"/>
+        <Filename Value="..\..\VDbIdxFile.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbCrc32.pas"/>
+        <Filename Value="..\..\VDbCrc32.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbSync.pas"/>
+        <Filename Value="..\..\VDbSync.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
     </Units>
@@ -92,7 +92,7 @@
       <UnitOutputDirectory Value="lib\backendchk"/>
     </SearchPaths>
     <Other>
-      <CustomOptions Value="-Fu.\dcpcrypt -Fu.\dcpcrypt\Ciphers -Fu.\dcpcrypt\Hashes -Fu.\dcpcrypt\lib\i386-win32"/>
+      <CustomOptions Value="-Fu..\..\dcpcrypt -Fu..\..\dcpcrypt\Ciphers -Fu..\..\dcpcrypt\Hashes -Fu..\..\dcpcrypt\lib\i386-win32"/>
     </Other>
   </CompilerOptions>
 </CONFIG>

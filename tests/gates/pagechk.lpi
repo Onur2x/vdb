@@ -32,11 +32,11 @@
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbPage.pas"/>
+        <Filename Value="..\..\VDbPage.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbCrc32.pas"/>
+        <Filename Value="..\..\VDbCrc32.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
     </Units>

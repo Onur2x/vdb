@@ -4,8 +4,8 @@
     <Version Value="12"/>
     <PathDelim Value="\"/>
     <General>
-      <SessionStorage Value="InProjectDir"/>
-      <Title Value="storechk"/>
+      <SessionStorage Value="InProjDir"/>
+      <Title Value="crashtest"/>
       <Scaled Value="True"/>
       <ResourceType Value="res"/>
       <UseXPManifest Value="True"/>
@@ -28,23 +28,35 @@
     </RequiredPackages>
     <Units>
       <Unit>
-        <Filename Value="storechk.lpr"/>
+        <Filename Value="crashtest.lpr"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbPageStore.pas"/>
+        <Filename Value="..\..\VDbPageEngine.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbPage.pas"/>
+        <Filename Value="..\..\VDbPageWal.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbCrc32.pas"/>
+        <Filename Value="..\..\VDbPageHeap.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
-        <Filename Value="VDbSync.pas"/>
+        <Filename Value="..\..\VDbPageStore.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\..\VDbPage.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\..\VDbCrc32.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="..\..\VDbSync.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
     </Units>
@@ -53,14 +65,14 @@
     <Version Value="11"/>
     <PathDelim Value="\"/>
     <Target>
-      <Filename Value="storechk"/>
+      <Filename Value="crashtest"/>
     </Target>
     <SearchPaths>
       <IncludeFiles Value="$(ProjOutDir)"/>
-      <UnitOutputDirectory Value="lib\storechk"/>
+      <UnitOutputDirectory Value="lib\crashtest"/>
     </SearchPaths>
     <Other>
-      <CustomOptions Value="-Fu.\dcpcrypt -Fu.\dcpcrypt\Ciphers -Fu.\dcpcrypt\Hashes -Fu.\dcpcrypt\lib\i386-win32"/>
+      <CustomOptions Value="-Fu..\..\dcpcrypt -Fu..\..\dcpcrypt\Ciphers -Fu..\..\dcpcrypt\Hashes -Fu..\..\dcpcrypt\lib\i386-win32"/>
     </Other>
   </CompilerOptions>
 </CONFIG>
