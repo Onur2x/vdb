@@ -607,7 +607,7 @@ kapatıldı. Hepsi **ayrıştırıcı + yürütücü** katmanında; dosya biçim
 | Yazım | Önce | Şimdi |
 |---|---|---|
 | `BEGIN TRANSACTION` / `BEGIN WORK` | `anlasilamayan ek: TRANSACTION` | kabul; davranış değişmez |
-| `BEGIN IMMEDIATE/DEFERRED/EXCLUSIVE` | sözdizimi hatası | kabul (kilit düzeyi yok sayılır; motor tek yazıcı) |
+| `BEGIN IMMEDIATE/DEFERRED/EXCLUSIVE` | sözdizimi hatası | kabul (kilit düzeyi yok sayılır; `BEGIN` normal işlem açar) |
 | `CREATE INDEX IF NOT EXISTS ix ...` | `"ON" bekleniyor` | aynı adlı indeks varsa **sessiz** başarı, tanım korunur |
 | `INSERT OR IGNORE` | `"INTO" bekleniyor` | çakışan satır atlanır (= `ON CONFLICT DO NOTHING`) |
 | `INSERT OR REPLACE` | `"INTO" bekleniyor` | PK dışı tüm kolonlar yeni satırdan yazılır; verilmeyen kolon DEFAULT/NULL |
