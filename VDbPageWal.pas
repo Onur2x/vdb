@@ -87,6 +87,17 @@ type
       FKeyCheck: TBytes;
       { v3.2: salt-okunur WAL (okuyucu oturum). }
       FReadOnlyMode: Boolean;
+    { v3.19 GRUP COMMIT: WAL'e FIILEN yazilmis en son LSN. FLSN'den farki:
+      FLSN Commit icinde kayitlar yazilmadan ONCE set edilir; fsync'in
+      kapsadigi araligi bilmek icin yazimdan SONRA isaretlenen bir deger
+      gerekir. Commit/Truncate/Recover/CommitCount tarafindan guncellenir. }
+    FWrittenLsn: LongWord;
+    { v3.19 GRUP COMMIT: fsync icin AYRI handle. Neden: TFileStream'in
+      konumu paylasilan durumdur; lider fsync yaparken baska bir thread
+      ayni stream'e yazarsa konum/ tampon bozulur. FlushFileBuffers
+      konum kullanmaz ve DOSYA duzeyinde calisir, yani ikinci handle ile
+      yapilan fsync birinci handle'in yazdiklarini da diske indirir. }
+    FSyncStream: TFileStream;
     procedure WriteHeader;
     procedure ReadHeader;
     function WriteRecord(Magic, PageNo, PayloadLen: LongWord;
@@ -119,6 +130,12 @@ type
     { Bekleyen cerceveleri diske yazar, commit kaydini ekler. DoSync=True
       ise fsync eder (P-DUR: commit fsync eder). }
     function Commit(DoSync: Boolean; LSN: LongWord): Boolean;
+    { v3.19 GRUP COMMIT: tamponu diske yazip fsync eder; Commit(True) ile
+      ayni isi yapar ama cagiran zaten Commit(False) yaptiysa yeniden
+      yazmaz. Yalniz FSyncBusy lideri cagirir. }
+    procedure SyncDurable;
+    { FIILEN yazilmis son LSN (0 = WAL'de yazilmis kayit yok). }
+    property WrittenLsn: LongWord read FWrittenLsn;
 
     { Commit edilmemis cerceveleri atar. }
     procedure Rollback;
@@ -343,6 +360,9 @@ begin
     FWalEncrypted := FEncryptedMode;
     FHasContent := False;
   end;
+  { v3.19: fsync icin ikinci handle (yalniz yazilabilir modda). }
+  if (not AReadOnly) and (FStream <> nil) and (FSyncStream = nil) then
+    FSyncStream := TFileStream.Create(FPath, fmOpenReadWrite or fmShareDenyNone);
 end;
 
 procedure TVdbPageWal.Close;
@@ -350,6 +370,7 @@ begin
   if FStream = nil then Exit;
   if FBufferCount > 0 then
     Rollback;
+  FreeAndNil(FSyncStream);
   FreeAndNil(FStream);
 end;
 
@@ -424,6 +445,21 @@ begin
   Result := crc;
 end;
 
+procedure TVdbPageWal.SyncDurable;
+var
+  S: TFileStream;
+begin
+  { v3.19 GRUP COMMIT: kayitlar zaten yazildi (Commit(False)); burada yalniz
+    isletim sisteminin tamponlari diske indirilir. Tek lider cagirir.
+    AYRI handle kullanilir: fsync baska bir thread'in yazmasiyla ayni anda
+    calisabilir; TFileStream'in konumu ortak oldugu icin FStream uzerinde
+    fsync yapmak yaris durumu uretirdi. }
+  if FReadOnlyMode then Exit;
+  S := FSyncStream;
+  if S = nil then Exit;
+  VDbFlushStream(S);
+end;
+
 function TVdbPageWal.Commit(DoSync: Boolean; LSN: LongWord): Boolean;
 var
   i: Integer;
@@ -456,6 +492,7 @@ begin
     VDbFlushStream(FStream);
   FBufferCount := 0;
   FHasContent := True;
+  FWrittenLsn := LSN;
   Result := True;
 end;
 
@@ -603,6 +640,9 @@ begin
     if (applied[i].PageNo = VDB_WAL_META_PAGE) and Assigned(Apply) then
       Apply(applied[i].PageNo, @applied[i].Data);
   Stats.Frames := appliedCount;
+  { v3.19: kurtarma sonrasi WAL'de yazilmis sayilan en son LSN, kurtarilan
+    son commit'in LSN'idir. }
+  FWrittenLsn := FLSN;
   Result := True;
 end;
 
@@ -610,17 +650,20 @@ function TVdbPageWal.CommitCount: Integer;
 var
   st: TVdbWalStats;
   oldLSN: LongWord;
+  oldWritten: LongWord;
 begin
   if (FStream = nil) or (not FHasContent) then
     Exit(0);
   { Apply = nil: yalnizca dogrulanmis commit'ler sayilir. Recover FLSN'i
     son commit'e ceker; canli WAL'de bu yan etki istenmez. }
   oldLSN := FLSN;
+  oldWritten := FWrittenLsn;
   try
     Recover(nil, st);
     Result := st.Commits;
   finally
     FLSN := oldLSN;
+    FWrittenLsn := oldWritten;
   end;
 end;
 
@@ -630,6 +673,10 @@ begin
   if FStream = nil then
     raise EVdbWal.Create('WAL acik degil');
   FLSN := CheckpointLSN;
+  { v3.19: checkpoint sonrasi WAL bos; yazilmis LSN de checkpoint LSN'idir.
+    Sifira cekmek YANLIS olur: LSN monoton artar, bekleyen AwaitDurable
+    cagrilari eski LSN ile karsilastirir. }
+  FWrittenLsn := CheckpointLSN;
   FBufferCount := 0;
   FStream.Size := VDB_PAGE_SIZE;
   WriteHeader;

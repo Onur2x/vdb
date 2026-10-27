@@ -2233,10 +2233,12 @@ var
   s: TWriteSet;
   i: Integer;
   fpair: TPair<Cardinal, TWriteSet>;
+  syncLsn: LongWord;
 begin
   RequireWritable;
   s := OwnSet;
   if s = nil then Exit;
+  syncLsn := 0;
   { v3.18 dilim 6: iyimser modda rezervasyon COMMIT aninda alinir (busy
     timeout boyunca bekler) ve ertelenen tazeleme kapatilir. Kilit sirasi
     BeginBatch ile ayni (once rezervasyon, sonra FEngCs) -- kilitlenme yok.
@@ -2324,9 +2326,15 @@ begin
     end;
     if FDirty then
     begin
-      FEng.Commit(True);
+      { v3.19 GRUP COMMIT: WAL'e yaz ama fsync ETME. fsync kritik bolumun
+        DISINDA, asagida ve GRUP halinde yapilir; boylece ayni anda commit
+        eden thread'ler TEK fsync'i paylasir (olculen: fsync commit'in
+        ~%60'i; P=4'te 1,05x'ten fazlasi hedeflenir). }
+      FEng.CommitNoSync(syncLsn);
       FDirty := False;
       LogFinish;
+      { MaybeCheckpoint kendi icinde WAL bariyerini (AwaitDurable) yapar;
+        WAL budanirsa syncLsn zaten durabil hale gelir. }
       MaybeCheckpoint;
       MaybeAutoCompact;     // v3.2 (H25)
     end;
@@ -2334,6 +2342,9 @@ begin
     FEng.Store.ReleaseDataWrite;
     FEngCs.Leave;
   end;
+  { v3.19: durabilite beklemesi kilitlerin DISINDA. }
+  if syncLsn <> 0 then
+    FEng.AwaitDurable(syncLsn);
   s.Free;
   finally
     FEng.Store.ReleaseWriteHold;

@@ -13,6 +13,9 @@ program backendchk;
     6) v3 checkpoint esigi: cok kucuk esikte WAL budanir, veri korunur.
     7) v3 kucuk havuzda N satir toplu yazim (tahliye + WAL yolu).
     8) v2 ve v3 ayni arayuzle ayni sonucu verir (davranis esitligi).
+    9) v3 GRUP COMMIT: cok is parcacigiyla paralel commit'te fsync sayisi
+       commit sayisindan COK kucuk olmali (tek fsync cok commit'i kapsar)
+       ve her commit donuste durabil olmali (veri kaybi yok).
 
   Cikis kodu: 0 = hepsi gecti, 1 = hata.
   Kullanim: backendchk <calisma_dizini> [satir_sayisi]
@@ -1551,6 +1554,245 @@ begin
     Fail('enc12) sifreli dosya sifresiz acildi');
 end;
 
+{ v3.19 GRUP COMMIT kapisi. Neden is parcacigi: uygulama tek surec icinde
+  cok oturumla yazar; grup commit tam olarak bu durumda ise yarar (ayni
+  WAL, tek fsync). Iki iddia:
+    1) fsync sayisi commit sayisindan COK kucuk -> tek fsync cok commit'i
+       kapsiyor (grup commit gercekten calisiyor, sessizce tek tek degil);
+    2) butun commit'ler durabil: CommitBatch dondugunde veri WAL'de ve
+       yeniden acilista eksiksiz okunuyor. }
+
+type
+  TGcWorker = class(TThread)
+  private
+    FBe: TVdbBackendV3;
+    FSlot: Integer;
+    FCount: Integer;
+    FErr: string;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(ABe: TVdbBackendV3; ASlot, ACount: Integer);
+    property Err: string read FErr;
+  end;
+
+threadvar
+  gGcSid: Cardinal;
+
+function GcSid: Cardinal;
+begin
+  Result := gGcSid;
+end;
+
+function GcVal(ASlot, AIndex: Integer): TBytes;
+begin
+  SetLength(Result, 24);
+  FillChar(Result[0], 24, Byte((ASlot * 31 + AIndex * 7) and $FF));
+end;
+
+constructor TGcWorker.Create(ABe: TVdbBackendV3; ASlot, ACount: Integer);
+begin
+  inherited Create(True);
+  FBe := ABe;
+  FSlot := ASlot;
+  FCount := ACount;
+  FErr := '';
+  FreeOnTerminate := False;
+end;
+
+procedure TGcWorker.Execute;
+var
+  i: Integer;
+begin
+  { Her is parcacigi AYRI oturum kimligi kullanmali: 0 paylasilirsa ayni
+    yazma kumesini bozarlar (olculdu: erisim ihlali). }
+  gGcSid := Cardinal(7000 + FSlot);
+  try
+    for i := 0 to FCount - 1 do
+    begin
+      FBe.BeginBatch;
+      try
+        FBe.Put(QWord(FSlot) * 100000 + QWord(i), GcVal(FSlot, i));
+        FBe.CommitBatch;
+      except
+        on E: Exception do
+        begin
+          try
+            FBe.AbortBatch;
+          except
+          end;
+          FErr := E.Message;
+          Exit;
+        end;
+      end;
+    end;
+  except
+    on E: Exception do
+      FErr := E.Message;
+  end;
+end;
+
+procedure GcClearDir(const ADir: string);
+var
+  sr: TSearchRec;
+  base: string;
+begin
+  base := IncludeTrailingPathDelimiter(ADir);
+  if FindFirst(base + '*', faAnyFile, sr) = 0 then
+  begin
+    repeat
+      if (sr.Name <> '.') and (sr.Name <> '..') then
+        if (sr.Attr and faDirectory) = 0 then
+          DeleteFile(base + sr.Name);
+    until FindNext(sr) <> 0;
+    FindClose(sr);
+  end;
+end;
+
+{ v3.19 GRUP COMMIT - DETERMINISTIK cekirdek iddiasi: tek fsync birden cok
+  commit'i kapsar. Zamanlamaya bagli degildir: commit'ler sirayla yazilir,
+  sonra TEK AwaitDurable hepsini durabil hale getirir. Ikinci bekleme ayni
+  LSN icin YENI fsync yapmamalidir (bekleyen, lidere katilir). }
+procedure TestV3GroupCoalesce;
+const
+  NC = 5;
+var
+  dir, db: string;
+  be: TVdbBackendV3;
+  eng: TVdbPageEngine;
+  i: Integer;
+  v: TBytes;
+  lsn: LongWord;
+  s0, s1: Int64;
+begin
+  WriteLn;
+  WriteLn('--- v3 grup commit cekirdegi (tek fsync, cok commit) ---');
+  dir := DirOf('gcc');
+  if not DirectoryExists(dir) then ForceDirectories(dir)
+  else GcClearDir(dir);
+  db := IncludeTrailingPathDelimiter(dir) + 'gcc.odb';
+  be := TVdbBackendV3.Create(db, True, 128, 20000);
+  try
+    eng := be.Engine;
+    s0 := eng.DebugSyncCount;
+    lsn := 0;
+    for i := 0 to NC - 1 do
+    begin
+      v := GcVal(9, i);
+      eng.Insert(QWord(900000 + i), v);
+      eng.CommitNoSync(lsn);
+    end;
+    if lsn = 0 then
+      Fail('CommitNoSync LSN dondurmedi')
+    else
+      Ok(Format('CommitNoSync LSN=%d', [lsn]));
+    eng.AwaitDurable(lsn);
+    s1 := eng.DebugSyncCount;
+    if (s1 - s0) = 1 then
+      Ok(Format('tek fsync %d commit kapsadi', [NC]))
+    else
+      Fail(Format('grup commit YOK: %d fsync / %d commit', [s1 - s0, NC]));
+    { Ayni LSN icin ikinci bekleme yeni fsync yapmamali. }
+    eng.AwaitDurable(lsn);
+    if eng.DebugSyncCount = s1 then
+      Ok('ayni LSN icin ikinci bekleme yeni fsync yapmadi')
+    else
+      Fail(Format('gereksiz fsync: %d -> %d', [s1, eng.DebugSyncCount]));
+    { Durabilite: yazilan satirlar okunabiliyor mu? }
+    if eng.Heap.TryGet(QWord(900004), v) then
+      Ok('tek fsync sonrasi veri okunabiliyor')
+    else
+      Fail('tek fsync sonrasi veri KAYIP');
+  finally
+    be.Free;
+  end;
+  { Yeniden acilista da satirlar yerinde olmali (checkpoint + WAL). }
+  be := TVdbBackendV3.Create(db, False, 128, 20000);
+  try
+    if be.Get(QWord(900000), v) and be.Get(QWord(900004), v) then
+      Ok('yeniden acilista satirlar yerinde')
+    else
+      Fail('yeniden acilista satir KAYBI');
+  finally
+    be.Free;
+  end;
+end;
+
+procedure TestV3GroupCommit;
+const
+  NW = 4;
+  NC = 40;
+var
+  dir, db: string;
+  be: TVdbBackendV3;
+  w: array[0..NW - 1] of TGcWorker;
+  i, j, total: Integer;
+  v: TBytes;
+  allOk: Boolean;
+  syncs: Int64;
+  errs: string;
+begin
+  WriteLn;
+  WriteLn('--- v3 grup commit (paralel is parcacilari) ---');
+  dir := DirOf('gc');
+  if not DirectoryExists(dir) then ForceDirectories(dir)
+  else GcClearDir(dir);
+  db := IncludeTrailingPathDelimiter(dir) + 'gc.odb';
+  total := NW * NC;
+  be := TVdbBackendV3.Create(db, True, 512, 20000);
+  errs := '';
+  VdbSessionIdFunc := @GcSid;
+  try
+    for i := 0 to NW - 1 do
+      w[i] := TGcWorker.Create(be, i, NC);
+    for i := 0 to NW - 1 do
+      w[i].Start;
+    for i := 0 to NW - 1 do
+    begin
+      w[i].WaitFor;
+      if w[i].Err <> '' then
+        errs := errs + Format(' [%d] %s', [i, w[i].Err]);
+      w[i].Free;
+    end;
+    syncs := be.Engine.DebugSyncCount;
+    be.Flush;
+  finally
+    VdbSessionIdFunc := nil;
+    be.Free;
+  end;
+
+  if errs = '' then
+    Ok(Format('paralel commit hatasiz (%d commit)', [total]))
+  else
+    Fail('paralel commit hatasi:' + errs);
+  { UST SINIR iddiasi (zamanlamaya bagli DEGIL): her commit icin en fazla bir
+    fsync. Daha fazlasi cifte fsync demektir. Gruplamanin KENDISI asagidaki
+    deterministik denetimde kanitlanir. }
+  if syncs <= total then
+    Ok(Format('fsync sayisi ust sinir icinde: %d <= commit %d', [syncs, total]))
+  else
+    Fail(Format('cifte fsync: fsync %d > commit %d', [syncs, total]));
+
+  { Durabilite: yeniden ac ve butun anahtarlari dogrula. }
+  be := TVdbBackendV3.Create(db, False, 512, 20000);
+  try
+    allOk := True;
+    for i := 0 to NW - 1 do
+      for j := 0 to NC - 1 do
+        if not be.Get(QWord(i) * 100000 + QWord(j), v) then
+        begin
+          allOk := False;
+          Break;
+        end;
+  finally
+    be.Free;
+  end;
+  if allOk then
+    Ok('grup commit sonrasi butun satirlar okunabiliyor')
+  else
+    Fail('grup commit sonrasi satir KAYBI');
+end;
+
 { ================================================================== ana }
 
 var
@@ -1582,6 +1824,8 @@ begin
   TestV3TagCount;
   TestV3Encryption(N);
   TestEquivalence(1000);
+  TestV3GroupCommit;
+  TestV3GroupCoalesce;
 
   WriteLn;
   WriteLn('================================================');

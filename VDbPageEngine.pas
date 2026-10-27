@@ -26,8 +26,8 @@ unit VDbPageEngine;
 interface
 
 uses
-  SysUtils, Generics.Collections, VDbPage, VDbPageStore, VDbPageHeap,
-  VDbPageWal, VDbIdxFile;
+  SysUtils, SyncObjs, Generics.Collections, VDbPage, VDbPageStore,
+  VDbPageHeap, VDbPageWal, VDbIdxFile;
 
 type
   EVdbPageEngine = class(Exception);
@@ -81,7 +81,24 @@ type
       { v3.2: acilista WAL'den yalnizca ilk N commit uygulanir (0 = hepsi).
         AS OF anlik goruntusu kopya uzerinde acilirken kullanilir. }
       FRecoverLimit: Integer;
+      { v3.19 GRUP COMMIT: fsync TEK lider tarafindan yapilir, bekleyenler
+        ayni fsync'i paylasir. Boylece N thread'in N fsync'i yerine bir
+        fsync olur (olculen: fsync tek basina commit'in ~%60'i).
+        FDurableLsn: fsync'in KAPSADIGI en buyuk LSN (WAL'e yazilmis).
+        FSyncBusy: su an bir lider fsync yapiyor.
+        FSyncEvt: lider bitince bekleyenleri uyandirir (manual-reset).
+        FSyncCount: yapilan gercek fsync sayisi (olcum/kapi icin).
+        FSyncErr: lider fsync hatasi; bekleyenlere aynen iletilir. }
+      FSyncCs: TCriticalSection;
+      FSyncEvt: TEvent;
+      FSyncBusy: Boolean;
+      FDurableLsn: LongWord;
+      FSyncCount: Int64;
+      FSyncErr: string;
     procedure InitEngine(const ADbPath: string; APoolPages: Integer);
+    { v3.19: Commit'in gercek govdesi. ASyncLsn = WAL'e yazilan en son LSN
+      (yazilacak kayit yoksa 0). DoSync=False ise fsync yapilmaz. }
+    function DoCommit(DoSync: Boolean; out ASyncLsn: LongWord): Boolean;
     function GetEncrypted: Boolean;
     function GetReadOnly: Boolean;
     procedure OnSpill(PageNo: LongWord; P: PVdbPage);
@@ -143,6 +160,16 @@ type
       atlanir (yalniz toplu yazim/test icin). }
     function Commit(DoSync: Boolean = True): Boolean;
 
+    { v3.19 GRUP COMMIT: commit'i WAL'e yazar, fsync ETMEZ; fsync'i
+      AwaitDurable yapar. ASyncLsn, durabil olmasi beklenen LSN'dir
+      (0 = bekleyecek bir sey yok). Kritik bolumu kisaltmak icin. }
+    function CommitNoSync(out ASyncLsn: LongWord): Boolean;
+
+    { v3.19: ASyncLsn'e kadar olan WAL kayitlarinin diskte oldugundan emin
+      olur. Cagiran zaten bekleyen varsa onun fsync'ini paylasir; yoksa
+      lider olup kendisi fsync eder. Hata varsa yukseltir. }
+    procedure AwaitDurable(ALsn: LongWord);
+
     { Onaylanmis sayfalari veritabani dosyasina yazar, fsync eder ve WAL'i
       budar. Cokme sonrasi acilista otomatik yapilir. }
     function Checkpoint(DoSync: Boolean = True): Boolean;
@@ -154,6 +181,9 @@ type
     property Heap: TVdbHeap read FHeap;
     property Wal: TVdbPageWal read FWal;
     property InTxn: Boolean read FInTxn;
+    { v3.19 GRUP COMMIT: yapilan GERCEK fsync sayisi. Kapi, fsync sayisinin
+      commit sayisindan cok kucuk oldugunu bununla kanitlar. }
+    property DebugSyncCount: Int64 read FSyncCount;
     { v3.3: ICERIK damgasi — sayfa duzeyi zone map onbellegi buna baglidir.
       Ayni damga = ayni satir icerigi. }
     property DataStamp: QWord read FDataStamp;
@@ -233,6 +263,13 @@ begin
     damgasiyla CAKISAMAZ. Alt 32 bit yalnizca VERI DEGISTIREN commit'lerde
     artar; salt-okunur islem commit'i (meta cercevesi yazsa bile) artirmaz. }
   FDataStamp := QWord(InterLockedIncrement(GEngineSerial)) shl 32 or 1;
+  { v3.19 GRUP COMMIT durumu. FSyncEvt manual-reset. }
+  FSyncCs := TCriticalSection.Create;
+  FSyncEvt := TEvent.Create(nil, True, False, '');
+  FSyncBusy := False;
+  FDurableLsn := 0;
+  FSyncCount := 0;
+  FSyncErr := '';
 end;
 
 function TVdbPageEngine.NextDataStamp: QWord;
@@ -287,6 +324,8 @@ begin
     ClearPending;          // ayri ayrilmis 4 KB imajlari birak
   end;
   FreeAndNil(FPendingIdx);
+  FreeAndNil(FSyncEvt);
+  FreeAndNil(FSyncCs);
   inherited Destroy;
 end;
 
@@ -698,6 +737,89 @@ end;
 
 function TVdbPageEngine.Commit(DoSync: Boolean): Boolean;
 var
+  syncLsn: LongWord;
+begin
+  { v3.19: eski sozlesme korunur — Commit(True) yazar VE bekler. }
+  Result := DoCommit(DoSync, syncLsn);
+  if DoSync and Result then
+    AwaitDurable(syncLsn);
+end;
+
+function TVdbPageEngine.CommitNoSync(out ASyncLsn: LongWord): Boolean;
+begin
+  { v3.19: yazar, fsync etmez. Durabilite cagiranin sorumlulugunda. }
+  Result := DoCommit(False, ASyncLsn);
+end;
+
+procedure TVdbPageEngine.AwaitDurable(ALsn: LongWord);
+var
+  target: LongWord;
+  leader: Boolean;
+  err: string;
+begin
+  { v3.19 GRUP COMMIT: TEK fsync, cok commit.
+    Neden grup: olculen tek fsync bedeli 0,32 ms; commit basina bu bedeli
+    odemek paralel yazimi serilestiriyordu (P=4 -> 1,05x). Burada ilk gelen
+    lider olur, WAL'e o an yazilmis EN SON LSN'i hedefler ve tek fsync
+    yapar; bu arada commit eden diger thread'lerin kayitlari da ayni
+    fsync'in kapsamina girer. Bekleyenler yalniz olayi bekler. }
+  if ALsn = 0 then Exit;
+  while True do
+  begin
+    leader := False;
+    target := 0;
+    FSyncCs.Enter;
+    try
+      if FDurableLsn >= ALsn then Exit;
+      if FSyncErr <> '' then
+        raise EVdbPageEngine.Create('WAL fsync hatasi: ' + FSyncErr);
+      if not FSyncBusy then
+      begin
+        FSyncBusy := True;
+        target := FWal.WrittenLsn;
+        leader := True;
+      end;
+    finally
+      FSyncCs.Leave;
+    end;
+
+    if leader then
+    begin
+      err := '';
+      try
+        FWal.SyncDurable;
+      except
+        on E: Exception do
+          err := E.Message;
+      end;
+      FSyncCs.Enter;
+      try
+        if err = '' then
+        begin
+          Inc(FSyncCount);
+          if target > FDurableLsn then
+            FDurableLsn := target;
+        end
+        else
+          FSyncErr := err;
+        FSyncBusy := False;
+        { manual-reset: once uyandir, sonra sifirla. Arada gelen bekleyen
+          yine de dongude FDurableLsn'i gorup cikar. }
+        FSyncEvt.SetEvent;
+        FSyncEvt.ResetEvent;
+      finally
+        FSyncCs.Leave;
+      end;
+      if err <> '' then
+        raise EVdbPageEngine.Create('WAL fsync hatasi: ' + err);
+    end
+    else
+      FSyncEvt.WaitFor(20);
+  end;
+end;
+
+function TVdbPageEngine.DoCommit(DoSync: Boolean; out ASyncLsn: LongWord): Boolean;
+var
   LSN: LongWord;
   i: Integer;
   dirty: TVdbPageNoArray;
@@ -706,6 +828,7 @@ var
   changed: Boolean;
 begin
   Result := False;
+  ASyncLsn := 0;
   if FStore = nil then
     raise EVdbPageEngine.Create('motor acik degil');
 
@@ -768,6 +891,9 @@ begin
         HICBIR SEY yazilmaz (checkpoint'e kadar). }
   if not FWal.Commit(DoSync, LSN) then
     Exit(False);
+  { v3.19: WAL'e yazilan en son LSN. DoSync=True ise bu noktada durabildir;
+    DoSync=False ise cagiran AwaitDurable ile bekler. }
+  ASyncLsn := FWal.WrittenLsn;
 
   FStore.EndTxn;
   FInTxn := False;
@@ -801,7 +927,21 @@ begin
   ClearPending;
   FStore.Flush(DoSync);
   if DoSync then
+  begin
+    { v3.19 GRUP COMMIT BARİYERİ: WAL budanmadan once icindeki her sey
+      DURABIL olmali; aksi halde fsync'i henuz yapilmamis bir commit'in
+      cerceveleri budanir ve cokme halinde kaybolur. Bekleyen liderler
+      bitene kadar bekle, sonra durabil LSN'i checkpoint LSN'ine cek. }
+    AwaitDurable(FWal.WrittenLsn);
     FWal.Truncate(FStore.LSN);
+    FSyncCs.Enter;
+    try
+      FDurableLsn := FWal.WrittenLsn;
+      FSyncErr := '';
+    finally
+      FSyncCs.Leave;
+    end;
+  end;
   { v3.16: guvenlik agi kilidini birak (bkz. Commit). }
   FStore.EndIoWrite;
   Result := True;
