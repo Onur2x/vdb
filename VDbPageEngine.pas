@@ -367,7 +367,7 @@ begin
     kilit altinda yazma yapilamaz. Bu yuzden yazan oturumda acilis TAM kilit
     altinda yapilir, sonunda paylasimliya inilir. }
   if not AReadOnly then
-    FStore.AcquireWrite
+    FStore.AcquireWriteOpen
   else
     { v3.18: SALT-OKUNUR acilis da PAYLASIMLI kilit altinda yapilir. Once RO
       oturum kilidi oturum boyu tuttugu icin bu gerekmiyordu gorunuyordu;

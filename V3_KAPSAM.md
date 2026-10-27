@@ -282,8 +282,10 @@ tamamlandı; **snapshot isolation da tamamlandı (v3.15)**; **süreçler arası
 sayacıyla önbellek tazeleme, `prochk` 15/15 gerçek iki süreç; şifreli dosya
 dahil)**. v3.18: açık salt-okunur oturum artık yazarları bloklamaz, RO kilit de
 ifade kapsamlı; uzun yazma işlemi de okuyucuları bloklamaz (tam kilit commit
-penceresine indi, yalnız yazarlar sıralı). Kapılar: `lockchk` 34/34,
-`prochk` 15/15. Yol haritasında
+penceresine indi). **Yazarlar da artık paraleldir** (v3.18 iyimser mod):
+işlemler aynı anda açılır, yalnız commit'ler sıralıdır; aynı anahtara iki
+süreç yazarsa ikinci commit **açık çakışma hatası** alır (veri kaybı yok).
+Kapılar: `lockchk` 36/36, `prochk` 15/15. Yol haritasında
 açık madde kalmadı.
 
 | Yetenek | Bugünkü davranış | Test |
@@ -577,8 +579,16 @@ Kapsam **süreç içi çok oturumlu yazma**dır: aynı `IVdbBackend` üzerinde b
   üzerinde **rezervasyon** tutar, tam kilit commit penceresine iner. Ölçüm:
   açık işlem altında 20 okuma, en yüksek **0 ms**; ikinci yazar aynı anda
   açılıp **27 ms**'de işini bitirdi; commit edilmemiş satır RO oturumda
-  görünmedi. **Yazarlar hâlâ sıralıdır** — paralel çok yazar (sayfa düzeyinde
-  çakışma yönetimi) bu sürümün kapsamında **yoktur**. Yan kusurlar
+  görünmedi.
+- **Paralel çok yazar — iyimser mod** (v3.18). `BeginBatch` rezervasyonu
+  **beklemeden** dener; alınamazsa işlem iyimser modda açılır (yazımlar
+  bellekte birikir, görüntü sabitlenir, anahtar başına before-image
+  toplanır) ve commit anında **anahtar bazında** çakışma denetimi yapılır.
+  **Aynı anahtara** iki süreç yazdıysa ikinci commit **açık hata** alır
+  (veri kaybı yok); **farklı anahtarlar** ise iki süreç de commit eder.
+  Ölçüm: açık işlem varken ikinci yazarın işlem açışı **0 ms** (eşik
+  300 ms). Commit'ler hâlâ sıralıdır; sayfa düzeyinde paralel commit
+  kapsam dışıdır. Kanıt: `lockchk` 3c/3d/3e. Yan kusurlar
   düzeltildi: `.gen` rezervasyonu artık tüm dosyayı değil veriden uzak bir
   bayt aralığını kilitler (yoksa RO okuma `EReadError` alıyordu) ve
   rezervasyon `ABusyMs` boyunca bekler (ilk uygulamada beklemiyordu).
@@ -860,13 +870,15 @@ okuma 4 satır görür. Test güncellendi (`v3sqlchk` 238/0).
 snapshot'a dayanan bir yazma, çakışan commit ilk yazmadan önce olmuşsa sessizce
 commit edilebilir (lost-update) — snapshot yalnız okumayı sabitler. `FUndo`
 belleği en uzun açık işlem boyunca büyür. Süreçler arası çok yazarlılık v3.16'da
-yapıldı (kilit işlem kapsamlı); **yazarlar hâlâ sıralıdır** — v3.18'de uzun
-işlem veri dosyasının tam kilidini tutmayı bıraktı (yalnız `.gen` rezervasyonu;
-tam kilit commit penceresinde), böylece okuyucular beklemez, ama iki yazar
-süreç aynı anda commit edemez. Paralel çok yazar kapsam dışıdır.
+yapıldı (kilit işlem kapsamlı). v3.18'de uzun işlem veri dosyasının tam
+kilidini tutmayı bıraktı (yalnız `.gen` rezervasyonu; tam kilit commit
+penceresinde) ve **yazarlar paralel** hâle geldi: işlemler aynı anda açılır,
+commit'ler sıralıdır. Çakışma denetimi **anahtar** düzeyindedir; aynı
+anahtara eşzamanlı yazan ikinci işlem **açık hata** alır (sessiz kayıp yok).
+Sayfa düzeyinde paralel commit kapsam dışıdır.
 
 Kapı: `sqltest` v3 **2874/0/33**, v2 **3305/0/0**; `v3sqlchk` **238/0**;
-`lockchk` **34/0**; `prochk` **15/0**; **16/16 kapı yeşil** (666 kontrol).
+`lockchk` **36/0**; `prochk` **15/0**; **16/16 kapı yeşil** (668 kontrol).
 CI (GitHub Actions) de aynı **16** kapıyı koşar — `snapchk`/`prochk`
 v3.17'de eklendi.
 

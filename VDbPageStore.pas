@@ -155,6 +155,14 @@ type
       FHoldDepth: Integer;
       { Rezervasyon su an `.gen` handle'i uzerinde tutuluyor mu? }
       FReserved: Boolean;
+      { v3.18: iyimser yazma islemi acikken okuma yolu tazeleme yapmaz
+        (islemin goruntusu sabit kalir). Bkz. RefreshIfStale. Sayac:
+        ic ice islemler icin. }
+      FDeferCount: Integer;
+      { v3.18 dilim 6: ACILIS tam kilidi rezervasyonsuz alir (AcquireWriteOpen).
+        Rezervasyon islemleri siralar; acilis yalniz kisa kritik bolum icin
+        tam kilide ihtiyac duyar. }
+      FSkipReserve: Boolean;
       FWriteCs: TRTLCriticalSection;
       { v3.16: islem kapsamli paylasimli kilit derinligi (yazan oturum). }
       FReadDepth: Integer;
@@ -232,6 +240,9 @@ type
       LockExclusive ile ayni: FBusyMs boyunca 1 ms'de bir yokla). }
     procedure LockReserve;
     procedure RefreshIfStale;
+    { v3.18: FDeferRefresh bayragini YOK SAYAN tazeleme. Yazma yollari
+      bunu kullanir: bayat onbellekle yazmak veri kaybi uretir. }
+    procedure RefreshIfStaleForce;
     { v3.16: yazma ilkelleri icin guvenlik agi (bkz. FAutoWrite). }
     procedure EnsureIoWrite;
     { v3.16: `<db>.gen` degisiklik sayaci. }
@@ -270,11 +281,20 @@ type
       Cikis: tam kilit birakilir, paylasimli kilide donulur.
       Ic ice cagri desteklidir: derinlik 0 -> 1 gecisinde kilit yukseltilir. }
     procedure AcquireWrite;
+    { v3.18 dilim 6: acilis icin tam kilit — rezervasyon ALMAZ. }
+    procedure AcquireWriteOpen;
     procedure ReleaseWrite;
     { v3.18: acik islem icin YAZAR REZERVASYONU (veri kilidi DEGIL).
       Uzun islem boyunca tutulur; okuyucular etkilenmez. }
     procedure AcquireWriteHold;
+    { v3.18: rezervasyonu BEKLETMEDEN dener. True: rezervasyon artik
+      BIZDE (FHoldDepth=1). False: baska bir surec tutuyor, hicbir sey
+      alinmadi; ISTISNA FIRLATMAZ. Iyimser yazma islemi bu yolla baslar. }
+    function TryAcquireWriteHold: Boolean;
     procedure ReleaseWriteHold;
+    { v3.18: iyimser islem boyunca okuma yolunun tazelemesini erteler. }
+    procedure BeginDeferRefresh;
+    procedure EndDeferRefresh;
     { v3.18: gercek veri kilidi penceresi (commit/uygulama aninda). }
     procedure AcquireDataWrite;
     procedure ReleaseDataWrite;
@@ -871,7 +891,7 @@ end;
   farkliysa baska bir surec commit etmistir -> onbellek dusurulur ve meta
   yeniden yuklenir. Meta sayfa duz metin oldugu icin ham karsilastirma
   yeterlidir (sifreleme yalniz kullanici sayfalarinda). }
-procedure TVDbPageStore.RefreshIfStale;
+procedure TVDbPageStore.RefreshIfStaleForce;
 var
   buf: TVdbPageBuf;
   len: Int64;
@@ -895,6 +915,18 @@ begin
   FSigGen := ReadGen;
   if Assigned(FOnRefreshed) then
     FOnRefreshed(Self);
+end;
+
+procedure TVDbPageStore.RefreshIfStale;
+begin
+  { v3.18: iyimser yazma islemi acikken (bkz. BeginDeferRefresh) okuma
+    yolu tazeleme YAPMAZ. Boylece islemin goruntusu islem boyunca sabit
+    kalir; anahtar basina before-image "islem basindaki deger" olur ve
+    commit'te karsilastirma dogru sonuc verir. Yazma yollari bu bayragi
+    YOK SAYAR (RefreshIfStaleForce): bayat onbellekle yazmak v3.17'de
+    veri kaybina yol acmisti. }
+  if FDeferCount > 0 then Exit;
+  RefreshIfStaleForce;
 end;
 
 procedure TVDbPageStore.EnsureIoWrite;
@@ -1003,14 +1035,22 @@ begin
       FHoldDepth > 0 ise rezervasyon zaten BIZDE. }
     if FHoldDepth = 0 then
     begin
-      LockReserve;
-      FReserved := True;
+      { v3.18 dilim 6: ACILIS rezervasyon ALMAZ (AcquireWriteOpen). Rezervasyon
+        ISLEMLERI siralar; acilis ise yalniz kisa bir kritik bolum icin tam
+        kilide ihtiyac duyar. Once acilis da rezervasyon istiyordu ve acik bir
+        islem tutan surec varken ikinci yazar HIC ACILAMIYORDU (olculdu:
+        lockchk 3c "yazar rezervasyonu 500 ms icinde alinamadi"). }
+      if not FSkipReserve then
+      begin
+        LockReserve;
+        FReserved := True;
+      end;
     end;
     LockExclusive;
     FLockedExcl := True;
     FLocked := True;
     try
-      RefreshIfStale;
+      RefreshIfStaleForce;
     except
       VDbUnlockStream(FStream);
       FLockedExcl := False;
@@ -1030,6 +1070,21 @@ begin
     FWriteDepth := 1;
   finally
     LeaveCriticalSection(FWriteCs);
+  end;
+end;
+
+procedure TVDbPageStore.AcquireWriteOpen;
+begin
+  { v3.18 dilim 6: ACILIS icin tam kilit — REZERVASYONSIZ. Rezervasyon
+    ISLEMLERI siralar; iki yazar surec ayni anda acilabilsin diye acilis
+    rezervasyon istemez. Acilisin kritik bolumu (WAL kurtarma, meta yazimi,
+    `.gen` artisi) tam kilit altindadir ve commit de ayni tam kilidi alir;
+    yani acilis ile commit CAKISMAZ. }
+  FSkipReserve := True;
+  try
+    AcquireWrite;
+  finally
+    FSkipReserve := False;
   end;
 end;
 
@@ -1186,7 +1241,7 @@ begin
     LockReserve;
     FReserved := True;
     try
-      RefreshIfStale;
+      RefreshIfStaleForce;
     except
       VDbUnlockGenReserve(FGenStream);
       FReserved := False;
@@ -1216,6 +1271,61 @@ begin
   end;
 end;
 
+{ v3.18: PARALEL COK YAZAR — beklemeden rezervasyon denemesi.
+  Basarili olursa bugunku (seri) davranis aynen surer: islem boyunca
+  rezervasyon BIZDE, anahtar basina before-image GEREKMEZ (sifir ek
+  maliyet). Basarisizsa baska bir surec ACIK islem tutuyor demektir:
+  cagiran iyimser moda gecer (NeedBefore + BeginDeferRefresh) ve commit
+  aninda rezervasyonu bekler. }
+function TVDbPageStore.TryAcquireWriteHold: Boolean;
+begin
+  Result := False;
+  if FStream = nil then Exit;
+  if FReadOnly then Exit;
+  EnterCriticalSection(FWriteCs);
+  try
+    if FHoldDepth > 0 then
+    begin
+      Inc(FHoldDepth);
+      Exit(True);
+    end;
+    if FGenStream = nil then Exit;
+    if not VDbLockGenReserve(FGenStream) then Exit;
+    FReserved := True;
+    try
+      RefreshIfStaleForce;
+    except
+      VDbUnlockGenReserve(FGenStream);
+      FReserved := False;
+      raise;
+    end;
+    FHoldDepth := 1;
+    Result := True;
+  finally
+    LeaveCriticalSection(FWriteCs);
+  end;
+end;
+
+procedure TVDbPageStore.BeginDeferRefresh;
+begin
+  EnterCriticalSection(FWriteCs);
+  try
+    inc(FDeferCount);
+  finally
+    LeaveCriticalSection(FWriteCs);
+  end;
+end;
+
+procedure TVDbPageStore.EndDeferRefresh;
+begin
+  EnterCriticalSection(FWriteCs);
+  try
+    if FDeferCount > 0 then dec(FDeferCount);
+  finally
+    LeaveCriticalSection(FWriteCs);
+  end;
+end;
+
 procedure TVDbPageStore.AcquireDataWrite;
 begin
   if FStream = nil then
@@ -1236,7 +1346,7 @@ begin
     FLockedExcl := True;
     FLocked := True;
     try
-      RefreshIfStale;
+      RefreshIfStaleForce;
     except
       VDbUnlockStream(FStream);
       FLockedExcl := False;

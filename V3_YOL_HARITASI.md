@@ -418,7 +418,7 @@ bilinçli olarak yok):
 | Salt-okunur oturum | `VdbOpenReadOnly` / `TVdbBackendV3.CreateReadOnly`: **hiç yazmaz**. `IsReadOnly=True`; `Put/BeginBatch/CommitBatch/Compact/RestoreFrom/Rekey` açık hata verir. `<db>.log` **açılmaz** (okuyucu günlük dizini oluşturmaz). |
 | WAL ve okuyucu | `TVDbPageWal.Open(AReadOnly)` dosyayı `fmOpenRead` açar, **yaratmaz**. Onaylanmış çerçeveler `InstallReadOnlyPage` ile **bellek katmanına** alınır (`FRoPages`); `LoadFrame` önce bu katmana bakar. Checkpoint/truncate yok. |
 | Çökme sonrası okuma | Salt-okunur oturum, WAL'de duran onaylanmış çerçeveleri disk belleğine yazmadan uygular: `.odb` ve `.wal` **bayt bayt değişmez** (kapıda ölçülür). |
-| Çok yazarlı | **Süreç içi** çok oturum yazabilir (v3.4: READ COMMITTED, ilk commit kazanır, çakışan commit `yazma cakismasi` ile durur). **Süreçler arası** hâlâ tek yazıcı: dosya kilidi ikinci süreci reddeder. |
+| Çok yazarlı | **Süreç içi** çok oturum yazabilir (v3.4: READ COMMITTED, ilk commit kazanır, çakışan commit `yazma cakismasi` ile durur). **Süreçler arası** hâlâ tek yazıcı: dosya kilidi ikinci süreci reddeder. (v3.2 tarihli satır; v3.16'da süreçler arası yazma, v3.18'de paralel yazar açıldı.) |
 
 Kapı — `lockchk` (14): gerçek **çocuk süreçler** (kendini farklı argümanlarla
 çalıştırır), yani kilit gerçek işletim sistemi kilididir.
@@ -1243,10 +1243,16 @@ güvenliğin bilinçli bedelidir.
   yazarları süresiz bloklamasına razıydı; bu sınır kaldırıldı.
   `lockchk` bölüm 3 artık hem "yazar bloklanmadı" hem "RO uyandıktan sonra
   yazarın yeni commit'ini gördü" kontrolünü yapar.
-- **Yazarlar sıralıdır**: bir yazma işlemi açıkken diğer süreçlerin yazma
-  girişleri `ABusyMs` boyunca bekler, sonra
-  `veritabani mesgul: yazar kilidi %d ms icinde alinamadi ...` hatası alır.
-  Uzun bir işlem diğer süreçlerin **okuyucularını da** bekletir.
+- **Yazarlar paraleldir, commit'ler sıralıdır** (v3.18). Rezervasyon
+  `BeginBatch`'te **beklemeden** denenir; alınamazsa işlem **iyimser modda**
+  açılır (yazımlar bellekte birikir, görüntü sabitlenir, anahtar başına
+  before-image toplanır). Commit anında rezervasyon `ABusyMs` boyunca
+  beklenir; **aynı anahtara** iki süreç yazdıysa commit
+  `yazma cakismasi: ...` hatasıyla **açıkça durur** (veri kaybı yok),
+  **farklı anahtarlar** ise iki süreç de commit eder. Uzun bir işlem
+  diğer süreçlerin **okuyucularını bekletmez** (v3.18 ölçümü: 0 ms).
+  Aynı anahtara eşzamanlı yazımda hata alınması bilinçli bir seçimdir;
+  kayıp güncelleme sessizce oluşmaz.
 - `ABusyMs` varsayılanı **0**'dır (hemen hata); çok süreçli kullanımda açıkça
   büyütülmelidir (testte 20.000 ms).
 - Adil kuyruk yoktur (aç yazar, sürekli yazan bir sürecin arkasında
@@ -1345,18 +1351,48 @@ kaldırmak. Her dilim ayrı kapı ve **ölçüm** ile doğrulandı.
    açılış kilitsiz kalırsa commit eden bir yazarla yarışıp eski görüntü
    okuyabilirdi.
    Kapı: `lockchk` 3b (açık işlem tutan yazar + 20 okuma) ve 4 (ikinci
-   yazar); `prochk` 15/15 (şifreli dahil). **Kalan sınır ölçülerek
-   belgelendi:** aynı anda açık iki yazar hâlâ sıraya girer — `lockchk` 3c
-   çocuğun açık işlemi sürerken ikinci yazarı dener; busy=700 ms'de
-   **giremedi**, toplam bekleme **1414 ms** (açılış ve işlem girişi ayrı
-   beklediği için üst sınır ~2×`ABusyMs`). Paralel çok yazar (sayfa
-   düzeyinde çakışma yönetimi) **kapsam dışıdır**: iki sürecin aynı anda
-   serbest liste/sayfa tahsisi yapması, işlem başına ayrı WAL akışı ve
-   sayfa düzeyinde çakışma denetimi gerektirir; bu, Öncelik 1'i (veri
-   kaybı yok) koruyacak çok sayıda yeni kapı ister ve ayrı bir iş olarak
-   ele alınmalıdır.
+   yazar); `prochk` 15/15 (şifreli dahil).
 
-Kapı durumu: **16/16 yeşil**, toplam **666 kontrol**.
+6. **Paralel çok yazar — iyimser mod (commit'ler sıralı, işlemler paralel).**
+   Önceki durum: rezervasyon `BeginBatch`'te alınıyordu, yani iki süreç aynı
+   anda **işlem açamıyordu** (`lockchk` 3c ölçümü: ikinci yazar busy=700 ms
+   içinde giremedi, toplam bekleme 1414 ms). Yeni akış:
+   - `BeginBatch` rezervasyonu **beklemeden** dener (`TryAcquireWriteHold`).
+   - **Alınırsa** bugünkü seri yol aynen çalışır: sıfır ek maliyet,
+     before-image gerekmez.
+   - **Alınamazsa iyimser mod**: işlem yine açılır, yazımlar bellekte
+     birikir (`TWriteSet.Map` zaten mantıksaldır — parti yazımında sayfaya
+     hiç dokunulmaz, sayfa tahsisi commit'te `ApplyBatch` ile olur),
+     görüntü sabitlenir (`BeginDeferRefresh` okuma yolunun tazelemesini
+     erteler) ve **anahtar başına before-image** toplanır (`NeedBefore`).
+   - **Commit** rezervasyonu `ABusyMs` boyunca bekleyerek alır
+     (`EndDeferRefresh` + `AcquireWriteHold`), sonra tam veri kilidini alıp
+     tazeler ve **anahtar bazında** çakışma denetimi yapar
+     (`VerifyNoConflict`, `S.Before` ile güncel motor değeri karşılaştırılır).
+     **Aynı anahtara iki süreç yazdıysa commit AÇIK hatayla durur**
+     (veri kaybı yok); **farklı anahtarlar** ise iki süreç de commit eder.
+   - Ek koruma: iyimser modda `FCommitGen <> S.StartGen` ise (aynı süreçte
+     başka bir küme commit etti) temkinli çakışma hatası verilir; böylece
+     before-image'ın başka bir yazımdan sonra yakalanması riski kapanır.
+   - `AbortBatch` iyimser modda yalnız ertelenen tazelemeyi kapatır
+     (tutulmayan rezervasyon bırakılmaz).
+   Bu dilimde bulunan **gerçek kusur**: yazar **açılışı** `AcquireWrite`
+   üzerinden rezervasyon istiyordu, bu yüzden açık işlem varken **ikinci
+   yazar hiç açılamıyordu** (`lockchk` 3c: `yazar rezervasyonu 500 ms içinde
+   alınamadı`) ve gerçek çakışma testi hiç çalışmıyordu. Düzeltme:
+   `AcquireWriteOpen` (`FSkipReserve`) — açılışın kritik bölümü (WAL
+   kurtarma, meta yazımı, `.gen` artışı) **tam kilit** altında yapılır ve
+   commit de aynı tam kilidi aldığı için çakışma olmaz.
+   Kapı: `lockchk` 3c/3d/3e — açık işlem varken ikinci yazarın `BeginBatch`'i
+   **0 ms** (eşik 300 ms); farklı anahtarla **iki süreç de commit etti**,
+   satır kaybı yok; aynı anahtarda ikinci commit **açık çakışma hatası**
+   verdi ve **ilk değer korundu**.
+   **Kalan sınır (dürüst):** commit'ler hâlâ **sıralıdır**; çakışma
+   yönetimi **anahtar** düzeyindedir, sayfa düzeyinde değildir. Aynı
+   anahtara eşzamanlı yazan iki işlemden biri hata alır — bu, kayıp
+   güncellemeye tercih edilen bilinçli seçimdir.
+
+Kapı durumu: **16/16 yeşil**, toplam **668 kontrol**.
 
 `sqltest` v3 **2874/0/33**, v2 **3305/0/0** (temel çizgiyle birebir).
 
@@ -1432,8 +1468,8 @@ kendi kapıları ve ölçümüyle):
 6. ~~**Süreçler arası çok yazarlılık**~~ **YAPILDI (v3.16)** — aynı `.odb`
    dosyasına birden çok süreç bağlanıp **sırayla** yazar; kilit işlem
    kapsamlıdır, önbellek `<db>.gen` sayacıyla tazelenir, veri kaybı yok
-   (`prochk` 15/15, gerçek iki süreç; şifreli dosya dahil). Yazarlar sıralıdır; uzun işlem diğer
-   süreçleri bekletir. Ayrıntı: §v3.16.
+   (`prochk` 15/15, gerçek iki süreç; şifreli dosya dahil). v3.18'de yazarlar
+   **paralel** çalışır (iyimser mod), yalnız commit'ler sıralıdır. Ayrıntı: §v3.16, §v3.18.
 
 ### Kapsam dışı (değişmedi)
 - M3 WASM, M7 async sunucu, WASM/edge

@@ -162,6 +162,14 @@ type
           kilit altinda True yapilir, sahibi kilitsiz okur (Boolean yazimi
           yirtilmaz). }
         SnapDirty: Boolean;
+        { v3.18: IYIMSER MOD. BeginBatch aninda yazar rezervasyonu
+          ALINAMADIYSA (baska bir surec acik islem tutuyor) islem yine
+          acilir: yazimlar bellekte birikir, goruntu sabitlenir (okuma
+          tazelemesi ertelenir) ve cakisma denetimi commit aninda anahtar
+          bazinda yapilir. Ayni anahtara iki surec yazdiysa commit ACIK
+          hatayla durur (veri kaybi YOK). Farkli anahtarlar: iki surec de
+          commit eder; yazarlar artik TAMAMEN sirali degildir. }
+        Optimistic: Boolean;
         constructor Create(ASession: Cardinal);
         destructor Destroy; override;
       end;
@@ -2165,6 +2173,7 @@ procedure TVdbBackendV3.BeginBatch;
 var
   s: TWriteSet;
   sid: Cardinal;
+  gotReserve: Boolean;
 begin
   RequireWritable;
   sid := VdbBackendSessionId;
@@ -2176,14 +2185,29 @@ begin
       surec yazacaksa busy timeout boyunca bekler.
       v3.18: artik islem boyunca TAM kilit DEGIL, yalniz rezervasyon
       tutulur; VERI kilidi commit penceresinde alinir. Boylece uzun bir
-      islem OKUYUCULARI bloklamaz (yazarlari bloklamaya devam eder). }
-    FEng.Store.AcquireWriteHold;
+      islem OKUYUCULARI bloklamaz.
+      v3.18 dilim 6: rezervasyon BEKLEMEDEN denenir. Alinirsa bugunku seri
+      yol aynen isler (sifir ek maliyet, before-image gerekmez). Alinamazsa
+      islem ACIK kalmaz: IYIMSER MOD'a gecilir -- yazimlar bellekte birikir,
+      islem goruntusu sabitlenir (okuma tazelemesi ertelenir) ve cakisma
+      denetimi COMMIT aninda anahtar bazinda yapilir. Ayni anahtara iki surec
+      yazdiysa commit ACIK hatayla durur (veri kaybi yok). }
+    gotReserve := FEng.Store.TryAcquireWriteHold;
     try
       s := TWriteSet.Create(sid);
       s.StartGen := FCommitGen;
+      if not gotReserve then
+      begin
+        s.Optimistic := True;
+        { Before-image ZORUNLU: cakisma ancak "ben baslarken deger neydi"
+          bilgisiyle yakalanabilir. Goruntu sabit kalsin diye okuma yolunun
+          tazelemesi islem boyunca ertelenir. }
+        s.NeedBefore := True;
+        FEng.Store.BeginDeferRefresh;
+      end;
       FSets.AddOrSetValue(sid, s);
     except
-      FEng.Store.ReleaseWriteHold;
+      if gotReserve then FEng.Store.ReleaseWriteHold;
       raise;
     end;
   finally
@@ -2200,6 +2224,16 @@ begin
   RequireWritable;
   s := OwnSet;
   if s = nil then Exit;
+  { v3.18 dilim 6: iyimser modda rezervasyon COMMIT aninda alinir (busy
+    timeout boyunca bekler) ve ertelenen tazeleme kapatilir. Kilit sirasi
+    BeginBatch ile ayni (once rezervasyon, sonra FEngCs) -- kilitlenme yok.
+    Rezervasyon alinamazsa hata yukari cikar; yazma kumesi ACIK kalir ve
+    cagiran AbortBatch ile kapatir (veri kaybi yok). }
+  if s.Optimistic then
+  begin
+    FEng.Store.EndDeferRefresh;
+    FEng.Store.AcquireWriteHold;
+  end;
   { v3.16: yazma kilidi hata yolunda da birakilmali (kilit sizintisi =
     dosyanin baska surecler icin kapanmasi). }
   try
@@ -2212,6 +2246,13 @@ begin
   try
     if Assigned(FBeforeCommit) then
       FBeforeCommit;        // kisit denetimi: hata firlatirsa kaplama durur
+    { v3.18 dilim 6: iyimser modda surec ICI baska bir kume commit ettiyse
+      before-image'lar baska bir yazimdan SONRA yakalanmis olabilir; temkinli
+      davran ve cakisma bildir (sessiz ezme yerine acik hata). }
+    if s.Optimistic and (FCommitGen <> s.StartGen) then
+      raise EVdbBackendV3.Create(
+        'yazma cakismasi: islem surerken ayni oturumda baska bir yazma ' +
+        'kumesi commit etti; islem yeniden denenmeli');
     { v3.4: cakisma denetimi UYGULAMADAN ONCE yapilir: yarim uygulama yok. }
     VerifyNoConflict(s);
     { v3.6: yabanci anahtar defteri. ONEMLI: ApplyBatch yazma kumesini
@@ -2281,10 +2322,12 @@ end;
 procedure TVdbBackendV3.AbortBatch;
 var
   s: TWriteSet;
+  optimistic: Boolean;
 begin
   RequireWritable;
   s := OwnSet;
   if s = nil then Exit;
+  optimistic := s.Optimistic;
   try
   FEngCs.Enter;
   try
@@ -2296,7 +2339,10 @@ begin
   end;
   s.Free;
   finally
-    FEng.Store.ReleaseWriteHold;
+    { v3.18 dilim 6: iyimser modda BeginBatch'te rezervasyon ALINMADI,
+      birakilacak bir sey yok; yalniz ertelenen tazelemeyi kapat. }
+    FEng.Store.EndDeferRefresh;
+    if not optimistic then FEng.Store.ReleaseWriteHold;
   end;
 end;
 

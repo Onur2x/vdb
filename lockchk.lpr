@@ -727,8 +727,9 @@ var
   i, rc, expectCount, iterNo: Integer;
   p1, p2: TProcess;
   aOut, bOut, msg, rep: string;
-  t0, elapsed, sz0, sz1, wal0, wal1, maxMs: Int64;
+  t0, elapsed, beginMs, sz0, sz1, wal0, wal1, maxMs: Int64;
   wrote, okAll, verified, gorunur: Boolean;
+  n0, n1: Integer;
   v: TBytes;
 begin
   dir := ParamStr(1);
@@ -860,27 +861,160 @@ begin
     else
       Ok('commit edilmemis satir RO oturumda gorunmedi');
 
-    { 3c) KALAN SINIR, OLCULEREK: yazarlar HALA SIRALI. Cocugun acik
-      islemi surerken ikinci bir yazar rezervasyonu alamaz. Bu bir kusur
-      degil, belgelenmis sinirdir; sayisi burada olculur ki belgede
-      "yazarlar sirali" ifadesi havada kalmasin. Rezervasyon islem
-      boyunca tutuldugu icin bekleme SURESI acik islemin suresi kadardir. }
-    if TryWriterPut(db, 700, 999001, msg, elapsed) then
-      Fail(Format('acik islem varken ikinci yazar GIRDI (%d ms) - ' +
-        'rezervasyon calismiyor', [elapsed]))
-    else if (Pos('mesgul', LowS(msg)) > 0) and (elapsed >= 600) then
-      Ok(Format('yazarlar sirali (belgelenmis sinir): ikinci yazar busy=700 ' +
-        'ms icinde giremedi; toplam bekleme %d ms (acilis ve islem girisi ' +
-        'ayri ayri bekler, ust sinir ~2 x ABusyMs)', [elapsed]))
+    { 3c) v3.18 dilim 6: ACIK ISLEM VARKEN IKINCI YAZARIN ISLEMI HEMEN
+      ACILIR. Once rezervasyon BeginBatch'te beklendigi icin ikinci surec
+      islem bile acamiyordu (olculdu: 1395 ms). Artik rezervasyon beklemeden
+      denenir; alinamazsa IYIMSER MOD'a gecilir ve islem derhal acilir. }
+    p1 := StartChild(['--writer-txn-hold', db, ready, '1500', '881001']);
+    t0 := MsNow;
+    while (not FileExists(ready)) and ((MsNow - t0) < 15000) do
+      Sleep(10);
+    if not FileExists(ready) then
+      Fail('dilim 6: yazar hazir isareti birakmadi')
     else
-      Fail(Format('ikinci yazar beklenmedik sekilde reddedildi: %d ms, %s',
-        [elapsed, msg]));
+    begin
+      beginMs := -1;
+      try
+        be := TVdbBackendV3.Create(db, False, VDB_DEF_POOL, 500);
+        t0 := MsNow;
+        be.BeginBatch;
+        beginMs := MsNow - t0;
+        be.AbortBatch;
+        be := nil;
+      except
+        on E: Exception do
+        begin
+          be := nil;
+          Fail('dilim 6: ikinci yazar islemi ACAMADI: ' + E.Message);
+        end;
+      end;
+      if beginMs >= 0 then
+      begin
+        if beginMs > 300 then
+          Fail(Format('acik islem varken ikinci yazar islemi %d ms bekledi ' +
+            '(esik 300 ms)', [beginMs]))
+        else
+          Ok(Format('acik islem varken ikinci yazar islemi HEMEN acildi ' +
+            '(iyimser mod, %d ms)', [beginMs]));
+      end;
+      rc := FinishChild(p1, aOut);
+      if rc = 0 then
+        Ok('acik islem tutan yazar sonunda commit etti')
+      else
+        Fail('acik islem tutan yazar (cikis ' + IntToStr(rc) + '): ' +
+          Trim(aOut));
+    end;
+
+    { 3d) FARKLI anahtarlara yazan iki surec: ikisi de commit eder, satir
+      kaybi YOK. Cocuk 600 ms acik islem tutar; ana surec bu sirada kendi
+      islemini acar ve commit'te kisa sure bekler (commit'ler sirali,
+      islemler PARALEL). }
+    if FileExists(ready) then DeleteFile(ready);
+    p1 := StartChild(['--writer-txn-hold', db, ready, '600', '881002']);
+    t0 := MsNow;
+    while (not FileExists(ready)) and ((MsNow - t0) < 15000) do
+      Sleep(10);
+    if not FileExists(ready) then
+      Fail('dilim 6: paralel yazar A hazir isareti birakmadi')
+    else
+    begin
+      wrote := False;
+      try
+        be := TVdbBackendV3.Create(db, False, VDB_DEF_POOL, 20000);
+        be.BeginBatch;
+        be.Put(881003, MakeVal(881003));
+        be.CommitBatch;
+        be := nil;
+        wrote := True;
+      except
+        on E: Exception do
+        begin
+          be := nil;
+          Fail('dilim 6: paralel yazar B commit EDEMEDI: ' + E.Message);
+        end;
+      end;
+      rc := FinishChild(p1, aOut);
+      if rc <> 0 then
+        Fail(Format('dilim 6: paralel yazar A basarisiz (rc=%d) %s',
+          [rc, Trim(aOut)]))
+      else if wrote then
+      begin
+        be := TVdbBackendV3.Create(db, True, VDB_DEF_POOL, 2000);
+        try
+          if be.Get(881002, v) and be.Get(881003, v) then
+            Ok('paralel iki yazar (farkli anahtar) IKISI DE commit etti, ' +
+              'satir kaybi yok')
+          else
+            Fail('dilim 6: paralel commit sonrasi satir EKSIK');
+        finally
+          be := nil;
+        end;
+      end;
+    end;
+
+    { 3e) AYNI anahtara yazan iki surec: ikinci commit ACIK cakisma hatasi
+      alir (v2'deki sessiz ezme YOK). Ilk yazarin degeri korunur. }
+    if FileExists(ready) then DeleteFile(ready);
+    p1 := StartChild(['--writer-txn-hold', db, ready, '600', '882001']);
+    t0 := MsNow;
+    while (not FileExists(ready)) and ((MsNow - t0) < 15000) do
+      Sleep(10);
+    if not FileExists(ready) then
+      Fail('dilim 6: cakisma cocugu hazir isareti birakmadi')
+    else
+    begin
+      wrote := False;
+      msg := '';
+      try
+        be := TVdbBackendV3.Create(db, False, VDB_DEF_POOL, 20000);
+        be.BeginBatch;
+        be.Put(882001, MakeVal(882001 + 500000));
+        try
+          be.CommitBatch;
+          wrote := True;
+        except
+          on E: Exception do
+            msg := E.Message;
+        end;
+        be := nil;
+      except
+        on E: Exception do
+        begin
+          be := nil;
+          msg := E.Message;
+        end;
+      end;
+      rc := FinishChild(p1, aOut);
+      if wrote then
+        Fail('dilim 6: AYNI anahtara iki yazar SESSIZCE commit etti ' +
+          '(veri kaybi riski)')
+      else if Pos('cakisma', LowS(msg)) = 0 then
+        Fail('dilim 6: cakisma yerine beklenmedik hata: ' + msg)
+      else if rc <> 0 then
+        Fail(Format('dilim 6: cakisma cocugu basarisiz (rc=%d) %s',
+          [rc, Trim(aOut)]))
+      else
+      begin
+        be := TVdbBackendV3.Create(db, True, VDB_DEF_POOL, 2000);
+        try
+          okAll := be.Get(882001, v);
+          rep := '';
+          if okAll and (Length(v) > 0) then
+          begin
+            SetLength(rep, Length(v));
+            Move(v[0], rep[1], Length(v));
+          end;
+          if okAll and (rep = IntToStr(882001)) then
+            Ok('ayni anahtara iki yazar: ikinci commit ACIK cakisma hatasi ' +
+              'verdi, ilk deger korundu')
+          else
+            Fail('dilim 6: cakisma sonrasi anahtar degeri BOZUK/eksik: ' + rep);
+        finally
+          be := nil;
+        end;
+      end;
+    end;
   end;
-  rc := FinishChild(p1, aOut);
-  if rc = 0 then
-    Ok('acik islem tutan yazar sonunda commit etti')
-  else
-    Fail('acik islem tutan yazar (cikis ' + IntToStr(rc) + '): ' + Trim(aOut));
   if FileExists(ready) then DeleteFile(ready);
 
   { 4) yazar tutarken ikinci yazar. }
@@ -917,8 +1051,9 @@ begin
   if FileExists(ready) then DeleteFile(ready);
 
   { 5) yazar kapandi: okuyucu en guncel sayiyi gorur.
-    500 temel + bolum 3 (500000) + bolum 3b (777001) = 502. }
-  expectCount := 502;
+    500 temel + bolum 3 (500000) + bolum 3b (777001) + dilim 6
+    (3c 881001, 3d 881002 + 881003, 3e 882001) = 506. }
+  expectCount := 506;
   be := TVdbBackendV3.CreateReadOnly(db, VDB_DEF_POOL, 0);
   if be.Count = expectCount then
     Ok(Format('yazici kapandiktan sonra okuyucu %d satir gordu', [expectCount]))
