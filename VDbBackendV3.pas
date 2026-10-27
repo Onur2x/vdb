@@ -546,6 +546,7 @@ var
     calisir; sabit ad cakismaya ve yarisa yol acardi). }
   GAsOfCounter: LongInt = 0;
 
+
 function TVdbBackendV3.GetEncrypted: Boolean;
 begin
   Result := (FEng <> nil) and FEng.Encrypted;
@@ -2232,6 +2233,14 @@ begin
   if s.Optimistic then
   begin
     FEng.Store.EndDeferRefresh;
+    { v3.18 DUZELTME — KILITLENME (olculdu: prochk 1/20 "yazar kilidi
+      20000 ms icinde alinamadi"). Iyimser islem commit anina kadar
+      PAYLASIMLI kilidi tutuyordu. Iki yazar ayni anda commit ederse:
+      A rezervasyonu alir ve tam kilidi ister, B paylasimliyi tutar ve
+      rezervasyonu ister -> 20 sn sonunda biri duser. Rezervasyonu
+      BEKLEMEDEN once paylasimli kilidi birak; cakisma denetimi zaten
+      tam kilit altinda taze veriyle yapilir. }
+    FEng.Store.ReleaseReadForUpgrade;
     FEng.Store.AcquireWriteHold;
   end;
   { v3.16: yazma kilidi hata yolunda da birakilmali (kilit sizintisi =

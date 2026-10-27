@@ -20,8 +20,23 @@ function VDbFlushDir(const DirPath: string): Boolean;
 // AShared=True ise PAYLASIMLI kilit alinir: birden cok salt-okunur okuyucu
 // ayni anda tutabilir, yazar (tam kilit) hepsinin bitmesini bekler.
 // v3.2: cok okuyucu / tek yazici.
+// v3.18 DUZELTME — OZ-KILITLENME (olculdu: prochk, 20 703 ms EX? / err=33).
+// Windows'ta bir surec KENDI paylasimli kilidini tam kilide YUKSELTEMEZ:
+// ayni handle uzerinde LockFileEx(EX) ERROR_LOCK_VIOLATION (33) verir.
+// Ayrica motorun dagitik boolean defteri (FLockedShared) ile isletim
+// sisteminin gercek kilit durumu ayrisma biliyordu: defter "kilit yok"
+// derken OS'te paylasimli kilit duruyor ve yazar 20 s bekliyordu.
+// Cozum: kilit defteri BURADA, handle basina tutulur; OS kilit durumu
+// her zaman bu defterle BIREBIR ayni kalir:
+//   * ayni handle'da SH varken SH istenirse -> OS'e DOKUNULMAZ (idempotent)
+//   * ayni handle'da EX varken SH istenirse -> True (EX, SH'yi kapsar)
+//   * ayni handle'da SH varken EX istenirse -> once SH bırakılır (yukseltme)
+//   * EX varken EX istenirse -> True
+// VDbUnlockStream her durumda guvenli: tutulan kilidi bir kez birakir.
 function VDbLockStream(S: TFileStream; AShared: Boolean = False): Boolean;
 procedure VDbUnlockStream(S: TFileStream);
+// Bu handle uzerinde BIZIM tuttugumuz kilit var mi (teshis/kapi icin).
+function VDbLockHeld(S: TFileStream; out AShared: Boolean): Boolean;
 
 { v3.18: DEGISIKLIK SAYACI (<db>.gen) REZERVASYON kilidi.
   NEDEN AYRI: VDbLockStream Windows'ta TUM dosyayi (offset 0, 2^64 bayt)
@@ -77,6 +92,73 @@ uses
     BaseUnix FpOpen/FpClose sabitleri icin korunur. }
   {$IFDEF UNIX}, BaseUnix, Unix{$ENDIF};
 
+const
+  VDB_LOCK_SLOTS = 64;
+
+type
+  TVDbLockSlot = record
+    Handle: NativeUInt;
+    Shared: Boolean;
+    Held: Boolean;
+  end;
+
+var
+  GLockCs: TRTLCriticalSection;
+  GLockInit: Boolean = False;
+  GLockSlots: array[0..VDB_LOCK_SLOTS - 1] of TVDbLockSlot;
+
+procedure LockBookInit;
+begin
+  if GLockInit then Exit;
+  InitCriticalSection(GLockCs);
+  GLockInit := True;
+end;
+
+function LockSlotOf(AHandle: NativeUInt; ACreate: Boolean): Integer;
+var
+  i, bos: Integer;
+begin
+  Result := -1;
+  bos := -1;
+  for i := 0 to VDB_LOCK_SLOTS - 1 do
+  begin
+    if GLockSlots[i].Held and (GLockSlots[i].Handle = AHandle) then
+      Exit(i);
+    if (not GLockSlots[i].Held) and (bos < 0) then
+      bos := i;
+  end;
+  if ACreate then
+  begin
+    if bos < 0 then
+      raise Exception.Create('VDbSync: kilit defteri dolu (cok fazla acik handle)');
+    GLockSlots[bos].Handle := AHandle;
+    GLockSlots[bos].Shared := False;
+    GLockSlots[bos].Held := False;
+    Result := bos;
+  end;
+end;
+
+function VDbLockHeld(S: TFileStream; out AShared: Boolean): Boolean;
+var
+  idx: Integer;
+begin
+  AShared := False;
+  Result := False;
+  if S = nil then Exit;
+  LockBookInit;
+  EnterCriticalSection(GLockCs);
+  try
+    idx := LockSlotOf(S.Handle, False);
+    if idx >= 0 then
+    begin
+      Result := GLockSlots[idx].Held;
+      AShared := GLockSlots[idx].Shared;
+    end;
+  finally
+    LeaveCriticalSection(GLockCs);
+  end;
+end;
+
 procedure VDbFlushStream(S: TFileStream);
 begin
   if S = nil then Exit;
@@ -127,16 +209,53 @@ function VDbLockStream(S: TFileStream; AShared: Boolean): Boolean;
 var
   ov: TOverlapped;
   flags: LongWord;
+  idx: Integer;
 {$ENDIF}
 begin
   Result := False;
   if S = nil then Exit;
   {$IFDEF WINDOWS}
-  FillChar(ov, SizeOf(ov), 0);
-  if AShared then flags := LOCKFILE_FAIL_IMMEDIATELY
-  else flags := LOCKFILE_EXCLUSIVE_LOCK or LOCKFILE_FAIL_IMMEDIATELY;
-  Result := Windows.LockFileEx(S.Handle, flags, 0,
-    $FFFFFFFF, $FFFFFFFF, @ov);
+  LockBookInit;
+  EnterCriticalSection(GLockCs);
+  try
+    idx := LockSlotOf(S.Handle, True);
+    { 1) Defterde zaten kilit varsa OS'e DOKUNMA (cift kilit sizintisi ve
+         kendi kendini bloklama buradan geliyordu). }
+    if GLockSlots[idx].Held then
+    begin
+      if GLockSlots[idx].Shared and (not AShared) then
+      begin
+        { 2) YUKSELTME: paylasimliyi birak, sonra tam kilidi iste.
+            Windows ayni handle'da SH -> EX yukseltmesine IZIN VERMEZ. }
+        FillChar(ov, SizeOf(ov), 0);
+        Windows.UnlockFileEx(S.Handle, 0, $FFFFFFFF, $FFFFFFFF, @ov);
+        GLockSlots[idx].Held := False;
+        GLockSlots[idx].Shared := False;
+      end
+      else
+      begin
+        { Paylasimli istek: SH veya EX yeterli. Tam istek + EX zaten var. }
+        Result := True;
+        Exit;
+      end;
+    end
+    ;
+    FillChar(ov, SizeOf(ov), 0);
+    if AShared then flags := LOCKFILE_FAIL_IMMEDIATELY
+    else flags := LOCKFILE_EXCLUSIVE_LOCK or LOCKFILE_FAIL_IMMEDIATELY;
+    Result := Windows.LockFileEx(S.Handle, flags, 0,
+      $FFFFFFFF, $FFFFFFFF, @ov);
+    if Result then
+    begin
+      GLockSlots[idx].Held := True;
+      GLockSlots[idx].Shared := AShared;
+    end
+    else
+    begin
+    end;
+  finally
+    LeaveCriticalSection(GLockCs);
+  end;
   {$ELSE}
     {$IFDEF UNIX}
     if AShared then
@@ -153,12 +272,26 @@ procedure VDbUnlockStream(S: TFileStream);
 {$IFDEF WINDOWS}
 var
   ov: TOverlapped;
+  idx: Integer;
 {$ENDIF}
 begin
   if S = nil then Exit;
   {$IFDEF WINDOWS}
-  FillChar(ov, SizeOf(ov), 0);
-  Windows.UnlockFileEx(S.Handle, 0, $FFFFFFFF, $FFFFFFFF, @ov);
+  LockBookInit;
+  EnterCriticalSection(GLockCs);
+  try
+    { v3.18 DUZELTME: defterde kilit YOKSA OS'e hic dokunma. Onceden her
+      cagri kosulsuz UnlockFileEx yapiyordu; defter ile OS ayrisabiliyor,
+      sonra yazar kendi (hayalet) paylasimli kilidi yuzunden 20 s bekliyordu. }
+    idx := LockSlotOf(S.Handle, False);
+    if (idx < 0) or (not GLockSlots[idx].Held) then Exit;
+    FillChar(ov, SizeOf(ov), 0);
+    Windows.UnlockFileEx(S.Handle, 0, $FFFFFFFF, $FFFFFFFF, @ov);
+    GLockSlots[idx].Held := False;
+    GLockSlots[idx].Shared := False;
+  finally
+    LeaveCriticalSection(GLockCs);
+  end;
   {$ELSE}
   {$IFDEF UNIX}
   FpFlock(S.Handle, VDB_LOCK_UN);

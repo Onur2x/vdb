@@ -243,6 +243,12 @@ type
     { v3.18: FDeferRefresh bayragini YOK SAYAN tazeleme. Yazma yollari
       bunu kullanir: bayat onbellekle yazmak veri kaybi uretir. }
     procedure RefreshIfStaleForce;
+    { v3.18 DUZELTME — VERI BUTUNLUGU: tazelemeyi VERI dosyasinin tam kilidi
+      altinda yapar, sonra kilidi birakir (islemin goruntusu yine sabit
+      degildir; yalniz bu okuma penceresi korunur). Rezervasyon (.gen) kilidi
+      BUNUN YERINE GECMEZ: baska bir surec tam kilidi tutup WAL'i kisaltirken
+      tazeleme yapmak yirtik goruntu ve kisa okuma hatasi uretiyordu. }
+    procedure RefreshUnderExclusive;
     { v3.16: yazma ilkelleri icin guvenlik agi (bkz. FAutoWrite). }
     procedure EnsureIoWrite;
     { v3.16: `<db>.gen` degisiklik sayaci. }
@@ -300,6 +306,13 @@ type
     procedure ReleaseDataWrite;
     procedure AcquireRead;
     procedure ReleaseRead;
+    { v3.18 DUZELTME — KILITLENME: iyimser yazar commit aninda rezervasyonu
+      beklerken PAYLASIMLI kilidi tutarsa iki yazar birbirini kilitler
+      (A rezervasyonu tutar + tam kilidi ister; B paylasimliyi tutar +
+      rezervasyonu ister). Bu metot, beklemeden ONCE paylasimli kilidi ve
+      okuma derinligini birakir. Dogruluk kaybolmaz: cakisma denetimi tam
+      kilit altinda TAZE veriyle yapilir (VerifyNoConflict). }
+    procedure ReleaseReadForUpgrade;
     function WriteHeld: Boolean;
     { v3.16: guvenlik agi ile ALINAN tam kilidi birakir. Yalnizca
       `EnsureIoWrite` kilit yukseltmesi yaptiysa etkilidir (aksi halde
@@ -854,7 +867,8 @@ begin
   if FBusyMs > 0 then
     raise EVdbPageStore.Create(Format(
       'veritabani mesgul: yazar kilidi %d ms icinde alinamadi ' +
-      '(baska bir yazma oturumu acik): %s', [FBusyMs, FPath]))
+      '(baska bir yazma oturumu acik): %s',
+      [FBusyMs, FPath]))
   else
     raise EVdbPageStore.Create(
       'veritabani mesgul: yazar kilidi alinamadi ' +
@@ -864,13 +878,24 @@ end;
 { v3.18: yazar rezervasyonu da BEKLER. Ilk uygulamada tek deneme yapildi ve
   prochk coktu: iki yazar surec ayni anda acabildiginda ikincisi "mesgul"
   aliyordu (veri kaybi yok ama ISLEV KAYBI: v3.16'daki sirayla yazma sozu
-  bozuluyordu). Bekleme politikasi LockExclusive ile BIREBIR ayni tutulur. }
+  bozuluyordu). Bekleme politikasi LockExclusive ile BIREBIR ayni tutulur.
+
+  v3.18 DUZELTME — KILITLENME (olculdu: prochk, "yazar kilidi 20000 ms
+  icinde alinamadi", teshis shared=0 readDepth=0 reserved=1):
+  A oturumu PAYLASIMLI okuma kilidini tutarken rezervasyonu bekliyordu;
+  B oturumu rezervasyonu tutarken TAM kilidi istiyordu. A'nin paylasimli
+  kilidi B'yi, B'nin rezervasyonu A'yi blokladigi icin kimse ilerlemiyor.
+  Cozum: rezervasyonu beklemeye baslamadan ONCE kendi paylasimli kilidimizi
+  birak. Kaybedilen sey yok: okuma yollari kilidi ifade basina yeniden alir
+  ve tazelik zaten tam kilit altinda dogrulanir. }
 procedure TVDbPageStore.LockReserve;
 var
   t0: QWord;
 begin
   if FGenStream = nil then
     raise EVdbPageStore.Create('kapali veritabani: yazar rezervasyonu alinamaz');
+  { Kilitten once birak: yoksa yukaridaki karsilikli kilitlenme olusur. }
+  ReleaseReadForUpgrade;
   t0 := GetTickCount64;
   repeat
     if VDbLockGenReserve(FGenStream) then Exit;
@@ -915,6 +940,52 @@ begin
   FSigGen := ReadGen;
   if Assigned(FOnRefreshed) then
     FOnRefreshed(Self);
+end;
+
+procedure TVDbPageStore.RefreshUnderExclusive;
+var
+  hadShared: Boolean;
+begin
+  if FStream = nil then Exit;
+  hadShared := FLockedShared;
+  if hadShared then
+  begin
+    VDbUnlockStream(FStream);
+    FLockedShared := False;
+    FLocked := False;
+  end;
+  LockExclusive;
+  try
+    RefreshIfStaleForce;
+  finally
+    VDbUnlockStream(FStream);
+    if hadShared then
+    begin
+      FLockedShared := TakeSharedLock;
+      FLocked := FLockedShared;
+    end;
+  end;
+end;
+
+procedure TVDbPageStore.ReleaseReadForUpgrade;
+begin
+  if FStream = nil then Exit;
+  EnterCriticalSection(FWriteCs);
+  try
+    { Tam kilit zaten bizde ya da rezervasyon bizde: birakilacak sey yok. }
+    if FLockedExcl then Exit;
+    if FHoldDepth > 0 then Exit;
+    if FWriteDepth > 0 then Exit;
+    FReadDepth := 0;
+    if FLockedShared then
+    begin
+      VDbUnlockStream(FStream);
+      FLockedShared := False;
+      FLocked := False;
+    end;
+  finally
+    LeaveCriticalSection(FWriteCs);
+  end;
 end;
 
 procedure TVDbPageStore.RefreshIfStale;
@@ -979,12 +1050,18 @@ begin
 end;
 
 function TVDbPageStore.ReadGen: QWord;
+var
+  got: Integer;
 begin
   Result := 0;
   if FGenStream = nil then Exit;
   if FGenStream.Size < 8 then Exit;
   FGenStream.Position := 0;
-  FGenStream.ReadBuffer(Result, 8);
+  { v3.18: `.gen` yalniz bir IPUCUDUR (asil veri baska yerde). Kisa okuma
+    gercek bir yarisin isareti olabilir; istisna atmak yerine 0 don ve
+    tazelemeyi ZORLA — 0 hicbir zaman gecerli bir nesil degildir. }
+  got := FGenStream.Read(Result, 8);
+  if got <> 8 then Result := 0;
 end;
 
 procedure TVDbPageStore.BumpGen;
@@ -1241,7 +1318,10 @@ begin
     LockReserve;
     FReserved := True;
     try
-      RefreshIfStaleForce;
+      { v3.18 DUZELTME: rezervasyon VERI kilidi degildir; baska bir surec
+        tam kilit altinda WAL'i budayabilir. Tazelemeyi TAM KILIT altinda
+        yap, yoksa kisa okuma (EReadError) ve yirtik goruntu riski var. }
+      RefreshUnderExclusive;
     except
       VDbUnlockGenReserve(FGenStream);
       FReserved := False;
@@ -1293,7 +1373,8 @@ begin
     if not VDbLockGenReserve(FGenStream) then Exit;
     FReserved := True;
     try
-      RefreshIfStaleForce;
+      { v3.18 DUZELTME: bkz. AcquireWriteHold — tazeleme tam kilit altinda. }
+      RefreshUnderExclusive;
     except
       VDbUnlockGenReserve(FGenStream);
       FReserved := False;
