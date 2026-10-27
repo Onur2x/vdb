@@ -319,6 +319,41 @@ begin
   end;
 end;
 
+{ --read-loop <db> <ms>
+  v3.18: YAZILABILIR oturumda okuma dongusu. Her ifade paylasimli
+  kilidi alip birakir; yazar icin kilit bosluklari olusur. Ana surec
+  bu sirada yazmayi dener (TestWriterStarvation). }
+function ChildReadLoop: Integer;
+var
+  db: string;
+  ms: Integer;
+  be: IVdbBackend;
+  t0: QWord;
+  sayi, c: Integer;
+begin
+  db := ParamStr(2);
+  ms := StrToIntDef(ParamStr(3), 1000);
+  sayi := 0;
+  c := -1;
+  try
+    be := TVdbBackendV3.Create(db, False, VDB_DEF_POOL, 5000);
+    t0 := GetTickCount64;
+    repeat
+      c := be.Count;
+      Inc(sayi);
+    until GetTickCount64 - t0 >= QWord(ms);
+    be := nil;
+    WriteLn(Format('TAMAM %d okuma (satir=%d)', [sayi, c]));
+    Result := 0;
+  except
+    on E: Exception do
+    begin
+      WriteLn('HATA ', E.Message);
+      Result := 10;
+    end;
+  end;
+end;
+
 { v3.9: motor kilidi (TVdbGate) - derinlik defteri.
   ONCEDEN FEngCs duz bir TCriticalSection'di ve ic ice cagrilar (ScanAll ->
   ScanCb -> OwnSet, ApplyBatch -> BatchMap ...) yalnizca "kritik bolum
@@ -498,6 +533,82 @@ begin
       Msg := E.Message;
   end;
   Elapsed := MsNow - t0;
+end;
+
+{ v3.18: AC KALMA (starvation) kapisi.
+  Cocuk YAZILABILIR oturumda 5 sn boyunca kesintisiz okuma yapar (her
+  ifade paylasimli kilidi alip birakir). Ana surec bu yuku altinda YAZAR
+  olarak acmayi ve COMMIT etmeyi dener. Beklenen: busy=5000 ms icinde
+  yazma girer. Yazar oncelikli yoklama (yazar 1 ms, okuyucu ustel artan)
+  olmasaydi yazar surekli okuyucu yuku altinda acliga dusebilirdi.
+  NOT: bu bir SMOKE kontroludur; kesin FIFO kaniti degildir. }
+procedure TestWriterStarvation(const Dir: string);
+const
+  COCUK_MS = 5000;
+  ESIK_MS = 2500;
+var
+  db: string;
+  p: TProcess;
+  co: string;
+  rc: Integer;
+  be: IVdbBackend;
+  i: Integer;
+  t0: Int64;
+  el: Int64;
+  girdi: Boolean;
+  msg: string;
+begin
+  db := IncludeTrailingPathDelimiter(Dir) + 'starve.odb';
+  if FileExists(db) then DeleteFile(db);
+  if FileExists(db + '.wal') then DeleteFile(db + '.wal');
+  if FileExists(db + '.gen') then DeleteFile(db + '.gen');
+  try
+    be := TVdbBackendV3.Create(db, True, VDB_DEF_POOL, 5000);
+    be.BeginBatch;
+    for i := 1 to 50 do
+      be.Put(i, MakeVal(i));
+    be.CommitBatch;
+    be := nil;
+  except
+    on E: Exception do
+    begin
+      Fail('yazar acligi: hazirlik basarisiz: ' + E.Message);
+      Exit;
+    end;
+  end;
+
+  p := StartChild(['--read-loop', db, IntToStr(COCUK_MS)]);
+  Sleep(300);
+
+  girdi := False;
+  msg := '';
+  t0 := MsNow;
+  try
+    be := TVdbBackendV3.Create(db, False, VDB_DEF_POOL, 5000);
+    be.Put(9999, MakeVal(9999));
+    be := nil;
+    girdi := True;
+  except
+    on E: Exception do
+      msg := E.Message;
+  end;
+  el := MsNow - t0;
+
+  rc := FinishChild(p, co);
+  if not girdi then
+    Fail(Format('yazar acligi: okuyucu yuku altinda yazma giremedi ' +
+      '(%d ms): %s', [el, msg]))
+  else if el > ESIK_MS then
+    Fail(Format('yazar acligi: yazma %d ms sonra girdi (esik %d ms)',
+      [el, ESIK_MS]))
+  else
+  begin
+    msg := Format('yazar acligi: kesintisiz okuma yuku altinda yazma %d ms icinde girdi (esik %d ms)', [el, ESIK_MS]);
+    Ok(msg);
+  end;
+  if rc <> 0 then
+    Fail(Format('yazar acligi: okuma cocugu hata verdi (rc=%d) %s', [rc, co]));
+  be := nil;
 end;
 
 procedure RunParent;
@@ -709,6 +820,9 @@ begin
   { 7) v3.9: motor kilidi defteri + es zamanli erisim. }
   TestGateDepth(dir);
 
+  { 8) v3.18: yazar acligi (starvation) - surekli okuma yuku altinda yazma. }
+  TestWriterStarvation(dir);
+
   WriteLn;
   WriteLn('================================================');
   WriteLn(Format('SONUC: gecen=%d kalan=%d', [gPass, gFail]));
@@ -750,6 +864,12 @@ begin
     begin
       gPass := 0; gFail := 0;
       ExitCode := ChildWriterHold;
+      Exit;
+    end;
+    if ParamStr(1) = '--read-loop' then
+    begin
+      gPass := 0; gFail := 0;
+      ExitCode := ChildReadLoop;
       Exit;
     end;
   end;

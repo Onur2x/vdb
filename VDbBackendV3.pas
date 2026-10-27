@@ -380,10 +380,14 @@ type
     { Sprint 3.4: sifreli v3 dosyasi. Anahtar 32 baytlık AES-256'dir;
       parola verilirse PBKDF2-SHA256 ile turetilir. Sifresiz dosyaya
       anahtar vermek net hatadir. }
+    { v3.18: sifreli dosyada da yazar kilidi bekleme suresi verilebilir;
+      boylece cok surecli yazma sifreli dosyada da calisir. }
     constructor CreateWithKey(const ADbPath: string; const AKey: TBytes;
-      ACreate: Boolean = True; APoolPages: Integer = VDB_DEF_POOL);
+      ACreate: Boolean = True; APoolPages: Integer = VDB_DEF_POOL;
+      ABusyMs: Integer = VDB_DEF_BUSY_MS);
     constructor CreateWithPassword(const ADbPath, APassword: string;
-      ACreate: Boolean = True; APoolPages: Integer = VDB_DEF_POOL);
+      ACreate: Boolean = True; APoolPages: Integer = VDB_DEF_POOL;
+      ABusyMs: Integer = VDB_DEF_BUSY_MS);
 
     { v3.2: SALT-OKUNUR acilis. Dosya paylasimli kilit ile acilir: birden cok
       okuyucu ayni anda calisabilir, yazar (tam kilit) bekler. Hicbir yazma
@@ -882,23 +886,24 @@ begin
 end;
 
 constructor TVdbBackendV3.CreateWithKey(const ADbPath: string;
-  const AKey: TBytes; ACreate: Boolean; APoolPages: Integer);
+  const AKey: TBytes; ACreate: Boolean; APoolPages: Integer;
+  ABusyMs: Integer);
 begin
   inherited Create;
   FKey := Copy(AKey, 0, Length(AKey));
   FPassword := '';
   FHasPassword := False;
-  InitBackend(ADbPath, ACreate, APoolPages);
+  InitBackend(ADbPath, ACreate, APoolPages, False, ABusyMs);
 end;
 
 constructor TVdbBackendV3.CreateWithPassword(const ADbPath, APassword: string;
-  ACreate: Boolean; APoolPages: Integer);
+  ACreate: Boolean; APoolPages: Integer; ABusyMs: Integer);
 begin
   inherited Create;
   FKey := nil;
   FPassword := APassword;
   FHasPassword := True;
-  InitBackend(ADbPath, ACreate, APoolPages);
+  InitBackend(ADbPath, ACreate, APoolPages, False, ABusyMs);
 end;
 
 constructor TVdbBackendV3.CreateReadOnly(const ADbPath: string;

@@ -85,9 +85,11 @@ procedure VdbOpenReadOnly(const Path: string; out Be: IVdbBackend;
 procedure VdbOpenWithBusyTimeout(const Path: string; out Be: IVdbBackend;
   BusyMs: Integer; CreateIfMissing: Boolean = True; PoolPages: Integer = 0);
 
-{ Sifreli v3 dosyasi acar/olusturur. v2 dosyalari bu yoldan ACILMAZ. }
+{ Sifreli v3 dosyasi acar/olusturur. v2 dosyalari bu yoldan ACILMAZ.
+  v3.18: BusyMs — yazar kilidi icin bekleme suresi (cok surecli yazma). }
 procedure VdbOpenWithPassword(const Path, Password: string;
-  out Be: IVdbBackend; CreateIfMissing: Boolean = True; PoolPages: Integer = 0);
+  out Be: IVdbBackend; CreateIfMissing: Boolean = True;
+  PoolPages: Integer = 0; BusyMs: Integer = VDB_DEF_BUSY_MS);
 
 implementation
 
@@ -267,7 +269,7 @@ end;
 
 procedure VdbOpenWithPassword(const Path, Password: string;
   out Be: IVdbBackend; CreateIfMissing: Boolean = True;
-  PoolPages: Integer = 0);
+  PoolPages: Integer = 0; BusyMs: Integer = VDB_DEF_BUSY_MS);
 var
   file_: string;
   fam: TVdbFamily;
@@ -285,7 +287,7 @@ begin
     ForceDirectories(ExtractFileDir(file_));
   pool := EffectivePool(PoolPages);
   Be := TVdbBackendV3.CreateWithPassword(file_, Password,
-    fam = vdfMissing, pool);
+    fam = vdfMissing, pool, BusyMs);
 end;
 
 end.

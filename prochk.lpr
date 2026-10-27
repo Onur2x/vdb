@@ -49,6 +49,42 @@ begin
   Result := IncludeTrailingPathDelimiter(D) + 'veritabani.odb';
 end;
 
+{ v3.18: sifreli dosyada cok surecli yazma. Ayni parola, ayni dosya, iki
+  ayri surec; ikisi de commit etmeli ve satirlar eksiksiz olmali. Sifreli
+  yolun busy timeout'u artik verilebiliyor (CreateWithPassword ... ABusyMs);
+  bu kapi o parametreyi ve sifreli WAL paylasimini birlikte sinar. }
+function CocukSifreli(const Dizin, Onek, Parola: string; Adet: Integer): Integer;
+var
+  be: TVdbBackendV3;
+  i: Integer;
+  anahtar: QWord;
+begin
+  Result := 0;
+  try
+    be := TVdbBackendV3.CreateWithPassword(DbYolu(Dizin), Parola, False, 256, 20000);
+    try
+      be.BeginBatch;
+      Sleep(400);
+      for i := 1 to Adet do
+      begin
+        if Onek = 'A' then anahtar := 3000 + QWord(i)
+        else anahtar := 4000 + QWord(i);
+        be.Put(anahtar, B(Onek + '-' + IntToStr(i)));
+      end;
+      be.CommitBatch;
+      WriteLn('cocuk-sifreli ', Onek, ': ', Adet, ' satir yazildi, toplam=', be.Count);
+    finally
+      be.Free;
+    end;
+  except
+    on E: Exception do
+    begin
+      WriteLn('cocuk-sifreli ', Onek, ' HATA: ', E.ClassName, ': ', E.Message);
+      Result := 4;
+    end;
+  end;
+end;
+
 { --------------------------------------------------------------- cocuk }
 function Cocuk(const Dizin, Onek: string; Adet: Integer): Integer;
 var
@@ -90,6 +126,102 @@ begin
   be.Free;
 end;
 
+procedure TestSifreliCokSurecli(const Ust: string);
+var
+  dir, sifre: string;
+  be: TVdbBackendV3;
+  p1, p2: TProcess;
+  i, n, eksik: Integer;
+  v: TBytes;
+  reddedildi: Boolean;
+begin
+  WriteLn;
+  WriteLn('--- sifreli dosyada cok surecli yazma (v3.18)');
+  dir := IncludeTrailingPathDelimiter(Ust) + 'sifreli';
+  ForceDirectories(dir);
+  sifre := 'cok-surec-parola';
+
+  DeleteFile(DbYolu(dir));
+  DeleteFile(DbYolu(dir) + '.gen');
+  DeleteFile(DbYolu(dir) + '.wal');
+  DeleteFile(DbYolu(dir) + '.idx');
+  DeleteFile(DbYolu(dir) + '.log');
+  DeleteFile(DbYolu(dir) + '.meta');
+  DeleteFile(DbYolu(dir) + '.undo');
+
+  { Tohum: sifreli dosya, 5 satir, kapanir. }
+  be := TVdbBackendV3.CreateWithPassword(DbYolu(dir), sifre, True, 256, 20000);
+  try
+    for i := 1 to 5 do be.Put(QWord(i), B('tohum-' + IntToStr(i)));
+    Ok('sifreli tohum 5 satir', be.Count = 5, IntToStr(be.Count));
+    Ok('dosya gercekten sifreli', be.Encrypted, BoolToStr(be.Encrypted, True));
+  finally
+    be.Free;
+  end;
+
+  { Iki cocuk AYNI ANDA sifreli dosyaya yazar. }
+  p1 := TProcess.Create(nil);
+  p2 := TProcess.Create(nil);
+  try
+    p1.Executable := ParamStr(0);
+    p1.Parameters.Add('--cocuk-sifreli');
+    p1.Parameters.Add(dir);
+    p1.Parameters.Add('A');
+    p1.Parameters.Add(sifre);
+    p1.Parameters.Add(IntToStr(COCUK_ADET));
+    p1.Options := [];
+    p1.Execute;
+
+    p2.Executable := ParamStr(0);
+    p2.Parameters.Add('--cocuk-sifreli');
+    p2.Parameters.Add(dir);
+    p2.Parameters.Add('B');
+    p2.Parameters.Add(sifre);
+    p2.Parameters.Add(IntToStr(COCUK_ADET));
+    p2.Options := [];
+    p2.Execute;
+
+    while p1.Running or p2.Running do Sleep(10);
+
+    Ok('sifreli cocuk A cikis kodu 0', p1.ExitStatus = 0, IntToStr(p1.ExitStatus));
+    Ok('sifreli cocuk B cikis kodu 0', p2.ExitStatus = 0, IntToStr(p2.ExitStatus));
+  finally
+    p1.Free;
+    p2.Free;
+  end;
+
+  { Dogrulama: dogru parola ile ac, TUM satirlar yerinde mi? }
+  be := TVdbBackendV3.CreateWithPassword(DbYolu(dir), sifre, False, 256, 20000);
+  try
+    n := be.Count;
+    Ok('sifreli toplam satir 5 + 2*' + IntToStr(COCUK_ADET),
+      n = 5 + 2 * COCUK_ADET, IntToStr(n));
+    eksik := 0;
+    for i := 1 to COCUK_ADET do
+    begin
+      if not be.Get(QWord(3000 + i), v) then Inc(eksik);
+      if not be.Get(QWord(4000 + i), v) then Inc(eksik);
+    end;
+    Ok('sifreli hicbir satir kaybolmadi', eksik = 0, 'eksik=' + IntToStr(eksik));
+  finally
+    be.Free;
+  end;
+
+  { Yanlis parola hala reddedilir (sifreleme butunlugu korunuyor). }
+  reddedildi := False;
+  try
+    be := TVdbBackendV3.CreateWithPassword(DbYolu(dir), 'yanlis-parola', False, 256, 2000);
+    try
+      be.Count;
+    finally
+      be.Free;
+    end;
+  except
+    on E: Exception do reddedildi := True;
+  end;
+  Ok('yanlis parola reddedildi', reddedildi, BoolToStr(reddedildi, True));
+end;
+
 { --------------------------------------------------------------- ana }
 var
   be: TVdbBackendV3;
@@ -103,6 +235,13 @@ begin
   if (ParamCount >= 1) and (ParamStr(1) = '--cocuk') then
   begin
     ExitCode := Cocuk(ParamStr(2), ParamStr(3), StrToIntDef(ParamStr(4), COCUK_ADET));
+    Exit;
+  end;
+
+  if (ParamCount >= 4) and (ParamStr(1) = '--cocuk-sifreli') then
+  begin
+    ExitCode := CocukSifreli(ParamStr(2), ParamStr(3), ParamStr(4),
+      StrToIntDef(ParamStr(5), COCUK_ADET));
     Exit;
   end;
 
@@ -190,6 +329,9 @@ begin
   finally
     be.Free;
   end;
+
+  { v3.18: sifreli dosyada cok surecli yazma. }
+  TestSifreliCokSurecli(ParamStr(1));
 
   WriteLn('---');
   WriteLn(Format('SONUC: gecen=%d kalan=%d', [gPass, gFail]));

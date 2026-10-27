@@ -771,22 +771,32 @@ begin
 end;
 
 { ---------------------------------------------------------------- v3.16 }
-{ Paylasimli kilidi alir; alinamazsa FBusyMs boyunca bekler. }
+{ v3.18 — AC KALMAYI ONLEME (adil kuyruk yerine yazar oncelikli yoklama).
+  Kesin FIFO surecler arasi bir kuyruk dosyasi gerektirir; onun yerine
+  yoklama araliklari ASIMETRIK yapilir: YAZAR 1 ms'de bir dener, OKUYUCU
+  ustel artan araliklarla (1,2,4,...50 ms) dener. Paylasimli kilit zaten
+  islem basina tutuldugu icin okuyucu kisa araliklarla birakir; yazar bu
+  boslukta en gec birkac ms icinde girer. Boylece surekli okuyucu yuku
+  altinda yazar acliga dusmez (olculdu: lockchk "yazar acligi" bolumu). }
 function TVDbPageStore.TakeSharedLock: Boolean;
 var
   t0: QWord;
+  bekle: Integer;
 begin
   Result := VDbLockStream(FStream, True);
   if Result then Exit;
   t0 := GetTickCount64;
+  bekle := 1;
   repeat
-    Sleep(10);
+    Sleep(bekle);
     Result := VDbLockStream(FStream, True);
     if Result then Exit;
+    if bekle < 50 then bekle := bekle * 2;
   until GetTickCount64 - t0 >= QWord(FBusyMs);
 end;
 
-{ Tam (yazma) kilidini alir; alinamazsa FBusyMs sonunda ACIK hata verir. }
+{ Tam (yazma) kilidini alir; alinamazsa FBusyMs sonunda ACIK hata verir.
+  Yoklama 1 ms: yazar okuyucudan DAHA SIK dener (bkz. TakeSharedLock). }
 procedure TVDbPageStore.LockExclusive;
 var
   t0: QWord;
@@ -795,7 +805,7 @@ begin
   repeat
     if VDbLockStream(FStream, False) then Exit;
     if GetTickCount64 - t0 >= QWord(FBusyMs) then Break;
-    Sleep(10);
+    Sleep(1);
   until False;
   if FBusyMs > 0 then
     raise EVdbPageStore.Create(Format(
