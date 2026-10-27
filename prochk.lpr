@@ -116,6 +116,10 @@ begin
   if DirectoryExists(ParamStr(1)) then
   begin
     DeleteFile(DbYolu(ParamStr(1)));
+    { v3.17: yan dosyalar da silinir; eski bir .gen sayaci ya da .wal
+      kalirsa yeni kosu bayat durumla baslar. }
+    DeleteFile(IncludeTrailingPathDelimiter(ParamStr(1)) + 'veritabani.odb.gen');
+    DeleteFile(IncludeTrailingPathDelimiter(ParamStr(1)) + 'veritabani.odb.wal');
     DeleteFile(IncludeTrailingPathDelimiter(ParamStr(1)) + 'veritabani.idx');
     DeleteFile(IncludeTrailingPathDelimiter(ParamStr(1)) + 'veritabani.log');
     DeleteFile(IncludeTrailingPathDelimiter(ParamStr(1)) + 'veritabani.meta');
