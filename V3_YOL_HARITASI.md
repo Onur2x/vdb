@@ -1505,6 +1505,79 @@ kaldırılacak; sıra şu üç adımda:
 Her adım ayrı ölçülecek; yalnız ölçülen kazanç tutulacak, gerisi geri
 alınacak.
 
+**7f. İki kusur ve bir varsayılan (2026-10-27).**
+
+*Okuma yolu, tam kilit altında.* Aralıklı görülen `EReadError: Stream read
+error` sekiz koşuda iki kez çıktı; tanı eklendiğinde ayrıntı netti:
+`sayfa 1 okunamadı (konum 4096, dosya boyu 282624, mantıksal sayfa 5)` —
+dosya sağlamdı, EOF yoktu. Kök neden `VDbSync.VDbLockStream`'in Windows'ta
+**tüm dosyayı** `LockFileEx` ile kilitlemesi: bir süreç tam kilit tutarken
+ötekinin `ReadFile`'ı `ERROR_LOCK_VIOLATION (33)` alıyor, `TFileStream`
+bunu "Stream read error" yapıyor. İyimser modda işlem **arasında** kilit
+tutulmadığı için okuma sayfaları başka sürecin tam kilidi altında
+kalabiliyordu. Düzeltme: `TVDbPageStore.ReadBytesAt` okuma hatasında, kilit
+bizde değilse paylaşımlı kilit alıp en fazla 8 kez yeniden dener; sonunda
+sayfa/konum/dosya boyu/kilit durumunu içeren **açık** hata verir. Aynı
+sekiz koşu sonrası çocuk hatası **0**.
+
+*Değişim günlüğü fsync'i.* `TVdbChangeLog.SyncGroups` (varsayılan
+`False`) ve `TVdbBackendV3.FDurableChangeLog` eklendi: grup sonu fsync'i
+artık varsayılan olarak **yapılmıyor**; fsync segment rotasyonunda
+(16 MB), `Close` ve açık `Flush` sırasında yapılıyor. Veritabanı verisi
+etkilenmez (WAL her commit'te fsync edilir); elektrik kesintisinde son
+segment (≤16 MB) kaybolabilir, süreç çökmesinde kayıp yoktur. Ölçüm
+(8 koşu): tek süreç **0,79–0,87 → 0,472–0,523 ms/commit** (~1,65x),
+paralel P=4 duvar **212–272 → 140–200 ms** (~1,45x).
+
+**7g. Grup commit: iş parçacıkları tek fsync'i paylaşıyor (2026-10-27).**
+
+Ölçülen sorun: aynı süreçte 4 iş parçacığı paralel commit ettiğinde
+hızlanma **1,05x**'ti; parçacıklar `FEngCs` + yazar rezervasyonu ile
+tamamen sıralanıyordu. Commit başına fsync tek başına maliyetin ~%60'ı
+(0,32 / 0,52 ms). Çözüm üç parça:
+
+1. `TVdbPageWal`: `FWrittenLsn` (WAL'e **fiilen** yazılmış son LSN;
+   `FLSN` kayıtlardan **önce** atandığı için kullanılamaz), `SyncDurable`
+   ve `WrittenLsn`. fsync **ayrı handle** ile yapılır (`FSyncStream`):
+   `TFileStream`'in konumu paylaşılan durumdur, lider fsync ederken başka
+   parçacığın yazması yarış durumu üretirdi; `FlushFileBuffers` konum
+   kullanmaz.
+2. `TVdbPageEngine`: `DoCommit` / `CommitNoSync(out ASyncLsn)` /
+   `AwaitDurable(ALsn)`. Bekleyenlerden **biri** lider seçilir, fsync'i
+   yalnız o yapar, ötekiler olayla uyanır; `FDurableLsn` hedefi zaten
+   karşılıyorsa bekleme **fsync'siz** döner. `Commit(DoSync=True)`
+   sözleşmesi korunur (ekle + bekle). `Checkpoint`, WAL'i budamadan önce
+   `AwaitDurable(FWal.WrittenLsn)` ile **bariyer** kurar.
+3. `TVdbBackendV3.CommitBatch`: `CommitNoSync` + fsync kritik bölümün
+   **dışında** (`ReleaseDataWrite` + `FEngCs.Leave` sonrası). Böylece
+   commit'ler üst üste biner ve tek fsync birkaçını kapsar.
+
+Ölçüm (`tmp64/ptbench`, tek backend + P iş parçacığı):
+
+| P | ms/commit | commit/s | hızlanma |
+|---|---|---|---|
+| 1 | 0,526 | 1902 | — |
+| 2 | 0,326 | 3066 | 1,64x |
+| 4 | 0,244 | 4102 | 2,13x |
+| 8 | 0,246 | 4057 | 2,20x |
+
+Süreç ölçekli `pcbench` (P=4) **0,53x** — grup commit **süreçler arası
+çalışmaz** (her süreç kendi WAL'ini açar); bu ölçümde gerileme de yok.
+Kapılar: `TestV3GroupCoalesce` deterministik olarak "5 `CommitNoSync` +
+tek `AwaitDurable` = **tam 1 fsync**" ve "aynı LSN için ikinci bekleme
+yeni fsync yapmaz" iddialarını kanıtlar; `TestV3GroupCommit` 4×40 paralel
+commit'te fsync ≤ commit ve yeniden açılışta satır kaybı olmadığını
+doğrular. Kapılar 16/16 yeşil, **682** kontrol; `sqltest` v3 2874/0/33,
+v2 3305/0/0.
+
+**Kalan sınır (dürüst):** grup commit yalnız süreç **içinde** çalışır.
+Süreçler arası paralel yazma hâlâ **0,53x**: rezervasyon kilidinin devri
+(`Sleep(1)` yoklaması, ölçülen ~0,6 ms/commit) ve her yazarın kendi
+tazelemesi. Sıradaki adımlar: (a) rezervasyon devrini olay tabanlı
+kuyruğa çevirmek, (b) tazelemeyi artımlı yapmak (WAL'in tamamı yerine
+yalnız yeni çerçeveler, heap dizinini baştan taramamak), (c) çakışma
+denetimini **sayfa LSN'i** düzeyine indirmek.
+
 ### Sürüm çizgisi kararı (2026-10-26): alpha hattı → **v1.0.0**
 
 Kullanıcı kararı, önceki "v4'e ertele" planını geçersiz kılar:
