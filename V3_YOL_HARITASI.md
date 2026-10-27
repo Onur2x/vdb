@@ -1154,8 +1154,10 @@ boyu** tutulur.
 
 **Nasıl çalışır.**
 - Açılış: yazan oturum kısa süreliğine **tam kilit** alır (WAL kurtarma, sürüm
-  yükseltmesi, meta yazımı), işi bitince **bırakır**. Salt-okunur oturum
-  paylaşımlı kilidi oturum boyu tutar (okuma görüntüsü sabit kalır).
+  yükseltmesi, meta yazımı), işi bitince **bırakır**. **v3.18'den itibaren
+  salt-okunur oturum da açılış bitiminde paylaşımlı kilidi bırakır**; kilit
+  yalnız ifade kapsamında tutulur. (Önceki sürümde RO oturum paylaşımlı kilidi
+  oturum boyu tutuyor, açık bir RO oturum yazarları süresiz blokluyordu.)
 - Her motor erişimi tek kapıdan (`FEngCs`) geçer; kapı derinliği 0→1 olduğunda
   **paylaşımlı kilit** alınır, 1→0 olduğunda bırakılır. Yazma girişinde
   paylaşımlı bırakılıp **tam kilit** alınır (`AcquireWrite`), çıkışta tersi
@@ -1205,15 +1207,22 @@ kez kilit alır, satır başına ek yük yoktur. Satır başına API döngüsün
 güvenliğin bilinçli bedelidir.
 
 **Testler.** `sqltest` v3 **2874/0/33**, v2 **3305/0/0**; `v3sqlchk` **238/0**;
-`lockchk` **29/0**; **16/16 kapı yeşil** (15 eski + yeni `prochk`).
+`lockchk` **30/0**; `prochk` **15/0**; **16/16 kapı yeşil** (toplam 691 kontrol).
 `prochk` gerçek iki süreçle yarışır: tohum 5 satır + A 40 + B 40 = **85 satır**,
-**eksik=0**; B, A'nın commit'ini görür (`toplam=85`).
+**eksik=0**; B, A'nın commit'ini görür (`toplam=85`). Şifreli dosyada da
+**85 satır, eksik=0**.
 
 **Bilinçli sınırlar (dokümante).**
-- Salt-okunur oturum, süreç içi görüntüsünü sabitlemek için paylaşımlı kilidi
-  **oturum boyu** tutar; bu yüzden **açık bir salt-okunur oturum yazarları
-  bloklar** (yazar `ABusyMs` sonunda hata alır — `lockchk` bölüm 3 bunu
-  doğrular). Uzun ömürlü GUI/rapor oturumları yazmayı geciktirir.
+- **v3.18: Salt-okunur oturum artık yazarları bloklamaz.** Kilit RO oturumda
+  da **ifade kapsamlıdır**; her okuma paylaşımlı kilidi alır, bırakır ve
+  `<db>.gen` değişmişse WAL imajları bellek içinde tazelenir + heap dizini
+  yeniden kurulur (`ResetReadOnlyImages` + `FWal.Recover(ApplyReadOnly)` +
+  `FHeap.Open`; diske **hiçbir şey** yazılmaz). **Bedeli:** RO oturumda
+  **tekrarlanabilir okuma (sabit görüntü) yoktur** — her ifade güncel durumu
+  görür. Önceki sürüm sabit görüntü karşılığında açık bir RO oturumun
+  yazarları süresiz bloklamasına razıydı; bu sınır kaldırıldı.
+  `lockchk` bölüm 3 artık hem "yazar bloklanmadı" hem "RO uyandıktan sonra
+  yazarın yeni commit'ini gördü" kontrolünü yapar.
 - **Yazarlar sıralıdır**: bir yazma işlemi açıkken diğer süreçlerin yazma
   girişleri `ABusyMs` boyunca bekler, sonra
   `veritabani mesgul: yazar kilidi %d ms icinde alinamadi ...` hatası alır.
@@ -1228,9 +1237,11 @@ güvenliğin bilinçli bedelidir.
   sınanmadı ve desteklenmez: şema bilgisi oturum açılışında yüklenir; sayfa
   önbelleği tazelense de başka sürecin şema değişikliği o oturuma yansımaz.
   Şema değişikliklerini tek süreçle yapın (`prochk` yalnız satır yazar).
-- Şifreli veritabanında çok süreçli yazma kod yolunda desteklenir
-  (`StoreRefreshed` WAL'i anahtar/tuzla yeniden açar) ama ayrı bir kapıyla
-  sınanmadı; `prochk` şifresiz dosya kullanır.
+- Şifreli veritabanında çok süreçli yazma **desteklenir ve sınanır**:
+  `prochk` şifreli çocuk süreçle iki süreç paralel yazar (5 + 40 + 40 = 85
+  satır, **eksik=0**), yanlış parola reddedilir. v3.18 öncesinde şifreli
+  açılış `ABusyMs` almıyordu (gerçek kusur); `CreateWithKey`,
+  `CreateWithPassword` ve `VdbOpenWithPassword` imzalarına `ABusyMs` eklendi.
 - Aynı süreç içindeki çok oturumlu davranış (v3.15 MVCC, ilk commit kazanır)
   değişmedi.
 
@@ -1247,6 +1258,47 @@ sağlamlaştırıldı:
   siliniyor (yavaş CI koşucusunda alt sürecin ilk commit'e ulaşamaması
   #36/#37'de de görülmüştü).
 
+
+### v3.18 — Belgelenmiş sınırların kaldırılması (2026-10-27)
+
+Amaç: v3.16'da "bilinçli sınır" olarak dokümante edilen üç davranışı
+kaldırmak. Her dilim ayrı kapı ve **ölçüm** ile doğrulandı.
+
+1. **Yazar açlığı (starvation) kaldırıldı.** Yoklama **asimetrik** yapıldı:
+   yazar `LockExclusive` yolunda `Sleep(1)` ile sık dener, okuyucu
+   `TakeSharedLock` yolunda **üstel geri çekilir** (1, 2, 4, …, 50 ms).
+   Bu bir **adil FIFO kuyruk değildir**; "yazar öncelikli yoklama"dır.
+   Kapı: `lockchk` 8. bölüm — çocuk süreç 5 sn kesintisiz okuma yapar,
+   yazar aynı anda commit etmeye çalışır. Ölçüm: yazar **5 ms** (tekrar
+   koşuda 225 ms) içinde girdi; eşik 2500 ms.
+2. **Şifreli dosyada çok süreçli yazma.** Gerçek kusur bulundu: şifreli
+   açılış (`CreateWithKey` / `CreateWithPassword` / `VdbOpenWithPassword`)
+   `ABusyMs` parametresini **hiç almıyordu**, yani busy beklemesi yoktu.
+   İmzalara `ABusyMs` eklendi. Kapı: `prochk` şifreli çocuk — iki süreç
+   paralel yazar, **85 satır eksiksiz**, yanlış parola reddedilir.
+3. **Süreçler arası DDL — DENENDİ VE GERİ ALINDI.** Otomatik
+   `EnsureSchemaFresh` şema **tembel** yazıldığı için, henüz diske
+   yazılmamış şemayı tazeleme sırasında **sessizce siliyordu** (Öncelik 1
+   ihlali). Bugünkü davranış korunur: süreçler arası DDL açık hatayla
+   durur (`GuardSchemaLoss`). Faydalı altyapı kaldı: `TVDbPageStore.GenStamp`
+   (yalnız bellek) ve `IVDbBackend.StoreGenStamp` (v3 gerçek, v2 `0`);
+   bugün çağıranı yok, davranış değişikliği yok.
+4. **Açık salt-okunur oturum yazarları artık bloklamaz.** Önceden RO oturum
+   paylaşımlı kilidi oturum boyu tutuyordu. Artık kilit RO oturumda da
+   **ifade kapsamlı**: `AcquireRead`/`ReleaseRead` arasında paylaşımlı kilit
+   alınır; `<db>.gen` değişmişse RO WAL imajları bellek içinde tazelenir
+   (`ResetReadOnlyImages` + `FWal.Recover(ApplyReadOnly)`) ve heap dizini
+   yeniden kurulur (`FHeap.Open`). RO bu yolda **diske hiçbir şey yazmaz**
+   (`Flush`/`Truncate` çağrılmaz). **Bedel: RO oturumda tekrarlanabilir
+   okuma (sabit görüntü) yoktur.**
+   Kapı: `lockchk` bölüm 3 — yazar açık RO oturum varken 2 sn busy içinde
+   commit eder (ölçülen **19 ms**), RO oturum uyandıktan sonra o commit'i
+   **görür** (satır sayısı 500 → 501, yeni anahtar okunur). Tazelik
+   kontrolü olmasaydı bu bir **yanlış sorgu sonucu** olurdu.
+
+Kapı durumu: **16/16 yeşil**, toplam **691 kontrol**.
+
+`sqltest` v3 **2874/0/33**, v2 **3305/0/0** (temel çizgiyle birebir).
 
 ### Sürüm çizgisi kararı (2026-10-26): alpha hattı → **v1.0.0**
 
@@ -1320,7 +1372,7 @@ kendi kapıları ve ölçümüyle):
 6. ~~**Süreçler arası çok yazarlılık**~~ **YAPILDI (v3.16)** — aynı `.odb`
    dosyasına birden çok süreç bağlanıp **sırayla** yazar; kilit işlem
    kapsamlıdır, önbellek `<db>.gen` sayacıyla tazelenir, veri kaybı yok
-   (`prochk` 8/8, gerçek iki süreç). Yazarlar sıralıdır; uzun işlem diğer
+   (`prochk` 15/15, gerçek iki süreç; şifreli dosya dahil). Yazarlar sıralıdır; uzun işlem diğer
    süreçleri bekletir. Ayrıntı: §v3.16.
 
 ### Kapsam dışı (değişmedi)

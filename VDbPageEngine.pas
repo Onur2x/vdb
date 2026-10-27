@@ -295,7 +295,30 @@ var
   st: TVdbWalStats;
 begin
   if (FWal = nil) or (FStore = nil) then Exit;
-  if FStore.ReadOnly then Exit;
+  if FStore.ReadOnly then
+  begin
+    { v3.18: SALT-OKUNUR TAZELEME. Once RO oturum paylasimli kilidi oturum
+      boyu tuttugu icin baska bir surec commit EDEMEZD I; bu yol hic
+      calismiyordu. Artik RO da kilit alip birakiyor, dolayisiyla buraya
+      gelinebilir. Yapilan: bellek WAL imajlarini bosalt, WAL'i salt-okunur
+      yeniden ac ve cerceveleri BELLEK katmanina uygula (diske YAZILMAZ),
+      sonra heap dizinini yeniden kur.
+      ONEMLI: burada FStore.Flush/Truncate CAGRILMAZ - RO oturum diske
+      yazmaz (lockchk "RO oturum diskte hicbir bayt degistirmedi" kapisi). }
+    FStore.ResetReadOnlyImages;
+    FWal.Close;
+    if FStore.Encrypted then
+      FWal.SetEncryptionKey(FStore.Key, FStore.Salt);
+    FWal.Open(True);
+    if FWal.HasContent then
+    begin
+      FWal.Recover(ApplyReadOnly, st, FRecoverLimit);
+      FWalStats := st;
+    end;
+    if FHeap <> nil then
+      FHeap.Open;
+    Exit;
+  end;
   { Baska bir surec commit etti: bizim WAL handle'i ve tanimligi bayat.
     Yeniden ac; varsa cerceveleri uygula (WAL cerceveleri sayfa imajidir,
     yeniden uygulamak idempotenttir) ve buda. }

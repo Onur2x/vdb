@@ -6,13 +6,18 @@ program lockchk;
     1) Ayni veritabanina AYNI ANDA iki salt-okunur oturum acilir ve
        birbirinin ayni satirlari okur (paylasimli kilit).
     2) Salt-okunur oturum acikken yazar, busy timeout boyunca bekler ve
-       sonunda ACIK "mesgul" hatasi alir.
-    3) Iki yazar: busy=0 ise hemen, busy=N ise ~N ms sonra "mesgul".
-    4) Salt-okunur oturumda yazma denemesi acik hata verir; VERIFY calisir.
-    5) Okuyucu <db>.log dizinini OLUSTURMAZ.
-    6) Cokme sonrasi (WAL'de onaylanmis, diske gecmemis cerceveler) salt-okunur
+       sonunda ACIK "mesgul" hatasi alir.  [v3.18'de KALDIRILDI: acik RO
+       oturum artik yazari bloklamaz; asagidaki 3. bolum yeni davranisi
+       ve tazeligi dogrular.]
+    3) v3.18: Acik RO oturum yazari BLOKLAMAZ; yazar commit eder ve RO
+       oturum uyandiktan sonra o commit'i GORUR (tazeleme).
+    4) Iki yazar: busy=0 ise hemen, busy=N ise ~N ms sonra "mesgul".
+    5) Salt-okunur oturumda yazma denemesi acik hata verir; VERIFY calisir.
+    6) Okuyucu <db>.log dizinini OLUSTURMAZ.
+    7) Cokme sonrasi (WAL'de onaylanmis, diske gecmemis cerceveler) salt-okunur
        oturum veriyi WAL katmanindan okur; diskte HICBIR bayt degistirmez.
-    7) Yazici kapaninca okuyucu en guncel satir sayisini gorur.
+    8) Yazici kapaninca okuyucu en guncel satir sayisini gorur.
+    9) Yazar acligi: kesintisiz okuma yuku altinda yazma girer.
 
   Cocuk surecler: bu program kendini farkli argumanlarla calistirir.
   Cikis kodu: 0 = hepsi gecti, 1 = hata.
@@ -213,18 +218,27 @@ begin
   end;
 end;
 
-{ --ro-hold <db> <beklenen_sayi> <hazir_dosyasi> <tutma_ms> }
+{ --ro-hold <db> <beklenen_sayi> <hazir_dosyasi> <tutma_ms>
+           [sonra_beklenen_sayi] [yeni_anahtar]
+  v3.18: uyandiktan SONRA yeniden okur. Verilirse satir sayisinin
+  <sonra_beklenen_sayi> oldugunu ve <yeni_anahtar> anahtarinin
+  yazarin commit ettigi degeri tasidigini dogrular. Bu, RO oturumun
+  BAYAT goruntu gormedigini (tazelemenin calistigini) kanitlar. }
 function ChildReadOnlyHold: Integer;
 var
   db, ready: string;
-  expect, holdMs: Integer;
+  expect, holdMs, expectAfter, newKey: Integer;
   be: IVdbBackend;
   f: TFileStream;
+  v: TBytes;
+  bulundu: Boolean;
 begin
   db := ParamStr(2);
   expect := StrToIntDef(ParamStr(3), -1);
   ready := ParamStr(4);
   holdMs := StrToIntDef(ParamStr(5), 1000);
+  expectAfter := StrToIntDef(ParamStr(6), -1);
+  newKey := StrToIntDef(ParamStr(7), 0);
   try
     VdbOpenReadOnly(db, be, VDB_DEF_POOL, 0);
     if be.Count <> expect then
@@ -239,6 +253,32 @@ begin
       f.Free;
     end;
     Sleep(holdMs);
+    { v3.18 TAZELIK: uyandiktan sonra baska surecin commit ettigi satiri
+      GORMELIYIZ. Gormezsek ya tazeleme calismiyor ya da RO oturum bayat
+      goruntu sunuyor - ikisi de yanlis sorgu sonucudur. }
+    if expectAfter >= 0 then
+    begin
+      if be.Count <> expectAfter then
+      begin
+        WriteLn(Format('HATA tazeleme sonrasi sayi %d (beklenen %d)',
+          [be.Count, expectAfter]));
+        Exit(11);
+      end;
+      if newKey <> 0 then
+      begin
+        bulundu := be.Get(newKey, v);
+        if not bulundu then
+        begin
+          WriteLn(Format('HATA tazeleme sonrasi anahtar %d yok', [newKey]));
+          Exit(12);
+        end;
+        if Length(v) <> Length(IntToStr(newKey)) then
+        begin
+          WriteLn(Format('HATA tazeleme sonrasi anahtar %d degeri yanlis', [newKey]));
+          Exit(13);
+        end;
+      end;
+    end;
     be := nil;
     WriteLn('TAMAM');
     Result := 0;
@@ -535,6 +575,32 @@ begin
   Elapsed := MsNow - t0;
 end;
 
+{ v3.18: yazarin RO oturumu BLOKLAMADIGINI ve commit ettigini birlikte
+  kanitlar. Yalniz acmak yetmez; RO oturumun YENI veriyi gormesi icin
+  gercek bir commit gerekir. }
+function TryWriterPut(const Db: string; BusyMs, Key: Integer;
+  out Msg: string; out Elapsed: Int64): Boolean;
+var
+  t0: Int64;
+  be: IVdbBackend;
+begin
+  t0 := MsNow;
+  Result := False;
+  Msg := '';
+  try
+    be := TVdbBackendV3.Create(Db, False, VDB_DEF_POOL, BusyMs);
+    be.BeginBatch;
+    be.Put(Key, MakeVal(Key));
+    be.CommitBatch;
+    be := nil;
+    Result := True;
+  except
+    on E: Exception do
+      Msg := E.Message;
+  end;
+  Elapsed := MsNow - t0;
+end;
+
 { v3.18: AC KALMA (starvation) kapisi.
   Cocuk YAZILABILIR oturumda 5 sn boyunca kesintisiz okuma yapar (her
   ifade paylasimli kilidi alip birakir). Ana surec bu yuku altinda YAZAR
@@ -672,9 +738,14 @@ begin
   else
     Ok('salt-okunur okuyucu <db>.log dizinini olusturmadi');
 
-  { 3) okuyucu tutarken yazar: busy timeout. }
+  { 3) v3.18: ACIK RO oturum yazari ARTIK BLOKLAMAZ ve RO oturum yazarin
+    YENI commit'ini GORUR. Once paylasimli kilit oturum boyu tutuluyordu,
+    yazar busy timeout sonunda "mesgul" aliyordu. Artik RO de kilidi islem
+    basina alip biraktigi icin yazar girmeli. BEDEL: RO oturumda
+    tekrarlanabilir okuma yoktur (bkz. VDbPageStore.AcquireRead yorumu);
+    her ifade guncel durumu gorur - asagidaki tazelik kontrolu bunu kanitlar. }
   if FileExists(ready) then DeleteFile(ready);
-  p1 := StartChild(['--ro-hold', db, '500', ready, '1500']);
+  p1 := StartChild(['--ro-hold', db, '500', ready, '2500', '501', '500000']);
   t0 := MsNow;
   while (not FileExists(ready)) and ((MsNow - t0) < 15000) do
     Sleep(10);
@@ -682,19 +753,18 @@ begin
     Fail('okuyucu hazir isareti birakmadi')
   else
   begin
-    if TryWriterOpen(db, 400, msg, elapsed) then
-      Fail('okuyucu varken yazar ACILDI (beklenmiyordu)')
-    else if (Pos('mesgul', LowS(msg)) > 0) and (elapsed >= 300) then
-      Ok(Format('okuyucu varken yazar mesgul: busy=400 ms, olculen %d ms',
+    if TryWriterPut(db, 2000, 500000, msg, elapsed) then
+      Ok(Format('acik RO oturum yazari bloklamadi, commit edildi (busy=2000 ms, olculen %d ms)',
         [elapsed]))
     else
-      Fail(Format('okuyucu varken yazar: %d ms, %s', [elapsed, msg]));
+      Fail(Format('acik RO oturum yazari BLOKLADI: %d ms, %s',
+        [elapsed, msg]));
   end;
   rc := FinishChild(p1, aOut);
   if rc = 0 then
-    Ok('okuyucu tutma testi tamamlandi')
+    Ok('okuyucu uyandiktan sonra yazarin YENI commit''ini gordu (tazeleme calisti)')
   else
-    Fail('okuyucu tutma (cikis ' + IntToStr(rc) + '): ' + Trim(aOut));
+    Fail('okuyucu tutma/tazelik (cikis ' + IntToStr(rc) + '): ' + Trim(aOut));
   if FileExists(ready) then DeleteFile(ready);
 
   { 4) yazar tutarken ikinci yazar. }

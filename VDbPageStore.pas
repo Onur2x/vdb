@@ -282,6 +282,8 @@ type
     { Salt-okunur oturumda WAL'den gelen imaji bellek katmanina alir.
       Diske YAZMAZ; meta sayfa (0) ise mantiksal alanlari tazeler. }
     procedure InstallReadOnlyPage(PageNo: LongWord; P: PVdbPage);
+    { v3.18: RO WAL imajlarini bosaltir (baska surec commit etti). }
+    procedure ResetReadOnlyImages;
     function ReadOnlyPageCount: Integer;
 
     { Test/kurtarma: diske HICBIR SEY yazmadan kapat (surec olumu
@@ -976,12 +978,15 @@ end;
 { v3.16: islem kapsamli PAYLASIMLI kilit. Yazan oturumda kilit artik oturum
   boyu tutulmadigi icin her islem girisi kilit alir ve meta imgasini
   dogrular; boylece baska bir surec commit ettiyse onbellek tazelenir.
-  Salt-okunur oturumda kilit zaten oturum boyu tutuldugu icin no-op'tur. }
+  v3.18: AYNI SEY SALT-OKUNUR oturum icin de gecerli. Onceki surumde RO
+  oturum paylasimli kilidi OTURUM BOYU tutuyordu; acik bir RO oturum
+  yazarlari SINIRSIZ blokluyordu. Artik RO de kilit alir/birakir.
+  BEDEL: RO oturumda tekrarlanabilir okuma (sabit goruntu) YOKTUR; her
+  ifade guncel durumu gorur. Diske yine hicbir sey yazilmaz. }
 procedure TVDbPageStore.AcquireRead;
 begin
   if FStream = nil then
     raise EVdbPageStore.Create('kapali veritabani: okuma kilidi alinamaz');
-  if FReadOnly then Exit;
   EnterCriticalSection(FWriteCs);
   try
     if FWriteDepth > 0 then
@@ -1012,7 +1017,7 @@ end;
 
 procedure TVDbPageStore.ReleaseRead;
 begin
-  if (FStream = nil) or FReadOnly then Exit;
+  if FStream = nil then Exit;
   EnterCriticalSection(FWriteCs);
   try
     if FReadDepth <= 0 then Exit;
@@ -1181,8 +1186,8 @@ begin
       { v3.16: YAZAN oturumda kilit SAKLANMAZ. Oturum boyu paylasimli kilit
         tutmak ikinci yazar surecin onunu tikiyordu (olculdu: prochk B 20 s
         bekleyip acilamadi). Artik kilit ISLEM BASINA alinir: AcquireRead /
-        AcquireWrite. Salt-okunur oturum ise (bugun oldugu gibi) paylasimli
-        kilidi oturum boyu tutar. }
+        AcquireWrite. v3.18: ayni kural SALT-OKUNUR oturum icin de gecerli;
+        acik RO oturum artik yazarlari bloklamaz. }
       { v3.16: degisiklik sayaci (<db>.gen). Paylasima acik; her surec kendi
         handle'i ile okur/yazar; yoksa olusturulur. Kilit BIRAKILMADAN once
         acilir ki acilis artisi ile yaris olmasin. }
@@ -1213,10 +1218,13 @@ begin
         if not AReadOnly then
           BumpGen;
       end;
-      if FLockedExcl then
+      { v3.18: acilis bitince kilit BIRAKILIR (hem yazan hem RO). Boylece
+        iki surec ayni anda acik olabilir; kilit yalniz islem basina alinir. }
+      if FLockedExcl or FLockedShared then
       begin
         VDbUnlockStream(FStream);
         FLockedExcl := False;
+        FLockedShared := False;
         FLocked := False;
       end;
     except
@@ -1285,6 +1293,20 @@ begin
 end;
 
 { ==================================================== v3.2 salt-okunur katman }
+
+{ v3.18: RO oturumunun WAL imajlarini (FRoPages) bosaltir. Baska bir
+  surec commit ettiginde motor bunu cagirir ve WAL'i yeniden uygular.
+  Diske HICBIR sey yazilmaz; yalnizca bellek imajlari birakilir. }
+procedure TVDbPageStore.ResetReadOnlyImages;
+var
+  q: PVdbPage;
+begin
+  if FRoPages = nil then Exit;
+  for q in FRoPages.Values do
+    FreeMem(q);
+  FRoPages.Clear;
+  FRoCount := 0;
+end;
 
 procedure TVDbPageStore.InstallReadOnlyPage(PageNo: LongWord; P: PVdbPage);
 var

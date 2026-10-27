@@ -279,7 +279,9 @@ Durum **2026-10-27**: PITR, B+tree, replikasyon, sayfa düzeyi zone map, `.idx`
 varint, satır INT varint ve **çok oturumlu yazma (MVCC, v3.4)** dilimleri
 tamamlandı; **snapshot isolation da tamamlandı (v3.15)**; **süreçler arası
 çok yazarlılık da tamamlandı (v3.16 — kilit işlem kapsamlı, `<db>.gen`
-sayacıyla önbellek tazeleme, `prochk` 8/8 gerçek iki süreç)**. Yol haritasında
+sayacıyla önbellek tazeleme, `prochk` 15/15 gerçek iki süreç; şifreli dosya
+dahil)**. v3.18: açık salt-okunur oturum artık yazarları bloklamaz, RO kilit de
+ifade kapsamlı (`lockchk` 30/30). Yol haritasında
 açık madde kalmadı.
 
 | Yetenek | Bugünkü davranış | Test |
@@ -398,13 +400,16 @@ v2/önceki v3 ile aynı; beklemek isteyen çağıran açıkça süre verir.
   **sıralıdır**: bir yazma işlemi açıkken diğer süreçler `ABusyMs` bekler,
   sonra net hata alır.
 
-Kapı: `lockchk` (14. kapı) **29/0** ve `prochk` (16. kapı) **8/0**. Gerçek
+Kapı: `lockchk` (14. kapı) **30/0** ve `prochk` (16. kapı) **15/0**. Gerçek
 **çocuk süreçler** kullanılır, yani kilit gerçek işletim sistemi kilididir: aynı
 anda iki okuyucu, iki yazarın **sırayla** commit etmesi, yazar varken
-salt-okunur oturumun **açılabilmesi**, salt-okunur yazma reddi + `VERIFY`,
+salt-okunur oturumun **açılabilmesi**, açık **salt-okunur oturumun yazarı
+bloklamaması** (v3.18: yazar 2 sn busy içinde commit eder, RO oturum uyandıktan
+sonra o commit'i **görür** — tazeleme kanıtı), salt-okunur yazma reddi + `VERIFY`,
 `<db>.log` oluşmaması, çökme sonrası WAL'den okuma ve diskte sıfır bayt
 değişim. `prochk` iki süreç paralel yazar; **satır kaybı yok**
-(5 + 40 + 40 = 85). 32 ve 64 bit yeşil.
+(5 + 40 + 40 = 85); şifreli dosyada da iki süreç paralel yazar ve
+**satır kaybı yok**. 32 ve 64 bit yeşil.
 
 Yol boyunca bulunan iki gerçek kusur: (1) `VdbOpenReadOnly` biçim keşfi için
 dosyanın ilk 4 baytını okuyordu; yazar tam aralık kilidi tutarken bu okuma
@@ -547,14 +552,22 @@ Kapsam **süreç içi çok oturumlu yazma**dır: aynı `IVdbBackend` üzerinde b
   Güvenlik ağı: paylaşımlı kilit altında bir yazma ilkeli çağrılırsa kilit
   kendiliğinden tam kilide yükselir (`FAutoWrite`).
 - **Bilinçli sınırlar:** yazarlar **sıralıdır** (uzun işlem diğer süreçlerin
-  okuyucularını da bekletir); **açık bir salt-okunur oturum** paylaşımlı kilidi
-  oturum boyu tuttuğu için yazarları bloklar (`lockchk` bölüm 3); adil kuyruk
-  yoktur; canlı veritabanının **sürüm yükseltmesi** çok süreçli kullanımda
+  okuyucularını da bekletir); adil kuyruk yoktur, yazar öncelikli yoklama
+  vardır; canlı veritabanının **sürüm yükseltmesi** çok süreçli kullanımda
   desteklenmez. **Süreçler arası DDL** (başka süreç açıkken `CREATE/DROP/ALTER`)
   sınanmadı ve desteklenmez: şema oturum açılışında yüklenir. Şifreli dosyada
-  çok süreçli yazma kod yolunda var ama ayrı bir kapıyla sınanmadı. Snapshot
+  çok süreçli yazma **sınanır** (`prochk` şifreli çocuk: iki süreç paralel
+  yazar, satır kaybı yok, yanlış parola reddedilir). Snapshot
   isolation süreç **içinde** var (v3.15), süreçler arasında görünürlük "son
   commit" düzeyindedir.
+- **Salt-okunur oturum artık yazarları bloklamaz** (v3.18). Kilit RO oturumda
+  da **ifade kapsamlıdır**: her okuma `AcquireRead`/`ReleaseRead` arasında
+  paylaşımlı kilidi alır, `<db>.gen` değişmişse WAL imajları bellek içinde
+  tazelenir ve heap dizini yeniden kurulur. **Bedel: RO oturumda
+  tekrarlanabilir okuma (sabit görüntü) yoktur** — her ifade güncel durumu
+  görür; diske yine hiçbir şey yazılmaz. Kanıt: `lockchk` bölüm 3 — yazar
+  RO oturum açıkken commit eder ve RO oturum uyandıktan sonra o commit'i
+  görür.
 
 | Ölçüm (`benchcmp`, 200k × 3 kolon, 3 koşu medyanı, 32 bit) | Değer |
 |---|---|
@@ -835,8 +848,9 @@ belleği en uzun açık işlem boyunca büyür. Süreçler arası çok yazarlıl
 yapıldı (kilit işlem kapsamlı); yazarlar sıralıdır.
 
 Kapı: `sqltest` v3 **2874/0/33**, v2 **3305/0/0**; `v3sqlchk` **238/0**;
-`lockchk` **29/0**; `prochk` **8/0**; **16/16 kapı yeşil**. CI (GitHub Actions)
-de aynı **16** kapıyı koşar — `snapchk`/`prochk` v3.17'de eklendi.
+`lockchk` **30/0**; `prochk` **15/0**; **16/16 kapı yeşil** (691 kontrol).
+CI (GitHub Actions) de aynı **16** kapıyı koşar — `snapchk`/`prochk`
+v3.17'de eklendi.
 
 ### Sürüm çizgisi (2026-10-26)
 
