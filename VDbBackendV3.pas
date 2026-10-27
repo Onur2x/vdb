@@ -655,7 +655,14 @@ begin
   baseDir := IncludeTrailingPathDelimiter(FLog.Dir) + 'base';
   ForceDirectories(baseDir);
   seq := FLog.LastSeq + 1;
-  name := 'b-' + IntToStr(seq) + '-' + IntToStr(FEng.Store.LSN) + '.odb';
+  { v3.18 DUZELTME — SUREÇLER ARASI DOSYA ADI CAKISMASI (olculdu: 8
+    paralel yazarda "Unable to create ...b-468-452.odb.tmp"). Ad yalniz
+    (seq, lsn) ikilisinden uretiliyordu; iki surec AYNI ikiliyi hesaplayinca
+    ayni gecici dosyaya yazmaya calisiyordu. Surec kimligi eklendi; ad artik
+    surecler arasi benzersiz. Okuma yolu adi COZMEZ: ad BASE kaydinin
+    icinde saklanir (WriteBase/ABaseName). }
+  name := 'b-' + VDbProcessToken + '-' + IntToStr(seq) + '-' +
+    IntToStr(FEng.Store.LSN) + '.odb';
   dest := IncludeTrailingPathDelimiter(baseDir) + name;
   if FileExists(dest) then
     if not DeleteFile(dest) then

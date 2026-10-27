@@ -2435,7 +2435,10 @@ begin
     raise EVdbPageStore.Create('CopyCommittedTo: hedef yol bos');
   dir := ExtractFileDir(DestPath);
   if dir <> '' then ForceDirectories(dir);
-  tmp := DestPath + '.tmp';
+  { v3.18: gecici ad SÜREÇ benzersiz olmali. Iki surec ayni hedefe kopyalarsa
+    (olculdu: degisim gunlugu taban imaji) ayni .tmp dosyasina yazip
+    "dosya kullanimda" hatasi veriyorlardi. }
+  tmp := DestPath + '.' + VDbProcessToken + '.tmp';
   if FileExists(tmp) then DeleteFile(tmp);
   BuildMetaImage(meta);
   fs := TFileStream.Create(tmp, fmCreate);
@@ -2494,7 +2497,8 @@ begin
     raise EVdbPageStore.Create('CopyBaseImageTo: hedef yol bos');
   dir := ExtractFileDir(DestPath);
   if dir <> '' then ForceDirectories(dir);
-  tmp := DestPath + '.tmp';
+  { v3.18: gecici ad SÜREÇ benzersiz olmali (bkz. CopyCommittedTo). }
+  tmp := DestPath + '.' + VDbProcessToken + '.tmp';
   if FileExists(tmp) then DeleteFile(tmp);
   fs := TFileStream.Create(tmp, fmCreate);
   try

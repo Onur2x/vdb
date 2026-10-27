@@ -54,6 +54,12 @@ const
 function VDbLockGenReserve(S: TFileStream): Boolean;
 procedure VDbUnlockGenReserve(S: TFileStream);
 
+{ v3.18: SUREC KIMLIGI — uretilen/gecici dosya adlarina eklenir. Ayni adi
+  iki surec uretirse Windows "dosya kullanimda" hatasi verir (olculdu:
+  .log\base\b-<seq>-<lsn>.odb.tmp, 8 paralel yazar). Surec ici sayac
+  yetmez: ad SURECLER ARASI benzersiz olmalidir. }
+function VDbProcessToken: string;
+
 // 2026-10-25 (Sprint 3.10): CANLI dosyanin boyunu KILIT ALMADAN ogrenir.
 // Neden: Unix'te FPC'nin TFileStream'i paylasim moduna gore flock() uygular;
 // motor dosyayi LOCK_EX ile tuttugu icin ayni dosyayi IKINCI kez acmak
@@ -296,6 +302,19 @@ begin
   {$IFDEF UNIX}
   FpFlock(S.Handle, VDB_LOCK_UN);
   {$ENDIF}
+  {$ENDIF}
+end;
+
+function VDbProcessToken: string;
+begin
+  {$IFDEF WINDOWS}
+  Result := IntToStr(Windows.GetCurrentProcessId);
+  {$ELSE}
+    {$IFDEF UNIX}
+    Result := IntToStr(FpGetPid);
+    {$ELSE}
+    Result := '0';
+    {$ENDIF}
   {$ENDIF}
 end;
 
