@@ -281,7 +281,9 @@ tamamlandı; **snapshot isolation da tamamlandı (v3.15)**; **süreçler arası
 çok yazarlılık da tamamlandı (v3.16 — kilit işlem kapsamlı, `<db>.gen`
 sayacıyla önbellek tazeleme, `prochk` 15/15 gerçek iki süreç; şifreli dosya
 dahil)**. v3.18: açık salt-okunur oturum artık yazarları bloklamaz, RO kilit de
-ifade kapsamlı (`lockchk` 30/30). Yol haritasında
+ifade kapsamlı; uzun yazma işlemi de okuyucuları bloklamaz (tam kilit commit
+penceresine indi, yalnız yazarlar sıralı). Kapılar: `lockchk` 33/33,
+`prochk` 15/15. Yol haritasında
 açık madde kalmadı.
 
 | Yetenek | Bugünkü davranış | Test |
@@ -400,12 +402,14 @@ v2/önceki v3 ile aynı; beklemek isteyen çağıran açıkça süre verir.
   **sıralıdır**: bir yazma işlemi açıkken diğer süreçler `ABusyMs` bekler,
   sonra net hata alır.
 
-Kapı: `lockchk` (14. kapı) **30/0** ve `prochk` (16. kapı) **15/0**. Gerçek
+Kapı: `lockchk` (14. kapı) **33/0** ve `prochk` (16. kapı) **15/0**. Gerçek
 **çocuk süreçler** kullanılır, yani kilit gerçek işletim sistemi kilididir: aynı
 anda iki okuyucu, iki yazarın **sırayla** commit etmesi, yazar varken
 salt-okunur oturumun **açılabilmesi**, açık **salt-okunur oturumun yazarı
 bloklamaması** (v3.18: yazar 2 sn busy içinde commit eder, RO oturum uyandıktan
-sonra o commit'i **görür** — tazeleme kanıtı), salt-okunur yazma reddi + `VERIFY`,
+sonra o commit'i **görür** — tazeleme kanıtı), **uzun yazma işleminin
+okuyucuyu bloklamaması** (v3.18: açık işlem altında 20 okuma, en yüksek
+**0 ms**; commit edilmemiş satır RO oturumda görünmez), salt-okunur yazma reddi + `VERIFY`,
 `<db>.log` oluşmaması, çökme sonrası WAL'den okuma ve diskte sıfır bayt
 değişim. `prochk` iki süreç paralel yazar; **satır kaybı yok**
 (5 + 40 + 40 = 85); şifreli dosyada da iki süreç paralel yazar ve
@@ -568,6 +572,17 @@ Kapsam **süreç içi çok oturumlu yazma**dır: aynı `IVdbBackend` üzerinde b
   görür; diske yine hiçbir şey yazılmaz. Kanıt: `lockchk` bölüm 3 — yazar
   RO oturum açıkken commit eder ve RO oturum uyandıktan sonra o commit'i
   görür.
+- **Uzun yazma işlemi okuyucuları bloklamaz** (v3.18). Yazar açık işlem
+  boyunca veri dosyasının tam kilidini **tutmaz**; yalnız `<db>.gen`
+  üzerinde **rezervasyon** tutar, tam kilit commit penceresine iner. Ölçüm:
+  açık işlem altında 20 okuma, en yüksek **0 ms**; ikinci yazar aynı anda
+  açılıp **27 ms**'de işini bitirdi; commit edilmemiş satır RO oturumda
+  görünmedi. **Yazarlar hâlâ sıralıdır** — paralel çok yazar (sayfa düzeyinde
+  çakışma yönetimi) bu sürümün kapsamında **yoktur**. Yan kusurlar
+  düzeltildi: `.gen` rezervasyonu artık tüm dosyayı değil veriden uzak bir
+  bayt aralığını kilitler (yoksa RO okuma `EReadError` alıyordu) ve
+  rezervasyon `ABusyMs` boyunca bekler (ilk uygulamada beklemiyordu).
+  Kanıt: `lockchk` bölüm 3b/4, `prochk` 15/15.
 
 | Ölçüm (`benchcmp`, 200k × 3 kolon, 3 koşu medyanı, 32 bit) | Değer |
 |---|---|
@@ -845,10 +860,13 @@ okuma 4 satır görür. Test güncellendi (`v3sqlchk` 238/0).
 snapshot'a dayanan bir yazma, çakışan commit ilk yazmadan önce olmuşsa sessizce
 commit edilebilir (lost-update) — snapshot yalnız okumayı sabitler. `FUndo`
 belleği en uzun açık işlem boyunca büyür. Süreçler arası çok yazarlılık v3.16'da
-yapıldı (kilit işlem kapsamlı); yazarlar sıralıdır.
+yapıldı (kilit işlem kapsamlı); **yazarlar hâlâ sıralıdır** — v3.18'de uzun
+işlem veri dosyasının tam kilidini tutmayı bıraktı (yalnız `.gen` rezervasyonu;
+tam kilit commit penceresinde), böylece okuyucular beklemez, ama iki yazar
+süreç aynı anda commit edemez. Paralel çok yazar kapsam dışıdır.
 
 Kapı: `sqltest` v3 **2874/0/33**, v2 **3305/0/0**; `v3sqlchk` **238/0**;
-`lockchk` **30/0**; `prochk` **15/0**; **16/16 kapı yeşil** (691 kontrol).
+`lockchk` **33/0**; `prochk` **15/0**; **16/16 kapı yeşil** (665 kontrol).
 CI (GitHub Actions) de aynı **16** kapıyı koşar — `snapchk`/`prochk`
 v3.17'de eklendi.
 

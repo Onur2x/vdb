@@ -1149,6 +1149,13 @@ okuyucu / tek yazar.
 | Paylaşımlı bayt-aralığı kilidi tutarken yazma | **`EWriteError`** — paylaşımlı kilit yalnız okumadır, aynı handle bile yazamaz |
 | Tam (exclusive) kilit tutarken **başka** handle'dan okuma | **`EReadError`** |
 
+Not (v3.18): bu tablo **veri dosyası** için geçerlidir. `<db>.gen` üzerindeki
+yazar rezervasyonu artık dosyanın **tamamını** değil, veriden uzak bir bayt
+aralığını (`VDB_GEN_LOCK_OFF`) kilitler; offset 0'daki 8 baytlık sayaç bu
+yüzden her süreç tarafından **okunabilir** kalır. Önce tüm dosya kilitleniyordu ve
+`.gen` okuyan salt-okunur oturum `EReadError` alıyordu (gerçek kusur,
+`lockchk` 3b'de yakalandı).
+
 Bu iki gerçek tasarımı belirledi: kilit **oturum boyu değil, işlem (statement)
 boyu** tutulur.
 
@@ -1177,6 +1184,19 @@ boyu** tutulur.
 - Sayaç **meta sayfaya değil ayrı dosyaya** yazılır: meta sayfaya commit LSN'i
   yazmak taban dosyanın kendi kendine tutarlılığını bozuyordu (sayfalar hâlâ
   WAL'de olabilir; `pitr`/`AS OF SEQUENCE 0` bunu yakaladı).
+- **v3.18 — iki katmanlı yazar kilidi.** Açık bir yazma işlemi artık veri
+  dosyasının **tam kilidini tutmaz**; okuyucuları bloklamasın diye yalnız
+  `<db>.gen` üzerinde **rezervasyon** (`VDbLockGenReserve`, 64 KiB offsette
+  1 bayt; veriye dokunmaz) tutar. Veri dosyasının tam kilidi **yalnız commit
+  penceresinde** alınır: `AcquireWrite` → `LockReserve` (işlem başına bir kez;
+  `FHoldDepth` 0'a ininceye kadar) + `LockExclusive`; commit bitince
+  `ReleaseWrite` tam kilidi bırakır ama rezervasyon sürer. Rezervasyon
+  tutulduğu sürece başka süreç commit **edemez**; bu yüzden işlem başındaki
+  tazelik doğrulaması işlem sonuna kadar geçerli kalır ve kayıp güncelleme
+  riski **artmaz**. Sonuç: uzun işlem okuyucuları **hiç bekletmez** (ölçülen
+  en yüksek okuma 0 ms), diğer **yazarlar** yine sıraya girer. Bekleme
+  hatası metni iki katman için ayrıdır (`yazar rezervasyonu ... alınamadı` /
+  tam kilit mesajı).
 - **Güvenlik ağı:** sayfa deposunun her yazma ilkeli (`WritePageAt`, `SaveMeta`,
   `GrowTo`, `TrimToLogical`) paylaşımlı kilit altında çağrılırsa kilidi
   **kendiliğinden tam kilide yükseltir** ve işlem sonunda bırakır. Unutulan bir
@@ -1295,8 +1315,39 @@ kaldırmak. Her dilim ayrı kapı ve **ölçüm** ile doğrulandı.
    commit eder (ölçülen **19 ms**), RO oturum uyandıktan sonra o commit'i
    **görür** (satır sayısı 500 → 501, yeni anahtar okunur). Tazelik
    kontrolü olmasaydı bu bir **yanlış sorgu sonucu** olurdu.
+5. **Uzun yazma işlemi okuyucuları artık bloklamaz.** Önce `BeginBatch`
+   işlem boyunca **tam (exclusive) kilit** tutuyordu; bir süreç 2 sn açık
+   işlem tutsa diğer süreçlerin **okuyucuları** bile "veritabanı meşgul"
+   alıyordu (ölçüldü, `lockchk` 3b). Yeni tasarım: **yazar rezervasyonu**.
+   Yazar işlem boyunca yalnız `<db>.gen` üzerinde **rezervasyon** tutar;
+   veri dosyasının tam kilidi **yalnız commit penceresinde** alınır
+   (`AcquireDataWrite`/`ReleaseDataWrite`). Böylece:
+   - okuyucular hiç beklemez (ölçülen en yüksek okuma **0 ms**, 20 okuma),
+   - diğer **yazarlar yine sıraya girer** (rezervasyon onları bekletir),
+   - commit edilmemiş satır RO oturumda **görünmez** (izolasyon korunur).
+   Rezervasyon tutulduğu sürece başka süreç commit edemez; bu yüzden işlem
+   başındaki tazeleme işlem sonuna kadar geçerlidir ve kayıp güncelleme
+   riski **artmaz**.
+   İki gerçek kusur bu dilimde bulundu ve düzeltildi:
+   - `VDbLockStream` Windows'ta **tüm dosyayı** (`offset 0`, 2^64 bayt)
+     kilitliyordu ve `LockFileEx` tam kilidi başka sürecin **okumasını** da
+     reddediyor. `.gen` okuyan okuyucu `EReadError: Stream read error`
+     alıyordu. Rezervasyon artık **veriden uzak bir bayt aralığına**
+     (`VDB_GEN_LOCK_OFF`, 64 KiB) alınır; offset 0'daki sayaç herkesçe
+     okunabilir (`VDbLockGenReserve`).
+   - İlk uygulamada rezervasyon **tek denemeydi** ve iki yazar süreç aynı
+     anda açılınca ikincisi "meşgul" alıyordu (`prochk` kırmızı: 40 satır
+     yazılamadı). Bekleme politikası `LockExclusive` ile birebir aynı yapıldı
+     (`LockReserve`, `ABusyMs` boyunca 1 ms yoklama). Ölçüm: ikinci yazar
+     **27 ms**'de açıldı (busy 10000).
+   Ayrıca RO **açılışı** artık paylaşımlı kilit altında yapılır (WAL
+   imajları, `.odb.idx`, heap dizini); RO kilidi ifade kapsamlı olduğu için
+   açılış kilitsiz kalırsa commit eden bir yazarla yarışıp eski görüntü
+   okuyabilirdi.
+   Kapı: `lockchk` 3b (açık işlem tutan yazar + 20 okuma) ve 4 (ikinci
+   yazar); `prochk` 15/15 (şifreli dahil).
 
-Kapı durumu: **16/16 yeşil**, toplam **691 kontrol**.
+Kapı durumu: **16/16 yeşil**, toplam **665 kontrol**.
 
 `sqltest` v3 **2874/0/33**, v2 **3305/0/0** (temel çizgiyle birebir).
 

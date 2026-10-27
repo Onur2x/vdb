@@ -148,6 +148,13 @@ type
       { Ayni surecte ic ice yazma girisleri (oturum basina yazma kumesi +
         otomatik commit). 0 -> 1 gecisinde kilit yukseltilir. }
       FWriteDepth: Integer;
+      { v3.18: acik yazma islemi (BeginBatch..CommitBatch) boyunca tutulan
+        REZERVASYON derinligi. Rezervasyon `.gen` handle'i uzerinden alinir;
+        VERI kilidi (FStream tam kilit) yalniz commit penceresinde alinir.
+        Boylece uzun bir islem okuyuculari BLOKLAMAZ, yazarlari bloklar. }
+      FHoldDepth: Integer;
+      { Rezervasyon su an `.gen` handle'i uzerinde tutuluyor mu? }
+      FReserved: Boolean;
       FWriteCs: TRTLCriticalSection;
       { v3.16: islem kapsamli paylasimli kilit derinligi (yazan oturum). }
       FReadDepth: Integer;
@@ -221,6 +228,9 @@ type
     { v3.16: kilit gecisleri. }
     function TakeSharedLock: Boolean;
     procedure LockExclusive;
+    { v3.18: `.gen` uzerindeki YAZAR REZERVASYONU (bekleme politikasi
+      LockExclusive ile ayni: FBusyMs boyunca 1 ms'de bir yokla). }
+    procedure LockReserve;
     procedure RefreshIfStale;
     { v3.16: yazma ilkelleri icin guvenlik agi (bkz. FAutoWrite). }
     procedure EnsureIoWrite;
@@ -261,6 +271,13 @@ type
       Ic ice cagri desteklidir: derinlik 0 -> 1 gecisinde kilit yukseltilir. }
     procedure AcquireWrite;
     procedure ReleaseWrite;
+    { v3.18: acik islem icin YAZAR REZERVASYONU (veri kilidi DEGIL).
+      Uzun islem boyunca tutulur; okuyucular etkilenmez. }
+    procedure AcquireWriteHold;
+    procedure ReleaseWriteHold;
+    { v3.18: gercek veri kilidi penceresi (commit/uygulama aninda). }
+    procedure AcquireDataWrite;
+    procedure ReleaseDataWrite;
     procedure AcquireRead;
     procedure ReleaseRead;
     function WriteHeld: Boolean;
@@ -824,6 +841,32 @@ begin
       '(baska bir yazma oturumu acik): ' + FPath);
 end;
 
+{ v3.18: yazar rezervasyonu da BEKLER. Ilk uygulamada tek deneme yapildi ve
+  prochk coktu: iki yazar surec ayni anda acabildiginda ikincisi "mesgul"
+  aliyordu (veri kaybi yok ama ISLEV KAYBI: v3.16'daki sirayla yazma sozu
+  bozuluyordu). Bekleme politikasi LockExclusive ile BIREBIR ayni tutulur. }
+procedure TVDbPageStore.LockReserve;
+var
+  t0: QWord;
+begin
+  if FGenStream = nil then
+    raise EVdbPageStore.Create('kapali veritabani: yazar rezervasyonu alinamaz');
+  t0 := GetTickCount64;
+  repeat
+    if VDbLockGenReserve(FGenStream) then Exit;
+    if GetTickCount64 - t0 >= QWord(FBusyMs) then Break;
+    Sleep(1);
+  until False;
+  if FBusyMs > 0 then
+    raise EVdbPageStore.Create(Format(
+      'veritabani mesgul: yazar rezervasyonu %d ms icinde alinamadi ' +
+      '(baska bir surec yaziyor): %s', [FBusyMs, FPath]))
+  else
+    raise EVdbPageStore.Create(
+      'veritabani mesgul: yazar rezervasyonu alinamadi ' +
+      '(baska bir surec yaziyor): ' + FPath);
+end;
+
 { Tam kilit ALTINDA cagrilir: diskteki meta sayfa son gorulen imajdan
   farkliysa baska bir surec commit etmistir -> onbellek dusurulur ve meta
   yeniden yuklenir. Meta sayfa duz metin oldugu icin ham karsilastirma
@@ -953,6 +996,16 @@ begin
       FLockedShared := False;
       FLocked := False;
     end;
+    { v3.18: YAZAR REZERVASYONU. Uzun acik islem yalniz rezervasyonu tutar
+      (bkz. AcquireWriteHold); kisa yazma yolu da AYNI rezervasyonu almak
+      ZORUNDA, yoksa acik bir islem varken ikinci yazar paralel girer ve
+      sira garantisi kaybolur. Rezervasyon `.gen` handle'inda tutulur.
+      FHoldDepth > 0 ise rezervasyon zaten BIZDE. }
+    if FHoldDepth = 0 then
+    begin
+      LockReserve;
+      FReserved := True;
+    end;
     LockExclusive;
     FLockedExcl := True;
     FLocked := True;
@@ -962,6 +1015,11 @@ begin
       VDbUnlockStream(FStream);
       FLockedExcl := False;
       FLocked := False;
+      if (FHoldDepth = 0) and FReserved then
+      begin
+        if FGenStream <> nil then VDbUnlockGenReserve(FGenStream);
+        FReserved := False;
+      end;
       if FReadDepth > 0 then
       begin
         FLockedShared := TakeSharedLock;
@@ -1074,8 +1132,143 @@ begin
       FLockedExcl := False;
       FLocked := False;
     end;
+    { v3.18: rezervasyonu birak (acik islem tutmuyorsa). }
+    if (FHoldDepth = 0) and FReserved then
+    begin
+      if FGenStream <> nil then VDbUnlockGenReserve(FGenStream);
+      FReserved := False;
+    end;
     { Paylasimliya don YALNIZCA okuyucu kilidi hala acikken. Oturum kapsami
       kilit modelinde (FReadDepth = 0) tam kilit tamamen birakilir. }
+    if FReadDepth > 0 then
+    begin
+      FLockedShared := VDbLockStream(FStream, True);
+      t0 := GetTickCount64;
+      while (not FLockedShared) and (GetTickCount64 - t0 < 5000) do
+      begin
+        Sleep(1);
+        FLockedShared := VDbLockStream(FStream, True);
+      end;
+      FLocked := FLockedShared;
+    end;
+  finally
+    LeaveCriticalSection(FWriteCs);
+  end;
+end;
+
+{ v3.18: ACIK ISLEM REZERVASYONU.
+  Uzun bir yazma islemi (BeginBatch..CommitBatch) VERI kilidini tutmaz:
+  yalniz `.gen` handle'i uzerinde yazar rezervasyonu tutar. Sonuc:
+  - Okuyucular BLOKLANMAZ (paylasimli kilit yalniz FStream'de, rezervasyon
+    orada degil). Onceki surumde BeginBatch tam kilidi aliyordu ve 2 sn'lik
+    bir islem bile okuyucuya "veritabani mesgul" veriyordu (olculdu).
+  - Diger YAZARLAR yine sirayla girer: hem rezervasyon hem veri kilidi
+    ayni `.gen`/`FStream` ikilisi uzerinden alinir.
+  Rezervasyon sirasinda baska surec commit EDEMEZ, bu yuzden islem
+  basindaki tazeleme islem sonuna kadar gecerlidir (kayip guncelleme
+  riski BU dilimde ARTMAZ). }
+procedure TVDbPageStore.AcquireWriteHold;
+begin
+  if FStream = nil then
+    raise EVdbPageStore.Create('kapali veritabani: yazma kilidi alinamaz');
+  if FReadOnly then
+    raise EVdbPageStore.Create('salt-okunur oturumda yazma yapilamaz');
+  EnterCriticalSection(FWriteCs);
+  try
+    if FHoldDepth > 0 then
+    begin
+      Inc(FHoldDepth);
+      Exit;
+    end;
+    if FGenStream = nil then
+      raise EVdbPageStore.Create(
+        'yazar rezervasyonu kurulamadi: degisiklik sayaci yok: ' + FPath);
+    LockReserve;
+    FReserved := True;
+    try
+      RefreshIfStale;
+    except
+      VDbUnlockGenReserve(FGenStream);
+      FReserved := False;
+      raise;
+    end;
+    FHoldDepth := 1;
+  finally
+    LeaveCriticalSection(FWriteCs);
+  end;
+end;
+
+procedure TVDbPageStore.ReleaseWriteHold;
+begin
+  if FStream = nil then Exit;
+  EnterCriticalSection(FWriteCs);
+  try
+    if FHoldDepth <= 0 then Exit;
+    Dec(FHoldDepth);
+    if FHoldDepth > 0 then Exit;
+    if FReserved then
+    begin
+      if FGenStream <> nil then VDbUnlockGenReserve(FGenStream);
+      FReserved := False;
+    end;
+  finally
+    LeaveCriticalSection(FWriteCs);
+  end;
+end;
+
+procedure TVDbPageStore.AcquireDataWrite;
+begin
+  if FStream = nil then
+    raise EVdbPageStore.Create('kapali veritabani: yazma kilidi alinamaz');
+  if FReadOnly then
+    raise EVdbPageStore.Create('salt-okunur oturumda yazma yapilamaz');
+  EnterCriticalSection(FWriteCs);
+  try
+    { Kisa yazma yolu zaten tam kilidi tutuyor olabilir. }
+    if FLockedExcl then Exit;
+    if FLockedShared then
+    begin
+      VDbUnlockStream(FStream);
+      FLockedShared := False;
+      FLocked := False;
+    end;
+    LockExclusive;
+    FLockedExcl := True;
+    FLocked := True;
+    try
+      RefreshIfStale;
+    except
+      VDbUnlockStream(FStream);
+      FLockedExcl := False;
+      FLocked := False;
+      if FReadDepth > 0 then
+      begin
+        FLockedShared := TakeSharedLock;
+        FLocked := FLockedShared;
+      end;
+      raise;
+    end;
+  finally
+    LeaveCriticalSection(FWriteCs);
+  end;
+end;
+
+procedure TVDbPageStore.ReleaseDataWrite;
+var
+  t0: QWord;
+begin
+  if FStream = nil then Exit;
+  EnterCriticalSection(FWriteCs);
+  try
+    if not FLockedExcl then Exit;
+    { Veri penceresi kapandi: degisiklik sayacini SIMDI artir. Acik islem
+      rezervasyonu hala bizde olsa da diger sureclerin okuyuculari taze
+      veriyi gormeli. }
+    if (FGenStream <> nil) and not FReadOnly then
+      BumpGen;
+    VDbUnlockStream(FStream);
+    FLockedExcl := False;
+    FLocked := False;
     if FReadDepth > 0 then
     begin
       FLockedShared := VDbLockStream(FStream, True);

@@ -367,7 +367,15 @@ begin
     kilit altinda yazma yapilamaz. Bu yuzden yazan oturumda acilis TAM kilit
     altinda yapilir, sonunda paylasimliya inilir. }
   if not AReadOnly then
-    FStore.AcquireWrite;
+    FStore.AcquireWrite
+  else
+    { v3.18: SALT-OKUNUR acilis da PAYLASIMLI kilit altinda yapilir. Once RO
+      oturum kilidi oturum boyu tuttugu icin bu gerekmiyordu gorunuyordu;
+      artik kilit ifade basina oldugu icin acilis (WAL imajlari, `.odb.idx`
+      yuklemesi, heap dizini) kilitsiz kalirdi ve tam o anda commit eden bir
+      yazarla yarisa girip YARIM/ESKI goruntu okuyabilirdi. Acilis bitince
+      birakilir; RO oturum diske yine hicbir sey yazmaz. }
+    FStore.AcquireRead;
   try
     if FWal.HasContent then
     begin
@@ -412,7 +420,9 @@ begin
   end;
   finally
     if not AReadOnly then
-      FStore.ReleaseWrite;
+      FStore.ReleaseWrite
+    else
+      FStore.ReleaseRead;
   end;
   FInTxn := False;
   ClearPending;

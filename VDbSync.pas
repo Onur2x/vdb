@@ -23,6 +23,22 @@ function VDbFlushDir(const DirPath: string): Boolean;
 function VDbLockStream(S: TFileStream; AShared: Boolean = False): Boolean;
 procedure VDbUnlockStream(S: TFileStream);
 
+{ v3.18: DEGISIKLIK SAYACI (<db>.gen) REZERVASYON kilidi.
+  NEDEN AYRI: VDbLockStream Windows'ta TUM dosyayi (offset 0, 2^64 bayt)
+  kilitler ve LockFileEx TAM kilidi baska surecin OKUMASINI da reddeder.
+  Sayac dosyasinin ilk 8 baytini okuyan herhangi bir oturum bu yuzden
+  EReadError aliyordu (lockchk bolum 3b bunu yakaladi: acik yazma islemi
+  tutan yazar, RO oturumun acilisini "Stream read error" ile dusuruyordu).
+  Cozum: rezervasyon kilidi sayac VERISINDEN UZAK bir bayt araligina
+  ([VDB_GEN_LOCK_OFF, +1)) alinir; boylece offset 0'daki 8 bayt her zaman
+  okunabilir. Windows'ta aralik kilidi gercekten araliktir; Unix'te flock
+  aralik desteklemez ama ZATEN danismalidir (advisory) - okumayi
+  engellemez, yazarlari yine siraya sokar. Platform bagimsiz sonuc ayni. }
+const
+  VDB_GEN_LOCK_OFF = $00010000;   // 64 KiB: sayac verisinin cok otesinde
+function VDbLockGenReserve(S: TFileStream): Boolean;
+procedure VDbUnlockGenReserve(S: TFileStream);
+
 // 2026-10-25 (Sprint 3.10): CANLI dosyanin boyunu KILIT ALMADAN ogrenir.
 // Neden: Unix'te FPC'nin TFileStream'i paylasim moduna gore flock() uygular;
 // motor dosyayi LOCK_EX ile tuttugu icin ayni dosyayi IKINCI kez acmak
@@ -143,6 +159,52 @@ begin
   {$IFDEF WINDOWS}
   FillChar(ov, SizeOf(ov), 0);
   Windows.UnlockFileEx(S.Handle, 0, $FFFFFFFF, $FFFFFFFF, @ov);
+  {$ELSE}
+  {$IFDEF UNIX}
+  FpFlock(S.Handle, VDB_LOCK_UN);
+  {$ENDIF}
+  {$ENDIF}
+end;
+
+function VDbLockGenReserve(S: TFileStream): Boolean;
+{$IFDEF WINDOWS}
+var
+  ov: TOverlapped;
+{$ENDIF}
+begin
+  Result := False;
+  if S = nil then Exit;
+  {$IFDEF WINDOWS}
+  FillChar(ov, SizeOf(ov), 0);
+  ov.Offset := VDB_GEN_LOCK_OFF;
+  ov.OffsetHigh := 0;
+  { 1 bayt: yalniz offset VDB_GEN_LOCK_OFF. Sayac verisi (offset 0..7)
+    KILITLI DEGIL, dolayisiyla tum oturumlar okuyabilir. }
+  Result := Windows.LockFileEx(S.Handle,
+    LOCKFILE_EXCLUSIVE_LOCK or LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, @ov);
+  {$ELSE}
+    {$IFDEF UNIX}
+    { flock aralik desteklemez; butun dosya kilitlenir ama advisory oldugu
+      icin okumayi ENGELLEMEZ, yalniz diger yazarlari siraya sokar. }
+    Result := FpFlock(S.Handle, VDB_LOCK_EX or VDB_LOCK_NB) = 0;
+    {$ELSE}
+    Result := True;
+    {$ENDIF}
+  {$ENDIF}
+end;
+
+procedure VDbUnlockGenReserve(S: TFileStream);
+{$IFDEF WINDOWS}
+var
+  ov: TOverlapped;
+{$ENDIF}
+begin
+  if S = nil then Exit;
+  {$IFDEF WINDOWS}
+  FillChar(ov, SizeOf(ov), 0);
+  ov.Offset := VDB_GEN_LOCK_OFF;
+  ov.OffsetHigh := 0;
+  Windows.UnlockFileEx(S.Handle, 0, 1, 0, @ov);
   {$ELSE}
   {$IFDEF UNIX}
   FpFlock(S.Handle, VDB_LOCK_UN);

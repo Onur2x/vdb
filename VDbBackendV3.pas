@@ -2171,17 +2171,19 @@ begin
   FEngCs.Enter;
   try
     if FSets.TryGetValue(sid, s) then Exit;   // zaten acik
-    { v3.16: SURELER ARASI COK YAZARLILIK. Islem boyunca TAM kilit tutulur:
-      ayni dosyaya baska bir surec yazacaksa busy timeout boyunca bekler,
-      biz commit edince kilidi devralir ve meta imgasindan onbellegini
-      tazeler. Boylece iki surec sirayla yazar, veri kaybi olmaz. }
-    FEng.Store.AcquireWrite;
+    { v3.16: SURELER ARASI COK YAZARLILIK. Yazarlar SIRAYLA girer: acik
+      islem boyunca YAZAR REZERVASYONU tutulur, ayni dosyaya baska bir
+      surec yazacaksa busy timeout boyunca bekler.
+      v3.18: artik islem boyunca TAM kilit DEGIL, yalniz rezervasyon
+      tutulur; VERI kilidi commit penceresinde alinir. Boylece uzun bir
+      islem OKUYUCULARI bloklamaz (yazarlari bloklamaya devam eder). }
+    FEng.Store.AcquireWriteHold;
     try
       s := TWriteSet.Create(sid);
       s.StartGen := FCommitGen;
       FSets.AddOrSetValue(sid, s);
     except
-      FEng.Store.ReleaseWrite;
+      FEng.Store.ReleaseWriteHold;
       raise;
     end;
   finally
@@ -2202,6 +2204,11 @@ begin
     dosyanin baska surecler icin kapanmasi). }
   try
   FEngCs.Enter;
+  { v3.18: VERI kilidi YALNIZ bu pencerede (uygulama + motor commit).
+    Islem boyunca tutulan sey yalniz YAZAR REZERVASYONUDUR; bu yuzden
+    uzun bir islem okuyuculari bloklamaz (olculdu: 2 sn'lik islem
+    sirasinda 20 okuma, en yuksek gecikme tek haneli ms). }
+  FEng.Store.AcquireDataWrite;
   try
     if Assigned(FBeforeCommit) then
       FBeforeCommit;        // kisit denetimi: hata firlatirsa kaplama durur
@@ -2262,11 +2269,12 @@ begin
       MaybeAutoCompact;     // v3.2 (H25)
     end;
   finally
+    FEng.Store.ReleaseDataWrite;
     FEngCs.Leave;
   end;
   s.Free;
   finally
-    FEng.Store.ReleaseWrite;
+    FEng.Store.ReleaseWriteHold;
   end;
 end;
 
@@ -2288,7 +2296,7 @@ begin
   end;
   s.Free;
   finally
-    FEng.Store.ReleaseWrite;
+    FEng.Store.ReleaseWriteHold;
   end;
 end;
 

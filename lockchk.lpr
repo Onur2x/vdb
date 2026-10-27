@@ -18,6 +18,8 @@ program lockchk;
        oturum veriyi WAL katmanindan okur; diskte HICBIR bayt degistirmez.
     8) Yazici kapaninca okuyucu en guncel satir sayisini gorur.
     9) Yazar acligi: kesintisiz okuma yuku altinda yazma girer.
+   10) v3.18: UZUN yazma islemi okuyuculari bloklamaz (olcum); commit
+       edilmemis satir RO oturumda gorunmez.
 
   Cocuk surecler: bu program kendini farkli argumanlarla calistirir.
   Cikis kodu: 0 = hepsi gecti, 1 = hata.
@@ -359,6 +361,46 @@ begin
   end;
 end;
 
+{ --writer-txn-hold <db> <hazir_dosyasi> <tutma_ms> <anahtar>
+  v3.18: ACIK YAZMA ISLEMI tutar. BeginBatch + Put yapar, hazir
+  dosyasini birakir, holdMs bekler, SONRA CommitBatch eder. Ana surec
+  bu pencerede okuma yapip gecikmeyi olcer; boylece "uzun islem
+  okuyuculari bloklar" iddiasi VARSAYILMAZ, OLCULUR. }
+function ChildWriterTxnHold: Integer;
+var
+  db, ready: string;
+  holdMs, key: Integer;
+  be: IVdbBackend;
+  f: TFileStream;
+begin
+  db := ParamStr(2);
+  ready := ParamStr(3);
+  holdMs := StrToIntDef(ParamStr(4), 1000);
+  key := StrToIntDef(ParamStr(5), 600000);
+  try
+    be := TVdbBackendV3.Create(db, False, VDB_DEF_POOL, 5000);
+    be.BeginBatch;
+    be.Put(key, MakeVal(key));
+    f := TFileStream.Create(ready, fmCreate);
+    try
+      f.WriteBuffer(holdMs, SizeOf(holdMs));
+    finally
+      f.Free;
+    end;
+    Sleep(holdMs);
+    be.CommitBatch;
+    be := nil;
+    WriteLn('TAMAM');
+    Result := 0;
+  except
+    on E: Exception do
+    begin
+      WriteLn('HATA ', E.Message);
+      Result := 10;
+    end;
+  end;
+end;
+
 { --read-loop <db> <ms>
   v3.18: YAZILABILIR oturumda okuma dongusu. Her ifade paylasimli
   kilidi alip birakir; yazar icin kilit bosluklari olusur. Ana surec
@@ -682,11 +724,11 @@ var
   dir, db, crashDb, ready: string;
   be: IVdbBackend;
   eng: TVdbPageEngine;
-  i, rc, expectCount: Integer;
+  i, rc, expectCount, iterNo: Integer;
   p1, p2: TProcess;
   aOut, bOut, msg, rep: string;
-  t0, elapsed, sz0, sz1, wal0, wal1: Int64;
-  wrote, okAll, verified: Boolean;
+  t0, elapsed, sz0, sz1, wal0, wal1, maxMs: Int64;
+  wrote, okAll, verified, gorunur: Boolean;
   v: TBytes;
 begin
   dir := ParamStr(1);
@@ -767,6 +809,64 @@ begin
     Fail('okuyucu tutma/tazelik (cikis ' + IntToStr(rc) + '): ' + Trim(aOut));
   if FileExists(ready) then DeleteFile(ready);
 
+  { 3b) v3.18: UZUN YAZMA ISLEMI okuyuculari bloklar mi? Batch acikken
+    kayit yalniz bellekte tutulur (TVdbBackendV3.Put, OwnSet dali) ve
+    kilit ALINMAZ; kilit commit aninda alinir. Bu bir VARSAYIM degil
+    OLCUM: cocuk yazar 2 sn acik islem tutarken RO backend ile okuma
+    yapilir ve EN YUKSEK gecikme raporlanir. Ayrica commit EDILMEMIS
+    satir RO oturumda GORUNMEMELIDIR (izolasyon).
+    DIKKAT: 500000 bu noktada ARTIK COMMIT EDILMIS durumda (bolum 3 onu
+    yazdi). O yuzden burada TAZE bir anahtar (777001) kullanilir; aksi
+    halde "gorunmedi" kontrolu yanlislikla FAIL verir. }
+  p1 := StartChild(['--writer-txn-hold', db, ready, '2000', '777001']);
+  t0 := MsNow;
+  while (not FileExists(ready)) and ((MsNow - t0) < 15000) do
+    Sleep(10);
+  if not FileExists(ready) then
+    Fail('acik islem tutan yazar hazir isareti birakmadi')
+  else
+  begin
+    maxMs := 0;
+    gorunur := False;
+    iterNo := 0;
+    try
+      VdbOpenReadOnly(db, be, VDB_DEF_POOL, 0);
+      for i := 1 to 20 do
+      begin
+        Inc(iterNo);
+        t0 := MsNow;
+        expectCount := be.Count;
+        if be.Get(777001, v) then
+          gorunur := True;
+        elapsed := MsNow - t0;
+        if elapsed > maxMs then maxMs := elapsed;
+        Sleep(50);
+      end;
+      be := nil;
+    except
+      on E: Exception do
+      begin
+        be := nil;
+        Fail(Format('acik islem sirasinda okuma HATA verdi (iterasyon %d): %s: %s',
+          [iterNo, E.ClassName, E.Message]));
+      end;
+    end;
+    if maxMs > 500 then
+      Fail(Format('acik yazma islemi okuyucuyu blokladi: en yuksek okuma %d ms', [maxMs]))
+    else
+      Ok(Format('acik yazma islemi okuyucuyu bloklamadi (20 okuma, en yuksek %d ms)', [maxMs]));
+    if gorunur then
+      Fail('commit edilmemis satir RO oturumda GORUNDU (izolasyon bozuk)')
+    else
+      Ok('commit edilmemis satir RO oturumda gorunmedi');
+  end;
+  rc := FinishChild(p1, aOut);
+  if rc = 0 then
+    Ok('acik islem tutan yazar sonunda commit etti')
+  else
+    Fail('acik islem tutan yazar (cikis ' + IntToStr(rc) + '): ' + Trim(aOut));
+  if FileExists(ready) then DeleteFile(ready);
+
   { 4) yazar tutarken ikinci yazar. }
   p1 := StartChild(['--writer-hold', db, ready, '2000']);
   t0 := MsNow;
@@ -800,8 +900,9 @@ begin
     Fail('yazar tutma (cikis ' + IntToStr(rc) + '): ' + Trim(aOut));
   if FileExists(ready) then DeleteFile(ready);
 
-  { 5) yazar kapandi: okuyucu en guncel sayiyi gorur. }
-  expectCount := 501;
+  { 5) yazar kapandi: okuyucu en guncel sayiyi gorur.
+    500 temel + bolum 3 (500000) + bolum 3b (777001) = 502. }
+  expectCount := 502;
   be := TVdbBackendV3.CreateReadOnly(db, VDB_DEF_POOL, 0);
   if be.Count = expectCount then
     Ok(Format('yazici kapandiktan sonra okuyucu %d satir gordu', [expectCount]))
@@ -928,6 +1029,12 @@ begin
     begin
       gPass := 0; gFail := 0;
       ExitCode := ChildWriterAttempt;
+      Exit;
+    end;
+    if ParamStr(1) = '--writer-txn-hold' then
+    begin
+      gPass := 0; gFail := 0;
+      ExitCode := ChildWriterTxnHold;
       Exit;
     end;
     if ParamStr(1) = '--writer-hold' then
