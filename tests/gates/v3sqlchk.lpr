@@ -53,6 +53,9 @@ var
   sr: TSearchRec;
   base: string;
 begin
+  // v3.23 guvenlik: depo kokunu supurme (bkz. backendchk CleanDir).
+  if gDir = '' then Exit;
+  if FileExists(IncludeTrailingPathDelimiter(gDir) + 'VDbCore.pas') then Exit;
   base := IncludeTrailingPathDelimiter(gDir);
   if FindFirst(base + '*', faAnyFile, sr) = 0 then
   begin
@@ -2493,7 +2496,8 @@ begin
   gPass := 0;
   gFail := 0;
   N := 2000;
-  if ParamCount >= 1 then gDir := ParamStr(1) else gDir := GetCurrentDir;
+  if ParamCount >= 1 then gDir := ParamStr(1)
+  else gDir := IncludeTrailingPathDelimiter(GetCurrentDir) + 'tmp64\gaterun\v3sql';
   if ParamCount >= 2 then N := StrToIntDef(ParamStr(2), N);
   if not DirectoryExists(gDir) then ForceDirectories(gDir);
 

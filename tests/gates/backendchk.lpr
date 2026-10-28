@@ -28,7 +28,7 @@ uses
     yoksa TEvent.Create "Failed to create OS basic event" verir. }
   {$IFDEF UNIX}cthreads,{$ENDIF}
   Classes, SysUtils, VDbBackendApi, VDbCore, VDbBackendV2, VDbBackendV3,
-  VDbPageEngine, VDbPage, VDbPageStore, VDbPageCrypto;
+  VDbPageEngine, VDbPage, VDbPageStore, VDbPageCrypto, VDbCrc32;
 
 var
   gPass, gFail: Int64;
@@ -71,6 +71,12 @@ var
   sr: TSearchRec;
   base: string;
 begin
+  // v3.23 guvenlik: kaynak agacinin kokunu asla supurme. gDir bos ise ya da
+  // icinde depo kaynagi varsa hicbir sey silinmez. (Bir kez argumansiz
+  // calistirilinca gDir = calisma dizini oluyor ve kok dizindeki tum dosyalar
+  // silinmisti.)
+  if gDir = '' then Exit;
+  if FileExists(IncludeTrailingPathDelimiter(gDir) + 'VDbCore.pas') then Exit;
   base := IncludeTrailingPathDelimiter(gDir);
   if FindFirst(base + '*', faAnyFile, sr) = 0 then
   begin
@@ -1718,6 +1724,56 @@ begin
   end;
 end;
 
+procedure TestV3Crc32;
+const
+  { Bilinen CRC32 (IEEE 802.3, yansimali) vektorleri. }
+  VEC: array[0..2] of AnsiString = ('a', 'abc', '123456789');
+  VECCRC: array[0..2] of LongWord = ($E8B7BE43, $352441C2, $CBF43926);
+var
+  i, n, off: Integer;
+  buf: TBytes;
+  a, b: LongWord;
+  bad: Integer;
+begin
+  WriteLn;
+  WriteLn('--- v3 CRC32 (slice-by-8) ---');
+  bad := 0;
+  for i := 0 to 2 do
+  begin
+    a := VDbCrc32Of(VEC[i][1], Length(VEC[i]));
+    if a = VECCRC[i] then
+      Ok(Format('bilinen vektor %d', [i]))
+    else
+    begin
+      Inc(bad);
+      Fail(Format('bilinen vektor %d: %x <> %x', [i, a, VECCRC[i]]));
+    end;
+  end;
+  { Uzunluk 0..264 ve hizasiz baslangic: hizli yol ile referans yol ayni
+    sonucu vermeli. i386'da hizasiz 64-bit okuma sessizce yanlis veri
+    urettigi icin bu kapi zorunlu. }
+  SetLength(buf, 4096 + 16);
+  for i := 0 to Length(buf) - 1 do
+    buf[i] := Byte((i * 37 + 11) and $FF);
+  for n := 0 to 264 do
+    for off := 0 to 7 do
+    begin
+      a := VDbCrc32UpdatePtr(VDbCrc32Init, @buf[off], n);
+      b := VDbCrc32UpdatePtrSlow(VDbCrc32Init, @buf[off], n);
+      if a <> b then
+      begin
+        Inc(bad);
+        if bad <= 3 then
+          Fail(Format('hizli/referans farki: n=%d off=%d %x <> %x',
+            [n, off, a, b]));
+      end;
+    end;
+  if bad = 0 then
+    Ok('hizli yol referansla 2120 uzunluk/hiza kombinasyonunda ayni')
+  else
+    Fail(Format('CRC uyusmazligi: %d durum', [bad]));
+end;
+
 procedure TestV3GroupCommit;
 const
   NW = 4;
@@ -1801,7 +1857,8 @@ begin
   gPass := 0;
   gFail := 0;
   N := 5000;
-  if ParamCount >= 1 then gDir := ParamStr(1) else gDir := GetCurrentDir;
+  if ParamCount >= 1 then gDir := ParamStr(1)
+  else gDir := IncludeTrailingPathDelimiter(GetCurrentDir) + 'tmp64\gaterun\backend';
   if ParamCount >= 2 then N := StrToIntDef(ParamStr(2), N);
   if not DirectoryExists(gDir) then ForceDirectories(gDir);
 
@@ -1825,6 +1882,7 @@ begin
   TestV3Encryption(N);
   TestEquivalence(1000);
   TestV3GroupCommit;
+  TestV3Crc32;
   TestV3GroupCoalesce;
 
   WriteLn;

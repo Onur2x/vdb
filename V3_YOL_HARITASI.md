@@ -1835,6 +1835,146 @@ kayıt için burada.)
   30, replchk 37, lockchk 36, snapchk 21, prochk 21); `sqltest` v3
   **2874/0/33**, v2 **3305/0/0**.
 
+## §7j v3.23 — CRC32 4,1x, değişim günlüğü, commit profili (2026-10-28)
+
+Bu turda ölçülen üç şey var: (1) CRC32'nin neden yavaş olduğu ve düzeltmesi,
+(2) commit yolunun tam dağılımı, (3) değişim günlüğü grup yazımının sabit
+maliyeti. Ayrıca ölçüm sırasında test araçlarında **veri kaybına yol açan bir
+kusur** bulundu; o da burada yazılı (§7j.7).
+
+### 7j.1 Ölçüm aletleri
+
+| Alet | Ne ölçer |
+|---|---|
+| `tmp64/mb1.lpr` | CRC 4096 B, `Move`, `TFileStream.WriteBuffer` vs ham `WriteFile` |
+| `tmp64/mb2.lpr` | CRC doğrulama: bilinen vektörler + bağımsız bayt-bayt referans |
+| `tmp64/mb3.lpr` | autocommit'te WAL'e yazılan çerçeve sayısı |
+| `tmp64/pcbench.lpr` | süreç/iş parçacığı autocommit (ısınma commit'i + `SPIKE` raporu) |
+| `tmp64/bulkbench.lpr` | toplu işlem (K satır × M işlem) |
+
+### 7j.2 CRC32: 7,22 → 1,745 µs (4,1x) — ve eski bir yanlış
+
+`VDbCrc32.pas`'ın başlığında "slice-by-8 FPC'de tutarsız sonuç verdi, bilerek
+kullanılmıyor" yazıyordu. Turun başında kök neden bulundu: eski deneme 8 baytı
+**hizalanmamış 64-bit işaretçi okumasıyla** (`PInt64(P)^`) alıyordu. i386'da
+hizasız erişim hata vermez, sessizce yanlış veri üretir — bu yüzden "tutarsız"
+görünüyordu. Doğru yol: ilk 4 baytı `Move(P[0], w, 4)` ile almak, kalan 4 baytı
+tek tek indekslemek.
+
+Yeni `VDbCrc32UpdatePtr` 8 baytta 8 tablo araması yapar; tablo `T[j][i] :=
+(T[j-1][i] shr 8) xor T[0][T[j-1][i] and $FF]` ile bir kez kurulur. Referans
+olarak **`VDbCrc32UpdatePtrSlow`** (bayt-bayt) ihraç edildi; kapı ikisini
+karşılaştırır.
+
+| Ölçüm (4096 B) | Önce | Sonra |
+|---|---|---|
+| `VDbCrc32UpdatePtr` | 7,22 µs | **1,745 µs** (4,1x) |
+| `DoCommit: AppendFrame` (sayfa mühürü) | 26,0 µs | **8,4 µs** |
+| `DoCommit: WAL Commit` | 44,0 µs | **31,7 µs** |
+
+Doğrulama: `mb2` bilinen vektörler (`a`→E8B7BE43, `abc`→352441C2,
+`123456789`→CBF43926), uzunluk 0..300 ve 301..4096, 31 hizasız başlangıç —
+hepsi geçti. Aynı kontrol `tests/gates/backendchk.lpr` içinde
+**`TestV3Crc32`** kapısı olarak kalıcılaştı (2120 kombinasyon).
+
+### 7j.3 Commit profili (pcbench P=1, 800 commit, µs/commit)
+
+| Kalem | µs |
+|---|---|
+| **CommitBatch toplam** | **391–397** |
+| fsync (`SyncDurable`, lider) | 302–325 |
+| WAL Commit (yazım + CRC) | 31,7–34,3 |
+| değişim günlüğü `LogFinish` | 9,86 (önce 17,9) |
+| kritik bölüm (kendi payı) | 9,7 |
+| `AppendFrame` (sayfa mührü) | 8,4–9,1 |
+| `AcquireDataWrite` | 4,0 |
+| `MaybeCheckpoint` | 3,2–4,0 |
+| `ApplyBatch` | 3,3 |
+| `AwaitDurable` (kendi payı) | 2,1–2,3 |
+| `ReleaseWriteHold` | 1,8–2,0 |
+| `OwnSet` | 0,21 |
+| `VerifyNoConflict` | 0,13 |
+
+`BeginBatch` ayrı: **17 µs** (`TryAcquireWriteHold` 3,9 + `TWriteSet.Create`
+2,0 + kilit altındaki gövde 0,27 + gate Leave 1,3). `Put` ≈ 2 µs.
+
+Yani CPU payı ≈ **75 µs**, fsync ≈ 310 µs. SQLite'ın aynı işteki CPU'su
+≈ 55 µs; aradaki fark 20 µs. fsync her ikisinde de baskın olduğu için toplam
+sürede fark küçük kalıyor.
+
+### 7j.4 Değişim günlüğü: `EndGroup` 17,9 → 9,86 µs
+
+`EndGroup` her commit'te (a) grubu tutacak yeni bir `TBytes` ayırıyordu,
+(b) segment boyunu öğrenmek için `FSeg.Size`'ı **iki kez** çağırıyordu
+(her biri bir `GetFileSizeEx`). İki alan eklendi:
+
+- `FSegLen: Int64` — geçerli segmentin yazılmış bayt sayısı; `Open`,
+  `OpenNewSeg`, `WriteBase`, `EndGroup`, `AppendForeignGroup` yollarında
+  tutulur, hata yolunda geri alınır.
+- `FBuf: TBytes` — grup tamponu; yalnız büyümesi gerektiğinde `SetLength`.
+
+Sonuç: `LogFinish` **17,9 → 9,86 µs**, `CommitBatch` 0,418 → 0,397 ms.
+`FSeg.Size` artık yalnız `Open`/`OpenNewSeg` gibi seyrek yollarda çağrılıyor;
+sayaç ile dosya boyu arasındaki tutarlılık `grep` ile tüm `FSeg.` kullanımları
+üzerinden denetlendi.
+
+### 7j.5 Ölçülen sonuçlar (temiz derleme)
+
+| Ölçüm | v3.22 | v3.23 | SQLite (WAL+FULL) |
+|---|---|---|---|
+| autocommit, tek süreç | 0,440 ms | **0,389–0,416 ms** (medyan ~0,406; 2.264–2.573 c/s) | 0,355 ms |
+| toplu 1000 satır/işlem | 2,254 ms | **1,970–2,013 ms** (≈497–508 bin satır/s) | 2,1 ms |
+| rollback journal kıyası | — | 1,538 ms SQLite'a karşı **~3,8x hızlı** | 1,538 ms |
+
+Yani **toplu yazmada v3 artık SQLite'tan hızlı**, tek satır autocommit'te
+~1,14x yavaş. Farkın tamamı CPU payındaki ~20 µs'dir; fsync eşit.
+
+### 7j.6 Kalan fark ve sıradaki iş
+
+Öncelik sırası (ölçülmüş paylar, autocommit):
+1. `BeginBatch` 17 µs — `TryAcquireWriteHold` (3,9) ve `TWriteSet.Create`
+   (2,0); sözlükleri havuzdan geri kullanmak.
+2. `WAL Commit` ~32 µs — `TFileStream.WriteBuffer` yerine ham `WriteFile`
+   (ölçülen fark ~1,85 µs/çağrı, commit'te 2–3 çağrı) ve `Seek(0, soEnd)`
+   yerine izlenen ofset. **Dikkat:** `Recover`, `Truncate`, `Open` konumu
+   değiştirir; izlenen ofset buralarda güncellenmezse WAL bozulur.
+3. `LogFinish` 9,86 µs — grup kaydını WAL commit'iyle tek yazmada birleştirmek.
+4. Kritik bölümün kendi payı 9,7 µs (`FSets.Remove`, `SnapApplyPending`,
+   `MergeTagDeltas`).
+
+### 7j.7 Test araçlarında veri kaybı kusuru (bulundu ve düzeltildi)
+
+Bu turda depo kökündeki **tüm izlenen dosyalar iki kez silinmiş** bulundu
+(alt dizinler etkilenmemişti). Kök neden bir kapı programıydı:
+
+- `tests/gates/backendchk.lpr`: `if ParamCount >= 1 then gDir := ParamStr(1)
+  else gDir := GetCurrentDir;` ve `CleanDir` `gDir` içindeki **tüm dosyaları**
+  siler; testler boyunca 15 kez çağrılır. Argümansız çalıştırıldığında
+  `gDir` = depo kökü → kök süpürüldü.
+- Aynı desen (`GetCurrentDir` + süpürme döngüsü) `v3sqlchk` ve `migchk`'te de
+  vardı; `idxchk` yalnız kendi veritabanı dosyalarını siliyordu ama varsayılanı
+  yine çalışma diziniydi.
+
+Düzeltme (iki katman):
+1. Varsayılan artık çalışma dizini değil, ayrılmış alt dizin:
+   `tmp64\gaterun\backend`, `...\idx`, `...\v3sql` vb.
+2. `CleanDir` savunması: `gDir` boşsa **veya** içinde `VDbCore.pas` varsa
+   hiçbir şey silinmez. Böylece yanlış bir varsayılan bile depoyu vuramaz.
+
+Doğrulama: `backendchk.exe` **argümansız** çalıştırıldı → 127/0 geçti ve
+`git status` yalnız amaçlanan 4 dosyayı gösterdi (silinme yok).
+
+Kurtarma notu: silinen dosyalar `git checkout -- .` ile HEAD'den geri
+getirildi; commit edilmemiş `VDbCrc32.pas` ve `VDbChangeLog.pas` değişiklikleri
+yeniden yazılıp `mb2` ve kapılarla doğrulandı. Kayıp yok.
+
+### 7j.8 Doğrulama (bu sürüm)
+
+16 kapı **686/0**: pagechk 21, storechk 15, heapchk 20, idxchk 19, backendchk
+127 (CRC kapısı dahil), v3sqlchk 238, migchk 13, factorychk 13, crashtest 11,
+logchk 43, pitrchk 21, btreechk 30, replchk 37, lockchk 36, snapchk 21,
+prochk 21. `sqltest` v3 **2864/0/33**, v2 **3295/0/0**.
+
 ### Sürüm çizgisi kararı (2026-10-26): alpha hattı → **v1.0.0**
 
 Kullanıcı kararı, önceki "v4'e ertele" planını geçersiz kılar:

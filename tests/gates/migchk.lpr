@@ -46,6 +46,9 @@ var
   sr: TSearchRec;
   base: string;
 begin
+  // v3.23 guvenlik: depo kokunu supurme (bkz. backendchk CleanDir).
+  if gDir = '' then Exit;
+  if FileExists(IncludeTrailingPathDelimiter(gDir) + 'VDbCore.pas') then Exit;
   base := IncludeTrailingPathDelimiter(gDir);
   if FindFirst(base + '*', faAnyFile, sr) = 0 then
   begin

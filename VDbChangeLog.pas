@@ -138,6 +138,10 @@ type
     FGroup: TList<TVdbLogChange>;
     FGroupBytes: Int64;
     FSegMax: Int64;             // rotasyon esigi (test icin degistirilebilir)
+    { v3.23: segment uzunlugu izlenir; her yazimda FSeg.Size (GetFileSizeEx)
+      cagirmak yerine sayac kullanilir. FBuf grup tamponu yeniden kullanilir. }
+    FSegLen: Int64;
+    FBuf: TBytes;
     FSeq: Int64;
     FGen: LongWord;
     FGuid: QWord;
@@ -489,6 +493,7 @@ begin
     raise;
   end;
   FSegNo := No;
+  FSegLen := FSeg.Size;
 end;
 
 { Var olan segmentlerin sonunu okur: son grup sirasi, Gen ve segment no.
@@ -683,6 +688,7 @@ begin
       fmOpenReadWrite or fmShareDenyNone);
     FSeg.Seek(0, soEnd);
     FSegNo := lastSeg;
+    FSegLen := FSeg.Size;
   except
     on E: Exception do
     begin
@@ -848,7 +854,7 @@ function TVdbChangeLog.EndGroup(AEngineLsn: LongWord;
   out ASeq, ATsMs: Int64): Boolean;
 var
   i, total, pos: Integer;
-  all, rec, payload: TBytes;
+  rec, payload: TBytes;
   seq, ts: Int64;
   posBefore: Int64;
   r: TVdbLogChange;
@@ -868,18 +874,20 @@ begin
   { v3.10: toplam boyut FGroupBytes'ten gelir (Add* zaten tam sayiyor);
     ONCEDEN tum grup bir kez daha dolasilip toplaniyordu. }
   total := Integer(FGroupBytes) + VDBLOG_REC_HDR + 4 + 4;   // END + sayi
-  SetLength(all, total);
+  { v3.23: tampon yeniden kullanilir (her commit'te ayirma yok). }
+  if Length(FBuf) < total then
+    SetLength(FBuf, total + 512);
   pos := 0;
   for i := 0 to FGroup.Count - 1 do
   begin
     r := FGroup[i];
-    pos := PutChangeRecAt(all, pos, VDBLOG_MAGIC_REC, r.Kind, seq, ts,
+    pos := PutChangeRecAt(FBuf, pos, VDBLOG_MAGIC_REC, r.Kind, seq, ts,
       r.TableId, r.Key, r.OldVal, r.NewVal);
   end;
   SetLength(payload, 4);
   PutU32(payload, 0, LongWord(FGroup.Count));
   rec := BuildRec(VDBLOG_MAGIC_END, 0, seq, ts, 0, AEngineLsn, payload);
-  Move(rec[0], all[pos], Length(rec));
+  Move(rec[0], FBuf[pos], Length(rec));
   pos := pos + Length(rec);
   if pos <> total then
   begin
@@ -889,11 +897,12 @@ begin
   try
     if FSeg = nil then
       OpenNewSeg(FSegNo + 1);
-    posBefore := FSeg.Size;
-    FSeg.WriteBuffer(all[0], total);
+    posBefore := FSegLen;
+    FSeg.WriteBuffer(FBuf[0], total);
+    Inc(FSegLen, total);
     if FSyncGroups then
       VDbFlushStream(FSeg);
-    if FSeg.Size >= FSegMax then
+    if FSegLen >= FSegMax then
       OpenNewSeg(FSegNo + 1);
   except
     on E: Exception do
@@ -901,8 +910,11 @@ begin
       FError := 'degisim gunlugu yazilamadi: ' + E.Message;
       { Yarim grup birakma: kuyruk kesilirse sonraki gruplar da okunamaz. }
       try
-        if (FSeg <> nil) and (FSeg.Size > posBefore) then
+        if (FSeg <> nil) and (FSegLen > posBefore) then
+        begin
           FSeg.Size := posBefore;
+          FSegLen := posBefore;
+        end;
       except
       end;
       AbortGroup;
@@ -943,6 +955,7 @@ begin
   if FSeg = nil then
     OpenNewSeg(FSegNo + 1);
   FSeg.WriteBuffer(rec[0], Length(rec));
+  Inc(FSegLen, Length(rec));
   VDbFlushStream(FSeg);
   FSeq := seq;
   Result := seq;
@@ -1024,19 +1037,23 @@ begin
     try
       if FSeg = nil then
         OpenNewSeg(FSegNo + 1);
-      posBefore := FSeg.Size;
+      posBefore := FSegLen;
       ms.Position := 0;
       FSeg.CopyFrom(ms, total);
+      Inc(FSegLen, total);
       VDbFlushStream(FSeg);
-      if FSeg.Size >= FSegMax then
+      if FSegLen >= FSegMax then
         OpenNewSeg(FSegNo + 1);
     except
       on E: Exception do
       begin
         FError := 'gunluk yazilamadi: ' + E.Message;
         try
-          if (FSeg <> nil) and (FSeg.Size > posBefore) then
+          if (FSeg <> nil) and (FSegLen > posBefore) then
+          begin
             FSeg.Size := posBefore;
+            FSegLen := posBefore;
+          end;
         except
         end;
         Exit;

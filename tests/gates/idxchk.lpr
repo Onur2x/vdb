@@ -565,7 +565,8 @@ begin
   gPass := 0;
   gFail := 0;
   N := 50000;
-  if ParamCount >= 1 then gDir := ParamStr(1) else gDir := GetCurrentDir;
+  if ParamCount >= 1 then gDir := ParamStr(1)
+  else gDir := IncludeTrailingPathDelimiter(GetCurrentDir) + 'tmp64\gaterun\idx';
   if ParamCount >= 2 then N := StrToIntDef(ParamStr(2), N);
   if not DirectoryExists(gDir) then ForceDirectories(gDir);
 
