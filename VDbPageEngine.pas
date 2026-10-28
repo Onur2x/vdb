@@ -740,7 +740,10 @@ var
   syncLsn: LongWord;
 begin
   { v3.19: eski sozlesme korunur — Commit(True) yazar VE bekler. }
-  Result := DoCommit(DoSync, syncLsn);
+  { v3.21: TEK fsync. Onceden DoCommit(True) FWal.Commit(True) uzerinden
+    stream'i flush ediyor, ardindan AwaitDurable -> SyncDurable AYNI dosyayi
+    ikinci kez flush ediyordu (commit basina iki FlushFileBuffers). }
+  Result := DoCommit(False, syncLsn);
   if DoSync and Result then
     AwaitDurable(syncLsn);
 end;

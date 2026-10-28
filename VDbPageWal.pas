@@ -427,21 +427,27 @@ end;
 function TVdbPageWal.WriteRecord(Magic, PageNo, PayloadLen: LongWord;
   const Payload): LongWord;
 var
-  hdr: array[0..VDB_WAL_REC_HDR - 1] of Byte;
+  { v3.21: sifreli zarf (4124 bayt) duz sayfadan BUYUK; tampon ikisini de
+    kapsamali. Onbellege sigmayan bir tampon boyu AV'ye yol acmisti. }
+  rec: array[0..VDB_WAL_REC_HDR + VDB_ENC_ENVELOPE - 1] of Byte;
   crc: LongWord;
 begin
-  Move(Magic, hdr[0], 4);
-  Move(FLSN, hdr[4], 4);
-  Move(PayloadLen, hdr[8], 4);
-  Move(PageNo, hdr[12], 4);
+  { v3.21: baslik + yuk TEK WriteFile ile yazilir (onceden iki cagri vardi:
+    20 bayt baslik, 4096 bayt yuk). Ek 4 KB kopya, kazanilan sistem
+    cagrisindan ucuz. }
+  Move(Magic, rec[0], 4);
+  Move(FLSN, rec[4], 4);
+  Move(PayloadLen, rec[8], 4);
+  Move(PageNo, rec[12], 4);
   if PayloadLen > 0 then
-    crc := WalCrc(hdr[0], 16, Payload, PayloadLen)
+  begin
+    Move(Payload, rec[VDB_WAL_REC_HDR], Integer(PayloadLen));
+    crc := WalCrc(rec[0], 16, rec[VDB_WAL_REC_HDR], Integer(PayloadLen));
+  end
   else
-    crc := WalCrc(hdr[0], 16, hdr[0], 0);
-  Move(crc, hdr[16], 4);
-  FStream.WriteBuffer(hdr[0], VDB_WAL_REC_HDR);
-  if PayloadLen > 0 then
-    FStream.WriteBuffer(Payload, PayloadLen);
+    crc := WalCrc(rec[0], 16, rec[0], 0);
+  Move(crc, rec[16], 4);
+  FStream.WriteBuffer(rec[0], VDB_WAL_REC_HDR + Integer(PayloadLen));
   Result := crc;
 end;
 
@@ -470,7 +476,9 @@ begin
     raise EVdbWal.Create('WAL acik degil');
   if FBufferCount = 0 then Exit(True);   // yazacak bir sey yok
   FLSN := LSN;
-  FStream.Position := FStream.Size;
+  { v3.21: tek arama. Onceden FStream.Size + Position atamasi iki arama
+    yapiyordu; Seek(0, soEnd) hem konumu hem sonu tek cagrida verir. }
+  FStream.Seek(0, soEnd);
   for i := 0 to FBufferCount - 1 do
   begin
     if FWalEncrypted then

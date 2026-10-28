@@ -1578,6 +1578,110 @@ kuyruğa çevirmek, (b) tazelemeyi artımlı yapmak (WAL'in tamamı yerine
 yalnız yeni çerçeveler, heap dizinini baştan taramamak), (c) çakışma
 denetimini **sayfa LSN'i** düzeyine indirmek.
 
+### 7h. SQLite ile karşılaştırmalı ölçüm (v3.21, 2026-10-27)
+
+Soru: "SQLite kadar hızlı mıyız; değilsek olmalıyız, hatta geçmeliyiz."
+Cevap **ölçümle** verildi. Aynı makine (AMD Ryzen 7 7730U, 16 mantıksal
+çekirdek, NVMe, Windows), aynı iş yükleri, aynı değer boyu (24 bayt).
+SQLite 3.50.4 / Python 3.14.0 (`tmp64/sqbench.py`), biz `tmp64/rwbench` ve
+`tmp64/pcbench`. Her koşuda dizin silinip yeniden oluşturuldu.
+
+#### 7h.1 Tek süreç, satır başına dayanıklılık
+
+| İş yükü | SQLite | v3 | Sonuç |
+|---|---|---|---|
+| autocommit INSERT, fsync her commit, **rollback journal + FULL** | 1,459 ms | **0,517 ms** | **v3 2,8x hızlı** |
+| autocommit INSERT, **WAL + synchronous=FULL** | 0,345 ms | 0,517 ms | v3 1,5x yavaş |
+| autocommit INSERT, WAL + NORMAL | 0,015 ms | (politika yok) | karşılaştırılamaz |
+| autocommit INSERT, WAL + OFF | 0,015 ms | (politika yok) | karşılaştırılamaz |
+
+Yani **her commit'i diske indiren** iki moddan birinde (rollback journal)
+SQLite'ı 2,8 kat geçiyoruz; WAL modunda 1,5 kat gerisindeyiz. Farkın tamamı
+CPU'dur: fsync tabanı bu makinede **0,28–0,30 ms** (ölçüldü: `tmp64/fsb2`,
+4 KB ve 4116 bayt, tek/ikinci handle, önceden ayrılmış dosya — hepsi aynı).
+SQLite'ın 0,345'inden fsync çıkarılınca CPU'su ~0,06 ms kalıyor; bizim
+CPU'muz ~0,21 ms.
+
+#### 7h.2 Toplu yazma, okuma, tarama
+
+| İş yükü | SQLite (delete/WAL) | v3 | Oran |
+|---|---|---|---|
+| 1000 satır tek işlemde | 2,9 / 1,9 ms | 32,7 ms | 11–17x yavaş |
+| 2000 nokta okuma | 29,0 / 6,3 ms | 41,5 ms | 1,4–6,5x yavaş |
+| tam tarama (20k–23k satır) | 0,8 ms | 1,67 ms | ~1,8x yavaş |
+
+**Buradaki gerçek bulgu:** tek satır `Put` **36 µs**, tek `Get` **21 µs**.
+SQLite'ta toplu işlemde satır başına 2 µs, nokta okumada 3 µs. Yani
+işlem başına CPU'muz SQLite'ın ~7–18 katı; toplu yazma tablosundaki
+"11–17x" aslında 1000 × 36 µs'lik `Put` maliyetidir, toplu işlemde ek bir
+kötüleşme yok. Sıradaki performans hedefi budur (§7h.5).
+
+#### 7h.3 Paralel yazma (çok süreç)
+
+| P | SQLite (WAL+FULL) | v3 (pcbench, yinelemeli) |
+|---|---|---|
+| 2 | 0,391 ms/commit, **0,88x** | 0,531–0,650 ms/commit, **0,78–0,96x** |
+| 4 | 0,393 ms/commit, **0,87x** | 0,575–0,594 ms/commit, **0,87–0,89x** |
+
+SQLite paralel yazmada **hızlanmıyor** (0,87–0,96x); biz de hızlanmıyoruz.
+Ortalama hızda iki motor **eşit**. Ancak v3'ün kuyruğu kötü: P=4'te tek bir
+`CommitBatch` **0,38–1,38 s**'ye sıçrıyor (SQLite'ta böyle bir kuyruk yok).
+Sebep tazeleme: başka süreç commit edince WAL'in **tamamı** yeniden
+oynatılıyor, ardından `Checkpoint` ile veri dosyasına yazılıp WAL budanıyor
+ve heap dizini **baştan taranıyor**. Sıradaki iş bu tazelemeyi artımlı
+yapmak (§7h.6).
+
+#### 7h.4 Denenip ölçülen ve geri alınanlar (bu tur)
+
+1. **Süreçler arası fsync birleştirme** (paylaşımlı `<wal>.dur` damgası:
+   yazılmış-offset + yayıncı PID + "yazıyor" niyeti). Üç sürüm denendi;
+   ölçülen: 0,50x, 0,54x, **0,35x** — tek süreçte kazanç yok, paralelde
+   gerileme. Nedeni: yazmalar rezervasyon kilidiyle **sıralı** olduğu için
+   iki süreç yazma/flush pencerelerini örtüşmüyor; birleştirme için
+   "bekleme süresi" (linger) gerekiyor ve o da tek yazıcılı veritabanına
+   bedel yüklüyor. **Geri alındı** (`git checkout`), yeni dosya/format
+   bırakılmadı. Tekrar denenirse: paylaşımlı bellek + gerçek kuyruk.
+2. **`AwaitDurable`'ı rezervasyon dışına almak** (fsync sırasında diğer
+   süreç yazabilsin): 0,47x — diğer süreç o arada yazıp tazeleme
+   tetikledikçe toplam maliyet arttı. **Geri alındı.**
+3. **Uyandırma jetonu / olay tabanlı kilit devri**: 0,07x (olay) ve 0,76x
+   (spin+`Sleep(1)`) — darboğaz kilit devri değildi. **Geri alındı.**
+4. **WAL'i önceden ayırma / hizalama**: fsync'e etkisi yok (0,28–0,30 ms).
+   Denenmedi, ölçüldü ve elendi.
+
+#### 7h.5 Bu turda KALAN kazançlar (ölçülmüş, geri alınmadı)
+
+- **Rezervasyon hızlı yolu** (`VDbPageStore`): rezervasyon bizdeyken `.gen`
+  nesli değişmediyse `RefreshUnderExclusive` (LockExclusive + ReadGen +
+  unlock + paylaşımlıyı geri alma = 4 sistem çağrısı) atlanır. Ölçüldü:
+  `BeginBatch` rezervasyon denemesi 16 µs → **6,8 µs**.
+- **Tek fsync** (`TVdbPageEngine.Commit`): `DoCommit(True)` yolunda WAL
+  stream'i flush edilip ardından `AwaitDurable` aynı dosyayı **ikinci kez**
+  flush ediyordu. Artık tek `FlushFileBuffers`.
+- **Tek `WriteFile`** (`TVdbPageWal.WriteRecord`): kayıt başlığı (20 bayt) ve
+  sayfa (4096 bayt) ayrı ayrı yazılıyordu; artık tek yazma. Ayrıca commit
+  başına `FStream.Size` + `Position :=` iki arama yerine tek `Seek(0, soEnd)`.
+  Ölçüldü: motor commit 0,105 → **0,094 ms**, fsync kovası 0,327 → **0,297 ms**
+  (taban çizgisi), toplam 0,525 → **0,517 ms/commit**.
+- **Bulunan gerçek kusur:** yeni tek-yazma yolu tamponu düz sayfa boyuna
+  (4116 bayt) göre ayırmıştı; **şifreli zarf 4124 bayt** olduğu için tampon
+  taşıyor ve şifreli çok süreçli yazmada **EAccessViolation** veriyordu.
+  `prochk` yakaladı, tampon `VDB_WAL_REC_HDR + VDB_ENC_ENVELOPE` yapıldı;
+  kapı 21/21.
+
+#### 7h.6 Dürüst sınır ve sıradaki iş
+
+- Kazandığımız yer: **commit başına tam dayanıklılık** (rollback journal
+  eşdeğeri) — 2,8x; ve eşitlik: çok süreçli paralel yazma.
+- Kaybettiğimiz yer: **WAL + FULL tek süreç** (1,5x) ve **işlem başına CPU**
+  (`Put` 36 µs, `Get` 21 µs). Eşitlenmek için CPU'yu ~4 kat düşürmek gerekir;
+  bu, sayfa CRC'sinin okuma yolundan çıkarılması, dizin aramalarının
+  sıkılaştırılması ve değer kopyalama tahsislerinin kaldırılması demektir.
+- WAL + NORMAL/OFF ile **yarışılamaz** (SQLite orada fsync yapmıyor,
+  0,015 ms). Böyle bir dayanıklılık politikası (`dpNormal`) bilinçli olarak
+  yok: kullanıcı önceliği "asla veri kaybı yok".
+- Doğrulama: 16 kapı **682/0**; `sqltest` v3 **2874/0/33**, v2 **3305/0/0**.
+
 ### Sürüm çizgisi kararı (2026-10-26): alpha hattı → **v1.0.0**
 
 Kullanıcı kararı, önceki "v4'e ertele" planını geçersiz kılar:

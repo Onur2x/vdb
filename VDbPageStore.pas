@@ -1319,10 +1319,10 @@ begin
     LockReserve;
     FReserved := True;
     try
-      { v3.18 DUZELTME: rezervasyon VERI kilidi degildir; baska bir surec
-        tam kilit altinda WAL'i budayabilir. Tazelemeyi TAM KILIT altinda
-        yap, yoksa kisa okuma (EReadError) ve yirtik goruntu riski var. }
-      RefreshUnderExclusive;
+      { v3.21: rezervasyon bizdeyken baska bir yazar commit edemez; nesil
+        degismediyse tam kilit turu gereksiz (bkz. TryAcquireWriteHold). }
+      if ReadGen <> FSigGen then
+        RefreshUnderExclusive;
     except
       VDbUnlockGenReserve(FGenStream);
       FReserved := False;
@@ -1374,8 +1374,12 @@ begin
     if not VDbLockGenReserve(FGenStream) then Exit;
     FReserved := True;
     try
-      { v3.18 DUZELTME: bkz. AcquireWriteHold — tazeleme tam kilit altinda. }
-      RefreshUnderExclusive;
+      { v3.21: rezervasyon bizdeyken baska bir yazar COMMIT EDEMEZ (.gen
+        neslini yalniz yazar artirir). Nesil degismediyse tam kilit turu
+        (LockExclusive + ReadGen + unlock + paylasimliyi geri alma = 4 sistem
+        cagrisi) gereksizdir; olculen kazanc ~10 us/commit. }
+      if ReadGen <> FSigGen then
+        RefreshUnderExclusive;
     except
       VDbUnlockGenReserve(FGenStream);
       FReserved := False;
