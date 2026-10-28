@@ -32,7 +32,7 @@ interface
 
 uses
   SysUtils, Classes, DateUtils, Generics.Collections, VDbCrc32, VDbPage, VDbSync,
-  VDbCrypt, VDbPageCrypto;
+  {$IFDEF WINDOWS}Windows,{$ENDIF} VDbCrypt, VDbPageCrypto;
 
 const
   VDB_FILE_MAGIC   = $33424456;   // 'VDB3' (little endian)
@@ -185,6 +185,18 @@ type
         gordugunde onbellegini tazeler. }
       FSigGen: QWord;
       FGenStream: TFileStream;
+      { v3.25: `.gen` sayaci icin BELLEK ESLEMESI. Okuma yolu eskiden her
+        ifade basina `SetFilePointer` + `ReadFile` (olculen ~2,5 us) yapiyordu;
+        eslenmis 8 baytlik goruntu bunu tek bellek okumasina indirir.
+        Guvenlik gerekcesi: dosya hicbir zaman silinmiyor/kucultulmuyor,
+        yalniz yerinde 8 bayt yaziliyor; Windows'ta eslenmis goruntu ile
+        `WriteFile` AYNI onbellek bolumunu kullanir, yani tutarlidir.
+        Ayrica sayac TUM yazmalarda (BumpGen) ve okumalarda (ReadGen) tam
+        ya da paylasimli kilit ALTINDA erisilir; dolayisiyla 32 bitlik iki
+        parcali okuma ile yirtik deger okunamaz. Esleme kurulamazsa eski
+        (Position + Read) yolu kullanilir; davranis degismez. }
+      FGenMap: PByte;
+      FGenMapH: THandle;
       { v3.16 GUVENLIK AGI: paylasimli kilit altindayken bir yazma ilkeli
         cagrilirsa (Windows'ta paylasimli kilit = yalniz okuma, ayni handle
         bile yazamaz) kilit KENDILIGINDEN tam kilide yukseltilir ve
@@ -240,6 +252,8 @@ type
     { v3.18: `.gen` uzerindeki YAZAR REZERVASYONU (bekleme politikasi
       LockExclusive ile ayni: FBusyMs boyunca 1 ms'de bir yokla). }
     procedure LockReserve;
+    { v3.26: rezervasyon birakma tek yerde (bes cagri noktasi). }
+    procedure UnlockGen;
     procedure RefreshIfStale;
     { v3.18: FDeferRefresh bayragini YOK SAYAN tazeleme. Yazma yollari
       bunu kullanir: bayat onbellekle yazmak veri kaybi uretir. }
@@ -255,6 +269,9 @@ type
     { v3.16: `<db>.gen` degisiklik sayaci. }
     function ReadGen: QWord;
     procedure BumpGen;
+    { v3.25: sayaci bellek eslemesinden okumak icin. }
+    procedure MapGen;
+    procedure UnmapGen;
     function TrunkGet(var P: PVdbPage): LongWord;   // count
     procedure TrunkSetCount(P: PVdbPage; N: LongWord);
     function TrunkEntry(P: PVdbPage; I: Integer): LongWord;
@@ -836,6 +853,7 @@ end;
   islem basina tutuldugu icin okuyucu kisa araliklarla birakir; yazar bu
   boslukta en gec birkac ms icinde girer. Boylece surekli okuyucu yuku
   altinda yazar acliga dusmez (olculdu: lockchk "yazar acligi" bolumu). }
+
 function TVDbPageStore.TakeSharedLock: Boolean;
 var
   t0: QWord;
@@ -876,19 +894,7 @@ begin
       '(baska bir yazma oturumu acik): ' + FPath);
 end;
 
-{ v3.18: yazar rezervasyonu da BEKLER. Ilk uygulamada tek deneme yapildi ve
-  prochk coktu: iki yazar surec ayni anda acabildiginda ikincisi "mesgul"
-  aliyordu (veri kaybi yok ama ISLEV KAYBI: v3.16'daki sirayla yazma sozu
-  bozuluyordu). Bekleme politikasi LockExclusive ile BIREBIR ayni tutulur.
 
-  v3.18 DUZELTME — KILITLENME (olculdu: prochk, "yazar kilidi 20000 ms
-  icinde alinamadi", teshis shared=0 readDepth=0 reserved=1):
-  A oturumu PAYLASIMLI okuma kilidini tutarken rezervasyonu bekliyordu;
-  B oturumu rezervasyonu tutarken TAM kilidi istiyordu. A'nin paylasimli
-  kilidi B'yi, B'nin rezervasyonu A'yi blokladigi icin kimse ilerlemiyor.
-  Cozum: rezervasyonu beklemeye baslamadan ONCE kendi paylasimli kilidimizi
-  birak. Kaybedilen sey yok: okuma yollari kilidi ifade basina yeniden alir
-  ve tazelik zaten tam kilit altinda dogrulanir. }
 procedure TVDbPageStore.LockReserve;
 var
   t0: QWord;
@@ -912,6 +918,7 @@ begin
       'veritabani mesgul: yazar rezervasyonu alinamadi ' +
       '(baska bir surec yaziyor): ' + FPath);
 end;
+
 
 { Tam kilit ALTINDA cagrilir: diskteki meta sayfa son gorulen imajdan
   farkliysa baska bir surec commit etmistir -> onbellek dusurulur ve meta
@@ -1060,12 +1067,66 @@ begin
   Result := FSigGen;
 end;
 
+procedure TVDbPageStore.UnmapGen;
+begin
+  if FGenMap <> nil then
+  begin
+    UnmapViewOfFile(FGenMap);
+    FGenMap := nil;
+  end;
+  if FGenMapH <> 0 then
+  begin
+    CloseHandle(FGenMapH);
+    FGenMapH := 0;
+  end;
+end;
+
+procedure TVDbPageStore.UnlockGen;
+begin
+  if FGenStream = nil then Exit;
+  VDbUnlockGenReserve(FGenStream);
+end;
+
+procedure TVDbPageStore.MapGen;
+{$IFDEF WINDOWS}
+var
+  h: THandle;
+  p: Pointer;
+{$ENDIF}
+begin
+  UnmapGen;
+  if FGenStream = nil then Exit;
+  {$IFDEF WINDOWS}
+  FGenMap := nil;
+  FGenMapH := 0;
+  if FGenStream.Size < 8 then Exit;
+  h := CreateFileMapping(FGenStream.Handle, nil, PAGE_READWRITE, 0, 8, nil);
+  if h = 0 then Exit;
+  p := MapViewOfFile(h, FILE_MAP_READ or FILE_MAP_WRITE, 0, 0, 8);
+  if p = nil then
+  begin
+    CloseHandle(h);
+    Exit;
+  end;
+  FGenMapH := h;
+  FGenMap := PByte(p);
+  {$ENDIF}
+end;
+
 function TVDbPageStore.ReadGen: QWord;
 var
   got: Integer;
 begin
   Result := 0;
   if FGenStream = nil then Exit;
+  { v3.25: eslenmis goruntu varsa okuma TEK bellek erisimidir; sistem
+    cagrisi yok. Yirtik okuma riski yok: sayac her zaman kilit altinda
+    yazilir/okunur (bkz. alan bildirimi). }
+  if FGenMap <> nil then
+  begin
+    Result := PQWord(FGenMap)^;
+    Exit;
+  end;
   { v3.22: `FGenStream.Size` denetimi KALDIRILDI (hizli yolda fazladan
     GetFileSizeEx). Kisa okuma zaten 0 dondurup tazelemeyi zorluyor. }
   FGenStream.Position := 0;
@@ -1082,6 +1143,11 @@ var
 begin
   if FGenStream = nil then Exit;
   v := ReadGen + 1;
+  { v3.25: yazma yolu BILEREK `WriteFile` olarak birakildi: esleme zaten
+    ayni onbellek bolumunu gosterir, fakat `WriteFile` niyeti aciktir ve
+    yazan tarafin kendi goruntusu de aninda guncellenir. Maliyet commit
+    basina 2 sistem cagrisi (olculen ~2,5 us; commit duvarinda fsync
+    ~310 us yaninda ihmal edilebilir). }
   FGenStream.Position := 0;
   FGenStream.WriteBuffer(v, 8);
   FSigGen := v;
@@ -1146,7 +1212,7 @@ begin
       FLocked := False;
       if (FHoldDepth = 0) and FReserved then
       begin
-        if FGenStream <> nil then VDbUnlockGenReserve(FGenStream);
+        UnlockGen;
         FReserved := False;
       end;
       if FReadDepth > 0 then
@@ -1291,7 +1357,7 @@ begin
     { v3.18: rezervasyonu birak (acik islem tutmuyorsa). }
     if (FHoldDepth = 0) and FReserved then
     begin
-      if FGenStream <> nil then VDbUnlockGenReserve(FGenStream);
+      UnlockGen;
       FReserved := False;
     end;
     { Paylasimliya don YALNIZCA okuyucu kilidi hala acikken. Oturum kapsami
@@ -1347,7 +1413,7 @@ begin
       if ReadGen <> FSigGen then
         RefreshUnderExclusive;
     except
-      VDbUnlockGenReserve(FGenStream);
+      UnlockGen;
       FReserved := False;
       raise;
     end;
@@ -1367,7 +1433,7 @@ begin
     if FHoldDepth > 0 then Exit;
     if FReserved then
     begin
-      if FGenStream <> nil then VDbUnlockGenReserve(FGenStream);
+      UnlockGen;
       FReserved := False;
     end;
   finally
@@ -1404,7 +1470,7 @@ begin
       if ReadGen <> FSigGen then
         RefreshUnderExclusive;
     except
-      VDbUnlockGenReserve(FGenStream);
+      UnlockGen;
       FReserved := False;
       raise;
     end;
@@ -1624,6 +1690,8 @@ begin
         end
         else
           FSigGen := ReadGen;
+        { v3.25: sayac eslemesi (yalniz okuma hizlandirmasi). }
+        MapGen;
         { v3.16: her YAZAR oturum acilisi sayaci bir kez ilerletir: acilis
           sirasinda yazilan meta (surum yukseltmesi) boylece diger sureclere
           de bildirilmis olur. Maliyet: oturum basina 8 bayt. }
@@ -1644,6 +1712,7 @@ begin
       FLocked := False;
       FLockedShared := False;
       FLockedExcl := False;
+      UnmapGen;
       FreeAndNil(FGenStream);
       FreeAndNil(FStream);
       raise;
@@ -1677,6 +1746,7 @@ begin
     finally
       if FLockedShared then VDbUnlockStream(FStream);
       if FLockedExcl then VDbUnlockStream(FStream);
+      UnmapGen;
       FreeAndNil(FGenStream);
       FreeAndNil(FStream);
       FLocked := False;
@@ -1694,6 +1764,7 @@ begin
   if FStream = nil then Exit;
   if FLockedShared then VDbUnlockStream(FStream);
   if FLockedExcl then VDbUnlockStream(FStream);
+  UnmapGen;
   FreeAndNil(FGenStream);
   FreeAndNil(FStream);
   FLocked := False;
@@ -2530,7 +2601,7 @@ begin
     (olculdu: degisim gunlugu taban imaji) ayni .tmp dosyasina yazip
     "dosya kullanimda" hatasi veriyorlardi. }
   tmp := DestPath + '.' + VDbProcessToken + '.tmp';
-  if FileExists(tmp) then DeleteFile(tmp);
+  if FileExists(tmp) then SysUtils.DeleteFile(tmp);
   BuildMetaImage(meta);
   fs := TFileStream.Create(tmp, fmCreate);
   try
@@ -2562,14 +2633,14 @@ begin
   end;
   try
     if FileExists(DestPath) then
-      if not DeleteFile(DestPath) then
+      if not SysUtils.DeleteFile(DestPath) then
         raise EVdbPageStore.Create('kopya: eski hedef silinemedi: ' + DestPath);
     if not RenameFile(tmp, DestPath) then
       raise EVdbPageStore.Create('kopya: hedefe tasinamadi: ' + DestPath);
     if dir <> '' then
       VDbFlushDir(dir);
   except
-    if FileExists(tmp) then DeleteFile(tmp);
+    if FileExists(tmp) then SysUtils.DeleteFile(tmp);
     raise;
   end;
 end;
@@ -2590,7 +2661,7 @@ begin
   if dir <> '' then ForceDirectories(dir);
   { v3.18: gecici ad SÜREÇ benzersiz olmali (bkz. CopyCommittedTo). }
   tmp := DestPath + '.' + VDbProcessToken + '.tmp';
-  if FileExists(tmp) then DeleteFile(tmp);
+  if FileExists(tmp) then SysUtils.DeleteFile(tmp);
   fs := TFileStream.Create(tmp, fmCreate);
   try
     FStream.Position := 0;
@@ -2609,14 +2680,14 @@ begin
   end;
   try
     if FileExists(DestPath) then
-      if not DeleteFile(DestPath) then
+      if not SysUtils.DeleteFile(DestPath) then
         raise EVdbPageStore.Create('taban kopyasi: eski hedef silinemedi: ' + DestPath);
     if not RenameFile(tmp, DestPath) then
       raise EVdbPageStore.Create('taban kopyasi: hedefe tasinamadi: ' + DestPath);
     if dir <> '' then
       VDbFlushDir(dir);
   except
-    if FileExists(tmp) then DeleteFile(tmp);
+    if FileExists(tmp) then SysUtils.DeleteFile(tmp);
     raise;
   end;
 end;

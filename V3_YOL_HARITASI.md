@@ -2164,6 +2164,147 @@ kendi kapıları ve ölçümüyle):
    (`prochk` 15/15, gerçek iki süreç; şifreli dosya dahil). v3.18'de yazarlar
    **paralel** çalışır (iyimser mod), yalnız commit'ler sıralıdır. Ayrıntı: §v3.16, §v3.18.
 
+### 7l. Nokta okuma 3,0x, paralel yazmada gerçek darboğaz (v3.25–v3.26, 2026-10-28)
+
+Bu dilim iki işi yaptı: **tekil okuma** maliyetini SQLite'ın altına indirmek ve
+**süreçler arası paralel yazma**nın neden 1,0x'i aşamadığını ölçmek. İkincisi
+bir performans ayarı değil, mimari bir sınır çıktı; ayrıntısı §7l.5'te.
+
+#### 7l.1 `.gen` sayaç dosyasının bellek eşlemesi (3,0x)
+
+`RefreshIfStale` hızlı yolu her ifade başında `.gen` dosyasından 8 bayt
+okuyordu: `SetFilePointer` + `ReadFile` = iki sistem çağrısı. Dosya hiç
+silinmiyor/küçültülmüyor (yalnız yerinde 8 bayt yazılıyor), bu yüzden
+`CreateFileMapping` + `MapViewOfFile` ile 8 bayt eşlendi; `ReadGen` artık tek
+bellek okuması. Windows'ta eşlenmiş görüntü ile `WriteFile` aynı önbellek
+bölümünü kullanır, yani tutarlılık korunur; sayaç zaten her zaman kilit
+altında okunup yazıldığı için yırtık değer riski yok. Eşleme kurulamazsa eski
+`Position + Read` yolu aynen çalışır (davranış değişmez).
+
+Ölçüm (`rwbench`, temiz dizin, 2000 nokta okuma):
+
+| | önce | sonra |
+|---|---|---|
+| NOKTA 2000 | 16,712 ms | **5,58–5,63 ms** |
+| sorgu başına | 8,4 µs | **2,80–2,81 µs** |
+| SQLite 3.50.4 WAL | — | 3,15 µs |
+
+Yani nokta okumada SQLite'tan **~1,1x hızlı** hale geldik.
+
+#### 7l.2 Kusur: her `Get` iki dosya kilidi çifti alıyordu
+
+Bellek eşlemesinden sonra bile 2000 `Get` için `LockFileEx` sayacı **4000**
+gösterdi. Kök neden: `TVdbBackendV3.Get`/`Exists` gövdesinde `SnapView` kendi
+`FEngCs` kapsamını açıyordu ve motor okuması için ikinci kapsam açılıyordu;
+`TVdbGate` 0→1 geçişinde `AcquireRead`, 1→0'da `ReleaseRead` çağırdığı için
+ifade başına iki kilit turu ödeniyordu. Düzeltme: gövdenin tamamı **tek**
+`FEngCs.Enter..finally Leave` kapsamına alındı (kilit semantiği aynı, yalnız
+daha uzun tutuluyor). Ölçüm: sayaç 4000 → **2000**, nokta okuma 4,46 → **2,80
+µs/sorgu**. `SnapView`'ın kendi kapsamı dokunulmadı (başka çağıranlar için
+gerekli; iç içe geçince kilit almıyor).
+
+#### 7l.3 Paralel yazma: ölçülen taban ve spike'lar
+
+`pcbench` (P süreç × N commit, her commit tek satır autocommit):
+
+| | sonuç |
+|---|---|
+| P=1, 3000 commit | 0,383–0,386 ms/commit (2614 commit/s) |
+| P=2, 3000 commit | 0,408 ms/commit, **0,95x** |
+| P=4, 2000–3000 commit | 0,387–0,46 ms/commit, **0,78–0,90x** |
+| P=4 en kötü commit | 0,17–1,09 **s** (1000 commit'te 1–5 adet, tekrarlanabilir) |
+
+`Sleep` ölçümü (`tmp64/sleepbench`): Windows varsayılan zamanlayıcı
+çözünürlüğünde `Sleep(1)` ortalama **14,53 ms** uyuyor (`timeBeginPeriod(1)`
+ile 1,41 ms, `Sleep(0)` 0,31 µs). Kilit tutma ~0,4 ms olduğu için 1 ms'lik
+yoklama boş pencereyi yakalayamıyordu.
+
+Kilit açlığının kanıtı (`-dDBG26` faz sayaçları): tüm spike'lar `res` (=
+`AcquireWriteHold` → `LockReserve`) içinde; `apply/wal/log/chk/dur` tek
+haneli–yüzlerce µs. Örnek: `res=864670 us deneme=1192`, `res=641814`. Windows
+`LockFileEx` sıra/fairness sunmaz; rezervasyonu bırakan süreç bir sonraki
+işleminde ~2 µs içinde geri aldığı için diğerleri 860 ms hiç ilerleyemiyordu.
+
+#### 7l.4 Denenip **geri alınan** düzeltmeler (hepsi ölçüldü)
+
+1. **Ön deneme** (`LockReserve` döngüsünden önce bir deneme): aynı handle ile
+   zaten kilitli aralığı Windows tekrar kilitlemeyi reddettiği için döngü hiç
+   başarılı olamadı; süreç 20 s sonra "rezervasyon alınamadı" hatası aldı
+   (P=4'te 3 çocuk). Kaldırıldı.
+2. **`FReserveMiss` devir penceresi**: yalnız *kaybeden* süreçte işaretlendiği
+   için kilidi tutan süreç hiç geri çekilmiyordu; açlık sürdü (0,84x).
+3. **Eşlenmiş `waiters` sayacı + `held` bayrağı**: adalet sağlandı (en kötü
+   commit 1,09 s → 2,5–5 ms) ama süreçler commit'leri **dönüşümlü** yaptığı
+   için her commit'te tam önbellek tazelemesi tetiklendi ve hız 0,29–0,65x'e
+   düştü (§7l.5).
+4. **Sürekli `Sleep(0)` yoklaması**: `LockFileEx` fırtınası fsync'i 19 ms'ye
+   çıkardı, 0,32x.
+5. **`AwaitDurable`'ı rezervasyon dışına almak** (v3.24'te): 0,47x — geri
+   alındı.
+
+Ders: süreçler arası kilit *adaleti* tek başına hız getirmez; asıl maliyet
+adalet sağlanınca ortaya çıkan önbellek tazelemesidir.
+
+#### 7l.5 Gerçek darboğaz: commit başına tam önbellek düşürme
+
+Her süreçler arası commit'te `AcquireWriteHold`, `.gen` değiştiğini görüp
+`RefreshUnderExclusive` → `RefreshIfStaleForce` → **`DropCache` + `LoadMeta`**
+(ölçülen **5–8 ms**) yapıyor; ardından tüm sayfalar diskten yeniden okunuyor.
+Açlık bu maliyeti **gizliyordu**: bir süreç kilidi kapıp 300 commit'i üst üste
+yaparken önbelleği sıcak kalıyor, diğerleri bekliyordu. Adil devir bu maliyeti
+her commit'e yayınca toplam süre 5x arttı. Yani "P=4'te 0,90x" gerçek bir
+paralellik değil, sıralı çalışmanın görüntüsüydü.
+
+Ayrıca rezervasyon **tüm commit boyunca** (WAL append + fsync dahil) tutulduğu
+için, önbellek sorunu çözülse bile paralel hızlanmanın üst sınırı ~1,0x'tir:
+iki süreç aynı anda fsync yapamaz. SQLite WAL, yazma kilidini fsync'ten önce
+bırakıp grup commit yaptığı için P=4'te 1,46x'e çıkıyor.
+
+#### 7l.6 SQLite 3.50.4 ile karşılaştırma (bu dilimde ölçülen)
+
+`tmp64/sqbench.py` (WAL + `synchronous=FULL`, süreç başına ayrı `.db`,
+`BEGIN IMMEDIATE`/`INSERT`/`COMMIT`):
+
+| | SQLite | v3 |
+|---|---|---|
+| tek süreç | 0,336 ms/commit | 0,383 ms |
+| P=2 | 0,385 ms (**0,87x**) | 0,408 ms (0,95x) |
+| P=4 | 0,230 ms (**1,46x**), en kötü 3,2 ms | 0,464 ms (0,79x), en kötü 2,5 ms |
+| 1000 satır tek işlem | 1,9 ms (WAL) | **1,99 ms** |
+| nokta okuma (2000) | 6,3 ms | **5,6 ms** |
+| tam tarama (20k) | ~0,8 ms | 1,73 ms |
+
+Durum: tekil commit, toplu yazma ve nokta okumada SQLite ile başabaş veya
+öndeyiz; **tam tarama ~2x yavaş**, **paralel yazmada SQLite geride bırakıyor**.
+
+#### 7l.7 Sıradaki dilim (tasarım kararı)
+
+Paralel yazmada 1,0x tavanını aşmak için iki iş gerekiyor; ikisi de bu dilimde
+bilerek yapılmadı (öncelik 1: yanlış sonuç riski taşıyan kestirmeler yok):
+
+1. **Sayfa düzeyinde geçerlilik**: `DropCache` yerine her çerçevede "hangi
+   commit'te yüklendi" damgası + paylaşılan sayfa-damga tablosu; yalnız
+   gerçekten değişen sayfa yeniden okunur. Şu an tek bir uzak commit 5–8 ms'lik
+   tam tazelemeye ve tüm önbelleğin kaybına yol açıyor.
+2. **Süreçler arası grup fsync**: `.gen` sayfasına eşlenmiş "durabil LSN"
+   alanı; bir sürecin `FlushFileBuffers`'ı diğerinin bekleyen LSN'ini de
+   kapsıyorsa bekleyen fsync'i atlar. Rezervasyon fsync'ten önce bırakılır
+   (WAL append hâlâ kilit altında).
+
+Bu iki iş bitmeden "paralel yazmada SQLite'tan hızlıyız" denemez.
+
+#### 7l.8 Doğrulama (bu sürüm)
+
+- 16 kapı: **686/0** (pagechk 21, storechk 15, heapchk 20, idxchk 19,
+  backendchk 127, v3sqlchk 238, migchk 13, factorychk 13, crashtest 11,
+  logchk 43, pitrchk 21, btreechk 30, replchk 37, lockchk 36, snapchk 21,
+  prochk 21).
+- `sqltest` v3 (`--backend=v3`, yeni dizin): **2864/0/33** (T152 dahil).
+- `sqltest` v2 (yeni dizin): **3295/0/0**.
+- `rwbench`: BULK 2,32 ms, NOKTA 2,81 µs/sorgu, TARAMA 1,73 ms.
+- `pcbench` P=1: 0,383 ms/commit; `bulkbench` 1000×20: 1,993 ms/işlem
+  (1,993 µs/satır, 501.756 satır/s, CommitBatch 1,147 ms).
+
 ### Kapsam dışı (değişmedi)
 - M3 WASM, M7 async sunucu, WASM/edge
 - ~~**Süreçler arası çok yazarlılık**~~ **v3.16'da yapıldı** (bkz. §v3.16).

@@ -1618,23 +1618,28 @@ var
   rec: TBatchRec;
   s: TWriteSet;
 begin
-  s := OwnSet;
-  if (s <> nil) and s.Map.TryGetValue(Key, rec) then
-  begin
-    if rec.Present then
-    begin
-      Value := Copy(rec.Value, 0, Length(rec.Value));
-      Exit(True);
-    end;
-    Value := nil;
-    Exit(False);
-  end;
-  { v3.15: acik islemde BASKA oturum commit ettiyse kendi anlik goruntumuz
-    gecerlidir; motor degeri okunmaz. }
-  if (s <> nil) and s.SnapDirty and SnapView(s, Key, rec.Present, Value) then
-    Exit(rec.Present);
+  { v3.25: TEK kapi kapsami. Onceden SnapView kendi kapsamini acip kapatiyordu;
+    snapshot yolu her cagrida bir kapi 0->1/1->0 gecisi (yani bir dosya kilidi
+    cifti) harcatiyordu. Olculdu: 2000 Get -> 4000 kapi girisi; tek kapsamda
+    2000. Kilit semantigi degismiyor: ayni kilit, yalnizca daha uzun tutuluyor
+    (zaten ifade basina alinan kilit). }
   FEngCs.Enter;
   try
+    s := OwnSet;
+    if (s <> nil) and s.Map.TryGetValue(Key, rec) then
+    begin
+      if rec.Present then
+      begin
+        Value := Copy(rec.Value, 0, Length(rec.Value));
+        Exit(True);
+      end;
+      Value := nil;
+      Exit(False);
+    end;
+    { v3.15: acik islemde BASKA oturum commit ettiyse kendi anlik goruntumuz
+      gecerlidir; motor degeri okunmaz. }
+    if (s <> nil) and s.SnapDirty and SnapView(s, Key, rec.Present, Value) then
+      Exit(rec.Present);
     Result := FEng.TryGet(Key, Value);
   finally
     FEngCs.Leave;
@@ -1704,18 +1709,20 @@ begin
   { v3.6: ONCEDEN satir basina BatchIsMine + BatchMap.ContainsKey + BatchMap[]
     uc ayri OwnSet (kilit + oturum sozlugu aramasi) yapiyordu; INSERT yolu her
     satirda Exists cagirir. Tek OwnSet + tek sozluk aramasi yeterli. }
-  s := OwnSet;
-  if (s <> nil) and s.Map.TryGetValue(Key, rec) then
-    Exit(rec.Present);
-  { v3.15: snapshot gorunurlugu — Get ile ayni karar. }
-  if (s <> nil) and s.SnapDirty then
-  begin
-    tmp := nil;
-    if SnapView(s, Key, pres, tmp) then
-      Exit(pres);
-  end;
+  { v3.25: Get ile ayni duzeltme — snapshot yolu ve motor okuması TEK kapi
+    kapsaminda; onceden cagri basina iki kilit cifti aliniyordu. }
   FEngCs.Enter;
   try
+    s := OwnSet;
+    if (s <> nil) and s.Map.TryGetValue(Key, rec) then
+      Exit(rec.Present);
+    { v3.15: snapshot gorunurlugu — Get ile ayni karar. }
+    if (s <> nil) and s.SnapDirty then
+    begin
+      tmp := nil;
+      if SnapView(s, Key, pres, tmp) then
+        Exit(pres);
+    end;
     Result := FEng.Contains(Key);
   finally
     FEngCs.Leave;
