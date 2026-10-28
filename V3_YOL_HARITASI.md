@@ -2265,6 +2265,13 @@ bırakıp grup commit yaptığı için P=4'te 1,46x'e çıkıyor.
 `tmp64/sqbench.py` (WAL + `synchronous=FULL`, süreç başına ayrı `.db`,
 `BEGIN IMMEDIATE`/`INSERT`/`COMMIT`):
 
+> **DÜZELTME (bkz. §7n):** Aşağıdaki P=2 / P=4 satırları **elma-elmaya değil**:
+> SQLite tarafında her süreç AYRI bir veritabanı dosyası açıyordu, v3 tarafında
+> ise tüm süreçler TEK dosyayı paylaşıyordu. Paylaşımlı dosyada SQLite da
+> 0,63–0,70x'e düşüyor ve en kötü commit 418–430 ms oluyor; ayrı dosyalarda v3
+> 1,59x / **2,71x**. Doğru karşılaştırma §7n'dedir; "paralel yazmada SQLite
+> geride bırakıyor" ifadesi bu tabloya dayandığı için **geçersizdir**.
+
 | | SQLite | v3 |
 |---|---|---|
 | tek süreç | 0,336 ms/commit | 0,383 ms |
@@ -2275,7 +2282,8 @@ bırakıp grup commit yaptığı için P=4'te 1,46x'e çıkıyor.
 | tam tarama (20k) | ~0,8 ms | 1,73 ms |
 
 Durum: tekil commit, toplu yazma ve nokta okumada SQLite ile başabaş veya
-öndeyiz; **tam tarama ~2x yavaş**, **paralel yazmada SQLite geride bırakıyor**.
+öndeyiz; **tam tarama ~2x yavaş**. Paralel yazma için §7n'e bakınız (ölçüm
+koşulları eşitlendiğinde v3 öndedir).
 
 #### 7l.7 Sıradaki dilim (tasarım kararı)
 
@@ -2374,18 +2382,85 @@ rezervasyon ön denemesi (aynı handle ile çift kilit → 20 s sonra açık hat
 #### 7m.5 Yapısal sonuç: mevcut tasarımla tavan ~1,0x
 
 Rezervasyon **tüm commit boyunca** (WAL ekleme + checkpoint + fsync) tutulduğu
-için eşzamanlı commit'ler tamamen serileşir; ölçülen 0,82–0,89x bu tavanın
-altında, açlık ise tavanın üstünde gürültü üretiyor. SQLite WAL'ın 1,46x'e
-çıkması üç özelliğin birlikte sonucu: (a) sayfa düzeyinde delta tazeleme
-(tüm WAL replay + tam heap taraması yok), (b) yazma kilidinin fsync'ten önce
-bırakılması, (c) paylaşılan `wal-index` üzerinden süreçler arası grup fsync.
-Üçü birlikte olmadan (b) tek başına zarar veriyor — 7m.3 bunun ölçülmüş kanıtı.
-Bu yüzden sıradaki dilim §7l.7'deki iki işi **tek paket** olarak ele almalı:
-önce tazeleme maliyeti düşmeli, sonra rezervasyon fsync'ten önce bırakılmalı,
-sonra `.gen` eşlemesinde paylaşılan `durableLsn` ile grup fsync eklenmeli.
+için eşzamanlı commit'ler tamamen serileşir; **tek bir dosyada** ölçülen
+0,82–0,89x bu tavanın altında, açlık ise tavanın üstünde gürültü üretiyor.
+Buradaki "SQLite 1,46x" karşılaştırması sonradan **geçersiz** çıktı: SQLite
+tarafında her süreç ayrı dosya açıyordu (§7n). Aynı koşulda (tek paylaşımlı
+dosya) SQLite 0,63–0,70x ve en kötü commit 418–430 ms; v3 0,82x ve 135 ms.
+
+Yine de yukarıdaki üç iş **tek dosyada** paralel hızı 1,0x'in üstüne çıkarmak
+için hâlâ gerekli: (a) sayfa düzeyinde delta tazeleme, (b) rezervasyonun
+fsync'ten önce bırakılması, (c) `.gen` eşlemesinde paylaşılan `durableLsn` ile
+süreçler arası grup fsync. (b) tek başına zarar veriyor — 7m.3 bunun ölçülmüş
+kanıtı.
 
 Güvenilirlik tarafı bu dilimde değişmedi: hiçbir deney commit edilmedi, ağaç
 `2f56ec3` (v3.25) ile aynı; kapılar ve `sqltest` sonuçları §7l.8'deki gibidir.
+
+### 7n. Paralel yazmada doğru karşılaştırma: v3, SQLite'ı iki koşulda da geçiyor (2026-10-28)
+
+§7l.6 ve §7m.5'teki "SQLite paralelde önde" sonucu **ölçüm hatasıydı**:
+`tmp64/sqbench.py` her sürece ayrı bir `.db` dosyası veriyor, `pcbench` ise tüm
+süreçleri tek veritabanına yazdırıyordu. Ayrı dosyalarda kilit çekişmesi hiç
+yoktur; tek dosyada vardır. İki koşulu da **iki motor için de** ölçtük.
+
+#### 7n.1 Ayrı veritabanı dosyaları (süreç başına bir dosya)
+
+`pcbench <dizin> <P> <N> apart` (yeni mod; her çocuk `ap0..apP-1` alt dizininde
+kendi veritabanını açar) — SQLite tarafı `sqbench.py`, WAL + `synchronous=FULL`,
+süreç başına ayrı `.db`:
+
+| | v3 | SQLite WAL | fark |
+|---|---|---|---|
+| P=1 taban | 0,383 ms/commit | 0,336 ms | SQLite %12 önde |
+| P=2 | 0,228 ms (**1,59x**) | 0,385 ms (0,87x) | v3 1,69x hızlı |
+| P=4 | **0,133–0,141 ms (2,71–3,06x)**, en kötü commit **1,1 ms** | 0,230 ms (1,46x), en kötü 3,2 ms | v3 1,63x hızlı, kuyruk 3x iyi |
+| P=4 toplam iş | 7.070–7.528 commit/s | 4.348 commit/s | v3 1,63–1,73x |
+
+v3 ayrı dosyalarda neredeyse doğrusal ölçekleniyor (üç koşu: 2,71x / 3,06x /
+2,82x) ve tek süreçteki %12'lik açığı paralelde fazlasıyla kapatıyor. En kötü
+commit 1,1 ms: **açlık yok**, çünkü paylaşılan kilit yok.
+
+#### 7n.2 Tek paylaşımlı veritabanı dosyası
+
+`pcbench <dizin> <P> <N>` (tüm süreçler tek dosya) — SQLite tarafı yeni
+`tmp64/sqbench_sh.py` (aynı dosya, WAL/rollback, `busy_timeout=60 s`):
+
+| P=4 | v3 | SQLite WAL | SQLite rollback |
+|---|---|---|---|
+| ms/commit | 0,488 | 0,595–0,577 | 1,849 |
+| hızlanma | **0,82x** | 0,63–0,70x | 0,85x |
+| en kötü commit | **135 ms** | 418–430 ms | **1.622 ms** |
+| toplam (1200 commit) | 585 ms | 692–714 ms | 2.219 ms |
+
+| P=2 | v3 | SQLite WAL | SQLite rollback |
+|---|---|---|---|
+| hızlanma | **0,82x** | 0,66–0,67x | 0,72x |
+| en kötü commit | 113 ms | 78–130 ms | 600 ms |
+
+Tek dosyada iki motor da 1,0x'in altında (yazma kilidi kaçınılmaz), ama v3
+**hem toplam sürede hem kuyrukta** önde: WAL'a göre %18 hızlı ve en kötü commit
+3x daha kısa; rollback journal'a göre toplamda 3,8x, kuyrukta 12x iyi.
+Açlık (135 ms) hâlâ v3'ün zayıf noktası ama SQLite'ınki (418–1.622 ms) daha
+kötü, çünkü `busy_timeout` yoklaması da aynı sorunu yaşıyor.
+
+#### 7n.3 Sonuç
+
+Kullanıcı hedefi olan "SQLite kadar hızlı, tercihen daha hızlı" **paralel
+yazmada iki koşulda da sağlandı**:
+
+- ayrı dosyalar: **2,71–3,06x vs 1,46x** (v3 1,63x hızlı, kuyruk 3x iyi)
+- tek dosya: **0,82x vs 0,63–0,70x** (v3 %18 hızlı, kuyruk 3x iyi)
+
+§7m.5'teki "tek dosyada 1,0x tavanı" hâlâ geçerli bir mimari sınır; ancak bu
+sınır SQLite'ı da bağlıyor ve SQLite bu sınırın altında daha kötü kalıyor.
+Sıradaki iyileştirme (§7l.7 paketi) artık "SQLite'ı yakalamak" için değil,
+tek dosyada 1,0x'i aşmak için yapılacak.
+
+Kalan tek ölçülmüş açık: **tam tarama ~2x yavaş** (1,73 ms vs ~0,8 ms / 20k
+satır) ve tekil commit'te %12–14. Kod değişikliği bu dilimde yok; yalnız ölçüm
+aracı `pcbench`'e `apart` modu ve yeni `tmp64/sqbench_sh.py` eklendi (ikisi de
+git dışı).
 
 ### Kapsam dışı (değişmedi)
 - M3 WASM, M7 async sunucu, WASM/edge
