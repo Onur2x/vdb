@@ -2305,6 +2305,88 @@ Bu iki iş bitmeden "paralel yazmada SQLite'tan hızlıyız" denemez.
 - `pcbench` P=1: 0,383 ms/commit; `bulkbench` 1000×20: 1,993 ms/işlem
   (1,993 µs/satır, 501.756 satır/s, CommitBatch 1,147 ms).
 
+### 7m. v3.26: paralel yazmada açlık — üç yol denendi, hiçbiri yetmedi (2026-10-28)
+
+§7l kapanırken paralel yazmanın (P=4) 0,79x olduğu ve arada 100–1100 ms'lik
+commit'ler bulunduğu görülmüştü. Bu dilimde önce **nerede** beklendiği kesin
+ölçüldü, sonra üç ayrı düzeltme denendi. Üçü de ölçüldü ve **geri alındı**;
+kod ağaçta yok. Aşağıdaki sayılar bu dilimde ölçülenlerdir.
+
+#### 7m.1 Gecikmenin tamamı rezervasyon kuyruğunda
+
+`CommitBatch` fazları (QPC, `-dDBG26`; geçici enstrümantasyon) P=4, 300 commit:
+
+| faz | süre |
+|---|---|
+| `hold` (`AcquireWriteHold`: tazeleme + `.gen` rezervasyonu) | **141 / 149 / 208 / 256 / 382 ms** |
+| `dwrite` (sayfa yazımı hazırlığı) | 3–5 µs |
+| `apply` (motora uygulama) | 6–25 µs |
+| `wal` (WAL ekleme) | 35–170 µs |
+| `chk` (`MaybeCheckpoint`) | 15–2.900 µs |
+| `dur` (fsync) | 276–863 µs |
+| `rel` (bırakma) | 1–3 µs |
+
+Tazeleme tarafında dağılım: `wal` (FWal kapat/aç + `Recover` = WAL'ın tamamının
+yeniden uygulanması) 1–31 ms, `chk` (`Checkpoint(True)`: sayfa yazımı + fsync +
+WAL budama) 0,8–1,2 ms, `heap` (`FHeap.Open`: tüm sayfaların CRC doğrulaması ve
+dizin kurulumu) **yalnız 198–430 µs**. Yani pahalı olan heap değil, WAL replay +
+checkpoint.
+
+Mekanizma: 4 süreçte commit ~0,35 ms sürüyor, rezervasyon neredeyse hiç boş
+kalmıyor. Windows `LockFileEx` sıra/fairness sunmaz; bırakan süreç bir sonraki
+commit'inde ~2 µs içinde geri alıyor, kaybeden ise 1 ms'lik yoklamalarla boş
+pencereyi yakalayamıyor → 100–380 ms hiç ilerleyememe (açlık). Aynı koşuda
+diğer iki süreç 0,350–0,358 ms/commit ile normal hızda kalıyor.
+
+#### 7m.2 Denenen A: tazelemede checkpoint'i atlamak → 0,76x
+
+`StoreRefreshed` içinde `Checkpoint(True)` çağrısı `{$IFDEF DEN28}` ile
+kaldırıldı. Sonuç: P=4 300 commit **0,76x**, en kötü commit 13,2 ms. WAL
+budanmadığı için `Recover` maliyeti her turda büyüdü; tazeleme ucuzlamadı,
+pahalandı. Geri alındı.
+
+#### 7m.3 Denenen B: fsync'i rezervasyonun dışına almak → 0,36x
+
+`CommitBatch` içinde `ReleaseWriteHold` `AwaitDurable`'dan **önce** çağrıldı
+(WAL eklemesi kilit altında, fsync dışarıda — SQLite'ın modeli). Sonuç: P=4
+**0,36x** (1,063 ms/commit), her tazelemede 4–32 ms WAL replay, 10'dan fazla
+30–200 ms'lik spike. Nedeni: rezervasyon fsync sırasında boş kalınca diğer
+süreç tazeleme + checkpoint fırtınası yapıyor, WAL şişiyor, grup fsync
+kazancından çok daha fazlası replay'de geri kaybediliyor. Bu deney, fsync'i
+dışarı almanın **tek başına** yeterli olmadığını, önce tazelemenin
+ucuzlaması gerektiğini kanıtladı. Geri alındı.
+
+#### 7m.4 Denenen C: `timeBeginPeriod(1)` → 0,81x
+
+`VDbSync.LockBookInit` içinde `timeBeginPeriod(1)` (winmm, süreç ömrü).
+`Sleep(1)` gerçekten 15,6 ms'den ~1 ms'ye indi (ayrı ölçüm: `sleepbench`),
+ama P=4 yine **0,81x** ve beklemeler hâlâ 149 / 208 ms. Yoklama çözünürlüğü
+artırmak açlığı çözmüyor: kilit boş penceresi ~2 µs, 1 ms'lik yoklama turu
+bu pencereyi yakalayamıyor. Geri alındı (sistem geneli zamanlayıcıyı
+yükseltmenin güç maliyeti de yok).
+
+Daha önce (v3.26 ilk turunda) denenen ve yine geri alınan yollar: sürekli
+`Sleep(0)` yoklaması (LockFileEx fırtınası fsync'i 19 ms'ye çıkardı, 0,32x),
+eşlenmiş `waiters`/`held` bayrağı (adalet sağlandı, en kötü commit 1,09 s →
+2,5–5 ms, ama 0,29–0,65x), bırakanın 30–60 µs geri çekilmesi (0,84x),
+rezervasyon ön denemesi (aynı handle ile çift kilit → 20 s sonra açık hata).
+
+#### 7m.5 Yapısal sonuç: mevcut tasarımla tavan ~1,0x
+
+Rezervasyon **tüm commit boyunca** (WAL ekleme + checkpoint + fsync) tutulduğu
+için eşzamanlı commit'ler tamamen serileşir; ölçülen 0,82–0,89x bu tavanın
+altında, açlık ise tavanın üstünde gürültü üretiyor. SQLite WAL'ın 1,46x'e
+çıkması üç özelliğin birlikte sonucu: (a) sayfa düzeyinde delta tazeleme
+(tüm WAL replay + tam heap taraması yok), (b) yazma kilidinin fsync'ten önce
+bırakılması, (c) paylaşılan `wal-index` üzerinden süreçler arası grup fsync.
+Üçü birlikte olmadan (b) tek başına zarar veriyor — 7m.3 bunun ölçülmüş kanıtı.
+Bu yüzden sıradaki dilim §7l.7'deki iki işi **tek paket** olarak ele almalı:
+önce tazeleme maliyeti düşmeli, sonra rezervasyon fsync'ten önce bırakılmalı,
+sonra `.gen` eşlemesinde paylaşılan `durableLsn` ile grup fsync eklenmeli.
+
+Güvenilirlik tarafı bu dilimde değişmedi: hiçbir deney commit edilmedi, ağaç
+`2f56ec3` (v3.25) ile aynı; kapılar ve `sqltest` sonuçları §7l.8'deki gibidir.
+
 ### Kapsam dışı (değişmedi)
 - M3 WASM, M7 async sunucu, WASM/edge
 - ~~**Süreçler arası çok yazarlılık**~~ **v3.16'da yapıldı** (bkz. §v3.16).
