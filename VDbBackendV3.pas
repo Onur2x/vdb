@@ -172,6 +172,10 @@ type
         Optimistic: Boolean;
         constructor Create(ASession: Cardinal);
         destructor Destroy; override;
+        { v3.24: havuzdan geri kullanilacak kume. Konteynerleri ATMAZ,
+          yalnizca bosaltir; boylece her islemde 5 konteyner yeniden
+          ayrilmaz (olculen: TWriteSet.Create ~2 us/commit). }
+        procedure ResetFor(ASession: Cardinal);
       end;
     var
       FEng: TVdbPageEngine;
@@ -198,6 +202,9 @@ type
       FSnapMap: TDictionary<QWord, TBatchRec>;
       { v3.15: commit sirasinda toplanan bekleyen post-image'ler. }
       FPendSnap: TList<TSnapPend>;
+      { v3.24: kapanan yazma kumelerinin havuzu. Kume nesnesi ve icindeki
+        konteynerler yeniden kullanilir; havuz FEngCs altinda tutulur. }
+      FSetPool: TList<TWriteSet>;
       { Motor erisimini (ve FSets'i) serilestiren ic kilit. TEK backend
         birden fazla is parcacigi tarafindan paylasilabilsin diye; islemler
         ARASINDA tutulmaz (uzun islem baska oturumu kilitlemez). }
@@ -291,7 +298,9 @@ type
       FLogPruneErr: string;
       procedure MaybeLogPrune;
       function ValBytes: Int64;
-      procedure MaybeAutoCompact;
+      { v3.24 DUZELTME: True = VACUUM gerceklesti. Cagiran, eski motorun
+        LSN'iyle durabilite bekleyemez (asagiya bakiniz). }
+      function MaybeAutoCompact: Boolean;
       function AutoCompactBody(out OldBytes, NewBytes: Int64;
         MaxDeadRatio: Double; MinBytes: Int64): Boolean;
       { v3.4: cagiran oturumun yazma kumesi var mi? (eski BatchIsMine) }
@@ -301,6 +310,9 @@ type
       procedure RequireBatchWrite;
       { v3.4: oturum basina yazma kumesine cozulen erisimciler. }
       function OwnSet: TWriteSet;
+      { v3.24: yazma kumesi havuzu (bkz. FSetPool). }
+      function AcquireSet(ASession: Cardinal): TWriteSet;
+      procedure ReleaseSet(S: TWriteSet);
       function GetBatchMap: TDictionary<QWord, TBatchRec>;
       function GetBatchOrder: TList<QWord>;
       function GetBatchTagDelta: TDictionary<Integer, Int64>;
@@ -568,6 +580,7 @@ begin
   FReadOnly := AReadOnly;
   FBusyMs := ABusyMs;
   FSets := TDictionary<Cardinal, TWriteSet>.Create;
+  FSetPool := TList<TWriteSet>.Create;
   FAlien := TDictionary<QWord, Int64>.Create;
   FUndo := TDictionary<QWord, TSnapRec>.Create;
   FPendSnap := TList<TSnapPend>.Create;
@@ -958,12 +971,19 @@ end;
 destructor TVdbBackendV3.Destroy;
 var
   pair: TPair<Cardinal, TWriteSet>;
+  i: Integer;
 begin
   { v3.4: kapanista yarim islemler YAZILMAZ; acik yazma kumeleri atilir. }
   if FSets <> nil then
     for pair in FSets do
       pair.Value.Free;
   FreeAndNil(FSets);
+  if FSetPool <> nil then
+  begin
+    for i := 0 to FSetPool.Count - 1 do
+      FSetPool[i].Free;
+    FreeAndNil(FSetPool);
+  end;
   FreeAndNil(FAlien);
   FreeAndNil(FUndo);
   FreeAndNil(FSnapMap);
@@ -1005,6 +1025,63 @@ begin
   Order.Free;
   Map.Free;
   inherited Destroy;
+end;
+
+procedure TVdbBackendV3.TWriteSet.ResetFor(ASession: Cardinal);
+var
+  i: Integer;
+begin
+  for i := 0 to Savepoints.Count - 1 do
+  begin
+    Savepoints[i].Journal.Free;
+    Savepoints[i].TagDelta.Free;
+  end;
+  Savepoints.Clear;
+  TagDelta.Clear;
+  Before.Clear;
+  Order.Clear;
+  Map.Clear;
+  Session := ASession;
+  StartGen := 0;
+  NeedBefore := False;
+  SnapDirty := False;
+  Optimistic := False;
+end;
+
+function TVdbBackendV3.AcquireSet(ASession: Cardinal): TWriteSet;
+begin
+  Result := nil;
+  FEngCs.Enter;
+  try
+    if (FSetPool <> nil) and (FSetPool.Count > 0) then
+    begin
+      Result := FSetPool[FSetPool.Count - 1];
+      FSetPool.Delete(FSetPool.Count - 1);
+      Result.ResetFor(ASession);
+    end
+    else
+      Result := TWriteSet.Create(ASession);
+  finally
+    FEngCs.Leave;
+  end;
+end;
+
+procedure TVdbBackendV3.ReleaseSet(S: TWriteSet);
+var
+  keep: Boolean;
+begin
+  FEngCs.Enter;
+  try
+    { Buyuk partiler havuzda TUTULMAZ: konteyner kapasitesi kalici olarak
+      sisirilmis kalmasin (200k satirlik partiden sonra bellek sismesi). }
+    keep := (FSetPool <> nil) and (FSetPool.Count < 8) and
+      (S.Map.Capacity <= 16384);
+    if keep then
+      FSetPool.Add(S);
+  finally
+    FEngCs.Leave;
+  end;
+  if not keep then S.Free;
 end;
 
 function TVdbBackendV3.OwnSet: TWriteSet;
@@ -2207,7 +2284,7 @@ begin
       yazdiysa commit ACIK hatayla durur (veri kaybi yok). }
     gotReserve := FEng.Store.TryAcquireWriteHold;
     try
-      s := TWriteSet.Create(sid);
+      s := AcquireSet(sid);
       s.StartGen := FCommitGen;
       if not gotReserve then
       begin
@@ -2324,6 +2401,11 @@ begin
       { v3.15: okuyucu kalmadi -> snapshot gecmisi de gerekmez. }
       FUndo.Clear;
     end;
+    { v3.24: kume artik kullanilmiyor; havuz KILIT ALTINDA (kilit sirasi
+      gate -> depo olarak korunur), boylece iplik guvenli ve kilit ters
+      cevrilmesi yok. }
+    ReleaseSet(s);
+    s := nil;
     if FDirty then
     begin
       { v3.19 GRUP COMMIT: WAL'e yaz ama fsync ETME. fsync kritik bolumun
@@ -2336,7 +2418,12 @@ begin
       { MaybeCheckpoint kendi icinde WAL bariyerini (AwaitDurable) yapar;
         WAL budanirsa syncLsn zaten durabil hale gelir. }
       MaybeCheckpoint;
-      MaybeAutoCompact;     // v3.2 (H25)
+      { v3.24: VACUUM olduysa syncLsn ESKI motora aitti; yeni motorun WAL'i
+        bos oldugu icin beklemek sonsuz dongu olurdu (olculdu: 70.000
+        fsync/s, ilerleme yok). VACUUM zaten Checkpoint(True) ile her seyi
+        fsync etti. }
+      if MaybeAutoCompact then
+        syncLsn := 0;
     end;
   finally
     FEng.Store.ReleaseDataWrite;
@@ -2344,8 +2431,7 @@ begin
   end;
   { v3.19: durabilite beklemesi kilitlerin DISINDA. }
   if syncLsn <> 0 then
-    FEng.AwaitDurable(syncLsn);
-  s.Free;
+  begin FEng.AwaitDurable(syncLsn); end;
   finally
     FEng.Store.ReleaseWriteHold;
   end;
@@ -2366,10 +2452,11 @@ begin
     LogAbort;               // yarim islem gunluge SIZMAZ
     FSets.Remove(s.Session);
     if FSets.Count = 0 then FUndo.Clear;
+    ReleaseSet(s);
+    s := nil;
   finally
     FEngCs.Leave;
   end;
-  s.Free;
   finally
     { v3.18 dilim 6: iyimser modda BeginBatch'te rezervasyon ALINMADI,
       birakilacak bir sey yok; yalniz ertelenen tazelemeyi kapat. }
@@ -3040,13 +3127,21 @@ begin
   Result := AutoCompactBody(OldBytes, NewBytes, MaxDeadRatio, MinBytes);
 end;
 
-procedure TVdbBackendV3.MaybeAutoCompact;
+function TVdbBackendV3.MaybeAutoCompact: Boolean;
 // H25: commit tamamlandiktan SONRA. Karar O(1); yalniz esik asilirsa dosya
 // bir kez bastan yazilir. Hata commit'i BOZMAZ (veri zaten fsync'li);
 // yalnizca LastAutoCompactError'a yazilir.
+//
+// v3.24: VACUUM moturu DEGISTIRIR (FEng yeni dosyayla yeniden kurulur).
+// Basarili VACUUM her seyi fsync etmistir (Checkpoint(True) + yeni dosyanin
+// yazimi), yani o ana kadar commit edilen veri DURABILDIR. Ama VACUUM'dan
+// ONCE alinmis bir LSN yeni motorda ANLAMSIZDIR: yeni WAL bos oldugu icin
+// FDurableLsn o LSN'e hicbir zaman ulasmaz. Cagiran bunu bilmek zorunda
+// oldugundan sonuc dondurulur (True = VACUUM yapildi).
 var
   o, n: Int64;
 begin
+  Result := False;
   if (not FAutoCompactOn) or FAutoCompactBusy then Exit;
   if BatchOpen or (FEng = nil) then Exit;
   if GetDeadBytes <= 0 then Exit;
@@ -3058,6 +3153,7 @@ begin
       AutoCompactBody(o, n, FAutoCompactRatio, FAutoCompactMinBytes);
       Inc(FAutoCompactCount);
       FLastAutoCompactError := '';
+      Result := True;
     except
       on E: Exception do
         FLastAutoCompactError := E.Message;

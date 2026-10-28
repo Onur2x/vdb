@@ -77,6 +77,10 @@ type
       FStream: TFileStream;
       FBuffer: array of TPending;    // commit bekleyen cerceveler
       FBufferCount: Integer;
+      { v3.24: commit sirasinda tum kayitlar (cerceveler + commit kaydi) TEK
+        WriteFile ile yazilir; tampon commit'ler arasinda yeniden kullanilir
+        (boyu yalniz buyur). }
+      FOutBuf: TBytes;
       FLSN: LongWord;
       FHasContent: Boolean;
       { Sprint 3.4: sifreli WAL. }
@@ -100,8 +104,6 @@ type
     FSyncStream: TFileStream;
     procedure WriteHeader;
     procedure ReadHeader;
-    function WriteRecord(Magic, PageNo, PayloadLen: LongWord;
-      const Payload): LongWord;
     procedure AppendBuffer(PageNo: LongWord; P: PVdbPage);
     function BufferedPageIndex(PageNo: LongWord): Integer;
   public
@@ -424,33 +426,6 @@ begin
   FBufferCount := 0;
 end;
 
-function TVdbPageWal.WriteRecord(Magic, PageNo, PayloadLen: LongWord;
-  const Payload): LongWord;
-var
-  { v3.21: sifreli zarf (4124 bayt) duz sayfadan BUYUK; tampon ikisini de
-    kapsamali. Onbellege sigmayan bir tampon boyu AV'ye yol acmisti. }
-  rec: array[0..VDB_WAL_REC_HDR + VDB_ENC_ENVELOPE - 1] of Byte;
-  crc: LongWord;
-begin
-  { v3.21: baslik + yuk TEK WriteFile ile yazilir (onceden iki cagri vardi:
-    20 bayt baslik, 4096 bayt yuk). Ek 4 KB kopya, kazanilan sistem
-    cagrisindan ucuz. }
-  Move(Magic, rec[0], 4);
-  Move(FLSN, rec[4], 4);
-  Move(PayloadLen, rec[8], 4);
-  Move(PageNo, rec[12], 4);
-  if PayloadLen > 0 then
-  begin
-    Move(Payload, rec[VDB_WAL_REC_HDR], Integer(PayloadLen));
-    crc := WalCrc(rec[0], 16, rec[VDB_WAL_REC_HDR], Integer(PayloadLen));
-  end
-  else
-    crc := WalCrc(rec[0], 16, rec[0], 0);
-  Move(crc, rec[16], 4);
-  FStream.WriteBuffer(rec[0], VDB_WAL_REC_HDR + Integer(PayloadLen));
-  Result := crc;
-end;
-
 procedure TVdbPageWal.SyncDurable;
 var
   S: TFileStream;
@@ -468,17 +443,33 @@ end;
 
 function TVdbPageWal.Commit(DoSync: Boolean; LSN: LongWord): Boolean;
 var
-  i: Integer;
+  i, total, off, payLen: Integer;
   env, plain: TBytes;
+  src: PByte;
+  magic, zero, crc: LongWord;
 begin
   Result := False;
   if FStream = nil then
     raise EVdbWal.Create('WAL acik degil');
   if FBufferCount = 0 then Exit(True);   // yazacak bir sey yok
   FLSN := LSN;
+  if FWalEncrypted then
+    payLen := VDB_ENC_ENVELOPE
+  else
+    payLen := VDB_PAGE_SIZE;
+  { v3.24: cerceveler + commit kaydi TEK tamponda toplanip TEK WriteFile ile
+    yazilir. Onceden commit basina 3 cagri vardi (2 cerceve + commit kaydi);
+    olculen fark ~1,85 us/cagri. Tampon uye alanda tutulur, commit'ler
+    arasinda yeniden kullanilir. }
+  total := FBufferCount * (VDB_WAL_REC_HDR + payLen) + VDB_WAL_REC_HDR;
+  if Length(FOutBuf) < total then
+    SetLength(FOutBuf, total + 8192);
   { v3.21: tek arama. Onceden FStream.Size + Position atamasi iki arama
     yapiyordu; Seek(0, soEnd) hem konumu hem sonu tek cagrida verir. }
   FStream.Seek(0, soEnd);
+  off := 0;
+  magic := VDB_WAL_REC_FRAME;
+  zero := 0;
   for i := 0 to FBufferCount - 1 do
   begin
     if FWalEncrypted then
@@ -488,14 +479,33 @@ begin
       if not VDbPageSeal(FKey, FSalt, FBuffer[i].PageNo, plain, env) then
         raise EVdbWal.Create(Format('WAL cercevesi %d sifrelenemedi',
           [FBuffer[i].PageNo]));
-      WriteRecord(VDB_WAL_REC_FRAME, FBuffer[i].PageNo, VDB_ENC_ENVELOPE,
-        env[0]);
+      src := @env[0];
     end
     else
-      WriteRecord(VDB_WAL_REC_FRAME, FBuffer[i].PageNo, VDB_PAGE_SIZE,
-        FBuffer[i].Data);
+      src := @FBuffer[i].Data[0];
+    Move(magic, FOutBuf[off], 4);
+    Move(FLSN, FOutBuf[off + 4], 4);
+    Move(payLen, FOutBuf[off + 8], 4);
+    Move(FBuffer[i].PageNo, FOutBuf[off + 12], 4);
+    Move(src^, FOutBuf[off + VDB_WAL_REC_HDR], payLen);
+    crc := WalCrc(FOutBuf[off], 16, FOutBuf[off + VDB_WAL_REC_HDR], payLen);
+    Move(crc, FOutBuf[off + 16], 4);
+    Inc(off, VDB_WAL_REC_HDR + payLen);
   end;
-  WriteRecord(VDB_WAL_REC_COMMIT, 0, 0, LSN);
+  { commit kaydi: yuk yok, CRC yalniz baslik uzerinden. }
+  magic := VDB_WAL_REC_COMMIT;
+  Move(magic, FOutBuf[off], 4);
+  Move(FLSN, FOutBuf[off + 4], 4);
+  Move(zero, FOutBuf[off + 8], 4);
+  Move(zero, FOutBuf[off + 12], 4);
+  crc := WalCrc(FOutBuf[off], 16, FOutBuf[off], 0);
+  Move(crc, FOutBuf[off + 16], 4);
+  Inc(off, VDB_WAL_REC_HDR);
+  FStream.WriteBuffer(FOutBuf[0], off);
+  { Cok buyuk islemlerden sonra tamponu birak: aksi halde WAL nesnesi omru
+    boyunca onlarca MB tutulur. Normal commit'lerde tampon yeniden kullanilir. }
+  if Length(FOutBuf) > 4 * 1024 * 1024 then
+    SetLength(FOutBuf, 0);
   if DoSync then
     VDbFlushStream(FStream);
   FBufferCount := 0;

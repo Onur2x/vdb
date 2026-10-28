@@ -1975,6 +1975,120 @@ yeniden yazılıp `mb2` ve kapılarla doğrulandı. Kayıp yok.
 logchk 43, pitrchk 21, btreechk 30, replchk 37, lockchk 36, snapchk 21,
 prochk 21. `sqltest` v3 **2864/0/33**, v2 **3295/0/0**.
 
+### 7k. WAL tek yazma, yazma kümesi havuzu ve bir "sonsuz fsync" kusuru (v3.24, 2026-10-28)
+
+Bu dilim üç iş içeriyor: iki ölçülmüş CPU kazancı ve **bir gerçek
+doğruluk/ilerleme kusurunun** düzeltmesi.
+
+#### 7k.1 WAL commit: kayıt başına yazma → commit başına tek `WriteFile`
+
+Önceden `Commit` her çerçeve için bir `WriteRecord` çağırıyordu (20 bayt
+başlık + 4096 bayt yük = iki `WriteBuffer`) ve sonunda commit kaydı için bir
+tane daha. Yani 2 çerçeveli tipik commit'te **5 sistem çağrısı**.
+
+Artık çerçeveler ve commit kaydı üye bir tamponda (`FOutBuf`) sırayla
+kurulur, commit **tek `WriteFile`** ile yazılır. Tampon commit'ler arasında
+yeniden kullanılır; yalnız büyür ve 4 MB'ı aşarsa bırakılır (200k satırlık
+bir partiden sonra WAL nesnesi ömrü boyunca onlarca MB tutmasın).
+
+CRC hesabı artık tampon üzerinden yapılır (ek kopya yok). Şifreli yolda
+zarf `FOutBuf`'a doğrudan yazılır; `WriteRecord`'un sabit `rec` dizisi ve
+dolayısıyla "zarf 4124 bayt, tampon 4096" tuzağı tamamen ortadan kalktı.
+
+Ölçüm (`pcbench` P=1, commit içi):
+
+| | önce | sonra |
+|---|---|---|
+| WAL `Commit` | 32,78 µs | 21,9–22,7 µs |
+| toplam commit CPU | ~78 µs | ~67 µs |
+
+Duvarda görünür bir fark **yok**: commit süresini fsync (~307–309 µs)
+belirliyor. Kazanç CPU payı olarak duruyor; P arttığında (paylaşılan fsync)
+ve yük altında işe yarar.
+
+#### 7k.2 Yazma kümesi havuzu: `TWriteSet.Create` 2,0 → `AcquireSet` 1,07 µs
+
+Her `BeginBatch` yeni bir `TWriteSet` kuruyordu: 5 konteyner
+(`TDictionary`, `TList`×2, …) sıfırdan ayrılıyordu. Artık kapanan kümeler
+`FSetPool`'a döner ve yeniden kullanılır (`ResetFor` konteynerleri **atmaz**,
+yalnız boşaltır).
+
+Sınır bilinçli: havuzda **en çok 8** küme ve yalnız `Map.Capacity <= 16384`
+olanlar tutulur. 200k satırlık bir partiden sonra kapasitesi şişmiş bir
+sözlüğü havuza koymak belleği kalıcı olarak şişirirdi. Havuz `FEngCs`
+altında tutulur (kilit sırası `gate -> depo` korunur, ters çevrilme yok).
+
+`CommitBatch` sonunda küme **kilit altında** havuza bırakılır; `AbortBatch`
+de aynısını yapar. Böylece iş parçacığı güvenliği ek kilit gerektirmez.
+
+#### 7k.3 KUSUR: VACUUM sonrası `AwaitDurable` sonsuz döngüsü
+
+**Belirti.** `sqltest` T152 (otomatik sıkıştırma) asılı kalıyordu; süreç
+CPU'yu tek çekirdekte %100 doldurup ilerlemiyordu.
+
+**Kök neden.** `MaybeAutoCompact` → `Compact` → `SwapDbFile` **motoru
+değiştirir**: yeni dosya, yeni `TVdbPageEngine`, yeni (boş) WAL. Ama
+`CommitBatch` `syncLsn`'i VACUUM'dan **önce** almıştı. VACUUM'dan sonra
+`FEng.AwaitDurable(syncLsn)` çağrılıyordu ve yeni motorun `FDurableLsn`
+sıfırdan başladığı için o LSN'e **hiçbir zaman** ulaşmıyordu. `AwaitDurable`
+döngüsü her turda fsync deniyordu.
+
+**Kanıt.** Frida syscall sayacı ile ölçüldü: **~70.000 `FlushFileBuffers`/sn**,
+yani ilerleme yok, sadece dönme. Yeniden üretim aracı
+(`tmp64/cp152.lpr`) düzeltme öncesi asılıyordu; düzeltme sonrası:
+
+```
+tmp64/b32/cp152.exe tmp64/cpx
+sayac=1 boyut=12288 olu=0 err=BITTI
+```
+
+ve tüm veri doğrulamaları (satır sayısı, içerik, indeks yolu) doğru.
+
+**Düzeltme.** `MaybeAutoCompact` artık `Boolean` döndürür (`True` = VACUUM
+gerçekleşti). `CommitBatch`, VACUUM olduysa `syncLsn := 0` yapar: bekleyecek
+bir şey yoktur, çünkü VACUUM zaten `Checkpoint(True)` ile **her şeyi fsync
+etmiştir**. Eski LSN yeni motorda anlamsızdır; onu beklemek yalnızca kilitlenme
+üretir.
+
+**Veri kaybı yok.** Bu bir ilerleme (canlılık) kusuruydu; commit edilen veri
+VACUUM'un kendi fsync'i ile durabildi. Kusur yalnızca "işlem asla bitmez"
+şeklinde görünüyordu.
+
+#### 7k.4 Ölçülen sonuçlar (bu sürüm, temiz derleme)
+
+Taban `pcbench`/`bulkbench` (temiz dizin, tek koşu):
+
+- autocommit: **0,380 ms/commit** (2628 commit/s); çocuk 100: 0,392 ms
+  (`CommitBatch 0,374`), en yüksek 2,5 ms, >5 ms yok.
+- toplu 1000 satır × 20 işlem: **1,923 ms/işlem**, satır başına 1,923 µs,
+  satır/s 520.115; `CommitBatch 1,121 ms/işlem`.
+
+Önceki sürüme (v3.23) göre toplu `CommitBatch` 1,19 → 1,11–1,13 ms/işlem.
+Autocommit fsync baskın olduğu için aynı bantta (0,389–0,416 → 0,380).
+
+#### 7k.5 Doğrulama
+
+- 16 kapı **686/0**: pagechk 21, storechk 15, heapchk 20, idxchk 19,
+  backendchk 127, v3sqlchk 238, migchk 13, factorychk 13, crashtest 11,
+  logchk 43, pitrchk 21, btreechk 30, replchk 37, lockchk 36, snapchk 21,
+  prochk 21.
+- `sqltest` v3 (yeni dizin): **2864/0/33** — T152'nin 14 kontrolü de OK
+  (sayaç=1, 28672 → 12288, ölü alan 0, satır içeriği doğru, kapanışta
+  tekrar çalışmıyor).
+- `sqltest` v2 (yeni dizin): **3295/0/0**.
+
+#### 7k.6 Sıradaki adaylar (henüz yapılmadı)
+
+- `LogFinish` 9,5 µs: `EndGroup` içinde commit başına `SetLength(payload,4)`
+  ve `BuildRec` tahsisi.
+- `BeginBatch`'in ~11 µs'lik kapı payı: `Store.AcquireRead` (SH kilit +
+  tazelik + `UnlockFileEx`) ve `TryAcquireWriteHold` içindeki
+  `VDbLockGenReserve` + `ReadGen`.
+- `MaybeCheckpoint` 4,6 µs, `AcquireDataWrite` 3,97 µs.
+- Süreçler arası paralel yazma hâlâ SQLite'ın altında (P=2 ~0,85x,
+  P=4 ~0,78x) ve SQLite kıyas tablosu (rollback journal, nokta okuma, tam
+  tarama, çok süreçli yazma) henüz tamamlanmadı.
+
 ### Sürüm çizgisi kararı (2026-10-26): alpha hattı → **v1.0.0**
 
 Kullanıcı kararı, önceki "v4'e ertele" planını geçersiz kılar:
