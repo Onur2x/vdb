@@ -116,6 +116,18 @@ type
     procedure Open(AReadOnly: Boolean = False);
     procedure Close;
 
+    { v3.28: BASKA SUREC COMMIT ETTI -> WAL gorunumunu tazele.
+      NEDEN AYRI METOT: ONCEDEN Close+Open yapiliyordu; yani her
+      tazelemede dosya kapatilip yeniden aciliyordu. Windows'ta YENI
+      YAZILMIS bir dosyanin ILK yeniden acilisi olculdu: 4-10 ms
+      (ayni dosyanin ikinci acilisi 40 us). Maliyet acilis katmaninda
+      (savunma/onbellek), handle'i koruyup yalniz basligi yeniden
+      okumak onu tamamen kaldirir: 6,5 ms -> ~0,05 ms.
+      GUVENLIK: WAL dosyasi hicbir yerde SILINMIYOR; Truncate yalniz
+      SetEndOfFile kullanir, dolayisiyla handle gecerliligini korur ve
+      diger surecin yazdiklari ayni handle'dan okunur. }
+    procedure Refresh(AReadOnly: Boolean);
+
     { Sprint 3.4: Open'dan ONCE cagrilir. Anahtar 32 bayt; tuz depodan
       gelir (AAD ayni olsun). }
     procedure SetEncryptionKey(const AKey, ASalt: TBytes);
@@ -162,6 +174,8 @@ type
   end;
 
 implementation
+
+
 
 type
   TPendingArray = array of TVdbPageWal.TPending;
@@ -374,6 +388,26 @@ begin
     Rollback;
   FreeAndNil(FSyncStream);
   FreeAndNil(FStream);
+end;
+
+procedure TVdbPageWal.Refresh(AReadOnly: Boolean);
+begin
+  { Mod degistiyse (ya da hic acilmamissa) eski yol tek secenek. }
+  if (FStream = nil) or (FReadOnlyMode <> AReadOnly) then
+  begin
+    Close;
+    Open(AReadOnly);
+    Exit;
+  end;
+  { Yazilmamis tampon varsa at (kapanista da ayni sey yapiliyordu). }
+  if FBufferCount > 0 then
+    Rollback;
+  FStream.Position := 0;
+  ReadHeader;
+  FWrittenLsn := FLSN;
+  { FStream.Size her cagrida isletim sistemine sorulur; baska surecin
+    uzattigi dosya buradan gorulur. }
+  FHasContent := FStream.Size > VDB_PAGE_SIZE;
 end;
 
 function TVdbPageWal.HasContent: Boolean;

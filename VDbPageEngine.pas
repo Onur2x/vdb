@@ -345,10 +345,12 @@ begin
       ONEMLI: burada FStore.Flush/Truncate CAGRILMAZ - RO oturum diske
       yazmaz (lockchk "RO oturum diskte hicbir bayt degistirmedi" kapisi). }
     FStore.ResetReadOnlyImages;
-    FWal.Close;
+    { v3.28: handle'lar KORUNUR (bkz TVdbPageWal.Refresh). Olculen: yeni
+      yazilmis bir dosyanin ilk yeniden acilisi 4-10 ms; tazeleme
+      maliyetinin %82'si yalnizca bu acilisti. Anahtar acikken tanimli. }
     if FStore.Encrypted then
       FWal.SetEncryptionKey(FStore.Key, FStore.Salt);
-    FWal.Open(True);
+    FWal.Refresh(True);
     if FWal.HasContent then
     begin
       FWal.Recover(ApplyReadOnly, st, FRecoverLimit);
@@ -361,10 +363,12 @@ begin
   { Baska bir surec commit etti: bizim WAL handle'i ve tanimligi bayat.
     Yeniden ac; varsa cerceveleri uygula (WAL cerceveleri sayfa imajidir,
     yeniden uygulamak idempotenttir) ve buda. }
-  FWal.Close;
+  { v3.28: WAL'i kapatip yeniden ACMAK yerine handle'lar korunur (bkz
+    TVdbPageWal.Refresh). WAL dosyasi hicbir yerde silinmiyor; Truncate
+    yalniz SetEndOfFile kullaniyor, dolayisiyla handle gecerli kalir. }
   if FStore.Encrypted then
     FWal.SetEncryptionKey(FStore.Key, FStore.Salt);
-  FWal.Open(False);
+  FWal.Refresh(False);
   if FWal.HasContent then
   begin
     FWal.Recover(ApplyRecovered, st, FRecoverLimit);

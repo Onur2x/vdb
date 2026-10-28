@@ -2458,9 +2458,147 @@ Sıradaki iyileştirme (§7l.7 paketi) artık "SQLite'ı yakalamak" için değil
 tek dosyada 1,0x'i aşmak için yapılacak.
 
 Kalan tek ölçülmüş açık: **tam tarama ~2x yavaş** (1,73 ms vs ~0,8 ms / 20k
-satır) ve tekil commit'te %12–14. Kod değişikliği bu dilimde yok; yalnız ölçüm
+satır) — **DÜZELTME (bkz. §7o.5): bu karşılaştırma geçersizdir; aynı işi yapan
+ölçümde v3 ~3,9x hızlıdır.** Gerçek açık tekil commit'te %12–14. Kod değişikliği bu dilimde yok; yalnız ölçüm
 aracı `pcbench`'e `apart` modu ve yeni `tmp64/sqbench_sh.py` eklendi (ikisi de
 git dışı).
+
+### 7o. Tazeleme maliyeti: 6,65 ms → 1,05 ms (v3.28, 2026-10-28)
+
+§7l.5 ve §7m.1'de "başka bir sürecin commit'ini görmek 6,65 ms" ölçülmüştü ve bu
+maliyet, adil kilit devri denemelerinin hepsini (v3.26) boşa çıkarıyordu
+(adalet sağlanınca her commit tazeleme ödüyor → 0,29–0,65x). Bu dilimde kök
+neden bulundu ve giderildi.
+
+#### 7o.1 Kök neden: yeni yazılmış bir dosyanın İLK yeniden açılışı 4–10 ms
+
+`tmp64/rfbench.lpr` (iki backend aynı dosyada; `be1` yazar, `be2`'nin uzak
+commit sonrası ilk `Get`'i tazelemeyi tetikler) ile `StoreRefreshed` fazları
+(DBG29, geçici) ayrıştırıldı — 300 tur:
+
+| faz | ortalama |
+|---|---|
+| `FWal.Close` | 3,5 µs |
+| `FWal.Open(False)` | **6.491 µs** |
+| `FWal.Recover` | 142 µs |
+| `Checkpoint(True)` | 1.056 µs |
+| `FHeap.Open` (tam CRC taraması + dizin) | 170 µs |
+| **toplam** | **7.900 µs** |
+
+`TVdbPageWal.Open` içi: `FileExists` 17 µs, **`VDbFileBytes` 5.612 µs**,
+`TFileStream.Create` 60 µs, `ReadHeader` 30 µs. `VDbFileBytes` içi:
+**`TFileStream.Create` 5.266 µs**.
+
+Bunun dosya içeriğiyle ilgisi yok. `tmp64/opbench5.lpr` (aynı turda sırayla:
+WAL'i 1. kez aç, 2. kez aç, `VDbFileBytes`, `.odb`'yi aç, gerçek tazeleme)
+12 tur:
+
+| ölçüm | değer |
+|---|---|
+| WAL'in **ilk** açılışı | 3.893–10.171 µs |
+| WAL'in **ikinci** açılışı | 37–69 µs |
+| `VDbFileBytes` (ilk açılıştan sonra) | 39–52 µs |
+| `.odb`'nin ilk açılışı | 3.848–5.411 µs |
+| `Get` (dosya zaten açıkken tazeleme) | 1.203–2.506 µs |
+
+Kural: **az önce yazılmış/fsync edilmiş bir dosyanın ilk yeniden açılışı
+4–10 ms; aynı dosyanın ikinci açılışı ~40 µs.** Uzantı (`.wal`/`.dat`), boyut ve
+`fmOpenRead`/`fmOpenReadWrite` farkı etkisiz (`tmp64/opbench4.lpr` doğruladı).
+Maliyet açılış katmanında (savunma yazılımı/önbellek); motorun kendi işi değil.
+
+#### 7o.2 Düzeltme: handle'ları koruyan `TVdbPageWal.Refresh`
+
+WAL dosyası hiçbir yerde **silinmiyor**; `Truncate` yalnız `SetEndOfFile`
+kullanıyor. Dolayısıyla handle geçerli kalır ve kapatıp yeniden açmak gereksiz:
+
+```pascal
+procedure TVdbPageWal.Refresh(AReadOnly: Boolean);
+begin
+  if (FStream = nil) or (FReadOnlyMode <> AReadOnly) then
+  begin
+    Close; Open(AReadOnly); Exit;
+  end;
+  if FBufferCount > 0 then Rollback;
+  FStream.Position := 0;
+  ReadHeader;
+  FWrittenLsn := FLSN;
+  FHasContent := FStream.Size > VDB_PAGE_SIZE;
+end;
+```
+
+`StoreRefreshed`'in hem RW hem RO dalında `FWal.Close; … FWal.Open(x)` üçlüsü
+`FWal.Refresh(x)` oldu. v3.17 (heap dizinini yeniden kur → satır ezilmesi) ve
+v3.18 (`Checkpoint` ile yaz, `Flush+Truncate` yapma → veri kaybı) düzeltmeleri
+korundu; yalnız dosya açılışı kaldırıldı.
+
+| | önce | sonra |
+|---|---|---|
+| tazeleme ortalama | **6,652 ms** | **1,053 ms** |
+| tazeleme en yüksek | 13,671 ms | 1,651 ms |
+
+**6,3x iyileşme.** `pcbench` P=4 koşusunda (300 commit/süreç, R33 sayaçlarıyla)
+tek bir süreçte tazeleme sayısı 0–4 ve tazeleme başına en yüksek süre:
+
+| | eski yol (Close+Open) | `Refresh` |
+|---|---|---|
+| tazeleme başına en yüksek | 15.472 µs (wal 13.891 + chk 12.332) | **429–525 µs** |
+| P=4 hızlanma | 0,68x / 0,91x | 0,74x / 0,79x / 0,86x |
+| >5 ms commit sayısı | 1–2 (282,7 ms'ye kadar) | **0** |
+
+Tek süreçte regresyon yok: `rwbench` BULK 2,299 ms, NOKTA **2,90 µs/sorgu**,
+TARAMA 1,740 ms/tarama; `bulkbench` 1,916 ms/işlem (1,916 µs/satır, 521.975
+satır/s); `pcbench` P=1 **0,375 ms/commit**.
+
+#### 7o.3 Kalan maliyet ve sıradaki aday
+
+1,05 ms'nin dağılımı: `Checkpoint(True)` **801 µs**, `FHeap.Open` 125 µs,
+`Recover` 88 µs. Sıradaki aday tazelemede checkpoint'i tam yapmamak değil
+(v3.26'da denendi: WAL şişti, 0,76x), **delta uygulama**: yalnız
+`LSN > Store.LSN` çerçevelerini uygulamak ve heap dizinini tam taramak yerine
+değişen sayfaların anahtarlarını düzeltmek. Bu, §7l.7(a) adayının ucuzlamış
+hâlidir; tek dosyada 1,0x'i aşmanın ön koşulu olmaya devam ediyor.
+
+#### 7o.4 Denenip geri alınan: kilit beklemesinde `Sleep(0)` dönme penceresi
+
+`LockExclusive`/`LockReserve` döngülerine ilk 6.000 tur `Sleep(0)` eklendi
+(≈2 ms). P=4, 300 commit, temiz dizin: 0,90x / 0,77x / 0,73x (ort. ~0,80x) —
+dönmesiz taban 0,82x / 0,81x / 0,78x. Kazanç yok. 100.000 turda 0,54x'e
+düştü (tam adil rotasyon → her commit tazeleme ödüyor). Ayrıca tanı için her
+kilit alımında dosya açan geçici kod 8,4 ms/commit sahte gecikme üretti
+(0,31x) — "ölçüm aletinin kendisi ölçümü bozuyor" tuzağı. Hepsi geri alındı.
+
+#### 7o.5 Tam tarama "2x yavaş" iddiası geçersiz (§7n.3 ve §7h.2 düzeltmesi)
+
+§7n.3'ün son paragrafındaki "tam tarama ~2x yavaş (1,73 ms vs ~0,8 ms / 20k)"
+karşılaştırması **elma-armut**tu: SQLite tarafındaki 0,8 ms, satırları
+istemciye malzemeyen bir C döngüsüne aitti. `tmp64/sqscan.py` (20k satır,
+24 baytlık değer, WAL, SQLite 3.50.4) ile aynı iş ölçüldü:
+
+| iş | SQLite WAL | v3 |
+|---|---|---|
+| `SELECT k,v` → `fetchall()` | 6,736 ms (336,8 ns/satır) | — |
+| `SELECT k,v` → yinele (kopyasız) | 6,453 ms (322,7 ns/satır) | — |
+| `SELECT k` → `fetchall()` | 4,232 ms (211,6 ns/satır) | — |
+| `SELECT count(*)` | 0,021 ms (canlı sayaç) | — |
+| `ScanAll` (tüm satırlar) | — | **1,740 ms / 23.000 satır = 75–86 ns/satır** |
+
+Aynı işi (tüm satırları istemciye malzemeleme) yapan ölçümde **v3 ~3,9x
+hızlı**. Tarama optimizasyonu gerekmiyor. (`ScanAll` doğruluğu da
+`tmp64/scanchk.lpr` ile ayrıca sınandı: 2.000 satır, uyumsuzluk 0.)
+
+#### 7o.6 Doğrulama (bu sürüm)
+
+| kapı | sonuç |
+|---|---|
+| 16 kapı (`g28.txt`) | **686/0** — pagechk 21, storechk 15, heapchk 20, idxchk 19, backendchk 127, v3sqlchk 238, migchk 13, factorychk 13, crashtest 11, logchk 43, pitrchk 21, btreechk 30, replchk 37, lockchk 36, snapchk 21, prochk 21 |
+| `sqltest` v3 (yeni dizin) | **2864/0/33** |
+| `sqltest` v2 (yeni dizin) | **3295/0/0** |
+
+Araç tuzağı (yeni): `tmp64/b32/pcbench.exe` bir ara eski/DBG'li kaynaktan
+derlenmiş hâlde kaldı ve P=4 için 0,21x gibi tekrarlanabilir ama **gerçek
+olmayan** sonuç verdi (bir çocuk 1,7–2,0 s dondu). Kaynak temizlenip yeniden
+derlenince aynı makinede 0,74–0,86x alındı. Ölçüm aletleri her dilimde yeniden
+derlenmeli (bkz. §7k sonundaki `rwbench` olayı).
 
 ### Kapsam dışı (değişmedi)
 - M3 WASM, M7 async sunucu, WASM/edge
