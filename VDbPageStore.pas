@@ -923,13 +923,17 @@ var
   len: Int64;
   g: QWord;
 begin
-  len := FStream.Size;
-  if len < VDB_PAGE_SIZE then Exit;
   { v3.16: ONCE 8 baytlik degisiklik sayaci okunur. Degismediyse 4 KB meta
-    sayfayi okumaya GEREK YOK: islem basina maliyet ~11 us'den ~2 us'ye iner
-    (olculdu: lockcost). }
+    sayfayi okumaya GEREK YOK.
+    v3.22: hizli yol YALNIZ sayaci okur. ONCEDEN burada da `FStream.Size`
+    (GetFileSizeEx) cagriliyordu ve `ReadGen` icinde bir `FGenStream.Size`
+    daha vardi: hizli yol 4 sistem cagrisi oduyordu (olculen 7,37 us/cagri,
+    toplu yazmada satir basina 3 cagri = 22 us). Simdi 2 cagri (Seek+Read);
+    dosya boyutu yalniz gercekten bayat olan yolda sorulur. }
   g := ReadGen;
   if (FGenStream <> nil) and (g = FSigGen) then Exit;
+  len := FStream.Size;
+  if len < VDB_PAGE_SIZE then Exit;
   FStream.Position := 0;
   FStream.ReadBuffer(buf, VDB_PAGE_SIZE);
   if (FGenStream = nil) and (Length(FMetaSig) = VDB_PAGE_SIZE) and
@@ -998,6 +1002,12 @@ begin
     YOK SAYAR (RefreshIfStaleForce): bayat onbellekle yazmak v3.17'de
     veri kaybina yol acmisti. }
   if FDeferCount > 0 then Exit;
+  { v3.22: yazar rezervasyonu BIZDEYKEN (FHoldDepth > 0) baska bir surec
+    commit EDEMEZ ve rezervasyon alinirken nesil karsilastirmasi
+    yapilmisti (bkz. AcquireWriteHold/TryAcquireWriteHold): onbellek islem
+    boyunca taze. Bu yuzden `.gen` dosyasini anahtar basina 3 kez yoklamak
+    (olculen 7,37 us x 3) gereksizdi — seri toplu yazmada tazelik bedava. }
+  if FHoldDepth > 0 then Exit;
   RefreshIfStaleForce;
 end;
 
@@ -1056,7 +1066,8 @@ var
 begin
   Result := 0;
   if FGenStream = nil then Exit;
-  if FGenStream.Size < 8 then Exit;
+  { v3.22: `FGenStream.Size` denetimi KALDIRILDI (hizli yolda fazladan
+    GetFileSizeEx). Kisa okuma zaten 0 dondurup tazelemeyi zorluyor. }
   FGenStream.Position := 0;
   { v3.18: `.gen` yalniz bir IPUCUDUR (asil veri baska yerde). Kisa okuma
     gercek bir yarisin isareti olabilir; istisna atmak yerine 0 don ve
@@ -1186,6 +1197,18 @@ begin
       Exit;
     end;
     if FReadDepth > 0 then
+    begin
+      Inc(FReadDepth);
+      Exit;
+    end;
+    { v3.22: yazar rezervasyonu BIZDEYKEN (FHoldDepth > 0) baska bir surec
+      commit EDEMEZ: rezervasyon, yazarlarin tam kilit/checkpoint/truncate
+      yolunun onunde durur. Onbellek de rezervasyon aninda tazelenmisti
+      (bkz. AcquireWriteHold). Bu yuzden anahtar basina paylasimli kilit
+      (olculen 0,96 us) ve tazelik yoklamasi gereksizdir.
+      KILIT ALINMADIGI icin FLockedShared False kalir; ReleaseRead yalniz
+      sayaci dusurur. }
+    if FHoldDepth > 0 then
     begin
       Inc(FReadDepth);
       Exit;

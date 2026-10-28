@@ -1629,7 +1629,8 @@ Ortalama hızda iki motor **eşit**. Ancak v3'ün kuyruğu kötü: P=4'te tek bi
 Sebep tazeleme: başka süreç commit edince WAL'in **tamamı** yeniden
 oynatılıyor, ardından `Checkpoint` ile veri dosyasına yazılıp WAL budanıyor
 ve heap dizini **baştan taranıyor**. Sıradaki iş bu tazelemeyi artımlı
-yapmak (§7h.6).
+yapmak (§7h.6). **DÜZELTME (v3.22):** bu iddia yanlış çıktı; sıçramalar
+ilk commit'in tek seferlik maliyetiydi ve tazeleme 1–5 ms. Bkz. §7i.6.
 
 #### 7h.4 Denenip ölçülen ve geri alınanlar (bu tur)
 
@@ -1681,6 +1682,158 @@ yapmak (§7h.6).
   0,015 ms). Böyle bir dayanıklılık politikası (`dpNormal`) bilinçli olarak
   yok: kullanıcı önceliği "asla veri kaybı yok".
 - Doğrulama: 16 kapı **682/0**; `sqltest` v3 **2874/0/33**, v2 **3305/0/0**.
+
+### 7i. Toplu yazma darboğazı: satır başına 31,7 → 2,25 µs (v3.22, 2026-10-28)
+
+Soru (§7h.6'dan): "işlem başına CPU'muz SQLite'ın 7–18 katı" — neden ve
+düzeltilebilir mi? Cevap: **evet, düzeltildi**; toplu yazmada SQLite ile
+başabaş olduk. Aşağıdaki bütün sayılar bu makinede, aynı gün, temiz dizinle
+ölçüldü (`tmp64/bulkbench`, `tmp64/pcbench`, `tmp64/sqbench.py`, SQLite
+3.50.4 / Python 3.14.0).
+
+#### 7i.1 Yeni ölçüm aletleri
+
+- `tmp64/bulkbench.lpr` — `bulkbench <dizin> <satır/işlem> <işlem>`: toplu
+  yazma; `Put` ve `CommitBatch` kovalarını ayrı ayrı raporlar, ısınma
+  commit'i yapar (ilk commit'in tek seferlik maliyeti ölçüme girmez).
+- `tmp64/lkb.lpr` — kilit mikro ölçümü: `VDbLockStream(SH)` +
+  `VDbUnlockStream` çifti **1,5 µs**, çıplak `LockFileEx`+`UnlockFileEx`
+  1,36 µs. **Kilit pahalı değil**, bu yüzden ilk bakışta yanlış yere
+  bakmamak gerekiyordu.
+
+#### 7i.2 Kök neden: `Put` 31 µs, ama sebep `Put`'un kendi işi değil
+
+Temel çizgi (1000 satır/işlem): **31,0 ms/işlem** → satır başına **31 µs**;
+SQLite aynı işi 2,1 ms'de yapıyordu (14x). `vprof` ile `Put` icine inildi
+(5000 satır):
+
+| Kova | µs/çağrı | Pay |
+|---|---|---|
+| `Put: Map.AddOrSetValue` | 0,52 | %1,7 |
+| `Put: Copy(Value)` | 0,06 | — |
+| `Put: NoteBefore` | 0,04 | — |
+| `Put: JournalKey` | **18,5** | %59 |
+| `Put: OwnSet` | **9,3** | %30 |
+
+`JournalKey` gövdesi yalnız `if (Savepoints = nil) or (Savepoints.Count = 0)
+then Exit;` idi. `Savepoints` bir **özellik** ve her erişimi `OwnSet`
+yapıyor: 2 erişim = 2 ek `OwnSet` = 18,5 µs. Yani satır başına üç ayrı
+`OwnSet` çağrısı vardı (biri `Put`'un kendisi, ikisi `JournalKey`).
+
+`OwnSet`'in kendisi ucuz (kilit 0,05 µs + sözlük 0,04 µs); pahalı olan
+`TVdbGate`'in **ilk giriş** kancası: `AcquireRead` → paylaşımlı kilit +
+`RefreshIfStaleForce` → ölçülen **7,37 µs/çağrı**. Sebep: tazelik hızlı
+yolu, `.gen` sayacını okumadan önce `FStream.Size` (GetFileSizeEx),
+`ReadGen` içinde bir `FGenStream.Size` daha, `Position := 0` (Seek) ve
+`Read(8)` (ReadFile) yapıyordu — **4 sistem çağrısı**, hepsi "değişmedi"
+demek için.
+
+#### 7i.3 Üç düzeltme
+
+1. **`JournalKey(S: TWriteSet; Key)`** — yazma kümesi parametre olarak
+   geçer, `S.Savepoints` kullanılır. Çağıranlar (`Put`, `Delete`) `s`'yi
+   zaten elinde tutuyordu. `Put` başına gate döngüsü **3 → 1**.
+2. **`RefreshIfStaleForce` hızlı yolu 4 → 2 sistem çağrısı**: nesil
+   karşılaştırması en başa alındı; `FStream.Size` yalnız gerçekten bayat
+   olan yolda sorulur; `ReadGen`'deki `FGenStream.Size` denetimi kaldırıldı
+   (kısa okuma zaten 0 döndürüp tazelemeyi zorluyor).
+3. **Rezervasyon bizdeyken (`FHoldDepth > 0`) `AcquireRead` ne paylaşımlı
+   kilit alır ne tazelik yoklar.** Gerekçe bir değişmez: rezervasyon,
+   yabancı yazarların commit yolunun (tam kilit + checkpoint + truncate)
+   önünde durur; ayrıca rezervasyon alınırken `.gen` karşılaştırması
+   yapılmıştır (`AcquireWriteHold`/`TryAcquireWriteHold`), yani önbellek
+   işlem boyunca tazedir. Bu, §7h.4'te reddedilen "işlem boyunca paylaşımlı
+   kilit tut" önerisi **değildir**: hiç kilit tutulmuyor, kilit yalnız
+   gerektiğinde (rezervasyon yokken) alınıyor.
+
+Her üç değişiklik de veri kaybı riski taşımadığı için kapılarla
+doğrulandı (§7i.7).
+
+#### 7i.4 Sonuç — toplu yazma
+
+| Aşama | ms/işlem (1000 satır) | µs/satır |
+|---|---|---|
+| Temel çizgi | 31,0 | 31,0 |
+| (1) `JournalKey` parametre | 4,77 | 4,77 |
+| (2) + tazelik hızlı yolu | 4,77 | 4,77 |
+| (3) + rezervasyon sırasında kilit/tazelik yok | 3,08 | 3,08 |
+| Temiz derleme, 20 işlem × 1000 satır | **2,25** | **2,25** |
+
+`bulkbench` son koşu: 20 işlem × 1000 satır = 20.000 satır **45,1 ms** →
+2,254 ms/işlem, **443.685 satır/s**; dağılım: `BeginBatch` 0,017 ms,
+`Put` toplam 0,769 ms, `CommitBatch` 1,467 ms.
+
+| Aynı iş | SQLite | v3 |
+|---|---|---|
+| 1000 satır tek işlem, rollback journal + FULL | 3,4 ms | **2,25 ms** (1,5x hızlı) |
+| 1000 satır tek işlem, WAL + FULL | 2,1 ms | 2,25 ms (1,07x yavaş) |
+
+#### 7i.5 Sonuç — tek satır autocommit (her commit fsync)
+
+`pcbench` P=1, 800 commit, 10 koşu (temiz derleme): **0,415–0,461
+ms/commit**, medyan **0,440 ms** → **~2.270 commit/s**. §7h.1'deki 0,517 ms
+ve "1,5x yavaş" düzeldi:
+
+| İş yükü | SQLite | v3 | Sonuç |
+|---|---|---|---|
+| autocommit, rollback journal + FULL | 1,538 ms | **0,440 ms** | **v3 3,5x hızlı** |
+| autocommit, WAL + synchronous=FULL | 0,355 ms | 0,440 ms | v3 1,24x yavaş |
+
+Kalan fark hâlâ CPU: fsync 0,28–0,30 ms olduğuna göre v3'ün CPU'su ~0,15 ms,
+SQLite'ın ~0,06 ms. Commit başına kalan kalemler (ölçüldü): `AwaitDurable`
+olay/fsync payı, WAL'e iki çerçeve yazımı, değişim günlüğü kaydı.
+
+#### 7i.6 Süreçler arası paralel yazma (ve §7h.3'ün düzeltmesi)
+
+| P | SQLite (WAL+FULL) | v3 (pcbench) |
+|---|---|---|
+| 2 | 0,443 ms/commit, 0,80x | 0,538 ms/commit, **0,85x** |
+| 4 | 0,434 ms/commit, 0,78x | 0,545 ms/commit, **0,78x** |
+
+Ortalama commit süresinde v3 SQLite'ın ~1,25 katı; **ölçeklenme davranışı
+birebir aynı** (ikisi de hızlanmıyor — fsync ve yazar sırası ortak darboğaz).
+
+**§7h.3 düzeltmesi (önceki iddia yanlıştı):** "P=4'te commit 0,38–1,38 s'ye
+sıçrıyor, sebep tazeleme" **doğru değildi**. `pcbench`'e ısınma commit'i ve
+>5 ms `SPIKE` raporu eklendikten sonra ölçüldü: sıçramaların tamamı
+**i=1**, yani ilk commit'in tek seferlik maliyetiydi (dosya oluşturma,
+antivirüs ilk dokunuşu). Isınmadan sonra P=4'te en yüksek `CommitBatch`
+0,3–2,6 ms, `>5ms` sayısı **0**. Tazeleme maliyeti de ölçüldü: 200 commit'te
+1–3 tazeleme, WAL `Recover` 0,4–4,9 ms, `Checkpoint` 0,9–2,8 ms,
+`Heap.Open` 0,2–0,3 ms — yani **ucuz**. Artımlı tazeleme (§7h.6'daki plan)
+bu nedenle **öncelik değil**; kuyruk iddiası kapatıldı. (Tek istisna: 200
+commit'lik bir P=4 koşusunda bir çocukta tek bir 321 ms'lik sıçrama
+görüldü; tekrarlanmadı, checkpoint sınırına denk geldiği düşünülüyor,
+kayıt için burada.)
+
+#### 7i.7 Denenip ölçülen ve geri alınanlar (bu tur)
+
+1. **`AwaitDurable` olay optimizasyonu** (bekleyen sayacı `FWaiters`;
+   olay yalnız gerçekten bekleyen varsa tetiklenir). Temiz A/B, 4'er koşu:
+   taban medyan **0,4955 ms**, değişiklikle **0,5005 ms**; çocukta ~%3
+   daha yavaş. **Kazanç yok → geri alındı.** (§7i.5'te bir ara "%5,5"
+   görülmüştü; o ölçüm kirlenmişti, geçersiz.)
+2. **`TVdbPageWal.Commit`'te tek `WriteFile`** (bütün kayıtlar tek tamponda
+   birleştirilip tek yazma). Autocommit: 0,496/0,520/0,503 vs 0,503/0,512/
+   0,530 ms; toplu: `CommitBatch` 1,894 vs 1,957/1,883 ms → **fark yok**.
+   fsync baskın olduğu için ikinci `WriteFile` ucuz. **Geri alındı**
+   (karmaşıklık + tampon belleği karşılıksız).
+
+#### 7i.8 Dürüst sınır ve sıradaki iş
+
+- **Kazanılan:** toplu yazmada SQLite ile başabaş (rollback journal'da 1,5x
+  hızlı), tek satır autocommit'te rollback journal'a karşı 3,5x hızlı,
+  WAL+FULL'a karşı 1,24x yavaş; paralel yazmada davranış aynı, ortalama
+  1,25x yavaş.
+- **Kalan fark CPU'dur**, fsync değil. Sıradaki hedefler (ölçülmüş paylar):
+  `CommitNoSync` 255 µs, değişim günlüğü `LogFinish` 280 µs, `AwaitDurable`
+  298 µs (1000 satırlık işlem başına). Bu üçü işlem başına **sabit**
+  maliyettir; tek satır autocommit'te doğrudan görünürler.
+- **Doğrulama (bu değişikliklerle):** 16 kapı **682/0** (pagechk 21,
+  storechk 15, heapchk 20, idxchk 19, backendchk 123, v3sqlchk 238,
+  migchk 13, factorychk 13, crashtest 11, logchk 43, pitrchk 21, btreechk
+  30, replchk 37, lockchk 36, snapchk 21, prochk 21); `sqltest` v3
+  **2874/0/33**, v2 **3305/0/0**.
 
 ### Sürüm çizgisi kararı (2026-10-26): alpha hattı → **v1.0.0**
 

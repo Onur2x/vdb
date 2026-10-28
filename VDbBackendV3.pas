@@ -377,7 +377,7 @@ type
     procedure SwapDbFileWith(const NewFilePath: string;
       const AKey: TBytes; const APassword: string; AHasPassword: Boolean);
     { v3.2: savepoint yardimcilari. }
-    procedure JournalKey(Key: QWord);
+    procedure JournalKey(S: TWriteSet; Key: QWord);
     procedure ClearSavepoints;
     function FindSavepoint(const Name: string): Integer;
   public
@@ -1347,7 +1347,7 @@ begin
     { v3.4: cakisma denetimi icin ILK yazimdan onceki motor degeri (v3.6:
       yalnizca gerektiginde, bkz. NoteBefore). }
     NoteBefore(s, Key);
-    JournalKey(Key);
+    JournalKey(s, Key);
     rec.Present := True;
     rec.Value := Copy(Value, 0, Length(Value));
     { v3.10: ONCEDEN `ContainsKey` + `AddOrSetValue` = anahtar basina IKI tam
@@ -1580,7 +1580,7 @@ begin
       HIC OLMAYAN anahtar icin de True donuyordu. Dogru yanit: silmeden
       ONCE var miydi? }
     NoteBefore(s, Key);
-    JournalKey(Key);
+    JournalKey(s, Key);
     had := FEng.Contains(Key);
     if s.Map.ContainsKey(Key) then
       had := s.Map[Key].Present;
@@ -2469,17 +2469,25 @@ end;
 
 { Key ilk kez (bu savepoint'ten sonra) degistirilmeden ONCE cagrilir:
   her aktif savepoint icin anahtarin o andaki halini bir kez saklar.
-  Maliyet yalnizca savepoint VARKEN ve anahtar basina BIR kez olur. }
-procedure TVdbBackendV3.JournalKey(Key: QWord);
+  Maliyet yalnizca savepoint VARKEN ve anahtar basina BIR kez olur.
+  v3.22: yazma kumesi PARAMETRE olarak alinir. ONCEDEN `Savepoints` ozelligi
+  (2 kez: nil denetimi + Count) her cagrida `OwnSet` yapiyordu; her OwnSet
+  gate dongusu acip kapattigi icin okuma kilidi + tazelik denetimi yeniden
+  odeniyordu. Put basina olculen: JournalKey 18,5 us (2 x OwnSet ~9,3 us).
+  Cagiranlar zaten `s`yi elinde tutuyor. }
+procedure TVdbBackendV3.JournalKey(S: TWriteSet; Key: QWord);
 var
   i: Integer;
   sp: TSavepointRec;
   je: TSavepointKeyRec;
+  sps: TList<TSavepointRec>;
 begin
-  if (Savepoints = nil) or (Savepoints.Count = 0) then Exit;
-  for i := 0 to Savepoints.Count - 1 do
+  if S = nil then Exit;
+  sps := S.Savepoints;
+  if (sps = nil) or (sps.Count = 0) then Exit;
+  for i := 0 to sps.Count - 1 do
   begin
-    sp := Savepoints[i];
+    sp := sps[i];
     if sp.Journal.ContainsKey(Key) then Continue;
     je.HadBefore := BatchMap.TryGetValue(Key, je.Rec);
     if not je.HadBefore then
