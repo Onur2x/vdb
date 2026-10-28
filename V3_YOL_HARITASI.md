@@ -2600,6 +2600,148 @@ olmayan** sonuç verdi (bir çocuk 1,7–2,0 s dondu). Kaynak temizlenip yeniden
 derlenince aynı makinede 0,74–0,86x alındı. Ölçüm aletleri her dilimde yeniden
 derlenmeli (bkz. §7k sonundaki `rwbench` olayı).
 
+### 7p. Karışık okuma/yazmada tazeleme: artımsal WAL taraması, tazelemede checkpoint yok (v3.29, 2026-10-28)
+
+§7o'dan sonra kalan **tek büyük açık** buydu: bir süreç yazarken başka bir
+sürecin okuma ifadesi her seferinde tazeliyordu ve bu tazeleme 1,05 ms
+sürüyordu. SQLite WAL aynı desende ~0 ödüyor; fark 40 kata kadar çıkıyordu.
+
+#### 7p.1 Önce ölçüm: karışık desen (`tmp64/mixbench.lpr`, `tmp64/mixbench.py`)
+
+`mixbench` iki oturum açar (aynı dosya): be1 her turda 1 satır commit eder,
+be2 aynı turda R kez nokta okuma yapar. `mixbench.py` aynı deseni SQLite
+WAL+FULL ile, iki bağlantıyla koşar.
+
+| desen | v3.28 okuma | v3.29 okuma | SQLite WAL okuma | v3.28 döngü | v3.29 döngü | SQLite döngü |
+|---|---|---|---|---|---|---|
+| R=1 (düşmanca) | 1039,8 µs | **270,2 µs** | 24,4 µs | 1,445 ms | **0,682 ms** | 0,375 ms |
+| R=10 (okuma ağırlıklı) | 109,1 µs | **30,4 µs** | 5,7 µs | 1,483 ms | **0,729 ms** | 0,409 ms |
+
+v3.29'da en yüksek tek okuma 0,629 ms. Tazeleme **3,85x** ucuzladı; döngü
+süresi 1,445 → 0,682 ms. SQLite karşısında döngü farkı 3,85x'ten **1,82x**'e
+indi.
+
+#### 7p.2 Kök neden: her okuma ifadesi tam tazeleme ödüyordu
+
+Okuma yolu: `RefreshIfStaleForce` (`VDbPageStore.pas:927-955`) → `ReadGen`
+(mmap, 8 bayt) → değişmişse `DropCache` + `LoadMeta` → `FOnRefreshed` =
+`TVdbPageEngine.StoreRefreshed` (`VDbPageEngine.pas:332-399`) ve orada:
+
+1. `FWal.Refresh(False)` (v3.28'de ucuzlatıldı, ~12 µs),
+2. `FWal.Recover(ApplyRecovered, ...)` — **WAL'in tamamı** baştan taranıp
+   CRC/şifre çözme + kopyalama ile yeniden uygulanıyordu,
+3. `Checkpoint(True)` — pending sayfaları yaz, `FStore.Flush(True)` (**fsync**),
+   `AwaitDurable`, `FWal.Truncate` (başlık + **ikinci fsync**),
+4. `FHeap.Open` — **1..PageCount-1 arası tüm sayfalar** `GetRawPage` ile
+   diskten okunup `PageVerify` (CRC) ve tüm hücreler `DirAdd` ile dizine
+   ekleniyordu.
+
+Ölçülen dağılım (§7o ile uyumlu): `chk` 801 µs, `heap` 125 µs, `rec` 88 µs.
+Yani iki fsync + tam WAL + tam DB taraması. Bunların hiçbiri okuma için
+gerekli değildi: okuma **görmek** ister, **durabil etmek** istemez.
+
+#### 7p.3 `TVdbPageWal.Recover` artımsal oldu
+
+İmza:
+
+```pascal
+function Recover(Apply: TVdbWalApplyProc; out Stats: TVdbWalStats;
+  MaxCommits: Integer = 0; MinLSN: LongWord = 0;
+  AIncremental: Boolean = False): Boolean;
+```
+
+- Yeni alanlar `FScanPos: Int64; FScanHdrLsn: LongWord;` — son başarılı
+  taramanın bittiği konum ve **o taramadaki WAL başlık LSN'i**. Başlık LSN'i
+  değişirse dosya kesilmiştir (`Truncate`), artımsal konum geçersizdir →
+  tam tarama. `FScanPos > FStream.Size` ise de tam tarama.
+- Kayıt başlığı doğrulandıktan **sonra**, CRC/şifre çözme/kopyalamadan
+  **önce**: `if lsn <= MinLSN then` → yük gövdesi atlanır (`Position + payLen`),
+  `goodPos` ilerletilir, `Continue`. Eski çerçeveler zaten DB dosyasında.
+- `MaxCommits` ile erken çıkışta `goodPos` o commit kaydının başında kalır →
+  kesme her zaman güvenli sınırda.
+- `Truncate` sonunda `FScanPos := VDB_PAGE_SIZE; FScanHdrLsn := FLSN;`.
+- `CommitCount` (`Recover(nil, st)`) varsayılanlarla tam tarama yapar; davranış
+  değişmedi.
+
+#### 7p.4 Tazelemede `Checkpoint(True)` yerine `InstallPending`
+
+Yeni `TVdbPageEngine.InstallPending`: pending imajları yalnız **resident
+olmayan** sayfalar için `FStore.InstallPage` ile önbelleğe kurar ve
+`ClearPending` yapar. Diske yazma, fsync, truncate YOK.
+
+Gerekçe (kodda da yorumlu):
+
+- Uygulanan çerçeveler WAL'de ve commit sırasında fsync edilmiş durumda;
+  tek durabil kaynak WAL'dir. Okuyucunun fsync yapması anlamsızdır.
+- `InstallPage` resident olmayan sayfayı zaten doğrudan diske yazar, resident
+  olanı önbellekte tazeler; yani uygulanan imaj kaybolmaz.
+- WAL, **yazarın** her commit'teki `MaybeCheckpoint`'i ile 8 MB'ta budanır
+  (`VDB_V3_CHECKPOINT_BYTES`) ve budama öncesi `FStore.Flush(True)` **tüm
+  dosyayı** fsync eder (dosya düzeyi; hangi süreç yazmış olursa olsun). Bu
+  yüzden "sayfalar durabil olmadan WAL kesildi" durumu oluşamaz.
+- v3.18'de veri kaybına yol açan kusur `Flush`'ın yalnız resident kirli
+  sayfaları yazmasıydı; burada pending imajlar **önce** önbelleğe kurulur,
+  "pending'i at sonra kes" sırası hiç kurulmaz. v3.17'deki "heap dizini bayat
+  kalınca satır ezilmesi" düzeltmesi (her tazelemede `FHeap.Open`) korundu.
+
+RO dalı da artımsal tarama kullanır (`ApplyReadOnly` ile, bellek imajları).
+
+#### 7p.5 Ölçümler (yeni kod, temiz dizinler)
+
+| ölçüm | sonuç |
+|---|---|
+| `mixbench mx3 300 1` | yazma 0,412 ms, **okuma 270,2 µs**, en yüksek 0,629 ms, döngü 0,682 ms |
+| `mixbench 300 10` | **okuma 30,4 µs**, döngü 0,729 ms |
+| `pcbench bn36a 1 3000` | **0,383 ms/commit**, 2613 commit/s, en yüksek 2,5 ms, >5 ms = 0 |
+| `pcbench bn36b 4 300` | 0,460 ms/commit, **0,80x**, >5 ms = 0 |
+| `pcbench bn36c 4 300` | 0,485 ms/commit, **0,78x**, iki spike (17,3 / 266,4 ms) |
+
+Tek süreçte regresyon yok (0,383 ms, §7o ile aynı). P=4 hâlâ 0,78–0,80x:
+tek dosyada yazar rezervasyonu açlığı **yapısal** sınır (§7m.5, §7o.4).
+
+#### 7p.6 Doğrulama
+
+Artımsal yolun doğruluğu kapılardan bağımsız olarak ayrıca zorlandı:
+`tmp64/deltachk.lpr` (yeni) bir oturumla hızla WAL'i 8 MB eşiğine taşıyıp
+**truncate + tam tarama geri dönüşünü** tetikler, diğer oturum her turda
+anahtarları okuyup değeri bellekteki modele göre doğrular (değer çözülemezse,
+gerilerse veya o turdan büyükse uyumsuz).
+
+| koşu | sonuç |
+|---|---|
+| `deltachk dc4 200 200 2000` | 40.000 okuma, **uyumsuz 0**, truncate 0 |
+| `deltachk dc5 800 200 2000` | 160.000 okuma, **uyumsuz 0**, truncate 1 |
+| `deltachk dc6 2000 500 20000` | **1.000.000 okuma, uyumsuz 0, truncate 6**; kapanış taraması 20.000/20.000, uyumsuz 0 |
+
+Yani hem artımsal (delta) yol hem de kesme sonrası tam tarama geri dönüşü
+veri doğruluğunu bozmuyor.
+
+| kapı | sonuç |
+|---|---|
+| 16 kapı (`g31.txt`) | **686/0** — pagechk 21, storechk 15, heapchk 20, idxchk 19, backendchk 127, v3sqlchk 238, migchk 13, factorychk 13, crashtest 11, logchk 43, pitrchk 21, btreechk 30, replchk 37, lockchk 36, snapchk 21, prochk 21 |
+| `sqltest` v3 (`sq31a --backend=v3`) | **2864/0/33** |
+| `sqltest` v2 (`sq31b`) | **3295/0/0** |
+
+Not: kapılar tek komutta koşulmalı — `python run_gates.py > g30.txt & python
+sum.py` cmd'de 0 baytlık dosya üretti ve sahte "kapı yok" sonucu verdi.
+
+#### 7p.7 Kalan: tazelemede O(DB) heap taraması
+
+270 µs'nin ~125 µs'si hâlâ `DropCache` + `FHeap.Open`'dur: tazeleme tüm
+sayfaları diskten okuyup CRC doğrular ve dizini yeniden kurar. Bu maliyet
+**DB boyuyla büyür** (23000 satır/~250 sayfa → 125 µs; 1 GB'ta ~130 ms).
+Delta'ya geçmek için değişen sayfa listesi ve sayfa→anahtar ters haritası
+gerekir:
+
+- WAL kesilmediyse değişen sayfalar artımsal taramadan bilinir; başka süreç
+  `Truncate` yaptıysa delta kaybolur → o turda tam yeniden yükleme kaçınılmaz.
+- Heap dizini açık adresleme (`FKey/FLoc/FUsed`); **sayfa→anahtar ters
+  haritası yok**, `DirDel` tek anahtar siler. Sayfa bazlı toplu silme bugün
+  O(cap) tarama demektir. Seçenekler: (a) ters harita + `ReindexPages`,
+  (b) checkpoint'te `.idx` yazıp okuyucunun yüklemesi, (c) sayfa damgası +
+  tembel doğrulama. Öncelik 1 (doğruluk) nedeniyle ayrı dilimde, kapsamlı
+  kapılarla ele alınacak.
+
 ### Kapsam dışı (değişmedi)
 - M3 WASM, M7 async sunucu, WASM/edge
 - ~~**Süreçler arası çok yazarlılık**~~ **v3.16'da yapıldı** (bkz. §v3.16).

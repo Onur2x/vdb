@@ -96,6 +96,18 @@ type
       kapsadigi araligi bilmek icin yazimdan SONRA isaretlenen bir deger
       gerekir. Commit/Truncate/Recover/CommitCount tarafindan guncellenir. }
     FWrittenLsn: LongWord;
+    { v3.29 ARTIMSAL GERI UYGULAMA (delta tazeleme).
+      Tazelemede WAL'in TAMAMI bastan uygulaniyordu; WAL buyudukce maliyet
+      dogrusal artiyordu. FScanPos: basariyla okunan son kayittan SONRAKI
+      bayt konumu. FScanHdrLsn: o tarama sirasindaki WAL BASLIK LSN'i.
+      Truncate basligi yeniden yazip LSN'i ilerlettigi icin baslik LSN'i
+      degistiyse dosya kesilmis demektir -> bastan taranir.
+      GUVENLIK: bu alanlara yalnizca kilit altinda (paylasimli kilit)
+      erisilir; o sirada baska surec WAL'e yazamaz. Yanlis konumdan devam
+      etmek eksik uygulama riski tasir; bu yuzden baslik LSN'i esit
+      degilse HER ZAMAN tam tarama yapilir. }
+    FScanPos: Int64;
+    FScanHdrLsn: LongWord;
     { v3.19 GRUP COMMIT: fsync icin AYRI handle. Neden: TFileStream'in
       konumu paylasilan durumdur; lider fsync yaparken baska bir thread
       ayni stream'e yazarsa konum/ tampon bozulur. FlushFileBuffers
@@ -157,8 +169,13 @@ type
     { WAL'i okuyup onaylanmis cerceveleri uygular.
       MaxCommits > 0 ise yalnizca ILK MaxCommits commit uygulanir (v3.2:
       AS OF anlik goruntusu). Okuma orada kesilir; kuyruk "yirtik" sayilmaz. }
+    { v3.29: MinLSN > 0 ise LSN'i bu degerden KUCUK/ESIT kayitlar
+      cozulmeden, CRC hesaplanmadan atlanir (zaten veritabani dosyasinda).
+      AIncremental=True ise son taramanin biraktigi konumdan devam edilir
+      (baslik LSN'i degismediyse); aksi halde bastan taranir. }
     function Recover(Apply: TVdbWalApplyProc; out Stats: TVdbWalStats;
-      MaxCommits: Integer = 0): Boolean;
+      MaxCommits: Integer = 0; MinLSN: LongWord = 0;
+      AIncremental: Boolean = False): Boolean;
 
     { WAL penceresindeki onaylanmis commit sayisi (uygulamaz, yalniz sayar).
       AS OF SEQUENCE icin ust sinirdir. }
@@ -551,8 +568,11 @@ end;
 { ---------------------------------------------------------------- kurtarma }
 
 function TVdbPageWal.Recover(Apply: TVdbWalApplyProc;
-  out Stats: TVdbWalStats; MaxCommits: Integer): Boolean;
+  out Stats: TVdbWalStats; MaxCommits: Integer; MinLSN: LongWord;
+  AIncremental: Boolean): Boolean;
 var
+  startPos, goodPos: Int64;
+  hdrLsn: LongWord;
   hdr: array[0..VDB_WAL_REC_HDR - 1] of Byte;
   magic, lsn, payLen, pageNo, crc: LongWord;
   calc: LongWord;
@@ -595,8 +615,17 @@ begin
   appliedCount := 0;
   if FStream = nil then
     raise EVdbWal.Create('WAL acik degil');
-  Stats.Bytes := FStream.Size - VDB_PAGE_SIZE;
-  FStream.Position := VDB_PAGE_SIZE;
+  hdrLsn := FLSN;
+  { v3.29: artimsal tarama. Konum YALNIZ (a) cagiran istediyse, (b) onceki
+    tarama gecerli bir konum biraktiysa, (c) WAL basligi DEGISMEDIYSE
+    (dosya kesilmedi) ve (d) konum dosya sinirinda ise kullanilir. }
+  startPos := VDB_PAGE_SIZE;
+  if AIncremental and (FScanPos >= VDB_PAGE_SIZE) and
+     (FScanHdrLsn = hdrLsn) and (FScanPos <= FStream.Size) then
+    startPos := FScanPos;
+  goodPos := startPos;
+  Stats.Bytes := FStream.Size - startPos;
+  FStream.Position := startPos;
   while FStream.Position < FStream.Size do
   begin
     got := FStream.Read(hdr[0], VDB_WAL_REC_HDR);
@@ -629,6 +658,15 @@ begin
     begin
       Stats.TornTail := True;
       Break;
+    end;
+    { v3.29: MinLSN'den eski kayitlar ZATEN veritabani dosyasinda (onbellek
+      oradan yuklendi). Cozme/CRC/kopyalama yapmadan yalniz konum ilerlet. }
+    if lsn <= MinLSN then
+    begin
+      if payLen > 0 then
+        FStream.Position := FStream.Position + payLen;
+      goodPos := FStream.Position;
+      Continue;
     end;
     calc := WalCrc(hdr[0], 16, hdr[0], 0);
     if payLen > 0 then
@@ -680,6 +718,9 @@ begin
       if (MaxCommits > 0) and (Stats.Commits >= MaxCommits) then
         Break;
     end;
+    { v3.29: son TAM dogrulanmis kaydin sonu. Yirtik kuyrukta buradan
+      ileri gidilmez; bir sonraki tarama ayni yerden devam eder. }
+    goodPos := FStream.Position;
   end;
 
   { Commit'siz kuyruk atilir. Meta sayfa (0) EN SON uygulanir: once veri
@@ -695,6 +736,8 @@ begin
   { v3.19: kurtarma sonrasi WAL'de yazilmis sayilan en son LSN, kurtarilan
     son commit'in LSN'idir. }
   FWrittenLsn := FLSN;
+  FScanPos := goodPos;
+  FScanHdrLsn := hdrLsn;
   Result := True;
 end;
 
@@ -725,6 +768,10 @@ begin
   if FStream = nil then
     raise EVdbWal.Create('WAL acik degil');
   FLSN := CheckpointLSN;
+  { v3.29: dosya kesildi -> artimsal tarama konumu gecersiz. Baslik LSN'i
+    CheckpointLSN olarak yazilacagi icin onunla esitlenir. }
+  FScanPos := VDB_PAGE_SIZE;
+  FScanHdrLsn := FLSN;
   { v3.19: checkpoint sonrasi WAL bos; yazilmis LSN de checkpoint LSN'idir.
     Sifira cekmek YANLIS olur: LSN monoton artar, bekleyen AwaitDurable
     cagrilari eski LSN ile karsilastirir. }

@@ -112,6 +112,9 @@ type
     function PendingIndex(PageNo: LongWord): Integer;
     procedure AddPending(PageNo: LongWord; P: PVdbPage);
     procedure ClearPending;
+    { v3.29: tazelemede tam Checkpoint yerine yalnizca tahliye edilmis
+      imajlari onbellege kurar (diske yazma/fsync/WAL budama YOK). }
+    procedure InstallPending;
     function GetIdxTagsValid: Boolean;
     { v3.3: veri degistiren commit'te damgayi ilerletir. }
     function NextDataStamp: QWord;
@@ -353,7 +356,9 @@ begin
     FWal.Refresh(True);
     if FWal.HasContent then
     begin
-      FWal.Recover(ApplyReadOnly, st, FRecoverLimit);
+      { v3.29: artimsal — yalniz onbellekteki taban LSN'den YENI cerceveler
+        uygulanir. Eski cerceveler zaten veritabani dosyasinda. }
+      FWal.Recover(ApplyReadOnly, st, FRecoverLimit, FStore.LSN, True);
       FWalStats := st;
     end;
     if FHeap <> nil then
@@ -371,17 +376,29 @@ begin
   FWal.Refresh(False);
   if FWal.HasContent then
   begin
-    FWal.Recover(ApplyRecovered, st, FRecoverLimit);
+    { v3.29: ARTIMSAL uygulama — taban, onbellegin yuklendigi meta LSN'idir
+      (RefreshIfStaleForce once DropCache + LoadMeta yapar). Ondan eski
+      cerceveler zaten dosyada; yalniz deltalari uygula. }
+    FWal.Recover(ApplyRecovered, st, FRecoverLimit, FStore.LSN, True);
     FWalStats := st;
-    { v3.18 DUZELTME — VERI KAYBI (olculdu: prochk 1/100, B'nin 40 satiri).
-      ONCEDEN burada `FStore.Flush(True); FWal.Truncate(FStore.LSN);` vardi.
-      Flush YALNIZ onbellekteki (resident) kirli sayfalari yazar; havuzdan
-      tahliye edilip FPending'e dusmus cerceve imajlari DISKE YAZILMAZ.
-      Ardindan Truncate WAL'i kesiyordu -> uygulanmis ama yazilmamis sayfalar
-      hem bellekten hem diskten dusuyordu (sessiz veri kaybi).
-      Checkpoint bu isi DOGRU sirayla yapar: once pending -> InstallPage,
-      sonra Flush, sonra Truncate. Ayni govdeyi burada da kullaniyoruz. }
-    Checkpoint(True);
+    { v3.29 — TAZELEMEDE CHECKPOINT KALDIRILDI (olculen: 6,65 -> 1,05 ms'lik
+      tazelemenin 0,80 ms'si tam checkpoint'ti; karisik okuma/yazmada her
+      okuma ifadesi bunu oduyordu: 1039 us/sorgu vs SQLite WAL 24 us).
+      NEDEN GUVENLI:
+        * Uygulanan cerceveler WAL'de ve WAL commit'te fsync edilmis durumda;
+          yani bu sayfalar icin tek durabil kaynak WAL'dir, dosya degil.
+        * InstallPage zaten sayfalari dosyaya yazar (yalniz fsync etmez).
+        * WAL sinirsiz buyumez: her commit MaybeCheckpoint'i cagirir ve
+          8 MB'ta Checkpoint(True) WAL'i budar. Bu budama once
+          FStore.Flush(True) ile TUM dosyayi fsync eder, sonra keser;
+          dolayisiyla "sayfalar durabil olmadan WAL kesildi" durumu olusmaz
+          (fsync dosya duzeyinde calisir, hangi surec yazmis olursa olsun).
+        * Onceki yolun korunma nedeni (v3.18: Flush YALNIZ resident kirli
+          sayfalari yazar, pending imajlar diske gitmez) burada da gecerli;
+          bu yuzden pending imajlar YALNIZ onbellege kurulur
+          (InstallPending) — hicbir zaman "once pending'i at, sonra kes"
+          sirasi kurulmaz. }
+    InstallPending;
   end;
   { v3.17 DUZELTME — VERI KAYBI: yalnizca sayfa onbellegini tazelemek
     YETMEZ. Heap'in bellek ici dizini (Anahtar -> sayfa/slot) hala ESKI;
@@ -911,6 +928,21 @@ begin
   { v3.3: yalnizca VERI degistiren commit zone map damgasini ilerletir. }
   if changed then NextDataStamp;
   Result := True;
+end;
+
+procedure TVdbPageEngine.InstallPending;
+var
+  i: Integer;
+begin
+  { v3.29: Checkpoint'in "pending -> onbellek" adimi. Diske yazma, fsync ve
+    WAL budama YAPILMAZ; bu yuzden veri kaybi riski yoktur (bkz
+    StoreRefreshed gerekcesi). Yalnizca pinli olmayan, onbellekte BULUNMAYAN
+    imajlar kurulur: bir sayfa onbellekte varsa cerceve imaji pending
+    kopyasindan her zaman daha yeni/esittir. }
+  for i := 0 to FPendingCount - 1 do
+    if not FStore.IsResident(FPending[i].PageNo) then
+      FStore.InstallPage(FPending[i].PageNo, PVdbPage(FPending[i].Data));
+  ClearPending;
 end;
 
 function TVdbPageEngine.Checkpoint(DoSync: Boolean): Boolean;
