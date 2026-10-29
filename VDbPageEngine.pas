@@ -221,6 +221,11 @@ type
 
 implementation
 
+{$IFDEF CPUPROF}
+uses
+  VDbCpuProf;
+{$ENDIF}
+
 var
   { v3.3: her motor ornegine essiz bir damga tabani vermek icin. }
   GEngineSerial: LongInt = 0;
@@ -850,6 +855,9 @@ var
   P: PVdbPage;
   meta: TVdbPageBuf;
   changed: Boolean;
+{$IFDEF CPUPROF}
+  d0, d1, d2: Int64;
+{$ENDIF}
 begin
   Result := False;
   ASyncLsn := 0;
@@ -857,8 +865,16 @@ begin
     raise EVdbPageEngine.Create('motor acik degil');
 
   if not FInTxn then
+  begin
+    {$IFDEF CPUPROF}
+    Inc(CP[9]);
+    {$ENDIF}
     Exit(True);
+  end;
 
+  {$IFDEF CPUPROF}
+  d0 := CpuProfNow;
+  {$ENDIF}
   LSN := FStore.NextLSN;
 
   { v3.1: YALNIZCA bu islemde degisen sayfalar yazilir.
@@ -910,6 +926,9 @@ begin
     FStore.BuildMetaImage(meta);
     FWal.AppendFrame(VDB_HDR_PAGE, @meta);
   end;
+  {$IFDEF CPUPROF}
+  d1 := CpuProfNow; CP[6] := CP[6] + (d1 - d0);
+  {$ENDIF}
 
   { 5) WAL commit + fsync: artik durabil. Veritabani dosyasina bu noktada
         HICBIR SEY yazilmaz (checkpoint'e kadar). }
@@ -918,6 +937,9 @@ begin
   { v3.19: WAL'e yazilan en son LSN. DoSync=True ise bu noktada durabildir;
     DoSync=False ise cagiran AwaitDurable ile bekler. }
   ASyncLsn := FWal.WrittenLsn;
+  {$IFDEF CPUPROF}
+  d2 := CpuProfNow; CP[7] := CP[7] + (d2 - d1);
+  {$ENDIF}
 
   FStore.EndTxn;
   FInTxn := False;
@@ -927,6 +949,10 @@ begin
   FStore.EndIoWrite;
   { v3.3: yalnizca VERI degistiren commit zone map damgasini ilerletir. }
   if changed then NextDataStamp;
+  {$IFDEF CPUPROF}
+  CP[8] := CP[8] + (CpuProfNow - d2);
+  Inc(CPN);
+  {$ENDIF}
   Result := True;
 end;
 

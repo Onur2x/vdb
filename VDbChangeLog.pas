@@ -853,8 +853,7 @@ end;
 function TVdbChangeLog.EndGroup(AEngineLsn: LongWord;
   out ASeq, ATsMs: Int64): Boolean;
 var
-  i, total, pos: Integer;
-  rec, payload: TBytes;
+  i, total, pos, recLen: Integer;
   seq, ts: Int64;
   posBefore: Int64;
   r: TVdbLogChange;
@@ -880,15 +879,29 @@ begin
   pos := 0;
   for i := 0 to FGroup.Count - 1 do
   begin
+    { Tek kopya: TList<T>.Items GetItem ile doner; alani alani erismek
+      satir basina 5 kopya uretirdi. }
     r := FGroup[i];
     pos := PutChangeRecAt(FBuf, pos, VDBLOG_MAGIC_REC, r.Kind, seq, ts,
       r.TableId, r.Key, r.OldVal, r.NewVal);
   end;
-  SetLength(payload, 4);
-  PutU32(payload, 0, LongWord(FGroup.Count));
-  rec := BuildRec(VDBLOG_MAGIC_END, 0, seq, ts, 0, AEngineLsn, payload);
-  Move(rec[0], FBuf[pos], Length(rec));
-  pos := pos + Length(rec);
+  { v3.30 SPRINT B/3: END kaydi dogrudan grup tamponuna yazilir. ONCEDEN
+    her commit'te (a) SetLength(payload, 4), (b) BuildRec icinde ikinci bir
+    SetLength + FillChar + CRC, (c) Move ile ucuncu kopya vardi — satir basina
+    2 bellek ayirmasi + 1 kopya. Alanlar BuildRec ile BIREBIR ayni
+    (magic/boy/seq/ts/kind/tableId/LSN/payload/CRC, ayni sira). }
+  recLen := VDBLOG_REC_HDR + 4 + 4;
+  FillChar(FBuf[pos], VDBLOG_REC_HDR, 0);
+  PutU32(FBuf, pos, VDBLOG_MAGIC_END);
+  PutU32(FBuf, pos + 4, 4);
+  Move(seq, FBuf[pos + 8], 8);
+  Move(ts, FBuf[pos + 16], 8);
+  FBuf[pos + 24] := 0;
+  PutU32(FBuf, pos + 28, 0);
+  PutU64(FBuf, pos + 32, AEngineLsn);
+  PutU32(FBuf, pos + VDBLOG_REC_HDR, LongWord(FGroup.Count));
+  PutU32(FBuf, pos + recLen - 4, VDbCrc32Of(FBuf[pos], recLen - 4));
+  Inc(pos, recLen);
   if pos <> total then
   begin
     AbortGroup;

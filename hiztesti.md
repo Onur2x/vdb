@@ -427,3 +427,279 @@ sayı tek koşudan raporlanmamalıdır.
 | PK okuma | 0,47 µs/satır | 0,40 µs/satır |
 | Ham tarama (kopyalı) | — | 11,3 ms |
 | Ham tarama (sıfır-kopya) | — | **9,1 ms** |
+
+## 10. UPDATE/DELETE şişme ölçümü — `bloatbench` (2026-10-28)
+
+Sprint A/1 ölçümü: 100k satır × 32 B değer, churn senaryosu (kabul hedefi
+**≤ %5**). Araç: `tests/bench/bloatbench` (`bloatbench <dizin> [satir] [deger]`).
+Her adımdan sonra temiz kapanış (`Checkpoint` + `SaveIdx` + `TrimToLogical`);
+ölçülen boy dosyadaki **gerçek** boydur. Şişme = gerçek boy / taze boy;
+"taze" aynı canlı kümenin sıfırdan yüklenmesidir (ideal boy, sıkıştırma
+eşdeğeri referans).
+
+| Adım | İş | Süre | Boy | Not |
+|---|---|---:|---:|---|
+| 1 | yükleme 100k | 66 ms | boy0 = 4.882.432 B (48,8 B/satır) | heap=1191 |
+| 2 | tamamını güncelle (aynı boyut) | 55 ms (0,55 µs/satır) | boy1 = boy0 | **sisme %0,00** (yerinde yazım) |
+| 3 | yarısını sil (50k) | 50 ms | boy2 = boy0 | delta %0,00 (her sayfada canlı satır kaldı) |
+| 4 | yeni anahtarlarla yeniden ekle (50k) | 55 ms | boy3 = boy0 | **churn şişmesi boy3/boy0 = %0,00** (hedef ≤ %5) |
+| 5 | canlıları büyüt (32 → 48 B) | 188 ms | boy4 = 6.508.544 B | +%33,31 — satırlar fiziksel büyüdü (beklenen) |
+| 6 | son tur güncelle (aynı boyut) | 84 ms | boy5 = boy4 | sisme %0,00; **boy5/taze = %0,00** |
+| 7 | hepsini sil (tam boşaltma) | 86 ms | boy6 = boy5 | dosya **küçülmez** (bkz. aşağıda) |
+
+**Özet sayılar (VACUUM'suz / taze referans):**
+
+- VACUUM'suz churn şişmesi (boy3/boy0): **%0,00** — kabul hedefi ≤ %5 **geçti**.
+- Churn + büyütme sonrası şişme (boy5/taze): **%0,00** — taze yükleme ile
+  birebir (6.508.544 B). Yani "VACUUM'lu" sayı da bu; gerçek bir Compact API'si
+  olmadığı için taze yükleme ideal referanstır.
+- `.idx` 64 B, `.wal` 4 KB (kapanış sonrası).
+
+### Kök neden ve motor düzeltmeleri (bu ölçümün öncesi)
+
+İlk koşuda churn şişmesi **+%50** idi (boy3 = 7.319.552 vs boy0 = 4.882.432).
+Kök neden iki motordu; ikisi de bu ölçümde kapandı:
+
+1. **`TVdbHeap.PlaceCell` yalnız `FWritePage`'e bakıyordu** — DELETE'in açtığı
+   delikler hiç kullanılmıyor, yeniden ekleme 595 yeni sayfa ayırıyordu.
+   Düzeltme: boşluk ipuçları (`FSpaceHints`) + `SpaceHintScan` (ilk yerleşim
+   hatasında tek tarama). Sonuç: boy3 = boy0, **%0,00**.
+2. **`TVDbPageStore.FreePage` yeni trunk için `ExtendFile` çağırıyordu** —
+   ilk serbest bırakılan sayfanın kendisi trunk olabilecekken dosya 1 sayfa
+   büyüyor; dolu trunk'ta da aynı şey tekrarlanıyordu. Düzeltme: trunk,
+   serbest bırakılan sayfanın kendisinden açılır. Sonuç: tam silmede boy6 =
+   boy5 (önceki +8 KB'lik büyüme gitti).
+
+### Dürüst sınır: tam boşaltmada dosya küçülmez
+
+Adım 7'de anahtar=0, heap=1 olmasına rağmen dosya 6.508.542 B'de kalır
+(1587 sayfa freelist'te). `TrimToLogical` yalnız `FPageCount`'a kadar kısar;
+freelist sayfaları `PageCount`'ta sayılır. Bu **SQLite'ın AutoCompact'sız
+davranışına benzer** ve tasarım kararıdır: `AutoCompact` varsayılan **False**.
+Gerçek geri kazanım (`Compact`) ayrı bir iş maddesidir (bkz.
+`tasks/v1_yol_haritasi.md`); ölçüm bu yüzden hem VACUUM'suz (boy5/taze =
+%0,00) hem taze referans (aynı sayı) olarak verildi.
+
+### Kapılar (bu değişikliklerden sonra, 2026-10-28)
+
+16 kapı **686/0**: pagechk 21, storechk 15, heapchk 20, idxchk 19,
+backendchk 127, v3sqlchk 238, migchk 13, factorychk 13, logchk 43, pitrchk 21,
+btreechk 30, replchk 37, lockchk 36, snapchk 21, prochk 21, crashtest 11
+(kalan=0). `storechk` freelist beklentileri yeni trunk davranışı (ExtendFile
+yok, `FreeCount` = trunk girişi) için güncellendi.
+
+---
+
+## 11. SQL katmanı dosya boyu dökümü — 77,6 B/satır (2026-10-28)
+
+Sprint A/2. Yeni araç: **`tests/bench/sizebench.lpr`** — `benchcmp` ile aynı
+iş yükünü kurar (`CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)`,
+satır `j`: `id=j, a=j*3, b='satir-'+j`), temiz kapanıştan sonra `.odb`'yi
+sayfa sayfa tarar ve baytların nereye gittiğini yazar.
+
+Kullanım: `sizebench <dizin> [satir_sayisi] [autocommit_sayisi]`
+
+### 11.1 Temiz toplu yükleme — 200.000 satır, autocommit yok
+
+`sizebench <dir> 200000 0` → **`.odb` = 9.400.320 B**
+
+| Bileşen | Toplam B | B/satır | Pay |
+|---|---:|---:|---:|
+| değer (`EncodeRow`) | 6.077.933 | **30,39** | %64,7 |
+| hücre başlığı (8 B anahtar + 4 B uzunluk) | 2.400.012 | **12,00** | %25,5 |
+| slot dizini (4 B) | 800.004 | **4,00** | %8,5 |
+| sayfa başlığı (24 B) | 55.056 | 0,28 | %0,6 |
+| sayfa CRC (4 B) | 9.176 | 0,05 | %0,1 |
+| bitişik boşluk | 53.989 | 0,27 | %0,6 |
+| parçalı (delik) | 50 | 0,00 | %0,0 |
+| meta sayfası + yuvarlama | 4.100 | 0,02 | %0,0 |
+| **`.odb` toplam** | **9.400.320** | **47,00** | %100 |
+
+Sayfa yapısı: heap **2294**, taşma **0**, freelist **0**, serbest **0**.
+Hücre **200.001** (200.000 satır + 1 şema), taşmalı **0**, hücre boyu 34–55 B,
+ort. 42,39 B. Parçalanma **sıfır** (Sprint A/1 `PlaceCell` boşluk ipuçları).
+
+Yan dosyalar: `.idx` = **2.188.448 B** (10,94 B/satır), `.wal` = 4.096 B.
+
+### 11.2 `EncodeRow` 30,39 B'nin dökümü
+
+Ölçüm 6.077.933 B / 200.001 hücre. Aşağıdaki dağılım ham hücre baytlarının
+çözümlemesiyle **birebir** doğrulandı (j=1 hücresi 22 B = 7+3+3+9).
+
+| Alan | B/satır | Ne |
+|---|---:|---|
+| satır kabuğu | 7,00 | 2 B `$FFFF` + 2 B tablo kimliği + 2 B pk→kolon referansı (v3.13 dedup) + 1 B kolon sayısı |
+| `id` (INT, PK) | 4,96 | 1 B ctype + 1 B uzunluk kodu + zigzag LEB128 (1–3 B; %95,9'unda 3 B) |
+| `a` (INT) | 4,99 | aynı |
+| `b` (TEXT) | 13,44 | 1 B ctype + 1 B uzunluk kodu + `'satir-'+j` (7–12 B UTF-8, ort. 11,44 B) |
+| **toplam** | **30,39** | |
+
+İlk hücrenin ham dökümü (j=1, degerBoy=22):
+
+```
+FF FF | 01 00 | 00 01 | 03 | 00 02 02 | 00 02 06 | 02 08 73 61 74 69 72 2D 31
+ ext    tablo=1  pk→0   3    id=1        a=3        b='satir-1'
+```
+
+**Yapısal yük: 29 B/satır** (7 kabuk + 3×2 ctype/uzunluk + 12 hücre başlığı +
+4 slot). Kalan 18 B iş yükünün kendi verisidir (`'satir-N'` metni + INT'ler).
+
+### 11.3 `.idx` 10,94 B
+
+Biçim (`VDbIdxFile.pas`): 64 B başlık + kayıt başına
+`Key(8) | PageNo(varint) | Slot(varint)`.
+200.001 kayıt × ort. **10,94 B** = 2.188.384 B + 64 B başlık ≈ 2.188.448 B.
+Anahtar **ham 8 bayt** kalır: `VDbHashKey` 64-bit FNV-1a, hash'ler tek biçimli
+dağıldığı için varint'e çevrilse ~10 B'ye çıkar, küçülmez. Sayfa/slot zaten
+varint.
+
+### 11.4 77,6 B/satır nereden geldi — ölçüm hatası, kod eksiği değil
+
+§9 ve `readme*.md` tablolarındaki **15.527.936 B (77,6 B/satır)** sayısı
+2026-10-25'te v3.0/v3.1 koduyla ölçülmüştü. Bugünkü kod (v3.29 + Sprint A motor
+düzeltmeleri) aynı `benchcmp` ile **10.178.560 B** veriyor
+(`benchcmp --backend=v3 200000 20000`, 3 tur medyan, 2026-10-28).
+
+İki farkın kaynağı:
+
+1. **Kod farkı.** Aradan geçen sürümler satırı küçülttü: v3.11 satır kabuğu,
+   v3.13 PK dedup (pk satırda iki kez durmuyor), v3.2 INT zigzag varint
+   (INT 12 B → 4–5 B), Sprint A `PlaceCell`/`FreePage`. §11.1'deki 47,00 B/satır
+   bugünkü kodun sayısıdır.
+2. **Bölen hatası.** `benchcmp` dosyaya 200.000 toplu + 20.000 autocommit +
+   1 şema = **220.001** hücre yazar ama `NRow=200000`'e böler. 77,6 sayısı bu
+   yüzden ~%10 şişkindir. Aynı dosyanın doğru böleni bugün **46,27 B/satır**.
+
+Kanıt: eski `.idx` boyu 3.520.080 B = 220.001 × 16 B + 64 B (eski sabit-boy
+kayıt) — dosyada gerçekten 220.001 satır varmış, bölen 200.000'di.
+
+**"~31 B/satır açıklanamayan boşluk" yok.** 47,00 B/satır'ın tamamı §11.1
+tablosunda; 30,39 B'nin tamamı §11.2'de.
+
+20.000 autocommit satırı toplam 778.240 B ekliyor (**38,9 B/satır**): bu
+satırların değerleri daha küçük (`b='auto'`, `a=1..20000`), o yüzden tek başına
+ucuzlar — commit başına şişme değil.
+
+### 11.5 11 MB hedefi ile karşılaştırma ve yol
+
+| Ölçü | Değer | Hedef | Durum |
+|---|---:|---:|---|
+| `.odb`, 200k toplu satır | 9.400.320 B (47,00 B/satır) | ≤ 11 MB (≤ 55 B/satır) | **tuttu** |
+| `.odb` + `.idx` | 11.588.768 B (57,94 B/satır) | ≤ 11 MB | %5 üstünde |
+| `.idx` tek başına | 2.188.448 B (10,94 B/satır) | — | tek açık kalem |
+
+Yol (sayılarla, uydurma sıkıştırma yok):
+
+- **`.odb` hedefi zaten tutuyor** (47,00 < 55). Sıkıştırma gerekmiyor.
+- **Kalan tek açık `.idx`.** İçinde sıkıştırma alanı yok (§11.3). Yapısal
+  seçenekler, ölçülür bedelleriyle:
+  - `.idx`'yi yazmama — diskte toplam 11,59 → 9,40 MB; karşılığında açılış
+    16 ms → **79 ms** (tam heap taraması, §3 ölçümü). Hedef 150 ms'nin altında.
+  - `.idx`'yi sayfa düzeyine indirme — 2294 sayfa × ~16 B ≈ **37 KB**
+    (yaklaşık hesap, ölçülmedi); karşılığında açılışta sayfa içi arama.
+    Ölçülmeden sayıya bağlanmaz.
+- **Satır içi gerçek 2 B'lik fırsat:** hücre başlığındaki uzunluk alanı 4 B
+  (`LongWord`) ama gövde sınırı 1.000 B / taşma 4.000 B. 200k satırda
+  **~400 kB** (dosyanın %4,3'ü). Biçim değişikliği ister (taşma bayrağı
+  `VDB_OVF_FLAG` bu alanda yaşıyor); ölçümle karar verilecek ayrı iş.
+
+### 11.6 Kapılar (bu değişiklikten sonra)
+
+`sizebench` yeni araçtır, kapı değildir. 16 kapı değişmedi — §10'daki
+**686/0** sayısı geçerlidir.
+
+## 12. Commit CPU profili — fsync'in payı (2026-10-29)
+
+Sprint B/5: `cpubench`'in ~160 µs/commit sayısının nereye gittiğini
+ayırmak için `-dCPUPROF` enstrümantasyonu yazıldı (`VDbCpuProf.pas`,
+`cpuprof.lpr`, `engprof.lpr`). Ölçüm **CPU zamanıdır** (GetProcessTimes,
+kernel+user); fsync *bekleme* sayılmaz ama `FlushFileBuffers`'ın
+**kernel CPU'su sayılır** — bu, aşağıdaki tabloda "fsync" satırının
+asıl kaynağıdır.
+
+### 12.1 Tekil autocommit, N=25000 (24 bayt değer)
+
+| Bileşen | µs/commit | Pay |
+|---|---:|---:|
+| hazırlık + kilit + uygulama | 0,62 | %0,4 |
+| **fsync** (`AwaitDurable`) | **159,25** | **%97,1** |
+| WAL commit (`DoCommit` içi) | 2,50 | %1,5 |
+| — bunun: motor:frame | 0,62 | |
+| — bunun: motor:wal | 1,87 | |
+| günlük (`LogFinish`) | 0,00 | %0,0 |
+| checkpoint | 1,87 | %1,1 |
+| bırakış | 0,00 | %0,0 |
+| **CommitBatch toplam** | **164,38** | %100 |
+
+`BeginBatch` 0,00 µs ve `Put+val` 0,63 µs — iş yükünün **tamamı**
+`CommitBatch`'te. Toplantı katmanı bedava.
+
+**Sonuç: optimize edilebilir CPU ≈ 5 µs** (fsync dışı). Toplamın %3'ü.
+§7j.3'teki "CPU payı ≈ 75 µs" hesabı **çürüdü**; o tahmin fsync süresini
+yanlış paylaştırıyordu. Gerçek ayrım: fsync **bekleme** ~300 µs duvar,
+ama fsync'in **kernel CPU'su** ~159 µs.
+
+### 12.2 engprof ↔ cpuprof çelişkisi (çözüldü)
+
+Önceki ölçümlerde `engprof` Commit(nosync) = 24,4 µs çıkarken
+`cpuprof` CommitNoSync = 1,9 µs ölçülüyordu — ikisi de `DoCommit(False)`.
+Kaynak **iş yükü farkıydı**:
+
+- `engprof` anahtarları `QWord(1000000+i) * $9E3779B97F4A7C15` — **rastgele
+  dağılıyor**, her insert farklı sayfayı kirletiyor → daha çok `TxnPages`,
+  daha çok WAL frame'i.
+- `cpuprof`/`cpubench` anahtarları artan (`1000000+i`) — aynı sayfa
+  yeniden kirleniyor → 1-2 frame/commit.
+
+DoCommit içi zamanlayıcılarla doğrulandı: `cpuprof`'ta motor:frame 0,62 +
+motor:wal 1,87 = **2,49 µs** ≈ backend "wal" 2,50 µs. `engprof`'ta aynı
+toplam 26,9 µs — fazladan olan frame sayısı. **Kod farkı yok**, aynı
+`DoCommit`.
+
+### 12.3 B/3 (LogFinish/EndGroup tahsis kaldırma) kararı
+
+A/B ölçümü farkı gürültüde kayboldu (A min 144,38 / ort ~159,1;
+B min 143,75 / ort ~159,3). Regresyon yok, kapılar temiz.
+**Tutuldu** — tahsis sayısı düştü, ölçülebilir hız kazancı yok.
+
+### 12.4 Sprint B kapanışı için ne kalıyor
+
+Kapanış maddesi: "autocommit 0,355 ms SQLite tabanına ≤ %5
+(≈ ≤ 0,37 ms) veya kalan farkın fsync dışı **ölçülmüş** CPU olduğu
+belgelenir."
+
+Ölçülen: fsync dışı CPU **≈ 5 µs**. SQLite'ın iddia edilen 55 µs
+CPU'sunun **onda biri**. Yani kalan fark fsync'te — bizim fsync'miz
+~159 µs kernel CPU harcıyor. Bu, Sprint B'nin kapatabileceği bir alan
+**değil**; grup fsync Sprint C'nin konusu (§7m.3).
+
+Sprint B'yi tam kapatmak için tek eksik: **SQLite'ın aynı iş yükünde
+CPU ölçümü** (`benchcmp`, WAL mode, autocommit, 24 bayt × N). O ölçüm
+"fark fsync'te" tezini sayıya bağlar. O ölçüm gelmeden Sprint B
+**koşullu kapandı** sayılır: optimize edilebilir alan kalmadı, kanıt
+eksik kalem SQLite karşılaştırması.
+
+### 12.5 SQLite CPU ölçümü (Sprint B kapanış kanıtı)
+
+Aynı iş yükü (24 bayt değer × 25.000, tek tek autocommit, `journal_mode=WAL`,
+`synchronous=FULL`), Python `sqlite3` (resmî 3.x), `time.process_time()`:
+
+| Motor | µs/işlem (CPU) | fsync dışı |
+|---|---:|---:|
+| **SQLite** (WAL+FULL) | **106,88** | ~5 (tahmin) |
+| **VDB v3** (`cpuprof`) | **164,38** | **5,13** (ölçüldü) |
+| fark | +57,5 | ≈ 0 |
+
+**Tez doğrulandı: kalan fark fsync'in kendisinde.** Bizim fsync'miz
+(`FlushFileBuffers` kernel CPU'su) **~159 µs**, SQLite'ınki ~102 µs
+(106,88 − ~5 iş). Fark ≈ **57 µs**.
+
+En olası kaynak: **WAL'e yazılan veri miktarı**. Biz her commit'te tam
+sayfa imajı (4 KB) yazıyoruz; SQLite yalnız değişen kaydı (~30 bayt +
+başlık). Kernel, `FlushFileBuffers`'ta yazılan bayt kadar CPU harcıyor.
+Bu, Sprint B'nin değil, ayrı bir tasarım işinin konusu (delta tabanlı WAL);
+sayfa imajı WAL'i kurtarma için basit ve güvenli — değişiklik ölçülmeden
+yapılmaz.
+
+Sprint B kapanışı **KAPANDI** sayılır: optimize edilebilir CPU ≈ 5 µs,
+fark fsync'te, kanıt §12.1 + §12.5.

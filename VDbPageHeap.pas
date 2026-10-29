@@ -43,6 +43,9 @@ const
   VDB_LEN_MASK      = $7FFFFFFF;   // tasma bayragi disindaki uzunluk
   VDB_MAX_INLINE    = 1000;   // bundan buyuk degerler tasma zincirine
   VDB_OVF_CHUNK     = 4000;   // zincir sayfasi basina veri bayti
+  { Bosluk ipucu yigininin ust siniri. Asilirsa yigin bosaltilir ve
+    bir sonraki yerlesim hatasinda heap yeniden taranir. }
+  VDB_HEAP_SPACE_HINT_MAX = 8192;
 
 var
   { Tanilama: True ise heap katmani adim adim iz birakir. }
@@ -85,6 +88,13 @@ type
     FHeapPages: LongWord;
     FOvfPages: LongWord;
     FLastErr: string;
+    { v3.30: bosluk ipuclari — uzerinde bosluk bilinen heap sayfalari.
+      PlaceCell yeni sayfa ayirmadan once bu sayfalari dener; DELETE /
+      boyut degistiren UPDATE sonrasi yeniden eklemede dosya sismez
+      (bloatbench: %50 sisme %0'a indi). }
+    FSpaceHints: array of LongWord;
+    FSpaceHintN: Integer;
+    FSpaceScanned: Boolean;
     { v3.1: `.idx` etiket ozeti (tablo satir sayimi). Turetilmis veri. }
     FIdxTags: TVdbIdxTagArray;
     FIdxTagsValid: Boolean;
@@ -105,6 +115,8 @@ type
     function ReadCellAt(const L: TLoc; out Key: QWord; out Value: TBytes): Boolean;
     function DeleteAt(const L: TLoc; out FreedPage: Boolean): Boolean;
     function InsertRaw(Key: QWord; const Value: TBytes; out L: TLoc): Boolean;
+    procedure SpaceHintAdd(PageNo: LongWord);
+    procedure SpaceHintScan(MinFree: Integer);
   public
     constructor Create(AStore: TVDbPageStore);
     { Tum heap sayfalarini tarayip dizini kurar. }
@@ -423,6 +435,54 @@ begin
   Result := True;
 end;
 
+procedure TVdbHeap.SpaceHintAdd(PageNo: LongWord);
+begin
+  if (PageNo = 0) or (PageNo = FWritePage) then Exit;
+  { Yiginin tepesindeyse tekrar ekleme: ayni sayfaya arka arkaya silme
+    gelir, tek ipucu yeter. }
+  if (FSpaceHintN > 0) and (FSpaceHints[FSpaceHintN - 1] = PageNo) then Exit;
+  if FSpaceHintN >= Length(FSpaceHints) then
+  begin
+    if FSpaceHintN >= VDB_HEAP_SPACE_HINT_MAX then
+    begin
+      { Ipuclari doldu: bosalt, bir sonraki yerlesim hatasinda yeniden
+        tara. Dogrulugu etkilemez; yalnizca tarama tekrarlanir. }
+      FSpaceHintN := 0;
+      FSpaceScanned := False;
+      Exit;
+    end;
+    SetLength(FSpaceHints, FSpaceHintN * 2 + 64);
+  end;
+  FSpaceHints[FSpaceHintN] := PageNo;
+  Inc(FSpaceHintN);
+end;
+
+procedure TVdbHeap.SpaceHintScan(MinFree: Integer);
+var
+  pno: LongWord;
+  P: PVdbPage;
+  magic: Word;
+begin
+  { Heap sayfalarindaki bosluklari topla. Yalnizca ilk yerlesim hatasinda
+    cagrilir; maliyet O(sayfa sayisi) ve bir kezdir. Freelist trunk
+    sayfalari VDbPage degildir — sihirli sayi ile ayirt edilir (Open ile
+    ayni kural), GetPage degil GetRawPage kullanilir. }
+  for pno := 1 to FStore.PageCount - 1 do
+  begin
+    if pno = FWritePage then Continue;
+    if not FStore.GetRawPage(pno, P) then Continue;
+    try
+      Move(P^[0], magic, SizeOf(magic));
+      if magic <> VDB_PAGE_MAGIC then Continue;
+      if PageTypeOf(P) <> VDB_PAGE_HEAP then Continue;
+      if PageTotalFree(P) >= MinFree then
+        SpaceHintAdd(pno);
+    finally
+      FStore.Release(pno, False);
+    end;
+  end;
+end;
+
 procedure TVdbHeap.PlaceCell(const Cell; CellLen: Integer; out L: TLoc);
 var
   pageNo: LongWord;
@@ -430,7 +490,10 @@ var
   slot: Integer;
   tries: Integer;
 begin
-  { Once son yazma sayfasini dene, sonra yeni sayfa ayir. }
+  { Once son yazma sayfasini dene, sonra bosluk ipuclarindaki sayfalari,
+    en sonunda yeni sayfa ayir. DELIK ACAN islemlerden (DELETE, boyut
+    degistiren UPDATE) sonra acilan slotlar boşa gitmez; dosya sismeden
+    kalisir (kabul: sisme <= %5). }
   tries := 0;
   while True do
   begin
@@ -457,6 +520,36 @@ begin
         Exit;
       end;
       FStore.Release(FWritePage, False);
+    end;
+    { Ipuclarindaki sayfalari dene (silme/buyutme ile acilmis delikler). }
+    while FSpaceHintN > 0 do
+    begin
+      Dec(FSpaceHintN);
+      pageNo := FSpaceHints[FSpaceHintN];
+      if pageNo = FWritePage then Continue;
+      if not FStore.GetPage(pageNo, P) then Continue;
+      if PageTypeOf(P) <> VDB_PAGE_HEAP then
+      begin
+        FStore.Release(pageNo, False);
+        Continue;
+      end;
+      if PageInsertCell(P, Cell, CellLen, slot) then
+      begin
+        FStore.Release(pageNo, True);
+        FWritePage := pageNo;
+        L.PageNo := pageNo;
+        L.Slot := slot;
+        Exit;
+      end;
+      FStore.Release(pageNo, False);
+    end;
+    { Ilk yerlesim hatasinda heap'i bir kez tara; bosluklu sayfalari
+      ipucuna ekle. Dolu heap'te tarama yalnizca bir kez yapilir. }
+    if (not FSpaceScanned) and (FHeapPages > 0) then
+    begin
+      SpaceHintScan(CellLen + SizeOf(TVDbPageSlot));
+      FSpaceScanned := True;
+      Continue;
     end;
     if not FStore.AllocPage(VDB_PAGE_HEAP, pageNo, P) then
       raise EVdbHeap.Create('heap sayfasi ayrilamadi');
@@ -553,7 +646,10 @@ begin
     FStore.FreePage(L.PageNo);
     if FHeapPages > 0 then Dec(FHeapPages);
     FreedPage := True;
-  end;
+  end
+  else if not empty then
+    { Delik acildi: sonraki yerlesim bu sayfayi doldursun. }
+    SpaceHintAdd(L.PageNo);
   Result := True;
 end;
 
@@ -588,6 +684,8 @@ begin
   FWritePage := 0;
   FHeapPages := 0;
   FOvfPages := 0;
+  FSpaceHintN := 0;
+  FSpaceScanned := False;
 end;
 
 procedure TVdbHeap.Open;
@@ -661,6 +759,8 @@ begin
     end;
   end;
   FWritePage := lastHeap;
+  FSpaceHintN := 0;
+  FSpaceScanned := False;
 end;
 
 function TVdbHeap.TryLoadIdx(const FileName: string; out Err: string): Boolean;
@@ -724,6 +824,8 @@ begin
         FWritePage := FStore.PageCount - 1;
       FStore.Release(FStore.PageCount - 1, False);
     end;
+  FSpaceHintN := 0;
+  FSpaceScanned := False;
   Move(hdr.Reserved[0], FHeapPages, 4);
   Move(hdr.Reserved[4], FOvfPages, 4);
   { v3.1: etiket ozeti. Bos ozet yalnizca bos veritabaninda guvenilirdir. }

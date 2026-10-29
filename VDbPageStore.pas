@@ -2332,7 +2332,7 @@ end;
 
 procedure TVDbPageStore.FreePage(PageNo: LongWord);
 var
-  trunk, newTrunk, cnt: LongWord;
+  trunk, cnt: LongWord;
   P: PVdbPage;
   e: string;
 begin
@@ -2347,17 +2347,21 @@ begin
   trunk := FFreeTrunk;
   if trunk = 0 then
   begin
-    { Ilk trunk: dosya sonuna ekle. }
-    ExtendFile(newTrunk);
-    if not GetPageInternal(newTrunk, False, P) then
+    { Ilk trunk: serbest birakilan sayfanin KENDISINI trunk yap.
+      Eski yol ExtendFile ile dosyayi 1 sayfa buyutuyordu (bloatbench:
+      tam silmede bosuna +8 KB). Trunk sayfalari FreeCount'a girmez. }
+    if not GetPageInternal(PageNo, False, P) then
       raise EVdbPageStore.Create('FreePage: trunk sayfasi olusturulamadi');
-    TrunkInit(P, newTrunk, 0);
-    Release(newTrunk, True);
-    FFreeTrunk := newTrunk;
-    trunk := newTrunk;
+    TrunkInit(P, PageNo, 0);
+    Release(PageNo, True);
+    FFreeTrunk := PageNo;
+    FMetaDirty := True;
+    FStructDirty := True;
+    Exit;
   end;
 
-  { Trunk sayfalari VDbPage formati kullanmaz; dogrulamayi TrunkCheck yapar. }  if not GetPageInternal(trunk, False, P) then
+  { Trunk sayfalari VDbPage formati kullanmaz; dogrulamayi TrunkCheck yapar. }
+  if not GetPageInternal(trunk, False, P) then
     raise EVdbPageStore.Create('FreePage: trunk okunamadi');
   if not TrunkCheck(P, e) then
   begin
@@ -2368,18 +2372,17 @@ begin
   cnt := TrunkGet(P);
   if cnt >= LongWord(VDB_TRUNK_MAX) then
   begin
-    { Trunk dolu: yeni trunk basa ekle. }
+    { Trunk dolu: serbest birakilan sayfayi YENI trunk yap (dosya buyumesin).
+      ExtendFile yerine PageNo kullanilir; trunk FreeCount'a girmez. }
     Release(trunk, False);
-    ExtendFile(newTrunk);
-    if not GetPageInternal(newTrunk, False, P) then
+    if not GetPageInternal(PageNo, False, P) then
       raise EVdbPageStore.Create('FreePage: yeni trunk olusturulamadi');
-    TrunkInit(P, newTrunk, trunk);
-    Release(newTrunk, True);
-    FFreeTrunk := newTrunk;
-    trunk := newTrunk;
-    if not GetPageInternal(trunk, False, P) then
-      raise EVdbPageStore.Create('FreePage: yeni trunk okunamadi');
-    cnt := 0;
+    TrunkInit(P, PageNo, trunk);
+    Release(PageNo, True);
+    FFreeTrunk := PageNo;
+    FMetaDirty := True;
+    FStructDirty := True;
+    Exit;
   end;
 
   TrunkSetEntry(P, cnt, PageNo);
