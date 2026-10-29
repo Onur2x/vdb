@@ -556,6 +556,11 @@ type
 
 implementation
 
+{$IFDEF CPUPROF}
+uses
+  VDbCpuProf;
+{$ENDIF}
+
 var
   { v3.2: AS OF gecici dosya adlari icin surec ici sayac (okuyucular PARALEL
     calisir; sabit ad cakismaya ve yarisa yol acardi). }
@@ -2318,7 +2323,13 @@ var
   i: Integer;
   fpair: TPair<Cardinal, TWriteSet>;
   syncLsn: LongWord;
+{$IFDEF CPUPROF}
+  p0, p1, p2, p3, p4, p5, p6, p7, p8, p9: Int64;
+{$ENDIF}
 begin
+{$IFDEF CPUPROF}
+  p0 := CpuProfNow;
+{$ENDIF}
   RequireWritable;
   s := OwnSet;
   if s = nil then Exit;
@@ -2413,6 +2424,9 @@ begin
       cevrilmesi yok. }
     ReleaseSet(s);
     s := nil;
+{$IFDEF CPUPROF}
+    p1 := CpuProfNow; CP[0] := CP[0] + (p1 - p0);   // hazirlik+kilit+uygulama
+{$ENDIF}
     if FDirty then
     begin
       { v3.19 GRUP COMMIT: WAL'e yaz ama fsync ETME. fsync kritik bolumun
@@ -2420,8 +2434,14 @@ begin
         eden thread'ler TEK fsync'i paylasir (olculen: fsync commit'in
         ~%60'i; P=4'te 1,05x'ten fazlasi hedeflenir). }
       FEng.CommitNoSync(syncLsn);
+{$IFDEF CPUPROF}
+      p2 := CpuProfNow; CP[1] := CP[1] + (p2 - p1);
+{$ENDIF}
       FDirty := False;
       LogFinish;
+{$IFDEF CPUPROF}
+      p1 := CpuProfNow; CP[2] := CP[2] + (p1 - p2);
+{$ENDIF}
       { MaybeCheckpoint kendi icinde WAL bariyerini (AwaitDurable) yapar;
         WAL budanirsa syncLsn zaten durabil hale gelir. }
       MaybeCheckpoint;
@@ -2431,17 +2451,29 @@ begin
         fsync etti. }
       if MaybeAutoCompact then
         syncLsn := 0;
+{$IFDEF CPUPROF}
+      CP[3] := CP[3] + (CpuProfNow - p1);
+{$ENDIF}
     end;
   finally
     FEng.Store.ReleaseDataWrite;
     FEngCs.Leave;
   end;
+{$IFDEF CPUPROF}
+  p1 := CpuProfNow;
+{$ENDIF}
   { v3.19: durabilite beklemesi kilitlerin DISINDA. }
   if syncLsn <> 0 then
   begin FEng.AwaitDurable(syncLsn); end;
+{$IFDEF CPUPROF}
+  p2 := CpuProfNow; CP[4] := CP[4] + (p2 - p1);
+{$ENDIF}
   finally
     FEng.Store.ReleaseWriteHold;
   end;
+{$IFDEF CPUPROF}
+  CP[5] := CP[5] + (CpuProfNow - p2);
+{$ENDIF}
 end;
 
 procedure TVdbBackendV3.AbortBatch;

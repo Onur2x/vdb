@@ -104,6 +104,7 @@ type
     procedure OnSpill(PageNo: LongWord; P: PVdbPage);
     function OnMiss(PageNo: LongWord; P: PVdbPage): Boolean;
     procedure ApplyRecovered(PageNo: LongWord; P: PVdbPage);
+    procedure ApplyRecoveredView(PageNo: LongWord; P: PVdbPage);
     procedure ApplyReadOnly(PageNo: LongWord; P: PVdbPage);
     { v3.16: sayfa deposu "baska surec commit etti" dediginde WAL
       gorunumunu tazele. }
@@ -114,7 +115,7 @@ type
     procedure ClearPending;
     { v3.29: tazelemede tam Checkpoint yerine yalnizca tahliye edilmis
       imajlari onbellege kurar (diske yazma/fsync/WAL budama YOK). }
-    procedure InstallPending;
+    procedure InstallPending(AViewOnly: Boolean = False);
     function GetIdxTagsValid: Boolean;
     { v3.3: veri degistiren commit'te damgayi ilerletir. }
     function NextDataStamp: QWord;
@@ -220,6 +221,11 @@ type
   end;
 
 implementation
+
+{$IFDEF CPUPROF}
+uses
+  VDbCpuProf;
+{$ENDIF}
 
 var
   { v3.3: her motor ornegine essiz bir damga tabani vermek icin. }
@@ -335,83 +341,126 @@ end;
 procedure TVdbPageEngine.StoreRefreshed(Sender: TObject);
 var
   st: TVdbWalStats;
+  needFull: Boolean;
 begin
   if (FWal = nil) or (FStore = nil) then Exit;
+  if FStore.Encrypted then
+    FWal.SetEncryptionKey(FStore.Key, FStore.Salt);
+
+  { ---- salt-okunur: imajlar FRoPages katmanina gider, tampon havuzunda
+        degildir. Bayat cerceve riski nedeniyle burada HER ZAMAN tam yol. }
   if FStore.ReadOnly then
   begin
-    { v3.18: SALT-OKUNUR TAZELEME. Once RO oturum paylasimli kilidi oturum
-      boyu tuttugu icin baska bir surec commit EDEMEZD I; bu yol hic
-      calismiyordu. Artik RO da kilit alip birakiyor, dolayisiyla buraya
-      gelinebilir. Yapilan: bellek WAL imajlarini bosalt, WAL'i salt-okunur
-      yeniden ac ve cerceveleri BELLEK katmanina uygula (diske YAZILMAZ),
-      sonra heap dizinini yeniden kur.
-      ONEMLI: burada FStore.Flush/Truncate CAGRILMAZ - RO oturum diske
-      yazmaz (lockchk "RO oturum diskte hicbir bayt degistirmedi" kapisi). }
+    { v3.18: SALT-OKUNUR TAZELEME. RO oturum diske YAZMAZ (lockchk "RO
+      oturum diskte hicbir bayt degistirmedi" kapisi). v3.31: DropCache
+      buraya tasindi — tazeleme karari artik motorda. }
     FStore.ResetReadOnlyImages;
-    { v3.28: handle'lar KORUNUR (bkz TVdbPageWal.Refresh). Olculen: yeni
-      yazilmis bir dosyanin ilk yeniden acilisi 4-10 ms; tazeleme
-      maliyetinin %82'si yalnizca bu acilisti. Anahtar acikken tanimli. }
-    if FStore.Encrypted then
-      FWal.SetEncryptionKey(FStore.Key, FStore.Salt);
+    FStore.DropCache;
     FWal.Refresh(True);
     if FWal.HasContent then
     begin
-      { v3.29: artimsal — yalniz onbellekteki taban LSN'den YENI cerceveler
-        uygulanir. Eski cerceveler zaten veritabani dosyasinda. }
-      FWal.Recover(ApplyReadOnly, st, FRecoverLimit, FStore.LSN, True);
+      FWal.Recover(ApplyReadOnly, st, FRecoverLimit, 0, False);
       FWalStats := st;
-    end;
+      if st.Commits > 0 then
+        FStore.SetViewLsn(FWal.WrittenLsn);
+    end
+    else
+      FStore.SetViewLsn(FStore.LSN);
     if FHeap <> nil then
       FHeap.Open;
     Exit;
   end;
-  { Baska bir surec commit etti: bizim WAL handle'i ve tanimligi bayat.
-    Yeniden ac; varsa cerceveleri uygula (WAL cerceveleri sayfa imajidir,
-    yeniden uygulamak idempotenttir) ve buda. }
-  { v3.28: WAL'i kapatip yeniden ACMAK yerine handle'lar korunur (bkz
-    TVdbPageWal.Refresh). WAL dosyasi hicbir yerde silinmiyor; Truncate
-    yalniz SetEndOfFile kullaniyor, dolayisiyla handle gecerli kalir. }
-  if FStore.Encrypted then
-    FWal.SetEncryptionKey(FStore.Key, FStore.Salt);
+
+  { v3.28: WAL handle'lari KORUNUR (bkz TVdbPageWal.Refresh). }
   FWal.Refresh(False);
+
+  { v3.31 GUVENLIK KORUMASI.
+    Onbellek + heap dizini FStore.ViewLsn'e kadar tutarlidir.
+    FWal.HeaderLsn ise veri dosyasinin TAMAMEN guncel oldugu LSN'dir
+    (Truncate oncesinde dosya fsync edilmistir; WAL'in o kismi silinmistir).
+      * ViewLsn < HeaderLsn  ->  degisiklikler yalniz VERI DOSYASINDADIR,
+        WAL'den budanmistir. Onbellekten vazgectigimiz icin yalnizca WAL'e
+        bakmak YETMEZ: bayat cerceve = veri bozulmasi. TAM yol (DropCache).
+      * ViewLsn >= HeaderLsn  ->  yeni cerceveler WAL'dedir; artimsal yol
+        guvenlidir (InstallPage yerinde tazeler).
+    v3.29'daki MinLSN = FStore.LSN yanlisti: LoadMeta onu diskteki META
+    LSN'ine cekiyor ve veri-yalniz commit'lerde meta GERIDE kalabiliyordu.
+    Artik taban ViewLsn'dir.
+    FRecoverLimit > 0 (AS OF) kismi kurtarmadir; delta yoluna girmez. }
+  needFull := (FRecoverLimit > 0) or (FStore.ViewLsn < FWal.HeaderLsn);
+
+  if needFull then
+  begin
+    FStore.DropCache;
+    if FWal.HasContent then
+    begin
+      { MinLSN = HeaderLsn: o LSN'e kadar zaten veri dosyasinda.
+        AIncremental: baslik LSN'i degistiyse (Truncate) Recover zaten
+        bastan tarar.
+        v3.31: yalnizca onbellege kur (paylasimli kilit altinda yazma
+        EWriteError uretir); imaj WAL'de fsync'li. }
+      FWal.Recover(ApplyRecoveredView, st, FRecoverLimit, FWal.HeaderLsn, True);
+      FWalStats := st;
+      if st.Commits > 0 then
+        FStore.SetLSN(FWal.WrittenLsn);
+      InstallPending(True);
+    end;
+    { Tam yeniden yukleme bitti: gorunum, veri dosyasinin duzeyidir.
+      Meta LSN'i geride kaldiysa (veri-yalniz commit'ler) burada
+      duzeltilir; aksi halde NextLSN LSN yeniden kullanimi yapardi. }
+    if FStore.LSN < FWal.HeaderLsn then
+      FStore.SetLSN(FWal.HeaderLsn);
+    FStore.SetViewLsn(FStore.LSN);
+    { v3.17: dizin (Anahtar -> sayfa/slot) ESKI kalirsa yazma, baska
+      surecin kullandigi sayfalari yeniden tahsis edip satirlari EZER
+      (prochk yakaladi). Tam yolda dizin bastan kurulur. }
+    if FHeap <> nil then
+    begin
+      if FInTxn or (FPendingCount > 0) then
+        raise EVdbPageEngine.Create(
+          'baska bir surec commit etti; acik islem varken onbellek ' +
+          'tazelenemez (islem kilidi tutulmamis)');
+      FHeap.Open;
+    end;
+    Exit;
+  end;
+
+  { ---- artimsal yol ----
+    Yalnizca ViewLsn'den SONRAKI cerceveler uygulanir. InstallPage yerlesik
+    cerceveyi yerinde tazeler, olmayani kurar; bayat cerceve kalmaz. }
   if FWal.HasContent then
   begin
-    { v3.29: ARTIMSAL uygulama — taban, onbellegin yuklendigi meta LSN'idir
-      (RefreshIfStaleForce once DropCache + LoadMeta yapar). Ondan eski
-      cerceveler zaten dosyada; yalniz deltalari uygula. }
-    FWal.Recover(ApplyRecovered, st, FRecoverLimit, FStore.LSN, True);
-    FWalStats := st;
-    { v3.29 — TAZELEMEDE CHECKPOINT KALDIRILDI (olculen: 6,65 -> 1,05 ms'lik
-      tazelemenin 0,80 ms'si tam checkpoint'ti; karisik okuma/yazmada her
-      okuma ifadesi bunu oduyordu: 1039 us/sorgu vs SQLite WAL 24 us).
+    { v3.29 — TAZELEMEDE CHECKPOINT KALDIRILDI (olculen: 6,65 -> 1,05 ms).
       NEDEN GUVENLI:
         * Uygulanan cerceveler WAL'de ve WAL commit'te fsync edilmis durumda;
           yani bu sayfalar icin tek durabil kaynak WAL'dir, dosya degil.
-        * InstallPage zaten sayfalari dosyaya yazar (yalniz fsync etmez).
+        * InstallPage(AViewOnly) yalniz onbellege kurar. Guncel sayfalarda
+          dosyadaki surum zaten yazanin commit'imajidir. YENI sayfalar
+          (dosyada olmayanlar) kirli isaretlenir; fiziksel buyume + yazma
+          bir sonraki Flush'te GrowTo ile yapilir.
         * WAL sinirsiz buyumez: her commit MaybeCheckpoint'i cagirir ve
-          8 MB'ta Checkpoint(True) WAL'i budar. Bu budama once
-          FStore.Flush(True) ile TUM dosyayi fsync eder, sonra keser;
-          dolayisiyla "sayfalar durabil olmadan WAL kesildi" durumu olusmaz
-          (fsync dosya duzeyinde calisir, hangi surec yazmis olursa olsun).
-        * Onceki yolun korunma nedeni (v3.18: Flush YALNIZ resident kirli
-          sayfalari yazar, pending imajlar diske gitmez) burada da gecerli;
-          bu yuzden pending imajlar YALNIZ onbellege kurulur
-          (InstallPending) — hicbir zaman "once pending'i at, sonra kes"
-          sirasi kurulmaz. }
-    InstallPending;
-  end;
-  { v3.17 DUZELTME — VERI KAYBI: yalnizca sayfa onbellegini tazelemek
-    YETMEZ. Heap'in bellek ici dizini (Anahtar -> sayfa/slot) hala ESKI;
-    bayat dizinle yazmak, baska surecin kullandigi sayfalari yeniden tahsis
-    edip SATIRLARINI EZER. prochk bunu CI'da yakaladi (A'nin 40 satiri
-    tamamen kayboldu, B'nin commit'i uzerine yazdi). Dizini yeniden kur. }
-  if FHeap <> nil then
-  begin
-    if FInTxn or (FPendingCount > 0) then
-      raise EVdbPageEngine.Create(
-        'baska bir surec commit etti; acik islem varken onbellek ' +
-        'tazelenemez (islem kilidi tutulmamis)');
-    FHeap.Open;
+          8 MB'ta Checkpoint(True) WAL'i budar; budama once FStore.Flush(True)
+          ile TUM dosyayi fsync eder.
+        * Pending imajlar yalniz onbellege kurulur (InstallPending). }
+    FWal.Recover(ApplyRecoveredView, st, FRecoverLimit, FStore.ViewLsn, True);
+    FWalStats := st;
+    if st.Commits > 0 then
+    begin
+      FStore.SetLSN(FWal.WrittenLsn);
+      FStore.SetViewLsn(FWal.WrittenLsn);
+    end;
+    InstallPending(True);
+    { v3.17: dizin bayat kalirsa yazma satir EZER. v3.31: tam tarama yerine
+      yalnizca DEGISEN sayfalar yeniden indesklenir (O(delta), DB boyundan
+      bagimsiz). Yalnizca gercekten uygulanan cerceve varsa gerekir. }
+    if (FHeap <> nil) and (st.Frames > 0) then
+    begin
+      if FInTxn or (FPendingCount > 0) then
+        raise EVdbPageEngine.Create(
+          'baska bir surec commit etti; acik islem varken onbellek ' +
+          'tazelenemez (islem kilidi tutulmamis)');
+      FHeap.ReindexPages(FWal.AppliedPages);
+    end;
   end;
 end;
 
@@ -421,6 +470,9 @@ var
   st: TVdbWalStats;
 begin
   FStore.OpenEx(ACreate, AReadOnly, ABusyMs);
+  { v3.31 (C/6): surecler arasi grup fsync. `.gen`'deki durabil LSN ile
+    baslat; boylece acilista fazladan fsync yapilmaz. }
+  FDurableLsn := FStore.DurableLsn;
   if FStore.Encrypted then
     FWal.SetEncryptionKey(FStore.Key, FStore.Salt);
   FWal.Open(AReadOnly);
@@ -452,6 +504,9 @@ begin
         katmaninda bellek imaji olarak tutulur ve okuma oradan karsilanir. }
       FWal.Recover(ApplyReadOnly, st, FRecoverLimit);
       FWalStats := st;
+      { v3.31: gorunum LSN'i kurtarilan son commit. RO oturum diske yazmaz. }
+      if st.Commits > 0 then
+        FStore.SetViewLsn(FWal.WrittenLsn);
       FHeap := TVdbHeap.Create(FStore);
       FIdxUsed := False;
       FIdxErr := '';
@@ -465,6 +520,15 @@ begin
     end;
     FWal.Recover(ApplyRecovered, st, FRecoverLimit);
     FWalStats := st;
+    { v3.31 LSN ESITLEME — GIZLI KUSUR (SetLSN hicbir yerde cagirilmiyordu):
+      Onbellek dolu bir WAL uzerinde acildiginda meta sayfadaki LSN,
+      son commit'in LSN'inde KALIYORDU (veri-yalniz commit'ler meta cercevesi
+      yazmaz). Sonra `Truncate(FStore.LSN)` o eski LSN'de kesiyor ve NextLSN
+      geride kalan degerden Inc ederek LSN YENIDEN KULLANIMI yaratiyordu.
+      Kurtarma sonrasi FLSN, gercek son commit LSN'ine esitlenir. }
+    if st.Commits > 0 then
+      FStore.SetLSN(FWal.WrittenLsn);
+    FStore.SetViewLsn(FStore.LSN);
     if st.Frames > 0 then
       FStore.Flush(True);
   end;
@@ -682,6 +746,14 @@ begin
   FStore.InstallPage(PageNo, P);
 end;
 
+{ v3.31 TAZELEME: yalnizca onbellege kurar, DISKE YAZMAZ. Tazeleme
+  paylasimli kilit altinda calisir; yazma Windows'ta kilit ihlali
+  (EWriteError) uretir. Imaj zaten WAL'de fsync'li. }
+procedure TVdbPageEngine.ApplyRecoveredView(PageNo: LongWord; P: PVdbPage);
+begin
+  FStore.InstallPage(PageNo, P, True);
+end;
+
 { v3.2 salt-okunur: WAL cercevesini DISKE YAZMADAN bellek katmanina alir. }
 procedure TVdbPageEngine.ApplyReadOnly(PageNo: LongWord; P: PVdbPage);
 begin
@@ -780,13 +852,20 @@ var
   target: LongWord;
   leader: Boolean;
   err: string;
+  shared: LongWord;
 begin
   { v3.19 GRUP COMMIT: TEK fsync, cok commit.
     Neden grup: olculen tek fsync bedeli 0,32 ms; commit basina bu bedeli
     odemek paralel yazimi serilestiriyordu (P=4 -> 1,05x). Burada ilk gelen
     lider olur, WAL'e o an yazilmis EN SON LSN'i hedefler ve tek fsync
     yapar; bu arada commit eden diger thread'lerin kayitlari da ayni
-    fsync'in kapsamina girer. Bekleyenler yalniz olayi bekler. }
+    fsync'in kapsamina girer. Bekleyenler yalniz olayi bekler.
+
+    v3.31 SURECLER ARASI GRUP FSYNC (C/6): ayni WAL dosyasini acan baska
+    bir process fsync yaptiginda bizim kayitlarimiz da o fsync'in
+    kapsamina girer (fsync dosya duzeyinde calisir, byte-araligi degil).
+    `.gen` eslemesindeki durabil LSN, son basarili fsync'in hedefidir;
+    monoton artar ve yalnizca fsync BASARILI olduktan sonra yazilir. }
   if ALsn = 0 then Exit;
   while True do
   begin
@@ -795,6 +874,13 @@ begin
     FSyncCs.Enter;
     try
       if FDurableLsn >= ALsn then Exit;
+      shared := FStore.DurableLsn;
+      if shared >= ALsn then
+      begin
+        if shared > FDurableLsn then
+          FDurableLsn := shared;
+        Exit;
+      end;
       if FSyncErr <> '' then
         raise EVdbPageEngine.Create('WAL fsync hatasi: ' + FSyncErr);
       if not FSyncBusy then
@@ -809,6 +895,23 @@ begin
 
     if leader then
     begin
+      { v3.31: lider secildikten sonra `.gen` yeniden kontrol edilir — o arada
+        baska bir process fsync ettiyse bizim fsync'imiz fazladan olur. }
+      shared := FStore.DurableLsn;
+      if shared >= target then
+      begin
+        FSyncCs.Enter;
+        try
+          if shared > FDurableLsn then
+            FDurableLsn := shared;
+          FSyncBusy := False;
+          FSyncEvt.SetEvent;
+          FSyncEvt.ResetEvent;
+        finally
+          FSyncCs.Leave;
+        end;
+        Exit;
+      end;
       err := '';
       try
         FWal.SyncDurable;
@@ -823,6 +926,8 @@ begin
           Inc(FSyncCount);
           if target > FDurableLsn then
             FDurableLsn := target;
+          { v3.31: surecler arasi bildirim — yalnizca basarili fsync'ten SONRA. }
+          FStore.SetDurableLsn(target);
         end
         else
           FSyncErr := err;
@@ -850,6 +955,9 @@ var
   P: PVdbPage;
   meta: TVdbPageBuf;
   changed: Boolean;
+{$IFDEF CPUPROF}
+  d0, d1, d2: Int64;
+{$ENDIF}
 begin
   Result := False;
   ASyncLsn := 0;
@@ -857,8 +965,16 @@ begin
     raise EVdbPageEngine.Create('motor acik degil');
 
   if not FInTxn then
+  begin
+    {$IFDEF CPUPROF}
+    Inc(CP[9]);
+    {$ENDIF}
     Exit(True);
+  end;
 
+  {$IFDEF CPUPROF}
+  d0 := CpuProfNow;
+  {$ENDIF}
   LSN := FStore.NextLSN;
 
   { v3.1: YALNIZCA bu islemde degisen sayfalar yazilir.
@@ -910,6 +1026,9 @@ begin
     FStore.BuildMetaImage(meta);
     FWal.AppendFrame(VDB_HDR_PAGE, @meta);
   end;
+  {$IFDEF CPUPROF}
+  d1 := CpuProfNow; CP[6] := CP[6] + (d1 - d0);
+  {$ENDIF}
 
   { 5) WAL commit + fsync: artik durabil. Veritabani dosyasina bu noktada
         HICBIR SEY yazilmaz (checkpoint'e kadar). }
@@ -918,6 +1037,12 @@ begin
   { v3.19: WAL'e yazilan en son LSN. DoSync=True ise bu noktada durabildir;
     DoSync=False ise cagiran AwaitDurable ile bekler. }
   ASyncLsn := FWal.WrittenLsn;
+  { v3.31: onbellek + heap dizini bu commit'i yansitiyor. Sonraki tazeleme
+    karari (ViewLsn < WAL.HeaderLsn) bu deger uzerinden verilir. }
+  FStore.SetViewLsn(FWal.WrittenLsn);
+  {$IFDEF CPUPROF}
+  d2 := CpuProfNow; CP[7] := CP[7] + (d2 - d1);
+  {$ENDIF}
 
   FStore.EndTxn;
   FInTxn := False;
@@ -927,10 +1052,14 @@ begin
   FStore.EndIoWrite;
   { v3.3: yalnizca VERI degistiren commit zone map damgasini ilerletir. }
   if changed then NextDataStamp;
+  {$IFDEF CPUPROF}
+  CP[8] := CP[8] + (CpuProfNow - d2);
+  Inc(CPN);
+  {$ENDIF}
   Result := True;
 end;
 
-procedure TVdbPageEngine.InstallPending;
+procedure TVdbPageEngine.InstallPending(AViewOnly: Boolean);
 var
   i: Integer;
 begin
@@ -941,7 +1070,8 @@ begin
     kopyasindan her zaman daha yeni/esittir. }
   for i := 0 to FPendingCount - 1 do
     if not FStore.IsResident(FPending[i].PageNo) then
-      FStore.InstallPage(FPending[i].PageNo, PVdbPage(FPending[i].Data));
+      FStore.InstallPage(FPending[i].PageNo, PVdbPage(FPending[i].Data),
+        AViewOnly);
   ClearPending;
 end;
 
@@ -977,6 +1107,7 @@ begin
     try
       FDurableLsn := FWal.WrittenLsn;
       FSyncErr := '';
+      FStore.SetDurableLsn(FWal.WrittenLsn);
     finally
       FSyncCs.Leave;
     end;

@@ -58,6 +58,10 @@ type
   { Kurtarma sirasinda her onaylanmis cerceve icin cagrilir. }
   TVdbWalApplyProc = procedure(PageNo: LongWord; P: PVdbPage) of object;
 
+  { v3.31: son Recover'in uyguladigi sayfa numaralari (tekillik).
+    Delta tazeleme: yalnizca bu sayfalari yeniden indesklemek gerekir. }
+  TVdbWalPageArray = array of LongWord;
+
   TVdbWalStats = record
     Frames: Integer;          // WAL'de commit edilmis cerceve sayisi
     Commits: Integer;
@@ -108,6 +112,16 @@ type
       degilse HER ZAMAN tam tarama yapilir. }
     FScanPos: Int64;
     FScanHdrLsn: LongWord;
+    { v3.31 DELTA TAZELEME.
+      FHeaderLsn: WAL basligindaki checkpoint LSN'i. Veri dosyasi bu LSN'e
+      kadar TAMAMEN gunceldir (Truncate oncesinde dosya fsync edilmistir);
+      onbellek bu LSN'den gerideyse yalniz WAL'e bakmak YETMEZ — o degisiklikler
+      zaten veri dosyasindadir ve WAL'den silinmis olabilir (drop cache gerekir).
+      FAppliedPages: son Recover'in uyguladigi (tekillik sonrasi) sayfa
+      numaralari. Bayat heap dizinini yalnizca bu sayfalar icin yeniden
+      indesklemek yeterlidir. }
+    FHeaderLsn: LongWord;
+    FAppliedPages: TVdbWalPageArray;
     { v3.19 GRUP COMMIT: fsync icin AYRI handle. Neden: TFileStream'in
       konumu paylasilan durumdur; lider fsync yaparken baska bir thread
       ayni stream'e yazarsa konum/ tampon bozulur. FlushFileBuffers
@@ -162,6 +176,11 @@ type
     procedure SyncDurable;
     { FIILEN yazilmis son LSN (0 = WAL'de yazilmis kayit yok). }
     property WrittenLsn: LongWord read FWrittenLsn;
+    { v3.31: WAL basligindaki checkpoint LSN'i. Veri dosyasi bu LSN'e kadar
+      guncel; onbellek bunun gerisindeyse tam tazeleme (DropCache) gerekir. }
+    property HeaderLsn: LongWord read FHeaderLsn;
+    { v3.31: son Recover'in uyguladigi sayfa numaralari (tekillik). }
+    property AppliedPages: TVdbWalPageArray read FAppliedPages;
 
     { Commit edilmemis cerceveleri atar. }
     procedure Rollback;
@@ -285,6 +304,7 @@ begin
     raise EVdbWal.Create('WAL basligi bozuk (CRC tutmadi)');
   Move(buf[12], lsn, 4);
   FLSN := lsn;
+  FHeaderLsn := lsn;
 
   Move(buf[VDB_WAL_FLAGS], flags, 4);
   if (flags and VDB_WAL_FLAG_ENC) <> 0 then
@@ -322,6 +342,8 @@ begin
   FBufferCount := 0;
   FHasContent := False;
   FLSN := 0;
+  FHeaderLsn := 0;
+  SetLength(FAppliedPages, 0);
   FEncryptedMode := False;
   FWalEncrypted := False;
   FKey := nil;
@@ -733,6 +755,12 @@ begin
     if (applied[i].PageNo = VDB_WAL_META_PAGE) and Assigned(Apply) then
       Apply(applied[i].PageNo, @applied[i].Data);
   Stats.Frames := appliedCount;
+  { v3.31: uygulanan sayfa numaralari — delta tazeleme icin. Tekillik zaten
+    AddTo'da yapildi; yalnizca numaralari kopyala. Meta sayfa (0) de listede
+    kalir; indesk yenileme onu yok sayar. }
+  SetLength(FAppliedPages, appliedCount);
+  for i := 0 to appliedCount - 1 do
+    FAppliedPages[i] := applied[i].PageNo;
   { v3.19: kurtarma sonrasi WAL'de yazilmis sayilan en son LSN, kurtarilan
     son commit'in LSN'idir. }
   FWrittenLsn := FLSN;
@@ -768,6 +796,7 @@ begin
   if FStream = nil then
     raise EVdbWal.Create('WAL acik degil');
   FLSN := CheckpointLSN;
+  FHeaderLsn := CheckpointLSN;
   { v3.29: dosya kesildi -> artimsal tarama konumu gecersiz. Baslik LSN'i
     CheckpointLSN olarak yazilacagi icin onunla esitlenir. }
   FScanPos := VDB_PAGE_SIZE;

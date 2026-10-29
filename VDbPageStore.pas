@@ -127,6 +127,12 @@ type
       FFreeTrunk: LongWord;
       FFreeCount: LongWord;
       FLSN: LongWord;
+      { v3.31 DELTA TAZELEME. FLSN meta sayfadaki (yapısal) LSN'dir ve veri-
+        yalnız commit'lerde geride kalabilir. FViewLsn ise onbellek + heap
+        dizininin tutarlı olduğu GERCEK commit LSN'idir. Tazeleme kararı buna
+        bakar: FViewLsn < WAL.HeaderLsn ise degisiklikler yalniz veri
+        dosyasindadir (WAL budanmistir) -> tam yeniden yukleme gerekir. }
+      FViewLsn: LongWord;
       FCreated: Int64;
       FReads: Int64;
       FWrites: Int64;
@@ -230,7 +236,7 @@ type
     procedure HashPut(PageNo: LongWord; Idx: Integer);
     procedure HashDel(PageNo: LongWord);
     procedure HashReset;
-    function LoadFrame(PageNo: LongWord): Integer;
+    function LoadFrame(PageNo: LongWord; AImage: PVdbPage = nil): Integer;
     function PickVictim: Integer;
     function GetPageInternal(PageNo: LongWord; DoVerify: Boolean;
       out P: PVdbPage): Boolean;
@@ -272,6 +278,9 @@ type
     { v3.25: sayaci bellek eslemesinden okumak icin. }
     procedure MapGen;
     procedure UnmapGen;
+    { v3.31: surecler arasi GRUP FSYNC. `.gen` eslemesinde offset 8'de
+      tutulan durabil LSN (fsync'in KAPSADIGI en buyuk LSN). }
+    function ReadDurableLsn: LongWord;
     function TrunkGet(var P: PVdbPage): LongWord;   // count
     procedure TrunkSetCount(P: PVdbPage; N: LongWord);
     function TrunkEntry(P: PVdbPage; I: Integer): LongWord;
@@ -347,6 +356,17 @@ type
       deger degisir; sema katmani bunu tazelik damgasi olarak kullanir. }
     function GenStamp: QWord;
 
+    { v3.31 SURECLER ARASI GRUP FSYNC. `.gen` eslemesinde offset 8'de
+      paylasilan durabil LSN: bir process'in fsync'i bu LSN'e kadar olan
+      TUM WAL kayitlarini kapsar. Baska bir process `AwaitDurable`'da
+      kendi LSN'i bu degerden kucuk/eşitse fsync'i ATLAYABILIR.
+
+      Monoton artar (yalnizca daha buyuk deger yazilir). Yalnizca fsync
+      BASARILI OLDUKTAN SONRA yazilmalidir; aksi halde fsync atlanir ve
+      veri kaybi olur. Yazim atomiktir (InterlockedCompareExchange). }
+    function DurableLsn: LongWord;
+    procedure SetDurableLsn(Value: LongWord);
+
     { Salt-okunur oturumda WAL'den gelen imaji bellek katmanina alir.
       Diske YAZMAZ; meta sayfa (0) ise mantiksal alanlari tazeler. }
     procedure InstallReadOnlyPage(PageNo: LongWord; P: PVdbPage);
@@ -400,6 +420,11 @@ type
 
     { Checkpoint LSN'ini ayarlar; sonraki SaveMeta bu degeri yazar. }
     procedure SetLSN(Value: LongWord);
+    { v3.31: onbellek + heap dizininin tutarli oldugu LSN'i isaretler.
+      Yalnizca motor cagirir (commit sonu, kurtarma sonu, acilis sonu).
+      LoadMeta BUNA DOKUNMAZ — tazeleme oncesi gorunum LSN'i korunur ki
+      "WAL budandi, tam tazeleme gerek" karari verilebilsin. }
+    procedure SetViewLsn(Value: LongWord);
 
     { Meta sayfasinin guncel imajini uretir (WAL'e cerceve olarak
       yazmak icin; diske yazmaz). }
@@ -428,8 +453,17 @@ type
 
     { WAL kurtarma: sayfa imajini yazar. Onbellekte varsa tazeler ve
       kirli isaretler; yoksa dogrudan dosyaya yazar. PageNo=0 ise meta
-      alanlari da tazelenir. }
-    procedure InstallPage(PageNo: LongWord; P: PVdbPage);
+      alanlari da tazelenir.
+
+      AViewOnly=True (v3.31 TAZELEME): DISKE YAZMAZ. Yalnizca onbellege
+      kurar ve sayfayi TEMIZ isaretler (Dirty=False). Gerekce: tazeleme
+      paylasimli kilit altinda calisir; Windows'ta yazma kilit ihlali
+      (EWriteError) uretir. Ayrica imaj zaten WAL'de fsync'li - durabil
+      kaynak WAL'dir, dosya degil; diskteki surum yazarin commit'inde
+      guncellenir. Checkpoint (Truncate) yalniz yazarin Flush'indan
+      sonra budandigi icin veri kaybi olmaz. }
+    procedure InstallPage(PageNo: LongWord; P: PVdbPage;
+      AViewOnly: Boolean = False);
 
     { Sayfa onbellekte mi? (Yukleme/tahliye tetiklemez.) }
     function IsResident(PageNo: LongWord): Boolean;
@@ -463,6 +497,7 @@ type
     property PageCount: LongWord read FPageCount;
     property FreeCount: LongWord read FFreeCount;
     property LSN: LongWord read FLSN;
+    property ViewLsn: LongWord read FViewLsn;
     { v3.1: meta sayfa diskte bayat mi (sayfa sayisi/freelist degisti)?
       Commit yalnizca True iken meta cercevesi yazar; commit LSN'i WAL commit
       kaydinda tasindigi icin degismemis meta imaji gereksizdi. }
@@ -945,13 +980,21 @@ begin
   FStream.ReadBuffer(buf, VDB_PAGE_SIZE);
   if (FGenStream = nil) and (Length(FMetaSig) = VDB_PAGE_SIZE) and
      CompareMem(@buf[0], @FMetaSig[0], VDB_PAGE_SIZE) then Exit;
-  DropCache;
+  { v3.31 DELTA TAZELEME: DropCache ARTIK BURADA DEGIL.
+    Onbellek bosaltilmaz; tazelenecek sayfalar kurtarma (WAL) tarafindan
+    InstallPage ile yerinde guncellenir. Karar motorda: ViewLsn < WAL
+    HeaderLsn ise (WAL budandi, degisiklik yalniz dosyada) motorda tam
+    DropCache yapilir. Burada onbellekten vazgectigimiz tek guvenlik:
+    kurtarma kanca'si YOKSA (OnRefreshed atanmamissa) tazeleme yapabilecek
+    kimse yoktur -> eski davranisa donup onbellek dusurulur. }
   FPhysSize := len;
   LoadMeta;
   { v3.16: baska bir surec commit etti — WAL gorunumunu de tazele. }
   FSigGen := ReadGen;
   if Assigned(FOnRefreshed) then
-    FOnRefreshed(Self);
+    FOnRefreshed(Self)
+  else
+    DropCache;
 end;
 
 procedure TVDbPageStore.RefreshUnderExclusive;
@@ -1099,10 +1142,11 @@ begin
   {$IFDEF WINDOWS}
   FGenMap := nil;
   FGenMapH := 0;
-  if FGenStream.Size < 8 then Exit;
-  h := CreateFileMapping(FGenStream.Handle, nil, PAGE_READWRITE, 0, 8, nil);
+  { v3.31: 8 -> 16 bayt. Offset 0 = gen sayaci, offset 8 = durabil LSN. }
+  if FGenStream.Size < 16 then Exit;
+  h := CreateFileMapping(FGenStream.Handle, nil, PAGE_READWRITE, 0, 16, nil);
   if h = 0 then Exit;
-  p := MapViewOfFile(h, FILE_MAP_READ or FILE_MAP_WRITE, 0, 0, 8);
+  p := MapViewOfFile(h, FILE_MAP_READ or FILE_MAP_WRITE, 0, 0, 16);
   if p = nil then
   begin
     CloseHandle(h);
@@ -1151,6 +1195,35 @@ begin
   FGenStream.Position := 0;
   FGenStream.WriteBuffer(v, 8);
   FSigGen := v;
+end;
+
+{ v3.31: `.gen` eslemesinde offset 8'de durabil LSN. }
+function TVDbPageStore.ReadDurableLsn: LongWord;
+begin
+  Result := 0;
+  if FGenMap = nil then Exit;
+  Result := PLongWord(FGenMap + 8)^;
+end;
+
+function TVDbPageStore.DurableLsn: LongWord;
+begin
+  Result := ReadDurableLsn;
+end;
+
+procedure TVDbPageStore.SetDurableLsn(Value: LongWord);
+var
+  p: PLongWord;
+  cur: LongWord;
+begin
+  if (FGenMap = nil) or (Value = 0) then Exit;
+  p := PLongWord(FGenMap + 8);
+  repeat
+    cur := p^;
+    if Value <= cur then Exit;
+    { Atomik: yalnizca daha buyuk deger yazilir (monoton artis). }
+    if LongWord(InterlockedCompareExchange(PLongint(p)^, Value, cur)) = cur then
+      Exit;
+  until False;
 end;
 
 procedure TVDbPageStore.AcquireWrite;
@@ -1577,6 +1650,7 @@ var
   t0: QWord;
   needUpgrade: Boolean;
   ver32: LongWord;
+  z: QWord;
 begin
   if FStream <> nil then Exit;
   exists := FileExists(FPath);
@@ -1682,11 +1756,22 @@ begin
       end;
       if FGenStream <> nil then
       begin
-        if FGenStream.Size < 8 then
+        { v3.31: 8 -> 16 bayt (offset 8 = durabil LSN). Eski 8 baytlik
+          dosya buyutulur; gen sayaci korunur, durabil LSN 0'dan baslar
+          (fazladan fsync, guvenli). }
+        if FGenStream.Size < 16 then
         begin
-          FSigGen := 0;
-          FGenStream.Position := 0;
-          FGenStream.WriteBuffer(FSigGen, 8);
+          if FGenStream.Size < 8 then
+          begin
+            FSigGen := 0;
+            FGenStream.Position := 0;
+            FGenStream.WriteBuffer(FSigGen, 8);
+          end
+          else
+            FSigGen := ReadGen;
+          FGenStream.Position := 8;
+          z := 0;
+          FGenStream.WriteBuffer(z, 8);  { durabil LSN = 0 }
         end
         else
           FSigGen := ReadGen;
@@ -1698,6 +1783,9 @@ begin
         if not AReadOnly then
           BumpGen;
       end;
+      { v3.31: onbellek bos, diskteki meta kadar taze. Kurtarma bunu
+        SetViewLsn ile ilerletecek (bkz. TVdbPageEngine.Open). }
+      FViewLsn := FLSN;
       { v3.18: acilis bitince kilit BIRAKILIR (hem yazan hem RO). Boylece
         iki surec ayni anda acik olabilir; kilit yalniz islem basina alinir. }
       if FLockedExcl or FLockedShared then
@@ -1981,7 +2069,7 @@ begin
   raise EVdbPageStore.Create('buffer pool dolu: tahliye edilecek sayfa yok');
 end;
 
-function TVDbPageStore.LoadFrame(PageNo: LongWord): Integer;
+function TVDbPageStore.LoadFrame(PageNo: LongWord; AImage: PVdbPage): Integer;
 var
   idx: Integer;
   fromPending: Boolean;
@@ -2006,6 +2094,20 @@ begin
     end;
     HashDel(FFrames[idx].PageNo);
     Inc(FEvictions);
+  end;
+  if AImage <> nil then
+  begin
+    { v3.31 TAZELEME: imaj hazir, diskten okunmaz. Imaj WAL'de fsync'li
+      oldugu icin TEMIZ isaretlenir; diskteki surum yazarin commit'inde
+      guncellenir. }
+    Move(AImage^, FFrames[idx].Data, VDB_PAGE_SIZE);
+    FFrames[idx].PageNo := PageNo;
+    FFrames[idx].Pins := 0;
+    FFrames[idx].Dirty := False;
+    FFrames[idx].TxnMark := 0;
+    FFrames[idx].Ref := True;
+    HashPut(PageNo, idx);
+    Exit(idx);
   end;
   fromPending := False;
   if (FRoPages <> nil) and FRoPages.TryGetValue(PageNo, roP) then
@@ -2332,7 +2434,7 @@ end;
 
 procedure TVDbPageStore.FreePage(PageNo: LongWord);
 var
-  trunk, newTrunk, cnt: LongWord;
+  trunk, cnt: LongWord;
   P: PVdbPage;
   e: string;
 begin
@@ -2347,17 +2449,21 @@ begin
   trunk := FFreeTrunk;
   if trunk = 0 then
   begin
-    { Ilk trunk: dosya sonuna ekle. }
-    ExtendFile(newTrunk);
-    if not GetPageInternal(newTrunk, False, P) then
+    { Ilk trunk: serbest birakilan sayfanin KENDISINI trunk yap.
+      Eski yol ExtendFile ile dosyayi 1 sayfa buyutuyordu (bloatbench:
+      tam silmede bosuna +8 KB). Trunk sayfalari FreeCount'a girmez. }
+    if not GetPageInternal(PageNo, False, P) then
       raise EVdbPageStore.Create('FreePage: trunk sayfasi olusturulamadi');
-    TrunkInit(P, newTrunk, 0);
-    Release(newTrunk, True);
-    FFreeTrunk := newTrunk;
-    trunk := newTrunk;
+    TrunkInit(P, PageNo, 0);
+    Release(PageNo, True);
+    FFreeTrunk := PageNo;
+    FMetaDirty := True;
+    FStructDirty := True;
+    Exit;
   end;
 
-  { Trunk sayfalari VDbPage formati kullanmaz; dogrulamayi TrunkCheck yapar. }  if not GetPageInternal(trunk, False, P) then
+  { Trunk sayfalari VDbPage formati kullanmaz; dogrulamayi TrunkCheck yapar. }
+  if not GetPageInternal(trunk, False, P) then
     raise EVdbPageStore.Create('FreePage: trunk okunamadi');
   if not TrunkCheck(P, e) then
   begin
@@ -2368,18 +2474,17 @@ begin
   cnt := TrunkGet(P);
   if cnt >= LongWord(VDB_TRUNK_MAX) then
   begin
-    { Trunk dolu: yeni trunk basa ekle. }
+    { Trunk dolu: serbest birakilan sayfayi YENI trunk yap (dosya buyumesin).
+      ExtendFile yerine PageNo kullanilir; trunk FreeCount'a girmez. }
     Release(trunk, False);
-    ExtendFile(newTrunk);
-    if not GetPageInternal(newTrunk, False, P) then
+    if not GetPageInternal(PageNo, False, P) then
       raise EVdbPageStore.Create('FreePage: yeni trunk olusturulamadi');
-    TrunkInit(P, newTrunk, trunk);
-    Release(newTrunk, True);
-    FFreeTrunk := newTrunk;
-    trunk := newTrunk;
-    if not GetPageInternal(trunk, False, P) then
-      raise EVdbPageStore.Create('FreePage: yeni trunk okunamadi');
-    cnt := 0;
+    TrunkInit(P, PageNo, trunk);
+    Release(PageNo, True);
+    FFreeTrunk := PageNo;
+    FMetaDirty := True;
+    FStructDirty := True;
+    Exit;
   end;
 
   TrunkSetEntry(P, cnt, PageNo);
@@ -2458,6 +2563,12 @@ var
   i: Integer;
 begin
   if FStream = nil then Exit;
+  { v3.31: tazeleme sirasinda yeni sayfa no'su FPageCount'i artirmis olabilir
+    ama disk buyutulmemisti (paylasimli kilit). Burada yazma kilidi altinda
+    dosya mantiksal boyuna buyutulur; aksi halde WritePageAt EOF'a yazar ve
+    TrimToLogical yanlis kirpar. }
+  if (not FReadOnly) and (FPageCount > 0) then
+    GrowTo(RequiredFileSize(FPageCount));
   for i := 0 to FPoolPages - 1 do
     if (FFrames[i].PageNo <> 0) and FFrames[i].Dirty then
     begin
@@ -2545,6 +2656,11 @@ procedure TVDbPageStore.SetLSN(Value: LongWord);
 begin
   FLSN := Value;
   FMetaDirty := True;
+end;
+
+procedure TVDbPageStore.SetViewLsn(Value: LongWord);
+begin
+  FViewLsn := Value;
 end;
 
 procedure TVDbPageStore.BuildMetaImage(out Buf: TVdbPageBuf);
@@ -2692,9 +2808,12 @@ begin
   end;
 end;
 
-procedure TVDbPageStore.InstallPage(PageNo: LongWord; P: PVdbPage);
+procedure TVDbPageStore.InstallPage(PageNo: LongWord; P: PVdbPage;
+  AViewOnly: Boolean);
 var
   idx: Integer;
+  buf: TVDbPageBuf;
+  isNew: Boolean;
 begin
   if FStream = nil then
     raise EVdbPageStore.Create('depolama acik degil (InstallPage)');
@@ -2708,26 +2827,75 @@ begin
       raise EVdbPageStore.Create(Format(
         'InstallPage: sayfa %d pinli (kurtarma sirasinda beklenmiyordu)', [PageNo]));
     Move(P^, FFrames[idx].Data, VDB_PAGE_SIZE);
-    FFrames[idx].Dirty := True;
-    FFrames[idx].TxnMark := FTxnId;
+    if AViewOnly then
+    begin
+      { v3.31: kirli bayrak KORUNUR. Yeni sayfa (dosyada olmayan) isaretliyse
+        ikinci bir imaj kurulumu onu silerse Checkpoint sayfayi atlar ve
+        WAL budaninca sayfa kaybolur. Temiz cerceve temiz kalir. }
+      FFrames[idx].TxnMark := 0;
+    end
+    else
+    begin
+      FFrames[idx].Dirty := True;
+      FFrames[idx].TxnMark := FTxnId;
+    end;
     Exit;
   end;
-  if PageNo >= FPageCount then
+  isNew := PageNo >= FPageCount;
+  if isNew then
   begin
     FPageCount := PageNo + 1;
-    GrowTo(RequiredFileSize(FPageCount));
+    { Tazelemede disk buyutmesi yapilmaz (paylasimli kilit altinda yazma
+      EWriteError uretir). Mantiksal sayfa sayisi artar; fiziksel buyume
+      bir sonraki Flush'te GrowTo ile olur. }
+    if not AViewOnly then
+      GrowTo(RequiredFileSize(FPageCount));
     FMetaDirty := True;
     FStructDirty := True;
   end;
   if PageNo = VDB_HDR_PAGE then
   begin
+    if AViewOnly then
+    begin
+      { Meta imaji yalnizca onbellege kurulur ve mantiksal alanlar
+        tazelenir; diske yazilmaz. }
+      Move(P^, buf, VDB_PAGE_SIZE);
+      Move(buf[12], FPageCount, 4);
+      Move(buf[16], FFreeTrunk, 4);
+      Move(buf[20], FFreeCount, 4);
+      Move(buf[24], FLSN, 4);
+      Exit;
+    end;
     { Meta sayfa her zaman DUZ metindir (sir tutmaz, sifreleme zarfi yok). }
     FStream.Position := 0;
     FStream.WriteBuffer(P^, VDB_PAGE_SIZE);
     LoadMeta;
-  end
-  else
-    WritePageAt(PageNo, P);
+    Exit;
+  end;
+  if AViewOnly then
+  begin
+    { Tazeleme: yalnizca onbellege kur. Imaj WAL'de fsync'li; diskteki surum
+      yazarin commit'inde guncellenir.
+      v3.31 DIZELTME (pcbench P=4 acilis taramasi catlamasi): YENI sayfa
+      (sayfa no >= sayfa sayisi) dosyada YOKTUR — icerik yalniz WAL'dedir.
+      TEMIZ isaretlenirse sonraki Checkpoint onu yazmadan WAL'i budar ve
+      sayfa sifir kalir (meta sayfa sayisi arttigi icin acilista "taninmiyor"
+      ya da "okunamadi" hatasi). Bu yuzden yalnizca YENI sayfalar KIRLI
+      isaretlenir; guncelleme durumunda dosyada zaten bir surum vardir ve
+      yazan surec kendi imajini yazar. }
+    LoadFrame(PageNo, P);
+    if isNew then
+    begin
+      idx := FindFrame(PageNo);
+      if idx >= 0 then
+      begin
+        FFrames[idx].Dirty := True;
+        FFrames[idx].TxnMark := 0;
+      end;
+    end;
+    Exit;
+  end;
+  WritePageAt(PageNo, P);
 end;
 
 function TVDbPageStore.IsResident(PageNo: LongWord): Boolean;

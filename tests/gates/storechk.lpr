@@ -6,10 +6,12 @@ program storechk;
     1) 2000 sayfa ayir, her birine desen yaz, hepsini geri oku (onbellek
        tahliyesi dahil: havuz 64 sayfa).
     2) Her 3. sayfayi serbest birak, ayni sayida yeniden ayir: freelist
-       geri kazanimi ve dosya buyumemesi.
+       geri kazanimi ve dosya buyumemesi. Ilk serbest birakilan sayfanin
+       kendisi trunk olur (ExtendFile YOK); FreeCount yalniz trunk
+       girislerini sayar, trunk sayfasi sayilmaz.
     3) Kapat/ac: veri kalici mi, baslik tutarli mi.
     4) Bilincli bozulma: veri sayfasi ve baslik sayfasi CRC'si yakalanir.
-    5) Freelist butunlugu: FreeCount = gercekten serbest sayfa sayisi, ve
+    5) Freelist butunlugu: FreeCount = trunk giris (entry) sayisi, ve
        serbest sayfalar tekrar ayirinca ayni kume (cift kayit yok).
     6) v2 dosyasi acilirsa net "MIGRATE TO v3" hatasi.
 
@@ -189,21 +191,23 @@ begin
         Inc(freed);
       end;
     st.Flush(True);
-    if st.FreeCount <> LongWord(freed) then
-      Fail(Format('FreeCount %d (beklenen %d)', [st.FreeCount, freed]))
+    { Ilk serbest birakilan sayfa trunk olur; FreeCount yalniz giris sayar. }
+    if st.FreeCount <> LongWord(freed - 1) then
+      Fail(Format('FreeCount %d (beklenen %d)', [st.FreeCount, freed - 1]))
     else
-      Ok(Format('%d sayfa serbest birakildi (FreeCount=%d)', [freed, st.FreeCount]));
-    { Ilk trunk dosya sonuna eklenir: 1 sayfalik kacinilmaz ek yuk. }
-    if (freed <= VDB_TRUNK_MAX) and (st.PageCount <> before + 1) then
+      Ok(Format('%d sayfa serbest birakildi (FreeCount=%d, 1 sayfa trunk)',
+        [freed, st.FreeCount]));
+    { Trunk serbest birakilan sayfadan gelir: dosya BUYUMEMELI. }
+    if (freed <= VDB_TRUNK_MAX) and (st.PageCount <> before) then
       Fail(Format('trunk sonrasi sayfa sayisi %d (beklenen %d)',
-        [st.PageCount, before + 1]))
+        [st.PageCount, before]))
     else
-      Ok(Format('trunk sayfasi eklendi, dosya %d -> %d sayfa',
-        [before, st.PageCount]));
+      Ok(Format('trunk icin dosya buyumedi, sayfa sayisi %d', [st.PageCount]));
 
-    { Ayni sayida yeniden ayir: veri sayfasi eklenmemeli. }
+    { Girisleri yeniden ayir: veri sayfasi eklenmemeli. Trunk'in kendisi
+      son adimda (asagida) sayfa olarak verilir. }
     realloc := 0;
-    for j := 0 to freed - 1 do
+    for j := 0 to freed - 2 do
     begin
       if not st.AllocPage(VDB_PAGE_HEAP, pno, P) then
       begin
@@ -220,7 +224,8 @@ begin
     else
       Ok(Format('%d sayfa yeniden ayrildi, FreeCount=0', [realloc]));
 
-    { Bosalan trunk SIZMAMALI: sonraki ayirma onu sayfa olarak vermeli. }
+    { Bosalan trunk SIZMAMALI: sonraki ayirma onu sayfa olarak vermeli.
+      Trunk = ilk serbest birakilan sayfa (Pages[0]). }
     before := st.PageCount;
     if not st.AllocPage(VDB_PAGE_HEAP, pno, P) then
       Fail('bos trunk sayfa olarak ayrilamadi')
@@ -230,9 +235,9 @@ begin
       st.Flush(True);
       if st.PageCount <> before then
         Fail(Format('bos trunk sizdi: dosya %d -> %d', [before, st.PageCount]))
-      else if pno <> before - 1 then
+      else if pno <> Pages[0] then
         Fail(Format('bos trunk sayfa olarak verilmedi (sayfa %d, beklenen %d)',
-          [pno, before - 1]))
+          [pno, Pages[0]]))
       else
         Ok(Format('bos trunk sizmedi, sayfa %d olarak geri kazanildi', [pno]));
     end;

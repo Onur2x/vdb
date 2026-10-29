@@ -6604,7 +6604,8 @@ var
   // Tek birlestirme adimi: birikmis sol (LR/LN/LT/Tabs) + sag tablo (JC).
   procedure MergeStep(var LR: TStrMatrix; var LN: TStrArray;
     var LT: TByteArray; var Tabs: TJoinTabs; JC: TJoinClause;
-    AUsing: TStrArray);   // F-28: nil = USING yok.
+    AUsing: TStrArray;    // F-28: nil = USING yok.
+    AWhere: TSqlExprNode); // v3.33: pushdown icin WHERE kosulu (nil = yok).
                           // DIKKAT: JC ve AUsing asla 'const' OLABILMEZ.
                           // TJoinClause record'u yonlendirilmis alanlar
                           // iceriyor (OnCondition) ve FPC
@@ -6650,6 +6651,9 @@ var
     bk: TDictionary<string, TList<Integer>>;
     lst: TList<Integer>;
     kj: string;
+    // v3.33: ON/WHERE tek tarafli predikat pushdown
+    OnLPreds, OnRPreds: TList<TSqlExprNode>;
+    WhLPreds, WhRPreds: TList<TSqlExprNode>;
 
     // LN ogesindeki nitelemeyi ('alias.kolon' -> 'kolon') atar.
     function AfterDot(const S: string): string;
@@ -6798,6 +6802,150 @@ var
         if not VDbCmpVal(a, b, '=', ct) then Exit(False);
       end;
       Result := True;
+    end;
+
+    { ------------------------------------------------------------
+      v3.33: ON/WHERE tek tarafli predikat pushdown.
+      AND agacindaki tek tarafa atif yapan alt kosullar, join
+      dongusunden ONCE ilgili tarafin taramasina itilir.
+      `ON a.k=b.k AND a.k>1000000` gibi durumlarda 1M aday cift
+      yerine yalniz gecen satirlar uzerinde calisilir.
+      //---------------------------------------------------------- }
+
+    // Bir ifadenin hangi tarafa atif yaptigini bulur.
+    // Doner: -1 = kolon yok, 0 = belirsiz/cok taraf, 1 = sol, 2 = sag
+    function ExprSide(N: TSqlExprNode): Integer;
+      function MergeSide(s1, s2: Integer): Integer;
+      begin
+        if (s1 = 0) or (s2 = 0) then Result := 0
+        else if s1 = -1 then Result := s2
+        else if s2 = -1 then Result := s1
+        else if s1 = s2 then Result := s1
+        else Result := 0;
+      end;
+    var
+      B: TSqlBinaryOpNode;
+      s, p, i2: Integer;
+    begin
+      Result := 0;
+      if N = nil then Exit(-1);
+      if N is TSqlLiteralNode then Exit(-1);
+      if N is TSqlColumnRefNode then
+      begin
+        s := Taraf(TSqlColumnRefNode(N), p);
+        if s = 0 then Exit(0);
+        Exit(s);
+      end;
+      if N is TSqlBinaryOpNode then
+      begin
+        B := TSqlBinaryOpNode(N);
+        Exit(MergeSide(ExprSide(B.Left), ExprSide(B.Right)));
+      end;
+      if N is TSqlUnaryOpNode then
+        Exit(ExprSide(TSqlUnaryOpNode(N).Operand));
+      if N is TSqlCastNode then
+        Exit(ExprSide(TSqlCastNode(N).Expr));
+      if N is TSqlCollateNode then
+        Exit(ExprSide(TSqlCollateNode(N).Inner));
+      if N is TSqlNullIfNode then
+        Exit(MergeSide(ExprSide(TSqlNullIfNode(N).Arg1),
+          ExprSide(TSqlNullIfNode(N).Arg2)));
+      if N is TSqlBetweenNode then
+        Exit(MergeSide(ExprSide(TSqlBetweenNode(N).Expr),
+          MergeSide(ExprSide(TSqlBetweenNode(N).LowBound),
+            ExprSide(TSqlBetweenNode(N).HighBound))));
+      if N is TSqlCoalesceNode then
+      begin
+        s := -1;
+        for i2 := 0 to TSqlCoalesceNode(N).Args.Count - 1 do
+          s := MergeSide(s, ExprSide(TSqlCoalesceNode(N).Args[i2]));
+        Exit(s);
+      end;
+      if N is TSqlInNode then
+      begin
+        if TSqlInNode(N).SubSelect <> nil then Exit(0);
+        s := ExprSide(TSqlInNode(N).Expr);
+        for i2 := 0 to TSqlInNode(N).List.Count - 1 do
+          s := MergeSide(s, ExprSide(TSqlInNode(N).List[i2]));
+        Exit(s);
+      end;
+      if N is TSqlCaseNode then
+      begin
+        s := ExprSide(TSqlCaseNode(N).Operand);
+        for i2 := 0 to TSqlCaseNode(N).Whens.Count - 1 do
+        begin
+          s := MergeSide(s, ExprSide(TSqlCaseNode(N).Whens[i2].Cond));
+          s := MergeSide(s, ExprSide(TSqlCaseNode(N).Whens[i2].Value));
+        end;
+        s := MergeSide(s, ExprSide(TSqlCaseNode(N).ElseExpr));
+        Exit(s);
+      end;
+      if N is TSqlFuncCallNode then
+      begin
+        s := ExprSide(TSqlFuncCallNode(N).Arg);
+        s := MergeSide(s, ExprSide(TSqlFuncCallNode(N).Filter));
+        if TSqlFuncCallNode(N).Args <> nil then
+          for i2 := 0 to TSqlFuncCallNode(N).Args.Count - 1 do
+            s := MergeSide(s, ExprSide(TSqlFuncCallNode(N).Args[i2]));
+        Exit(s);
+      end;
+      // Bilinmeyen/agir dugumler (subquery, window, agg...): guvenli taraf
+      Result := 0;
+    end;
+
+    // AND agacindaki tek tarafli alt kosullari topla.
+    procedure CollectOneSided(N: TSqlExprNode;
+      LPreds, RPreds: TList<TSqlExprNode>);
+    var
+      B: TSqlBinaryOpNode;
+      s: Integer;
+    begin
+      if N = nil then Exit;
+      if N is TSqlBinaryOpNode then
+      begin
+        B := TSqlBinaryOpNode(N);
+        if B.Op = sboAnd then
+        begin
+          CollectOneSided(B.Left, LPreds, RPreds);
+          CollectOneSided(B.Right, LPreds, RPreds);
+          Exit;
+        end;
+      end;
+      s := ExprSide(N);
+      if s = 1 then LPreds.Add(N)
+      else if s = 2 then RPreds.Add(N);
+    end;
+
+    // Tek tarafli predikatlari ilgili tarafa uygula.
+    // SideStart/SideLen: ilgili tarafin birlesik satirdaki ofset/uzunlugu.
+    procedure FilterSide(var Rows: TStrMatrix; Preds: TList<TSqlExprNode>;
+      SideStart, SideLen: Integer);
+    var
+      fi, k2, q2, kn2: Integer;
+      pdRow: TStrArray;
+      pdKeep: TStrMatrix;
+      pdOk: Boolean;
+    begin
+      if (Preds = nil) or (Preds.Count = 0) then Exit;
+      kn2 := 0;
+      SetLength(pdKeep, Length(Rows));
+      SetLength(pdRow, n1 + n2);
+      for fi := 0 to High(Rows) do
+      begin
+        for k2 := 0 to n1 + n2 - 1 do pdRow[k2] := '';
+        for k2 := 0 to SideLen - 1 do pdRow[SideStart + k2] := Rows[fi][k2];
+        pdOk := True;
+        for q2 := 0 to Preds.Count - 1 do
+          if not EvalBool(Preds[q2], pdRow, LN, LT) then
+          begin pdOk := False; Break; end;
+        if pdOk then
+        begin
+          pdKeep[kn2] := Rows[fi];
+          Inc(kn2);
+        end;
+      end;
+      SetLength(pdKeep, kn2);
+      Rows := pdKeep;
     end;
 
   begin
@@ -7080,6 +7228,59 @@ var
     end;
 
     { ----------------------------------------------------------------
+      v3.33: ON/WHERE tek tarafli predikat pushdown.
+      AND agacindaki tek tarafa atif yapan alt kosullar, join
+      dongusunden ONCE ilgili tarafin taramasina itilir.
+
+      Guvenlik kurallari:
+        - ON sol tek tarafli: yalniz INNER/RIGHT (LEFT/FULL'da NULL
+          sarmalama gereken satirlar kaybolurdu).
+        - ON sag tek tarafli: yalniz INNER/LEFT (RIGHT/FULL'da NULL
+          sarmalama gereken satirlar kaybolurdu).
+        - WHERE tek tarafli: her join tipinde guvenli (WHERE zaten
+          sonuclari eler; erken eleme ayni sonucu verir).
+      //-------------------------------------------------------------- }
+    if JC.OnCondition <> nil then
+    begin
+      OnLPreds := TList<TSqlExprNode>.Create;
+      OnRPreds := TList<TSqlExprNode>.Create;
+      try
+        CollectOneSided(JC.OnCondition, OnLPreds, OnRPreds);
+        if (OnLPreds.Count > 0) and
+           ((JC.JoinType = jtInner) or (JC.JoinType = jtRight)) then
+          FilterSide(LR, OnLPreds, 0, n1);
+        if (OnRPreds.Count > 0) and
+           ((JC.JoinType = jtInner) or (JC.JoinType = jtLeft)) then
+          FilterSide(rRows, OnRPreds, n1, n2);
+      finally
+        OnLPreds.Free;
+        OnRPreds.Free;
+      end;
+    end;
+    if AWhere <> nil then
+    begin
+      WhLPreds := TList<TSqlExprNode>.Create;
+      WhRPreds := TList<TSqlExprNode>.Create;
+      try
+        CollectOneSided(AWhere, WhLPreds, WhRPreds);
+        // v3.34: WHERE pushdown guvenlik kurallari (ON'un tersi):
+        //   WHERE sol tek tarafli -> yalniz INNER/LEFT
+        //   WHERE sag tek tarafli -> yalniz INNER/RIGHT
+        // FULL'de hicbiri guvenli degil: NULL sarmalama gerekli satirlar
+        // filtrelenirse kaybolur (bkz. FULL sag-korumali testi).
+        if (WhLPreds.Count > 0) and
+           ((JC.JoinType = jtInner) or (JC.JoinType = jtLeft)) then
+          FilterSide(LR, WhLPreds, 0, n1);
+        if (WhRPreds.Count > 0) and
+           ((JC.JoinType = jtInner) or (JC.JoinType = jtRight)) then
+          FilterSide(rRows, WhRPreds, n1, n2);
+      finally
+        WhLPreds.Free;
+        WhRPreds.Free;
+      end;
+    end;
+
+    { ----------------------------------------------------------------
       HIZLI YOL: ON <sol kolon> = <sag kolon>
       Sag tarafin JOIN kolonunda indeks (veya PK) varsa sol satir basina
       yalniz O(log n + eslesme) kadar bakilir.
@@ -7133,8 +7334,8 @@ var
     else
     begin
       // klasik ic ice dongu (sag tarafta indeks/PK yok veya CTE)
-      if not rIsCte then
-        FT.ScanRows(JC.Table, rPks, rRows);
+      // v3.33: rRows zaten yuklu (satir 6941); yeniden tarama kaldirildi
+      // (pushdown filtresini bozuyordu).
       mrN := 0;
       if HashOK then
       begin
@@ -7350,10 +7551,10 @@ begin
   // F-28: JoinUsing listesi MoreJoins ile ayni sira; ilk JOIN icin
   // indis 0, MoreJoins[i] icin i+1. Eksikse nil (USING yok).
   MergeStep(LRows, LNames, LTypes, LTabs, Stmt.Join,
-    UsingAt(Stmt, 0));
+    UsingAt(Stmt, 0), Stmt.WhereClause);
   for t := 0 to Stmt.MoreJoins.Count - 1 do
     MergeStep(LRows, LNames, LTypes, LTabs, Stmt.MoreJoins[t],
-      UsingAt(Stmt, t + 1));
+      UsingAt(Stmt, t + 1), Stmt.WhereClause);
   MergedRows := LRows;
   MergedColNames := LNames;
   MergedColTypes := LTypes;

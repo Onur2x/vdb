@@ -52,15 +52,15 @@ Bunlar v3'ün kıyaslanacağı gerçek taban çizgisi. Tüm sayılar benim ölç
 
 **v3.0 kabul hedefleri (200k satır) — v3.1 sonucu:**
 
-| Metrik | Hedef | Ölçüm yöntemi | v3.0 | v3.1 (2026-10-25) | Durum |
+| Metrik | Hedef | Ölçüm yöntemi | v3.0 | v3.1 → v1.yol A | Durum |
 |---|---|---|---|---|---|
-| Dosya boyutu | **≤ 11 MB** (≤ 55 B/satır) | `DataFileSize` | sayfa harness **9,76 MB** (48,8 B/satır) + `.idx` 3,20; SQL harness 15,5 MB (77,6) + `.idx` 3,52 → **diskte toplam 19,0 MB** | değişmedi | kısmen |
+| Dosya boyutu | **≤ 11 MB** (≤ 55 B/satır) | `DataFileSize` | sayfa harness **9,76 MB** (48,8 B/satır) + `.idx` 3,20; SQL harness 15,5 MB (77,6) + `.idx` 3,52 → **diskte toplam 19,0 MB** | SQL harness **9,40 MB (47,00 B/satır)** + `.idx` 2,19 → **diskte toplam 11,59 MB** (2026-10-28; döküm `hiztesti.md` §11) | ✔ `.odb` / `.idx` açık |
 | Açılış | **≤ 150 ms** | `kv.Open` süresi (3 tekrarın medyanı) | 32 ms (v2: 984) | **27,8 ms** | ✔ |
 | `COUNT(*)` | **≤ 16 ms** | sayaç | 62 ms (v2: 31) | **0,1 ms** (canlı sayaç) | ✔ |
 | PK nokta | **≤ 7 µs** (gerilemez) | `WHERE id=` | 6,25 µs (v2: 6,25) | **5,13 µs** | ✔ |
 | Toplu INSERT | **≤ 5 µs/satır** (gerilemez) | 200k tek batch | 6,64 µs (v2: 4,46) | **5,79 µs** (256 KB'lık uzatma) | sınırda |
 | Autocommit INSERT | **≤ 0,55 ms** (gerilemez) | 20k tek satır | 0,557 ms (v2: 0,431) | **0,449 ms** (işlem başına WAL) | ✔ |
-| UPDATE/DELETE sonrası şişme | **≤ %5** | 100k UPDATE sonrası dosya artışı | ölçülmedi (VACUUM geri kazanıyor) | ölçülmedi | — |
+| UPDATE/DELETE sonrası şişme | **≤ %5** | `tests/bench/bloatbench`: 100k churn (UPDATE + DELETE + yeniden ekleme), taze yükleme referansı | ölçülmedi | **%0,00** (churn: boy3/boy0; boy5/taze de %0,00 — 2026-10-28) | ✔ |
 
 v3.0'da tutmayan üç metrik v3.1'de kapandı; kalan tek sınır **toplu INSERT**tir
 (5,79 µs, hedef 5). Kök neden sayfa imajlı WAL'in 2x yazma hacmidir — tasarım
@@ -68,15 +68,20 @@ maliyeti. Autocommit'te kalan fark **dayanıklılık tabanıdır**: tek fsync
 0,330 ms (ayrı `fsyncbench` ölçümü), commit başına WAL 63.373 → 8.252 B.
 Kök nedenler, ölçümler ve koşular arası sapma `hiztesti.md` §9'da.
 
-**Boyut konusunda dikkat (dürüstlük):** v3 veri dosyası v2'den %19,5 küçük, ama
-yanına **`.odb.idx`** (3,52 MB; anahtar → sayfa/slot açılış önbelleği) yazıyor.
-`.idx` silinebilir (açılış 79 ms, hedef 150 ms) fakat yok sayılırsa toplam
-diskteki kazanç %19,5 değil **%1,2** olur. v3.1 boyut işi **değildir** (dosya
-boyutu değişmedi: 15.527.936 B / 77,6 B/satır). Asıl boyut kazancı için sıradaki
-sürümde (a) PK dizisinin heap ile aynı anahtarı ikinci kez yazması (hücre
-başına 12 B başlık + 4 B slot + ayrı PK girdisi) ve (b) hücre başlığının
-sıkıştırılması incelenecek; `.idx` için varsayılan açık/kapalı kararı da
-bekliyor (şimdilik: her zaman yazılır).
+**Boyut konusunda dikkat (dürüstlük):** v3 veri dosyası v2'den küçüktür ama
+yanına **`.odb.idx`** (anahtar → sayfa/slot açılış önbelleği) yazar. `.idx`
+silinebilir (açılış 79 ms, hedef 150 ms) fakat yok sayılırsa kazanç daralır.
+`v3.1` satırı boyut işi **değildi** (dosya boyutu değişmemişti: 15.527.936 B /
+77,6 B/satır).
+
+**2026-10-28 düzeltmesi (Sprint A/2, `hiztesti.md` §11):** 77,6 B/satır sayısı
+bayattır ve iki şişkinlik taşıyordu — (1) v3.0/v3.1 koduyla ölçülmüştü,
+(2) `benchcmp` 220.001 hücreyi 200.000'e bölüyordu. Bugünkü kod aynı
+harness'la **`.odb` = 9.400.320 B (47,00 B/satır)** veriyor: 30,39 `EncodeRow`
++ 12 hücre başlığı + 4 slot + 0,65 sayfa/ozi. Yapısal yük 29 B/satır, kalanı
+iş yükünün verisi. **`.odb` 11 MB hedefini tutuyor** (47,00 < 55); açık kalan
+tek kalem `.idx` (10,94 B/satır, 2,19 MB) — içinde sıkıştırma alanı yok, ya
+yazılmayacak (açılış 79 ms) ya da sayfa düzeyine indirilecek (ölçülmedi).
 
 Not: v3.1'de `COUNT(*)` artık tarama yapmıyor (canlı sayaç, 0,1 ms); hedefin
 16 ms olması v3.0'da farkın CPU değil **okunacak bayt** olmasındandı.
@@ -1898,9 +1903,17 @@ hepsi geçti. Aynı kontrol `tests/gates/backendchk.lpr` içinde
 `BeginBatch` ayrı: **17 µs** (`TryAcquireWriteHold` 3,9 + `TWriteSet.Create`
 2,0 + kilit altındaki gövde 0,27 + gate Leave 1,3). `Put` ≈ 2 µs.
 
-Yani CPU payı ≈ **75 µs**, fsync ≈ 310 µs. SQLite'ın aynı işteki CPU'su
-≈ 55 µs; aradaki fark 20 µs. fsync her ikisinde de baskın olduğu için toplam
-sürede fark küçük kalıyor.
+Yani fsync dışı **duvar** süresi ≈ **75 µs**, fsync ≈ 310 µs. SQLite'ın
+aynı işteki CPU'su ≈ 55 µs.
+
+> **v3.30 düzeltmesi (2026-10-29, Sprint B/5):** Yukarıdaki tablo **duvar
+> ölçümüdür** (pcbench P=1, QPC). "CPU payı" etiketi yanlıştı — o ~75 µs'in
+> içinde I/O bekleme ve context switch de var. Gerçek **CPU** ayrımı
+> `cpuprof` ile ölçüldü (`hiztesti.md` §12): toplam 164 µs CPU'nun
+> **159 µs'i fsync** (`FlushFileBuffers` kernel CPU'su), fsync dışı CPU
+> yalnız **≈ 5 µs**. Yani §7j.3'ün "SQLite'a göre 20 µs CPU farkı"
+> çıkarımı da çürüdü; bizim fsync dışı CPU'muz SQLite'ınkinden **küçük**.
+> Kalan fark fsync'in kendisinde — bu, Sprint C'nin konusu (grup fsync).
 
 ### 7j.4 Değişim günlüğü: `EndGroup` 17,9 → 9,86 µs
 
@@ -1931,13 +1944,19 @@ Yani **toplu yazmada v3 artık SQLite'tan hızlı**, tek satır autocommit'te
 
 ### 7j.6 Kalan fark ve sıradaki iş
 
-Öncelik sırası (ölçülmüş paylar, autocommit):
+> **v3.30 notu:** Aşağıdaki paylar **duvar** ölçümüdür. `cpuprof` (CPU,
+> `hiztesti.md` §12) aynı yolu çok daha küçük gösteriyor: `BeginBatch`
+> 0,00 µs, WAL commit 2,50 µs, `LogFinish` 0,00 µs. Yani bu kalemlerin
+> çoğu **bekleme**, CPU değil. CPU'da optimize edilebilir alan ≈ 5 µs.
+
+Öncelik sırası (ölçülmüş **duvar** payları, autocommit):
 1. `BeginBatch` 17 µs — `TryAcquireWriteHold` (3,9) ve `TWriteSet.Create`
    (2,0); sözlükleri havuzdan geri kullanmak.
 2. `WAL Commit` ~32 µs — `TFileStream.WriteBuffer` yerine ham `WriteFile`
    (ölçülen fark ~1,85 µs/çağrı, commit'te 2–3 çağrı) ve `Seek(0, soEnd)`
    yerine izlenen ofset. **Dikkat:** `Recover`, `Truncate`, `Open` konumu
    değiştirir; izlenen ofset buralarda güncellenmezse WAL bozulur.
+   FPC kanıtı: yalnız `Seek` atlama ~1 µs; büyük kazanç yok.
 3. `LogFinish` 9,86 µs — grup kaydını WAL commit'iyle tek yazmada birleştirmek.
 4. Kritik bölümün kendi payı 9,7 µs (`FSets.Remove`, `SnapApplyPending`,
    `MergeTagDeltas`).
@@ -2725,22 +2744,17 @@ veri doğruluğunu bozmuyor.
 Not: kapılar tek komutta koşulmalı — `python run_gates.py > g30.txt & python
 sum.py` cmd'de 0 baytlık dosya üretti ve sahte "kapı yok" sonucu verdi.
 
-#### 7p.7 Kalan: tazelemede O(DB) heap taraması
+#### 7p.7 ~~Kalan: tazelemede O(DB) heap taraması~~ **Sprint D'de yapıldı (2026-10-29)**
 
-270 µs'nin ~125 µs'si hâlâ `DropCache` + `FHeap.Open`'dur: tazeleme tüm
+~~270 µs'nin ~125 µs'si hâlâ `DropCache` + `FHeap.Open`'dur: tazeleme tüm
 sayfaları diskten okuyup CRC doğrular ve dizini yeniden kurar. Bu maliyet
-**DB boyuyla büyür** (23000 satır/~250 sayfa → 125 µs; 1 GB'ta ~130 ms).
-Delta'ya geçmek için değişen sayfa listesi ve sayfa→anahtar ters haritası
-gerekir:
+**DB boyuyla büyür** (23000 satır/~250 sayfa → 125 µs; 1 GB'ta ~130 ms).~~
 
-- WAL kesilmediyse değişen sayfalar artımsal taramadan bilinir; başka süreç
-  `Truncate` yaptıysa delta kaybolur → o turda tam yeniden yükleme kaçınılmaz.
-- Heap dizini açık adresleme (`FKey/FLoc/FUsed`); **sayfa→anahtar ters
-  haritası yok**, `DirDel` tek anahtar siler. Sayfa bazlı toplu silme bugün
-  O(cap) tarama demektir. Seçenekler: (a) ters harita + `ReindexPages`,
-  (b) checkpoint'te `.idx` yazıp okuyucunun yüklemesi, (c) sayfa damgası +
-  tembel doğrulama. Öncelik 1 (doğruluk) nedeniyle ayrı dilimde, kapsamlı
-  kapılarla ele alınacak.
+**Çözüm (a) uygulandı:** `FPageKeys` ters haritası (sayfa→anahtar) +
+`FPageType` sayfa tipi izi. `ReindexPages` Phase 1'i O(cap) → O(delta).
+`mixbench` 23k satırda okuma 1,49x (23x değil) — bkz. `hiztesti.md` §15.
+16 kapı 686/0. WAL budama (`Truncate`) hâlâ tam yeniden yükleme gerektirir
+(kabul edildi).
 
 ### Kapsam dışı (değişmedi)
 - M3 WASM, M7 async sunucu, WASM/edge
@@ -3174,4 +3188,4 @@ En yavaş tek ölçüm 32 ms; ilk turda `.idx` soğuk önbellekten okunduğu iç
 - `MIGRATE TO v3` 200k satırda 0 fark
 - v2.3 etiketi ve dalı bozulmamış
 - Rakamlar dokümanda, ölçümle doğrulanmış
-- `v3.0` etiketi push edilmiş, CI yeşil
+- `v1.0.0` etiketi push edilmiş, CI yeşil
