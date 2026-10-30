@@ -10296,11 +10296,9 @@ begin
 
   b := EncodeRow(t.TableId, Pk, t, newVals);
   key := VDbHashKey(t.Name, Pk);
-  if FKvB.Get(key, oldB) then
-    if DecodeRow(oldB, exTid, exPk, exVals) and
-       ((exTid <> t.TableId) or (exPk <> Pk)) then
-      raise EVDbException.CreateFmt(ecHashCollision,
-        'VDb: hash carpismasi (%s, %s)', [t.Name, Pk]);
+  { Hash carpisma denetimi zaten ReadRow'da yapildi (orada raise eder).
+    Burada ikinci kez Get+DecodeRow yapmak her UPDATE'te satiri bir kez
+    daha cozuyordu; gereksiz. }
   FKvB.Put(key, b);
 
   // Indeks bakimi: yalniz degisen kolonlardan birini iceren indeksler.

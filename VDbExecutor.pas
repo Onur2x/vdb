@@ -15149,6 +15149,8 @@ var
   returningRows: TStrMatrix;
   retRow: TStrArray;
   hasReturning: Boolean;
+  // Sicak yol: tetikleyici / RLS yokken satir basina lookup'lar tamamen atlanir
+  hasRowTrig, hasRls: Boolean;
   // F-33: VIEW desteği
   baseTable: string;
   viewColMap: TStrArray;
@@ -15352,6 +15354,12 @@ begin
           raise EVDbException.Create(ecUnsupported,
             'UPDATE: PK kolonu guncellenemez: ' + colNames[setIdx]);
 
+  // Tetikleyici / RLS meta verisi UPDATE boyunca degismez: bir kez bak,
+  // yoksa satir basina FireTriggers + Rls* cagrisini tamamen atla (sicak yol).
+  hasRowTrig :=
+    (Length(FT.TriggersFor(Stmt.Table, Byte(ttBefore), Byte(teUpdate))) > 0) or
+    (Length(FT.TriggersFor(Stmt.Table, Byte(ttAfter), Byte(teUpdate))) > 0);
+  hasRls := FT.RlsApplies(Stmt.Table);
 
   if not FT.Backend.InBatch then
   begin
@@ -15362,7 +15370,7 @@ begin
 
         if not RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes) then Continue;
         // R-19: gorunmeyen satir guncellenemez (USING)
-        if not RlsRowVisible(Stmt.Table, 3, allRows[i], colNames, colTypes) then Continue;
+        if hasRls and not RlsRowVisible(Stmt.Table, 3, allRows[i], colNames, colTypes) then Continue;
         SetLength(newVals, Length(td.Cols));
         for j := 0 to High(td.Cols) do newVals[j] := allRows[i][j];
         for j := 0 to Stmt.Assignments.Count - 1 do
@@ -15375,13 +15383,14 @@ begin
             newVals[ci] := EvalExpr(TSqlExprNode(Stmt.Assignments[j].Expr), allRows[i], colNames, colTypes);
         end;
         // R-19: yeni satir WITH CHECK'ten gecmeli
-        if not RlsCheckRow(Stmt.Table, 3, newVals, colNames, colTypes) then
+        if hasRls and not RlsCheckRow(Stmt.Table, 3, newVals, colNames, colTypes) then
           raise EVDbException.CreateFmt(ecPermissionDenied,
             'RLS politika ihlali: rol "%s" tablo "%s" icin bu satiri yazamaz',
             [FT.CurrentRole, Stmt.Table]);
         // F-36: BEFORE UPDATE ROW tetikleyiciler (NEW degisikliklerini FireTriggerDef isler)
-        FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teUpdate),
-          allRows[i], newVals, colNames, Res, True);
+        if hasRowTrig then
+          FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teUpdate),
+            allRows[i], newVals, colNames, Res, True);
         if FT.UpdateRowInPlace(Stmt.Table, pks[i], newVals) then
         begin
           Inc(rCount);
@@ -15403,12 +15412,14 @@ begin
           end;
         end;
         // F-36: AFTER UPDATE ROW tetikleyiciler
-        FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teUpdate),
-          allRows[i], newVals, colNames, Res, True);
+        if hasRowTrig then
+          FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teUpdate),
+            allRows[i], newVals, colNames, Res, True);
       end;
       FT.Backend.CommitBatch;
       // F-36: AFTER UPDATE STATEMENT tetikleyiciler (tum satirlardan sonra)
-      FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teUpdate), nil, nil, [], Res, False);
+      if hasRowTrig then
+        FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teUpdate), nil, nil, [], Res, False);
     except
       FT.AbortBatch;
       raise;
@@ -15420,7 +15431,7 @@ begin
     begin
       if not RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes) then Continue;
       // R-19: gorunmeyen satir guncellenemez (USING)
-      if not RlsRowVisible(Stmt.Table, 3, allRows[i], colNames, colTypes) then Continue;
+      if hasRls and not RlsRowVisible(Stmt.Table, 3, allRows[i], colNames, colTypes) then Continue;
       SetLength(newVals, Length(td.Cols));
       for j := 0 to High(td.Cols) do newVals[j] := allRows[i][j];
       for j := 0 to Stmt.Assignments.Count - 1 do
@@ -15433,13 +15444,14 @@ begin
           newVals[ci] := EvalExpr(TSqlExprNode(Stmt.Assignments[j].Expr), allRows[i], colNames, colTypes);
       end;
       // R-19: yeni satir WITH CHECK'ten gecmeli
-      if not RlsCheckRow(Stmt.Table, 3, newVals, colNames, colTypes) then
+      if hasRls and not RlsCheckRow(Stmt.Table, 3, newVals, colNames, colTypes) then
         raise EVDbException.CreateFmt(ecPermissionDenied,
           'RLS politika ihlali: rol "%s" tablo "%s" icin bu satiri yazamaz',
           [FT.CurrentRole, Stmt.Table]);
       // F-36: BEFORE UPDATE ROW tetikleyiciler (NEW degisikliklerini FireTriggerDef isler)
-      FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teUpdate),
-        allRows[i], newVals, colNames, Res, True);
+      if hasRowTrig then
+        FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teUpdate),
+          allRows[i], newVals, colNames, Res, True);
       if FT.UpdateRowInPlace(Stmt.Table, pks[i], newVals) then
       begin
         Inc(rCount);
@@ -15461,11 +15473,13 @@ begin
         end;
       end;
       // F-36: AFTER UPDATE ROW tetikleyiciler
-      FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teUpdate),
-        allRows[i], newVals, colNames, Res, True);
+      if hasRowTrig then
+        FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teUpdate),
+          allRows[i], newVals, colNames, Res, True);
     end;
       // F-36: AFTER UPDATE STATEMENT tetikleyiciler (tum satirlardan sonra)
-      FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teUpdate), nil, nil, [], Res, False);
+      if hasRowTrig then
+        FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teUpdate), nil, nil, [], Res, False);
   end;
 
   // R-04: RETURNING - sonuclari Res'e aktar
@@ -15501,6 +15515,8 @@ var
   returningRows: TStrMatrix;
   retRow: TStrArray;
   hasReturning: Boolean;
+  // Sicak yol: tetikleyici / RLS yokken satir basina lookup'lar tamamen atlanir
+  hasRowTrig, hasRls: Boolean;
   // F-33: VIEW desteği
   baseTable: string;
   viewColMap: TStrArray;
@@ -15554,13 +15570,20 @@ begin
     // R-13 Full: partition pruning (UPDATE/DELETE taramalari da kullanir)
     FT.ScanRowsPart(Stmt.Table, pks, allRows, PartTargetsOf(td, Stmt.WhereClause));
 
+  // Tetikleyici / RLS meta verisi DELETE boyunca degismez: bir kez bak,
+  // yoksa satir basina FireTriggers + Rls* cagrisini tamamen atla (sicak yol).
+  hasRowTrig :=
+    (Length(FT.TriggersFor(Stmt.Table, Byte(ttBefore), Byte(teDelete))) > 0) or
+    (Length(FT.TriggersFor(Stmt.Table, Byte(ttAfter), Byte(teDelete))) > 0);
+  hasRls := FT.RlsApplies(Stmt.Table);
+
   toDelete := TList<Integer>.Create;
   if hasReturning then
     SetLength(toDeleteRows, 0);
   try
     for i := 0 to High(allRows) do
       if RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes) and
-         RlsRowVisible(Stmt.Table, 4, allRows[i], colNames, colTypes) then   // R-19
+         ((not hasRls) or RlsRowVisible(Stmt.Table, 4, allRows[i], colNames, colTypes)) then   // R-19
       begin
         toDelete.Add(i);
         if hasReturning then
@@ -15581,16 +15604,19 @@ begin
           begin
 
             // F-36: BEFORE DELETE ROW tetikleyiciler (satir silinmeden once)
-            FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teDelete),
-              allRows[toDelete[i]], nil, allColNames, Res, True);
+            if hasRowTrig then
+              FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teDelete),
+                allRows[toDelete[i]], nil, allColNames, Res, True);
             FT.Delete(Stmt.Table, pks[toDelete[i]]);
             // F-36: AFTER DELETE ROW tetikleyiciler (satir silindikten sonra)
-            FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete),
-              allRows[toDelete[i]], nil, allColNames, Res, True);
+            if hasRowTrig then
+              FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete),
+                allRows[toDelete[i]], nil, allColNames, Res, True);
           end;
           FT.Backend.CommitBatch;
           // F-36: AFTER DELETE STATEMENT tetikleyiciler (tum satirlardan sonra)
-          FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete), nil, nil, [], Res, False);
+          if hasRowTrig then
+            FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete), nil, nil, [], Res, False);
         except
           FT.AbortBatch;
           raise;
@@ -15601,15 +15627,18 @@ begin
         for i := 0 to toDelete.Count - 1 do
         begin
           // F-36: BEFORE DELETE ROW tetikleyiciler (satir silinmeden once)
-          FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teDelete),
-            allRows[toDelete[i]], nil, allColNames, Res, True);
+          if hasRowTrig then
+            FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teDelete),
+              allRows[toDelete[i]], nil, allColNames, Res, True);
           FT.Delete(Stmt.Table, pks[toDelete[i]]);
           // F-36: AFTER DELETE ROW tetikleyiciler (satir silindikten sonra)
-          FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete),
-            allRows[toDelete[i]], nil, allColNames, Res, True);
+          if hasRowTrig then
+            FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete),
+              allRows[toDelete[i]], nil, allColNames, Res, True);
         end;
         // F-36: AFTER DELETE STATEMENT tetikleyiciler (tum satirlardan sonra)
-        FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete), nil, nil, [], Res, False);
+        if hasRowTrig then
+          FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete), nil, nil, [], Res, False);
       end;
     end;
   finally
