@@ -175,6 +175,15 @@ type
     function ExecAllInner(const Stmts: TStrArray): TSqlResult;
     // F-35: check if statement is a read-only SELECT
     function IsSelectStatement(const S: string): Boolean;
+    // P-CACHE: SQL metninin ilk kelimesi SELECT/WITH/INSERT/UPDATE/DELETE mi?
+    // Yalniz plan onbellegi on-eleme icin; kesin karar IsCacheableAst'te.
+    function IsCacheableText(const S: string): Boolean;
+    // P-CACHE: AST plan onbellegine alinabilir mi? Yalniz DML/SELECT dugumleri
+    // (WITH ... INSERT gibi metin sezgisini yalanlayan durumlar burada ayiklanir).
+    function IsCacheableAst(Stmt: TSqlStmtNode): Boolean;
+    // P-CACHE: onbellek anahtari. '?' JSONB operatoru / yer tutucu ayrimi
+    // parametre sayisina bagli oldugundan anahtar onu da tasir.
+    function PlanCacheKey(const Sql: string): string;
   public
     constructor Create(AT: TVTableDb);
     // F-21: yavas sorgu kayitlari burada serbest birakilir
@@ -3099,6 +3108,43 @@ begin
   end;
 end;
 
+function TVSql.IsCacheableText(const S: string): Boolean;
+// P-CACHE: ilk kelime SELECT/WITH/INSERT/UPDATE/DELETE ise True.
+// Yalniz plan onbellegi on-eleme acisindan; kesin karar IsCacheableAst'te.
+// (Metin sezgisi yanilabilir: 'WITH ... INSERT' gercekte INSERT'tir.)
+var
+  p, sv: Integer;
+  w: string;
+begin
+  sv := FParamIdx;
+  p := 1;
+  Result := False;
+  try
+    if not Tok(S, p, w) then Exit;
+    w := UpperCase(w);
+    Result := (w = 'SELECT') or (w = 'WITH') or (w = 'INSERT') or
+              (w = 'UPDATE') or (w = 'DELETE');
+  finally
+    FParamIdx := sv;
+  end;
+end;
+
+function TVSql.IsCacheableAst(Stmt: TSqlStmtNode): Boolean;
+// P-CACHE: yalniz DML/SELECT dugumleri onbelleklenir. Metin sezgisinin
+// kacirdigi durumlar (WITH ... INSERT -> TSqlInsertStmt) burada ayiklanir.
+begin
+  Result := (Stmt is TSqlSelectStmt) or (Stmt is TSqlInsertStmt) or
+            (Stmt is TSqlUpdateStmt) or (Stmt is TSqlDeleteStmt);
+end;
+
+function TVSql.PlanCacheKey(const Sql: string): string;
+// P-CACHE: onbellek anahtari. '?' karakteri parametre sayisina bagli olarak
+// ya yer tutucu ya da JSONB operatorudur; bu yuzden parametre sayisi da
+// anahtarin parcasi olmak zorunda. '#0' ayiraci SQL metninde gecemez.
+begin
+  Result := Sql + #0 + IntToStr(Length(FParams));
+end;
+
 function TVSql.ExecAll(const Stmts: TStrArray): TSqlResult;
 // Cumle listesini sirayla isler. Affected TOPLAM, Fields/Rows ise SATIR
 // DONDUREN SON cumlenin sonucu (yoksa son cumlenin sonucu).
@@ -3802,6 +3848,11 @@ var
   w1, w2, w3: string;
   fastOk: Boolean;
   spanRoot, spanChild: TVDbTraceSpan;
+  // P-CACHE: plan onbellegi anahtari / karar degiskenleri
+  cacheKey: string;
+  cacheable: Boolean;
+  i: Integer;
+  lit: TSqlLiteralNode;
 begin
   { FPC 3.2.2 / x86_64: bazi cagri baglamlarinda yonetilen alanli kayit
     donduren fonksiyonun gecici sonucu sifirlanmiyor; onceki cagridan
@@ -4052,33 +4103,52 @@ begin
     end;
   end;
 
-  // H7 (2026-10-18): PLAN ONBELLEGI. Parametresiz SELECT tekrar gelirse AST
-  // yeniden ayristirilmaz (parse maliyeti atlanir). Onbellekteki AST
-  // sahiplenilir; onbellekten kullanimda Free EDILMEZ.
-  if (Length(FParams) = 0) and IsSelectStatement(Sql) and
-     FPlanCache.TryGetValue(Sql, astStmt) then
+  // H7 + P-CACHE (2026-10-30): PLAN ONBELLEGI. SELECT/INSERT/UPDATE/DELETE
+  // tekrar geldiginde AST yeniden ayristirilmaz (parse maliyeti atlanir).
+  // P-CACHE ile '?' / '$N' yer tutucularinin degerleri her calistirmada
+  // ParamLits uzerinden guncellenir; boylece ayni plan farkli parametrelerle
+  // yeniden kullanilir. Onbellekteki AST sahiplenilir; kullanimda Free EDILMEZ.
+  cacheable := IsCacheableText(Sql);
+  cacheKey := '';
+  if cacheable then
   begin
-    Inc(FPlanHits);
-    SlowMarkStart;
-    try
-      spanChild := VDbTraceBegin('sql.execute', spanRoot);
-      VDbTraceSetCurrent(spanChild);
+    cacheKey := PlanCacheKey(Sql);
+    if FPlanCache.TryGetValue(cacheKey, astStmt) then
+    begin
+      Inc(FPlanHits);
+      // P-CACHE: yer tutucu degerlerini bu calistirma icin guncelle.
+      // ParamIdx = -1 olan sabit literal'a dokunulmaz.
+      if Length(FParams) > 0 then
+        for i := 0 to astStmt.ParamLits.Count - 1 do
+        begin
+          lit := astStmt.ParamLits[i];
+          if (lit.ParamIdx >= 0) and (lit.ParamIdx <= High(FParams)) then
+            lit.StrVal := FParams[lit.ParamIdx];
+        end;
+      SlowMarkStart;
       try
-        Result := FExecutor.Execute(astStmt);
+        spanChild := VDbTraceBegin('sql.execute', spanRoot);
+        VDbTraceSetCurrent(spanChild);
+        try
+          Result := FExecutor.Execute(astStmt);
+        finally
+          VDbTraceSetCurrent(nil);
+          VDbTraceEnd(spanChild);
+        end;
       finally
-        VDbTraceSetCurrent(nil);
-        VDbTraceEnd(spanChild);
+        FLastMs := ElapsedMs;
+        NoteSlow(Sql, FLastMs, Length(Result.Rows));
+        RecordCommand(Sql, FLastMs * 1000, 0);
       end;
-    finally
-      FLastMs := ElapsedMs;
-      NoteSlow(Sql, FLastMs, Length(Result.Rows));
-      RecordCommand(Sql, FLastMs * 1000, 0);
+      // Guvenlik agi: yurutucu AST'yi yerinde degistirdiyse (sonraki
+      // calistirmalarda farkli bir yol tutulduysa) plan artik guvenilir
+      // degildir; onbellegten cikar ki sonraki calistirma yeniden ayristsin.
+      if FExecutor.StmtMutated then
+        FPlanCache.Remove(cacheKey);
+      Exit;
     end;
-    Exit;
+    Inc(FPlanMiss);
   end;
-
-  // Diger tum komutlar icin AST Pipeline (P-25: FParser ve FExecutor yeniden kullanilir)
-  if (Length(FParams) = 0) and IsSelectStatement(Sql) then Inc(FPlanMiss);
   spanChild := VDbTraceBegin('sql.parse', spanRoot);
   try
     astStmt := FParser.Parse(Sql, FParams);
@@ -4109,13 +4179,25 @@ begin
       RecordCommand(Sql, FLastMs * 1000, 0);
     end;
 
-    // H7: basarili + parametresiz SELECT'i onbellege al (sahiplik aktarilir)
-    if (Length(FParams) = 0) and IsSelectStatement(Sql) then
+    // H7 + P-CACHE: basarili + guvenli plani onbellege al (sahiplik aktarilir).
+    //  - Yalniz DML/SELECT dugumleri (IsCacheableAst): 'WITH ... INSERT' gibi
+    //    metin sezgisini yalanlayan durumlar burada ayiklanir.
+    //  - Parametresiz DML onbellegi kirletmesin diye cache'lenmez; yalniz
+    //    parametreli DML veya SELECT cache'lenir.
+    //  - ParamsBoundOk = False ise bazi degerler literal OLMAYAN alanlara
+    //    gomulmustur (LIMIT ?, tanimlayici, -? vb.); boyle AST yeniden
+    //    kullanilamaz, cunku placeholder bolumu ayristirma sirasinda kaybolur.
+    //  - StmtMutated = True ise yurutucu AST'yi yerinde degistirmistir
+    //    (view yazimi, ON CONFLICT varsayilan esleme, CHECK katlama, govde
+    //    sahiplik devri); boyle AST onbellege ALINMAZ.
+    if cacheable and IsCacheableAst(astStmt) and FParser.ParamsBoundOk and
+       (not FExecutor.StmtMutated) and
+       ((Length(FParams) > 0) or (astStmt is TSqlSelectStmt)) then
     begin
       if FPlanCache.Count >= PLAN_CACHE_CAP then FPlanCache.Clear;
-      if not FPlanCache.ContainsKey(Sql) then
+      if not FPlanCache.ContainsKey(cacheKey) then
       begin
-        FPlanCache.Add(Sql, astStmt);
+        FPlanCache.Add(cacheKey, astStmt);
         astStmt := nil;   // sahiplik onbellege gecti; finally Free ETMEZ
       end;
     end

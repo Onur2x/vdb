@@ -44,6 +44,10 @@ type
     FloatVal: Double;
     StrVal: string;
     BoolVal: Boolean;
+    // P-CACHE: >=0 ise bu literal bir '?' / '$N' yer tutucusudur ve
+    // her calistirmada ParamLits uzerinden FParams[ParamIdx] degeriyle
+    // guncellenir. -1 = sabit literal (eski davranis).
+    ParamIdx: Integer;
     constructor CreateNull;
     constructor CreateInt(const V: Int64);
     constructor CreateFloat(const V: Double);
@@ -271,7 +275,13 @@ type
 
   TSqlStmtNode = class(TSqlNode)
   public
+     // P-CACHE: bu AST'deki '?' / '$N' yer tutuculari (ParamIdx >= 0 olan
+     // literal'lar). Elemanlar AST'nin kendisine aittir; yalniz liste
+     // serbest birakilir. Plan onbellegi ile birlikte saklanir ki farkli
+     // parametre degerleriyle yeniden calistirilabilsin.
+     ParamLits: TList<TSqlLiteralNode>;
      constructor Create; override;
+     destructor Destroy; override;
   end;
 
   { SELECT Cikti Kolonu Tanimi }
@@ -988,6 +998,7 @@ end;
 constructor TSqlLiteralNode.CreateNull;
 begin
   inherited Create;
+  ParamIdx := -1;
   LitType := sltNull;
   StrVal := '';
   IntVal := 0;
@@ -998,6 +1009,7 @@ end;
 constructor TSqlLiteralNode.CreateInt(const V: Int64);
 begin
   inherited Create;
+  ParamIdx := -1;
   LitType := sltInt;
   IntVal := V;
   StrVal := IntToStr(V);
@@ -1008,6 +1020,7 @@ end;
 constructor TSqlLiteralNode.CreateFloat(const V: Double);
 begin
   inherited Create;
+  ParamIdx := -1;
   LitType := sltFloat;
   FloatVal := V;
   StrVal := VdbTable.VDbFloatToStr(V);
@@ -1018,6 +1031,7 @@ end;
 constructor TSqlLiteralNode.CreateStr(const V: string);
 begin
   inherited Create;
+  ParamIdx := -1;
   LitType := sltString;
   StrVal := V;
   IntVal := 0;
@@ -1028,6 +1042,7 @@ end;
 constructor TSqlLiteralNode.CreateBool(const V: Boolean);
 begin
   inherited Create;
+  ParamIdx := -1;
   LitType := sltBool;
   BoolVal := V;
   if V then StrVal := 'True' else StrVal := 'False';
@@ -1395,6 +1410,14 @@ end;
 constructor TSqlStmtNode.Create;
 begin
   inherited Create;
+  ParamLits := TList<TSqlLiteralNode>.Create;
+end;
+
+destructor TSqlStmtNode.Destroy;
+begin
+  // Elemanlar AST'nin kendisine aittir (child dagitimi) — yalniz liste.
+  ParamLits.Free;
+  inherited Destroy;
 end;
 
 { TSqlSelectStmt }

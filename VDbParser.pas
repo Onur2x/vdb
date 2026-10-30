@@ -41,6 +41,17 @@ type
     FLen   : Integer;
     FParams: TStrArray;
     FParamIdx: Integer;
+    // P-CACHE: son okunan token'in '?' / '$N' yer tutucusu olup olmadigi
+    // ve parametresi. NextToken her token'da sifirlar; ParsePrimary
+    // literal olustururken ParamLits listesine isaretler.
+    FLastParamIdx: Integer;
+    FParamLits: TList<TSqlLiteralNode>;
+    // P-CACHE: Parse boyunca tuketilen yer tutucu sayisi. PeekToken/TryEat
+    // geri sardiginda bu da geri sarilir. FParamLits.Count ile esit degilse
+    // bazi degerler literal OLAYAN alanlara (LIMIT ?, tanimlayici, -? vb.)
+    // gomulmustur; boyle AST plan onbellegine alinamaz.
+    FPlaceholdersUsed: Integer;
+    FParamsBoundOk: Boolean;
     // F1-22: ifade/parantez derinlik sayaci (yigin tasmasini onler)
     FDepth  : Integer;
     // F1-12: UNION/EXCEPT/INTERSECT sag SELECT'i icin kuyruk (ORDER BY /
@@ -172,8 +183,16 @@ type
     { Parse: SQL metnini ayrıştırır, AST dugumu dondurur.
       Params: '?' yer tutucularini sirasıyla doldurur; `$1`, `$2` ...
       ise Params dizisinde 1-tabanli konumu secer. }
+    constructor Create;
+    destructor Destroy; override;
     function Parse(const ASql: string;
                    const AParams: array of string): TSqlStmtNode;
+    { P-CACHE: son Parse'te tum '?' / '$N' yer tutuculari ifade LITERAL'i
+      olarak mi yakalandi? False ise bazi degerler AST'nin literal olmayan
+      alanlarina gomulmustur (LIMIT ?, tanimlayici, -? gibi); boyle bir AST
+      her calistirmada ayni parametre degerlerini tasir, plan onbellegine
+      ALINMAMALIDIR. }
+    property ParamsBoundOk: Boolean read FParamsBoundOk;
   end;
 
 { M1: SQL metnindeki en buyuk konumsal parametre numarasini dondurur
@@ -329,6 +348,7 @@ begin
   T := '';
   IsStringLit := False;
   Result := False;
+  FLastParamIdx := -1;   // P-CACHE: bu token yer tutucu degil
   if FPos > FLen then Exit;
 
   // F-22: '?' iki anlamli: parametre yer tutucusu VEYA JSONB "anahtar var mi"
@@ -340,8 +360,11 @@ begin
     if FParamIdx <= High(FParams) then
     begin
       Inc(FPos);
+      // P-CACHE: ParamIdx, Inc'den ONCE alinir (0-tabanli konum).
+      FLastParamIdx := FParamIdx;
       T := FParams[FParamIdx];
       Inc(FParamIdx);
+      Inc(FPlaceholdersUsed);
       IsStringLit := True;
       Result := True;
       Exit;
@@ -382,7 +405,9 @@ begin
       raise EVDbException.CreateFmt(ecSyntaxError,
         'parametre $%d tanimli degil (toplam %d)', [pidx, Length(FParams)]);
     FPos := i;
+    FLastParamIdx := pidx - 1;
     T := FParams[pidx - 1];
+    Inc(FPlaceholdersUsed);
     IsStringLit := True;
     Result := True;
     Exit;
@@ -703,34 +728,38 @@ begin
 end;
 
 function TVDbParser.PeekToken: string;
-var SavePos, SaveIdx: Integer; T: string;
+var SavePos, SaveIdx, SaveUsed: Integer; T: string;
 begin
-  SavePos := FPos; SaveIdx := FParamIdx;
+  SavePos := FPos; SaveIdx := FParamIdx; SaveUsed := FPlaceholdersUsed;
   if not NextToken(T) then T := '';
-  FPos := SavePos; FParamIdx := SaveIdx;
+  FPos := SavePos; FParamIdx := SaveIdx; FPlaceholdersUsed := SaveUsed;
   Result := UpperCase(T);
 end;
 
 function TVDbParser.PeekToken2: string;
-var SavePos, SaveIdx: Integer; T: string;
+var SavePos, SaveIdx, SaveUsed: Integer; T: string;
 begin
-  SavePos := FPos; SaveIdx := FParamIdx;
-  if not NextToken(T) then begin FPos := SavePos; FParamIdx := SaveIdx; Result := ''; Exit; end;
+  SavePos := FPos; SaveIdx := FParamIdx; SaveUsed := FPlaceholdersUsed;
+  if not NextToken(T) then
+  begin
+    FPos := SavePos; FParamIdx := SaveIdx; FPlaceholdersUsed := SaveUsed;
+    Result := ''; Exit;
+  end;
   if not NextToken(T) then T := '';
-  FPos := SavePos; FParamIdx := SaveIdx;
+  FPos := SavePos; FParamIdx := SaveIdx; FPlaceholdersUsed := SaveUsed;
   Result := UpperCase(T);
 end;
 
 function TVDbParser.PeekToken3: string;
 // Ucuncu siradaki token'a bakar (FPos degismez). `LEFT JOIN LATERAL`
 // gibi uc kelimelik bir ozdesligi tek bakista test etmek icin gerekli.
-var SavePos, SaveIdx: Integer; T: string; k: Integer;
+var SavePos, SaveIdx, SaveUsed: Integer; T: string; k: Integer;
 begin
-  SavePos := FPos; SaveIdx := FParamIdx;
+  SavePos := FPos; SaveIdx := FParamIdx; SaveUsed := FPlaceholdersUsed;
   T := '';
   for k := 1 to 3 do
     if not NextToken(T) then T := '';
-  FPos := SavePos; FParamIdx := SaveIdx;
+  FPos := SavePos; FParamIdx := SaveIdx; FPlaceholdersUsed := SaveUsed;
   Result := UpperCase(T);
 end;
 
@@ -756,9 +785,9 @@ begin
 end;
 
 function TVDbParser.TryEat(const W: string): Boolean;
-var SavePos, SaveIdx: Integer; T: string;
+var SavePos, SaveIdx, SaveUsed: Integer; T: string;
 begin
-  SavePos := FPos; SaveIdx := FParamIdx;
+  SavePos := FPos; SaveIdx := FParamIdx; SaveUsed := FPlaceholdersUsed;
   if not NextToken(T) then begin Result := False; Exit; end;
   if SameText(T, W) then
   begin
@@ -766,7 +795,7 @@ begin
   end
   else
   begin
-    FPos := SavePos; FParamIdx := SaveIdx;
+    FPos := SavePos; FParamIdx := SaveIdx; FPlaceholdersUsed := SaveUsed;
     Result := False;
   end;
 end;
@@ -958,7 +987,13 @@ begin
       if Stmt <> nil then
         Stmt.CheckExprs.Add(ParseExpr)
       else
+      begin
+        // P-CACHE: atilan alt agac yer tutucu literal tasimis olabilir.
+        // Serbest birakilan dugumler FParamLits listesinde isaret kalmasin
+        // (sonrasi icin tutarsizlik / asiri temkinli atlama yeterli).
         ParseExpr.Free;
+        FParamLits.Clear;
+      end;
       Expect(')');
     end
     // ---- R-11: DEFERRABLE / INITIALLY ----
@@ -1037,7 +1072,10 @@ begin
           try
             C.GenExpr := ExprToText(GenAST);
           finally
+            // P-CACHE: AST metne cevrilip atiliyor; yer tutucu literal
+            // isaretleri listede kalmasin (bkz. CHECK dalindaki not).
             GenAST.Free;
+            FParamLits.Clear;
           end;
           C.Generated := True;
           Expect(')');
@@ -1883,7 +1921,17 @@ begin
 
   // String sabiti (tek tırnaklı metin veya ? parametresi)
   if IsLit then
-    Exit(TSqlLiteralNode.CreateStr(T));
+  begin
+    Result := TSqlLiteralNode.CreateStr(T);
+    // P-CACHE: '?' / '$N' yer tutucusu ise ParamIdx'i isaretle; calistirma
+    // oncesi degerler FParams'ten bu dugum uzerinden guncellenir.
+    if FLastParamIdx >= 0 then
+    begin
+      TSqlLiteralNode(Result).ParamIdx := FLastParamIdx;
+      FParamLits.Add(TSqlLiteralNode(Result));
+    end;
+    Exit;
+  end;
 
   // NULL
   if U = 'NULL' then Exit(TSqlLiteralNode.CreateNull);
@@ -4853,6 +4901,22 @@ begin
   end;
 end;
 
+constructor TVDbParser.Create;
+begin
+  inherited Create;
+  FParamLits := TList<TSqlLiteralNode>.Create;
+  FLastParamIdx := -1;
+  FPlaceholdersUsed := 0;
+  FParamsBoundOk := True;
+end;
+
+destructor TVDbParser.Destroy;
+begin
+  // Elemanlar AST'nin kendisine aittir; yalnizca liste serbest birakilir.
+  FParamLits.Free;
+  inherited Destroy;
+end;
+
 function TVDbParser.Parse(const ASql: string;
                            const AParams: array of string): TSqlStmtNode;
 var
@@ -4869,6 +4933,12 @@ begin
   FParamIdx := 0;
   FDepth := 0;   // F1-22: derinlik sayaci sifirlanir
   FSuppressTail := False; // F1-12
+  // P-CACHE: onceki Parse'ten kalan placeholder listesi temizlenir
+  // (elemanlar o AST'ye aitti; burada yalniz referanslar atilir).
+  FLastParamIdx := -1;
+  FPlaceholdersUsed := 0;
+  FParamsBoundOk := True;
+  FParamLits.Clear;
   SetLength(FParams, Length(AParams));
   for i := 0 to High(AParams) do FParams[i] := AParams[i];
 
@@ -5000,7 +5070,11 @@ begin
     else if U2 = 'ROLE' then
     begin
       // ROLE token'i ParseRole icinde tüketilecek; burda tüketme!
-      FPos := FPos - Length(T) - 1; FParamIdx := FParamIdx - 1; // geri sar
+      // FParamIdx yalniz GERCEK yer tutucu tuketildiyse geri sarilir;
+      // 'ROLE' anahtar kelimesi FParamIdx'i ilerletmez (asagi inerse
+      // FParams[-1] erisimi olurdu). Bkz. FLastParamIdx.
+      FPos := FPos - Length(T) - 1;
+      if FLastParamIdx >= 0 then FParamIdx := FParamIdx - 1; // geri sar
       Result := ParseRole;
     end
     else if U2 = 'POLICY' then
@@ -5245,6 +5319,17 @@ else if U = 'ARCHIVE' then Result := ParseAdmin('ARCHIVE', '')
       raise EVDbException.CreateFmt(ecSyntaxError, 'anlasilamayan ek: %s', [T]);
     end;
   end;
+
+  // P-CACHE: placeholder literal listesini kok AST'ye aktar. Elemanlar
+  // zaten agacin icindedir (sahiplik child dagitiminda); liste yalnizca
+  // calistirma oncesi deger guncellemesi icin yol gosterir. Sayac ile
+  // liste esit degilse bazi yer tutucular literal olmayan alanlara
+  // gomulmustur (LIMIT ?, tanimlayici, -? ...): boyle AST onbelleklenmez.
+  FParamsBoundOk := (FParamLits.Count = FPlaceholdersUsed);
+  if Result <> nil then
+    for i := 0 to FParamLits.Count - 1 do
+      Result.ParamLits.Add(FParamLits[i]);
+  FParamLits.Clear;
 end;
 
 end.

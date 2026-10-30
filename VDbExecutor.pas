@@ -144,6 +144,12 @@ type
     // NarrowRows bu modda satir OKUMAZ, FCountResult'a sayiyi yazar.
     FCountOnly: Boolean;
     FCountResult: Int64;
+    // P-CACHE: yurutucu AST'yi YERINDE degistirdiyse True (view yazimi,
+    // INSERT OR REPLACE varsayilan esleme, CHECK katlama, govde sahiplik
+    // devri). Boyle AST'ler plan onbellegine ALINMAZ: ikinci calistirma
+    // zaten degismis agaci gorurdu (OR REPLACE'te OnConflictSetExprs
+    // her calistirmada BIRIKERDI). Execute girisinde sifirlanir.
+    FStmtMutated: Boolean;
     // 4.3: HAVING icinde dogrudan aggregate. EvalBool sirasinda aktif
     // grup baglami: FAggIdx <> nil iken EvalExpr'de aggregate cagrilari
     // grup satirlari uzerinden hesaplanir (alias zorunlu degil). yalnizca
@@ -580,6 +586,9 @@ type
     // F-40/F-41: TVSql tarafindan atanan oturum kimligi ve yalitim.
     property SessionId: Cardinal read FSessionId write FSessionId;
     property Isolation: TIsolationLevel read FIsolation write FIsolation;
+    { P-CACHE: son Execute AST'yi yerinde degistirdi mi? True ise o AST
+      plan onbellegine alinmaz (bkz. FStmtMutated). }
+    property StmtMutated: Boolean read FStmtMutated;
     { F-35: FUNCTION/PROCEDURE govdesi bu executor ile calistirilir.
       Parametre degerleri FOuterRow/FOuterColNames uzerinden gecer.
       VDbTable'daki ExecuteFunctionFor/CallProcedureFor bunlari
@@ -13378,6 +13387,7 @@ begin
   if AnalyzeViewUpdatable(Stmt.Table, baseTable, viewColMap) then
   begin
     // View -> base table'a yeniden yaz
+    FStmtMutated := True;   // P-CACHE: AST yerinde degisiyor
     Stmt.Table := baseTable;
     // Kolon eslemesi: view kolonlari -> base kolonlari
     if Length(Stmt.Columns) > 0 then
@@ -13475,6 +13485,9 @@ begin
     if Stmt.OnConflictSetExprs.Count > 0 then
       raise EVDbException.Create(ecSyntaxError,
         'INSERT OR REPLACE ile ON CONFLICT ... DO UPDATE birlikte kullanilamaz');
+    // P-CACHE: asagida OnConflictSetExprs HER calistirmada doldurulur;
+    // onbelleklenmis AST'de liste BIRIKERDI.
+    FStmtMutated := True;
     for i := 0 to High(td.Cols) do
     begin
       if (td.PkIndex >= 0) and (i = td.PkIndex) then Continue;
@@ -13497,7 +13510,10 @@ begin
     Stmt.OnConflictAction := ocaDoUpdate;
   end
   else if Stmt.OrAction = ioaIgnore then
+  begin
+    FStmtMutated := True;   // P-CACHE: AST yazimi — onbellek disi birak
     Stmt.OnConflictAction := ocaDoNothing;
+  end;
 
   // R-03: ON CONFLICT action mapping
   onConflictAction := ocaNone;
@@ -15178,6 +15194,7 @@ begin
       'view uzerine UPDATE yapilamaz (guncellenemez view): ' + Stmt.Table);
   if AnalyzeViewUpdatable(Stmt.Table, baseTable, viewColMap) then
   begin
+    FStmtMutated := True;   // P-CACHE: AST yerinde degisiyor
     Stmt.Table := baseTable;
     // SET atamalarını base kolonlarına çevir (viewColMap: "viewCol=baseCol")
     originalAssignments := Stmt.Assignments;
@@ -15543,6 +15560,7 @@ begin
       'view uzerine DELETE yapilamaz (guncellenemez view): ' + Stmt.Table);
   if AnalyzeViewUpdatable(Stmt.Table, baseTable, viewColMap) then
   begin
+    FStmtMutated := True;   // P-CACHE: AST yerinde degisiyor
     Stmt.Table := baseTable;
     // WHERE clause kolonları view kolonlarından base kolonlarına çevrilmeli
     // (Basit: exec içinde RowMatches zaten base tablo kolonları kullanıyor)
@@ -15826,6 +15844,8 @@ begin
   begin
     for i := 0 to Stmt.CheckExprs.Count - 1 do
       Stmt.Checks := AndWhereGroups(Stmt.Checks, ExprToWhereGroups(Stmt.CheckExprs[i], Stmt.Cols));
+    if Stmt.CheckExprs.Count > 0 then
+      FStmtMutated := True;   // P-CACHE: CHECK'ler WHERE grubuna katlandi
   end;
   // R-13: Table Partitioning - tablo tanimina ekleme
   FT.CreateTable(Stmt.Table, Stmt.Cols, Stmt.PkIndex, Stmt.Checks, Stmt.Fks, Stmt.PartitionType, Stmt.PartitionCol, Stmt.PartitionValues);
@@ -16501,6 +16521,7 @@ begin
   if FT.FunctionExists(Stmt.Name) then
   begin
     FT.SetFunctionBody(Stmt.Name, Stmt.Body);
+    FStmtMutated := True;   // P-CACHE: govde sahipligi kataloga devredildi
     Stmt.Body := nil;
   end;
   Res.Affected := 1; Res.LastTable := Stmt.Name; Res.Msg := 'OK';
@@ -16536,6 +16557,7 @@ begin
   if FT.ProcedureExists(Stmt.Name) then
   begin
     FT.SetProcedureBody(Stmt.Name, Stmt.Body);
+    FStmtMutated := True;   // P-CACHE: govde sahipligi kataloga devredildi
     Stmt.Body := nil;
   end;
   Res.Affected := 1; Res.LastTable := Stmt.Name; Res.Msg := 'OK';
@@ -16569,6 +16591,7 @@ begin
     // AS govdesi + WHEN kosulu: sahiplik FTriggers'e devredilir.
     FT.SetTriggerDef(Stmt.TriggerName, Stmt.WhenCondition, Stmt.Body);
     // Burada serbest birakma - catalog sahiplendi.
+    FStmtMutated := True;   // P-CACHE: govde/WHEN sahipligi kataloga devredildi
     Stmt.WhenCondition := nil;
     Stmt.Body := nil;
   end;
@@ -18711,6 +18734,7 @@ begin
   SetLength(Result.Fields, 0);
   SetLength(Result.FieldTypes, 0);
   SetLength(Result.Rows, 0);
+  FStmtMutated := False;   // P-CACHE: bu calistirma AST'yi degistirdi mi?
   if Stmt = nil then Exit;
 
   // F-41: bu cumleyi calistiran oturumu yazma yoluna bildir.
