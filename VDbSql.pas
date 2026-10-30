@@ -3888,6 +3888,18 @@ begin
         RecordCommand(Sql, FLastMs * 1000, 0);
         Exit;
       end;
+      // P-DUR v3: literal ret edildiyse parametreli INSERT seridini dene.
+      if Length(FParams) > 0 then
+      begin
+        fastOk := FExecutor.ExecFastParamInsert(Sql, FParams, Result);
+        if fastOk then
+        begin
+          FLastMs := ElapsedMs;
+          NoteSlow(Sql, FLastMs, Length(Result.Rows));
+          RecordCommand(Sql, FLastMs * 1000, 0);
+          Exit;
+        end;
+      end;
     except
       FLastMs := ElapsedMs;
       NoteSlow(Sql, FLastMs, Length(Result.Rows));

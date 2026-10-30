@@ -613,6 +613,13 @@ type
       hata istisnalari ayni sirada ayni noktalardan firlar. }
     function ExecFastLiteralInsert(const Sql: string;
       out Res: TSqlResult): Boolean;
+    { P-DUR v3: parametreli INSERT hizli seridi.
+        INSERT INTO <tablo> [(kolon,...)] VALUES(?,?,...)
+      Yer tutucular AParams'tan okunur; literal INSERT seridinin ayni
+      semantik kapilarini uygular. En ufak sapmada False doner, genel yol
+      aynen calisir. }
+    function ExecFastParamInsert(const Sql: string;
+      const AParams: TStrArray; out Res: TSqlResult): Boolean;
     { H13 (2026-10-19): COPY dosya akisi.
         COPY <tablo> [(kolon,...)] FROM '<yol>' [WITH] [(] [FORMAT CSV|TEXT|ARROW]
                     [, HEADER] [, DELIMITER 'x'] [, NULL 'x'] [, QUOTE 'x'] [)]
@@ -14232,6 +14239,148 @@ begin
   end;
 
   Res.Affected := nrows;
+  Res.LastTable := tbl;
+  Res.Msg := 'OK';
+  SetLength(Res.Fields, 0);
+  SetLength(Res.Rows, 0);
+  Result := True;
+end;
+
+{ P-DUR v3 - ExecFastParamInsert
+  Literal INSERT seridinin ayni iskeleti; degerler SQL metninden degil
+  AParams'tan okunur. '?' yer tutucu sayisi ile parametre sayisi eslesmezse
+  ret -> genel yol. Tek satirlik VALUES desteklenir (cok satirli ret). }
+function TVSqlExecutor.ExecFastParamInsert(const Sql: string;
+  const AParams: TStrArray; out Res: TSqlResult): Boolean;
+var
+  n, p, nc, nv, pi: Integer;
+  s, tbl: string;
+  cnames, vals: TStrArray;
+  td: TTableDef;
+
+  procedure SkipWs;
+  begin
+    while (p <= n) and (Sql[p] in [' ', #9, #10, #13]) do Inc(p);
+  end;
+
+  function WordChar(c: Char): Boolean;
+  begin
+    Result := (c in ['A'..'Z', 'a'..'z', '0'..'9', '_', '$']);
+  end;
+
+  function MatchKw(const Kw: string): Boolean;
+  var
+    k: Integer;
+  begin
+    Result := False;
+    SkipWs;
+    if p + Length(Kw) - 1 > n then Exit;
+    for k := 1 to Length(Kw) do
+      if UpCase(Sql[p + k - 1]) <> Kw[k] then Exit;
+    if (p + Length(Kw) <= n) and WordChar(Sql[p + Length(Kw)]) then Exit;
+    Inc(p, Length(Kw));
+    Result := True;
+  end;
+
+  function ReadIdent(out S: string): Boolean;
+  var
+    st: Integer;
+  begin
+    Result := False;
+    SkipWs;
+    if p > n then Exit;
+    if not (Sql[p] in ['A'..'Z', 'a'..'z', '_']) then Exit;
+    st := p;
+    while (p <= n) and WordChar(Sql[p]) do Inc(p);
+    S := Copy(Sql, st, p - st);
+    Result := True;
+  end;
+
+begin
+  Result := False;
+  n := Length(Sql);
+  p := 1;
+
+  // ---- Bicim tanima ----
+  if not MatchKw('INSERT') then Exit;
+  if not MatchKw('INTO') then Exit;
+  if not ReadIdent(tbl) then Exit;
+  SetLength(cnames, 8);
+  nc := 0;
+  SkipWs;
+  if (p <= n) and (Sql[p] = '(') then
+  begin
+    Inc(p);
+    repeat
+      if not ReadIdent(s) then Exit;
+      if nc >= Length(cnames) then SetLength(cnames, nc * 2);
+      cnames[nc] := s;
+      Inc(nc);
+      SkipWs;
+      if (p <= n) and (Sql[p] = ',') then begin Inc(p); Continue; end;
+      Break;
+    until False;
+    if (p > n) or (Sql[p] <> ')') then Exit;
+    Inc(p);
+    SetLength(cnames, nc);
+  end;
+  if not MatchKw('VALUES') then Exit;
+
+  // Tek satirlik VALUES(?, ?, ...)
+  SkipWs;
+  if (p > n) or (Sql[p] <> '(') then Exit;
+  Inc(p);
+  SetLength(vals, 8);
+  nv := 0;
+  repeat
+    SkipWs;
+    if (p > n) then Exit;
+    if Sql[p] = '?' then
+    begin
+      Inc(p);
+      if nv >= Length(vals) then SetLength(vals, nv * 2);
+      vals[nv] := '';   // placeholder — asagida FParams ile doldurulur
+      Inc(nv);
+    end
+    else
+      Exit;   // literal veya ifade -> genel yol
+    SkipWs;
+    if (p <= n) and (Sql[p] = ',') then begin Inc(p); Continue; end;
+    Break;
+  until False;
+  if (p > n) or (Sql[p] <> ')') then Exit;
+  Inc(p);
+  if p <= n then Exit;   // kuyruk (RETURNING, ON CONFLICT, ;)
+  if nv = 0 then Exit;
+
+  // ---- Parametre eslesmesi ----
+  pi := Length(AParams);
+  if nv > pi then Exit;   // eksik parametre -> genel yol hata uretsin
+
+  // ---- Semantik kapilar ----
+  if not FT.TableExists(tbl) then Exit;
+  if FT.IsView(tbl) then Exit;
+  if Length(FT.TriggersFor(tbl, Byte(ttBefore), Byte(teInsert))) > 0 then Exit;
+  if Length(FT.TriggersFor(tbl, Byte(ttAfter),  Byte(teInsert))) > 0 then Exit;
+  if nc = 0 then
+  begin
+    td := FT.GetTable(tbl);
+    if nv <> Length(td.Cols) then Exit;
+    SetLength(cnames, Length(td.Cols));
+    for nc := 0 to High(td.Cols) do cnames[nc] := td.Cols[nc].Name;
+  end
+  else if nc <> nv then Exit;
+  FT.RequirePriv(tbl, Ord(pkInsert));
+
+  // ---- Degerleri AParams'tan doldur ----
+  SetLength(vals, nv);
+  for pi := 0 to nv - 1 do
+    vals[pi] := AParams[pi];
+
+  RlsRequireInsert(tbl, cnames, vals);
+  FT.Insert(tbl, cnames, vals);
+
+  Res.Affected := 1;
   Res.LastTable := tbl;
   Res.Msg := 'OK';
   SetLength(Res.Fields, 0);
