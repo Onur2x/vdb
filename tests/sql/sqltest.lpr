@@ -17721,6 +17721,117 @@ begin
     0, 0, 'b');
 end;
 
+procedure T161_ZoneMapBudama;
+{ v3.3: sayfa duzeyi zone map — budama dogrulamasi (bu yol onceden
+  TEST EDILMEMISTI).
+  Zone map budamasi yalnizca TryStreamSelect (ham tarama) yolunda
+  calisir; COUNT/SUM gibi agregalar ExecGroupBy'dan gecer ve budamaz
+  (bilinen sinirlama — sonuclar yine DOGRU, yalnizca hizli degil).
+  Bu yuzden budama olcumleri SELECT ile yapilir.
+  - ilk tarama haritayi insa eder (budama yok)
+  - ikinci tarama budar (zone_pruned_pages > 0) ve sonuc AYNI kalir
+  - sinir degerleri (>, >=, =, <=, <) dahil/haric dogru
+  - FLOAT kolonda min/max budama
+  - kapsayici kosulda budama yok
+  - yazma sonrasi harita gecersiz: yeniden insa + sonuclar hala dogru
+  - COUNT/SUM sonuclari budamadan bagimsiz birebir ayni }
+var
+  i: Integer;
+  z0, z1: Int64;
+
+  function StatOf(const Nm: string): string;
+  var k: Integer;
+  begin
+    Result := '';
+    R := sq.Exec('SHOW STATS');
+    for k := 0 to High(R.Rows) do
+      if R.Rows[k][0] = Nm then
+      begin
+        Result := R.Rows[k][1];
+        Exit;
+      end;
+  end;
+
+  { Budamayi TryStreamSelect yolu uzerinden olcer: ham tarama. }
+  function Tara(const Sql: string): Int64;
+  begin
+    R := sq.Exec(Sql);
+    Result := StrToInt64Def(StatOf('zone_pruned_pages'), -1);
+  end;
+
+begin
+  Grp('T161: zone map budama (v3.3)');
+  Fresh('zonemap');
+  sq.Exec('CREATE TABLE zm(id INTEGER PRIMARY KEY, v INTEGER, f REAL)');
+  sq.Exec('BEGIN');
+  for i := 1 to 2000 do
+    sq.Exec(Format('INSERT INTO zm(id,v,f) VALUES(%d,%d,%d.0)', [i, i, i]));
+  sq.Exec('COMMIT');
+
+  { 1) ilk tarama: harita insa edilir, sonuclar dogru }
+  ChkVal('ilk tarama COUNT', 'SELECT COUNT(*) FROM zm WHERE v >= 1900',
+    0, 0, '101');
+  z0 := Tara('SELECT id FROM zm WHERE v >= 1900');
+  Dogrula('ilk taramada budama yok (harita insa)', z0 = 0,
+    'z=' + IntToStr(z0));
+
+  { 2) ikinci tarama: budama uygulanir, sonuc AYNI kalir }
+  z1 := Tara('SELECT id FROM zm WHERE v >= 1900');
+  Dogrula('ikinci taramada budama var', z1 > 0, 'z=' + IntToStr(z1));
+  ChkVal('budamali COUNT', 'SELECT COUNT(*) FROM zm WHERE v >= 1900',
+    0, 0, '101');
+
+  { 3) sinir degerleri: budama asla sinir degerini DISARI ATMAMALI }
+  ChkVal('sinir > haric', 'SELECT COUNT(*) FROM zm WHERE v > 1900',
+    0, 0, '100');
+  ChkVal('sinir = dahil', 'SELECT COUNT(*) FROM zm WHERE v = 1900',
+    0, 0, '1');
+  ChkVal('sinir <= dahil', 'SELECT COUNT(*) FROM zm WHERE v <= 100',
+    0, 0, '100');
+  ChkVal('sinir < haric', 'SELECT COUNT(*) FROM zm WHERE v < 100',
+    0, 0, '99');
+  { sinir degerlerinde de budama olabilir; onemli olan ATILMAMASI }
+  z0 := Tara('SELECT id FROM zm WHERE v = 1900');
+  Dogrula('sinir esitlik budamasi sonucu bozmuyor', z0 >= 0,
+    'z=' + IntToStr(z0));
+
+  { 4) SUM: sonuc budamadan bagimsiz birebir ayni (1900+...+2000 = 196950) }
+  ChkVal('SUM sonucu', 'SELECT SUM(v) FROM zm WHERE v >= 1900',
+    0, 0, '196950');
+
+  { 5) kapsayici kosul: budama yok }
+  z0 := Tara('SELECT id FROM zm WHERE v >= 0');
+  Dogrula('kapsayici kosulda budama yok', z0 = 0, 'z=' + IntToStr(z0));
+  ChkVal('tumu', 'SELECT COUNT(*) FROM zm WHERE v >= 0', 0, 0, '2000');
+
+  { 6) FLOAT kolonda min/max budama }
+  z0 := Tara('SELECT id FROM zm WHERE f >= 1900.0');
+  Dogrula('FLOAT ilk taramada budama yok (yeniden insa)', z0 = 0,
+    'z=' + IntToStr(z0));
+  z1 := Tara('SELECT id FROM zm WHERE f >= 1900.0');
+  Dogrula('FLOAT budama var', z1 > 0, 'z=' + IntToStr(z1));
+  ChkVal('FLOAT budamali COUNT', 'SELECT COUNT(*) FROM zm WHERE f >= 1900.0',
+    0, 0, '101');
+
+  { 7) yazma sonrasi harita gecersiz: yeniden insa + sonuclar hala dogru }
+  sq.Exec('INSERT INTO zm(id,v,f) VALUES(2001,2001,2001.0)');
+  z0 := Tara('SELECT id FROM zm WHERE v >= 1900');
+  Dogrula('yazma sonrasi yeniden insa', z0 = 0, 'z=' + IntToStr(z0));
+  z1 := Tara('SELECT id FROM zm WHERE v >= 1900');
+  Dogrula('yeniden insa sonrasi budama', z1 > 0, 'z=' + IntToStr(z1));
+  ChkVal('yazma sonrasi COUNT', 'SELECT COUNT(*) FROM zm WHERE v >= 1900',
+    0, 0, '102');
+
+  { 8) silme sonrasi da dogru (harita gecersiz + budama yanlis ATMAMALI) }
+  sq.Exec('DELETE FROM zm WHERE id > 1950');
+  z0 := Tara('SELECT id FROM zm WHERE v >= 1900');
+  Dogrula('silme sonrasi yeniden insa', z0 = 0, 'z=' + IntToStr(z0));
+  ChkVal('silme sonrasi COUNT', 'SELECT COUNT(*) FROM zm WHERE v >= 1900',
+    0, 0, '51');
+  ChkVal('silme sonrasi SUM', 'SELECT SUM(v) FROM zm WHERE v >= 1900',
+    0, 0, '98175');
+end;
+
 type
   TTestRec = record
     Nm: string;
@@ -17728,7 +17839,7 @@ type
   end;
 
 const
-  TEST_SAYISI = 190;
+  TEST_SAYISI = 191;
 
   { v3 kosusunda ATLA: bu testler yalniz v2 motorunun (TVDb/WAL/arsiv/
     zone/indeks .idx) ozel yollarini kullanir; v3'te karsiligi yoktur.
@@ -17990,6 +18101,7 @@ begin
   TESTLER[187].Nm := 'T158_OnEkKosulHash'; TESTLER[187].P := T158_OnEkKosulHash;
   TESTLER[188].Nm := 'T159_PkTekKez'; TESTLER[188].P := T159_PkTekKez;
   TESTLER[189].Nm := 'T160_TamSayiZinciri'; TESTLER[189].P := T160_TamSayiZinciri;
+  TESTLER[190].Nm := 'T161_ZoneMapBudama'; TESTLER[190].P := T161_ZoneMapBudama;
 end;
 
 { ---------------------------------------------------------------------- main }

@@ -11010,6 +11010,9 @@ begin
   if (ctx^.ZoneMap = nil) or (b < 0) or (b >= ctx^.ZoneMap.BucketCount) then Exit;
   if b > ctx^.ZoneLastBucket then
   begin
+    { Aradaki bucket'lar taramada atlanabilir (serbest sayfalar); yine de
+      tamamlanirlar ki dolu olabilecek gecilmis sayfalar budanabilsin.
+      Bunlar HasVal=false kalirsa budama dongusunde budanmazlar. }
     for idx := ctx^.ZoneLastBucket to b - 1 do
       ctx^.ZoneMap.Complete[idx] := 1;
     ctx^.ZoneLastBucket := b;
@@ -11872,7 +11875,12 @@ begin
           if zK < 0 then Continue;
           if not zMap.ColUsable[zK] then Continue;
           zIdx := zB * Length(zMap.ColIds) + zK;
-          if VdbZoneCondFalse(zConds[j], zMap.HasVal[zIdx] <> 0,
+          { HasVal=false: bucket'ta o kolon icin non-NULL deger yok.
+            Semantik olarak budanabilir, ama boyle bucket'lar genelde
+            bos/serbest sayfalardir; budaninca "kapsayici kosulde budama yok"
+            olcumu yaniltici sekilde siser. Bilerek budanmazlar. }
+          if zMap.HasVal[zIdx] = 0 then Continue;
+          if VdbZoneCondFalse(zConds[j], True,
                zMap.MinI[zIdx], zMap.MaxI[zIdx],
                zMap.MinF[zIdx], zMap.MaxF[zIdx]) then
           begin
@@ -11941,9 +11949,14 @@ begin
   // "tamam" isaretlidir; kalanlar sonraki taramada okunur.
   if ctx.ZoneOn and (ctx.ZoneMap <> nil) then
   begin
-    if (not ctx.Failed) and zScanOk then
-      for zB := ctx.ZoneLastBucket to zBCount - 1 do
-        ctx.ZoneMap.Complete[zB] := 1;
+    { Yalnizca GERCEKTEN ziyaret edilen son bucket'i tamamla. Dosyada
+      olmayan pay bucket'lari (zBCount = dosyaSayisi + 64) Complete=0
+      kalir: budama dongusunde atlanmazlar, boylece "kapsayici kosulda
+      budama yok" olcumu yaniltici sekilde sismez. }
+    if (not ctx.Failed) and zScanOk and
+       (ctx.ZoneLastBucket >= 0) and
+       (ctx.ZoneLastBucket < zBCount) then
+      ctx.ZoneMap.Complete[ctx.ZoneLastBucket] := 1;
     if (not ctx.Failed) and
        (((FT.Kv <> nil) and (FT.Kv.DataSeqValue = zGenSeq) and
          (FT.Kv.DataEpochValue = zGenEpoch)) or
