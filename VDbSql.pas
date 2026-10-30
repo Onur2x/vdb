@@ -3940,6 +3940,51 @@ begin
     end;
   end;
 
+  // P-CACHE (2026-10-30): tekil PK nokta DELETE hizli seridi
+  // ('D'/'d' ile baslayan, WHERE pk = val iceren basit silmeler)
+  if (Length(Sql) > 15) and ((Sql[1] = 'D') or (Sql[1] = 'd')) then
+  begin
+    SlowMarkStart;
+    try
+      fastOk := FExecutor.ExecFastPointDelete(Sql, FParams, Result);
+      if fastOk then
+      begin
+        FLastMs := ElapsedMs;
+        NoteSlow(Sql, FLastMs, Length(Result.Rows));
+        RecordCommand(Sql, FLastMs * 1000, 0);
+        Exit;
+      end;
+    except
+      FLastMs := ElapsedMs;
+      NoteSlow(Sql, FLastMs, Length(Result.Rows));
+      RecordCommand(Sql, FLastMs * 1000, 0);
+      raise;
+    end;
+  end;
+
+  // P-CACHE (2026-10-30): tekil PK nokta UPDATE hizli seridi
+  // ('U'/'u' ile baslayan, WHERE pk = val + literal SET iceren basit
+  // guncellemeler; tetikleyici/RLS/EXPRESSION SET/PK yazma -> genel yol)
+  if (Length(Sql) > 15) and ((Sql[1] = 'U') or (Sql[1] = 'u')) then
+  begin
+    SlowMarkStart;
+    try
+      fastOk := FExecutor.ExecFastPointUpdate(Sql, FParams, Result);
+      if fastOk then
+      begin
+        FLastMs := ElapsedMs;
+        NoteSlow(Sql, FLastMs, Length(Result.Rows));
+        RecordCommand(Sql, FLastMs * 1000, 0);
+        Exit;
+      end;
+    except
+      FLastMs := ElapsedMs;
+      NoteSlow(Sql, FLastMs, Length(Result.Rows));
+      RecordCommand(Sql, FLastMs * 1000, 0);
+      raise;
+    end;
+  end;
+
   // DB yonetim komutlari TVSql uzerinde ozel dosya yonetimi gerektirir
   pTest := 1;
   if Tok(Sql, pTest, w1) then

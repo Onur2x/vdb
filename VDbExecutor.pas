@@ -634,6 +634,43 @@ type
       ret edilir ve genel yol aynen calisir. }
     function ExecFastPointSelect(const Sql: string;
       const AParams: TStrArray; out Res: TSqlResult): Boolean;
+    { P-23/P-CACHE hizli seritlerin ORTAK literal + yer tutucu okuyucusu.
+      Metin literalleri genel yolun (VDbParser) kanonik bicimine CEVRILIR:
+      '05' gibi kanonik olmayanlar RET -> genel yol ayni sonucu uretir
+      (serit '05' ile ararken parser '5' ile arardi — davranis farki).
+      '?'/'$N' yer tutuculari AParams'tan okunur; metin yeniden
+      ayristirilmaz, enjeksiyon mumkun degildir. Iki form KARISTIRILAMAZ.
+      Basarisizlikta p geri sarilir (sayi kuyrugunda yari tuketim olmaz).
+      Cagiran, tum literal yuvalari okunduktan sonra
+      PhUsed = Length(AParams) sartini aramalidir (fail-closed). }
+    function FastReadLit(const Sql: string; var p: Integer; n: Integer;
+      const AParams: TStrArray; var PhUsed: Integer; var PhNumbered: Boolean;
+      out S: string): Boolean;
+    { P-CACHE (2026-10-30): Tekil PK nokta DELETE hizli seridi
+      (`DELETE FROM <tablo> WHERE <pk> = <val>`). AST/Parser yukunu atlar.
+      Yalniz birebir bu bicimi tanir; RETURNING, ORDER BY, LIMIT, JOIN,
+      tetikleyici, VIEW, RLS, PK'siz tablo ya da PK disi kolularda False
+      doner ve GENEL YOL AYNEN calisir. Kabul yolunda genel yolun
+      sarmalama dizisi birebir uygulanir: RequirePriv(pkDelete) -> batch
+      (gerekiyorsa) -> FT.Delete (CheckRowWritable / ReadRow / CheckRestrict
+      FK kaskadi / IdxDelRow / FKvB.Delete tablo katmaninda); hata
+      istisnalari ayni noktalardan firlar. <val> '?'/'$N' yer tutucusu
+      olabilir; deger AParams'tan alinir. }
+    function ExecFastPointDelete(const Sql: string;
+      const AParams: TStrArray; out Res: TSqlResult): Boolean;
+    { P-CACHE (2026-10-30): Tekil PK nokta UPDATE hizli seridi
+      (`UPDATE <tablo> SET <kol> = <lit> [, <kol> = <lit>...] WHERE <pk> = <val>`).
+      AST/Parser + NarrowRows + RowMatches + EvalExpr yukunu atlar; satiri
+      okur, literal degerleri uygular, TVTableDb.UpdateRowInPlace'e verir.
+      Yalniz literal SET degerlerini tanir (ifade, fonksiyon, kolon referansi,
+      DEFAULT, RETURNING, JOIN, FROM, tetikleyici, VIEW, RLS, PK'ya yazma
+      durumunda False doner ve GENEL YOL AYNEN calisir). Kabul yolunda
+      RequirePriv(pkUpdate) genel yolun AYNI metodu; NOT NULL / CHECK /
+      UNIQUE / FK / GENERATED / IDENTITY / kaskad denetimlerinin tamami
+      UpdateRowInPlace icerisindedir — serit bunlari tekrarlamaz.
+      <lit>/'<val>' '?'/'$N' yer tutucusu olabilir; deger AParams'tan alinir. }
+    function ExecFastPointUpdate(const Sql: string;
+      const AParams: TStrArray; out Res: TSqlResult): Boolean;
   end;
 
 implementation
@@ -14951,10 +14988,171 @@ begin
   SetLength(Res.Rows, 0);
 end;
 
+function TVSqlExecutor.FastReadLit(const Sql: string; var p: Integer; n: Integer;
+  const AParams: TStrArray; var PhUsed: Integer; var PhNumbered: Boolean;
+  out S: string): Boolean;
+var
+  st: Integer;
+  pi: Int64;
+  fv: Double;
+  w: string;
+
+  procedure SkipWs;
+  begin
+    while (p <= n) and (Sql[p] in [' ', #9, #10, #13]) do Inc(p);
+  end;
+
+  function WordChar(c: Char): Boolean;
+  begin
+    Result := (c in ['A'..'Z', 'a'..'z', '0'..'9', '_', '$']);
+  end;
+
+begin
+  Result := False;
+  S := '';
+  SkipWs;
+  if p > n then Exit;
+
+  // ---- yer tutucu: '?' (sirali) ya da '$N' (numarali) ----
+  if Sql[p] = '?' then
+  begin
+    if PhNumbered then Exit;          // form karisimi -> genel yol
+    if PhUsed > High(AParams) then Exit;
+    Inc(p);
+    // '?|' / '?&' JSONB operatorleri serit disi
+    if (p <= n) and (Sql[p] in ['|', '&']) then Exit;
+    S := AParams[PhUsed];
+    Inc(PhUsed);
+    Result := True;
+    Exit;
+  end;
+  if Sql[p] = '$' then
+  begin
+    if (PhUsed > 0) and (not PhNumbered) then Exit;  // form karisimi
+    Inc(p);
+    if (p > n) or not (Sql[p] in ['0'..'9']) then Exit;
+    pi := 0;
+    while (p <= n) and (Sql[p] in ['0'..'9']) do
+    begin
+      pi := pi * 10 + (Ord(Sql[p]) - Ord('0'));
+      Inc(p);
+    end;
+    if (pi < 1) or (pi > Length(AParams)) then Exit;
+    S := AParams[pi - 1];
+    PhNumbered := True;
+    Inc(PhUsed);
+    Result := True;
+    Exit;
+  end;
+
+  // ---- kelime literalleri: NULL / TRUE / FALSE ----
+  if Sql[p] in ['A'..'Z', 'a'..'z'] then
+  begin
+    st := p;
+    while (p <= n) and WordChar(Sql[p]) do Inc(p);
+    w := UpperCase(Copy(Sql, st, p - st));
+    if w = 'NULL'       then begin S := '';      Result := True end
+    else if w = 'TRUE'  then begin S := 'True';  Result := True end
+    else if w = 'FALSE' then begin S := 'False'; Result := True end
+    else p := st;                    // baska kelime: konumu geri al
+    Exit;
+  end;
+
+  // ---- metin literal ----
+  if Sql[p] = '''' then
+  begin
+    Inc(p);
+    st := p;
+    while p <= n do
+    begin
+      if Sql[p] = '''' then
+      begin
+        if (p < n) and (Sql[p + 1] = '''') then
+        begin
+          S := S + Copy(Sql, st, p - st) + '''';
+          Inc(p, 2);
+          st := p;
+        end
+        else
+        begin
+          S := S + Copy(Sql, st, p - st);
+          Inc(p);
+          Result := True;
+          Exit;
+        end;
+      end
+      else
+        Inc(p);
+    end;
+    p := st - 1;   // kapanmamis string: konumu basa sar, genel yol hatayi uretsin
+    Exit;
+  end;
+
+  // ---- sayi: genel yolun kanonik bicimi (VDbParser ParseLiteral) ----
+  //   tam sayi : 0 | [1-9][0-9]*   ve opsiyonel '-' (parser '+yi unary'de
+  //              kabul etmez -> RET)
+  //   float    : [0-9]+ '.' [0-9]+  [+/- eE [0-9]+]  -> VDbParseFloat
+  //              ile okunur, StrVal = VDbFloatToStr(fv) (CreateFloat ile birebir)
+  //   '05', '5.', '1e5', '0x1', tasma -> RET -> genel yol ayni sonucu uretir.
+  if not (Sql[p] in ['0'..'9', '-']) then Exit;
+  st := p;
+  if Sql[p] = '-' then
+  begin
+    Inc(p);
+    if (p > n) or not (Sql[p] in ['0'..'9']) then
+    begin
+      p := st;
+      Exit;
+    end;
+  end;
+  if Sql[p] = '0' then
+  begin
+    Inc(p);
+    if (p <= n) and (Sql[p] in ['0'..'9']) then begin p := st; Exit; end;  // 05
+  end
+  else
+    while (p <= n) and (Sql[p] in ['0'..'9']) do Inc(p);
+  if (p < n) and (Sql[p] = '.') and (Sql[p + 1] in ['0'..'9']) then
+  begin
+    Inc(p);
+    while (p <= n) and (Sql[p] in ['0'..'9']) do Inc(p);
+    if (p <= n) and ((Sql[p] = 'E') or (Sql[p] = 'e')) then
+    begin
+      Inc(p);
+      if (p <= n) and ((Sql[p] = '+') or (Sql[p] = '-')) then Inc(p);
+      if (p > n) or not (Sql[p] in ['0'..'9']) then begin p := st; Exit; end;
+      while (p <= n) and (Sql[p] in ['0'..'9']) do Inc(p);
+    end;
+    if (p <= n) and WordChar(Sql[p]) then begin p := st; Exit; end;
+    if not VDbParseFloat(Copy(Sql, st, p - st), fv) then begin p := st; Exit; end;
+    S := VDbFloatToStr(fv);
+    Result := True;
+    Exit;
+  end;
+  // tam sayi sonrasi '. / E / harf / '_' / '$' varsa bu bir sayi degildir
+  if (p <= n) and ((Sql[p] = '.') or (Sql[p] = 'E') or (Sql[p] = 'e') or
+     WordChar(Sql[p])) then begin p := st; Exit; end;
+  // kanonik tam sayi -> CreateInt ile birebir: StrVal = IntToStr(iv)
+  S := Copy(Sql, st, p - st);
+  if S[1] = '-' then
+  begin
+    if not VDbParseInt(Copy(S, 2, Length(S) - 1), pi) then begin p := st; Exit; end;
+    S := IntToStr(-pi);
+  end
+  else
+  begin
+    if not VDbParseInt(S, pi) then begin p := st; Exit; end;
+    S := IntToStr(pi);
+  end;
+  Result := True;
+end;
+
 function TVSqlExecutor.ExecFastPointSelect(const Sql: string;
   const AParams: TStrArray; out Res: TSqlResult): Boolean;
 var
   n, p, nc, i, ci: Integer;
+  phUsed: Integer;
+  phNumbered: Boolean;
   s, tbl, pkCol, pkVal: string;
   cnames: TStrArray;
   colMap: TIntArray;
@@ -15000,84 +15198,18 @@ var
   end;
 
   function ReadLit(out S: string): Boolean;
-  var
-    st, pi: Integer;
   begin
-    Result := False;
-    S := '';
-    SkipWs;
-    if p > n then Exit;
-    // P-CACHE: yer tutucu ('?' / '$N') kabulu. Deger metinden degil
-    // AParams'tan gelir; metin yeniden ayristirilmaz, enjeksiyon mumkun degil.
-    // Parametre bagli degilse ('?' + bos AParams -> F-22 JSONB operatoru)
-    // ya da sayim tutmuyorsa serit REDDEDILIR; genel yol dogru hatayi uretir.
-    if Sql[p] = '?' then
-    begin
-      if Length(AParams) <> 1 then Exit; // yalniz tek yer tutuculu serit
-      Inc(p);
-      // '?|' / '?&' JSONB operatorleri serit disi; genel yol ayiklar
-      if (p <= n) and (Sql[p] in ['|', '&']) then Exit;
-      S := AParams[0];
-      Result := True;
-      Exit;
-    end;
-    if Sql[p] = '$' then
-    begin
-      Inc(p);
-      if (p > n) or not (Sql[p] in ['0'..'9']) then Exit;
-      pi := 0;
-      while (p <= n) and (Sql[p] in ['0'..'9']) do
-      begin
-        pi := pi * 10 + (Ord(Sql[p]) - Ord('0'));
-        Inc(p);
-      end;
-      if (pi < 1) or (pi > Length(AParams)) then Exit;
-      S := AParams[pi - 1];
-      Result := True;
-      Exit;
-    end;
-    if Sql[p] = '''' then
-    begin
-      Inc(p);
-      st := p;
-      while p <= n do
-      begin
-        if Sql[p] = '''' then
-        begin
-          if (p < n) and (Sql[p + 1] = '''') then
-          begin
-            S := S + Copy(Sql, st, p - st) + '''';
-            Inc(p, 2);
-            st := p;
-          end
-          else
-          begin
-            S := S + Copy(Sql, st, p - st);
-            Inc(p);
-            Result := True;
-            Exit;
-          end;
-        end
-        else
-          Inc(p);
-      end;
-      Exit;
-    end;
-    if Sql[p] in ['0'..'9', '-', '+'] then
-    begin
-      st := p;
-      if Sql[p] in ['-', '+'] then Inc(p);
-      while (p <= n) and (Sql[p] in ['0'..'9']) do Inc(p);
-      if (p <= n) and WordChar(Sql[p]) then Exit;
-      S := Copy(Sql, st, p - st);
-      Result := True;
-    end;
+    // Ortak okuyucu: kanonik metin literal + '?'/'$N' yer tutucu.
+    // Ayrintilar ve ret kurallari icin FastReadLit'a bakin.
+    Result := FastReadLit(Sql, p, n, AParams, phUsed, phNumbered, S);
   end;
 
 begin
   Result := False;
   n := Length(Sql);
   p := 1;
+  phUsed := 0;
+  phNumbered := False;
 
   // 1. SELECT ile baslamali
   if not MatchKw('SELECT') then Exit;
@@ -15115,6 +15247,9 @@ begin
   if (p > n) or (Sql[p] <> '=') then Exit;
   Inc(p);
   if not ReadLit(pkVal) then Exit;
+  // Fail-closed: yer tutucu kullanimi parametre sayisiyla birebir olmali.
+  // Fazla/eksik parametre ya da '?'-JSONB karisimi genel yola duser.
+  if phUsed <> Length(AParams) then Exit;
 
   SkipWs;
   // Fazladan sozcuk (ORDER, LIMIT, GROUP, AND vb.) varsa serit ret eder
@@ -15179,6 +15314,281 @@ begin
   Res.LastTable := td.Name;
   Res.Msg := 'OK';
   Res.Stmts := 1;
+  Result := True;
+end;
+
+function TVSqlExecutor.ExecFastPointDelete(const Sql: string;
+  const AParams: TStrArray; out Res: TSqlResult): Boolean;
+var
+  n, p: Integer;
+  phUsed: Integer;
+  phNumbered: Boolean;
+  tbl, pkCol, pkVal: string;
+  td: TTableDef;
+
+  procedure SkipWs;
+  begin
+    while (p <= n) and (Sql[p] in [' ', #9, #10, #13]) do Inc(p);
+  end;
+
+  function WordChar(c: Char): Boolean;
+  begin
+    Result := (c in ['A'..'Z', 'a'..'z', '0'..'9', '_', '$']);
+  end;
+
+  function MatchKw(const Kw: string): Boolean;
+  var
+    k: Integer;
+  begin
+    Result := False;
+    SkipWs;
+    if p + Length(Kw) - 1 > n then Exit;
+    for k := 1 to Length(Kw) do
+      if UpCase(Sql[p + k - 1]) <> Kw[k] then Exit;
+    if (p + Length(Kw) <= n) and WordChar(Sql[p + Length(Kw)]) then Exit;
+    Inc(p, Length(Kw));
+    Result := True;
+  end;
+
+  function ReadIdent(out S: string): Boolean;
+  var
+    st: Integer;
+  begin
+    Result := False;
+    SkipWs;
+    if p > n then Exit;
+    if not (Sql[p] in ['A'..'Z', 'a'..'z', '_']) then Exit;
+    st := p;
+    while (p <= n) and WordChar(Sql[p]) do Inc(p);
+    S := Copy(Sql, st, p - st);
+    Result := True;
+  end;
+
+  function ReadLit(out S: string): Boolean;
+  begin
+    // Ortak okuyucu: kanonik metin literal + '?'/'$N' yer tutucu.
+    Result := FastReadLit(Sql, p, n, AParams, phUsed, phNumbered, S);
+  end;
+
+begin
+  Result := False;
+  n := Length(Sql);
+  p := 1;
+  phUsed := 0;
+  phNumbered := False;
+
+  // 1. DELETE FROM <table> WHERE <pk> = <val>
+  if not MatchKw('DELETE') then Exit;
+  if not MatchKw('FROM') then Exit;
+  if not ReadIdent(tbl) then Exit;
+  if not MatchKw('WHERE') then Exit;
+  if not ReadIdent(pkCol) then Exit;
+  SkipWs;
+  if (p > n) or (Sql[p] <> '=') then Exit;
+  Inc(p);
+  if not ReadLit(pkVal) then Exit;
+  // Fail-closed: yer tutucu kullanimi parametre sayisiyla birebir olmali.
+  if phUsed <> Length(AParams) then Exit;
+
+  SkipWs;
+  // Fazladan sozcuk (RETURNING, ORDER, LIMIT, AND vb.) varsa serit ret eder
+  if p <= n then Exit;
+
+  // Semantik kontroller
+  if not FT.TableExists(tbl) then Exit;
+  if FT.IsView(tbl) then Exit;
+  if FT.RlsApplies(tbl) then Exit; // RLS varsa genel yol filtrelesin
+  // DELETE tetikleyicileri (STATEMENT + ROW, BEFORE + AFTER) genel yolun
+  // FireTriggers cagri noktalaridir; biri bile varsa serit kapanir.
+  if Length(FT.TriggersFor(tbl, Byte(ttBefore), Byte(teDelete))) > 0 then Exit;
+  if Length(FT.TriggersFor(tbl, Byte(ttAfter),  Byte(teDelete))) > 0 then Exit;
+
+  td := FT.GetTable(tbl);
+  if td.PkIndex < 0 then Exit; // PK'si olmayan tablo
+  if VDbNorm(td.Cols[td.PkIndex].Name) <> VDbNorm(pkCol) then Exit; // kosul PK kolonu uzerinde degil
+
+  // R-18: genel yolun cagirdigi AYNI metot, AYNI sira.
+  FT.RequirePriv(tbl, Ord(pkDelete));
+
+  // Tek satir: INSERT seridindeki gibi batch YOK. PK/UNIQUE/FK kaskadi,
+  // RESTRICT, IdxDelRow, CheckRowWritable — hepsi FT.Delete icerisinde.
+  if FT.Delete(tbl, pkVal) then
+    Res.Affected := 1
+  else
+    Res.Affected := 0;
+
+  Res.LastTable := tbl;
+  Res.Msg := 'OK';
+  SetLength(Res.Fields, 0);
+  SetLength(Res.Rows, 0);
+  Result := True;
+end;
+
+function TVSqlExecutor.ExecFastPointUpdate(const Sql: string;
+  const AParams: TStrArray; out Res: TSqlResult): Boolean;
+var
+  n, p, i, j, ci: Integer;
+  phUsed: Integer;
+  phNumbered: Boolean;
+  tbl, pkCol, pkVal, s: string;
+  setCols, setVals, oldVals, newVals: TStrArray;
+  nset: Integer;
+  td: TTableDef;
+
+  procedure SkipWs;
+  begin
+    while (p <= n) and (Sql[p] in [' ', #9, #10, #13]) do Inc(p);
+  end;
+
+  function WordChar(c: Char): Boolean;
+  begin
+    Result := (c in ['A'..'Z', 'a'..'z', '0'..'9', '_', '$']);
+  end;
+
+  function MatchKw(const Kw: string): Boolean;
+  var
+    k: Integer;
+  begin
+    Result := False;
+    SkipWs;
+    if p + Length(Kw) - 1 > n then Exit;
+    for k := 1 to Length(Kw) do
+      if UpCase(Sql[p + k - 1]) <> Kw[k] then Exit;
+    if (p + Length(Kw) <= n) and WordChar(Sql[p + Length(Kw)]) then Exit;
+    Inc(p, Length(Kw));
+    Result := True;
+  end;
+
+  function ReadIdent(out S: string): Boolean;
+  var
+    st: Integer;
+  begin
+    Result := False;
+    SkipWs;
+    if p > n then Exit;
+    if not (Sql[p] in ['A'..'Z', 'a'..'z', '_']) then Exit;
+    st := p;
+    while (p <= n) and WordChar(Sql[p]) do Inc(p);
+    S := Copy(Sql, st, p - st);
+    Result := True;
+  end;
+
+  function ReadLit(out S: string): Boolean;
+  begin
+    // Ortak okuyucu: kanonik metin literal + '?'/'$N' yer tutucu.
+    Result := FastReadLit(Sql, p, n, AParams, phUsed, phNumbered, S);
+  end;
+
+begin
+  Result := False;
+  n := Length(Sql);
+  p := 1;
+  phUsed := 0;
+  phNumbered := False;
+  nset := 0;
+
+  // 1. UPDATE <table> SET
+  if not MatchKw('UPDATE') then Exit;
+  if not ReadIdent(tbl) then Exit;
+  if not MatchKw('SET') then Exit;
+
+  // 2. SET <col> = <lit> [, <col> = <lit>]...
+  //    col adi ve literal AYRI okunur (asagidaki eslesme boyle dogru).
+  repeat
+    if not ReadIdent(s) then Exit;
+    SetLength(setCols, nset + 1);
+    setCols[nset] := s;
+    SkipWs;
+    if (p > n) or (Sql[p] <> '=') then Exit;   // :=, ==, >= vb. serit disi
+    Inc(p);
+    if not ReadLit(s) then Exit;               // ifade/fonksiyon -> genel yol
+    SetLength(setVals, nset + 1);
+    setVals[nset] := s;
+    Inc(nset);
+    SkipWs;
+    if (p <= n) and (Sql[p] = ',') then begin Inc(p); Continue; end;
+    Break;
+  until False;
+
+  // 3. WHERE <pk_col> = <val>
+  if not MatchKw('WHERE') then Exit;
+  if not ReadIdent(pkCol) then Exit;
+  SkipWs;
+  if (p > n) or (Sql[p] <> '=') then Exit;
+  Inc(p);
+  if not ReadLit(pkVal) then Exit;
+  // Fail-closed: yer tutucu kullanimi parametre sayisiyla birebir olmali.
+  if phUsed <> Length(AParams) then Exit;
+
+  SkipWs;
+  // Fazladan sozcuk (RETURNING, ORDER, LIMIT, FROM, AND vb.) serit disi
+  if p <= n then Exit;
+  if nset = 0 then Exit;
+
+  // Semantik kontroller
+  if not FT.TableExists(tbl) then Exit;
+  if FT.IsView(tbl) then Exit;
+  if FT.RlsApplies(tbl) then Exit; // RLS varsa genel yol filtrelesin
+  // UPDATE tetikleyicileri (STATEMENT + ROW, BEFORE + AFTER) genel yolun
+  // FireTriggers cagri noktalaridir; biri bile varsa serit kapanir.
+  if Length(FT.TriggersFor(tbl, Byte(ttBefore), Byte(teUpdate))) > 0 then Exit;
+  if Length(FT.TriggersFor(tbl, Byte(ttAfter),  Byte(teUpdate))) > 0 then Exit;
+
+  td := FT.GetTable(tbl);
+  if td.PkIndex < 0 then Exit; // PK'si olmayan tablo
+  if VDbNorm(td.Cols[td.PkIndex].Name) <> VDbNorm(pkCol) then Exit;
+
+  // SET kolonlari: hepsi tanimli olmali, PK'ya yazilamaz (genel yol
+  // ecUnsupported firlatir — o hatayi AYNI bicimde uretmesi icin serit
+  // kapanir ve genel yol calisir).
+  for i := 0 to nset - 1 do
+  begin
+    ci := -1;
+    for j := 0 to High(td.Cols) do
+      if VDbNorm(td.Cols[j].Name) = VDbNorm(setCols[i]) then
+      begin ci := j; Break; end;
+    if ci < 0 then Exit;                  // kolon yok -> genel yol hatayi uretsin
+    if ci = td.PkIndex then Exit;         // PK guncellenemez -> genel yol hatasi
+  end;
+
+  // R-18: genel yolun cagirdigi AYNI metot, AYNI sira.
+  FT.RequirePriv(tbl, Ord(pkUpdate));
+
+  // Satiri oku; yoksa 0 satir (genel yol ile ayni).
+  if not FT.ReadRow(tbl, pkVal, oldVals) then
+  begin
+    Res.Affected := 0;
+    Res.LastTable := tbl;
+    Res.Msg := 'OK';
+    SetLength(Res.Fields, 0);
+    SetLength(Res.Rows, 0);
+    Result := True;
+    Exit;
+  end;
+
+  // Yeni satir: eskisinin kopyasi + literal SET degerleri (sira ile; son
+  // yazan kazanir — genel yolun döngü davranisiyla ayni).
+  SetLength(newVals, Length(td.Cols));
+  for j := 0 to High(td.Cols) do newVals[j] := oldVals[j];
+  for i := 0 to nset - 1 do
+    for j := 0 to High(td.Cols) do
+      if VDbNorm(td.Cols[j].Name) = VDbNorm(setCols[i]) then
+      begin
+        newVals[j] := setVals[i];
+        Break;
+      end;
+
+  // NOT NULL / CHECK / UNIQUE / FK / GENERATED / IDENTITY / kaskad
+  // denetimlerinin tamami UpdateRowInPlace icerisinde — serit tekrarlama.
+  if FT.UpdateRowInPlace(tbl, pkVal, newVals) then
+    Res.Affected := 1
+  else
+    Res.Affected := 0;
+
+  Res.LastTable := tbl;
+  Res.Msg := 'OK';
+  SetLength(Res.Fields, 0);
+  SetLength(Res.Rows, 0);
   Result := True;
 end;
 
