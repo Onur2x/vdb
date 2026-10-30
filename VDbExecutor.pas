@@ -15580,7 +15580,8 @@ begin
 
   // NOT NULL / CHECK / UNIQUE / FK / GENERATED / IDENTITY / kaskad
   // denetimlerinin tamami UpdateRowInPlace icerisinde — serit tekrarlama.
-  if FT.UpdateRowInPlace(tbl, pkVal, newVals) then
+  // PreReadVals: satir zaten okundu (yukarida); icinde ikinci ReadRow yok.
+  if FT.UpdateRowInPlace(tbl, pkVal, newVals, oldVals) then
     Res.Affected := 1
   else
     Res.Affected := 0;
@@ -15865,7 +15866,7 @@ begin
         if hasRowTrig then
           FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teUpdate),
             allRows[i], newVals, colNames, Res, True);
-        if FT.UpdateRowInPlace(Stmt.Table, pks[i], newVals) then
+        if FT.UpdateRowInPlace(Stmt.Table, pks[i], newVals, allRows[i]) then
         begin
           Inc(rCount);
           if hasReturning then
@@ -15926,7 +15927,7 @@ begin
       if hasRowTrig then
         FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teUpdate),
           allRows[i], newVals, colNames, Res, True);
-      if FT.UpdateRowInPlace(Stmt.Table, pks[i], newVals) then
+      if FT.UpdateRowInPlace(Stmt.Table, pks[i], newVals, allRows[i]) then
       begin
         Inc(rCount);
         if hasReturning then

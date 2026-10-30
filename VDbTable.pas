@@ -693,8 +693,12 @@ type
     // (F1-4: SQL UPDATE once Delete+Insert yapiyordu; ilgisiz kolon
     //  degisikligi bile cocuk satirlari ON DELETE CASCADE ile siliyordu.)
     // False donerse satir bulunamadi (hicbir sey yazilmadi).
+    // PreReadVals: satir onceden okunduysa (ReadRow) eski degerleri verir;
+    // icinde IKINCI KEZ ReadRow (KV Get + DecodeRow) yapilmaz. nil ise
+    // eskisi gibi satir okunur. UPDATE hizli yolu ve genel yol bunu
+    // kullanir: satir zaten eldeyken tekrar diskten cozmek israftir.
     function UpdateRowInPlace(const Table: string; const Pk: string;
-      const SrcVals: TStrArray): Boolean;
+      const SrcVals: TStrArray; PreReadVals: TStrArray = nil): Boolean;
     // UPDATE SET ifadesini SATIR BASINA hesaplar.
     function EvalSetExpr(const T: TTableDef; const E: TSetExpr;
       const Old: TStrArray; const ColName: string): string;
@@ -10220,7 +10224,7 @@ begin
 end;
 
 function TVTableDb.UpdateRowInPlace(const Table: string; const Pk: string;
-  const SrcVals: TStrArray): Boolean;
+  const SrcVals: TStrArray; PreReadVals: TStrArray): Boolean;
 var
   t: TTableDef;
   i, j, k2, k3: Integer;
@@ -10237,7 +10241,9 @@ var
 begin
   t := GetTable(Table);
   CheckRowWritable(t.Name, Pk);
-  if not ReadRow(t.Name, Pk, oldVals) then Exit(False);
+  if PreReadVals <> nil then
+    oldVals := PreReadVals       // satir zaten okunmus — KV Get + DecodeRow atlaniyor
+  else if not ReadRow(t.Name, Pk, oldVals) then Exit(False);
   if Length(SrcVals) <> Length(t.Cols) then
     raise EVDbException.Create(ecColumnNotFound,
       'UPDATE: sutun sayisi uymuyor (' + t.Name + ')');
@@ -10385,7 +10391,8 @@ begin
         newVals[setIdx[j]] := EvalSetExpr(t, SetExprs[j], oldVals, SetCols[j]);
       // Satir mantigi TEK yerde: UpdateRowInPlace (kisitler + FK +
       // ON UPDATE CASCADE/RESTRICT + indeks/UNIQUE bakimi).
-      if UpdateRowInPlace(t.Name, pks[i], newVals) then Inc(Result);
+      // PreReadVals: rows[i] satiri zaten okunmus; ikinci ReadRow yok.
+      if UpdateRowInPlace(t.Name, pks[i], newVals, oldVals) then Inc(Result);
     end;
     if ownBatch then FKvB.CommitBatch;
   except
