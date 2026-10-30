@@ -3924,7 +3924,7 @@ begin
   begin
     SlowMarkStart;
     try
-      fastOk := FExecutor.ExecFastPointSelect(Sql, Result);
+      fastOk := FExecutor.ExecFastPointSelect(Sql, FParams, Result);
       if fastOk then
       begin
         FLastMs := ElapsedMs;

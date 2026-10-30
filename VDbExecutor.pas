@@ -628,9 +628,12 @@ type
     function ExecFastCopy(const Sql: string;
       out Res: TSqlResult): Boolean;
     { P-23 (2026-10-17): Tekil PK nokta sorgusu icin hizli serit (SELECT <cols> FROM <table> WHERE <pk> = <val>).
-      AST Parser/Executor olusturma yukunu atlayarak dogrudan TVTableDb.ReadRow uzerinden calisir. }
+      AST Parser/Executor olusturma yukunu atlayarak dogrudan TVTableDb.ReadRow uzerinden calisir.
+      P-CACHE: <val> yer tutucu da olabilir ('?' ya da '$N'); deger AParams'tan
+      alinir, metin yeniden ayristirilmaz. Parametre sayisi tutmuyorsa serit
+      ret edilir ve genel yol aynen calisir. }
     function ExecFastPointSelect(const Sql: string;
-      out Res: TSqlResult): Boolean;
+      const AParams: TStrArray; out Res: TSqlResult): Boolean;
   end;
 
 implementation
@@ -14949,7 +14952,7 @@ begin
 end;
 
 function TVSqlExecutor.ExecFastPointSelect(const Sql: string;
-  out Res: TSqlResult): Boolean;
+  const AParams: TStrArray; out Res: TSqlResult): Boolean;
 var
   n, p, nc, i, ci: Integer;
   s, tbl, pkCol, pkVal: string;
@@ -14998,12 +15001,41 @@ var
 
   function ReadLit(out S: string): Boolean;
   var
-    st: Integer;
+    st, pi: Integer;
   begin
     Result := False;
     S := '';
     SkipWs;
     if p > n then Exit;
+    // P-CACHE: yer tutucu ('?' / '$N') kabulu. Deger metinden degil
+    // AParams'tan gelir; metin yeniden ayristirilmaz, enjeksiyon mumkun degil.
+    // Parametre bagli degilse ('?' + bos AParams -> F-22 JSONB operatoru)
+    // ya da sayim tutmuyorsa serit REDDEDILIR; genel yol dogru hatayi uretir.
+    if Sql[p] = '?' then
+    begin
+      if Length(AParams) <> 1 then Exit; // yalniz tek yer tutuculu serit
+      Inc(p);
+      // '?|' / '?&' JSONB operatorleri serit disi; genel yol ayiklar
+      if (p <= n) and (Sql[p] in ['|', '&']) then Exit;
+      S := AParams[0];
+      Result := True;
+      Exit;
+    end;
+    if Sql[p] = '$' then
+    begin
+      Inc(p);
+      if (p > n) or not (Sql[p] in ['0'..'9']) then Exit;
+      pi := 0;
+      while (p <= n) and (Sql[p] in ['0'..'9']) do
+      begin
+        pi := pi * 10 + (Ord(Sql[p]) - Ord('0'));
+        Inc(p);
+      end;
+      if (pi < 1) or (pi > Length(AParams)) then Exit;
+      S := AParams[pi - 1];
+      Result := True;
+      Exit;
+    end;
     if Sql[p] = '''' then
     begin
       Inc(p);
@@ -15092,6 +15124,10 @@ begin
   if not FT.TableExists(tbl) then Exit;
   if FT.IsView(tbl) then Exit;
   if FT.RlsApplies(tbl) then Exit; // RLS varsa genel yol filtrelesin
+  // P-CACHE: yetki kontrolu seritten once. Genel yol (ExecSelect) RequirePriv
+  // yapar; serit onu atliyordu. INSERT seridi bunu zaten yapiyordu (bkz.
+  // ExecFastLiteralInsert) — SELECT seridi de ayni sarmalama dizisini uygular.
+  FT.RequirePriv(tbl, Ord(pkSelect));
 
   td := FT.GetTable(tbl);
   if td.PkIndex < 0 then Exit; // PK'si olmayan tablo
