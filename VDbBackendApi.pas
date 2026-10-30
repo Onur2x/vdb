@@ -167,6 +167,13 @@ type
     { Commit edilmemis yazma var mi (Flush karari icin). }
     function GetDirty: Boolean;
     property Dirty: Boolean read GetDirty;
+    { P-DUR v2: Flush'ta fsync yapilsin mi? True = her autocommit yaziminda
+      fsync (tam dayaniklilik, P-DUR sozlesmesi). False = fsync checkpoint'e
+      ertelenir (SQLite synchronous=NORMAL). Olculen fark: fsync ~360 us/islem.
+      v2: True (tek yazici, her yazimda fsync). }
+    function GetDurableOnFlush: Boolean;
+    procedure SetDurableOnFlush(AValue: Boolean);
+    property DurableOnFlush: Boolean read GetDurableOnFlush write SetDurableOnFlush;
     { v3 tek yazar: karsilik yok (no-op). v2'de baska oturumun acik
       islemi bitene kadar bekler. }
     procedure WaitForeignTxn(ASessionId: Cardinal);

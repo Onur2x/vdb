@@ -80,6 +80,8 @@ type
     function FileEncrypted: Boolean;
     procedure SetBeforeCommit(Proc: TDbCommitHook);
     function GetDirty: Boolean;
+    function GetDurableOnFlush: Boolean;
+    procedure SetDurableOnFlush(AValue: Boolean);
     procedure WaitForeignTxn(ASessionId: Cardinal);
     procedure RefreshBatchSnapshot;
     function GetFilePath: string;
@@ -344,6 +346,16 @@ end;
 function TVDbBackendV2.GetDirty: Boolean;
 begin
   Result := FDb.Dirty;
+end;
+
+function TVDbBackendV2.GetDurableOnFlush: Boolean;
+begin
+  Result := True;  { v2: tek yazici, her yazimda fsync — hep dayanikli }
+end;
+
+procedure TVDbBackendV2.SetDurableOnFlush(AValue: Boolean);
+begin
+  { v2'de karsiligi yok: tek yazici sozlesmesi her yazimda fsync yapar. }
 end;
 
 procedure TVDbBackendV2.WaitForeignTxn(ASessionId: Cardinal);

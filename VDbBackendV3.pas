@@ -250,6 +250,11 @@ type
       FReplayErr: string;
       FReplayLastSeq: Int64;
       FReplayLastTs: Int64;
+      { P-DUR v2: Flush'ta fsync yapilsin mi? True = mevcut P-DUR sozlesmesi
+        (her autocommit yaziminda fsync). False = fsync checkpoint'e ertelenir
+        (SQLite synchronous=NORMAL davranisi; surec cokmesinde guvenli, isletim
+        sistemi cokmesinde son commit'ler kaybolabilir). }
+      FDurableOnFlush: Boolean;
       { Sprint 3.12: parti anahtarlarinin GELIS SIRASI. TDictionary
         dolasimi rastgele oldugu icin ApplyBatch sayfalara sicramali
         yaziyordu (olculen: 200k toplu yazim 8,0 us/satir; sirali
@@ -460,6 +465,10 @@ type
     function KeyFingerprint: string;
     { Checkpoint esigi (bayt). 0 = yalnizca kapanis/Flush'ta. }
     property CheckpointBytes: Int64 read FCheckpointBytes write FCheckpointBytes;
+    { P-DUR v2: Flush'ta fsync yapilsin mi? True = her autocommit yaziminda
+      fsync (tam dayaniklilik). False = fsync checkpoint'e ertelenir (SQLite
+      synchronous=NORMAL). Olculen fark: fsync ~360 us/islem. }
+    property DurableOnFlush: Boolean read FDurableOnFlush write FDurableOnFlush;
 
     procedure Put(Key: QWord; const Value: TBytes);
     function Get(Key: QWord; out Value: TBytes): Boolean;
@@ -556,6 +565,8 @@ type
     function FileEncrypted: Boolean;
     procedure SetBeforeCommit(Proc: TDbCommitHook);
     function GetDirty: Boolean;
+    function GetDurableOnFlush: Boolean;
+    procedure SetDurableOnFlush(AValue: Boolean);
     procedure WaitForeignTxn(ASessionId: Cardinal);
     procedure RefreshBatchSnapshot;
     function GetFilePath: string;
@@ -638,6 +649,7 @@ begin
   FLogPruneErr := '';
   FDirty := False;
   FCheckpointBytes := VDB_V3_CHECKPOINT_BYTES;
+  FDurableOnFlush := True;   { P-DUR v2: varsayilan tam dayaniklilik }
   FPoolPages := APoolPages;
   FEng := NewEngine(ADbPath);
   try
@@ -2671,6 +2683,8 @@ begin
 end;
 
 procedure TVdbBackendV3.Flush;
+var
+  syncLsn: LongWord;
 begin
   if BatchOpen then Exit;
   { P-DUR sozlesmesi yalniz DAYANIKLILIK ister: commit WAL'e yazilip fsync
@@ -2680,7 +2694,11 @@ begin
     Olculen bedel: autocommit INSERT 0,42 ms (v2) -> 1,17 ms (v3) — kabul
     hedefi 0,55 ms asiliyordu. Artik checkpoint YALNIZ esik asilinca
     (`MaybeCheckpoint`), acik cagrida, kapanista, yedekte ve VACUUM'da
-    yapilir; veri dosyasi motor acikken bayat olabilir, dogru kaynak WAL'dir. }
+    yapilir; veri dosyasi motor acikken bayat olabilir, dogru kaynak WAL'dir.
+
+    P-DUR v2 (DurableOnFlush=False): fsync checkpoint'e ertelenir. WAL'e
+    yazim yapilir ama disk bariyeri cekilmez; MaybeCheckpoint esik asilinca
+    veya kapanista fsync eder. Olculen fark: fsync ~360 us/islem. }
   if FDirty then
   begin
     { v3.16: motor commit'i sayfa yazar -> tam kilit gerekir. }
@@ -2690,7 +2708,14 @@ begin
       try
         if FDirty then
         begin
-          FEng.Commit(True);
+          if FDurableOnFlush then
+            FEng.Commit(True)
+          else
+          begin
+            { SQLite synchronous=NORMAL: WAL'e yaz, fsync etme.
+              fsync MaybeCheckpoint veya kapanis ile yapilir. }
+            FEng.CommitNoSync(syncLsn);
+          end;
           FDirty := False;
           LogFinish;
           MaybeCheckpoint;
@@ -2982,6 +3007,16 @@ end;
 function TVdbBackendV3.GetDirty: Boolean;
 begin
   Result := FDirty or (BatchOpen and (BatchMap.Count > 0));
+end;
+
+function TVdbBackendV3.GetDurableOnFlush: Boolean;
+begin
+  Result := FDurableOnFlush;
+end;
+
+procedure TVdbBackendV3.SetDurableOnFlush(AValue: Boolean);
+begin
+  FDurableOnFlush := AValue;
 end;
 
 procedure TVdbBackendV3.WaitForeignTxn(ASessionId: Cardinal);
