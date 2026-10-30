@@ -15151,6 +15151,8 @@ var
   hasReturning: Boolean;
   // Sicak yol: tetikleyici / RLS yokken satir basina lookup'lar tamamen atlanir
   hasRowTrig, hasRls: Boolean;
+  // NarrowRows daraltmasi WHERE'in tamamini kapsiyorsa döngüde RowMatches gereksiz
+  isExact: Boolean;
   // F-33: VIEW desteği
   baseTable: string;
   viewColMap: TStrArray;
@@ -15243,10 +15245,16 @@ begin
 
   { Once her zaman FT.ScanRows -> 100.000 satirlik tabloda tek bir
     "UPDATE ... WHERE id = 5" ~1 saniye suruyordu. Simdi once adaylar
-    daraltilir (PK nokta / indeks dilimi); bulunamazsa tam tarama. }
-  if not NarrowRows(td, Stmt.WhereClause, colNames, colTypes, pks, allRows) then
+    daraltilir (PK nokta / indeks dilimi); bulunamazsa tam tarama.
+    IsExact: daraltma WHERE'in tamamini kapsiyorsa döngüde RowMatches
+    tekrar edilmez (PK noktada zaten NarrowRows icinde uygulanir). }
+  isExact := False;
+  if not NarrowRows(td, Stmt.WhereClause, colNames, colTypes, pks, allRows, isExact) then
+  begin
+    isExact := False;
     // R-13 Full: partition pruning (UPDATE/DELETE taramalari da kullanir)
     FT.ScanRowsPart(Stmt.Table, pks, allRows, PartTargetsOf(td, Stmt.WhereClause));
+  end;
 
   SetLength(allColNames, Length(td.Cols));
   for i := 0 to High(td.Cols) do allColNames[i] := td.Cols[i].Name;
@@ -15338,6 +15346,9 @@ begin
     pks := joinedPks;
     colNames := jNames;
     colTypes := jTypes;
+    // WHERE join filtresinde zaten uygulandi (yukaridaki RowMatches);
+    // döngüde RowMatches tekrar edilmez.
+    isExact := True;
   end;
 
   rCount := 0;
@@ -15368,7 +15379,7 @@ begin
       for i := 0 to High(allRows) do
       begin
 
-        if not RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes) then Continue;
+        if (not isExact) and (not RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes)) then Continue;
         // R-19: gorunmeyen satir guncellenemez (USING)
         if hasRls and not RlsRowVisible(Stmt.Table, 3, allRows[i], colNames, colTypes) then Continue;
         SetLength(newVals, Length(td.Cols));
@@ -15429,7 +15440,7 @@ begin
   begin
     for i := 0 to High(allRows) do
     begin
-      if not RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes) then Continue;
+      if (not isExact) and (not RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes)) then Continue;
       // R-19: gorunmeyen satir guncellenemez (USING)
       if hasRls and not RlsRowVisible(Stmt.Table, 3, allRows[i], colNames, colTypes) then Continue;
       SetLength(newVals, Length(td.Cols));
@@ -15517,6 +15528,8 @@ var
   hasReturning: Boolean;
   // Sicak yol: tetikleyici / RLS yokken satir basina lookup'lar tamamen atlanir
   hasRowTrig, hasRls: Boolean;
+  // NarrowRows daraltmasi WHERE'in tamamini kapsiyorsa döngüde RowMatches gereksiz
+  isExact: Boolean;
   // F-33: VIEW desteği
   baseTable: string;
   viewColMap: TStrArray;
@@ -15565,10 +15578,16 @@ begin
   end;
 
   { Once her zaman tam tarama: "DELETE ... WHERE id = 5" 100.000 satirlik
-    tabloda ~1 saniye suruyordu. Simdi PK nokta / indeks dilimi denenir. }
-  if not NarrowRows(td, Stmt.WhereClause, colNames, colTypes, pks, allRows) then
+    tabloda ~1 saniye suruyordu. Simdi PK nokta / indeks dilimi denenir.
+    IsExact: daraltma WHERE'in tamamini kapsiyorsa döngüde RowMatches
+    tekrar edilmez. }
+  isExact := False;
+  if not NarrowRows(td, Stmt.WhereClause, colNames, colTypes, pks, allRows, isExact) then
+  begin
+    isExact := False;
     // R-13 Full: partition pruning (UPDATE/DELETE taramalari da kullanir)
     FT.ScanRowsPart(Stmt.Table, pks, allRows, PartTargetsOf(td, Stmt.WhereClause));
+  end;
 
   // Tetikleyici / RLS meta verisi DELETE boyunca degismez: bir kez bak,
   // yoksa satir basina FireTriggers + Rls* cagrisini tamamen atla (sicak yol).
@@ -15582,7 +15601,7 @@ begin
     SetLength(toDeleteRows, 0);
   try
     for i := 0 to High(allRows) do
-      if RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes) and
+      if (isExact or RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes)) and
          ((not hasRls) or RlsRowVisible(Stmt.Table, 4, allRows[i], colNames, colTypes)) then   // R-19
       begin
         toDelete.Add(i);
