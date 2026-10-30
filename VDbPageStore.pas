@@ -1187,11 +1187,17 @@ var
 begin
   if FGenStream = nil then Exit;
   v := ReadGen + 1;
-  { v3.25: yazma yolu BILEREK `WriteFile` olarak birakildi: esleme zaten
-    ayni onbellek bolumunu gosterir, fakat `WriteFile` niyeti aciktir ve
-    yazan tarafin kendi goruntusu de aninda guncellenir. Maliyet commit
-    basina 2 sistem cagrisi (olculen ~2,5 us; commit duvarinda fsync
-    ~310 us yaninda ihmal edilebilir). }
+  { v4: eslenmis goruntu varsa dogrudan bellek bolumune yaz — Seek + WriteFile
+    (2 syscall, ~2,5 us) yerine tek bellek erisimi. Eski v3.25 yorumu WriteFile
+    'niyet acik' diye birakmisti; esleme zaten ayni onbellek bolumunu gosterir
+    ve yazan tarafin kendi goruntusu de aninda guncellenir. Dayaniklilik ayni:
+    her iki yolda da OS onbellegi uzerinden gider, FlushFileBuffers yok. }
+  if FGenMap <> nil then
+  begin
+    PQWord(FGenMap)^ := v;
+    FSigGen := v;
+    Exit;
+  end;
   FGenStream.Position := 0;
   FGenStream.WriteBuffer(v, 8);
   FSigGen := v;

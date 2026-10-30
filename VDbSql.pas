@@ -3858,11 +3858,11 @@ begin
     donduren fonksiyonun gecici sonucu sifirlanmiyor; onceki cagridan
     kalan (artik serbest birakilmis) dizi isaretcileri SetLength tarafindan
     yeniden finalize edilip yigin bozulmasina yol aciyor. Sonuc deposunu
-    finalize ETMEDEN sifirla; girisde sahiplenilmis veri yoktur. }
+    finalize ETMEDEN sifirla; girisde sahiplenilmis veri yoktur.
+    v4: FillChar zaten tum alanlari sifirlar (dizi/string isaretcileri = nil
+    = bos); ardindan SetLength(..., 0) ve '' atamalari gereksiz. }
   FillChar(Result, SizeOf(Result), 0);
-  Result.Affected := 0; Result.Msg := ''; SetLength(Result.Fields, 0);
-  SetLength(Result.FieldTypes, 0); SetLength(Result.Rows, 0);
-  Result.LastTable := ''; Result.Stmts := 1;
+  Result.Stmts := 1;
 
   { F-42: dogrudan ExecRaw cagrilari da yabanci acik transaction'i beklesin. }
   FT.Backend.WaitForeignTxn(FSessionId);

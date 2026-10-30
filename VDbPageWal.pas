@@ -79,7 +79,9 @@ type
     var
       FPath: string;
       FStream: TFileStream;
-      FBuffer: array of TPending;    // commit bekleyen cerceveler
+      { v4: ara TPending kopyasi kaldirildi — yuk dogrudan FOutBuf'a yazilir.
+        Yalniz sayfa numaralari tutulur (dedup + baslik icin). }
+      FFramePages: array of LongWord;
       FBufferCount: Integer;
       { v3.24: commit sirasinda tum kayitlar (cerceveler + commit kaydi) TEK
         WriteFile ile yazilir; tampon commit'ler arasinda yeniden kullanilir
@@ -461,25 +463,45 @@ var
   i: Integer;
 begin
   for i := 0 to FBufferCount - 1 do
-    if FBuffer[i].PageNo = PageNo then Exit(i);
+    if FFramePages[i] = PageNo then Exit(i);
   Result := -1;
 end;
 
 procedure TVdbPageWal.AppendBuffer(PageNo: LongWord; P: PVdbPage);
 var
-  i: Integer;
+  i, off, payLen: Integer;
+  plain, env: TBytes;
 begin
+  { v4: yuk dogrudan FOutBuf'a yazilir; ara TPending kopyasi yok.
+    Eski akis: P → FBuffer (4KB Move) → Commit'te FOutBuf (4KB Move).
+    Yeni akis: P → FOutBuf (tek Move). Dedup son yazim kazanir (ayni). }
+  if FWalEncrypted then
+    payLen := VDB_ENC_ENVELOPE
+  else
+    payLen := VDB_PAGE_SIZE;
   i := BufferedPageIndex(PageNo);
-  if i >= 0 then
+  if i < 0 then
   begin
-    Move(P^, FBuffer[i].Data, VDB_PAGE_SIZE);
-    Exit;
+    i := FBufferCount;
+    Inc(FBufferCount);
+    if FBufferCount > Length(FFramePages) then
+      SetLength(FFramePages, FBufferCount + 64);
+    FFramePages[i] := PageNo;
   end;
-  if FBufferCount >= Length(FBuffer) then
-    SetLength(FBuffer, FBufferCount + 64);
-  FBuffer[FBufferCount].PageNo := PageNo;
-  Move(P^, FBuffer[FBufferCount].Data, VDB_PAGE_SIZE);
-  Inc(FBufferCount);
+  off := i * (VDB_WAL_REC_HDR + payLen) + VDB_WAL_REC_HDR;
+  if Length(FOutBuf) < off + payLen + VDB_WAL_REC_HDR then
+    SetLength(FOutBuf, off + payLen + VDB_WAL_REC_HDR + 8192);
+  if FWalEncrypted then
+  begin
+    SetLength(plain, VDB_PAGE_SIZE);
+    Move(P^, plain[0], VDB_PAGE_SIZE);
+    if not VDbPageSeal(FKey, FSalt, PageNo, plain, env) then
+      raise EVdbWal.Create(Format('WAL cercevesi %d sifrelenemedi',
+        [PageNo]));
+    Move(env[0], FOutBuf[off], payLen);
+  end
+  else
+    Move(P^, FOutBuf[off], payLen);
 end;
 
 procedure TVdbPageWal.AppendFrame(PageNo: LongWord; P: PVdbPage);
@@ -517,8 +539,6 @@ end;
 function TVdbPageWal.Commit(DoSync: Boolean; LSN: LongWord): Boolean;
 var
   i, total, off, payLen: Integer;
-  env, plain: TBytes;
-  src: PByte;
   magic, zero, crc: LongWord;
 begin
   Result := False;
@@ -530,37 +550,21 @@ begin
     payLen := VDB_ENC_ENVELOPE
   else
     payLen := VDB_PAGE_SIZE;
-  { v3.24: cerceveler + commit kaydi TEK tamponda toplanip TEK WriteFile ile
-    yazilir. Onceden commit basina 3 cagri vardi (2 cerceve + commit kaydi);
-    olculen fark ~1,85 us/cagri. Tampon uye alanda tutulur, commit'ler
-    arasinda yeniden kullanilir. }
+  { v4: yuk zaten AppendBuffer'da FOutBuf'a yazildi; yalniz baslik + CRC. }
   total := FBufferCount * (VDB_WAL_REC_HDR + payLen) + VDB_WAL_REC_HDR;
   if Length(FOutBuf) < total then
     SetLength(FOutBuf, total + 8192);
-  { v3.21: tek arama. Onceden FStream.Size + Position atamasi iki arama
-    yapiyordu; Seek(0, soEnd) hem konumu hem sonu tek cagrida verir. }
+  { v3.21: tek arama. Seek(0, soEnd) hem konumu hem sonu tek cagrida verir. }
   FStream.Seek(0, soEnd);
   off := 0;
   magic := VDB_WAL_REC_FRAME;
   zero := 0;
   for i := 0 to FBufferCount - 1 do
   begin
-    if FWalEncrypted then
-    begin
-      SetLength(plain, VDB_PAGE_SIZE);
-      Move(FBuffer[i].Data, plain[0], VDB_PAGE_SIZE);
-      if not VDbPageSeal(FKey, FSalt, FBuffer[i].PageNo, plain, env) then
-        raise EVdbWal.Create(Format('WAL cercevesi %d sifrelenemedi',
-          [FBuffer[i].PageNo]));
-      src := @env[0];
-    end
-    else
-      src := @FBuffer[i].Data[0];
     Move(magic, FOutBuf[off], 4);
     Move(FLSN, FOutBuf[off + 4], 4);
     Move(payLen, FOutBuf[off + 8], 4);
-    Move(FBuffer[i].PageNo, FOutBuf[off + 12], 4);
-    Move(src^, FOutBuf[off + VDB_WAL_REC_HDR], payLen);
+    Move(FFramePages[i], FOutBuf[off + 12], 4);
     crc := WalCrc(FOutBuf[off], 16, FOutBuf[off + VDB_WAL_REC_HDR], payLen);
     Move(crc, FOutBuf[off + 16], 4);
     Inc(off, VDB_WAL_REC_HDR + payLen);
