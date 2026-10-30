@@ -11302,13 +11302,17 @@ var
   k: string;
   i: Integer;
   found: Boolean;
+  normTbl: string;
 begin
 
   if FTriggers = nil then Exit;
+  { v4: bos tetikleyici sozlugunde enumerator olusturmayi atla. }
+  if FTriggers.Count = 0 then Exit;
+  normTbl := VDbNorm(TableName);
   for k in FTriggers.Keys do
   begin
     if not FTriggers.TryGetValue(k, td) then Continue;
-    if td.TableName <> VDbNorm(TableName) then
+    if td.TableName <> normTbl then
       Continue;
     if td.Timing <> Timing then
       Continue;
