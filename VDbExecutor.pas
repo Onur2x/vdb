@@ -14055,7 +14055,7 @@ begin
   if not MatchKw('INSERT') then Exit;
   if not MatchKw('INTO') then Exit;
   if not ReadIdent(tbl) then Exit;
-  SetLength(cnames, 0);
+  SetLength(cnames, 8);   // P-21: onceden ayr, her kolonda yeniden tahsis yok
   nc := 0;
   SkipWs;
   if (p <= n) and (Sql[p] = '(') then
@@ -14063,7 +14063,7 @@ begin
     Inc(p);
     repeat
       if not ReadIdent(s) then Exit;
-      SetLength(cnames, nc + 1);
+      if nc >= Length(cnames) then SetLength(cnames, nc * 2);
       cnames[nc] := s;
       Inc(nc);
       SkipWs;
@@ -14072,18 +14072,21 @@ begin
     until False;
     if (p > n) or (Sql[p] <> ')') then Exit;
     Inc(p);
+    SetLength(cnames, nc);   // P-21: gercek boyuta kucult
   end;
   if not MatchKw('VALUES') then Exit;
   // H13: cok-satirli VALUES '(v,..),(v,..),..' — parse BIR KEZ, AST yok.
   // Bos tuple '()' genel yola birakilir (ReadValue basarisiz -> Exit).
+  // P-21: rows kapasitesi katlanarak buyur; her satirda yeniden tahsis yok.
   nrows := 0;
   expNv := -1;
+  SetLength(rows, 16);   // P-21: baslangic kapasitesi
   repeat
     SkipWs;
     if (p > n) or (Sql[p] <> '(') then Exit;
     Inc(p);
-    SetLength(vals, 8);
-    cap := 8;
+    if expNv > 0 then begin SetLength(vals, expNv); cap := expNv; end  // P-21
+    else begin SetLength(vals, 8); cap := 8; end;
     nv := 0;
     repeat
       if not ReadValue(s) then Exit;
@@ -14100,7 +14103,7 @@ begin
     SetLength(vals, nv);
     if expNv < 0 then expNv := nv
     else if nv <> expNv then Exit;        // satirlar arasi deger sayisi farkli -> genel
-    SetLength(rows, nrows + 1);
+    if nrows >= Length(rows) then SetLength(rows, nrows * 2);  // P-21
     rows[nrows] := vals;
     Inc(nrows);
     SkipWs;

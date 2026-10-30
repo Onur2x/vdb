@@ -1698,7 +1698,12 @@ begin
     // sifreleme 'stored' uzerinde yapilir). WAL replay de AppendRec'i
     // cagirdigi icin gunkluk yeniden yazimlari da kapsar.
     if @FRowTagFunc <> nil then
-      loc.TableId := FRowTagFunc(Value, Length(Value))
+    begin
+      if Length(Value) > 0 then
+        loc.TableId := FRowTagFunc(@Value[0], Length(Value))
+      else
+        loc.TableId := FRowTagFunc(nil, 0);
+    end
     else
       loc.TableId := -1;
     FIndex.AddOrSetValue(Key, loc);
@@ -1960,13 +1965,13 @@ begin
     begin
       if (h.Flags and VDB_FLAG_ENCRYPTED) <> 0 then
       begin
-        if DecryptValue(buf, tagPlain) then
-          tag := FRowTagFunc(tagPlain, Length(tagPlain))
+        if DecryptValue(buf, tagPlain) and (Length(tagPlain) >= 2) then
+          tag := FRowTagFunc(@tagPlain[0], Length(tagPlain))
         else
           tag := -1;   // cozulemedi -> filtre uygulanmaz (guvenli taraf)
       end
       else
-        tag := FRowTagFunc(buf, Integer(h.ValLen));
+        tag := FRowTagFunc(@buf[0], Integer(h.ValLen));
     end
     else
       tag := -1;

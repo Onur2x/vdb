@@ -1095,3 +1095,218 @@ Sprint F **KAPANDI**: 200k × 3 kolon ölçümü tamamlandı. Hedef tablosu:
 | PK ve yazma gerilememiş | v3'te COUNT(*) 0,0 ms (v2: 29,4 ms) | ✔ |
 
 Tüm kapılar 686/0, SQL testleri 3295/0. `v1.0.0` etiketi hazır.
+
+---
+
+## 18. Sprint G/0 — delta WAL hipotezi A/B ölçümü (2026-10-29)
+
+**Soru:** Toplu yazım boşlukları (INSERT 1M 7,7x / UPDATE 100k 15,8x / DELETE 100k
+14,9x) fsync'ten mi kaynaklanıyor? Delta tabanlı WAL (sayfa imajı yerine ~100 B
+değişiklik kaydı) bu boşlukları kapatır mı?
+
+**Plan gereği:** "G/0: A/B ölçüm önce. Kazanç kanıtlanmadan koda girilmez."
+
+### 18.1 Araçlar
+
+- `walab` — gerçek WAL çerçeve düzenini taklit eden ham A/B ölçümü.
+  20 B başlık + payload + commit kaydı; `--nosync`, `--frames=K`.
+  Duvar (`QueryPerformanceCounter`) + CPU (`GetProcessTimes`) + B/commit.
+  3 tur medyan, N=20000.
+- `bulkcpu` — motorun toplu yazım yolunu CPUPROF bileşenleriyle ölçer.
+  `TVdbBackendV3` üzerinden tek `BeginBatch`/`CommitBatch` içinde N satır.
+
+### 18.2 A/B: payload boyu ↔ fsync CPU'su (walab, N=20000, 3 tur medyan)
+
+| paylen | B/commit | duvar ms/commit | CPU ms/commit |
+|---:|---:|---:|---:|
+| 4096 | 4136 | 0,331 | 0,108 |
+| 1024 | 1064 | 0,307 | 0,098 |
+| 128 | 168 | 0,309 | 0,095 |
+| 30 | 70 | 0,310 | 0,091 |
+| 0 | 40 | 0,307 | 0,086 |
+
+**Sonuç:** Payload 100× azalsa bile CPU yalnızca **108 → 86 µs** (22 µs, ~%20);
+duvar **331 → 307 µs** (~%7). fsync sabit maliyeti **~85–100 µs** ve payload'a
+neredeyse bağımsız.
+
+`--nosync` (yalnız yazma, fsync yok):
+
+| paylen | CPU ms/commit |
+|---:|---:|
+| 4096 | 0,010 |
+| 30 | 0,006 |
+| 0 | 0,005 |
+
+Yazma bedeli ihmal edilir. Fark tamamen fsync'in sabit maliyeti.
+
+**--frames=4** (16484 B): 4096→0,125 ms; 30→0,103 ms. Fark yine ~22 µs.
+**--frames=2** (gerçek motor 8252 B): duvar 0,338 ms; CPU 0,130 ms.
+**Dosya boyu etkisi:** N=500 (~2 MB) 0,094 vs N=20000 (~82 MB) 0,102 — önemsiz.
+**C:\temp (aynı disk):** 4096→0,106; 30→0,092; 0→0,095 — D: ile aynı.
+
+### 18.3 Toplu yol: fsync-bound mı, CPU-bound mu? (bulkcpu, N=100000, 24 B)
+
+| İş | duvar ms | CPU ms | µs/satır (duvar) | µs/satır (CPU) |
+|---|---:|---:|---:|---:|
+| INSERT | 189,0 | 187,5 | 1,89 | 1,88 |
+| UPDATE | 198,3 | 187,5 | 1,98 | 1,88 |
+| DELETE | 202,0 | 203,1 | 2,02 | 2,03 |
+
+**duvar ≈ CPU** — I/O beklemesi yok. Toplu yol **CPU-bound**.
+
+CPUPROF bileşen dağılımı (ort. µs/commit, N=4 işlem; GetProcessTimes 15,6 ms
+çözünürlük, büyük değerler güvenilir, fsync ölçülür düzeyin altında kalıyor):
+
+| Bileşen | µs/commit | Pay |
+|---|---:|---:|
+| hazirlik+kilit+uygulama | 58.594 | %65 |
+| gunluk (LogFinish) | 15.625 | %17 |
+| wal (CommitNoSync) | 7.813 | %9 |
+| motor:frame | 3.906 | %4 |
+| motor:wal | 3.906 | %4 |
+| fsync (AwaitDurable) | ölçülemiyor | ~%0 |
+
+Toplu yolda fsync işlem sonunda **bir kez** olur (~0,33 ms). Satır başına
+1,89 µs'lik işin fsync olması imkansız.
+
+### 18.4 SQL katmanı ↔ ham motor
+
+| Yol | µs/satır | Not |
+|---|---:|---|
+| Ham backend `Put(key, 24B)` | **1,89** | bulkcpu, 100k tek işlem |
+| SQL/tablo `tb.Insert` (3 kolon + PK) | 24,1 | §4, 1M satır |
+| SQLite INSERT (BEGIN/COMMIT) | 3,12 | §4 |
+
+**Ham motor zaten SQLite'dan hızlı** (1,89 vs 3,12). §4'teki 7,7x boşluğun
+~%93'ü SQL/tablo katmanında: satır biçimleme, `IntToStr` dönüşümleri, PK indeks
+bakımı, tip dönüşümleri. Depolama motoru darboğaz değil.
+
+### 18.5 Sonuç — hipotez ÇÜRÜDÜ
+
+1. **Delta WAL fsync boşluğunu kapatamaz.** Payload 100× azalsa bile kazanç
+   ~22 µs (108→86). Planın "fsync 159→~20 µs, INSERT 7-19x→1-2x" tahmini
+   gerçekçi değil.
+2. **Toplu boşluklar fsync'ten değil.** duvar ≈ CPU; fsync toplam zamanın
+   binde biri. Delta WAL bu boşluklara hiçbir şey kazandırmaz.
+3. **Asıl hedef SQL/tablo katmanı.** Ham motor 1,89 µs/satır; SQL yolu 24,1.
+   ~22 µs/satır satır işleme, indeks ve biçimleme gidiyor.
+4. **İkincil hedef:** `AwaitDurable` kitap işi. Ham write+fsync (4 KB):
+   108 µs CPU. Motorda fsync bileşeni 159 µs. ~50 µs fark lider seçimi,
+   kritik bölüm, olay sinyalizasyonu. Küçük ama gerçek.
+
+**Sprint G (delta WAL) iptal.** Planın öngördüğü gibi "kazanç çıkmazsa plan
+orada dürüstçe biter." Sprint H (tarama budama) ve SQL katmanı optimizasyonu
+öncelikli.
+
+---
+
+## 19. SQL/tablo katmanı parçalanması (2026-10-29)
+
+Sprint G/0 sonrası asıl hedef olan SQL/tablo katmanı katman katman ölçüldü.
+Araçlar: `insprof`, `insprof2`, `skipdup`, `rowcost` (tmp64/g0).
+
+### 19.1 §4 ↔ tablo API farkı açıklandı
+
+§4'ün 24,1 µs/satır sayısı **SQL metni** yolu (`sq.Exec`) ile ölçülmüştü.
+Tablo API (`tb.BeginBatch` + `tb.Insert`) aynı işi **5,35–6,24 µs/satır**
+yapıyor (insprof2, 200k ve 1M). Fark: **~17,7 µs/satır SQL parser/executor
+overhead**. §5'teki "açık batch" sayısı (0,0064 ms/satır = 6,4 µs) tablo
+API'siyle uyumlu.
+
+| Yol | µs/satır | Not |
+|---|---:|---|
+| SQL text (`sq.Exec`, §4) | 24,1 | parser + executor dahil |
+| Tablo API (insprof2, 1M) | 6,24 | staging 4,16 + commit 2,09 |
+| Tablo API (insprof2, 200k) | 5,35 | staging 3,88 + commit 1,47 |
+| SQLite INSERT (§4) | 3,12 | — |
+
+### 19.2 Tablo API bileşen kırılımı (rowcost, 100k)
+
+| Bileşen | µs/satır | Oran |
+|---|---:|---:|
+| `VDbHashKey` | 0,241 | %7 |
+| `FKvB.Put` (batch) | 1,213 | %36 |
+| EncodeRow + IdxAddRow + overhead | 1,886 | %56 |
+| **Toplam (SkipDupCheck ile)** | **3,340** | |
+
+`SkipDupCheck` açıkken ek 339 µs/satır duplicate check (toplam %8,9).
+
+### 19.3 Duplicate check (Exists) anomalisı
+
+`insprof` doğrudan `be.Exists(key)` çağırdığında **1,826 µs/adet** — batch
+DIŞINDAYKEN her çağrı `FEngCs` → `OnFirstEnter` → `AcquireRead` → dosya
+kilidi (`TakeSharedLock` + `RefreshIfStale`) → iş → `ReleaseRead` →
+`VDbUnlockStream` zinciri çalıştırıyor. v2'de aynı çağrı **0,055 µs** (salt
+hash araması). Fark: **33x**.
+
+Batch İÇİNDE ise `FEngCs` zaten tutulduğundan yeniden giriş hızlı yolu
+kullanılır, dosya kilidi tekrar alınmaz → maliyet **~339 µs**'e düşer
+(`SkipDupCheck` kazancı).
+
+**Optimizasyon (uygulandı):**
+1. `TVTableDb.SkipDupCheck` özelliği — toplu eklemede `FKvB.Exists` çağrısını
+   atlar. Cagiran benzersiz PK garantisi vermelidir.
+2. `TVdbBackendV3.Exists` — `OwnSet` satır içine alındı, çift kilit
+   kaldırıldı (etki minimal: 1,826 → 1,809 µs).
+
+### 19.4 Hedef
+
+| Hedef | Mevcut | Potansiyel | Zorluk |
+|---|---:|---:|---|
+| SQL text parser/executor | 17,7 µs/satır | ~2-4 µs? | Yüksek (parser + executor) |
+| EncodeRow + Idx + overhead | 1,89 µs/satır | ~1,0? | Orta |
+| Put(batch) | 1,21 µs/satır | ~0,8? | Düşük |
+| Exists (batch dışı dosya kilidi) | 1,83 µs/satır | ~0,1 | Orta (kilitleme mimarisi) |
+
+**Sonuç:** Tablo API'si SQLite ile aynı seviyede (3,3 vs 3,12 µs/satır).
+7,7x boşluğun tamamı SQL text katmanında. Bir sonraki sprint bu olmalı.
+
+### 19.5 SQL overhead parçalanması ve multi-row VALUES (2026-10-29)
+
+`sqlcost.lpr` ile SQL text INSERT yolunun bileşenleri ölçüldü (ayrı taze
+veritabanlarında, WAL artığı önlenir). 100k ve 1M sonuçları:
+
+| Senaryo | 100k (µs/satır) | 1M (µs/satır) | Açıklama |
+|---|---:|---:|---|
+| A) SQL text batch (ayrı `sq.Exec`) | 11,07 | 12,22 | §4 yolu |
+| B) Tablo API batch (`tb.Insert`) | 4,98 | 6,39 | Referans |
+| C) Parse-only `SELECT 1` | 5,63 | 6,41 | `Exec`+`ExecRaw` tabanı |
+| D) Autocommit INSERT | 400 | 402 | Tek fsync/satır |
+| E) SQL sade batch | 11,40 | 12,53 | Format basit SQL |
+| F) Tek SQL dizesi (ayrı INSERT'ler) | 10,41 | 14,38 | `ExecAllInner` |
+| **G) Multi-row VALUES (100 satır/INSERT)** | **6,07** | **7,62** | **Tek ayrıştırma** |
+
+**Ana bulgular:**
+
+1. **SQL overhead (A − B) ≈ 6,2 µs/satır** — bunun ~5,5 µs'si `Exec`+`ExecRaw`
+   sarmalayıcı kitap işi (C = 5,6 µs/call). Ayrıştırma (manüel parser) ucuz.
+
+2. **Kilit kitap işi (A − F) ≈ 0,7–1,1 µs/satır** — `Exec`'teki `SplitStatements`,
+   `IsSelectStatement`, `FT.Lock/Unlock`, session yönetimi. `ExecAllInner` bunu
+   bir kez yapar.
+
+3. **Multi-row VALUES (G) büyük kazanç:** Tek `INSERT INTO t(...) VALUES
+   (...),(...),...` ile N satır tek ayrıştırma + tek semantik kapi turu.
+   SQL overhead **6,2 → 1,1 µs/satır** (%82 azalma). G − B farkı yalnızca
+   ~1,2 µs/satır — bunun çoğu test kodundaki `Format`+birleştirme.
+
+4. **F (tek dev SQL dizesi) 1M'de kötüleşir** (14,4 µs): O(n²) string
+   birleştirme, ~50 MB SQL dizesi. Multi-row VALUES'te dize boyutu ~100x
+   daha küçük.
+
+**Uygulanan kod optimizasyonları (P-21):**
+- `Exec`/`Exec(Params)`: INSERT/UPDATE/DELETE'de `IsSelectStatement` atlanır
+  (ilk karakter kontrolü). `Tok`+`UpperCase`+`try/finally` her yazmada ~0,2 µs.
+- `ExecFastLiteralInsert`: `cnames` önceden ayrılır (satır başına yeniden
+  tahsis yok). `rows` kapasitesi katlanarak büyür.
+- `SplitStatements`: Çift `Trim` çağrısı tekilleştirildi.
+
+**Semantic kapılar ucuz** (motor kullanıcı modunda):
+- `TableExists`: `FTables.ContainsKey` — sözlük araması
+- `IsView`: `TryGetValue` — sözlük araması
+- `TriggersFor` × 2: `FTriggers = nil` ise anında çıkış
+- `RequirePriv` → `RoleCan`: `FCurrentRole = ''` ise `Exit(True)`
+- `RlsRequireInsert` → `RlsApplies` → `RlsEnabled`: `FRlsOn.TryGetValue`
+
+**Sonraki hedef:** Tablo API (B = 6,4 µs/satır @ 1M) hâlâ SQLite'ın (3,12)
+2x altında. `FT.Insert` içindeki `EncodeRow` + `IdxAddRow` + `Put` optimizasyonu.

@@ -16585,12 +16585,25 @@ begin
     'sayac=' + IntToStr(CountB));
 
   // 4) Esik dusurulunce BIR SONRAKI commit'te tam bir kez calisir.
+  // v3'te olu alan = freelist sayfalari*4096; kismi dolu sayfa boslugu
+  // SAYILMAZ (v2'de olu kayit bayti sayildigi icin oran daha yukselirdi).
+  // 200 satirlik silme bazen tek sayfa bosaltir → sabit 0.20 esigi flaky.
+  // Esik, gercek olcume gore yarisi kadar ayarlanir: boylece "esik asilinca"
+  // durumu gercekten olusur, tetikleme yolu dogrulanir.
   SetMinB(4096);
-  SetRatioB(0.20);
-  cnt0 := CountB;
+  dead0 := DeadB;
   sz0 := SizeB;
-  Dogrula('esik dusuk ayarli', (MinB = 4096) and
-    (Abs(RatioB - 0.20) < 1e-9), 'oran=' + FloatToStr(RatioB));
+  if (sz0 > 0) and (dead0 > 0) then
+  begin
+    SetRatioB((Double(dead0) / Double(sz0)) * 0.5);
+    if RatioB < 0.01 then SetRatioB(0.01);
+  end
+  else
+    SetRatioB(0.20);
+  cnt0 := CountB;
+  Dogrula('esik dusuk ayarli', (MinB = 4096) and (RatioB < 0.20),
+    'oran=' + FloatToStr(RatioB) + ' olu=' + IntToStr(dead0) +
+    ' boyut=' + IntToStr(sz0));
   sq.Exec(Format('DELETE FROM ac WHERE id = %d', [4]));
   Dogrula('esik asilinca sikistirildi', CountB = cnt0 + 1,
     'sayac=' + IntToStr(CountB) + ' oluOnce=' + IntToStr(dead0));

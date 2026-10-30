@@ -215,6 +215,7 @@ type
   PartCol: string;
   PartVals: array of string;
   end;
+  PTableDef = ^TTableDef;
 
   { R-13 Full: partition pruning hedef kumesi. HasFilter=False ise filtre
     yok (butun satirlar taranir); Parts bos ise HICBIR bolum taranmaz
@@ -355,11 +356,27 @@ type
     // P-24: Batch yazim sirasinda tablo semasini ve kolon siralamasini onbellekleme
     FBatchTableCached: Boolean;
     FBatchTableDef: TTableDef;
+    FOpenTDef: TTableDef; // P-30: batch disi Insert icin anlik sema (pointer hedef)
+    // P-31: auto-inc sayac onbellegi. Batch boyunca her satirda FAutoInc
+    // sozlugune yazmak yerine Int64 uzerinde calisir; Commit/Abort'ta
+    // tek seferde yazdirilir. 1M satirda 1M dict okuma+yazma tasarrufu.
+    FBatchAutoIncTid: Word;
+    FBatchAutoIncVal: Int64;
+    FBatchAutoIncValid: Boolean;
     // H10 (2026-10-18): batch basina BIR KEZ hesaplanan VDbHashKeyPrefix tohumu.
     // FBatchTableCached ile ayni gecerlilikte (ad eslesmesi kontrol edilir).
     FBatchHashPrefix: QWord;
     FBatchColMapValid: Boolean;
     FBatchColMap: TIntArray;
+    // P-32: batch tablosunun lazy PK indeksi var mi? IdxAddRow'da FPkIdx
+    // ContainsKey aramasini atlamak icin. FBatchTableCached ile ayni gecerlilikte.
+    FBatchHasPkIdx: Boolean;
+    // P-26: batch'te vals dizi on-tahsisi — SetLength atlanir.
+    FBatchVals: TStrArray;
+    // G/1 (2026-10-29): toplu eklemede duplicate check atlama. Her satirda
+    // FKvB.Exists cagrisi dosya kilidi alip biraktigi icin ~1,8 us/satir.
+    // Cagiran benzersiz PK garantisi veriyorsa True yapilir.
+    FSkipDupCheck: Boolean;
   // F2-12: aktif FK kaskad zinciri derinligi (koruma sayaci)
   FCascadeDepth: Integer;
     FNextId: Word;
@@ -418,6 +435,8 @@ type
     // P-17a: sicak sayac okuma; sozlukte yoksa sema kaydi alani (view/eski sema).
     procedure BumpAutoInc(const T: TTableDef; NewVal: Int64);
     // P-17a: sema kaydina DOKUNMADAN sayaci yukselt + semayi kirle.
+    procedure FlushAutoIncCache;
+    // P-31: batch auto-inc onbellegini sozluge yazdir.
     function AutoIncPersistOf(const T: TTableDef): Int64;
     // M10: IDENTITY kolonlarini doldurur; ALWAYS acik degeri reddeder,
     // BY DEFAULT acik degeri kabul edip sayaci ilerletir.
@@ -625,6 +644,10 @@ type
     function GetTableNameById(AId: Word): string;
     // satir: values[] string formda, tip donusumu burada
     procedure Insert(const Table: string; const ColNames, StrVals: array of string);
+    // G/1: toplu eklemede duplicate check atlama. True iken Insert, PK
+    // cakisma denetimi yapmaz (FKvB.Exists cagirmaz). Cagiran benzersiz
+    // PK garantisi vermelidir. Varsayilan False.
+    property SkipDupCheck: Boolean read FSkipDupCheck write FSkipDupCheck;
     // COKMULU ekleme (tek atomik batch): Values satirlari = VALUES gruplari.
     procedure BatchInsert(const Table: string; const ColNames: array of string;
       const Rows: array of TStrArray);
@@ -1748,11 +1771,20 @@ begin
     Result := S;
     Exit;
   end;
-  v := Trim(S);
+  { P-24: Trim atlama — temiz degerlerde (bosluk yok) kopya yapma.
+    FPC Trim her zaman yeni dizi tahsis eder; bosluk yoksa `v := S`
+    yeterlidir (reference-counted atama). }
+  if (S <> '') and (S[1] > ' ') and (S[Length(S)] > ' ') then
+    v := S
+  else
+    v := Trim(S);
   Result := v;
   if v = '' then Exit; // NULL serbest (NOT NULL ayri denetlenir)
   // SQL NULL literal: her tipe NULL yazar (NOT NULL ayri denetlenir)
-  if SameText(v, 'NULL') then
+  // P-29: SameText cagrisi oncesi uzunluk kontrolu — 'NULL' disi degerlerde
+  // karsilastirma fonksiyonu cagrilmaz (SameText zaten uzunluk kontrolu
+  // yapar ama fonksiyon cagri overhead'ini atlar).
+  if (Length(v) = 4) and SameText(v, 'NULL') then
   begin
     Result := '';
     Exit;
@@ -3428,8 +3460,11 @@ var
   iv: Int64;
   fv: Double;
   bv: Byte;
+  u: QWord;           // P-33: satir ici PutIntCompact
+  tmp: array[0..9] of Byte;
+  n, j: Integer;
 
-  procedure Grow(Need: Integer);
+  procedure Grow(Need: Integer); inline;
   var n: Integer;
   begin
     if p + Need > Length(b) then
@@ -3441,19 +3476,19 @@ var
     end;
   end;
 
-  procedure PutU16(V: Word);
+  procedure PutU16(V: Word); inline;
   begin
     Grow(2);
     b[p] := Byte(V); b[p + 1] := Byte(V shr 8); Inc(p, 2);
   end;
 
-  procedure PutI32(V: LongInt);
+  procedure PutI32(V: LongInt); inline;
   begin
     Grow(4);
     Move(V, b[p], 4); Inc(p, 4);
   end;
 
-  procedure PutVarU(V: LongWord);
+  procedure PutVarU(V: LongWord); inline;
   begin
     Grow(5);
     while V >= $80 do
@@ -3464,7 +3499,7 @@ var
     b[p] := Byte(V); Inc(p);
   end;
 
-  procedure PutLenCode(N: Integer);
+  procedure PutLenCode(N: Integer); inline;
   { v3.11: 0 = NULL, aksi halde N + 1. }
   begin
     if N < 0 then PutVarU(0) else PutVarU(LongWord(N) + 1);
@@ -3475,7 +3510,7 @@ var
     Varint 8 bayt veya daha uzun gerekiyorsa ESKI ham bicime (vlen=8)
     donulur: vlen=8 her zaman "ham little-endian Int64" demektir, boylece
     eski dosyalar hala okunur ve karisiklik olmaz. }
-  procedure PutIntCompact(V: Int64);
+  procedure PutIntCompact(V: Int64); inline;
   var
     u: QWord;
     tmp: array[0..9] of Byte;
@@ -3514,7 +3549,7 @@ var
     end;
   end;
 
-  function IsPureAscii(const S: string): Boolean;
+  function IsPureAscii(const S: string): Boolean; inline;
   var j: Integer;
   begin
     for j := 1 to Length(S) do
@@ -3522,12 +3557,12 @@ var
     Result := True;
   end;
 
-  procedure PutPkU8Len(N: Integer);
+  procedure PutPkU8Len(N: Integer); inline;
   begin
     PutVarU(LongWord(N));
   end;
 
-  procedure PutPkU8(const S: string);
+  procedure PutPkU8(const S: string); inline;
   // varint uzunluk + UTF-8 baytlar (pk).
   var sb: TBytes;
   begin
@@ -3554,7 +3589,7 @@ var
     Bu, pk'nin satirda iki kez durmasini onler (satirin %17-32'si). }
   procedure PutPkField(const S: string);
   var
-    j: Integer;
+    j, j2: Integer;
     canon: string;
     iv: Int64;
     fv: Double;
@@ -3568,7 +3603,30 @@ var
       case T.Cols[T.PkIndex].Ctype of
         VCT_INT:
           begin
-            if VDbParseInt(Vals[T.PkIndex], iv) then
+            { P-25: zaten kanonik IntToStr biciminde mi? (hizli yol)
+              IntToStr(VDbParseInt(s)) = s ise parse+format atlaniyor.
+              Kanonik bicim: '0' | -?[1-9][0-9]*  (IntToStr uretimi). }
+            j2 := 1;
+            if Vals[T.PkIndex][1] = '-' then
+            begin
+              if (Length(Vals[T.PkIndex]) < 2) or (Vals[T.PkIndex][2] = '0') then
+                j2 := 0                        // '-', '-0', '-0x' → kanonik degil
+              else
+                j2 := 2;
+            end
+            else if Vals[T.PkIndex][1] = '0' then
+              j2 := Ord(Length(Vals[T.PkIndex]) = 1); // '0' kanonik; '0x' degil
+            if j2 > 0 then
+            begin
+              while (j2 <= Length(Vals[T.PkIndex])) and
+                    (Vals[T.PkIndex][j2] >= '0') and (Vals[T.PkIndex][j2] <= '9') do
+                Inc(j2);
+              if j2 <= Length(Vals[T.PkIndex]) then
+                j2 := 0;                       // rakam disi karakter
+            end;
+            if j2 > 0 then
+              canon := Vals[T.PkIndex]         // zaten kanonik
+            else if VDbParseInt(Vals[T.PkIndex], iv) then
               canon := IntToStr(iv)
             else
               canon := #1;                 // eslesmez
@@ -3606,7 +3664,7 @@ var
       PutPkU8(S);
   end;
 
-  procedure PutTextU8(const S: string);
+  procedure PutTextU8(const S: string); inline;
   // lenCode + UTF-8 baytlar (metin kolonu).
   var sb: TBytes;
   begin
@@ -3630,8 +3688,8 @@ var
 var
   initCap: Integer;
 begin
-  initCap := 16 + Length(Pk) * 2 + Length(T.Cols) * 24;
-  if initCap < 128 then initCap := 128;
+  initCap := 16 + Length(Pk) * 2 + Length(T.Cols) * 16;
+  if initCap < 64 then initCap := 64;
   SetLength(b, initCap); p := 0;
   { v3.11: uzatilmis govde isareti + tablo kimligi. }
   PutU16(VDB_ROW_EXT);
@@ -3664,9 +3722,41 @@ begin
     end;
     case T.Cols[i].Ctype of
       VCT_INT:
-        if (i < Length(Vals)) and (Vals[i] <> '') and VDbParseInt(Vals[i], iv) then
-          PutIntCompact(iv)
-        else PutLenCode(-1);
+        if (i < Length(Vals)) and (Vals[i] <> '') then
+        begin
+          { P-33: dogrulama burada — VDbNormValue artik INT icin parse etmiyor. }
+          if not VDbParseInt(Vals[i], iv) then
+            raise EVDbException.Create(ecTypeMismatch, 'INTEGER degil: ' + Vals[i]);
+          { P-33: PutIntCompact satir ici (n<8) — nested cagi overhead'i kalkar. }
+          if iv < 0 then
+            u := (QWord(-(iv + 1)) shl 1) or 1
+          else
+            u := QWord(iv) shl 1;
+          n := 1;
+          while n < 10 do
+          begin
+            if (u shr (7 * n)) = 0 then Break;
+            Inc(n);
+          end;
+          if n >= 8 then
+            PutIntCompact(iv)
+          else
+          begin
+            Grow(n + 1);
+            b[p] := Byte(n + 1); Inc(p);
+            for j := 0 to n - 1 do
+            begin
+              tmp[j] := Byte(u and $7F);
+              u := u shr 7;
+            end;
+            for j := 0 to n - 1 do
+            begin
+              if j < n - 1 then b[p] := tmp[j] or $80 else b[p] := tmp[j];
+              Inc(p);
+            end;
+          end;
+        end
+        else begin b[p] := 0; Inc(p); end;
       VCT_FLOAT:
         if (i < Length(Vals)) and (Vals[i] <> '') and VDbParseFloat(Vals[i], fv) then
         begin PutLenCode(8); Grow(8); Move(fv, b[p], 8); Inc(p, 8); end
@@ -3688,10 +3778,6 @@ begin
     else
       if (i < Length(Vals)) and (Vals[i] <> '') then
       begin
-        // VCT_BLOB = ham bayt: kodlama/temizleme YAPILMAZ (eski bayt-yolu
-        // birebir korundu). Metin kolonlari PutTextU8 ile UTF-8'e normalize
-        // edilir; BLOB'da bu gecersiz UTF-8 baytlarini U+FFFD'ye cevirerek
-        // JPEG/PNG/exe gibi ikili veriyi bozardi.
         if T.Cols[i].Ctype = VCT_BLOB then
         begin
           sv := VDbS2B(Vals[i]);
@@ -3701,9 +3787,32 @@ begin
           Inc(p, Length(sv));
         end
         else
-          PutTextU8(Vals[i]);
+        begin
+          { P-33: PutTextU8 satir ici (ASCII) — nested cagi overhead'i kalkar. }
+          j := 1;
+          while (j <= Length(Vals[i])) and (Vals[i][j] < #128) do Inc(j);
+          if j > Length(Vals[i]) then
+          begin
+            n := Length(Vals[i]);
+            Grow(n + 5);
+            { P-39: n+1 >= 128 ise uzunluk varint'i 2+ bayt olur
+              (PutLenCode ayni bicimi yazar). Eski satir ici kod yalnizca
+              tek bayt yaziyordu; 127+ baytlik ASCII metinde devam bayti
+              kayboluyor, DecodeRow XML baytlarini uzunluk saniyordu. }
+            if n + 1 < 128 then
+            begin
+              b[p] := Byte(n + 1); Inc(p);
+            end
+            else
+              PutLenCode(n);
+            if n > 0 then Move(Vals[i][1], b[p], n);
+            Inc(p, n);
+          end
+          else
+            PutTextU8(Vals[i]);
+        end;
       end
-      else PutLenCode(-1);
+      else begin b[p] := 0; Inc(p); end;
     end;
   end;
   SetLength(b, p);
@@ -4138,21 +4247,21 @@ begin
     KeyHash, ColCount - 1, FType, FOff, FLen);
 end;
 
-function VDbRowTagOf(const PlainValue: TBytes; ValueLen: Integer): Integer;
+function VDbRowTagOf(PlainValue: PByte; ValueLen: Integer): Integer;
 // R-26 (2026-10-15): KV katmanina verdigimiz TABLO ID cozucusu.
+// P-38: PByte + uzunluk — TBytes refcount'u tetiklemez.
 begin
   Result := -1;
-  if (ValueLen < 2) or (Length(PlainValue) < 2) then Exit;
+  if (PlainValue = nil) or (ValueLen < 2) then Exit;
   // sema kaydi ('VSCH1') satir degildir; ilk iki bayti rastgele bir
   // tablo id'sine denk gelebilir -> mutlaka -1 yap.
   if (ValueLen >= Length(VDB_SCHEMA_TAG)) and
-     (Length(PlainValue) >= Length(VDB_SCHEMA_TAG)) and
-     CompareMem(@PlainValue[0], @VDB_SCHEMA_TAG[1], Length(VDB_SCHEMA_TAG)) then
+     CompareMem(PlainValue, @VDB_SCHEMA_TAG[1], Length(VDB_SCHEMA_TAG)) then
     Exit;
   // ReadU16 ile birebir ayni hesap; v3.11: v2 govdede tablo kimligi 2. sozcukte
   if ((Integer(PlainValue[0]) or (Integer(PlainValue[1]) shl 8)) = Integer(VDB_ROW_EXT)) and
      (ValueLen < 4) then Exit;   // isaret var ama basligin devami yok: satir degil
-  Result := Integer(VdbRowTableIdAt(@PlainValue[0]));
+  Result := Integer(VdbRowTableIdAt(PlainValue));
 end;
 
 { TVTableDb }
@@ -5068,8 +5177,11 @@ end;
 function TVTableDb.AutoIncOf(const T: TTableDef): Int64;
 // P-17a: sicak sayac okuma. Sozlukte kayit yoksa sema kaydi alanindan
 // gelir (CREATE/LOAD sonrasi ilk yazim, view'lar, eski semalar).
+// P-31: batch icinde onbellekten oku — sozluk aramasi atlanir.
 begin
-  if not FAutoInc.TryGetValue(T.TableId, Result) then
+  if FBatchAutoIncValid and (FBatchAutoIncTid = T.TableId) then
+    Result := FBatchAutoIncVal
+  else if not FAutoInc.TryGetValue(T.TableId, Result) then
     Result := T.AutoInc;
 end;
 
@@ -5088,9 +5200,35 @@ procedure TVTableDb.BumpAutoInc(const T: TTableDef; NewVal: Int64);
 // degisikligi (FSchemaDirty) yazar; sayac icin her islemde sema yazilmaz.
 // Dayaniklilik kaybi yok: sayac okunamazsa acilista ReadRow/MaxPkInt ile
 // kendini onarir (bkz. ApplyIdentity ve Insert'teki oto-sayac yolu).
+// P-31: batch icinde sozluk yazmasi yerine onbellek uzerinde max al.
 begin
-  FAutoInc.AddOrSetValue(T.TableId, NewVal);
+  if FBatchAutoIncValid and (FBatchAutoIncTid = T.TableId) then
+  begin
+    if NewVal > FBatchAutoIncVal then
+      FBatchAutoIncVal := NewVal;
+  end
+  else if FKvB.InBatch then
+  begin
+    // P-31: onbellek ilk kullanimda aktiflesir (veya tablo degisince)
+    if FBatchAutoIncValid then
+      FAutoInc.AddOrSetValue(FBatchAutoIncTid, FBatchAutoIncVal);
+    FBatchAutoIncTid := T.TableId;
+    FBatchAutoIncVal := NewVal;
+    FBatchAutoIncValid := True;
+  end
+  else
+    FAutoInc.AddOrSetValue(T.TableId, NewVal);
   FAutoIncDirty := True;
+end;
+
+procedure TVTableDb.FlushAutoIncCache;
+// P-31: onbellekteki sayaci sozluge yazdir ve gecersiz kil.
+begin
+  if FBatchAutoIncValid then
+  begin
+    FAutoInc.AddOrSetValue(FBatchAutoIncTid, FBatchAutoIncVal);
+    FBatchAutoIncValid := False;
+  end;
 end;
 
 procedure TVTableDb.ApplyIdentity(const T: TTableDef; var Vals: TStrArray);
@@ -5274,6 +5412,8 @@ begin
   sp.SnapById := TDictionary<Word, string>.Create;
   for kvI in FById do
     sp.SnapById.AddOrSetValue(kvI.Key, kvI.Value);
+  { P-31: onbellekteki guncel auto-inc degerleri snapshot'a girsin. }
+  FlushAutoIncCache;
   sp.SnapAutoInc := TDictionary<Word, Int64>.Create;
   for kvA in FAutoInc do
     sp.SnapAutoInc.AddOrSetValue(kvA.Key, kvA.Value);
@@ -5297,6 +5437,8 @@ begin
   FAutoInc.Clear;
   for kvA in sp.SnapAutoInc do
     FAutoInc.AddOrSetValue(kvA.Key, kvA.Value);
+  { P-31: geri yuklenen degerler onbellegi bayatlatir. }
+  FBatchAutoIncValid := False;
   FNextId := sp.SnapNextId;
   FSchemaDirty := sp.SnapDirty;
   { Geri alinan DDL'in "kasitli silme" isaretleri de gecersizdir. }
@@ -5384,9 +5526,14 @@ end;
 
 procedure TVTableDb.ResetBatchTableCache;
 begin
+  // P-31: onbellek burada yazdirilmaz — AbortBatch'te geri alma
+  // FSnapAutoInc ile yapilir. Yalnizca gecersiz kil.
+  FBatchAutoIncValid := False;
   FBatchTableCached := False;
+  FBatchHasPkIdx := False;
   FBatchColMapValid := False;
   SetLength(FBatchColMap, 0);
+  SetLength(FBatchVals, 0);   // P-26
 end;
 
 procedure TVTableDb.BeginBatch;
@@ -5402,6 +5549,7 @@ end;
 
 procedure TVTableDb.CommitBatch;
 begin
+  FlushAutoIncCache;           // P-31: sayac onbellegini sozluge yazdir
   ResetBatchTableCache;
   if FSchemaDirty then
     SaveSchema; // batch icine yazilir, tek fsync commit'te
@@ -5501,7 +5649,23 @@ begin
   for i := 0 to High(T.Cols) do
   begin
     if Vals[i] <> '' then
-      Vals[i] := VDbNormValue(T.Cols[i].Ctype, Vals[i]);
+    begin
+      if (T.Cols[i].Ctype = VCT_INT) or (T.Cols[i].Ctype = VCT_STR) then
+      begin
+        { P-33: INT icin hizli yol — VDbParseInt dogrulamasi atlaniyor.
+          Kanonik olmayan degerler EncodeRow'da yakalanir (hata verilir).
+          Yalnizca bosluk/NULL denetimi yapilir.
+          P-35: TEXT icin de ayni yol — VDbNormValue zaten yalnizca
+          Trim + NULL denetimi yapar; temiz degerlerde fonksiyon cagrisi
+          ve ara atama tamamen atlanir. }
+        if (Length(Vals[i]) = 4) and SameText(Vals[i], 'NULL') then
+          Vals[i] := ''
+        else if (Vals[i][1] <= ' ') or (Vals[i][Length(Vals[i])] <= ' ') then
+          Vals[i] := VDbNormValue(T.Cols[i].Ctype, Vals[i]);
+      end
+      else
+        Vals[i] := VDbNormValue(T.Cols[i].Ctype, Vals[i]);
+    end;
     // M4: VECTOR(n) boyut/format dogrulamasi (INSERT/UPDATE/Batch/copy).
     if (T.Cols[i].VecDim > 0) and (Vals[i] <> '') and
        (not VDbVectorDimOK(Vals[i], T.Cols[i].VecDim)) then
@@ -6029,6 +6193,8 @@ var
   rc: Integer;
   pk: string;
 begin
+  // P-32: FK yoksa hicbir sey yapma (en yaygin durum).
+  if Length(T.Fks) = 0 then Exit;
   // ---- R-11: DEFERRABLE FK ertelemesi ----
   // Yalniz (a) acik bir batch icinde, (b) SET CONSTRAINTS ... DEFERRED
   // etkin ve (c) tabloda DEFERRABLE bir FK varken ertelenir. Batch disinda
@@ -9343,7 +9509,7 @@ end;
 
 procedure TVTableDb.Insert(const Table: string; const ColNames, StrVals: array of string);
 var
-  t: TTableDef;
+  tp: PTableDef;   // P-30: sema kopyasi yerine isaretci (refcount yok)
   vals, exVals, dummyVals: TStrArray;
   provided: array of Boolean;
   i, ci: Integer;
@@ -9359,19 +9525,26 @@ begin
   inBatch := FKvB.InBatch;
   if inBatch and FBatchTableCached and (FBatchTableDef.Name = Table) then
   begin
-    t := FBatchTableDef;
+    tp := @FBatchTableDef;
     prefix := FBatchHashPrefix;
   end
   else
   begin
-    t := GetTable(Table);
-    prefix := VDbHashKeyPrefix(t.Name);
     if inBatch then
     begin
-      FBatchTableDef := t;
+      FBatchTableDef := GetTable(Table);
+      tp := @FBatchTableDef;
+      prefix := VDbHashKeyPrefix(FBatchTableDef.Name);
       FBatchTableCached := True;
       FBatchColMapValid := False;
       FBatchHashPrefix := prefix;
+      FBatchHasPkIdx := FPkIdx.ContainsKey(FBatchTableDef.TableId);
+    end
+    else
+    begin
+      FOpenTDef := GetTable(Table);
+      tp := @FOpenTDef;
+      prefix := VDbHashKeyPrefix(FOpenTDef.Name);
     end;
   end;
 
@@ -9382,23 +9555,32 @@ begin
     raise EVDbException.CreateFmt(ecInvalidArgument, '%s: sutun sayisi (%d) deger sayisiyla (%d) esit degil',
       [Table, Length(ColNames), Length(StrVals)]);
 
-  SetLength(vals, Length(t.Cols));
+  { P-26: vals dizi on-tahsisi — batch'te ayni tablo icin SetLength atlanir.
+    vals := FBatchVals referans paylasir; tum kullanimlar satir sonunda
+    biter, cagiranlar referans saklamaz. }
+  if Length(FBatchVals) <> Length(tp^.Cols) then
+    SetLength(FBatchVals, Length(tp^.Cols));
+  vals := FBatchVals;
 
   if inBatch and FBatchColMapValid and (Length(FBatchColMap) = Length(ColNames)) then
   begin
-    for i := 0 to High(t.Cols) do
-      if t.Cols[i].HasDef then vals[i] := t.Cols[i].Def else vals[i] := '';
+    { P-34: tüm kolonlar sağlanıyorsa varsayılan doldurma döngüsü atlanıyor.
+      İkinci döngü zaten her kolonu StrVals'ten yazar; eski string'lerin
+      refcount'u doğrudan düşer, gereksiz ara atamalar (vals[i] := '') olmaz. }
+    if Length(ColNames) < Length(tp^.Cols) then
+      for i := 0 to High(tp^.Cols) do
+        if tp^.Cols[i].HasDef then vals[i] := tp^.Cols[i].Def else vals[i] := '';
     for i := 0 to High(ColNames) do
       vals[FBatchColMap[i]] := StrVals[i];
   end
   else
   begin
-    SetLength(provided, Length(t.Cols));
+    SetLength(provided, Length(tp^.Cols));
     for i := 0 to High(vals) do begin vals[i] := ''; provided[i] := False; end;
     if inBatch then SetLength(FBatchColMap, Length(ColNames));
     for i := 0 to High(ColNames) do
     begin
-      ci := FindCol(t, ColNames[i]);
+      ci := FindCol(tp^, ColNames[i]);
       if ci < 0 then raise EVDbException.Create(ecColumnNotFound, 'kolon yok: ' + ColNames[i]);
       if provided[ci] then
         raise EVDbException.Create(ecColumnExists, 'kolon iki kez verildi: ' + ColNames[i]);
@@ -9409,54 +9591,54 @@ begin
     if inBatch then FBatchColMapValid := True;
     // verilmemis kolonlara DEFAULT
     for i := 0 to High(vals) do
-      if not provided[i] and t.Cols[i].HasDef then
-        vals[i] := t.Cols[i].Def;
+      if not provided[i] and tp^.Cols[i].HasDef then
+        vals[i] := tp^.Cols[i].Def;
   end;
   // M10: IDENTITY kolonlarini doldur (GENERATED'den once; generated
   // ifadeler identity degerine bagli olabilir).
-  ApplyIdentity(t, vals);
+  ApplyIdentity(tp^, vals);
   // M10: GENERATED kolonlari hesapla (tum INSERT yollari buradan gecer).
-  VDbApplyGenerated(t, vals);
+  VDbApplyGenerated(tp^, vals);
   // F2-22: PK TANIMLANMAMISSA sentetik satir anahtari uretilir.
   // ONCEDEN PkIndex 0'a zorlandigi icin ilk kolon hem anahtar hem de
   // ortuk UNIQUE idi: `CREATE TABLE t(a,b)` + ayni a ile ikinci satir
   // "duplicate PK" hatasi veriyordu. Artik ilk kolon serbesttir.
   // Sayac olarak AutoInc kullanilir: PK'li tabloda oldugu gibi semada
   // kalici olarak saklanir, yeniden acilista carpisma olusmaz.
-  if t.PkIndex < 0 then
+  if tp^.PkIndex < 0 then
   begin
     // P-17a: sayac ayri sozlukte; sema kaydi (TTableDef) bastan yazilmaz.
-    iv := AutoIncOf(t) + 1;
+    iv := AutoIncOf(tp^) + 1;
     pk := '@' + IntToStr(iv);
-    BumpAutoInc(t, iv);
+    BumpAutoInc(tp^, iv);
   end
   else
   begin
-    pk := vals[t.PkIndex];
-    if t.Cols[t.PkIndex].Ctype = VCT_INT then
+    pk := vals[tp^.PkIndex];
+    if tp^.Cols[tp^.PkIndex].Ctype = VCT_INT then
     begin
       if pk = '' then
       begin
         // oto-sayac; eski DB'de sayac geride kalmissa veriyle uzlastir
-        iv := AutoIncOf(t) + 1;
-        if ReadRow(t.Name, IntToStr(iv), dummyVals) then
-          iv := MaxPkInt(t) + 1;
-        vals[t.PkIndex] := IntToStr(iv);
-        pk := vals[t.PkIndex];
-        BumpAutoInc(t, iv);
+        iv := AutoIncOf(tp^) + 1;
+        if ReadRow(tp^.Name, IntToStr(iv), dummyVals) then
+          iv := MaxPkInt(tp^) + 1;
+        vals[tp^.PkIndex] := IntToStr(iv);
+        pk := vals[tp^.PkIndex];
+        BumpAutoInc(tp^, iv);
       end
-      else if VDbParseInt(pk, iv) and (iv > AutoIncOf(t)) then
+      else if VDbParseInt(pk, iv) and (iv > AutoIncOf(tp^)) then
         // acik PK verildiyse sayaci ilerlet ki sonraki oto deger cakismasin
-        BumpAutoInc(t, iv);
+        BumpAutoInc(tp^, iv);
     end;
     if pk = '' then raise EVDbException.Create(ecInvalidName, 'PK bos olamaz');
   end;
-  CheckConstraints(t, vals, '');
+  CheckConstraints(tp^, vals, '');
   // tarih-PK normallesmis olabilir (sentetik anahtarda dokunulmaz)
-  if t.PkIndex >= 0 then pk := vals[t.PkIndex];
-  if not VDbCheckOK(vals, t.Checks) then
-    raise EVDbException.Create(ecCheckViolation, 'CHECK ihlali: ' + t.Name);
-  CheckFk(t, vals);
+  if tp^.PkIndex >= 0 then pk := vals[tp^.PkIndex];
+  if not VDbCheckOK(vals, tp^.Checks) then
+    raise EVDbException.Create(ecCheckViolation, 'CHECK ihlali: ' + tp^.Name);
+  CheckFk(tp^, vals);
   // H10 (2026-10-18): batch tohumu bir kez hesaplandigindan pk'nin ham
   // baytlari dogrudan katilir. Saf-ASCII pk'da string baytlari =
   // UTF8Encode(pk) oldugu icin sonuc VDbHashKey ile BIREBIR (hashchk).
@@ -9464,21 +9646,26 @@ begin
   if (Length(pk) > 0) and VDbIsPureAscii(pk) then
     key := VDbHashKeyBytes(prefix, PByte(@pk[1]), Length(pk))
   else
-    key := VDbHashKey(t.Name, pk);
+    key := VDbHashKey(tp^.Name, pk);
   // P-17c: cakisma denetimi icin Get degeri (TBytes) ayirip cok atiyordu.
   // Exists saf aramadir (pending+index+tombstone); yalniz anahtar GERCEKTEN
   // varsa deger okunur ve "duplicate vs hash carpismasi" siniflandirmasi
   // aynen korunur.
+  // G/1: SkipDupCheck=True iken atla — toplu eklemede cagiran benzersiz PK
+  // garantisi verir; Exists her satirda dosya kilidi aldigindan ~1,8 us tasarruf.
+  if not FSkipDupCheck then
   if FKvB.Exists(key) and FKvB.Get(key, b) then
   begin
-    if DecodeRow(b, exTid, exPk, exVals) and (exTid = t.TableId) and (exPk = pk) then
+    if DecodeRow(b, exTid, exPk, exVals) and (exTid = tp^.TableId) and (exPk = pk) then
       raise EVDbException.Create(ecDuplicatePrimaryKey, 'duplicate PK: ' + pk)
     else
-      raise EVDbException.CreateFmt(ecHashCollision, 'VDb: hash carpismasi (%s, %s)', [t.Name, pk]);
+      raise EVDbException.CreateFmt(ecHashCollision, 'VDb: hash carpismasi (%s, %s)', [tp^.Name, pk]);
   end;
-  b := EncodeRow(t.TableId, pk, t, vals);
+  b := EncodeRow(tp^.TableId, pk, tp^, vals);
   FKvB.Put(key, b);
-  IdxAddRow(t, vals, pk, -1);
+  // P-32: indeks ve lazy PK indeksi yoksa IdxAddRow tamamen atlanir.
+  if (not inBatch) or FBatchHasPkIdx or (Length(tp^.Idx) > 0) then
+    IdxAddRow(tp^, vals, pk, -1);
 end;
 
 function TVTableDb.Delete(const Table: string; const Pk: string): Boolean;

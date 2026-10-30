@@ -2912,10 +2912,12 @@ begin
     genel yol her ifadede ~2.4 us yiyordu; tek-ifadeli cagrilar baskin. }
   if Pos(';', S) = 0 then
   begin
-    if Trim(S) <> '' then
+    { P-21: tek Trim — iki cagri yerine bir. }
+    w := Trim(S);
+    if w <> '' then
     begin
       SetLength(Result, 1);
-      Result[0] := Trim(S);
+      Result[0] := w;
     end;
     Exit;
   end;
@@ -3251,7 +3253,10 @@ begin
   FT.Backend.WaitForeignTxn(FSessionId);
   try
 
-  if (Length(st) = 1) and IsSelectStatement(st[0]) then
+  { P-21: SELECT/WITH disi cumlelerde IsSelectStatement cagrisini ATLA.
+    Tok + UpperCase + try/finally her yazmada ~0.2 us yiyordu. }
+  if (Length(st) = 1) and (Length(st[0]) > 0) and
+     (st[0][1] in ['S', 's', 'W', 'w']) and IsSelectStatement(st[0]) then
   begin
     // Tek SELECT: okuma kilidi (paralel calisabilir)
     SetLength(FParams, 0);
@@ -3312,7 +3317,9 @@ begin
   FT.Backend.WaitForeignTxn(FSessionId);
   try
 
-  if (Length(st) = 1) and IsSelectStatement(st[0]) then
+  { P-21: SELECT/WITH disi cumlelerde IsSelectStatement cagrisini ATLA. }
+  if (Length(st) = 1) and (Length(st[0]) > 0) and
+     (st[0][1] in ['S', 's', 'W', 'w']) and IsSelectStatement(st[0]) then
   begin
     // Tek SELECT: okuma kilidi (paralel calisabilir)
     SetLength(FParams, Length(Params));

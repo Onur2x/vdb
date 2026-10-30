@@ -80,7 +80,17 @@ type
     type
       TBatchRec = record
         Present: Boolean;
+        { P-38: deger artik tek tamponda (ValBuf) saklanir. Value yalnizca
+          Before/savepoint kayitlarinda kullanilir (eski motor degeri);
+          Recs girislerinde nil'dir ve refcount maliyeti yoktur. }
         Value: TBytes;
+        ValOff: Integer;   // ValBuf icindeki baslangic
+        ValLen: Integer;   // deger uzunlugu (bayt)
+        { P-36: yalnizca Map degerlerinde gecerli — Order/Recs dizisindeki
+          indeks. Boylece ayni anahtar ikinci kez yazildiginda (Put/Delete)
+          paralel Recs girisi O(1) guncellenir; ApplyBatch artik satir basina
+          Map aramasi yapmaz. }
+        Idx: Integer;
       end;
       { v3.2 savepoint gunlugu: bir anahtarin savepoint'ten ONCEKI hali.
         HadBefore=False ise anahtar FBatch'te hic yoktu; geri almada
@@ -141,8 +151,20 @@ type
         riski vardir ve commit ACIK hatayla durur (veri kaybi yok). }
       TWriteSet = class
         Session: Cardinal;
-        Map: TDictionary<QWord, TBatchRec>;
+        { P-38: Map yalnizca anahtar -> Recs indeksi saklar (4 bayt/giris).
+          ONCEDEN TBatchRec sakliyordu (16 bayt/giris + TBytes refcount).
+          1M satirda sozluk 24MB -> 12MB; her giriste cache miss azalir. }
+        Map: TDictionary<QWord, Integer>;
         Order: TList<QWord>;
+        { P-36: Order ile ES uzunluklu, indeks eslesmeli kayit listesi.
+          ApplyBatch/SnapCapture döngüsü artik Map.TryGetValue yapmaz;
+          dogrudan Recs[i] okur (satir basina bir hash aramasi eksilir). }
+        Recs: TList<TBatchRec>;
+        { P-38: deger tamponu — tum yazma degerleri tek TBytes icinde
+          ardisik saklanir. 1M kucuk heap alokasyonu ortadan kalkar;
+          ApplyBatch'te okuma artik ardisik bellekten (cache-dostu). }
+        ValBuf: TBytes;
+        ValLen: Integer;  // ValBuf'ta kullanilan bayt sayisi
         Before: TDictionary<QWord, TBatchRec>;
         TagDelta: TDictionary<Integer, Int64>;
         Savepoints: TList<TSavepointRec>;
@@ -249,6 +271,13 @@ type
         ONCEDEN ScanCb her satirda BatchIsMine + BatchMap cagirip 3 kez
         OwnSet (kilit + oturum sozlugu aramasi) yapiyordu. }
       FScanSet: TWriteSet;
+      { P-22 (2026-10-29): parti yazma kumesi onbellegi. OwnSet her cagrisinda
+        FEngCs + FSets.TryGetValue yapiyordu; INSERT yolu satir basina 3 kez
+        cagirir (InBatch -> GetBatchOpen -> OwnSet, Exists icinde FSets lookup,
+        Put -> OwnSet). Onbellek ile tek oturumlu toplu yazmada kilit tamamen
+        atlanir. Cok oturumlu kullanimda yanlis oturum SID'inden duser. }
+      FBatchSet: TWriteSet;
+      FBatchSetSid: Cardinal;
       { v3.1: ScanRawIterAll dogrudan akitilir (satir basina dizi buyutmesi
         ve toplu kopyalama YOK). }
       FStreamCb: TVDbRawCb;
@@ -313,12 +342,12 @@ type
       { v3.24: yazma kumesi havuzu (bkz. FSetPool). }
       function AcquireSet(ASession: Cardinal): TWriteSet;
       procedure ReleaseSet(S: TWriteSet);
-      function GetBatchMap: TDictionary<QWord, TBatchRec>;
+      function GetBatchMap: TDictionary<QWord, Integer>;
       function GetBatchOrder: TList<QWord>;
       function GetBatchTagDelta: TDictionary<Integer, Int64>;
       function GetSavepoints: TList<TSavepointRec>;
       function GetBatchOpen: Boolean;
-      property BatchMap: TDictionary<QWord, TBatchRec> read GetBatchMap;
+      property BatchMap: TDictionary<QWord, Integer> read GetBatchMap;
       property BatchOrder: TList<QWord> read GetBatchOrder;
       property BatchTagDelta: TDictionary<Integer, Int64> read GetBatchTagDelta;
       property Savepoints: TList<TSavepointRec> read GetSavepoints;
@@ -334,10 +363,10 @@ type
     function GetIsReadOnly: Boolean;
     function GetBusyTimeoutMs: Integer;
     { --- v4: mantiksal degisim gunlugu --- }
-    function LogTag(const V: TBytes): Integer;
+    function LogTag(P: PByte; L: Integer): Integer;
     procedure OpenChangeLog;
     procedure EnsureLogBase(AFlags: LongWord; const AReason: string);
-    procedure LogPut(AKey: QWord; const AOld, ANew: TBytes);
+    procedure LogPut(AKey: QWord; const AOld: TBytes; ANew: PByte; ANewLen: Integer);
     procedure LogDel(AKey: QWord; const AOld: TBytes);
     procedure LogFinish;
     procedure LogAbort;
@@ -362,7 +391,9 @@ type
     function EffectiveCount: Integer;
     procedure MaybeCheckpoint;
     function PassFilter(Key: QWord; const Value: TBytes;
-      TableFilter: Integer): Boolean;
+      TableFilter: Integer): Boolean; overload;
+    function PassFilter(Key: QWord; Data: PByte; DataLen: Integer;
+      TableFilter: Integer): Boolean; overload;
     procedure ScanCb(Key: QWord; const Value: TBytes);
     { v3.2: AS OF tarama geri cagirimi. Canli partinin kaplamasi BILEREK
       karistirilmaz: anlik goruntu yalniz commit edilmis sayfalardan gelir. }
@@ -657,11 +688,11 @@ end;
 
 { --------------------------------------------------- v4: degisim gunlugu }
 
-function TVdbBackendV3.LogTag(const V: TBytes): Integer;
+function TVdbBackendV3.LogTag(P: PByte; L: Integer): Integer;
 begin
   if not Assigned(FRowTag) then Exit(-1);
-  if Length(V) = 0 then Exit(-1);
-  Result := FRowTag(@V[0], Length(V));
+  if (L = 0) or (P = nil) then Exit(-1);
+  Result := FRowTag(P, L);
 end;
 
 procedure TVdbBackendV3.EnsureLogBase(AFlags: LongWord;
@@ -751,7 +782,9 @@ begin
   end;
 end;
 
-procedure TVdbBackendV3.LogPut(AKey: QWord; const AOld, ANew: TBytes);
+procedure TVdbBackendV3.LogPut(AKey: QWord; const AOld: TBytes; ANew: PByte; ANewLen: Integer);
+var
+  newBytes: TBytes;
 begin
   if FLogSuspended then Exit;
   if (FLog = nil) or (not FLog.Enabled) then Exit;
@@ -760,7 +793,15 @@ begin
     FLog.BeginGroup;
     FLogInGroup := True;
   end;
-  FLog.AddPut(LogTag(ANew), AKey, AOld, ANew);
+  { P-38: ANew pointer olarak gelir; TBytes yalnizca gunluk acikken olusturulur. }
+  if ANewLen > 0 then
+  begin
+    SetLength(newBytes, ANewLen);
+    Move(ANew^, newBytes[0], ANewLen);
+  end
+  else
+    newBytes := nil;
+  FLog.AddPut(LogTag(ANew, ANewLen), AKey, AOld, newBytes);
 end;
 
 procedure TVdbBackendV3.LogDel(AKey: QWord; const AOld: TBytes);
@@ -772,7 +813,10 @@ begin
     FLog.BeginGroup;
     FLogInGroup := True;
   end;
-  FLog.AddDel(LogTag(AOld), AKey, AOld);
+  if Length(AOld) > 0 then
+    FLog.AddDel(LogTag(@AOld[0], Length(AOld)), AKey, AOld)
+  else
+    FLog.AddDel(LogTag(nil, 0), AKey, AOld);
 end;
 
 procedure TVdbBackendV3.LogFinish;
@@ -1007,8 +1051,11 @@ constructor TVdbBackendV3.TWriteSet.Create(ASession: Cardinal);
 begin
   inherited Create;
   Session := ASession;
-  Map := TDictionary<QWord, TBatchRec>.Create;
+  Map := TDictionary<QWord, Integer>.Create;
   Order := TList<QWord>.Create;
+  Recs := TList<TBatchRec>.Create;
+  ValBuf := nil;
+  ValLen := 0;
   Before := TDictionary<QWord, TBatchRec>.Create;
   TagDelta := TDictionary<Integer, Int64>.Create;
   Savepoints := TList<TSavepointRec>.Create;
@@ -1027,6 +1074,7 @@ begin
   Savepoints.Free;
   TagDelta.Free;
   Before.Free;
+  Recs.Free;
   Order.Free;
   Map.Free;
   inherited Destroy;
@@ -1044,8 +1092,10 @@ begin
   Savepoints.Clear;
   TagDelta.Clear;
   Before.Clear;
+  Recs.Clear;
   Order.Clear;
   Map.Clear;
+  ValLen := 0;   // ValBuf kapasitesi korunur, yalnizca uzunluk sifirlanir
   Session := ASession;
   StartGen := 0;
   NeedBefore := False;
@@ -1093,6 +1143,11 @@ function TVdbBackendV3.OwnSet: TWriteSet;
 var
   sid: Cardinal;
 begin
+  { P-22: onbellek — tek oturumlu toplu yazmada kilit tamamen atlanir.
+    FBatchSet yalniz BeginBatch'te yazilir, Commit/Abort'ta temizlenir;
+    kendi oturumumuzun disinda hicbir is parcacigi dokunmaz. }
+  Result := FBatchSet;
+  if (Result <> nil) and (FBatchSetSid = VdbBackendSessionId) then Exit;
   Result := nil;
   if FSets = nil then Exit;
   sid := VdbBackendSessionId;
@@ -1104,7 +1159,7 @@ begin
   end;
 end;
 
-function TVdbBackendV3.GetBatchMap: TDictionary<QWord, TBatchRec>;
+function TVdbBackendV3.GetBatchMap: TDictionary<QWord, Integer>;
 var
   s: TWriteSet;
 begin
@@ -1138,6 +1193,10 @@ end;
 
 function TVdbBackendV3.GetBatchOpen: Boolean;
 begin
+  { P-22: onbellek kontrolu — kilit yok. Onbellek dusurse (cok oturumlu)
+    OwnSet'in kilitleme yoluna duser. }
+  Result := (FBatchSet <> nil) and (FBatchSetSid = VdbBackendSessionId);
+  if Result then Exit;
   Result := OwnSet <> nil;
 end;
 
@@ -1150,27 +1209,43 @@ var
 begin
   if TableFilter < 0 then Exit(True);
   if not Assigned(FRowTag) then Exit(True);
-  tag := FRowTag(Value, Length(Value));
+  if Length(Value) > 0 then tag := FRowTag(@Value[0], Length(Value))
+  else tag := FRowTag(nil, 0);
+  Result := (tag < 0) or (tag = TableFilter);
+end;
+
+function TVdbBackendV3.PassFilter(Key: QWord; Data: PByte; DataLen: Integer;
+  TableFilter: Integer): Boolean;
+var
+  tag: Integer;
+begin
+  if TableFilter < 0 then Exit(True);
+  if not Assigned(FRowTag) then Exit(True);
+  tag := FRowTag(Data, DataLen);
   Result := (tag < 0) or (tag = TableFilter);
 end;
 
 function TVdbBackendV3.EffectiveCount: Integer;
 var
-  pair: TPair<QWord, TBatchRec>;
+  pair: TPair<QWord, Integer>;
   spair: TPair<QWord, TSnapRec>;
   s: TWriteSet;
   sp: Boolean;
   sv: TBytes;
   n: Integer;
+  idx: Integer;
 begin
   FEngCs.Enter;
   try
     n := FEng.Count;
-    if BatchIsMine then
-      for pair in BatchMap do
+    s := OwnSet;
+    if s <> nil then
+      for pair in s.Map do
       begin
-        { Kaplamadaki her kayit: eskiden var miydi? }
-        if pair.Value.Present then
+        { Kaplamadaki her kayit: eskiden var miydi?
+          P-38: Map Integer (Recs indeksi) saklar; Present Recs'ten okunur. }
+        idx := pair.Value;
+        if s.Recs[idx].Present then
         begin
           if not FEng.Contains(pair.Key) then Inc(n);
         end
@@ -1180,7 +1255,6 @@ begin
     { v3.15: snapshot duzeltmesi. Kendi kaplamamizda olmayan, BASKA oturumun
       snapshot'tan sonra degistirdigi anahtarlar icin motor durumu ile
       snapshot durumunun gorunurluk farki sayilir. }
-    s := OwnSet;
     if (s <> nil) and s.SnapDirty and (FUndo <> nil) then
       for spair in FUndo do
       begin
@@ -1245,29 +1319,42 @@ var
   i: Integer;
   key: QWord;
   rec: TBatchRec;
+  s: TWriteSet;
   ok: Boolean;
   oldTag, newTag: Integer;
   oldVal: TBytes;
+  vptr: PByte;
+  vlen: Integer;
 begin
-  if BatchMap.Count = 0 then Exit;
+  s := OwnSet;
+  if (s = nil) or (s.Order.Count = 0) then Exit;
   { Giris sirasi: sayfalara ARDISIK yazilir (rastgele dolasim = sayfa
-    sicramasi = yavas toplu yazim). }
-  for i := 0 to BatchOrder.Count - 1 do
+    sicramasi = yavas toplu yazim).
+    P-36: rec dogrudan Recs[i]'den okunur — satir basina Map.TryGetValue
+    aramasi tamamen kalkar.
+    P-38: deger ValBuf'tan dogrudan pointer ile gecirilir — satir basina
+    TBytes tahsisi + refcount artirimi yok. }
+  for i := 0 to s.Order.Count - 1 do
   begin
-    key := BatchOrder[i];
-    if not BatchMap.TryGetValue(key, rec) then Continue;
+    key := s.Order[i];
+    rec := s.Recs[i];
+    vlen := rec.ValLen;
+    if vlen > 0 then
+      vptr := @s.ValBuf[rec.ValOff]
+    else
+      vptr := nil;
     if rec.Present then
     begin
       { ONCEDEN her anahtar icin ayrica `Contains` cagriliyordu; `Insert`
         zaten "anahtar var mi" diye bakiyor. Once eklemeyi dene, yalniz
         cakismada guncelle: toplu eklemede bir hash aramasi eksilir. }
-      ok := FEng.Insert(key, rec.Value);
+      ok := FEng.Insert(key, vptr, vlen);
       if ok then
       begin
         { v3.1: yeni satir -> etiket sayaci +1 }
-        if Length(rec.Value) > 0 then
-          TagAdd(TagOf(@rec.Value[0], Length(rec.Value)), 1);
-        LogPut(key, nil, rec.Value);
+        if vlen > 0 then
+          TagAdd(TagOf(vptr, vlen), 1);
+        LogPut(key, nil, vptr, vlen);
       end
       else
       begin
@@ -1276,16 +1363,16 @@ begin
         oldVal := nil;
         FEng.TryGet(key, oldVal);
         oldTag := -2;
-        if Length(rec.Value) > 0 then
+        if vlen > 0 then
           if Length(oldVal) > 0 then
             oldTag := TagOf(@oldVal[0], Length(oldVal));
-        ok := FEng.Update(key, rec.Value);
+        ok := FEng.Update(key, vptr, vlen);
         if not ok then
           raise EVdbBackendV3.Create(Format(
             'toplu yazim basarisiz: anahtar $%.16x', [key]));
-        if Length(rec.Value) > 0 then
+        if vlen > 0 then
         begin
-          newTag := TagOf(@rec.Value[0], Length(rec.Value));
+          newTag := TagOf(vptr, vlen);
           if oldTag = -2 then TagAdd(newTag, 1)
           else if oldTag <> newTag then
           begin
@@ -1293,7 +1380,7 @@ begin
             TagAdd(newTag, 1);
           end;
         end;
-        LogPut(key, oldVal, rec.Value);
+        LogPut(key, oldVal, vptr, vlen);
       end;
     end
     else
@@ -1310,8 +1397,10 @@ begin
         FEng.Delete(key);    // yoksa da zararsiz (gunluge YAZILMAZ)
     end;
   end;
-  BatchMap.Clear;
-  BatchOrder.Clear;
+  s.Map.Clear;
+  s.Order.Clear;
+  s.Recs.Clear;
+  s.ValLen := 0;   // P-38: ValBuf kapasitesi korunur, icerik bosaltildi
   FDirty := True;
 end;
 
@@ -1414,10 +1503,10 @@ end;
 procedure TVdbBackendV3.Put(Key: QWord; const Value: TBytes);
 var
   rec: TBatchRec;
+  oldIdx: Integer;
   oldTag, newTag: Integer;
   oldVal: TBytes;
   s: TWriteSet;
-  n0: Integer;
 begin
   RequireWritable;
   RequireBatchWrite;
@@ -1431,14 +1520,32 @@ begin
     NoteBefore(s, Key);
     JournalKey(s, Key);
     rec.Present := True;
-    rec.Value := Copy(Value, 0, Length(Value));
-    { v3.10: ONCEDEN `ContainsKey` + `AddOrSetValue` = anahtar basina IKI tam
-      arama (200k satirda olculen: 0,719 us; tek arama 0,595 us). Count
-      degisimi "yeni anahtar mi" sorusunu bedava yanitlar. }
-    n0 := s.Map.Count;
-    s.Map.AddOrSetValue(Key, rec);
-    if s.Map.Count <> n0 then
+    { P-38: deger tek tampona (ValBuf) kopyalanir; TBytes refcount
+      artirilmaz. Recs girisi yalnizca (ValOff, ValLen) saklar — record
+      kopyasi ucuz (refcount yok). }
+    rec.ValOff := s.ValLen;
+    rec.ValLen := Length(Value);
+    if rec.ValLen > 0 then
+    begin
+      if s.ValLen + rec.ValLen > Length(s.ValBuf) then
+        SetLength(s.ValBuf, (s.ValLen + rec.ValLen) * 2 + 256);
+      Move(Value[0], s.ValBuf[s.ValLen], rec.ValLen);
+      Inc(s.ValLen, rec.ValLen);
+    end;
+    rec.Value := nil;   // Recs'te TBytes tutulmaz (refcount = 0)
+    { P-38: Map yalnizca anahtar -> Recs indeksi saklar (4 bayt). }
+    if s.Map.TryGetValue(Key, oldIdx) then
+    begin
+      rec.Idx := oldIdx;
+      s.Recs[oldIdx] := rec;
+    end
+    else
+    begin
+      rec.Idx := s.Order.Count;
       s.Order.Add(Key);
+      s.Recs.Add(rec);
+      s.Map.Add(Key, rec.Idx);
+    end;
     Exit;
   end;
   { v3.16: otomatik commit yazimi — tam kilit (baska surecle sirayla). }
@@ -1454,7 +1561,10 @@ begin
       if Length(Value) > 0 then
         TagAdd(TagOf(@Value[0], Length(Value)), 1);
       FDirty := True;
-      LogPut(Key, nil, Value);
+      if Length(Value) > 0 then
+        LogPut(Key, nil, @Value[0], Length(Value))
+      else
+        LogPut(Key, nil, nil, 0);
       Exit;
     end;
     { Anahtar zaten var: etiket DEGISEBILIR (DROP TABLE + ayni PK ile yeniden
@@ -1478,7 +1588,10 @@ begin
       end;
     end;
     FDirty := True;
-    LogPut(Key, oldVal, Value);
+    if Length(Value) > 0 then
+      LogPut(Key, oldVal, @Value[0], Length(Value))
+    else
+      LogPut(Key, oldVal, nil, 0);
   finally
     FEngCs.Leave;
   end;
@@ -1571,10 +1684,19 @@ begin
   FPendSnap.Clear;
   for i := 0 to S.Order.Count - 1 do
   begin
-    if not S.Map.TryGetValue(S.Order[i], rec) then Continue;
+    { P-36: rec dogrudan Recs[i]'den — Map aramasi yok.
+      P-38: deger Rec.Value'da degil, S.ValBuf icindeki [ValOff..ValOff+ValLen]
+      araliginda tutulur; snapshot'a gercek kopyasi alinir. }
+    rec := S.Recs[i];
     pend.Key := S.Order[i];
     pend.Rec.Present := rec.Present;
-    pend.Rec.Value := Copy(rec.Value, 0, Length(rec.Value));
+    if rec.ValLen > 0 then
+    begin
+      SetLength(pend.Rec.Value, rec.ValLen);
+      Move(S.ValBuf[rec.ValOff], pend.Rec.Value[0], rec.ValLen);
+    end
+    else
+      pend.Rec.Value := nil;
     pend.BaseKnown := False;
     pend.Base.Present := False;
     pend.Base.Value := nil;
@@ -1620,22 +1742,24 @@ end;
 
 function TVdbBackendV3.Get(Key: QWord; out Value: TBytes): Boolean;
 var
-  rec: TBatchRec;
+  idx: Integer;
+  pres: Boolean;
   s: TWriteSet;
 begin
-  { v3.25: TEK kapi kapsami. Onceden SnapView kendi kapsamini acip kapatiyordu;
-    snapshot yolu her cagrida bir kapi 0->1/1->0 gecisi (yani bir dosya kilidi
-    cifti) harcatiyordu. Olculdu: 2000 Get -> 4000 kapi girisi; tek kapsamda
-    2000. Kilit semantigi degismiyor: ayni kilit, yalnizca daha uzun tutuluyor
-    (zaten ifade basina alinan kilit). }
   FEngCs.Enter;
   try
     s := OwnSet;
-    if (s <> nil) and s.Map.TryGetValue(Key, rec) then
+    if (s <> nil) and s.Map.TryGetValue(Key, idx) then
     begin
-      if rec.Present then
+      if s.Recs[idx].Present then
       begin
-        Value := Copy(rec.Value, 0, Length(rec.Value));
+        if s.Recs[idx].ValLen > 0 then
+        begin
+          SetLength(Value, s.Recs[idx].ValLen);
+          Move(s.ValBuf[s.Recs[idx].ValOff], Value[0], s.Recs[idx].ValLen);
+        end
+        else
+          Value := nil;
         Exit(True);
       end;
       Value := nil;
@@ -1643,8 +1767,8 @@ begin
     end;
     { v3.15: acik islemde BASKA oturum commit ettiyse kendi anlik goruntumuz
       gecerlidir; motor degeri okunmaz. }
-    if (s <> nil) and s.SnapDirty and SnapView(s, Key, rec.Present, Value) then
-      Exit(rec.Present);
+    if (s <> nil) and s.SnapDirty and SnapView(s, Key, pres, Value) then
+      Exit(pres);
     Result := FEng.TryGet(Key, Value);
   finally
     FEngCs.Leave;
@@ -1654,6 +1778,7 @@ end;
 function TVdbBackendV3.Delete(Key: QWord): Boolean;
 var
   rec: TBatchRec;
+  oldIdx: Integer;
   had: Boolean;
   oldVal: TBytes;
   s: TWriteSet;
@@ -1662,20 +1787,27 @@ begin
   s := OwnSet;
   if s <> nil then
   begin
-    { ONCEDEN: `BatchMap.AddOrSetValue(...)`'dan SONRA `BatchMap.ContainsKey`
-      soruluyordu; bu her zaman True oldugu icin parti icinde Delete
-      HIC OLMAYAN anahtar icin de True donuyordu. Dogru yanit: silmeden
-      ONCE var miydi? }
     NoteBefore(s, Key);
     JournalKey(s, Key);
     had := FEng.Contains(Key);
-    if s.Map.ContainsKey(Key) then
-      had := s.Map[Key].Present;
     rec.Present := False;
     rec.Value := nil;
-    if not s.Map.ContainsKey(Key) then
+    rec.ValOff := -1;
+    rec.ValLen := 0;
+    { P-38: Map yalnizca anahtar -> Recs indeksi saklar. }
+    if s.Map.TryGetValue(Key, oldIdx) then
+    begin
+      had := s.Recs[oldIdx].Present;
+      rec.Idx := oldIdx;
+      s.Recs[oldIdx] := rec;
+    end
+    else
+    begin
+      rec.Idx := s.Order.Count;
       s.Order.Add(Key);
-    s.Map.AddOrSetValue(Key, rec);
+      s.Recs.Add(rec);
+      s.Map.Add(Key, rec.Idx);
+    end;
     Exit(had);
   end;
   { v3.16: otomatik commit silme — tam kilit. }
@@ -1707,20 +1839,32 @@ end;
 function TVdbBackendV3.Exists(Key: QWord): Boolean;
 var
   s: TWriteSet;
-  rec: TBatchRec;
+  idx: Integer;
   tmp: TBytes;
   pres: Boolean;
+  sid: Cardinal;
 begin
-  { v3.6: ONCEDEN satir basina BatchIsMine + BatchMap.ContainsKey + BatchMap[]
-    uc ayri OwnSet (kilit + oturum sozlugu aramasi) yapiyordu; INSERT yolu her
-    satirda Exists cagirir. Tek OwnSet + tek sozluk aramasi yeterli. }
-  { v3.25: Get ile ayni duzeltme — snapshot yolu ve motor okuması TEK kapi
-    kapsaminda; onceden cagri basina iki kilit cifti aliniyordu. }
+  { P-22: write set onbellek — parti icindeki anahtarlari kilitsiz bul. }
+  s := FBatchSet;
+  if (s <> nil) and (FBatchSetSid = VdbBackendSessionId) then
+  begin
+    if s.Map.TryGetValue(Key, idx) then Exit(s.Recs[idx].Present);
+  end
+  else
+    s := nil;
   FEngCs.Enter;
   try
-    s := OwnSet;
-    if (s <> nil) and s.Map.TryGetValue(Key, rec) then
-      Exit(rec.Present);
+    if s = nil then
+    begin
+      s := nil;
+      if FSets <> nil then
+      begin
+        sid := VdbBackendSessionId;
+        FSets.TryGetValue(sid, s);
+      end;
+      if (s <> nil) and s.Map.TryGetValue(Key, idx) then
+        Exit(s.Recs[idx].Present);
+    end;
     { v3.15: snapshot gorunurlugu — Get ile ayni karar. }
     if (s <> nil) and s.SnapDirty then
     begin
@@ -1768,6 +1912,8 @@ procedure TVdbBackendV3.ScanAll(out Keys: TQWordArray; out Vals: TValArray;
   TableFilter: Integer);
 var
   pair: TPair<QWord, TBatchRec>;
+  i: Integer;
+  rec: TBatchRec;
 begin
   { v3.4: tarama tamponlari (FScanKeys/FScanN) BACKEND alanidir; ayni
     backend'i paylasan oturumlar ayni anda tararsa birbirini bozardi.
@@ -1811,20 +1957,33 @@ begin
       FreeAndNil(FSnapMap);
     end;
 
-    { Kaplama tarafi: en guncel deger. }
+    { Kaplama tarafi: en guncel deger.
+      P-38: Map Integer saklar; deger Recs[i] + ValBuf uzerinden okunur. }
     if FScanSet <> nil then
-      for pair in FScanSet.Map do
+      for i := 0 to FScanSet.Order.Count - 1 do
       begin
-        if not pair.Value.Present then Continue;
-        if not PassFilter(pair.Key, pair.Value.Value, TableFilter) then Continue;
+        rec := FScanSet.Recs[i];
+        if not rec.Present then Continue;
+        if rec.ValLen > 0 then
+        begin
+          if not PassFilter(FScanSet.Order[i], @FScanSet.ValBuf[rec.ValOff],
+            rec.ValLen, TableFilter) then Continue;
+        end
+        else if not PassFilter(FScanSet.Order[i], nil, 0, TableFilter) then Continue;
         if FScanN >= FScanCap then
         begin
           if FScanCap < 256 then FScanCap := 256 else FScanCap := FScanCap * 2;
           SetLength(FScanKeys, FScanCap);
           SetLength(FScanVals, FScanCap);
         end;
-        FScanKeys[FScanN] := pair.Key;
-        FScanVals[FScanN] := Copy(pair.Value.Value, 0, Length(pair.Value.Value));
+        FScanKeys[FScanN] := FScanSet.Order[i];
+        if rec.ValLen > 0 then
+        begin
+          SetLength(FScanVals[FScanN], rec.ValLen);
+          Move(FScanSet.ValBuf[rec.ValOff], FScanVals[FScanN][0], rec.ValLen);
+        end
+        else
+          FScanVals[FScanN] := nil;
         Inc(FScanN);
       end;
 
@@ -1997,20 +2156,17 @@ end;
 
 procedure TVdbBackendV3.StreamCbRaw(Key: QWord; Data: PByte; Len: Integer);
 var
-  tag, n: Integer;
+  tag: Integer;
 begin
   if FStreamAbort then Exit;
   if BatchIsMine and BatchMap.ContainsKey(Key) then Exit;
   { v3.15: snapshot'ta motordan farkli anahtarlar motor tarafinda atlanir. }
   if (FSnapMap <> nil) and FSnapMap.ContainsKey(Key) then Exit;
   { PassFilter'in sifir-kopya esdegeri: satir etiketi degerin ILK baytlarindan
-    cikar; 8 baytlik sabit tampona kopyalanir (satir basina tahsis YOK). }
+    cikar. P-38: FRowTag PByte aldigindan ara tampona kopyalama YOK. }
   if (FStreamFilter >= 0) and Assigned(FRowTag) then
   begin
-    n := Len;
-    if n > Length(FStreamTagBuf) then n := Length(FStreamTagBuf);
-    if n > 0 then Move(Data^, FStreamTagBuf[0], n);
-    tag := FRowTag(FStreamTagBuf, Len);
+    tag := FRowTag(Data, Len);
     if (tag >= 0) and (tag <> FStreamFilter) then Exit;
   end;
   if not FStreamCb(Key, Data, Len, FStreamUser) then
@@ -2021,7 +2177,12 @@ function TVdbBackendV3.ScanRawIterAll(TableFilter: Integer;
   Cb: TVDbRawCb; User: Pointer): Boolean;
 var
   pair: TPair<QWord, TBatchRec>;
-  n: Integer;
+  bs: TWriteSet;
+  i, n: Integer;
+  bkey: QWord;
+  brec: TBatchRec;
+  bptr: PByte;
+  blen: Integer;
 begin
   { v3.1: sonuc kumesi ARTIK BIRIKTIRILMEZ; satirlar dogrudan geri cagirima
     akitilir ve sayfa ici hucre KOPYALANMAZ. Eski yol her satirda iki dinamik
@@ -2058,17 +2219,24 @@ begin
       end;
 
     if BatchOpen then
-      for pair in BatchMap do
-      begin
-        if not pair.Value.Present then Continue;
-        if not PassFilter(pair.Key, pair.Value.Value, TableFilter) then Continue;
-        n := Length(pair.Value.Value);
-        if n > 0 then
+    begin
+      { P-38: Map Integer saklar; deger ValBuf'tan pointer ile okunur. }
+      bs := OwnSet;
+      if bs <> nil then
+        for i := 0 to bs.Order.Count - 1 do
         begin
-          if not Cb(pair.Key, @pair.Value.Value[0], n, User) then Exit(False);
-        end
-        else if not Cb(pair.Key, nil, 0, User) then Exit(False);
-      end;
+          bkey := bs.Order[i];
+          brec := bs.Recs[i];
+          if not brec.Present then Continue;
+          blen := brec.ValLen;
+          if blen > 0 then
+            bptr := @bs.ValBuf[brec.ValOff]
+          else
+            bptr := nil;
+          if not PassFilter(bkey, bptr, blen, TableFilter) then Continue;
+          if not Cb(bkey, bptr, blen, User) then Exit(False);
+        end;
+    end;
     Result := True;
   finally
     FreeAndNil(FSnapMap);
@@ -2081,16 +2249,14 @@ end;
 procedure TVdbBackendV3.StreamCbRawPaged(Key: QWord; Data: PByte;
   Len: Integer; PageNo: LongWord);
 var
-  tag, n: Integer;
+  tag: Integer;
 begin
   if FStreamAbort then Exit;
   if BatchIsMine and BatchMap.ContainsKey(Key) then Exit;
   if (FStreamFilter >= 0) and Assigned(FRowTag) then
   begin
-    n := Len;
-    if n > Length(FStreamTagBuf) then n := Length(FStreamTagBuf);
-    if n > 0 then Move(Data^, FStreamTagBuf[0], n);
-    tag := FRowTag(FStreamTagBuf, Len);
+    { P-38: FRowTag PByte aldigindan ara tampona kopyalama YOK. }
+    tag := FRowTag(Data, Len);
     if (tag >= 0) and (tag <> FStreamFilter) then Exit;
   end;
   if not FStreamPageCb(Key, Data, Len, PageNo, FStreamPageUser) then
@@ -2131,17 +2297,12 @@ end;
 
 function TVdbBackendV3.TagOf(Data: PByte; Len: Integer): Integer;
 { Satir etiketi = degerin ilk baytlari (FRowTag). Sema kaydi -1 doner.
-  Sabit tampona en fazla 16 bayt kopyalanir; satir basina tahsis YOK. }
-var
-  n: Integer;
+  P-38: FRowTag PByte aldigindan ara tampona kopyalama YOK — dogrudan
+  deger baytlari isaret edilir (satir basina 16 baytlik kopya kalkar). }
 begin
   if not Assigned(FRowTag) then Exit(-1);
   if (Data = nil) or (Len <= 0) then Exit(-1);
-  if Length(FTagBuf) < 16 then SetLength(FTagBuf, 16);
-  n := Len;
-  if n > 16 then n := 16;
-  Move(Data^, FTagBuf[0], n);
-  Result := FRowTag(FTagBuf, Len);
+  Result := FRowTag(Data, Len);
 end;
 
 procedure TVdbBackendV3.TagAdd(Tag: Integer; Delta: Int64);
@@ -2308,6 +2469,9 @@ begin
         FEng.Store.BeginDeferRefresh;
       end;
       FSets.AddOrSetValue(sid, s);
+      { P-22: onbellek — sonraki OwnSet/GetBatchOpen cagrilari kilitsiz. }
+      FBatchSet := s;
+      FBatchSetSid := sid;
     except
       if gotReserve then FEng.Store.ReleaseWriteHold;
       raise;
@@ -2413,6 +2577,7 @@ begin
     { v3.4: yazma kumesi commit ile KAPANIR (eski kodda BatchOpen:=False
       bu noktadaydi; otomatik sikistirma acik parti gormemeli). }
     FSets.Remove(s.Session);
+    FBatchSet := nil;   { P-22: onbellek temizle }
     if FSets.Count = 0 then
     begin
       FAlien.Clear;
@@ -2490,6 +2655,7 @@ begin
   try
     LogAbort;               // yarim islem gunluge SIZMAZ
     FSets.Remove(s.Session);
+    FBatchSet := nil;   { P-22: onbellek temizle }
     if FSets.Count = 0 then FUndo.Clear;
     ReleaseSet(s);
     s := nil;
@@ -2603,7 +2769,7 @@ end;
   Cagiranlar zaten `s`yi elinde tutuyor. }
 procedure TVdbBackendV3.JournalKey(S: TWriteSet; Key: QWord);
 var
-  i: Integer;
+  i, idx: Integer;
   sp: TSavepointRec;
   je: TSavepointKeyRec;
   sps: TList<TSavepointRec>;
@@ -2615,11 +2781,22 @@ begin
   begin
     sp := sps[i];
     if sp.Journal.ContainsKey(Key) then Continue;
-    je.HadBefore := BatchMap.TryGetValue(Key, je.Rec);
-    if not je.HadBefore then
+    { P-38: Map Integer (Recs indeksi) saklar; TBatchRec Recs'ten okunur.
+      ValOff/ValLen ValBuf'a isaret eder; ValBuf ekleme-yonlu oldugu icin
+      geri alma sirasinda deger hala oradadir. }
+    if S.Map.TryGetValue(Key, idx) then
     begin
+      je.HadBefore := True;
+      je.Rec := S.Recs[idx];
+    end
+    else
+    begin
+      je.HadBefore := False;
       je.Rec.Present := False;
       je.Rec.Value := nil;
+      je.Rec.ValOff := -1;
+      je.Rec.ValLen := 0;
+      je.Rec.Idx := -1;
     end;
     sp.Journal.AddOrSetValue(Key, je);
   end;
@@ -2664,7 +2841,18 @@ begin
   for pair in sp.Journal do
   begin
     if pair.Value.HadBefore then
-      BatchMap.AddOrSetValue(pair.Key, pair.Value.Rec)
+    begin
+      { P-36: paralel Recs girisi de eski haline doner. Idx, gunluge
+        alindigi andaki Order indeksidir; Order yalnizca OrderLen UZERINDEN
+        kirpildigi icin bu indeks hala gecerlidir.
+        P-38: Map Integer (Recs indeksi) saklar; deger ValBuf'tan okunur. }
+      if (st <> nil) and (pair.Value.Rec.Idx >= 0) and
+         (pair.Value.Rec.Idx < st.Recs.Count) then
+      begin
+        st.Recs[pair.Value.Rec.Idx] := pair.Value.Rec;
+        st.Map.AddOrSetValue(pair.Key, pair.Value.Rec.Idx);
+      end;
+    end
     else
     begin
       BatchMap.Remove(pair.Key);
@@ -2673,9 +2861,12 @@ begin
   end;
   { 2) BatchOrder'i savepoint uzunluguna kirp. Girisler yalnizca "BatchMap'te
     yokken" eklendigi ve savepoint disinda silinmedigi icin kirpma tam
-    olarak sonradan eklenen girisleri atar. }
+    olarak sonradan eklenen girisleri atar. Recs de es uzunlukta kirpilir. }
   while BatchOrder.Count > sp.OrderLen do
     BatchOrder.Delete(BatchOrder.Count - 1);
+  if st <> nil then
+    while st.Recs.Count > sp.OrderLen do
+      st.Recs.Delete(st.Recs.Count - 1);
   { 3) Etiket deltalari da savepoint haline doner. }
   BatchTagDelta.Clear;
   for tp in sp.TagDelta do

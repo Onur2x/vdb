@@ -31,8 +31,10 @@ type
   { R-26: satirin icindeki TABLO ID'yi cozucu. KV katmani satir bicimini
     BILMEZ; cozucuyu VDbTable saglar.
       >= 0 : bu kayit o tabloya ait satir
-      -1   : satir degil (semaya benzer ozel kayit) -> filtre uygulanmaz }
-  TVDbRowTagFunc = function(const PlainValue: TBytes; ValueLen: Integer): Integer;
+      -1   : satir degil (semaya benzer ozel kayit) -> filtre uygulanmaz
+    P-38: PByte + uzunluk — TBytes refcount'u tetiklemez, ValBuf icindeki
+    baytlara dogrudan isaret edilebilir. }
+  TVDbRowTagFunc = function(PlainValue: PByte; ValueLen: Integer): Integer;
 
   { P-18a: sifir-kopya tarama geri cagrisi. Buf, motorun ic tamponuna
     isaret eder — YALNIZ cagri sirasinda gecerlidir, saklanmamali.

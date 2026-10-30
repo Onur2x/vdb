@@ -146,8 +146,10 @@ type
       WAL tamponu diske yazilmadan atilir. }
     procedure SimulateCrash;
 
-    function Insert(Key: QWord; const Value: TBytes): Boolean;
-    function Update(Key: QWord; const Value: TBytes): Boolean;
+    function Insert(Key: QWord; const Value: TBytes): Boolean; overload;
+    function Insert(Key: QWord; Data: PByte; DataLen: Integer): Boolean; overload;
+    function Update(Key: QWord; const Value: TBytes): Boolean; overload;
+    function Update(Key: QWord; Data: PByte; DataLen: Integer): Boolean; overload;
     function Delete(Key: QWord): Boolean;
     function TryGet(Key: QWord; out Value: TBytes): Boolean;
     function Contains(Key: QWord): Boolean;
@@ -778,10 +780,24 @@ begin
   if Result then FInTxn := True;
 end;
 
+function TVdbPageEngine.Insert(Key: QWord; Data: PByte; DataLen: Integer): Boolean;
+begin
+  RequireWritable;
+  Result := FHeap.Insert(Key, Data, DataLen);
+  if Result then FInTxn := True;
+end;
+
 function TVdbPageEngine.Update(Key: QWord; const Value: TBytes): Boolean;
 begin
   RequireWritable;
   Result := FHeap.Update(Key, Value);
+  if Result then FInTxn := True;
+end;
+
+function TVdbPageEngine.Update(Key: QWord; Data: PByte; DataLen: Integer): Boolean;
+begin
+  RequireWritable;
+  Result := FHeap.Update(Key, Data, DataLen);
   if Result then FInTxn := True;
 end;
 

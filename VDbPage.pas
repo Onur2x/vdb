@@ -109,6 +109,12 @@ function PageGetCell(P: PVdbPage; Slot: Integer; out Data: PByte;
 function PageInsertCell(P: PVdbPage; const Data; Len: Integer;
   out Slot: Integer): Boolean;
 
+{ P-37: anahtar + degeri dogrudan sayfaya yazar (ara tampon yok).
+  Hucre duzeni: [8 bayt anahtar][4 bayt uzunluk][deger].
+  P-38: pointer + uzunluk alir — TBytes refcount maliyeti yok. }
+function PageInsertKV(P: PVdbPage; Key: QWord; Data: PByte; DataLen: Integer;
+  out Slot: Integer): Boolean;
+
 { Ayni boyutta yerinde yazar. Farkli boyutta once yeni hucre ekler,
   basarili olursa eskisini siler (veri kaybi olmaz). }
 function PageUpdateCell(P: PVdbPage; Slot: Integer; const Data; Len: Integer;
@@ -438,14 +444,16 @@ begin
   if (Len <= 0) or (Len > VDB_PAGE_CELL_MAX) then Exit;
   H := PageHdr(P);
 
-  { Bos slot var mi? }
+  { Bos slot var mi? P-37: saf eklemede (FragBytes=0) tarama gereksiz —
+    hic silme olmadiysa bos slot yoktur; O(n) tarama tamamen atlanir. }
   freeSlot := -1;
-  for i := 0 to H^.SlotCount - 1 do
-    if PageSlotPtr(P, i)^.Off = 0 then
-    begin
-      freeSlot := i;
-      Break;
-    end;
+  if H^.FragBytes > 0 then
+    for i := 0 to H^.SlotCount - 1 do
+      if PageSlotPtr(P, i)^.Off = 0 then
+      begin
+        freeSlot := i;
+        Break;
+      end;
   if freeSlot >= 0 then needSlot := 0 else needSlot := 1;
 
   if not PageRoomFor(P, Len, needSlot) then
@@ -476,6 +484,71 @@ begin
 
   PageSlotPtr(P, Slot)^.Off := newOff;
   PageSlotPtr(P, Slot)^.Len := Len;
+  H^.FreeSpace := H^.ContentOff - (VDB_PAGE_HDR + H^.SlotCount * SLOT_SIZE);
+  Result := True;
+end;
+
+function PageInsertKV(P: PVdbPage; Key: QWord; Data: PByte; DataLen: Integer;
+  out Slot: Integer): Boolean;
+{ P-37: anahtar + degeri dogrudan sayfaya yazar. FCellBuf ara tamponu
+  kullanilmaz; tek kopya: deger -> sayfa.
+  P-38: pointer + uzunluk alir — TBytes refcount maliyeti yok. }
+var
+  H: PVdbPageHdr;
+  i, freeSlot, newOff, needSlot, need: Integer;
+  lenField: LongWord;
+begin
+  Result := False;
+  Slot := -1;
+  if P = nil then Exit;
+  need := 12 + DataLen;  // 8 anahtar + 4 uzunluk + deger
+  if (need <= 0) or (need > VDB_PAGE_CELL_MAX) then Exit;
+  H := PageHdr(P);
+
+  { Bos slot var mi? P-37: saf eklemede (FragBytes=0) tarama gereksiz. }
+  freeSlot := -1;
+  if H^.FragBytes > 0 then
+    for i := 0 to H^.SlotCount - 1 do
+      if PageSlotPtr(P, i)^.Off = 0 then
+      begin
+        freeSlot := i;
+        Break;
+      end;
+  if freeSlot >= 0 then needSlot := 0 else needSlot := 1;
+
+  if not PageRoomFor(P, need, needSlot) then
+  begin
+    if H^.FragBytes > 0 then
+    begin
+      if not PageCompact(P) then Exit;
+      H := PageHdr(P);
+      if not PageRoomFor(P, need, needSlot) then Exit;
+    end
+    else
+      Exit;
+  end;
+
+  newOff := H^.ContentOff - need;
+  if newOff < VDB_PAGE_HDR + (H^.SlotCount + needSlot) * SLOT_SIZE then Exit;
+
+  { Hucreyi dogrudan sayfaya yaz: [anahtar 8][uzunluk 4][deger] }
+  lenField := LongWord(DataLen);
+  Move(Key, (PByte(P) + newOff)^, 8);
+  Move(lenField, (PByte(P) + newOff + 8)^, 4);
+  if (DataLen > 0) and (Data <> nil) then
+    Move(Data^, (PByte(P) + newOff + 12)^, DataLen);
+
+  H^.ContentOff := newOff;
+  if needSlot = 1 then
+  begin
+    Slot := H^.SlotCount;
+    Inc(H^.SlotCount);
+  end
+  else
+    Slot := freeSlot;
+
+  PageSlotPtr(P, Slot)^.Off := newOff;
+  PageSlotPtr(P, Slot)^.Len := need;
   H^.FreeSpace := H^.ContentOff - (VDB_PAGE_HDR + H^.SlotCount * SLOT_SIZE);
   Result := True;
 end;

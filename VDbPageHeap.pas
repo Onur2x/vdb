@@ -95,6 +95,10 @@ type
     FSpaceHints: array of LongWord;
     FSpaceHintN: Integer;
     FSpaceScanned: Boolean;
+    { P-28: hucre tamponu yeniden kullanimi — BuildCell her cagrida
+      SetLength ile heap alloc yapiyordu. Batch'te satir basina 1 alloc
+      tasarrufu. }
+    FCellBuf: TBytes;
     { v3.1: `.idx` etiket ozeti (tablo satir sayimi). Turetilmis veri. }
     FIdxTags: TVdbIdxTagArray;
     FIdxTagsValid: Boolean;
@@ -117,15 +121,17 @@ type
     procedure PageMapClear;
     procedure PlaceCell(const Cell; CellLen: Integer;
       out L: TLoc);
+    procedure PlaceCellKV(Key: QWord; Data: PByte; DataLen: Integer;
+      out L: TLoc);
     function BuildCell(Key: QWord; const Value: TBytes;
       out Cell: TBytes): Boolean;
-    procedure WriteOverflow(const Value: TBytes; out FirstPage: LongWord);
+    procedure WriteOverflow(Data: PByte; DataLen: Integer; out FirstPage: LongWord);
     function ReadOverflow(FirstPage: LongWord; Len: Integer;
       out Value: TBytes): Boolean;
     procedure FreeOverflow(FirstPage: LongWord);
     function ReadCellAt(const L: TLoc; out Key: QWord; out Value: TBytes): Boolean;
     function DeleteAt(const L: TLoc; out FreedPage: Boolean): Boolean;
-    function InsertRaw(Key: QWord; const Value: TBytes; out L: TLoc): Boolean;
+    function InsertRaw(Key: QWord; Data: PByte; DataLen: Integer; out L: TLoc): Boolean;
     procedure SpaceHintAdd(PageNo: LongWord);
     procedure SpaceHintScan(MinFree: Integer);
   public
@@ -161,10 +167,13 @@ type
     procedure SaveIdx(const FileName: string;
       const Tags: TVdbIdxTagArray); overload;
 
-    { Yeni anahtar ekler. Anahtar zaten varsa False. }
-    function Insert(Key: QWord; const Value: TBytes): Boolean;
+    { Yeni anahtar ekler. Anahtar zaten varsa False.
+      P-38: PByte surumu TBytes refcount'u atlatir (toplu yazim yolu). }
+    function Insert(Key: QWord; const Value: TBytes): Boolean; overload;
+    function Insert(Key: QWord; Data: PByte; DataLen: Integer): Boolean; overload;
     { Var olan anahtari gunceller. Anahtar yoksa False. }
-    function Update(Key: QWord; const Value: TBytes): Boolean;
+    function Update(Key: QWord; const Value: TBytes): Boolean; overload;
+    function Update(Key: QWord; Data: PByte; DataLen: Integer): Boolean; overload;
     function Delete(Key: QWord): Boolean;
     function TryGet(Key: QWord; out Value: TBytes): Boolean;
     function Contains(Key: QWord): Boolean;
@@ -339,14 +348,14 @@ end;
 
 { ================================================================== tasma }
 
-procedure TVdbHeap.WriteOverflow(const Value: TBytes; out FirstPage: LongWord);
+procedure TVdbHeap.WriteOverflow(Data: PByte; DataLen: Integer; out FirstPage: LongWord);
 var
   total, nChunks, i, ofs, chunk, slot: Integer;
   pageNo, nextNo: LongWord;
   P: PVdbPage;
   cell: TBytes;
 begin
-  total := Length(Value);
+  total := DataLen;
   nChunks := (total + VDB_OVF_CHUNK - 1) div VDB_OVF_CHUNK;
   if nChunks < 1 then nChunks := 1;
   nextNo := 0;
@@ -367,7 +376,7 @@ begin
     SetLength(cell, 4 + chunk);
     Move(nextNo, cell[0], 4);
     if chunk > 0 then
-      Move(Value[ofs], cell[4], chunk);
+      Move((Data + ofs)^, cell[4], chunk);
     if not PageInsertCell(P, cell[0], Length(cell), slot) then
     begin
       FStore.Release(pageNo, False);
@@ -482,6 +491,7 @@ function TVdbHeap.BuildCell(Key: QWord; const Value: TBytes;
 var
   len: LongWord;
   zero: LongWord;
+  need: Integer;
 begin
   Result := False;
   len := Length(Value);
@@ -489,19 +499,25 @@ begin
   if len > VDB_MAX_INLINE then
   begin
     { Tasma: hucre yalnizca anahtar + bayrakli uzunluk + ilk sayfa. }
-    SetLength(Cell, VDB_CELL_HDR + 4);
-    Move(Key, Cell[0], 8);
+    need := VDB_CELL_HDR + 4;
+    if Length(FCellBuf) < need then SetLength(FCellBuf, need);
+    Move(Key, FCellBuf[0], 8);
     len := len or VDB_OVF_FLAG;
-    Move(len, Cell[8], 4);
-    Move(zero, Cell[VDB_CELL_HDR], 4);
+    Move(len, FCellBuf[8], 4);
+    Move(zero, FCellBuf[VDB_CELL_HDR], 4);
+    SetLength(FCellBuf, need);
+    Cell := FCellBuf;
     Result := True;
     Exit;
   end;
-  SetLength(Cell, VDB_CELL_HDR + Integer(len));
-  Move(Key, Cell[0], 8);
-  Move(len, Cell[8], 4);
+  need := VDB_CELL_HDR + Integer(len);
+  if Length(FCellBuf) < need then SetLength(FCellBuf, need);
+  Move(Key, FCellBuf[0], 8);
+  Move(len, FCellBuf[8], 4);
   if len > 0 then
-    Move(Value[0], Cell[VDB_CELL_HDR], len);
+    Move(Value[0], FCellBuf[VDB_CELL_HDR], len);
+  SetLength(FCellBuf, need);
+  Cell := FCellBuf;
   Result := True;
 end;
 
@@ -632,6 +648,75 @@ begin
   end;
 end;
 
+procedure TVdbHeap.PlaceCellKV(Key: QWord; Data: PByte; DataLen: Integer;
+  out L: TLoc);
+{ P-37: anahtar + degeri dogrudan sayfaya yazar (FCellBuf yok).
+  P-38: pointer + uzunluk alir — TBytes refcount maliyeti yok. }
+var
+  pageNo: LongWord;
+  P: PVdbPage;
+  slot: Integer;
+  tries: Integer;
+begin
+  tries := 0;
+  while True do
+  begin
+    Inc(tries);
+    if tries > 64 then
+      raise EVdbHeap.Create(Format(
+        'PlaceCellKV: 64 denemede yazilamadi (deger=%d bayt, son sayfa=%d)',
+        [DataLen, FWritePage]));
+    if FWritePage <> 0 then
+    begin
+      if not FStore.GetPage(FWritePage, P) then
+        raise EVdbHeap.Create('yazma sayfasi okunamadi');
+      if PageInsertKV(P, Key, Data, DataLen, slot) then
+      begin
+        FStore.Release(FWritePage, True);
+        L.PageNo := FWritePage;
+        L.Slot := slot;
+        Exit;
+      end;
+      FStore.Release(FWritePage, False);
+    end;
+    while FSpaceHintN > 0 do
+    begin
+      Dec(FSpaceHintN);
+      pageNo := FSpaceHints[FSpaceHintN];
+      if pageNo = FWritePage then Continue;
+      if not FStore.GetPage(pageNo, P) then Continue;
+      if PageTypeOf(P) <> VDB_PAGE_HEAP then
+      begin
+        FStore.Release(pageNo, False);
+        Continue;
+      end;
+      if PageInsertKV(P, Key, Data, DataLen, slot) then
+      begin
+        FStore.Release(pageNo, True);
+        FWritePage := pageNo;
+        L.PageNo := pageNo;
+        L.Slot := slot;
+        Exit;
+      end;
+      FStore.Release(pageNo, False);
+    end;
+    if (not FSpaceScanned) and (FHeapPages > 0) then
+    begin
+      SpaceHintScan(VDB_CELL_HDR + DataLen + SizeOf(TVDbPageSlot));
+      FSpaceScanned := True;
+      Continue;
+    end;
+    if not FStore.AllocPage(VDB_PAGE_HEAP, pageNo, P) then
+      raise EVdbHeap.Create('heap sayfasi ayrilamadi');
+    Inc(FHeapPages);
+    if pageNo >= LongWord(Length(FPageType)) then
+      SetLength(FPageType, pageNo + 64);
+    FPageType[pageNo] := 1;
+    FWritePage := pageNo;
+    FStore.Release(pageNo, True);
+  end;
+end;
+
 function TVdbHeap.ReadCellAt(const L: TLoc; out Key: QWord;
   out Value: TBytes): Boolean;
 var
@@ -726,20 +811,36 @@ begin
   Result := True;
 end;
 
-function TVdbHeap.InsertRaw(Key: QWord; const Value: TBytes;
+function TVdbHeap.InsertRaw(Key: QWord; Data: PByte; DataLen: Integer;
   out L: TLoc): Boolean;
 var
-  cell: TBytes;
+  len, zero: LongWord;
+  need: Integer;
   first: LongWord;
 begin
   Result := False;
-  if not BuildCell(Key, Value, cell) then Exit;
-  if Length(Value) > VDB_MAX_INLINE then
+  len := DataLen;
+  if len > VDB_MAX_INLINE then
   begin
-    WriteOverflow(Value, first);
-    Move(first, cell[VDB_CELL_HDR], 4);
+    { Tasma: hucre yalnizca anahtar + bayrakli uzunluk + ilk sayfa.
+      Bu yol nadir; FCellBuf ara tamponu kullanilir. }
+    zero := 0;
+    need := VDB_CELL_HDR + 4;
+    if Length(FCellBuf) < need then SetLength(FCellBuf, need);
+    Move(Key, FCellBuf[0], 8);
+    len := len or VDB_OVF_FLAG;
+    Move(len, FCellBuf[8], 4);
+    Move(zero, FCellBuf[VDB_CELL_HDR], 4);
+    WriteOverflow(Data, DataLen, first);
+    Move(first, FCellBuf[VDB_CELL_HDR], 4);
+    PlaceCell(FCellBuf[0], need, L);
+  end
+  else
+  begin
+    { P-37: anahtar + degeri dogrudan sayfaya yaz (tek kopya).
+      P-38: deger PByte + uzunluk olarak gecirilir (TBytes refcount yok). }
+    PlaceCellKV(Key, Data, DataLen, L);
   end;
-  PlaceCell(cell[0], Length(cell), L);
   Result := True;
 end;
 
@@ -1094,17 +1195,65 @@ begin
 end;
 
 function TVdbHeap.Insert(Key: QWord; const Value: TBytes): Boolean;
+begin
+  if Length(Value) > 0 then
+    Result := Insert(Key, @Value[0], Length(Value))
+  else
+    Result := Insert(Key, nil, 0);
+end;
+
+function TVdbHeap.Insert(Key: QWord; Data: PByte; DataLen: Integer): Boolean;
 var
   L: TLoc;
+  h: LongWord;
+  guard: LongWord;
+  slot: LongWord;
+  found: Boolean;
 begin
   Result := False;
-  if Contains(Key) then Exit;
-  if not InsertRaw(Key, Value, L) then Exit;
-  DirAdd(Key, L);
+  { P-27: tek geciste varlik denetimi + bos slot bulma.
+    ONCEDEN: Contains (DirFind) + DirAdd = 2 hash aramasi.
+    SIMDI: tek sondalama — anahtar varsa False, yoksa slot hazir. }
+  if (FCap = 0) or ((FCount + 1) * 4 > Integer(FCap) * 3) then
+    DirGrow;
+  h := DirHash(Key);
+  guard := 0;
+  slot := 0;
+  found := False;
+  while FUsed[h] <> 0 do
+  begin
+    if (FUsed[h] = 1) and (FKey[h] = Key) then
+    begin
+      Exit;                       // anahtar zaten var
+    end;
+    if (not found) and (FUsed[h] = 2) then
+    begin
+      slot := h;                  // tombstone — yeniden kullanilabilir
+      found := True;
+    end;
+    h := (h + 1) and (FCap - 1);
+    Inc(guard);
+    if guard > FCap then Exit;
+  end;
+  if not found then slot := h;    // ilk bos yuva
+  if not InsertRaw(Key, Data, DataLen, L) then Exit;
+  FUsed[slot] := 1;
+  FKey[slot] := Key;
+  FLoc[slot] := L;
+  Inc(FCount);
+  PageMapAdd(L.PageNo, Key);
   Result := True;
 end;
 
 function TVdbHeap.Update(Key: QWord; const Value: TBytes): Boolean;
+begin
+  if Length(Value) > 0 then
+    Result := Update(Key, @Value[0], Length(Value))
+  else
+    Result := Update(Key, nil, 0);
+end;
+
+function TVdbHeap.Update(Key: QWord; Data: PByte; DataLen: Integer): Boolean;
 var
   idx: LongWord;
   L: TLoc;
@@ -1127,10 +1276,10 @@ begin
     if PageGetCell(P, L.Slot, d, dl) and (dl >= VDB_CELL_HDR) then
     begin
       Move((d + 8)^, len, 4);
-      if ((len and VDB_OVF_FLAG) = 0) and (Integer(len) = Length(Value)) then
+      if ((len and VDB_OVF_FLAG) = 0) and (Integer(len) = DataLen) then
       begin
-        if len > 0 then
-          Move(Value[0], (d + VDB_CELL_HDR)^, len);
+        if DataLen > 0 then
+          Move(Data^, (d + VDB_CELL_HDR)^, DataLen);
         inPlace := True;
       end;
     end;
@@ -1143,9 +1292,14 @@ begin
   if not ReadCellAt(L, Key, oldVal) then Exit;
   if not DeleteAt(L, freed) then Exit;
   DirDel(Key);
-  if not InsertRaw(Key, Value, L) then
+  if not InsertRaw(Key, Data, DataLen, L) then
   begin
-    if InsertRaw(Key, oldVal, L) then
+    if Length(oldVal) > 0 then
+    begin
+      if InsertRaw(Key, @oldVal[0], Length(oldVal), L) then
+        DirAdd(Key, L);
+    end
+    else if InsertRaw(Key, nil, 0, L) then
       DirAdd(Key, L);
     Exit(False);
   end;
