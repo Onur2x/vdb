@@ -73,6 +73,11 @@ type
     ['{B4E1C7A2-9F31-4D68-8E5A-2C7B1D904E56}']
     { --- temel kayit islemleri --- }
     procedure Put(Key: QWord; const Value: TBytes);
+    { P-65: TBytes tahsisini atlayan yazim. EncodeRowInto gibi yeniden
+      kullanilan tamponlardan dogrudan yazmak icin — satir basina 1 alloc +
+      1 shrink gider. TBytes surumu bunu sarar; motor katmani (FEng.Insert/
+      Update) zaten PByte overload'ina sahiptir. }
+    procedure PutPtr(Key: QWord; Data: PByte; DataLen: Integer);
     function Get(Key: QWord; out Value: TBytes): Boolean;
     function Delete(Key: QWord): Boolean;
     function Exists(Key: QWord): Boolean;

@@ -478,6 +478,7 @@ type
       read GetExclusiveAccess write SetExclusiveAccess;
 
     procedure Put(Key: QWord; const Value: TBytes);
+    procedure PutPtr(Key: QWord; Data: PByte; DataLen: Integer);   // P-65
     function Get(Key: QWord; out Value: TBytes): Boolean;
     function Delete(Key: QWord): Boolean;
     function Exists(Key: QWord): Boolean;
@@ -1524,6 +1525,16 @@ begin
 end;
 
 procedure TVdbBackendV3.Put(Key: QWord; const Value: TBytes);
+begin
+  if Length(Value) > 0 then
+    PutPtr(Key, @Value[0], Length(Value))
+  else
+    PutPtr(Key, nil, 0);
+end;
+
+procedure TVdbBackendV3.PutPtr(Key: QWord; Data: PByte; DataLen: Integer);
+{ P-65: govde. Put bunu TBytes'tan sarar; hot yol (EncodeRowInto + FEncBuf)
+  tahsis etmeden buraya iner. }
 var
   rec: TBatchRec;
   oldIdx: Integer;
@@ -1547,12 +1558,12 @@ begin
       artirilmaz. Recs girisi yalnizca (ValOff, ValLen) saklar — record
       kopyasi ucuz (refcount yok). }
     rec.ValOff := s.ValLen;
-    rec.ValLen := Length(Value);
+    rec.ValLen := DataLen;
     if rec.ValLen > 0 then
     begin
       if s.ValLen + rec.ValLen > Length(s.ValBuf) then
         SetLength(s.ValBuf, (s.ValLen + rec.ValLen) * 2 + 256);
-      Move(Value[0], s.ValBuf[s.ValLen], rec.ValLen);
+      Move(Data^, s.ValBuf[s.ValLen], rec.ValLen);
       Inc(s.ValLen, rec.ValLen);
     end;
     rec.Value := nil;   // Recs'te TBytes tutulmaz (refcount = 0)
@@ -1579,13 +1590,13 @@ begin
     { Tek anahtar yolu: once eklemeyi dene (Insert zaten varlik denetimi
       yapar), yalniz cakismada guncelle. Boylece anahtar basina bir hash
       aramasi eksilir. }
-    if FEng.Insert(Key, Value) then
+    if FEng.Insert(Key, Data, DataLen) then
     begin
-      if Length(Value) > 0 then
-        TagAdd(TagOf(@Value[0], Length(Value)), 1);
+      if DataLen > 0 then
+        TagAdd(TagOf(Data, DataLen), 1);
       FDirty := True;
-      if Length(Value) > 0 then
-        LogPut(Key, nil, @Value[0], Length(Value))
+      if DataLen > 0 then
+        LogPut(Key, nil, Data, DataLen)
       else
         LogPut(Key, nil, nil, 0);
       Exit;
@@ -1596,13 +1607,13 @@ begin
     oldVal := nil;
     FEng.TryGet(Key, oldVal);
     oldTag := -2;
-    if (Length(Value) > 0) and (Length(oldVal) > 0) then
+    if (DataLen > 0) and (Length(oldVal) > 0) then
       oldTag := TagOf(@oldVal[0], Length(oldVal));
-    if not FEng.Update(Key, Value) then
+    if not FEng.Update(Key, Data, DataLen) then
       raise EVdbBackendV3.Create('ekleme/guncelleme basarisiz');
-    if Length(Value) > 0 then
+    if DataLen > 0 then
     begin
-      newTag := TagOf(@Value[0], Length(Value));
+      newTag := TagOf(Data, DataLen);
       if oldTag = -2 then TagAdd(newTag, 1)
       else if oldTag <> newTag then
       begin
@@ -1611,8 +1622,8 @@ begin
       end;
     end;
     FDirty := True;
-    if Length(Value) > 0 then
-      LogPut(Key, oldVal, @Value[0], Length(Value))
+    if DataLen > 0 then
+      LogPut(Key, oldVal, Data, DataLen)
     else
       LogPut(Key, oldVal, nil, 0);
   finally

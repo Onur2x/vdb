@@ -380,6 +380,19 @@ type
     // P-32: batch tablosunun lazy PK indeksi var mi? IdxAddRow'da FPkIdx
     // ContainsKey aramasini atlamak icin. FBatchTableCached ile ayni gecerlilikte.
     FBatchHasPkIdx: Boolean;
+    // P-65: IdxAddRow atlama onbellegi — tek girdi (tablo kimligi + Idx sayisi).
+    // Non-batch INSERT yolunda IdxAddRow cagrisi HER SATIRDA yapiliyordu
+    // (P-32 kosulu `(not inBatch)` yuzunden hep True). Indeks islemi yoksa
+    // cagri tamamen atlanir. FPkIdx.AddOrSetValue (IndexScan) onbellegi
+    // gecersiz kilar; Idx sayisi degisimi (CREATE/DROP INDEX) de gecerlilik
+    // anahtarina dahildir.
+    FHasIdxWorkTid: Word;
+    FHasIdxWorkNIdx: Integer;
+    FHasIdxWork: Boolean;
+    // P-65: EncodeRowInto yeniden kullanilan satir tamponu. PutPtr degeri
+    // cagri aninda kopyaladigi (batch: ValBuf; non-batch: sayfaya Move)
+    // icin tampon guvenle paylasilir. Kapasite hic kucultulmez.
+    FEncBuf: TBytes;
     // P-26: batch'te vals dizi on-tahsisi — SetLength atlanir.
     FBatchVals: TStrArray;
     // G/1 (2026-10-29): toplu eklemede duplicate check atlama. Her satirda
@@ -577,6 +590,9 @@ type
       const Pk: string; const OnlyPos: Integer);
     procedure IdxDelRow(const T: TTableDef; const Vals: TStrArray;
       const Pk: string; const OnlyPos: Integer);
+    // P-65: bu tabloda IdxAddRow'yi gereken is var mi? (T.Idx dolu veya
+    // lazy PK indeksi kurulmus). Tek girdili onbellek — bakiniz FHasIdxWork*.
+    function HasIdxWork(const T: TTableDef): Boolean;
     procedure BuildPkIdx(const T: TTableDef; out E: TIdxEntries);
     { Kurucularin ortak alan kurulumu (Sprint 2.7). }
     procedure InitCore;
@@ -3460,15 +3476,20 @@ begin
     Result := B[2] or (Word(B[3]) shl 8);
 end;
 
-function EncodeRow(TableId: Word; const Pk: string; const T: TTableDef; const Vals: TStrArray): TBytes;
+function EncodeRowInto(var b: TBytes; TableId: Word; const Pk: string;
+  const T: TTableDef; const Vals: TStrArray): Integer;
 // P-17b (2026-10-16): WIRE FORMAT BIREBIR ayni (DecodeRow/PeekRawRow/CRC
 // yeni durumu bilmiyor); tahsis baskisi azaltildi. ONCE: INT/FLOAT alan
 // basina SetLength(sv,8), BOOL'da TBytes.Create, metin alaninda
 // UTF8Encode+VDbS2B CIFT kopya -> satir basina ~10-13 dinamik dizi tahsisi.
 // Simdi: tek buyuyen tampon; saf-ASCII metin (ezici cogunluk) kaynak
 // diziden DOĞRUDAN tasinir — UTF8Encode cikisi bayt bayt ayni olurdu.
+//
+// P-65: b artik CAGIRANIN tamponudur (FEncBuf gibi yeniden kullanilan
+// TBytes). Kapasite buyutulur ama HIC KUCULTULMEZ; donen deger yazilan
+// bayt sayisidir (Length(b) kapasitedir). Boylece satir basina 1 alloc +
+// 1 shrink gider. Cagiran degeri PutPtr ile (Data, DataLen) olarak yazar.
 var
-  b: TBytes;
   p: Integer;
   i: Integer;
   sv: TBytes;
@@ -3706,7 +3727,9 @@ var
 begin
   initCap := 16 + Length(Pk) * 2 + Length(T.Cols) * 16;
   if initCap < 64 then initCap := 64;
-  SetLength(b, initCap); p := 0;
+  // P-65: kapasiteyi koru — yalnizca yetmiyorsa buyut.
+  if Length(b) < initCap then SetLength(b, initCap);
+  p := 0;
   { v3.11: uzatilmis govde isareti + tablo kimligi. }
   PutU16(VDB_ROW_EXT);
   PutU16(TableId);
@@ -3831,8 +3854,21 @@ begin
       else begin b[p] := 0; Inc(p); end;
     end;
   end;
-  SetLength(b, p);
-  Result := b;
+  // P-65: shrink YOK — donen deger yazilan bayt sayisi. Cagiran
+  // PutPtr(@b[0], n) ile yazar veya istege bagli olarak SetLength(b, n)
+  // ile eski TBytes soy sozlesmesine doner (EncodeRow sarmalayicisi).
+  Result := p;
+end;
+
+function EncodeRow(TableId: Word; const Pk: string; const T: TTableDef; const Vals: TStrArray): TBytes;
+// Eski soy sozlesme: tam boyutlu TBytes doner (Length = veri uzunlugu).
+// P-65: govde EncodeRowInto'dadir; burasi yalnizca son SetLength shrink'ini
+// uygular — eski cagri siteleri (Update/PutRow/batch) ayni kalir.
+var
+  n: Integer;
+begin
+  n := EncodeRowInto(Result, TableId, Pk, T, Vals);
+  SetLength(Result, n);
 end;
 
 function ReadU16(const B: TBytes; var P: Integer; out V: Word): Boolean;
@@ -6958,6 +6994,23 @@ begin
   Result := lo;
 end;
 
+function TVTableDb.HasIdxWork(const T: TTableDef): Boolean;
+// P-65: IdxAddRow'yi gereken is var mi? Idx doluysa VEYA lazy PK indeksi
+// kurulmussa (FPkIdx) True. Tek girdili onbellek: ayni tabloya ardisik
+// INSERT'lerde ContainsKey her satirda araniyordu.
+// Gecerlilik anahtari (TableId, Length(Idx)) — CREATE/DROP INDEX Idx
+// sayisini degistirir; FPkIdx'e yeni giris IndexScan'de eklenir ve orada
+// onbellek gecersiz kalinir (FHasIdxWorkTid := 0).
+begin
+  if (FHasIdxWorkTid <> T.TableId) or (FHasIdxWorkNIdx <> Length(T.Idx)) then
+  begin
+    FHasIdxWorkTid := T.TableId;
+    FHasIdxWorkNIdx := Length(T.Idx);
+    FHasIdxWork := (Length(T.Idx) > 0) or FPkIdx.ContainsKey(T.TableId);
+  end;
+  Result := FHasIdxWork;
+end;
+
 procedure TVTableDb.IdxAddRow(const T: TTableDef; const Vals: TStrArray;
   const Pk: string; const OnlyPos: Integer);
 // Satirin indeks anahtarlarini gunceller (cok kolonlu destekli).
@@ -8942,6 +8995,8 @@ begin
         BuildPkIdx(t, Entries);
         FPkIdx.AddOrSetValue(TableId, Entries);
         FPkIdxDirty.AddOrSetValue(TableId, False);
+        // P-65: HasIdxWork onbellegi artik bu tabloda IdxAddRow gerektirir.
+        FHasIdxWorkTid := 0;
       end;
       Result := True;
     end;
@@ -9558,6 +9613,7 @@ var
   key: QWord;
   prefix: QWord;   // H10: batch tohumu
   b: TBytes;
+  n: Integer;      // P-65: EncodeRowInto yazim uzunlugu
   exTid: Word;
   inBatch: Boolean;
 begin
@@ -9734,10 +9790,14 @@ begin
     else
       raise EVDbException.CreateFmt(ecHashCollision, 'VDb: hash carpismasi (%s, %s)', [tp^.Name, pk]);
   end;
-  b := EncodeRow(tp^.TableId, pk, tp^, vals);
-  FKvB.Put(key, b);
-  // P-32: indeks ve lazy PK indeksi yoksa IdxAddRow tamamen atlanir.
-  if (not inBatch) or FBatchHasPkIdx or (Length(tp^.Idx) > 0) then
+  // P-65: EncodeRowInto + PutPtr — FEncBuf yeniden kullanilir, satir
+  // basina TBytes alloc+shrink gider. PutPtr degeri cagri aninda kopyalar.
+  n := EncodeRowInto(FEncBuf, tp^.TableId, pk, tp^, vals);
+  FKvB.PutPtr(key, Pointer(FEncBuf), n);
+  // P-32/P-65: indeks islemi yoksa IdxAddRow tamamen atlanir.
+  // P-65: non-batch'te de tek girdili onbellek — (not inBatch) kosulu
+  // yuzunden cagri HER SATIRDA yapiliyordu.
+  if HasIdxWork(tp^) then
     IdxAddRow(tp^, vals, pk, -1);
 end;
 

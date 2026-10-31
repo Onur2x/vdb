@@ -33,6 +33,7 @@ type
     property Db: TVDb read FDb;
 
     procedure Put(Key: QWord; const Value: TBytes);
+    procedure PutPtr(Key: QWord; Data: PByte; DataLen: Integer);   // P-65
     function Get(Key: QWord; out Value: TBytes): Boolean;
     function Delete(Key: QWord): Boolean;
     function Exists(Key: QWord): Boolean;
@@ -181,6 +182,20 @@ end;
 procedure TVDbBackendV2.Put(Key: QWord; const Value: TBytes);
 begin
   FDb.Put(Key, Value);
+end;
+
+procedure TVDbBackendV2.PutPtr(Key: QWord; Data: PByte; DataLen: Integer);
+// P-65: v2 motorunda PByte yolu yok — TBytes'a kopyalayip Put'a iner.
+// Hot yol v3'tedir; burasi yalnizca arayuz tamligi icin.
+var
+  tmp: TBytes;
+begin
+  if DataLen > 0 then
+  begin
+    SetLength(tmp, DataLen);
+    Move(Data^, tmp[0], DataLen);
+  end;
+  FDb.Put(Key, tmp);
 end;
 
 function TVDbBackendV2.Get(Key: QWord; out Value: TBytes): Boolean;
