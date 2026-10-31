@@ -444,6 +444,10 @@ type
     { Meta sayfasinin guncel imajini uretir (WAL'e cerceve olarak
       yazmak icin; diske yazmaz). }
     procedure BuildMetaImage(out Buf: TVdbPageBuf);
+    { P-62: meta imaji WAL'e yazildiktan sonra cagrilir. FStructDirty
+      yalnizca SaveMeta'da sifirlaniyordu; WAL yolunda kalici olarak
+      True kaliyordu -> her commit'te gereksiz 4 KB meta cercevesi. }
+    procedure ClearStructDirty;
 
     { Sprint 3.2: checkpoint sonrasi tutarli, bayt-bayt kopya. Meta sayfa
       imaji yeniden uretilir, tum sayfalar onbellek/diskten okunup hedefe
@@ -2768,6 +2772,11 @@ begin
   crc := VDbCrc32Of(Buf, VDB_PAGE_BODY_END);
   q := PLongWord(@Buf[VDB_PAGE_BODY_END]);
   q^ := crc;
+end;
+
+procedure TVDbPageStore.ClearStructDirty;
+begin
+  FStructDirty := False;
 end;
 
 procedure TVDbPageStore.CopyCommittedTo(const DestPath: string);

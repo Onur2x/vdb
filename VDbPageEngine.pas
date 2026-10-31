@@ -1032,6 +1032,12 @@ begin
   begin
     FStore.BuildMetaImage(meta);
     FWal.AppendFrame(VDB_HDR_PAGE, @meta);
+    { P-62: meta imaji WAL tamponuna yazildi. FStructDirty yalnizca
+      SaveMeta'da sifirlaniyordu; WAL yolunda kalici True kaliyordu ve
+      her commit'te gereksiz 4 KB meta cercevesi yaziliyordu (tek INSERT'te
+      2. cerceve). Commit basarisizsa cerceve zaten tampondadir; sonraki
+      denemede tekrar yazilir. }
+    FStore.ClearStructDirty;
   end;
 
   { 4) GUVENLIK AGI: tampon bossa commit kaydi yazilmaz ve LSN ilerlemezdi.
