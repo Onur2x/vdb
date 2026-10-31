@@ -92,6 +92,12 @@ type
       FOutBuf: TBytes;
       FLSN: LongWord;
       FHasContent: Boolean;
+      { P-57: FStream konumu dosya sonunda mi? Commit'te Seek(0, soEnd)
+        atlaniyor. Tek surecli modda Commit sonrasi konum zaten sondadir;
+        Refresh/Recover/ReadHeader konumu bastan baslattigi icin bayrak
+        duser. Cok surecli modda StoreRefreshed -> FWal.Refresh bayragi
+        sifirlar. }
+      FAtEnd: Boolean;
       { Sprint 3.4: sifreli WAL. }
       FEncryptedMode: Boolean;   // cagiran (motor) sifreleme istiyor mu
       FWalEncrypted: Boolean;    // diskteki baslik ne diyor
@@ -282,6 +288,9 @@ begin
   q^ := VDbCrc32Of(buf, VDB_PAGE_BODY_END);
   FStream.Position := 0;
   FStream.WriteBuffer(buf, VDB_PAGE_SIZE);
+  { P-57: WriteHeader yalniz yeni dosya (Open) ve Truncate'ta cagrilir;
+    her ikisinde de dosya boyutu = VDB_PAGE_SIZE, dolayisiyla konum sondadir. }
+  FAtEnd := True;
 end;
 
 procedure TVDbPageWal.ReadHeader;
@@ -298,6 +307,7 @@ begin
     raise EVdbWal.Create(Format('WAL dosyasi cok kucuk (%d bayt)', [FStream.Size]));
   FStream.Position := 0;
   FStream.ReadBuffer(buf, VDB_PAGE_SIZE);
+  FAtEnd := False;   // P-57: konum VDB_PAGE_SIZE'ta; dosya sonunda olmayabilir
   Move(buf[0], magic, 4);
   if magic <> VDB_WAL_MAGIC then
     raise EVdbWal.Create(Format('gecersiz WAL sihirli sayisi: $%.8x', [magic]));
@@ -352,6 +362,7 @@ begin
   FPath := APath;
   FBufferCount := 0;
   FHasContent := False;
+  FAtEnd := False;
   FLSN := 0;
   FHeaderLsn := 0;
   FWalVer := VDB_WAL_VER;   // P-53: Open/ReadHeader gunceller
@@ -564,8 +575,10 @@ begin
   total := FBufferCount * (VDB_WAL_REC_HDR + payLen) + VDB_WAL_REC_HDR;
   if Length(FOutBuf) < total then
     SetLength(FOutBuf, total + 8192);
-  { v3.21: tek arama. Seek(0, soEnd) hem konumu hem sonu tek cagrida verir. }
-  FStream.Seek(0, soEnd);
+  { P-57: konum zaten sondaysa Seek atlaniyor. Tek surecli modda Commit
+    sonrasi konum sondadir; Refresh/Recover/ReadHeader disaridan gelir. }
+  if not FAtEnd then
+    FStream.Seek(0, soEnd);
   off := 0;
   magic := VDB_WAL_REC_FRAME;
   zero := 0;
@@ -594,6 +607,7 @@ begin
   Move(crc, FOutBuf[off + 16], 4);
   Inc(off, VDB_WAL_REC_HDR);
   FStream.WriteBuffer(FOutBuf[0], off);
+  FAtEnd := True;   // P-57: konum artik dosya sonunda
   { Cok buyuk islemlerden sonra tamponu birak: aksi halde WAL nesnesi omru
     boyunca onlarca MB tutulur. Normal commit'lerde tampon yeniden kullanilir. }
   if Length(FOutBuf) > 4 * 1024 * 1024 then
@@ -656,6 +670,7 @@ begin
   appliedCount := 0;
   if FStream = nil then
     raise EVdbWal.Create('WAL acik degil');
+  FAtEnd := False;   // P-57: Recover dosyayi tarar; konum son degildir
   hdrLsn := FLSN;
   { v3.29: artimsal tarama. Konum YALNIZ (a) cagiran istediyse, (b) onceki
     tarama gecerli bir konum biraktiysa, (c) WAL basligi DEGISMEDIYSE
