@@ -643,7 +643,10 @@ type
       out Pk: string; out Vals: TStrArray): Boolean;
     function GetTableNameById(AId: Word): string;
     // satir: values[] string formda, tip donusumu burada
-    procedure Insert(const Table: string; const ColNames, StrVals: array of string);
+    // P-55: ATableDef verilirse GetTable cagrisi atlanir (fast path zaten
+    // tablo tanimini cekmistir). Nil ise eski davranis.
+    procedure Insert(const Table: string; const ColNames, StrVals: array of string;
+      ATableDef: PTableDef = nil);
     // G/1: toplu eklemede duplicate check atlama. True iken Insert, PK
     // cakisma denetimi yapmaz (FKvB.Exists cagirmaz). Cagiran benzersiz
     // PK garantisi vermelidir. Varsayilan False.
@@ -9511,7 +9514,8 @@ begin
   end;
 end;
 
-procedure TVTableDb.Insert(const Table: string; const ColNames, StrVals: array of string);
+procedure TVTableDb.Insert(const Table: string; const ColNames, StrVals: array of string;
+  ATableDef: PTableDef);
 var
   tp: PTableDef;   // P-30: sema kopyasi yerine isaretci (refcount yok)
   vals, exVals, dummyVals: TStrArray;
@@ -9527,7 +9531,14 @@ var
   matchCachedCols: Boolean;
 begin
   inBatch := FKvB.InBatch;
-  if inBatch and FBatchTableCached and (FBatchTableDef.Name = Table) then
+  { P-55: fast path zaten tablo tanimini cekmis — GetTable derin kopyasini
+    atla. Batch disi ve ATableDef verilmisse dogrudan kullan. }
+  if (ATableDef <> nil) and (not inBatch) then
+  begin
+    tp := ATableDef;
+    prefix := VDbHashKeyPrefix(tp^.Name);
+  end
+  else if inBatch and FBatchTableCached and (FBatchTableDef.Name = Table) then
   begin
     tp := @FBatchTableDef;
     prefix := FBatchHashPrefix;
@@ -9536,9 +9547,17 @@ begin
   begin
     if inBatch then
     begin
-      FBatchTableDef := GetTable(Table);
+      if ATableDef <> nil then
+      begin
+        FBatchTableDef := ATableDef^;
+        prefix := VDbHashKeyPrefix(ATableDef^.Name);
+      end
+      else
+      begin
+        FBatchTableDef := GetTable(Table);
+        prefix := VDbHashKeyPrefix(FBatchTableDef.Name);
+      end;
       tp := @FBatchTableDef;
-      prefix := VDbHashKeyPrefix(FBatchTableDef.Name);
       FBatchTableCached := True;
       FBatchColMapValid := False;
       FBatchHashPrefix := prefix;

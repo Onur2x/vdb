@@ -13582,7 +13582,7 @@ begin
         NewRow := subRes.Rows[i];
         FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
         RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
-        FT.Insert(Stmt.Table, cnames, NewRow);
+        FT.Insert(Stmt.Table, cnames, NewRow, @td);   // P-55
         Inc(rCount);
         FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
         if hasReturning then
@@ -13667,7 +13667,7 @@ begin
               NewRow := [];
               FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
               RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
-              FT.Insert(Stmt.Table, [], NewRow);
+              FT.Insert(Stmt.Table, [], NewRow, @td);   // P-55
               Inc(rCount);
               FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
               if hasReturning then
@@ -13752,7 +13752,7 @@ begin
                 NewRow := strVals;
                 FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
                 RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
-                FT.Insert(Stmt.Table, cnames, NewRow);
+                FT.Insert(Stmt.Table, cnames, NewRow, @td);   // P-55
                 Inc(rCount);
                 FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
               end;
@@ -13806,7 +13806,7 @@ begin
           begin
             NewRow := [];
             FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
-            FT.Insert(Stmt.Table, [], NewRow);
+            FT.Insert(Stmt.Table, [], NewRow, @td);   // P-55
             Inc(rCount);
             FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
             if hasReturning then
@@ -13886,7 +13886,7 @@ begin
               NewRow := strVals;
               FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
               RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
-              FT.Insert(Stmt.Table, cnames, NewRow);
+              FT.Insert(Stmt.Table, cnames, NewRow, @td);   // P-55
               Inc(rCount);
               FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
             end;
@@ -14215,7 +14215,7 @@ begin
     // R-19 RLS: genel yolun cagirdigi AYNI metot.
     RlsRequireInsert(tbl, cnames, rows[0]);
     // PK/UNIQUE/NOT NULL/CHECK/AutoInc/FK denetimleri FT.Insert icerisinde.
-    FT.Insert(tbl, cnames, rows[0]);
+    FT.Insert(tbl, cnames, rows[0], @td);   // P-55: GetTable atla
   end
   else
   begin
@@ -14230,7 +14230,7 @@ begin
       for bi2 := 0 to nrows - 1 do
       begin
         RlsRequireInsert(tbl, cnames, rows[bi2]);   // R-19
-        FT.Insert(tbl, cnames, rows[bi2]);
+        FT.Insert(tbl, cnames, rows[bi2], @td);   // P-55
       end;
       if bi = 1 then FT.Backend.CommitBatch;
     except
@@ -14380,7 +14380,7 @@ begin
     vals[pi] := AParams[pi];
 
   RlsRequireInsert(tbl, cnames, vals);
-  FT.Insert(tbl, cnames, vals);
+  FT.Insert(tbl, cnames, vals, @td);   // P-55: GetTable atla
 
   Res.Affected := 1;
   Res.LastTable := tbl;
@@ -15109,7 +15109,7 @@ begin
             FireTriggers(tbl, Byte(ttBefore), Byte(teInsert),
               nil, row, cnames, Res, True);
           RlsRequireInsert(tbl, cnames, row);
-          FT.Insert(tbl, cnames, row);
+          FT.Insert(tbl, cnames, row, @td);   // P-55: GetTable derin kopyasini atla
           Inc(total);
           if hasInsTrig then
             FireTriggers(tbl, Byte(ttAfter), Byte(teInsert),
