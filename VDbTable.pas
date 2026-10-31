@@ -357,9 +357,11 @@ type
     FBatchTableCached: Boolean;
     FBatchTableDef: TTableDef;
     FOpenTDef: TTableDef; // P-30: batch disi Insert icin anlik sema (pointer hedef)
-    // P-31: auto-inc sayac onbellegi. Batch boyunca her satirda FAutoInc
-    // sozlugune yazmak yerine Int64 uzerinde calisir; Commit/Abort'ta
-    // tek seferde yazdirilir. 1M satirda 1M dict okuma+yazma tasarrufu.
+    // P-31: auto-inc sayac onbellegi. Her satirda FAutoInc sozlugune yazmak
+    // yerine Int64 uzerinde calisir; Commit/Abort'ta tek seferde yazdirilir.
+    // P-64: onbellek artik batch DISINDA da kullanilir (non-batch INSERT).
+    // Sozlukten dogrudan okuyan her yol (AutoIncPersistOf, SnapshotSchema,
+    // Close, DROP TABLE) onbellegi hesaba katmak ZORUNDADIR.
     FBatchAutoIncTid: Word;
     FBatchAutoIncVal: Int64;
     FBatchAutoIncValid: Boolean;
@@ -5227,17 +5229,17 @@ begin
     if NewVal > FBatchAutoIncVal then
       FBatchAutoIncVal := NewVal;
   end
-  else if FKvB.InBatch then
+  else
   begin
-    // P-31: onbellek ilk kullanimda aktiflesir (veya tablo degisince)
+    // P-31: onbellek ilk kullanimda aktiflesir (veya tablo degisince).
+    // P-64: artik batch DISINDA da kullanilir — ardisik INSERT'lerde
+    // sozluk okuma+yazmasi (TryGetValue + AddOrSetValue) atlanir.
     if FBatchAutoIncValid then
       FAutoInc.AddOrSetValue(FBatchAutoIncTid, FBatchAutoIncVal);
     FBatchAutoIncTid := T.TableId;
     FBatchAutoIncVal := NewVal;
     FBatchAutoIncValid := True;
-  end
-  else
-    FAutoInc.AddOrSetValue(T.TableId, NewVal);
+  end;
   FAutoIncDirty := True;
 end;
 
@@ -5297,6 +5299,11 @@ begin
   Result := T.AutoInc;
   if FAutoInc.TryGetValue(T.TableId, v) then
     if v > Result then Result := v;
+  // P-64: onbellekteki (henuz sozluge yazilmamis) sayac da dahil.
+  // Aksi halde SaveSchema bayat (dusuk) sayac yazar ve yeniden acilista
+  // IDENTITY PK cakismasi olusur.
+  if FBatchAutoIncValid and (FBatchAutoIncTid = T.TableId) then
+    if FBatchAutoIncVal > Result then Result := FBatchAutoIncVal;
 end;
 
 procedure TVTableDb.SnapshotSchema;
@@ -5308,6 +5315,10 @@ var
   kvA: TPair<Word, Int64>;   // P-17a
 begin
   ClearSchemaSnapshot;
+  // P-64: onbellekteki sayac sozluge yazilsin ki yedek dogru degeri tasisin.
+  // Aksi halde abort, onbellekteki artisi kaybetmis (bayat) bir sayaci
+  // geri yukler ve IDENTITY PK cakismasi olusur.
+  FlushAutoIncCache;
   FSnapActive := True;
   FSnapDirty := FSchemaDirty;
   FSnapNextId := FNextId;
@@ -5343,6 +5354,7 @@ begin
   if FSnapAutoInc <> nil then
     for kvA in FSnapAutoInc do
       FAutoInc.AddOrSetValue(kvA.Key, kvA.Value);
+  FBatchAutoIncValid := False;   // P-64: geri yuklenen degerler onbellegi bayatlatir
   FNextId := FSnapNextId;
   FSchemaDirty := FSnapDirty;
   // ROLLBACK: tablo geri geliyor, o yuzden intent listesini temizle
@@ -5615,6 +5627,7 @@ end;
 
 procedure TVTableDb.Close;
 begin
+  FlushAutoIncCache;   // P-64: onbellekteki sayaci sozluge yazdir (yoksa SaveSchema bayat sayac yazar)
   ResetBatchTableCache;
   // sayaclari kalici yap; Close asla patlamaz
   try
@@ -9429,6 +9442,9 @@ begin
   IntentDrop(Name);   // sema korumasi: bu kaybolma kasitli
   FTables.Remove(VDbNorm(Name));
   FAutoInc.Remove(t.TableId);   // P-17a: dusen tablonun sicak sayaci temizle
+  // P-64: onbellek bu tabloya aitse gecersiz kil; sonraki flush yeniden yazmasin.
+  if FBatchAutoIncValid and (FBatchAutoIncTid = t.TableId) then
+    FBatchAutoIncValid := False;
   FById.Remove(t.TableId);
   for j := 0 to High(t.Idx) do
   begin

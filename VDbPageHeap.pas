@@ -107,6 +107,10 @@ type
       listesi; DirAdd/DirDel ile bakimli. Yalnizca dizin girdisi olan (HEAP)
       sayfalari izler. }
     FPageKeys: array of array of QWord;
+    { P-64: mantiksel sayim — FPageKeys[PageNo] dizi KAPASITESIDIR, gercek
+      girdi sayisi FPageKeyCount[PageNo]. Boylece PageMapAdd her eklemede
+      SetLength(n+1) yerine geometrik buyur (O(1) amortized). }
+    FPageKeyCount: array of Integer;
     { v3.32: sayfa tipi izi. 0=bilinmiyor, 1=HEAP, 2=OVF. FHeapPages/FOvfPages
       guncellemesi icin eski tip bilgisi. Open ve ReindexPages'te doldurulur. }
     FPageType: array of Byte;
@@ -261,6 +265,7 @@ begin
   FillChar(FUsed[0], FCap, 0);
   FCount := 0;
   SetLength(FPageKeys, 0);   { ters harita yeniden kurulur; FPageType KORUNUR }
+  SetLength(FPageKeyCount, 0);   // P-64
   if oldCap > 0 then
     for i := 0 to oldCap - 1 do
       if oldUsed[i] = 1 then
@@ -316,26 +321,37 @@ end;
 
 procedure TVdbHeap.PageMapAdd(PageNo: LongWord; K: QWord);
 var
-  n: Integer;
+  n, cap: Integer;
 begin
   if PageNo >= LongWord(Length(FPageKeys)) then
+  begin
     SetLength(FPageKeys, PageNo + 64);
-  n := Length(FPageKeys[PageNo]);
-  SetLength(FPageKeys[PageNo], n + 1);
+    SetLength(FPageKeyCount, PageNo + 64);
+  end;
+  n := FPageKeyCount[PageNo];
+  cap := Length(FPageKeys[PageNo]);
+  if n >= cap then
+  begin
+    { P-64: geometrik buyume — O(1) amortized. ONCEDEN her Insert'te
+      SetLength(n+1) ile tam kopyalama yapiliyordu (O(n) per call). }
+    if cap < 8 then cap := 8 else cap := cap * 2;
+    SetLength(FPageKeys[PageNo], cap);
+  end;
   FPageKeys[PageNo][n] := K;
+  FPageKeyCount[PageNo] := n + 1;
 end;
 
 procedure TVdbHeap.PageMapRemove(PageNo: LongWord; K: QWord);
 var
   i, n: Integer;
 begin
-  if PageNo >= LongWord(Length(FPageKeys)) then Exit;
-  n := Length(FPageKeys[PageNo]);
+  if PageNo >= LongWord(Length(FPageKeyCount)) then Exit;
+  n := FPageKeyCount[PageNo];
   for i := 0 to n - 1 do
     if FPageKeys[PageNo][i] = K then
     begin
       FPageKeys[PageNo][i] := FPageKeys[PageNo][n - 1];
-      SetLength(FPageKeys[PageNo], n - 1);
+      FPageKeyCount[PageNo] := n - 1;   // P-64: dizi boyutu DEGISTIRILMEZ
       Exit;
     end;
 end;
@@ -343,6 +359,7 @@ end;
 procedure TVdbHeap.PageMapClear;
 begin
   SetLength(FPageKeys, 0);
+  SetLength(FPageKeyCount, 0);   // P-64
   SetLength(FPageType, 0);
 end;
 
@@ -997,12 +1014,13 @@ begin
     pno := changed[i];
     if pno < LongWord(Length(FPageKeys)) then
     begin
-      for j := 0 to High(FPageKeys[pno]) do
+      for j := 0 to FPageKeyCount[pno] - 1 do   // P-64
         if DirFind(FPageKeys[pno][j], fh) then
         begin
           FUsed[fh] := 2;
           Dec(FCount);
         end;
+      FPageKeyCount[pno] := 0;
       SetLength(FPageKeys[pno], 0);
     end;
   end;
@@ -1010,12 +1028,13 @@ begin
     girdileri de temizle. }
   for pno := FStore.PageCount to LongWord(Length(FPageKeys)) - 1 do
   begin
-    for j := 0 to High(FPageKeys[pno]) do
+    for j := 0 to FPageKeyCount[pno] - 1 do   // P-64
       if DirFind(FPageKeys[pno][j], fh) then
       begin
         FUsed[fh] := 2;
         Dec(FCount);
       end;
+    FPageKeyCount[pno] := 0;
     SetLength(FPageKeys[pno], 0);
   end;
 
