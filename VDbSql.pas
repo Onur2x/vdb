@@ -3349,9 +3349,45 @@ var
   i: Integer;
   st: TStrArray;
   prevSess: Cardinal;
+  fastOk: Boolean;
 begin
   { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
   FillChar(Result, SizeOf(Result), 0);
+  Result.Stmts := 1;
+
+  { P-59: TEK SATIRLIK PARAMETRELI INSERT — tam sarmalayici atlama.
+    SplitStatements, ExecRaw giris islemleri (cift FillChar, cift
+    WaitForeignTxn, Trace, SlowMark, NoteSlow, RecordCommand) ve SELECT
+    kontrolu atlanir. Hizli yol basarisiz olursa normal yola dusulur. }
+  if (Length(Sql) > 13) and ((Sql[1] = 'I') or (Sql[1] = 'i')) and
+     (Pos(';', Sql) = 0) and (Length(Params) > 0) then
+  begin
+    prevSess := VDbGetWriteSession;
+    VDbSetWriteSession(FSessionId);
+    FT.Backend.WaitForeignTxn(FSessionId);
+    try
+      FT.Lock;
+      try
+        SetLength(FParams, Length(Params));
+        for i := 0 to High(Params) do
+          FParams[i] := Params[i];
+        FParamIdx := 0;
+        fastOk := FExecutor.ExecFastParamInsert(Sql, FParams, Result);
+        if fastOk then
+        begin
+          if FT.Backend.Dirty then FT.Backend.Flush;
+          Exit;
+        end;
+      finally
+        FT.Unlock;
+      end;
+    finally
+      VDbSetWriteSession(prevSess);
+    end;
+    { Hizli yol basarisiz — sonucu sifirla ve normal yola dus. }
+    FillChar(Result, SizeOf(Result), 0);
+    Result.Stmts := 1;
+  end;
 
   // KR-7 (MREW): SELECT sorgulari LockRead (paralel), yazma Lock (seri).
   st := SplitStatements(Sql);

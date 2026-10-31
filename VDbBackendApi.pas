@@ -181,6 +181,12 @@ type
     function GetDurableOnFlush: Boolean;
     procedure SetDurableOnFlush(AValue: Boolean);
     property DurableOnFlush: Boolean read GetDurableOnFlush write SetDurableOnFlush;
+    { P-58c: tek surecli erisim. True ise dosya kilidi syscall'lari ve
+      ust katman MREW kilidi atlanir (tek is parcacigi sozlesmesi).
+      Varsayilan False. }
+    function GetExclusiveAccess: Boolean;
+    procedure SetExclusiveAccess(AValue: Boolean);
+    property ExclusiveAccess: Boolean read GetExclusiveAccess write SetExclusiveAccess;
     { v3 tek yazar: karsilik yok (no-op). v2'de baska oturumun acik
       islemi bitene kadar bekler. }
     procedure WaitForeignTxn(ASessionId: Cardinal);

@@ -84,6 +84,8 @@ type
     function GetDirty: Boolean;
     function GetDurableOnFlush: Boolean;
     procedure SetDurableOnFlush(AValue: Boolean);
+    function GetExclusiveAccess: Boolean;
+    procedure SetExclusiveAccess(AValue: Boolean);
     procedure WaitForeignTxn(ASessionId: Cardinal);
     procedure RefreshBatchSnapshot;
     function GetFilePath: string;
@@ -368,6 +370,16 @@ end;
 procedure TVDbBackendV2.SetDurableOnFlush(AValue: Boolean);
 begin
   { v2'de karsiligi yok: tek yazici sozlesmesi her yazimda fsync yapar. }
+end;
+
+function TVDbBackendV2.GetExclusiveAccess: Boolean;
+begin
+  Result := False;  { v2: tek yazici, kilitsiz mod yok }
+end;
+
+procedure TVDbBackendV2.SetExclusiveAccess(AValue: Boolean);
+begin
+  { v2'de karsiligi yok. }
 end;
 
 procedure TVDbBackendV2.WaitForeignTxn(ASessionId: Cardinal);

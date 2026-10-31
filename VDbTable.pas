@@ -4387,21 +4387,27 @@ end;
 
 procedure TVTableDb.Lock;
 begin
+  { P-60: ExclusiveAccess modunda MREW kilidi atla — tek is parcacigi
+    sozlesmesinde kilit gereksiz. }
+  if FKvB.ExclusiveAccess then Exit;
   FLock.BeginWrite;
 end;
 
 procedure TVTableDb.Unlock;
 begin
+  if FKvB.ExclusiveAccess then Exit;
   FLock.EndWrite;
 end;
 
 procedure TVTableDb.LockRead;
 begin
+  if FKvB.ExclusiveAccess then Exit;
   FLock.BeginRead;
 end;
 
 procedure TVTableDb.UnlockRead;
 begin
+  if FKvB.ExclusiveAccess then Exit;
   FLock.EndRead;
 end;
 
