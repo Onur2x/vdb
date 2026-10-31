@@ -815,15 +815,23 @@ begin
     FLog.BeginGroup;
     FLogInGroup := True;
   end;
-  { P-38: ANew pointer olarak gelir; TBytes yalnizca gunluk acikken olusturulur. }
-  if ANewLen > 0 then
-  begin
-    SetLength(newBytes, ANewLen);
-    Move(ANew^, newBytes[0], ANewLen);
-  end
+  { P-68: yeni-deger yolu (eski deger yok — toplu INSERT'in ezici
+    cogunlugu) ayirmasiz: deger dogrudan gunluk grup tamponuna kopyalanir.
+    Eski deger varsa (guncelleme) TBytes yolu kalir. }
+  if (Length(AOld) = 0) and (ANewLen > 0) then
+    FLog.AddPutPtr(LogTag(ANew, ANewLen), AKey, ANew, ANewLen)
   else
-    newBytes := nil;
-  FLog.AddPut(LogTag(ANew, ANewLen), AKey, AOld, newBytes);
+  begin
+    { P-38: ANew pointer olarak gelir; TBytes yalnizca gunluk acikken olusturulur. }
+    if ANewLen > 0 then
+    begin
+      SetLength(newBytes, ANewLen);
+      Move(ANew^, newBytes[0], ANewLen);
+    end
+    else
+      newBytes := nil;
+    FLog.AddPut(LogTag(ANew, ANewLen), AKey, AOld, newBytes);
+  end;
 end;
 
 procedure TVdbBackendV3.LogDel(AKey: QWord; const AOld: TBytes);

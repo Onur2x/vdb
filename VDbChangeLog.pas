@@ -66,14 +66,6 @@ const
 type
   EVdbChangeLog = class(Exception);
 
-  TVdbLogChange = record
-    Kind: Byte;              // VDBLOG_KIND_PUT / _DEL
-    TableId: Integer;
-    Key: QWord;
-    OldVal: TBytes;
-    NewVal: TBytes;
-  end;
-
   TVdbLogEntry = record
     Kind: Byte;              // PUT / DEL / BASE
     Seq: Int64;              // commit (grup) sirasi; monoton
@@ -135,7 +127,6 @@ type
     FDir: string;
     FSeg: TFileStream;
     FSegNo: LongWord;
-    FGroup: TList<TVdbLogChange>;
     FGroupBytes: Int64;
     FSegMax: Int64;             // rotasyon esigi (test icin degistirilebilir)
     { v3.23: segment uzunlugu izlenir; her yazimda FSeg.Size (GetFileSizeEx)
@@ -149,7 +140,14 @@ type
     FEnabled: Boolean;
     FSyncGroups: Boolean;
     FError: string;
-    FLocal: TVdbLogChange;      // Add* icin gecici
+    { P-68: kayitlar Add aninda DOGRUDAN FBuf'a yazilir; FGroup listesi ve
+      FLocal gecici kaydi kalkti. FPos = tamponda yazim konumu, FCount =
+      gruptaki kayit sayisi, FGroupSeq/FGroupTs = BeginGroup'ta donmus
+      degerler (kayitlar sonradan yeniden yazilmadigi icin basta bellidir). }
+    FPos: Integer;
+    FCount: Integer;
+    FGroupSeq: Int64;
+    FGroupTs: Int64;
     function SegPath(No: LongWord): string;
     procedure WriteSegHeader(S: TFileStream; SegNo: LongWord);
     procedure OpenNewSeg(No: LongWord);
@@ -158,6 +156,12 @@ type
     function BuildRec(AMagic: LongWord; AKind: Byte; ASeq, ATsMs: Int64;
       ATableId: Integer; AKey: QWord; const Payload: TBytes): TBytes;
     function TakePayload(Kind: Byte; const AOld, ANew: TBytes): TBytes;
+    { P-68: FBuf'i FPos+ANeed bayt alacak kadar buyutur (geometrik). }
+    procedure GrowBuf(ANeed: Integer);
+    { P-68: tek kayit yazar — tum Add* yollari buradan gecer. Kayit Add
+      aninda tampona yazilir; seq/ts FGroupSeq/FGroupTs'ten gelir. }
+    procedure AppendChange(AKind: Byte; ATableId: Integer; AKey: QWord;
+      AOld: PByte; AOldLen: Integer; ANew: PByte; ANewLen: Integer);
   public
     constructor Create;
     destructor Destroy; override;
@@ -189,6 +193,10 @@ type
     procedure BeginGroup;
     procedure AddPut(ATableId: Integer; AKey: QWord;
       const AOld, ANew: TBytes);
+    { P-68: yeni-deger yolu icin ayirma yok — deger DOGRUDAN tampona
+      kopyalanir (cagiran TBytes tahsis etmez). Eski deger yoktur. }
+    procedure AddPutPtr(ATableId: Integer; AKey: QWord;
+      ANew: PByte; ANewLen: Integer);
     procedure AddDel(ATableId: Integer; AKey: QWord; const AOld: TBytes);
     procedure AbortGroup;
     { Grubu diske yazar (SyncGroups=True ise fsync de eder). Basarida
@@ -428,13 +436,14 @@ end;
 constructor TVdbChangeLog.Create;
 begin
   inherited Create;
-  FGroup := TList<TVdbLogChange>.Create;
   FSeq := 0;
   FGen := 1;
   FGuid := 0;
   FEnabled := False;
   FSegNo := 0;
   FGroupBytes := 0;
+  FPos := 0;
+  FCount := 0;
   FSegMax := VDBLOG_SEG_MAX;
   FSyncGroups := False;
 end;
@@ -442,7 +451,6 @@ end;
 destructor TVdbChangeLog.Destroy;
 begin
   Close;
-  FGroup.Free;
   inherited Destroy;
 end;
 
@@ -761,15 +769,16 @@ end;
   kopya) cagriliyor, sonra ucuncu kez grup tamponuna kopyalaniyordu:
   satir basina 2 ayirma + 3 kopya. Bu yardimci kaydi dogrudan grup
   tamponuna yazar; uretilen baytlar BuildRec+TakePayload ile BIREBIR
-  aynidir (alan alan ayni sira, ayni CRC). }
+  aynidir (alan alan ayni sira, ayni CRC).
+  P-68: TBytes yerine isaretciler — bos dizi icin @Dizi[0] riski yok. }
 function PutChangeRecAt(var Buf: TBytes; Pos: Integer; AMagic: LongWord;
   AKind: Byte; ASeq, ATsMs: Int64; ATableId: Integer; AKey: QWord;
-  const AOld, ANew: TBytes): Integer;
+  AOld: PByte; AOldLen: Integer; ANew: PByte; ANewLen: Integer): Integer;
 var
   payloadLen, recLen, p: Integer;
 begin
-  payloadLen := 8 + Length(AOld);
-  if AKind = VDBLOG_KIND_PUT then Inc(payloadLen, Length(ANew));
+  payloadLen := 8 + AOldLen;
+  if AKind = VDBLOG_KIND_PUT then Inc(payloadLen, ANewLen);
   recLen := VDBLOG_REC_HDR + payloadLen + 4;
   FillChar(Buf[Pos], VDBLOG_REC_HDR, 0);
   PutU32(Buf, Pos, AMagic);
@@ -780,72 +789,104 @@ begin
   PutU32(Buf, Pos + 28, LongWord(ATableId));
   PutU64(Buf, Pos + 32, AKey);
   p := Pos + VDBLOG_REC_HDR;
-  PutU32(Buf, p, LongWord(Length(AOld)));
+  PutU32(Buf, p, LongWord(AOldLen));
   if AKind = VDBLOG_KIND_PUT then
-    PutU32(Buf, p + 4, LongWord(Length(ANew)))
+    PutU32(Buf, p + 4, LongWord(ANewLen))
   else
     PutU32(Buf, p + 4, 0);
   Inc(p, 8);
-  if Length(AOld) > 0 then
+  if AOldLen > 0 then
   begin
-    Move(AOld[0], Buf[p], Length(AOld));
-    Inc(p, Length(AOld));
+    Move(AOld^, Buf[p], AOldLen);
+    Inc(p, AOldLen);
   end;
-  if (AKind = VDBLOG_KIND_PUT) and (Length(ANew) > 0) then
+  if (AKind = VDBLOG_KIND_PUT) and (ANewLen > 0) then
   begin
-    Move(ANew[0], Buf[p], Length(ANew));
-    Inc(p, Length(ANew));
+    Move(ANew^, Buf[p], ANewLen);
+    Inc(p, ANewLen);
   end;
   PutU32(Buf, Pos + recLen - 4, VDbCrc32Of(Buf[Pos], recLen - 4));
   Result := Pos + recLen;
+end;
+
+function BytesPtr(const B: TBytes): PByte;
+begin
+  if Length(B) > 0 then Result := @B[0] else Result := nil;
+end;
+
+procedure TVdbChangeLog.GrowBuf(ANeed: Integer);
+var
+  cap, ncap: Integer;
+begin
+  cap := Length(FBuf);
+  if FPos + ANeed <= cap then Exit;
+  { P-64 tarzi geometrik buyume: 1M satirlik grupta (~70 MB) ~20 buyume
+    yerine log2 adim; her buyume tum blogu tasir. }
+  ncap := cap * 2;
+  if ncap < FPos + ANeed then ncap := FPos + ANeed;
+  Inc(ncap, 512);
+  SetLength(FBuf, ncap);
+end;
+
+procedure TVdbChangeLog.AppendChange(AKind: Byte; ATableId: Integer;
+  AKey: QWord; AOld: PByte; AOldLen: Integer; ANew: PByte; ANewLen: Integer);
+var
+  payloadLen, recLen: Integer;
+begin
+  if not FInGroup then Exit;
+  payloadLen := 8 + AOldLen;
+  if AKind = VDBLOG_KIND_PUT then Inc(payloadLen, ANewLen);
+  recLen := VDBLOG_REC_HDR + payloadLen + 4;
+  FGroupBytes := FGroupBytes + recLen;
+  if FGroupBytes > VDBLOG_GROUP_MAX then
+    raise EVdbChangeLog.Create(Format(
+      'degisim gunlugu: tek islem %d bayti asti (sinir %d)',
+      [FGroupBytes, VDBLOG_GROUP_MAX]));
+  GrowBuf(recLen);
+  FPos := PutChangeRecAt(FBuf, FPos, VDBLOG_MAGIC_REC, AKind,
+    FGroupSeq, FGroupTs, ATableId, AKey, AOld, AOldLen, ANew, ANewLen);
+  Inc(FCount);
 end;
 
 procedure TVdbChangeLog.BeginGroup;
 begin
   if not FEnabled then Exit;
   if FInGroup then AbortGroup;
-  FGroup.Clear;
+  FPos := 0;
+  FCount := 0;
   FGroupBytes := 0;
+  { P-68: seq/ts artik BeginGroup'ta doner — kayitlar Add aninda tam
+    yazildigi icin sonradan eklenemez. Deger eski yolla ayni: seq=FSeq+1
+    (FSeq yalniz EndGroup'ta ilerler), ts=grup zamani. }
+  FGroupSeq := FSeq + 1;
+  FGroupTs := VdbLogNowMs;
   FInGroup := True;
 end;
 
 procedure TVdbChangeLog.AddPut(ATableId: Integer; AKey: QWord;
   const AOld, ANew: TBytes);
 begin
-  if not FInGroup then Exit;
-  FLocal.Kind := VDBLOG_KIND_PUT;
-  FLocal.TableId := ATableId;
-  FLocal.Key := AKey;
-  FLocal.OldVal := AOld;
-  FLocal.NewVal := ANew;
-  FGroup.Add(FLocal);
-  FGroupBytes := FGroupBytes + VDBLOG_REC_HDR + 4 + RecPayloadLen(AOld, ANew);
-  if FGroupBytes > VDBLOG_GROUP_MAX then
-    raise EVdbChangeLog.Create(Format(
-      'degisim gunlugu: tek islem %d bayti asti (sinir %d)',
-      [FGroupBytes, VDBLOG_GROUP_MAX]));
+  AppendChange(VDBLOG_KIND_PUT, ATableId, AKey,
+    BytesPtr(AOld), Length(AOld), BytesPtr(ANew), Length(ANew));
+end;
+
+procedure TVdbChangeLog.AddPutPtr(ATableId: Integer; AKey: QWord;
+  ANew: PByte; ANewLen: Integer);
+begin
+  AppendChange(VDBLOG_KIND_PUT, ATableId, AKey, nil, 0, ANew, ANewLen);
 end;
 
 procedure TVdbChangeLog.AddDel(ATableId: Integer; AKey: QWord;
   const AOld: TBytes);
 begin
-  if not FInGroup then Exit;
-  FLocal.Kind := VDBLOG_KIND_DEL;
-  FLocal.TableId := ATableId;
-  FLocal.Key := AKey;
-  FLocal.OldVal := AOld;
-  FLocal.NewVal := nil;
-  FGroup.Add(FLocal);
-  FGroupBytes := FGroupBytes + VDBLOG_REC_HDR + 4 + 8 + Length(AOld);
-  if FGroupBytes > VDBLOG_GROUP_MAX then
-    raise EVdbChangeLog.Create(Format(
-      'degisim gunlugu: tek islem %d bayti asti (sinir %d)',
-      [FGroupBytes, VDBLOG_GROUP_MAX]));
+  AppendChange(VDBLOG_KIND_DEL, ATableId, AKey,
+    BytesPtr(AOld), Length(AOld), nil, 0);
 end;
 
 procedure TVdbChangeLog.AbortGroup;
 begin
-  FGroup.Clear;
+  FPos := 0;
+  FCount := 0;
   FGroupBytes := 0;
   FInGroup := False;
 end;
@@ -853,44 +894,33 @@ end;
 function TVdbChangeLog.EndGroup(AEngineLsn: LongWord;
   out ASeq, ATsMs: Int64): Boolean;
 var
-  i, total, pos, recLen: Integer;
+  total, pos, recLen: Integer;
   seq, ts: Int64;
   posBefore: Int64;
-  r: TVdbLogChange;
 begin
   ASeq := FSeq;
   ATsMs := 0;
   Result := True;
   if not FEnabled then Exit;
   if not FInGroup then Exit;
-  if FGroup.Count = 0 then
+  if FCount = 0 then
   begin
     FInGroup := False;
     Exit;
   end;
-  seq := FSeq + 1;
-  ts := VdbLogNowMs;
-  { v3.10: toplam boyut FGroupBytes'ten gelir (Add* zaten tam sayiyor);
-    ONCEDEN tum grup bir kez daha dolasilip toplaniyordu. }
-  total := Integer(FGroupBytes) + VDBLOG_REC_HDR + 4 + 4;   // END + sayi
-  { v3.23: tampon yeniden kullanilir (her commit'te ayirma yok). }
-  if Length(FBuf) < total then
-    SetLength(FBuf, total + 512);
-  pos := 0;
-  for i := 0 to FGroup.Count - 1 do
-  begin
-    { Tek kopya: TList<T>.Items GetItem ile doner; alani alani erismek
-      satir basina 5 kopya uretirdi. }
-    r := FGroup[i];
-    pos := PutChangeRecAt(FBuf, pos, VDBLOG_MAGIC_REC, r.Kind, seq, ts,
-      r.TableId, r.Key, r.OldVal, r.NewVal);
-  end;
+  seq := FGroupSeq;
+  ts := FGroupTs;
+  { P-68: kayitlar Add aninda zaten FBuf'ta; yalnizca END kaydi eklenir
+    ve tampon TEK seferde yazilir. Satir listesi dolasimi, kayit kopyasi
+    ve yeniden boyut hesabi yok. }
   { v3.30 SPRINT B/3: END kaydi dogrudan grup tamponuna yazilir. ONCEDEN
     her commit'te (a) SetLength(payload, 4), (b) BuildRec icinde ikinci bir
     SetLength + FillChar + CRC, (c) Move ile ucuncu kopya vardi — satir basina
     2 bellek ayirmasi + 1 kopya. Alanlar BuildRec ile BIREBIR ayni
     (magic/boy/seq/ts/kind/tableId/LSN/payload/CRC, ayni sira). }
   recLen := VDBLOG_REC_HDR + 4 + 4;
+  GrowBuf(recLen);
+  pos := FPos;
   FillChar(FBuf[pos], VDBLOG_REC_HDR, 0);
   PutU32(FBuf, pos, VDBLOG_MAGIC_END);
   PutU32(FBuf, pos + 4, 4);
@@ -899,14 +929,9 @@ begin
   FBuf[pos + 24] := 0;
   PutU32(FBuf, pos + 28, 0);
   PutU64(FBuf, pos + 32, AEngineLsn);
-  PutU32(FBuf, pos + VDBLOG_REC_HDR, LongWord(FGroup.Count));
+  PutU32(FBuf, pos + VDBLOG_REC_HDR, LongWord(FCount));
   PutU32(FBuf, pos + recLen - 4, VDbCrc32Of(FBuf[pos], recLen - 4));
-  Inc(pos, recLen);
-  if pos <> total then
-  begin
-    AbortGroup;
-    raise EVdbChangeLog.Create('degisim gunlugu: ic boyut uyusmazligi');
-  end;
+  total := pos + recLen;
   try
     if FSeg = nil then
       OpenNewSeg(FSegNo + 1);
@@ -937,7 +962,8 @@ begin
   FSeq := seq;
   ASeq := seq;
   ATsMs := ts;
-  FGroup.Clear;
+  FPos := 0;
+  FCount := 0;
   FGroupBytes := 0;
   FInGroup := False;
 end;
