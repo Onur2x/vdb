@@ -380,6 +380,12 @@ type
     // P-32: batch tablosunun lazy PK indeksi var mi? IdxAddRow'da FPkIdx
     // ContainsKey aramasini atlamak icin. FBatchTableCached ile ayni gecerlilikte.
     FBatchHasPkIdx: Boolean;
+    // P-67: identity/generated tarama onbellegi. ApplyIdentity ve
+    // VDbApplyGenerated her satirda Tum Cols dizisini tarar; hic identity
+    // veya generated kolonu yoksa (ezici cogunluk) iki dongu tamamen atlanir.
+    // FBatchTableCached / FOpenTDef ile ayni gecerlilikte.
+    FBatchHasIdentity: Boolean;
+    FBatchHasGenerated: Boolean;
     // P-65: IdxAddRow atlama onbellegi — tek girdi (tablo kimligi + Idx sayisi).
     // Non-batch INSERT yolunda IdxAddRow cagrisi HER SATIRDA yapiliyordu
     // (P-32 kosulu `(not inBatch)` yuzunden hep True). Indeks islemi yoksa
@@ -5599,6 +5605,8 @@ begin
   FBatchAutoIncValid := False;
   FBatchTableCached := False;
   FBatchHasPkIdx := False;
+  FBatchHasIdentity := False;   // P-67
+  FBatchHasGenerated := False;  // P-67
   FBatchColMapValid := False;
   SetLength(FBatchColMap, 0);
   FColMapTable := '';       // P-63
@@ -9629,6 +9637,14 @@ begin
     begin
       FPrefixCacheName := tp^.Name;
       FPrefixCacheVal := VDbHashKeyPrefix(tp^.Name);
+      { P-67: identity/generated tarama onbellegi — tablo degisince bir kez. }
+      FBatchHasIdentity := False;
+      FBatchHasGenerated := False;
+      for i := 0 to High(tp^.Cols) do
+      begin
+        if tp^.Cols[i].Identity <> 0 then FBatchHasIdentity := True;
+        if tp^.Cols[i].Generated then FBatchHasGenerated := True;
+      end;
     end;
     prefix := FPrefixCacheVal;
   end
@@ -9658,6 +9674,14 @@ begin
       FPrefixCacheName := tp^.Name;   // P-56: batch disi sonraki INSERT'ler icin
       FPrefixCacheVal := prefix;
       FBatchHasPkIdx := FPkIdx.ContainsKey(FBatchTableDef.TableId);
+      // P-67: identity/generated tarama onbellegi — tablo kurulurken bir kez.
+      FBatchHasIdentity := False;
+      FBatchHasGenerated := False;
+      for i := 0 to High(FBatchTableDef.Cols) do
+      begin
+        if FBatchTableDef.Cols[i].Identity <> 0 then FBatchHasIdentity := True;
+        if FBatchTableDef.Cols[i].Generated then FBatchHasGenerated := True;
+      end;
     end
     else
     begin
@@ -9668,6 +9692,14 @@ begin
       begin
         FPrefixCacheName := FOpenTDef.Name;
         FPrefixCacheVal := VDbHashKeyPrefix(FOpenTDef.Name);
+        // P-67: identity/generated tarama onbellegi — tablo degisince bir kez.
+        FBatchHasIdentity := False;
+        FBatchHasGenerated := False;
+        for i := 0 to High(FOpenTDef.Cols) do
+        begin
+          if FOpenTDef.Cols[i].Identity <> 0 then FBatchHasIdentity := True;
+          if FOpenTDef.Cols[i].Generated then FBatchHasGenerated := True;
+        end;
       end;
       prefix := FPrefixCacheVal;
     end;
@@ -9725,9 +9757,12 @@ begin
   end;
   // M10: IDENTITY kolonlarini doldur (GENERATED'den once; generated
   // ifadeler identity degerine bagli olabilir).
-  ApplyIdentity(tp^, vals);
+  // P-67: tabloda boyle bir kolon yoksa (ezici cogunluk) dongu tamamen atlanir.
+  if FBatchHasIdentity then
+    ApplyIdentity(tp^, vals);
   // M10: GENERATED kolonlari hesapla (tum INSERT yollari buradan gecer).
-  VDbApplyGenerated(tp^, vals);
+  if FBatchHasGenerated then
+    VDbApplyGenerated(tp^, vals);
   // F2-22: PK TANIMLANMAMISSA sentetik satir anahtari uretilir.
   // ONCEDEN PkIndex 0'a zorlandigi icin ilk kolon hem anahtar hem de
   // ortuk UNIQUE idi: `CREATE TABLE t(a,b)` + ayni a ile ikinci satir
