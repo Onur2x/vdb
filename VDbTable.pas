@@ -366,6 +366,10 @@ type
     // H10 (2026-10-18): batch basina BIR KEZ hesaplanan VDbHashKeyPrefix tohumu.
     // FBatchTableCached ile ayni gecerlilikte (ad eslesmesi kontrol edilir).
     FBatchHashPrefix: QWord;
+    // P-56: non-batch yolunda VDbHashKeyPrefix tek girdili onbellegi.
+    // Ayni tabloya ardisik INSERT'lerde VDbNorm+UTF8Encode+FNV atlaniyor.
+    FPrefixCacheName: string;
+    FPrefixCacheVal: QWord;
     FBatchColMapValid: Boolean;
     FBatchColMap: TIntArray;
     // P-32: batch tablosunun lazy PK indeksi var mi? IdxAddRow'da FPkIdx
@@ -5541,6 +5545,8 @@ begin
   FBatchColMapValid := False;
   SetLength(FBatchColMap, 0);
   SetLength(FBatchVals, 0);   // P-26
+  FPrefixCacheName := '';     // P-56
+  FPrefixCacheVal := 0;
 end;
 
 procedure TVTableDb.BeginBatch;
@@ -9536,7 +9542,14 @@ begin
   if (ATableDef <> nil) and (not inBatch) then
   begin
     tp := ATableDef;
-    prefix := VDbHashKeyPrefix(tp^.Name);
+    { P-56: tek girdili prefix onbellegi — ayni tabloya ardisik INSERT'lerde
+      VDbNorm+UTF8Encode+FNV atlaniyor. }
+    if FPrefixCacheName <> tp^.Name then
+    begin
+      FPrefixCacheName := tp^.Name;
+      FPrefixCacheVal := VDbHashKeyPrefix(tp^.Name);
+    end;
+    prefix := FPrefixCacheVal;
   end
   else if inBatch and FBatchTableCached and (FBatchTableDef.Name = Table) then
   begin
@@ -9561,13 +9574,21 @@ begin
       FBatchTableCached := True;
       FBatchColMapValid := False;
       FBatchHashPrefix := prefix;
+      FPrefixCacheName := tp^.Name;   // P-56: batch disi sonraki INSERT'ler icin
+      FPrefixCacheVal := prefix;
       FBatchHasPkIdx := FPkIdx.ContainsKey(FBatchTableDef.TableId);
     end
     else
     begin
       FOpenTDef := GetTable(Table);
       tp := @FOpenTDef;
-      prefix := VDbHashKeyPrefix(FOpenTDef.Name);
+      { P-56: ayni tabloya ardisik INSERT'lerde prefix onbellegi. }
+      if FPrefixCacheName <> FOpenTDef.Name then
+      begin
+        FPrefixCacheName := FOpenTDef.Name;
+        FPrefixCacheVal := VDbHashKeyPrefix(FOpenTDef.Name);
+      end;
+      prefix := FPrefixCacheVal;
     end;
   end;
 
