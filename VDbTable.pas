@@ -370,8 +370,11 @@ type
     // Ayni tabloya ardisik INSERT'lerde VDbNorm+UTF8Encode+FNV atlaniyor.
     FPrefixCacheName: string;
     FPrefixCacheVal: QWord;
+    // P-63: kolon esleme onbellegi — batch VE non-batch INSERT yolunda ortak.
+    // Ayni tabloya ardisik INSERT'lerde FindCol + provided[] tahsisi atlanir.
     FBatchColMapValid: Boolean;
     FBatchColMap: TIntArray;
+    FColMapTable: string;   // P-63: eslemin hangi tablo icin gecerli oldugu
     // P-32: batch tablosunun lazy PK indeksi var mi? IdxAddRow'da FPkIdx
     // ContainsKey aramasini atlamak icin. FBatchTableCached ile ayni gecerlilikte.
     FBatchHasPkIdx: Boolean;
@@ -5550,6 +5553,7 @@ begin
   FBatchHasPkIdx := False;
   FBatchColMapValid := False;
   SetLength(FBatchColMap, 0);
+  FColMapTable := '';       // P-63
   SetLength(FBatchVals, 0);   // P-26
   FPrefixCacheName := '';     // P-56
   FPrefixCacheVal := 0;
@@ -9540,7 +9544,6 @@ var
   b: TBytes;
   exTid: Word;
   inBatch: Boolean;
-  matchCachedCols: Boolean;
 begin
   inBatch := FKvB.InBatch;
   { P-55: fast path zaten tablo tanimini cekmis — GetTable derin kopyasini
@@ -9612,11 +9615,14 @@ begin
     SetLength(FBatchVals, Length(tp^.Cols));
   vals := FBatchVals;
 
-  if inBatch and FBatchColMapValid and (Length(FBatchColMap) = Length(ColNames)) then
+  if FBatchColMapValid and (Length(FBatchColMap) = Length(ColNames)) and
+     (FColMapTable = tp^.Name) then
   begin
     { P-34: tüm kolonlar sağlanıyorsa varsayılan doldurma döngüsü atlanıyor.
       İkinci döngü zaten her kolonu StrVals'ten yazar; eski string'lerin
-      refcount'u doğrudan düşer, gereksiz ara atamalar (vals[i] := '') olmaz. }
+      refcount'u doğrudan düşer, gereksiz ara atamalar (vals[i] := '') olmaz.
+      P-63: bu yol artik batch DISINDA da kullanilir — FindCol + provided[]
+      tahsisi her INSERT'te atlaniyor. }
     if Length(ColNames) < Length(tp^.Cols) then
       for i := 0 to High(tp^.Cols) do
         if tp^.Cols[i].HasDef then vals[i] := tp^.Cols[i].Def else vals[i] := '';
@@ -9627,7 +9633,7 @@ begin
   begin
     SetLength(provided, Length(tp^.Cols));
     for i := 0 to High(vals) do begin vals[i] := ''; provided[i] := False; end;
-    if inBatch then SetLength(FBatchColMap, Length(ColNames));
+    SetLength(FBatchColMap, Length(ColNames));
     for i := 0 to High(ColNames) do
     begin
       ci := FindCol(tp^, ColNames[i]);
@@ -9636,9 +9642,10 @@ begin
         raise EVDbException.Create(ecColumnExists, 'kolon iki kez verildi: ' + ColNames[i]);
       vals[ci] := StrVals[i];
       provided[ci] := True;
-      if inBatch then FBatchColMap[i] := ci;
+      FBatchColMap[i] := ci;
     end;
-    if inBatch then FBatchColMapValid := True;
+    FBatchColMapValid := True;
+    FColMapTable := tp^.Name;
     // verilmemis kolonlara DEFAULT
     for i := 0 to High(vals) do
       if not provided[i] and tp^.Cols[i].HasDef then
