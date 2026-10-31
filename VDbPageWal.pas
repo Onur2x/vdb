@@ -92,6 +92,10 @@ type
       FOutBuf: TBytes;
       FLSN: LongWord;
       FHasContent: Boolean;
+      { P-61: WAL dosyasi boyutu sayaçi — FStream.Size (syscall) yerine
+        bellekten okunur. Commit'te artar, Truncate'de sifirlanir,
+        Open/Refresh'te diskten bir kez okunur. }
+      FWrittenBytes: Int64;
       { P-57: FStream konumu dosya sonunda mi? Commit'te Seek(0, soEnd)
         atlaniyor. Tek surecli modda Commit sonrasi konum zaten sondadir;
         Refresh/Recover/ReadHeader konumu bastan baslattigi icin bayrak
@@ -416,6 +420,7 @@ begin
     try
       ReadHeader;
       FHasContent := FStream.Size > VDB_PAGE_SIZE;
+      FWrittenBytes := FStream.Size;
     except
       FreeAndNil(FStream);
       raise;
@@ -426,6 +431,7 @@ begin
     { Salt-okunur: WAL yok -> icerik yok. Dosya OLUSTURULMAZ. }
     FLSN := 0;
     FHasContent := False;
+    FWrittenBytes := 0;
   end
   else
   begin
@@ -437,6 +443,7 @@ begin
     VDbFlushStream(FStream);
     FWalEncrypted := FEncryptedMode;
     FHasContent := False;
+    FWrittenBytes := FStream.Size;
   end;
   { v3.19: fsync icin ikinci handle (yalniz yazilabilir modda). }
   if (not AReadOnly) and (FStream <> nil) and (FSyncStream = nil) then
@@ -470,6 +477,7 @@ begin
   { FStream.Size her cagrida isletim sistemine sorulur; baska surecin
     uzattigi dosya buradan gorulur. }
   FHasContent := FStream.Size > VDB_PAGE_SIZE;
+  FWrittenBytes := FStream.Size;
 end;
 
 function TVdbPageWal.HasContent: Boolean;
@@ -608,6 +616,7 @@ begin
   Inc(off, VDB_WAL_REC_HDR);
   FStream.WriteBuffer(FOutBuf[0], off);
   FAtEnd := True;   // P-57: konum artik dosya sonunda
+  Inc(FWrittenBytes, off);   // P-61: boyut sayaci
   { Cok buyuk islemlerden sonra tamponu birak: aksi halde WAL nesnesi omru
     boyunca onlarca MB tutulur. Normal commit'lerde tampon yeniden kullanilir. }
   if Length(FOutBuf) > 4 * 1024 * 1024 then
@@ -855,6 +864,7 @@ begin
   FWrittenLsn := CheckpointLSN;
   FBufferCount := 0;
   FStream.Size := VDB_PAGE_SIZE;
+  FWrittenBytes := VDB_PAGE_SIZE;   // P-61
   WriteHeader;
   VDbFlushStream(FStream);
   FHasContent := False;
@@ -864,7 +874,7 @@ function TVdbPageWal.Bytes: Int64;
 begin
   if FStream = nil then
     Exit(0);
-  Result := FStream.Size +
+  Result := FWrittenBytes +
     Int64(FBufferCount) * (VDB_PAGE_SIZE + VDB_WAL_REC_HDR);
 end;
 

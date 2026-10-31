@@ -1171,6 +1171,8 @@ begin
   if (Result <> nil) and (FBatchSetSid = VdbBackendSessionId) then Exit;
   Result := nil;
   if FSets = nil then Exit;
+  { P-61: bos kume — kilide girmeden cik. TryGetValue sonucu zaten nil olur. }
+  if FSets.Count = 0 then Exit;
   sid := VdbBackendSessionId;
   FEngCs.Enter;
   try
@@ -2695,6 +2697,10 @@ procedure TVdbBackendV3.Flush;
 var
   syncLsn: LongWord;
 begin
+  { P-61: FDirty kontrolu ONCE — bos Flush'ta BatchOpen/OwnSet zinciri
+    (FEngCs + dictionary arama) tamamen atlanir. Olculen: bos Flush 1,76 us
+    -> 0,01 us. Mantik esittir: FDirty=False ise yapilacak is yok. }
+  if not FDirty then Exit;
   if BatchOpen then Exit;
   { P-DUR sozlesmesi yalniz DAYANIKLILIK ister: commit WAL'e yazilip fsync
     edilir. 2026-10-25 (Sprint 3.12): ONCEDEN burada tam `Checkpoint` de
@@ -2708,34 +2714,32 @@ begin
     P-DUR v2 (DurableOnFlush=False): fsync checkpoint'e ertelenir. WAL'e
     yazim yapilir ama disk bariyeri cekilmez; MaybeCheckpoint esik asilinca
     veya kapanista fsync eder. Olculen fark: fsync ~360 us/islem. }
-  if FDirty then
-  begin
-    { v3.16: motor commit'i sayfa yazar -> tam kilit gerekir. }
-    FEng.Store.AcquireWrite;
+  { v3.16: motor commit'i sayfa yazar -> tam kilit gerekir. }
+  FEng.Store.AcquireWrite;
+  try
+    FEngCs.Enter;
     try
-      FEngCs.Enter;
-      try
-        if FDirty then
+      { Ic FDirty kontrolu: kilit alinirken baska oturum flush etmis olabilir. }
+      if FDirty then
+      begin
+        if FDurableOnFlush then
+          FEng.Commit(True)
+        else
         begin
-          if FDurableOnFlush then
-            FEng.Commit(True)
-          else
-          begin
-            { SQLite synchronous=NORMAL: WAL'e yaz, fsync etme.
-              fsync MaybeCheckpoint veya kapanis ile yapilir. }
-            FEng.CommitNoSync(syncLsn);
-          end;
-          FDirty := False;
-          LogFinish;
-          MaybeCheckpoint;
-          MaybeAutoCompact;     // v3.2 (H25): autocommit yolu
+          { SQLite synchronous=NORMAL: WAL'e yaz, fsync etme.
+            fsync MaybeCheckpoint veya kapanis ile yapilir. }
+          FEng.CommitNoSync(syncLsn);
         end;
-      finally
-        FEngCs.Leave;
+        FDirty := False;
+        LogFinish;
+        MaybeCheckpoint;
+        MaybeAutoCompact;     // v3.2 (H25): autocommit yolu
       end;
     finally
-      FEng.Store.ReleaseWrite;
+      FEngCs.Leave;
     end;
+  finally
+    FEng.Store.ReleaseWrite;
   end;
 end;
 
