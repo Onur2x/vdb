@@ -119,6 +119,12 @@ type
       FStream: TFileStream;
       FPoolPages: Integer;
       FFrames: array of TFrame;
+      { P-54: islem bazli kirli cerceve listesi. TxnPages yalniz bu listeyi
+        gezer (O(kirli)) — tum havuzu taramak (O(havuz=512)) yerine.
+        Liste eski/tekrarli girdiler icerebilir; TxnPages dogrulamayla
+        suzulur (TxnMark = FTxnId ve Dirty). }
+      FTxnDirty: array of Integer;
+      FTxnDirtyCount: Integer;
       FHashKey: array of LongWord;   // 0 = bos
       FHashVal: array of Integer;
       FHashMask: LongWord;
@@ -649,6 +655,7 @@ begin
   FClock := 0;
   FLSN := 0;
   FTxnId := 1;
+  FTxnDirtyCount := 0;
   FIterations := VDB_ENC_ITER;
   { v3.16: yazma kilidi yuvasi + kilit durumu. }
   InitCriticalSection(FWriteCs);
@@ -2143,7 +2150,15 @@ begin
     ONCE olduysa). Mark'i guncel islem yap ki bir sonraki Commit onu yazsin;
     gereksiz yazim zararsiz, atlanan yazim VERI KAYBI olurdu. }
   if FReadOnly then FFrames[idx].TxnMark := 0
-  else if fromPending then FFrames[idx].TxnMark := FTxnId
+  else if fromPending then
+  begin
+    FFrames[idx].TxnMark := FTxnId;
+    { P-54: pending'den gelen imaj da kirli listeye girer. }
+    if FTxnDirtyCount >= Length(FTxnDirty) then
+      SetLength(FTxnDirty, FTxnDirtyCount * 2 + 8);
+    FTxnDirty[FTxnDirtyCount] := idx;
+    Inc(FTxnDirtyCount);
+  end
   else FFrames[idx].TxnMark := 0;
   FFrames[idx].Ref := True;
   HashPut(PageNo, idx);
@@ -2201,8 +2216,17 @@ begin
   if Dirty then
   begin
     FFrames[idx].Dirty := True;
-    { v3.1: bu islemde degisti -> bir sonraki Commit bu cerceveyi WAL'e yazar. }
-    FFrames[idx].TxnMark := FTxnId;
+    { v3.1: bu islemde degisti -> bir sonraki Commit bu cerceveyi WAL'e yazar.
+      P-54: cerceve listeye yalnizca geciste eklenir (tekrar kirletmede
+      zaten listededir). }
+    if FFrames[idx].TxnMark <> FTxnId then
+    begin
+      FFrames[idx].TxnMark := FTxnId;
+      if FTxnDirtyCount >= Length(FTxnDirty) then
+        SetLength(FTxnDirty, FTxnDirtyCount * 2 + 8);
+      FTxnDirty[FTxnDirtyCount] := idx;
+      Inc(FTxnDirtyCount);
+    end;
   end;
   Dec(FFrames[idx].Pins);
 end;
@@ -2598,10 +2622,12 @@ begin
     FFrames[i].Pins := 0;
     FFrames[i].Dirty := False;
     FFrames[i].Ref := False;
+    FFrames[i].TxnMark := 0;
   end;
   if FHashKey <> nil then
     HashReset;
   FClock := 0;
+  FTxnDirtyCount := 0;   // P-54
 end;
 
 function TVDbPageStore.DirtyPages: TVdbPageNoArray;
@@ -2622,24 +2648,30 @@ end;
 
 function TVDbPageStore.TxnPages: TVdbPageNoArray;
 var
-  i, n, cap: Integer;
+  i, idx, n, cap: Integer;
 begin
   SetLength(Result, 0);
   n := 0;
   cap := 0;
-  for i := 0 to FPoolPages - 1 do
-    if (FFrames[i].PageNo <> 0) and FFrames[i].Dirty and
-       (FFrames[i].TxnMark = FTxnId) and
-       (FFrames[i].PageNo <> VDB_HDR_PAGE) then
+  { P-54: tam havuz taramasi (O(512)) yerine kirli cerceve listesi (O(kirli)).
+    Liste eski/tekrarli girdiler icerebilir; asagidaki dogrulama suzer. }
+  for i := 0 to FTxnDirtyCount - 1 do
+  begin
+    idx := FTxnDirty[i];
+    if (idx >= 0) and (idx < FPoolPages) and
+       (FFrames[idx].PageNo <> 0) and FFrames[idx].Dirty and
+       (FFrames[idx].TxnMark = FTxnId) and
+       (FFrames[idx].PageNo <> VDB_HDR_PAGE) then
     begin
       if n >= cap then
       begin
         if cap = 0 then cap := 8 else cap := cap * 2;
         SetLength(Result, cap);
       end;
-      Result[n] := FFrames[i].PageNo;
+      Result[n] := FFrames[idx].PageNo;
       Inc(n);
     end;
+  end;
   SetLength(Result, n);
 end;
 
@@ -2656,6 +2688,8 @@ procedure TVDbPageStore.EndTxn;
 begin
   Inc(FTxnId);
   if FTxnId = 0 then FTxnId := 1;
+  { P-54: kirli cerceve listesi bu islem icin bitti. }
+  FTxnDirtyCount := 0;
 end;
 
 procedure TVDbPageStore.SetLSN(Value: LongWord);
@@ -2843,7 +2877,15 @@ begin
     else
     begin
       FFrames[idx].Dirty := True;
-      FFrames[idx].TxnMark := FTxnId;
+      { P-54: kirli cerceve listesine ekle (yalniz geciste). }
+      if FFrames[idx].TxnMark <> FTxnId then
+      begin
+        FFrames[idx].TxnMark := FTxnId;
+        if FTxnDirtyCount >= Length(FTxnDirty) then
+          SetLength(FTxnDirty, FTxnDirtyCount * 2 + 8);
+        FTxnDirty[FTxnDirtyCount] := idx;
+        Inc(FTxnDirtyCount);
+      end;
     end;
     Exit;
   end;
