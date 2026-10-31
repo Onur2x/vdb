@@ -729,6 +729,16 @@ begin
       end
       else
         Move(raw[0], payload[0], VDB_PAGE_SIZE);
+      { P-52: sayfa ici CRC dogrulamasi. AppendFrame'de PageSeal ile yazilan
+        deger karsilastirilir. WalCrc tasiyici bozulmayi yakalar; bu denetim
+        sayfa govdesinin ic butunlugunu ayrica dogrular — ileride WalCrc
+        yalniz basliga indirilirse tek guvenlik katmani bu olur. }
+      if PageCrcCalc(PVdbPage(@payload[0])) <>
+         PageCrcStored(PVdbPage(@payload[0])) then
+      begin
+        Stats.TornTail := True;
+        Break;
+      end;
       AddTo(pending, pendingCount, pageNo, payload);
     end
     else
