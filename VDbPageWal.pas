@@ -38,7 +38,10 @@ uses
 
 const
   VDB_WAL_MAGIC       = $334C5756;   // 'VWL3'
-  VDB_WAL_VER         = 1;
+  VDB_WAL_VER         = 2;
+  { P-53: surum 1 — WalCrc baslik + yuk uzerinden. Surum 2 — WalCrc yalniz
+    baslik; yuk butunlugu PageSeal CRC ile saglanir (daha az CRC maliyeti). }
+  VDB_WAL_VER_COMPAT  = 1;   // desteklenen en eski surum
   { Meta sayfa numarasi (VDbPageStore.VDB_HDR_PAGE ile ayni; bu birim
     depo birimine bagimli olmamak icin yerel sabit tutar). }
   VDB_WAL_META_PAGE   = 0;
@@ -114,6 +117,10 @@ type
       degilse HER ZAMAN tam tarama yapilir. }
     FScanPos: Int64;
     FScanHdrLsn: LongWord;
+    { P-53: acik WAL dosyasinin kayit CRC bicimi. 1 = baslik+yuk, 2 = yalniz
+      baslik (PageSeal yuk butunlugunu tasir). ReadHeader'da belirlenir;
+      WriteHeader yeni dosyalara 2 yazar. Truncate sonrasi surum 2'ye yukselir. }
+    FWalVer: LongWord;
     { v3.31 DELTA TAZELEME.
       FHeaderLsn: WAL basligindaki checkpoint LSN'i. Veri dosyasi bu LSN'e
       kadar TAMAMEN gunceldir (Truncate oncesinde dosya fsync edilmistir);
@@ -255,6 +262,7 @@ begin
   FillChar(buf, SizeOf(buf), 0);
   magic := VDB_WAL_MAGIC;
   ver := VDB_WAL_VER;
+  FWalVer := VDB_WAL_VER;   // P-53: yeni/yeniden yazilan baslik daima son surum
   ps := VDB_PAGE_SIZE;
   lsn := FLSN;
   Move(magic, buf[0], 4);
@@ -294,8 +302,9 @@ begin
   if magic <> VDB_WAL_MAGIC then
     raise EVdbWal.Create(Format('gecersiz WAL sihirli sayisi: $%.8x', [magic]));
   Move(buf[4], ver, 4);
-  if ver <> VDB_WAL_VER then
+  if (ver < VDB_WAL_VER_COMPAT) or (ver > VDB_WAL_VER) then
     raise EVdbWal.Create(Format('desteklenmeyen WAL surumu: %d', [ver]));
+  FWalVer := ver;
   Move(buf[8], ps, 2);
   if ps <> VDB_PAGE_SIZE then
     raise EVdbWal.Create(Format('WAL sayfa boyu %d (beklenen %d)',
@@ -345,6 +354,7 @@ begin
   FHasContent := False;
   FLSN := 0;
   FHeaderLsn := 0;
+  FWalVer := VDB_WAL_VER;   // P-53: Open/ReadHeader gunceller
   SetLength(FAppliedPages, 0);
   FEncryptedMode := False;
   FWalEncrypted := False;
@@ -565,7 +575,12 @@ begin
     Move(FLSN, FOutBuf[off + 4], 4);
     Move(payLen, FOutBuf[off + 8], 4);
     Move(FFramePages[i], FOutBuf[off + 12], 4);
-    crc := WalCrc(FOutBuf[off], 16, FOutBuf[off + VDB_WAL_REC_HDR], payLen);
+    { P-53: surum 2'de CRC yalniz baslik uzerinden — yuk butunlugu
+      PageSeal'de. Surum 1'de eski bicim (baslik + yuk) korunur. }
+    if FWalVer >= 2 then
+      crc := WalCrc(FOutBuf[off], 16, FOutBuf[off], 0)
+    else
+      crc := WalCrc(FOutBuf[off], 16, FOutBuf[off + VDB_WAL_REC_HDR], payLen);
     Move(crc, FOutBuf[off + 16], 4);
     Inc(off, VDB_WAL_REC_HDR + payLen);
   end;
@@ -709,7 +724,11 @@ begin
         Stats.TornTail := True;
         Break;
       end;
-      calc := WalCrc(hdr[0], 16, raw[0], payLen);
+      { P-53: surum 2'de CRC yalniz baslik uzerinden hesaplandi (yukarida);
+        yuk butunlugu asagida PageSeal ile dogrulanir. Surum 1'de eski
+        bicim: CRC baslik + yuk uzerinden. }
+      if FWalVer < 2 then
+        calc := WalCrc(hdr[0], 16, raw[0], payLen);
     end;
     if calc <> crc then
     begin
