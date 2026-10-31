@@ -70,6 +70,16 @@ type
         PageNo: LongWord;
         Slot: Word;
       end;
+      { P-66: AoS dizi girdisi — Key/Loc/Used tek satirda. Eski SoA uc ayri
+        dizi idi (FKey/FLoc/FUsed); her sondalama 2-3 ayri cache line'a
+        dokunuyordu. 1M girdide ~30MB uc dizi, tek diziye iner; her provada
+        1 cache line yeter. TLoc packed (6 bayt) + QWord (8) + Byte (1) =
+        15 bayt, dogal hizalama ile 16 bayt. }
+      TDirEntry = record
+        Key: QWord;
+        Loc: TLoc;
+        Used: Byte;   // 0=bos, 1=dolu, 2=tombstone
+      end;
       TScanProc = procedure(Key: QWord; const Value: TBytes) of object;
       { v3.1: sifir-kopya tarama. Data yalnizca geri cagirim SURESI boyunca
         gecerlidir (sayfa ici hucreye isaret eder; tasma hucrelerinde gecici
@@ -79,9 +89,7 @@ type
       TScanRawPageProc = procedure(Key: QWord; Data: PByte; Len: Integer;
         PageNo: LongWord) of object;  private
     FStore: TVDbPageStore;
-    FKey: array of QWord;
-    FLoc: array of TLoc;
-    FUsed: array of Byte;
+    FDir: array of TDirEntry;   // P-66: AoS — tek dizi, 16 bayt/girdi
     FCap: LongWord;
     FCount: Integer;
     FWritePage: LongWord;
@@ -226,9 +234,9 @@ begin
   if FCap = 0 then Exit;
   h := DirHash(K);
   guard := 0;
-  while FUsed[h] <> 0 do
+  while FDir[h].Used <> 0 do
   begin
-    if (FUsed[h] = 1) and (FKey[h] = K) then
+    if (FDir[h].Used = 1) and (FDir[h].Key = K) then
     begin
       Idx := h;
       Exit(True);
@@ -245,31 +253,25 @@ end;
 
 procedure TVdbHeap.DirGrow;
 var
-  oldKey: array of QWord;
-  oldLoc: array of TLoc;
-  oldUsed: array of Byte;
+  oldDir: array of TDirEntry;
   oldCap: LongWord;
   i: LongWord;
 begin
-  oldKey := FKey;
-  oldLoc := FLoc;
-  oldUsed := FUsed;
+  oldDir := FDir;
   oldCap := FCap;
   if FCap = 0 then FCap := 256 else FCap := FCap * 2;
-  SetLength(FKey, FCap);
-  SetLength(FLoc, FCap);
-  SetLength(FUsed, FCap);
+  SetLength(FDir, FCap);
   { DIKKAT: SetLength buyuturken eski baytlari KORUR. Yeni tabloda
     eski dolu isaretleri kalirsa hem yinelenen kayit olur hem de sondalama
     zinciri kapanarak sonsuz donguye girer. Bu yuzden acikca sifirla. }
-  FillChar(FUsed[0], FCap, 0);
+  FillChar(FDir[0], FCap * SizeOf(TDirEntry), 0);
   FCount := 0;
   SetLength(FPageKeys, 0);   { ters harita yeniden kurulur; FPageType KORUNUR }
   SetLength(FPageKeyCount, 0);   // P-64
   if oldCap > 0 then
     for i := 0 to oldCap - 1 do
-      if oldUsed[i] = 1 then
-        DirAdd(oldKey[i], oldLoc[i]);
+      if oldDir[i].Used = 1 then
+        DirAdd(oldDir[i].Key, oldDir[i].Loc);
 end;
 
 procedure TVdbHeap.DirAdd(K: QWord; const L: TLoc);
@@ -281,7 +283,7 @@ begin
     DirGrow;
   h := DirHash(K);
   guard := 0;
-  while FUsed[h] = 1 do
+  while FDir[h].Used = 1 do
   begin
     h := (h + 1) and (FCap - 1);
     Inc(guard);
@@ -289,9 +291,9 @@ begin
       raise EVdbHeap.Create(Format(
         'dizin ekleme dongusu (cap=%d, count=%d)', [FCap, FCount]));
   end;
-  FUsed[h] := 1;
-  FKey[h] := K;
-  FLoc[h] := L;
+  FDir[h].Key := K;
+  FDir[h].Loc := L;
+  FDir[h].Used := 1;
   Inc(FCount);
   PageMapAdd(L.PageNo, K);
 end;
@@ -303,8 +305,8 @@ begin
   Result := False;
   if not DirFind(K, h) then Exit;
   { Tombstone: silme sirasinda zinciri koparmamak icin 2 = olu. }
-  PageMapRemove(FLoc[h].PageNo, K);
-  FUsed[h] := 2;
+  PageMapRemove(FDir[h].Loc.PageNo, K);
+  FDir[h].Used := 2;
   Dec(FCount);
   Result := True;
 end;
@@ -312,7 +314,7 @@ end;
 procedure TVdbHeap.DirReset;
 begin
   if FCap > 0 then
-    FillChar(FUsed[0], FCap, 0);
+    FillChar(FDir[0], FCap * SizeOf(TDirEntry), 0);
   FCount := 0;
   PageMapClear;
 end;
@@ -1017,7 +1019,7 @@ begin
       for j := 0 to FPageKeyCount[pno] - 1 do   // P-64
         if DirFind(FPageKeys[pno][j], fh) then
         begin
-          FUsed[fh] := 2;
+          FDir[fh].Used := 2;
           Dec(FCount);
         end;
       FPageKeyCount[pno] := 0;
@@ -1031,7 +1033,7 @@ begin
     for j := 0 to FPageKeyCount[pno] - 1 do   // P-64
       if DirFind(FPageKeys[pno][j], fh) then
       begin
-        FUsed[fh] := 2;
+        FDir[fh].Used := 2;
         Dec(FCount);
       end;
     FPageKeyCount[pno] := 0;
@@ -1200,11 +1202,11 @@ begin
   n := 0;
   SetLength(entries, FCount);
   for i := 0 to FCap - 1 do
-    if FUsed[i] = 1 then
+    if FDir[i].Used = 1 then
     begin
-      entries[n].Key := FKey[i];
-      entries[n].PageNo := FLoc[i].PageNo;
-      entries[n].Slot := FLoc[i].Slot;
+      entries[n].Key := FDir[i].Key;
+      entries[n].PageNo := FDir[i].Loc.PageNo;
+      entries[n].Slot := FDir[i].Loc.Slot;
       entries[n].Pad := 0;
       Inc(n);
     end;
@@ -1239,13 +1241,13 @@ begin
   guard := 0;
   slot := 0;
   found := False;
-  while FUsed[h] <> 0 do
+  while FDir[h].Used <> 0 do
   begin
-    if (FUsed[h] = 1) and (FKey[h] = Key) then
+    if (FDir[h].Used = 1) and (FDir[h].Key = Key) then
     begin
       Exit;                       // anahtar zaten var
     end;
-    if (not found) and (FUsed[h] = 2) then
+    if (not found) and (FDir[h].Used = 2) then
     begin
       slot := h;                  // tombstone — yeniden kullanilabilir
       found := True;
@@ -1256,9 +1258,9 @@ begin
   end;
   if not found then slot := h;    // ilk bos yuva
   if not InsertRaw(Key, Data, DataLen, L) then Exit;
-  FUsed[slot] := 1;
-  FKey[slot] := Key;
-  FLoc[slot] := L;
+  FDir[slot].Key := Key;
+  FDir[slot].Loc := L;
+  FDir[slot].Used := 1;
   Inc(FCount);
   PageMapAdd(L.PageNo, Key);
   Result := True;
@@ -1285,7 +1287,7 @@ var
 begin
   Result := False;
   if not DirFind(Key, idx) then Exit;
-  L := FLoc[idx];
+  L := FDir[idx].Loc;
 
   { Ayni uzunlukta ve tasma yoksa YERINDE yaz: slot ve sayfa degismez,
     yeni hucre ayrilmaz. En sik guncelleme yolu budur. }
@@ -1334,7 +1336,7 @@ var
 begin
   Result := False;
   if not DirFind(Key, idx) then Exit;
-  L := FLoc[idx];
+  L := FDir[idx].Loc;
   if not DeleteAt(L, freed) then Exit;
   DirDel(Key);
   Result := True;
@@ -1354,22 +1356,22 @@ begin
   Result := False;
   SetLength(Value, 0);
   if not DirFind(Key, idx) then Exit;
-  if not FStore.GetPage(FLoc[idx].PageNo, P) then Exit;
+  if not FStore.GetPage(FDir[idx].Loc.PageNo, P) then Exit;
   released := False;
-  if not PageGetCell(P, FLoc[idx].Slot, d, dl) then
+  if not PageGetCell(P, FDir[idx].Loc.Slot, d, dl) then
   begin
-    FStore.Release(FLoc[idx].PageNo, False);
+    FStore.Release(FDir[idx].Loc.PageNo, False);
     Exit;
   end;
   if dl < VDB_CELL_HDR then
   begin
-    FStore.Release(FLoc[idx].PageNo, False);
+    FStore.Release(FDir[idx].Loc.PageNo, False);
     Exit;
   end;
   Move(d^, k, 8);
   if k <> Key then
   begin
-    FStore.Release(FLoc[idx].PageNo, False);
+    FStore.Release(FDir[idx].Loc.PageNo, False);
     Exit;   { bayat dizin kaydi }
   end;
   Move((d + 8)^, len, 4);
@@ -1379,18 +1381,18 @@ begin
     if dl >= VDB_CELL_HDR + 4 then
     begin
       Move((d + VDB_CELL_HDR)^, first, 4);
-      FStore.Release(FLoc[idx].PageNo, False);
+      FStore.Release(FDir[idx].Loc.PageNo, False);
       released := True;
       Result := ReadOverflow(first, len, Value);
     end;
     if not released then
-      FStore.Release(FLoc[idx].PageNo, False);
+      FStore.Release(FDir[idx].Loc.PageNo, False);
     Exit;
   end;
   SetLength(Value, len);
   if len > 0 then
     Move((d + VDB_CELL_HDR)^, Value[0], len);
-  FStore.Release(FLoc[idx].PageNo, False);
+  FStore.Release(FDir[idx].Loc.PageNo, False);
   Result := True;
 end;
 
