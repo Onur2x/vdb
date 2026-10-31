@@ -2921,8 +2921,13 @@ begin
     genel yol her ifadede ~2.4 us yiyordu; tek-ifadeli cagrilar baskin. }
   if Pos(';', S) = 0 then
   begin
-    { P-21: tek Trim — iki cagri yerine bir. }
-    w := Trim(S);
+    { P-21: tek Trim — iki cagri yerine bir.
+      P-51: temiz girdide Trim atlama — Trim her zaman yeni string tahsis
+      eder; programatik SQL genelde bosluk icermez. }
+    if (n > 0) and (S[1] > ' ') and (S[n] > ' ') then
+      w := S
+    else
+      w := Trim(S);
     if w <> '' then
     begin
       SetLength(Result, 1);

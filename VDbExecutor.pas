@@ -14190,8 +14190,10 @@ begin
   nv := expNv;
 
   // ---- Semantik kapilar: gecilirse genel yolun ayni sirasi ayni hata ----
-  if not FT.TableExists(tbl) then Exit;   // genel: 'tablo bulunamadi'
-  if FT.IsView(tbl) then Exit;            // view kurallari genel yolda
+  { P-51: tek tablo araması — TableExists + IsView + GetTable yerine
+    TryGetTableDef (tek VDbNorm + tek sozluk aramasi). }
+  if not FT.TryGetTableDef(tbl, td) then Exit;   // genel: 'tablo bulunamadi'
+  if td.IsView then Exit;                         // view kurallari genel yolda
   // INSERT tetikleyicileri (STATEMENT + ROW, BEFORE + AFTER) genel yolun
   // FireTriggers cagri noktalaridir; biri bile varsa serit kapanir.
   if Length(FT.TriggersFor(tbl, Byte(ttBefore), Byte(teInsert))) > 0 then Exit;
@@ -14199,7 +14201,6 @@ begin
   if nc = 0 then
   begin
     // Kolon listesi yok: genel yoldaki gibi tum tablo kolonlari.
-    td := FT.GetTable(tbl);
     if nv <> Length(td.Cols) then Exit;   // sayi farki: genel hata
     SetLength(cnames, Length(td.Cols));
     for nc := 0 to High(td.Cols) do cnames[nc] := td.Cols[nc].Name;
@@ -14358,13 +14359,14 @@ begin
   if nv > pi then Exit;   // eksik parametre -> genel yol hata uretsin
 
   // ---- Semantik kapilar ----
-  if not FT.TableExists(tbl) then Exit;
-  if FT.IsView(tbl) then Exit;
+  { P-51: tek tablo araması — TableExists + IsView + GetTable yerine
+    TryGetTableDef (tek VDbNorm + tek sozluk aramasi). }
+  if not FT.TryGetTableDef(tbl, td) then Exit;
+  if td.IsView then Exit;
   if Length(FT.TriggersFor(tbl, Byte(ttBefore), Byte(teInsert))) > 0 then Exit;
   if Length(FT.TriggersFor(tbl, Byte(ttAfter),  Byte(teInsert))) > 0 then Exit;
   if nc = 0 then
   begin
-    td := FT.GetTable(tbl);
     if nv <> Length(td.Cols) then Exit;
     SetLength(cnames, Length(td.Cols));
     for nc := 0 to High(td.Cols) do cnames[nc] := td.Cols[nc].Name;
@@ -14910,12 +14912,12 @@ begin
         'COPY: hedef dizin bulunamadi: ' + ExtractFileDir(path));
   end;
 
-  if not FT.TableExists(tbl) then
+  { P-51: tek tablo araması. }
+  if not FT.TryGetTableDef(tbl, td) then
     raise EVDbException.Create(ecNotFound, 'COPY: tablo bulunamadi: ' + tbl);
-  if FT.IsView(tbl) then
+  if td.IsView then
     raise EVDbException.Create(ecUnsupported,
       'COPY: view uzerine toplu yukleme desteklenmiyor: ' + tbl);
-  td := FT.GetTable(tbl);
   if Length(cnames) = 0 then
   begin
     SetLength(cnames, Length(td.Cols));
@@ -15405,15 +15407,15 @@ begin
   if p <= n then Exit;
 
   // Semantik kontroller
-  if not FT.TableExists(tbl) then Exit;
-  if FT.IsView(tbl) then Exit;
+  { P-51: tek tablo araması. }
+  if not FT.TryGetTableDef(tbl, td) then Exit;
+  if td.IsView then Exit;
   if FT.RlsApplies(tbl) then Exit; // RLS varsa genel yol filtrelesin
   // P-CACHE: yetki kontrolu seritten once. Genel yol (ExecSelect) RequirePriv
   // yapar; serit onu atliyordu. INSERT seridi bunu zaten yapiyordu (bkz.
   // ExecFastLiteralInsert) — SELECT seridi de ayni sarmalama dizisini uygular.
   FT.RequirePriv(tbl, Ord(pkSelect));
 
-  td := FT.GetTable(tbl);
   if td.PkIndex < 0 then Exit; // PK'si olmayan tablo
   if VDbNorm(td.Cols[td.PkIndex].Name) <> VDbNorm(pkCol) then Exit; // kosul PK kolonu uzerinde degil
 
@@ -15544,15 +15546,15 @@ begin
   if p <= n then Exit;
 
   // Semantik kontroller
-  if not FT.TableExists(tbl) then Exit;
-  if FT.IsView(tbl) then Exit;
+  { P-51: tek tablo araması. }
+  if not FT.TryGetTableDef(tbl, td) then Exit;
+  if td.IsView then Exit;
   if FT.RlsApplies(tbl) then Exit; // RLS varsa genel yol filtrelesin
   // DELETE tetikleyicileri (STATEMENT + ROW, BEFORE + AFTER) genel yolun
   // FireTriggers cagri noktalaridir; biri bile varsa serit kapanir.
   if Length(FT.TriggersFor(tbl, Byte(ttBefore), Byte(teDelete))) > 0 then Exit;
   if Length(FT.TriggersFor(tbl, Byte(ttAfter),  Byte(teDelete))) > 0 then Exit;
 
-  td := FT.GetTable(tbl);
   if td.PkIndex < 0 then Exit; // PK'si olmayan tablo
   if VDbNorm(td.Cols[td.PkIndex].Name) <> VDbNorm(pkCol) then Exit; // kosul PK kolonu uzerinde degil
 
@@ -15675,15 +15677,15 @@ begin
   if nset = 0 then Exit;
 
   // Semantik kontroller
-  if not FT.TableExists(tbl) then Exit;
-  if FT.IsView(tbl) then Exit;
+  { P-51: tek tablo araması. }
+  if not FT.TryGetTableDef(tbl, td) then Exit;
+  if td.IsView then Exit;
   if FT.RlsApplies(tbl) then Exit; // RLS varsa genel yol filtrelesin
   // UPDATE tetikleyicileri (STATEMENT + ROW, BEFORE + AFTER) genel yolun
   // FireTriggers cagri noktalaridir; biri bile varsa serit kapanir.
   if Length(FT.TriggersFor(tbl, Byte(ttBefore), Byte(teUpdate))) > 0 then Exit;
   if Length(FT.TriggersFor(tbl, Byte(ttAfter),  Byte(teUpdate))) > 0 then Exit;
 
-  td := FT.GetTable(tbl);
   if td.PkIndex < 0 then Exit; // PK'si olmayan tablo
   if VDbNorm(td.Cols[td.PkIndex].Name) <> VDbNorm(pkCol) then Exit;
 
