@@ -175,6 +175,12 @@ type
         Rezervasyon islemleri siralar; acilis yalniz kisa kritik bolum icin
         tam kilide ihtiyac duyar. }
       FSkipReserve: Boolean;
+      { P-58c: TEK SURECLI ERISIM. True ise AcquireWrite/ReleaseWrite dosya
+        kilidi syscall'larini TAMAMEN atlar (LockReserve + LockExclusive +
+        UnlockGen + UnlockStream + RefreshIfStaleForce + BumpGen). Tek surec
+        erisiminde bunlar gereksizdir: MREW kilidi zaten yazarlari siralar.
+        Uygulama tek surec oldugunu BILIYORSA acar. }
+      FExclusiveAccess: Boolean;
       FWriteCs: TRTLCriticalSection;
       { v3.16: islem kapsamli paylasimli kilit derinligi (yazan oturum). }
       FReadDepth: Integer;
@@ -313,6 +319,9 @@ type
       ABusyMs: Integer = VDB_DEF_BUSY_MS);
     property ReadOnly: Boolean read FReadOnly;
     property BusyTimeoutMs: Integer read FBusyMs;
+    { P-58c: tek surecli erisim modu. True iken dosya kilidi syscall'lari
+      atlanir (bkz. FExclusiveAccess). Varsayilan False. }
+    property ExclusiveAccess: Boolean read FExclusiveAccess write FExclusiveAccess;
 
     { v3.16: surecler arasi cok yazarlilik.
       Giris: paylasimli kilit birakilir, tam kilit ABusyMs boyunca denenir,
@@ -1253,6 +1262,14 @@ begin
       Inc(FWriteDepth);
       Exit;
     end;
+    { P-58c: tek surecli erisim — dosya kilidi syscall'larini ATLA.
+      MREW kilidi zaten yazarlari siralar; LockReserve + LockExclusive +
+      RefreshIfStaleForce gereksiz. }
+    if FExclusiveAccess then
+    begin
+      FWriteDepth := 1;
+      Exit;
+    end;
     { Guvenlik agi tam kilidi zaten almissa (yazma ilkeli icinden cagri)
       sahipligi acik yazmaya devret. }
     if FAutoWrite and FLockedExcl then
@@ -1429,6 +1446,8 @@ begin
     if FWriteDepth <= 0 then Exit;
     Dec(FWriteDepth);
     if FWriteDepth > 0 then Exit;
+    { P-58c: tek surecli erisim — dosya kilidi syscall'larini ATLA. }
+    if FExclusiveAccess then Exit;
     { v3.16: ISLEM SONU — degisiklik sayacini artir. Baska bir surec bunu
       gorunce onbellegini tazeler. Meta sayfaya DOKUNULMAZ: taban dosyanin
       kendi kendine tutarliligi korunur (sayfalar hala WAL'de olabilir). }
@@ -1488,6 +1507,12 @@ begin
       Inc(FHoldDepth);
       Exit;
     end;
+    { P-58c: tek surecli erisim — rezervasyon syscall'larini ATLA. }
+    if FExclusiveAccess then
+    begin
+      FHoldDepth := 1;
+      Exit;
+    end;
     if FGenStream = nil then
       raise EVdbPageStore.Create(
         'yazar rezervasyonu kurulamadi: degisiklik sayaci yok: ' + FPath);
@@ -1517,6 +1542,7 @@ begin
     if FHoldDepth <= 0 then Exit;
     Dec(FHoldDepth);
     if FHoldDepth > 0 then Exit;
+    if FExclusiveAccess then Exit;
     if FReserved then
     begin
       UnlockGen;
@@ -1543,6 +1569,12 @@ begin
     if FHoldDepth > 0 then
     begin
       Inc(FHoldDepth);
+      Exit(True);
+    end;
+    { P-58c: tek surecli erisim — rezervasyon basarisiz olamaz. }
+    if FExclusiveAccess then
+    begin
+      FHoldDepth := 1;
       Exit(True);
     end;
     if FGenStream = nil then Exit;

@@ -117,6 +117,13 @@ type
     procedure CommitBatch;
     procedure AbortBatch;
     procedure Flush;
+    { P-58b: yazma kilidi disardan tutulabilsin diye. BeginWrite dosya
+      kilidini alir; Flush icindeki AcquireWrite/ReleaseWrite ic ice giris
+      sayacini artirip azaltir (FWriteDepth>0 hizli yolu). EndWrite kilit
+      serbest birakilir. Tek INSERT + Flush yolunda 4 dosya kilidi
+      syscall'indan 2'ye duser. }
+    procedure BeginWrite;
+    procedure EndWrite;
     function GetInBatch: Boolean;
     property InBatch: Boolean read GetInBatch;
     { v3.4: bu backend'de acik yazma islemi TEK mi? (0 veya 1 islem).

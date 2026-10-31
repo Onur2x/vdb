@@ -367,6 +367,8 @@ type
     function GetEncrypted: Boolean;
     function GetIsReadOnly: Boolean;
     function GetBusyTimeoutMs: Integer;
+    function GetExclusiveAccess: Boolean;
+    procedure SetExclusiveAccess(AValue: Boolean);
     { --- v4: mantiksal degisim gunlugu --- }
     function LogTag(P: PByte; L: Integer): Integer;
     procedure OpenChangeLog;
@@ -469,6 +471,11 @@ type
       fsync (tam dayaniklilik). False = fsync checkpoint'e ertelenir (SQLite
       synchronous=NORMAL). Olculen fark: fsync ~360 us/islem. }
     property DurableOnFlush: Boolean read FDurableOnFlush write FDurableOnFlush;
+    { P-58c: tek surecli erisim modu. True iken dosya kilidi syscall'lari
+      atlanir (LockReserve + LockExclusive + UnlockGen + UnlockStream).
+      Uygulama tek surec oldugunu BILIYORSA acar. Varsayilan False. }
+    property ExclusiveAccess: Boolean
+      read GetExclusiveAccess write SetExclusiveAccess;
 
     procedure Put(Key: QWord; const Value: TBytes);
     function Get(Key: QWord; out Value: TBytes): Boolean;
@@ -502,6 +509,8 @@ type
     procedure CommitBatch;
     procedure AbortBatch;
     procedure Flush;
+    procedure BeginWrite;   // P-58b
+    procedure EndWrite;     // P-58b
     function GetInBatch: Boolean;
     { v3.4: acik yazma islemi 0 veya 1 tane mi? (DDL/SAVEPOINT kosulu) }
     function SoleWriter: Boolean;
@@ -2730,6 +2739,16 @@ begin
   end;
 end;
 
+procedure TVdbBackendV3.BeginWrite;
+begin
+  FEng.Store.AcquireWrite;
+end;
+
+procedure TVdbBackendV3.EndWrite;
+begin
+  FEng.Store.ReleaseWrite;
+end;
+
 function TVdbBackendV3.GetInBatch: Boolean;
 begin
   Result := BatchOpen;
@@ -3017,6 +3036,16 @@ end;
 procedure TVdbBackendV3.SetDurableOnFlush(AValue: Boolean);
 begin
   FDurableOnFlush := AValue;
+end;
+
+function TVdbBackendV3.GetExclusiveAccess: Boolean;
+begin
+  Result := FEng.Store.ExclusiveAccess;
+end;
+
+procedure TVdbBackendV3.SetExclusiveAccess(AValue: Boolean);
+begin
+  FEng.Store.ExclusiveAccess := AValue;
 end;
 
 procedure TVdbBackendV3.WaitForeignTxn(ASessionId: Cardinal);

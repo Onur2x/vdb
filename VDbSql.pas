@@ -3881,10 +3881,25 @@ begin
   VDbTraceSetAttr(spanRoot, 'db.statement', Sql);
   try
   // P-18c (2026-10-16): literal INSERT hizli seridi.
+  // P-58a (2026-10-31): parametreli sorgularda once param seridi denenir;
+  // literal parse denemesi bos yere calismaz (~0.85 us tasarruf).
   if (Length(Sql) > 13) and ((Sql[1] = 'I') or (Sql[1] = 'i')) then
   begin
     SlowMarkStart;
     try
+      // Once parametreli INSERT (FParams varsa) — '?'
+      if Length(FParams) > 0 then
+      begin
+        fastOk := FExecutor.ExecFastParamInsert(Sql, FParams, Result);
+        if fastOk then
+        begin
+          FLastMs := ElapsedMs;
+          NoteSlow(Sql, FLastMs, Length(Result.Rows));
+          RecordCommand(Sql, FLastMs * 1000, 0);
+          Exit;
+        end;
+      end;
+      // Literal INSERT (parametre yok veya param seridi basarisiz)
       fastOk := FExecutor.ExecFastLiteralInsert(Sql, Result);
       if fastOk then
       begin
@@ -3893,7 +3908,8 @@ begin
         RecordCommand(Sql, FLastMs * 1000, 0);
         Exit;
       end;
-      // P-DUR v3: literal ret edildiyse parametreli INSERT seridini dene.
+      // P-DUR v3: ikisi de basarisizsa parametreli INSERT tekrar dene
+      // (literal parse yanlis tetiklenmis olabilir)
       if Length(FParams) > 0 then
       begin
         fastOk := FExecutor.ExecFastParamInsert(Sql, FParams, Result);

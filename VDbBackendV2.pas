@@ -60,6 +60,8 @@ type
     procedure CommitBatch;
     procedure AbortBatch;
     procedure Flush;
+    procedure BeginWrite;   // P-58b: v2'de no-op (tek yazici, dosya kilidi yok)
+    procedure EndWrite;     // P-58b
     function GetInBatch: Boolean;
     function SoleWriter: Boolean;
     function StoreGenStamp: Int64;
@@ -269,6 +271,16 @@ end;
 procedure TVDbBackendV2.Flush;
 begin
   FDb.Flush;
+end;
+
+procedure TVDbBackendV2.BeginWrite;
+begin
+  { v2: tek yazici, dosya kilidi yok — no-op. }
+end;
+
+procedure TVDbBackendV2.EndWrite;
+begin
+  { v2: tek yazici, dosya kilidi yok — no-op. }
 end;
 
 function TVDbBackendV2.GetInBatch: Boolean;
