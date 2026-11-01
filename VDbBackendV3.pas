@@ -665,11 +665,69 @@ type
     procedure Compact(out OldBytes, NewBytes: Int64);
   end;
 
+{$IFDEF APPLPROF}
+  { P-72 arastirma birimi (bkz. implementation): ApplyBatch'in Insert /
+  etiket / gunluk yollarinin QPC alt zamanlari. }
+  procedure AppProfReset;
+  procedure AppProfUs(out InsUs, TagUs, LogUs: Double; out N: Int64);
+{$ENDIF}
+
 implementation
 
 {$IFDEF CPUPROF}
 uses
   VDbCpuProf;
+{$ENDIF}
+
+{$IFDEF APPLPROF}
+{ P-72 arastirma: ApplyBatch icindeki ucisan yollarin (Insert/Tag/Log)
+  QPC tabanli alt zamanlarindan paylarini gormek icin olcum birimi.
+  p67diag -dAPPLPROF ile okur. Normal surum hicbir sey bilmez.
+  Windows birimi KASITLI cekilmez: SysUtils.DeleteFile'i golgeledigi
+  biliniyor (22 cagri noktasi); yalnizca iki API external alinir. }
+procedure QueryPerformanceCounter(var lpPerformanceCount: Int64);
+  stdcall; external 'kernel32' name 'QueryPerformanceCounter';
+function QueryPerformanceFrequency(var lpFrequency: Int64): LongBool;
+  stdcall; external 'kernel32' name 'QueryPerformanceFrequency';
+var
+  APQpf: Int64 = 0;
+  APIns: Int64 = 0;
+  APTag: Int64 = 0;
+  APLog: Int64 = 0;
+  APN: Int64 = 0;
+
+function APQpc: Int64; forward;
+
+function APQpc: Int64;
+var
+  c: Int64;
+begin
+  if APQpf = 0 then
+    QueryPerformanceFrequency(APQpf);
+  QueryPerformanceCounter(c);
+  Result := c;
+end;
+
+procedure AppProfReset;
+begin
+  APIns := 0;
+  APTag := 0;
+  APLog := 0;
+  APN := 0;
+end;
+
+procedure AppProfUs(out InsUs, TagUs, LogUs: Double; out N: Int64);
+var
+  q: Double;
+begin
+  if APQpf = 0 then
+    QueryPerformanceFrequency(APQpf);
+  q := 1000000 / APQpf;
+  InsUs := APIns * q;
+  TagUs := APTag * q;
+  LogUs := APLog * q;
+  N := APN;
+end;
 {$ENDIF}
 
 var
@@ -1606,6 +1664,9 @@ var
   oldVal: TBytes;
   vptr: PByte;
   vlen: Integer;
+{$IFDEF APPLPROF}
+  apt: Int64;
+{$ENDIF}
 begin
   s := OwnSet;
   if (s = nil) or (s.Order.Count = 0) then Exit;
@@ -1629,13 +1690,30 @@ begin
       { ONCEDEN her anahtar icin ayrica `Contains` cagriliyordu; `Insert`
         zaten "anahtar var mi" diye bakiyor. Once eklemeyi dene, yalniz
         cakismada guncelle: toplu eklemede bir hash aramasi eksilir. }
+{$IFDEF APPLPROF}
+      apt := APQpc;
+{$ENDIF}
       ok := FEng.Insert(key, vptr, vlen);
+{$IFDEF APPLPROF}
+      APIns := APIns + (APQpc - apt);
+{$ENDIF}
       if ok then
       begin
         { v3.1: yeni satir -> etiket sayaci +1 }
+{$IFDEF APPLPROF}
+        apt := APQpc;
+{$ENDIF}
         if vlen > 0 then
           TagAdd(TagOf(vptr, vlen), 1);
+{$IFDEF APPLPROF}
+        APTag := APTag + (APQpc - apt);
+        apt := APQpc;
+{$ENDIF}
         LogPut(key, nil, vptr, vlen);
+{$IFDEF APPLPROF}
+        APLog := APLog + (APQpc - apt);
+        Inc(APN);
+{$ENDIF}
       end
       else
       begin

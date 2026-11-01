@@ -255,7 +255,7 @@ procedure TVdbHeap.DirGrow;
 var
   oldDir: array of TDirEntry;
   oldCap: LongWord;
-  i: LongWord;
+  i, h: LongWord;
 begin
   oldDir := FDir;
   oldCap := FCap;
@@ -266,12 +266,22 @@ begin
     zinciri kapanarak sonsuz donguye girer. Bu yuzden acikca sifirla. }
   FillChar(FDir[0], FCap * SizeOf(TDirEntry), 0);
   FCount := 0;
-  SetLength(FPageKeys, 0);   { ters harita yeniden kurulur; FPageType KORUNUR }
-  SetLength(FPageKeyCount, 0);   // P-64
+  { P-72: TERS HARITA (FPageKeys) ARTIK DOKUNULMAZ. ONCEDEN her buyumede
+    silinip DirAdd uzerinden tum anahtarlarla yeniden kuruluyordu — oysa
+    yeniden ornekleme anahtarin SAYFA yerini (Loc) degistirmez; haritanin
+    icerdigi bilgi aynidir. 1M anahtarli buyumede ~1,6M gereksiz
+    PageMapAdd + dis dizi calkantisi demekti (olculen: FEng.Insert
+    0,69 us/satir'in buyuk bolumu). Yerlesim dogrudan yapilir. }
   if oldCap > 0 then
     for i := 0 to oldCap - 1 do
       if oldDir[i].Used = 1 then
-        DirAdd(oldDir[i].Key, oldDir[i].Loc);
+      begin
+        h := DirHash(oldDir[i].Key);
+        while FDir[h].Used <> 0 do
+          h := (h + 1) and (FCap - 1);
+        FDir[h] := oldDir[i];
+        Inc(FCount);
+      end;
 end;
 
 procedure TVdbHeap.DirAdd(K: QWord; const L: TLoc);
