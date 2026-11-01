@@ -705,6 +705,9 @@ begin
       Dec(FSpaceHintN);
       pageNo := FSpaceHints[FSpaceHintN];
       if pageNo = FWritePage then Continue;
+      { P-75: bayat ipucu korumasi (bkz. PlaceCellKV). }
+      if (pageNo >= LongWord(Length(FPageType))) or
+         (FPageType[pageNo] <> 1) then Continue;
       if not FStore.GetPage(pageNo, P) then Continue;
       if PageTypeOf(P) <> VDB_PAGE_HEAP then
       begin
@@ -785,6 +788,11 @@ begin
       Dec(FSpaceHintN);
       pageNo := FSpaceHints[FSpaceHintN];
       if pageNo = FWritePage then Continue;
+      { P-75: ipucu bayat olabilir (sayfa sonradan bosalip freelist'e
+        dusmus). FPageType dogrulugu — trunk sayfayi GetPage'le okumak
+        dogrulama hatasidir. }
+      if (pageNo >= LongWord(Length(FPageType))) or
+         (FPageType[pageNo] <> 1) then Continue;
       if not FStore.GetPage(pageNo, P) then Continue;
       if PageTypeOf(P) <> VDB_PAGE_HEAP then
       begin
@@ -907,6 +915,13 @@ begin
   begin
     FStore.FreePage(L.PageNo);
     if FHeapPages > 0 then Dec(FHeapPages);
+    { P-75: sayfa artik heap degil. ONCEDEN FPageType guncellenmiyordu;
+      sayfa freelist'e (trunk'a) dustukten sonra FSpaceHints'teki BAYAT
+      ipucu yoluyla GetPage (dogrulamali) okunuyor ve "sihirli sayi bozuk:
+      $4656" (trunk imzasi 'VF') hatasi veriyordu (DROP TABLE + buyuk
+      batch yeniden uretilebiliyordu: dropbug mod 1). }
+    if L.PageNo < LongWord(Length(FPageType)) then
+      FPageType[L.PageNo] := 0;
     FreedPage := True;
   end
   else if not empty then
