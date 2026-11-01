@@ -213,7 +213,61 @@ type
     property LastError: string read FLastErr;
   end;
 
+{$IFDEF APPLPROF}
+  { P-73 arastirma: heap icin QPC alt zamanlari (PlaceCellKV / DirGrow /
+    Insert toplami). p67diag -dAPPLPROF ile okur. Windows birimi KASITLI
+    cekilmez (SysUtils.DeleteFile golgeleme riski). }
+  procedure HeapProfReset;
+  procedure HeapProfUs(out InsUs, PlaceUs, GrowUs: Double; out N: Int64);
+{$ENDIF}
+
 implementation
+
+{$IFDEF APPLPROF}
+procedure QueryPerformanceCounter(var lpPerformanceCount: Int64);
+  stdcall; external 'kernel32' name 'QueryPerformanceCounter';
+function QueryPerformanceFrequency(var lpFrequency: Int64): LongBool;
+  stdcall; external 'kernel32' name 'QueryPerformanceFrequency';
+var
+  HPQpf: Int64 = 0;
+  HPIns: Int64 = 0;
+  HPPlace: Int64 = 0;
+  HPGrow: Int64 = 0;
+  HPN: Int64 = 0;
+
+function HPQpc: Int64; forward;
+
+function HPQpc: Int64;
+var
+  c: Int64;
+begin
+  if HPQpf = 0 then
+    QueryPerformanceFrequency(HPQpf);
+  QueryPerformanceCounter(c);
+  Result := c;
+end;
+
+procedure HeapProfReset;
+begin
+  HPIns := 0;
+  HPPlace := 0;
+  HPGrow := 0;
+  HPN := 0;
+end;
+
+procedure HeapProfUs(out InsUs, PlaceUs, GrowUs: Double; out N: Int64);
+var
+  q: Double;
+begin
+  if HPQpf = 0 then
+    QueryPerformanceFrequency(HPQpf);
+  q := 1000000 / HPQpf;
+  InsUs := HPIns * q;
+  PlaceUs := HPPlace * q;
+  GrowUs := HPGrow * q;
+  N := HPN;
+end;
+{$ENDIF}
 
 { ============================================================ bellek dizini }
 
@@ -256,7 +310,13 @@ var
   oldDir: array of TDirEntry;
   oldCap: LongWord;
   i, h: LongWord;
+{$IFDEF APPLPROF}
+  apt: Int64;
+{$ENDIF}
 begin
+{$IFDEF APPLPROF}
+  apt := HPQpc;
+{$ENDIF}
   oldDir := FDir;
   oldCap := FCap;
   if FCap = 0 then FCap := 256 else FCap := FCap * 2;
@@ -282,6 +342,9 @@ begin
         FDir[h] := oldDir[i];
         Inc(FCount);
       end;
+{$IFDEF APPLPROF}
+  HPGrow := HPGrow + (HPQpc - apt);
+{$ENDIF}
 end;
 
 procedure TVdbHeap.DirAdd(K: QWord; const L: TLoc);
@@ -686,7 +749,14 @@ var
   P: PVdbPage;
   slot: Integer;
   tries: Integer;
+  widx: Integer;   // P-73: yazma sayfasinin cerceve indeksi
+{$IFDEF APPLPROF}
+  apt: Int64;
+{$ENDIF}
 begin
+{$IFDEF APPLPROF}
+  apt := HPQpc;
+{$ENDIF}
   tries := 0;
   while True do
   begin
@@ -697,16 +767,18 @@ begin
         [DataLen, FWritePage]));
     if FWritePage <> 0 then
     begin
-      if not FStore.GetPage(FWritePage, P) then
+      { P-73: GetPageIdx + ReleaseIdx — Release'in FindFrame aramasi
+        atlanir (satir basina bir hash aramasi eksilir). }
+      if not FStore.GetPageIdx(FWritePage, P, widx) then
         raise EVdbHeap.Create('yazma sayfasi okunamadi');
       if PageInsertKV(P, Key, Data, DataLen, slot) then
       begin
-        FStore.Release(FWritePage, True);
+        FStore.ReleaseIdx(widx, True);
         L.PageNo := FWritePage;
         L.Slot := slot;
         Exit;
       end;
-      FStore.Release(FWritePage, False);
+      FStore.ReleaseIdx(widx, False);
     end;
     while FSpaceHintN > 0 do
     begin
@@ -744,6 +816,9 @@ begin
     FWritePage := pageNo;
     FStore.Release(pageNo, True);
   end;
+{$IFDEF APPLPROF}
+  HPPlace := HPPlace + (HPQpc - apt);
+{$ENDIF}
 end;
 
 function TVdbHeap.ReadCellAt(const L: TLoc; out Key: QWord;
@@ -1240,7 +1315,13 @@ var
   guard: LongWord;
   slot: LongWord;
   found: Boolean;
+{$IFDEF APPLPROF}
+  apt: Int64;
+{$ENDIF}
 begin
+{$IFDEF APPLPROF}
+  apt := HPQpc;
+{$ENDIF}
   Result := False;
   { P-27: tek geciste varlik denetimi + bos slot bulma.
     ONCEDEN: Contains (DirFind) + DirAdd = 2 hash aramasi.
@@ -1274,6 +1355,10 @@ begin
   Inc(FCount);
   PageMapAdd(L.PageNo, Key);
   Result := True;
+{$IFDEF APPLPROF}
+  HPIns := HPIns + (HPQpc - apt);
+  Inc(HPN);
+{$ENDIF}
 end;
 
 function TVdbHeap.Update(Key: QWord; const Value: TBytes): Boolean;

@@ -396,6 +396,13 @@ type
     { Sayfayi okur ve pinler. Basarisizsa False (sayfa yok / CRC bozuk). }
     function GetPage(PageNo: LongWord; out P: PVdbPage): Boolean;
 
+    { P-73: cerceve INDEKSIyle GetPage/Release — ardarda ayni sayfaya
+      yazan yollar (heap PlaceCellKV) satir basina IKINCI FindFrame
+      hash aramasini atlar. }
+    function GetPageIdx(PageNo: LongWord; out P: PVdbPage;
+      out Idx: Integer): Boolean;
+    procedure ReleaseIdx(Idx: Integer; Dirty: Boolean = False);
+
     { Sayfayi CRC/yapi denetimi YAPMADAN okur ve pinler. Yalnizca sayfa
       tipini kesfetmek icin (freelist trunk sayfalari VDbPage formati
       kullanmaz) ve PageInit oncesi kullanilir. Cagiran, icerigi
@@ -2233,6 +2240,60 @@ end;
 function TVDbPageStore.GetPage(PageNo: LongWord; out P: PVdbPage): Boolean;
 begin
   Result := GetPageInternal(PageNo, True, P);
+end;
+
+function TVDbPageStore.GetPageIdx(PageNo: LongWord; out P: PVdbPage;
+  out Idx: Integer): Boolean;
+var
+  e: string;
+begin
+  { GetPageInternal ile ayni akis; cerceve indeksi disari cikarilir.
+    (GetPageInternal'e out Idx eklense iki cagirici daha etkilenirdi;
+    burada bilincli kopya — sicak yol icin ucuz tutuldu.) }
+  Result := False;
+  P := nil;
+  Idx := -1;
+  if FStream = nil then
+    raise EVdbPageStore.Create('depo acik degil');
+  if (PageNo = 0) or (PageNo >= FPageCount) then Exit;
+  Idx := FindFrame(PageNo);
+  if Idx < 0 then
+  begin
+    Idx := LoadFrame(PageNo);
+    if not PageVerify(@FFrames[Idx].Data, e) then
+    begin
+      HashDel(PageNo);
+      FFrames[Idx].PageNo := 0;
+      FFrames[Idx].Pins := 0;
+      raise EVdbPageStore.Create(Format('sayfa %d bozuk: %s', [PageNo, e]));
+    end;
+  end;
+  Inc(FFrames[Idx].Pins);
+  FFrames[Idx].Ref := True;
+  P := @FFrames[Idx].Data;
+  Result := True;
+end;
+
+procedure TVDbPageStore.ReleaseIdx(Idx: Integer; Dirty: Boolean);
+begin
+  { Release ile ayni govde; FindFrame atlanir (cagiran indeksi bilir). }
+  if (Idx < 0) or (Idx >= FPoolPages) then
+    raise EVdbPageStore.Create(Format('ReleaseIdx: gecersiz cerceve %d', [Idx]));
+  if FFrames[Idx].Pins <= 0 then
+    raise EVdbPageStore.Create(Format('ReleaseIdx: cerceve %d pinli degil', [Idx]));
+  if Dirty then
+  begin
+    FFrames[Idx].Dirty := True;
+    if FFrames[Idx].TxnMark <> FTxnId then
+    begin
+      FFrames[Idx].TxnMark := FTxnId;
+      if FTxnDirtyCount >= Length(FTxnDirty) then
+        SetLength(FTxnDirty, FTxnDirtyCount * 2 + 8);
+      FTxnDirty[FTxnDirtyCount] := Idx;
+      Inc(FTxnDirtyCount);
+    end;
+  end;
+  Dec(FFrames[Idx].Pins);
 end;
 
 function TVDbPageStore.GetRawPage(PageNo: LongWord; out P: PVdbPage): Boolean;
