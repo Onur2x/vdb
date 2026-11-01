@@ -314,6 +314,14 @@ type
         FEngCs altindayiz ve MergeTagDeltas hemen ardindan geliyordu —
         satir basina iki ek sozluk islemi bosa gidiyordu. }
       FInApply: Boolean;
+      { P-69: apply sirasinda etiket KOSUCUSU. Toplu INSERT'te ardisik
+        satirlar ayni etiketi tasir; satir basina iki sozluk islemi
+        (TryGetValue + AddOrSetValue) yerine kosucu sayaci birikir,
+        FlushTagRun grubu bitince BIR kez yazilir. Etiket -1..65535
+        araliginda olabildiginden gecerlilik ayri bayrakta. }
+      FApplyTagRun: Integer;
+      FApplyTagRunCnt: Int64;
+      FApplyTagRunOn: Boolean;
       { Sayac kuruldu mu? False ise tutulan harita guvenilmez; ilk COUNT
         isteginde tam taramayla kurulur. }
       FTagCountsValid: Boolean;
@@ -413,6 +421,8 @@ type
     { v3.1: etiket sayaci yardimcilari. }
     function TagOf(Data: PByte; Len: Integer): Integer;
     procedure TagAdd(Tag: Integer; Delta: Int64);
+    { P-69: etiket kosucusunu FTagCounts'a isler (bir sozluk islemi). }
+    procedure FlushTagRun;
     procedure TagBuildCb(Key: QWord; Data: PByte; Len: Integer);
     procedure RebuildTagCounts;
     function LoadTagCountsFromIdx: Boolean;
@@ -2360,10 +2370,43 @@ begin
     BatchTagDelta.AddOrSetValue(Tag, cur + Delta);
     Exit;
   end;
+  if FInApply then
+  begin
+    { P-69: ayni etiket ust uste gelirse sozluge HIC dokunulmaz —
+      kosucu sayacinda birikir. Farkli etiket onceki kosucuyu bosaltir
+      (iki sozluk islemi; eski yolla ayni). FlushTagRun apply sonunda
+      cagrilir (CommitBatch'in finally blogu). }
+    if FApplyTagRunOn and (Tag = FApplyTagRun) then
+    begin
+      FApplyTagRunCnt := FApplyTagRunCnt + Delta;
+      Exit;
+    end;
+    FlushTagRun;
+    FApplyTagRun := Tag;
+    FApplyTagRunCnt := Delta;
+    FApplyTagRunOn := True;
+    Exit;
+  end;
   if not FTagCounts.TryGetValue(Tag, cur) then cur := 0;
   cur := cur + Delta;
   if cur <= 0 then FTagCounts.Remove(Tag)
   else FTagCounts.AddOrSetValue(Tag, cur);
+end;
+
+procedure TVdbBackendV3.FlushTagRun;
+var
+  cur: Int64;
+begin
+  if not FApplyTagRunOn then Exit;
+  FApplyTagRunOn := False;
+  { Sayac gecersizse TagAdd kosucuyu doldurmamistir; temiz durum. }
+  if not FTagCountsValid then Exit;
+  if not FTagCounts.TryGetValue(FApplyTagRun, cur) then cur := 0;
+  cur := cur + FApplyTagRunCnt;
+  if cur <= 0 then FTagCounts.Remove(FApplyTagRun)
+  else FTagCounts.AddOrSetValue(FApplyTagRun, cur);
+  FApplyTagRun := 0;
+  FApplyTagRunCnt := 0;
 end;
 
 procedure TVdbBackendV3.TagBuildCb(Key: QWord; Data: PByte; Len: Integer);
@@ -2610,6 +2653,9 @@ begin
       ApplyBatch;
     finally
       FInApply := False;
+      { P-69: etiket kosucusunu sayaca isle — hata yolunda da: motora
+        yazilan satirlar icin sayac tutarli kalsin. }
+      FlushTagRun;
     end;
     { v3.1: parti ici etiket degisimleri simdi sayaca islenir. }
     MergeTagDeltas;
