@@ -75,6 +75,54 @@ type
     function MaxDepth: Integer;
   end;
 
+  { P-70: yazma kumesi icin anahtar -> indeks haritasi. FPC TDictionary
+    her Add'de yigindan dugum ayirir; toplu INSERT'te satir basina
+    TryGetValue + Add icin olculen ~0,156 us. Bu tablo DUZ acik-sondalama:
+    paralel diziler, bellek ayirma yalnizca buyume aninda, sondalama
+    kumesi dizide yandas (VDbPageStore hash tablosu ile ayni desen).
+    Silme geriye-kaydirmali (VDbPageStore.HashDel ile ayni algoritma). }
+  TVdbKvIdxPair = record
+    Key: QWord;
+    Value: Integer;
+  end;
+
+  TVdbKvIdxMap = class;
+
+  TVdbKvIdxEnum = class
+  private
+    FMap: TVdbKvIdxMap;
+    FPos: Integer;
+    FCurrent: TVdbKvIdxPair;
+  public
+    constructor Create(AMap: TVdbKvIdxMap);
+    function MoveNext: Boolean;
+    property Current: TVdbKvIdxPair read FCurrent;
+  end;
+
+  TVdbKvIdxMap = class
+  private
+    FKeys: array of QWord;
+    FVals: array of Integer;
+    FUsed: array of Byte;   // 0 = bos, 1 = dolu
+    FCap: Integer;          // kapasite (2'nin kuvveti; 0 = tablo yok)
+    FCount: Integer;
+    function EnumNext(var Pos: Integer; out Key: QWord; out Val: Integer): Boolean;
+    procedure PutFree(Key: QWord; Val: Integer);
+    procedure Grow;
+  public
+    function TryGetValue(Key: QWord; out Value: Integer): Boolean;
+    function ContainsKey(Key: QWord): Boolean;
+    { Add: anahtar varsa uzerine yazar (cagiranlar miss'ten sonra ekler;
+      TDictionary.Add'in cift-anahtar hatasi davranisi hic kullanilmiyor). }
+    procedure Add(Key: QWord; Value: Integer);
+    procedure AddOrSetValue(Key: QWord; Value: Integer);
+    procedure Remove(Key: QWord);
+    procedure Clear;
+    function Count: Integer;
+    function Capacity: Integer;
+    function GetEnumerator: TVdbKvIdxEnum;
+  end;
+
   TVdbBackendV3 = class(TInterfacedObject, IVDbBackend)
   private
     type
@@ -153,8 +201,9 @@ type
         Session: Cardinal;
         { P-38: Map yalnizca anahtar -> Recs indeksi saklar (4 bayt/giris).
           ONCEDEN TBatchRec sakliyordu (16 bayt/giris + TBytes refcount).
-          1M satirda sozluk 24MB -> 12MB; her giriste cache miss azalir. }
-        Map: TDictionary<QWord, Integer>;
+          1M satirda sozluk 24MB -> 12MB; her giriste cache miss azalir.
+          P-70: duz acik-sondalama tablo — dugum ayirmasi yok. }
+        Map: TVdbKvIdxMap;
         Order: TList<QWord>;
         { P-36: Order ile ES uzunluklu, indeks eslesmeli kayit listesi.
           ApplyBatch/SnapCapture döngüsü artik Map.TryGetValue yapmaz;
@@ -355,12 +404,12 @@ type
       { v3.24: yazma kumesi havuzu (bkz. FSetPool). }
       function AcquireSet(ASession: Cardinal): TWriteSet;
       procedure ReleaseSet(S: TWriteSet);
-      function GetBatchMap: TDictionary<QWord, Integer>;
+      function GetBatchMap: TVdbKvIdxMap;
       function GetBatchOrder: TList<QWord>;
       function GetBatchTagDelta: TDictionary<Integer, Int64>;
       function GetSavepoints: TList<TSavepointRec>;
       function GetBatchOpen: Boolean;
-      property BatchMap: TDictionary<QWord, Integer> read GetBatchMap;
+      property BatchMap: TVdbKvIdxMap read GetBatchMap;
       property BatchOrder: TList<QWord> read GetBatchOrder;
       property BatchTagDelta: TDictionary<Integer, Int64> read GetBatchTagDelta;
       property Savepoints: TList<TSavepointRec> read GetSavepoints;
@@ -1085,13 +1134,203 @@ begin
   inherited Destroy;
 end;
 
+{ ------------------------------------------- P-70: duz anahtar->indeks haritasi }
+
+{ Anahtarlar FNV ciktisidir ama dagilimi garanti degil; splitmix64
+  sonlandiricisiyla karistirip dusuk bitlere iniyoruz. }
+function KvMix64(k: QWord): QWord;
+begin
+  k := k xor (k shr 30);
+  k := k * QWord($BF58476D1CE4E5B9);
+  k := k xor (k shr 27);
+  k := k * QWord($94D049BB133111EB);
+  Result := k xor (k shr 31);
+end;
+
+constructor TVdbKvIdxEnum.Create(AMap: TVdbKvIdxMap);
+begin
+  inherited Create;
+  FMap := AMap;
+  FPos := -1;
+end;
+
+function TVdbKvIdxEnum.MoveNext: Boolean;
+begin
+  Result := False;
+  if FMap = nil then Exit;
+  Result := FMap.EnumNext(FPos, FCurrent.Key, FCurrent.Value);
+end;
+
+function TVdbKvIdxMap.EnumNext(var Pos: Integer; out Key: QWord;
+  out Val: Integer): Boolean;
+begin
+  Result := False;
+  Inc(Pos);
+  while Pos < FCap do
+    if FUsed[Pos] <> 0 then
+    begin
+      Key := FKeys[Pos];
+      Val := FVals[Pos];
+      Exit(True);
+    end
+    else
+      Inc(Pos);
+end;
+
+procedure TVdbKvIdxMap.PutFree(Key: QWord; Val: Integer);
+var
+  h: LongWord;
+begin
+  h := LongWord(KvMix64(Key)) and LongWord(FCap - 1);
+  while FUsed[h] <> 0 do
+    h := (h + 1) and LongWord(FCap - 1);
+  FKeys[h] := Key;
+  FVals[h] := Val;
+  FUsed[h] := 1;
+end;
+
+procedure TVdbKvIdxMap.Grow;
+var
+  ncap, i: Integer;
+  oldKeys: array of QWord;
+  oldVals: array of Integer;
+  oldUsed: array of Byte;
+begin
+  ncap := FCap * 2;
+  if ncap = 0 then ncap := 256;
+  oldKeys := FKeys;
+  oldVals := FVals;
+  oldUsed := FUsed;
+  FKeys := nil;
+  FVals := nil;
+  FUsed := nil;
+  FCap := ncap;
+  SetLength(FKeys, ncap);
+  SetLength(FVals, ncap);
+  SetLength(FUsed, ncap);
+  FCount := 0;
+  for i := 0 to High(oldUsed) do
+    if oldUsed[i] <> 0 then
+    begin
+      PutFree(oldKeys[i], oldVals[i]);
+      Inc(FCount);
+    end;
+end;
+
+function TVdbKvIdxMap.TryGetValue(Key: QWord; out Value: Integer): Boolean;
+var
+  h: LongWord;
+begin
+  Result := False;
+  if FCap = 0 then Exit;
+  h := LongWord(KvMix64(Key)) and LongWord(FCap - 1);
+  while FUsed[h] <> 0 do
+  begin
+    if FKeys[h] = Key then
+    begin
+      Value := FVals[h];
+      Exit(True);
+    end;
+    h := (h + 1) and LongWord(FCap - 1);
+  end;
+end;
+
+function TVdbKvIdxMap.ContainsKey(Key: QWord): Boolean;
+var
+  dummy: Integer;
+begin
+  Result := TryGetValue(Key, dummy);
+end;
+
+procedure TVdbKvIdxMap.Add(Key: QWord; Value: Integer);
+var
+  h: LongWord;
+begin
+  if (FCap = 0) or (FCount * 4 >= FCap * 3) then
+    Grow;
+  h := LongWord(KvMix64(Key)) and LongWord(FCap - 1);
+  while FUsed[h] <> 0 do
+  begin
+    if FKeys[h] = Key then
+    begin
+      FVals[h] := Value;   { cagiran miss'ten sonra ekler; savunmaci uste yazma }
+      Exit;
+    end;
+    h := (h + 1) and LongWord(FCap - 1);
+  end;
+  FKeys[h] := Key;
+  FVals[h] := Value;
+  FUsed[h] := 1;
+  Inc(FCount);
+end;
+
+procedure TVdbKvIdxMap.AddOrSetValue(Key: QWord; Value: Integer);
+begin
+  Add(Key, Value);
+end;
+
+procedure TVdbKvIdxMap.Remove(Key: QWord);
+var
+  h, j: LongWord;
+  k: QWord;
+  v: Integer;
+begin
+  if FCap = 0 then Exit;
+  h := LongWord(KvMix64(Key)) and LongWord(FCap - 1);
+  while FUsed[h] <> 0 do
+  begin
+    if FKeys[h] = Key then
+    begin
+      FUsed[h] := 0;
+      Dec(FCount);
+      { Dogrusal sondalamada kume butunlugu: bosalan slottan sonraki
+        dolu girisler geriden tasinir (VDbPageStore.HashDel ile ayni). }
+      j := (h + 1) and LongWord(FCap - 1);
+      while FUsed[j] <> 0 do
+      begin
+        k := FKeys[j];
+        v := FVals[j];
+        FUsed[j] := 0;
+        Dec(FCount);
+        PutFree(k, v);
+        Inc(FCount);
+        j := (j + 1) and LongWord(FCap - 1);
+      end;
+      Exit;
+    end;
+    h := (h + 1) and LongWord(FCap - 1);
+  end;
+end;
+
+procedure TVdbKvIdxMap.Clear;
+begin
+  if FCount = 0 then Exit;
+  FillChar(FUsed[0], FCap, 0);
+  FCount := 0;
+end;
+
+function TVdbKvIdxMap.Count: Integer;
+begin
+  Result := FCount;
+end;
+
+function TVdbKvIdxMap.Capacity: Integer;
+begin
+  Result := FCap;
+end;
+
+function TVdbKvIdxMap.GetEnumerator: TVdbKvIdxEnum;
+begin
+  Result := TVdbKvIdxEnum.Create(Self);
+end;
+
 { ------------------------------------------------ v3.4: oturum yazma kumesi }
 
 constructor TVdbBackendV3.TWriteSet.Create(ASession: Cardinal);
 begin
   inherited Create;
   Session := ASession;
-  Map := TDictionary<QWord, Integer>.Create;
+  Map := TVdbKvIdxMap.Create;
   Order := TList<QWord>.Create;
   Recs := TList<TBatchRec>.Create;
   ValBuf := nil;
@@ -1201,7 +1440,7 @@ begin
   end;
 end;
 
-function TVdbBackendV3.GetBatchMap: TDictionary<QWord, Integer>;
+function TVdbBackendV3.GetBatchMap: TVdbKvIdxMap;
 var
   s: TWriteSet;
 begin
@@ -1269,7 +1508,7 @@ end;
 
 function TVdbBackendV3.EffectiveCount: Integer;
 var
-  pair: TPair<QWord, Integer>;
+  pair: TVdbKvIdxPair;
   spair: TPair<QWord, TSnapRec>;
   s: TWriteSet;
   sp: Boolean;

@@ -498,7 +498,7 @@ end;
 
 procedure TVdbPageWal.AppendBuffer(PageNo: LongWord; P: PVdbPage);
 var
-  i, off, payLen: Integer;
+  i, off, payLen, ncap: Integer;
   plain, env: TBytes;
 begin
   { v4: yuk dogrudan FOutBuf'a yazilir; ara TPending kopyasi yok.
@@ -513,13 +513,25 @@ begin
   begin
     i := FBufferCount;
     Inc(FBufferCount);
+    { P-70: geometrik buyume — onceden her cercevede +64 giris; 12K
+      cercevelik committe 12K SetLength, her biri diziyi bastan kopyalar. }
     if FBufferCount > Length(FFramePages) then
-      SetLength(FFramePages, FBufferCount + 64);
+      SetLength(FFramePages, FBufferCount * 2 + 64);
     FFramePages[i] := PageNo;
   end;
   off := i * (VDB_WAL_REC_HDR + payLen) + VDB_WAL_REC_HDR;
+  { P-70: GEOMETRIK buyume — onceden her cercevede tampon yalnizca BIR
+    cerceve kadar buyutuluyordu; yerinde genisleme basarisiz olursa her
+    SetLength tum tamponu bastan kopyalar (12K cerceve = kuadratik; 1M
+    satirlik committe olculen 1,6 s). Kapasite artik ikiye katlanir. }
   if Length(FOutBuf) < off + payLen + VDB_WAL_REC_HDR then
-    SetLength(FOutBuf, off + payLen + VDB_WAL_REC_HDR + 8192);
+  begin
+    ncap := Length(FOutBuf) * 2;
+    if ncap < off + payLen + VDB_WAL_REC_HDR then
+      ncap := off + payLen + VDB_WAL_REC_HDR;
+    Inc(ncap, 8192);
+    SetLength(FOutBuf, ncap);
+  end;
   if FWalEncrypted then
   begin
     SetLength(plain, VDB_PAGE_SIZE);
