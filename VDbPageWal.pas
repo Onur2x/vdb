@@ -86,6 +86,13 @@ type
         Yalniz sayfa numaralari tutulur (dedup + baslik icin). }
       FFramePages: array of LongWord;
       FBufferCount: Integer;
+      { P-71: cerceve dedup haritasi. BufferedPageIndex onceden tamponu
+        DOGRUSAL taramaktaydi (12K cercevelik committe ~72M karsilastirma,
+        olculen ~0,05-0,1 us/satir). Acik-sondalama; anahtar sayfaNo+1
+        (VDB_HDR_PAGE=0 gecerli bir sayfa oldugundan 0 = bos yuva). }
+      FBufHash: array of LongWord;
+      FBufHashIdx: array of Integer;
+      FBufHashCap: Integer;   // 2'nin kuvveti; 0 = tablo yok
       { v3.24: commit sirasinda tum kayitlar (cerceveler + commit kaydi) TEK
         WriteFile ile yazilir; tampon commit'ler arasinda yeniden kullanilir
         (boyu yalniz buyur). }
@@ -151,6 +158,10 @@ type
     procedure ReadHeader;
     procedure AppendBuffer(PageNo: LongWord; P: PVdbPage);
     function BufferedPageIndex(PageNo: LongWord): Integer;
+    { P-71: dedup haritasi islemleri. }
+    procedure BufHashClear;
+    procedure BufHashRawPut(PageNo: LongWord; Idx: Integer);
+    procedure BufHashGrow;
   public
     constructor Create(const APath: string);
     destructor Destroy; override;
@@ -489,11 +500,58 @@ end;
 
 function TVdbPageWal.BufferedPageIndex(PageNo: LongWord): Integer;
 var
-  i: Integer;
+  h: LongWord;
 begin
-  for i := 0 to FBufferCount - 1 do
-    if FFramePages[i] = PageNo then Exit(i);
+  { P-71: dogrusal tarama yerine acik-sondalama (yukarida alan yorumu). }
   Result := -1;
+  if FBufHashCap = 0 then Exit;
+  h := (PageNo * LongWord(2654435761)) and LongWord(FBufHashCap - 1);
+  while FBufHash[h] <> 0 do
+  begin
+    if FBufHash[h] = PageNo + 1 then
+      Exit(FBufHashIdx[h]);
+    h := (h + 1) and LongWord(FBufHashCap - 1);
+  end;
+end;
+
+procedure TVdbPageWal.BufHashRawPut(PageNo: LongWord; Idx: Integer);
+var
+  h: LongWord;
+begin
+  h := (PageNo * LongWord(2654435761)) and LongWord(FBufHashCap - 1);
+  while FBufHash[h] <> 0 do
+    h := (h + 1) and LongWord(FBufHashCap - 1);
+  FBufHash[h] := PageNo + 1;
+  FBufHashIdx[h] := Idx;
+end;
+
+procedure TVdbPageWal.BufHashGrow;
+var
+  ncap, i: Integer;
+begin
+  ncap := FBufHashCap * 2;
+  if ncap = 0 then ncap := 1024;
+  { DIKKAT: SetLength var olan girisleri KORUR (yalnizca kuyrugu sifirlar).
+    Eski girisler eski maskeyle yerlestirilmisti; tablo once TAMAMEN
+    bosaltilip yeni maskeyle yeniden kurulmazsa her buyumede bayat
+    girisler ikiye katlanir, tablo dolar ve sondalama sonsuz donguye girer. }
+  SetLength(FBufHash, ncap);
+  SetLength(FBufHashIdx, ncap);
+  FillChar(FBufHash[0], ncap * 4, 0);
+  FBufHashCap := ncap;
+  { Yeniden yerlestirme: en yeni cerceve (FFramePages[FBufferCount-1])
+    AppendBuffer'da RawPut ile eklenecegi icin burada atlanir — yoksa
+    iki kez girilir. }
+  for i := 0 to FBufferCount - 2 do
+    BufHashRawPut(FFramePages[i], i);
+end;
+
+procedure TVdbPageWal.BufHashClear;
+begin
+  { Cagiran FBufferCount'i sifirlarken cagirir; sira bagimliligi olmasin
+    diye kosulsuz temizlenir (32K yuvali tabloda ~128 KB FillChar). }
+  if FBufHashCap > 0 then
+    FillChar(FBufHash[0], FBufHashCap * 4, 0);
 end;
 
 procedure TVdbPageWal.AppendBuffer(PageNo: LongWord; P: PVdbPage);
@@ -518,6 +576,10 @@ begin
     if FBufferCount > Length(FFramePages) then
       SetLength(FFramePages, FBufferCount * 2 + 64);
     FFramePages[i] := PageNo;
+    { P-71: dedup haritasina ekle (%75 dolulukta buyur). }
+    if (FBufHashCap = 0) or (FBufferCount * 4 >= FBufHashCap * 3) then
+      BufHashGrow;
+    BufHashRawPut(PageNo, i);
   end;
   off := i * (VDB_WAL_REC_HDR + payLen) + VDB_WAL_REC_HDR;
   { P-70: GEOMETRIK buyume — onceden her cercevede tampon yalnizca BIR
@@ -560,6 +622,7 @@ end;
 procedure TVdbPageWal.Rollback;
 begin
   FBufferCount := 0;
+  BufHashClear;   // P-71
 end;
 
 procedure TVdbPageWal.SyncDurable;
@@ -636,6 +699,7 @@ begin
   if DoSync then
     VDbFlushStream(FStream);
   FBufferCount := 0;
+  BufHashClear;   // P-71
   FHasContent := True;
   FWrittenLsn := LSN;
   Result := True;
@@ -875,6 +939,7 @@ begin
     cagrilari eski LSN ile karsilastirir. }
   FWrittenLsn := CheckpointLSN;
   FBufferCount := 0;
+  BufHashClear;   // P-71
   FStream.Size := VDB_PAGE_SIZE;
   FWrittenBytes := VDB_PAGE_SIZE;   // P-61
   WriteHeader;
