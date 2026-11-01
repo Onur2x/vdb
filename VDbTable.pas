@@ -1049,10 +1049,81 @@ function VdbSortParallelEnabled: Boolean;
 procedure VdbSetWriteSession(AId: Cardinal);
 function VdbGetWriteSession: Cardinal;
 
+{$IFDEF APPLPROF}
+  { P-74 arastirma: TVTableDb.Insert satir yolu icin RDTSC alt zamanlari
+    (QPC burada fazla pahali — dongu toplami ~800 ns). p67diag -dAPPLPROF
+    ile okur; normal surum hicbir sey bilmez. }
+  procedure TableProfReset;
+  procedure TableProfUs(out TblUs, MapUs, ChkUs, WrUs, EncUs: Double;
+    out N: Int64);
+{$ENDIF}
+
 implementation
 
 uses
   VDbSync, VDbParallel;
+
+{$IFDEF APPLPROF}
+{ Windows birimi KASITLI cekilmez (SysUtils golgeleme riski). }
+procedure QpcCounter(var v: Int64);
+  stdcall; external 'kernel32' name 'QueryPerformanceCounter';
+function QpcFrequency(var v: Int64): LongBool;
+  stdcall; external 'kernel32' name 'QueryPerformanceFrequency';
+
+function TTsc: Int64;
+{ RDTSC — dongu sayaci. i386: sonuc EDX:EAX'da, Int64 donus konvansiyonu. }
+asm
+  rdtsc
+end;
+
+var
+  TPTbl: Int64 = 0;   // Insert toplami (giris -> cikis)
+  TPMap: Int64 = 0;   // kolon esleme + vals doldurma
+  TPChk: Int64 = 0;   // PK hazirligi + kisit denetimleri + anahtar hash
+  TPWr: Int64 = 0;    // EncodeRowInto + PutPtr
+  TPEnc: Int64 = 0;   // EncodeRowInto (ayri; PutPtr = TPWr - TPEnc)
+  TPN: Int64 = 0;
+  TPFreqTsc: Double = 0;   // dongu/us (kalibrasyon)
+
+procedure CalibTsc;
+var
+  c0, c1, t0, t1, f: Int64;
+begin
+  // 10 ms orneklem: QPC karsisindan dongu frekansi.
+  f := 0;
+  QpcFrequency(f);
+  QpcCounter(t0);
+  c0 := TTsc;
+  repeat
+    QpcCounter(t1);
+  until (t1 - t0) >= f div 100;
+  c1 := TTsc;
+  TPFreqTsc := (c1 - c0) / 10000;   // dongu / us (orneklem 10 ms = 10000 us)
+end;
+
+procedure TableProfReset;
+begin
+  TPTbl := 0;
+  TPMap := 0;
+  TPChk := 0;
+  TPWr := 0;
+  TPEnc := 0;
+  TPN := 0;
+end;
+
+procedure TableProfUs(out TblUs, MapUs, ChkUs, WrUs, EncUs: Double;
+  out N: Int64);
+begin
+  if TPFreqTsc = 0 then
+    CalibTsc;
+  TblUs := TPTbl / TPFreqTsc;
+  MapUs := TPMap / TPFreqTsc;
+  ChkUs := TPChk / TPFreqTsc;
+  WrUs := TPWr / TPFreqTsc;
+  EncUs := TPEnc / TPFreqTsc;
+  N := TPN;
+end;
+{$ENDIF}
 
 procedure VdbSetWriteSession(AId: Cardinal);
 begin
@@ -9624,6 +9695,9 @@ var
   n: Integer;      // P-65: EncodeRowInto yazim uzunlugu
   exTid: Word;
   inBatch: Boolean;
+{$IFDEF APPLPROF}
+  tp0, tp1, tp2: Int64;
+{$ENDIF}
 begin
   inBatch := FKvB.InBatch;
   { P-55: fast path zaten tablo tanimini cekmis — GetTable derin kopyasini
@@ -9718,6 +9792,10 @@ begin
   if Length(FBatchVals) <> Length(tp^.Cols) then
     SetLength(FBatchVals, Length(tp^.Cols));
   vals := FBatchVals;
+{$IFDEF APPLPROF}
+  tp0 := TTsc;
+  tp1 := tp0;
+{$ENDIF}
 
   if FBatchColMapValid and (Length(FBatchColMap) = Length(ColNames)) and
      (FColMapTable = tp^.Name) then
@@ -9755,6 +9833,11 @@ begin
       if not provided[i] and tp^.Cols[i].HasDef then
         vals[i] := tp^.Cols[i].Def;
   end;
+{$IFDEF APPLPROF}
+  tp2 := TTsc;
+  TPMap := TPMap + (tp2 - tp1);
+  tp1 := tp2;
+{$ENDIF}
   // M10: IDENTITY kolonlarini doldur (GENERATED'den once; generated
   // ifadeler identity degerine bagli olabilir).
   // P-67: tabloda boyle bir kolon yoksa (ezici cogunluk) dongu tamamen atlanir.
@@ -9825,15 +9908,31 @@ begin
     else
       raise EVDbException.CreateFmt(ecHashCollision, 'VDb: hash carpismasi (%s, %s)', [tp^.Name, pk]);
   end;
+{$IFDEF APPLPROF}
+  tp2 := TTsc;
+  TPChk := TPChk + (tp2 - tp1);
+  tp1 := tp2;
+{$ENDIF}
   // P-65: EncodeRowInto + PutPtr — FEncBuf yeniden kullanilir, satir
   // basina TBytes alloc+shrink gider. PutPtr degeri cagri aninda kopyalar.
   n := EncodeRowInto(FEncBuf, tp^.TableId, pk, tp^, vals);
+{$IFDEF APPLPROF}
+  tp2 := TTsc;
+  TPEnc := TPEnc + (tp2 - tp1);
+  tp1 := tp2;
+{$ENDIF}
   FKvB.PutPtr(key, Pointer(FEncBuf), n);
   // P-32/P-65: indeks islemi yoksa IdxAddRow tamamen atlanir.
   // P-65: non-batch'te de tek girdili onbellek — (not inBatch) kosulu
   // yuzunden cagri HER SATIRDA yapiliyordu.
   if HasIdxWork(tp^) then
     IdxAddRow(tp^, vals, pk, -1);
+{$IFDEF APPLPROF}
+  tp2 := TTsc;
+  TPWr := TPWr + (tp2 - tp1);
+  TPTbl := TPTbl + (tp2 - tp0);
+  Inc(TPN);
+{$ENDIF}
 end;
 
 function TVTableDb.Delete(const Table: string; const Pk: string): Boolean;
