@@ -48,42 +48,27 @@ jobs:
         timeout-minutes: 12
         shell: pwsh
         run: |
-          & $env:LAZBUILD -B tests/sql/sqltest.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B tests/gates/pagechk.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B tests/gates/storechk.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B tests/gates/heapchk.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B tests/gates/crashtest.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B tests/gates/idxchk.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B tests/gates/backendchk.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B tests/gates/v3sqlchk.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B tests/gates/migchk.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B vdbmig.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B tests/gates/factorychk.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B tests/gates/logchk.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B tests/gates/pitrchk.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B tests/gates/btreechk.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B tests/gates/replchk.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B tests/gates/lockchk.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B tests/gates/snapchk.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:LAZBUILD -B tests/gates/prochk.lpi
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # P-80: dongu + ::error ek aciklamasi — Actions API'si kimlik
+          # dogrulama istediginden dusen projenin ciktisi ancak boyle
+          # gorunur olur (genel repolarda check-runs API'sinden okunur).
+          $projs = @(
+            'tests/sql/sqltest', 'tests/gates/pagechk', 'tests/gates/storechk',
+            'tests/gates/heapchk', 'tests/gates/crashtest', 'tests/gates/idxchk',
+            'tests/gates/backendchk', 'tests/gates/v3sqlchk', 'tests/gates/migchk',
+            'vdbmig', 'tests/gates/factorychk', 'tests/gates/logchk',
+            'tests/gates/pitrchk', 'tests/gates/btreechk', 'tests/gates/replchk',
+            'tests/gates/lockchk', 'tests/gates/snapchk', 'tests/gates/prochk')
+          foreach ($p in $projs) {
+            $o = & $env:LAZBUILD -B "$p.lpi" 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host $o
+              $tail = ($o -split "`r?`n" | Where-Object {
+                $_ -match 'Fatal|Error' } | Select-Object -Last 3) -join ' | '
+              $tail = $tail -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+              Write-Host "::error title=$p::$tail"
+              exit 1
+            }
+          }
 
       - name: Sayfa deposu kapisi (storechk)
         shell: pwsh
