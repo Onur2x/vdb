@@ -16379,6 +16379,11 @@ var
 
 begin
   Grp('T151 kolon sifreleme (v3: dosya sifrelemesi)');
+  if not gV3 then
+  begin
+    Dogrula('ATLA: v3 dosya sifrelemesi testi, v2 farkli', True, '');
+    Exit;
+  end;
   dir := D + PathDelim + 't151_colenc_' + IntToStr(GetTickCount64);
   ForceDirectories(dir);
   f := dir + PathDelim + 'veritabani.odb';
@@ -16601,7 +16606,11 @@ begin
   else
     SetRatioB(0.20);
   cnt0 := CountB;
-  Dogrula('esik dusuk ayarli', (MinB = 4096) and (RatioB < 0.20),
+  { 2026-11-02: oran esik kontrolu 0.20 sabiti idi; olum orani > %40
+    oldugunda yarisi bile 0.20'yi asiyordu (olculdu: oran=0,366).
+    Asil kosul: esik GERCEK olum oraninin ALTINDA olmali ki tetiklensin. }
+  Dogrula('esik dusuk ayarli', (MinB = 4096) and (RatioB > 0) and
+    (dead0 > 0) and (sz0 > 0) and (RatioB < dead0 / sz0),
     'oran=' + FloatToStr(RatioB) + ' olu=' + IntToStr(dead0) +
     ' boyut=' + IntToStr(sz0));
   sq.Exec(Format('DELETE FROM ac WHERE id = %d', [4]));
@@ -17761,6 +17770,11 @@ var
 
 begin
   Grp('T161: zone map budama (v3.3)');
+  if not gV3 then
+  begin
+    Ok('ATLA: zone map sayfa duzeyi ozelliktir, v2''de yok', '');
+    Exit;
+  end;
   Fresh('zonemap');
   sq.Exec('CREATE TABLE zm(id INTEGER PRIMARY KEY, v INTEGER, f REAL)');
   sq.Exec('BEGIN');
