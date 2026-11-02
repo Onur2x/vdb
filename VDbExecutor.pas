@@ -6656,6 +6656,8 @@ var
   ViewRes: TSqlResult;
   ViewTypes: TByteArray;
   i, t: Integer;
+  // v3.37: sol taraf daraltma icin gecici liste
+  leftPreds: TList<TSqlExprNode>;
 
   // Tek birlestirme adimi: birikmis sol (LR/LN/LT/Tabs) + sag tablo (JC).
   procedure MergeStep(var LR: TStrMatrix; var LN: TStrArray;
@@ -7649,6 +7651,230 @@ var
       end;
   end;
 
+  // v3.37: sol taraf daraltmasi — FROM tablosuna atif yapan tek tarafli
+  // predikatlarla NarrowRows. Guvenlik kurallari:
+  //   WHERE-sol: yalniz HICBIR join RIGHT/FULL degilse (sol NULL-uretilmez;
+  //   RIGHT/FULL NULL-sarmalama satirlari IS NULL gibi NULL-kabul eden
+  //   predikatlardan gecer, erken eleme yanlis sonuc uretir — bkz. v3.36).
+  //   ON-sol (join J): yalniz J INNER/RIGHT ise. LEFT/FULL sol satiri
+  //   NULL-sarmalama ile korur; erken eleme kaybettirir. Sonraki join'lerden
+  //   bagimsiz (adim bazli dogru: INNER/RIGHT zaten o satiri duser).
+  // NarrowRows her zaman UST KUME dondugu icin guvenlidir; ON/WHERE sonraki
+  // asamalarda yeniden dogrulanir.
+
+  // Tum join'ler INNER/LEFT mi? (hic RIGHT/FULL yoksa sol NULL-uretilmez)
+  function AllJoinsPreserveLeft: Boolean;
+  var
+    u: Integer;
+  begin
+    Result := True;
+    if Stmt.HasJoin and
+       ((Stmt.Join.JoinType = jtRight) or (Stmt.Join.JoinType = jtFull)) then
+    begin
+      Result := False;
+      Exit;
+    end;
+    if Stmt.MoreJoins = nil then Exit;
+    for u := 0 to Stmt.MoreJoins.Count - 1 do
+      if (Stmt.MoreJoins[u].JoinType = jtRight) or
+         (Stmt.MoreJoins[u].JoinType = jtFull) then
+      begin
+        Result := False;
+        Exit;
+      end;
+  end;
+
+  // Bir kolon adi herhangi bir join tablosunda geciyor mu?
+  // Bulunamazsa (CTE/tanimsiz) muhafazakar True doner -> push edilmez.
+  function ColInJoinTable(const nm: string): Boolean;
+  var
+    w, t2: Integer;
+    jd: TTableDef;
+    jn: TStrArray;
+    jtyp: TByteArray;
+    jr: TStrMatrix;
+  begin
+    Result := True;
+    if Stmt.HasJoin then
+    begin
+      if TryCte(Stmt.Join.Table, jn, jtyp, jr) then
+      begin
+        for w := 0 to High(jn) do
+          if VDbNorm(jn[w]) = nm then Exit;
+      end
+      else if FT.TryGetTableDef(Stmt.Join.Table, jd) then
+      begin
+        for w := 0 to High(jd.Cols) do
+          if VDbNorm(jd.Cols[w].Name) = nm then Exit;
+      end
+      else
+        Exit;
+    end;
+    if Stmt.MoreJoins <> nil then
+      for t2 := 0 to Stmt.MoreJoins.Count - 1 do
+      begin
+        if TryCte(Stmt.MoreJoins[t2].Table, jn, jtyp, jr) then
+        begin
+          for w := 0 to High(jn) do
+            if VDbNorm(jn[w]) = nm then Exit;
+        end
+        else if FT.TryGetTableDef(Stmt.MoreJoins[t2].Table, jd) then
+        begin
+          for w := 0 to High(jd.Cols) do
+            if VDbNorm(jd.Cols[w].Name) = nm then Exit;
+        end
+        else
+          Exit;
+      end;
+    Result := False;
+  end;
+
+  // Ifade yalniz FROM tablosuna mi atif yapiyor?
+  function RefsOnlyFrom(E: TSqlExprNode): Boolean;
+    function ColOk(C: TSqlColumnRefNode): Boolean;
+    var
+      w: Integer;
+      nm, fromEff: string;
+    begin
+      Result := False;
+      if C = nil then Exit;
+      nm := VDbNorm(C.ColumnName);
+      if C.TableQualifier <> '' then
+      begin
+        fromEff := Stmt.FromAlias;
+        if fromEff = '' then fromEff := Stmt.FromTable;
+        if not SameText(C.TableQualifier, fromEff) then Exit;
+        for w := 0 to High(td0.Cols) do
+          if VDbNorm(td0.Cols[w].Name) = nm then Exit(True);
+        Exit;
+      end;
+      // Niteliksiz: FROM'da olmali VE join tablolarinda OLMAMALI
+      for w := 0 to High(td0.Cols) do
+        if VDbNorm(td0.Cols[w].Name) = nm then
+        begin
+          if ColInJoinTable(nm) then Exit;
+          Exit(True);
+        end;
+    end;
+    function Walk(N: TSqlExprNode): Boolean;
+    var
+      B: TSqlBinaryOpNode;
+      k: Integer;
+    begin
+      Result := False;
+      if N = nil then Exit(True);
+      if N is TSqlLiteralNode then Exit(True);
+      if N is TSqlColumnRefNode then Exit(ColOk(TSqlColumnRefNode(N)));
+      if N is TSqlBinaryOpNode then
+      begin
+        B := TSqlBinaryOpNode(N);
+        Exit(Walk(B.Left) and Walk(B.Right));
+      end;
+      if N is TSqlUnaryOpNode then
+        Exit(Walk(TSqlUnaryOpNode(N).Operand));
+      if N is TSqlCastNode then
+        Exit(Walk(TSqlCastNode(N).Expr));
+      if N is TSqlCollateNode then
+        Exit(Walk(TSqlCollateNode(N).Inner));
+      if N is TSqlNullIfNode then
+        Exit(Walk(TSqlNullIfNode(N).Arg1) and Walk(TSqlNullIfNode(N).Arg2));
+      if N is TSqlBetweenNode then
+        Exit(Walk(TSqlBetweenNode(N).Expr) and
+             Walk(TSqlBetweenNode(N).LowBound) and
+             Walk(TSqlBetweenNode(N).HighBound));
+      if N is TSqlCoalesceNode then
+      begin
+        for k := 0 to TSqlCoalesceNode(N).Args.Count - 1 do
+          if not Walk(TSqlCoalesceNode(N).Args[k]) then Exit;
+        Exit(True);
+      end;
+      if N is TSqlInNode then
+      begin
+        if TSqlInNode(N).SubSelect <> nil then Exit;
+        if not Walk(TSqlInNode(N).Expr) then Exit;
+        for k := 0 to TSqlInNode(N).List.Count - 1 do
+          if not Walk(TSqlInNode(N).List[k]) then Exit;
+        Exit(True);
+      end;
+      if N is TSqlCaseNode then
+      begin
+        if not Walk(TSqlCaseNode(N).Operand) then Exit;
+        for k := 0 to TSqlCaseNode(N).Whens.Count - 1 do
+        begin
+          if not Walk(TSqlCaseNode(N).Whens[k].Cond) then Exit;
+          if not Walk(TSqlCaseNode(N).Whens[k].Value) then Exit;
+        end;
+        Exit(Walk(TSqlCaseNode(N).ElseExpr));
+      end;
+      if N is TSqlFuncCallNode then
+      begin
+        if not Walk(TSqlFuncCallNode(N).Arg) then Exit;
+        if not Walk(TSqlFuncCallNode(N).Filter) then Exit;
+        if TSqlFuncCallNode(N).Args <> nil then
+          for k := 0 to TSqlFuncCallNode(N).Args.Count - 1 do
+            if not Walk(TSqlFuncCallNode(N).Args[k]) then Exit;
+        Exit(True);
+      end;
+      // Bilinmeyen/agir dugum (window, agg...): muhafazakar
+      Result := False;
+    end;
+  begin
+    Result := Walk(E);
+  end;
+
+  // AND agacindaki FROM'a atif yapan alt kosullari topla.
+  procedure CollectFromConjuncts(N: TSqlExprNode; Preds: TList<TSqlExprNode>);
+  var
+    B: TSqlBinaryOpNode;
+  begin
+    if N = nil then Exit;
+    if N is TSqlBinaryOpNode then
+    begin
+      B := TSqlBinaryOpNode(N);
+      if B.Op = sboAnd then
+      begin
+        CollectFromConjuncts(B.Left, Preds);
+        CollectFromConjuncts(B.Right, Preds);
+        Exit;
+      end;
+    end;
+    if RefsOnlyFrom(N) then Preds.Add(N);
+  end;
+
+  // v3.37: NarrowRows ile sol taraf daraltma. Basariliysa True doner ve
+  // Pks/Rows daraltilmis gelir; basarisizsa tam tarama yapilmali.
+  function TryNarrowLeftSide(const Td: TTableDef;
+    const Cn: TStrArray; const Ct: TByteArray;
+    APreds: TList<TSqlExprNode>;
+    out Pks: TStrArray; out Rows: TStrMatrix): Boolean;
+  var
+    AndTree, Nn: TSqlExprNode;
+    B: TSqlBinaryOpNode;
+    i2: Integer;
+    IsExact: Boolean;
+  begin
+    Result := False;
+    SetLength(Pks, 0);
+    SetLength(Rows, 0);
+    if (APreds = nil) or (APreds.Count = 0) then Exit;
+    AndTree := APreds[0];
+    for i2 := 1 to APreds.Count - 1 do
+      AndTree := TSqlBinaryOpNode.Create(sboAnd, AndTree, APreds[i2]);
+    try
+      Result := NarrowRows(Td, AndTree, Cn, Ct, Pks, Rows, IsExact);
+    finally
+      Nn := AndTree;
+      while (Nn <> APreds[0]) and (Nn is TSqlBinaryOpNode) do
+      begin
+        B := TSqlBinaryOpNode(Nn);
+        Nn := B.Left;
+        B.Left := nil;
+        B.Right := nil;
+        B.Free;
+      end;
+    end;
+  end;
+
 begin
   // Adim 0: sol taraf (FROM tablo veya CTE) yuklenir, isimler nitelenir
 
@@ -7691,7 +7917,32 @@ begin
       SetLength(pks0, 0);
     end
     else
-      FT.ScanRows(Stmt.FromTable, pks0, LRows);
+    begin
+      // v3.37: sol taraf daraltmasi — FROM'a atif yapan tek tarafli
+      // predikatlarla NarrowRows. WHERE-sol yalniz hicbir join RIGHT/FULL
+      // degilse; ON-sol yalniz o join INNER/RIGHT ise toplanir.
+      leftPreds := TList<TSqlExprNode>.Create;
+      try
+        if (Stmt.WhereClause <> nil) and AllJoinsPreserveLeft then
+          CollectFromConjuncts(Stmt.WhereClause, leftPreds);
+        if Stmt.HasJoin and (Stmt.Join.OnCondition <> nil) and
+           ((Stmt.Join.JoinType = jtInner) or (Stmt.Join.JoinType = jtRight)) then
+          CollectFromConjuncts(Stmt.Join.OnCondition, leftPreds);
+        if Stmt.MoreJoins <> nil then
+          for t := 0 to Stmt.MoreJoins.Count - 1 do
+            if (Stmt.MoreJoins[t].OnCondition <> nil) and
+               ((Stmt.MoreJoins[t].JoinType = jtInner) or
+                (Stmt.MoreJoins[t].JoinType = jtRight)) then
+              CollectFromConjuncts(Stmt.MoreJoins[t].OnCondition, leftPreds);
+        if (leftPreds.Count > 0) and
+           TryNarrowLeftSide(td0, cn0, ct0, leftPreds, pks0, LRows) then
+          { daraltilmis }
+        else
+          FT.ScanRows(Stmt.FromTable, pks0, LRows);
+      finally
+        leftPreds.Free;
+      end;
+    end;
   end;
   SetLength(LNames, Length(cn0));
   SetLength(LTypes, Length(cn0));
