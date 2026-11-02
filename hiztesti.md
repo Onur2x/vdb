@@ -1436,3 +1436,60 @@ INNER/LEFT. Bunlar adım bazlı doğrudur (sonraki join'lerden bağımsız),
 ### 21.5 Kapılar (2026-11-03)
 
 SQL testleri: v3 **2885/0/33**, v2 **3287/0/0** — hepsi geçti.
+
+---
+
+## 22. v3.37 — Sol taraf daraltma (2026-11-03)
+
+### 22.1 Bulgu
+
+v3.35 yalnız **sağ taraf** taramasını `NarrowRows` ile daraltıyordu.
+FROM tablosuna atıf yapan tek taraflı predikatlar (WHERE-sol veya
+ON-sol) hâlâ `FT.ScanRows` ile tam taranıyordu.
+
+Ölçüm (`scanpushbench` S5): `SELECT COUNT(*) FROM b JOIN a ON a.k=b.k
+WHERE b.y > 99990` — büyük sol tablo (100k satır), seçici sol filtre →
+**406 ms** (v3.36'da).
+
+### 22.2 Kural (güvenlik kanıtı)
+
+Sol taraf daraltma yalnızca şu koşullarda güvenlidir:
+
+* **WHERE-sol:** hiçbir join RIGHT/FULL değilse (`AllJoinsPreserveLeft`).
+  Sebep: RIGHT/FULL sol sütunları NULL-sarmalayarak `IS NULL` gibi
+  NULL-kabul eden predikatların sonucunu değiştirir.
+* **ON-sol (join J):** yalnız J INNER/RIGHT ise. LEFT/FULL sol satırı
+  NULL-sarmalama ile korur; erken eleme kaybettirir. Sonraki join'lerden
+  **bağımsız** (adım bazlı doğru: INNER/RIGHT zaten o satırı düşürür).
+
+`NarrowRows` her zaman üst küme döndüğü için ON/WHERE sonraki aşamalarda
+yeniden doğrulanır (`JoinOnOk` / final WHERE). LATERAL özel durum
+gerektirmez (aynı kurallar geçerli).
+
+### 22.3 Uygulama
+
+`VDbExecutor.pas` → `ExecJoinScan` içinde yeni yardımcılar:
+
+* `AllJoinsPreserveLeft: Boolean` — tüm join'ler INNER/LEFT mi.
+* `ColInJoinTable(const nm: string): Boolean` — kolon adı join
+  tablolarında geçiyor mu (muhtemel çakışma kontrolü).
+* `RefsOnlyFrom(E: TSqlExprNode): Boolean` — ifade yalnız FROM tablosuna
+  atıf yapıyor mu. Nitelemeli ad `AliasEff` ile eşleşmeli; niteliksiz ad
+  hem td0'da olmalı hem join tablolarında geçmemeli.
+* `CollectFromConjuncts` — AND ağacını böl, uygun predikatları topla.
+* `TryNarrowLeftSide` — AND ağacı kur, `NarrowRows` çağır.
+
+Daraltma bloğu: WHERE-sol (`AllJoinsPreserveLeft`), ON-sol (INNER/RIGHT
+join'ler) predikatlarını toplar, `TryNarrowLeftSide` dener, başarısızsa
+`FT.ScanRows`'a düşer.
+
+### 22.4 Ölçüm (scanpushbench, 100k sağ / 100 sol)
+
+| Senaryo | v3.36 | v3.37 | Kazanç |
+|---|---:|---:|---|
+| S5: `b JOIN a WHERE b.y > 99990` (sol daraltma) | 406 ms | **0 ms** | **∞** |
+| S6: `b JOIN a WHERE b.y > 0` (geniş sol) | 438–453 ms | 484–516 ms | ~eşit |
+
+### 22.5 Kapılar (2026-11-03)
+
+wherenull **7/7**, chainnull **6/6**, sqltest v3 **2885/0/33**, v2 **3287/0/0**.

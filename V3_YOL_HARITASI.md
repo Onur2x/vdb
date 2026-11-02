@@ -900,6 +900,14 @@ bkz. `hiztesti.md` §16.
 > sonraki join'lerde RIGHT/FULL yoksa daraltılır. ON kuralları adım bazlı
 > kalır (zincirden bağımsız, kanıtlandı). Ayrıntı: `hiztesti.md` §21.
 
+> **v3.37 eki (2026-11-03):** Sol taraf daraltma eklendi. FROM tablosuna
+> atıf yapan tek taraflı predikatlarla `NarrowRows` (önce yalnız sağ
+> taraf daraltılıyordu). WHERE-sol yalnız hiçbir join RIGHT/FULL
+> değilse; ON-sol yalnız o join INNER/RIGHT ise (sonraki join'lerden
+> bağımsız). Güvenlik: NarrowRows üst küme döndüğü için sonraki
+> aşamalarda yeniden doğrulanır. S5: 406 ms → **0 ms**. Ayrıntı:
+> `hiztesti.md` §22.
+
 Testler: `sqltest` v3 **2832/0/33**, v2 **3266/0/0**; yeni
 `T158_OnEkKosulHash` (INNER / LEFT / FULL / PK / OR kökü / NULL ve
 imkânsız ek koşul yolları). 14/14 kapı yeşil.
