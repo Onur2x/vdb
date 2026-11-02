@@ -1493,3 +1493,56 @@ join'ler) predikatlarını toplar, `TryNarrowLeftSide` dener, başarısızsa
 ### 22.5 Kapılar (2026-11-03)
 
 wherenull **7/7**, chainnull **6/6**, sqltest v3 **2885/0/33**, v2 **3287/0/0**.
+
+---
+
+## 23. P-xx yazma yolu kampanyası (2026-10-30 … 2026-11-02)
+
+§19'daki tablo API'si 5,35–6,24 µs/satır seviyesindeydi. P-49…P-75
+kampanyasıyla yazma yolu mikro-optimizasyonları uygulandı; P-76…P-84
+platform/CI düzeltmeleri.
+
+### 23.1 Ana optimizasyonlar (P-49 … P-75)
+
+| # | Optimizasyon | Etki |
+|---|---|---|
+| P-49 | WAL ara kopyalama kaldırma | Bellek kopyası azaldı |
+| P-50 | `TriggersFor` hızlı yol | Boş sözlükte anında çıkış |
+| P-51 | Fast path'lerde tek tablo araması | Çift arama kaldırıldı |
+| P-52 | Recover'da PageSeal CRC doğrulaması | Güvenlik + hız |
+| P-53 | WAL sürüm 2 — `WalCrc` yalnız başlık | CRC maliyeti düştü |
+| P-54 | İşlem bazlı kirli çerçeve listesi | `TxnPages` O(kirli) |
+| P-55 | `Insert`'e `ATableDef` parametresi | `GetTable` derin kopyası atlandı |
+| P-56 | `VDbHashKeyPrefix` tek girdili önbellek | Non-batch INSERT |
+| P-57 | Commit'te `Seek(0, soEnd)` atlama | `FAtEnd` bayrağı |
+| P-58 | SQL INSERT parametre önceliği | Tek süreçli erişim kilidi atlama |
+| P-59/60 | SQL INSERT sarmalayıcı atlama | `ExclusiveAccess` MREW kilidi |
+| P-61 | Flush: `FDirty` erken çıkış | Boş flush atlandı |
+| P-62 | Meta çerçevesi atlama | `FStructDirty` commit'te sıfırlandı |
+| P-63 | Non-batch INSERT kolon eşleme önbelleği | Yeniden arama kaldırıldı |
+| P-64 | `PageMapAdd` geometrik büyüme | O(n²) `SetLength` önlendi |
+| P-65 | `EncodeRowInto` yeniden kullanılan tampon | Tahsis azaldı |
+| P-66 | Hash tablosu SoA → AoS (`TDirEntry`) | Cache miss azaldı |
+| P-67 | Identity/generated tarama atlama | `FBatchHasIdentity` önbelleği |
+| P-68 | Değişiklik günlüğü doğrudan grup tamponu | `AddPutPtr` |
+| P-69 | Apply fazında etiket koşucusu | `FlushTagRun` |
+| P-70 | Yazma kümesi düz hash haritası | WAL tamponu geometrik büyüme |
+| P-71 | WAL çerçeve dedup haritası | Doğrusal taramadan hash'e |
+| P-72 | `DirGrow` ters haritayı yeniden kurmayı bıraktı | O(n) → O(delta) |
+| P-73 | `PlaceCellKV` ikinci `FindFrame` atlandı | Çift arama kaldırıldı |
+| P-75 | DROP TABLE + büyük batch sayfa bozulması | Bayat space hint düzeltmesi |
+
+### 23.2 Ölçüm — `p67diag` (2026-11-03, N=200.000, best-of-5)
+
+| Bileşen | µs/satır |
+|---|---:|
+| String üretimi | 0,142 |
+| Insert döngüsü | 0,716 |
+| `CommitBatch` | 0,609 |
+| **Toplam (döngü+commit)** | **1,325** |
+
+İki koşu: 1,325 ve 1,324 µs/satır — tutarlı.
+
+§19'daki 5,35–6,24 µs/satır tablo API'si ile karşılaştırıldığında
+**~4x** hızlanma. P-xx kampanyasının ana kazancı yazma yolu tahsis
+diyeti, önbellek tekilleştirme ve kilit atlamalarıdır.
