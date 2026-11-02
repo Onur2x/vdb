@@ -10,6 +10,8 @@ program prochk;
                               -> cocuk: kendi anahtarlariyla parti yazar }
 {$mode delphi}{$H+}
 uses
+  { FPC/Unix: cthreads programin EN BASINDA olmali (TEvent/TThread). }
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes, Process, VDbBackendApi, VDbBackendV3;
 
 const

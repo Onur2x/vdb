@@ -25,6 +25,8 @@ program btreechk;
 {$mode delphi}{$H+}
 
 uses
+  { FPC/Unix: cthreads programin EN BASINDA olmali (TEvent/TThread). }
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, DateUtils, VDbSkipList, VDbBTree;
 
 function QueryPerformanceCounter(out C: Int64): LongBool; stdcall;

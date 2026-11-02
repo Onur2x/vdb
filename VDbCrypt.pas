@@ -170,7 +170,11 @@ uses
   {$IFDEF MSWINDOWS} Windows, {$ENDIF}
   {$IFDEF UNIX} BaseUnix, {$ENDIF}
   Generics.Collections, SyncObjs,
-  dcpcrypt2, dcpblockciphers, dcprijndael, dcpsha256, VDbKdf;
+  { P-77: birim adlari dosya adlariyla BIREBIR (Linux/macOS'ta dosya
+    sistemi buyuk/kucuk harf duyarlidir; Windows'ta yanlis harf
+    kopyasinin sessizce calismasi CI'da linux/macos kapilarini
+    dusuruyordu). }
+  DCPcrypt2, DCPblockciphers, DCPrijndael, DCPsha256, VDbKdf;
 
 { M6: Unix'te DPAPI yok; anahtar dosyasi yalnizca dosya izinleriyle
   korunur. .colkey'i sahibine okuma/yazma ile sinirla (0600). }

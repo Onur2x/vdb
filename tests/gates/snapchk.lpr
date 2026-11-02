@@ -10,6 +10,8 @@ program snapchk;
   Kullanim: snapchk <dizin> }
 {$mode delphi}{$H+}
 uses
+  { FPC/Unix: cthreads programin EN BASINDA olmali (TEvent/TThread). }
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes, VDbBackendApi, VDbBackendV3;
 
 var

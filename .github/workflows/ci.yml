@@ -569,7 +569,15 @@ jobs:
           sudo apt-get install -y fp-compiler
 
       - name: Kapilari derle ve kos (runall.sh)
-        run: sh tests/gates/runall.sh "$RUNNER_TEMP/vdbgates"
+        run: |
+          sh tests/gates/runall.sh "$RUNNER_TEMP/vdbgates" || {
+            echo '--- HATA AYIKLAMA: tum gunluklerin son 15 satiri ---'
+            for f in "$RUNNER_TEMP"/vdbgates/*.log; do
+              echo "== $f"
+              tail -15 "$f" || true
+            done
+            exit 1
+          }
 
   macos-test:
     runs-on: macos-latest
@@ -583,4 +591,12 @@ jobs:
           brew install fpc
 
       - name: Kapilari derle ve kos (runall.sh)
-        run: sh tests/gates/runall.sh "$RUNNER_TEMP/vdbgates"
+        run: |
+          sh tests/gates/runall.sh "$RUNNER_TEMP/vdbgates" || {
+            echo '--- HATA AYIKLAMA: tum gunluklerin son 15 satiri ---'
+            for f in "$RUNNER_TEMP"/vdbgates/*.log; do
+              echo "== $f"
+              tail -15 "$f" || true
+            done
+            exit 1
+          }

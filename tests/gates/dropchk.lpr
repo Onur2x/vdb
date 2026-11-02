@@ -1,12 +1,15 @@
-program dropbug;
-{ DROP TABLE + buyuk batch sayfa bozulmasi yeniden uretici.
-  Kullanim: dropbug <dizin> [satir_sayisi] [mod]
+program dropchk;
+{ DROP TABLE + buyuk batch sayfa bozulmasi yeniden uretici (P-75 dugumunu
+  izler). Kullanim: dropchk <dizin> [satir_sayisi] [mod]
   mod 1: buyuk batch -> DROP -> buyuk batch -> kapat/yeniden ac
   mod 2: batch ICINDE DROP -> ayni batch'te buyuk insert -> commit
   mod 3: DROP -> buyuk batch -> DROP -> buyuk batch (iki tur) }
 {$mode delphi}{$H+}
 uses
-  Windows, SysUtils, Classes,
+  { FPC/Unix: cthreads programin EN BASINDA olmali (TEvent/TThread). }
+  {$IFDEF UNIX}cthreads,{$ENDIF}
+  {$IFDEF MSWINDOWS}Windows,{$ENDIF}
+  SysUtils, Classes,
   VDbCore, VDbTypes, VDbTable, VDbSql,
   VDbBackendApi, VDbBackendV3;
 
@@ -14,12 +17,19 @@ var
   gQpf: Int64;
 
 function NowUs: Int64;
-var c: Int64;
+var
+  c: Int64;
 begin
+  {$IFDEF MSWINDOWS}
   if gQpf = 0 then
     if not QueryPerformanceFrequency(gQpf) then gQpf := 1000;
   QueryPerformanceCounter(c);
   Result := (c * 1000000) div gQpf;
+  {$ELSE}
+  { Unix: bu arac yalnizca kaba sure yazdirir; Now (~ms cozunurluk)
+    yeterlidir. }
+  Result := Trunc(Now * 86400 * 1000000);
+  {$ENDIF}
 end;
 
 var
