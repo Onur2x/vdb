@@ -566,7 +566,10 @@ jobs:
         run: |
           sudo apt-get update
           # Ubuntu 24.04: fp-compiler = FPC 3.2.2 (rtl-generics dahil).
-          sudo apt-get install -y fp-compiler
+          # SyncObjs ve Process FCL birimleridir; ayri paketteler
+          # (fp-units-fcl) — ek aciklamalarda "Can't find unit SyncObjs"
+          # hatasiyla olculdu.
+          sudo apt-get install -y fp-compiler fp-units-fcl
 
       - name: Kapilari derle ve kos (runall.sh)
         run: |

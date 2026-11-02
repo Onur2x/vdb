@@ -1139,6 +1139,10 @@ end;
 
 procedure TVDbPageStore.UnmapGen;
 begin
+  { P-77: esleme yalnizca Windows'ta kurulur (bkz. MapGen); Unix'te
+    FGenMap/FGenMapH zaten nil kalir. Govde korumasizdi — macOS/Linux
+    derlemesinde UnmapViewOfFile/CloseHandle bulunamadi. }
+  {$IFDEF WINDOWS}
   if FGenMap <> nil then
   begin
     UnmapViewOfFile(FGenMap);
@@ -1149,6 +1153,7 @@ begin
     CloseHandle(FGenMapH);
     FGenMapH := 0;
   end;
+  {$ENDIF}
 end;
 
 procedure TVDbPageStore.UnlockGen;

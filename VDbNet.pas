@@ -113,6 +113,20 @@ begin
     fpShutdown(ASock, VDB_SHUT_RDWR);
 end;
 
+{$IFDEF DARWIN}
+procedure VdbNoSigPipe(s: TVdbSocket);
+{ P-77: macOS'ta MSG_NOSIGNAL yoktur; SIGPIPE soket duzeyinde
+  SO_NOSIGPIPE ile kesilir (Linux'te fpSend'e MSG_NOSIGNAL verilir,
+  Windows'ta SIGPIPE kavrami yoktur). Kabul edilen soketler bunu
+  KALITAMAZ — her yeni sokette bir kez kurulur. }
+var
+  one: Integer;
+begin
+  one := 1;
+  fpSetSockOpt(s, SOL_SOCKET, SO_NOSIGPIPE, @one, SizeOf(one));
+end;
+{$ENDIF}
+
 function VdbTcpListen(APort: Word; ABacklog: Integer): TVdbSocket;
 var
   s: TVdbSocket;
@@ -122,6 +136,7 @@ begin
   Result := VDB_SOCK_INVALID;
   s := fpSocket(AF_INET, SOCK_STREAM, 0);
   if s = VDB_SOCK_INVALID then Exit;
+  {$IFDEF DARWIN}VdbNoSigPipe(s);{$ENDIF}
   one := 1;
   { Testler ayni portta ardişikan yeniden baslayabilsin diye. }
   fpSetSockOpt(s, SOL_SOCKET, SO_REUSEADDR, @one, SizeOf(one));
@@ -151,6 +166,10 @@ var
 begin
   dl := SizeOf(dummy);
   Result := fpAccept(AListen, psockaddr(@dummy), @dl);
+  {$IFDEF DARWIN}
+  if Result <> VDB_SOCK_INVALID then
+    VdbNoSigPipe(Result);   { kabul edilen soket SO_NOSIGPIPE'i kalitamaz }
+  {$ENDIF}
 end;
 
 function VdbTcpConnect(const AHost: string; APort: Word): TVdbSocket;
@@ -161,6 +180,7 @@ begin
   Result := VDB_SOCK_INVALID;
   s := fpSocket(AF_INET, SOCK_STREAM, 0);
   if s = VDB_SOCK_INVALID then Exit;
+  {$IFDEF DARWIN}VdbNoSigPipe(s);{$ENDIF}
   FillChar(addr, SizeOf(addr), 0);
   addr.sin_family := AF_INET;
   addr.sin_port := htons(APort);
@@ -189,8 +209,11 @@ begin
     { Unix: karsi taraf kapatmissa send() SIGPIPE uretir ve sureci
       sonlandirir (sqltest'te R-17 TCP testinde gorulen exit 141).
       MSG_NOSIGNAL ile EPIPE normal hata olarak doner; dongu False ile
-      cikar. Windows'ta bayrak yoktur. }
-{$IFDEF UNIX}
+      cikar. Windows'ta bayrak yoktur. macOS'ta MSG_NOSIGNAL YOKTUR
+      (P-77: olculen 'Identifier not found'); SIGPIPE yerine soket
+      duzeyinde SO_NOSIGPIPE kurulur (bkz. VdbTcpConnect/SocketPair
+      cagrilari) ve bayrak 0 gecer. }
+{$IFDEF LINUX}
     n := fpSend(ASock, p + sent, ALen - sent, MSG_NOSIGNAL);
 {$ELSE}
     n := fpSend(ASock, p + sent, ALen - sent, 0);
