@@ -27,12 +27,8 @@ program btreechk;
 uses
   { FPC/Unix: cthreads programin EN BASINDA olmali (TEvent/TThread). }
   {$IFDEF UNIX}cthreads,{$ENDIF}
+  {$IFDEF MSWINDOWS}Windows,{$ENDIF}
   SysUtils, DateUtils, VDbSkipList, VDbBTree;
-
-function QueryPerformanceCounter(out C: Int64): LongBool; stdcall;
-  external 'kernel32' name 'QueryPerformanceCounter';
-function QueryPerformanceFrequency(out F: Int64): LongBool; stdcall;
-  external 'kernel32' name 'QueryPerformanceFrequency';
 
 var
   gPass, gFail: Int64;
@@ -42,12 +38,19 @@ function NowUs: Int64;
 var
   c: Int64;
 begin
+  {$IFDEF MSWINDOWS}
   if gQpf = 0 then
     if not QueryPerformanceFrequency(gQpf) then gQpf := 1000;
   QueryPerformanceCounter(c);
   if gQpf >= 1000000 then Result := c div (gQpf div 1000000)
   else if gQpf >= 1000 then Result := (c * 1000) div gQpf
   else Result := c * 1000;
+  {$ELSE}
+  { P-79: 'external kernel32' Unix'te baglayiciyi kiriyordu
+    (ld: cannot find -lkernel32). Bu arac kaba sure yazdirir; Now
+    (~ms cozunurluk) yeterlidir. }
+  Result := Trunc(Now * 86400 * 1000000);
+  {$ENDIF}
 end;
 
 procedure Ok(const S: string);
