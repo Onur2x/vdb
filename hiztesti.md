@@ -1362,3 +1362,77 @@ sınar; değişiklik yalnızca SQL join katmanında (`VDbExecutor.pas` →
 `MergeStep`). Aynı koddan koşan iki macOS koşusunun biri geçti biri düştü —
 `TestKill9` alt süreç zamanlaması kaynaklı bilinen gürültü (kaynakta
 2026-10-25 CI #36/#37 notu). İlişkili değil.
+
+## 21. v3.36 — WHERE pushdown zincir güvenliği (2026-11-03)
+
+### 21.1 Bulgu
+
+`wherenull` ve `chainnull` testleri, WHERE tek taraflı erken eleme
+(`FilterSide` ve v3.35 tarama daraltması) kurallarının **zincir bilinci**
+eksik olduğunu ortaya çıkardı. v3.34–v3.35'te güvenlik yalnız o adımın
+join tipine bakıyordu:
+
+```
+SELECT a.id, a.x, c.id
+FROM a INNER JOIN b ON a.k=b.k
+     RIGHT JOIN c ON c.k=a.k
+WHERE a.x IS NULL
+```
+
+`a.x` sol tarafta, tek taraflı. İlk adım `INNER` → eski kural "güvenli"
+diyordu ve `a` satırlarını erken eliyordu. Ancak sonraki adımda `RIGHT JOIN
+c` var: eşleşmeyen `c` satırları NULL sarmalama üretir ve bu satırlar
+`WHERE a.x IS NULL`'dan geçer. Erken eleme `a2`'yi (x=NULL) silince
+`a2b2` çifti RIGHT'te eşleşemez hâle geliyor → fazladan NULL satırı
+oluşuyor.
+
+| Senaryo | Düzeltme öncesi | Doğru |
+|---|---|---|
+| `a INNER JOIN b ... RIGHT JOIN c` + `WHERE a.x IS NULL` | 2 satır | **1** |
+| `a INNER JOIN b ... FULL JOIN c` + `WHERE a.x IS NULL` | 3 satır | **2** |
+
+### 21.2 Kural
+
+WHERE tek taraflı erken eleme yalnızca şu koşulda güvenli:
+
+* **WHERE-sol:** `join[i] ∈ {INNER, LEFT}` **ve** sonraki join'lerde
+  RIGHT/FULL yok (sol taraf NULL-üretilmez).
+* **WHERE-sağ:** `join[i] ∈ {INNER, RIGHT}` **ve** sonraki join'lerde
+  RIGHT/FULL yok.
+
+`NarrowRows`'un `IS NULL`'u bilmiyor olması (tam taramaya düşmesi) bu
+bug'ı örtüyordu — tesadüfi koruma, kurala bağlanmamalı.
+
+**ON pushdown kuralları değişmedi:** ON-sol → INNER/RIGHT; ON-sağ →
+INNER/LEFT. Bunlar adım bazlı doğrudur (sonraki join'lerden bağımsız),
+çünkü ON yalnız o adımın eşleşmesini etkiler.
+
+### 21.3 Düzeltme
+
+`VDbExecutor.pas` → `MergeStep`:
+
+* İmza: `ARestPreservesLeft: Boolean` parametresi eklendi. True ise bu
+  adımdan **sonra** hiçbir join RIGHT/FULL değil.
+* `RestPreservesLeft(FromIdx)` yardımcısı (`ExecJoinScan` içinde):
+  `Stmt.MoreJoins[FromIdx..]` içinde RIGHT/FULL arar.
+* Çağrılar: `RestPreservesLeft(0)` (ilk adım), `RestPreservesLeft(t+1)`
+  (sonraki adımlar).
+* WHERE `FilterSide` kapıları: her iki tarafa da `ARestPreservesLeft`
+  koşulu eklendi.
+* Tarama daraltması: ON-sağ (`tmpRP`, INNER/LEFT) ve WHERE-sağ (`tmpWP`,
+  INNER/RIGHT + `ARestPreservesLeft`) `tmpNarrow`'da **ayrı** kapılarla
+  birleştiriliyor.
+
+### 21.4 Testler
+
+* `tests/bench/wherenull.lpr` — 7 senaryo, beklenen satır sayısıyla
+  karşılaştırır: LEFT+`IS NULL`, NULL-rejecting WHERE, INNER+`IS NULL`,
+  zincir INNER…RIGHT, zincir INNER…FULL, RIGHT+`IS NULL`.
+* `tests/bench/chainnull.lpr` — 6 zincir senaryosu, beklenen satır sayısı
+  doğrulamalı.
+
+İkisi de `SONUC: gecen=hepsi kalan=0`.
+
+### 21.5 Kapılar (2026-11-03)
+
+SQL testleri: v3 **2885/0/33**, v2 **3287/0/0** — hepsi geçti.

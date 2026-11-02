@@ -106,6 +106,27 @@ begin
     WriteLn('  sonuc=', R.Rows[0][0], '  sure=', t1 - t0, ' ms');
   end;
 
+  { Sorgu 5: BUYUK sol tablo + secici sol filtre (sol taraf daraltma adayi).
+    FROM b (nR satir) JOIN a (nL satir); WHERE b.y > nR-10 sol tek tarafli. }
+  for k := 1 to 2 do
+  begin
+    WriteLn('S5.', k, ': SELECT COUNT(*) FROM b JOIN a ON a.k=b.k WHERE b.y > ', nR - 10);
+    t0 := NowMs;
+    R := sq.Exec('SELECT COUNT(*) FROM b JOIN a ON a.k=b.k WHERE b.y > ' + IntToStr(nR - 10));
+    t1 := NowMs;
+    WriteLn('  sonuc=', R.Rows[0][0], '  sure=', t1 - t0, ' ms');
+  end;
+
+  { Sorgu 6: genis sol filtre (taban) }
+  for k := 1 to 2 do
+  begin
+    WriteLn('S6.', k, ': SELECT COUNT(*) FROM b JOIN a ON a.k=b.k WHERE b.y > 0');
+    t0 := NowMs;
+    R := sq.Exec('SELECT COUNT(*) FROM b JOIN a ON a.k=b.k WHERE b.y > 0');
+    t1 := NowMs;
+    WriteLn('  sonuc=', R.Rows[0][0], '  sure=', t1 - t0, ' ms');
+  end;
+
   sq.Free; tb.Free; kv.Free;
   WriteLn('TEMIZ');
 end.

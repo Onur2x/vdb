@@ -6661,12 +6661,18 @@ var
   procedure MergeStep(var LR: TStrMatrix; var LN: TStrArray;
     var LT: TByteArray; var Tabs: TJoinTabs; JC: TJoinClause;
     AUsing: TStrArray;    // F-28: nil = USING yok.
-    AWhere: TSqlExprNode); // v3.33: pushdown icin WHERE kosulu (nil = yok).
+    AWhere: TSqlExprNode; // v3.33: pushdown icin WHERE kosulu (nil = yok).
                           // DIKKAT: JC ve AUsing asla 'const' OLABILMEZ.
                           // TJoinClause record'u yonlendirilmis alanlar
                           // iceriyor (OnCondition) ve FPC
                           // 'const' yonlendirmede bunlari bos sayabiliyor
                           // -> AV.
+    ARestPreservesLeft: Boolean); // v3.36: bu adimdan SONRA hicbir join
+                          // RIGHT/FULL degilse True. WHERE tek taraflı
+                          // erken eleme yalniz o zaman guvenli: RIGHT/FULL
+                          // sol tarafi NULL-uretir ve NULL-kabul eden
+                          // predikatlar (`IS NULL`) yanlis sonuc uretir
+                          // (bkz. wherenull testi: INNER...RIGHT zinciri).
   // UsingAt, JoinUsing listesinden belirtilen sira icin USING kolonlarini
   // dondurur (yoksa nil). Liste MoreJoins ile ayni sıradadır.
   var
@@ -6712,6 +6718,9 @@ var
     WhLPreds, WhRPreds: TList<TSqlExprNode>;
     // v3.35: tarama-seviyesi pushdown icin gecici listeler
     tmpLP, tmpRP: TList<TSqlExprNode>;
+    // v3.36: ON-sag ve WHERE-sag AYRI guvenlik kurallariyla daraltilir;
+    // tmpWP WHERE-sag, tmpNarrow daraltmaya verilecek birlesim.
+    tmpWP, tmpNarrow: TList<TSqlExprNode>;
 
     // LN ogesindeki nitelemeyi ('alias.kolon' -> 'kolon') atar.
     function AfterDot(const S: string): string;
@@ -7183,29 +7192,43 @@ var
     begin
       rDef := FT.GetTable(JC.Table);
       BuildColInfo(rDef, rCn, rCt);
-      // v3.35: tarama-seviyesi pushdown — tek taraflı predikatlarla
+      // v3.35/3.36: tarama-seviyesi pushdown — tek taraflı predikatlarla
       // NarrowRows dene. Basariliysa satirlar zaten daraltilmis gelir;
       // FilterSide sonra yeniden dogrular (ust kume garantisi).
-      // GUVENLIK: sag taraf daraltmasi yalniz INNER/LEFT icin guvenli.
-      // RIGHT/FULL'de eslesmeyen sag satirlar NULL sarmalama gerektirir;
-      // daraltma bu satirlari kaybettirirdi.
+      // GUVENLIK (ON-sag ve WHERE-sag AYRI):
+      //   ON-sag daraltma  -> yalniz INNER/LEFT
+      //     (RIGHT/FULL'de eslesmeyen sag satirlar NULL sarmalama gerektirir)
+      //   WHERE-sag daraltma -> yalniz INNER/RIGHT + ARestPreservesLeft
+      //     (LEFT'te sag NULL-uretilir; `IS NULL` gibi NULL-kabul eden
+      //     predikat yanlis sonuc verir. Sonraki RIGHT/FULL da sol tarafi
+      //     NULL-urettigi icin ayni nedenle erken eleme guvensizdir.)
       tmpLP := TList<TSqlExprNode>.Create;
       tmpRP := TList<TSqlExprNode>.Create;
+      tmpWP := TList<TSqlExprNode>.Create;
+      tmpNarrow := TList<TSqlExprNode>.Create;
       try
         if JC.OnCondition <> nil then
           CollectOneSided(JC.OnCondition, tmpLP, tmpRP);
         if AWhere <> nil then
-          CollectOneSided(AWhere, tmpLP, tmpRP);
+          CollectOneSided(AWhere, tmpLP, tmpWP);
         if (JC.JoinType = jtInner) or (JC.JoinType = jtLeft) then
         begin
-          if not TryNarrowRightSide(rDef, rCn, rCt, tmpRP, rPks, rRows) then
-            FT.ScanRows(JC.Table, rPks, rRows);
-        end
-        else
+          for i := 0 to tmpRP.Count - 1 do
+            tmpNarrow.Add(tmpRP[i]);
+        end;
+        if ((JC.JoinType = jtInner) or (JC.JoinType = jtRight)) and
+           ARestPreservesLeft then
+        begin
+          for i := 0 to tmpWP.Count - 1 do
+            tmpNarrow.Add(tmpWP[i]);
+        end;
+        if not TryNarrowRightSide(rDef, rCn, rCt, tmpNarrow, rPks, rRows) then
           FT.ScanRows(JC.Table, rPks, rRows);
       finally
         tmpLP.Free;
         tmpRP.Free;
+        tmpWP.Free;
+        tmpNarrow.Free;
       end;
     end;
     n1 := Length(LN); n2 := Length(rCn);
@@ -7387,10 +7410,13 @@ var
         //   WHERE sag tek tarafli -> yalniz INNER/RIGHT
         // FULL'de hicbiri guvenli degil: NULL sarmalama gerekli satirlar
         // filtrelenirse kaybolur (bkz. FULL sag-korumali testi).
-        if (WhLPreds.Count > 0) and
+        // v3.36 ek kosulu: ARestPreservesLeft. Sonraki join'lerde RIGHT/FULL
+        // varsa erken eleme, o join'in NULL-urettigi satirlari yanlis
+        // sekilde artirir (`IS NULL` onlardan gecer) — bkz. wherenull.
+        if (WhLPreds.Count > 0) and ARestPreservesLeft and
            ((JC.JoinType = jtInner) or (JC.JoinType = jtLeft)) then
           FilterSide(LR, WhLPreds, 0, n1);
-        if (WhRPreds.Count > 0) and
+        if (WhRPreds.Count > 0) and ARestPreservesLeft and
            ((JC.JoinType = jtInner) or (JC.JoinType = jtRight)) then
           FilterSide(rRows, WhRPreds, n1, n2);
       finally
@@ -7604,6 +7630,25 @@ var
     Result := AStmt.JoinUsing[Idx].UsingCols;
   end;
 
+  // v3.36: WHERE pushdown zincir guvenligi. FromIdx, MoreJoins icindeki
+  // ilk SONRAKI join'in indisidir; o noktadan sonraki hicbir join RIGHT/FULL
+  // degilse True. (RIGHT/FULL sol tarafi NULL-uretir; erken WHERE eleme
+  // NULL-kabul eden predikatlarla yanlis sonuc uretir.)
+  function RestPreservesLeft(FromIdx: Integer): Boolean;
+  var
+    u: Integer;
+  begin
+    Result := True;
+    if Stmt.MoreJoins = nil then Exit;
+    for u := FromIdx to Stmt.MoreJoins.Count - 1 do
+      if (Stmt.MoreJoins[u].JoinType = jtRight) or
+         (Stmt.MoreJoins[u].JoinType = jtFull) then
+      begin
+        Result := False;
+        Exit;
+      end;
+  end;
+
 begin
   // Adim 0: sol taraf (FROM tablo veya CTE) yuklenir, isimler nitelenir
 
@@ -7670,10 +7715,10 @@ begin
   // F-28: JoinUsing listesi MoreJoins ile ayni sira; ilk JOIN icin
   // indis 0, MoreJoins[i] icin i+1. Eksikse nil (USING yok).
   MergeStep(LRows, LNames, LTypes, LTabs, Stmt.Join,
-    UsingAt(Stmt, 0), Stmt.WhereClause);
+    UsingAt(Stmt, 0), Stmt.WhereClause, RestPreservesLeft(0));
   for t := 0 to Stmt.MoreJoins.Count - 1 do
     MergeStep(LRows, LNames, LTypes, LTabs, Stmt.MoreJoins[t],
-      UsingAt(Stmt, t + 1), Stmt.WhereClause);
+      UsingAt(Stmt, t + 1), Stmt.WhereClause, RestPreservesLeft(t + 1));
   MergedRows := LRows;
   MergedColNames := LNames;
   MergedColTypes := LTypes;

@@ -888,6 +888,18 @@ bkz. `hiztesti.md` §16.
 > INNER/LEFT; RIGHT/FULL'de NULL sarmalama gerekir). Seçici sağ filtrede
 > 203 ms → **0 ms (~203x)**. Ayrıntı: `hiztesti.md` §20.
 
+> **v3.36 eki (2026-11-03):** WHERE tek taraflı erken eleme
+> (`FilterSide` / tarama daraltması) **zincir bilinci** gerektirir.
+> v3.34–v3.35'te yalnız o adımın join tipine bakılıyordu; sonraki join'lerde
+> RIGHT/FULL varsa NULL sarmalama satırları `IS NULL` gibi NULL-kabul eden
+> predikatlardan geçiyor, erken eleme gerçek satırları silerek eşleşmeyi
+> değiştiriyordu (`a INNER JOIN b ... RIGHT JOIN c ... WHERE a.x IS NULL` →
+> 2 satır, doğrusu 1). Düzeltme: `ARestPreservesLeft` parametresi +
+> `RestPreservesLeft()` yardımcısı; WHERE-sol yalnız INNER/LEFT **ve**
+> sonraki join'lerde RIGHT/FULL yoksa, WHERE-sağ yalnız INNER/RIGHT **ve**
+> sonraki join'lerde RIGHT/FULL yoksa daraltılır. ON kuralları adım bazlı
+> kalır (zincirden bağımsız, kanıtlandı). Ayrıntı: `hiztesti.md` §21.
+
 Testler: `sqltest` v3 **2832/0/33**, v2 **3266/0/0**; yeni
 `T158_OnEkKosulHash` (INNER / LEFT / FULL / PK / OR kökü / NULL ve
 imkânsız ek koşul yolları). 14/14 kapı yeşil.
