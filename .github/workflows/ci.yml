@@ -63,7 +63,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               Write-Host $o
               $tail = ($o -split "`r?`n" | Where-Object {
-                $_ -match 'Fatal|Error' } | Select-Object -Last 3) -join ' | '
+                $_ -match 'Fatal|Error|\.pas\(' } | Select-Object -Last 8) -join ' | '
               $tail = $tail -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
               Write-Host "::error title=$p::$tail"
               exit 1
