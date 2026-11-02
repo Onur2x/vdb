@@ -550,3 +550,37 @@ jobs:
             exit 1
           }
           Write-Host 'TUM ORNEKLER DERLENDI'
+
+  # v3.35: UC PLATFORM kapisi. Windows isi yukarida (lazbuild + tum
+  # kapilar + ornekler); Linux/macOS asagida tests/gates/runall.sh
+  # uzerinden ayni kapi tablosunu kosar. Motor birimlerindeki Windows
+  # kullanimlari {$IFDEF MSWINDOWS} korumali; tek gercek asm blogu
+  # (RDTSC) yalnizca -dAPPLPROF ile derlenir.
+  linux-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: FPC kur
+        run: |
+          sudo apt-get update
+          # Ubuntu 24.04: fp-compiler = FPC 3.2.2 (rtl-generics dahil).
+          sudo apt-get install -y fp-compiler
+
+      - name: Kapilari derle ve kos (runall.sh)
+        run: sh tests/gates/runall.sh "$RUNNER_TEMP/vdbgates"
+
+  macos-test:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: FPC kur
+        run: |
+          # macos-latest = arm64; Homebrew fpc = 3.2.2 arm64.
+          brew install fpc
+
+      - name: Kapilari derle ve kos (runall.sh)
+        run: sh tests/gates/runall.sh "$RUNNER_TEMP/vdbgates"

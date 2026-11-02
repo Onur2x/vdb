@@ -201,11 +201,13 @@ end;
 
 { ======================================================= 2) v3 temel sozlesme }
 
-function RowTag(const PlainValue: TBytes; ValueLen: Integer): Integer;
+function RowTag(PlainValue: PByte; ValueLen: Integer): Integer;
 begin
-  { Degerin ilk bayti tablo kimligi; 0 = satir degil. }
-  if ValueLen < 1 then Exit(-1);
-  Result := PlainValue[0];
+  { Degerin ilk bayti tablo kimligi; 0 = satir degil.
+    P-38'ten beri TVDbRowTagFunc PByte alir; eski TBytes imzasi yalnizca
+    @ isaretcisiyle (turden bagimsiz) derlendigi icin burada kalabilmisti. }
+  if (ValueLen < 1) or (PlainValue = nil) then Exit(-1);
+  Result := PlainValue^;
   if Result = 0 then Result := -1;
 end;
 
@@ -1091,10 +1093,10 @@ end;
   Sayac TURETILMIS veridir: acilista .idx ozetinden (ya da bos veritabaninda
   sifirdan) kurulur, yazmada artimli guncellenir; ozet yoksa/bayatsa bir kez
   tam taramayla yeniden kurulur. Veri kaybi riski YOKTUR. }
-function TestTagOf(const PlainValue: TBytes; ValueLen: Integer): Integer;
+function TestTagOf(PlainValue: PByte; ValueLen: Integer): Integer;
 begin
   Result := -1;
-  if (ValueLen < 2) or (Length(PlainValue) < 2) then Exit;
+  if (ValueLen < 2) or (PlainValue = nil) then Exit;
   Result := Integer(PlainValue[0]) or (Integer(PlainValue[1]) shl 8);
 end;
 
