@@ -401,7 +401,7 @@ begin
   h.HdrCrc := VDbCrc32Of(h, VDB_IDX_CRC_LEN);
 
   tmp := FileName + '.tmp';
-  f := TFileStream.Create(tmp, fmCreate);
+  f := TFileStream.Create(tmp, fmCreate or fmShareDenyNone);
   try
     f.WriteBuffer(h, VDB_IDX_HDR_SIZE);
     if Length(buf) > 0 then

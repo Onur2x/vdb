@@ -116,7 +116,7 @@ type
       end;
     var
       FPath: string;
-      FStream: TFileStream;
+      FStream: THandleStream;
       FPoolPages: Integer;
       FFrames: array of TFrame;
       { P-54: islem bazli kirli cerceve listesi. TxnPages yalniz bu listeyi
@@ -202,7 +202,7 @@ type
         her yazma islemi sonunda 8 bayt artirilir. Baska bir surec bunu
         gordugunde onbellegini tazeler. }
       FSigGen: QWord;
-      FGenStream: TFileStream;
+      FGenStream: THandleStream;
       { v3.25: `.gen` sayaci icin BELLEK ESLEMESI. Okuma yolu eskiden her
         ifade basina `SetFilePointer` + `ReadFile` (olculen ~2,5 us) yapiyordu;
         eslenmis 8 baytlik goruntu bunu tek bellek okumasina indirir.
@@ -1310,7 +1310,7 @@ begin
     if FHoldDepth = 0 then
     begin
       { v3.18 dilim 6: ACILIS rezervasyon ALMAZ (AcquireWriteOpen). Rezervasyon
-        ISLEMLERI siralar; acilis ise yalniz kisa bir kritik bolum icin tam
+        ISLEMLERI siralar; acilis ise yalnizca kisa bir kritik bolum icin tam
         kilide ihtiyac duyar. Once acilis da rezervasyon istiyordu ve acik bir
         islem tutan surec varken ikinci yazar HIC ACILAMIYORDU (olculdu:
         lockchk 3c "yazar rezervasyonu 500 ms icinde alinamadi"). }
@@ -1320,7 +1320,27 @@ begin
         FReserved := True;
       end;
     end;
-    LockExclusive;
+    { P-84: LockExclusive basarisiz olursa rezervasyon SIZIYORDU (FReserved
+      True, .gen uzerinde EX kilit acikta kaliyordu) — sonraki tum yazarlar
+      surecin kalaninda bloklaniyordu (prochk/Linux'ta cocuk surecler 20 sn
+      sonra 'yazar rezervasyonu alinamadi' ile dustu; strace ile olculdu).
+      Windows'ta da ayni sizinti varydi (aralik kilidi sızar), yalnizca
+      yarisma pencerelerinde gorunmuyordu. }
+    try
+      LockExclusive;
+    except
+      if (FHoldDepth = 0) and FReserved then
+      begin
+        UnlockGen;
+        FReserved := False;
+      end;
+      if FReadDepth > 0 then
+      begin
+        FLockedShared := TakeSharedLock;
+        FLocked := FLockedShared;
+      end;
+      raise;
+    end;
     FLockedExcl := True;
     FLocked := True;
     try
@@ -1721,13 +1741,11 @@ begin
     raise EVdbPageStore.Create('salt-okunur acilis: dosya yok: ' + FPath);
   FBusyMs := ABusyMs;
   try
-    if AReadOnly then
-      { Paylasim: yazar da acabilmeli (fmShareDenyNone). Kilit PAYLASIMLI. }
-      FStream := TFileStream.Create(FPath, fmOpenRead or fmShareDenyNone)
-    else if exists then
-      FStream := TFileStream.Create(FPath, fmOpenReadWrite or fmShareDenyNone)
-    else
-      FStream := TFileStream.Create(FPath, fmCreate or fmShareDenyNone);
+    { P-84: VDbOpenStreamNoFlock — Unix'te FPC'nin FileOpen'i paylasim
+      modunu acilis aninda flock(SH,NB) olarak uygular; baska surec EX
+      tutarken acilis EAGAIN ile dusuyordu (prochk cocuk surecleri).
+      Windows'ta davranis ayni (TFileStream + fmShareDenyNone). }
+    FStream := VDbOpenStreamNoFlock(FPath, AReadOnly, not exists);
   except
     on E: Exception do
     begin
@@ -1737,7 +1755,8 @@ begin
         EAGAIN ("Try again") olarak gelir. }
       if VDbIsSharingViolation(E) then
         raise EVdbPageStore.Create(
-          'veritabani dosyasi kullanimda (baska islem acik): ' + FPath)
+          'veritabani dosyasi kullanimda (baska islem acik): ' + FPath +
+          ' [' + E.ClassName + ': ' + E.Message + ']')
       else
         raise;
     end;
@@ -1805,12 +1824,12 @@ begin
         handle'i ile okur/yazar; yoksa olusturulur. Kilit BIRAKILMADAN once
         acilir ki acilis artisi ile yaris olmasin. }
       try
-        FGenStream := TFileStream.Create(FPath + '.gen',
-          fmOpenReadWrite or fmShareDenyNone);
+        { P-84: kilitlenmesiz acis (bkz. VDbOpenStreamNoFlock) — .gen
+          sayac dosyasi da yazarlar arasi paylasilir. }
+        FGenStream := VDbOpenStreamNoFlock(FPath + '.gen', False, False);
       except
         try
-          FGenStream := TFileStream.Create(FPath + '.gen',
-            fmCreate or fmShareDenyNone);
+          FGenStream := VDbOpenStreamNoFlock(FPath + '.gen', False, True);
         except
           FGenStream := nil;
         end;
@@ -1895,6 +1914,14 @@ begin
     finally
       if FLockedShared then VDbUnlockStream(FStream);
       if FLockedExcl then VDbUnlockStream(FStream);
+      { P-84: rezervasyon kapanista birakilmali — Store.Close'un kendi
+        AcquireWrite'i .gen EX alir; finally eskiden yalniz .odb kilidini
+        birakiyordu. Unix'te sizan EX sonraki oturumun/surecin tum
+        yazmalarini sonsuza dek blokluyordu (minimal yeniden uretici:
+        wslrepro — 2. oturum 'yazar rezervasyonu alinamadi'). }
+      if FReserved then
+        UnlockGen;
+      FReserved := False;
       UnmapGen;
       FreeAndNil(FGenStream);
       FreeAndNil(FStream);
@@ -1913,6 +1940,10 @@ begin
   if FStream = nil then Exit;
   if FLockedShared then VDbUnlockStream(FStream);
   if FLockedExcl then VDbUnlockStream(FStream);
+  { P-84: rezervasyon kapanista BIRAKILMALI (bkz. Close). }
+  if FReserved then
+    UnlockGen;
+  FReserved := False;
   UnmapGen;
   FreeAndNil(FGenStream);
   FreeAndNil(FStream);
@@ -2866,7 +2897,7 @@ begin
   tmp := DestPath + '.' + VDbProcessToken + '.tmp';
   if FileExists(tmp) then SysUtils.DeleteFile(tmp);
   BuildMetaImage(meta);
-  fs := TFileStream.Create(tmp, fmCreate);
+  fs := TFileStream.Create(tmp, fmCreate or fmShareDenyNone);
   try
     fs.WriteBuffer(meta, SizeOf(meta));
     for pno := 1 to FPageCount - 1 do
@@ -2925,7 +2956,7 @@ begin
   { v3.18: gecici ad SÜREÇ benzersiz olmali (bkz. CopyCommittedTo). }
   tmp := DestPath + '.' + VDbProcessToken + '.tmp';
   if FileExists(tmp) then SysUtils.DeleteFile(tmp);
-  fs := TFileStream.Create(tmp, fmCreate);
+  fs := TFileStream.Create(tmp, fmCreate or fmShareDenyNone);
   try
     FStream.Position := 0;
     left := FPhysSize;

@@ -347,13 +347,13 @@ begin
     Ok(Format('arsiv kopyalandi: %d bayt', [n]))
   else
     Fail('arsiv bos');
-  if DirectoryExists(DirOf('arsiv\base')) then
+  if DirectoryExists(DirOf('arsiv' + PathDelim + 'base')) then
     Ok('arsivde taban dizini var')
   else
     Fail('arsivde taban dizini yok');
   if DirectoryExists(DirOf('arsiv')) then
   begin
-    if FindFirst(DirOf('arsiv\*.vlog'), faAnyFile, sr) = 0 then
+    if FindFirst(DirOf('arsiv' + PathDelim + '*.vlog'), faAnyFile, sr) = 0 then
     begin
       Ok('arsivde segment var');
       FindClose(sr);

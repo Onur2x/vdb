@@ -7,7 +7,7 @@ interface
 uses
   Classes;
 
-procedure VDbFlushStream(S: TFileStream);
+procedure VDbFlushStream(S: THandleStream);
 // Dizin girdisini (dosya olusturma/rename/silme) kalici hale getirir.
 // F2-1: ONCEDEN hatalar TAMAMEN YUTULUYORDU (Unix'te FpOpen ve
 // FpFsync hatalari kontrol edilmiyordu). Artik sonuc dondurur:
@@ -33,10 +33,10 @@ function VDbFlushDir(const DirPath: string): Boolean;
 //   * ayni handle'da SH varken EX istenirse -> once SH bırakılır (yukseltme)
 //   * EX varken EX istenirse -> True
 // VDbUnlockStream her durumda guvenli: tutulan kilidi bir kez birakir.
-function VDbLockStream(S: TFileStream; AShared: Boolean = False): Boolean;
-procedure VDbUnlockStream(S: TFileStream);
+function VDbLockStream(S: THandleStream; AShared: Boolean = False): Boolean;
+procedure VDbUnlockStream(S: THandleStream);
 // Bu handle uzerinde BIZIM tuttugumuz kilit var mi (teshis/kapi icin).
-function VDbLockHeld(S: TFileStream; out AShared: Boolean): Boolean;
+function VDbLockHeld(S: THandleStream; out AShared: Boolean): Boolean;
 
 { v3.18: DEGISIKLIK SAYACI (<db>.gen) REZERVASYON kilidi.
   NEDEN AYRI: VDbLockStream Windows'ta TUM dosyayi (offset 0, 2^64 bayt)
@@ -51,8 +51,8 @@ function VDbLockHeld(S: TFileStream; out AShared: Boolean): Boolean;
   engellemez, yazarlari yine siraya sokar. Platform bagimsiz sonuc ayni. }
 const
   VDB_GEN_LOCK_OFF = $00010000;   // 64 KiB: sayac verisinin cok otesinde
-function VDbLockGenReserve(S: TFileStream): Boolean;
-procedure VDbUnlockGenReserve(S: TFileStream);
+function VDbLockGenReserve(S: THandleStream): Boolean;
+procedure VDbUnlockGenReserve(S: THandleStream);
 
 { v3.18: SUREC KIMLIGI — uretilen/gecici dosya adlarina eklenir. Ayni adi
   iki surec uretirse Windows "dosya kullanimda" hatasi verir (olculdu:
@@ -67,6 +67,20 @@ function VDbProcessToken: string;
 // sorun gorunmez (paylasimli okuma serbest). Bu yuzden boy olcumu acmaz,
 // stat() kullanir. Dosya yoksa -1 doner.
 function VDbFileBytes(const Path: string): Int64;
+
+{ P-84: kilitlenMESIZ akis acar (VDbPageStore.FStream/FGenStream icin).
+  NEDEN: FPC'nin Unix FileOpen'i paylasim modunu ACILIS ANINDA flock()
+  olarak uygular (fmShareDenyNone -> LOCK_SH|LOCK_NB; bkz. rtl/unix
+  sysutils.pp DoFileLocking). Baska bir surec LOCK_EX tutarken yapilan
+  ikinci acilis EAGAIN ile DUSER — oysa VDB'nin tasariminda acilis HER
+  ZAMAN basarilir, kilitleme sonradan TakeSharedLock/LockReserve ile
+  yoklamali yapilir (Windows'ta fmShareDenyNone + LockFileEx boyle
+  calisir; prochk'un cocuk surecleri Linux'ta acilamiyordu).
+  Unix'te fd FpOpen ile alinir ve THandleStream'e sarilir (TFileStream'in
+  fd alan kurucusu yok); Windows'ta TFileStream oldugu gibi kullanilir.
+  Hata: EFOpenError (OpenEx'in except yolu aynen calisir). }
+function VDbOpenStreamNoFlock(const APath: string; AReadOnly: Boolean;
+  ACreate: Boolean): THandleStream;
 
 // 2026-10-04: "dosya baska islemde acik" ayrimini yapar.
 // Windows'ta paylasim ihlali ERROR_SHARING_VIOLATION (32) veya
@@ -144,7 +158,7 @@ begin
   end;
 end;
 
-function VDbLockHeld(S: TFileStream; out AShared: Boolean): Boolean;
+function VDbLockHeld(S: THandleStream; out AShared: Boolean): Boolean;
 var
   idx: Integer;
 begin
@@ -165,7 +179,7 @@ begin
   end;
 end;
 
-procedure VDbFlushStream(S: TFileStream);
+procedure VDbFlushStream(S: THandleStream);
 begin
   if S = nil then Exit;
   {$IFDEF WINDOWS}
@@ -210,7 +224,7 @@ begin
   {$ENDIF}
 end;
 
-function VDbLockStream(S: TFileStream; AShared: Boolean): Boolean;
+function VDbLockStream(S: THandleStream; AShared: Boolean): Boolean;
 {$IFDEF WINDOWS}
 var
   ov: TOverlapped;
@@ -274,7 +288,7 @@ begin
   {$ENDIF}
 end;
 
-procedure VDbUnlockStream(S: TFileStream);
+procedure VDbUnlockStream(S: THandleStream);
 {$IFDEF WINDOWS}
 var
   ov: TOverlapped;
@@ -318,7 +332,7 @@ begin
   {$ENDIF}
 end;
 
-function VDbLockGenReserve(S: TFileStream): Boolean;
+function VDbLockGenReserve(S: THandleStream): Boolean;
 {$IFDEF WINDOWS}
 var
   ov: TOverlapped;
@@ -345,7 +359,7 @@ begin
   {$ENDIF}
 end;
 
-procedure VDbUnlockGenReserve(S: TFileStream);
+procedure VDbUnlockGenReserve(S: THandleStream);
 {$IFDEF WINDOWS}
 var
   ov: TOverlapped;
@@ -392,6 +406,36 @@ begin
   end;
 end;
 {$ENDIF}
+
+function VDbOpenStreamNoFlock(const APath: string; AReadOnly: Boolean;
+  ACreate: Boolean): THandleStream;
+{$IFDEF UNIX}
+var
+  fd: Integer;
+  flags: Integer;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  if AReadOnly then
+    flags := O_RdOnly
+  else
+    flags := O_RdWr;
+  if ACreate then
+    flags := flags or O_Creat;
+  fd := FpOpen(PChar(APath), flags, $1B6);   // 0666 (umask uygulanir)
+  if fd < 0 then
+    raise EFOpenError.CreateFmt(
+      'Unable to open file "%s": %s', [APath, SysErrorMessage(fpGetErrno)]);
+  Result := THandleStream.Create(fd);
+  {$ELSE}
+  if AReadOnly then
+    Result := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone)
+  else if ACreate then
+    Result := TFileStream.Create(APath, fmCreate or fmShareDenyNone)
+  else
+    Result := TFileStream.Create(APath, fmOpenReadWrite or fmShareDenyNone);
+  {$ENDIF}
+end;
 
 function VDbIsSharingViolation(const E: TObject): Boolean;
 var
