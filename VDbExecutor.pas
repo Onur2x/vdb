@@ -6710,6 +6710,8 @@ var
     // v3.33: ON/WHERE tek tarafli predikat pushdown
     OnLPreds, OnRPreds: TList<TSqlExprNode>;
     WhLPreds, WhRPreds: TList<TSqlExprNode>;
+    // v3.35: tarama-seviyesi pushdown icin gecici listeler
+    tmpLP, tmpRP: TList<TSqlExprNode>;
 
     // LN ogesindeki nitelemeyi ('alias.kolon' -> 'kolon') atar.
     function AfterDot(const S: string): string;
@@ -7004,6 +7006,44 @@ var
       Rows := pdKeep;
     end;
 
+    // v3.35: tarama-seviyesi pushdown — tek taraflı predikatlarla
+    // NarrowRows dene. Başarılıysa True döner ve Pks/Rows daraltılır.
+    // NarrowRows her zaman ÜST KÜME döndüğü için güvenlik korunur
+    // (FilterSide sonra yeniden doğrular).
+    function TryNarrowRightSide(const Td: TTableDef;
+      const Cn: TStrArray; const Ct: TByteArray;
+      RPreds: TList<TSqlExprNode>;
+      out Pks: TStrArray; out Rows: TStrMatrix): Boolean;
+    var
+      AndTree, N: TSqlExprNode;
+      B: TSqlBinaryOpNode;
+      i: Integer;
+      IsExact: Boolean;
+    begin
+      Result := False;
+      SetLength(Pks, 0);
+      SetLength(Rows, 0);
+      if (RPreds = nil) or (RPreds.Count = 0) then Exit;
+      // AND tree kur (sol-derin): ((P0 AND P1) AND P2) ...
+      AndTree := RPreds[0];
+      for i := 1 to RPreds.Count - 1 do
+        AndTree := TSqlBinaryOpNode.Create(sboAnd, AndTree, RPreds[i]);
+      try
+        Result := NarrowRows(Td, AndTree, Cn, Ct, Pks, Rows, IsExact);
+      finally
+        // Ara düğümleri serbest bırak (yapraklar paylaşıldı — serbest bırakma).
+        N := AndTree;
+        while (N <> RPreds[0]) and (N is TSqlBinaryOpNode) do
+        begin
+          B := TSqlBinaryOpNode(N);
+          N := B.Left;
+          B.Left := nil;
+          B.Right := nil;
+          B.Free;
+        end;
+      end;
+    end;
+
   begin
     { ------------------------------------------------------------
       F-29: LATERAL — sol kume HER SATIR icin sag taraf yeniden
@@ -7135,6 +7175,7 @@ var
 
     // P5-CTE: sag taraf CTE ise materyal kume kullanilir; indeks/PK
     // hizli yolu atlanir (klasik ic ice dongu her zaman dogrudur).
+    if JC.Alias <> '' then rAlias := JC.Alias else rAlias := JC.Table;
     rIsCte := TryCte(JC.Table, rCn, rCt, rRows);
     if rIsCte then
       PseudoDef(JC.Table, rCn, rCt, rDef)
@@ -7142,9 +7183,31 @@ var
     begin
       rDef := FT.GetTable(JC.Table);
       BuildColInfo(rDef, rCn, rCt);
-      FT.ScanRows(JC.Table, rPks, rRows);
+      // v3.35: tarama-seviyesi pushdown — tek taraflı predikatlarla
+      // NarrowRows dene. Basariliysa satirlar zaten daraltilmis gelir;
+      // FilterSide sonra yeniden dogrular (ust kume garantisi).
+      // GUVENLIK: sag taraf daraltmasi yalniz INNER/LEFT icin guvenli.
+      // RIGHT/FULL'de eslesmeyen sag satirlar NULL sarmalama gerektirir;
+      // daraltma bu satirlari kaybettirirdi.
+      tmpLP := TList<TSqlExprNode>.Create;
+      tmpRP := TList<TSqlExprNode>.Create;
+      try
+        if JC.OnCondition <> nil then
+          CollectOneSided(JC.OnCondition, tmpLP, tmpRP);
+        if AWhere <> nil then
+          CollectOneSided(AWhere, tmpLP, tmpRP);
+        if (JC.JoinType = jtInner) or (JC.JoinType = jtLeft) then
+        begin
+          if not TryNarrowRightSide(rDef, rCn, rCt, tmpRP, rPks, rRows) then
+            FT.ScanRows(JC.Table, rPks, rRows);
+        end
+        else
+          FT.ScanRows(JC.Table, rPks, rRows);
+      finally
+        tmpLP.Free;
+        tmpRP.Free;
+      end;
     end;
-    if JC.Alias <> '' then rAlias := JC.Alias else rAlias := JC.Table;
     n1 := Length(LN); n2 := Length(rCn);
 
     { ------------------------------------------------------------
