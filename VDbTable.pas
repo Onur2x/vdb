@@ -3944,6 +3944,12 @@ function EncodeRow(TableId: Word; const Pk: string; const T: TTableDef; const Va
 var
   n: Integer;
 begin
+  // T125: Result'i temizle. FPC, cagri tarafindaki degiskeni (nb/b) gizli
+  // Result: TBytes var-parametresi olarak gecirir. Eger o degisken daha
+  // once FKvB.Put ile FPending'te paylasildiysa (refcount=2),
+  // EncodeRowInto mevcut tampona yazar ve onceki pending degeri bozulur.
+  // Result := nil paylasilan tamponu birakir; her cagri taze dizi alir.
+  Result := nil;
   n := EncodeRowInto(Result, TableId, Pk, T, Vals);
   SetLength(Result, n);
 end;
@@ -10091,10 +10097,12 @@ var
   b: TBytes;
   tid: Word;
   apk: string;
+  hk: QWord;
 begin
   Result := False;
   t := GetTable(Table);
-  if not FKvB.Get(VDbHashKey(t.Name, Pk), b) then Exit;
+  hk := VDbHashKey(t.Name, Pk);
+  if not FKvB.Get(hk, b) then Exit;
   if not DecodeRow(b, tid, apk, Vals) then Exit;
   if (tid = t.TableId) and (apk = Pk) then
   begin
