@@ -52,6 +52,15 @@ FPCFLAGS="-O2 -XX $FORCEB -FU$UNITDIR -Fudcpcrypt -Fudcpcrypt/Ciphers -Fudcpcryp
 FAIL=0
 PASS=0
 
+# GitHub Actions ek aciklamasi: genel repolarda kimlik dogrulamadan
+# OKUNABILEN tek kanal (check-runs API). Yeni satirlar %0A ile kodlanir.
+annot() {
+  _t="$1"; shift
+  _m=$(printf '%s' "$*" | tr '\r' ' ' | tr '\n' '%' | sed 's/%/%0A/g' |
+    cut -c1-600)
+  echo "::error title=$_t::$_m"
+}
+
 # derle <lpr-yolu> <cikti-adi>
 derle() {
   _lpr="$1"; _ad="$2"
@@ -59,6 +68,7 @@ derle() {
   if ! "$FPC" $FPCFLAGS -o"$BIN/$_ad$EXT" "$_lpr" > "$WORK/$_ad.build.log" 2>&1; then
     echo "  DERLEME HATASI ($_ad):"
     grep -E "Error|Fatal|error" "$WORK/$_ad.build.log" | head -5
+    annot "$_ad derleme" "$(grep -E 'Error|Fatal' "$WORK/$_ad.build.log" | head -4 | tr '\n' ' ')"
     FAIL=$((FAIL + 1))
     return 1
   fi
@@ -74,18 +84,21 @@ kos() {
   if ! "$BIN/$_ad$EXT" "$@" > "$WORK/$_ad.run.log" 2>&1; then
     echo "  KOSMA HATASI ($_ad) — son satirlar:"
     tail -10 "$WORK/$_ad.run.log"
+    annot "$_ad kapi" "$(tail -4 "$WORK/$_ad.run.log" | tr '\n' ' ')"
     FAIL=$((FAIL + 1))
     return 1
   fi
   if ! grep -q "$_bek" "$WORK/$_ad.run.log"; then
     echo "  BASARISIZ ($_ad): '$_bek' bulunamadi — son satirlar:"
     tail -10 "$WORK/$_ad.run.log"
+    annot "$_ad kapi" "beklenen: $_bek | $(tail -3 "$WORK/$_ad.run.log" | tr '\n' ' ')"
     FAIL=$((FAIL + 1))
     return 1
   fi
   if grep -q "kalan=" "$WORK/$_ad.run.log" && ! grep -q "kalan=0" "$WORK/$_ad.run.log"; then
     echo "  BASARISIZ ($_ad): kalan > 0 — son satirlar:"
     tail -10 "$WORK/$_ad.run.log"
+    annot "$_ad kapi" "kalan>0 | $(tail -3 "$WORK/$_ad.run.log" | tr '\n' ' ')"
     FAIL=$((FAIL + 1))
     return 1
   fi
