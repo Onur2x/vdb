@@ -882,6 +882,12 @@ değerlendirilmesidir; sonuç üretimi (1M satır × 6 kolon kopyası) ayrıca
 tek taraflı yüklemi ilgili tarafın taramasına itildi → **61,1 ms (~97x)**,
 bkz. `hiztesti.md` §16.
 
+> **v3.35 eki (2026-11-03):** Sprint E pushdown'u filtrelemeyi taramadan
+> **sonra** uyguluyordu; sağ taraf yine `FT.ScanRows` ile tam taranıyordu.
+> v3.35'te tarama **öncesi** `NarrowRows` daraltması eklendi (yalnız
+> INNER/LEFT; RIGHT/FULL'de NULL sarmalama gerekir). Seçici sağ filtrede
+> 203 ms → **0 ms (~203x)**. Ayrıntı: `hiztesti.md` §20.
+
 Testler: `sqltest` v3 **2832/0/33**, v2 **3266/0/0**; yeni
 `T158_OnEkKosulHash` (INNER / LEFT / FULL / PK / OR kökü / NULL ve
 imkânsız ek koşul yolları). 14/14 kapı yeşil.

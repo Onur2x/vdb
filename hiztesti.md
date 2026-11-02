@@ -1310,3 +1310,55 @@ veritabanlarında, WAL artığı önlenir). 100k ve 1M sonuçları:
 
 **Sonraki hedef:** Tablo API (B = 6,4 µs/satır @ 1M) hâlâ SQLite'ın (3,12)
 2x altında. `FT.Insert` içindeki `EncodeRow` + `IdxAddRow` + `Put` optimizasyonu.
+
+## 20. v3.35 — Tarama-seviyesi join pushdown (2026-11-03)
+
+### 20.1 Yapılan
+
+Sprint E pushdown'u filtrelemeyi join döngüsüne girmeden **sonra** uyguluyordu
+(`FilterSide` satır matrisini eler). Ancak sağ taraf her zaman
+`FT.ScanRows` ile **tam** taranıyordu — yani daraltma avantajı yalnızca
+join döngüsüne giren satır sayısına yansıyordu, tarama maliyetine değil.
+
+v3.35'te `MergeStep` içinde sağ taraf yüklenirken tek taraflı predikatlar
+önce `NarrowRows`'a verilir:
+
+* `TryNarrowRightSide(Td, Cn, Ct, RPreds, Pks, Rows)` — AND ağacını kurar,
+  `NarrowRows`'u dener. Başarısızsa `FT.ScanRows`'a düşülür.
+* `NarrowRows` her zaman **üst küme** döndürdüğü için `FilterSide` sonraki
+  doğrulamayı aynen yapar; yanlış negatif yok.
+* Mekanizma: WHERE/ON AST'sinden PK eşitliği → O(1) tek satır; indeksli
+  kolonda `= > >= < <= BETWEEN IN` → indeks dilimi.
+
+**Güvenlik:** Sağ taraf daraltması yalnız `jtInner`/`jtLeft` için güvenli.
+`RIGHT`/`FULL`'de esleşmeyen sağ satırların NULL sarmalama ile korunması
+gerekiyor; daraltma bu satırları kaybettirir. Bu iki tipte her zaman tam
+tarama yapılır. (Bu kural ilk denemede ihlal edildi; 5 FULL/RIGHT testi
+düştü ve düzeltildi.)
+
+### 20.2 Ölçüm — `scanpushbench` (2026-11-03)
+
+`tests/bench/scanpushbench.lpr`: 100k satırlık sağ tablo (`b`, indeksli
+`y` ve `k`), 100 satırlık sol tablo (`a`). Sıcak koşular:
+
+| Sorgu | Taban | Daraltmalı | Kazanç |
+|---|---|---|---|
+| S1 seçici WHERE (`b.y > 99990`) | 203 ms | **0 ms** | **~203x** |
+| S2 geniş WHERE (`b.y > 0`) | 219 ms | 234 ms | ~%7 yavaş |
+| S3 sol filtre (`a.k > 95`) | 62 ms | 63 ms | etkisiz (beklenen) |
+| S4 seçici ON (`b.y > 99990`) | 203 ms | **0 ms** | **~203x** |
+
+S2'deki ~%7 kayıp, seçici olmayan filtrelerde `NarrowRows`'un tüm satırları
+üst küme olarak döndürmesinden geliyor (indeks dilimi = tam tarama). Küçük
+ve dar bir overhead; seçici sorgulardaki kazanç yanında önemsiz.
+
+### 20.3 Kapılar (2026-11-03)
+
+SQL testleri: v3 **2885/0/33**, v2 **3287/0/0** — hepsi geçti.
+
+CI (macOS) `crashtest` kapısı bu commit'te 10/11 ile düştü
+(`COKME KURTARMA HATALI`). Bu kapı depolama katmanını (WAL/sayfa motoru)
+sınar; değişiklik yalnızca SQL join katmanında (`VDbExecutor.pas` →
+`MergeStep`). Aynı koddan koşan iki macOS koşusunun biri geçti biri düştü —
+`TestKill9` alt süreç zamanlaması kaynaklı bilinen gürültü (kaynakta
+2026-10-25 CI #36/#37 notu). İlişkili değil.
