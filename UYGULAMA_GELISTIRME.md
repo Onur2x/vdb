@@ -360,8 +360,9 @@ s'de bitmiyordu** (klasik çift döngü, 100M ifade değerlendirmesi). Artık
 `JoinOnOk`'ta aynen uygulanır (sonuç değişmez); ek koşul varsa indeks/PK
 hızlı yolu kapatılır (o yol ek koşulu atlardı). Aynı sorgu **5.926 ms**.
 Merge JOIN ve Bloom filtresi **ölçümle reddedildi** (gerekçeler:
-`V3_YOL_HARITASI.md` §Sürüm çizgisi kararı). Kalan ölçülmüş fırsat: ON/WHERE
-yüklemlerinin ilgili tarafa itilmesi.
+`V3_YOL_HARITASI.md` §Sürüm çizgisi kararı). ON/WHERE pushdown **Sprint E'de
+yapıldı** (v3.34, 2026-10-29): 5.926 ms → **61,1 ms (~97x)**, bkz.
+`hiztesti.md` §16.
 
 **Sürüm çizgisi (2026-10-26):** Bu hat **alpha**'dır; `v3.x` numaraları
 yayın sürümü değil çalışma dilimi adıdır. Kalan maddeler (dosya boyutu,

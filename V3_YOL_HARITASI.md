@@ -878,10 +878,9 @@ kümesi değişmez. Ek koşul varsa **indeks/PK hızlı yolu kapatılır**: o yo
 
 **Kalan maliyet.** 5,9 s, 1M aday çift için ek koşulun çift başına
 değerlendirilmesidir; sonuç üretimi (1M satır × 6 kolon kopyası) ayrıca
-~3,2 s. Bir sonraki kazanç ON/WHERE yüklemlerinin ilgili tarafa
-**itilmesidir** (`a.k > 1000000` solda 0 satır bırakır → iş ~0). Bu,
-ölçümle belirlenmiş ayrı bir maddedir; merge JOIN bu iki darboğazın
-ikisini de çözmez (bkz. "Sürüm çizgisi kararı", madde 2).
+~3,2 s. Bu da **Sprint E'de çözüldü** (v3.34, 2026-10-29): ON/WHERE'in
+tek taraflı yüklemi ilgili tarafın taramasına itildi → **61,1 ms (~97x)**,
+bkz. `hiztesti.md` §16.
 
 Testler: `sqltest` v3 **2832/0/33**, v2 **3266/0/0**; yeni
 `T158_OnEkKosulHash` (INNER / LEFT / FULL / PK / OR kökü / NULL ve
@@ -2155,9 +2154,10 @@ kendi kapıları ve ölçümüyle):
    kolon=kolon eşitliği hash anahtarı olur, ek koşullar `JoinOnOk`'ta
    aynen uygulanır (semantik değişmez; LEFT/FULL/NULL testleri eklendi).
    Aynı sorgu artık **5.926 ms**. Kalan maliyet, 1M aday çift için ek
-   koşulun çift başına değerlendirilmesidir; bir sonraki kazanç ON/WHERE
-   yüklemlerinin ilgili tarafa **itilmesidir** (ölçülmüş fırsat, ayrı
-   madde).
+   koşulun çift başına değerlendirilmesiydi; bu da **Sprint E'de yapıldı**
+   (v3.34, 2026-10-29): ON/WHERE'in tek taraflı yüklemi ilgili tarafın
+   taramasına itildi (`ExprSide`/`CollectOneSided`/`FilterSide`) →
+   **61,1 ms (~97x)**. Ayrıntı: `hiztesti.md` §16.
 3. ~~**Dosya boyutu**~~ — **YAPILDI (v3.13, 2026-10-26).** PK'nin satır
    gövdesinde ikinci kez yazılması kaldırıldı (`pkLen = 0` + kolon
    indeksi; dosya sürümü 5, eski dosyalar okunur ve ilk yazmada yükseltilir).

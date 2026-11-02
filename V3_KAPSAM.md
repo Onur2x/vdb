@@ -731,8 +731,9 @@ ağacının içindeki kolon=kolon eşitliği hash anahtarı olur, ek koşullar
 `JoinOnOk`'ta uygulanır (sonuç değişmez). Ek koşul varsa indeks/PK hızlı
 yolu kapatılır (o yol `JoinOnOk` çağırmaz → ek koşulu atlardı).
 
-Kalan ölçülmüş fırsat: ON/WHERE yüklemlerinin ilgili tarafa itilmesi
-(`a.k > 1000000` solda 0 satır bırakır). Bu ayrı bir maddedir.
+ON/WHERE pushdown **Sprint E'de yapıldı** (v3.34, 2026-10-29): tek taraflı
+yüklemler ilgili tarafın taramasına itildi → **61,1 ms (~97x)**, bkz.
+`hiztesti.md` §16.
 
 Kapı: `sqltest` v3 **2832/0/33**, v2 **3266/0/0** (yeni
 `T158_OnEkKosulHash`: INNER/LEFT/FULL/PK/OR kökü/NULL/imkânsız ek koşul);
