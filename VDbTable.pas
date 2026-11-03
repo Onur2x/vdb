@@ -1283,7 +1283,7 @@ begin
   if Length(S) > 0 then Move(S[1], Result[0], Length(S));
 end;
 
-function VDbB2S(const B: TBytes; Pos, Len: Integer): RawByteString;
+function VDbB2S(const B: TBytes; Pos, Len: Integer): AnsiString;
 begin
   { FPC 3.2.2/x86_64: yonetilen tur donduren fonksiyonun gecici sonucu
     sifirlanmis olmayabilir; SetLength(Result, ...) o bayat isaretciyi
@@ -4137,6 +4137,17 @@ begin
   Result := True;
 end;
 
+// P-91b: saf-ASCII bayt araligi mi? UTF8Decode atlaniyor (3 tahsis -> 1).
+function VdbPureAscii(P: PByte; L: Integer): Boolean;
+var
+  k: Integer;
+begin
+  Result := False;
+  for k := 0 to L - 1 do
+    if P[k] >= $80 then Exit;
+  Result := True;
+end;
+
 procedure VDbRowFromOffsetsP(B: PByte; ColCount: Integer;
   const FType: array of Byte; const FOff, FLen: array of Integer;
   out Vals: TStrArray);
@@ -4148,6 +4159,7 @@ var
   s: RawByteString;
   tid: Word;
   plain: TBytes;
+  p: PByte;
 begin
   if B <> nil then tid := VdbRowTableIdAt(B) else tid := 0;
   SetLength(Vals, ColCount);
@@ -4168,7 +4180,8 @@ begin
         begin Vals[i] := BoolToStr(B[FOff[i]] <> 0, True); end;
     else
       begin
-        SetString(s, PAnsiChar(NativeUInt(B) + NativeUInt(FOff[i])), FLen[i]);
+        p := PByte(NativeUInt(B) + NativeUInt(FOff[i]));
+        SetString(s, PAnsiChar(p), FLen[i]);
         if VDbColumnIsSealed(s) then
         begin
           plain := VDbColumnOpen(tid, i, VDbS2B(s));
@@ -4176,7 +4189,10 @@ begin
           else Vals[i] := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
         end
         else if FType[i] = VCT_BLOB then Vals[i] := s
-        else Vals[i] := UTF8Decode(s);
+        else if VdbPureAscii(p, FLen[i]) then
+          SetString(Vals[i], PAnsiChar(p), FLen[i])   // P-91b: ASCII — UTF8Decode yok
+        else
+          Vals[i] := UTF8Decode(s);
       end;
     end;
   end;
@@ -4193,6 +4209,7 @@ var
   s: RawByteString;
   tid: Word;
   plain: TBytes;
+  p: PByte;
 begin
   if B <> nil then tid := VdbRowTableIdAt(B) else tid := 0;
   SetLength(Vals, ColCount);
@@ -4214,7 +4231,8 @@ begin
         begin Vals[i] := BoolToStr(B[FOff[i]] <> 0, True); end;
     else
       begin
-        SetString(s, PAnsiChar(NativeUInt(B) + NativeUInt(FOff[i])), FLen[i]);
+        p := PByte(NativeUInt(B) + NativeUInt(FOff[i]));
+        SetString(s, PAnsiChar(p), FLen[i]);
         if VDbColumnIsSealed(s) then
         begin
           plain := VDbColumnOpen(tid, i, VDbS2B(s));
@@ -4222,7 +4240,10 @@ begin
           else Vals[i] := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
         end
         else if FType[i] = VCT_BLOB then Vals[i] := s
-        else Vals[i] := UTF8Decode(s);
+        else if VdbPureAscii(p, FLen[i]) then
+          SetString(Vals[i], PAnsiChar(p), FLen[i])   // P-91b: ASCII — UTF8Decode yok
+        else
+          Vals[i] := UTF8Decode(s);
       end;
     end;
   end;
@@ -4236,6 +4257,7 @@ var
   s: RawByteString;
   tid: Word;
   plain: TBytes;
+  p: PByte;
 begin
   Result := '';
   if (B = nil) or (Col < 0) or (Col >= ColCount) or
@@ -4256,7 +4278,8 @@ begin
       Result := BoolToStr(B[FOff[Col]] <> 0, True);
   else
     begin
-      SetString(s, PAnsiChar(NativeUInt(B) + NativeUInt(FOff[Col])), FLen[Col]);
+      p := PByte(NativeUInt(B) + NativeUInt(FOff[Col]));
+      SetString(s, PAnsiChar(p), FLen[Col]);
       if VDbColumnIsSealed(s) then
       begin
         plain := VDbColumnOpen(tid, Col, VDbS2B(s));
@@ -4264,7 +4287,10 @@ begin
         else Result := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
       end
       else if FType[Col] = VCT_BLOB then Result := s
-      else Result := UTF8Decode(s);
+      else if VdbPureAscii(p, FLen[Col]) then
+        SetString(Result, PAnsiChar(p), FLen[Col])   // P-91b: ASCII — UTF8Decode yok
+      else
+        Result := UTF8Decode(s);
     end;
   end;
 end;
@@ -4319,6 +4345,8 @@ begin
       end
       else if ct = VCT_BLOB then
         Vals[i] := s
+      else if VdbPureAscii(@B[p], vl) then
+        SetString(Vals[i], PAnsiChar(@B[p]), vl)   // P-91b: ASCII — UTF8Decode yok
       else
         Vals[i] := UTF8Decode(s);
     end;

@@ -1893,3 +1893,35 @@ SetString+UTF8Decode). Bu optimizasyon doğru ama ölçülebilir kazanç sağlam
 yine de gereksiz işi atladığı için tutuldu.
 
 Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMİZ, chainnull TEMİZ.
+
+## §34 — P-91b: ASCII hızlı yolu — UTF8Decode atlanıyor
+
+**Tarih:** 2026-11-03
+**Dal:** v3
+**Sorun:** TEXT kolon decode'unda `UTF8Decode(s)` çağrısı her seferinde
+`WideString` (UTF-16) oluşturuyor, sonra `AnsiString`'e geri dönüyordu.
+Bu 3 ayrı tahsis demek (RawByteString + WideString + AnsiString). Saf-ASCII
+metinlerde bu tamamen gereksiz — doğrudan `SetString` ile 1 tahsis yeterli.
+
+**Çözüm:**
+1. `VdbPureAscii(P: PByte; L: Integer): Boolean` helper fonksiyonu eklendi
+   (`VDbTable.pas`). Baytların hepsi `< $80` ise `True` döner.
+2. `VDbRowFromOffsetsP`, `VDbRowFromOffsetsMaskP`, `VDbColFromOffsetsP` ve
+   `VDbDecodeRawRowP` içindeki TEXT yoluna ASCII kontrolü eklendi:
+   - Saf ASCII ise → `SetString(Vals[i], PAnsiChar(p), FLen[i])` (1 tahsis)
+   - Değilse → `UTF8Decode(s)` (eski yol, UTF-8 korunur)
+
+**Etki (joindiag):**
+| Sorgu | P-91 | P-91b | Değişim |
+|-------|------|-------|---------|
+| B: SELECT * 100k | 104.767 us | 91.002 us | **−%13** |
+| D: JOIN COUNT | 1.539 us | 1.509 us | −%2 |
+| G: NarrowRows | 609 us | 585 us | −%4 |
+
+B sorgusu doğrudan `VDbRowFromOffsetsP` üzerinden 100k satır × 4 kolon
+decode ediyor; ASCII hızlı yolu burada belirgin kazanç sağlıyor. D/E/F/G
+zaten küçük olduğu için etki sınırlı.
+
+p67diag INSERT: 1.368 us/satır (P-91 ile aynı seviye, gürültü içinde).
+
+Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMİZ, chainnull TEMİZ.
