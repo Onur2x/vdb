@@ -458,6 +458,12 @@ type
       dahil davranis degismez). }
     function TryStreamAgg(Stmt: TSqlSelectStmt; const td: TTableDef;
       out Res: TSqlResult): Boolean;
+    { P-87: INNER equi-join + saf aggregate (COUNT/SUM/AVG/MIN/MAX,
+      GROUP BY'suz) icin indeks surucu join kisayolu. Sira-bagimsiz
+      oldugu icin KUCUK taraftan surulup diger tarafta PK/indeks
+      aranir; buyuk tablo materyalizasyonu tamamen atlanir.
+      Sekil uymazsa False -> genel ExecJoinScan + ExecGroupBy yolu. }
+    function TryJoinAgg(Stmt: TSqlSelectStmt; out Res: TSqlResult): Boolean;
     { H13 (2026-10-21): GROUP BY + basit aggregate'leri ham akistan tek
       passede hesaplar. Tum satirlar string matrisine cevrilmez; her grup
       icin yalniz anahtar + sayaclar tutulur. Sekil uymazsa False -> genel
@@ -8999,6 +9005,407 @@ begin
 end;
 
 { ------------------------------------------------------------
+  P-87 (2026-11-03) - TryJoinAgg
+  INNER equi-join + saf aggregate (GROUP BY'suz) sorgularinda
+  indeks surucu join kisayolu. Sira-bagimsiz oldugu icin buyuk
+  tablo materyalizasyonu tamamen atlanir: indeks OLMAYAN taraftan
+  surulur, diger tarafta PK/indeks aranir (joindiag: S6 ~550 ms
+  -> ~2 ms). Aggregate semantigi EvalAggregateValue ile BIREBIR
+  (COUNT(*) satir sayar; COUNT(col) NULL olmayani; SUM cntI>0
+  iken sumF; AVG avgCnt>0 iken sumF/avgCnt; MIN/MAX VDbCmpVal +
+  ham deger). Sekil uymazsa False -> genel ExecJoinScan +
+  ExecGroupBy yolu AYNEN calisir.
+  ------------------------------------------------------------ }
+function TVSqlExecutor.TryJoinAgg(Stmt: TSqlSelectStmt; out Res: TSqlResult): Boolean;
+type
+  TJaPlan = record
+    Fn: TSqlFuncCallNode;
+    Col: Integer;            // -1 = COUNT(*); digeri birlesik satir indeksi
+    Cnt, AvgCnt: Int64;
+    SumF: Double;
+    MinV, MaxV: string;      // EvalAggregateValue: ham deger
+    AggCt: Byte;
+  end;
+var
+  tdL, tdR: TTableDef;
+  cnL, cnR, cnM: TStrArray;
+  ctL, ctR, ctM: TByteArray;
+  aliasL, aliasR, lkName, drvName: string;
+  nL, nR, jColL, jColR: Integer;
+  eqn: TSqlBinaryOpNode;
+  cl, cr, ws1, ws2, i2: Integer;
+  hasL, hasR, usePkL, usePkR, DriveRight: Boolean;
+  srcL, srcR: TIdxSource;
+  range: TIdxEntries;
+  drvPks: TStrArray;
+  drvRows: TStrMatrix;
+  d, lrow, merged: TStrArray;
+  plans: array of TJaPlan;
+  fn: TSqlFuncCallNode;
+  cref: TSqlColumnRefNode;
+  j, k, matchCnt: Integer;
+  jv: string;
+  ncntL, ncntR: Int64;
+
+  function OnEqNode(N: TSqlExprNode): TSqlBinaryOpNode;
+  var
+    B: TSqlBinaryOpNode;
+  begin
+    Result := nil;
+    if N = nil then Exit;
+    if not (N is TSqlBinaryOpNode) then Exit;
+    B := TSqlBinaryOpNode(N);
+    if (B.Op = sboEq) and (B.Left is TSqlColumnRefNode) and
+       (B.Right is TSqlColumnRefNode) then
+    begin
+      Result := B;
+      Exit;
+    end;
+    if B.Op = sboAnd then
+    begin
+      Result := OnEqNode(B.Left);
+      if Result = nil then Result := OnEqNode(B.Right);
+    end;
+  end;
+
+  function WhichSide(C: TSqlColumnRefNode; out Idx: Integer): Integer;
+  var
+    nm: string;
+    w, hit, side: Integer;
+  begin
+    Result := 0;
+    Idx := -1;
+    if C.TableQualifier <> '' then
+    begin
+      if SameText(C.TableQualifier, aliasL) then
+      begin
+        if SameText(C.TableQualifier, aliasR) then Exit;
+        nm := VDbNorm(C.ColumnName);
+        for w := 0 to High(cnL) do
+          if VDbNorm(cnL[w]) = nm then
+          begin
+            Idx := w;
+            Exit(1);
+          end;
+        Exit;
+      end;
+      if SameText(C.TableQualifier, aliasR) then
+      begin
+        nm := VDbNorm(C.ColumnName);
+        for w := 0 to High(cnR) do
+          if VDbNorm(cnR[w]) = nm then
+          begin
+            Idx := w;
+            Exit(2);
+          end;
+      end;
+      Exit;
+    end;
+    hit := 0; side := 0;
+    nm := VDbNorm(C.ColumnName);
+    for w := 0 to High(cnL) do
+      if VDbNorm(cnL[w]) = nm then
+      begin
+        Inc(hit); side := 1; Idx := w;
+      end;
+    for w := 0 to High(cnR) do
+      if VDbNorm(cnR[w]) = nm then
+      begin
+        Inc(hit); side := 2; Idx := w;
+      end;
+    if hit = 1 then Result := side
+    else Idx := -1;
+  end;
+
+  procedure AccOne(var Pl: TJaPlan; const V: string);
+  var
+    fv: Double;
+  begin
+    if Pl.Col < 0 then
+    begin
+      Inc(Pl.Cnt);                 // COUNT(*)
+      Exit;
+    end;
+    if V = '' then Exit;           // NULL: sayilmaz
+    Inc(Pl.Cnt);
+    if VDbParseFloat(V, fv) then
+    begin
+      Pl.SumF := Pl.SumF + fv;
+      Inc(Pl.AvgCnt);
+    end;
+    if (Pl.MinV = '') or VDbCmpVal(V, Pl.MinV, '<', Pl.AggCt) then
+      Pl.MinV := V;
+    if (Pl.MaxV = '') or VDbCmpVal(V, Pl.MaxV, '>', Pl.AggCt) then
+      Pl.MaxV := V;
+  end;
+
+begin
+  Result := False;
+  { --- 1) Sorgu sekli korumasi --- }
+  if not Stmt.HasJoin then Exit;
+  if (Stmt.MoreJoins <> nil) and (Stmt.MoreJoins.Count > 0) then Exit;
+  if Stmt.Join.JoinType <> jtInner then Exit;
+  if Stmt.Join.Natural then Exit;
+  if Stmt.Join.LateralIdx <> -1 then Exit;
+  if (Stmt.JoinUsing <> nil) and (Stmt.JoinUsing.Count > 0) then Exit;
+  if (Stmt.LateralSubs <> nil) and (Stmt.LateralSubs.Count > 0) then Exit;
+  if Stmt.Join.OnCondition = nil then Exit;
+  if (Stmt.SetOp <> sokNone) or (Stmt.RightSelect <> nil) then Exit;
+  if Stmt.AsOf <> saoNone then Exit;
+  if (Stmt.WithQueries <> nil) and (Stmt.WithQueries.Count > 0) then Exit;
+  if Stmt.IsDistinct then Exit;
+  if (Stmt.HavingClause <> nil) or (Stmt.QualifyClause <> nil) then Exit;
+  if (Stmt.GroupByCols <> nil) and (Stmt.GroupByCols.Count > 0) then Exit;
+  if (Stmt.OrderBy <> nil) and (Stmt.OrderBy.Count > 0) then Exit;
+  if (Stmt.LimitVal >= 0) or (Stmt.OffsetVal <> 0) then Exit;
+  if HasWindow(Stmt) then Exit;
+  if Stmt.Columns.Count = 0 then Exit;
+
+  { --- 2) Iki taraf da gercek tablo olmali --- }
+  if not FT.TryGetTableDef(Stmt.FromTable, tdL) then Exit;
+  if not FT.TryGetTableDef(Stmt.Join.Table, tdR) then Exit;
+  if tdL.IsView or tdR.IsView then Exit;
+  if FT.RlsApplies(Stmt.FromTable) or FT.RlsApplies(Stmt.Join.Table) then Exit;
+
+  if Stmt.FromAlias <> '' then aliasL := Stmt.FromAlias
+  else aliasL := Stmt.FromTable;
+  if Stmt.Join.Alias <> '' then aliasR := Stmt.Join.Alias
+  else aliasR := Stmt.Join.Table;
+
+  BuildColInfo(tdL, cnL, ctL);
+  BuildColInfo(tdR, cnR, ctR);
+  nL := Length(cnL);
+  nR := Length(cnR);
+
+  { --- 3) ON esitlik kolonlari: biri sol, biri sag --- }
+  eqn := OnEqNode(Stmt.Join.OnCondition);
+  if eqn = nil then Exit;
+  ws1 := WhichSide(TSqlColumnRefNode(eqn.Left), cl);
+  ws2 := WhichSide(TSqlColumnRefNode(eqn.Right), cr);
+  if (ws1 = 1) and (ws2 = 2) then
+  begin
+    jColL := cl;
+    jColR := cr;
+  end
+  else if (ws1 = 2) and (ws2 = 1) then
+  begin
+    jColL := cr;
+    jColR := cl;
+  end
+  else
+    Exit;
+
+  { --- 4) Yol secimi: PK/indeks hangi tarafta? --- }
+  hasL := False; usePkL := False;
+  hasR := False; usePkR := False;
+  if tdL.PkIndex = jColL then
+  begin
+    hasL := True;
+    usePkL := True;
+  end
+  else if FT.TryGetIdxSource(tdL.TableId, jColL, srcL) then
+    hasL := True;
+  if tdR.PkIndex = jColR then
+  begin
+    hasR := True;
+    usePkR := True;
+  end
+  else if FT.TryGetIdxSource(tdR.TableId, jColR, srcR) then
+    hasR := True;
+  if (not hasL) and (not hasR) then Exit;
+
+  if hasL and (not hasR) then
+    DriveRight := True
+  else if hasR and (not hasL) then
+    DriveRight := False
+  else
+  begin
+    ncntL := -1;
+    ncntR := -1;
+    if FT.Kv <> nil then
+    begin
+      if not FT.Kv.TryGetTableRowCount(tdL.TableId, ncntL) then ncntL := -1;
+      if not FT.Kv.TryGetTableRowCount(tdR.TableId, ncntR) then ncntR := -1;
+    end
+    else if FT.Backend <> nil then
+    begin
+      ncntL := FT.Backend.CountTable(tdL.TableId);
+      ncntR := FT.Backend.CountTable(tdR.TableId);
+    end;
+    if (ncntL >= 0) and (ncntR >= 0) then
+      DriveRight := (ncntR <= ncntL)
+    else
+      DriveRight := False;
+  end;
+
+  { --- 5) Birlesik kolon adlari/tipleri (ExecJoinScan ile ayni) --- }
+  SetLength(cnM, nL + nR);
+  SetLength(ctM, nL + nR);
+  for k := 0 to nL - 1 do
+  begin
+    cnM[k] := aliasL + '.' + cnL[k];
+    ctM[k] := ctL[k];
+  end;
+  for k := 0 to nR - 1 do
+  begin
+    cnM[nL + k] := aliasR + '.' + cnR[k];
+    ctM[nL + k] := ctR[k];
+  end;
+
+  { --- 6) Aggregate planlari --- }
+  SetLength(plans, Stmt.Columns.Count);
+  for j := 0 to Stmt.Columns.Count - 1 do
+  begin
+    if not (Stmt.Columns[j].Expr is TSqlFuncCallNode) then Exit;
+    fn := TSqlFuncCallNode(Stmt.Columns[j].Expr);
+    if not ((fn.FuncName = 'COUNT') or (fn.FuncName = 'SUM') or
+            (fn.FuncName = 'AVG') or (fn.FuncName = 'MIN') or
+            (fn.FuncName = 'MAX')) then Exit;
+    if fn.IsDistinct or (fn.Filter <> nil) then Exit;
+    plans[j].Fn := fn;
+    plans[j].Col := -1;
+    plans[j].Cnt := 0;
+    plans[j].AvgCnt := 0;
+    plans[j].SumF := 0;
+    plans[j].MinV := '';
+    plans[j].MaxV := '';
+    plans[j].AggCt := VCT_STR;
+    if fn.IsStar then
+    begin
+      if fn.FuncName <> 'COUNT' then Exit;
+      Continue;
+    end;
+    if not (fn.Arg is TSqlColumnRefNode) then Exit;
+    cref := TSqlColumnRefNode(fn.Arg);
+    k := FindColIdx(cref.ColumnName, cref.TableQualifier, cnM);
+    if (k < 0) or (k > High(ctM)) then Exit;
+    plans[j].Col := k;
+    plans[j].AggCt := ctM[k];
+  end;
+
+  { --- 7) Surus dongusu --- }
+  if DriveRight then
+  begin
+    drvName := Stmt.Join.Table;
+    lkName := Stmt.FromTable;
+  end
+  else
+  begin
+    drvName := Stmt.FromTable;
+    lkName := Stmt.Join.Table;
+  end;
+  FT.ScanRows(drvName, drvPks, drvRows);
+  SetLength(merged, nL + nR);
+  matchCnt := 0;
+  for j := 0 to High(drvRows) do
+  begin
+    d := drvRows[j];
+    if DriveRight then
+    begin
+      if d[jColR] = '' then Continue;
+      jv := VDbNormValue(tdL.Cols[jColL].Ctype, d[jColR]);
+    end
+    else
+    begin
+      if d[jColL] = '' then Continue;
+      jv := VDbNormValue(tdR.Cols[jColR].Ctype, d[jColL]);
+    end;
+
+    if DriveRight then
+    begin
+      if usePkL then
+      begin
+        if not FT.ReadRow(lkName, jv, lrow) then Continue;
+        SetLength(range, 1);
+        range[0].Pk := jv;
+        if lrow[jColL] <> d[jColR] then Continue;
+      end
+      else if IdxSourceRange(srcL, '=', jv, range) <= 0 then
+        Continue;
+    end
+    else
+    begin
+      if usePkR then
+      begin
+        if not FT.ReadRow(lkName, jv, lrow) then Continue;
+        SetLength(range, 1);
+        range[0].Pk := jv;
+        if lrow[jColR] <> d[jColL] then Continue;
+      end
+      else if IdxSourceRange(srcR, '=', jv, range) <= 0 then
+        Continue;
+    end;
+
+    for i2 := 0 to High(range) do
+    begin
+      if DriveRight then
+      begin
+        if not usePkL then
+          if not FT.ReadRow(lkName, range[i2].Pk, lrow) then Continue;
+        for k := 0 to nL - 1 do merged[k] := lrow[k];
+        for k := 0 to nR - 1 do merged[nL + k] := d[k];
+      end
+      else
+      begin
+        if not usePkR then
+          if not FT.ReadRow(lkName, range[i2].Pk, lrow) then Continue;
+        for k := 0 to nL - 1 do merged[k] := d[k];
+        for k := 0 to nR - 1 do merged[nL + k] := lrow[k];
+      end;
+
+      if not EvalBool(Stmt.Join.OnCondition, merged, cnM, ctM) then Continue;
+      if matchCnt >= 2000000 then
+        raise EVDbException.Create(ecLimit, 'JOIN sonucu cok buyuk (2M sinir)');
+      Inc(matchCnt);
+
+      if (Stmt.WhereClause <> nil) and
+         (not RowMatches(Stmt.WhereClause, merged, cnM, ctM)) then
+        Continue;
+
+      for k := 0 to High(plans) do
+        if plans[k].Col < 0 then
+          AccOne(plans[k], '')
+        else
+          AccOne(plans[k], merged[plans[k].Col]);
+    end;
+  end;
+
+  { --- 8) Sonuc: EvalAggregateValue + ExecGroupBy alan adi kurallari --- }
+  SetLength(Res.Fields, Stmt.Columns.Count);
+  SetLength(Res.Rows, 1);
+  SetLength(Res.Rows[0], Stmt.Columns.Count);
+  for j := 0 to Stmt.Columns.Count - 1 do
+  begin
+    fn := plans[j].Fn;
+    if Stmt.Columns[j].Alias <> '' then
+      Res.Fields[j] := Stmt.Columns[j].Alias
+    else
+      Res.Fields[j] := fn.FuncName;
+    if fn.FuncName = 'COUNT' then
+      Res.Rows[0][j] := IntToStr(plans[j].Cnt)
+    else if fn.FuncName = 'SUM' then
+    begin
+      if plans[j].Cnt > 0 then
+        Res.Rows[0][j] := VDbFloatToStr(plans[j].SumF)
+      else Res.Rows[0][j] := '';
+    end
+    else if fn.FuncName = 'AVG' then
+    begin
+      if plans[j].AvgCnt > 0 then
+        Res.Rows[0][j] := VDbFloatToStr(plans[j].SumF / plans[j].AvgCnt)
+      else Res.Rows[0][j] := '';
+    end
+    else if fn.FuncName = 'MIN' then
+      Res.Rows[0][j] := plans[j].MinV
+    else  // MAX
+      Res.Rows[0][j] := plans[j].MaxV;
+  end;
+  Res.Affected := 1;
+  Res.Msg := 'OK';
+  Result := True;
+end;
+
+{ ------------------------------------------------------------
   H13 (2026-10-21) - TryStreamGroupBy
   ------------------------------------------------------------
   ExecGroupBy tum satirlari once TStrMatrix'e cevirip her satir icin
@@ -13105,6 +13512,12 @@ begin
 
   if Stmt.HasJoin then
   begin
+    // P-87: INNER equi-join + saf aggregate -> indeks surucu kisayolu.
+    // Sira-bagimsiz; buyuk tablo materyalizasyonu atlanir. Uymazsa False
+    // ve asagidaki genel yol AYNEN calisir.
+    if (Stmt.GroupByCols.Count = 0) and HasAggregate(Stmt) and
+       TryJoinAgg(Stmt, Res) then
+      Exit;
     // P5-1 / 4.2 (2026-10-06): JOIN ile GROUP BY/aggregate ARTIK
     // calisir â€” birlesim ciktisi ayni ExecGroupBy hattindan gecer.
     // WHERE'i ExecGroupBy zaten kendisi uygular; onceden filtrelemek

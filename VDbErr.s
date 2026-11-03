@@ -260,6 +260,14 @@ VDBERR_$$_VDBERRORNAME$TVDBERRORCODE$$ANSISTRING:
 	je	.Lj74
 	subb	$1,%al
 	je	.Lj75
+	subb	$1,%al
+	je	.Lj76
+	subb	$1,%al
+	je	.Lj77
+	subb	$1,%al
+	je	.Lj78
+	subb	$1,%al
+	je	.Lj79
 	jmp	.Lj40
 	.balign 4,0x90
 .Lj41:
@@ -472,6 +480,30 @@ VDBERR_$$_VDBERRORNAME$TVDBERRORCODE$$ANSISTRING:
 	call	fpc_ansistr_assign
 	jmp	.Lj39
 	.balign 4,0x90
+.Lj76:
+	movl	-8(%ebp),%eax
+	movl	$.Ld36,%edx
+	call	fpc_ansistr_assign
+	jmp	.Lj39
+	.balign 4,0x90
+.Lj77:
+	movl	-8(%ebp),%eax
+	movl	$.Ld37,%edx
+	call	fpc_ansistr_assign
+	jmp	.Lj39
+	.balign 4,0x90
+.Lj78:
+	movl	-8(%ebp),%eax
+	movl	$.Ld38,%edx
+	call	fpc_ansistr_assign
+	jmp	.Lj39
+	.balign 4,0x90
+.Lj79:
+	movl	-8(%ebp),%eax
+	movl	$.Ld39,%edx
+	call	fpc_ansistr_assign
+	jmp	.Lj39
+	.balign 4,0x90
 .Lj40:
 	movl	-8(%ebp),%eax
 	movl	$.Ld2,%edx
@@ -490,7 +522,7 @@ VDBERR_$$_VDBERRORNAME$TVDBERRORCODE$$ANSISTRING:
 VMT_$VDBERR_$$_EVDBEXCEPTION:
 	.long	16,-16
 	.long	VMT_$SYSUTILS_$$_EXCEPTION$indirect
-	.long	.Ld36
+	.long	.Ld40
 	.long	0,0,0
 	.long	RTTI_$VDBERR_$$_EVDBEXCEPTION
 	.long	0,0,0,0
@@ -514,7 +546,7 @@ VMT_$VDBERR_$$_EVDBEXCEPTION:
 
 .section .rodata.n_VMT_$VDBERR_$$_EVDBEXCEPTION,"d"
 	.balign 4
-.Ld36:
+.Ld40:
 	.byte	13
 	.ascii	"EVDbException"
 # End asmlist al_const
@@ -799,6 +831,38 @@ VMT_$VDBERR_$$_EVDBEXCEPTION:
 	.long	-1,11
 .Ld35:
 	.ascii	"ecJsonError\000"
+
+.section .rodata.n_.Ld36,"d"
+	.balign 4
+.Ld36$strlab:
+	.short	0,1
+	.long	-1,18
+.Ld36:
+	.ascii	"ecPermissionDenied\000"
+
+.section .rodata.n_.Ld37,"d"
+	.balign 4
+.Ld37$strlab:
+	.short	0,1
+	.long	-1,14
+.Ld37:
+	.ascii	"ecObjectExists\000"
+
+.section .rodata.n_.Ld38,"d"
+	.balign 4
+.Ld38$strlab:
+	.short	0,1
+	.long	-1,10
+.Ld38:
+	.ascii	"ecNotFound\000"
+
+.section .rodata.n_.Ld39,"d"
+	.balign 4
+.Ld39$strlab:
+	.short	0,1
+	.long	-1,14
+.Ld39:
+	.ascii	"ecLockConflict\000"
 # End asmlist al_typedconsts
 # Begin asmlist al_rtti
 
@@ -809,7 +873,7 @@ RTTI_$VDBERR_$$_TVDBERRORCODE:
 	.byte	3,13
 	.ascii	"TVDbErrorCode"
 	.byte	1
-	.long	0,34,0
+	.long	0,38,0
 	.byte	6
 	.ascii	"ecNone"
 	.byte	9
@@ -880,6 +944,14 @@ RTTI_$VDBERR_$$_TVDBERRORCODE:
 	.ascii	"ecPoolClosed"
 	.byte	11
 	.ascii	"ecJsonError"
+	.byte	18
+	.ascii	"ecPermissionDenied"
+	.byte	14
+	.ascii	"ecObjectExists"
+	.byte	10
+	.ascii	"ecNotFound"
+	.byte	14
+	.ascii	"ecLockConflict"
 	.byte	6
 	.ascii	"VDbErr"
 	.byte	0
@@ -888,7 +960,7 @@ RTTI_$VDBERR_$$_TVDBERRORCODE:
 	.balign 4
 .globl	RTTI_$VDBERR_$$_TVDBERRORCODE_s2o
 RTTI_$VDBERR_$$_TVDBERRORCODE_s2o:
-	.long	35,22
+	.long	39,22
 	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+356
 	.long	14
 	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+222
@@ -930,12 +1002,20 @@ RTTI_$VDBERR_$$_TVDBERRORCODE_s2o:
 	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+555
 	.long	10
 	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+167
+	.long	38
+	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+612
 	.long	25
 	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+410
 	.long	0
 	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+28
+	.long	37
+	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+601
 	.long	21
 	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+337
+	.long	36
+	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+586
+	.long	35
+	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+567
 	.long	33
 	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+542
 	.long	32
@@ -999,6 +1079,10 @@ RTTI_$VDBERR_$$_TVDBERRORCODE_o2s:
 	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+528
 	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+542
 	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+555
+	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+567
+	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+586
+	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+601
+	.long	RTTI_$VDBERR_$$_TVDBERRORCODE+612
 
 .section .rodata.n_INIT_$VDBERR_$$_EVDBEXCEPTION,"d"
 	.balign 8
