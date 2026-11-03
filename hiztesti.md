@@ -1694,3 +1694,47 @@ genel yol). İkincil indeks + WHERE varsa NarrowRows tercih edilir.
 
 Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMIZ,
 chainnull TEMIZ.
+
+## 28. P-89 — TryStreamJoin: sol taraf LRows materyalizasyonu atlama (2026-11-03)
+
+Tek INNER/LEFT equi-join'de sol taraf `ScanRawIterAll` ile akışkan
+taranır; `LRows` materyalizasyonu tamamen atlanır. Sağ taraf hash
+veya indeks/PK ile probe edilir. TryJoinAgg'ın reddettiği şekiller
+(LEFT JOIN, ifade SELECT, ORDER BY, pencere) bu yoldan geçer.
+
+`VdbStreamJoinCb` satır bazlı callback: `VDbPeekRawRowP` + `VDbHashKey`
+çarpışma + `VDbRowFromOffsetsP` decode + sol pushdown filtre + hash/index
+probe + OnHasExtra `EvalBool` + blok büyüme (256→2×) + LEFT NULL-genisletme.
+
+Birleşik kolon adları `ExecJoinScan` ile birebir aynı: `aliasL.kolon` /
+`aliasR.kolon`. Çıktı matrisi aynı formatta.
+
+**Düzeltmeler (bu dilimde):**
+- `ctx.bk` (TDictionary) yönetilen tip DEĞİL — NarrowRows Exit'inde
+  `finally` bloğu çöp pointer'ı serbest bırakıyordu (4× AV). Düzeltme:
+  `ctx.bk := nil` fonksiyonun en başına taşındı.
+- Hash normalizasyon: sol join anahtarı `C^.LTypes[C^.HashL]` ile
+  normalize edilmeli (sol tip), `C^.HashRType` DEĞİL. Hem hash hem
+  indeks/PK yolunda düzeltildi.
+
+`p89lj` (100k sol / 200 sağ, en iyi us, 3 tekrar):
+
+| Sorgu | Genel yol | TryStreamJoin | Kazanç |
+|---|---:|---:|---:|
+| A) LEFT JOIN COUNT | 195.208 us | 199.204 us | — |
+| B) LEFT JOIN ifade SELECT | 315.278 us | 318.579 us | — |
+| C) INNER JOIN ORDER BY LIMIT | 261.737 us | 239.482 us | **1,09x** |
+| D) LEFT JOIN WHERE-sol | 798.140 us | 694.245 us | **1,15x** |
+
+A/B'de kazanç yok: 100k çıktı satırı materyalizasyonu baskın maliyet;
+akışkan tarama LRows tasarrufu callback overhead ile dengeleniyor.
+C'de ORDER BY + LIMIT, D'de WHERE filtrelemesi akışkan taramanın
+erken çıkış/filtre avantajını gösteriyor.
+
+Güvenlik: NarrowRows sol predikatlarla denenir — True ise `Exit(False)`
+(genel yol), False veya predikat yoksa akışkan. LEFT eşleşmeyen satır
+NULL-genisletilir. OnHasExtra=False ise `EvalBool` atlanır (P-85).
+Kolon adları/tipleri `ExecJoinScan` ile birebir aynı.
+
+Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMIZ,
+chainnull TEMIZ.

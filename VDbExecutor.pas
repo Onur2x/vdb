@@ -464,6 +464,13 @@ type
       aranir; buyuk tablo materyalizasyonu tamamen atlanir.
       Sekil uymazsa False -> genel ExecJoinScan + ExecGroupBy yolu. }
     function TryJoinAgg(Stmt: TSqlSelectStmt; out Res: TSqlResult): Boolean;
+    { P-89: tek INNER/LEFT equi-join icin sol tarafta LRows materyalizasyonu
+      atlaniyor. Sol taraf ScanRawIterAll ile akislanir, sag taraf hash
+      (veya indeks/PK) ile probe edilir. TryJoinAgg'in reddettigi LEFT
+      JOIN, ifade SELECT, ORDER BY, LIMIT, GROUP BY gibi sekillerde de
+      calisir. Sekil uymazsa False -> genel ExecJoinScan yolu AYNEN. }
+    function TryStreamJoin(Stmt: TSqlSelectStmt; out MergedRows: TStrMatrix;
+      out MergedColNames: TStrArray; out MergedColTypes: TByteArray): Boolean;
     { H13 (2026-10-21): GROUP BY + basit aggregate'leri ham akistan tek
       passede hesaplar. Tum satirlar string matrisine cevrilmez; her grup
       icin yalniz anahtar + sayaclar tutulur. Sekil uymazsa False -> genel
@@ -9457,6 +9464,578 @@ begin
   Result := True;
 end;
 
+type
+  { P-89: akisli JOIN baglami. Sol taraf ham akistan okunur, sag taraf
+    hash tablosu (veya indeks/PK) ile probe edilir. Cikti matrisi
+    ExecJoinScan ile birebir ayni bicimde kurulur. }
+  TStreamJoinCtx = record
+    Exec: TVSqlExecutor;
+    LTableId: Word;
+    LTableName: string;
+    LHashPrefix: QWord;
+    LColCnt: Integer;
+    LFType: TByteArray;
+    LFOff, LFLen: TIntArray;
+    LNames: TStrArray;
+    LTypes: TByteArray;
+    HashOn: Boolean;
+    RRows: TStrMatrix;
+    HashL: Integer;
+    HashRrel: Integer;
+    HashRType: Byte;
+    bk: TDictionary<string, TList<Integer>>;
+    UseIdx: Boolean;
+    UsePk: Boolean;
+    JoinSrc: TIdxSource;
+    RTableName: string;
+    RColCnt: Integer;
+    nL, nR: Integer;
+    MergedNames: TStrArray;
+    MergedTypes: TByteArray;
+    OnCond: TSqlExprNode;
+    OnHasExtra: Boolean;
+    IsLeft: Boolean;
+    LPreds: TList<TSqlExprNode>;
+    RPreds: TList<TSqlExprNode>;
+    OutRows: TStrMatrix;
+    OutCap: Integer;
+    OutN: Integer;
+    MatchCnt: Integer;
+    Failed: Boolean;
+  end;
+  PStreamJoinCtx = ^TStreamJoinCtx;
+
+{ ------------------------------------------------------------
+  P-89 (2026-11-03) - TryStreamJoin
+  ------------------------------------------------------------
+  Tek INNER/LEFT equi-join icin sol tarafta LRows materyalizasyonu
+  atlaniyor. Sol taraf ScanRawIterAll ile akislanir, sag taraf hash
+  (veya indeks/PK) ile probe edilir. Cikti matrisi ExecJoinScan ile
+  birebir ayni bicimde kurulur (birlesik kolon adlari/tipleri dahil).
+  Sekil uymazsa False -> genel ExecJoinScan yolu AYNEN calisir. }
+
+function VdbStreamJoinCb(Key: QWord; Buf: PByte; Len: Integer;
+  User: Pointer): Boolean;
+var
+  C: PStreamJoinCtx;
+  tid: Word;
+  pk: string;
+  lrow, merged, rrow: TStrArray;
+  jv, kj: string;
+  lst: TList<Integer>;
+  matchFound: Boolean;
+  i, k, x: Integer;
+  range: TIdxEntries;
+  onOk: Boolean;
+begin
+  C := User;
+  Result := True;
+  if Key = VDB_SCHEMA_KEY then Exit;
+  if not VDbPeekRawRowP(Buf, Len, C^.LColCnt, tid, pk,
+                        C^.LFType, C^.LFOff, C^.LFLen) then
+  begin
+    C^.Failed := True;
+    Exit(False);
+  end;
+  if tid <> C^.LTableId then Exit;
+  if VDbHashKey(C^.LTableName, pk) <> Key then
+  begin
+    C^.Failed := True;
+    Exit(False);
+  end;
+  VDbRowFromOffsetsP(Buf, C^.LColCnt, C^.LFType, C^.LFOff, C^.LFLen, lrow);
+  // tek tarafli sol pushdown
+  if (C^.LPreds <> nil) and (C^.LPreds.Count > 0) then
+  begin
+    SetLength(merged, C^.nL + C^.nR);
+    for k := 0 to C^.nL - 1 do merged[k] := lrow[k];
+    for k := 0 to C^.nR - 1 do merged[C^.nL + k] := '';
+    for i := 0 to C^.LPreds.Count - 1 do
+      if not C^.Exec.EvalBool(C^.LPreds[i], merged, C^.MergedNames, C^.MergedTypes) then
+        Exit;
+  end;
+  SetLength(merged, C^.nL + C^.nR);
+  for k := 0 to C^.nL - 1 do merged[k] := lrow[k];
+  matchFound := False;
+  if C^.HashOn then
+  begin
+    if lrow[C^.HashL] = '' then
+      jv := ''
+    else
+      jv := VDbNormValue(C^.LTypes[C^.HashL], lrow[C^.HashL]);
+    if jv <> '' then
+    begin
+      if C^.bk.TryGetValue(jv, lst) then
+        for x := 0 to lst.Count - 1 do
+        begin
+          for k := 0 to C^.nR - 1 do merged[C^.nL + k] := C^.RRows[lst[x]][k];
+          onOk := (not C^.OnHasExtra) or
+                  C^.Exec.EvalBool(C^.OnCond, merged, C^.MergedNames, C^.MergedTypes);
+          if onOk then
+          begin
+            if C^.MatchCnt >= 2000000 then
+              raise EVDbException.Create(ecLimit, 'JOIN sonucu cok buyuk (2M sinir)');
+            Inc(C^.MatchCnt);
+            if C^.OutN >= C^.OutCap then
+            begin
+              if C^.OutCap = 0 then C^.OutCap := 256
+              else C^.OutCap := C^.OutCap * 2;
+              SetLength(C^.OutRows, C^.OutCap);
+            end;
+            SetLength(C^.OutRows[C^.OutN], C^.nL + C^.nR);
+            for k := 0 to C^.nL + C^.nR - 1 do
+              C^.OutRows[C^.OutN][k] := merged[k];
+            Inc(C^.OutN);
+            matchFound := True;
+          end;
+        end;
+    end;
+  end
+  else
+  begin
+    // indeks/PK yolu
+    if lrow[C^.HashL] = '' then
+      jv := ''
+    else
+      jv := VDbNormValue(C^.LTypes[C^.HashL], lrow[C^.HashL]);
+    if jv <> '' then
+    begin
+      if C^.UsePk then
+      begin
+        if C^.Exec.FT.ReadRow(C^.RTableName, jv, rrow) then
+        begin
+          SetLength(range, 1);
+          range[0].Pk := jv;
+          if rrow[C^.HashRrel] = lrow[C^.HashL] then
+          begin
+            for k := 0 to C^.nR - 1 do merged[C^.nL + k] := rrow[k];
+            onOk := (not C^.OnHasExtra) or
+                    C^.Exec.EvalBool(C^.OnCond, merged, C^.MergedNames, C^.MergedTypes);
+            if onOk then
+            begin
+              if C^.MatchCnt >= 2000000 then
+                raise EVDbException.Create(ecLimit, 'JOIN sonucu cok buyuk (2M sinir)');
+              Inc(C^.MatchCnt);
+              if C^.OutN >= C^.OutCap then
+              begin
+                if C^.OutCap = 0 then C^.OutCap := 256
+                else C^.OutCap := C^.OutCap * 2;
+                SetLength(C^.OutRows, C^.OutCap);
+              end;
+              SetLength(C^.OutRows[C^.OutN], C^.nL + C^.nR);
+              for k := 0 to C^.nL + C^.nR - 1 do
+                C^.OutRows[C^.OutN][k] := merged[k];
+              Inc(C^.OutN);
+              matchFound := True;
+            end;
+          end;
+        end;
+      end
+      else if IdxSourceRange(C^.JoinSrc, '=', jv, range) > 0 then
+      begin
+        for i := 0 to High(range) do
+        begin
+          if not C^.Exec.FT.ReadRow(C^.RTableName, range[i].Pk, rrow) then Continue;
+          for k := 0 to C^.nR - 1 do merged[C^.nL + k] := rrow[k];
+          onOk := (not C^.OnHasExtra) or
+                  C^.Exec.EvalBool(C^.OnCond, merged, C^.MergedNames, C^.MergedTypes);
+          if onOk then
+          begin
+            if C^.MatchCnt >= 2000000 then
+              raise EVDbException.Create(ecLimit, 'JOIN sonucu cok buyuk (2M sinir)');
+            Inc(C^.MatchCnt);
+            if C^.OutN >= C^.OutCap then
+            begin
+              if C^.OutCap = 0 then C^.OutCap := 256
+              else C^.OutCap := C^.OutCap * 2;
+              SetLength(C^.OutRows, C^.OutCap);
+            end;
+            SetLength(C^.OutRows[C^.OutN], C^.nL + C^.nR);
+            for k := 0 to C^.nL + C^.nR - 1 do
+              C^.OutRows[C^.OutN][k] := merged[k];
+            Inc(C^.OutN);
+            matchFound := True;
+          end;
+        end;
+      end;
+    end;
+  end;
+  // LEFT JOIN: eslesmeyen sol satir NULL-genisletilir
+  if (not matchFound) and C^.IsLeft then
+  begin
+    for k := 0 to C^.nL - 1 do merged[k] := lrow[k];
+    for k := 0 to C^.nR - 1 do merged[C^.nL + k] := '';
+    if C^.OutN >= C^.OutCap then
+    begin
+      if C^.OutCap = 0 then C^.OutCap := 256
+      else C^.OutCap := C^.OutCap * 2;
+      SetLength(C^.OutRows, C^.OutCap);
+    end;
+    SetLength(C^.OutRows[C^.OutN], C^.nL + C^.nR);
+    for k := 0 to C^.nL + C^.nR - 1 do
+      C^.OutRows[C^.OutN][k] := merged[k];
+    Inc(C^.OutN);
+  end;
+end;
+
+function TVSqlExecutor.TryStreamJoin(Stmt: TSqlSelectStmt;
+  out MergedRows: TStrMatrix; out MergedColNames: TStrArray;
+  out MergedColTypes: TByteArray): Boolean;
+var
+  tdL, tdR: TTableDef;
+  cnL, cnR, cnM: TStrArray;
+  ctL, ctR, ctM: TByteArray;
+  aliasL, aliasR: string;
+  nL, nR, jColL, jColR: Integer;
+  eqn: TSqlBinaryOpNode;
+  cl, cr, ws1, ws2, i2, k: Integer;
+  OnHasExtra: Boolean;
+  ctx: TStreamJoinCtx;
+  lp, rp: TList<TSqlExprNode>;
+  lst: TList<Integer>;
+  kj: string;
+  j: Integer;
+  scanOk: Boolean;
+  AndTree, Nn: TSqlExprNode;
+  Bb: TSqlBinaryOpNode;
+  tmpPks: TStrArray;
+  tmpRows: TStrMatrix;
+  tmpExact: Boolean;
+  pksR: TStrArray;
+
+  function OnEqNode(N: TSqlExprNode): TSqlBinaryOpNode;
+  var
+    B: TSqlBinaryOpNode;
+  begin
+    Result := nil;
+    if N = nil then Exit;
+    if not (N is TSqlBinaryOpNode) then Exit;
+    B := TSqlBinaryOpNode(N);
+    if (B.Op = sboEq) and (B.Left is TSqlColumnRefNode) and
+       (B.Right is TSqlColumnRefNode) then
+    begin
+      Result := B;
+      Exit;
+    end;
+    if B.Op = sboAnd then
+    begin
+      Result := OnEqNode(B.Left);
+      if Result = nil then Result := OnEqNode(B.Right);
+    end;
+  end;
+
+  function WhichSide(C: TSqlColumnRefNode; out Idx: Integer): Integer;
+  var
+    nm: string;
+    w, hit, side: Integer;
+  begin
+    Result := 0;
+    Idx := -1;
+    if C.TableQualifier <> '' then
+    begin
+      if SameText(C.TableQualifier, aliasL) then
+      begin
+        if SameText(C.TableQualifier, aliasR) then Exit;
+        nm := VDbNorm(C.ColumnName);
+        for w := 0 to High(cnL) do
+          if VDbNorm(cnL[w]) = nm then begin Idx := w; Exit(1); end;
+        Exit;
+      end;
+      if SameText(C.TableQualifier, aliasR) then
+      begin
+        nm := VDbNorm(C.ColumnName);
+        for w := 0 to High(cnR) do
+          if VDbNorm(cnR[w]) = nm then begin Idx := w; Exit(2); end;
+      end;
+      Exit;
+    end;
+    hit := 0; side := 0;
+    nm := VDbNorm(C.ColumnName);
+    for w := 0 to High(cnL) do
+      if VDbNorm(cnL[w]) = nm then begin Inc(hit); side := 1; Idx := w; end;
+    for w := 0 to High(cnR) do
+      if VDbNorm(cnR[w]) = nm then begin Inc(hit); side := 2; Idx := w; end;
+    if hit = 1 then Result := side else Idx := -1;
+  end;
+
+  function ExprSide(N: TSqlExprNode): Integer;
+    function MergeSide(s1, s2: Integer): Integer;
+    begin
+      if (s1 = 0) or (s2 = 0) then Result := 0
+      else if s1 = -1 then Result := s2
+      else if s2 = -1 then Result := s1
+      else if s1 = s2 then Result := s1
+      else Result := 0;
+    end;
+  var
+    B: TSqlBinaryOpNode;
+    s, p, i3: Integer;
+  begin
+    Result := 0;
+    if N = nil then Exit(-1);
+    if N is TSqlLiteralNode then Exit(-1);
+    if N is TSqlColumnRefNode then
+    begin
+      s := WhichSide(TSqlColumnRefNode(N), p);
+      if s = 0 then Exit(0);
+      Exit(s);
+    end;
+    if N is TSqlBinaryOpNode then
+    begin
+      B := TSqlBinaryOpNode(N);
+      Exit(MergeSide(ExprSide(B.Left), ExprSide(B.Right)));
+    end;
+    if N is TSqlUnaryOpNode then
+      Exit(ExprSide(TSqlUnaryOpNode(N).Operand));
+    if N is TSqlCastNode then
+      Exit(ExprSide(TSqlCastNode(N).Expr));
+    if N is TSqlCollateNode then
+      Exit(ExprSide(TSqlCollateNode(N).Inner));
+    if N is TSqlNullIfNode then
+      Exit(MergeSide(ExprSide(TSqlNullIfNode(N).Arg1),
+        ExprSide(TSqlNullIfNode(N).Arg2)));
+    if N is TSqlBetweenNode then
+      Exit(MergeSide(ExprSide(TSqlBetweenNode(N).Expr),
+        MergeSide(ExprSide(TSqlBetweenNode(N).LowBound),
+          ExprSide(TSqlBetweenNode(N).HighBound))));
+    if N is TSqlCoalesceNode then
+    begin
+      s := -1;
+      for i3 := 0 to TSqlCoalesceNode(N).Args.Count - 1 do
+        s := MergeSide(s, ExprSide(TSqlCoalesceNode(N).Args[i3]));
+      Exit(s);
+    end;
+    if N is TSqlInNode then
+    begin
+      if TSqlInNode(N).SubSelect <> nil then Exit(0);
+      s := ExprSide(TSqlInNode(N).Expr);
+      for i3 := 0 to TSqlInNode(N).List.Count - 1 do
+        s := MergeSide(s, ExprSide(TSqlInNode(N).List[i3]));
+      Exit(s);
+    end;
+    if N is TSqlCaseNode then
+    begin
+      s := ExprSide(TSqlCaseNode(N).Operand);
+      for i3 := 0 to TSqlCaseNode(N).Whens.Count - 1 do
+      begin
+        s := MergeSide(s, ExprSide(TSqlCaseNode(N).Whens[i3].Cond));
+        s := MergeSide(s, ExprSide(TSqlCaseNode(N).Whens[i3].Value));
+      end;
+      s := MergeSide(s, ExprSide(TSqlCaseNode(N).ElseExpr));
+      Exit(s);
+    end;
+    if N is TSqlFuncCallNode then
+    begin
+      s := ExprSide(TSqlFuncCallNode(N).Arg);
+      s := MergeSide(s, ExprSide(TSqlFuncCallNode(N).Filter));
+      if TSqlFuncCallNode(N).Args <> nil then
+        for i3 := 0 to TSqlFuncCallNode(N).Args.Count - 1 do
+          s := MergeSide(s, ExprSide(TSqlFuncCallNode(N).Args[i3]));
+      Exit(s);
+    end;
+    Result := 0;
+  end;
+
+  procedure CollectOneSided(N: TSqlExprNode;
+    LPreds, RPreds: TList<TSqlExprNode>);
+  var
+    B: TSqlBinaryOpNode;
+    s: Integer;
+  begin
+    if N = nil then Exit;
+    if (N is TSqlBinaryOpNode) and (TSqlBinaryOpNode(N).Op = sboAnd) then
+    begin
+      B := TSqlBinaryOpNode(N);
+      CollectOneSided(B.Left, LPreds, RPreds);
+      CollectOneSided(B.Right, LPreds, RPreds);
+      Exit;
+    end;
+    s := ExprSide(N);
+    if (s = 1) and (LPreds <> nil) then LPreds.Add(N)
+    else if (s = 2) and (RPreds <> nil) then RPreds.Add(N);
+  end;
+
+begin
+  Result := False;
+  ctx.bk := nil;   { P-89 duzeltme: NarrowRows Exit'inde finally bk'yi okur }
+  { --- 1) Sorgu sekli korumasi --- }
+  if not Stmt.HasJoin then Exit;
+  if (Stmt.MoreJoins <> nil) and (Stmt.MoreJoins.Count > 0) then Exit;
+  if not ((Stmt.Join.JoinType = jtInner) or (Stmt.Join.JoinType = jtLeft)) then Exit;
+  if Stmt.Join.Natural then Exit;
+  if Stmt.Join.LateralIdx <> -1 then Exit;
+  if (Stmt.JoinUsing <> nil) and (Stmt.JoinUsing.Count > 0) then Exit;
+  if (Stmt.LateralSubs <> nil) and (Stmt.LateralSubs.Count > 0) then Exit;
+  if Stmt.Join.OnCondition = nil then Exit;
+  if (Stmt.SetOp <> sokNone) or (Stmt.RightSelect <> nil) then Exit;
+  if Stmt.AsOf <> saoNone then Exit;
+  if (Stmt.WithQueries <> nil) and (Stmt.WithQueries.Count > 0) then Exit;
+  if Stmt.Columns.Count = 0 then Exit;
+
+  { --- 2) Iki taraf da gercek tablo olmali --- }
+  if not FT.TryGetTableDef(Stmt.FromTable, tdL) then Exit;
+  if not FT.TryGetTableDef(Stmt.Join.Table, tdR) then Exit;
+  if tdL.IsView or tdR.IsView then Exit;
+  if FT.RlsApplies(Stmt.FromTable) or FT.RlsApplies(Stmt.Join.Table) then Exit;
+
+  if Stmt.FromAlias <> '' then aliasL := Stmt.FromAlias
+  else aliasL := Stmt.FromTable;
+  if Stmt.Join.Alias <> '' then aliasR := Stmt.Join.Alias
+  else aliasR := Stmt.Join.Table;
+
+  BuildColInfo(tdL, cnL, ctL);
+  BuildColInfo(tdR, cnR, ctR);
+  nL := Length(cnL);
+  nR := Length(cnR);
+
+  { --- 3) ON esitlik kolonlari --- }
+  eqn := OnEqNode(Stmt.Join.OnCondition);
+  if eqn = nil then Exit;
+  ws1 := WhichSide(TSqlColumnRefNode(eqn.Left), cl);
+  ws2 := WhichSide(TSqlColumnRefNode(eqn.Right), cr);
+  if (ws1 = 1) and (ws2 = 2) then begin jColL := cl; jColR := cr; end
+  else if (ws1 = 2) and (ws2 = 1) then begin jColL := cr; jColR := cl; end
+  else Exit;
+
+  { --- 4) OnHasExtra: ON'da esitlikten baska kosul var mi? --- }
+  OnHasExtra := (Stmt.Join.OnCondition is TSqlBinaryOpNode) and
+                (TSqlBinaryOpNode(Stmt.Join.OnCondition).Op = sboAnd);
+
+  { --- 5) Birlesik kolon adlari/tipleri --- }
+  SetLength(cnM, nL + nR);
+  SetLength(ctM, nL + nR);
+  for k := 0 to nL - 1 do begin cnM[k] := aliasL + '.' + cnL[k]; ctM[k] := ctL[k]; end;
+  for k := 0 to nR - 1 do begin cnM[nL + k] := aliasR + '.' + cnR[k]; ctM[nL + k] := ctR[k]; end;
+
+  { --- 6) Tek tarafli pushdown topla --- }
+  lp := TList<TSqlExprNode>.Create;
+  rp := TList<TSqlExprNode>.Create;
+  try
+    // ON-sol: yalniz INNER (LEFT'te eslesmeyen sol satir NULL-uretir)
+    // ON-sag: INNER ve LEFT
+    if Stmt.Join.JoinType = jtInner then
+      CollectOneSided(Stmt.Join.OnCondition, lp, rp)
+    else
+      CollectOneSided(Stmt.Join.OnCondition, nil, rp);
+    // WHERE-sol: INNER ve LEFT (tek join -> ARestPreservesLeft=True)
+    // WHERE-sag: yalniz INNER
+    if Stmt.Join.JoinType = jtInner then
+      CollectOneSided(Stmt.WhereClause, lp, rp)
+    else
+      CollectOneSided(Stmt.WhereClause, lp, nil);
+
+    { --- 7) NarrowRows: sol predikatlar varsa dene. Basariliysa genel
+        yol (satirlar zaten materyalize, indeks taramasi tamamlandi).
+        Basarisizsa veya predikat yoksa stream. --- }
+    if lp.Count > 0 then
+    begin
+      AndTree := lp[0];
+      for i2 := 1 to lp.Count - 1 do
+        AndTree := TSqlBinaryOpNode.Create(sboAnd, AndTree, lp[i2]);
+      try
+        if NarrowRows(tdL, AndTree, cnL, ctL, tmpPks, tmpRows, tmpExact) then
+          Exit;
+      finally
+        Nn := AndTree;
+        while (Nn <> lp[0]) and (Nn is TSqlBinaryOpNode) do
+        begin
+          Bb := TSqlBinaryOpNode(Nn);
+          Nn := Bb.Left;
+          Bb.Left := nil;
+          Bb.Right := nil;
+          Bb.Free;
+        end;
+      end;
+    end;
+
+    { --- 8) Sag taraf yukle / indeks hazirla --- }
+    ctx.bk := nil;
+    ctx.Exec := Self;
+    ctx.LTableId := tdL.TableId;
+    ctx.LTableName := tdL.Name;
+    ctx.LHashPrefix := VDbHashKeyPrefix(tdL.Name);
+    ctx.LColCnt := nL;
+    SetLength(ctx.LFType, nL);
+    SetLength(ctx.LFOff, nL);
+    SetLength(ctx.LFLen, nL);
+    ctx.LNames := cnL;
+    ctx.LTypes := ctL;
+    ctx.nL := nL;
+    ctx.nR := nR;
+    ctx.MergedNames := cnM;
+    ctx.MergedTypes := ctM;
+    ctx.OnCond := Stmt.Join.OnCondition;
+    ctx.OnHasExtra := OnHasExtra;
+    ctx.IsLeft := (Stmt.Join.JoinType = jtLeft);
+    ctx.LPreds := lp;
+    ctx.RPreds := rp;
+    ctx.HashL := jColL;
+    ctx.HashRrel := jColR;
+    ctx.HashRType := tdR.Cols[jColR].Ctype;
+    ctx.MatchCnt := 0;
+    ctx.Failed := False;
+    ctx.OutN := 0;
+    ctx.OutCap := 0;
+    SetLength(ctx.OutRows, 0);
+
+    // yol secimi: sag tarafta indeks/PK var mi?
+    ctx.UseIdx := False;
+    ctx.UsePk := False;
+    ctx.HashOn := False;
+    if (not OnHasExtra) and (tdR.PkIndex = jColR) then
+    begin
+      ctx.UsePk := True;
+      ctx.RTableName := tdR.Name;
+      ctx.RColCnt := nR;
+    end
+    else if (not OnHasExtra) and FT.TryGetIdxSource(tdR.TableId, jColR, ctx.JoinSrc) then
+    begin
+      ctx.UseIdx := True;
+      ctx.RTableName := tdR.Name;
+      ctx.RColCnt := nR;
+    end
+    else
+    begin
+      // hash join: sag taraf yuklenir
+      ctx.HashOn := True;
+      FT.ScanRows(Stmt.Join.Table, pksR, ctx.RRows);
+      ctx.bk := TDictionary<string, TList<Integer>>.Create;
+      for j := 0 to High(ctx.RRows) do
+      begin
+        if ctx.RRows[j][jColR] = '' then Continue;
+        kj := VDbNormValue(tdR.Cols[jColR].Ctype, ctx.RRows[j][jColR]);
+        if not ctx.bk.TryGetValue(kj, lst) then
+        begin
+          lst := TList<Integer>.Create;
+          ctx.bk.Add(kj, lst);
+        end;
+        lst.Add(j);
+      end;
+    end;
+
+    { --- 9) Sol taraf akislandir --- }
+    scanOk := FT.Backend.ScanRawIterAll(tdL.TableId, VdbStreamJoinCb, @ctx);
+
+    if ctx.Failed then Exit;
+
+    { --- 10) Sonuc --- }
+    SetLength(MergedRows, ctx.OutN);
+    for k := 0 to ctx.OutN - 1 do
+      MergedRows[k] := ctx.OutRows[k];
+    MergedColNames := cnM;
+    MergedColTypes := ctM;
+    Result := True;
+  finally
+    if ctx.bk <> nil then
+    begin
+      for lst in ctx.bk.Values do lst.Free;
+      ctx.bk.Free;
+    end;
+    lp.Free;
+    rp.Free;
+  end;
+end;
+
 { ------------------------------------------------------------
   H13 (2026-10-21) - TryStreamGroupBy
   ------------------------------------------------------------
@@ -13622,12 +14201,10 @@ begin
     // False ve asagidaki genel yol AYNEN calisir.
     if (Stmt.GroupByCols.Count = 0) and TryJoinAgg(Stmt, Res) then
       Exit;
-    // P5-1 / 4.2 (2026-10-06): JOIN ile GROUP BY/aggregate ARTIK
-    // calisir â€” birlesim ciktisi ayni ExecGroupBy hattindan gecer.
-    // WHERE'i ExecGroupBy zaten kendisi uygular; onceden filtrelemek
-    // yalnizca is yukunu azaltir, sonucu degistirmez. Set-op hala
-    // reddedilir (F1-12 ayni kural, ayni mesaj).
-    ExecJoinScan(Stmt, allRows, colNames, colTypes);
+    // P-89: tek INNER/LEFT equi-join icin sol taraf LRows materyalizasyonu
+    // atlaniyor (akislanir). Uymazsa False ve asagidaki genel yol AYNEN.
+    if not TryStreamJoin(Stmt, allRows, colNames, colTypes) then
+      ExecJoinScan(Stmt, allRows, colNames, colTypes);
     if (Stmt.GroupByCols.Count > 0) or HasAggregate(Stmt) then
     begin
       if HasSetOp then
