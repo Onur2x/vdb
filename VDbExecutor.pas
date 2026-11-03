@@ -11604,6 +11604,7 @@ type
     UseMask: Boolean;      // P-90: maskeli decode kullan
     HashPrefix: QWord;     // P-90d: VDbHashKeyPrefix tohumu (satir basina hesaplanmaz)
     MaxCol: Integer;       // P-90d: peek erken durma — yalnizca 0..MaxCol cozulur
+    DirectDecode: Boolean; // P-91: kimlik ColMap + WHERE yok → dogrudan cikti satirina decode
     Failed: Boolean;
   end;
   PStreamSelCtx = ^TStreamSelCtx;
@@ -13087,6 +13088,28 @@ begin
       // rvUndecided: asagidaki on-eleme + RowMatches yolu.
     end;
   end;
+  // P-91: kimlik ColMap + WHERE yok → vals ve prow atlaniyor, decode dogrudan
+  // cikti satirina yazilir. Bu yol yalnizca tum kolonlar SELECT'te ve sira
+  // ayniyken kullanilir (DirectDecode init'te hesaplanir).
+  if ctx^.DirectDecode then
+  begin
+    Inc(ctx^.Seen);
+    if ctx^.Seen <= ctx^.Offset then Exit(True);
+    if ctx^.Emitted >= ctx^.OutCap then
+    begin
+      if ctx^.OutCap = 0 then ctx^.OutCap := 256
+      else ctx^.OutCap := ctx^.OutCap * 2;
+      SetLength(ctx^.OutRows, ctx^.OutCap);
+    end;
+    SetLength(ctx^.OutRows[ctx^.Emitted], ctx^.ColCnt);
+    if ctx^.UseMask then
+      VDbRowFromOffsetsMaskP(Buf, ctx^.ColCnt, ctx^.FType, ctx^.FOff, ctx^.FLen, ctx^.NeedCols, ctx^.OutRows[ctx^.Emitted])
+    else
+      VDbRowFromOffsetsP(Buf, ctx^.ColCnt, ctx^.FType, ctx^.FOff, ctx^.FLen, ctx^.OutRows[ctx^.Emitted]);
+    Inc(ctx^.Emitted);
+    if (ctx^.Limit >= 0) and (ctx^.Emitted >= ctx^.Limit) then Exit(False);
+    Exit(True);
+  end;
   if not whereOK then
   begin
     // H1 ham-yuklem: kesinlikle UYMAYAN satiri HIC string'e cozmeden ele.
@@ -13837,6 +13860,14 @@ begin
       Break;
     end;
   end;
+  // P-91: dogrudan decode — kimlik ColMap + WHERE yok + tum kolonlar SELECT'te.
+  // Bu durumda vals ara dizisi ve prow kopyasi atlaniyor; decode dogrudan
+  // cikti satirina yazilir.
+  ctx.DirectDecode := ctx.AllSimpleCols and (Stmt.WhereClause = nil) and
+    (Stmt.Columns.Count = ctx.ColCnt);
+  if ctx.DirectDecode then
+    for j := 0 to ctx.ColCnt - 1 do
+      if ctx.ColMap[j] <> j then begin ctx.DirectDecode := False; Break; end;
 
   // P-90: kolon budama maskesi — WHERE + SELECT + ORDER BY kolonlarini topla.
   // Maskeli decode yalnizca bu kolonlari cozer; digerleri '' birakilir.

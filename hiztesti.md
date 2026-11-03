@@ -1871,3 +1871,25 @@ eşleşmezse `Failed := True` ile genel yol hatası korunur. MaxCol erken durma
 yalnızca hash + offset doldurma için; tam satır decode sonra yapılır.
 
 Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMİZ, chainnull TEMİZ.
+
+## §33 — P-91: DirectDecode — kimlik ColMap + WHERE yok doğrudan decode
+
+**Tarih:** 2026-11-03
+**Dal:** v3
+**Sorun:** `VdbStreamSelCb` her satırda ara `vals` dizisi kurup sonra `prow`'a
+kopyalıyordu. Kimlik ColMap (tüm kolonlar SELECT'te, sıra aynı) + WHERE yokken
+bu kopya gereksizdi.
+
+**Çözüm:**
+1. `TStreamSelCtx`'e `DirectDecode: Boolean` eklendi.
+2. Init'te: `AllSimpleCols` + `WhereClause=nil` + `Columns.Count=ColCnt` +
+   `ColMap[j]=j` ise `DirectDecode=True`.
+3. Callback'te `DirectDecode` ise decode doğrudan `OutRows[Emitted]`'a yazılır;
+   `vals` ve `prow` ara dizileri tamamen atlanır.
+
+**Etki:** B sorgusu (100k tam tarama) 104.767 us — P-90d ile aynı seviye.
+Asıl maliyet `VDbRowFromOffsetsP` içindeki string tahsislerinde (IntToStr,
+SetString+UTF8Decode). Bu optimizasyon doğru ama ölçülebilir kazanç sağlamıyor;
+yine de gereksiz işi atladığı için tutuldu.
+
+Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMİZ, chainnull TEMİZ.
