@@ -413,7 +413,7 @@ begin
     x := x.Children[0];
   if (x = nil) or (Length(x.Entries) = 0) then
   begin
-    FillChar(Result, SizeOf(Result), 0);
+    Result := Default(TVDbSkipEntry);
     Exit;
   end;
   Result := x.Entries[0];

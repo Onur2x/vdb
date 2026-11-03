@@ -756,7 +756,7 @@ var
   i: Integer;
 begin
   { Bkz. VDbSql.ExecRaw: gecici sonuc sifirlanmis olmayabilir. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := '';
   for i := 0 to High(Row) do
     Result := Result + IntToStr(Length(Row[i])) + ':' + Row[i] + VDB_ROWKEY_SEP;
 end;
@@ -1900,7 +1900,7 @@ begin
   { Bkz. VDbSql.ExecRaw: FPC yonetilen fonksiyon sonucunu sifirlamayabilir.
     Iade edilen gecici, onceki cagridan kalma (serbest birakilmis) bir
     dize isaretcisi tasiyabilir; atama onu finalize edip yigini bozar. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := '';
   if Expr = nil then Exit('');
 
   { v3.14: TAM SAYI zinciri hizli yolu. Yalniz +,-,* ve INT kolon/tam sayi
@@ -2948,7 +2948,7 @@ var
 begin
   { Bkz. ExecRaw/Execute: gecici kayit sonucu sifirlanmamis olabilir;
     TryGetValue(out Result) ve ilk SetLength bunu finalize etmemeli. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
   // Correlated subqueries (OuterRow <> nil) cannot be cached - must re-execute per outer row
   if (OuterRow = nil) and (not FNoSubCache) and (FSubCache <> nil) and
      FSubCache.TryGetValue(Pointer(Sel), Result) then
@@ -18749,7 +18749,7 @@ end;
 function TVSqlExecutor.EvalExprFor(Expr: TSqlExprNode; const Row: TStrArray): string;
 begin
   { Bkz. VDbSql.ExecRaw: gecici sonuc sifirlanmis olmayabilir. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := '';
   Result := EvalExpr(Expr, Row, nil, nil);
 end;
 
@@ -21243,7 +21243,7 @@ var
 begin
 
   { Bkz. VDbSql.ExecRaw: FPC 3.2.2/x86_64 gecici kayit sonucunu sifirlamayabilir. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
   Result.Affected := 0;
   SetLength(Result.Fields, 0);
   SetLength(Result.FieldTypes, 0);
@@ -21334,7 +21334,7 @@ begin
   else if Stmt is TSqlBlockStmt then
   begin
     // TRIGGER / PROCEDURE govdesi gibi BEGIN..END bloklarini calistir
-    FillChar(Result, SizeOf(Result), 0);
+    Result := Default(TSqlResult);
     Result.Msg := 'OK';
     for st in TSqlBlockStmt(Stmt).Stmts do
     begin

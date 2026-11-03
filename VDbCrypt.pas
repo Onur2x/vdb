@@ -1415,7 +1415,7 @@ var
 begin
   { Bkz. VDbB2S: gecici sonuc sifirlanmis olmayabilir; Result := nil de
     bayat isaretciyi finalize ederdi. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := nil;
   if not VDbColumnKeyGet(KeyId, key) then
     raise EVdbCryptError.Create('kolon anahtari yuklu degil (keyId=' +
       IntToStr(Int64(KeyId)) + ')', VDB_CRYPTO_ERR);
@@ -1446,7 +1446,7 @@ var
 begin
   { Bkz. VDbB2S: gecici sonuc sifirlanmis olmayabilir; Result := nil de
     bayat isaretciyi finalize ederdi. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := nil;
   m := Length(VDB_COL_VALUE_MAGIC);
   if not VDbColumnIsSealed(Stored) then
     raise EVdbCryptError.Create('kolon degeri sifreli degil',

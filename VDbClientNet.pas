@@ -188,7 +188,7 @@ var
 begin
   { Bkz. VDbSql.ExecRaw: gecici kayit sonucu sifirlanmamis olabilir.
     Default(TSqlResult) atamasi da eski (bayat) alanlari finalize eder. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
   if FSock = VDB_SOCK_INVALID then RaiseDisconnected('EXEC');
 
   { ---- istemci -> sunucu: QUERY cercevesi ---- }
@@ -322,7 +322,7 @@ var
 begin
   { Bkz. VDbSql.ExecRaw: gecici kayit sonucu sifirlanmamis olabilir.
     Default(TSqlResult) atamasi da eski (bayat) alanlari finalize eder. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
   if FSock = VDB_SOCK_INVALID then RaiseDisconnected('EXECUTE');
   if not VdbSendU8(FSock, VDBS_CMD_EXECUTE) then
     raise EVdbClientError.Create('baglanti koptu: EXECUTE gonderimi');

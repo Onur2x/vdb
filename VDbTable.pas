@@ -1278,19 +1278,27 @@ end;
 function VDbS2B(const S: RawByteString): TBytes;
 begin
   { Bkz. VDbB2S: gecici sonuc sifirlanmis olmayabilir. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := nil;
   SetLength(Result, Length(S));
   if Length(S) > 0 then Move(S[1], Result[0], Length(S));
 end;
 
-function VDbB2S(const B: TBytes; Pos, Len: Integer): AnsiString;
+{ P-OOM: SIZINTI DUZELTMESI.
+  Onceden bu is `function VDbB2S(...): RawByteString` idi ve sonuc `string`
+  degiskenlere ataniyordu. FPC 3.2.4'te RawByteString (CP_NONE) -> string
+  atamasi kod sayfasi donusumu yapiyor; olusan blok hicbir zaman serbest
+  birakilmiyor (olculdu: cagri basina 1 blok, satir basina 1 blok).
+  Cozum: yonetilen tur DONDURME; hedef string'i yerinde doldur.
+  Baytlar aynen yazilir (kod sayfasi donusumu YOK) - eski davranis korunur. }
+procedure VDbB2SInto(const B: TBytes; Pos, Len: Integer; var S: string);
 begin
-  { FPC 3.2.2/x86_64: yonetilen tur donduren fonksiyonun gecici sonucu
-    sifirlanmis olmayabilir; SetLength(Result, ...) o bayat isaretciyi
-    finalize etmeye calisip yigini bozar. Sahiplenilmis veri yoktur. }
-  FillChar(Result, SizeOf(Result), 0);
-  SetLength(Result, Len);
-  if Len > 0 then Move(B[Pos], Result[1], Len);
+  SetLength(S, Len);
+  if Len > 0 then Move(B[Pos], S[1], Len);
+end;
+
+function VDbB2S(const B: TBytes; Pos, Len: Integer): string;
+begin
+  VDbB2SInto(B, Pos, Len, Result);
 end;
 
 function VDbNorm(const S: string): string;
@@ -1323,7 +1331,7 @@ end;
 function VDbHashKey(const Table, Pk: string): QWord;
 var
   h: QWord;
-  s: RawByteString;
+  s: RawByteString;   { UTF8Encode sonucu: baytlar korunmali }
   i: Integer;
 begin
   s := UTF8Encode(VDbNorm(Table) + #0 + Pk);
@@ -4042,14 +4050,18 @@ begin
       VCT_BOOL: begin Vals[i] := BoolToStr(B[p] <> 0, True); end;
     else
     begin
-      rawS := VDbB2S(B, p, vl);
+      rawS := '';
+      VDbB2SInto(B, p, vl, rawS);
       if VDbColumnIsSealed(rawS) then
       begin
         plain := VDbColumnOpen(TableId, i, VDbS2B(rawS));
         if ct = VCT_BLOB then
-          Vals[i] := VDbB2S(plain, 0, Length(plain))
+          VDbB2SInto(plain, 0, Length(plain), Vals[i])
         else
-          Vals[i] := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
+        begin
+          VDbB2SInto(plain, 0, Length(plain), rawS);
+          Vals[i] := UTF8Decode(rawS);
+        end;
       end
       else if ct = VCT_BLOB then
         Vals[i] := rawS                    // ham bayt, kodlama yok
@@ -4156,7 +4168,7 @@ var
   i: Integer;
   iv: Int64;
   fv: Double;
-  s: RawByteString;
+  s: string;   { P-OOM: RawByteString DEGIL - bkz. VDbB2SInto aciklamasi }
   tid: Word;
   plain: TBytes;
   p: PByte;
@@ -4206,7 +4218,7 @@ var
   i: Integer;
   iv: Int64;
   fv: Double;
-  s: RawByteString;
+  s: string;   { P-OOM: RawByteString DEGIL - bkz. VDbB2SInto aciklamasi }
   tid: Word;
   plain: TBytes;
   p: PByte;
@@ -4254,7 +4266,7 @@ function VDbColFromOffsetsP(B: PByte; ColCount, Col: Integer;
 var
   iv: Int64;
   fv: Double;
-  s: RawByteString;
+  s: string;   { P-OOM: RawByteString DEGIL - bkz. VDbB2SInto aciklamasi }
   tid: Word;
   plain: TBytes;
   p: PByte;

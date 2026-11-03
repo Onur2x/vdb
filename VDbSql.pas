@@ -3164,7 +3164,7 @@ var
   prevSess: Cardinal;
 begin
   { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
   prevSess := VDbGetWriteSession;
   VDbSetWriteSession(FSessionId);
   FT.Backend.WaitForeignTxn(FSessionId);
@@ -3230,7 +3230,7 @@ var
   ownBatch, okAll: Boolean;
 begin
   { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
   Result.Affected := 0;
   Result.Msg := '';
   SetLength(Result.Fields, 0);
@@ -3282,7 +3282,7 @@ var
   prevSess: Cardinal;
 begin
   { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
 
   // KR-7 (MREW): SELECT sorgulari LockRead (paralel), yazma Lock (seri).
   st := SplitStatements(Sql);
@@ -3352,7 +3352,7 @@ var
   fastOk: Boolean;
 begin
   { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
   Result.Stmts := 1;
 
   { P-59: TEK SATIRLIK PARAMETRELI INSERT — tam sarmalayici atlama.
@@ -3385,7 +3385,7 @@ begin
       VDbSetWriteSession(prevSess);
     end;
     { Hizli yol basarisiz — sonucu sifirla ve normal yola dus. }
-    FillChar(Result, SizeOf(Result), 0);
+    Result := Default(TSqlResult);
     Result.Stmts := 1;
   end;
 
@@ -3547,7 +3547,7 @@ var
   nkv: TVDb;
 begin
   { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
   ifNotExists := False;
   if PeekWord(Sql, P) = 'IF' then
   begin
@@ -3592,7 +3592,7 @@ var
   ifExists: Boolean;
 begin
   { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
   ifExists := False;
   if PeekWord(Sql, P) = 'IF' then
   begin
@@ -3641,7 +3641,7 @@ var
   ms: QWord;
 begin
   { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
   if PeekWord(Sql, P) = 'DATABASE' then
     Tok(Sql, P, t);   // 'DATABASE' tokeni tuketildi
   if not Tok(Sql, P, t) then raise EVDbException.Create(ecInvalidName, 'veritabani adi yok');
@@ -3672,7 +3672,7 @@ var
   t, f: string;
 begin
   { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
   if PeekWord(Sql, P) = 'DATABASE' then
     Tok(Sql, P, t);
   f := FT.Backend.FilePath;
@@ -3691,7 +3691,7 @@ var
   ms: QWord;
 begin
   { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
   ExpectWord(Sql, P, 'TO');   // "BACKUP TO '<dosya>'"
   if not Tok(Sql, P, dest) then raise EVDbException.Create(ecInvalidName, 'dosya adi yok');
   dest := Trim(dest);
@@ -3735,7 +3735,7 @@ var
   rep: TVdbMigrateReport;
   err: string;
 begin
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
   if FT.Kv = nil then
     raise EVDbException.Create(ecUnsupported,
       'MIGRATE: kaynak zaten v3 sayfa motoru');
@@ -3765,7 +3765,7 @@ var
   rep: TVdbMigrateReport;
   err: string;
 begin
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
   dest := PathArg(Sql, P);
   if not SameText(ExtractFileExt(dest), VDB_EXT) then
     dest := dest + VDB_EXT;
@@ -3902,7 +3902,7 @@ begin
     finalize ETMEDEN sifirla; girisde sahiplenilmis veri yoktur.
     v4: FillChar zaten tum alanlari sifirlar (dizi/string isaretcileri = nil
     = bos); ardindan SetLength(..., 0) ve '' atamalari gereksiz. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
   Result.Stmts := 1;
 
   { F-42: dogrudan ExecRaw cagrilari da yabanci acik transaction'i beklesin. }

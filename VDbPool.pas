@@ -443,7 +443,7 @@ var
   Q: TVSql;
 begin
   { Bkz. VDbSql.ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
   Q := Acquire;
   try
     Result := Q.Exec(Sql);
@@ -458,7 +458,7 @@ var
   Q: TVSql;
 begin
   { Bkz. VDbSql.ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
-  FillChar(Result, SizeOf(Result), 0);
+  Result := Default(TSqlResult);
   Q := Acquire;
   try
     Result := Q.Exec(Sql, Params);
