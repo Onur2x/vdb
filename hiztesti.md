@@ -1612,36 +1612,40 @@ dinleme). Bu hata **P-86'sız tabanda da birebir aynı** (3284/2/0);
 
 ## 26. P-87 — INNER equi-join + saf aggregate indeks sürücü kısayolu (2026-11-03)
 
-`TryJoinAgg`: GROUP BY'suz, yalnız COUNT/SUM/AVG/MIN/MAX içeren
-INNER equi-join sorgularında **indeks olmayan taraftan sür, indeksli
-tarafta PK/indeks ara**. Sıra-bağımsız olduğu için büyük tablo
+`TryJoinAgg`: GROUP BY'suz INNER equi-join sorgularında **indeks
+olmayan taraftan sür, indeksli tarafta PK/indeks ara**. Büyük tablo
 materyalizasyonu tamamen atlanır.
+
+İki mod:
+- **Aggregate** (COUNT/SUM/AVG/MIN/MAX): tek satır sonuç, sıra-bağımsız.
+- **Basit kolon** (P-87b): `SELECT b.id, a.id FROM ...` gibi — sonuç
+  satırları toplanır. Sıra-bağımsız değildir; ORDER BY varsa reddedilir
+  (genel yol sıralar).
 
 S6 vaka analizi (`b` 100k, `a` 100, `idx_b_k` var):
 `hasL=True, hasR=False` → `DriveRight=True` → `a`'dan (100 satır)
-sür, `b`'yi `idx_b_k` ile ara → ~1,6 ms (önce: ~550 ms hash join).
-350x hızlanma.
+sür, `b`'yi `idx_b_k` ile ara → ~1,5 ms (önce: ~550 ms hash join).
 
 `joindiag` (100k satır, en iyi us, 3 tekrar):
 
-| Sorgu | P-86 | P-87 | Not |
-|---|---:|---:|---|
-| A) `COUNT(*)` tek tablo | 10 us | 10 us | KR-1B O(1) — değişmedi |
-| B) tam tarama SELECT | 336.723 us | 332.668 us | Materyalizasyon — değişmedi |
-| C) `COUNT(*) WHERE` | 12 us | 12 us | Ham akış — değişmedi |
-| D) S6 hash join COUNT | 549.826 us | **1.648 us** | TryJoinAgg: 334x |
-| E) S6 satırları (100) | 552.949 us | 536.578 us | Non-aggregate → genel yol |
-| F) S2 indeks join | 1.587 us | 1.490 us | P-86 yolu korundu |
-| G) NarrowRows indeksli | 782 us | 1.503 us | TryJoinAgg'a girdi, WHERE sonra |
+| Sorgu | P-86 | P-87 | P-87b | Not |
+|---|---:|---:|---:|---|
+| A) `COUNT(*)` tek tablo | 10 us | 10 us | 16 us | KR-1B O(1) |
+| B) tam tarama SELECT | 336.723 us | 332.668 us | 337.073 us | Materyalizasyon |
+| C) `COUNT(*) WHERE` | 12 us | 12 us | 12 us | Ham akış |
+| D) S6 hash join COUNT | 549.826 us | 1.648 us | 1.525 us | 360x |
+| E) S6 satırları (100) | 552.949 us | 536.578 us | **1.526 us** | 352x |
+| F) S2 indeks join | 1.587 us | 1.490 us | 1.486 us | P-86 korundu |
+| G) NarrowRows indeksli | 782 us | 1.503 us | 1.525 us | WHERE sonra |
 
-Güvenlik: yalnız INNER + tek eşitlik ON + gerçek tablo + saf
-aggregate. LEFT/RIGHT/FULL, NATURAL/USING, LATERAL, GROUP BY,
-HAVING, DISTINCT, ORDER BY, LIMIT, pencere fonksiyonu, view, RLS
-varsa `False` → genel `ExecJoinScan` + `ExecGroupBy` yolu AYNEN
-çalışır. Aggregate semantiği `EvalAggregateValue` ile birebir:
-COUNT(*) satır sayar; COUNT(col) NULL olmayanı; SUM `cntI>0` iken
-`sumF`; AVG `avgCnt>0` iken `sumF/avgCnt`; MIN/MAX `VDbCmpVal` +
-ham değer.
+Güvenlik: yalnız INNER + tek eşitlik ON + gerçek tablo + (saf
+aggregate | basit kolon). LEFT/RIGHT/FULL, NATURAL/USING, LATERAL,
+GROUP BY, HAVING, DISTINCT, ORDER BY, LIMIT, pencere fonksiyonu,
+view, RLS varsa `False` → genel `ExecJoinScan` + `ExecGroupBy`
+yolu AYNEN çalışır. Aggregate semantiği `EvalAggregateValue` ile
+birebir: COUNT(*) satır sayar; COUNT(col) NULL olmayanı; SUM
+`cntI>0` iken `sumF`; AVG `avgCnt>0` iken `sumF/avgCnt`; MIN/MAX
+`VDbCmpVal` + ham değer.
 
 Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMIZ,
 chainnull TEMIZ.

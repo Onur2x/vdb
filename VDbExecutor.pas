@@ -9046,6 +9046,10 @@ var
   j, k, matchCnt: Integer;
   jv: string;
   ncntL, ncntR: Int64;
+  IsAgg: Boolean;              // True: aggregate tek satir; False: kolon cikti
+  selCols: array of Integer;   // ColMode: her SELECT ognesinin birlesik indeksi
+  outRows: TStrMatrix;
+  outN: Integer;
 
   function OnEqNode(N: TSqlExprNode): TSqlBinaryOpNode;
   var
@@ -9252,35 +9256,51 @@ begin
     ctM[nL + k] := ctR[k];
   end;
 
-  { --- 6) Aggregate planlari --- }
-  SetLength(plans, Stmt.Columns.Count);
+  { --- 6) SELECT listesi: ya hep aggregate ya hep basit kolon --- }
+  IsAgg := Stmt.Columns[0].Expr is TSqlFuncCallNode;
+  SetLength(selCols, Stmt.Columns.Count);
+  if IsAgg then
+    SetLength(plans, Stmt.Columns.Count)
+  else
+    SetLength(plans, 0);
   for j := 0 to Stmt.Columns.Count - 1 do
   begin
-    if not (Stmt.Columns[j].Expr is TSqlFuncCallNode) then Exit;
-    fn := TSqlFuncCallNode(Stmt.Columns[j].Expr);
-    if not ((fn.FuncName = 'COUNT') or (fn.FuncName = 'SUM') or
-            (fn.FuncName = 'AVG') or (fn.FuncName = 'MIN') or
-            (fn.FuncName = 'MAX')) then Exit;
-    if fn.IsDistinct or (fn.Filter <> nil) then Exit;
-    plans[j].Fn := fn;
-    plans[j].Col := -1;
-    plans[j].Cnt := 0;
-    plans[j].AvgCnt := 0;
-    plans[j].SumF := 0;
-    plans[j].MinV := '';
-    plans[j].MaxV := '';
-    plans[j].AggCt := VCT_STR;
-    if fn.IsStar then
+    if IsAgg then
     begin
-      if fn.FuncName <> 'COUNT' then Exit;
-      Continue;
+      if not (Stmt.Columns[j].Expr is TSqlFuncCallNode) then Exit;
+      fn := TSqlFuncCallNode(Stmt.Columns[j].Expr);
+      if not ((fn.FuncName = 'COUNT') or (fn.FuncName = 'SUM') or
+              (fn.FuncName = 'AVG') or (fn.FuncName = 'MIN') or
+              (fn.FuncName = 'MAX')) then Exit;
+      if fn.IsDistinct or (fn.Filter <> nil) then Exit;
+      plans[j].Fn := fn;
+      plans[j].Col := -1;
+      plans[j].Cnt := 0;
+      plans[j].AvgCnt := 0;
+      plans[j].SumF := 0;
+      plans[j].MinV := '';
+      plans[j].MaxV := '';
+      plans[j].AggCt := VCT_STR;
+      if fn.IsStar then
+      begin
+        if fn.FuncName <> 'COUNT' then Exit;
+        Continue;
+      end;
+      if not (fn.Arg is TSqlColumnRefNode) then Exit;
+      cref := TSqlColumnRefNode(fn.Arg);
+      k := FindColIdx(cref.ColumnName, cref.TableQualifier, cnM);
+      if (k < 0) or (k > High(ctM)) then Exit;
+      plans[j].Col := k;
+      plans[j].AggCt := ctM[k];
+    end
+    else
+    begin
+      if not (Stmt.Columns[j].Expr is TSqlColumnRefNode) then Exit;
+      cref := TSqlColumnRefNode(Stmt.Columns[j].Expr);
+      k := FindColIdx(cref.ColumnName, cref.TableQualifier, cnM);
+      if (k < 0) or (k > High(ctM)) then Exit;
+      selCols[j] := k;
     end;
-    if not (fn.Arg is TSqlColumnRefNode) then Exit;
-    cref := TSqlColumnRefNode(fn.Arg);
-    k := FindColIdx(cref.ColumnName, cref.TableQualifier, cnM);
-    if (k < 0) or (k > High(ctM)) then Exit;
-    plans[j].Col := k;
-    plans[j].AggCt := ctM[k];
   end;
 
   { --- 7) Surus dongusu --- }
@@ -9297,6 +9317,8 @@ begin
   FT.ScanRows(drvName, drvPks, drvRows);
   SetLength(merged, nL + nR);
   matchCnt := 0;
+  outN := 0;
+  if not IsAgg then SetLength(outRows, 0);
   for j := 0 to High(drvRows) do
   begin
     d := drvRows[j];
@@ -9362,43 +9384,73 @@ begin
          (not RowMatches(Stmt.WhereClause, merged, cnM, ctM)) then
         Continue;
 
-      for k := 0 to High(plans) do
-        if plans[k].Col < 0 then
-          AccOne(plans[k], '')
-        else
-          AccOne(plans[k], merged[plans[k].Col]);
+      if IsAgg then
+      begin
+        for k := 0 to High(plans) do
+          if plans[k].Col < 0 then
+            AccOne(plans[k], '')
+          else
+            AccOne(plans[k], merged[plans[k].Col]);
+      end
+      else
+      begin
+        if outN >= Length(outRows) then
+          SetLength(outRows, outN + 64);
+        SetLength(outRows[outN], Stmt.Columns.Count);
+        for k := 0 to Stmt.Columns.Count - 1 do
+          outRows[outN][k] := merged[selCols[k]];
+        Inc(outN);
+      end;
     end;
   end;
 
-  { --- 8) Sonuc: EvalAggregateValue + ExecGroupBy alan adi kurallari --- }
+  { --- 8) Sonuc --- }
   SetLength(Res.Fields, Stmt.Columns.Count);
-  SetLength(Res.Rows, 1);
-  SetLength(Res.Rows[0], Stmt.Columns.Count);
-  for j := 0 to Stmt.Columns.Count - 1 do
+  if IsAgg then
   begin
-    fn := plans[j].Fn;
-    if Stmt.Columns[j].Alias <> '' then
-      Res.Fields[j] := Stmt.Columns[j].Alias
-    else
-      Res.Fields[j] := fn.FuncName;
-    if fn.FuncName = 'COUNT' then
-      Res.Rows[0][j] := IntToStr(plans[j].Cnt)
-    else if fn.FuncName = 'SUM' then
+    SetLength(Res.Rows, 1);
+    SetLength(Res.Rows[0], Stmt.Columns.Count);
+    for j := 0 to Stmt.Columns.Count - 1 do
     begin
-      if plans[j].Cnt > 0 then
-        Res.Rows[0][j] := VDbFloatToStr(plans[j].SumF)
-      else Res.Rows[0][j] := '';
-    end
-    else if fn.FuncName = 'AVG' then
-    begin
-      if plans[j].AvgCnt > 0 then
-        Res.Rows[0][j] := VDbFloatToStr(plans[j].SumF / plans[j].AvgCnt)
-      else Res.Rows[0][j] := '';
-    end
-    else if fn.FuncName = 'MIN' then
-      Res.Rows[0][j] := plans[j].MinV
-    else  // MAX
-      Res.Rows[0][j] := plans[j].MaxV;
+      fn := plans[j].Fn;
+      if Stmt.Columns[j].Alias <> '' then
+        Res.Fields[j] := Stmt.Columns[j].Alias
+      else
+        Res.Fields[j] := fn.FuncName;
+      if fn.FuncName = 'COUNT' then
+        Res.Rows[0][j] := IntToStr(plans[j].Cnt)
+      else if fn.FuncName = 'SUM' then
+      begin
+        if plans[j].Cnt > 0 then
+          Res.Rows[0][j] := VDbFloatToStr(plans[j].SumF)
+        else Res.Rows[0][j] := '';
+      end
+      else if fn.FuncName = 'AVG' then
+      begin
+        if plans[j].AvgCnt > 0 then
+          Res.Rows[0][j] := VDbFloatToStr(plans[j].SumF / plans[j].AvgCnt)
+        else Res.Rows[0][j] := '';
+      end
+      else if fn.FuncName = 'MIN' then
+        Res.Rows[0][j] := plans[j].MinV
+      else  // MAX
+        Res.Rows[0][j] := plans[j].MaxV;
+    end;
+    Res.Affected := 1;
+  end
+  else
+  begin
+    for j := 0 to Stmt.Columns.Count - 1 do
+      if Stmt.Columns[j].Alias <> '' then
+        Res.Fields[j] := Stmt.Columns[j].Alias
+      else if Stmt.Columns[j].Expr is TSqlColumnRefNode then
+        Res.Fields[j] := TSqlColumnRefNode(Stmt.Columns[j].Expr).ColumnName
+      else
+        Res.Fields[j] := 'col' + IntToStr(j + 1);
+    SetLength(Res.Rows, outN);
+    for j := 0 to outN - 1 do
+      Res.Rows[j] := outRows[j];
+    Res.Affected := outN;
   end;
   Res.Affected := 1;
   Res.Msg := 'OK';
@@ -13512,11 +13564,10 @@ begin
 
   if Stmt.HasJoin then
   begin
-    // P-87: INNER equi-join + saf aggregate -> indeks surucu kisayolu.
-    // Sira-bagimsiz; buyuk tablo materyalizasyonu atlanir. Uymazsa False
-    // ve asagidaki genel yol AYNEN calisir.
-    if (Stmt.GroupByCols.Count = 0) and HasAggregate(Stmt) and
-       TryJoinAgg(Stmt, Res) then
+    // P-87: INNER equi-join + (saf aggregate | basit kolon) -> indeks
+    // surucu kisayolu. Buyuk tablo materyalizasyonu atlanir. Uymazsa
+    // False ve asagidaki genel yol AYNEN calisir.
+    if (Stmt.GroupByCols.Count = 0) and TryJoinAgg(Stmt, Res) then
       Exit;
     // P5-1 / 4.2 (2026-10-06): JOIN ile GROUP BY/aggregate ARTIK
     // calisir â€” birlesim ciktisi ayni ExecGroupBy hattindan gecer.
