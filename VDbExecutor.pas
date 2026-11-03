@@ -9210,6 +9210,18 @@ var
   selCols: array of Integer;   // ColMode: her SELECT ognesinin birlesik indeksi
   outRows: TStrMatrix;
   outN: Integer;
+  drvPreds: TList<TSqlExprNode>;
+  drvNarrowed: Boolean;
+  AndTree, Nn: TSqlExprNode;
+  Bn: TSqlBinaryOpNode;
+  IsExact: Boolean;
+  nIdx: Integer;
+  whSide: Integer;
+  scanLk: Boolean;
+  lkPks: TStrArray;
+  lkRows: TStrMatrix;
+  lkPreds: TList<TSqlExprNode>;
+  lkMatchIdx: array of Integer;
 
   function OnEqNode(N: TSqlExprNode): TSqlBinaryOpNode;
   var
@@ -9279,6 +9291,61 @@ var
       end;
     if hit = 1 then Result := side
     else Idx := -1;
+  end;
+
+  // P-90b: ifadenin hangi tabloda olduğunu bul (0=bilinmiyor, 1=sol, 2=sağ)
+  function ExprSide(N: TSqlExprNode): Integer;
+    function MergeSide(s1, s2: Integer): Integer;
+    begin
+      if (s1 = 0) or (s2 = 0) then Result := 0
+      else if s1 = -1 then Result := s2
+      else if s2 = -1 then Result := s1
+      else if s1 = s2 then Result := s1
+      else Result := 0;
+    end;
+  var
+    B: TSqlBinaryOpNode;
+    s, p: Integer;
+  begin
+    Result := 0;
+    if N = nil then Exit(-1);
+    if N is TSqlLiteralNode then Exit(-1);
+    if N is TSqlColumnRefNode then
+    begin
+      s := WhichSide(TSqlColumnRefNode(N), p);
+      if s = 0 then Exit(0);
+      Exit(s);
+    end;
+    if N is TSqlBinaryOpNode then
+    begin
+      B := TSqlBinaryOpNode(N);
+      Exit(MergeSide(ExprSide(B.Left), ExprSide(B.Right)));
+    end;
+    if N is TSqlUnaryOpNode then
+      Exit(ExprSide(TSqlUnaryOpNode(N).Operand));
+    if N is TSqlCastNode then
+      Exit(ExprSide(TSqlCastNode(N).Expr));
+    if N is TSqlCollateNode then
+      Exit(ExprSide(TSqlCollateNode(N).Inner));
+  end;
+
+  // WHERE predikatlarından tek taraflı olanları topla
+  procedure CollectDrvPreds(N: TSqlExprNode; Side: Integer;
+    Preds: TList<TSqlExprNode>);
+  var
+    B: TSqlBinaryOpNode;
+    s: Integer;
+  begin
+    if N = nil then Exit;
+    if (N is TSqlBinaryOpNode) and (TSqlBinaryOpNode(N).Op = sboAnd) then
+    begin
+      B := TSqlBinaryOpNode(N);
+      CollectDrvPreds(B.Left, Side, Preds);
+      CollectDrvPreds(B.Right, Side, Preds);
+      Exit;
+    end;
+    s := ExprSide(N);
+    if s = Side then Preds.Add(N);
   end;
 
   procedure AccOne(var Pl: TJaPlan; const V: string);
@@ -9378,12 +9445,22 @@ begin
     hasR := True;
   if (not hasL) and (not hasR) then Exit;
 
+  // P-90b: WHERE tek taraflı predikatlar sürücü seçimini etkiler.
+  // WHERE sol tablodaysa sol taraftan sürü (NarrowRows ile daraltılabilir).
+  // WHERE sağ tablodaysa sağ taraftan sürü.
+  whSide := 0;
+  if Stmt.WhereClause <> nil then
+    whSide := ExprSide(Stmt.WhereClause);
+
   if hasL and (not hasR) then
-    DriveRight := True
+    DriveRight := True   // sag taraftan sur, sol tarafta indeks var
   else if hasR and (not hasL) then
-    DriveRight := False
+    DriveRight := False  // sol taraftan sur, sag tarafta indeks var
   else
   begin
+    // P-90b: WHERE tek taraflı predikatlar sürücü seçimini etkiler.
+    // WHERE sol tablodaysa sol taraftan sürü (NarrowRows ile daraltılabilir).
+    // WHERE sağ tablodaysa sağ taraftan sürü.
     ncntL := -1;
     ncntR := -1;
     if FT.Kv <> nil then
@@ -9396,7 +9473,20 @@ begin
       ncntL := FT.Backend.CountTable(tdL.TableId);
       ncntR := FT.Backend.CountTable(tdR.TableId);
     end;
-    if (ncntL >= 0) and (ncntR >= 0) then
+    // P-90b: WHERE tek taraflı predikatlar sürücü seçimini etkiler.
+    // WHERE sol tablodaysa sol taraftan sürü (NarrowRows ile daraltılabilir).
+    // WHERE sağ tablodaysa sağ taraftan sürü.
+    if Stmt.WhereClause <> nil then
+    begin
+      whSide := ExprSide(Stmt.WhereClause);
+      if whSide = 1 then DriveRight := False
+      else if whSide = 2 then DriveRight := True
+      else if (ncntL >= 0) and (ncntR >= 0) then
+        DriveRight := (ncntR <= ncntL)
+      else
+        DriveRight := False;
+    end
+    else if (ncntL >= 0) and (ncntR >= 0) then
       DriveRight := (ncntR <= ncntL)
     else
       DriveRight := False;
@@ -9474,7 +9564,78 @@ begin
     drvName := Stmt.FromTable;
     lkName := Stmt.Join.Table;
   end;
-  FT.ScanRows(drvName, drvPks, drvRows);
+  // P-90b: WHERE tek taraflı predikatlarla sürücü tabloyu daralt.
+  // NarrowRows başarılıysa indeks kullanarak daraltır; değilse tam tarama.
+  drvPreds := TList<TSqlExprNode>.Create;
+  try
+    CollectDrvPreds(Stmt.WhereClause, Ord(DriveRight) + 1, drvPreds);
+    drvNarrowed := False;
+    if drvPreds.Count > 0 then
+    begin
+      // AND tree kur ve NarrowRows dene
+      AndTree := drvPreds[0];
+      for nIdx := 1 to drvPreds.Count - 1 do
+        AndTree := TSqlBinaryOpNode.Create(sboAnd, AndTree, drvPreds[nIdx]);
+      try
+        if DriveRight then
+          drvNarrowed := NarrowRows(tdR, AndTree, cnR, ctR, drvPks, drvRows, IsExact)
+        else
+          drvNarrowed := NarrowRows(tdL, AndTree, cnL, ctL, drvPks, drvRows, IsExact);
+      finally
+        // Ara düğümleri serbest bırak (yapraklar paylaşıldı)
+        Nn := AndTree;
+        while (Nn <> drvPreds[0]) and (Nn is TSqlBinaryOpNode) do
+        begin
+          Bn := TSqlBinaryOpNode(Nn);
+          Nn := Bn.Left;
+          Bn.Left := nil;
+          Bn.Right := nil;
+          Bn.Free;
+        end;
+      end;
+    end;
+    if not drvNarrowed then
+      FT.ScanRows(drvName, drvPks, drvRows);
+  finally
+    drvPreds.Free;
+  end;
+  // P-90b: lookup tarafini da WHERE ile daralt; kucuk kume ise tarama ile ara.
+  // hasL=True, hasR=False + WHERE sol tarafta: NarrowRows b'yi 10 satira daraltir,
+  // boylece her a satiri icin 10 b satiri taranir (indeks arama yerine).
+  scanLk := False;
+  lkPreds := TList<TSqlExprNode>.Create;
+  try
+    if DriveRight then
+      CollectDrvPreds(Stmt.WhereClause, 1, lkPreds)   // sol = lookup
+    else
+      CollectDrvPreds(Stmt.WhereClause, 2, lkPreds);  // sag = lookup
+    if lkPreds.Count > 0 then
+    begin
+      AndTree := lkPreds[0];
+      for nIdx := 1 to lkPreds.Count - 1 do
+        AndTree := TSqlBinaryOpNode.Create(sboAnd, AndTree, lkPreds[nIdx]);
+      try
+        if DriveRight then
+          scanLk := NarrowRows(tdL, AndTree, cnL, ctL, lkPks, lkRows, IsExact)
+        else
+          scanLk := NarrowRows(tdR, AndTree, cnR, ctR, lkPks, lkRows, IsExact);
+        // Yalnizca kucuk kumelerde tarama tabanli arama (regresyon korumasi)
+        scanLk := scanLk and (Length(lkRows) <= 1000);
+      finally
+        Nn := AndTree;
+        while (Nn <> lkPreds[0]) and (Nn is TSqlBinaryOpNode) do
+        begin
+          Bn := TSqlBinaryOpNode(Nn);
+          Nn := Bn.Left;
+          Bn.Left := nil;
+          Bn.Right := nil;
+          Bn.Free;
+        end;
+      end;
+    end;
+  finally
+    lkPreds.Free;
+  end;
   SetLength(merged, nL + nR);
   matchCnt := 0;
   outN := 0;
@@ -9493,7 +9654,29 @@ begin
       jv := VDbNormValue(tdR.Cols[jColR].Ctype, d[jColL]);
     end;
 
-    if DriveRight then
+    if scanLk then
+    begin
+      // Lookup tarafinda indeks yok / daraltildi: bellekteki satirlarda tara
+      SetLength(range, 0);
+      SetLength(lkMatchIdx, 0);
+      for i2 := 0 to High(lkRows) do
+      begin
+        if DriveRight then
+        begin
+          if lkRows[i2][jColL] <> d[jColR] then Continue;
+        end
+        else
+        begin
+          if lkRows[i2][jColR] <> d[jColL] then Continue;
+        end;
+        SetLength(range, Length(range) + 1);
+        range[High(range)].Pk := lkPks[i2];
+        SetLength(lkMatchIdx, Length(lkMatchIdx) + 1);
+        lkMatchIdx[High(lkMatchIdx)] := i2;
+      end;
+      if Length(range) = 0 then Continue;
+    end
+    else if DriveRight then
     begin
       if usePkL then
       begin
@@ -9520,7 +9703,21 @@ begin
 
     for i2 := 0 to High(range) do
     begin
-      if DriveRight then
+      if scanLk then
+      begin
+        lrow := lkRows[lkMatchIdx[i2]];
+        if DriveRight then
+        begin
+          for k := 0 to nL - 1 do merged[k] := lrow[k];
+          for k := 0 to nR - 1 do merged[nL + k] := d[k];
+        end
+        else
+        begin
+          for k := 0 to nL - 1 do merged[k] := d[k];
+          for k := 0 to nR - 1 do merged[nL + k] := lrow[k];
+        end;
+      end
+      else if DriveRight then
       begin
         if not usePkL then
           if not FT.ReadRow(lkName, range[i2].Pk, lrow) then Continue;

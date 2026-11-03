@@ -1775,3 +1775,33 @@ TSqlCaseNode, TSqlFuncCallNode, TSqlBetweenNode vb. eksikti).
 
 Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMIZ,
 chainnull TEMIZ.
+
+---
+
+## §30 — P-90b: G regresyonu düzeltmesi (TryJoinAgg WHERE seçiciliği)
+
+**Tarih:** 2026-11-03
+**Dal:** v3
+**Sorun:** G sorgusu (`SELECT COUNT(*) FROM b JOIN a ON a.k=b.k WHERE b.y > 99990`)
+1507 us sürüyordu. `hasL=True, hasR=False` durumunda WHERE sol taraftayken
+NarrowRows yanlış tabloyu (a) daraltmayı deniyordu → boş predikat → daraltma yok.
+
+**Kök neden:** `DriveRight := True` (a'dan sürü) zorlanıyordu. WHERE `b.y > 99990`
+sol tarafta (b) → `CollectDrvPreds(..., 2, ...)` sağ taraf predikatları topluyordu
+→ boş → NarrowRows yok. Sonuç: 100 indeks araması × ~100 eşleşme = 10.000 satır okuma.
+
+**Çözüm (lookup tarafı daraltma):**
+1. Sürücü daraltma bloğundan sonra lookup tarafı da WHERE ile daraltılıyor.
+2. `CollectDrvPreds` ile lookup tarafının predikatları toplanıyor.
+3. `NarrowRows` ile lookup tablosu daraltılıyor (G'de: 100k → 10 satır).
+4. Küçük kümelerde (≤1000 satır) tarama tabanlı arama kullanılıyor (`scanLk`).
+5. `lkRows` üzerinde join kolonu karşılaştırmasıyla eşleşen satırlar bulunuyor.
+6. Regresyon koruması: daraltma başarısızsa veya küme büyükse indeks yoluna düşülüyor.
+
+**Etki:** G sorgusu 1507 us → **626 us** (%58 iyileşme).
+
+**Güvenlik:** `NarrowRows` her zaman ÜST KÜME döndüğü için doğru sonuç korunur.
+Tarama tabanlı arama yalnızca `scanLk=True` iken devreye girer; aksi halde
+indeks yolu (IdxSourceRange/ReadRow) eskisi gibi çalışır.
+
+Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMIZ, chainnull TEMIZ.
