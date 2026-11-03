@@ -1836,3 +1836,38 @@ yoluna düşülüyordu ama materyalizasyon israfı çoktan yapılmıştı.
 indeks yoluna düşer.
 
 Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMİZ, chainnull TEMİZ.
+
+## §32 — P-90d: VDbPeekRawRowKeyHashTo — PK string'siz hash doğrulama
+
+**Tarih:** 2026-11-03
+**Dal:** v3
+**Sorun:** `VdbStreamSelCb` her satırda `VDbPeekRawRowP` (PK string allocate +
+SetString + UTF8Decode) + `VDbHashKey` (UTF8Encode + FNV) yapıyordu. 100k satırlık
+tam taramada bu milyonlarca gereksiz string tahsisi ve hash hesaplamasıydı.
+
+**Kök neden:** `VDbPeekRawRowP` PK string'ini kurar (`SetString`), sonra
+`VDbHashKey` aynı stringi UTF-8'e encode edip FNV hash üretir. Her ikisi de
+satır bazında tekrarlanır.
+
+**Çözüm:**
+1. `TStreamSelCtx`'e `HashPrefix: QWord` ve `MaxCol: Integer` eklendi.
+2. Init bloğunda `ctx.HashPrefix := VDbHashKeyPrefix(td.Name)` — bir kez.
+3. UseMask bloğundan sonra `ctx.MaxCol` hesaplandı (UseMask ise en yüksek
+   NeedCols indeksi, değilse ColCnt-1) — erken kolon durması.
+4. `VdbStreamSelCb`'de `VDbPeekRawRowP` + `VDbHashKey` →
+   `VDbPeekRawRowKeyHashTo` (PK string'siz, hash ham baytlardan, MaxCol erken durma).
+
+**Etki (joindiag, en iyi süre us):**
+- B (100k tam tarama SELECT): 141.720 → **104.930 us** (%26 iyileşme)
+- D (JOIN COUNT): 1.564 → **1.519 us**
+- E (JOIN sonuc): 1.586 → **1.496 us**
+- F (indeks join): 1.517 → **1.481 us**
+- G (NarrowRows): 606 → **580 us**
+
+p67diag INSERT: 1,349 us/satır (değişmedi — INSERT yolu etkilenmez).
+
+**Güvenlik:** `VDbPeekRawRowKeyHashTo` aynı sınırları kontrol eder; hash
+eşleşmezse `Failed := True` ile genel yol hatası korunur. MaxCol erken durma
+yalnızca hash + offset doldurma için; tam satır decode sonra yapılır.
+
+Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMİZ, chainnull TEMİZ.

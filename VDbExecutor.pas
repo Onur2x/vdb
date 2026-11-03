@@ -11602,6 +11602,8 @@ type
     ColMap: TIntArray;     // P-88: SELECT j -> tablo kolon indeksi
     NeedCols: array of Boolean; // P-90: kolon budama maskesi
     UseMask: Boolean;      // P-90: maskeli decode kullan
+    HashPrefix: QWord;     // P-90d: VDbHashKeyPrefix tohumu (satir basina hesaplanmaz)
+    MaxCol: Integer;       // P-90d: peek erken durma — yalnizca 0..MaxCol cozulur
     Failed: Boolean;
   end;
   PStreamSelCtx = ^TStreamSelCtx;
@@ -13050,21 +13052,23 @@ function VdbStreamSelCb(Key: QWord; Buf: PByte; Len: Integer;
 var
   ctx: ^TStreamSelCtx;
   tid: Word;
-  pk: string;
+  keyHash: QWord;
   vals, prow: TStrArray;
   j: Integer;
   whereOK: Boolean;
 begin
   ctx := User;
   if Key = VDB_SCHEMA_KEY then Exit(True);
-  if not VDbPeekRawRowP(Buf, Len, ctx^.ColCnt, tid, pk,
-                        ctx^.FType, ctx^.FOff, ctx^.FLen) then
+  // P-90d: PK string'siz hash — VDbPeekRawRowP + VDbHashKey yerine
+  // ham baytlardan hash; MaxCol ile erken kolon durmasi.
+  if not VDbPeekRawRowKeyHashTo(Buf, Len, ctx^.ColCnt, tid, ctx^.HashPrefix,
+                        keyHash, ctx^.MaxCol, ctx^.FType, ctx^.FOff, ctx^.FLen) then
   begin
     ctx^.Failed := True;   // bozuk/eski sema: genel yol ayni hatayi uretir
     Exit(False);
   end;
   if tid <> ctx^.TableId then Exit(True);   // baska tablo: ScanRowsPart gibi atla
-  if VDbHashKey(ctx^.TableName, pk) <> Key then
+  if keyHash <> Key then
   begin
     ctx^.Failed := True;   // hash carpismasi: genel yol NET HATA verir
     Exit(False);
@@ -13794,6 +13798,8 @@ begin
   ctx.Exec := Self;
   ctx.TableId := td.TableId;
   ctx.TableName := td.Name;
+  // P-90d: hash tohumu bir kez — satir basina VDbHashKey (UTF8Encode+FNV) gider.
+  ctx.HashPrefix := VDbHashKeyPrefix(td.Name);
   ctx.ColCnt := Length(td.Cols);
   SetLength(ctx.FType, ctx.ColCnt);
   SetLength(ctx.FOff, ctx.ColCnt);
@@ -13846,6 +13852,15 @@ begin
   ctx.UseMask := False;
   for j := 0 to ctx.ColCnt - 1 do
     if ctx.NeedCols[j] then begin ctx.UseMask := True; Break; end;
+  // P-90d: peek erken durma — yalnizca gereken son kolona kadar coz.
+  // Kullanilmayan kuyruk kolonlarinda FOff/FLen kurulmaz.
+  ctx.MaxCol := ctx.ColCnt - 1;
+  if ctx.UseMask then
+  begin
+    ctx.MaxCol := 0;
+    for j := 0 to ctx.ColCnt - 1 do
+      if ctx.NeedCols[j] then ctx.MaxCol := j;
+  end;
 
   zScanOk := True;
   if FT.Kv <> nil then
