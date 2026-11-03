@@ -1804,4 +1804,35 @@ sol tarafta (b) → `CollectDrvPreds(..., 2, ...)` sağ taraf predikatları topl
 Tarama tabanlı arama yalnızca `scanLk=True` iken devreye girer; aksi halde
 indeks yolu (IdxSourceRange/ReadRow) eskisi gibi çalışır.
 
-Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMIZ, chainnull TEMIZ.
+Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMİZ, chainnull TEMİZ.
+
+---
+
+## §31 — P-90c: D regresyonu düzeltmesi (NarrowRows MaxRows parametresi)
+
+**Tarih:** 2026-11-03
+**Dal:** v3
+**Sorun:** D sorgusu (`SELECT COUNT(*) FROM b JOIN a ON a.k=b.k WHERE b.y > 0`)
+P-90b lookup daraltma bloğundan sonra 231.392 us sürüyordu (P-87'de 1.525 us).
+`WHERE b.y > 0` seçici olmayan predikatla lookup tarafında (b) NarrowRows
+çağrılıyor ve 100k satır materyalize ediliyordu.
+
+**Kök neden:** `NarrowRows` içinde `IdxSourceRangeBounds` 100k indeks girdisini
+`e` dizisine dolduruyordu. MaxRows kontrolü bu doldurmadan SONRA idi → 100k
+satır okunup sonra atılıyordu. Sonra `scanLk := False` (100k > 1000) ile indeks
+yoluna düşülüyordu ama materyalizasyon israfı çoktan yapılmıştı.
+
+**Çözüm:**
+1. `NarrowRows`'a `MaxRows: Integer = 0` parametresi eklendi (her iki overload).
+2. `IdxSourceCountBounds` ile dilim sayısı ÖNCEDEN kontrol ediliyor.
+3. `MaxRows` aşılırsa materyalizasyon yapılmadan `False` dönülüyor.
+4. Lookup daraltma bloğunda `MaxRows=1000` geçiriliyor.
+
+**Etki:** D sorgusu 231.392 us → **1.676 us** (%99,3 iyileşme, P-87 hedefi
+1.525 us'a yakın). G sorgusu stabil: **609 us**.
+
+**Güvenlik:** `MaxRows=0` (varsayılan) davranış değiştirmez. `NarrowRows` hâlâ
+ÜST KÜME döndüğü için doğru sonuç korunur. `False` dönüşünde çağıran taraf
+indeks yoluna düşer.
+
+Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMİZ, chainnull TEMİZ.

@@ -411,10 +411,11 @@ type
     function NarrowRows(const Td: TTableDef; WhereClause: TSqlExprNode;
       const ColNames: TStrArray; const ColTypes: TByteArray;
       out Pks: TStrArray; out Rows: TStrMatrix;
-      out IsExact: Boolean): Boolean; overload;
+      out IsExact: Boolean; MaxRows: Integer = 0): Boolean; overload;
     function NarrowRows(const Td: TTableDef; WhereClause: TSqlExprNode;
       const ColNames: TStrArray; const ColTypes: TByteArray;
-      out Pks: TStrArray; out Rows: TStrMatrix): Boolean; overload;
+      out Pks: TStrArray; out Rows: TStrMatrix;
+      MaxRows: Integer = 0): Boolean; overload;
     { H3: Saf COUNT(*) + indekslenebilir WHERE. Satirlari okumadan, indeks
       dilimindeki girdi sayisini dondurur. WHERE'in tamami dilimle
       temsil edilemiyorsa False -> genel yol. }
@@ -4190,7 +4191,8 @@ end;
 
 function TVSqlExecutor.NarrowRows(const Td: TTableDef; WhereClause: TSqlExprNode;
   const ColNames: TStrArray; const ColTypes: TByteArray;
-  out Pks: TStrArray; out Rows: TStrMatrix; out IsExact: Boolean): Boolean;
+  out Pks: TStrArray; out Rows: TStrMatrix; out IsExact: Boolean;
+  MaxRows: Integer): Boolean;
 var
   conj: TList<TSqlExprNode>;
   i, ci, lo, hi, l2, h2, n: Integer;
@@ -4569,6 +4571,17 @@ begin
         Exit;  // False -> cagri FT.ScanRows ile tam tarama yapar
     end;
 
+    // MaxRows asilirsa materyalizasyon yapmadan False doner. IdxSourceCountBounds
+    // ile sayi onceden ogrenilir; boylece buyuk dilimlerde e dizisi doldurulmaz.
+    if (MaxRows > 0) and
+       (IdxSourceCountBounds(bestSrc, bestLoVal, bestHiVal,
+         hasLo, hasHi, bestLoInc, bestHiInc) > MaxRows) then
+    begin
+      SetLength(Pks, 0);
+      SetLength(Rows, 0);
+      Exit(False);
+    end;
+
     // Kullanilacak kolonun dilimini skiplist'ten/diziden al.
     if IdxSourceRangeBounds(bestSrc, bestLoVal, bestHiVal,
       hasLo, hasHi, bestLoInc, bestHiInc, e) <= 0 then
@@ -4609,11 +4622,12 @@ end;
 
 function TVSqlExecutor.NarrowRows(const Td: TTableDef; WhereClause: TSqlExprNode;
   const ColNames: TStrArray; const ColTypes: TByteArray;
-  out Pks: TStrArray; out Rows: TStrMatrix): Boolean;
+  out Pks: TStrArray; out Rows: TStrMatrix;
+  MaxRows: Integer): Boolean;
 var
   dummyExact: Boolean;
 begin
-  Result := NarrowRows(Td, WhereClause, ColNames, ColTypes, Pks, Rows, dummyExact);
+  Result := NarrowRows(Td, WhereClause, ColNames, ColTypes, Pks, Rows, dummyExact, MaxRows);
 end;
 
 function TVSqlExecutor.TryIndexCount(const Td: TTableDef; Stmt: TSqlSelectStmt;
@@ -9615,12 +9629,12 @@ begin
       for nIdx := 1 to lkPreds.Count - 1 do
         AndTree := TSqlBinaryOpNode.Create(sboAnd, AndTree, lkPreds[nIdx]);
       try
+        // MaxRows=1000: buyuk kumelerde materyalizasyon yapmadan False doner,
+        // boylece secici olmayan WHERE'lerde (orn. b.y>0) 100k satir okunmaz.
         if DriveRight then
-          scanLk := NarrowRows(tdL, AndTree, cnL, ctL, lkPks, lkRows, IsExact)
+          scanLk := NarrowRows(tdL, AndTree, cnL, ctL, lkPks, lkRows, IsExact, 1000)
         else
-          scanLk := NarrowRows(tdR, AndTree, cnR, ctR, lkPks, lkRows, IsExact);
-        // Yalnizca kucuk kumelerde tarama tabanli arama (regresyon korumasi)
-        scanLk := scanLk and (Length(lkRows) <= 1000);
+          scanLk := NarrowRows(tdR, AndTree, cnR, ctR, lkPks, lkRows, IsExact, 1000);
       finally
         Nn := AndTree;
         while (Nn <> lkPreds[0]) and (Nn is TSqlBinaryOpNode) do
