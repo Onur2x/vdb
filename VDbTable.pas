@@ -910,6 +910,11 @@ function VDbDecodeRawRowP(B: PByte; Len: Integer;
 procedure VDbRowFromOffsetsP(B: PByte; ColCount: Integer;
   const FType: array of Byte; const FOff, FLen: array of Integer;
   out Vals: TStrArray);
+{ P-90: kolon budama — yalnizca Need[i]=True kolonlari cozer.
+  Diger kolonlar '' birakilir. Cagri tarafinda Need dogru boyutta olmali. }
+procedure VDbRowFromOffsetsMaskP(B: PByte; ColCount: Integer;
+  const FType: array of Byte; const FOff, FLen: array of Integer;
+  const Need: array of Boolean; out Vals: TStrArray);
 { H12: tek kolonu cozer (top-N akisli taramada tum satiri string
   matrisine cevirmeden siralama anahtarini almak icin). Deger bicimi
   VDbRowFromOffsetsP ile birebir aynidir. }
@@ -4156,6 +4161,52 @@ begin
             Vals[i] := IntToStr(iv)
           else
             Vals[i] := '';   { bozuk yuk: sessiz YANLIS sayi uretme }
+        end;
+      VCT_FLOAT:
+        begin Move(B[FOff[i]], fv, 8); Vals[i] := VDbFloatToStr(fv); end;
+      VCT_BOOL:
+        begin Vals[i] := BoolToStr(B[FOff[i]] <> 0, True); end;
+    else
+      begin
+        SetString(s, PAnsiChar(NativeUInt(B) + NativeUInt(FOff[i])), FLen[i]);
+        if VDbColumnIsSealed(s) then
+        begin
+          plain := VDbColumnOpen(tid, i, VDbS2B(s));
+          if FType[i] = VCT_BLOB then Vals[i] := VDbB2S(plain, 0, Length(plain))
+          else Vals[i] := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
+        end
+        else if FType[i] = VCT_BLOB then Vals[i] := s
+        else Vals[i] := UTF8Decode(s);
+      end;
+    end;
+  end;
+end;
+
+// P-90: kolon budama — yalnizca Need[i]=True kolonlari cozer.
+procedure VDbRowFromOffsetsMaskP(B: PByte; ColCount: Integer;
+  const FType: array of Byte; const FOff, FLen: array of Integer;
+  const Need: array of Boolean; out Vals: TStrArray);
+var
+  i: Integer;
+  iv: Int64;
+  fv: Double;
+  s: RawByteString;
+  tid: Word;
+  plain: TBytes;
+begin
+  if B <> nil then tid := VdbRowTableIdAt(B) else tid := 0;
+  SetLength(Vals, ColCount);
+  for i := 0 to ColCount - 1 do
+  begin
+    if (i > High(Need)) or (not Need[i]) then begin Vals[i] := ''; Continue; end;
+    if (FOff[i] < 0) or (FLen[i] = 0) then begin Vals[i] := ''; Continue; end;
+    case FType[i] of
+      VCT_INT:
+        begin
+          if VDbIntFromPayload(B + FOff[i], FLen[i], iv) then
+            Vals[i] := IntToStr(iv)
+          else
+            Vals[i] := '';
         end;
       VCT_FLOAT:
         begin Move(B[FOff[i]], fv, 8); Vals[i] := VDbFloatToStr(fv); end;

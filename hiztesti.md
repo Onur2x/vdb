@@ -1738,3 +1738,40 @@ Kolon adları/tipleri `ExecJoinScan` ile birebir aynı.
 
 Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMIZ,
 chainnull TEMIZ.
+
+## 29. P-90 — Kolon budama / kısmi decode (2026-11-03)
+
+`VDbRowFromOffsetsP` tüm kolonları decode ediyordu; sorgu yalnızca
+birkaç kolon referans etse bile. Yeni `VDbRowFromOffsetsMaskP` yalnızca
+`Need[i]=True` kolonları çözer; diğerleri `''` bırakılır.
+
+`CollectExprCols` ifade ağaçlarını yürüyerek tüm kolon referanslarını
+toplar: TSqlColumnRefNode, TSqlBinaryOpNode, TSqlUnaryOpNode, TSqlInNode,
+TSqlQuantNode, TSqlAggNode, TSqlCastNode, TSqlBetweenNode, TSqlCollateNode,
+TSqlFuncCallNode, TSqlCaseNode, TSqlNullIfNode, TSqlCoalesceNode,
+TSqlJsonKeyNode, TSqlWindowNode.
+
+`TStreamSelCtx`'e `NeedCols: array of Boolean` ve `UseMask: Boolean`
+eklendi. WHERE + SELECT + ORDER BY kolonları taranıp maske kurulur.
+`VdbStreamSelCb` her iki dalında (whereOK=True/False) maskeyi kullanır.
+
+`p90col` (100k satır, 10 kolonlu tablo, en iyi us, 3 tekrar):
+
+| Sorgu | Budama yok | Budama var | Kazanç |
+|---|---:|---:|---:|
+| A) SELECT * (10 kolon) | 259.810 us | 267.561 us | — |
+| B) SELECT 2 kolon | 256.275 us | **120.086 us** | **2,13x** |
+| C) SELECT 2 string kolon | 256.613 us | **139.347 us** | **1,84x** |
+| D) COUNT(*) WHERE 1 kolon | 37.133 us | 38.986 us | — |
+
+A'da budama etkisiz (tüm kolonlar gerekli, maske overhead'i var).
+B/C'de 2 kolon seçildiğinde decode maliyeti ~%50 azalıyor. D'de
+WHERE zaten ham-yuklem ile eliyor, decode minimal.
+
+Güvenlik: maske yalnızca deşifre edilmeyen kolonları boş bırakır;
+`EvalExpr`/`RowMatches` yalnızca referans edilen kolonları okur.
+Tüm ifade tipleri kapsandı (ilk sürümde 8 test başarısızdı —
+TSqlCaseNode, TSqlFuncCallNode, TSqlBetweenNode vb. eksikti).
+
+Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMIZ,
+chainnull TEMIZ.

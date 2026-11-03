@@ -362,6 +362,9 @@ type
       const SelectStmt: TSqlSelectStmt): Integer;
     function RowMatches(WhereClause: TSqlExprNode; const Row: TStrArray;
       const ColNames: TStrArray; const ColTypes: TByteArray): Boolean;
+    // P-90: kolon budama — ifade agacindaki tum kolon referanslarini topla
+    procedure CollectExprCols(E: TSqlExprNode; const ColNames: TStrArray;
+      var Need: array of Boolean);
     procedure DoSort(var Rows: TStrMatrix; const Keys: TStrArray;
       OrderBy: TList<TOrderItem>;
       const ColNames: TStrArray; const ColTypes: TByteArray;
@@ -939,6 +942,156 @@ begin
         Exit(i);
     end;
   Result := -1;
+end;
+
+// P-90: kolon budama — ifade agacindaki tum kolon referanslarini topla.
+// Need[i] = True yapilir; agaç yuruyusu rekurzif.
+procedure TVSqlExecutor.CollectExprCols(E: TSqlExprNode;
+  const ColNames: TStrArray; var Need: array of Boolean);
+var
+  cr: TSqlColumnRefNode;
+  ci: Integer;
+  bin: TSqlBinaryOpNode;
+  un: TSqlUnaryOpNode;
+  inn: TSqlInNode;
+  qn: TSqlQuantNode;
+  ag: TSqlAggNode;
+  cas: TSqlCastNode;
+  btw: TSqlBetweenNode;
+  col: TSqlCollateNode;
+  fc: TSqlFuncCallNode;
+  cs: TSqlCaseNode;
+  ni: TSqlNullIfNode;
+  co: TSqlCoalesceNode;
+  jk: TSqlJsonKeyNode;
+  wn: TSqlWindowNode;
+  i: Integer;
+begin
+  if E = nil then Exit;
+  if E is TSqlColumnRefNode then
+  begin
+    cr := TSqlColumnRefNode(E);
+    ci := FindColIdx(cr.ColumnName, cr.TableQualifier, ColNames);
+    if (ci >= 0) and (ci <= High(Need)) then Need[ci] := True;
+    Exit;
+  end;
+  if E is TSqlBinaryOpNode then
+  begin
+    bin := TSqlBinaryOpNode(E);
+    CollectExprCols(bin.Left, ColNames, Need);
+    CollectExprCols(bin.Right, ColNames, Need);
+    Exit;
+  end;
+  if E is TSqlUnaryOpNode then
+  begin
+    un := TSqlUnaryOpNode(E);
+    CollectExprCols(un.Operand, ColNames, Need);
+    Exit;
+  end;
+  if E is TSqlInNode then
+  begin
+    inn := TSqlInNode(E);
+    CollectExprCols(inn.Expr, ColNames, Need);
+    if inn.List <> nil then
+      for i := 0 to inn.List.Count - 1 do
+        CollectExprCols(inn.List[i], ColNames, Need);
+    Exit;
+  end;
+  if E is TSqlQuantNode then
+  begin
+    qn := TSqlQuantNode(E);
+    CollectExprCols(qn.Left, ColNames, Need);
+    Exit;
+  end;
+  if E is TSqlAggNode then
+  begin
+    ag := TSqlAggNode(E);
+    CollectExprCols(ag.Arg, ColNames, Need);
+    CollectExprCols(ag.Sep, ColNames, Need);
+    Exit;
+  end;
+  if E is TSqlCastNode then
+  begin
+    cas := TSqlCastNode(E);
+    CollectExprCols(cas.Expr, ColNames, Need);
+    Exit;
+  end;
+  if E is TSqlBetweenNode then
+  begin
+    btw := TSqlBetweenNode(E);
+    CollectExprCols(btw.Expr, ColNames, Need);
+    CollectExprCols(btw.LowBound, ColNames, Need);
+    CollectExprCols(btw.HighBound, ColNames, Need);
+    Exit;
+  end;
+  if E is TSqlCollateNode then
+  begin
+    col := TSqlCollateNode(E);
+    CollectExprCols(col.Inner, ColNames, Need);
+    Exit;
+  end;
+  if E is TSqlFuncCallNode then
+  begin
+    fc := TSqlFuncCallNode(E);
+    CollectExprCols(fc.Arg, ColNames, Need);
+    CollectExprCols(fc.Filter, ColNames, Need);
+    if fc.Args <> nil then
+      for i := 0 to fc.Args.Count - 1 do
+        CollectExprCols(fc.Args[i], ColNames, Need);
+    Exit;
+  end;
+  if E is TSqlCaseNode then
+  begin
+    cs := TSqlCaseNode(E);
+    CollectExprCols(cs.Operand, ColNames, Need);
+    if cs.Whens <> nil then
+      for i := 0 to cs.Whens.Count - 1 do
+      begin
+        CollectExprCols(cs.Whens[i].Cond, ColNames, Need);
+        CollectExprCols(cs.Whens[i].Value, ColNames, Need);
+      end;
+    CollectExprCols(cs.ElseExpr, ColNames, Need);
+    Exit;
+  end;
+  if E is TSqlNullIfNode then
+  begin
+    ni := TSqlNullIfNode(E);
+    CollectExprCols(ni.Arg1, ColNames, Need);
+    CollectExprCols(ni.Arg2, ColNames, Need);
+    Exit;
+  end;
+  if E is TSqlCoalesceNode then
+  begin
+    co := TSqlCoalesceNode(E);
+    if co.Args <> nil then
+      for i := 0 to co.Args.Count - 1 do
+        CollectExprCols(co.Args[i], ColNames, Need);
+    Exit;
+  end;
+  if E is TSqlJsonKeyNode then
+  begin
+    jk := TSqlJsonKeyNode(E);
+    CollectExprCols(jk.Left, ColNames, Need);
+    if jk.Keys <> nil then
+      for i := 0 to jk.Keys.Count - 1 do
+        CollectExprCols(jk.Keys[i], ColNames, Need);
+    Exit;
+  end;
+  if E is TSqlWindowNode then
+  begin
+    wn := TSqlWindowNode(E);
+    CollectExprCols(wn.Arg, ColNames, Need);
+    CollectExprCols(wn.Default, ColNames, Need);
+    if wn.Partitions <> nil then
+      for i := 0 to wn.Partitions.Count - 1 do
+        CollectExprCols(wn.Partitions[i], ColNames, Need);
+    if wn.OrderBys <> nil then
+      for i := 0 to wn.OrderBys.Count - 1 do
+        CollectExprCols(wn.OrderBys[i].Expr, ColNames, Need);
+    Exit;
+  end;
+  // TSqlLiteralNode, TSqlSubqueryNode — alt ifade yok veya alt sorgu
+  // (ayri baglam). Varsayilan: eleme yapma.
 end;
 
 function TVSqlExecutor.FindColIdxInViewSelect(const ColumnName, TableQualifier: string;
@@ -11236,6 +11389,8 @@ type
     OutCap: Integer;       // P-88: OutRows kapasitesi (O(N^2) buyumeyi onler)
     AllSimpleCols: Boolean; // P-88: tum SELECT ogeleri basit kolon ref mi
     ColMap: TIntArray;     // P-88: SELECT j -> tablo kolon indeksi
+    NeedCols: array of Boolean; // P-90: kolon budama maskesi
+    UseMask: Boolean;      // P-90: maskeli decode kullan
     Failed: Boolean;
   end;
   PStreamSelCtx = ^TStreamSelCtx;
@@ -12724,13 +12879,21 @@ begin
        (not VdbStreamSelRawPass(ctx^.RawConds, Buf, ctx^.FType,
                                 ctx^.FOff, ctx^.FLen)) then
       Exit(True);
-    VDbRowFromOffsetsP(Buf, ctx^.ColCnt, ctx^.FType, ctx^.FOff, ctx^.FLen, vals);
+    if ctx^.UseMask then
+      VDbRowFromOffsetsMaskP(Buf, ctx^.ColCnt, ctx^.FType, ctx^.FOff, ctx^.FLen, ctx^.NeedCols, vals)
+    else
+      VDbRowFromOffsetsP(Buf, ctx^.ColCnt, ctx^.FType, ctx^.FOff, ctx^.FLen, vals);
     if (ctx^.Where <> nil) and
        (not ctx^.Exec.RowMatches(ctx^.Where, vals, ctx^.ColNames, ctx^.ColTypes)) then
       Exit(True);
   end
   else
-    VDbRowFromOffsetsP(Buf, ctx^.ColCnt, ctx^.FType, ctx^.FOff, ctx^.FLen, vals);
+  begin
+    if ctx^.UseMask then
+      VDbRowFromOffsetsMaskP(Buf, ctx^.ColCnt, ctx^.FType, ctx^.FOff, ctx^.FLen, ctx^.NeedCols, vals)
+    else
+      VDbRowFromOffsetsP(Buf, ctx^.ColCnt, ctx^.FType, ctx^.FOff, ctx^.FLen, vals);
+  end;
   Inc(ctx^.Seen);
   if ctx^.Seen <= ctx^.Offset then Exit(True);
   SetLength(prow, ctx^.Columns.Count);
@@ -13457,6 +13620,21 @@ begin
       Break;
     end;
   end;
+
+  // P-90: kolon budama maskesi — WHERE + SELECT + ORDER BY kolonlarini topla.
+  // Maskeli decode yalnizca bu kolonlari cozer; digerleri '' birakilir.
+  SetLength(ctx.NeedCols, ctx.ColCnt);
+  for j := 0 to ctx.ColCnt - 1 do ctx.NeedCols[j] := False;
+  CollectExprCols(Stmt.WhereClause, cn, ctx.NeedCols);
+  for j := 0 to Stmt.Columns.Count - 1 do
+    CollectExprCols(Stmt.Columns[j].Expr, cn, ctx.NeedCols);
+  if Stmt.OrderBy <> nil then
+    for j := 0 to Stmt.OrderBy.Count - 1 do
+      CollectExprCols(Stmt.OrderBy[j].Expr, cn, ctx.NeedCols);
+  // Hiç kolon gerekmiyorsa (ör. COUNT(*) WHERE sabit) maskeyi kapat.
+  ctx.UseMask := False;
+  for j := 0 to ctx.ColCnt - 1 do
+    if ctx.NeedCols[j] then begin ctx.UseMask := True; Break; end;
 
   zScanOk := True;
   if FT.Kv <> nil then
