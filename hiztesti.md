@@ -1571,3 +1571,41 @@ sonuc ayni" fuzz testi bu farkı yakaladı (fark=20); indeks join'de
 Doğrulama: sqltest v3 3287/0/0, sqltest v2 3287/0/0, wherenull TEMIZ
 (7 senaryo), chainnull TEMIZ (6 senaryo). scanpushbench S6:
 484–500 ms (önceki 484–516 ms aralığında, gerileme yok).
+
+## 25. P-86 — İndeks/PK join'de sağ taraf materyalizasyonu atlandı (2026-11-03)
+
+İndeks/PK join yolu (`JoinIdxCol2 >= 0`) `rRows`'u **hiç okumaz**:
+esleşen satır `FT.ReadRow` ile nokta atışı getirilir. Buna rağmen
+`MergeStep` her join adımında sağ tabloyu `ScanRows`/`NarrowRows` ile
+tam materyalize ediyordu. Büyük sağ tabloda bu, join'in kendisinden
+pahalıydı (100k satır ≈ 500 ms).
+
+Düzeltme: yol seçimi (`JoinIdxCol1/2`, `JoinUsePk`, `HashL/HashRrel`)
+taramadan **önce** yapıldı; yol indeks/PK ise `rRows`/`rPks` boş
+bırakılıp tarama tamamen atlandı. WHERE zaten sonradan `RowMatches`
+ile uygulandığı için sonuç değişmez; ON eşitliği indeks/PK eşleşmesiyle
+doğrulanır (P-85 notu).
+
+Güvenlik: yalnız INNER/LEFT + tek eşitlik ON + gerçek indeks/PK
+varsa atlanır. RIGHT/FULL, CTE, NATURAL/USING, `OnHasExtra` (ek ON
+predikatı) ve indekssiz durumlar eski yolda kalır — o yollar `rRows`
+okur.
+
+`scanpushbench` (sag=100000, sol=100), aynı oturumda P-85 tabanıyla
+karşılaştırma:
+
+| Sorgu | P-85 | P-86 | Not |
+|---|---:|---:|---|
+| S2 `a JOIN b WHERE b.y>0` | 500 ms | **0 ms** | İndeks join, sağ 100k — materyalizasyon atlandı |
+| S3 `a JOIN b WHERE a.k>95` | 141 ms | **0–16 ms** | Aynı yol |
+| S1 seçici sağ filtre | 672→0 ms | 328→0 ms | İlk tur maliyeti |
+| S6 `b JOIN a WHERE b.y>0` | 484–500 ms | 500 ms | Değişmedi: sağda indeks yok → hash join, sol 100k tarama |
+
+S6'daki 500 ms artık **sol taraf** tam taraması + hash kurulumu;
+P-86'nın kapsamı dışında. Sıradaki aday: sol tablo `LRows`
+materyalizasyonu (akışkan tarama).
+
+Doğrulama: wherenull TEMIZ, chainnull TEMIZ; sqltest v2 3284/2/0,
+v3 2882/2/33 — tek başarısızlık `T109_PoolSlotTCP` (port 54722
+dinleme). Bu hata **P-86'sız tabanda da birebir aynı** (3284/2/0);
+çevresel, join yolundan bağımsız.

@@ -7194,6 +7194,70 @@ var
     begin
       rDef := FT.GetTable(JC.Table);
       BuildColInfo(rDef, rCn, rCt);
+    end;
+    n1 := Length(LN); n2 := Length(rCn);
+
+    { ------------------------------------------------------------
+      P-86: JOIN yol secimi TARAMADAN ONCE.
+      Indeks/PK hizli yolu rRows'u HIC okumaz (yalniz FT.ReadRow ile
+      eslesen satiri getirir). Yol kesinse sag tarafi materyalize
+      etmek israf — buyuk sag tabloda tam tarama (~500 ms) bosa gider.
+      WHERE sonradan RowMatches ile uygulanir; ON esitligi
+      indeks/PK eslesmesiyle dogrulanir (bkz. P-85 notu).
+      //---------------------------------------------------------- }
+    JoinIdxCol1 := -1; JoinIdxCol2 := -1; JoinUsePk := False;
+    HashL := -1; HashRrel := -1;
+    OnHasExtra := False;
+    if JC.OnCondition is TSqlBinaryOpNode then
+    begin
+      { v3.12: AND varsa ek kosul var demektir; esitligi agactan cikar.
+        Boyle bir durumda indeks/PK hizli yolu KULLANILMAZ (PK yolu
+        JoinOnOk cagirmaz -> ek kosul atlanirdi). Hash yolu JoinOnOk'u
+        cagirdigi icin guvenli. }
+      if TSqlBinaryOpNode(JC.OnCondition).Op = sboAnd then
+        OnHasExtra := True;
+      eqn := OnEqNode(JC.OnCondition);
+      if eqn <> nil then
+      begin
+        j := Taraf(TSqlColumnRefNode(eqn.Left), i);
+        k := Taraf(TSqlColumnRefNode(eqn.Right), q);
+        if (j = 1) and (k = 2) and (i >= 0) and (q >= 0) then
+        begin
+          JoinIdxCol1 := i; JoinIdxCol2 := q;
+        end
+        else if (j = 2) and (k = 1) and (i >= 0) and (q >= 0) then
+        begin
+          JoinIdxCol1 := q; JoinIdxCol2 := i;
+        end;
+        if (JoinIdxCol1 >= 0) and (JoinIdxCol2 >= 0) then
+        begin
+          HashL := JoinIdxCol1;
+          HashRrel := JoinIdxCol2 - n1;
+        end;
+      end;
+    end;
+    if JoinIdxCol2 >= 0 then
+    begin
+      if OnHasExtra then
+        JoinIdxCol2 := -1   // ek ON kosulu var -> hash yolu (JoinOnOk uygular)
+      else if rIsCte then
+        JoinIdxCol2 := -1   // CTE'de indeks/PK yok -> klasik yol
+      else if (JC.JoinType = jtRight) or (JC.JoinType = jtFull) then
+        JoinIdxCol2 := -1   // P5-RF: sag surucu klasik dongu kullanir
+      else if rDef.PkIndex = JoinIdxCol2 - n1 then
+        JoinUsePk := True
+      else if not FT.TryGetIdxSource(rDef.TableId, JoinIdxCol2 - n1, JoinSrc) then
+        JoinIdxCol2 := -1;   // indeks yok -> klasik yol
+    end;
+
+    if JoinIdxCol2 >= 0 then
+    begin
+      // P-86: indeks/PK yolu rRows okumaz; materyalizasyon atlansin.
+      SetLength(rRows, 0);
+      SetLength(rPks, 0);
+    end
+    else if not rIsCte then
+    begin
       // v3.35/3.36: tarama-seviyesi pushdown — tek taraflı predikatlarla
       // NarrowRows dene. Basariliysa satirlar zaten daraltilmis gelir;
       // FilterSide sonra yeniden dogrular (ust kume garantisi).
@@ -7233,7 +7297,6 @@ var
         tmpNarrow.Free;
       end;
     end;
-    n1 := Length(LN); n2 := Length(rCn);
 
     { ------------------------------------------------------------
       F-27/F-28: NATURAL JOIN ve USING (...) hazirligi.
@@ -7306,50 +7369,8 @@ var
       end;
     end;
 
-    JoinIdxCol1 := -1; JoinIdxCol2 := -1; JoinUsePk := False;
-    HashL := -1; HashRrel := -1;
-    OnHasExtra := False;
-    if JC.OnCondition is TSqlBinaryOpNode then
-    begin
-      { v3.12: AND varsa ek kosul var demektir; esitligi agactan cikar.
-        Boyle bir durumda indeks/PK hizli yolu KULLANILMAZ (PK yolu
-        JoinOnOk cagirmaz -> ek kosul atlanirdi). Hash yolu JoinOnOk'u
-        cagirdigi icin guvenli. }
-      if TSqlBinaryOpNode(JC.OnCondition).Op = sboAnd then
-        OnHasExtra := True;
-      eqn := OnEqNode(JC.OnCondition);
-      if eqn <> nil then
-      begin
-        j := Taraf(TSqlColumnRefNode(eqn.Left), i);
-        k := Taraf(TSqlColumnRefNode(eqn.Right), q);
-        if (j = 1) and (k = 2) and (i >= 0) and (q >= 0) then
-        begin
-          JoinIdxCol1 := i; JoinIdxCol2 := q;
-        end
-        else if (j = 2) and (k = 1) and (i >= 0) and (q >= 0) then
-        begin
-          JoinIdxCol1 := q; JoinIdxCol2 := i;
-        end;
-        if (JoinIdxCol1 >= 0) and (JoinIdxCol2 >= 0) then
-        begin
-          HashL := JoinIdxCol1;
-          HashRrel := JoinIdxCol2 - n1;
-        end;
-      end;
-    end;
-    if JoinIdxCol2 >= 0 then
-    begin
-      if OnHasExtra then
-        JoinIdxCol2 := -1   // ek ON kosulu var -> hash yolu (JoinOnOk uygular)
-      else if rIsCte then
-        JoinIdxCol2 := -1   // CTE'de indeks/PK yok -> klasik yol
-      else if (JC.JoinType = jtRight) or (JC.JoinType = jtFull) then
-        JoinIdxCol2 := -1   // P5-RF: sag surucu klasik dongu kullanir
-      else if rDef.PkIndex = JoinIdxCol2 - n1 then
-        JoinUsePk := True
-      else if not FT.TryGetIdxSource(rDef.TableId, JoinIdxCol2 - n1, JoinSrc) then
-        JoinIdxCol2 := -1;   // indeks yok -> klasik yol
-    end;
+    // P-86: JoinIdxCol1/2, JoinUsePk, HashL/HashRrel, OnHasExtra
+    // taramadan once hesaplandi (bkz. ustteki yol-secimi blogu).
     // H2 (2026-10-18): indeks hizli yolu UYGULANMIYORSA ve ON tek esitlikse
     // sag tarafi hash tablosuna koyup O(N+M) yap. Kurallar:
     //   - yalniz INNER/LEFT (RIGHT/FULL sag surucu semantigini bozmamak icin),
