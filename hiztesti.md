@@ -1546,3 +1546,28 @@ platform/CI düzeltmeleri.
 §19'daki 5,35–6,24 µs/satır tablo API'si ile karşılaştırıldığında
 **~4x** hızlanma. P-xx kampanyasının ana kazancı yazma yolu tahsis
 diyeti, önbellek tekilleştirme ve kilit atlamalarıdır.
+
+## 24. P-85 — Join yolunda gereksiz `JoinOnOk` atlanması (2026-11-03)
+
+Hash join yolunda `OnHasExtra=False` ise ON koşulu yalnız eşitliktir;
+hash eşleşmesi `VDbNormValue` ile normalleştirilmiş anahtar üzerinden
+zaten doğrular. Bu durumda `JoinOnOk`/`EvalBool` çağrısı gereksizdir —
+atlandı.
+
+İndeks join yolunda aynı optimizasyon **denendi ve geri alındı**:
+`IdxSourceRange` normalize değerlerle eşleşir, `jv=''` (NULL) iken
+NULL girişlerini de bulur. `JoinOnOk` atlanınca NULL=NULL eşleşmesi
+kabul edilir (üç-değerli mantıkta yanlış). Hash join ise ham değerle
+NULL atladığı için orada güvenlidir. sqltest "indeksli ve indekssiz
+sonuc ayni" fuzz testi bu farkı yakaladı (fark=20); indeks join'de
+`JoinOnOk` korundu.
+
+| Yol | P-85 | `JoinOnOk` | Neden |
+|---|---|---|---|
+| PK join | — | zaten yok | Ham eşitlik kontrolü |
+| Hash join | aktif | `OnHasExtra=False` iken atlanır | Ham NULL atlaması güvenli |
+| İndeks join | geri alındı | korunur | Normalize eşleşme NULL kabul eder |
+
+Doğrulama: sqltest v3 3287/0/0, sqltest v2 3287/0/0, wherenull TEMIZ
+(7 senaryo), chainnull TEMIZ (6 senaryo). scanpushbench S6:
+484–500 ms (önceki 484–516 ms aralığında, gerileme yok).

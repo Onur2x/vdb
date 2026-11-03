@@ -7460,6 +7460,11 @@ var
               SetLength(merged, n1 + n2);
               for q := 0 to n1 - 1 do merged[q] := LR[i][q];
               for q := 0 to n2 - 1 do merged[n1 + q] := rv2[q];
+              { P-85 not: indeks join yolunda JoinOnOk KALDIRILAMAZ.
+                Indeks normalize degerlerle eslesir; NULL('') girisleri
+                de bulunur. JoinOnOk/EvalBool NULL=NULL eslesmesini
+                reddeder (uc-degerli mantik). Hash join ise ham degerle
+                NULL kontrolu yaptigi icin orada guvenli. }
               onOk := JoinOnOk(merged, LN, LT);
               if onOk then
               begin
@@ -7515,7 +7520,9 @@ var
                   j := lst[x];
                   for k := 0 to n1 - 1 do merged[k] := LR[i][k];
                   for k := 0 to n2 - 1 do merged[n1 + k] := rRows[j][k];
-                  if JoinOnOk(merged, LN, LT) then
+                  { P-85: ON yalniz esitlikse (OnHasExtra=False) hash eslesmesi
+                    zaten dogruladi; JoinOnOk/EvalBool cagrisi gereksiz. }
+                  if (not OnHasExtra) or JoinOnOk(merged, LN, LT) then
                   begin
                     MrPush(merged);
                     matchFound := True;
