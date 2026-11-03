@@ -1649,3 +1649,48 @@ birebir: COUNT(*) satır sayar; COUNT(col) NULL olmayanı; SUM
 
 Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMIZ,
 chainnull TEMIZ.
+
+## 27. P-88 — Akışkan tarama: tam SELECT materyalizasyonu atlama (2026-11-03)
+
+`TryStreamSelect` kapısı LIMIT'siz tam taramalara açıldı. Eski kapı
+`LIMIT yok + ham koşu yok + ağaç yok → genel` diyordu; ara
+materyalizasyon (ScanSnapshot TBytes + allRows + filteredRows)
+atlandığı için akışkan tarama her durumda daha hızlıdır.
+
+Üç değişiklik:
+1. **Kapı gevşetme**: LIMIT'siz tam taramalar artık `ScanRawIterAll`
+   + `VdbStreamSelCb` ile akar. `ScanSnapshot`'ın 100k TBytes
+   alloc+kopyası, `allRows` ara TStrMatrix'i ve `filteredRows`
+   referans kopyası tamamen atlanır.
+2. **İndeks kapısı**: `WHERE` yoksa ikincil indeksler işlevsizdir;
+   tam taramada akışkan tarama daha hızlıdır. `WHERE` varsa eski
+   tercih korunur (NarrowRows indeks daraltması daha iyi olabilir).
+3. **OutRows blok büyüme**: `SetLength(OutRows, Length+1)` satır
+   başına O(N²) idi; 256'lık bloklarla ikiye katlama yapıldı.
+4. **Basit kolon doğrudan kopyalama**: Tüm SELECT ögeleri basit
+   kolon referansıysa `EvalExpr` atlanır, `vals[ColMap[j]]` doğrudan
+   kopyalanır. Sınır kontrolü: ColMap geçersizse `EvalExpr`'a düşülür.
+
+`joindiag` (100k satır, en iyi us, 3 tekrar):
+
+| Sorgu | P-87b | P-88 | Kazanç |
+|---|---:|---:|---:|
+| A) `COUNT(*)` tek tablo | 16 us | 7 us | — |
+| B) tam tarama SELECT | 337.073 us | **140.337 us** | **2.4x** |
+| C) `COUNT(*) WHERE` | 12 us | 14 us | — |
+| D) S6 hash join COUNT | 1.525 us | 1.513 us | — |
+| E) S6 satırları (100) | 1.526 us | 1.499 us | — |
+| F) S2 indeks join | 1.486 us | 1.490 us | — |
+| G) NarrowRows indeksli | 1.525 us | 1.530 us | — |
+
+B sorgusu 337 ms → 140 ms. Kalan maliyet: `VDbRowFromOffsetsP`
+(tüm kolonların string decode'u) + projeksiyon + çıktı
+materyalizasyonu (100k × 4 string — kaçınılmaz, sonuç zaten bu).
+
+Güvenlik: mevcut şekil korumaları AYNEN korundu (JOIN, set-op,
+DISTINCT, GROUP BY, pencere, QUALIFY, view, RLS, AS OF, CTE →
+genel yol). İkincil indeks + WHERE varsa NarrowRows tercih edilir.
+`VDbHashKey` çarpışma kontrolü satır başına korunur.
+
+Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMIZ,
+chainnull TEMIZ.

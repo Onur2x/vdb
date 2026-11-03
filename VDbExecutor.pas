@@ -10654,6 +10654,9 @@ type
     CurBucket: Integer;
     ZoneLastBucket: Integer;
     OutRows: TStrMatrix;
+    OutCap: Integer;       // P-88: OutRows kapasitesi (O(N^2) buyumeyi onler)
+    AllSimpleCols: Boolean; // P-88: tum SELECT ogeleri basit kolon ref mi
+    ColMap: TIntArray;     // P-88: SELECT j -> tablo kolon indeksi
     Failed: Boolean;
   end;
   PStreamSelCtx = ^TStreamSelCtx;
@@ -12152,11 +12155,33 @@ begin
   Inc(ctx^.Seen);
   if ctx^.Seen <= ctx^.Offset then Exit(True);
   SetLength(prow, ctx^.Columns.Count);
-  for j := 0 to ctx^.Columns.Count - 1 do
-    prow[j] := ctx^.Exec.EvalExpr(ctx^.Columns[j].Expr, vals,
-                                  ctx^.ColNames, ctx^.ColTypes);
-  SetLength(ctx^.OutRows, Length(ctx^.OutRows) + 1);
-  ctx^.OutRows[High(ctx^.OutRows)] := prow;
+  // P-88: basit kolon referanslarinda EvalExpr atla, dogrudan kopyala.
+  // Sinir kontrolu: ColMap yanlis indeks donerse EvalExpr'a dus.
+  if ctx^.AllSimpleCols then
+  begin
+    for j := 0 to ctx^.Columns.Count - 1 do
+    begin
+      if (ctx^.ColMap[j] >= 0) and (ctx^.ColMap[j] < Length(vals)) then
+        prow[j] := vals[ctx^.ColMap[j]]
+      else
+        prow[j] := ctx^.Exec.EvalExpr(ctx^.Columns[j].Expr, vals,
+                                      ctx^.ColNames, ctx^.ColTypes);
+    end;
+  end
+  else
+  begin
+    for j := 0 to ctx^.Columns.Count - 1 do
+      prow[j] := ctx^.Exec.EvalExpr(ctx^.Columns[j].Expr, vals,
+                                    ctx^.ColNames, ctx^.ColTypes);
+  end;
+  // P-88: blok buyume — satir basina SetLength O(N^2) idi.
+  if ctx^.Emitted >= ctx^.OutCap then
+  begin
+    if ctx^.OutCap = 0 then ctx^.OutCap := 256
+    else ctx^.OutCap := ctx^.OutCap * 2;
+    SetLength(ctx^.OutRows, ctx^.OutCap);
+  end;
+  ctx^.OutRows[ctx^.Emitted] := prow;
   Inc(ctx^.Emitted);
   if (ctx^.Limit >= 0) and (ctx^.Emitted >= ctx^.Limit) then Exit(False);
   Result := True;
@@ -12587,7 +12612,9 @@ begin
   if Stmt.Columns.Count = 0 then Exit;
   // Ikincil indeks varsa ya da WHERE PK'ya basvuruyorsa genel yol
   // (indeks/PK daraltmasi) daha iyi olabilir; streaming KULLANMA.
-  if Length(td.Idx) > 0 then Exit;
+  // P-88: WHERE YOKsa tam tarama — indeksler islevsiz, akisli tarama
+  // ara materyalizasyonu atlattigi icin daha hizlidir.
+  if (Length(td.Idx) > 0) and (Stmt.WhereClause <> nil) then Exit;
   if td.PkIndex >= 0 then
   begin
     pkName := td.Cols[td.PkIndex].Name;
@@ -12639,9 +12666,9 @@ begin
   ctx.RawTree := VdbBuildRawTree(Self, Stmt.WhereClause, td, cn, ct, root);
   ctx.RawTreeRoot := root;
 
-  // LIMIT yok, ham yuklem yok ve agac da yoksa: erken durma/eleme yok -> genel.
-  if (Stmt.LimitVal < 0) and (not ctx.HasRaw) and
-     (ctx.RawTreeRoot < 0) then Exit;
+  // P-88: LIMIT yok + ham kosu yok + agac yok -> yine de akisli tarama.
+  // Ara materyalizasyon (ScanSnapshot TBytes + allRows + filteredRows)
+  // atlandigi icin genel yoldan hizlidir.
 
   // ---- H3 (2026-10-18): aralik/esitlik icin zone map ----
   // Kosullar yalnizca sayisal kolonlara uygulanir. Harita gecersizse
@@ -12827,7 +12854,30 @@ begin
   ctx.Seen := 0;
   ctx.Emitted := 0;
   SetLength(ctx.OutRows, 0);
+  ctx.OutCap := 0;
   ctx.Failed := False;
+  // P-88: basit kolon ref kontrolu — hepsi kolon ref ise dogrudan kopyalama.
+  ctx.AllSimpleCols := True;
+  SetLength(ctx.ColMap, Stmt.Columns.Count);
+  for j := 0 to Stmt.Columns.Count - 1 do
+  begin
+    if Stmt.Columns[j].Expr is TSqlColumnRefNode then
+    begin
+      ctx.ColMap[j] := FindColIdx(
+        TSqlColumnRefNode(Stmt.Columns[j].Expr).ColumnName,
+        TSqlColumnRefNode(Stmt.Columns[j].Expr).TableQualifier, cn);
+      if ctx.ColMap[j] < 0 then
+      begin
+        ctx.AllSimpleCols := False;
+        Break;
+      end;
+    end
+    else
+    begin
+      ctx.AllSimpleCols := False;
+      Break;
+    end;
+  end;
 
   zScanOk := True;
   if FT.Kv <> nil then
@@ -12877,6 +12927,9 @@ begin
     ctx.ZoneMap := nil;
   end;
   if ctx.Failed then Exit(False);
+
+  // P-88: OutRows kapasitesini gercek satir sayisina kirp.
+  SetLength(ctx.OutRows, ctx.Emitted);
 
   // M1: cikti tipleri (pgwire OID'leri icin)
   SetLength(outTypes, Length(outCols));
