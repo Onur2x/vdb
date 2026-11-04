@@ -163,6 +163,7 @@ function VDbColumnSeal(KeyId: QWord; TableId, ColIndex: Word;
 function VDbColumnOpen(TableId, ColIndex: Word; const Stored: TBytes): TBytes;
 function VDbColumnIsSealed(const B: TBytes): Boolean; overload;
 function VDbColumnIsSealed(const S: string): Boolean; overload;
+function VDbColumnIsSealed(P: PByte; L: Integer): Boolean; overload;
 
 implementation
 
@@ -1405,6 +1406,13 @@ begin
   Result := False;
   if Length(S) < Length(VDB_COL_VALUE_MAGIC) then Exit;
   Result := Copy(S, 1, Length(VDB_COL_VALUE_MAGIC)) = VDB_COL_VALUE_MAGIC;
+end;
+
+function VDbColumnIsSealed(P: PByte; L: Integer): Boolean;
+begin
+  Result := False;
+  if (P = nil) or (L < Length(VDB_COL_VALUE_MAGIC)) then Exit;
+  Result := CompareMem(P, @VDB_COL_VALUE_MAGIC[1], Length(VDB_COL_VALUE_MAGIC));
 end;
 
 function VDbColumnSeal(KeyId: QWord; TableId, ColIndex: Word;

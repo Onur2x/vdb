@@ -1992,3 +1992,46 @@ Non-DirectDecode yolunda eski iki geçiş aynen korunur.
 141.720 → 75.161 us (**−%47**).
 
 Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMİZ, chainnull TEMİZ.
+
+---
+
+## §37 — P-94: Çift tahsis kaldırma (decode yolunda tek SetString)
+
+**Tarih:** 2026-11-04
+**Dal:** v3
+**Sorun:** ASCII metin kolonlarında decode her satırda 2 tahsis yapıyordu:
+
+```pascal
+SetString(s, PAnsiChar(p), FLen[i]);                          // 1. tahsis
+if VdbPureAscii(p, FLen[i]) then
+  SetString(Vals[i], PAnsiChar(p), FLen[i])                   // 2. tahsis (aynı veri!)
+```
+
+100k satır × 2 metin kolonu = 200k gereksiz ara string + kopyalama.
+Sealed kontrolü de `VDbColumnIsSealed(s: string)` ile yapılıyordu —
+her kolon için bir geçici string kopyası (`Copy`) üretiyordu.
+
+**Çözüm:**
+1. `VDbColumnIsSealed(P: PByte; L: Integer)` overload eklendi (`VDbCrypt.pas`).
+   Bayt düzeyinde `CompareMem` — tahsis yok. String overload korundu.
+2. 6 decode fonksiyonunda mantık yeniden düzenlendi:
+   - Sealed ise: tahsis + decrypt (zorunlu)
+   - BLOB veya saf-ASCII ise: **tek** `SetString(Vals[i], ...)` — ara `s` yok
+   - Non-ASCII ise: `s` + `UTF8Decode(s)` (UTF-16 dönüşümü zorunlu)
+
+Düzeltilen fonksiyonlar: `DecodeRow`, `VDbRowFromOffsetsP`,
+`VDbRowFromOffsetsMaskP`, `VDbColFromOffsetsP`, `VDbDecodeRawRowP`,
+`VDbDecodeStreamRowP`.
+
+**Etki (joindiag, en iyi süreler):**
+| Sorgu | P-93 | P-94 | Değişim |
+|-------|------|------|---------|
+| B: SELECT * 100k | 75.161 us | **68.205 us** | **−%9** |
+| D: JOIN COUNT | 1.483 us | 1.466 us | −%1 |
+| E: JOIN 100 satır | 1.511 us | 1.466 us | −%3 |
+| G: NarrowRows | 580 us | 572 us | −%1 |
+
+Ölçüm aralığı (3 çalıştırma): B=68.205–75.008 us. P-90'dan bu yana toplam
+141.720 → 68.205 us (**−%52**).
+
+Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMİZ, chainnull TEMİZ.

@@ -4045,6 +4045,17 @@ begin
     S[n - i] := buf[i];
 end;
 
+// P-91b: saf-ASCII bayt araligi mi? UTF8Decode atlaniyor (3 tahsis -> 1).
+function VdbPureAscii(P: PByte; L: Integer): Boolean;
+var
+  k: Integer;
+begin
+  Result := False;
+  for k := 0 to L - 1 do
+    if P[k] >= $80 then Exit;
+  Result := True;
+end;
+
 function DecodeRow(const B: TBytes; out TableId: Word; out Pk: string; out Vals: TStrArray): Boolean;
 // Satiri kayitli sira ile cozer. Alanlar eski semaya gore yazilmis
 // olabilir; ALTER TABLE sirasinda cagricilar SrcCts ile kesisim
@@ -4081,10 +4092,10 @@ begin
       VCT_BOOL: begin Vals[i] := BoolToStr(B[p] <> 0, True); end;
     else
     begin
-      rawS := '';
-      VDbB2SInto(B, p, vl, rawS);
-      if VDbColumnIsSealed(rawS) then
+      if VDbColumnIsSealed(@B[p], vl) then
       begin
+        rawS := '';
+        VDbB2SInto(B, p, vl, rawS);
         plain := VDbColumnOpen(TableId, i, VDbS2B(rawS));
         if ct = VCT_BLOB then
           VDbB2SInto(plain, 0, Length(plain), Vals[i])
@@ -4094,10 +4105,14 @@ begin
           Vals[i] := UTF8Decode(rawS);
         end;
       end
-      else if ct = VCT_BLOB then
-        Vals[i] := rawS                    // ham bayt, kodlama yok
+      else if (ct = VCT_BLOB) or VdbPureAscii(@B[p], vl) then
+        VDbB2SInto(B, p, vl, Vals[i])   // P-94: tek tahsis + ASCII hizli yol
       else
+      begin
+        rawS := '';
+        VDbB2SInto(B, p, vl, rawS);
         Vals[i] := UTF8Decode(rawS);
+      end;
     end;
     end;
     Inc(p, vl);
@@ -4180,17 +4195,6 @@ begin
   Result := True;
 end;
 
-// P-91b: saf-ASCII bayt araligi mi? UTF8Decode atlaniyor (3 tahsis -> 1).
-function VdbPureAscii(P: PByte; L: Integer): Boolean;
-var
-  k: Integer;
-begin
-  Result := False;
-  for k := 0 to L - 1 do
-    if P[k] >= $80 then Exit;
-  Result := True;
-end;
-
 procedure VDbRowFromOffsetsP(B: PByte; ColCount: Integer;
   const FType: array of Byte; const FOff, FLen: array of Integer;
   out Vals: TStrArray);
@@ -4224,18 +4228,20 @@ begin
     else
       begin
         p := PByte(NativeUInt(B) + NativeUInt(FOff[i]));
-        SetString(s, PAnsiChar(p), FLen[i]);
-        if VDbColumnIsSealed(s) then
+        if VDbColumnIsSealed(p, FLen[i]) then
         begin
+          SetString(s, PAnsiChar(p), FLen[i]);
           plain := VDbColumnOpen(tid, i, VDbS2B(s));
           if FType[i] = VCT_BLOB then Vals[i] := VDbB2S(plain, 0, Length(plain))
           else Vals[i] := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
         end
-        else if FType[i] = VCT_BLOB then Vals[i] := s
-        else if VdbPureAscii(p, FLen[i]) then
-          SetString(Vals[i], PAnsiChar(p), FLen[i])   // P-91b: ASCII — UTF8Decode yok
+        else if (FType[i] = VCT_BLOB) or VdbPureAscii(p, FLen[i]) then
+          SetString(Vals[i], PAnsiChar(p), FLen[i])   // P-94: tek tahsis
         else
+        begin
+          SetString(s, PAnsiChar(p), FLen[i]);
           Vals[i] := UTF8Decode(s);
+        end;
       end;
     end;
   end;
@@ -4275,18 +4281,20 @@ begin
     else
       begin
         p := PByte(NativeUInt(B) + NativeUInt(FOff[i]));
-        SetString(s, PAnsiChar(p), FLen[i]);
-        if VDbColumnIsSealed(s) then
+        if VDbColumnIsSealed(p, FLen[i]) then
         begin
+          SetString(s, PAnsiChar(p), FLen[i]);
           plain := VDbColumnOpen(tid, i, VDbS2B(s));
           if FType[i] = VCT_BLOB then Vals[i] := VDbB2S(plain, 0, Length(plain))
           else Vals[i] := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
         end
-        else if FType[i] = VCT_BLOB then Vals[i] := s
-        else if VdbPureAscii(p, FLen[i]) then
-          SetString(Vals[i], PAnsiChar(p), FLen[i])   // P-91b: ASCII — UTF8Decode yok
+        else if (FType[i] = VCT_BLOB) or VdbPureAscii(p, FLen[i]) then
+          SetString(Vals[i], PAnsiChar(p), FLen[i])   // P-94: tek tahsis
         else
+        begin
+          SetString(s, PAnsiChar(p), FLen[i]);
           Vals[i] := UTF8Decode(s);
+        end;
       end;
     end;
   end;
@@ -4322,18 +4330,20 @@ begin
   else
     begin
       p := PByte(NativeUInt(B) + NativeUInt(FOff[Col]));
-      SetString(s, PAnsiChar(p), FLen[Col]);
-      if VDbColumnIsSealed(s) then
+      if VDbColumnIsSealed(p, FLen[Col]) then
       begin
+        SetString(s, PAnsiChar(p), FLen[Col]);
         plain := VDbColumnOpen(tid, Col, VDbS2B(s));
         if FType[Col] = VCT_BLOB then Result := VDbB2S(plain, 0, Length(plain))
         else Result := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
       end
-      else if FType[Col] = VCT_BLOB then Result := s
-      else if VdbPureAscii(p, FLen[Col]) then
-        SetString(Result, PAnsiChar(p), FLen[Col])   // P-91b: ASCII — UTF8Decode yok
+      else if (FType[Col] = VCT_BLOB) or VdbPureAscii(p, FLen[Col]) then
+        SetString(Result, PAnsiChar(p), FLen[Col])   // P-94: tek tahsis
       else
+      begin
+        SetString(s, PAnsiChar(p), FLen[Col]);
         Result := UTF8Decode(s);
+      end;
     end;
   end;
 end;
@@ -4379,19 +4389,20 @@ begin
       VCT_BOOL: begin Vals[i] := BoolToStr(B[p] <> 0, True); end;
     else
     begin
-      s := SliceStr(p, vl);
-      if VDbColumnIsSealed(string(s)) then
+      if VDbColumnIsSealed(@B[p], vl) then
       begin
+        s := SliceStr(p, vl);
         plain := VDbColumnOpen(TableId, i, VDbS2B(string(s)));
         if ct = VCT_BLOB then Vals[i] := VDbB2S(plain, 0, Length(plain))
         else Vals[i] := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
       end
-      else if ct = VCT_BLOB then
-        Vals[i] := s
-      else if VdbPureAscii(@B[p], vl) then
-        SetString(Vals[i], PAnsiChar(@B[p]), vl)   // P-91b: ASCII — UTF8Decode yok
+      else if (ct = VCT_BLOB) or VdbPureAscii(@B[p], vl) then
+        SetString(Vals[i], PAnsiChar(@B[p]), vl)   // P-94: tek tahsis
       else
+      begin
+        s := SliceStr(p, vl);
         Vals[i] := UTF8Decode(s);
+      end;
     end;
     end;
     Inc(p, vl);
@@ -4598,18 +4609,20 @@ begin
         begin Vals[i] := BoolToStr(src^ <> 0, True); end;
     else
       begin
-        SetString(s, PAnsiChar(src), vl);
-        if VDbColumnIsSealed(s) then
+        if VDbColumnIsSealed(src, vl) then
         begin
+          SetString(s, PAnsiChar(src), vl);
           plain := VDbColumnOpen(H.TableId, i, VDbS2B(s));
           if ct = VCT_BLOB then Vals[i] := VDbB2S(plain, 0, Length(plain))
           else Vals[i] := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
         end
-        else if ct = VCT_BLOB then Vals[i] := s
-        else if VdbPureAscii(src, vl) then
-          SetString(Vals[i], PAnsiChar(src), vl)
+        else if (ct = VCT_BLOB) or VdbPureAscii(src, vl) then
+          SetString(Vals[i], PAnsiChar(src), vl)   // P-94: tek tahsis
         else
+        begin
+          SetString(s, PAnsiChar(src), vl);
           Vals[i] := UTF8Decode(s);
+        end;
       end;
     end;
     Inc(p, vl);
