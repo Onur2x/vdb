@@ -2191,3 +2191,21 @@ sayısı yarıya iner (6 basamaklı sayı için 6 → 3 iterasyon). Negatif ve
 → **~%6 kazanç**.
 
 Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
+
+## §45 — P-104: VdbRowHdrOf FillChar kaldırma
+
+**Tarih:** 2026-11-04
+**Dal:** v3
+**Commit:** `5817821`
+
+`VdbRowHdrOf` içindeki `FillChar(H, SizeOf(H), 0)` kaldırıldı. Normal
+yolda tüm alanlar (Ext, TableId, PkLen, PkFromCol, PkOff, ColCount,
+ColOff) koşulsuz atanıyor. Hata yollarında `Result = False` döner ve
+çağrılar `if not VdbRowHdrOf(...) then Exit;` deseniyle `H`'yi hiç
+kullanmaz. 100k satır × ~24 bayt = ~2.4MB gereksiz sıfırlama kaldırıldı.
+
+Ölçüm (joindiag B, 4 ölçüm): 56046, 62096, 61566, 57841 us. En_iyi
+56046 us — taban ~57635 us altında. Ölçüm gürültüsü kazançtan büyük;
+teorik olarak risksiz iyileştirme.
+
+Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
