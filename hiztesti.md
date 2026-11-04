@@ -2122,3 +2122,20 @@ ile kopyalanıyor ve normal decode bloğu atlanıyor (`Inc(p, vl); Continue`).
 Medyan ~64 us. Önceki taban ~68–75 us → **~%8 kazanç**.
 
 Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
+
+## §41 — P-98b: VDbFloatToStr/VDbParseFloat TFormatSettings önbelleği
+
+**Tarih:** 2026-11-04
+**Dal:** v3
+**Commit:** `e233efd`
+
+`VDbFloatToStr` ve `VDbParseFloat` her çağrıda `DefaultFormatSettings`'i
+yerel `TFormatSettings` değişkenine kopyalıyordu (~50 bayt/kopya). Bu kopya
+kaldırıldı; global `VDbFloatFmt` değişkeni `initialization` bölümünde bir kez
+kuruluyor (`DecimalSeparator := '.'`, `ThousandSeparator := #0`).
+
+B metriğinde (INT+INT+INT+TEXT) FLOAT kolon olmadığı için doğrudan etki
+gözlenmedi (64698–66384 us, aykırı değer 72599). FLOAT kolonlu iş
+yüklerinde her satır başına ~50 bayt/call tasarruf sağlar.
+
+Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
