@@ -920,6 +920,14 @@ procedure VDbRowFromOffsetsMaskP(B: PByte; ColCount: Integer;
   VDbRowFromOffsetsP ile birebir aynidir. }
 function VDbColFromOffsetsP(B: PByte; ColCount, Col: Integer;
   const FType: array of Byte; const FOff, FLen: array of Integer): string;
+{ P-93: tek gecis — peek + decode birlesik. VDbPeekRawRowKeyHashTo +
+  VDbRowFromOffsetsP'nin yaptigi isi tek dongude yapar; FType/FOff/FLen
+  ara dizileri yazilmaz/okunmaz. Kolonlar dogrudan Vals'e cozulur.
+  KeyHash, VDbHashKeyBytes ile uretilir (P-90d ile birebir).
+  Basarisizsa Result=False, KeyHash gecersizdir. }
+function VDbDecodeStreamRowP(B: PByte; Len, ColCount: Integer;
+  HashPrefix: QWord; out TableId: Word; out KeyHash: QWord;
+  out Vals: TStrArray): Boolean;
 { P-18a (2026-10-16): VDbPeekRawRow'un PByte+Len surumu. ScanRawIter
   geri-cagrisinda kayit tamponu TBytes DEGIL, chunk icinde bir araliktir;
   yeni TBytes ayirmadan ayni sinir kontrolleriyle onizlenir. Semantigi
@@ -4494,6 +4502,125 @@ function VDbPeekRawRowKeyHash(B: PByte; Len, ColCount: Integer;
 begin
   Result := VDbPeekRawRowKeyHashTo(B, Len, ColCount, TableId, HashPrefix,
     KeyHash, ColCount - 1, FType, FOff, FLen);
+end;
+
+// P-93: tek gecis — VDbPeekRawRowKeyHashTo + VDbRowFromOffsetsP birlesik.
+// FType/FOff/FLen ara dizileri yazilmaz/okunmaz; kolonlar tek dongude
+// dogrudan Vals'e cozulur. KeyHash P-90d ile birebir ayni uretilir.
+function VDbDecodeStreamRowP(B: PByte; Len, ColCount: Integer;
+  HashPrefix: QWord; out TableId: Word; out KeyHash: QWord;
+  out Vals: TStrArray): Boolean;
+var
+  H: TVdbRowHdr;
+  p: Integer;
+  i: Integer;
+  vl: LongInt;
+  ct: Byte;
+  iv: Int64;
+  fv: Double;
+  s: string;
+  plain: TBytes;
+  pkPtr: PByte;
+  pkLen: Integer;
+  pkCol: Integer;
+  pkBuf: array[0..27] of AnsiChar;
+  src: PByte;
+begin
+  Result := False;
+  KeyHash := 0;
+  SetLength(Vals, ColCount);
+  if B = nil then Exit;
+  if not VdbRowHdrOf(B, Len, H) then Exit;
+  if H.ColCount <> ColCount then Exit;
+  TableId := H.TableId;
+
+  // PK kaynagi
+  pkPtr := nil;
+  pkLen := H.PkLen;
+  pkCol := H.PkFromCol;
+  if pkCol >= 0 then
+  begin
+    if pkCol >= ColCount then Exit;
+  end
+  else
+  begin
+    if H.PkLen > 0 then pkPtr := B + H.PkOff
+    else pkPtr := B;
+  end;
+
+  p := H.ColOff;
+  for i := 0 to ColCount - 1 do
+  begin
+    if p >= Len then Exit;
+    ct := B[p]; Inc(p);
+    if not VdbRowColLen(B, Len, p, H.Ext, vl) then Exit;
+    if vl = -1 then
+    begin
+      Vals[i] := '';
+      if i = pkCol then Exit;   // pk NULL olamaz
+      Continue;
+    end;
+    if (vl < 0) or (p + vl > Len) then Exit;
+    src := B + p;
+
+    // PK kolonu: hash icin kaynak goster
+    if i = pkCol then
+    begin
+      case ct of
+        VCT_INT:
+          begin
+            if not VDbIntFromPayload(src, vl, iv) then Exit;
+            pkLen := VdbIntToDecBuf(iv, pkBuf);
+            if pkLen <= 0 then Exit;
+            pkPtr := @pkBuf[0];
+          end;
+        VCT_FLOAT, VCT_BOOL: Exit;
+      else
+        begin
+          pkPtr := src;
+          pkLen := vl;
+        end;
+      end;
+    end;
+
+    // Dogrudan decode
+    case ct of
+      VCT_INT:
+        begin
+          if VDbIntFromPayload(src, vl, iv) then
+            VdbIntToStrTo(Vals[i], iv)
+          else
+            Vals[i] := '';
+        end;
+      VCT_FLOAT:
+        begin Move(src^, fv, 8); Vals[i] := VDbFloatToStr(fv); end;
+      VCT_BOOL:
+        begin Vals[i] := BoolToStr(src^ <> 0, True); end;
+    else
+      begin
+        SetString(s, PAnsiChar(src), vl);
+        if VDbColumnIsSealed(s) then
+        begin
+          plain := VDbColumnOpen(H.TableId, i, VDbS2B(s));
+          if ct = VCT_BLOB then Vals[i] := VDbB2S(plain, 0, Length(plain))
+          else Vals[i] := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
+        end
+        else if ct = VCT_BLOB then Vals[i] := s
+        else if VdbPureAscii(src, vl) then
+          SetString(Vals[i], PAnsiChar(src), vl)
+        else
+          Vals[i] := UTF8Decode(s);
+      end;
+    end;
+    Inc(p, vl);
+  end;
+
+  if pkCol >= 0 then
+  begin
+    if pkPtr = nil then Exit;   // pk cozulmedi
+  end;
+  KeyHash := VDbHashKeyBytes(HashPrefix, pkPtr, pkLen);
+  Result := True;
 end;
 
 function VDbRowTagOf(PlainValue: PByte; ValueLen: Integer): Integer;

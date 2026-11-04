@@ -1960,3 +1960,35 @@ sorgusu 141.720 → 79.170 us (**−%44**).
 p67diag INSERT: 1.338 us/satır (hafif iyileşme).
 
 Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMİZ, chainnull TEMİZ.
+
+## §36 — P-93: Tek geçiş DirectDecode — VDbDecodeStreamRowP
+
+**Tarih:** 2026-11-04
+**Dal:** v3
+**Sorun:** DirectDecode yolunda satır başına 2 geçiş yapılıyordu:
+1. `VDbPeekRawRowKeyHashTo` — FType/FOff/FLen ara dizilerini yazar, PK hash üretir
+2. `VDbRowFromOffsetsP` — FType/FOff/FLen okuyarak Vals'i decode eder
+
+Ara diziler (3× ColCount Integer/Byte) her satırda yazılır + okunur.
+100k satır × 4 kolon = 400k gereksiz bellek erişimi.
+
+**Çözüm:** `VDbDecodeStreamRowP` (`VDbTable.pas`) — hash doğrulama + decode
+tek döngüde. FType/FOff/FLen hiç kurulmaz/okunmaz. PK hash `VDbHashKeyBytes`
+ile üretilir (P-90d ile birebir aynı semantik). Sealed kolonlar, ASCII hızlı
+yolu, INT/FLOAT/BOOL decode mekanizması korunur.
+
+`VDbExecutor.pas` callback'inde DirectDecode yolu tamamen ayrı:
+`VDbDecodeStreamRowP` → tid/keyHash doğrulama → zone map → emit.
+Non-DirectDecode yolunda eski iki geçiş aynen korunur.
+
+**Etki (joindiag, en iyi süreler):**
+| Sorgu | P-92 | P-93 | Değişim |
+|-------|------|------|---------|
+| B: SELECT * 100k | 79.170 us | **75.161 us** | **−%5** |
+| D: JOIN COUNT | 1.484 us | 1.483 us | ±%0 |
+| G: NarrowRows | 574 us | 580 us | ±%1 |
+
+Ölçüm aralığı (3 çalıştırma): B=75.161–79.125 us. P-90'dan bu yana toplam
+141.720 → 75.161 us (**−%47**).
+
+Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMİZ, chainnull TEMİZ.

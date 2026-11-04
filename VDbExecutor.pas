@@ -13060,6 +13060,37 @@ var
 begin
   ctx := User;
   if Key = VDB_SCHEMA_KEY then Exit(True);
+  // P-93: DirectDecode tek gecis — hash dogrulama + decode ayni dongude.
+  // FType/FOff/FLen ara dizileri yazilmaz/okunmaz; Vals dogrudan cikti
+  // satirina cozulur. Yalnizca kimlik ColMap + WHERE yok + tum kolonlar
+  // SELECT'te iken kullanilir (init'te hesaplanir).
+  if ctx^.DirectDecode then
+  begin
+    if ctx^.Emitted >= ctx^.OutCap then
+    begin
+      if ctx^.OutCap = 0 then ctx^.OutCap := 256
+      else ctx^.OutCap := ctx^.OutCap * 2;
+      SetLength(ctx^.OutRows, ctx^.OutCap);
+    end;
+    if not VDbDecodeStreamRowP(Buf, Len, ctx^.ColCnt, ctx^.HashPrefix,
+                               tid, keyHash, ctx^.OutRows[ctx^.Emitted]) then
+    begin
+      ctx^.Failed := True;
+      Exit(False);
+    end;
+    if tid <> ctx^.TableId then Exit(True);
+    if keyHash <> Key then
+    begin
+      ctx^.Failed := True;
+      Exit(False);
+    end;
+    if ctx^.ZoneOn then VdbStreamSelZoneAdd(ctx, Buf, Len);
+    Inc(ctx^.Seen);
+    if ctx^.Seen <= ctx^.Offset then Exit(True);
+    Inc(ctx^.Emitted);
+    if (ctx^.Limit >= 0) and (ctx^.Emitted >= ctx^.Limit) then Exit(False);
+    Exit(True);
+  end;
   // P-90d: PK string'siz hash — VDbPeekRawRowP + VDbHashKey yerine
   // ham baytlardan hash; MaxCol ile erken kolon durmasi.
   if not VDbPeekRawRowKeyHashTo(Buf, Len, ctx^.ColCnt, tid, ctx^.HashPrefix,
@@ -13087,29 +13118,6 @@ begin
       rvTrue: whereOK := True;
       // rvUndecided: asagidaki on-eleme + RowMatches yolu.
     end;
-  end;
-  // P-91: kimlik ColMap + WHERE yok → vals ve prow atlaniyor, decode dogrudan
-  // cikti satirina yazilir. Bu yol yalnizca tum kolonlar SELECT'te ve sira
-  // ayniyken kullanilir (DirectDecode init'te hesaplanir).
-  if ctx^.DirectDecode then
-  begin
-    Inc(ctx^.Seen);
-    if ctx^.Seen <= ctx^.Offset then Exit(True);
-    if ctx^.Emitted >= ctx^.OutCap then
-    begin
-      if ctx^.OutCap = 0 then ctx^.OutCap := 256
-      else ctx^.OutCap := ctx^.OutCap * 2;
-      SetLength(ctx^.OutRows, ctx^.OutCap);
-    end;
-    // P-92: SetLength(OutRows[Emitted], ColCnt) kaldirildi —
-    // VDbRowFromOffsetsP/MaskP 'out' parametre ile zaten SetLength yapiyor.
-    if ctx^.UseMask then
-      VDbRowFromOffsetsMaskP(Buf, ctx^.ColCnt, ctx^.FType, ctx^.FOff, ctx^.FLen, ctx^.NeedCols, ctx^.OutRows[ctx^.Emitted])
-    else
-      VDbRowFromOffsetsP(Buf, ctx^.ColCnt, ctx^.FType, ctx^.FOff, ctx^.FLen, ctx^.OutRows[ctx^.Emitted]);
-    Inc(ctx^.Emitted);
-    if (ctx^.Limit >= 0) and (ctx^.Emitted >= ctx^.Limit) then Exit(False);
-    Exit(True);
   end;
   if not whereOK then
   begin
