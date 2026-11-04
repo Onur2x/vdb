@@ -3383,7 +3383,6 @@ var
   u: LongWord;
 begin
   Result := False;
-  FillChar(H, SizeOf(H), 0);
   H.PkFromCol := -1;
   if (B = nil) or (Len < 2) then Exit;
   p := 0;
