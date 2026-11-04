@@ -2209,3 +2209,26 @@ kullanmaz. 100k satır × ~24 bayt = ~2.4MB gereksiz sıfırlama kaldırıldı.
 teorik olarak risksiz iyileştirme.
 
 Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
+
+## §46 — P-105: ScanRawIter FIndex.Ptr^ ile kopyasız tarama
+
+**Tarih:** 2026-11-05
+**Dal:** v3
+
+`ScanRawIter` PAS A direct döngüsündeki `for pair in FIndex do` yerine
+`for pPair in FIndex.Ptr^ do` kullanıldı. FPC `TDictionary.Ptr`
+property'si (`PPointersCollection(@FItems)`) işaretçi iterasyonu
+sağlar; `GetCurrent` `@FItems^[FIndex].Pair` döndürür, `TPair` kopyası
+olmaz. Eski döngü her adımda ~40 baytlık `TPair<QWord, TDbLoc>` kopyası
+üretiyordu (i386'ta gizli sonuç geçici + atama = 2 kopya). Semantik
+korundu (R-26 `TableId < 0` filtresi dahil). `VDbHashKey`'e
+dokunulmadı. Diğer `for pair in FIndex do` döngüleri (RebuildTableKeys,
+ScanSnapshot, PrepareRawScan, savepoint, compact, backup) bilinçli
+olarak değiştirilmedi — yalnızca B metriğinin sıcak yolu hedeflendi.
+
+Ölçüm (joindiag B, 7 interleave A/B çifti; ayrı ikililer, sırayla):
+taban 58542–62574 us (medyan 60519), P-105 56395–63202 us (medyan
+57015). 7 çiftin 6'sında P-105 hızlı; en_iyi %3.7, medyan %5.8
+kazanç. Tek aykırı çiftte makine kayması %4.4 aleyhte.
+
+Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.

@@ -3789,9 +3789,11 @@ type
     Size: LongWord;
     Key: QWord;
   end;
+  { P-105: FIndex.Ptr taramasi isaretcili doner (TPair kopyasi yok). }
+  PVDbPair = ^TPair<QWord, TDbLoc>;
 var
   fsize: Int64;
-  pair: TPair<QWord, TDbLoc>;
+  pPair: PVDbPair;
   h: TVDbRecHead;
   n: Integer;
   op: TPendOp;
@@ -3902,15 +3904,18 @@ begin
     end;
     if direct then
     begin
-      for pair in FIndex do
+      // P-105: FIndex.Ptr — isaretcili, kopyasiz dolasim.
+      // Eski `for pair in FIndex` her adimda TPair (~40B) kopyasini
+      // uretiyordu (i386'ta gizli sonuc gecici + atama = 2 kopya).
+      for pPair in FIndex.Ptr^ do
       begin
         if TableFilter >= 0 then
         begin
           // R-26: TableId < 0 (sema) hicbir filtrede elenmez.
-          if (pair.Value.TableId >= 0) and (pair.Value.TableId <> TableFilter) then
+          if (pPair^.Value.TableId >= 0) and (pPair^.Value.TableId <> TableFilter) then
             Continue;
         end;
-        Consider(pair.Key, pair.Value);
+        Consider(pPair^.Key, pPair^.Value);
       end;
     end
     else
