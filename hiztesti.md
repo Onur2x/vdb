@@ -2158,3 +2158,20 @@ FPC'de `SetLength` da uzunluk değişince yeni buffer tahsis ediyor,
 ön tahsis işe yaramıyor (B=71–75 us, ~%12 kötüleşme).
 
 Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
+
+## §43 — P-100: ScanRawIter PAS A direct mod
+
+**Tarih:** 2026-11-04
+**Dal:** v3
+**Commit:** `b8628d1`
+
+`ScanRawIter` PAS A'da tablo filtresi varken `FTableKeys` + `FIndex.TryGetValue`
+yolu kullanılıyordu (satır başına 1 hash lookup). `PrepareRawScan`'daki
+heuristic (tablo ≥ 1/3 toplam ise `direct`) `ScanRawIter`'a da uygulandı.
+Yogun tabloda `FIndex` doğrudan dolaşılır; ~100k satır için ~100k hash lookup
+önlenir.
+
+Ölçüm (joindiag B, 11 ölçüm): 61495–63055 us (aykırı: 68137–71675).
+Önceki taban ~64000 us → **~%2–3 kazanç**.
+
+Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
