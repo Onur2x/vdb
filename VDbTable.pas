@@ -4584,6 +4584,9 @@ begin
             pkLen := VdbIntToDecBuf(iv, pkBuf);
             if pkLen <= 0 then Exit;
             pkPtr := @pkBuf[0];
+            SetString(Vals[i], PAnsiChar(@pkBuf[0]), pkLen); // P-97a: pkBuf'dan dogrudan
+            Inc(p, vl);
+            Continue;
           end;
         VCT_FLOAT, VCT_BOOL: Exit;
       else
