@@ -927,7 +927,7 @@ function VDbColFromOffsetsP(B: PByte; ColCount, Col: Integer;
   Basarisizsa Result=False, KeyHash gecersizdir. }
 function VDbDecodeStreamRowP(B: PByte; Len, ColCount: Integer;
   HashPrefix: QWord; out TableId: Word; out KeyHash: QWord;
-  out Vals: TStrArray): Boolean;
+  var Vals: TStrArray): Boolean;
 { P-18a (2026-10-16): VDbPeekRawRow'un PByte+Len surumu. ScanRawIter
   geri-cagrisinda kayit tamponu TBytes DEGIL, chunk icinde bir araliktir;
   yeni TBytes ayirmadan ayni sinir kontrolleriyle onizlenir. Semantigi
@@ -4520,7 +4520,7 @@ end;
 // dogrudan Vals'e cozulur. KeyHash P-90d ile birebir ayni uretilir.
 function VDbDecodeStreamRowP(B: PByte; Len, ColCount: Integer;
   HashPrefix: QWord; out TableId: Word; out KeyHash: QWord;
-  out Vals: TStrArray): Boolean;
+  var Vals: TStrArray): Boolean;
 var
   H: TVdbRowHdr;
   p: Integer;
@@ -4539,7 +4539,7 @@ var
 begin
   Result := False;
   KeyHash := 0;
-  SetLength(Vals, ColCount);
+  if Length(Vals) <> ColCount then SetLength(Vals, ColCount);
   if B = nil then Exit;
   if not VdbRowHdrOf(B, Len, H) then Exit;
   if H.ColCount <> ColCount then Exit;
