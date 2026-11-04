@@ -3463,7 +3463,9 @@ function VdbIntToDecBuf(V: Int64; var Buf: array of AnsiChar): Integer;
   yolu satir basina string ayirmasin). Negatif ve MinInt64 dogru.
   Yer yetersizse 0 doner.
   P-101: iki basamakli lookup tablosu — her iterasyonda 2 basamak, yari
-  sayida bolme islemi. }
+  sayida bolme islemi.
+  P-106: i386'ta 64-bit bolme kitaplik cagrisidir (~50-80 ns); 32-bit
+  bolme tek DIV komutudur. Deger LongWord'e sigiyorsa 32-bit yol. }
 const
   D2: array[0..99] of packed array[0..1] of AnsiChar = (
     '00', '01', '02', '03', '04', '05', '06', '07', '08', '09',
@@ -3481,6 +3483,7 @@ var
   i, n: Integer;
   neg: Boolean;
   u: QWord;
+  u32: LongWord;
   r: Integer;
 begin
   Result := 0;
@@ -3488,30 +3491,63 @@ begin
   if neg then u := QWord(-(V + 1)) + 1 else u := QWord(V);
   i := High(Buf);
   n := 0;
-  while u >= 100 do
+  if u <= $FFFFFFFF then
   begin
-    if i < 1 then Exit;
-    r := u mod 100;
-    u := u div 100;
-    Buf[i] := D2[r][1];      // birler
-    Buf[i - 1] := D2[r][0];  // onlar
-    Dec(i, 2);
-    Inc(n, 2);
-  end;
-  if u >= 10 then
-  begin
-    if i < 1 then Exit;
-    Buf[i] := D2[u][1];
-    Buf[i - 1] := D2[u][0];
-    Dec(i, 2);
-    Inc(n, 2);
+    { P-106: 32-bit bolme yolu — tek DIV komutu. }
+    u32 := LongWord(u);
+    while u32 >= 100 do
+    begin
+      if i < 1 then Exit;
+      r := u32 mod 100;
+      u32 := u32 div 100;
+      Buf[i] := D2[r][1];      // birler
+      Buf[i - 1] := D2[r][0];  // onlar
+      Dec(i, 2);
+      Inc(n, 2);
+    end;
+    if u32 >= 10 then
+    begin
+      if i < 1 then Exit;
+      Buf[i] := D2[u32][1];
+      Buf[i - 1] := D2[u32][0];
+      Dec(i, 2);
+      Inc(n, 2);
+    end
+    else
+    begin
+      if i < 0 then Exit;
+      Buf[i] := AnsiChar(Ord('0') + Integer(u32));
+      Dec(i);
+      Inc(n);
+    end;
   end
   else
   begin
-    if i < 0 then Exit;
-    Buf[i] := AnsiChar(Ord('0') + Integer(u));
-    Dec(i);
-    Inc(n);
+    while u >= 100 do
+    begin
+      if i < 1 then Exit;
+      r := u mod 100;
+      u := u div 100;
+      Buf[i] := D2[r][1];      // birler
+      Buf[i - 1] := D2[r][0];  // onlar
+      Dec(i, 2);
+      Inc(n, 2);
+    end;
+    if u >= 10 then
+    begin
+      if i < 1 then Exit;
+      Buf[i] := D2[u][1];
+      Buf[i - 1] := D2[u][0];
+      Dec(i, 2);
+      Inc(n, 2);
+    end
+    else
+    begin
+      if i < 0 then Exit;
+      Buf[i] := AnsiChar(Ord('0') + Integer(u));
+      Dec(i);
+      Inc(n);
+    end;
   end;
   if neg then
   begin

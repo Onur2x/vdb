@@ -2232,3 +2232,25 @@ taban 58542–62574 us (medyan 60519), P-105 56395–63202 us (medyan
 kazanç. Tek aykırı çiftte makine kayması %4.4 aleyhte.
 
 Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
+
+## §47 — P-106: VdbIntToDecBuf 32-bit bolme yolu
+
+**Tarih:** 2026-11-05
+**Dal:** v3
+
+`VdbIntToDecBuf`'da `u <= $FFFFFFFF` oldugunda 32-bit yol eklendi.
+i386'ta 64-bit `div/mod` kitaplik cagrisidir (~50-80 ns/delenme);
+LongWord `div/mod` ise tek DIV komutudur. D2 lookup iki basamakli
+yapi korundu, yalnizca bolme genisligi daraltildi. QWord yolu buyuk
+degerler (>= 2^32) ve MinInt64 icin ayni kaldi.
+
+Ablasyon (joindiag B): saf tarama 8.4 ms, +growth 6.9 ms,
++parse/hash 26.1 ms (en buyuk kalem), +4xSetString ~17 ms. Parse+hash
+= 260 ns/satir; hipotez 3 INT kolonunda 64-bit bolmeler.
+
+Olcum (joindiag B, 3 interleave A/B cifti; P-105'e karsi, ayri
+ikililer, sirayla): P-105 57752/57901/63547 us (medyan 57901),
+P-106 54246/57814/54688 us (medyan 54688). 3 ciftin 2'sinde P-106
+hizli; en_iyi %6.1, medyan %5.5 kazanc. Tek ciftte esit (~%0.2).
+
+Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMIZ.
