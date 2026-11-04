@@ -2083,3 +2083,23 @@ her kolonu yazmıyor, `out` finalize garantisi gerekli).
 
 Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
 Ölçüm: joindiag B=69.579 us (P-94: 68.205 us, gürültü aralığı).
+
+## §39 — P-96a: Boş pending dictionary kontrolünü atla
+
+**Tarih:** 2026-11-04
+**Dal:** v3
+**Commit:** `693cfa1`
+
+`ScanRawIter.Consider` ve `ScanSnapshot.Consider` içinde satır başına
+`pendKeys.ContainsKey(K)` + `pendDels.ContainsKey(K)` çağrısı yapılıyordu.
+Okuma-yalnız sorgularda (batch yok) her iki dictionary de boş — `ContainsKey`
+her zaman `False` dönüyordu, saf israf.
+
+`hasPend: Boolean` bayrağı eklendi. Dictionary doldurulduktan sonra
+`(pendKeys.Count > 0) or (pendDels.Count > 0)` ile set ediliyor; `Consider`
+içinde `if hasPend then` ile korunuyor.
+
+Etki: 100k satırlık taramada 200k gereksiz dictionary lookup kaldırıldı.
+Ölçüm gürültü aralığında (joindiag B=71–75 us).
+
+Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
