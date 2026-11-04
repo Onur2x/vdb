@@ -13054,8 +13054,9 @@ var
   ctx: ^TStreamSelCtx;
   tid: Word;
   keyHash: QWord;
-  vals, prow: TStrArray;
+  vals: TStrArray;
   j: Integer;
+  oldCap: Integer;
   whereOK: Boolean;
 begin
   ctx := User;
@@ -13068,9 +13069,13 @@ begin
   begin
     if ctx^.Emitted >= ctx^.OutCap then
     begin
+      oldCap := ctx^.OutCap;
       if ctx^.OutCap = 0 then ctx^.OutCap := 256
       else ctx^.OutCap := ctx^.OutCap * 2;
       SetLength(ctx^.OutRows, ctx^.OutCap);
+      // P-96: inner dizi on-tahsisi — satir basina SetLength kaldirir
+      for j := oldCap to ctx^.OutCap - 1 do
+        SetLength(ctx^.OutRows[j], ctx^.ColCnt);
     end;
     if not VDbDecodeStreamRowP(Buf, Len, ctx^.ColCnt, ctx^.HashPrefix,
                                tid, keyHash, ctx^.OutRows[ctx^.Emitted]) then
@@ -13143,7 +13148,16 @@ begin
   end;
   Inc(ctx^.Seen);
   if ctx^.Seen <= ctx^.Offset then Exit(True);
-  SetLength(prow, ctx^.Columns.Count);
+  // P-96/P-99: blok buyume + inner dizi on-tahsisi; prow ara tahsisi yok.
+  if ctx^.Emitted >= ctx^.OutCap then
+  begin
+    oldCap := ctx^.OutCap;
+    if ctx^.OutCap = 0 then ctx^.OutCap := 256
+    else ctx^.OutCap := ctx^.OutCap * 2;
+    SetLength(ctx^.OutRows, ctx^.OutCap);
+    for j := oldCap to ctx^.OutCap - 1 do
+      SetLength(ctx^.OutRows[j], ctx^.Columns.Count);
+  end;
   // P-88: basit kolon referanslarinda EvalExpr atla, dogrudan kopyala.
   // Sinir kontrolu: ColMap yanlis indeks donerse EvalExpr'a dus.
   if ctx^.AllSimpleCols then
@@ -13151,26 +13165,18 @@ begin
     for j := 0 to ctx^.Columns.Count - 1 do
     begin
       if (ctx^.ColMap[j] >= 0) and (ctx^.ColMap[j] < Length(vals)) then
-        prow[j] := vals[ctx^.ColMap[j]]
+        ctx^.OutRows[ctx^.Emitted][j] := vals[ctx^.ColMap[j]]
       else
-        prow[j] := ctx^.Exec.EvalExpr(ctx^.Columns[j].Expr, vals,
+        ctx^.OutRows[ctx^.Emitted][j] := ctx^.Exec.EvalExpr(ctx^.Columns[j].Expr, vals,
                                       ctx^.ColNames, ctx^.ColTypes);
     end;
   end
   else
   begin
     for j := 0 to ctx^.Columns.Count - 1 do
-      prow[j] := ctx^.Exec.EvalExpr(ctx^.Columns[j].Expr, vals,
+      ctx^.OutRows[ctx^.Emitted][j] := ctx^.Exec.EvalExpr(ctx^.Columns[j].Expr, vals,
                                     ctx^.ColNames, ctx^.ColTypes);
   end;
-  // P-88: blok buyume — satir basina SetLength O(N^2) idi.
-  if ctx^.Emitted >= ctx^.OutCap then
-  begin
-    if ctx^.OutCap = 0 then ctx^.OutCap := 256
-    else ctx^.OutCap := ctx^.OutCap * 2;
-    SetLength(ctx^.OutRows, ctx^.OutCap);
-  end;
-  ctx^.OutRows[ctx^.Emitted] := prow;
   Inc(ctx^.Emitted);
   if (ctx^.Limit >= 0) and (ctx^.Emitted >= ctx^.Limit) then Exit(False);
   Result := True;
@@ -13846,6 +13852,14 @@ begin
   ctx.Emitted := 0;
   SetLength(ctx.OutRows, 0);
   ctx.OutCap := 0;
+  // P-98: LIMIT biliniyorsa OutRows on-tahsis et (tekrarli buyume onlenir)
+  if (ctx.Limit > 0) and (ctx.Limit <= VDB_MAX_RESULT_ROWS) then
+  begin
+    ctx.OutCap := ctx.Limit;
+    SetLength(ctx.OutRows, ctx.OutCap);
+    for j := 0 to ctx.OutCap - 1 do
+      SetLength(ctx.OutRows[j], ctx.Columns.Count);
+  end;
   ctx.Failed := False;
   // P-88: basit kolon ref kontrolu — hepsi kolon ref ise dogrudan kopyalama.
   ctx.AllSimpleCols := True;
