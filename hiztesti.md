@@ -2139,3 +2139,22 @@ gözlenmedi (64698–66384 us, aykırı değer 72599). FLOAT kolonlu iş
 yüklerinde her satır başına ~50 bayt/call tasarruf sağlar.
 
 Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
+
+## §42 — P-99b: VdbIntToStrTo bulk copy + VdbPureAscii inline
+
+**Tarih:** 2026-11-04
+**Dal:** v3
+**Commit:** `98435e5`
+
+`VdbIntToStrTo`: `VdbIntToDecBuf` + `SetString` ile byte-by-byte yazım
+kaldırıldı (bulk copy). `VdbPureAscii`: `inline` edildi, fonksiyon çağrı
+overhead'i kalktı.
+
+Ölçüm (joindiag B, 5 tekrar): 64592, 64592, 62959, 63460, 64010 us.
+Medyan ~64 us. Önceki taban ~65 us → **~%2 kazanç** (gürültü aralığında).
+
+Not: P-99a (SetLength+Move ile ön tahsis) denendi ve geri alındı —
+FPC'de `SetLength` da uzunluk değişince yeni buffer tahsis ediyor,
+ön tahsis işe yaramıyor (B=71–75 us, ~%12 kötüleşme).
+
+Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
