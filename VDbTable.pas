@@ -1230,6 +1230,8 @@ var
   GVdbConcGateClosed: Boolean = False;
   // H6-sort: paralel siralama (test kancasi; varsayilan ACIK).
   GSortParallelEnabled: Boolean = True;
+  // P-98b: float bicimlendirme — her cagirda TFormatSettings kopyasini onler.
+  VDbFloatFmt: TFormatSettings;
 
 procedure VdbSetSortParallel(AEnabled: Boolean);
 begin
@@ -1435,12 +1437,9 @@ begin
 end;
 
 function VDbParseFloat(const S: string; out V: Double): Boolean;
-var
-  pfs: TFormatSettings;
 begin
-  pfs := DefaultFormatSettings;
-  pfs.DecimalSeparator := '.';
-  Result := TryStrToFloat(Trim(S), V, pfs);
+  // P-98b: global VDbFloatFmt — her cagirda TFormatSettings kopyasini onler
+  Result := TryStrToFloat(Trim(S), V, VDbFloatFmt);
   if not Result then Result := TryStrToFloat(Trim(S), V);
 end;
 
@@ -1962,14 +1961,10 @@ begin
 end;
 
 function VDbFloatToStr(V: Double): string;
-var
-  fs: TFormatSettings;
 begin
   // cikti her locale'de ayni: ondalik nokta
-  fs := DefaultFormatSettings;
-  fs.DecimalSeparator := '.';
-  fs.ThousandSeparator := #0;
-  Result := FloatToStr(V, fs);
+  // P-98b: global VDbFloatFmt — her cagirda TFormatSettings kopyasini onler
+  Result := FloatToStr(V, VDbFloatFmt);
 end;
 
 function VDbIdxCmp(const A, B: string; Ctype: Byte): Integer;
@@ -11882,5 +11877,11 @@ begin
   else
     Result := '';
 end;
+
+initialization
+  // P-98b: float bicimlendirme — bir kez kur, sonsuza dek kullan
+  VDbFloatFmt := DefaultFormatSettings;
+  VDbFloatFmt.DecimalSeparator := '.';
+  VDbFloatFmt.ThousandSeparator := #0;
 
 end.
