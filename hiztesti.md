@@ -2175,3 +2175,19 @@ Yogun tabloda `FIndex` doğrudan dolaşılır; ~100k satır için ~100k hash loo
 Önceki taban ~64000 us → **~%2–3 kazanç**.
 
 Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
+
+## §44 — P-101: VdbIntToDecBuf iki basamaklı lookup tablosu
+
+**Tarih:** 2026-11-04
+**Dal:** v3
+**Commit:** `9060389`
+
+`VdbIntToDecBuf` tek basamaklı `u mod 10` / `u div 10` döngüsü yerine
+`D2[0..99]` lookup tablosu ile her iterasyonda 2 basamak yazar. Bölme
+sayısı yarıya iner (6 basamaklı sayı için 6 → 3 iterasyon). Negatif ve
+`MinInt64` doğru.
+
+Ölçüm (joindiag B, 2 ölçüm): 57635, 57722 us. Önceki taban ~61500 us
+→ **~%6 kazanç**.
+
+Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
