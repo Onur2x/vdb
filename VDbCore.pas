@@ -3519,6 +3519,7 @@ var
   op: TPendOp;
   pendKeys: TDictionary<QWord, Byte>;
   pendDels: TDictionary<QWord, Byte>; // pending DEL -> index'deki satir gorunmemeli
+  hasPend: Boolean;                    // P-96a: bos dict kontrolunu atla
   count: Integer;
   // P-13 toplu okuma durumdizileri
   cands: array of TScanCand;
@@ -3574,8 +3575,11 @@ var
        (L.Offset + Int64(SizeOf(h)) + Int64(L.Size) > fsize) then
       Exit;
     // Pending ile cakisma kontrolu
-    if pendKeys.ContainsKey(K) then Exit;
-    if pendDels.ContainsKey(K) then Exit;
+    if hasPend then
+    begin
+      if pendKeys.ContainsKey(K) then Exit;
+      if pendDels.ContainsKey(K) then Exit;
+    end;
 
     Keys[count] := K;
     cands[candCnt].Off := L.Offset;
@@ -3599,6 +3603,7 @@ begin
           pendDels.AddOrSetValue(FPending[n].Key, 0)
         else
           pendKeys.AddOrSetValue(FPending[n].Key, 0);
+    hasPend := (pendKeys.Count > 0) or (pendDels.Count > 0);
 
     // Tahmini boyut: index + pending puts
     SetLength(Keys, FIndex.Count + pendKeys.Count);
@@ -3791,6 +3796,7 @@ var
   n: Integer;
   op: TPendOp;
   pendKeys, pendDels: TDictionary<QWord, Byte>;
+  hasPend: Boolean;                   // P-96a: bos dict kontrolunu atla
   cands: array of TIterCand;
   bBeg, bCur: array of Integer;
   bLo, bHi: array of Int64;
@@ -3839,8 +3845,11 @@ var
     if (L.Offset < 0) or
        (L.Offset + Int64(SizeOf(h)) + Int64(L.Size) > fsize) then
       Exit;
-    if pendKeys.ContainsKey(K) then Exit;
-    if pendDels.ContainsKey(K) then Exit;
+    if hasPend then
+    begin
+      if pendKeys.ContainsKey(K) then Exit;
+      if pendDels.ContainsKey(K) then Exit;
+    end;
     cands[candCnt].Off := L.Offset;
     cands[candCnt].Size := L.Size;
     cands[candCnt].Key := K;
@@ -3874,6 +3883,7 @@ begin
           pendDels.AddOrSetValue(FPending[n].Key, 0)
         else
           pendKeys.AddOrSetValue(FPending[n].Key, 0);
+    hasPend := (pendKeys.Count > 0) or (pendDels.Count > 0);
 
     // ---- PAS A: gorunur adaylari topla (dosyaya hic dokunmaz) ----
     SetLength(cands, FIndex.Count);
