@@ -2068,3 +2068,18 @@ Tekrarlı blok büyümesi (256→512→1024…) önleniyor.
 - `VDbFloatToStr` integer fast-path: suçlu değildi, geri alındı.
 
 Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
+
+### P-95c — Tek fonksiyonda güvenli `var` dönüşümü
+
+`VDbDecodeStreamRowP` tek başına `var Vals`'a çevrildi. Güvenli olmasının
+nedenleri:
+1. Tüm kolonları yazıyor (mask yok, atlanan kolon yok).
+2. Çağrı yerinde `ctx^.OutRows[ctx^.Emitted]` doğrudan hedef — benzersiz referans.
+3. P-96 inner ön tahsis ile `Length(Vals) = ColCount` olacağından
+   `if Length(Vals) <> ColCount then SetLength` hiçbir şey yapmıyor.
+
+Diğer decode fonksiyonlarında `out` korundu (özellikle `VDbRowFromOffsetsMaskP`
+her kolonu yazmıyor, `out` finalize garantisi gerekli).
+
+Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
+Ölçüm: joindiag B=69.579 us (P-94: 68.205 us, gürültü aralığı).
