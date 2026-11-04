@@ -3811,6 +3811,7 @@ var
   // KR-1: hedef-tablo anahtar dizini dolasim durumu
   tloc: TDbLoc;
   tl: TList<QWord>;
+  direct: Boolean;              // P-100: yogun tabloda FIndex'i dogrudan dolas
 
   procedure DecryptIfNeeded(var V: TBytes; Flags: Byte; RecKey: QWord);
   var
@@ -3886,12 +3887,35 @@ begin
     hasPend := (pendKeys.Count > 0) or (pendDels.Count > 0);
 
     // ---- PAS A: gorunur adaylari topla (dosyaya hic dokunmaz) ----
+    // P-100: yogun tabloda FIndex'i dogrudan dolas (hash lookup yok).
+    // PrepareRawScan'daki heuristic ile ayni: tablo >= 1/3 toplam ise direct.
     SetLength(cands, FIndex.Count);
     candCnt := 0;
+    direct := True;
     if TableFilter >= 0 then
     begin
-      // KR-1: YALNIZCA hedef tablonun anahtarlari (O(tablo), O(toplam) degil).
       if FTableKeysDirty then RebuildTableKeys;
+      if FTableKeys.TryGetValue(TableFilter, tl) then
+        direct := (Int64(tl.Count) * 3 >= FIndex.Count)
+      else
+        direct := True;
+    end;
+    if direct then
+    begin
+      for pair in FIndex do
+      begin
+        if TableFilter >= 0 then
+        begin
+          // R-26: TableId < 0 (sema) hicbir filtrede elenmez.
+          if (pair.Value.TableId >= 0) and (pair.Value.TableId <> TableFilter) then
+            Continue;
+        end;
+        Consider(pair.Key, pair.Value);
+      end;
+    end
+    else
+    begin
+      // KR-1: YALNIZCA hedef tablonun anahtarlari (O(tablo), O(toplam) degil).
       if FTableKeys.TryGetValue(TableFilter, tl) then
         for n := 0 to tl.Count - 1 do
           if FIndex.TryGetValue(tl[n], tloc) then Consider(tl[n], tloc);
@@ -3899,10 +3923,7 @@ begin
       if FTableKeys.TryGetValue(-1, tl) then
         for n := 0 to tl.Count - 1 do
           if FIndex.TryGetValue(tl[n], tloc) then Consider(tl[n], tloc);
-    end
-    else
-      for pair in FIndex do
-        Consider(pair.Key, pair.Value);
+    end;
 
     // ---- PAS B: bucket sayim-donusturmesi (ScanSnapshot ile birebir) ----
     if candCnt > 0 then
