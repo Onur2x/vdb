@@ -2103,3 +2103,22 @@ Etki: 100k satırlık taramada 200k gereksiz dictionary lookup kaldırıldı.
 Ölçüm gürültü aralığında (joindiag B=71–75 us).
 
 Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
+
+## §40 — P-97a: PK INT çift decode kaldırma
+
+**Tarih:** 2026-11-04
+**Dal:** v3
+**Commit:** `8c6dcd5`
+
+`VDbDecodeStreamRowP` içinde PK kolonu `VCT_INT` ise `VDbIntFromPayload` +
+`VdbIntToDecBuf` ile hash kaynağı hazırlanıyordu; ardından normal decode
+bloğunda `VDbIntFromPayload` + `VdbIntToStrTo` ile **aynı integer ikinci kez**
+çözülüp stringe dönüştürülüyordu.
+
+Artık `VdbIntToDecBuf` çıktısı (`pkBuf`) doğrudan `SetString(Vals[i], ...)`
+ile kopyalanıyor ve normal decode bloğu atlanıyor (`Inc(p, vl); Continue`).
+
+Ölçüm (joindiag B, 5 tekrar): 64186, 64007, 73418, 62575, 64839 us.
+Medyan ~64 us. Önceki taban ~68–75 us → **~%8 kazanç**.
+
+Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
