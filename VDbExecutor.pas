@@ -13101,7 +13101,8 @@ begin
       else ctx^.OutCap := ctx^.OutCap * 2;
       SetLength(ctx^.OutRows, ctx^.OutCap);
     end;
-    SetLength(ctx^.OutRows[ctx^.Emitted], ctx^.ColCnt);
+    // P-92: SetLength(OutRows[Emitted], ColCnt) kaldirildi —
+    // VDbRowFromOffsetsP/MaskP 'out' parametre ile zaten SetLength yapiyor.
     if ctx^.UseMask then
       VDbRowFromOffsetsMaskP(Buf, ctx^.ColCnt, ctx^.FType, ctx^.FOff, ctx^.FLen, ctx^.NeedCols, ctx^.OutRows[ctx^.Emitted])
     else

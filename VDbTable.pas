@@ -4014,6 +4014,29 @@ begin
   Result := True;
 end;
 
+// P-92: IntToStr'in gecici string + refcount donusunu atlar. IntToStr
+// iceride Str(Value, S) ile gecici S kurup Result := S ile kopyalar;
+// burada rakamlar dogrudan hedef string'e yazilir (1 tahsis, 0 refcount).
+procedure VdbIntToStrTo(var S: string; v: Int64);
+var
+  buf: array[0..19] of AnsiChar;
+  n, i: Integer;
+  u: QWord;
+begin
+  if v = 0 then begin SetString(S, '0', 1); Exit; end;
+  if v < 0 then u := QWord(-v) else u := QWord(v);
+  n := 0;
+  repeat
+    buf[n] := AnsiChar(Ord('0') + Byte(u mod 10));
+    u := u div 10;
+    Inc(n);
+  until u = 0;
+  if v < 0 then begin buf[n] := '-'; Inc(n); end;
+  SetString(S, nil, n);
+  for i := 0 to n - 1 do
+    S[n - i] := buf[i];
+end;
+
 function DecodeRow(const B: TBytes; out TableId: Word; out Pk: string; out Vals: TStrArray): Boolean;
 // Satiri kayitli sira ile cozer. Alanlar eski semaya gore yazilmis
 // olabilir; ALTER TABLE sirasinda cagricilar SrcCts ile kesisim
@@ -4045,7 +4068,7 @@ begin
     if vl = -1 then begin Vals[i] := ''; Continue; end;
     if (vl < 0) or (p + vl > Length(B)) then Exit;
     case ct of
-      VCT_INT: begin if not VDbIntFromPayload(@B[p], vl, iv) then Exit; Vals[i] := IntToStr(iv); end;
+      VCT_INT: begin if not VDbIntFromPayload(@B[p], vl, iv) then Exit; VdbIntToStrTo(Vals[i], iv); end;
       VCT_FLOAT: begin if vl <> 8 then Exit; Move(B[p], fv, 8); Vals[i] := VDbFloatToStr(fv); end;
       VCT_BOOL: begin Vals[i] := BoolToStr(B[p] <> 0, True); end;
     else
@@ -4182,7 +4205,7 @@ begin
       VCT_INT:
         begin
           if VDbIntFromPayload(B + FOff[i], FLen[i], iv) then
-            Vals[i] := IntToStr(iv)
+            VdbIntToStrTo(Vals[i], iv)   // P-92: dogrudan hedefe
           else
             Vals[i] := '';   { bozuk yuk: sessiz YANLIS sayi uretme }
         end;
@@ -4233,7 +4256,7 @@ begin
       VCT_INT:
         begin
           if VDbIntFromPayload(B + FOff[i], FLen[i], iv) then
-            Vals[i] := IntToStr(iv)
+            VdbIntToStrTo(Vals[i], iv)   // P-92: dogrudan hedefe
           else
             Vals[i] := '';
         end;
@@ -4280,7 +4303,7 @@ begin
     VCT_INT:
       begin
         if VDbIntFromPayload(B + FOff[Col], FLen[Col], iv) then
-          Result := IntToStr(iv)
+          VdbIntToStrTo(Result, iv)   // P-92: dogrudan hedefe
         else
           Result := '';
       end;
@@ -4343,7 +4366,7 @@ begin
     if vl = -1 then begin Vals[i] := ''; Continue; end;
     if (vl < 0) or (p + vl > Len) then Exit;
     case ct of
-      VCT_INT: begin if not VDbIntFromPayload(@B[p], vl, iv) then Exit; Vals[i] := IntToStr(iv); end;
+      VCT_INT: begin if not VDbIntFromPayload(@B[p], vl, iv) then Exit; VdbIntToStrTo(Vals[i], iv); end;
       VCT_FLOAT: begin if vl <> 8 then Exit; Move(B[p], fv, 8); Vals[i] := VDbFloatToStr(fv); end;
       VCT_BOOL: begin Vals[i] := BoolToStr(B[p] <> 0, True); end;
     else

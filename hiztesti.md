@@ -1925,3 +1925,38 @@ zaten küçük olduğu için etki sınırlı.
 p67diag INSERT: 1.368 us/satır (P-91 ile aynı seviye, gürültü içinde).
 
 Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMİZ, chainnull TEMİZ.
+
+## §35 — P-92: VdbIntToStrTo + DirectDecode'de gereksiz SetLength kaldırma
+
+**Tarih:** 2026-11-04
+**Dal:** v3
+**Sorun:** İki israf:
+1. `Vals[i] := IntToStr(iv)` — FPC'de `IntToStr` geçici string `S` kurar,
+   `Result := S` ile kopyalar, sonra `S` finalize edilir. Bu 1 tahsis + 2
+   refcount işlemi demek. Hedefe doğrudan yazmak bunu atlar.
+2. DirectDecode yolunda `SetLength(OutRows[Emitted], ColCnt)` çağrılıp
+   sonra `VDbRowFromOffsetsP`'e `out` parametre olarak geçiliyordu. `out`
+   parametre girişte finalize edildiği için ilk SetLength tamamen boşa gidiyor.
+
+**Çözüm:**
+1. `VdbIntToStrTo(var S: string; v: Int64)` helper eklendi (`VDbTable.pas`).
+   Rakamlar stack buffer'a yazılır, tek `SetString` ile hedefe kopyalanır.
+   5 sıcak decode yolunda `IntToStr` → `VdbIntToStrTo` değiştirildi:
+   `DecodeRow`, `VDbRowFromOffsetsP`, `VDbRowFromOffsetsMaskP`,
+   `VDbColFromOffsetsP`, `VDbDecodeRawRowP`.
+2. `VDbExecutor.pas` DirectDecode bloğundan gereksiz `SetLength` kaldırıldı.
+
+**Etki (joindiag, en iyi süreler):**
+| Sorgu | P-91b | P-92 | Değişim |
+|-------|-------|------|---------|
+| B: SELECT * 100k | 91.002 us | **79.170 us** | **−%13** |
+| D: JOIN COUNT | 1.509 us | 1.484 us | −%2 |
+| G: NarrowRows | 585 us | 574 us | −%2 |
+
+B sorgusu 3 INT + 1 TEXT kolonu decode ediyor; `VdbIntToStrTo` 300k INT
+hücresinde geçici tahsis + refcount'u atlıyor. Toplam P-90'dan bu yana B
+sorgusu 141.720 → 79.170 us (**−%44**).
+
+p67diag INSERT: 1.338 us/satır (hafif iyileşme).
+
+Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMİZ, chainnull TEMİZ.
