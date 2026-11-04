@@ -2035,3 +2035,36 @@ Düzeltilen fonksiyonlar: `DecodeRow`, `VDbRowFromOffsetsP`,
 141.720 → 68.205 us (**−%52**).
 
 Doğrulama: sqltest 3287/0/0 (tümü geçti), wherenull TEMİZ, chainnull TEMİZ.
+
+---
+
+## §38 — P-95b: OutRows inner ön tahsis + LIMIT ön tahsis + prow kaldırma
+
+**Tarih:** 2026-11-04
+**Dal:** v3
+**Commit:** `1df6269`
+
+P-95 (`out`→`var`) ve P-97 (`VDbFloatToStr` integer fast-path) denendi;
+JOIN/ORDER BY/LIMIT testlerini bozdu (sqltest 2603/616). Her ikisi de
+tamamen geri alındı. Korunan güvenli optimizasyonlar:
+
+**P-96 — OutRows inner dizi ön tahsisi (non-DirectDecode):**
+Blok büyümesinde yeni satırların inner dizileri önceden `SetLength`'leniyor.
+Satır başına tekrarlı `SetLength` kaldırıldı.
+
+**P-98 — LIMIT bazlı OutRows ön tahsisi:**
+`LIMIT n` biliniyorsa `OutRows` baştan `n` kapasiteyle ayrılıyor.
+Tekrarlı blok büyümesi (256→512→1024…) önleniyor.
+
+**P-99 — prow ara tahsisinin kaldırılması (non-DirectDecode):**
+`prow: TStrArray` ara dizisi kaldırıldı; değerler doğrudan
+`ctx^.OutRows[ctx^.Emitted][j]`'ye yazılıyor. Satır başına bir tahsis + kopya gitti.
+
+**Geri alınanlar (P-95/P-97):**
+- `out Vals` → `var Vals` dönüşümü: FPC'de `out` parametre girişte finalize
+  edilir; `var` korur. Decode fonksiyonlarında JOIN/ORDER BY sonuçlarını bozdu.
+- `if Length(Vals) <> N then SetLength` → koşulsuz `SetLength`: `out` ile
+  zaten her girişte finalize edildiği için koşul anlamsız.
+- `VDbFloatToStr` integer fast-path: suçlu değildi, geri alındı.
+
+Doğrulama: sqltest 3287/0/0, wherenull TEMİZ, chainnull TEMİZ.
