@@ -4020,28 +4020,19 @@ end;
 // P-92: IntToStr'in gecici string + refcount donusunu atlar. IntToStr
 // iceride Str(Value, S) ile gecici S kurup Result := S ile kopyalar;
 // burada rakamlar dogrudan hedef string'e yazilir (1 tahsis, 0 refcount).
+// P-99b: VdbIntToDecBuf + SetString — bulk copy, byte-by-byte yazim yok.
 procedure VdbIntToStrTo(var S: string; v: Int64);
 var
   buf: array[0..19] of AnsiChar;
-  n, i: Integer;
-  u: QWord;
+  n: Integer;
 begin
-  if v = 0 then begin SetString(S, '0', 1); Exit; end;
-  if v < 0 then u := QWord(-v) else u := QWord(v);
-  n := 0;
-  repeat
-    buf[n] := AnsiChar(Ord('0') + Byte(u mod 10));
-    u := u div 10;
-    Inc(n);
-  until u = 0;
-  if v < 0 then begin buf[n] := '-'; Inc(n); end;
-  SetString(S, nil, n);
-  for i := 0 to n - 1 do
-    S[n - i] := buf[i];
+  n := VdbIntToDecBuf(v, buf);
+  if n <= 0 then begin S := ''; Exit; end;
+  SetString(S, PAnsiChar(@buf[0]), n);
 end;
 
 // P-91b: saf-ASCII bayt araligi mi? UTF8Decode atlaniyor (3 tahsis -> 1).
-function VdbPureAscii(P: PByte; L: Integer): Boolean;
+function VdbPureAscii(P: PByte; L: Integer): Boolean; inline;
 var
   k: Integer;
 begin
