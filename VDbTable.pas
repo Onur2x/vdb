@@ -927,7 +927,7 @@ function VDbColFromOffsetsP(B: PByte; ColCount, Col: Integer;
   Basarisizsa Result=False, KeyHash gecersizdir. }
 function VDbDecodeStreamRowP(B: PByte; Len, ColCount: Integer;
   HashPrefix: QWord; out TableId: Word; out KeyHash: QWord;
-  var Vals: TStrArray): Boolean;
+  var Vals: TStrArray): Boolean; inline;
 { P-18a (2026-10-16): VDbPeekRawRow'un PByte+Len surumu. ScanRawIter
   geri-cagrisinda kayit tamponu TBytes DEGIL, chunk icinde bir araliktir;
   yeni TBytes ayirmadan ayni sinir kontrolleriyle onizlenir. Semantigi

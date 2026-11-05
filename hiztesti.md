@@ -2611,3 +2611,59 @@ olculebilir kazanc sagliyor. `VdbIntToDecBufOff` yeni fonksiyon olarak eklendi,
 orijinal `VdbIntToDecBuf` bozulmadi.
 
 Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMIZ.
+
+---
+
+## P-119: Callback zinciri düzleştirme + inline
+
+**Tarih:** 2026-11-05
+**Durum:** TUTULDU
+
+### Degisiklik
+- `VDbDecodeStreamRowP` (VDbTable.pas) interface deklarasyonuna `inline` eklendi.
+  Cross-unit inlining ile sarmalayici cagrisi kaldirildi.
+- `VdbStreamSelPageCb` kaldirildi. `VdbStreamSelCb` artik `TVDbRawPageCb`
+  imzasina sahip (`PageNo: LongWord` parametresi eklendi); `CurBucket`
+  ataması dogrudan fonksiyon govdesinde yapilir (`PageNo > 0` kosulu ile —
+  KV zoned yolda CurBucket disaridan set edilir, bozulmaz).
+- Non-paged yollar (KV zoned, tam tarama, v2) icin `VdbStreamSelCbNoPage`
+  ince sarmalayicisi eklendi (soğuk yol).
+
+### Gerekce
+B metriği (DirectDecode) satir basina zincir: `ScanAllRawPaged` →
+`StreamCbRawPaged` → `VdbStreamSelPageCb` → `VdbStreamSelCb` →
+`VDbDecodeStreamRowP` → `VDbDecodeStreamRowExtP`. 5 fonksiyon cagrisi/satır.
+P-119 ile `VdbStreamSelPageCb` kaldirildi ve `VDbDecodeStreamRowP` inline
+edildi → 3 cagri/satir. ~12ns/satir tasarruf × 100k satir ≈ 1.2ms.
+
+### Olcum (joindiag B, 16 interleave A/B cifti)
+| Cift | BASE | P-119 | Fark |
+|------|------|-------|------|
+| 1 | 43530 | 39654 | -8.9% |
+| 2 | 41247 | 41495 | +0.6% |
+| 3 | 43744 | 41809 | -4.4% |
+| 4 | 43285 | 42272 | -2.3% |
+| 5 | 43912 | 41919 | -4.5% |
+| 6 | 45235 | 39975 | -11.6% |
+| 7 | 42985 | 41453 | -3.6% |
+| 8 | 47849 | 45885 | -4.1% |
+| 9 | 41576 | 42238 | +1.6% |
+| 10 | 42032 | 41468 | -1.3% |
+| 11 | 42683 | 46146 | +8.1% |
+| 12 | 44533 | 43495 | -2.3% |
+| 13 | 41805 | 41945 | +0.3% |
+| 14 | 48815 | 43290 | -11.3% |
+| 15 | 44774 | 42459 | -5.2% |
+| 16 | 47761 | 49935 | +4.6% |
+
+- BASE medyan: 43637 us
+- P-119 medyan: 42092 us
+- **Iyilesme: %3.54** (esik %2 uzerinde)
+- BASE ortalama: 44110 us, P-119 ortalama: 42840 us (**%2.88**)
+- 11/16 ciftte iyilesme; 5 ciftte yavaslama (gurultu — c11, c16 belirgin).
+
+**Sonuc:** TUTULDU. Callback zincirinde iki cagri kaldirildi; DirectDecode
+yolunda olculebilir kazanc saglandi. Non-paged yollar `VdbStreamSelCbNoPage`
+ile ayni semantigi korur.
+
+Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMİZ.

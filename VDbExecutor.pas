@@ -13035,21 +13035,19 @@ begin
 end;
 
 function VdbStreamSelCb(Key: QWord; Buf: PByte; Len: Integer;
-  User: Pointer): Boolean; forward;
+  PageNo: LongWord; User: Pointer): Boolean; forward;
 
-function VdbStreamSelPageCb(Key: QWord; Buf: PByte; Len: Integer;
-  PageNo: LongWord; User: Pointer): Boolean;
-{ v3.3: sayfa numarali sarmalayici. Zone map bucket'i = heap sayfa numarasi. }
-var
-  ctx: ^TStreamSelCtx;
+function VdbStreamSelCbNoPage(Key: QWord; Buf: PByte; Len: Integer;
+  User: Pointer): Boolean;
+{ P-119: non-paged ince sarmalayici (KV zoned / tam tarama). CurBucket'i
+  bozmamak icin PageNo=0 gecilir — VdbStreamSelCb yalnizca PageNo>0 iken
+  CurBucket yazar. }
 begin
-  ctx := User;
-  ctx^.CurBucket := Integer(PageNo);
-  Result := VdbStreamSelCb(Key, Buf, Len, User);
+  Result := VdbStreamSelCb(Key, Buf, Len, 0, User);
 end;
 
 function VdbStreamSelCb(Key: QWord; Buf: PByte; Len: Integer;
-  User: Pointer): Boolean;
+  PageNo: LongWord; User: Pointer): Boolean;
 var
   ctx: ^TStreamSelCtx;
   tid: Word;
@@ -13060,6 +13058,8 @@ var
   whereOK: Boolean;
 begin
   ctx := User;
+  { P-119: sayfa bucket'i dogrudan burada — VdbStreamSelPageCb kaldirildi. }
+  if PageNo > 0 then ctx^.CurBucket := Integer(PageNo);
   if Key = VDB_SCHEMA_KEY then Exit(True);
   // P-93: DirectDecode tek gecis — hash dogrulama + decode ayni dongude.
   // FType/FOff/FLen ara dizileri yazilmaz/okunmaz; Vals dogrudan cikti
@@ -13919,19 +13919,19 @@ begin
   zScanOk := True;
   if FT.Kv <> nil then
     zScanOk := FT.Kv.ScanRawIterAllZoned(td.TableId, zSkipPtr, Length(zSkip),
-      @ctx.CurBucket, VdbStreamSelCb, @ctx)
+      @ctx.CurBucket, VdbStreamSelCbNoPage, @ctx)
   else if zV3 then
   begin
     { v3.3: sayfa duzeyi zone map. zSkip = sayfa numarasi -> atla bayragi. }
     zScanOk := FT.Backend.ScanRawIterAllPaged(td.TableId, zSkipPtr,
-      Length(zSkip), VdbStreamSelPageCb, @ctx);
+      Length(zSkip), VdbStreamSelCb, @ctx);
     { Paged yol desteklenmediyse (ör. toplu yazim) hicbir satir akitilmadi;
       tam taramaya dusulur. }
     if (not zScanOk) and (ctx.Seen = 0) then
-      zScanOk := FT.Backend.ScanRawIterAll(td.TableId, VdbStreamSelCb, @ctx);
+      zScanOk := FT.Backend.ScanRawIterAll(td.TableId, VdbStreamSelCbNoPage, @ctx);
   end
   else
-    zScanOk := FT.Backend.ScanRawIterAll(td.TableId, VdbStreamSelCb, @ctx);
+    zScanOk := FT.Backend.ScanRawIterAll(td.TableId, VdbStreamSelCbNoPage, @ctx);
 
   // H3: insa edilen haritayi yayinla (yalnizca veri hala ayni surumdeyse).
   // LIMIT ile erken durulduysa yalnizca TAM islenen on-ek bucket'lar
