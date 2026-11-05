@@ -4099,7 +4099,7 @@ begin
   Move(P^, S[1], L);
 end;
 
-procedure VdbIntToStrTo(var S: string; v: Int64);
+procedure VdbIntToStrTo(var S: string; v: Int64); inline;
 var
   buf: array[0..19] of AnsiChar;
   n: Integer;
@@ -4747,7 +4747,9 @@ begin
         begin Vals[i] := BoolToStr(src^ <> 0, True); end;
     else
       begin
-        if VDbColumnIsSealed(src, vl) then
+        // P-109: sealed fast-reject — magic 'VDBC1', ilk bayt 'V' degilse
+        // CompareMem cagrisi yapmadan gec (B'de TEXT degerleri 'satir-N').
+        if (vl >= 5) and (src^ = Ord('V')) and VDbColumnIsSealed(src, vl) then
         begin
           VdbBytesToStr(s, src, vl);
           plain := VDbColumnOpen(TableId, i, VDbS2B(s));

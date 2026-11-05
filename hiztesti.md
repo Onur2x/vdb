@@ -2316,3 +2316,25 @@ tahsisleri) ~7 ms, parse+hash ~16 ms (onceki ~20 ms'den dustu), hucre
 tahsisleri ~8 ms, diger ~8 ms.
 
 Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMIZ.
+
+---
+
+## §50. P-109: Sealed fast-reject + VdbIntToStrTo inline
+
+**Dal:** v3
+
+P-108'deki flat Ext decode yolunda iki maliyet kalemi azaltildi:
+
+1) Sealed fast-reject — `VDbColumnIsSealed` cagrisi `CompareMem` ile
+   'VDBC1' magic'ini kontrol ediyor. B'de TEXT degerleri 'satir-N' ile
+   basliyor (ilk bayt 'V' degil). Artik `src^ = Ord('V')` on kontrolu ile
+   CompareMem yapmadan geciliyor. Hedef yalnizca ExtP icindeki kontrol;
+   genel yol (VDbDecodeStreamRowP) aynen duruyor.
+2) `VdbIntToStrTo`'ya `inline` eklendi — PK INT decode'ta cagri
+   overhead'i kaldirildi.
+
+Olcum (joindiag B, 3 interleave A/B cifti, P-108'e karsi):
+P-108 46677–53312 us (medyan 47575), P-109 44889–47052 us (medyan
+45265). 3 ciftin 3'unde de P-109 hizli; medyan %4.9 kazanc.
+
+Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMIZ.
