@@ -4606,6 +4606,42 @@ begin
     KeyHash, ColCount - 1, FType, FOff, FLen);
 end;
 
+// P-115: soğuk kolon yolları (sealed/UTF8/FLOAT/BOOL) — yönetilen yerel
+// değişkenler (string/TBytes) bu fonksiyonda; ExtP sıcak yolunda init/final
+// ve try/finally overhead'i olmaz.
+procedure VdbDecodeColSpecial(TableId: Word; ColIdx: Integer; ct: Byte;
+  src: PByte; vl: Integer; var S: string);
+var
+  tmp: string;
+  plain: TBytes;
+  fv: Double;
+begin
+  case ct of
+    VCT_FLOAT:
+      begin Move(src^, fv, 8); S := VDbFloatToStr(fv); end;
+    VCT_BOOL:
+      begin S := BoolToStr(src^ <> 0, True); end;
+  else
+    begin
+      // Sealed kontrolü: 'V' ile başlıyorsa ve magic eşleşiyorsa çöz
+      if (vl >= 5) and (src^ = Ord('V')) and VDbColumnIsSealed(src, vl) then
+      begin
+        VdbBytesToStr(tmp, src, vl);
+        plain := VDbColumnOpen(TableId, ColIdx, VDbS2B(tmp));
+        if ct = VCT_BLOB then S := VDbB2S(plain, 0, Length(plain))
+        else S := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
+      end
+      else if (ct = VCT_BLOB) or VdbPureAscii(src, vl) then
+        VdbBytesToStr(S, src, vl)
+      else
+      begin
+        VdbBytesToStr(tmp, src, vl);
+        S := UTF8Decode(tmp);
+      end;
+    end;
+  end;
+end;
+
 // P-108: Ext satir icin duz decode. Header parse + VarU 1-bayt fast path
 // + IntFromPayload 1-3 bayt sik yolu satir icinde. Sealed/UTF8/FLOAT/BOOL
 // cold path mevcut yardimcilara duser. Non-Ext satir: False doner,
@@ -4619,9 +4655,6 @@ var
   u: LongWord;
   uu: QWord;
   iv: Int64;
-  fv: Double;
-  s: string;
-  plain: TBytes;
   pkPtr: PByte;
   pkBuf: array[0..27] of AnsiChar;
   src: PByte;
@@ -4742,55 +4775,37 @@ begin
       end;
     end;
 
-    // Dogrudan decode
-    case ct of
-      VCT_INT:
-        begin
-          // IntFromPayload satir ici (1-3 bayt sik yol)
-          if vl = 8 then begin Move(src^, iv, 8); ok := True; end
-          else if (vl >= 1) and (vl <= 3) then
-          begin
-            ok := True;
-            uu := 0;
-            for j := 0 to vl - 1 do
-            begin
-              by := src[j];
-              if j < vl - 1 then begin if (by and $80) = 0 then begin ok := False; Break; end; end
-              else if (by and $80) <> 0 then begin ok := False; Break; end;
-              uu := uu or (QWord(by and $7F) shl (7 * j));
-            end;
-            if ok and (vl > 1) and (src[vl - 1] = 0) then ok := False;
-            if ok then iv := Int64(uu shr 1) xor -Int64(uu and 1);
-          end
-          else
-            ok := VDbIntFromPayload(src, vl, iv);
-          if ok then VdbIntToStrTo(Vals[i], iv)
-          else Vals[i] := '';
-        end;
-      VCT_FLOAT:
-        begin Move(src^, fv, 8); Vals[i] := VDbFloatToStr(fv); end;
-      VCT_BOOL:
-        begin Vals[i] := BoolToStr(src^ <> 0, True); end;
-    else
+    // Dogrudan decode — INT + saf ASCII TEXT sıcak yol (satır içi);
+    // sealed/UTF8/FLOAT/BOOL soğuk yardımcıya.
+    if ct = VCT_INT then
+    begin
+      // IntFromPayload satir ici (1-3 bayt sik yol)
+      if vl = 8 then begin Move(src^, iv, 8); ok := True; end
+      else if (vl >= 1) and (vl <= 3) then
       begin
-        // P-109: sealed fast-reject — magic 'VDBC1', ilk bayt 'V' degilse
-        // CompareMem cagrisi yapmadan gec (B'de TEXT degerleri 'satir-N').
-        if (vl >= 5) and (src^ = Ord('V')) and VDbColumnIsSealed(src, vl) then
+        ok := True;
+        uu := 0;
+        for j := 0 to vl - 1 do
         begin
-          VdbBytesToStr(s, src, vl);
-          plain := VDbColumnOpen(TableId, i, VDbS2B(s));
-          if ct = VCT_BLOB then Vals[i] := VDbB2S(plain, 0, Length(plain))
-          else Vals[i] := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
-        end
-        else if (ct = VCT_BLOB) or VdbPureAscii(src, vl) then
-          VdbBytesToStr(Vals[i], src, vl)
-        else
-        begin
-          VdbBytesToStr(s, src, vl);
-          Vals[i] := UTF8Decode(s);
+          by := src[j];
+          if j < vl - 1 then begin if (by and $80) = 0 then begin ok := False; Break; end; end
+          else if (by and $80) <> 0 then begin ok := False; Break; end;
+          uu := uu or (QWord(by and $7F) shl (7 * j));
         end;
-      end;
-    end;
+        if ok and (vl > 1) and (src[vl - 1] = 0) then ok := False;
+        if ok then iv := Int64(uu shr 1) xor -Int64(uu and 1);
+      end
+      else
+        ok := VDbIntFromPayload(src, vl, iv);
+      if ok then VdbIntToStrTo(Vals[i], iv)
+      else Vals[i] := '';
+    end
+    else if (ct <> VCT_FLOAT) and (ct <> VCT_BOOL) and
+            ((ct = VCT_BLOB) or
+             (((vl < 5) or (src^ <> Ord('V'))) and VdbPureAscii(src, vl))) then
+      VdbBytesToStr(Vals[i], src, vl)
+    else
+      VdbDecodeColSpecial(TableId, i, ct, src, vl, Vals[i]);
     Inc(p, vl);
   end;
 

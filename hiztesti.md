@@ -2519,3 +2519,44 @@ sagliyor. MMSingleThreaded bayragi yanlis kullanilirse veri bozulur —
 yalnizca tek is parcacigi oldugundan emin oldugunda set et.
 
 Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMIZ.
+
+---
+
+## P-115c: Ext decode — yönetilen yerel çıkarma + saf ASCII TEXT satır içi
+
+**Tarih:** 2026-11-05
+**Hedef:** `VDbDecodeStreamRowExtP`'deki yönetilen yerel (`s: string`, `plain: TBytes`)
+init/final overhead'ini kaldırma ve saf ASCII TEXT kolon yolunu satır içine alma.
+
+### Yapilan
+- `VdbDecodeColSpecial` yardımcı fonksiyonu oluşturuldu: sealed/UTF8/FLOAT/BOOL
+  soğuk yolları taşır. Yönetilen yereller (`tmp: string`, `plain: TBytes`) bu
+  fonksiyonda kalır — sıcak yolda try/finally ve init/final yok.
+- `VDbDecodeStreamRowExtP`'den `s: string`, `plain: TBytes`, `fv: Double`
+  yerel değişkenleri kaldırıldı.
+- Kolon döngüsünde INT sıcak yol satır içi kaldı; saf ASCII TEXT (`VCT_STR`,
+  `VCT_DATE`, `VCT_DATETIME`, `VCT_TIME`) ve `VCT_BLOB` de satır içi
+  `VdbBytesToStr` ile çözülür. FLOAT/BOOL/sealed/UTF8 soğuk yardımcıya gider.
+
+### Olcum (joindiag B, 8 interleave A/B cifti)
+| Cift | BASE | P-115c | Fark |
+|------|------|--------|------|
+| 1 | 55342 | 47326 | -14.5% |
+| 2 | 48462 | 47801 | -1.4% |
+| 3 | 52195 | 51513 | -1.3% |
+| 4 | 51717 | 52853 | +2.2% |
+| 5 | 56151 | 52084 | -7.2% |
+| 6 | 52025 | 50428 | -3.1% |
+| 7 | 49355 | 47437 | -3.9% |
+| 8 | 51196 | 48959 | -4.4% |
+
+- BASE medyan: 51871 us
+- P-115c medyan: 49694 us
+- **Iyilesme: -%4.19** (esik %2 uzerinde)
+- 7/8 ciftte iyilesme; 1 ciftte hafif yavaslama (gurultu).
+
+**Sonuc:** TUTULDU. Yonetilen yerel cikarma + satir ici ASCII TEXT yolu
+olculebilir kazanc sagliyor. Saf ASCII metin degerleri (B'de 'satir-N')
+artik fonksiyon cagrisi olmadan dogrudan kopyalaniyor.
+
+Dogrulama: sqltest 2885/0/0, wherenull TEMIZ, chainnull TEMIZ.
