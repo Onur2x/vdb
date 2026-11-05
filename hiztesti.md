@@ -2372,3 +2372,39 @@ P-109 43640–50563 us (medyan 45126), P-110 42116–43610 us (medyan
 
 Dogrulama: sqltest 3287/0/0 (test 132 paralel dahil), wherenull TEMIZ,
 chainnull TEMIZ.
+
+---
+
+## §52. P-111: preIdx projeksiyon + DecodeRow pk inline
+
+**Dal:** v3
+
+B metrigindeki tarama/projeksiyon hattinda uc kucuk optimizasyon:
+
+1. **VDbHashKeyPrefix + VDbHashKeyBytes:** ScanRowsPart'ta satir basina
+   VDbHashKey (UTF8Encode + string concat + FNV) yerine, dongu disinda bir
+   kez hesaplanan prefix + ASCII fast path. Saf-ASCII pk'lerde byte-level
+   hash (VDbIsPureAscii).
+2. **preIdx on cozumleme:** Projeksiyonda satir basina EvalExpr → FindColIdx
+   (SameText dolanimi) yerine, kolon referanslari icin onceden cozumlenmis
+   indeks dizisi (preIdx). canDirectProj: tek tablo, penceresiz, kapsam
+   yoksa guvenli.
+3. **Kimlik projeksiyonu:** SELECT b.id, b.k, b.y, b.ad FROM b = tum
+   kolonlar sirayla ise outRows := filteredRows (satir kopyasi tamamen
+   atlanir).
+4. **DecodeRow pk inline:** VdbRowPkOf'in ayri santiye taramasi kaldirildi
+   — pk ya satir govdesinden ya da H.PkFromCol kolonundan ana donguden
+   cikarilir (Pk := Vals[H.PkFromCol]).
+
+Olcum (joindiag B, 3 seri × 5 interleave A/B cifti, P-110'a karsi):
+- 1. seri (hash + preIdx): P-110 medyan 43258, P-111 medyan 42834 (%1.0).
+- 2. seri (+kimlik projeksiyon): P-110 medyan 43057, P-111 medyan 42778 (%0.6).
+- 3. seri (+DecodeRow pk inline): P-110 medyan 42949, P-111 medyan 43095
+  (P-111 %0.3 yavas — gurultu bandi icinde).
+
+**Sonuc:** Birlesim B metrinde olculebilir kazanc saglamadi (esik %2 asagida).
+Kod daha temiz (cift ayristirma kaldirildi, projeksiyon atlaniyor) ama
+performans notr. T-kritik overhead muhtemelen ScanSnapshot TBytes tahsisleri
+ve DecodeRow string tahsisleri (satir basina 4 string = 400k tahsis).
+
+Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMIZ.

@@ -4126,6 +4126,9 @@ function DecodeRow(const B: TBytes; out TableId: Word; out Pk: string; out Vals:
 // Satiri kayitli sira ile cozer. Alanlar eski semaya gore yazilmis
 // olabilir; ALTER TABLE sirasinda cagricilar SrcCts ile kesisim
 // dondurum yapar.
+// P-111: VdbRowPkOf'in ayri santiye taramasi kaldirildi — pk ya satir
+// govdesinden (H.PkFromCol < 0) ya da H.PkFromCol kolonundan cikarilir.
+// Kolon pk'si icin Pk = Vals[H.PkFromCol] (tum tiplerde bicim birebir).
 var
   H: TVdbRowHdr;
   p: Integer;
@@ -4136,12 +4139,27 @@ var
   fv: Double;
   rawS: string;
   plain: TBytes;
+  pkRs: RawByteString;
 begin
   Result := False;
   if Length(B) < 2 then Exit;
   if not VdbRowHdrOf(@B[0], Length(B), H) then Exit;
   TableId := H.TableId;
-  if not VdbRowPkOf(@B[0], Length(B), H, Pk) then Exit;
+  // P-111: pk kaynagini ayikla (VdbRowPkOf'in yerine)
+  if H.PkFromCol = VDB_ROW_PK_EMPTY then
+    Pk := ''
+  else if H.PkFromCol < 0 then
+  begin
+    if (H.PkLen < 0) or (H.PkOff < 0) or (H.PkOff + H.PkLen > Length(B)) then Exit;
+    if H.PkLen = 0 then Pk := ''
+    else
+    begin
+      SetString(pkRs, PAnsiChar(@B[H.PkOff]), H.PkLen);
+      Pk := UTF8Decode(pkRs);
+    end;
+  end
+  else
+    Pk := '';   // kolon pk'si dongude doldurulacak
   cc := H.ColCount;
   SetLength(Vals, cc);
   p := H.ColOff;
@@ -4150,7 +4168,12 @@ begin
     if p >= Length(B) then Exit;
     ct := B[p]; Inc(p);
     if not VdbRowColLen(@B[0], Length(B), p, H.Ext, vl) then Exit;
-    if vl = -1 then begin Vals[i] := ''; Continue; end;
+    if vl = -1 then
+    begin
+      Vals[i] := '';
+      if i = H.PkFromCol then Pk := '';
+      Continue;
+    end;
     if (vl < 0) or (p + vl > Length(B)) then Exit;
     case ct of
       VCT_INT: begin if not VDbIntFromPayload(@B[p], vl, iv) then Exit; VdbIntToStrTo(Vals[i], iv); end;
@@ -4181,6 +4204,8 @@ begin
       end;
     end;
     end;
+    // P-111: kolon pk'si — deger zaten cozuldu, dogrudan al
+    if i = H.PkFromCol then Pk := Vals[i];
     Inc(p, vl);
   end;
   Result := True;
@@ -10790,6 +10815,8 @@ var
   pci: Integer;       // R-13 Full: bolme kolonu indeksi (-1 = filtre yok)
   pno, pj: Integer;
   hit: Boolean;
+  hashPrefix: QWord;  // P-111: VDbHashKeyPrefix tohumu (dongu disinda)
+  kh: QWord;
 begin
   t := GetTable(Table);
   // R-13 Full: bolme kolonunu BIR KEZ coz. Filtre istenmis ama kolon
@@ -10805,6 +10832,7 @@ begin
   SetLength(Pks, Length(keys));
   SetLength(Rows, Length(keys));
   n := 0;
+  hashPrefix := VDbHashKeyPrefix(t.Name);   // P-111: bir kez
   for i := 0 to High(keys) do
   begin
     k := keys[i];
@@ -10822,7 +10850,11 @@ begin
     // hesaplanmis olmali. Degilse iki farkli satir ayni 64-bit anahtari
     // paylasmis demektir; bu durumda SATIR SESSIZCE BIR DIGERININ
     // YERINE GEZER (veri kaybi, hicbir hata verilmez). Artik net hata verir.
-    if VDbHashKey(t.Name, pk) <> k then
+    if (Length(pk) > 0) and VDbIsPureAscii(pk) then
+      kh := VDbHashKeyBytes(hashPrefix, PByte(@pk[1]), Length(pk))
+    else
+      kh := VDbHashKey(t.Name, pk);
+    if kh <> k then
       raise EVDbException.CreateFmt(ecHashCollision, 
         'HASH CARPISMASI: tablo %s, pk=%s -> iki satir ayni anahtari paylasiyor. ' +
         'Veritabani bozulmus; yedekten geri yukleyin.', [t.Name, pk]);

@@ -14465,6 +14465,9 @@ var
   rowKey: string;
   isDup, found, SkipOffsetLimit, HasSetOp, deferOrder, isExactNarrow: Boolean;
   preferStream: Boolean;
+  // P-111: projeksiyonda basit kolon referansi icin onceden indeks
+  preIdx: TIntArray;
+  canDirectProj, isIdentityProj: Boolean;
   orderName: string;
   baseIdx, tmpSlot, origCols: Integer;
   // H1 (2026-10-18): LIMIT erken-cikis
@@ -15055,22 +15058,58 @@ begin
     // F-09: QUALIFY â€” pencere hesaplandiktan SONRA, projeksiyondan ONCE
     if Stmt.QualifyClause <> nil then
       ApplyQualify(Stmt, filteredRows, colNames, colTypes, WinVals, WinSlot);
-    // outRows uzunlugu kirpilan filteredRows ile eslesmeli
-    SetLength(outRows, Length(filteredRows));
-    for i := 0 to High(filteredRows) do
+    // P-111: basit kolon referanslari icin EvalExpr cagrisini atla.
+    // FindColIdx sonuclari dongu ONCE bir kez cozulur; her hucrede
+    // 400k kez EvalExpr + FindColIdx (SameText dolasimi) yapilmaz.
+    // Yalnizca dis/ic kapsamlar PASIFken gecerli (FProcRow/FOuterRow/
+    // FExcludedRow devredeyse EvalExpr farkli cozumleyebilir).
+    canDirectProj := (not HasWindow(Stmt)) and (Stmt.QualifyClause = nil) and
+      ((FProcRow = nil) or (Length(FProcColNames) = 0)) and
+      (FOuterRow = nil) and (FExcludedRow = nil);
+    isIdentityProj := False;
+    if canDirectProj then
     begin
-      SetLength(outRows[i], Stmt.Columns.Count);
+      SetLength(preIdx, Stmt.Columns.Count);
       for j := 0 to Stmt.Columns.Count - 1 do
-        if (j < Length(WinSlot)) and (WinSlot[j] >= 0) and
-           (i < Length(WinVals)) and (WinSlot[j] < Length(WinVals[i])) then
-          outRows[i][j] := WinVals[i][WinSlot[j]]
-        else if Stmt.Columns[j].Expr is TSqlAggNode then
-        begin
-          // F-14/F-15: aggregate'siz SELECT'te tum tablo tek gruptur
-          outRows[i][j] := '';
-        end
+        if Stmt.Columns[j].Expr is TSqlColumnRefNode then
+          preIdx[j] := FindColIdx(
+            TSqlColumnRefNode(Stmt.Columns[j].Expr).ColumnName,
+            TSqlColumnRefNode(Stmt.Columns[j].Expr).TableQualifier, colNames)
         else
-          outRows[i][j] := EvalExpr(Stmt.Columns[j].Expr, filteredRows[i], colNames, colTypes);
+          preIdx[j] := -1;
+      // P-111b: kimlik projeksiyonu — tum kolonlar ayni sirada ise
+      // satir kopyasi tamamen atlanir (SELECT b.id, b.k, ... FROM b gibi).
+      if Stmt.Columns.Count = Length(colNames) then
+      begin
+        isIdentityProj := True;
+        for j := 0 to Stmt.Columns.Count - 1 do
+          if preIdx[j] <> j then begin isIdentityProj := False; Break; end;
+        if isIdentityProj then
+          outRows := filteredRows;
+      end;
+    end;
+    if not isIdentityProj then
+    begin
+      // outRows uzunlugu kirpilan filteredRows ile eslesmeli
+      SetLength(outRows, Length(filteredRows));
+      for i := 0 to High(filteredRows) do
+      begin
+        SetLength(outRows[i], Stmt.Columns.Count);
+        for j := 0 to Stmt.Columns.Count - 1 do
+          if (j < Length(WinSlot)) and (WinSlot[j] >= 0) and
+             (i < Length(WinVals)) and (WinSlot[j] < Length(WinVals[i])) then
+            outRows[i][j] := WinVals[i][WinSlot[j]]
+          else if Stmt.Columns[j].Expr is TSqlAggNode then
+          begin
+            // F-14/F-15: aggregate'siz SELECT'te tum tablo tek gruptur
+            outRows[i][j] := '';
+          end
+          else if canDirectProj and (preIdx[j] >= 0) and
+                  (preIdx[j] < Length(filteredRows[i])) then
+            outRows[i][j] := filteredRows[i][preIdx[j]]
+          else
+            outRows[i][j] := EvalExpr(Stmt.Columns[j].Expr, filteredRows[i], colNames, colTypes);
+      end;
     end;
   end;
 
