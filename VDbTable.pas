@@ -4580,6 +4580,200 @@ begin
     KeyHash, ColCount - 1, FType, FOff, FLen);
 end;
 
+// P-108: Ext satir icin duz decode. Header parse + VarU 1-bayt fast path
+// + IntFromPayload 1-3 bayt sik yolu satir icinde. Sealed/UTF8/FLOAT/BOOL
+// cold path mevcut yardimcilara duser. Non-Ext satir: False doner,
+// cagiran genel yolu kullanir.
+function VDbDecodeStreamRowExtP(B: PByte; Len, ColCount: Integer;
+  HashPrefix: QWord; out TableId: Word; out KeyHash: QWord;
+  var Vals: TStrArray): Boolean;
+var
+  p, i, vl, pkCol, pkLen, j: Integer;
+  ct, by: Byte;
+  u: LongWord;
+  uu: QWord;
+  iv: Int64;
+  fv: Double;
+  s: string;
+  plain: TBytes;
+  pkPtr: PByte;
+  pkBuf: array[0..27] of AnsiChar;
+  src: PByte;
+  ok: Boolean;
+begin
+  Result := False;
+  KeyHash := 0;
+  if Length(Vals) <> ColCount then SetLength(Vals, ColCount);
+  if (B = nil) or (Len < 7) then Exit;   // min Ext baslik: 2+2+1+1+1
+  if (B[0] <> $FF) or (B[1] <> $FF) then Exit;  // Ext degil
+
+  p := 2;
+  TableId := B[p] or (Word(B[p + 1]) shl 8);
+  Inc(p, 2);
+
+  // VarU PkLen — 1-bayt fast path
+  if p >= Len then Exit;
+  u := B[p];
+  if (u and $80) = 0 then Inc(p)
+  else begin Dec(p); if not VdbVarUGet(B, Len, p, u) then Exit; end;
+  pkLen := Integer(u);
+
+  pkCol := -1;
+  pkPtr := nil;
+
+  if pkLen = 0 then
+  begin
+    // VarU pkInfo: 0 = bos pk, else PkFromCol = u-1
+    if p >= Len then Exit;
+    u := B[p];
+    if (u and $80) = 0 then Inc(p)
+    else begin Dec(p); if not VdbVarUGet(B, Len, p, u) then Exit; end;
+    if u = 0 then pkCol := VDB_ROW_PK_EMPTY
+    else pkCol := Integer(u) - 1;
+    pkLen := 0;
+  end
+  else
+  begin
+    if p + pkLen > Len then Exit;
+    pkPtr := B + p;
+    Inc(p, pkLen);
+  end;
+
+  // VarU ColCount
+  if p >= Len then Exit;
+  u := B[p];
+  if (u and $80) = 0 then Inc(p)
+  else begin Dec(p); if not VdbVarUGet(B, Len, p, u) then Exit; end;
+  if Integer(u) <> ColCount then Exit;
+
+  if pkCol >= 0 then
+  begin
+    if pkCol >= ColCount then Exit;
+  end
+  else if pkLen = 0 then
+    pkPtr := B;
+
+  // Kolon dongusu
+  for i := 0 to ColCount - 1 do
+  begin
+    if p >= Len then Exit;
+    ct := B[p]; Inc(p);
+
+    // VarU vl — 1-bayt fast path (0 = NULL, else vl = u-1)
+    if p >= Len then Exit;
+    u := B[p];
+    if (u and $80) = 0 then Inc(p)
+    else begin Dec(p); if not VdbVarUGet(B, Len, p, u) then Exit; end;
+    if u = 0 then vl := -1
+    else vl := LongInt(u - 1);
+
+    if vl = -1 then
+    begin
+      Vals[i] := '';
+      if i = pkCol then Exit;   // pk NULL olamaz
+      Continue;
+    end;
+    if (vl < 0) or (p + vl > Len) then Exit;
+    src := B + p;
+
+    // PK kolonu: hash icin kaynak goster
+    if i = pkCol then
+    begin
+      case ct of
+        VCT_INT:
+          begin
+            // IntFromPayload satir ici (1-3 bayt sik yol)
+            if vl = 8 then Move(src^, iv, 8)
+            else if (vl >= 1) and (vl <= 3) then
+            begin
+              ok := True;
+              uu := 0;
+              for j := 0 to vl - 1 do
+              begin
+                by := src[j];
+                if j < vl - 1 then begin if (by and $80) = 0 then begin ok := False; Break; end; end
+                else if (by and $80) <> 0 then begin ok := False; Break; end;
+                uu := uu or (QWord(by and $7F) shl (7 * j));
+              end;
+              if ok and (vl > 1) and (src[vl - 1] = 0) then ok := False;
+              if not ok then Exit;
+              iv := Int64(uu shr 1) xor -Int64(uu and 1);
+            end
+            else if not VDbIntFromPayload(src, vl, iv) then Exit;
+            pkLen := VdbIntToDecBuf(iv, pkBuf);
+            if pkLen <= 0 then Exit;
+            pkPtr := @pkBuf[0];
+            VdbBytesToStr(Vals[i], @pkBuf[0], pkLen);
+            Inc(p, vl);
+            Continue;
+          end;
+        VCT_FLOAT, VCT_BOOL: Exit;
+      else
+        begin
+          pkPtr := src;
+          pkLen := vl;
+        end;
+      end;
+    end;
+
+    // Dogrudan decode
+    case ct of
+      VCT_INT:
+        begin
+          // IntFromPayload satir ici (1-3 bayt sik yol)
+          if vl = 8 then begin Move(src^, iv, 8); ok := True; end
+          else if (vl >= 1) and (vl <= 3) then
+          begin
+            ok := True;
+            uu := 0;
+            for j := 0 to vl - 1 do
+            begin
+              by := src[j];
+              if j < vl - 1 then begin if (by and $80) = 0 then begin ok := False; Break; end; end
+              else if (by and $80) <> 0 then begin ok := False; Break; end;
+              uu := uu or (QWord(by and $7F) shl (7 * j));
+            end;
+            if ok and (vl > 1) and (src[vl - 1] = 0) then ok := False;
+            if ok then iv := Int64(uu shr 1) xor -Int64(uu and 1);
+          end
+          else
+            ok := VDbIntFromPayload(src, vl, iv);
+          if ok then VdbIntToStrTo(Vals[i], iv)
+          else Vals[i] := '';
+        end;
+      VCT_FLOAT:
+        begin Move(src^, fv, 8); Vals[i] := VDbFloatToStr(fv); end;
+      VCT_BOOL:
+        begin Vals[i] := BoolToStr(src^ <> 0, True); end;
+    else
+      begin
+        if VDbColumnIsSealed(src, vl) then
+        begin
+          VdbBytesToStr(s, src, vl);
+          plain := VDbColumnOpen(TableId, i, VDbS2B(s));
+          if ct = VCT_BLOB then Vals[i] := VDbB2S(plain, 0, Length(plain))
+          else Vals[i] := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
+        end
+        else if (ct = VCT_BLOB) or VdbPureAscii(src, vl) then
+          VdbBytesToStr(Vals[i], src, vl)
+        else
+        begin
+          VdbBytesToStr(s, src, vl);
+          Vals[i] := UTF8Decode(s);
+        end;
+      end;
+    end;
+    Inc(p, vl);
+  end;
+
+  if pkCol >= 0 then
+  begin
+    if pkPtr = nil then Exit;   // pk cozulmedi
+  end;
+  KeyHash := VDbHashKeyBytes(HashPrefix, pkPtr, pkLen);
+  Result := True;
+end;
+
 // P-93: tek gecis — VDbPeekRawRowKeyHashTo + VDbRowFromOffsetsP birlesik.
 // FType/FOff/FLen ara dizileri yazilmaz/okunmaz; kolonlar tek dongude
 // dogrudan Vals'e cozulur. KeyHash P-90d ile birebir ayni uretilir.
@@ -4602,6 +4796,14 @@ var
   pkBuf: array[0..27] of AnsiChar;
   src: PByte;
 begin
+  // P-108: Ext satir icin hizli duz decode
+  if (B <> nil) and (Len >= 2) and (B[0] = $FF) and (B[1] = $FF) then
+  begin
+    Result := VDbDecodeStreamRowExtP(B, Len, ColCount, HashPrefix,
+      TableId, KeyHash, Vals);
+    Exit;
+  end;
+
   Result := False;
   KeyHash := 0;
   if Length(Vals) <> ColCount then SetLength(Vals, ColCount);

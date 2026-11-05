@@ -2282,3 +2282,37 @@ asil buyuk kalem (~19 ms = 4x100k string tahsisi) ama API degisikligi
 ister.
 
 Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMIZ.
+
+## §49 — P-108: Flat Ext decode (header + VarU + IntFromPayload satir ici)
+
+**Tarih:** 2026-11-05
+**Dal:** v3
+
+VDbDecodeStreamRowP'ye Ext-only duz decode yolu (VDbDecodeStreamRowExtP).
+Bilesenler:
+
+1) Header parse satir icinde — VdbRowHdrOf cagrisi ve TVdbRowHdr record
+   kurulumu yok. Ext marker ($FFFF) kontrolu + TableId + VarU PkLen +
+   VarU pkInfo + VarU ColCount dogrudan.
+2) VarU 1-bayt fast path — kolon dongusunde her VarU okumasi icin
+   `(B[p] and $80)=0` kontrolu tek bayt, cok baytli durumda VdbVarUGet'e
+   fallback. B metrigindeki degerlerin cogu 1 bayt (ColCount=4, PkLen=0,
+   pkInfo=1, kolon uzunluklari kucuk).
+3) IntFromPayload 1-3 bayt sik yolu satir icinde — B'deki 3 INT kolonu
+   (id, k, y: 1..100000) zigzag VarInt olarak 1-3 bayt. VDbIntFromPayload
+   cagrisi yerine dogrudan bit islemleri. Len=8 (Move) ve nadir 4-7 bayt
+   durumlari fallback'te.
+4) Cold path korundu: sealed (VDbColumnIsSealed + VDbColumnOpen), UTF8
+   decode, FLOAT, BOOL — mevcut yardimcilara duser. Non-Ext satirlar
+   icin eski genel yol aynen duruyor (VDbDecodeStreamRowP Ext degilse
+   VDbDecodeStreamRowExtP'yi cagirip cikiyor).
+
+Olcum (joindiag B, 3 interleave A/B cifti, P-107'a karsi):
+P-107 47048–51795 us (medyan 49070), P-108 46435–48978 us (medyan
+46925). 3 ciftin 3'unde de P-108 hizli; medyan %4.4 kazanc.
+
+Kalan dagilim tahmini (~47 ms): scan ~8 ms, growth (inner row array
+tahsisleri) ~7 ms, parse+hash ~16 ms (onceki ~20 ms'den dustu), hucre
+tahsisleri ~8 ms, diger ~8 ms.
+
+Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMIZ.
