@@ -2254,3 +2254,31 @@ P-106 54246/57814/54688 us (medyan 54688). 3 ciftin 2'sinde P-106
 hizli; en_iyi %6.1, medyan %5.5 kazanc. Tek ciftte esit (~%0.2).
 
 Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMIZ.
+
+## §48 — P-107: SetLength+Move ve inline VarU/kolon parse
+
+**Tarih:** 2026-11-05
+**Dal:** v3
+
+Iki degisiklik:
+1) SetString yerine SetLength+Move (VdbBytesToStr yardimcisi + 
+   VdbIntToStrTo). strbench TAZE tahsiste SetString 26.4 ns/hucre,
+   SetLength+Move 22.9 ns/hucre (FPC SetString ek yol ayrimi yapiyor).
+   Ilk olcum yanilticiydi: best-of-7'de SetLength mevcut buffer'i
+   yeniden kullaniyordu (7.8 ns) — strbench'e her tekrardan once
+   bosaltma eklendi.
+2) VdbVarUGet ve VdbRowColLen'a `inline` — decode dongusunde satir
+   basina ~19 fonksiyon cagrisi vardi; cagri cercevesi i386'ta 2-5 ns.
+
+Olcum (joindiag B, 3 interleave A/B cifti, P-106'a karsi):
+P-106 53835–55085 us (medyan 53923), P-107 48907–50860 us (medyan
+49289). 3 ciftin 3'unde de P-107 hizli; en_iyi %9.2, medyan %8.6
+kazanc.
+
+Ablasyon notu: hash (VDbHashKeyBytes FNV-64) yalnizca ~%1.5 —
+strength reduction adayi degil. D4 lookup bu is yuku icin kazancsiz
+(degerler 1-6 basamak). Tahsis sayisini azaltmak (slab/kolonar sonuc)
+asil buyuk kalem (~19 ms = 4x100k string tahsisi) ama API degisikligi
+ister.
+
+Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMIZ.

@@ -3348,7 +3348,7 @@ const
   VDB_ROW_PK_EMPTY = -100;
 
 function VdbVarUGet(B: PByte; Len: Integer; var P: Integer;
-  out U: LongWord): Boolean;
+  out U: LongWord): Boolean; inline;
 { Isaretsiz LEB128; en fazla 5 bayt (32 bit). }
 var
   sh: Integer;
@@ -3439,7 +3439,7 @@ begin
 end;
 
 function VdbRowColLen(B: PByte; Len: Integer; var P: Integer; Ext: Boolean;
-  out Vl: LongInt): Boolean;
+  out Vl: LongInt): Boolean; inline;
 { KOLON UZUNLUGU. cikis: -1 = NULL, aksi halde yuk uzunlugu. }
 var
   u: LongWord;
@@ -4090,6 +4090,15 @@ end;
 // iceride Str(Value, S) ile gecici S kurup Result := S ile kopyalar;
 // burada rakamlar dogrudan hedef string'e yazilir (1 tahsis, 0 refcount).
 // P-99b: VdbIntToDecBuf + SetString — bulk copy, byte-by-byte yazim yok.
+// P-107: SetString yerine SetLength+Move — strbench taze tahsiste
+//   26.4 -> 22.9 ns/hucre (SetString ek yol ayrimi yapiyor).
+procedure VdbBytesToStr(var S: string; P: Pointer; L: Integer); inline;
+begin
+  if L <= 0 then begin S := ''; Exit; end;
+  SetLength(S, L);
+  Move(P^, S[1], L);
+end;
+
 procedure VdbIntToStrTo(var S: string; v: Int64);
 var
   buf: array[0..19] of AnsiChar;
@@ -4097,7 +4106,8 @@ var
 begin
   n := VdbIntToDecBuf(v, buf);
   if n <= 0 then begin S := ''; Exit; end;
-  SetString(S, PAnsiChar(@buf[0]), n);
+  SetLength(S, n);
+  Move(buf[0], S[1], n);
 end;
 
 // P-91b: saf-ASCII bayt araligi mi? UTF8Decode atlaniyor (3 tahsis -> 1).
@@ -4639,7 +4649,7 @@ begin
             pkLen := VdbIntToDecBuf(iv, pkBuf);
             if pkLen <= 0 then Exit;
             pkPtr := @pkBuf[0];
-            SetString(Vals[i], PAnsiChar(@pkBuf[0]), pkLen); // P-97a: pkBuf'dan dogrudan
+            VdbBytesToStr(Vals[i], @pkBuf[0], pkLen); // P-97a + P-107
             Inc(p, vl);
             Continue;
           end;
@@ -4669,16 +4679,16 @@ begin
       begin
         if VDbColumnIsSealed(src, vl) then
         begin
-          SetString(s, PAnsiChar(src), vl);
+          VdbBytesToStr(s, src, vl);   // P-107
           plain := VDbColumnOpen(H.TableId, i, VDbS2B(s));
           if ct = VCT_BLOB then Vals[i] := VDbB2S(plain, 0, Length(plain))
           else Vals[i] := UTF8Decode(VDbB2S(plain, 0, Length(plain)));
         end
         else if (ct = VCT_BLOB) or VdbPureAscii(src, vl) then
-          SetString(Vals[i], PAnsiChar(src), vl)   // P-94: tek tahsis
+          VdbBytesToStr(Vals[i], src, vl)   // P-94 + P-107
         else
         begin
-          SetString(s, PAnsiChar(src), vl);
+          VdbBytesToStr(s, src, vl);
           Vals[i] := UTF8Decode(s);
         end;
       end;
