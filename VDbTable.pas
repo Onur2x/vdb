@@ -1074,6 +1074,7 @@ function VdbGetWriteSession: Cardinal;
 implementation
 
 uses
+  VDbMM, // P-110: ozel bellek yoneticisi (initialization'da kurulur)
   VDbSync, VDbParallel;
 
 {$IFDEF APPLPROF}

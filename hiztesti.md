@@ -2338,3 +2338,37 @@ P-108 46677–53312 us (medyan 47575), P-109 44889–47052 us (medyan
 45265). 3 ciftin 3'unde de P-109 hizli; medyan %4.9 kazanc.
 
 Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMIZ.
+
+---
+
+## §51. P-110: VDbMM ozel bellek yoneticisi (spinlock)
+
+**Dal:** v3
+
+VDB B metrigindeki 400k+ kucuk tahsis (string hucreler + ic satir dizileri)
+icin FPC varsayilan heap'ine karsi ozel bellek yoneticisi eklendi (VDbMM.pas).
+
+Tasarim:
+- 64KB'lik VirtualAlloc slab'lari (64KB hizali — bitmap ile slab tespiti).
+- 16 boyut sinifi (16..512 bayt). Her sinif: serbest liste + bump isaretcisi.
+- <=512 bayt: slab'lardan; >512 bayt: orijinal yoneticiden dogrudan.
+- FreeMem: bitmap ile slab mi diye bak, slab ise serbest listeye ekle.
+- Senkronizasyon: InterlockedExchange spinlock (tek LOCK XCHG, kritik
+  bolumden hizli). Tek is parcaciginda neredeyse bedava; cok is
+  parcaciginda dogru calisir (sqltest test 132 paralel dahil).
+
+Iterasyon gecmisi:
+- Kritik bolum (TRTLCriticalSection): 47018 us — P-109'dan yavas.
+- Kilit yok (global, senkronizasyonsuz): 5/5 hizli ama sqltest test 132 cokuyor.
+- threadvar serbest listeler: sqltest temiz ama %25 yavas (FPC TLS pahali).
+- IsMultiThread + ayri SmallGetMem: ~48500 us (inline engelleniyor).
+- IsMultiThread + her sey MMGetMem icinde: 50822 us (hala yavas).
+- Lock-free CAS (Treiber stack): sqltest asili kaldi (ABA/CAS tip sorunu).
+- **Spinlock (InterlockedExchange): 5/5 hizli + sqltest temiz.** Secildi.
+
+Olcum (joindiag B, 5 interleave A/B cifti, P-109'a karsi):
+P-109 43640–50563 us (medyan 45126), P-110 42116–43610 us (medyan
+42432). 5 ciftin 5'inde de P-110 hizli; medyan %6.0 kazanc.
+
+Dogrulama: sqltest 3287/0/0 (test 132 paralel dahil), wherenull TEMIZ,
+chainnull TEMIZ.

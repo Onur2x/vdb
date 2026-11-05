@@ -7,6 +7,7 @@ program joindiag;
 {$mode delphi}{$H+}
 uses
   Windows, SysUtils, Classes,
+  VDbMM, // P-110: ozel bellek yoneticisi (initialization'da kurulur)
   VDbCore, VDbTypes, VDbTable, VDbSql;
 
 var
