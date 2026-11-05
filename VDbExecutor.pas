@@ -20230,6 +20230,7 @@ var
   tbls, tmpi: TStrArray;
   tmprow: TStrMatrix;
   i, j: Integer;
+  rc: Int64;             // SHOW TABLES: backend satir sayaci (varsa)
   td: TTableDef;
   cn, chk, fkCol: string;
   icols: TIntArray;
@@ -20445,8 +20446,19 @@ begin
         begin
           SetLength(Res.Rows[i], 2);
           Res.Rows[i][0] := tbls[i];
-          FT.ScanRows(tbls[i], tmpi, tmprow);
-          Res.Rows[i][1] := IntToStr(Length(tmprow));
+          { P-97: satir sayisi backend'in canli sayacindan O(1) okunur.
+            Eskiden her tablo icin ScanRows cagriliyordu; 132 tabloda bu
+            6,5 saniye suruyordu (her tablo bastan sona decode ediliyordu).
+            Sayac -1 dondururse (backend saymiyorsa) eski tam taramaya duseriz. }
+          rc := -1;
+          if FT.Backend <> nil then
+            rc := FT.Backend.CountTable(FT.GetTable(tbls[i]).TableId);
+          if rc < 0 then
+          begin
+            FT.ScanRows(tbls[i], tmpi, tmprow);
+            rc := Length(tmprow);
+          end;
+          Res.Rows[i][1] := IntToStr(rc);
         end;
         Res.Affected := Length(tbls);
         Res.Msg := IntToStr(Length(tbls)) + ' tablo';
