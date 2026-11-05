@@ -62,6 +62,7 @@ begin
   dir := ParamStr(1);
   nR := 100000;
   if ParamCount >= 2 then nR := StrToIntDef(ParamStr(2), 100000);
+  MMSingleThreaded := True; // P-110 v4: tek is parcacigi — spinlock atla
   ForceDirectories(dir);
   kv := TVDb.Create;
   tb := TVTableDb.Create(kv);

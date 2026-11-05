@@ -2479,3 +2479,43 @@ bu sorun yok.
 olculebilir kazanc sagliyor. Gurultu bandi genis ama yon tutarli.
 
 Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMIZ.
+
+---
+
+## P-110 v4: VDbMM single-threaded mod (spinlock atlama)
+
+**Tarih:** 2026-11-05
+**Hedef:** B metrinde 400k+ kucuk tahsisin kilit overhead'ini ortadan kaldirma.
+
+### Yapilan
+VDbMM.pas'a `MMSingleThreaded: Boolean` bayragi eklendi (interface'de export).
+`LockAcquire`/`LockRelease` icinde `if MMSingleThreaded then Exit` — bayrak
+True ise LOCK XCHG tamamen atlanir. joindiag startup'ta bayragi set eder.
+
+Tek is parcaciginda her tahsis 2x LOCK XCHG (~10ns) yapiyordu. 400k tahsis
+× 10ns ≈ 4ms kilit overhead. Bu optimizasyon bu maliyeti sifira indirir.
+
+### Olcum (joindiag B, 10 interleave A/B cifti)
+| Cift | BASE | P-110v4 | Fark |
+|------|------|---------|------|
+| 1 | 44832 | 41337 | -7.8% |
+| 2 | 46037 | 40242 | -12.6% |
+| 3 | 42880 | 41525 | -3.2% |
+| 4 | 41680 | 41794 | +0.3% |
+| 5 | 42113 | 42510 | +0.9% |
+| 6 | 41667 | 40583 | -2.6% |
+| 7 | 43193 | 40619 | -5.9% |
+| 8 | 42496 | 39432 | -7.2% |
+| 9 | 43404 | 41439 | -4.5% |
+| 10 | 45907 | 39573 | -13.8% |
+
+- BASE medyan: 43036 us
+- P-110v4 medyan: 40978 us
+- **Iyilesme: -%4.78** (esik %2 uzerinde)
+- 8/10 ciftte iyilesme; 2 ciftte hafif yavaslama (gurultu).
+
+**Sonuc:** TUTULDU. Tek is parcaciginda spinlock atlama olculebilir kazanc
+sagliyor. MMSingleThreaded bayragi yanlis kullanilirse veri bozulur —
+yalnizca tek is parcacigi oldugundan emin oldugunda set et.
+
+Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMIZ.

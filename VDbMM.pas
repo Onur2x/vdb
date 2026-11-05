@@ -12,6 +12,7 @@ unit VDbMM;
 
   Senkronizasyon (P-110 v3): InterlockedExchange spinlock. Tek is parcaciginda
   tek LOCK XCHG (~5ns), cok is parcaciginda dogru. Kritik bolumden hizli.
+  P-110 v4: MMSingleThreaded=True ise kilit tamamen atlanir (~10ns/tahsis).
 
   Guvenlik: her slab basliginda dogrulama sihirli sayisi; bitmap yalnizca
   bizim slab'larimizi isaretler; eski tahsisler (kurulumdan once) orijinal
@@ -19,6 +20,12 @@ unit VDbMM;
 {$mode delphi}{$H+}
 
 interface
+
+var
+  { P-110 v4: tek is parcacigi bayragi. True ise LockAcquire/LockRelease
+    tamamen atlanir (LOCK XCHG ~10ns/tahsis). Yanlis kullanilirse veri
+    bozulur — yalnizca tek is parcacigi oldugundan emin oldugunda set et. }
+  MMSingleThreaded: Boolean;
 
 implementation
 
@@ -61,12 +68,14 @@ var
 
 procedure LockAcquire; inline;
 begin
+  if MMSingleThreaded then Exit;
   while InterlockedExchange(MMLock, 1) <> 0 do
     ; // spin — kisa kritik bolum, contention nadir
 end;
 
 procedure LockRelease; inline;
 begin
+  if MMSingleThreaded then Exit;
   InterlockedExchange(MMLock, 0);
 end;
 
