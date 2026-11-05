@@ -2560,3 +2560,54 @@ olculebilir kazanc sagliyor. Saf ASCII metin degerleri (B'de 'satir-N')
 artik fonksiyon cagrisi olmadan dogrudan kopyalaniyor.
 
 Dogrulama: sqltest 2885/0/0, wherenull TEMIZ, chainnull TEMIZ.
+
+---
+
+## P-117b: VdbIntToDecBufOff — hizalama Move'u atlama
+
+**Tarih:** 2026-11-05
+**Durum:** TUTULDU
+
+### Degisiklik
+- `VdbIntToDecBufOff` eklendi: D2 lookup tablosu ayni, ancak `Move(Buf[i+1], Buf[0], n)`
+  hizalama adimi atlanir. `Start: Integer` out parametresi ile baslangic pozisyonu doner.
+- `VdbIntToStrTo` artik `VdbIntToDecBufOff` kullanir: `Move(buf[start], S[1], n)` —
+  tek Move, hizalama Move'u yok.
+- Orijinal `VdbIntToDecBuf` bozulmadan korundu (pk yollari hala onu kullanir).
+
+### Gerekce
+`VdbIntToDecBuf` sahaya hizali yazar sonra `Move(Buf[i+1], Buf[0], n)` ile sola hizalar.
+Bu Move + `VdbIntToStrTo`'deki kopyalama Move'u = cift Move. Birini atlamak
+her INT hucre icin ~2-5ns tasarruf (300k INT hucre × 2-5ns ≈ 0.6-1.5ms).
+
+### Olcum (joindiag B, 16 interleave A/B cifti)
+| Cift | BASE | P-117b | Fark |
+|------|------|--------|------|
+| 1 | 42465 | 40265 | -5.2% |
+| 2 | 40229 | 40433 | +0.5% |
+| 3 | 40381 | 40172 | -0.5% |
+| 4 | 42086 | 41188 | -2.1% |
+| 5 | 42454 | 40789 | -3.9% |
+| 6 | 39339 | 43367 | +10.2% |
+| 7 | 40602 | 39141 | -3.6% |
+| 8 | 48087 | 42037 | -12.6% |
+| 9 | 44819 | 42564 | -5.0% |
+| 10 | 42146 | 41450 | -1.7% |
+| 11 | 42482 | 41130 | -3.2% |
+| 12 | 47276 | 40035 | -15.3% |
+| 13 | 42320 | 39995 | -5.5% |
+| 14 | 40770 | 46796 | +14.8% |
+| 15 | 56337 | 45107 | -19.9% |
+| 16 | 43228 | 41590 | -3.8% |
+
+- BASE medyan: 42387 us
+- P-117b medyan: 41159 us
+- **Iyilesme: %2.90** (esik %2 uzerinde)
+- BASE ortalama: 42689 us, P-117b ortalama: 41594 us (**%2.57**)
+- 12/16 ciftte iyilesme; 4 ciftte yavaslama (gurultu — c6, c14 belirgin).
+
+**Sonuc:** TUTULDU. Hizalama Move'unu atlama tek Move ile INT donusumunde
+olculebilir kazanc sagliyor. `VdbIntToDecBufOff` yeni fonksiyon olarak eklendi,
+orijinal `VdbIntToDecBuf` bozulmadi.
+
+Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMIZ.

@@ -3561,6 +3561,104 @@ begin
   Result := n;
 end;
 
+// P-117: hizalama Move'u olmayan varyant — baslangic pozisyonu out parametre.
+function VdbIntToDecBufOff(V: Int64; var Buf: array of AnsiChar;
+  out Start: Integer): Integer;
+const
+  D2: array[0..99] of packed array[0..1] of AnsiChar = (
+    '00', '01', '02', '03', '04', '05', '06', '07', '08', '09',
+    '10', '11', '12', '13', '14', '15', '16', '17', '18', '19',
+    '20', '21', '22', '23', '24', '25', '26', '27', '28', '29',
+    '30', '31', '32', '33', '34', '35', '36', '37', '38', '39',
+    '40', '41', '42', '43', '44', '45', '46', '47', '48', '49',
+    '50', '51', '52', '53', '54', '55', '56', '57', '58', '59',
+    '60', '61', '62', '63', '64', '65', '66', '67', '68', '69',
+    '70', '71', '72', '73', '74', '75', '76', '77', '78', '79',
+    '80', '81', '82', '83', '84', '85', '86', '87', '88', '89',
+    '90', '91', '92', '93', '94', '95', '96', '97', '98', '99'
+  );
+var
+  i, n: Integer;
+  neg: Boolean;
+  u: QWord;
+  u32: LongWord;
+  r: Integer;
+begin
+  Result := 0;
+  Start := 0;
+  neg := V < 0;
+  if neg then u := QWord(-(V + 1)) + 1 else u := QWord(V);
+  i := High(Buf);
+  n := 0;
+  if u <= $FFFFFFFF then
+  begin
+    u32 := LongWord(u);
+    while u32 >= 100 do
+    begin
+      if i < 1 then Exit;
+      r := u32 mod 100;
+      u32 := u32 div 100;
+      Buf[i] := D2[r][1];
+      Buf[i - 1] := D2[r][0];
+      Dec(i, 2);
+      Inc(n, 2);
+    end;
+    if u32 >= 10 then
+    begin
+      if i < 1 then Exit;
+      Buf[i] := D2[u32][1];
+      Buf[i - 1] := D2[u32][0];
+      Dec(i, 2);
+      Inc(n, 2);
+    end
+    else
+    begin
+      if i < 0 then Exit;
+      Buf[i] := AnsiChar(Ord('0') + Integer(u32));
+      Dec(i);
+      Inc(n);
+    end;
+  end
+  else
+  begin
+    while u >= 100 do
+    begin
+      if i < 1 then Exit;
+      r := u mod 100;
+      u := u div 100;
+      Buf[i] := D2[r][1];
+      Buf[i - 1] := D2[r][0];
+      Dec(i, 2);
+      Inc(n, 2);
+    end;
+    if u >= 10 then
+    begin
+      if i < 1 then Exit;
+      Buf[i] := D2[u][1];
+      Buf[i - 1] := D2[u][0];
+      Dec(i, 2);
+      Inc(n, 2);
+    end
+    else
+    begin
+      if i < 0 then Exit;
+      Buf[i] := AnsiChar(Ord('0') + Integer(u));
+      Dec(i);
+      Inc(n);
+    end;
+  end;
+  if neg then
+  begin
+    if i < 0 then Exit;
+    Buf[i] := '-';
+    Inc(n);
+    Dec(i);
+  end;
+  // Hizalama YOK — Start pozisyonu doner, cagrici dogrudan kopyalar.
+  Start := i + 1;
+  Result := n;
+end;
+
 function VdbRowPkOf(B: PByte; Len: Integer; const H: TVdbRowHdr;
   out Pk: string): Boolean;
 { v3.13: satirdan pk metnini uretir. PK govdede satir ici ise oradan;
@@ -4103,12 +4201,12 @@ end;
 procedure VdbIntToStrTo(var S: string; v: Int64); inline;
 var
   buf: array[0..19] of AnsiChar;
-  n: Integer;
+  n, start: Integer;
 begin
-  n := VdbIntToDecBuf(v, buf);
+  n := VdbIntToDecBufOff(v, buf, start);
   if n <= 0 then begin S := ''; Exit; end;
   SetLength(S, n);
-  Move(buf[0], S[1], n);
+  Move(buf[start], S[1], n);
 end;
 
 // P-91b: saf-ASCII bayt araligi mi? UTF8Decode atlaniyor (3 tahsis -> 1).
