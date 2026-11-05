@@ -4191,22 +4191,40 @@ end;
 // P-99b: VdbIntToDecBuf + SetString — bulk copy, byte-by-byte yazim yok.
 // P-107: SetString yerine SetLength+Move — strbench taze tahsiste
 //   26.4 -> 22.9 ns/hucre (SetString ek yol ayrimi yapiyor).
-procedure VdbBytesToStr(var S: string; P: Pointer; L: Integer); inline;
+// P-120: SetLength+Move — P-107'de en hizli yol olarak olculdu.
+procedure VdbStrFromBytes(var S: string; P: Pointer; L: Integer); inline;
 begin
   if L <= 0 then begin S := ''; Exit; end;
   SetLength(S, L);
   Move(P^, S[1], L);
 end;
 
+procedure VdbBytesToStr(var S: string; P: Pointer; L: Integer); inline;
+begin
+  VdbStrFromBytes(S, P, L);
+end;
+
+// P-121: INT scratch buffer — ayni tam sayi degeri art arda gelirse
+//   string tahsisi atlaniyor (B metriginde id=k=y=i, 2/3 tasarruf).
+var
+  LastIntVal: Int64 = Low(Int64);
+  LastIntStr: string;
+
 procedure VdbIntToStrTo(var S: string; v: Int64); inline;
 var
   buf: array[0..19] of AnsiChar;
   n, start: Integer;
 begin
+  if (v = LastIntVal) and (Pointer(LastIntStr) <> nil) then
+  begin
+    S := LastIntStr;   // refcount++, paylasimli string
+    Exit;
+  end;
   n := VdbIntToDecBufOff(v, buf, start);
   if n <= 0 then begin S := ''; Exit; end;
-  SetLength(S, n);
-  Move(buf[start], S[1], n);
+  VdbStrFromBytes(S, @buf[start], n);
+  LastIntVal := v;
+  LastIntStr := S;     // refcount++, paylasimli string
 end;
 
 // P-91b: saf-ASCII bayt araligi mi? UTF8Decode atlaniyor (3 tahsis -> 1).

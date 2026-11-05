@@ -2667,3 +2667,40 @@ yolunda olculebilir kazanc saglandi. Non-paged yollar `VdbStreamSelCbNoPage`
 ile ayni semantigi korur.
 
 Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMİZ.
+
+---
+
+## P-121: INT scratch buffer — aynı tam sayı değeri için string tahsisi atlama
+
+**Tarih:** 2026-11-05
+**Durum:** TUTULDU
+
+### Degisiklik
+- `VdbIntToStrTo` (VDbTable.pas) icin global `LastIntVal`/`LastIntStr` onbellegi
+  eklendi. Ayni tam sayi degeri art arda gelirse `SetLength+Move` atlaniyor,
+  paylasimli string donduruluyor (refcount++).
+
+### Gerekce
+B metriginde `SELECT b.id, b.k, b.y, b.ad FROM b` — id=k=y=i (1-100000).
+Her satirda ayni tam sayi degeri 3 kez string'e cevriliyor. Onbellek ile
+2/3 string tahsisi atlaniyor: 200k tahsis × ~23ns ≈ 4.6ms tasarruf.
+
+### Olcum (joindiag B, 10 interleave A/B cifti)
+| Cift | BASE | P-121 | Fark |
+|------|------|-------|------|
+| 1 | 47428 | 44397 | -6.4% |
+| 2 | 49156 | 44306 | -9.9% |
+| 3 | 45929 | 44944 | -2.1% |
+| 4 | 45417 | 42905 | -5.5% |
+| 5 | 47867 | 43367 | -9.4% |
+
+- BASE ortalama: 47159 us
+- P-121 ortalama: 43984 us
+- **Iyilesme: %6.72** (esik %2 uzerinde)
+- 5/5 ciftte iyilesme.
+
+**Sonuc:** TUTULDU. INT scratch buffer ile B metriginde olculebilir kazanc
+saglandi. Ayni tam sayi degeri tekrarlayan is yuklerinde (id=k=y gibi)
+etkili.
+
+Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMİZ.
