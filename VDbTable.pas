@@ -4641,7 +4641,7 @@ begin
   if p >= Len then Exit;
   u := B[p];
   if (u and $80) = 0 then Inc(p)
-  else begin Dec(p); if not VdbVarUGet(B, Len, p, u) then Exit; end;
+  else if not VdbVarUGet(B, Len, p, u) then Exit;
   pkLen := Integer(u);
 
   pkCol := -1;
@@ -4653,7 +4653,7 @@ begin
     if p >= Len then Exit;
     u := B[p];
     if (u and $80) = 0 then Inc(p)
-    else begin Dec(p); if not VdbVarUGet(B, Len, p, u) then Exit; end;
+    else if not VdbVarUGet(B, Len, p, u) then Exit;
     if u = 0 then pkCol := VDB_ROW_PK_EMPTY
     else pkCol := Integer(u) - 1;
     pkLen := 0;
@@ -4669,7 +4669,7 @@ begin
   if p >= Len then Exit;
   u := B[p];
   if (u and $80) = 0 then Inc(p)
-  else begin Dec(p); if not VdbVarUGet(B, Len, p, u) then Exit; end;
+  else if not VdbVarUGet(B, Len, p, u) then Exit;
   if Integer(u) <> ColCount then Exit;
 
   if pkCol >= 0 then
@@ -4689,7 +4689,7 @@ begin
     if p >= Len then Exit;
     u := B[p];
     if (u and $80) = 0 then Inc(p)
-    else begin Dec(p); if not VdbVarUGet(B, Len, p, u) then Exit; end;
+    else if not VdbVarUGet(B, Len, p, u) then Exit;
     if u = 0 then vl := -1
     else vl := LongInt(u - 1);
 
