@@ -4805,7 +4805,7 @@ end;
 // P-93: tek gecis — VDbPeekRawRowKeyHashTo + VDbRowFromOffsetsP birlesik.
 // FType/FOff/FLen ara dizileri yazilmaz/okunmaz; kolonlar tek dongude
 // dogrudan Vals'e cozulur. KeyHash P-90d ile birebir ayni uretilir.
-function VDbDecodeStreamRowP(B: PByte; Len, ColCount: Integer;
+function VDbDecodeStreamRowLegacyP(B: PByte; Len, ColCount: Integer;
   HashPrefix: QWord; out TableId: Word; out KeyHash: QWord;
   var Vals: TStrArray): Boolean;
 var
@@ -4824,14 +4824,6 @@ var
   pkBuf: array[0..27] of AnsiChar;
   src: PByte;
 begin
-  // P-108: Ext satir icin hizli duz decode
-  if (B <> nil) and (Len >= 2) and (B[0] = $FF) and (B[1] = $FF) then
-  begin
-    Result := VDbDecodeStreamRowExtP(B, Len, ColCount, HashPrefix,
-      TableId, KeyHash, Vals);
-    Exit;
-  end;
-
   Result := False;
   KeyHash := 0;
   if Length(Vals) <> ColCount then SetLength(Vals, ColCount);
@@ -4932,6 +4924,20 @@ begin
   end;
   KeyHash := VDbHashKeyBytes(HashPrefix, pkPtr, pkLen);
   Result := True;
+end;
+
+function VDbDecodeStreamRowP(B: PByte; Len, ColCount: Integer;
+  HashPrefix: QWord; out TableId: Word; out KeyHash: QWord;
+  var Vals: TStrArray): Boolean;
+{ P-114: ince sarmalayici — managed local'lar LegacyP'ye tasindi.
+  Ext satir yolunda agir stack frame (string/TBytes init/final) yok. }
+begin
+  if (B <> nil) and (Len >= 2) and (B[0] = $FF) and (B[1] = $FF) then
+    Result := VDbDecodeStreamRowExtP(B, Len, ColCount, HashPrefix,
+      TableId, KeyHash, Vals)
+  else
+    Result := VDbDecodeStreamRowLegacyP(B, Len, ColCount, HashPrefix,
+      TableId, KeyHash, Vals);
 end;
 
 function VDbRowTagOf(PlainValue: PByte; ValueLen: Integer): Integer;

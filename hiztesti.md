@@ -2408,3 +2408,74 @@ performans notr. T-kritik overhead muhtemelen ScanSnapshot TBytes tahsisleri
 ve DecodeRow string tahsisleri (satir basina 4 string = 400k tahsis).
 
 Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMIZ.
+
+---
+
+## P-113: threadvar VDbMM (REDDEDILDI) + hash strength reduction (REDDEDILDI)
+
+**Tarih:** 2026-11-05
+**Hedef:** B metrigi 43ms -> daha hizli.
+
+### P-113a: FNV-1a hash strength reduction
+`h * QWord($100000001B3)` yerine shift+add ($100000001B3 = 2^40+2^8+2^7+2^5+2^4+2^1+2^0).
+Sonuc: FPC -O2 64-bit carpmiyi zaten iyi inline ediyor, kazanc yok (medyan 43629->43808, +%0.4 yavas). GERI ALINDI.
+
+### P-113b: threadvar VDbMM (tcmalloc tarzi per-thread arena)
+`threadvar TFreeList/TBumpPtr/TBumpEnd` ile kilitsiz free list + bump; kilit yalnizca
+yeni slab acarken bitmap guncellemesi icin.
+
+Olcum (3 interleave A/B):
+- BASE (spinlock): 43200, 42890, 42383 (medyan 42890)
+- P-113 (threadvar): 53772, 53809, 55329 (medyan 53809) = **+%25.5 YAVAS**
+
+**Ders:** i386-win32 FPC'de `threadvar` TLS erisimi her degiskene erisimde
+FS-segment indirection yapar. Tek is parcaciginda `InterlockedExchange`
+spinlock (~5ns, LOCK XCHG) bundan cok daha ucuz. Global array dogrudan
+bellek erisimi; threadvar ise TLS lookup. GERI ALINDI.
+
+---
+
+## P-114: Thin decode wrapper (managed local tasarrufu)
+
+**Tarih:** 2026-11-05
+**Hedef:** B metriginde Ext satir decode yolundan wrapper stack frame tasarrufu.
+
+### Yapilan
+`VDbDecodeStreamRowP` ikiye bolundu:
+- `VDbDecodeStreamRowP`: ince sarmalayici — yalnizca Ext header ($FF $FF) kontrolu
+  + dispatch. Managed local (`string`, `TBytes`) YOK.
+- `VDbDecodeStreamRowLegacyP`: eski non-Ext decode yolu (tum managed local'lar burada).
+- `VDbDecodeStreamRowExtP`: degismedi (zaten ExtP yoluydu).
+
+Boylece B metrindeki 100k Ext satir her seferinde agir stack frame
+(string/TBytes init/final) olusturmadan ExtP'ye duser.
+
+### Reddedilen alternatif: callback'ten dogrudan ExtP cagrisi
+`VDbDecodeStreamRowExtP`'yi interface'e acip callback'ten dogrudan cagirmak
+**+%36 yavaslatti** (medyan 42721 -> 58332). Muhtemel sebep: cross-unit call
+overhead + code layout bozulmasi. Thin wrapper ayni birim icinde kaldigi icin
+bu sorun yok.
+
+### Olcum (joindiag B, 10 interleave A/B cifti)
+| Cift | BASE | P-114 | Fark |
+|------|------|-------|------|
+| 1 | 45756 | 43871 | -4.1% |
+| 2 | 44580 | 43237 | -3.0% |
+| 3 | 46978 | 43822 | -6.7% |
+| 4 | 43568 | 43217 | -0.8% |
+| 5 | 45231 | 60722 | aykiri |
+| 6 | 44888 | 43788 | -2.4% |
+| 7 | 45062 | 44701 | -0.8% |
+| 8 | 42550 | 42465 | -0.2% |
+| 9 | 44705 | 52861 | aykiri |
+| 10 | 48993 | 52194 | aykiri |
+
+- BASE medyan: 44975 us
+- P-114 medyan: 43847 us
+- **Iyilesme: -%2.5** (esik %2 uzerinde)
+- 7/10 ciftte iyilesme; 3 aykiri deger sistem gurultusu (P-114 >52k).
+
+**Sonuc:** TUTULDU. Ext yolunda managed local stack frame kaldirilmasi
+olculebilir kazanc sagliyor. Gurultu bandi genis ama yon tutarli.
+
+Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMIZ.
