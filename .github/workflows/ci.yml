@@ -55,7 +55,7 @@ jobs:
             'tests/sql/sqltest', 'tests/gates/pagechk', 'tests/gates/storechk',
             'tests/gates/heapchk', 'tests/gates/crashtest', 'tests/gates/idxchk',
             'tests/gates/backendchk', 'tests/gates/v3sqlchk', 'tests/gates/migchk',
-            'tests/gates/colmapchk',
+            'tests/gates/colmapchk', 'tests/gates/mvchk',
             'vdbmig', 'tests/gates/factorychk', 'tests/gates/logchk',
             'tests/gates/pitrchk', 'tests/gates/btreechk', 'tests/gates/replchk',
             'tests/gates/lockchk', 'tests/gates/snapchk', 'tests/gates/prochk',
@@ -193,6 +193,21 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'colmapchk kalan > 0'
+            exit 1
+          }
+
+      - name: Materialized view kaliciligi kapisi (mvchk)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbmvchk'
+          $out = & .\tests\gates\mvchk.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'MATERIALIZED VIEW KALICILIGI DOGRULANDI') {
+            Write-Error 'mvchk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'mvchk kalan > 0'
             exit 1
           }
 

@@ -120,6 +120,7 @@ derle tests/gates/dropchk.lpr dropchk && \
 derle tests/gates/idxchk.lpr idxchk && kos idxchk "KALICI DIZIN DOGRULANDI" "$WORK/idxchk" 50000
 derle tests/gates/backendchk.lpr backendchk && kos backendchk "BACKEND DIKISI DOGRULANDI" "$WORK/backendchk" 5000
 derle tests/gates/colmapchk.lpr colmapchk && kos colmapchk "KOLON HARITASI ONBELLEGI DOGRULANDI" "$WORK/colmapchk"
+derle tests/gates/mvchk.lpr mvchk && kos mvchk "MATERIALIZED VIEW KALICILIGI DOGRULANDI" "$WORK/mvchk"
 derle tests/gates/v3sqlchk.lpr v3sqlchk && kos v3sqlchk "V3 SQL KATMANI DOGRULANDI" "$WORK/v3sqlchk" 1200
 derle tests/gates/migchk.lpr migchk && kos migchk "V2 -> V3 GOCU DOGRULANDI" "$WORK/migchk" 5000
 derle tests/gates/factorychk.lpr factorychk && kos factorychk "FACTORY DOGRULANDI" "$WORK/factorychk"

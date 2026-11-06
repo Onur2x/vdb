@@ -5639,6 +5639,23 @@ procedure ParseLines(Lines: TStrings);
               FTables.AddOrSetValue(VDbNorm(parts[1]), tq);
             end;
           end;
+        end
+        // R2-D-YENI-2: #M = tablo | hex(SelectText). Tablo satiri bundan
+        // ONCE yazilir; burada tanim GUNCELLENIR. Eski semalarda #M yoktur.
+        else if (Length(s) > 2) and (CompareText(Copy(s, 1, 2), '#M') = 0) then
+        begin
+          parts.DelimitedText := s;
+          if parts.Count >= 3 then
+          begin
+            tq := Default(TTableDef);
+            if FTables.TryGetValue(VDbNorm(parts[1]), tq) then
+            begin
+              tq.IsMaterializedView := True;
+              tq.SelectText := HexFld(parts[2]);
+              tq.SelectStmt := nil;   // AST pointer kalici degil
+              FTables.AddOrSetValue(VDbNorm(parts[1]), tq);
+            end;
+          end;
         end;
         Continue;
       end;
@@ -6129,6 +6146,14 @@ begin
         sl.Add('#Q|' + kv.Value.Name + '|' + kv.Value.PartType + '|' +
           kv.Value.PartCol + '|' + s);
       end;
+      // R2-D-YENI-2: materialized view tanimi ayri '#M' satirinda yazilir
+      // (R-13 '#Q' ile ayni desen; eski semalarda bu satir yoktur ve MV
+      // zaten yoktu -> geriye uyumlu). Yazilmazsa yeniden acilista
+      // IsMaterializedView kaybolur, REFRESH 'materialized view yok'
+      // hatasi verir. SelectStmt (AST pointer) KALICI DEGILDIR; REFRESH
+      // zaten SelectText'i yeniden ayristirir.
+      if kv.Value.IsMaterializedView then
+        sl.Add('#M|' + kv.Value.Name + '|' + HexEncFld(kv.Value.SelectText));
     end;
     // ---- R-18: ROLES / GRANTS (ayri satirlar, '#R' ve '#G' oneki) ----
     // Tablo satirlari 8 alanli '|' ile ayrilir; RBAC satirlari farkli
@@ -12393,6 +12418,9 @@ procedure TVTableDb.DropMaterializedView(const ViewName: string; const IfExists:
 var
   v: TTableDef;
   i: Integer;
+  keys: TQWordArray;
+  raw: TValArray;
+  tid: Word;
   vals: TStrArray;
   pk: string;
 begin
@@ -12407,16 +12435,19 @@ begin
   // listede yok sayip "sema bozuldu" hatasÄ± verir ve TUM sema yazÄ±mÄ±
   // reddeder (DROP TABLE ile aynÄ± koruma yolu).
   IntentDrop(VDbNorm(ViewName));
-  i := 0;
-  while i < v.AutoInc do
+  // R2-D-YENI-2: sayac yerine tarama (bkz. ClearMaterializedView).
+  FKvB.ScanAll(keys, raw, v.TableId);
+  for i := 0 to High(keys) do
   begin
-    pk := '@mv' + IntToStr(i);
-    if ReadRow(VDbNorm(ViewName), pk, vals) then
+    if keys[i] = VDB_SCHEMA_KEY then Continue;
+    if DecodeRow(raw[i], tid, pk, vals) and (tid = v.TableId) then
       IdxDelRow(v, vals, pk, -1);
-    FKvB.Delete(VDbHashKey(v.Name, pk));
-    Inc(i);
+    FKvB.Delete(keys[i]);
   end;
   FTables.Remove(VDbNorm(ViewName));
+  FAutoInc.Remove(v.TableId);
+  if FBatchAutoIncValid and (FBatchAutoIncTid = v.TableId) then
+    FBatchAutoIncValid := False;
   MarkSchema;
 end;
 
@@ -12467,6 +12498,7 @@ var
   v: TTableDef;
   pk: string;
   n, d: Integer;
+  ai: Int64;
 begin
   if not FTables.TryGetValue(VDbNorm(ViewName), v) then Exit;
   // DIKKAT: EncodeRow T.Cols sayisina gore serer. Sema henuz kurulmadiysa
@@ -12484,8 +12516,13 @@ begin
     v.Cols[d].Def := '';
     v.Cols[d].Unique := False;
   end;
-  pk := '@mv' + IntToStr(v.AutoInc);
-  Inc(v.AutoInc);
+  // R2-D-YENI-2: sayac yalnizca kayit alanindan (v.AutoInc) okunmaz;
+  // sozluk ve batch onbellegi de dahil max alinir. Aksi halde ayni oturumda
+  // kayit alani bayat kalirsa var olan @mv anahtari EZILIR.
+  ai := AutoIncPersistOf(v);
+  pk := '@mv' + IntToStr(ai);
+  v.AutoInc := ai + 1;
+  BumpAutoInc(v, ai + 1);
   // AutoInc ONCE yazilir: PutRow asagida yeni kopyayi alip EncodeRow eder.
   FTables.AddOrSetValue(VDbNorm(ViewName), v);
   PutRow(FTables[VDbNorm(ViewName)], pk, StrVals);
@@ -12495,23 +12532,35 @@ procedure TVTableDb.ClearMaterializedView(const ViewName: string);
 // REFRESH/CREATE oncesi: eski satirlari KV'den GERCEKTEN sil.
 // DIKKAT: sadece IdxDelRow cagirmak yeterli DEGIL - KV kaydi kalir ve
 // "kayit cozulemedi (tablo=..., anahtar=...)" hatasi verir.
+//
+// R2-D-YENI-2: satirlar v.AutoInc sayacina GORE DEGIL, KV'de TableId ile
+// TARANARAK silinir. Sayac oturumlar arasi guvenilir degildir (kalici
+// yazilmazsa yeniden acilista 0 olur): o zaman eski satirlar silinmez,
+// yeni satirlar @mv0'dan baslayip eskilerin UZERINE yazar ve MV'de eski
+// + yeni karisik satirlar kalir (sessiz yanlis sorgu sonucu).
 var
   v: TTableDef;
+  keys: TQWordArray;
+  raw: TValArray;
   i: Integer;
+  tid: Word;
   vals: TStrArray;
   pk: string;
 begin
   if not FTables.TryGetValue(VDbNorm(ViewName), v) then Exit;
-  i := 0;
-  while i < v.AutoInc do
+  FKvB.ScanAll(keys, raw, v.TableId);
+  for i := 0 to High(keys) do
   begin
-    pk := '@mv' + IntToStr(i);
-    if ReadRow(VDbNorm(ViewName), pk, vals) then
-      IdxDelRow(v, vals, pk, -1);
-    FKvB.Delete(VDbHashKey(v.Name, pk));
-    Inc(i);
+    if keys[i] = VDB_SCHEMA_KEY then Continue;
+    if not DecodeRow(raw[i], tid, pk, vals) then Continue;
+    if tid <> v.TableId then Continue;
+    IdxDelRow(v, vals, pk, -1);
+    FKvB.Delete(keys[i]);
   end;
   v.AutoInc := 0;
+  FAutoInc.Remove(v.TableId);
+  if FBatchAutoIncValid and (FBatchAutoIncTid = v.TableId) then
+    FBatchAutoIncValid := False;
   FTables.AddOrSetValue(VDbNorm(ViewName), v);
   MarkSchema;
 end;
@@ -12520,18 +12569,33 @@ procedure TVTableDb.ResetMaterializedView(const ViewName: string);
 // REFRESH: satirlari + kolon semasini TEK AddOrSetValue ile sifirla.
 // DIKKAT: ClearMaterializedView + ayri SetLength iki ayri yazma demektir;
 // araya GetTable/LoadSchema girerse eski sema geri gelir.
+//
+// R2-D-YENI-2: ClearMaterializedView ile ayni gerekce - satirlar SAYACTAN
+// bagimsiz taranarak silinir. Yalnizca FKvB.Delete cagrilir (bu yol eski
+// davranisti); IdxDelRow gerekmez cunku MV'lerin dizini yoktur, ancak
+// kalinti kalmasin diye yine de denenir.
 var
   v: TTableDef;
+  keys: TQWordArray;
+  raw: TValArray;
   i: Integer;
+  tid: Word;
+  vals: TStrArray;
+  pk: string;
 begin
   if not FTables.TryGetValue(VDbNorm(ViewName), v) then Exit;
-  i := 0;
-  while i < v.AutoInc do
+  FKvB.ScanAll(keys, raw, v.TableId);
+  for i := 0 to High(keys) do
   begin
-    FKvB.Delete(VDbHashKey(v.Name, '@mv' + IntToStr(i)));
-    Inc(i);
+    if keys[i] = VDB_SCHEMA_KEY then Continue;
+    if DecodeRow(raw[i], tid, pk, vals) and (tid = v.TableId) then
+      IdxDelRow(v, vals, pk, -1);
+    FKvB.Delete(keys[i]);
   end;
   v.AutoInc := 0;
+  FAutoInc.Remove(v.TableId);
+  if FBatchAutoIncValid and (FBatchAutoIncTid = v.TableId) then
+    FBatchAutoIncValid := False;
   SetLength(v.Cols, 0);
   FTables.AddOrSetValue(VDbNorm(ViewName), v);
   MarkSchema;
