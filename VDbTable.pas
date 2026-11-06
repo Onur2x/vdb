@@ -287,6 +287,8 @@ type
     TableId: Word;
     IndexName: string;      // normallestirilmis (VDbNorm)
     Builder: TVdbConcIdxBuilder;
+    // R2-B-3: insayi baslatan oturum kimligi (0 = ham API/global).
+    OwnerSid: Cardinal;
   end;
 
   { v3.2: TVTableDb seviyesinde SAVEPOINT sema yedegi. Backend yalnizca
@@ -348,6 +350,21 @@ type
     // B-3: FIdxDirty.IndexOf(k) dogrusal taramasi yerine son eklenen anahtar
     // onbellegi. -1 = gecersiz. Liste elemani SILINDIGINDE/CLEAR'da sifirlanir.
     FLastDirtyIdx: Int64;
+    { B-02: indeks onbellegi kilitleri. KILIT SIRASI:
+      FLock -> FIdxBuildCs -> FEngCs -> FIdxCs (yaprak).
+      FIdxCs tutulurken FKvB / GetTable / ScanRows / FIdxBuildCs / FLock
+      ALINMAZ; yalnizca bellek ici sozluk/dizi islemleri yapilir.
+      FIdxBuildCs tembel indeks insasini seri kiler ve FIdxCs'ten ONCE
+      alinir; insa suresince tutulur, tarama FIdxCs YOKKEN yapilir. }
+    FIdxCs: TCriticalSection;
+    FIdxBuildCs: TCriticalSection;
+    { P-129: CONCURRENTLY kayit defteri (FConcBuilders) icin kisa kilit.
+      Iki paralel SELECT ayni anda PollConcurrentIndexes cagirabildigi
+      icin defter uzerinde serilestirme gerekir; aksi halde ayni kayit
+      iki thread'de finalize edilip COIFT serbest birakilabilir.
+      Kilit sirasinda EN DISTA yer alir (FConcCs -> FIdxCs); baska
+      hicbir yol tersten almaz. }
+    FConcCs: TCriticalSection;
     // R-22 Full: surmekte olan CONCURRENTLY insalari (kayit defteri).
     // Yalniz ANA thread erisir; is parcaciklari kendi dizileriyle ugrasir.
     FConcBuilders: TList<TVdbConcRec>;
@@ -427,6 +444,8 @@ type
   FCascadeDepth: Integer;
     FNextId: Word;
     FSnapActive: Boolean;          // batch basinda sema yedegi alindi mi
+    // R2-B-3: sema yedeginin sahibi oturum (0 = ham API/global).
+    FSnapOwner: Cardinal;
     FSnapTables: TDictionary<string, TTableDef>; // batch basindaki sema
     FSnapById: TDictionary<Word, string>;
     FSnapNextId: Word;
@@ -435,6 +454,8 @@ type
     { v3.2: SAVEPOINT sema yedekleri (en sona eklenir). Backend kendi KV
       gunlugunu tutar; burada yalnizca bellekteki sema katmani yedeklenir. }
     FSavepoints: TList<TVTableSavepoint>;
+    // R2-B-3: savepoint yigininin sahibi oturum (0 = ham API/global).
+    FSavepointsOwner: Cardinal;
     // F-35: kullanici tanimli fonksiyon/prosedur kataloglari.
     // DIKKAT: sema ile birlikte diske yazilmaz; oturum ici kayit.
     FFunctions: TDictionary<string, TFunctionDef>;
@@ -446,6 +467,10 @@ type
     // ertelenir; FDeferredRows ertelenen (tablo, satir) ciftlerini tutar.
     FDeferred: Boolean;
     FDeferredRows: TList<string>;
+    // R2-B-3: FDeferredRows ile PARALEL oturum kimligi listesi.
+    // Iki liste daima ayni uzunlukta tutulur; temizleme yalniz sahibi
+    // 0 (ham API) ya da cagiran oturum olan girdileri kaldirir.
+    FDeferredRowSids: TList<Cardinal>;
     // F-41: SELECT ... FOR UPDATE satir kilitleri. Anahtar = lower(tablo)#1+pk;
     // deger = kilidi tutan oturum kimligi. Kilitler tx sonunda birakilir.
     FRowLocks: TDictionary<string, Cardinal>;
@@ -518,6 +543,9 @@ type
     procedure CheckConstraints(const T: TTableDef; var Vals: TStrArray; const ExcludePk: string);
     function RefValueExists(const Rt: TTableDef; ColIdx: Integer; const V: string): Boolean;
     procedure CheckFk(const T: TTableDef; const Vals: TStrArray);
+    // R2-B-3: yalniz sahibi 0 ya da cagiran oturum olan ertelenen
+    // satirlari siler; baska oturumun girdileri korunur.
+    procedure ClearDeferredOwn;
     // ---------- R-11: DEFERRABLE CONSTRAINTS ----------
     // `SET CONSTRAINTS ALL DEFERRED` sonrasi FK denetimi COMMIT'e kadar
     // ertelenir; boylece cocuk satiri ebeveyninden ONCE eklenebilir.
@@ -608,7 +636,8 @@ type
     function FindIdxDefById(ATableId: Word; const AIndexName: string;
       out t: TTableDef; out IdxPos: Integer): Boolean;
     procedure StartConcBuild(const t: TTableDef; IdxPos: Integer);
-    procedure StopConcBuilders(const AIndexName: string = '');
+    procedure StopConcBuilders(const AIndexName: string = '';
+      AOwnOnly: Boolean = False);
     procedure BuildOneIndex(const T: TTableDef; IdxPos: Integer);
     function IdxColsOf(const T: TTableDef; IdxPos: Integer): TIntArray;
     // F2-11: IdxPos konumundaki indeks ColIdx kolonunu iceriyor mu?
@@ -5364,6 +5393,7 @@ begin
   FProcedures := TDictionary<string, TFunctionDef>.Create;
   FTriggers := TDictionary<string, TTriggerDef>.Create;
   FDeferredRows := TList<string>.Create;
+  FDeferredRowSids := TList<Cardinal>.Create;   // R2-B-3
   FDeferred := False;
   FRowLocks := TDictionary<string, Cardinal>.Create;   // F-41
   FRowLockCs := TCriticalSection.Create;
@@ -5377,30 +5407,39 @@ begin
   FIdxCtype := TDictionary<Int64, Byte>.Create;
   FIdxUniq := TDictionary<Int64, TDictionary<string, string>>.Create;
   FIdxDirty := TList<Int64>.Create;
+  FIdxCs := TCriticalSection.Create;        // B-02: yaprak kilit
+  FIdxBuildCs := TCriticalSection.Create;   // B-02: tembel insa kilidi
   FPkIdx := TDictionary<Word, TIdxEntries>.Create;
   FPkIdxDirty := TDictionary<Word, Boolean>.Create;
   FAutoInc := TDictionary<Word, Int64>.Create;   // P-17a
+  FConcCs := TCriticalSection.Create;           // P-129: conc defter kilidi
   FConcBuilders := TList<TVdbConcRec>.Create;   // R-22 Full
   FSchemaDirty := False;
   FNextId := 1;
   FSnapActive := False;
+  FSnapOwner := 0;      // R2-B-3
   FSnapTables := nil;
   FSnapById := nil;
   FSnapAutoInc := nil;   // P-17a
   FSnapNextId := 1;
   FSnapDirty := False;
   FSavepoints := TList<TVTableSavepoint>.Create;   // v3.2
+  FSavepointsOwner := 0;   // R2-B-3
   ResetBatchTableCache;
 end;
 
 destructor TVTableDb.Destroy;
 begin
   StopConcBuilders;   // R-22: surmekte olan insalar durdurulur (INVALID kalir)
+  // Yikimda sahiplik engeli uygulanmaz: kaynaklar her durumda serbest kalmali.
+  FSnapOwner := 0;
   ClearSchemaSnapshot;
+  FSavepointsOwner := 0;   // R2-B-3: yikimda engel uygulanmaz
   ClearSavepoints;    // v3.2
   FSavepoints.Free;
   FreeAllTriggers;   // F-36: govde AST'leri serbest birakilir
   FDeferredRows.Free;   // R-11
+  FDeferredRowSids.Free;   // R2-B-3
   FRowLocks.Free;       // F-41
   FRowLockCs.Free;
   FRoles.Free;          // R-18
@@ -5423,6 +5462,9 @@ begin
   FPkIdxDirty.Free;
   FAutoInc.Free;   // P-17a
   FConcBuilders.Free;   // R-22 Full
+  FConcCs.Free;         // P-129
+  FIdxCs.Free;          // B-02
+  FIdxBuildCs.Free;     // B-02
   FLock.Free;
   { 2026-10-25: MOTOR REFERANSI BIRAKILMALI. v3 backend dosyayi (bayt-araligi
     kilidiyle) acik tutar. Yalnizca `Be := nil` yetmez: TVTableDb de arayuzu
@@ -6365,12 +6407,18 @@ var
   kvI: TPair<Word, string>;
   kvA: TPair<Word, Int64>;   // P-17a
 begin
+  // R2-B-3: baska bir oturumun sema yedegi EZILMEZ. Bu oturumun DDL'i
+  // zaten RequireSoleTxn ile engellendigi icin mevcut yedegi korumak
+  // yeterlidir.
+  if FSnapActive and (FSnapOwner <> 0) and
+     (FSnapOwner <> VDbGetTxnSession) then Exit;
   ClearSchemaSnapshot;
   // P-64: onbellekteki sayac sozluge yazilsin ki yedek dogru degeri tasisin.
   // Aksi halde abort, onbellekteki artisi kaybetmis (bayat) bir sayaci
   // geri yukler ve IDENTITY PK cakismasi olusur.
   FlushAutoIncCache;
   FSnapActive := True;
+  FSnapOwner := VDbGetTxnSession;   // R2-B-3
   FSnapDirty := FSchemaDirty;
   FSnapNextId := FNextId;
   FSnapTables := TDictionary<string, TTableDef>.Create;
@@ -6393,6 +6441,8 @@ var
   kvA: TPair<Word, Int64>;   // P-17a
 begin
   if not FSnapActive then Exit;
+  // R2-B-3: yalniz yedegin sahibi oturum geri yukleyebilir.
+  if (FSnapOwner <> 0) and (FSnapOwner <> VDbGetTxnSession) then Exit;
   FTables.Clear;
   FById.Clear;
   for kvT in FSnapTables do
@@ -6416,7 +6466,10 @@ end;
 
 procedure TVTableDb.ClearSchemaSnapshot;
 begin
+  // R2-B-3: baska oturumun yedegini temizleme.
+  if (FSnapOwner <> 0) and (FSnapOwner <> VDbGetTxnSession) then Exit;
   FSnapActive := False;
+  FSnapOwner := 0;
   FreeAndNil(FSnapTables);
   FreeAndNil(FSnapById);
   FreeAndNil(FSnapAutoInc);   // P-17a
@@ -6452,6 +6505,10 @@ var
   sp: TVTableSavepoint;
 begin
   if FSavepoints = nil then Exit;
+  // R2-B-3: yigin baska bir oturuma aitse DOKUNMA. Bos yigin ya da
+  // sahibi 0 (ham API) / cagiran oturum ise temizlenir.
+  if (FSavepoints.Count > 0) and (FSavepointsOwner <> 0) and
+     (FSavepointsOwner <> VDbGetTxnSession) then Exit;
   for i := 0 to FSavepoints.Count - 1 do
   begin
     sp := FSavepoints[i];
@@ -6460,6 +6517,7 @@ begin
     sp.SnapAutoInc.Free;
   end;
   FSavepoints.Clear;
+  FSavepointsOwner := 0;
 end;
 
 { Index'ten itibaren (DAHIL) savepoint sema yedeklerini atar. }
@@ -6477,6 +6535,8 @@ begin
     sp.SnapAutoInc.Free;
     FSavepoints.Delete(i);
   end;
+  // R2-B-3: yigin bosaldiysa sahiplik de duser.
+  if FSavepoints.Count = 0 then FSavepointsOwner := 0;
 end;
 
 procedure TVTableDb.PushSchemaSavepoint(const Name: string);
@@ -6500,6 +6560,14 @@ begin
   sp.SnapAutoInc := TDictionary<Word, Int64>.Create;
   for kvA in FAutoInc do
     sp.SnapAutoInc.AddOrSetValue(kvA.Key, kvA.Value);
+  // R2-B-3: ilk savepoint'te sahip atanir; farkli sahipli yigina ekleme
+  // (RequireSoleTxn zaten engelliyor; bu ek savunma) acik hata verir.
+  if FSavepoints.Count = 0 then
+    FSavepointsOwner := VDbGetTxnSession
+  else if (FSavepointsOwner <> 0) and
+          (FSavepointsOwner <> VDbGetTxnSession) then
+    raise EVDbException.Create(ecLockConflict,
+      'SAVEPOINT: baska bir oturumun savepoint yigini var');
   FSavepoints.Add(sp);
 end;
 
@@ -6564,8 +6632,13 @@ begin
   { 3) Indeksler VERIDEN yeniden kurulur: geri alinan yazmalarin bekleyen
     indeks islemleri ve bellek dizileri artik veriyle uyusmaz. }
   RebuildIndexes;
-  for kvT in FTables do
-    FPkIdxDirty.AddOrSetValue(kvT.Value.TableId, True);
+  FIdxCs.Enter;
+  try
+    for kvT in FTables do
+      FPkIdxDirty.AddOrSetValue(kvT.Value.TableId, True);
+  finally
+    FIdxCs.Leave;
+  end;
 end;
 
 procedure TVTableDb.ReleaseSavepoint(const Name: string);
@@ -6603,7 +6676,7 @@ begin
   StopConcBuilders;
   ResetBatchTableCache;
   ClearSchemaSnapshot;
-  FDeferredRows.Clear;
+  ClearDeferredOwn;   // R2-B-3: baska oturumun girdileri korunur
   LoadSchema;
 end;
 
@@ -6624,7 +6697,12 @@ begin
   FPrefixCacheVal := 0;
   FOpenTDefValid := False;    // B-4
   FOpenTDefRawName := '';
-  FLastDirtyIdx := -1;        // B-3
+  FIdxCs.Enter;               // B-02: B-3 onbellegi de korunur
+  try
+    FLastDirtyIdx := -1;        // B-3
+  finally
+    FIdxCs.Leave;
+  end;
 end;
 
 procedure TVTableDb.ResetBatchSchemaCaches;
@@ -6690,14 +6768,17 @@ begin
   // olan CONCURRENTLY insalari da bu noktada iptal edilir (sonuctan
   // vazgec: indeks INVALID kalir). Bekleyen islemler islem isaretli
   // olmadigindan ayirt edilemez; iptal tek GUVENLI secenektir.
-  StopConcBuilders;
+  // R2-B-3: yalniz BU oturumun (ve sahibi 0 olan) insalari iptal edilir;
+  // baska oturumun CONCURRENTLY insasi korunur.
+  StopConcBuilders('', True);
   FKvB.AbortBatch;
   ClearSavepoints;   // v3.2
   // R-11: geri alinan islemde ertelenen satirlar da gecerlidir artik;
   // COMMIT'e kadar bekleyen liste TEMIZLENMEZSE sonraki gercek
   // COMMIT'te "satir kayboldu" hatasi verir (rollback edilmis bir
   // satiri denetlemeye calisir).
-  FDeferredRows.Clear;
+  // R2-B-3: yalniz kendi (ve sahibi 0) girdilerimiz silinir.
+  ClearDeferredOwn;
   RestoreSchemaSnapshot;
   for kv in FTables do
     for j := 0 to High(kv.Value.Idx) do
@@ -6765,6 +6846,7 @@ var
   ik: Int64;
   um: TDictionary<string, string>;
   sahip: string;
+  hasUniq: Boolean;   // B-02
 begin
   { B-5: bolme kolonu konumu satir basina degil, cagri basina bir kez
     cozulur. ONCEDEN her kolonda `T.PartType <> ''` ve
@@ -6813,9 +6895,18 @@ begin
     begin
       // hizli yol: deger -> sahip pk haritasi
       ik := IdxKey(T.TableId, i);
-      if FIdxUniq.TryGetValue(ik, um) then
+      // B-02: harita aramasi yaprak kilit altinda
+      FIdxCs.Enter;
+      try
+        hasUniq := FIdxUniq.TryGetValue(ik, um);
+        if hasUniq then
+          hasUniq := um.TryGetValue(Vals[i], sahip);
+      finally
+        FIdxCs.Leave;
+      end;
+      if hasUniq then
       begin
-        if um.TryGetValue(Vals[i], sahip) and (sahip <> ExcludePk) then
+        if sahip <> ExcludePk then
           raise EVDbException.Create(ecUniqueViolation, 'UNIQUE ihlali: ' + T.Cols[i].Name);
         Continue;
       end;
@@ -6828,9 +6919,17 @@ begin
           BuildOneIndex(T, k);
           Break;
         end;
-      if FIdxUniq.TryGetValue(ik, um) then
+      FIdxCs.Enter;   // B-02
+      try
+        hasUniq := FIdxUniq.TryGetValue(ik, um);
+        if hasUniq then
+          hasUniq := um.TryGetValue(Vals[i], sahip);
+      finally
+        FIdxCs.Leave;
+      end;
+      if hasUniq then
       begin
-        if um.TryGetValue(Vals[i], sahip) and (sahip <> ExcludePk) then
+        if sahip <> ExcludePk then
           raise EVDbException.Create(ecUniqueViolation, 'UNIQUE ihlali: ' + T.Cols[i].Name);
         Continue;
       end;
@@ -6867,9 +6966,17 @@ begin
         Continue;              // ifade hesaplanamadiysa bu kisit denetlenmez
       if ikey = '' then Continue;   // NULL sayilmaz
       ik := IdxKeyPos(T, i);
-      if FIdxUniq.TryGetValue(ik, um) then
+      FIdxCs.Enter;   // B-02
+      try
+        hasUniq := FIdxUniq.TryGetValue(ik, um);
+        if hasUniq then
+          hasUniq := um.TryGetValue(ikey, sahip);
+      finally
+        FIdxCs.Leave;
+      end;
+      if hasUniq then
       begin
-        if um.TryGetValue(ikey, sahip) and (sahip <> ExcludePk) then
+        if sahip <> ExcludePk then
           raise EVDbException.Create(ecUniqueViolation,
             'UNIQUE ihlali: ' + T.Idx[i].Name);
         Continue;
@@ -6877,9 +6984,17 @@ begin
       // harita henuz kurulmadiysa kur
       if not T.Idx[i].Invalid then   // R-22: concurrent insa kurulmaz
         BuildOneIndex(T, i);
-      if FIdxUniq.TryGetValue(ik, um) then
+      FIdxCs.Enter;   // B-02
+      try
+        hasUniq := FIdxUniq.TryGetValue(ik, um);
+        if hasUniq then
+          hasUniq := um.TryGetValue(ikey, sahip);
+      finally
+        FIdxCs.Leave;
+      end;
+      if hasUniq then
       begin
-        if um.TryGetValue(ikey, sahip) and (sahip <> ExcludePk) then
+        if sahip <> ExcludePk then
           raise EVDbException.Create(ecUniqueViolation,
             'UNIQUE ihlali: ' + T.Idx[i].Name);
         Continue;
@@ -7293,6 +7408,7 @@ var
   tbl, pk: string;
   saved: Boolean;
   dup: TStringList;
+  sid: Cardinal;
 begin
   { v3.4: liste GLOBAL. Baska bir oturum acikken bu listeyi denetlemek ve
     temizlemek o oturumun ertelenen satirlarini SESSIZCE kaybettirirdi;
@@ -7304,6 +7420,7 @@ begin
   if FDeferredRows.Count = 0 then Exit;
   saved := FDeferred;
   FDeferred := False;     // yeniden denetimde tekrar erteleme
+  sid := VDbGetTxnSession;   // R2-B-3
   dup := TStringList.Create;
   dup.Sorted := True;
   dup.Duplicates := dupIgnore;
@@ -7312,6 +7429,9 @@ begin
     // birkac kez yazilabilir, her seferinde denetmek gereksiz.
     for i := 0 to FDeferredRows.Count - 1 do
     begin
+      // R2-B-3: yalniz sahibi 0 (ham API) ya da bu oturum olan girdiler.
+      if (FDeferredRowSids[i] <> 0) and (FDeferredRowSids[i] <> sid) then
+        Continue;
       entry := FDeferredRows[i];
       sep := Pos(#1, entry);
       if sep <= 0 then Continue;
@@ -7334,8 +7454,8 @@ begin
     FDeferred := saved;
     // Denetim bitti (basari da hata da). Ihlal halinde liste
     // temizlenmezse, COMMIT reddedildikten sonra kullanici ayni
-    // hatayi tekrar alir.
-    FDeferredRows.Clear;
+    // hatayi tekrar alir. R2-B-3: yalniz kendi girdilerimiz silinir.
+    ClearDeferredOwn;
     dup.Free;
   end;
 end;
@@ -7364,6 +7484,7 @@ begin
         'tek yazma isleminde calisin veya SET CONSTRAINTS ... IMMEDIATE kullanin');
     pk := Vals[T.PkIndex];
     FDeferredRows.Add(T.Name + #1 + pk);
+    FDeferredRowSids.Add(VDbGetTxnSession);   // R2-B-3: paralel sahiplik
     Exit;
   end;
   for i := 0 to High(T.Fks) do
@@ -7391,6 +7512,24 @@ begin
       raise EVDbException.CreateFmt(ecForeignKeyViolation, 'FOREIGN KEY ihlali: %s.%s=%s kayitli degil',
         [T.Name, T.Cols[T.Fks[i].Col].Name, Vals[T.Fks[i].Col]]);
   end;
+end;
+
+procedure TVTableDb.ClearDeferredOwn;
+// R2-B-3: ertelenen FK listesinden yalniz sahibi 0 (ham API) ya da
+// cagiran oturum olan girdileri kaldirir. Iki liste her zaman paralel
+// kalir; baska oturumun girdileri korunur.
+var
+  i: Integer;
+  sid: Cardinal;
+begin
+  if FDeferredRows = nil then Exit;
+  sid := VDbGetTxnSession;
+  for i := FDeferredRows.Count - 1 downto 0 do
+    if (FDeferredRowSids[i] = 0) or (FDeferredRowSids[i] = sid) then
+    begin
+      FDeferredRows.Delete(i);
+      FDeferredRowSids.Delete(i);
+    end;
 end;
 
 procedure TVTableDb.PutRow(const T: TTableDef; const Pk: string;
@@ -8116,13 +8255,18 @@ function TVTableDb.HasIdxWork(const T: TTableDef): Boolean;
 // sayisini degistirir; FPkIdx'e yeni giris IndexScan'de eklenir ve orada
 // onbellek gecersiz kalinir (FHasIdxWorkTid := 0).
 begin
-  if (FHasIdxWorkTid <> T.TableId) or (FHasIdxWorkNIdx <> Length(T.Idx)) then
-  begin
-    FHasIdxWorkTid := T.TableId;
-    FHasIdxWorkNIdx := Length(T.Idx);
-    FHasIdxWork := (Length(T.Idx) > 0) or FPkIdx.ContainsKey(T.TableId);
+  FIdxCs.Enter;
+  try
+    if (FHasIdxWorkTid <> T.TableId) or (FHasIdxWorkNIdx <> Length(T.Idx)) then
+    begin
+      FHasIdxWorkTid := T.TableId;
+      FHasIdxWorkNIdx := Length(T.Idx);
+      FHasIdxWork := (Length(T.Idx) > 0) or FPkIdx.ContainsKey(T.TableId);
+    end;
+    Result := FHasIdxWork;
+  finally
+    FIdxCs.Leave;
   end;
-  Result := FHasIdxWork;
 end;
 
 procedure TVTableDb.AddDirty(const k: Int64);
@@ -8131,10 +8275,18 @@ procedure TVTableDb.AddDirty(const k: Int64);
 // gectigi icin "FLastDirtyIdx daima listede VAR olan bir anahtardir"
 // degismezi yapisal olarak korunur (tek girdilik onbellek yaniltilamaz).
 begin
-  if FLastDirtyIdx <> k then
-  begin
-    if FIdxDirty.IndexOf(k) < 0 then FIdxDirty.Add(k);
-    FLastDirtyIdx := k;
+  { B-02: ayni thread'de ic ice giris serbesttir (IdxAddRow FIdxCs
+    tutarken cagirir). "Yaprak" kurali BASKA kilitlerin alinmamasidir;
+    kendi kendine yeniden giris degildir. }
+  FIdxCs.Enter;
+  try
+    if FLastDirtyIdx <> k then
+    begin
+      if FIdxDirty.IndexOf(k) < 0 then FIdxDirty.Add(k);
+      FLastDirtyIdx := k;
+    end;
+  finally
+    FIdxCs.Leave;
   end;
 end;
 
@@ -8142,15 +8294,25 @@ procedure TVTableDb.RemoveDirty(const k: Int64);
 var
   i: Integer;
 begin
-  i := FIdxDirty.IndexOf(k);
-  if i >= 0 then FIdxDirty.Delete(i);
-  FLastDirtyIdx := -1;   // B-3: liste degisti
+  FIdxCs.Enter;
+  try
+    i := FIdxDirty.IndexOf(k);
+    if i >= 0 then FIdxDirty.Delete(i);
+    FLastDirtyIdx := -1;   // B-3: liste degisti
+  finally
+    FIdxCs.Leave;
+  end;
 end;
 
 procedure TVTableDb.ClearDirty;
 begin
-  FIdxDirty.Clear;
-  FLastDirtyIdx := -1;   // B-3: liste bosaldi
+  FIdxCs.Enter;
+  try
+    FIdxDirty.Clear;
+    FLastDirtyIdx := -1;   // B-3: liste bosaldi
+  finally
+    FIdxCs.Leave;
+  end;
 end;
 
 procedure TVTableDb.IdxAddRow(const T: TTableDef; const Vals: TStrArray;
@@ -8165,6 +8327,8 @@ var
   m: TDictionary<string, string>;
   key: string;
 begin
+  FIdxCs.Enter;   // B-02: yaprak kilit; FKvB/GetTable/ScanRows YOK
+  try
   // PK lazy index kirli isaretle (T.Idx'te PK yok, burada yakalanir)
   if FPkIdx.ContainsKey(T.TableId) then
     FPkIdxDirty.AddOrSetValue(T.TableId, True);
@@ -8205,6 +8369,9 @@ begin
     // (R2-B-4: ekl/sil/clear artik tek yardimcidan gecer).
     AddDirty(k);
   end;
+  finally
+    FIdxCs.Leave;
+  end;
 end;
 
 procedure TVTableDb.IdxDelRow(const T: TTableDef; const Vals: TStrArray;
@@ -8218,6 +8385,8 @@ var
   m: TDictionary<string, string>;
   key, s: string;
 begin
+  FIdxCs.Enter;   // B-02
+  try
   // PK lazy index kirli isaretle
   if FPkIdx.ContainsKey(T.TableId) then
     FPkIdxDirty.AddOrSetValue(T.TableId, True);
@@ -8248,6 +8417,9 @@ begin
       if m.TryGetValue(key, s) and (s = Pk) then m.Remove(key);
     AddDirty(k);
   end;
+  finally
+    FIdxCs.Leave;
+  end;
 end;
 
 procedure TVTableDb.IdxAdd(TableId: Word; ColIdx: Integer; const Key, Pk: string; Ctype: Byte);
@@ -8258,6 +8430,8 @@ var
   op: TIdxOp;
   m: TDictionary<string, string>;
 begin
+  FIdxCs.Enter;   // B-02
+  try
   k := IdxKey(TableId, ColIdx);
   if not FIdxOps.TryGetValue(k, l) then
   begin
@@ -8272,6 +8446,9 @@ begin
   // F3-5: bos anahtar haritaya yazilmaz (IdxAddRow ile ayni gerekce)
   if (Key <> '') and FIdxUniq.TryGetValue(k, m) then m.AddOrSetValue(Key, Pk);
   AddDirty(k);
+  finally
+    FIdxCs.Leave;
+  end;
 end;
 
 procedure TVTableDb.IdxDel(TableId: Word; ColIdx: Integer; const Key, Pk: string; Ctype: Byte);
@@ -8283,6 +8460,8 @@ var
   m: TDictionary<string, string>;
   s: string;
 begin
+  FIdxCs.Enter;   // B-02
+  try
   k := IdxKey(TableId, ColIdx);
   if not FIdxOps.TryGetValue(k, l) then
   begin
@@ -8297,6 +8476,9 @@ begin
   if FIdxUniq.TryGetValue(k, m) then
     if m.TryGetValue(Key, s) and (s = Pk) then m.Remove(Key);
   AddDirty(k);
+  finally
+    FIdxCs.Leave;
+  end;
 end;
 
 procedure TVTableDb.FreeIdxUniqMaps;
@@ -8304,9 +8486,14 @@ procedure TVTableDb.FreeIdxUniqMaps;
 var
   kv: TPair<Int64, TDictionary<string, string>>;
 begin
-  if FIdxUniq = nil then Exit;
-  for kv in FIdxUniq do kv.Value.Free;
-  FIdxUniq.Clear;
+  FIdxCs.Enter;   // B-02
+  try
+    if FIdxUniq = nil then Exit;
+    for kv in FIdxUniq do kv.Value.Free;
+    FIdxUniq.Clear;
+  finally
+    FIdxCs.Leave;
+  end;
 end;
 
 procedure TVTableDb.DropIdxPend(const k: Int64);
@@ -8322,6 +8509,8 @@ var
   um: TDictionary<string, string>;
   sk: TIdxSkip;
 begin
+  FIdxCs.Enter;   // B-02
+  try
   if FIdxOps.TryGetValue(k, l) then
   begin
     l.Free;
@@ -8339,6 +8528,9 @@ begin
     FIdxUniq.Remove(k);
   end;
   RemoveDirty(k);        // R2-B-4: tek silme noktasi
+  finally
+    FIdxCs.Leave;
+  end;
 end;
 
 procedure TVTableDb.BuildIdxEntries(const T: TTableDef; IdxPos: Integer;
@@ -8537,14 +8729,12 @@ begin
     SortIdxEntriesCols(e, ctypes)
   else
     SortIdxEntries(e, T.Cols[ci].Ctype);
-  FMemIdx.AddOrSetValue(k, e);
+  // B-02: yaprak kilit altinda uzun is yapilmaz. Skip listesi ve UNIQUE
+  // haritasi ONCE (FIdxCs disinda) kurulur; yalniz takas kisa tutulur.
   SetIdxSkipFromEntries(k, e);
-  if expr <> '' then
-    FIdxCtype.AddOrSetValue(k, keyCt)     // F-18
-  else
-    FIdxCtype.AddOrSetValue(k, T.Cols[ci].Ctype);
   // UNIQUE kolonlarda "deger -> sahip pk" haritasini kur
   // F-17: bos (=NULL) anahtar haritaya yazilmaz.
+  um := nil;
   if (pred = '') and
      ((expr <> '') and T.Idx[IdxPos].Uniq or
       (expr = '') and (ci >= 0) and T.Cols[ci].Unique) then
@@ -8553,7 +8743,19 @@ begin
     for i := 0 to High(e) do
       if e[i].Key <> '' then
         um.AddOrSetValue(e[i].Key, e[i].Pk);
+  end;
+  // B-02: sonuclar KISA sureligine FIdxCs altinda yazilir.
+  FIdxCs.Enter;
+  try
+  FMemIdx.AddOrSetValue(k, e);
+  if expr <> '' then
+    FIdxCtype.AddOrSetValue(k, keyCt)     // F-18
+  else
+    FIdxCtype.AddOrSetValue(k, T.Cols[ci].Ctype);
+  if um <> nil then
     FIdxUniq.AddOrSetValue(k, um);
+  finally
+    FIdxCs.Leave;
   end;
 end;
 
@@ -8609,26 +8811,32 @@ begin
     singleCt := keyCt;   // ifade indeksi (multi=True; kullanilmaz)
   rec.TableId := t.TableId;
   rec.IndexName := t.Idx[IdxPos].Name;
+  rec.OwnerSid := VDbGetTxnSession;   // R2-B-3
   rec.Builder := TVdbConcIdxBuilder.Create(Self, e, ctypes, singleCt, multi);
   FConcBuilders.Add(rec);
 end;
 
-procedure TVTableDb.StopConcBuilders(const AIndexName: string);
+procedure TVTableDb.StopConcBuilders(const AIndexName: string;
+  AOwnOnly: Boolean);
 // R-22 Full: surmekte olan insalari durdurur ve SONUCTAN VAZGECER:
 // indeks INVALID kalir (PostgreSQL'deki yarida kalan CONCURRENTLY insasi
 // gibi; DROP INDEX ile temizlenir ya da yeniden kurulur). AIndexName
-// bossa tumu durdurulur. Test kapisinin unutulmus olmasi sorun
-// degildir: kapi burada acilir.
+// bossa tumu durdurulur. R2-B-3: AOwnOnly=True ise yalniz cagiran
+// oturumun insalari; oturum kimligi 0 ise eski davranis (tumu).
+// Test kapisinin unutulmus olmasi sorun degildir: kapi burada acilir.
 var
   i: Integer;
   rec: TVdbConcRec;
+  sid: Cardinal;
 begin
   if FConcBuilders = nil then Exit;
+  sid := VDbGetTxnSession;
   GVdbConcGateClosed := False;   // test kancasi kapatilir (kilitlenme yok)
   for i := FConcBuilders.Count - 1 downto 0 do
   begin
     rec := FConcBuilders[i];
     if (AIndexName <> '') and (rec.IndexName <> AIndexName) then Continue;
+    if AOwnOnly and (sid <> 0) and (rec.OwnerSid <> sid) then Continue;
     rec.Builder.Terminate;
     rec.Builder.WaitFor;
     rec.Builder.Free;
@@ -8657,8 +8865,15 @@ var
   um: TDictionary<string, string>;
   sk2: TIdxSkip;
   a: TVDbSkipEntryArray;
+  ct: Byte;             // B-02
+  needFlush: Boolean;   // B-02
 begin
   if (FConcBuilders = nil) or (FConcBuilders.Count = 0) then Exit;
+  // P-129: iki paralel SELECT ayni anda buraya girebilir (her ikisi de
+  // FLock OKUMA altinda). Defteri ve finalize'i serilestir; aksi halde
+  // ayni kayit iki kez Free edilir.
+  FConcCs.Enter;
+  try
   if AForce then GVdbConcGateClosed := False;   // kilitlenme yok
   i := 0;
   while i < FConcBuilders.Count do
@@ -8672,34 +8887,59 @@ begin
     begin
       k := IdxKeyPos(t, pos);
       ci := t.Idx[pos].Col;
+      // B-02: yaprak kilit altinda uzun is yapilmaz. Onbellek yazimlari
+      // KISA FIdxCs bolgelerinde; skip insasi, catch-up flush ve UNIQUE
+      // haritasi kilit DISINDA kalir.
       // 1) siralanmis anlik goruntu girdileri
-      FMemIdx.AddOrSetValue(k, rec.Builder.Entries);
       if t.Idx[pos].ExprText <> '' then
-        FIdxCtype.AddOrSetValue(k, IdxCtypeOfPos(t, pos))
+        ct := IdxCtypeOfPos(t, pos)
       else
-        FIdxCtype.AddOrSetValue(k, t.Cols[ci].Ctype);
+        ct := t.Cols[ci].Ctype;
+      FIdxCs.Enter;
+      try
+        FMemIdx.AddOrSetValue(k, rec.Builder.Entries);
+        FIdxCtype.AddOrSetValue(k, ct);
+        needFlush := FIdxDirty.IndexOf(k) >= 0;
+      finally
+        FIdxCs.Leave;
+      end;
       SetIdxSkipFromEntries(k, rec.Builder.Entries);
       // 2) CATCH-UP: insa penceresindeki yazmalar
-      if FIdxDirty.IndexOf(k) >= 0 then
+      if needFlush then
         FlushIdxPending(k);
       // 3) UNIQUE haritasi (BuildOneIndex ile ayni kural)
       if (t.Idx[pos].Predicate = '') and
          ((t.Idx[pos].ExprText <> '') and t.Idx[pos].Uniq or
           (t.Idx[pos].ExprText = '') and (ci >= 0) and t.Cols[ci].Unique) then
       begin
+        SetLength(a, 0);
+        FIdxCs.Enter;
+        try
+          if FSkipIdx.TryGetValue(k, sk2) then
+            sk2.List.All(a)          // hizli bellek ici kopya
+          else if FMemIdx.TryGetValue(k, e) then
+          begin
+            SetLength(a, Length(e));
+            for m := 0 to High(e) do
+            begin
+              a[m].Value := e[m].Pk;
+              a[m].Key := e[m].Key;
+              a[m].Cov := e[m].Cov;
+            end;
+          end;
+        finally
+          FIdxCs.Leave;
+        end;
         um := TDictionary<string, string>.Create;
-        if FSkipIdx.TryGetValue(k, sk2) then
-        begin
-          sk2.List.All(a);
-          for m := 0 to High(a) do
-            if a[m].Key <> '' then
-              um.AddOrSetValue(a[m].Key, a[m].Value);
-        end
-        else if FMemIdx.TryGetValue(k, e) then
-          for m := 0 to High(e) do
-            if e[m].Key <> '' then
-              um.AddOrSetValue(e[m].Key, e[m].Pk);
-        FIdxUniq.AddOrSetValue(k, um);
+        for m := 0 to High(a) do
+          if a[m].Key <> '' then
+            um.AddOrSetValue(a[m].Key, a[m].Value);
+        FIdxCs.Enter;
+        try
+          FIdxUniq.AddOrSetValue(k, um);
+        finally
+          FIdxCs.Leave;
+        end;
       end;
       // 4) gecerlilik + kalicilik
       t.Idx[pos].Invalid := False;
@@ -8708,6 +8948,9 @@ begin
     end;
     rec.Builder.Free;
     FConcBuilders.Delete(i);
+  end;
+  finally
+    FConcCs.Leave;
   end;
 end;
 
@@ -8910,6 +9153,8 @@ var
   nm: string;
   t: TTableDef;
   sk: TIdxSkip;
+  hasMem: Boolean;
+  needFlush: Boolean;   // B-02
 begin
   Result := -1;   // -1 = indeks bellekte degil / yok
   if not FById.TryGetValue(TableId, nm) then Exit;
@@ -8919,19 +9164,55 @@ begin
   // okunmaz, kurulmaz, bekleyen islemleri FLUSH EDILMEZ: -1 doner.
   if t.Idx[IdxPos].Invalid then Exit;
   k := IdxKeyPos(t, IdxPos);
-  if FIdxDirty.IndexOf(k) >= 0 then
+  // B-02 Faz A: kisa onbellek kontrolu (yaprak kilit). Flush FIdxCs
+  // DISINDA: FlushIdxPending skip insasinda GetTable cagirabilir.
+  FIdxCs.Enter;
+  try
+    needFlush := FIdxDirty.IndexOf(k) >= 0;
+  finally
+    FIdxCs.Leave;
+  end;
+  if needFlush then
     FlushIdxPending(k);
-  if FSkipIdx.TryGetValue(k, sk) then
-  begin
-    Result := sk.List.Count;
-    Exit;
+  FIdxCs.Enter;
+  try
+    if FSkipIdx.TryGetValue(k, sk) then
+    begin
+      Result := sk.List.Count;
+      Exit;
+    end;
+    hasMem := FMemIdx.ContainsKey(k);
+  finally
+    FIdxCs.Leave;
   end;
   // Indeksler TENBEL kurulur; "kac kayit var" sorusu bunu yine de
   // yanitlayabilmelidir, yoksa SHOW INDEXES ilk acikta -1 gosterirdi.
-  if not FMemIdx.ContainsKey(k) then
-    BuildOneIndex(t, IdxPos);
-  if not FMemIdx.TryGetValue(k, e) then Exit;
-  Result := Length(e);
+  if not hasMem then
+  begin
+    FIdxBuildCs.Enter;   // B-02: tembel insayi seri kil
+    try
+      FIdxCs.Enter;
+      try
+        needFlush := FIdxDirty.IndexOf(k) >= 0;
+        hasMem := FMemIdx.ContainsKey(k);
+      finally
+        FIdxCs.Leave;
+      end;
+      if needFlush then
+        FlushIdxPending(k);
+      if not hasMem then
+        BuildOneIndex(t, IdxPos);   // FIdxCs YOK: tarama yapar
+    finally
+      FIdxBuildCs.Leave;
+    end;
+  end;
+  FIdxCs.Enter;
+  try
+    if not FMemIdx.TryGetValue(k, e) then Exit;
+    Result := Length(e);
+  finally
+    FIdxCs.Leave;
+  end;
 end;
 
 function TVTableDb.IdxColsOfPosTable(TableId: Word; IdxPos: Integer): TIntArray;
@@ -9016,9 +9297,14 @@ begin
   // R-22: tum indeksler veriden yeniden kurulacagi icin surmekte olan
   // CONCURRENTLY insalari iptal edilir (INVALID kalirlar).
   StopConcBuilders;
-  FMemIdx.Clear;
-  FreeIdxSkips;
-  FreeIdxPend;
+  FIdxCs.Enter;   // B-02: kisa temizlik; insa kilit DISINDA
+  try
+    FMemIdx.Clear;
+    FreeIdxSkips;
+    FreeIdxPend;
+  finally
+    FIdxCs.Leave;
+  end;
   for kv in FTables do
     for j := 0 to High(kv.Value.Idx) do
       if not kv.Value.Idx[j].Invalid then   // R-22: INVALID kurulmaz
@@ -9416,6 +9702,8 @@ begin
   if j >= 0 then
   begin
     // F2-11: bekleyen indeks islemlerini de at
+    FIdxCs.Enter;   // B-02
+    try
     for i := 0 to High(nt.Idx) do
       if IdxHasCol(nt, i, ci) then
       begin
@@ -9427,6 +9715,9 @@ begin
           FSkipIdx.Remove(IdxKey(t.TableId, nt.Idx[i].Col));
         end;
       end;
+    finally
+      FIdxCs.Leave;
+    end;
     for i := j to High(nt.Idx) - 1 do nt.Idx[i] := nt.Idx[i + 1];
     SetLength(nt.Idx, Length(nt.Idx) - 1);
     for i := 0 to High(nt.Idx) do
@@ -9748,6 +10039,8 @@ var
   k: Int64;
   l: TList<TIdxOp>;
 begin
+  FIdxCs.Enter;   // B-02
+  try
   if FIdxDirty = nil then Exit;
   for i := 0 to FIdxDirty.Count - 1 do
   begin
@@ -9762,6 +10055,9 @@ begin
   FIdxCtype.Clear;
   FreeIdxUniqMaps;
   ClearDirty;            // R2-B-4: tek temizleme noktasi
+  finally
+    FIdxCs.Leave;
+  end;
 end;
 
 // Satir Pk'sini tek dize anahtarina cevirir (tampon ici; diskte tutulmaz).
@@ -9892,8 +10188,12 @@ var
   oldKey: string;
   op: TIdxOp;
   p: TPair<string, TIdxOp>;
+  needSkip: Boolean;
+  cur: TList<TIdxOp>;   // B-02: paralel okur yarisini saptar
 
 begin
+  FIdxCs.Enter;   // B-02
+  try
   if not FIdxOps.TryGetValue(k, ops) then Exit;
   if ops.Count = 0 then
   begin
@@ -9916,9 +10216,23 @@ begin
 
   // H3: kanonik indeks skiplist ise bekleyen islemleri O(log N) uygula.
   // Siralanmis dizi guncellenmez; FMemIdx yalnizca cold okuma cache'i olarak
-  // gecersiz kilinir.
-  if (not FSkipIdx.ContainsKey(k)) and FMemIdx.TryGetValue(k, e) then
+  // gecersiz kilinir. (Skip insasi FIdxCs DISINDA yapilir: GetTable cagirir.)
+  needSkip := (not FSkipIdx.ContainsKey(k)) and FMemIdx.TryGetValue(k, e);
+  finally
+    FIdxCs.Leave;
+  end;
+  if needSkip then
     SetIdxSkipFromEntries(k, e);
+  FIdxCs.Enter;   // B-02
+  try
+  // Arada baska bir okur ayni listeyi uygulayip serbest biraktiysa
+  // (kilit birakildigi icin mumkun) yerel yapilarla yetin.
+  if not (FIdxOps.TryGetValue(k, cur) and (cur = ops)) then
+  begin
+    lastOp.Free;
+    oldKeys.Free;
+    Exit;
+  end;
   if FSkipIdx.TryGetValue(k, sk) then
   begin
     for p in lastOp do
@@ -9945,37 +10259,57 @@ begin
   ops.Free;
   FIdxOps.Remove(k);
   RemoveDirty(k);        // R2-B-4: tek silme noktasi
-  Exit;
+  finally
+    FIdxCs.Leave;
+  end;
 end;
 
 procedure TVTableDb.FreeIdxSkips;
 var
   kv: TPair<Int64, TIdxSkip>;
 begin
-  if FSkipIdx = nil then Exit;
-  for kv in FSkipIdx do kv.Value.Free;
-  FSkipIdx.Clear;
+  FIdxCs.Enter;   // B-02
+  try
+    if FSkipIdx = nil then Exit;
+    for kv in FSkipIdx do kv.Value.Free;
+    FSkipIdx.Clear;
+  finally
+    FIdxCs.Leave;
+  end;
 end;
 
 procedure TVTableDb.SetIdxSkipFromEntries(const k: Int64; const E: TIdxEntries);
 var
-  sk: TIdxSkip;
+  sk, old: TIdxSkip;
   ct: Byte;
   cts: TByteArray;
 begin
+  // B-02: IdxCtypesByKey -> GetTable cagirir; FIdxCs TUTULMADAN hesaplanir.
   cts := IdxCtypesByKey(k);
-  if Length(cts) = 0 then
-  begin
-    if not FIdxCtype.TryGetValue(k, ct) then ct := VCT_STR;
-    SetLength(cts, 1);
-    cts[0] := ct;
-  end
-  else if not FIdxCtype.TryGetValue(k, ct) then
-    ct := cts[0];
-  if FSkipIdx.TryGetValue(k, sk) then sk.Free;
+  FIdxCs.Enter;
+  try
+    if Length(cts) = 0 then
+    begin
+      if not FIdxCtype.TryGetValue(k, ct) then ct := VCT_STR;
+      SetLength(cts, 1);
+      cts[0] := ct;
+    end
+    else if not FIdxCtype.TryGetValue(k, ct) then
+      ct := cts[0];
+  finally
+    FIdxCs.Leave;
+  end;
+  // Skip listesi insasi (siralama) FIdxCs DISINDA yapilir: yaprak kilit
+  // altinda uzun is yapilmaz. Sonuc kisa sureligine takas edilir.
   sk := TIdxSkip.Create(ct, cts);
   sk.LoadFromEntries(E);
-  FSkipIdx.AddOrSetValue(k, sk);
+  FIdxCs.Enter;   // B-02
+  try
+    if FSkipIdx.TryGetValue(k, old) then old.Free;
+    FSkipIdx.AddOrSetValue(k, sk);
+  finally
+    FIdxCs.Leave;
+  end;
 end;
 
 function TVTableDb.IdxSourceReady(TableId: Word; ColIdx: Integer): Boolean;
@@ -9983,8 +10317,13 @@ var
   k: Int64;
 begin
   k := IdxKey(TableId, ColIdx);
-  Result := FMemIdx.ContainsKey(k) or FSkipIdx.ContainsKey(k) or
-            (FIdxDirty.IndexOf(k) >= 0);
+  FIdxCs.Enter;   // B-02
+  try
+    Result := FMemIdx.ContainsKey(k) or FSkipIdx.ContainsKey(k) or
+              (FIdxDirty.IndexOf(k) >= 0);
+  finally
+    FIdxCs.Leave;
+  end;
 end;
 
 function TVTableDb.TryGetIdxSource(TableId: Word; ColIdx: Integer;
@@ -9996,6 +10335,7 @@ var
   j: Integer;
   e: TIdxEntries;
   sk: TIdxSkip;
+  needFlush, hasSkip, hasMem, hasCt: Boolean;   // B-02
 begin
   Result := False;
   Src.Skip := nil;
@@ -10009,27 +10349,90 @@ begin
          (t.Idx[j].ExprText = '') and t.Idx[j].Invalid then
         Exit(False);
   end;
-  if FIdxDirty.IndexOf(k) >= 0 then
+  // B-02: asama A - kisa kontrol FIdxCs altinda, bekleyenlerin flush'i
+  // (GetTable/FKvB cagirabilir) FIdxCs DISINDA.
+  needFlush := False;
+  FIdxCs.Enter;
+  try
+    if FIdxDirty.IndexOf(k) >= 0 then
+      needFlush := True;
+  finally
+    FIdxCs.Leave;
+  end;
+  if needFlush then
     FlushIdxPending(k);
-  if not FSkipIdx.ContainsKey(k) then
+
+  hasSkip := False;
+  hasMem := False;
+  FIdxCs.Enter;
+  try
+    hasSkip := FSkipIdx.TryGetValue(k, sk);
+    if not hasSkip then
+      hasMem := FMemIdx.TryGetValue(k, e);
+  finally
+    FIdxCs.Leave;
+  end;
+  if (not hasSkip) and hasMem then
   begin
-    if FMemIdx.TryGetValue(k, e) then
-      SetIdxSkipFromEntries(k, e)
-    else if FById.TryGetValue(TableId, nm) then
-    begin
-      t := GetTable(nm);
-      for j := 0 to High(t.Idx) do
-        if (t.Idx[j].Col = ColIdx) and not t.Idx[j].Invalid then
-        begin
-          BuildOneIndex(t, j);
-          if FMemIdx.TryGetValue(k, e) then
-            SetIdxSkipFromEntries(k, e);
-          Break;
-        end;
+    SetIdxSkipFromEntries(k, e);   // FIdxCs disinda (siralama)
+    FIdxCs.Enter;
+    try
+      hasSkip := FSkipIdx.TryGetValue(k, sk);
+    finally
+      FIdxCs.Leave;
     end;
   end;
-  if FSkipIdx.TryGetValue(k, sk) then
+
+  // B-02: asama B - tembel insa seri kilitle (FIdxBuildCs) yapilir.
+  // Insa FIdxCs TUTULMADAN calisir; FIdxBuildCs -> FIdxCs sirasi korunur.
+  if not hasSkip then
   begin
+    FIdxBuildCs.Enter;
+    try
+      FIdxCs.Enter;
+      try
+        hasSkip := FSkipIdx.TryGetValue(k, sk);
+        if (not hasSkip) and FMemIdx.TryGetValue(k, e) then
+          hasMem := True;
+      finally
+        FIdxCs.Leave;
+      end;
+      if (not hasSkip) and hasMem then
+      begin
+        SetIdxSkipFromEntries(k, e);
+        FIdxCs.Enter;
+        try
+          hasSkip := FSkipIdx.TryGetValue(k, sk);
+        finally
+          FIdxCs.Leave;
+        end;
+      end;
+      if (not hasSkip) and FById.TryGetValue(TableId, nm) then
+      begin
+        t := GetTable(nm);
+        for j := 0 to High(t.Idx) do
+          if (t.Idx[j].Col = ColIdx) and not t.Idx[j].Invalid then
+          begin
+            BuildOneIndex(t, j);
+            Break;
+          end;
+      end;
+      FIdxCs.Enter;
+      try
+        hasSkip := FSkipIdx.TryGetValue(k, sk);
+      finally
+        FIdxCs.Leave;
+      end;
+    finally
+      FIdxBuildCs.Leave;
+    end;
+  end;
+
+  if hasSkip then
+  begin
+    // NOT (B-02): Src.Skip isaretcisi kilit BIRAKTIKTAN sonra da yineleme
+    // icin kullanilir. Bu sozlesme korunur: skip listesine mutasyon yalniz
+    // FLock YAZMA kilidi altinda yapilir; okuyucular okuma kilidi tutar.
     Src.Skip := sk;
     Src.Ctype := sk.Cmp.Ctype;
     Src.NParts := IdxNPartsByKey(k);
@@ -10039,7 +10442,13 @@ begin
   if TryGetMemIndex(TableId, ColIdx, e) then
   begin
     Src.Arr := e;
-    if not FIdxCtype.TryGetValue(k, Src.Ctype) then
+    FIdxCs.Enter;
+    try
+      hasCt := FIdxCtype.TryGetValue(k, Src.Ctype);
+    finally
+      FIdxCs.Leave;
+    end;
+    if not hasCt then
     begin
       // PK indeksi T.Idx listesinde degildir; bu yuzden FIdxCtype'ta
       // kaydi yoktur. Varsayilan VCT_STR yanlistir: INTEGER PK'da
@@ -10075,6 +10484,7 @@ var
   t: TTableDef;
   j: Integer;
   dirty: Boolean;
+  needFlush, hasMem, hasSkip: Boolean;   // B-02
   sk: TIdxSkip;
   a: TVDbSkipEntryArray;
 begin
@@ -10092,35 +10502,102 @@ begin
         Exit(False);
   end;
   k := IdxKey(TableId, ColIdx);
-  if FIdxDirty.IndexOf(k) >= 0 then
+  // B-02: asama A - kisa kontrol FIdxCs altinda; flush (GetTable/FKvB)
+  // FIdxCs DISINDA.
+  FIdxCs.Enter;
+  try
+    needFlush := FIdxDirty.IndexOf(k) >= 0;
+  finally
+    FIdxCs.Leave;
+  end;
+  if needFlush then
     FlushIdxPending(k);
-  if not FMemIdx.ContainsKey(k) then
+
+  hasMem := False;
+  hasSkip := False;
+  FIdxCs.Enter;
+  try
+    hasMem := FMemIdx.TryGetValue(k, Entries);
+    if not hasMem then
+      hasSkip := FSkipIdx.TryGetValue(k, sk);
+  finally
+    FIdxCs.Leave;
+  end;
+  if (not hasMem) and hasSkip then
   begin
-    if FSkipIdx.TryGetValue(k, sk) then
+    // H3: dizi yalnizca cold okuma icin skiplist'ten malzeme edilir.
+    // Malzeme etme (uzun is) FIdxCs DISINDA yapilir.
+    sk.List.All(a);
+    SetLength(Entries, Length(a));
+    for j := 0 to High(a) do
     begin
-      // H3: dizi yalnizca cold okuma icin skiplist'ten malzeme edilir.
-      sk.List.All(a);
-      SetLength(Entries, Length(a));
-      for j := 0 to High(a) do
-      begin
-        Entries[j].Key := a[j].Key;
-        Entries[j].Pk := a[j].Value;
-        Entries[j].Cov := a[j].Cov;
-      end;
+      Entries[j].Key := a[j].Key;
+      Entries[j].Pk := a[j].Value;
+      Entries[j].Cov := a[j].Cov;
+    end;
+    FIdxCs.Enter;
+    try
       FMemIdx.AddOrSetValue(k, Entries);
-    end
-    else if FById.TryGetValue(TableId, nm) then
-    begin
-      t := GetTable(nm);
-      for j := 0 to High(t.Idx) do
-        if (t.Idx[j].Col = ColIdx) and not t.Idx[j].Invalid then   // R-22
-        begin
-          BuildOneIndex(t, j);
-          Break;
-        end;
+    finally
+      FIdxCs.Leave;
+    end;
+    hasMem := True;
+  end;
+  if not hasMem then
+  begin
+    // B-02: asama B - tembel insa seri kilitle; tarama FIdxCs YOKKEN.
+    FIdxBuildCs.Enter;
+    try
+      FIdxCs.Enter;
+      try
+        hasMem := FMemIdx.TryGetValue(k, Entries);
+        if not hasMem then
+          hasSkip := FSkipIdx.TryGetValue(k, sk);
+      finally
+        FIdxCs.Leave;
+      end;
+      if (not hasMem) and (not hasSkip) and FById.TryGetValue(TableId, nm) then
+      begin
+        t := GetTable(nm);
+        for j := 0 to High(t.Idx) do
+          if (t.Idx[j].Col = ColIdx) and not t.Idx[j].Invalid then   // R-22
+          begin
+            BuildOneIndex(t, j);
+            Break;
+          end;
+      end;
+      FIdxCs.Enter;
+      try
+        if not hasMem then
+          hasMem := FMemIdx.TryGetValue(k, Entries);
+      finally
+        FIdxCs.Leave;
+      end;
+    finally
+      FIdxBuildCs.Leave;
     end;
   end;
-  Result := FMemIdx.TryGetValue(k, Entries);
+  // B-02: bu arada baska bir okur skip listesi kurup dizi onbellegini
+  // gecersiz kilmis olabilir; skiplist'ten malzeme et.
+  if (not hasMem) and hasSkip then
+  begin
+    sk.List.All(a);
+    SetLength(Entries, Length(a));
+    for j := 0 to High(a) do
+    begin
+      Entries[j].Key := a[j].Key;
+      Entries[j].Pk := a[j].Value;
+      Entries[j].Cov := a[j].Cov;
+    end;
+    FIdxCs.Enter;
+    try
+      FMemIdx.AddOrSetValue(k, Entries);
+    finally
+      FIdxCs.Leave;
+    end;
+    hasMem := True;
+  end;
+  Result := hasMem;
   // PK lazy index: T.Idx'te PK icin normal indeks YOKSA ve bu kolon
   // PK kolonuysa, ayri bir sirali diziden cevapla. Boylece BETWEEN/
   // ORDER BY range query'leri Seq Scan yerine Index Scan yapar.
@@ -10130,15 +10607,44 @@ begin
     t := GetTable(nm);
     if (t.PkIndex >= 0) and (ColIdx = t.PkIndex) then
     begin
-      dirty := True;
-      FPkIdxDirty.TryGetValue(TableId, dirty);
-      if (not FPkIdx.TryGetValue(TableId, Entries)) or dirty then
+      // B-02: asama A
+      FIdxCs.Enter;
+      try
+        dirty := True;
+        FPkIdxDirty.TryGetValue(TableId, dirty);
+        hasMem := FPkIdx.TryGetValue(TableId, Entries);
+      finally
+        FIdxCs.Leave;
+      end;
+      if (not hasMem) or dirty then
       begin
-        BuildPkIdx(t, Entries);
-        FPkIdx.AddOrSetValue(TableId, Entries);
-        FPkIdxDirty.AddOrSetValue(TableId, False);
-        // P-65: HasIdxWork onbellegi artik bu tabloda IdxAddRow gerektirir.
-        FHasIdxWorkTid := 0;
+        // B-02: asama B - BuildPkIdx (tarama) FIdxCs YOKKEN.
+        FIdxBuildCs.Enter;
+        try
+          FIdxCs.Enter;
+          try
+            dirty := True;
+            FPkIdxDirty.TryGetValue(TableId, dirty);
+            hasMem := FPkIdx.TryGetValue(TableId, Entries);
+          finally
+            FIdxCs.Leave;
+          end;
+          if (not hasMem) or dirty then
+          begin
+            BuildPkIdx(t, Entries);
+            FIdxCs.Enter;
+            try
+              FPkIdx.AddOrSetValue(TableId, Entries);
+              FPkIdxDirty.AddOrSetValue(TableId, False);
+              // P-65: HasIdxWork onbellegi artik bu tabloda IdxAddRow gerektirir.
+              FHasIdxWorkTid := 0;
+            finally
+              FIdxCs.Leave;
+            end;
+          end;
+        finally
+          FIdxBuildCs.Leave;
+        end;
       end;
       Result := True;
     end;
@@ -10311,13 +10817,18 @@ begin
         t := kv.Value;
         // indeks hem bellekten hem de tampondan KALDIRILIR
         DropIdxPend(IdxKeyPos(t, j));   // F-17: partial indeks anahtari
-        FMemIdx.Remove(IdxKeyPos(t, j));
-        if FSkipIdx.ContainsKey(IdxKeyPos(t, j)) then
-        begin
-          FSkipIdx[IdxKeyPos(t, j)].Free;
-          FSkipIdx.Remove(IdxKeyPos(t, j));
+        FIdxCs.Enter;   // B-02
+        try
+          FMemIdx.Remove(IdxKeyPos(t, j));
+          if FSkipIdx.ContainsKey(IdxKeyPos(t, j)) then
+          begin
+            FSkipIdx[IdxKeyPos(t, j)].Free;
+            FSkipIdx.Remove(IdxKeyPos(t, j));
+          end;
+          FIdxCtype.Remove(IdxKeyPos(t, j));
+        finally
+          FIdxCs.Leave;
         end;
-        FIdxCtype.Remove(IdxKeyPos(t, j));
         for m := j to High(t.Idx) - 1 do
           t.Idx[m] := t.Idx[m + 1];
         SetLength(t.Idx, Length(t.Idx) - 1);
@@ -10643,14 +11154,19 @@ begin
   if FBatchAutoIncValid and (FBatchAutoIncTid = t.TableId) then
     FBatchAutoIncValid := False;
   FById.Remove(t.TableId);
-  for j := 0 to High(t.Idx) do
-  begin
-    FMemIdx.Remove(IdxKey(t.TableId, t.Idx[j].Col));
-    if FSkipIdx.ContainsKey(IdxKey(t.TableId, t.Idx[j].Col)) then
+  FIdxCs.Enter;   // B-02
+  try
+    for j := 0 to High(t.Idx) do
     begin
-      FSkipIdx[IdxKey(t.TableId, t.Idx[j].Col)].Free;
-      FSkipIdx.Remove(IdxKey(t.TableId, t.Idx[j].Col));
+      FMemIdx.Remove(IdxKey(t.TableId, t.Idx[j].Col));
+      if FSkipIdx.ContainsKey(IdxKey(t.TableId, t.Idx[j].Col)) then
+      begin
+        FSkipIdx[IdxKey(t.TableId, t.Idx[j].Col)].Free;
+        FSkipIdx.Remove(IdxKey(t.TableId, t.Idx[j].Col));
+      end;
     end;
+  finally
+    FIdxCs.Leave;
   end;
   // F2-6: Artik var olmayan tabloya isaret eden FK TANIMLARINI cocuk
   // tablolardan kaldir. Aksi halde cocukta sonraki INSERT'ler FK
@@ -10810,7 +11326,12 @@ begin
       FBatchHashPrefix := prefix;
       FPrefixCacheName := tp^.Name;   // P-56: batch disi sonraki INSERT'ler icin
       FPrefixCacheVal := prefix;
-      FBatchHasPkIdx := FPkIdx.ContainsKey(FBatchTableDef.TableId);
+      FIdxCs.Enter;   // B-02
+      try
+        FBatchHasPkIdx := FPkIdx.ContainsKey(FBatchTableDef.TableId);
+      finally
+        FIdxCs.Leave;
+      end;
       // P-67: identity/generated tarama onbellegi — tablo kurulurken bir kez.
       FBatchHasIdentity := False;
       FBatchHasGenerated := False;

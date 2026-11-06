@@ -1179,6 +1179,10 @@ var
   i: Integer;
 begin
   { v3.4: kapanista yarim islemler YAZILMAZ; acik yazma kumeleri atilir. }
+  { R2-B-2: batch onbellegi kapanista da temizlenir; FSets asagida
+    serbest birakildigi icin isaretci sarkmasin. }
+  FBatchSet := nil;
+  FBatchSetSid := 0;
   if FSets <> nil then
     for pair in FSets do
       pair.Value.Free;
@@ -1491,7 +1495,11 @@ var
 begin
   { P-22: onbellek — tek oturumlu toplu yazmada kilit tamamen atlanir.
     FBatchSet yalniz BeginBatch'te yazilir, Commit/Abort'ta temizlenir;
-    kendi oturumumuzun disinda hicbir is parcacigi dokunmaz. }
+    kendi oturumumuzun disinda hicbir is parcacigi dokunmaz.
+    R2-B-2: okuyucu ONCE isaretciyi, SONRA SID'i okur (yayin sirasinin
+    tersi). Yazici SID'i isaretciden once yazar, temizlemede isaretciyi
+    once siler; boylece yarim cift gorulmez. Ayni oturum kimliginin iki
+    thread'de kullanilmasi desteklenmez (bkz. kilit_sirasi.md bolum 3). }
   Result := FBatchSet;
   if (Result <> nil) and (FBatchSetSid = VdbBackendSessionId) then Exit;
   Result := nil;
@@ -1542,7 +1550,9 @@ end;
 function TVdbBackendV3.GetBatchOpen: Boolean;
 begin
   { P-22: onbellek kontrolu — kilit yok. Onbellek dusurse (cok oturumlu)
-    OwnSet'in kilitleme yoluna duser. }
+    OwnSet'in kilitleme yoluna duser. R2-B-2: once isaretci, sonra SID
+    okunur (yayin sirasinin tersi); ayni oturum kimliginin iki thread'de
+    kullanilmasi desteklenmez. }
   Result := (FBatchSet <> nil) and (FBatchSetSid = VdbBackendSessionId);
   if Result then Exit;
   Result := OwnSet <> nil;
@@ -2039,6 +2049,10 @@ var
   v: TBytes;
   rec: TBatchRec;
 begin
+  { B-01: sahiplik cagiran TARAMADADIR. Tarama girisinde onceki baglam
+    yedeklenip FSnapMap nil'e cekildigi icin burada serbest birakilan sey
+    yalnizca bu cagrinin (varsa onceki) kendi haritasidir; dis taramanin
+    haritasi savedSnap'tedir ve buraya hic gelmez. }
   FreeAndNil(FSnapMap);
   if (S = nil) or (not S.SnapDirty) then Exit;
   FSnapMap := TDictionary<QWord, TBatchRec>.Create;
@@ -2223,7 +2237,9 @@ var
   pres: Boolean;
   sid: Cardinal;
 begin
-  { P-22: write set onbellek — parti icindeki anahtarlari kilitsiz bul. }
+  { P-22: write set onbellek — parti icindeki anahtarlari kilitsiz bul.
+    R2-B-2: once isaretci, sonra SID okunur (yayin sirasinin tersi);
+    ayni oturum kimliginin iki thread'de kullanilmasi desteklenmez. }
   s := FBatchSet;
   if (s <> nil) and (FBatchSetSid = VdbBackendSessionId) then
   begin
@@ -2293,18 +2309,37 @@ var
   pair: TPair<QWord, TBatchRec>;
   i: Integer;
   rec: TBatchRec;
+  savedSnap: TDictionary<QWord, TBatchRec>;
+  savedKeys: TQWordArray;
+  savedVals: TValArray;
+  savedN, savedCap, savedFilter: Integer;
+  savedSet: TWriteSet;
 begin
   { v3.4: tarama tamponlari (FScanKeys/FScanN) BACKEND alanidir; ayni
     backend'i paylasan oturumlar ayni anda tararsa birbirini bozardi.
     Kilit tarama boyunca tutulur. v3.9: geri cagirim ayni is parcaciginda
     oldugu icin TVdbGate bunu ACIKCA yeniden giris sayar (derinlik 2);
-    kritik bolumun kendisi yeniden girisli olmak zorunda degildir. }
+    kritik bolumun kendisi yeniden girisli olmak zorunda degildir.
+    B-01: kullanici geri cagirimi icinden alt sorgu calisirsa ic tarama
+    ayni alanlari ezer. Bu yuzden onceki tarama baglami kilit ALTINDA
+    kaydedilir, kendi baglamimiz kurulur, cikista geri yuklenir. Boylece
+    ic tarama dis taramanin FSnapMap'ini serbest BIRAKMAZ (UAF yok). }
   FEngCs.Enter;
   try
+    savedSnap := FSnapMap;
+    FSnapMap := nil;
+    savedKeys := FScanKeys;
     FScanKeys := nil;
+    savedVals := FScanVals;
     FScanVals := nil;
+    savedN := FScanN;
     FScanN := 0;
+    savedCap := FScanCap;
     FScanCap := 0;
+    savedFilter := FScanFilter;
+    savedSet := FScanSet;
+    FScanSet := nil;
+
     FScanFilter := TableFilter;
     { v3.9: oturumun yazma kumesi tarama boyunca sabit (kilit zaten bizde). }
     FScanSet := OwnSet;
@@ -2376,6 +2411,16 @@ begin
     FScanCap := 0;
     FScanSet := nil;
   finally
+    { B-01: yalnizca KENDI snapshot haritamizi serbest birak; dis taramanin
+      haritasi savedSnap'te duruyor. Ardindan onceki baglami geri yukle. }
+    FreeAndNil(FSnapMap);
+    FScanKeys := savedKeys;
+    FScanVals := savedVals;
+    FScanN := savedN;
+    FScanCap := savedCap;
+    FScanFilter := savedFilter;
+    FScanSet := savedSet;
+    FSnapMap := savedSnap;
     FEngCs.Leave;
   end;
 end;
@@ -2562,6 +2607,11 @@ var
   brec: TBatchRec;
   bptr: PByte;
   blen: Integer;
+  savedCb: TVDbRawCb;
+  savedUser: Pointer;
+  savedAbort: Boolean;
+  savedFilter: Integer;
+  savedSnap: TDictionary<QWord, TBatchRec>;
 begin
   { v3.1: sonuc kumesi ARTIK BIRIKTIRILMEZ; satirlar dogrudan geri cagirima
     akitilir ve sayfa ici hucre KOPYALANMAZ. Eski yol her satirda iki dinamik
@@ -2569,14 +2619,23 @@ begin
     yeniden tahsis), ayrica satir basina deger icin bir TBytes ayiriyordu.
     Gorunurluk/eleme kurallari AYNI: once motor (kaplamada islem gormus
     anahtarlar atlanir), sonra kaplama. }
-  FStreamCb := Cb;
-  FStreamUser := User;
-  FStreamAbort := False;
-  FStreamFilter := TableFilter;
   { v3.4: akitma durumu BACKEND alanidir; ayni backend'i paylasan oturumlar
     ayni anda tararsa birbirini bozardi -> tarama boyunca kilit. }
   FEngCs.Enter;
   try
+    { B-01: onceki tarama baglami yalniz kilit ALTINDA kaydedilir (kilit
+      disi yarisi yok) ve cikista geri yuklenir; ic tarama dis taramanin
+      geri cagirimini/haritasini ezmez. }
+    savedCb := FStreamCb;
+    savedUser := FStreamUser;
+    savedAbort := FStreamAbort;
+    savedFilter := FStreamFilter;
+    savedSnap := FSnapMap;
+    FSnapMap := nil;
+    FStreamCb := Cb;
+    FStreamUser := User;
+    FStreamAbort := False;
+    FStreamFilter := TableFilter;
     if Length(FStreamTagBuf) < 8 then SetLength(FStreamTagBuf, 8);
     SnapBuild(OwnSet);
     FEng.ScanAllRaw(StreamCbRaw);
@@ -2618,7 +2677,14 @@ begin
     end;
     Result := True;
   finally
+    { B-01: kendi haritamizi serbest birak, onceki baglami geri yukle.
+      Exit(False) yollari da buradan gecer; kilit dengesi korunur. }
     FreeAndNil(FSnapMap);
+    FStreamCb := savedCb;
+    FStreamUser := savedUser;
+    FStreamAbort := savedAbort;
+    FStreamFilter := savedFilter;
+    FSnapMap := savedSnap;
     FEngCs.Leave;
   end;
 end;
@@ -2645,20 +2711,35 @@ end;
 function TVdbBackendV3.ScanRawIterAllPaged(TableFilter: Integer;
   Skip: PByte; SkipCount: Integer;
   Cb: TVDbRawPageCb; User: Pointer): Boolean;
+var
+  savedCb: TVDbRawPageCb;
+  savedUser: Pointer;
+  savedAbort: Boolean;
+  savedFilter: Integer;
 begin
   { Toplu yazim acikken bekleyen kayitlarin sayfasi YOKTUR ve harita da
     guvenilmez; cagiran tam taramaya duser. }
   if BatchOpen then Exit(False);
-  FStreamPageCb := Cb;
-  FStreamPageUser := User;
-  FStreamAbort := False;
-  FStreamFilter := TableFilter;
   FEngCs.Enter;
   try
+    { B-01: yalniz kilit ALTINDA yaz; onceki baglami kaydet, cikista geri
+      yukle. Ic tarama dis taramanin geri cagirimini/abort bayragini ezmez. }
+    savedCb := FStreamPageCb;
+    savedUser := FStreamPageUser;
+    savedAbort := FStreamAbort;
+    savedFilter := FStreamFilter;
+    FStreamPageCb := Cb;
+    FStreamPageUser := User;
+    FStreamAbort := False;
+    FStreamFilter := TableFilter;
     if Length(FStreamTagBuf) < 8 then SetLength(FStreamTagBuf, 8);
     FEng.ScanAllRawPaged(StreamCbRawPaged, Skip, SkipCount);
     Result := not FStreamAbort;
   finally
+    FStreamPageCb := savedCb;
+    FStreamPageUser := savedUser;
+    FStreamAbort := savedAbort;
+    FStreamFilter := savedFilter;
     FEngCs.Leave;
   end;
 end;
@@ -2881,9 +2962,11 @@ begin
         FEng.Store.BeginDeferRefresh;
       end;
       FSets.AddOrSetValue(sid, s);
-      { P-22: onbellek — sonraki OwnSet/GetBatchOpen cagrilari kilitsiz. }
-      FBatchSet := s;
+      { P-22: onbellek — sonraki OwnSet/GetBatchOpen cagrilari kilitsiz.
+        R2-B-2 yayin sirasi: once SID, sonra isaretci (isaretci en son).
+        Boylece kilitsiz okuyucu isaretciyi gordugunde SID de hazirdir. }
       FBatchSetSid := sid;
+      FBatchSet := s;
     except
       if gotReserve then FEng.Store.ReleaseWriteHold;
       raise;
@@ -2996,7 +3079,10 @@ begin
     { v3.4: yazma kumesi commit ile KAPANIR (eski kodda BatchOpen:=False
       bu noktadaydi; otomatik sikistirma acik parti gormemeli). }
     FSets.Remove(s.Session);
-    FBatchSet := nil;   { P-22: onbellek temizle }
+    { P-22: onbellek temizle. R2-B-2 temizleme sirasi: once isaretci,
+      sonra SID; okuyucu nil isaretci gordugunde SID'e bakmaz. }
+    FBatchSet := nil;
+    FBatchSetSid := 0;
     if FSets.Count = 0 then
     begin
       FAlien.Clear;
@@ -3098,7 +3184,9 @@ begin
   try
     LogAbort;               // yarim islem gunluge SIZMAZ
     FSets.Remove(s.Session);
-    FBatchSet := nil;   { P-22: onbellek temizle }
+    { P-22: onbellek temizle. R2-B-2: once isaretci, sonra SID. }
+    FBatchSet := nil;
+    FBatchSetSid := 0;
     if FSets.Count = 0 then FUndo.Clear;
     ReleaseSet(s);
     s := nil;

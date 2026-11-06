@@ -1510,3 +1510,58 @@ gerilemesi olculemedi (statik denetim).
 4. **B-01 + B-02 + R2-B-2 + R2-B-3** (EK-G'de ertelendi; hala KRITIK).
 5. **R2-A-4** page-heap `len` sinir denetimi; **R2-C-2** fsync yutulmesi.
 6. D-Y1/Y2 SUM/AVG hassasiyeti; B-05/B-07 kilit sizintilari.
+
+# EK-I — P-128 uygulama kaydi (2026-11-06)
+
+Kapsam: **B-01 + B-02 + R2-B-2 + R2-B-3**. EK-G'de ertelenen dort kalemin
+uygulanmasi; ayrica karsi denetimde (A4) cikan ve kapsama giren P-129
+duzeltmesi.
+
+## EK-I.1 Yapilan degisiklikler
+
+| Kalem | Yer | Ozet |
+|---|---|---|
+| B-01 | `VDbBackendV3.pas` `ScanAll`, `ScanRawIterAll`, `ScanRawIterAllPaged` | Tarama alanlari (`FStream*`, `FScan*`, `FSnapMap`) `FEngCs` altinda kaydedilip geri yuklenir; ic ice tarama dis taramanin baglamini ezmez, `FSnapMap` yalniz sahibi tarafindan serbest birakilir. |
+| B-02 | `VDbTable.pas` yeni `FIdxCs` (yaprak) + `FIdxBuildCs` (seri insa) | Indeks onbellekleri kisa kritik bolgelerde korunur; tarama/siralama kilit DISINDA yapilir. Tembel insa `FLock -> FIdxBuildCs -> FEngCs -> FIdxCs` sirasini izler. |
+| R2-B-2 | `VDbBackendV3.pas` batch yollari | `FBatchSet`/`FBatchSetSid` ciftinin yayin sirasi tanimlandi (yazarken once SID sonra isaretci; temizlerken once isaretci sonra SID; okuyucu once isaretci sonra SID). Kapanista cift sifirlanir. |
+| R2-B-3 | `VDbTable.pas` sema yedegi/savepoint/ertelenen FK/CONCURRENTLY | Tum bu durumlar oturum kimligi (SID) tasir; abort/commit yalniz kendi kayitlarini geri alir. SID 0 ham API'nin eski global davranisini korur. |
+| P-129 | `VDbTable.pas` `FConcCs` | Iki paralel SELECT ayni anda `PollConcurrentIndexes` cagirabildigi icin CONCURRENTLY defteri ve finalize govdesi serilestirildi (ayni kaydin iki kez `Free` edilmesi onlendi). |
+
+Belge: `dokuman/kilit_sirasi.md` (katman tablosu, 8 degismez kural, kalan
+riskler). Kapi: `tests/gates/concurchk.lpr` (+ `.lpi`, `runall.sh`, CI).
+
+## EK-I.2 Dogrulama
+
+- Tam kapi seti taze dizinde: **21/21 GECTI** (`runall.sh tmp64/c1/gates12 -B`).
+- `concurchk`: paylasilan tek `TVdbBackendV3` + tek `TVTableDb`, baglanti
+  basina ayri `TVSql`; 30/30 (paralel indeksli SELECT/INSERT, ic ice tarama,
+  iki oturumun BEGIN/ROLLBACK ve ertelenen FK sahipligi).
+- `wherenull` / `chainnull`: `SONUC: gecen=hepsi kalan=0` — TEMIZ.
+
+Not: calisma agacinda ayri bir isin (C-1/C-3/C-16) commit edilmemis
+degisiklikleri vardi; P-128 dogrulamasi bu degisiklikler gecici olarak
+kenara alinarak yapildi (stash), ardindan geri yuklendi. C-16 su an
+`dropchk`'i kirdigi icin P-128 commit'ine dahil edilmedi.
+
+## EK-I.3 Karsi denetim (A4) triyaji
+
+| # | Bulgu | Karar |
+|---|---|---|
+| R1 | `Src.Skip` odunc omru: okuyucu yinelerken baska yol listeyi degistirip serbest birakabilir | **ERTELENDI** — kalici cozum referans sayimi/kopya; EK-I.4 |
+| R2 | `PollConcurrentIndexes` kilitsiz defter (cift `Free`) | **DUZELTILDI** — P-129 `FConcCs` |
+| R3 | `FIdxBuildCs` <-> `FEngCs` ters cevrilmesi (ic ice akis alt sorgusu) | **ERTELENDI** — bugun planlayici insayi `FEngCs` disinda yapiyor; yeni ic ice insa noktasi eklenirse risk |
+| R4 | `RestoreSchemaSnapshot` baska oturumun AutoInc'ini ezme | **ERTELENDI** — DDL/DML `FLock` yazma ile serilesiyor; oturum bazli sayac ayri is |
+| R5 | `Destroy`'ta `FBatchSet` temizlenmemesi | **DUZELTILDI** — kapanista `FBatchSet := nil; FBatchSetSid := 0` |
+| R6 | "`FIdxCs` yaprak degil yinelemeli" metin celiskisi | **DUZELTILDI** — kod yorumu + belge: ayni thread'de ic ice giris serbest, "yaprak" baska kilitlerin alinmamasidir |
+| R7 | `PollConcurrentIndexes` FIdxCs altinda agir is | **KISMEN** — UNIQUE haritasi icin liste kopyasi `FIdxCs` altinda kaliyor (bellek ici, O(n)); skip/siralama/flush zaten kilit disinda |
+
+## EK-I.4 Ertelenenler (gerekce)
+
+1. **R1 `Src.Skip` yasam suresi.** Skip listesine referans sayimi eklemek
+   veya okuyucuya kopya vermek `TryGetIdxSource` sozlesmesini ve tum
+   cagiranlari degistirir; tek noktada guvenli yapilamaz.
+2. **R3 ic ice insa kilidi.** `FEngCs` tutulurken `FIdxBuildCs` alinmasini
+   engellemek icin gate derinligine `TVTableDb`'den erisim (arayuz
+   genisletmesi) gerekir; planlayici bugun bunu tetiklemiyor.
+3. **R4 oturum bazli AutoInc.** `FAutoInc` su an tablo basina tek sayac;
+   oturum ayrimi kalici bicim/sema degisikligi ister.

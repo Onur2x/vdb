@@ -129,6 +129,7 @@ derle tests/gates/replchk.lpr replchk && kos replchk "REPLIKASYON DOGRULANDI" "$
 derle tests/gates/lockchk.lpr lockchk && kos lockchk "COK OKUYUCU / TEK YAZICI DOGRULANDI" "$WORK/lockchk"
 derle tests/gates/snapchk.lpr snapchk && kos snapchk "kalan=0" "$WORK/snapchk"
 derle tests/gates/prochk.lpr prochk && kos prochk "kalan=0" "$WORK/prochk"
+derle tests/gates/concurchk.lpr concurchk && kos concurchk "ESZAMANLILIK DOGRULANDI" "$WORK/concurchk"
 derle tests/sql/sqltest.lpr sqltest && kos sqltest "TUM SQL TESTLERI GECTI" "$WORK/sqltest" --backend=v3
 
 echo "================================"

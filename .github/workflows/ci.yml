@@ -57,7 +57,8 @@ jobs:
             'tests/gates/backendchk', 'tests/gates/v3sqlchk', 'tests/gates/migchk',
             'vdbmig', 'tests/gates/factorychk', 'tests/gates/logchk',
             'tests/gates/pitrchk', 'tests/gates/btreechk', 'tests/gates/replchk',
-            'tests/gates/lockchk', 'tests/gates/snapchk', 'tests/gates/prochk')
+            'tests/gates/lockchk', 'tests/gates/snapchk', 'tests/gates/prochk',
+            'tests/gates/concurchk')
           foreach ($p in $projs) {
             $o = & $env:LAZBUILD -B "$p.lpi" 2>&1 | Out-String
             if ($LASTEXITCODE -ne 0) {
@@ -386,6 +387,27 @@ jobs:
             $tail = $tail -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
             Write-Host "::error title=prochk::$tail"
             Write-Error 'prochk kalan > 0'
+            exit 1
+          }
+
+      - name: Es zamanlilik kapisi (concurchk)
+        shell: pwsh
+        run: |
+          # Cok baglantili es zamanli indeksli okuma + yazma; ic ice tarama
+          # tekrari (B-01) ve iki oturumun islem durumu (R2-B-3).
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbconcurchk'
+          $out = & .\tests\gates\concurchk.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'ESZAMANLILIK DOGRULANDI') {
+            $tail = ($out -split "`r?`n" | Where-Object { $_.Trim() -ne '' } |
+              Select-Object -Last 25) -join ' || '
+            $tail = $tail -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+            Write-Host "::error title=concurchk::$tail"
+            Write-Error 'concurchk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'concurchk kalan > 0'
             exit 1
           }
 
