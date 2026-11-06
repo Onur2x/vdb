@@ -77,6 +77,11 @@ const
 type
   EVdbPageStore = class(Exception);
 
+  { C-3: diskteki sayfa bu oturumun gorunumunden (ViewLsn) daha yeni bir
+    commit tasiyor. Sayfa onbellege ALINMAZ; cagiran (motor) onbellegi
+    tazeleyip okumayi yeniden denemelidir. }
+  EVdbPageStale = class(EVdbPageStore);
+
   { Kirli sayfa onbellege sigmadiginda, DISKE YAZILMADAN ONCE cagrilir.
     v3 motoru bunu WAL'e cerceve eklemek icin kullanir (write-ahead).
     Atanmamis ise sayfa dogrudan diske yazilir (WAL'siz kullanim). }
@@ -198,6 +203,9 @@ type
         commit'i diger surecler FARK ETMEZ. }
       FSigLSN: LongWord;
       FOnRefreshed: TNotifyEvent;
+      { C-3: bayat okuma uzerine tazeleme cagrisi surerken tekrar bayat
+        okuma olusursa sonsuz donguye girmemek icin. }
+      FStaleRetry: Boolean;
       { v3.16: SURECLER ARASI DEGISIKLIK DAMGASI. Meta sayfaya commit LSN'i
         yazmak taban dosyanin kendi kendine tutarliligini BOZAR (sayfalar
         hala WAL'de olabilir; AS OF/PITR testi bunu yakaladi). Bu yuzden
@@ -262,6 +270,9 @@ type
     procedure ReadPageAt(PageNo: LongWord; P: PVdbPage);
     procedure ReadBytesAt(Pos: Int64; var Buf; Len: Integer; PageNo: LongWord);
     procedure WritePageAt(PageNo: LongWord; P: PVdbPage);
+    function StaleOnDisk(PageNo: LongWord; P: PVdbPage): Boolean;
+    procedure CheckFreshRead(PageNo: LongWord; P: PVdbPage);
+    function TryRefreshAfterStale: Boolean;
     procedure ExtendFile(out NewPageNo: LongWord);
     procedure GrowTo(Required: Int64);
     procedure TrimToLogical;
@@ -2082,6 +2093,70 @@ begin
   end;
 end;
 
+{ C-16: yalniz gercek VDbPage imajlarinda LSN alani vardir. Freelist trunk
+  sayfalari ham bicimdedir ('VFT1'); 20. bayt onlarin ikinci girdisidir.
+  Bu ayrim LSN damgalama, bayat-yazma korumasi ve bayat-okuma denetiminde
+  kullanilir. }
+function IsVdbPageImage(P: PVdbPage): Boolean; inline;
+begin
+  Result := (P <> nil) and (PageHdr(P)^.Magic = VDB_PAGE_MAGIC);
+end;
+
+function IsTrunkImage(P: PVdbPage): Boolean; inline;
+var
+  m: LongWord;
+begin
+  Result := False;
+  if P = nil then Exit;
+  Move(P^[0], m, SizeOf(m));
+  Result := m = VDB_TRUNK_MAGIC;
+end;
+
+procedure TVDbPageStore.CheckFreshRead(PageNo: LongWord; P: PVdbPage);
+{ C-3: disk imajinin LSN'i bu oturumun gorunumunden (ViewLsn) BUYUKSE
+  sayfa bu surecin gordugu bir commit'e ait degildir; baska bir surecin
+  checkpoint'i olabilir. Karisik gorunum (sayfa A eski, sayfa B yeni)
+  uretmek yerine acikca reddedilir; motor onbellegi tazeleyip okumayi
+  yeniden dener. FViewLsn = 0 gorunum henuz kurulmadi demektir (dogrudan
+  Store kullanimi) -> denetim yapilmaz. Trunk ve meta sayfalarda damga
+  yoktur. }
+var
+  lsn: LongWord;
+begin
+  if FViewLsn = 0 then Exit;
+  if PageNo = VDB_HDR_PAGE then Exit;
+  if not IsVdbPageImage(P) then Exit;
+  lsn := PageHdr(P)^.LSN;
+  if lsn > FViewLsn then
+    raise EVdbPageStale.Create(Format(
+      'sayfa %d bayat: disk LSN %d > gorunum LSN %d ' +
+      '(baska surec checkpoint etmis; onbellek tazelenmeli)',
+      [PageNo, lsn, FViewLsn]));
+end;
+
+function TVDbPageStore.TryRefreshAfterStale: Boolean;
+{ C-3: bayat okuma uzerine onbellegi tazeler. Cagri sirasinda PINLI
+  cerceve varsa tazeleme (DropCache/InstallPage) pinli isaretcileri
+  gecersiz kilabilecegi icin yapilmaz; guvenli reddetme korunur.
+  FStaleRetry: tazelemenin kendisi okuma yapip yeniden bayatlik gorurse
+  ic ice tazeleme baslatilmaz. }
+var
+  i: Integer;
+begin
+  Result := False;
+  if FStaleRetry then Exit;
+  if not Assigned(FOnRefreshed) then Exit;
+  for i := 0 to High(FFrames) do
+    if (FFrames[i].PageNo <> 0) and (FFrames[i].Pins > 0) then Exit;
+  FStaleRetry := True;
+  try
+    FOnRefreshed(Self);
+    Result := True;
+  finally
+    FStaleRetry := False;
+  end;
+end;
+
 procedure TVDbPageStore.ReadPageAt(PageNo: LongWord; P: PVdbPage);
 var
   env: TBytes;
@@ -2113,6 +2188,8 @@ begin
   else
     ReadBytesAt(OffsetOf(PageNo), P^, VDB_PAGE_SIZE, PageNo);
   Inc(FReads);
+  { C-3: bayat sayfa korlemesine onbellege alinmaz. }
+  CheckFreshRead(PageNo, P);
 end;
 
 procedure TVDbPageStore.WritePageAt(PageNo: LongWord; P: PVdbPage);
@@ -2137,6 +2214,58 @@ begin
   else
     FStream.WriteBuffer(P^, VDB_PAGE_SIZE);
   Inc(FWrites);
+end;
+
+function TVDbPageStore.StaleOnDisk(PageNo: LongWord; P: PVdbPage): Boolean;
+{ C-16/C-1 bayat yazma korumasi: sayfa konumundaki mevcut imajin LSN
+  damgasi yeni imajin damgasindan BUYUKSE bu yazma atlanir. Baska bir
+  surec daha yeni bir commit imajini yazmis ve WAL'i budamistir; eski
+  imaji uzerine yazmak o commit'i kalici olarak siler.
+
+  Yalniz gecerli VDbPage imajlari karsilastirilir. Freelist trunk
+  sayfalari (VDB_TRUNK_MAGIC) VDbPage basligi tasimaz; 20. bayt LSN
+  degil ikinci girdidir. Meta sayfada da (VDB_HDR_PAGE) 20. bayt
+  FFreeCount'tur. Bu sayfalarda koruma uygulanmaz.
+  Diskteki imaj gecersiz/yarim ise (sihirli sayi, kendi numarasi veya CRC
+  tutmuyorsa) damgasina guvenilmez; yazmaya izin verilir. Okuma hatasi
+  (EOF / bozuk zarf) da yazma yonundedir (diskLsn=0). }
+var
+  diskLsn: LongWord;
+  img: TVdbPageBuf;
+  env, plain: TBytes;
+begin
+  Result := False;
+  if PageNo = VDB_HDR_PAGE then Exit;
+  if PageNo >= FPageCount then Exit;   { yeni sayfa: diskte imaj yok }
+  { Yeni imaj da VDbPage bicimi degilse (trunk) LSN alani yoktur. }
+  if not IsVdbPageImage(P) then Exit;
+  diskLsn := 0;
+  try
+    if FEncrypted then
+    begin
+      { Zarf AEAD ile butunluk dogrular; cozulen duz imaj denetlenir. }
+      SetLength(env, VDB_ENC_ENVELOPE);
+      ReadBytesAt(OffsetOf(PageNo), env[0], VDB_ENC_ENVELOPE, PageNo);
+      if VDbPageOpen(FKey, FSalt, PageNo, env, plain) then
+      begin
+        Move(plain[0], img, VDB_PAGE_SIZE);
+        if IsVdbPageImage(@img) and (PageHdr(@img)^.PageNo = PageNo) then
+          diskLsn := PageHdr(@img)^.LSN;
+      end;
+    end
+    else
+    begin
+      ReadBytesAt(OffsetOf(PageNo), img, VDB_PAGE_SIZE, PageNo);
+      { CRC de denetlenir: yarim kalmis bir yazmanin baytlarindan buyuk
+        bir "LSN" okunup dogru yerel imaj atlatilamaz. }
+      if IsVdbPageImage(@img) and (PageHdr(@img)^.PageNo = PageNo) and
+         (PageCrcCalc(@img) = PageCrcStored(@img)) then
+        diskLsn := PageHdr(@img)^.LSN;
+    end;
+  except
+    diskLsn := 0;
+  end;
+  Result := diskLsn > PageHdr(P)^.LSN;
 end;
 
 function TVDbPageStore.PickVictim: Integer;
@@ -2188,7 +2317,10 @@ begin
       else
       begin
         PageSeal(@FFrames[idx].Data);
-        WritePageAt(FFrames[idx].PageNo, @FFrames[idx].Data);
+        { C-16: bayat imaj baskasinin daha yeni commit imajinin uzerine
+          yazilmaz (bkz. StaleOnDisk). }
+        if not StaleOnDisk(FFrames[idx].PageNo, @FFrames[idx].Data) then
+          WritePageAt(FFrames[idx].PageNo, @FFrames[idx].Data);
       end;
       FFrames[idx].Dirty := False;
     end;
@@ -2197,13 +2329,16 @@ begin
   end;
   if AImage <> nil then
   begin
-    { v3.31 TAZELEME: imaj hazir, diskten okunmaz. Imaj WAL'de fsync'li
-      oldugu icin TEMIZ isaretlenir; diskteki surum yazarin commit'inde
-      guncellenir. }
+    { C-1 (v3.31 boslugu): imaj WAL'den gelir ama VERI DOSYASINDA
+      olmayabilir (commit yalnizca WAL'e yazar). TEMIZ isaretlenirse
+      sonraki Checkpoint onu yazmadan WAL'i budar ve onayli imaj
+      kaybolur. Yazma modunda KIRLI isaretlenir; Flush, WAL budanmadan
+      dosyaya yazar. TxnMark=0: imaj zaten WAL'dedir, commit setine
+      katilmaz (TxnPages TxnMark=FTxnId ister). }
     Move(AImage^, FFrames[idx].Data, VDB_PAGE_SIZE);
     FFrames[idx].PageNo := PageNo;
     FFrames[idx].Pins := 0;
-    FFrames[idx].Dirty := False;
+    FFrames[idx].Dirty := not FReadOnly;
     FFrames[idx].TxnMark := 0;
     FFrames[idx].Ref := True;
     HashPut(PageNo, idx);
@@ -2224,7 +2359,21 @@ begin
     fromPending := True;
   end
   else
-    ReadPageAt(PageNo, @FFrames[idx].Data);
+  begin
+    try
+      ReadPageAt(PageNo, @FFrames[idx].Data);
+    except
+      { C-3: okuma reddedildi (bayat sayfa). Cagiran tazeleyip yeniden
+        deneyecek; gozde cerceve yarim bir durumda kalmamali. }
+      HashDel(PageNo);
+      FFrames[idx].PageNo := 0;
+      FFrames[idx].Pins := 0;
+      FFrames[idx].Dirty := False;
+      FFrames[idx].TxnMark := 0;
+      FFrames[idx].Ref := False;
+      raise;
+    end;
+  end;
   FFrames[idx].PageNo := PageNo;
   FFrames[idx].Pins := 0;
   { Salt-okunurda HICBIR sey kirli degildir; aksi halde Flush yazmaya
@@ -2266,7 +2415,20 @@ begin
   idx := FindFrame(PageNo);
   if idx < 0 then
   begin
-    idx := LoadFrame(PageNo);
+    try
+      idx := LoadFrame(PageNo);
+    except
+      on Ex: EVdbPageStale do
+      begin
+        { C-3: onbellegi tazele ve okumayi BIR kez yeniden dene. Tazeleme
+          mumkun degilse (pinli cerceve / geri cagri yok) reddetme korunur. }
+        if not TryRefreshAfterStale then
+          raise;
+        idx := FindFrame(PageNo);
+        if idx < 0 then
+          idx := LoadFrame(PageNo);
+      end;
+    end;
     if DoVerify and not PageVerify(@FFrames[idx].Data, e) then
     begin
       HashDel(PageNo);
@@ -2303,7 +2465,19 @@ begin
   Idx := FindFrame(PageNo);
   if Idx < 0 then
   begin
-    Idx := LoadFrame(PageNo);
+    try
+      Idx := LoadFrame(PageNo);
+    except
+      on Ex: EVdbPageStale do
+      begin
+        { C-3: bkz. GetPageInternal — tazele, BIR kez yeniden dene. }
+        if not TryRefreshAfterStale then
+          raise;
+        Idx := FindFrame(PageNo);
+        if Idx < 0 then
+          Idx := LoadFrame(PageNo);
+      end;
+    end;
     if not PageVerify(@FFrames[Idx].Data, e) then
     begin
       HashDel(PageNo);
@@ -2328,6 +2502,11 @@ begin
   if Dirty then
   begin
     FFrames[Idx].Dirty := True;
+    { C-16: yerel degisiklik damgasi (ust sinir FLSN). Freelist trunk
+      sayfasinda 20. bayt ikinci girdidir; damga oraya yazilirsa trunk
+      bozulur ve CRC bayat kalir. Trunk damgalanmaz. }
+    if not IsTrunkImage(PVdbPage(@FFrames[Idx].Data)) then
+      PageHdr(PVdbPage(@FFrames[Idx].Data))^.LSN := FLSN;
     if FFrames[Idx].TxnMark <> FTxnId then
     begin
       FFrames[Idx].TxnMark := FTxnId;
@@ -2357,6 +2536,10 @@ begin
   if Dirty then
   begin
     FFrames[idx].Dirty := True;
+    { C-16: yerel degisiklik damgasi (ust sinir FLSN). Trunk sayfasi
+      damgalanmaz (20. bayt trunk girdisidir; bkz. ReleaseIdx). }
+    if not IsTrunkImage(PVdbPage(@FFrames[idx].Data)) then
+      PageHdr(PVdbPage(@FFrames[idx].Data))^.LSN := FLSN;
     { v3.1: bu islemde degisti -> bir sonraki Commit bu cerceveyi WAL'e yazar.
       P-54: cerceve listeye yalnizca geciste eklenir (tekrar kirletmede
       zaten listededir). }
@@ -2744,8 +2927,24 @@ begin
     if (FFrames[i].PageNo <> 0) and FFrames[i].Dirty then
     begin
       PageSeal(@FFrames[i].Data);
-      WritePageAt(FFrames[i].PageNo, @FFrames[i].Data);
-      FFrames[i].Dirty := False;
+      if StaleOnDisk(FFrames[i].PageNo, @FFrames[i].Data) then
+      begin
+        { C-1/C-16: baska surec daha yeni bir imaji yazmis. Eski imaji
+          uzerine yazmak o commit'i siler; cerceve diskteki GUNCEL
+          surumle tazelenir ve temizlenir (okumalar eski veri
+          gostermesin). Tazeleme basarisizsa cerceve kirli kalsin. }
+        try
+          ReadPageAt(FFrames[i].PageNo, @FFrames[i].Data);
+          FFrames[i].Dirty := False;
+        except
+          FFrames[i].Dirty := True;
+        end;
+      end
+      else
+      begin
+        WritePageAt(FFrames[i].PageNo, @FFrames[i].Data);
+        FFrames[i].Dirty := False;
+      end;
     end;
   if FMetaDirty then
     SaveMeta;
@@ -2757,18 +2956,27 @@ procedure TVDbPageStore.DropCache;
 var
   i: Integer;
 begin
+  { C-1/C-3: kirli cerceveler ATILMAZ. Icinde ya islenmemis yerel is
+    vardir ya da WAL'den kurulmus, dosyaya HENUZ inmemis bir commit
+    imaji. Eski davranis (hepsini dusur) bu imajlari sessizce silerdi:
+    onbellek tahliyesi + WAL budama = kalici kayip. Yalniz temiz
+    cerceveler dusurulur; kirli olanlar yuvasinda ve hash'te kalir,
+    sonraki Flush dosyaya yazar. FTxnDirty listesi de korunur
+    (TxnPages dogrulamasi dusen yuvalari zaten eler). }
   for i := 0 to High(FFrames) do
-  begin
-    FFrames[i].PageNo := 0;
-    FFrames[i].Pins := 0;
-    FFrames[i].Dirty := False;
-    FFrames[i].Ref := False;
-    FFrames[i].TxnMark := 0;
-  end;
-  if FHashKey <> nil then
-    HashReset;
+    if (FFrames[i].PageNo <> 0) and FFrames[i].Dirty then
+      FFrames[i].Ref := False
+    else
+    begin
+      if (FFrames[i].PageNo <> 0) and (FHashKey <> nil) then
+        HashDel(FFrames[i].PageNo);
+      FFrames[i].PageNo := 0;
+      FFrames[i].Pins := 0;
+      FFrames[i].Dirty := False;
+      FFrames[i].Ref := False;
+      FFrames[i].TxnMark := 0;
+    end;
   FClock := 0;
-  FTxnDirtyCount := 0;   // P-54
 end;
 
 function TVDbPageStore.DirtyPages: TVdbPageNoArray;
@@ -3012,12 +3220,23 @@ begin
     if FFrames[idx].Pins > 0 then
       raise EVdbPageStore.Create(Format(
         'InstallPage: sayfa %d pinli (kurtarma sirasinda beklenmiyordu)', [PageNo]));
+    { C-16: bu islemde kirletilmis (TxnMark<>0) cerceve hicbir LSN
+      kosuluyla ezilmez: islenmemis yerel is her zaman korunur. Kirli ama
+      islemsiz cerceve yalniz daha yeni gecerli imajla, temiz cerceve ise
+      her imajla degistirilebilir. }
+    if FFrames[idx].Dirty and (FFrames[idx].TxnMark <> 0) then
+      Exit;
+    if IsVdbPageImage(P) and FFrames[idx].Dirty and
+       (PageHdr(P)^.LSN <= PageHdr(PVdbPage(@FFrames[idx].Data))^.LSN) then
+      Exit;
     Move(P^, FFrames[idx].Data, VDB_PAGE_SIZE);
     if AViewOnly then
     begin
-      { v3.31: kirli bayrak KORUNUR. Yeni sayfa (dosyada olmayan) isaretliyse
-        ikinci bir imaj kurulumu onu silerse Checkpoint sayfayi atlar ve
-        WAL budaninca sayfa kaybolur. Temiz cerceve temiz kalir. }
+      { C-1 (v3.31 boslugu): WAL imaji dosyada olmayabilir (commit
+        yalnizca WAL'e yazar). Temiz cerceve de kirli isaretlenir ki
+        Flush onu WAL budanmadan dosyaya yazar. }
+      if not FReadOnly then
+        FFrames[idx].Dirty := True;
       FFrames[idx].TxnMark := 0;
     end
     else
@@ -3089,7 +3308,8 @@ begin
     end;
     Exit;
   end;
-  WritePageAt(PageNo, P);
+  if not StaleOnDisk(PageNo, P) then
+    WritePageAt(PageNo, P);
 end;
 
 function TVDbPageStore.IsResident(PageNo: LongWord): Boolean;

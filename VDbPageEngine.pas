@@ -674,6 +674,14 @@ begin
   if i >= 0 then
   begin
     Move(P^, FPending[i].Data^, VDB_PAGE_SIZE);
+    { C-16: damga CRC'den once (ust sinir FStore.LSN; commit'te gercek
+      commit LSN ile ezilir). Yalniz gercek VDbPage imajlarinda LSN alani
+      vardir: freelist trunk sayfalari ham bicimdedir ve 20. bayt onlarin
+      IKINCI girdisidir; oraya damga yazmak trunk'i bozar. Meta sayfada da
+      damga yoktur. }
+    if (PageNo <> VDB_HDR_PAGE) and
+       (PageHdr(PVdbPage(FPending[i].Data))^.Magic = VDB_PAGE_MAGIC) then
+      PageHdr(PVdbPage(FPending[i].Data))^.LSN := FStore.LSN;
     PageSeal(PVdbPage(FPending[i].Data));
     FPending[i].Mark := FStore.TxnMarkOf(PageNo);
     Exit;
@@ -689,6 +697,11 @@ begin
   FPending[i].Mark := FStore.TxnMarkOf(PageNo);
   GetMem(FPending[i].Data, VDB_PAGE_SIZE);
   Move(P^, FPending[i].Data^, VDB_PAGE_SIZE);
+  { C-16: damga CRC'den once (ust sinir FStore.LSN). Trunk/meta imajlarinda
+    LSN alani yoktur; damga yalniz gercek VDbPage imajlarina yazilir. }
+  if (PageNo <> VDB_HDR_PAGE) and
+     (PageHdr(PVdbPage(FPending[i].Data))^.Magic = VDB_PAGE_MAGIC) then
+    PageHdr(PVdbPage(FPending[i].Data))^.LSN := FStore.LSN;
   { Cerceveden tahliye aninda CRC BAYAT olabilir (sayfa henuz
     muhurlenmemis). Pending imaji sonradan OnMiss ile okunup
     dogrulanacagi icin burada muhurle. }
@@ -1017,7 +1030,7 @@ begin
   for i := 0 to High(dirty) do
     if FStore.GetPage(dirty[i], P) then
     begin
-      FWal.AppendFrame(dirty[i], P);
+      FWal.AppendFrame(dirty[i], P, LSN);
       FStore.Release(dirty[i], False);
     end;
 
@@ -1027,7 +1040,7 @@ begin
         guncel islem isaretiyle kirli kalir, yani yukaridaki 1. adim kapsar. }
   for i := 0 to FPendingCount - 1 do
     if FPending[i].Mark = FStore.TxnId then
-      FWal.AppendFrame(FPending[i].PageNo, PVdbPage(FPending[i].Data));
+      FWal.AppendFrame(FPending[i].PageNo, PVdbPage(FPending[i].Data), LSN);
 
   { 3) Meta sayfa imaji. Yalnizca meta YAPISAL olarak degistiyse (sayfa
         sayisi / freelist). LSN commit kaydinda tasinir ve kurtarma FLSN'i
@@ -1044,7 +1057,7 @@ begin
   if FStore.MetaStructDirty then
   begin
     FStore.BuildMetaImage(meta);
-    FWal.AppendFrame(VDB_HDR_PAGE, @meta);
+    FWal.AppendFrame(VDB_HDR_PAGE, @meta, LSN);
     { P-62: meta imaji WAL tamponuna yazildi. FStructDirty yalnizca
       SaveMeta'da sifirlaniyordu; WAL yolunda kalici True kaliyordu ve
       her commit'te gereksiz 4 KB meta cercevesi yaziliyordu (tek INSERT'te
@@ -1059,7 +1072,7 @@ begin
   if FWal.BufferedCount = 0 then
   begin
     FStore.BuildMetaImage(meta);
-    FWal.AppendFrame(VDB_HDR_PAGE, @meta);
+    FWal.AppendFrame(VDB_HDR_PAGE, @meta, LSN);
   end;
   {$IFDEF CPUPROF}
   d1 := CpuProfNow; CP[6] := CP[6] + (d1 - d0);
@@ -1113,6 +1126,7 @@ end;
 function TVdbPageEngine.Checkpoint(DoSync: Boolean): Boolean;
 var
   i: Integer;
+  st: TVdbWalStats;
 begin
   Result := False;
   if FStore = nil then
@@ -1129,6 +1143,36 @@ begin
     if not FStore.IsResident(FPending[i].PageNo) then
       FStore.InstallPage(FPending[i].PageNo, PVdbPage(FPending[i].Data));
   ClearPending;
+  { C-1: bu surecin HIC GORMEDIGI baska sureclerin onayli commit imajlari
+    da Truncate'ten ONCE dosyaya inmeli. Artimsal WAL taramasi yalnizca
+    onbellege kurar (ApplyRecoveredView); kurulan imajlar kirli isaretlenir
+    ve asagidaki Flush bunlari dosyaya yazar. Tarama tetikledigi tahliyeler
+    (OnSpill -> pending) yeniden kurulur; is bitene kadar donulur.
+    AS OF (FRecoverLimit > 0) KISMI kurtarma modudur: Recover limiti HER
+    cagrida yeniden uygular; dongu limitin otesine gecerdi. Bu modda dongu
+    calistirilmaz (tek seferlik kurtarma yukaridaki pending adiminda kalir;
+    HEAD davranisi korunur). }
+  if FRecoverLimit = 0 then
+    repeat
+      for i := 0 to FPendingCount - 1 do
+        if not FStore.IsResident(FPending[i].PageNo) then
+          FStore.InstallPage(FPending[i].PageNo, PVdbPage(FPending[i].Data));
+      ClearPending;
+      st.Commits := 0;
+      if FWal.HasContent then
+      begin
+        { MinLSN = gorunum LSN'i: onbellegin/diskin zaten yansittigi
+          kayitlar atlanir. Sonlanma: ViewLsn uygulanan her commit'te
+          ilerler; sonraki tur ayni kayitlari atlar (st.Commits = 0) ve
+          tahliye kaynakli pending de kurulmus olur. }
+        FWal.Recover(ApplyRecoveredView, st, 0, FStore.ViewLsn, True);
+        if st.Commits > 0 then
+        begin
+          FStore.SetLSN(FWal.WrittenLsn);
+          FStore.SetViewLsn(FWal.WrittenLsn);
+        end;
+      end;
+    until (st.Commits = 0) and (FPendingCount = 0);
   FStore.Flush(DoSync);
   if DoSync then
   begin

@@ -55,6 +55,19 @@ const
   VDB_WAL_SALT        = 36;   // 16 bayt
   VDB_WAL_FLAG_ENC    = 1;
 
+  { R2-C-YENI-2: WAL'in ait oldugu VERITABANI KIMLIGI. Ayni yolda
+    DROP+CREATE ile yeniden yaratilan DB'ye eski .wal uygulanmasin.
+    Kimlik, veri dosyasinin meta sayfasindaki yaratilis damgasindan ve
+    bicim alanlarindan turetilir (VDbPageStore bagimliligi olmasin diye
+    ofsetler yerel sabit). Cagiran daha guclu bir kimlik (or. UUID)
+    saglarsa SetDatabaseId ile Open'dan ONCE verir. }
+  VDB_WAL_DBID        = 64;   // 16 bayt (52..63 serbest)
+  VDB_WAL_DBID_LEN    = 16;
+  { VDbPageStore.VDB_FILE_MAGIC ile ayni ('VDB3'). }
+  VDB_WAL_DB_MAGIC    = $33424456;
+  VDB_WAL_DB_CREATED  = 28;   // meta: Int64 yaratilis damgasi
+  VDB_WAL_DB_IDBYTES  = 36;   // magic(4)+ver(4)+...+created(8 @28)
+
 type
   EVdbWal = class(Exception);
 
@@ -154,6 +167,19 @@ type
       konum kullanmaz ve DOSYA duzeyinde calisir, yani ikinci handle ile
       yapilan fsync birinci handle'in yazdiklarini da diske indirir. }
     FSyncStream: TFileStream;
+    { R2-C-YENI-2: dogrulanmis/verilmis veritabani kimligi. Ilk Open'da
+      turetilir ve oturum boyunca onbellekte kalir (Refresh sicak yoldur;
+      her tazelemede veri dosyasini yeniden acmak istemeyiz). }
+    FDbId: TBytes;
+    FDbIdKnown: Boolean;
+    function DbFilePath: string;
+    function DeriveDbId(out AId: TBytes): Boolean;
+    procedure EnsureDbId;
+    { C-1: WAL govdesindeki TUM gecerli kayitlar CheckpointLSN'den kucuk/
+      esit mi? Yalnizca oyle ise govde budanabilir. AMaxLsn: gorulen en
+      buyuk kayit LSN'i (FWrittenLsn'i geri dusurmemek icin). }
+    function WalBodySafeToPrune(CheckpointLSN: LongWord;
+      out AMaxLsn: LongWord): Boolean;
     procedure WriteHeader;
     procedure ReadHeader;
     procedure AppendBuffer(PageNo: LongWord; P: PVdbPage);
@@ -189,13 +215,20 @@ type
     procedure SetEncryptionKey(const AKey, ASalt: TBytes);
     property Encrypted: Boolean read FEncryptedMode;
 
+    { R2-C-YENI-2: veritabani kimligini acikca ver (Open'dan ONCE).
+      16 bayt beklenir; bos TBytes kimligi temizler ve yeniden turetmeye
+      doner. Verilmezse kimlik veri dosyasinin meta sayfasindan turetilir;
+      boylece eski .wal yeni DB'ye sessizce uygulanmaz. }
+    procedure SetDatabaseId(const AId: TBytes);
+    property DatabaseId: TBytes read FDbId;
+
     { WAL'de uygulanacak (commit edilmis) cerceve var mi? Acilista
       kurtarma gerekip gerekmedigine karar vermek icin. }
     function HasContent: Boolean;
 
     { Commit bekleyen cerceveyi ekler (bellekte). Ayni sayfa icin son
       ekleme kazanir. }
-    procedure AppendFrame(PageNo: LongWord; P: PVdbPage);
+    procedure AppendFrame(PageNo: LongWord; P: PVdbPage; ALsn: LongWord);
 
     { Bekleyen cerceveleri diske yazar, commit kaydini ekler. DoSync=True
       ise fsync eder (P-DUR: commit fsync eder). }
@@ -269,6 +302,89 @@ begin
   Result := True;
 end;
 
+function BytesAllZero(const A: TBytes): Boolean;
+var
+  i: Integer;
+begin
+  for i := 0 to High(A) do
+    if A[i] <> 0 then Exit(False);
+  Result := True;
+end;
+
+{ ------------------------------------------------------ veritabani kimligi }
+
+function TVdbPageWal.DbFilePath: string;
+begin
+  { WAL sozlesmesi: <db yolu> + '.wal'. Farkli bir adlandirma kullanilirsa
+    kimlik turetilemez; bu durumda dogrulama yapilmaz (eski davranis). }
+  Result := FPath;
+  if (Length(Result) > 4) and
+     SameText(Copy(Result, Length(Result) - 3, 4), '.wal') then
+    SetLength(Result, Length(Result) - 4)
+  else
+    Result := '';
+end;
+
+function TVdbPageWal.DeriveDbId(out AId: TBytes): Boolean;
+var
+  p: string;
+  S: THandleStream;
+  buf: array[0..VDB_WAL_DB_IDBYTES - 1] of Byte;
+  magic, ver: LongWord;
+begin
+  Result := False;
+  AId := nil;
+  p := DbFilePath;
+  if p = '' then Exit;
+  if not FileExists(p) then Exit;
+  S := nil;
+  try
+    try
+      { Kilit istemeyen acilis: motor veri dosyasinda tam/paylasimli kilit
+        tutuyor olabilir (bkz VDbSync.VDbOpenStreamNoFlock). }
+      S := VDbOpenStreamNoFlock(p, True, False);
+      if S.Size < VDB_WAL_DB_IDBYTES then Exit;
+      S.Position := 0;
+      S.ReadBuffer(buf[0], VDB_WAL_DB_IDBYTES);
+    except
+      { Okunamayan dosya -> kimlik yok; cagiran guvenli tarafa karar verir. }
+      Exit;
+    end;
+  finally
+    S.Free;
+  end;
+  Move(buf[0], magic, 4);
+  if magic <> VDB_WAL_DB_MAGIC then Exit;
+  Move(buf[4], ver, 4);
+  SetLength(AId, VDB_WAL_DBID_LEN);
+  Move(buf[VDB_WAL_DB_CREATED], AId[0], 8);
+  Move(magic, AId[8], 4);
+  Move(ver, AId[12], 4);
+  Result := True;
+end;
+
+procedure TVdbPageWal.EnsureDbId;
+begin
+  if FDbIdKnown then Exit;
+  if DeriveDbId(FDbId) then
+    FDbIdKnown := True;
+end;
+
+procedure TVdbPageWal.SetDatabaseId(const AId: TBytes);
+begin
+  if Length(AId) = 0 then
+  begin
+    FDbId := nil;
+    FDbIdKnown := False;
+    Exit;
+  end;
+  if Length(AId) <> VDB_WAL_DBID_LEN then
+    raise EVdbWal.Create(Format('WAL DB kimligi %d bayt (beklenen %d)',
+      [Length(AId), VDB_WAL_DBID_LEN]));
+  FDbId := Copy(AId, 0, Length(AId));
+  FDbIdKnown := True;
+end;
+
 { ------------------------------------------------------------------ baslik }
 
 procedure TVDbPageWal.WriteHeader;
@@ -299,6 +415,11 @@ begin
     if Length(FSalt) = VDB_ENC_SALT_LEN then
       Move(FSalt[0], buf[VDB_WAL_SALT], VDB_ENC_SALT_LEN);
   end;
+  { R2-C-YENI-2: veritabani kimligi. Kimlik turetilenemezse alan sifir
+    kalir (eski bicim) ve ReadHeader dogrulama yapmaz. }
+  EnsureDbId;
+  if FDbIdKnown and (Length(FDbId) = VDB_WAL_DBID_LEN) then
+    Move(FDbId[0], buf[VDB_WAL_DBID], VDB_WAL_DBID_LEN);
   q := PLongWord(@buf[VDB_PAGE_BODY_END]);
   q^ := VDbCrc32Of(buf, VDB_PAGE_BODY_END);
   FStream.Position := 0;
@@ -313,7 +434,7 @@ var
   buf: TVDbPageBuf;
   magic, ver, lsn, crc: LongWord;
   flags: LongWord;
-  storedCheck, storedSalt: TBytes;
+  storedCheck, storedSalt, storedId: TBytes;
   i: Integer;
   ps: Word;
   q: PLongWord;
@@ -367,6 +488,41 @@ begin
         'WAL sifresiz ama veritabani sifreli (eski WAL dosyasini silin)');
     FWalEncrypted := False;
   end;
+
+  { R2-C-YENI-2: kimlik dogrulamasi. Alan sifirsa dosya bu korumadan ONCE
+    yazilmistir (uyumluluk: dogrulama yapilmaz). Sifir degilse guncel
+    veritabani kimligiyle karsilastirilir.
+      * Govde VARSA ve kimlik farkli -> eski WAL baska DB'ye aittir;
+        uygulanmasi veri bozulmasi demektir -> ACIK HATA.
+      * Govde BOSSA (yalniz baslik) -> uygulanacak cerceve yok; yazilabilir
+        oturumda baslik yeni kimlik + LSN 0 ile tazelenir. Boylece ayni
+        yolda silinip yeniden yaratilan DB eski bos .wal yuzunden acilmaz
+        hale gelmez. }
+  SetLength(storedId, VDB_WAL_DBID_LEN);
+  Move(buf[VDB_WAL_DBID], storedId[0], VDB_WAL_DBID_LEN);
+  if not BytesAllZero(storedId) then
+  begin
+    EnsureDbId;
+    if FDbIdKnown then
+    begin
+      if not BytesEqual(storedId, FDbId) then
+      begin
+        if FStream.Size > VDB_PAGE_SIZE then
+          raise EVdbWal.Create(
+            'WAL baska bir veritabanina ait (kimlik farkli); ' +
+            'eski WAL dosyasini silin');
+        if not FReadOnlyMode then
+        begin
+          FLSN := 0;
+          FHeaderLsn := 0;
+          WriteHeader;
+        end;
+      end;
+    end
+    else if FStream.Size > VDB_PAGE_SIZE then
+      raise EVdbWal.Create(
+        'WAL veritabani kimligi dogrulanamadi (veri dosyasi okunamadi)');
+  end;
 end;
 
 { ------------------------------------------------------------------ yasam }
@@ -387,6 +543,13 @@ begin
   FKey := nil;
   FSalt := nil;
   FKeyCheck := nil;
+  FDbId := nil;
+  FDbIdKnown := False;
+  { R2-C-YENI-1: acik dosya yokken "yazilmis" LSN iddiasi yoktur. }
+  FWrittenLsn := 0;
+  FWrittenBytes := 0;
+  FScanPos := 0;
+  FScanHdrLsn := 0;
 end;
 
 procedure TVdbPageWal.SetEncryptionKey(const AKey, ASalt: TBytes);
@@ -432,6 +595,10 @@ begin
       ReadHeader;
       FHasContent := FStream.Size > VDB_PAGE_SIZE;
       FWrittenBytes := FStream.Size;
+      { R2-C-YENI-1: yeni bir gorunum. Baslik LSN'i alt sinirdir; Recover
+        govdedeki son commit'e yukseltir. Onceki oturumdan kalan deger
+        TASINMAZ (dosya/DB degismis olabilir). }
+      FWrittenLsn := FLSN;
     except
       FreeAndNil(FStream);
       raise;
@@ -443,6 +610,7 @@ begin
     FLSN := 0;
     FHasContent := False;
     FWrittenBytes := 0;
+    FWrittenLsn := 0;
   end
   else
   begin
@@ -450,6 +618,7 @@ begin
       bir surec/oturum acabilmeli. Yazma yine veritabani kilidiyle siralanir. }
     FStream := TFileStream.Create(FPath, fmCreate or fmShareDenyNone);
     FLSN := 0;
+    FWrittenLsn := 0;
     WriteHeader;
     VDbFlushStream(FStream);
     FWalEncrypted := FEncryptedMode;
@@ -484,7 +653,14 @@ begin
     Rollback;
   FStream.Position := 0;
   ReadHeader;
-  FWrittenLsn := FLSN;
+  { R2-C-YENI-1: FWrittenLsn ASLA DUSURULMEZ. Baslik LSN'i yalnizca
+    checkpoint isaretidir; govdede daha yeni yazilmis kayitlar olabilir.
+    Eski `FWrittenLsn := FLSN` degeri geri cekiyordu; AwaitDurable'daki
+    `ALsn > WrittenLsn -> Exit` erken cikisi fsync'i SESSIZCE atliyor ve
+    fsync edilmemis commit "durabil" sayiliyordu. Yukari yonlu guncelleme
+    guvenlidir: en kotu durumda fazladan bir fsync yapilir. }
+  if FLSN > FWrittenLsn then
+    FWrittenLsn := FLSN;
   { FStream.Size her cagrida isletim sistemine sorulur; baska surecin
     uzattigi dosya buradan gorulur. }
   FHasContent := FStream.Size > VDB_PAGE_SIZE;
@@ -607,7 +783,7 @@ begin
     Move(P^, FOutBuf[off], payLen);
 end;
 
-procedure TVdbPageWal.AppendFrame(PageNo: LongWord; P: PVdbPage);
+procedure TVdbPageWal.AppendFrame(PageNo: LongWord; P: PVdbPage; ALsn: LongWord);
 begin
   if FStream = nil then
     raise EVdbWal.Create('WAL acik degil');
@@ -615,6 +791,21 @@ begin
     raise EVdbWal.Create('salt-okunur WAL: cerceve eklenemez');
   { Cerceve DISKE YAZILACAK bir imajdir: CRC'si simdi hesaplanir. Boylece
     kurtarma sirasinda yazilan sayfa PageVerify'dan gecer. }
+  { C-16: SIRA ONEMLI - damga (1) once, CRC (2) sonra, tampona kopya (3)
+    en son. CRC tum sayfayi kapsadigi icin damga CRC'den SONRA yazilirsa
+    hem WAL imaji hem disk imaji dogrulamadan gecmezdi.
+    Meta sayfa (VDB_WAL_META_PAGE) ISTISNADIR: bu sayfa normal sayfa
+    basligi tasimaz; offset 20 FFreeCount'tur (VDbPageStore.BuildMetaImage).
+    Damga yazmak freelist sayacini bozardi, bu yuzden atlanir. Meta'nin
+    kendi LSN'i zaten offset 24'tedir ve motor imaji kurarken yazar.
+    Meta page 0 oldugu icin "PageNo <> 0" ile ayni; sabit okunurluk icin.
+    Freelist trunk sayfasinda (VFT1) offset 20 IKINCI GIRDIDIR: damga oraya
+    yazilirsa PageSeal CRC'yi bozulmus icerik uzerinden tazeler ve trunk
+    sessizce bozulur (freelist yanlis sayfa verir -> veri kaybi). Damga
+    yalnizca gercek VDbPage imajlarina (VP sihirli sozcugu) yazilir. }
+  if (PageNo <> VDB_WAL_META_PAGE) and
+     (PageHdr(P)^.Magic = VDB_PAGE_MAGIC) then
+    PageHdr(P)^.LSN := ALsn;
   PageSeal(P);
   AppendBuffer(PageNo, P);
 end;
@@ -636,7 +827,11 @@ begin
     fsync yapmak yaris durumu uretirdi. }
   if FReadOnlyMode then Exit;
   S := FSyncStream;
-  if S = nil then Exit;
+  if S = nil then
+    { R2-C-YENI-1: fsync kanali yoksa "basarili" donmek yanlis durabil
+      onayi olurdu. Yazilabilir WAL'de bu kanal Open'da kurulur; yoklugu
+      gercek bir hatadir. }
+    raise EVdbWal.Create('WAL fsync kanali yok (durabilite dogrulanamaz)');
   VDbFlushStream(S);
 end;
 
@@ -691,7 +886,23 @@ begin
   crc := WalCrc(FOutBuf[off], 16, FOutBuf[off], 0);
   Move(crc, FOutBuf[off + 16], 4);
   Inc(off, VDB_WAL_REC_HDR);
-  FStream.WriteBuffer(FOutBuf[0], off);
+  try
+    FStream.WriteBuffer(FOutBuf[0], off);
+  except
+    { R2-C-3 artigi: yazim yarida kaldiysa dosyada kesik/bayat bir kuyruk
+      kalir. Sonraki commit onun ARDINA eklenir; kurtarma kesik kayitta
+      durdugu icin SONRAKI commit'ler de gorunmez olurdu (sessiz kayip).
+      Bu commit'e ait bolumu geri kirp; tampon korunur (cagiran tekrar
+      deneyebilir). }
+    try
+      FStream.Size := startPos;
+      FStream.Seek(0, soEnd);
+      FAtEnd := True;
+    except
+      { En iyi caba; asil hatayi maskeleme. }
+    end;
+    raise;
+  end;
   FAtEnd := True;   // P-57: konum artik dosya sonunda
   Inc(FWrittenBytes, off);   // P-61: boyut sayaci
   { Cok buyuk islemlerden sonra tamponu birak: aksi halde WAL nesnesi omru
@@ -740,6 +951,7 @@ function TVdbPageWal.Recover(Apply: TVdbWalApplyProc;
 var
   startPos, goodPos: Int64;
   hdrLsn: LongWord;
+  maxLsn: LongWord;
   hdr: array[0..VDB_WAL_REC_HDR - 1] of Byte;
   magic, lsn, payLen, pageNo, crc: LongWord;
   calc: LongWord;
@@ -784,6 +996,12 @@ begin
     raise EVdbWal.Create('WAL acik degil');
   FAtEnd := False;   // P-57: Recover dosyayi tarar; konum son degildir
   hdrLsn := FLSN;
+  { R2-C-YENI-1: tarama boyunca gorulen en buyuk LSN. Yalnizca CRC'den
+    GECEN kayitlar sayilir (bozuk basliktaki LSN durabilite filigranini
+    sisirmesin). MinLSN ile atlanan kayitlar zaten bu surecin yazmadigi,
+    daha onceki yazarlara ait kayitlardir. FWrittenLsn yalnizca yukari
+    guncellenir (asla geri cekilmez). }
+  maxLsn := FLSN;
   { v3.29: artimsal tarama. Konum YALNIZ (a) cagiran istediyse, (b) onceki
     tarama gecerli bir konum biraktiysa, (c) WAL basligi DEGISMEDIYSE
     (dosya kesilmedi) ve (d) konum dosya sinirinda ise kullanilir. }
@@ -862,6 +1080,11 @@ begin
       Stats.TornTail := True;
       Break;
     end;
+    { R2-C-YENI-1: yalniz CRC'den GECEN kayit "yazilmis" sayilir. Bozuk
+      basliktaki LSN'in durabilite filigranini (.gen) sisirmesine izin
+      verme. }
+    if lsn > maxLsn then
+      maxLsn := lsn;
 
     if magic = VDB_WAL_REC_FRAME then
     begin
@@ -927,8 +1150,13 @@ begin
   for i := 0 to appliedCount - 1 do
     FAppliedPages[i] := applied[i].PageNo;
   { v3.19: kurtarma sonrasi WAL'de yazilmis sayilan en son LSN, kurtarilan
-    son commit'in LSN'idir. }
-  FWrittenLsn := FLSN;
+    son commit'in LSN'idir. R2-C-YENI-1: yalniz YUKARI guncelle - MinLSN
+    ile atlanan kayitlar yuzunden degeri geri cekmek, fsync'i atlayan
+    yanlis "durabil" onayina yol acabilir. }
+  if FLSN > maxLsn then
+    maxLsn := FLSN;
+  if maxLsn > FWrittenLsn then
+    FWrittenLsn := maxLsn;
   FScanPos := goodPos;
   FScanHdrLsn := hdrLsn;
   Result := True;
@@ -968,11 +1196,97 @@ begin
   end;
 end;
 
+function TVdbPageWal.WalBodySafeToPrune(CheckpointLSN: LongWord;
+  out AMaxLsn: LongWord): Boolean;
+var
+  fileSize, oldPos: Int64;
+  hdr: array[0..VDB_WAL_REC_HDR - 1] of Byte;
+  magic, lsn, payLen, crc, calc: LongWord;
+  expectedLen: LongWord;
+  got: Integer;
+  raw: TBytes;
+begin
+  { C-1: FILTRELIDIR. Govde yalnizca TUM gecerli kayitlarin LSN'i
+    CheckpointLSN'den kucuk/esitse budanabilir. Checkpoint'in otesinde
+    (henuz veri dosyasina inmeyen, or. baska surecin) bir commit varsa
+    govdeye DOKUNULMAZ. Kesik/bozuk kuyruk "gecerli kayit" degildir;
+    kurtarma da orada durur, dolayisiyla budama guvenlidir.
+    AMaxLsn: CRC'den gecen kayitlarin en buyuk LSN'i. }
+  Result := True;
+  AMaxLsn := 0;
+  fileSize := FStream.Size;
+  oldPos := FStream.Position;
+  try
+    FStream.Position := VDB_PAGE_SIZE;
+    while FStream.Position + VDB_WAL_REC_HDR <= fileSize do
+    begin
+      got := FStream.Read(hdr[0], VDB_WAL_REC_HDR);
+      if got <> VDB_WAL_REC_HDR then Break;
+      Move(hdr[0], magic, 4);
+      Move(hdr[4], lsn, 4);
+      Move(hdr[8], payLen, 4);
+      Move(hdr[16], crc, 4);
+      if (magic <> VDB_WAL_REC_FRAME) and (magic <> VDB_WAL_REC_COMMIT) then
+        Break;
+      if magic = VDB_WAL_REC_FRAME then
+      begin
+        if FWalEncrypted then expectedLen := VDB_ENC_ENVELOPE
+        else expectedLen := VDB_PAGE_SIZE;
+        if payLen <> expectedLen then Break;
+      end
+      else if payLen <> 0 then
+        Break;
+      calc := WalCrc(hdr[0], 16, hdr[0], 0);
+      if payLen > 0 then
+      begin
+        if payLen > 65536 then Break;
+        SetLength(raw, payLen);
+        got := FStream.Read(raw[0], payLen);
+        if got <> Integer(payLen) then Break;
+        if FWalVer < 2 then
+          calc := WalCrc(hdr[0], 16, raw[0], payLen);
+      end;
+      if calc <> crc then Break;
+      if lsn > AMaxLsn then
+        AMaxLsn := lsn;
+      if lsn > CheckpointLSN then
+      begin
+        Result := False;
+        Break;
+      end;
+    end;
+  finally
+    FStream.Position := oldPos;
+  end;
+end;
+
 procedure TVdbPageWal.Truncate(CheckpointLSN: LongWord);
+var
+  safe: Boolean;
+  maxLsn: LongWord;
 begin
   if FReadOnlyMode then Exit;
   if FStream = nil then
     raise EVdbWal.Create('WAL acik degil');
+  safe := WalBodySafeToPrune(CheckpointLSN, maxLsn);
+  if not safe then
+  begin
+    { C-1: checkpoint'in otesinde cerceveler var -> HICBIR SEY budanmaz.
+      Baslik da YAZILMAZ: yarim kalmis bir geciste (crash) dosyanin ESKI
+      hali oldugu gibi gecerlidir. Bekleyen bellek tamponu da ATILMAZ:
+      diske yazilmamis bir commit'i sessizce silmek veri kaybi olurdu.
+      FWrittenLsn geri cekilmez; tarama sirasinda gorulen en buyuk LSN'e
+      kadar yukseltilir. }
+    if CheckpointLSN > FWrittenLsn then
+      FWrittenLsn := CheckpointLSN;
+    if maxLsn > FWrittenLsn then
+      FWrittenLsn := maxLsn;
+    Exit;
+  end;
+  { Yalniz GUVENLI budama yolunda bekleyen tampon atilir (zaten diske
+    yazildi; asagida govde silinip baslik yeniden yazilacak). }
+  FBufferCount := 0;
+  BufHashClear;   // P-71
   FLSN := CheckpointLSN;
   FHeaderLsn := CheckpointLSN;
   { v3.29: dosya kesildi -> artimsal tarama konumu gecersiz. Baslik LSN'i
@@ -983,11 +1297,11 @@ begin
     Sifira cekmek YANLIS olur: LSN monoton artar, bekleyen AwaitDurable
     cagrilari eski LSN ile karsilastirir. }
   FWrittenLsn := CheckpointLSN;
-  FBufferCount := 0;
-  BufHashClear;   // P-71
   FStream.Size := VDB_PAGE_SIZE;
   FWrittenBytes := VDB_PAGE_SIZE;   // P-61
   WriteHeader;
+  FStream.Seek(0, soEnd);
+  FAtEnd := True;
   VDbFlushStream(FStream);
   FHasContent := False;
 end;

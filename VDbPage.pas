@@ -72,6 +72,10 @@ type
   end;
 
 { --- temel --- }
+{ C-16: sayfa basligina erisim; LSN damgasi okuyan/yazan yollar
+  (VDbPageStore.StaleOnDisk) de kullanir. }
+function PageHdr(P: PVdbPage): PVdbPageHdr; inline;
+
 function PageInit(P: PVdbPage; PageNo: LongWord; PageType: Byte): Boolean;
 
 { CRC'yi hesaplar ve son 4 bayta yazar. Her yazmadan sonra cagrilmali. }
