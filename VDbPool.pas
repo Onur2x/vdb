@@ -55,6 +55,10 @@ type
     FAvail: TEvent;               // bosta baglanti sinyali
     FIdle: TList<TVSql>;          // bosta ornekler
     FAll: TList<TVSql>;           // havuzun urettigi tum ornekler (sahiplik)
+    { R2-B-5: Acquire'in urettigi orneklerin sahibi thread. Yanlis
+      sahiplikte Release, motoru/mutex'i baska thread'in altindan
+      cekmeden once acik hata verir. }
+    FOwners: TDictionary<Pointer, THandle>;
     FOut: Integer;                // disaridaki ornek sayisi
     FClosed: Boolean;
     FTimeoutMs: Integer;
@@ -142,18 +146,6 @@ begin
   FTb := ATableDb;
   FSize := ASize;
   FTimeoutMs := ATimeoutMs;
-  // NOT: TCriticalSection/TEvent SyncObjs'ten gelir; interface uses'te
-  // zaten var. Implementation uses'e SADECE Windows eklenir (asagida).
-  FLock := TCriticalSection.Create;
-  // Manuel-reset degil: tek bekleyeni uyandirir (otomatik sifirlanir).
-  FAvail := TEvent.Create(nil, False, False, '');
-  FIdle := TList<TVSql>.Create;
-  FAll := TList<TVSql>.Create;
-  for i := 1 to FSize do
-  begin
-    FIdle.Add(TVSql.Create(FTb));
-    FAll.Add(FIdle[FIdle.Count - 1]);
-  end;
   FOut := 0;
   FClosed := False;
   // R-12: varsayilan TEK surec modu. CreateXProc ile cok surece
@@ -162,6 +154,27 @@ begin
   FMySlot := -1;
   FSlotBusy := False;
   FMutex := nil;
+  FOwnedKv := nil;
+  FOwnedTb := nil;
+  FXProcDir := '';
+  // R2-A-6: kurulum yarida kalirsa destructor cagrilir; alanlar bu
+  // yuzden nil baslatilir ve asagidaki her adim nil denetimine dayanir.
+  FLock := nil;
+  FAvail := nil;
+  FIdle := nil;
+  FAll := nil;
+  FOwners := nil;
+  FLock := TCriticalSection.Create;
+  // Manuel-reset degil: tek bekleyeni uyandirir (otomatik sifirlanir).
+  FAvail := TEvent.Create(nil, False, False, '');
+  FIdle := TList<TVSql>.Create;
+  FAll := TList<TVSql>.Create;
+  FOwners := TDictionary<Pointer, THandle>.Create;
+  for i := 1 to FSize do
+  begin
+    FIdle.Add(TVSql.Create(FTb));
+    FAll.Add(FIdle[FIdle.Count - 1]);
+  end;
 end;
 
 { ------------------------------------------------------------------
@@ -283,6 +296,10 @@ begin
     if id > 0 then
     begin
       FMySlot := id;
+      { R2-A-5: sayac kiralama ile BIRLIKTE artirilir. Boylece
+        OpenEngine (veya mutex Enter) hata verse bile ReleaseSlot'un
+        decrement'i hep eslesir; releaseler arasinda kayma olmaz. }
+      InterlockedIncrement(PPoolHeader(FShm.Header)^.ActiveConnections);
       Result := True;
       Exit;
     end;
@@ -295,6 +312,8 @@ begin
   if FShm = nil then Exit;
   if FMySlot > 0 then
   begin
+    { R2-A-5: bu decrement yalnizca AcquireSlot'un artirdigi sayaci
+      geri alir (artirma kiralama ile atomik eslesir). }
     InterlockedDecrement(PPoolHeader(FShm.Header)^.ActiveConnections);
     FShm.ReleaseSlot(FMySlot);
     FMySlot := -1;
@@ -304,18 +323,32 @@ end;
 constructor TVDbPool.CreateXProc(const AXName, ADataDir: string; ASize: Integer;
   ATimeoutMs: Integer);
 begin
+  { R2-A-6: TObject kurulumu ATLANMAMALI. Constructor sonradan hata
+    verse FPC destructor'i cagirir; nil alanlarla guvenli calisir. }
+  inherited Create;
   if ASize < 1 then ASize := 1;
   FSize := ASize;
   FTimeoutMs := ATimeoutMs;
-  FLock := TCriticalSection.Create;
-  FAvail := TEvent.Create(nil, False, False, '');
-  FIdle := TList<TVSql>.Create;
-  FAll := TList<TVSql>.Create;
   FOut := 0;
   FClosed := False;
   FMySlot := -1;
   FSlotBusy := False;
   FXProcDir := ADataDir;
+  FTb := nil;
+  FShm := nil;
+  FMutex := nil;
+  FOwnedKv := nil;
+  FOwnedTb := nil;
+  FLock := nil;
+  FAvail := nil;
+  FIdle := nil;
+  FAll := nil;
+  FOwners := nil;
+  FLock := TCriticalSection.Create;
+  FAvail := TEvent.Create(nil, False, False, '');
+  FIdle := TList<TVSql>.Create;
+  FAll := TList<TVSql>.Create;
+  FOwners := TDictionary<Pointer, THandle>.Create;
   { NOT: Motor BURADA ACILMAZ. .odb dosyasi ozel kilitlidir; iki
     surec ayni anda motoru acamaz. Motor Acquire'da isimli mutex
     alindiktan SONRA acilir, Release'de kapatilir. }
@@ -326,20 +359,29 @@ destructor TVDbPool.Destroy;
 var
   i: Integer;
 begin
-  FLock.Enter;
-  try
-    FClosed := True;
+  { R2-A-6: yarim kurulumda FLock/FIdle/FAll nil olabilir. }
+  if FLock <> nil then
+  begin
+    FLock.Enter;
+    try
+      FClosed := True;
+      if FIdle <> nil then
+        for i := 0 to FIdle.Count - 1 do
+          FIdle[i].Free;
+      // Disaridaki ornekler uygulamaya aittir (dokumante); burada
+      // serbest birakilmaz (cift-free riski).
+    finally
+      FLock.Leave;
+    end;
+  end
+  else if FIdle <> nil then
     for i := 0 to FIdle.Count - 1 do
       FIdle[i].Free;
-    FIdle.Free;
-    FAll.Free;
-    // Disaridaki ornekler uygulamaya aittir (dokumante); burada
-    // serbest birakilmaz (cift-free riski).
-  finally
-    FLock.Leave;
-  end;
-  FAvail.Free;
-  FLock.Free;
+  FreeAndNil(FIdle);
+  FreeAndNil(FAll);
+  FreeAndNil(FOwners);
+  FreeAndNil(FAvail);
+  FreeAndNil(FLock);
   { R-12: slotu birak ve SHM'i kapat. DB kilidi (FMutex) once
     serbest birakilmali ki baska surecler kilitli kalmasin. }
   DoneXProc;
@@ -367,15 +409,15 @@ begin
       'TVDbPool: paylasilan slot yok (%d ms, kapasite=%d)',
       [FTimeoutMs, FSize]);
   Locked := False;
-  if FMutex <> nil then
-  begin
-    FMutex.Enter;
-    Locked := True;
-  end;
   try
+    { R2-A-5: mutex Enter da hata yoluna dahil. Kilit alinamazsa
+      kiralanan slot asagidaki except'ta birakilir. }
+    if FMutex <> nil then
+    begin
+      FMutex.Enter;
+      Locked := True;
+    end;
     OpenEngine;   // cok surec modunda motoru simdi ac
-    if FShm <> nil then
-      InterlockedIncrement(PPoolHeader(FShm.Header)^.ActiveConnections);
   except
     if Locked then FMutex.Leave;
     ReleaseSlot;
@@ -388,6 +430,7 @@ begin
         raise EVDbException.Create(ecPoolClosed,
           'TVDbPool: havuz kapali');
       Result := TVSql.Create(FTb);
+      FOwners.AddOrSetValue(Pointer(Result), THandle(GetCurrentThreadId));
       Inc(FOut);
     finally
       FLock.Leave;
@@ -404,10 +447,28 @@ procedure TVDbPool.Release(Sql: TVSql);
 { NOT: Sql = nil OLABILIR ve BU BIR HATA DEGILDIR. Cagiran bazen
   yalnizca "is parcam bitti, kilidi birak" demek ister (orn. slot
   sayimi testi). Onceki surumde `if Sql = nil then Exit` vardi ve
-  bu durumda slot ASLA birakilmiyordu -> kapasite siziyordu. }
+  bu durumda slot ASLA birakilmiyordu -> kapasite siziyordu.
+
+  R2-B-5: havuzun uretmedigi / baska thread'den Release edilen ornek
+  icin motoru ve mutex'i baska thread'in altindan cekmek yerine acik
+  hata (ecInvalidArgument) verilir. Boylece use-after-free onlenir. }
+var
+  Owner: THandle;
 begin
   if Sql <> nil then
   begin
+    FLock.Enter;
+    try
+      if not FOwners.TryGetValue(Pointer(Sql), Owner) then
+        raise EVDbException.Create(ecInvalidArgument,
+          'TVDbPool: havuzun uretmedigi ornek Release edildi');
+      if Owner <> THandle(GetCurrentThreadId) then
+        raise EVDbException.Create(ecInvalidArgument,
+          'TVDbPool: ornek farkli thread''den Release ediliyor');
+      FOwners.Remove(Pointer(Sql));
+    finally
+      FLock.Leave;
+    end;
     // Cok surec modunda TVSql ornegi is parcasi basina olusturulur;
     // burada serbest birakilir.
     Sql.Free;
@@ -418,6 +479,11 @@ begin
       FLock.Leave;
     end;
   end;
+  { R2-B-5: sahipsiz Release(nil). Bu ornekte kiralanmis slot yoksa
+    motor zaten kapalidir ve FMutex.Leave sahipsiz cagrilinca
+    EPrimsError firlatir. Tek surec modunda (FShm = nil) davranis
+    degismez. }
+  if (FShm <> nil) and (FMySlot <= 0) then Exit;
   { R-12: sirasi: motoru kapat -> isimli mutex'i birak -> SHM slotunu
     birak. Motori kapatmadan mutex birakilirsa baska surec dosyayi
     acamaz. }

@@ -364,6 +364,10 @@ type
     // degismedikce GetTable'in tam TTableDef kopyasi yeniden yapilmaz.
     // Gecersiz kilma: ResetBatchTableCache, MarkSchema, LoadSchema.
     FOpenTDefValid: Boolean;
+    // R2-E-5: FOpenTDef'in hangi HAM (normalize edilmemis) tablo adi icin
+    // gecerli oldugu. Insert'te satir basina VDbNorm(Table) cagirmamak icin
+    // ham ad saklanir; ad esitse normalize sonucu da esittir.
+    FOpenTDefRawName: string;
     // P-31: auto-inc sayac onbellegi. Her satirda FAutoInc sozlugune yazmak
     // yerine Int64 uzerinde calisir; Commit/Abort'ta tek seferde yazdirilir.
     // P-64: onbellek artik batch DISINDA da kullanilir (non-batch INSERT).
@@ -379,6 +383,13 @@ type
     // Ayni tabloya ardisik INSERT'lerde VDbNorm+UTF8Encode+FNV atlaniyor.
     FPrefixCacheName: string;
     FPrefixCacheVal: QWord;
+    // B-11: PutRow'un KENDI prefix onbellegi. Insert, "FPrefixCacheName=X
+    // ise FBatchHasIdentity/FBatchHasGenerated X icindir" degismeziyle
+    // calisir; PutRow ayni alanlari yazarsa bu degismez bozulur (R2-D-1).
+    // Bu yuzden PutRow burada ayri alanlar kullanir; Insert'in onbellegine
+    // hic dokunmaz.
+    FPutPrefixName: string;
+    FPutPrefixVal: QWord;
     // P-63: kolon esleme onbellegi — batch VE non-batch INSERT yolunda ortak.
     // Ayni tabloya ardisik INSERT'lerde FindCol + provided[] tahsisi atlanir.
     FBatchColMapValid: Boolean;
@@ -459,6 +470,12 @@ type
     // sema ile bellekteki tablo listesi karsilastirilir.
     FIntentDrop: TStrArray;    // DROP TABLE / RENAME ile kaldirilanlar
     procedure ResetBatchTableCache;
+    procedure ResetBatchSchemaCaches;
+    // R2-F-1: yalnizca semadan turetilen batch onbelleklerini gecersiz kil
+    // (auto-inc sayaci ve indeks kirli durumu KORUNUR).
+    procedure AddDirty(const k: Int64);
+    procedure RemoveDirty(const k: Int64);
+    procedure ClearDirty;
     procedure IntentDrop(const Name: string);
     function IntentHas(const Name: string): Boolean;
     procedure GuardSchemaLoss;
@@ -2079,16 +2096,83 @@ end;
   olsa bile sorgu sonucu degismez (indeks yalnizca on daraltir, dogrulamayi
   WHERE yine yapar).
   Bos Predicate = normal indeks (tum satirlar). }
-function VDbPredOK(const Predicate: string; const Vals: TStrArray;
+{ B-12: Duz predikat adimi (atom) gosterimi.
+  Eski kod kosulu HER SATIRDA bastan ayristirip ayni anda degerlendiriyordu.
+  Burada ayristirma Vals'ten bagimsizdir (yalnizca Predicate metni ve kolon
+  duzenine bakar); bu yuzden plan bir kez kurulup satirlar arasinda yeniden
+  kullanilabilir. Degerlendirme kurali eski kodla birebir aynidir:
+  tum atomlar AND ile birlestirilir, NULL/UNKNOWN -> FALSE. }
+type
+  TVDbPredOpKind = (pjoLiteral, pjoNullLit, pjoColumn);
+  TVDbPredOperand = record
+    Kind: TVDbPredOpKind;
+    Value: string;      // literal metin (pjoLiteral)
+    ColIdx: Integer;    // kolon konumu (pjoColumn)
+  end;
+  TVDbPredAtomKind = (pjaIsNull, pjaIn, pjaCmp);
+  TVDbPredAtom = record
+    Kind: TVDbPredAtomKind;
+    Neg: Boolean;                    // pjaIsNull: IS NOT NULL
+    Lhs, Rhs: TVDbPredOperand;
+    Op: string;                      // pjaCmp operatoru
+    Ctype: Byte;                     // eski paylasilan `ctype` degeri
+    InList: array of TVDbPredOperand;
+  end;
+  TVDbPredPlan = record
+    Valid: Boolean;                  // ayristirma basarili mi
+    Atoms: array of TVDbPredAtom;    // AND ile bagli, sirayla degerlendirilir
+  end;
+
+{ B-12: threadvar, sinirli (4 girdilik) onbellek. P-65'teki tek girdilik
+  desen burada yetmez: IdxAddRow/IdxDelRow satir basina TUM kismi indeksleri
+  gezer, yani A ve B predikatlari satir basina sirayla gelir; tek girdi her
+  cagrida isabetsiz olurdu. 4 girdi pratikteki kismi indeks sayisini karsilar.
+  Plan kolon KONUMLARINI sakladigi icin metin tek basina anahtar olamaz:
+  ayni metin farkli kolon duzenine sahip baska bir tabloda yanlis konumlara
+  isaret eder. Bu yuzden kolon adlari ve Ctype'lari da saklanip isabette
+  karsilastirilir (pahali is bir kez, dogrulama ucuz). }
+const
+  VDB_PRED_CACHE_N = 4;
+type
+  TVDbPredCacheEntry = record
+    Ready: Boolean;
+    Text: string;
+    ColN: Integer;
+    ColNames: array of string;
+    ColCtypes: array of Byte;
+    Plan: TVDbPredPlan;
+  end;
+
+threadvar
+  GPredPlanCache: array[0..VDB_PRED_CACHE_N - 1] of TVDbPredCacheEntry;
+  GPredPlanNext: Integer;
+
+{ Onbellekteki planin kolon duzeni hala gecerli mi? Ad + Ctype + sira.
+  Adlar zaten normalize saklanir; VDbNorm gerekmez. }
+function VDbPredLayoutOK(const E: TVDbPredCacheEntry;
   const Cols: array of TColDef): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  if Length(Cols) <> E.ColN then Exit;
+  for i := 0 to High(Cols) do
+    if (Cols[i].Name <> E.ColNames[i]) or
+       (Cols[i].Ctype <> E.ColCtypes[i]) then Exit;
+  Result := True;
+end;
+
+{ B-12: Predicate metnini atom listesine cevirir. Dil, eski VDbPredOK
+  ayristiricisiyla AYNIDIR (ayni WordIs/SkipWs/Operand kurallari, ayni
+  guvenli FALSE yollari). Degerlendirme ayri yapildigi icin burada Vals
+  kullanilmaz. }
+function VDbPredParsePlan(const Predicate: string;
+  const Cols: array of TColDef): TVDbPredPlan;
 var
   S: string;
   P: Integer;
-  neg, found, sub: Boolean;      // Atom/Expr paylasilan bayraklar
-  opS, lhsS, rhsS: string;
-  lhsNull, rhsNull: Boolean;
-  ci, k, cmp: Integer;
-  ctype: Byte;
+  curCtype: Byte;
+  Atoms: array of TVDbPredAtom;
 
   function Expr: Boolean; forward;
   function AndExpr: Boolean; forward;
@@ -2115,7 +2199,6 @@ var
   end;
 
   function WordIs(const W: string): Boolean;
-  // P konumunda W kelimesi var mi (sonrasi boslak / ')' / son)?
   begin
     Result := (P + Length(W) - 1 <= Length(S)) and
               (Copy(S, P, Length(W)) = W) and
@@ -2123,16 +2206,22 @@ var
                (S[P + Length(W)] = ' ') or (S[P + Length(W)] = ')'));
   end;
 
-  { Tek bir deger okur: 'metin' | sayi | NULL | kolon.
-    Basarisiz olursa False doner (cagiran guvenli FALSE yoluna gider). }
-  function Operand(out SVal: string; out IsNull: Boolean): Boolean;
+  procedure AddAtom(const A: TVDbPredAtom);
+  begin
+    SetLength(Atoms, Length(Atoms) + 1);
+    Atoms[High(Atoms)] := A;
+  end;
+
+  { Tek bir deger okur: 'metin' | sayi | NULL | kolon. }
+  function Operand(out Opnd: TVDbPredOperand): Boolean;
   var
     v: string;
-    cmp2: Integer;   // FPC 4058: FOR sayaci dis degisken olamaz
+    ci, cmp2: Integer;   // FPC 4058: FOR sayaci dis degisken olamaz
   begin
+    Opnd.Kind := pjoLiteral;
+    Opnd.Value := '';
+    Opnd.ColIdx := -1;
     SkipWs;
-    IsNull := False;
-    SVal := '';
     if P > Length(S) then Exit(False);
     if S[P] = '''' then                    // 'metin' sabiti
     begin
@@ -2141,14 +2230,14 @@ var
       begin
         if S[P] <> '''' then
         begin
-          SVal := SVal + S[P];
+          Opnd.Value := Opnd.Value + S[P];
           Inc(P);
           Continue;
         end;
         // '' kacisi mi, yoksa kapanis mi?
         if (P + 1 <= Length(S)) and (S[P + 1] = '''') then
         begin
-          SVal := SVal + '''';
+          Opnd.Value := Opnd.Value + '''';
           Inc(P, 2);
           Continue;
         end;
@@ -2162,14 +2251,14 @@ var
       while (P <= Length(S)) and (((S[P] >= '0') and (S[P] <= '9')) or
             (S[P] = '.')) do
       begin
-        SVal := SVal + S[P];
+        Opnd.Value := Opnd.Value + S[P];
         Inc(P);
       end;
       Exit(True);
     end;
     if WordIs('NULL') then
     begin
-      IsNull := True;
+      Opnd.Kind := pjoNullLit;
       Inc(P, 4);
       Exit(True);
     end;
@@ -2181,71 +2270,75 @@ var
       Inc(P);
     end;
     if v = '' then Exit(False);
-    k := LastDot(v);
-    if k > 0 then v := Copy(v, k + 1, MaxInt);
+    ci := LastDot(v);
+    if ci > 0 then v := Copy(v, ci + 1, MaxInt);
+    // Kolon adlari normalize saklanir; VDbNorm(v) bir kez yeter.
+    v := VDbNorm(v);
     ci := -1;
     for cmp2 := 0 to High(Cols) do
-      if VDbNorm(Cols[cmp2].Name) = VDbNorm(v) then
+      if Cols[cmp2].Name = v then
       begin
         ci := cmp2;
         Break;
       end;
     if ci < 0 then Exit(False);            // bilinmeyen kolon -> guvenli FALSE
-    ctype := Cols[ci].Ctype;
-    if ci >= Length(Vals) then
-    begin
-      IsNull := True;                     // eksik deger = NULL
-      Exit(True);
-    end;
-    SVal := Vals[ci];
-    IsNull := (SVal = '');
+    curCtype := Cols[ci].Ctype;
+    Opnd.Kind := pjoColumn;
+    Opnd.ColIdx := ci;
     Exit(True);
   end;
 
   function Atom: Boolean;
+  var
+    a: TVDbPredAtom;
   begin
+    Result := False;
     SkipWs;
-    if P > Length(S) then Exit(False);
+    if P > Length(S) then Exit;
     // IS [NOT] NULL
     if WordIs('IS') then
     begin
       Inc(P, 2);
       SkipWs;
-      neg := False;
+      a.Kind := pjaIsNull;
+      a.Neg := False;
       if WordIs('NOT') then
       begin
-        neg := True;
+        a.Neg := True;
         Inc(P, 3);
         SkipWs;
       end;
-      if not WordIs('NULL') then Exit(False);
+      if not WordIs('NULL') then Exit;
       Inc(P, 4);
-      if not Operand(rhsS, rhsNull) then Exit(False);
-      if neg then Exit(not rhsNull) else Exit(rhsNull);
+      // ORIJINAL DAVRANIS: NULL'dan sonra ayrica bir operand beklenir;
+      // yoksa atom ayristirilamaz (guvenli FALSE).
+      if not Operand(a.Rhs) then Exit;
+      AddAtom(a);
+      Exit(True);
     end;
     // NOT IN (...) desteklenmiyor -> guvenli FALSE
-    if WordIs('NOT') then Exit(False);
+    if WordIs('NOT') then Exit;
     // IN (a, b, ...)
     if WordIs('IN') then
     begin
       Inc(P, 2);
       SkipWs;
-      if (P > Length(S)) or (S[P] <> '(') then Exit(False);
+      if (P > Length(S)) or (S[P] <> '(') then Exit;
       Inc(P);
-      if not Operand(lhsS, lhsNull) then Exit(False);
-      if lhsNull then Exit(False);        // NULL IN (...) -> UNKNOWN -> FALSE
-      found := False;
+      a.Kind := pjaIn;
+      if not Operand(a.Lhs) then Exit;
+      SetLength(a.InList, 0);
       while True do
       begin
         SkipWs;
-        if P > Length(S) then Exit(False);
+        if P > Length(S) then Exit;
         if S[P] = ')' then
         begin
           Inc(P);
           Break;
         end;
-        if not Operand(rhsS, rhsNull) then Exit(False);
-        if (not rhsNull) and (rhsS = lhsS) then found := True;
+        SetLength(a.InList, Length(a.InList) + 1);
+        if not Operand(a.InList[High(a.InList)]) then Exit;
         SkipWs;
         if (P <= Length(S)) and (S[P] = ',') then
         begin
@@ -2257,73 +2350,82 @@ var
           Inc(P);
           Break;
         end;
-        Exit(False);
+        Exit;
       end;
-      Exit(found);
+      AddAtom(a);
+      Exit(True);
     end;
     // ( ... )
     if S[P] = '(' then
     begin
       Inc(P);
-      sub := Expr;
+      Result := Expr;
+      if not Result then Exit;
       SkipWs;
       if (P > Length(S)) or (S[P] <> ')') then Exit(False);
       Inc(P);
-      Exit(sub);
+      Exit(True);
     end;
     // operand [op operand]
-    if not Operand(lhsS, lhsNull) then Exit(False);
+    a.Kind := pjaCmp;
+    if not Operand(a.Lhs) then Exit;
     SkipWs;
-    if P > Length(S) then Exit(False);
-    opS := '';
+    if P > Length(S) then Exit;
+    a.Op := '';
     if S[P] = '<' then
     begin
       if (P + 1 <= Length(S)) and (S[P+1] = '>') then
-      begin opS := '<>'; Inc(P, 2); end
+      begin a.Op := '<>'; Inc(P, 2); end
       else if (P + 1 <= Length(S)) and (S[P+1] = '=') then
-      begin opS := '<='; Inc(P, 2); end
-      else begin opS := '<'; Inc(P); end;
+      begin a.Op := '<='; Inc(P, 2); end
+      else begin a.Op := '<'; Inc(P); end;
     end
     else if S[P] = '>' then
     begin
       if (P + 1 <= Length(S)) and (S[P+1] = '=') then
-      begin opS := '>='; Inc(P, 2); end
-      else begin opS := '>'; Inc(P); end;
+      begin a.Op := '>='; Inc(P, 2); end
+      else begin a.Op := '>'; Inc(P); end;
     end
-    else if S[P] = '=' then begin opS := '='; Inc(P); end
-    else Exit(False);                     // LIKE / fonksiyon / vs -> desteklenmiyor
+    else if S[P] = '=' then begin a.Op := '='; Inc(P); end
+    else Exit;                            // LIKE / fonksiyon / vs -> desteklenmiyor
     SkipWs;
-    if not Operand(rhsS, rhsNull) then Exit(False);
-    if lhsNull or rhsNull then Exit(False);   // SQL NULL: sonuc UNKNOWN
-    Exit(VDbCmpVal(lhsS, rhsS, opS, ctype));
+    if not Operand(a.Rhs) then Exit;
+    // Orijinal kodda karsilastirma, RHS islendikten sonraki `ctype` ile
+    // yapiliyordu; burada ayristirma anindaki ayni deger saklanir.
+    a.Ctype := curCtype;
+    AddAtom(a);
+    Result := True;
   end;
 
   function AndExpr: Boolean;
   begin
     Result := Atom;
-    while True do
+    while Result do
     begin
       SkipWs;
       if WordIs('AND') then
       begin
         Inc(P, 3);
-        if not Atom then Exit(False);     // kisa devre: hep guvenli FALSE
+        Result := Atom;
         Continue;
       end;
       Break;
     end;
   end;
 
+  { Orijinal Expr'de OR dallari da AND gibi birlesiyordu (ilk AndExpr'in
+    degeri sonucu belirler, sonrakiler yalnizca False yapabilir). Bu yuzden
+    duz atom listesi + AND degerlendirmesi birebir esdegerdir. }
   function Expr: Boolean;
   begin
     Result := AndExpr;
-    while True do
+    while Result do
     begin
       SkipWs;
       if WordIs('OR') then
       begin
         Inc(P, 2);
-        if not AndExpr then Exit(False);
+        Result := AndExpr;
         Continue;
       end;
       Break;
@@ -2331,16 +2433,143 @@ var
   end;
 
 begin
-  // Bos predicate = normal indeks (tum satirlar indekslenir)
-  Result := True;
-  if Predicate = '' then Exit;
+  Result.Valid := False;
+  Result.Atoms := nil;
+  Atoms := nil;
   S := Predicate;
   P := 1;
-  Result := False;
+  // Orijinal `ctype` yalnizca kolon operandinda atanirdi ve ilk atamadan
+  // once okunmasi tanimsizdi (yalnizca iki tarafi da literal olan, motorun
+  // uretmedigi bir kosulda). Onbellege alinan plan deterministik olsun diye
+  // 0 (VCT_INT) ile baslatilir.
+  curCtype := 0;
   if not Expr then Exit;
   SkipWs;
   // Tum metin tuketilmis olmali; artik varsa guvenli FALSE
-  if P > Length(S) then Result := True;
+  if P <= Length(S) then Exit;
+  Result.Atoms := Atoms;      // referans paylasimi; kopya yok
+  Result.Valid := True;
+end;
+
+function VDbPredOperandNull(const Opnd: TVDbPredOperand;
+  const Vals: TStrArray): Boolean;
+begin
+  case Opnd.Kind of
+    pjoNullLit:
+      Result := True;
+    pjoColumn:
+      if Opnd.ColIdx >= Length(Vals) then
+        Result := True                 // eksik deger = NULL
+      else
+        Result := (Vals[Opnd.ColIdx] = '');
+  else
+    Result := False;                   // '' sabiti NULL DEGILDIR
+  end;
+end;
+
+function VDbPredOperandValue(const Opnd: TVDbPredOperand;
+  const Vals: TStrArray): string;
+begin
+  if Opnd.Kind = pjoColumn then
+  begin
+    if Opnd.ColIdx < Length(Vals) then
+      Result := Vals[Opnd.ColIdx]
+    else
+      Result := '';
+  end
+  else
+    Result := Opnd.Value;
+end;
+
+{ B-12: Plani satira uygular. Eski kodla ayni kisa devre ve NULL kurallari:
+  herhangi bir atom False ise sonuc False; NULL/UNKNOWN karsilastirma False. }
+function VDbPredEval(const Plan: TVDbPredPlan;
+  const Vals: TStrArray): Boolean;
+var
+  i, j: Integer;
+  lv: string;
+  lnull: Boolean;
+begin
+  for i := 0 to High(Plan.Atoms) do
+  begin
+    case Plan.Atoms[i].Kind of
+      pjaIsNull:
+        begin
+          lnull := VDbPredOperandNull(Plan.Atoms[i].Rhs, Vals);
+          if Plan.Atoms[i].Neg then Result := not lnull else Result := lnull;
+        end;
+      pjaIn:
+        begin
+          // NULL IN (...) -> UNKNOWN -> FALSE
+          if VDbPredOperandNull(Plan.Atoms[i].Lhs, Vals) then
+            Result := False
+          else
+          begin
+            lv := VDbPredOperandValue(Plan.Atoms[i].Lhs, Vals);
+            Result := False;
+            for j := 0 to High(Plan.Atoms[i].InList) do
+              if (not VDbPredOperandNull(Plan.Atoms[i].InList[j], Vals)) and
+                 (VDbPredOperandValue(Plan.Atoms[i].InList[j], Vals) = lv) then
+              begin
+                Result := True;
+                Break;
+              end;
+          end;
+        end;
+      else  // pjaCmp
+        begin
+          if VDbPredOperandNull(Plan.Atoms[i].Lhs, Vals) or
+             VDbPredOperandNull(Plan.Atoms[i].Rhs, Vals) then
+            Result := False               // SQL NULL: sonuc UNKNOWN
+          else
+            Result := VDbCmpVal(VDbPredOperandValue(Plan.Atoms[i].Lhs, Vals),
+                                VDbPredOperandValue(Plan.Atoms[i].Rhs, Vals),
+                                Plan.Atoms[i].Op, Plan.Atoms[i].Ctype);
+        end;
+    end;
+    if not Result then Exit;
+  end;
+  Result := True;
+end;
+
+function VDbPredOK(const Predicate: string; const Vals: TStrArray;
+  const Cols: array of TColDef): Boolean;
+var
+  i, slot: Integer;
+begin
+  // Bos predicate = normal indeks (tum satirlar indekslenir)
+  if Predicate = '' then Exit(True);
+  slot := -1;
+  for i := 0 to VDB_PRED_CACHE_N - 1 do
+    if GPredPlanCache[i].Ready and (GPredPlanCache[i].Text = Predicate) and
+       VDbPredLayoutOK(GPredPlanCache[i], Cols) then
+    begin
+      slot := i;
+      Break;
+    end;
+  if slot < 0 then
+  begin
+    // Round-robin yer degistirme; GPredPlanNext her zaman [0, N) araliginda.
+    slot := GPredPlanNext;
+    Inc(GPredPlanNext);
+    if GPredPlanNext >= VDB_PRED_CACHE_N then GPredPlanNext := 0;
+    // Once hazir bayragini dusur: ayristirma sirasinda bir istisna olursa
+    // yarim guncellenmis onbellek kullanilmasin.
+    GPredPlanCache[slot].Ready := False;
+    GPredPlanCache[slot].Text := Predicate;
+    GPredPlanCache[slot].ColN := Length(Cols);
+    SetLength(GPredPlanCache[slot].ColNames, Length(Cols));
+    SetLength(GPredPlanCache[slot].ColCtypes, Length(Cols));
+    for i := 0 to High(Cols) do
+    begin
+      GPredPlanCache[slot].ColNames[i] := Cols[i].Name;
+      GPredPlanCache[slot].ColCtypes[i] := Cols[i].Ctype;
+    end;
+    GPredPlanCache[slot].Plan := VDbPredParsePlan(Predicate, Cols);
+    GPredPlanCache[slot].Ready := True;
+  end;
+  if not GPredPlanCache[slot].Plan.Valid then Exit(False);
+  Result := VDbPredEval(GPredPlanCache[slot].Plan, Vals);
 end;
 
 { F-18: ifade indeks anahtari hesabi.
@@ -5993,7 +6222,12 @@ procedure TVTableDb.MarkSchema;
 begin
   { v3.4: sema tek kayitlik GLOBAL durumdur; coklu yazmada DDL reddedilir. }
   RequireSoleTxn('DDL');
-  FOpenTDefValid := False;   // B-4: sema degisti, non-batch Insert onbellegi bayat
+  // R2-F-1 / R2-D-2: batch ici DDL (CREATE/DROP INDEX, ALTER ADD/DROP
+  // COLUMN, RENAME, ...) sonrasi FBatchTableDef/FBatchColMap/P-67
+  // bayraklari ve non-batch FOpenTDef onbellegi BAYAT kalirdi; sonraki
+  // INSERT yanlis kolon haritasi ya da eksik indeks listesi kullanirdi.
+  // Semadan turetilen tum onbellekler tek noktada dusurulur.
+  ResetBatchSchemaCaches;
   if FKvB.InBatch then
     FSchemaDirty := True
   else
@@ -6389,7 +6623,32 @@ begin
   FPrefixCacheName := '';     // P-56
   FPrefixCacheVal := 0;
   FOpenTDefValid := False;    // B-4
+  FOpenTDefRawName := '';
   FLastDirtyIdx := -1;        // B-3
+end;
+
+procedure TVTableDb.ResetBatchSchemaCaches;
+// R2-F-1: sema degisikliginin TEK noktasindan (MarkSchema) cagrilir.
+// ResetBatchTableCache'ten farki: FBatchAutoIncValid'i ve FIdxDirty/
+// FLastDirtyIdx durumunu KORUR. Tam sifirlama burada kullanilsaydi
+// `BEGIN; INSERT; ALTER; INSERT` dizisinde ikinci INSERT auto-inc
+// onbellegini sozlukte bulamaz, ayni IDENTITY degerini yeniden uretirdi.
+// Burada yalniz semadan TURETILEN onbellekler dusurulur: tablo tanimi,
+// kolon haritasi, P-67 bayraklari, P-56 prefix ve B-4 FOpenTDef.
+// (FBatchHashPrefix/FBatchHasPkIdx, FBatchTableCached ile ayni
+// gecerlilige baglidir; FHasIdxWork'un anahtari Idx sayisini icerir.)
+begin
+  FBatchTableCached := False;
+  FBatchHasPkIdx := False;
+  FBatchHasIdentity := False;
+  FBatchHasGenerated := False;
+  FBatchColMapValid := False;
+  SetLength(FBatchColMap, 0);
+  FColMapTable := '';
+  FPrefixCacheName := '';
+  FPrefixCacheVal := 0;
+  FOpenTDefValid := False;
+  FOpenTDefRawName := '';
 end;
 
 procedure TVTableDb.BeginBatch;
@@ -6496,13 +6755,27 @@ var
   ikey: string;              // F2-23: UNIQUE bilesik indeks anahtari
   rkey: string;             // F-18: ifade UNIQUE karsilastirma anahtari
   eCtype: Byte;             // F-18
-  icols: TIntArray;          // F2-23: indeks kolonlari
+  icols: TIntArray;          // F2-23: indeks kolonlari (kopyasiz referans)
+  nparts: Integer;           // B-5: indeksin kolon sayisi (IdxColsOf yerine)
+  firstCol: Integer;         // B-5: indeksin ilk kolonu
+  jkey: string;              // B-5: tam tarama karsilastirma anahtari
+  partIdx: Integer;          // B-5: bolme kolonunun konumu (cagri basina bir kez)
   pks: TStrArray;
   rows: TStrMatrix;
   ik: Int64;
   um: TDictionary<string, string>;
   sahip: string;
 begin
+  { B-5: bolme kolonu konumu satir basina degil, cagri basina bir kez
+    cozulur. ONCEDEN her kolonda `T.PartType <> ''` ve
+    `T.Cols[i].Name = T.PartCol` dize karsilastirmasi tekrarlaniyordu. }
+  partIdx := -1;
+  if T.PartType <> '' then
+  begin
+    k := 0;
+    while (k <= High(T.Cols)) and (T.Cols[k].Name <> T.PartCol) do Inc(k);
+    if k <= High(T.Cols) then partIdx := k;
+  end;
   for i := 0 to High(T.Cols) do
   begin
     if Vals[i] <> '' then
@@ -6533,7 +6806,7 @@ begin
     // R-13 Full: bolme anahtari NULL olamaz (hangi bolume dusecegi
     // hesaplanamazdi). INSERT ve UPDATE yollari CheckConstraints'ten
     // gectigi icin tek noktada denetlenir.
-    if (T.PartType <> '') and (T.Cols[i].Name = T.PartCol) and (Vals[i] = '') then
+    if (partIdx = i) and (Vals[i] = '') then
       raise EVDbException.Create(ecNotNullViolation,
         'partition anahtari NULL olamaz: ' + T.PartCol);
     if T.Cols[i].Unique and (Vals[i] <> '') then
@@ -6622,8 +6895,26 @@ begin
         end;
       Continue;
     end;
-    icols := IdxColsOf(T, i);
-    ikey := VDbIdxJoin(Vals, icols);
+    { B-5: IdxColsOf her satirda TIntArray kopyasi ayiriyordu. Kolon listesi
+      zaten T.Idx[i].Cols'ta durur; sabit referans yeterlidir. Tek kolonlu
+      indekste (Cols bos) hic ayirma yapmadan dogrudan deger alinir. }
+    if Length(T.Idx[i].Cols) > 0 then
+    begin
+      icols := T.Idx[i].Cols;   // referans paylasimi; kopya YOK
+      nparts := Length(icols);
+      firstCol := icols[0];
+      ikey := VDbIdxJoin(Vals, icols);
+    end
+    else
+    begin
+      icols := nil;
+      nparts := 1;
+      firstCol := T.Idx[i].Col;
+      if (firstCol >= 0) and (firstCol < Length(Vals)) then
+        ikey := Vals[firstCol]
+      else
+        ikey := '';
+    end;
     if ikey = '' then Continue;
     // hizli yol: indeks dizisinden ilk kolonun TUM karsiliklarini al
     // (cok kolonlu indeks girdileri PARCA PARCA sirali oldugu icin ham
@@ -6631,10 +6922,10 @@ begin
     // alinir, sonra tam anahtar esitligi denetlenir).
     if TryGetMemIndex(T.TableId, T.Idx[i].Col, e) then
     begin
-      if Length(icols) <= 1 then
+      if nparts <= 1 then
       begin
         lo := 0; hi := 0;
-        if VDbIdxRange(e, T.Cols[icols[0]].Ctype, '=', ikey, lo, hi) then
+        if VDbIdxRange(e, T.Cols[firstCol].Ctype, '=', ikey, lo, hi) then
           for k := lo to hi - 1 do
             if e[k].Pk <> ExcludePk then
               raise EVDbException.Create(ecUniqueViolation,
@@ -6647,7 +6938,7 @@ begin
         // Once ilk parca ELDE EDILIP verilseydi, degerin kendi icindeki #1
         // yeniden ayirici sayilir ve karsilastirma bozulurdu.
         lo := 0; hi := 0;
-        if VDbIdxRangeLK(e, T.Cols[icols[0]].Ctype, '=', ikey, Length(icols), lo, hi) then
+        if VDbIdxRangeLK(e, T.Cols[firstCol].Ctype, '=', ikey, nparts, lo, hi) then
           for k := lo to hi - 1 do
             if (e[k].Pk <> ExcludePk) and (e[k].Key = ikey) then
               raise EVDbException.Create(ecUniqueViolation,
@@ -6661,7 +6952,13 @@ begin
       for k := 0 to High(pks) do
       begin
         if pks[k] = ExcludePk then Continue;
-        if VDbIdxJoin(rows[k], icols) = ikey then
+        if icols <> nil then
+          jkey := VDbIdxJoin(rows[k], icols)
+        else if (firstCol >= 0) and (firstCol < Length(rows[k])) then
+          jkey := rows[k][firstCol]
+        else
+          jkey := '';
+        if jkey = ikey then
           raise EVDbException.Create(ecUniqueViolation,
             'UNIQUE ihlali: ' + T.Idx[i].Name);
       end;
@@ -7045,7 +7342,7 @@ end;
 
 procedure TVTableDb.CheckFk(const T: TTableDef; const Vals: TStrArray);
 var
-  i: Integer;
+  i, k: Integer;
   rt: TTableDef;
   rc: Integer;
   pk: string;
@@ -7072,12 +7369,22 @@ begin
   for i := 0 to High(T.Fks) do
   begin
     if Vals[T.Fks[i].Col] = '' then Continue; // NULL serbest
+    { B-6: TFkDef.RefTable/RefCol semaya yazilirken VDbNorm'lanir
+      (CreateTable/LoadSchema/Rename); T.Name ve Cols[].Name da normalize
+      tutulur. Bu yuzden satir basina VDbNorm cagrisi ve FindCol icindeki
+      ikinci VDbNorm gereksizdir; karsilastirmalar birebir ayni sonucu verir. }
     // F2-12: kendine referansta hedef tablo T'nin kendisi (zaten var).
-    if VDbNorm(T.Fks[i].RefTable) = T.Name then
+    if T.Fks[i].RefTable = T.Name then
       rt := T
     else if not FTables.TryGetValue(T.Fks[i].RefTable, rt) then
       raise EVDbException.Create(ecForeignKeyViolation, 'FK hedef tablo yok: ' + T.Fks[i].RefTable);
-    rc := FindCol(rt, T.Fks[i].RefCol);
+    rc := -1;
+    for k := 0 to High(rt.Cols) do
+      if rt.Cols[k].Name = T.Fks[i].RefCol then
+      begin
+        rc := k;
+        Break;
+      end;
     if rc < 0 then
       raise EVDbException.Create(ecForeignKeyViolation, 'FK hedef kolon yok: ' + T.Fks[i].RefCol);
     if not RefValueExists(rt, rc, Vals[T.Fks[i].Col]) then
@@ -7108,16 +7415,20 @@ begin
       raise EVDbException.Create(ecNotNullViolation,
         'partition anahtari NULL olamaz: ' + T.PartCol);
   end;
-  { B-11: Insert'teki P-56 prefix onbellegi. Ayni tabloya ardisik
+  { B-11: PutRow'a ozel P-56 prefix onbellegi. Ayni tabloya ardisik
     PUT/UPDATE'larda VDbNorm+UTF8Encode+tablo-kismi FNV tekrarlanmaz.
-    Saf-ASCII pk'da Insert ile ayni hizli yol; sonuc VDbHashKey ile birebir. }
-  if FPrefixCacheName <> T.Name then
+    Saf-ASCII pk'da Insert ile ayni hizli yol; sonuc VDbHashKey ile birebir.
+    R2-D-1: Insert'in FPrefixCacheName alani BURADA KULLANILMAZ. Insert'in
+    P-67 bayrak onbellegi "FPrefixCacheName=X ise bayraklar X icindir"
+    degismeziyle calisir; PutRow o alani yazarsa degismez bozulur ve sonraki
+    INSERT IDENTITY/GENERATED taramasini atlardi. }
+  if FPutPrefixName <> T.Name then
   begin
-    FPrefixCacheName := T.Name;
-    FPrefixCacheVal := VDbHashKeyPrefix(T.Name);
+    FPutPrefixName := T.Name;
+    FPutPrefixVal := VDbHashKeyPrefix(T.Name);
   end;
   if (Length(Pk) > 0) and VDbIsPureAscii(Pk) then
-    key := VDbHashKeyBytes(FPrefixCacheVal, PByte(@Pk[1]), Length(Pk))
+    key := VDbHashKeyBytes(FPutPrefixVal, PByte(@Pk[1]), Length(Pk))
   else
     key := VDbHashKey(T.Name, Pk);
   if FKvB.Get(key, oldB) then
@@ -7331,7 +7642,12 @@ begin
           PutRow(child, plan[i].Pks[n], newVals);
         end;
     end;
-    if ownBatch then FKvB.CommitBatch;
+    // R2-D-3: abort kolu zaten TVTableDb.AbortBatch (indeksleri veriden
+    // yeniden kurar). Commit de ayni seviyede olmali: F1-9 deseni geregi
+    // FlushAutoIncCache + ResetBatchTableCache + FSchemaDirty yazimi.
+    // BeginBatch burada FKvB.BeginBatch'tir; TVTableDb.CommitBatch bunun
+    // ustune yalniz guvenli ek isler yapar (FSnapActive ise ClearSchema...).
+    if ownBatch then CommitBatch;
   except
     if ownBatch then AbortBatch;
     raise;
@@ -7809,6 +8125,34 @@ begin
   Result := FHasIdxWork;
 end;
 
+procedure TVTableDb.AddDirty(const k: Int64);
+// R2-B-4: FIdxDirty'ye TEK giris noktasi. FLastDirtyIdx yalniz burada
+// ilerletilir; liste elemani silen her yol RemoveDirty/ClearDirty'den
+// gectigi icin "FLastDirtyIdx daima listede VAR olan bir anahtardir"
+// degismezi yapisal olarak korunur (tek girdilik onbellek yaniltilamaz).
+begin
+  if FLastDirtyIdx <> k then
+  begin
+    if FIdxDirty.IndexOf(k) < 0 then FIdxDirty.Add(k);
+    FLastDirtyIdx := k;
+  end;
+end;
+
+procedure TVTableDb.RemoveDirty(const k: Int64);
+var
+  i: Integer;
+begin
+  i := FIdxDirty.IndexOf(k);
+  if i >= 0 then FIdxDirty.Delete(i);
+  FLastDirtyIdx := -1;   // B-3: liste degisti
+end;
+
+procedure TVTableDb.ClearDirty;
+begin
+  FIdxDirty.Clear;
+  FLastDirtyIdx := -1;   // B-3: liste bosaldi
+end;
+
 procedure TVTableDb.IdxAddRow(const T: TTableDef; const Vals: TStrArray;
   const Pk: string; const OnlyPos: Integer);
 // Satirin indeks anahtarlarini gunceller (cok kolonlu destekli).
@@ -7857,12 +8201,9 @@ begin
     if (key <> '') and FIdxUniq.TryGetValue(k, m) then m.AddOrSetValue(key, Pk);
     // B-3: son eklenen anahtar onbellegi - ardisik satirlarda ayni indeks
     // anahtari icin O(kirli liste) IndexOf taramasi atlanir. Onbellek
-    // FIdxDirty'den eleman silinen/clear edilen TUM noktalarda -1 yapilir.
-    if FLastDirtyIdx <> k then
-    begin
-      if FIdxDirty.IndexOf(k) < 0 then FIdxDirty.Add(k);
-      FLastDirtyIdx := k;
-    end;
+    // FIdxDirty'den eleman silinen/clear edilen TUM noktalarda -1 yapilir
+    // (R2-B-4: ekl/sil/clear artik tek yardimcidan gecer).
+    AddDirty(k);
   end;
 end;
 
@@ -7905,7 +8246,7 @@ begin
     // UNIQUE kolon haritasi: deger -> sahip pk
     if FIdxUniq.TryGetValue(k, m) then
       if m.TryGetValue(key, s) and (s = Pk) then m.Remove(key);
-    if FIdxDirty.IndexOf(k) < 0 then FIdxDirty.Add(k);
+    AddDirty(k);
   end;
 end;
 
@@ -7930,7 +8271,7 @@ begin
   FIdxCtype.AddOrSetValue(k, Ctype);
   // F3-5: bos anahtar haritaya yazilmaz (IdxAddRow ile ayni gerekce)
   if (Key <> '') and FIdxUniq.TryGetValue(k, m) then m.AddOrSetValue(Key, Pk);
-  if FIdxDirty.IndexOf(k) < 0 then FIdxDirty.Add(k);
+  AddDirty(k);
 end;
 
 procedure TVTableDb.IdxDel(TableId: Word; ColIdx: Integer; const Key, Pk: string; Ctype: Byte);
@@ -7955,7 +8296,7 @@ begin
   FIdxCtype.AddOrSetValue(k, Ctype);
   if FIdxUniq.TryGetValue(k, m) then
     if m.TryGetValue(Key, s) and (s = Pk) then m.Remove(Key);
-  if FIdxDirty.IndexOf(k) < 0 then FIdxDirty.Add(k);
+  AddDirty(k);
 end;
 
 procedure TVTableDb.FreeIdxUniqMaps;
@@ -7978,7 +8319,6 @@ procedure TVTableDb.DropIdxPend(const k: Int64);
 // ORDER BY tam taramadan fazla satir donuyordu).
 var
   l: TList<TIdxOp>;
-  m: Integer;
   um: TDictionary<string, string>;
   sk: TIdxSkip;
 begin
@@ -7998,9 +8338,7 @@ begin
     um.Free;
     FIdxUniq.Remove(k);
   end;
-  m := FIdxDirty.IndexOf(k);
-  if m >= 0 then FIdxDirty.Delete(m);
-  FLastDirtyIdx := -1;   // B-3: liste degisti
+  RemoveDirty(k);        // R2-B-4: tek silme noktasi
 end;
 
 procedure TVTableDb.BuildIdxEntries(const T: TTableDef; IdxPos: Integer;
@@ -9423,8 +9761,7 @@ begin
   FIdxOps.Clear;
   FIdxCtype.Clear;
   FreeIdxUniqMaps;
-  FIdxDirty.Clear;
-  FLastDirtyIdx := -1;   // B-3: liste bosaldi
+  ClearDirty;            // R2-B-4: tek temizleme noktasi
 end;
 
 // Satir Pk'sini tek dize anahtarina cevirir (tampon ici; diskte tutulmaz).
@@ -9597,9 +9934,7 @@ begin
     oldKeys.Free;
     ops.Free;
     FIdxOps.Remove(k);
-    i := FIdxDirty.IndexOf(k);
-    if i >= 0 then FIdxDirty.Delete(i);
-    FLastDirtyIdx := -1;   // B-3: liste degisti
+    RemoveDirty(k);        // R2-B-4: tek silme noktasi
     Exit;
   end;
 
@@ -9609,9 +9944,7 @@ begin
   oldKeys.Free;
   ops.Free;
   FIdxOps.Remove(k);
-  i := FIdxDirty.IndexOf(k);
-  if i >= 0 then FIdxDirty.Delete(i);
-  FLastDirtyIdx := -1;   // B-3: liste degisti
+  RemoveDirty(k);        // R2-B-4: tek silme noktasi
   Exit;
 end;
 
@@ -10493,10 +10826,13 @@ begin
         INSERT'lerde GetTable'in tam TTableDef kayit kopyasi atlanir.
         Gecerlilik: ad eslesmesi + sema nesli (FOpenTDefValid, MarkSchema /
         ResetBatchTableCache / LoadSchema tarafindan sifirlanir). }
-      if (not FOpenTDefValid) or (FOpenTDef.Name <> VDbNorm(Table)) then
+      // R2-E-5: satir basina VDbNorm(Table) yerine HAM ad esitligi. Ham ad
+      // esitse normalize sonucu da esittir; degilse (yalniz iska) tazelenir.
+      if (not FOpenTDefValid) or (FOpenTDefRawName <> Table) then
       begin
         FOpenTDef := GetTable(Table);
         FOpenTDefValid := True;
+        FOpenTDefRawName := Table;
         FPrefixCacheName := '';   // tazelenen sema: prefix + P-67 bayraklari yeniden hesaplansin
       end;
       tp := @FOpenTDef;

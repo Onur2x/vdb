@@ -146,7 +146,7 @@ begin
 
   LockRelease;
 
-  // 3) Yeni slab (VirtualAlloc — kendi icinde guvenli)
+  // 3) Yeni slab. VirtualAlloc yavas sistem cagrisi oldugu icin kilit disinda.
   slab := VirtualAlloc(nil, SLAB_SIZE, MEM_COMMIT or MEM_RESERVE, PAGE_READWRITE);
   if slab = nil then
   begin
@@ -156,9 +156,24 @@ begin
   slab^.Magic := SLAB_MAGIC;
   slab^.SizeClass := sc;
   idx := PtrUInt(slab) shr 16;
-  SlabBits[idx shr 3] := SlabBits[idx shr 3] or (1 shl (idx and 7));
 
   LockAcquire;
+  // R2-A-2: kilit disindayken baska is parcacigi ayni sinifa slab yayinladiysa
+  // onun bump alanindan al; bizim slab'i OS'e iade et. Aksi halde ikinci yayin
+  // birincinin kalan bump alanini cope atardi.
+  if BumpPtr[sc] <> nil then
+  begin
+    Result := BumpPtr[sc];
+    Inc(BumpPtr[sc], ClassSize[sc]);
+    if BumpPtr[sc] >= BumpEnd[sc] then BumpPtr[sc] := nil;
+    LockRelease;
+    VirtualFree(slab, 0, MEM_RELEASE);
+    Exit;
+  end;
+  // R2-A-1: SlabBits guncellemesi oku-yaz-bicim; kilitsiz yapilirsa ayni bayta
+  // dusen iki slab'tan biri bit kaybeder; MMFreeMem blogu yabanci sanip FPC
+  // heap'ine iade eder. Bu yuzden bit seti kilit altinda.
+  SlabBits[idx shr 3] := SlabBits[idx shr 3] or (1 shl (idx and 7));
   BumpPtr[sc] := PByte(slab) + SLAB_HDR;
   BumpEnd[sc] := PByte(slab) + SLAB_HDR +
     ((SLAB_SIZE - SLAB_HDR) div ClassSize[sc]) * ClassSize[sc];
@@ -208,6 +223,7 @@ var
   oldSize: PtrUInt;
   newP: Pointer;
   slab: PSlabHdr;
+  sc: Integer;
 begin
   if P = nil then
   begin
@@ -224,7 +240,14 @@ begin
   if IsOurSlab(P) then
   begin
     slab := PSlabHdr(PtrUInt(P) and PtrUInt(not (SLAB_SIZE - 1)));
-    oldSize := ClassSize[slab^.SizeClass];
+    // R2-A-3: MMFreeMem'deki sihirli sayi denetimi burada da gerekli; aksi
+    // halde bozuk baslik ClassSize[slab^.SizeClass] ile sinir disi okuma yapar.
+    sc := slab^.SizeClass;
+    if (slab^.Magic <> SLAB_MAGIC) or (sc < 0) or (sc >= NUM_CLASSES) then
+      // Sahiplik bitmap'te ama sinif bilinmiyor: eski bloga dokunmadan basarisiz
+      // don; cagiran eski isaretcisini korur, heap bozulmaz, dev Move olmaz.
+      Exit(nil);
+    oldSize := ClassSize[sc];
     if Size <= oldSize then Exit(P);
     newP := MMGetMem(Size);
     if newP = nil then Exit(nil);
@@ -240,12 +263,18 @@ end;
 function MMMemSize(P: Pointer): PtrUInt;
 var
   slab: PSlabHdr;
+  sc: Integer;
 begin
   if P = nil then Exit(0);
   if IsOurSlab(P) then
   begin
     slab := PSlabHdr(PtrUInt(P) and PtrUInt(not (SLAB_SIZE - 1)));
-    Result := ClassSize[slab^.SizeClass];
+    // R2-A-3: bozuk baslikta SizeClass sinir disi olabilir; dogrulamadan
+    // ClassSize'a indeksleme yapma. Bilinmeyen boyut icin 0 (guvenli) don.
+    sc := slab^.SizeClass;
+    if (slab^.Magic <> SLAB_MAGIC) or (sc < 0) or (sc >= NUM_CLASSES) then
+      Exit(0);
+    Result := ClassSize[sc];
     Exit;
   end;
   Result := OldMM.MemSize(P);

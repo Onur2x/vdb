@@ -11145,7 +11145,7 @@ var
   present: TDictionary<string, Byte>;  // simdi var olan PK'lar
   curPks: TStrArray;
   curRows: TStrMatrix;
-  cnt, n, i, outn: Integer;
+  cnt, n, i, outn, cap: Integer;
   key, k: QWord;
   fl: Byte;
   val: TBytes;
@@ -11171,8 +11171,15 @@ var
         'AS OF: gecmis satir semasi (%d kolon) guncel semadan (%d kolon) farkli; ' +
         'ALTER TABLE sonrasi gecmis okunamaz (pk=%s)',
         [Length(AVals), Length(ColNames), APk]);
-    SetLength(Pks, outn + 1);
-    SetLength(Rows, outn + 1);
+    { R2-A-14: satir basina SetLength(n+1) O(n^2) idi. Diziyi katlamali
+      kapasiteyle buyut; fonksiyon sonunda tam uzunluga kirp. }
+    if outn >= cap then
+    begin
+      if cap < 16 then cap := 16
+      else cap := cap * 2;
+      SetLength(Pks, cap);
+      SetLength(Rows, cap);
+    end;
     Pks[outn] := APk;
     Rows[outn] := AVals;
     Inc(outn);
@@ -11182,6 +11189,7 @@ begin
   SetLength(Pks, 0);
   SetLength(Rows, 0);
   outn := 0;
+  cap := 0;
 
   { v3.2: v3 sayfa motoru — WAL'de mantiksal kayit yok, ama sayfa imajlari
     N'inci commit'in TAM veritabani goruntusunu verir. Goruntu gecici bir
@@ -11321,6 +11329,10 @@ begin
     afterPk.Free;
     present.Free;
   end;
+  // R2-A-14: katlamali buyume nedeniyle kapasite fazlasi olabilir;
+  // cagiran taraf tam uzunluk gorur.
+  SetLength(Pks, outn);
+  SetLength(Rows, outn);
 end;
 
 procedure TVSqlExecutor.ExecRole(Stmt: TRoleStmt; out Res: TSqlResult);
@@ -15340,6 +15352,10 @@ var
   def: TTriggerDef;
   trNames: TStrArray;
   viewColNames: TStrArray;
+  // B9: cumle kapsamli tetikleyici/RLS on kontrolu
+  hasInsTrig, rlsApplies, needRls: Boolean;
+  // R2-E-6: INSERT ... SELECT satir dongusu icin kendi batch'i
+  ownBatch: Boolean;
 begin
 
   SetLength(emptyArr1, 0);
@@ -15565,34 +15581,66 @@ begin
 
   // F-36: BEFORE STATEMENT tetikleyiciler (tum satirlardan once, bir kez)
   FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, nil, [], Res, False);
+  { B9: tetikleyici meta verisi tek cumle yurutme boyunca degismez.
+    INSERT ROW tetikleyicisi yoksa satir basina iki FireTriggers cagrisi
+    tamamen bosadir; sonucu dongu oncesi bir kez belirle. Liste bos
+    degilse (STATEMENT tetikleyicisi bile olsa) cagrilar AYNEN surer. }
+  hasInsTrig :=
+    (Length(FT.TriggersFor(Stmt.Table, Byte(ttBefore), Byte(teInsert))) > 0) or
+    (Length(FT.TriggersFor(Stmt.Table, Byte(ttAfter), Byte(teInsert))) > 0);
+  { R-19: RLS karari da cumle basina bir kez. RLS kapaliyken
+    RlsRequireInsert ilk satirda cikiyordu; rol yalnizca bir tetikleyici
+    govdesinde degisebileceginden INSERT tetikleyicisi yokken karar
+    dongu boyunca sabittir. Tetikleyici varsa eski satir basina cagri
+    korunur (muhafazakar). }
+  rlsApplies := FT.RlsApplies(Stmt.Table);
+  needRls := rlsApplies or hasInsTrig;
   if Stmt.SelectSrc <> nil then
   begin
     // INSERT ... SELECT with optional ON CONFLICT
     ExecSelect(Stmt.SelectSrc, subRes);
     if onConflictAction = ocaNone then
     begin
-      for i := 0 to High(subRes.Rows) do
-      begin
-        NewRow := subRes.Rows[i];
-        FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
-        RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
-        FT.Insert(Stmt.Table, cnames, NewRow, @td);   // P-55
-        Inc(rCount);
-        FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
-        if hasReturning then
+      { R2-E-6: cok satirli VALUES daliyla ayni desen. Cumle tek batch'e
+        alinir; cagiran zaten batch icindeyse (VDbSql.ExecAllInner) sarma
+        yapilmaz, dis batch siniri korunur. Satir hatasinda AbortBatch tum
+        INSERT ... SELECT ifadesini geri alir; tek cumle atomikligi
+        PostgreSQL semantigiyle aynidir ve VALUES yolu da bunu uygular. }
+      ownBatch := not FT.Backend.InBatch;
+      if ownBatch then FT.BeginBatch;
+      try
+        for i := 0 to High(subRes.Rows) do
         begin
-          SetLength(retRow, Length(returningColNames));
-          for j := 0 to High(returningColNames) do
+          NewRow := subRes.Rows[i];
+          if hasInsTrig then
+            FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
+          if needRls then
+            RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
+          FT.Insert(Stmt.Table, cnames, NewRow, @td);   // P-55
+          Inc(rCount);
+          if hasInsTrig then
+            FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
+          if hasReturning then
           begin
-            ci := retCi[j];
-            if ci >= 0 then
-              retRow[j] := subRes.Rows[i][ci]
-            else
-              retRow[j] := '';
+            SetLength(retRow, Length(returningColNames));
+            for j := 0 to High(returningColNames) do
+            begin
+              ci := retCi[j];
+              if ci >= 0 then
+                retRow[j] := subRes.Rows[i][ci]
+              else
+                retRow[j] := '';
+            end;
+            SetLength(returningRows, Length(returningRows) + 1);
+            returningRows[High(returningRows)] := retRow;
           end;
-          SetLength(returningRows, Length(returningRows) + 1);
-          returningRows[High(returningRows)] := retRow;
         end;
+        if ownBatch then FT.CommitBatch;
+      except
+        // AbortBatch ikinci bir istisna firlatirsa asil hatayi maskelemesin.
+        if ownBatch then
+          try FT.AbortBatch; except end;
+        raise;
       end;
     end
     else
@@ -15606,35 +15654,47 @@ begin
       // Build SET values for DO UPDATE (evaluate expressions once per row)
       // We'll build this inside the loop per row since expressions may reference EXCLUDED
 
-      for i := 0 to High(subRes.Rows) do
-      begin
-        FExcludedRow := subRes.Rows[i];
-        FExcludedColNames := cnames;
-        // Build SET values for this row (expressions may reference EXCLUDED)
-        SetLength(upsertSetValues, Stmt.OnConflictSetExprs.Count);
-        BuildUpsertSetValues(Stmt, FExcludedRow, FExcludedColNames, allColNames, td, upsertSetValues);
-        if FT.UpsertRowReturning(Stmt.Table, cnames, subRes.Rows[i],
-          onConflictAction, Stmt.OnConflictTarget, upsertSetValues,
-          outPk, outVals) then
+      { R2-E-6: upsert dalinda da ayni batch deseni (bkz. ustteki ocaNone
+        dali); satir hatasinda tum INSERT ... SELECT geri alinir. }
+      ownBatch := not FT.Backend.InBatch;
+      if ownBatch then FT.BeginBatch;
+      try
+        for i := 0 to High(subRes.Rows) do
         begin
-          Inc(rCount);
-          if hasReturning then
+          FExcludedRow := subRes.Rows[i];
+          FExcludedColNames := cnames;
+          // Build SET values for this row (expressions may reference EXCLUDED)
+          SetLength(upsertSetValues, Stmt.OnConflictSetExprs.Count);
+          BuildUpsertSetValues(Stmt, FExcludedRow, FExcludedColNames, allColNames, td, upsertSetValues);
+          if FT.UpsertRowReturning(Stmt.Table, cnames, subRes.Rows[i],
+            onConflictAction, Stmt.OnConflictTarget, upsertSetValues,
+            outPk, outVals) then
           begin
-            // R-04: listede gercek IFADE varsa EvaluateReturning devreye girer;
-            // duz kolonlarda eski (hizli) yol korunur.
-            if not MakeReturningRow(Stmt, outVals, allColNames, colTypes, retRow) then
+            Inc(rCount);
+            if hasReturning then
             begin
-              SetLength(retRow, Length(returningColNames));
-              for j := 0 to High(returningColNames) do
+              // R-04: listede gercek IFADE varsa EvaluateReturning devreye girer;
+              // duz kolonlarda eski (hizli) yol korunur.
+              if not MakeReturningRow(Stmt, outVals, allColNames, colTypes, retRow) then
               begin
-                ci := retCiAll[j];
-                if ci >= 0 then retRow[j] := outVals[ci];
+                SetLength(retRow, Length(returningColNames));
+                for j := 0 to High(returningColNames) do
+                begin
+                  ci := retCiAll[j];
+                  if ci >= 0 then retRow[j] := outVals[ci];
+                end;
               end;
+              SetLength(returningRows, Length(returningRows) + 1);
+              returningRows[High(returningRows)] := retRow;
             end;
-            SetLength(returningRows, Length(returningRows) + 1);
-            returningRows[High(returningRows)] := retRow;
           end;
         end;
+        if ownBatch then FT.CommitBatch;
+      except
+        // AbortBatch ikinci bir istisna firlatirsa asil hatayi maskelemesin.
+        if ownBatch then
+          try FT.AbortBatch; except end;
+        raise;
       end;
     end;
   end
@@ -15656,11 +15716,14 @@ begin
             if onConflictAction = ocaNone then
             begin
               NewRow := [];
-              FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
-              RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
+              if hasInsTrig then
+                FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
+              if needRls then
+                RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
               FT.Insert(Stmt.Table, [], NewRow, @td);   // P-55
               Inc(rCount);
-              FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
+              if hasInsTrig then
+                FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
               if hasReturning then
               begin
                 // INSERT () VALUES () - tum kolonlar DEFAULT/NULL
@@ -15669,7 +15732,9 @@ begin
                   retRow[j] := '';
                 SetLength(returningRows, Length(returningRows) + 1);
                 returningRows[High(returningRows)] := retRow;
-                FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
+                // R2-E-7: AFTER ROW tetikleyicisi yukarida (FT.Insert sonrasi)
+                // zaten bir kez ateslendi. Buradaki ikinci cagri F-36
+                // sozlesmesini (satir basina tek BEFORE + tek AFTER) bozuyordu.
               end;
             end
             else
@@ -15716,8 +15781,10 @@ begin
               begin
                 // F-36: BEFORE ROW tetikleyiciler
                 NewRow := strVals;
-                FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
-                RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
+                if hasInsTrig then
+                  FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
+                if needRls then
+                  RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
                 if FT.InsertReturning(Stmt.Table, cnames, NewRow, outPk, outVals) then
                 begin
                   Inc(rCount);
@@ -15734,25 +15801,30 @@ begin
                   end;
                   SetLength(returningRows, Length(returningRows) + 1);
                   returningRows[High(returningRows)] := retRow;
-                  FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
+                  if hasInsTrig then
+                    FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
                 end;
               end
               else
               begin
                 // F-36: BEFORE ROW tetikleyiciler
                 NewRow := strVals;
-                FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
-                RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
+                if hasInsTrig then
+                  FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
+                if needRls then
+                  RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
                 FT.Insert(Stmt.Table, cnames, NewRow, @td);   // P-55
                 Inc(rCount);
-                FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
+                if hasInsTrig then
+                  FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
               end;
             end
             else
             begin
               FExcludedRow := strVals;
               FExcludedColNames := cnames;
-              RlsRequireInsert(Stmt.Table, cnames, strVals);   // R-19 (upsert)
+              if needRls then
+                RlsRequireInsert(Stmt.Table, cnames, strVals);   // R-19 (upsert)
               // Build SET values for this row
               SetLength(upsertSetValues, Stmt.OnConflictSetExprs.Count);
               BuildUpsertSetValues(Stmt, FExcludedRow, FExcludedColNames, allColNames, td, upsertSetValues);
@@ -15796,10 +15868,12 @@ begin
           if onConflictAction = ocaNone then
           begin
             NewRow := [];
-            FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
+            if hasInsTrig then
+              FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
             FT.Insert(Stmt.Table, [], NewRow, @td);   // P-55
             Inc(rCount);
-            FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
+            if hasInsTrig then
+              FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
             if hasReturning then
             begin
               SetLength(retRow, Length(returningColNames));
@@ -15851,8 +15925,10 @@ begin
             begin
               // F-36: BEFORE ROW tetikleyiciler
               NewRow := strVals;
-              FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
-              RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
+              if hasInsTrig then
+                FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
+              if needRls then
+                RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
               if FT.InsertReturning(Stmt.Table, cnames, NewRow, outPk, outVals) then
               begin
                 Inc(rCount);
@@ -15875,18 +15951,22 @@ begin
             begin
               // F-36: BEFORE ROW tetikleyiciler
               NewRow := strVals;
-              FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
-              RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
+              if hasInsTrig then
+                FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
+              if needRls then
+                RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
               FT.Insert(Stmt.Table, cnames, NewRow, @td);   // P-55
               Inc(rCount);
-              FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
+              if hasInsTrig then
+                FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
             end;
           end
           else
           begin
             FExcludedRow := strVals;
             FExcludedColNames := cnames;
-            RlsRequireInsert(Stmt.Table, cnames, strVals);   // R-19 (upsert)
+            if needRls then
+              RlsRequireInsert(Stmt.Table, cnames, strVals);   // R-19 (upsert)
             SetLength(upsertSetValues, Stmt.OnConflictSetExprs.Count);
             BuildUpsertSetValues(Stmt, FExcludedRow, FExcludedColNames, allColNames, td, upsertSetValues);
             if FT.UpsertRowReturning(Stmt.Table, cnames, strVals,
@@ -18463,12 +18543,19 @@ var
   item: TSelectColumnItem;
   colName: string;
   Ref: TSqlColumnRefNode;
+  existed: Boolean;
 begin
+  existed := FT.ViewExists(Stmt.ViewName);
   FT.CreateView(Stmt.ViewName, Stmt.SelectStmt, Stmt.SelectText, Stmt.IfNotExists);
-  // F-33: View kolonlarini SELECT'ten turet ve kaydet
-  if FT.TryGetTableDef(Stmt.ViewName, v) and v.IsView then
+  // F-33: View kolonlarini SELECT'ten turet ve kaydet.
+  // DIKKAT: Katalogdaki v.SelectStmt ESKI bir pointer'dir; CREATE cumlesi
+  // bitince AST Free edildigi icin dangling olur (bkz. REFRESH MV notu).
+  // Sema yalnizca AZ ONCE ayristirilan Stmt.SelectStmt'ten turetilir.
+  // IF NOT EXISTS + zaten var ise mevcut sema KORUNUR (yeniden yazilmaz).
+  if (not (existed and Stmt.IfNotExists)) and
+     FT.TryGetTableDef(Stmt.ViewName, v) and v.IsView then
   begin
-    Sel := TSqlSelectStmt(v.SelectStmt);
+    Sel := TSqlSelectStmt(Stmt.SelectStmt);
     if Sel <> nil then
     begin
       SetLength(v.Cols, 0);
@@ -19359,7 +19446,6 @@ procedure TVSqlExecutor.FireTriggers(
   const OldRow: TStrArray; const NewRow: TStrArray;
   const NewColNames: TStrArray; out Res: TSqlResult; IsRowOp: Boolean);
 var
-  tds: TTableDef;
   names: TStrArray;
   i, e: Integer;
   def: TTriggerDef;
@@ -19371,7 +19457,9 @@ begin
   // IsRowOp = False (STATEMENT) ise STATEMENT tetikleyicileri,
   // True ise bu satir icin ROW tetikleyicileri ateslenir.
   if not FT.TableExists(TableName) then Exit;
-  tds := FT.GetTable(TableName);
+  // R2-E-1: burada FT.GetTable sonucu kullanilmiyordu; tam TTableDef
+  // kopyasi (Cols/Idx/Fks/Checks refcount trafigi) her cagrida bosa
+  // gidiyordu. Tam sema gerekmiyorsa yalniz tetikleyici listesi yeter.
   names := FT.TriggersFor(TableName, Timing, Event);
   if Length(names) = 0 then Exit;
   for i := 0 to High(names) do

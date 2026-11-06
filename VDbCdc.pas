@@ -58,6 +58,16 @@ type
     TableName: string;
     PK: string;
     Vals: TStrArray;
+    { R2-A-8: FSeen budamasinda "bu kayit hala guncel mi" damgasi. }
+    Stamp: QWord;
+  end;
+
+  { R2-A-8: FSeen icin FIFO budama kuyrugu. Ayni anahtar birden cok
+    kez guncellenirse eski kuyruk girdileri damga uyusmadigi icin
+    atilir; guncel kayit korunur. }
+  TSeenTrack = record
+    Key: QWord;
+    Stamp: QWord;
   end;
 
   TVDbCdcThread = class(TThread)
@@ -81,6 +91,9 @@ type
     FBuffer: TList<TCDCEvent>;
     FFlushInterval: Integer;
     FSeen: TDictionary<QWord, TRowInfo>; // yalnizca CDC parcasi erisir
+    FSeenQ: TQueue<TSeenTrack>;          // FSeen budama sirasi
+    FSeenStamp: QWord;                   // FSeen guncelleme damgasi
+    FMaxSeen: Integer;                   // FSeen ust siniri (0 = sinirsiz)
     FSeq: QWord;
     FEvents: Integer;
     FSkipped: Integer;
@@ -114,6 +127,10 @@ type
     property PendingCount: Integer read GetPendingCount;
     property Running: Boolean read FRunning;
     property MaxPending: Integer read FMaxPending write FMaxPending;
+    { R2-A-8: gorulen-satir haritasinin ust siniri. 0 = sinirsiz.
+      Sinir asilirsa EN ESKI kayit dusurulur; dusurulen anahtar icin
+      sonraki PUT cdcInsert (cdcUpdate yerine), DEL ise atlanir. }
+    property MaxSeen: Integer read FMaxSeen write FMaxSeen;
     property DroppedCount: Integer read FDropped;
   end;
 
@@ -162,6 +179,9 @@ begin
   FLock := TCriticalSection.Create;
   FBuffer := TList<TCDCEvent>.Create;
   FSeen := TDictionary<QWord, TRowInfo>.Create;
+  FSeenQ := TQueue<TSeenTrack>.Create;
+  FSeenStamp := 0;
+  FMaxSeen := 100000;   // gorulen-satir haritasi icin bellek siniri
   FFlushInterval := 1000;
   FRunning := False;
   FNextIndex := 0;
@@ -175,6 +195,7 @@ end;
 destructor TVDbCdc.Destroy;
 begin
   Stop;
+  FSeenQ.Free;
   FSeen.Free;
   FBuffer.Free;
   FLock.Free;
@@ -276,6 +297,9 @@ var
   tid: Word;
   pk: string;
   vals: TStrArray;
+  tr: TSeenTrack;
+  cur: TRowInfo;
+  drop: Integer;
 begin
   ev.OldValues := nil;
   ev.NewValues := nil;
@@ -321,7 +345,24 @@ begin
     info.TableName := ev.TableName;
     info.PK := pk;
     info.Vals := Copy(vals, 0, Length(vals));
+    { R2-A-8: her PUT'a artan damga ver; harita siniri asilirsa
+      EN ESKI damgali kayitlari dusur. Ayni anahtarin eski kuyruk
+      girdileri, damga uyusmadigi icin guncel kaydi silmez. }
+    Inc(FSeenStamp);
+    info.Stamp := FSeenStamp;
     FSeen.AddOrSetValue(AKey, info);
+    if FMaxSeen > 0 then
+    begin
+      tr.Key := AKey;
+      tr.Stamp := FSeenStamp;
+      FSeenQ.Enqueue(tr);
+      while FSeenQ.Count > FMaxSeen do
+      begin
+        tr := FSeenQ.Dequeue;
+        if FSeen.TryGetValue(tr.Key, cur) and (cur.Stamp = tr.Stamp) then
+          FSeen.Remove(tr.Key);
+      end;
+    end;
   end
   else { VDB_FLAG_DEL }
   begin
@@ -354,12 +395,14 @@ begin
     { POLL modu bellek siniri: tampon tasiarsa EN ESKI olay dusurulur
       (istemci geride kalmis demektir; kayip DroppedCount ile SAYILIR,
       sessizce gizlenmez). }
-    if FMaxPending > 0 then
-      while FBuffer.Count > FMaxPending do
-      begin
-        FBuffer.Delete(0);
-        Inc(FDropped);
-      end;
+    { R2-A-9: fazlaligi TEK DeleteRange ile at; her olay icin
+      Delete(0) cagirmak O(k*n) kopyalama yapiyordu. }
+    if (FMaxPending > 0) and (FBuffer.Count > FMaxPending) then
+    begin
+      drop := FBuffer.Count - FMaxPending;
+      FBuffer.DeleteRange(0, drop);
+      Inc(FDropped, drop);
+    end;
   finally
     FLock.Leave;
   end;

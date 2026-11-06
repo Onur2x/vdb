@@ -290,6 +290,11 @@ type
       FLogBaseSeq: Int64;
       { v4 replikasyon: uygulama penceresinde yerel gunluge yazim kapali. }
       FLogSuspended: Boolean;
+      { B/3 devami: LogPut'un guncelleme yolunda satir basina TBytes
+        ayirmamak icin nesne omurlu tampon. TVdbChangeLog.AddPut degeri
+        ANINDA grup tamponuna kopyalar ve referansi disarida tutmaz;
+        dolayisiyla tamponu yeniden kullanmak yazilan baytlari degistirmez. }
+      FLogNewBuf: TBytes;
       { v3.19: degisim gunlugu her commit'te fsync edilsin mi? (bkz. asagidaki
         DurableChangeLog ozelligi ve VDbChangeLog.SyncGroups) }
       FDurableChangeLog: Boolean;
@@ -922,8 +927,6 @@ begin
 end;
 
 procedure TVdbBackendV3.LogPut(AKey: QWord; const AOld: TBytes; ANew: PByte; ANewLen: Integer);
-var
-  newBytes: TBytes;
 begin
   if FLogSuspended then Exit;
   if (FLog = nil) or (not FLog.Enabled) then Exit;
@@ -939,15 +942,19 @@ begin
     FLog.AddPutPtr(LogTag(ANew, ANewLen), AKey, ANew, ANewLen)
   else
   begin
-    { P-38: ANew pointer olarak gelir; TBytes yalnizca gunluk acikken olusturulur. }
+    { P-38: ANew pointer olarak gelir; TBytes yalnizca gunluk acikken
+      kullanilir. B/3 devami: tampon NESNE omurludur; satir basina ayirma
+      yerine yalnizca boyu degistiginde SetLength cagrilir. AddPut degeri
+      aninda kopyaladigi icin icerik kullanimdan sonra degismez. }
     if ANewLen > 0 then
     begin
-      SetLength(newBytes, ANewLen);
-      Move(ANew^, newBytes[0], ANewLen);
+      if Length(FLogNewBuf) <> ANewLen then
+        SetLength(FLogNewBuf, ANewLen);
+      Move(ANew^, FLogNewBuf[0], ANewLen);
+      FLog.AddPut(LogTag(ANew, ANewLen), AKey, AOld, FLogNewBuf);
     end
     else
-      newBytes := nil;
-    FLog.AddPut(LogTag(ANew, ANewLen), AKey, AOld, newBytes);
+      FLog.AddPut(LogTag(ANew, ANewLen), AKey, AOld, nil);
   end;
 end;
 

@@ -164,6 +164,11 @@ type
     procedure ExecShowSlowQueries(out Res: TSqlResult);
     function CountSlow: Integer;
     function GetPlanCacheSize: Integer;   // H7
+    // H7/P-CACHE: onbellekteki TUM AST'leri serbest birakir ve sozlugu bosaltir.
+    // SAHIPLIK KURALI: onbellege eklenen AST dugumunun sahibi onbellektir.
+    // Bu yuzden her temizleme/silme yolu (cap asimi, DDL, zorla temizleme,
+    // destructor) dugumleri burada Free eder; baska yerde Clear cagrilmaz.
+    procedure FreePlanCache;
     // Bu cumle otomatik transaction (batch) icinde calistirilabilir mi?
     function StmtBatchSafe(const S: string): Boolean;
     function ExecRaw(const Sql: string): TSqlResult;
@@ -264,14 +269,12 @@ begin
 end;
 
 destructor TVSql.Destroy;
-var
-  pn: TSqlStmtNode;
 begin
   // F-41: kapanan oturum kendi satir kilitlerini birakir. Acik batch'e
   // DOKUNULMAZ: batch TVDb basina globaldir ve baska bir TVSql'e ait olabilir.
   FT.UnlockRows(FSessionId);
-  // H7: onbellekteki AST'ler sahiplenilir
-  for pn in FPlanCache.Values do pn.Free;
+  // H7: onbellekteki AST'ler sahiplenilir (tek temizleme noktasi).
+  FreePlanCache;
   FPlanCache.Free;
   FExecutor.Free;
   FParser.Free;
@@ -355,12 +358,19 @@ begin
   Result := FPlanCache.Count;
 end;
 
-procedure TVSql.ClearPlanCache;
+procedure TVSql.FreePlanCache;
 var
   pn: TSqlStmtNode;
 begin
+  // Dugumler anahtar basina tektir (Add yalniz ContainsKey = False iken
+  // yapilir), bu yuzden Values uzerinde bir tur yeterli; cift Free olmaz.
   for pn in FPlanCache.Values do pn.Free;
   FPlanCache.Clear;
+end;
+
+procedure TVSql.ClearPlanCache;
+begin
+  FreePlanCache;
 end;
 
 // --- M9: Prometheus text exposition (saf metin; ag katmani disarida) ---
@@ -2907,9 +2917,13 @@ var
   inStr, inDq, inLine, inBlock: Boolean;
   c: Char;
   depth: Integer;   // F-35: acik BEGIN...END blok derinligi
-  w, w2: string;
-  j: Integer;
+  w: string;
+  j, idStart: Integer;
+  part: string;
+  cnt, cap: Integer;   // B7: sonuc kapasitesi (O(n^2) buyumeyi onler)
 begin
+  cnt := 0;
+  cap := 0;
   SetLength(Result, 0);
   n := Length(S);
   { P-20: HIZLI YOL. Hic ';' yoksa bolme de, BEGIN/END govde sayaci da
@@ -3003,14 +3017,15 @@ begin
     // Karsilastirma: BEGIN TRANSACTION/WORK bir blok BASLATMAZ.
     if (c in ['A'..'Z', 'a'..'z', '_']) then
     begin
-      w := '';
+      // B7: tanimlayiciyi karakter karakter birlestirmek yerine
+      // baslangic/bitis indeksiyle tek Copy. Anahtar kelime karsilastirmasi
+      // CompareText ile (ASCII, buyuk/kucuk harf duyarsiz) — UpperCase
+      // tahsisi yok. Tarama yalniz ASCII harf/rakam/alt cizgi kabul eder.
+      idStart := i;
       while (i <= n) and (S[i] in ['A'..'Z', 'a'..'z', '0'..'9', '_']) do
-      begin
-        w := w + S[i];
         Inc(i);
-      end;
-      w2 := UpperCase(w);
-      if w2 = 'BEGIN' then
+      w := Copy(S, idStart, i - idStart);
+      if CompareText(w, 'BEGIN') = 0 then
       begin
         // BEGIN; / BEGIN TRANSACTION / BEGIN WORK / BEGIN DEFERRED ->
         // transaction baslangici, govde blogu DEGIL.
@@ -3021,37 +3036,50 @@ begin
           j := 0                       // bos cumle: blok acmaz
         else
         begin
+          idStart := j;
           while (j <= n) and (S[j] in ['A'..'Z', 'a'..'z']) do
-          begin
-            w := w + S[j];
             Inc(j);
-          end;
-          w := UpperCase(w);
+          w := Copy(S, idStart, j - idStart);
         end;
-        if (w <> 'TRANSACTION') and (w <> 'WORK') and (w <> 'DEFERRED') and
-           (j <> 0) then
+        if (CompareText(w, 'TRANSACTION') <> 0) and
+           (CompareText(w, 'WORK') <> 0) and
+           (CompareText(w, 'DEFERRED') <> 0) and (j <> 0) then
           Inc(depth);
       end
-      else if (w2 = 'END') and (depth > 0) then
+      else if (CompareText(w, 'END') = 0) and (depth > 0) then
         Dec(depth);
       Continue;
     end;
     if (c = ';') and (depth <= 0) then
     begin
-      if Trim(Copy(S, start, i - start)) <> '' then
+      // B7: Copy+Trim bir kez; sonuc dizisi katlanarak buyur (O(n^2) yok).
+      part := Trim(Copy(S, start, i - start));
+      if part <> '' then
       begin
-        SetLength(Result, Length(Result) + 1);
-        Result[High(Result)] := Trim(Copy(S, start, i - start));
+        if cnt >= cap then
+        begin
+          if cap = 0 then cap := 4 else cap := cap * 2;
+          SetLength(Result, cap);
+        end;
+        Result[cnt] := part;
+        Inc(cnt);
       end;
       start := i + 1;
     end;
     Inc(i);
   end;
-  if Trim(Copy(S, start, MaxInt)) <> '' then
+  part := Trim(Copy(S, start, MaxInt));
+  if part <> '' then
   begin
-    SetLength(Result, Length(Result) + 1);
-    Result[High(Result)] := Trim(Copy(S, start, MaxInt));
+    if cnt >= cap then
+    begin
+      if cap = 0 then cap := 4 else cap := cap * 2;
+      SetLength(Result, cap);
+    end;
+    Result[cnt] := part;
+    Inc(cnt);
   end;
+  SetLength(Result, cnt);
 end;
 
 function TVSql.StmtBatchSafe(const S: string): Boolean;
@@ -4257,6 +4285,11 @@ begin
       // Guvenlik agi: yurutucu AST'yi yerinde degistirdiyse (sonraki
       // calistirmalarda farkli bir yol tutulduysa) plan artik guvenilir
       // degildir; onbellegten cikar ki sonraki calistirma yeniden ayristsin.
+      // DIKKAT: Burada dugum Free EDILMEZ. StmtMutated, yurutucunun AST'nin
+      // bir bolumunun sahipligini kataloğa (view/prosedur/trigger govdesi)
+      // DEVRETTIGI anlamina da gelir; serbest birakmak dangling pointer
+      // uretir (XML bolumunde bozulma olarak goruldu). Dugum sizintisi
+      // bilinclidir; plan onbellegi zaten CAP ile sinirlidir.
       if FExecutor.StmtMutated then
         FPlanCache.Remove(cacheKey);
       Exit;
@@ -4308,7 +4341,7 @@ begin
        (not FExecutor.StmtMutated) and
        ((Length(FParams) > 0) or (astStmt is TSqlSelectStmt)) then
     begin
-      if FPlanCache.Count >= PLAN_CACHE_CAP then FPlanCache.Clear;
+      if FPlanCache.Count >= PLAN_CACHE_CAP then FreePlanCache;
       if not FPlanCache.ContainsKey(cacheKey) then
       begin
         FPlanCache.Add(cacheKey, astStmt);
@@ -4324,7 +4357,7 @@ begin
         w1 := UpperCase(w1);
         if (w1 = 'CREATE') or (w1 = 'DROP') or (w1 = 'ALTER') or
            (w1 = 'TRUNCATE') or (w1 = 'RENAME') then
-          FPlanCache.Clear;
+          FreePlanCache;
       end;
     end;
     Exit;

@@ -206,10 +206,11 @@ var
   u: QWord;
   i: Integer;
 begin
+  { R2-A-13: tek tahsis + indeksle yazma (dongude birlesim yok). }
   u := QWord(V);
-  Result := '';
+  SetLength(Result, 8);
   for i := 7 downto 0 do
-    Result := Result + AnsiChar((u shr (i * 8)) and $FF);
+    Result[8 - i] := AnsiChar((u shr (i * 8)) and $FF);
 end;
 
 function NetF64(D: Double): AnsiString;
@@ -218,9 +219,9 @@ var
   i: Integer;
 begin
   Move(D, u, 8);
-  Result := '';
+  SetLength(Result, 8);
   for i := 7 downto 0 do
-    Result := Result + AnsiChar((u shr (i * 8)) and $FF);
+    Result[8 - i] := AnsiChar((u shr (i * 8)) and $FF);
 end;
 
 function PgMsg(const T: AnsiChar; const Body: AnsiString): AnsiString;
@@ -410,18 +411,31 @@ end;
 function RowDescMsgFmt(const Fields: TStrArray; const Types: TByteArray;
   const Fmts: array of Integer): AnsiString;
 var
-  body: AnsiString;
+  sb: TStringBuilder;
   i: Integer;
   oid: LongInt;
 begin
-  body := NetI16(Length(Fields));
-  for i := 0 to High(Fields) do
-  begin
-    if i < Length(Types) then oid := PgOidOf(Types[i]) else oid := 25;
-    body := body + Fields[i] + #0 + NetI32(0) + NetI16(0) + NetI32(oid) +
-      NetI16(-1) + NetI32(-1) + NetI16(PgFmtAt(Fmts, i));
+  { R2-A-13: sutun basina AnsiString birlestirme O(n^2) idi; kapasiteli
+    tek tampon kullan. }
+  sb := TStringBuilder.Create(64 + Length(Fields) * 20);
+  try
+    sb.Append(NetI16(Length(Fields)));
+    for i := 0 to High(Fields) do
+    begin
+      if i < Length(Types) then oid := PgOidOf(Types[i]) else oid := 25;
+      sb.Append(Fields[i]);
+      sb.Append(#0);
+      sb.Append(NetI32(0));
+      sb.Append(NetI16(0));
+      sb.Append(NetI32(oid));
+      sb.Append(NetI16(-1));
+      sb.Append(NetI32(-1));
+      sb.Append(NetI16(PgFmtAt(Fmts, i)));
+    end;
+    Result := PgMsg('T', sb.ToString);
+  finally
+    sb.Free;
   end;
-  Result := PgMsg('T', body);
 end;
 
 function RowDescMsg(const Fields: TStrArray;
@@ -503,27 +517,31 @@ end;
 function DataRowMsgFmt(const Row: TStrArray; const Types: TByteArray;
   const Fmts: array of Integer): AnsiString;
 var
-  body: AnsiString;
+  sb: TStringBuilder;
   i: Integer;
   v: AnsiString;
   oid: LongInt;
 begin
-  body := NetI16(Length(Row));
-  for i := 0 to High(Row) do
-  begin
-    if PgFmtAt(Fmts, i) = 1 then
+  { R2-A-13: hucre basina birlestirme yerine kapasiteli tek tampon. }
+  sb := TStringBuilder.Create(64 + Length(Row) * 16);
+  try
+    sb.Append(NetI16(Length(Row)));
+    for i := 0 to High(Row) do
     begin
-      if i < Length(Types) then oid := PgOidOf(Types[i]) else oid := 25;
-      v := PgBinText(Row[i], oid);
-      body := body + NetI32(Length(v)) + v;
-    end
-    else
-    begin
-      v := Row[i];
-      body := body + NetI32(Length(v)) + v;
+      if PgFmtAt(Fmts, i) = 1 then
+      begin
+        if i < Length(Types) then oid := PgOidOf(Types[i]) else oid := 25;
+        v := PgBinText(Row[i], oid);
+      end
+      else
+        v := Row[i];
+      sb.Append(NetI32(Length(v)));
+      sb.Append(v);
     end;
+    Result := PgMsg('D', sb.ToString);
+  finally
+    sb.Free;
   end;
-  Result := PgMsg('D', body);
 end;
 
 function DataRowMsg(const Row: TStrArray): AnsiString;
@@ -533,13 +551,19 @@ end;
 
 function ParamDescMsg(const Oids: array of LongInt): AnsiString;
 var
-  body: AnsiString;
+  sb: TStringBuilder;
   i: Integer;
 begin
-  body := NetI16(Length(Oids));
-  for i := 0 to High(Oids) do
-    body := body + NetI32(Oids[i]);
-  Result := PgMsg('t', body);
+  { R2-A-13: parametre basina birlesim yerine tek tampon. }
+  sb := TStringBuilder.Create(2 + Length(Oids) * 4);
+  try
+    sb.Append(NetI16(Length(Oids)));
+    for i := 0 to High(Oids) do
+      sb.Append(NetI32(Oids[i]));
+    Result := PgMsg('t', sb.ToString);
+  finally
+    sb.Free;
+  end;
 end;
 
 { M1: PostgreSQL binary parametre -> VDB metin degeri. }
@@ -1162,16 +1186,23 @@ end;
 
 function PgCopyLine(const Fields: TStrArray; const Spec: TPgCopySpec): string;
 var
+  sb: TStringBuilder;
   i: Integer;
 begin
-  Result := '';
-  for i := 0 to High(Fields) do
-  begin
-    if i > 0 then Result := Result + Spec.Delimiter;
-    if Spec.Format = 'csv' then
-      Result := Result + PgCsvField(Fields[i], Spec.Delimiter, Spec.Quote)
-    else
-      Result := Result + PgTextField(Fields[i]);
+  { R2-A-13: satir icinde alan basina birlestirme yerine tek tampon. }
+  sb := TStringBuilder.Create(64 + Length(Fields) * 16);
+  try
+    for i := 0 to High(Fields) do
+    begin
+      if i > 0 then sb.Append(Spec.Delimiter);
+      if Spec.Format = 'csv' then
+        sb.Append(PgCsvField(Fields[i], Spec.Delimiter, Spec.Quote))
+      else
+        sb.Append(PgTextField(Fields[i]));
+    end;
+    Result := sb.ToString;
+  finally
+    sb.Free;
   end;
 end;
 
@@ -1884,6 +1915,13 @@ begin
       else if typ = Ord('S') then            // Sync
       begin
         skipUntilSync := False;
+        { R2-A-11: PostgreSQL semantiginde Sync islemi bitirir ve
+          portallar dusurulur. Portal sonuc kumeleri (tum satirlar
+          bellekte) burada serbest birakilir; aksi halde adlandirilmis
+          portalini kapatmayan istemcide baglanti basina sinirsiz
+          birikim olur. Prepared statement'lar oturum omurludur,
+          Stmts korunur. }
+        Portals.Clear;
         if not SendPg(FIO, ReadyMsg) then Break;
       end
       else if typ = Ord('H') then            // Flush: hemen gonderiyoruz, no-op
