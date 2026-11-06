@@ -37,6 +37,11 @@ FK kaskadli UPDATE sonrasi INSERT'te `ApplyIdentity`/`VDbApplyGenerated`
 atlanir → **kalici yanlis veri** (R2-D-1 / R2-E-3, iki ajan tarafindan
 dogrulandi). Bu yama birlesmeden duzeltilmeli.
 
+> **GUNCELLEME (2026-11-06):** Bu rapordaki guvenli bulgular P-126 ve P-127
+> commit'lerinde uygulandi; kapatilan/kapatilmayan tum maddeler ve gerekceleri
+> **EK-G — UYGULAMA KAYDI** bolumundedir. Kalan mimari maddeler (B-01, B-02,
+> R2-B-2/B-3, C-1/C-3/C-16) bilincli olarak ertelendi.
+
 ---
 
 ## 1. Eski iddialarin kaderi — eksen eksen
@@ -1366,3 +1371,73 @@ Yöntem: `tests/gates/*.lpr` + `tests/sql/sqltest.lpr` `uses` listeleri ve test 
 
 ---
 *Bu rapor salt okunur inceleme sonucu üretilmiştir; hiçbir kaynak dosya değiştirilmemiş, hiçbir derleme/çalıştırma yapılmamıştır. Satır numaraları 06.11.2026 çalışma ağacı (HEAD `1fe0acf` + kirli 7 dosya) görseline göredir.*
+---
+
+# EK-G — UYGULAMA KAYDI (2026-11-06)
+
+Bu ek, raporun yukaridaki bolumlerinde "gecerli" isaretlenen bulgularin
+hangi commit'lerle kapatildigini ve kapatilmayanlarin gerekcesini kaydeder.
+Kod yorumlarindaki `R2-*` etiketleri buradaki kimliklerle birebirdir.
+
+## G.1 Duzeltildi
+
+| Bulgu | Commit | Ozet |
+|---|---|---|
+| R2-A-1 / R2-B-1 | P-126 | `SlabBits` guncellemesi kilit altina alindi |
+| R2-A-2 | P-126 | Yeni slab yayininda mevcut bump alani korunur, bos slab iade edilir |
+| R2-A-3 | P-126 | `MMReallocMem`/`MMMemSize` slab basligini dogrular; bozuk baslikta sinir disi okuma yok |
+| R2-A-5 | P-126 | `ActiveConnections` kiralamayla birlikte artar; `Release(nil)` sahipsiz mutex birakmaz |
+| R2-A-6 | P-126 | `CreateXProc` `inherited Create` cagirir; destructor nil guvenli |
+| R2-A-8 | P-126 | `FSeen` FIFO budama ile sinirli (`MaxSeen`, varsayilan 100000) |
+| R2-A-9 | P-126 | Tampon tasmasi tek `DeleteRange` (O(k*n) -> O(k)) |
+| R2-A-11 | P-126 | PgWire `Sync` portallari temizler |
+| R2-A-12 | P-127 | COPY gecici dosya adi surec tokeni + atomik sayac; TOCTOU kalkti |
+| R2-A-13 | P-126 | PgWire mesaj uretimi tek kapasiteli tampon |
+| R2-A-14 | P-126 | `BuildAsOfRows` katlamali buyume |
+| R2-B-4 | P-126 | `FIdxDirty` tek giris noktasi (`AddDirty`/`RemoveDirty`/`ClearDirty`) |
+| R2-B-5 | P-126 | Havuz ornek sahipligi denetimi (yanlis thread Release -> acik hata) |
+| R2-C-1 | P-127 | `AwaitDurable` hedefi guncel WAL uzayinda degilse beklemez |
+| R2-C-3 | P-127 | fsync hatasinda WAL yazimi geri kirpilir (hayalet commit yok) |
+| R2-C-4 | P-127 | `CommitCount` tarama imlecini geri yukler |
+| R2-D-1 / R2-E-3 | P-126 | `PutRow` ayri prefix onbellegi kullanir; P-67 degismezi korunur |
+| R2-D-2 / R2-D-3 / D-1a / R2-F-1 | P-126 | `MarkSchema` semadan turetilen tum batch onbelleklerini dusurur; FK kaskad commit/abort simetrik |
+| R2-E-1 | P-126 | `FireTriggers` olu `TTableDef` kopyasi kaldirildi |
+| R2-E-5 | P-126 | Non-batch Insert onbelleginde satir basina `VDbNorm` kaldirildi |
+| R2-E-6 | P-126 | `INSERT ... SELECT` tek batch icinde atomik |
+| R2-E-7 | P-126 | `INSERT () VALUES ()` yolundaki cift AFTER tetikleyici kaldirildi |
+| B-5 / B-6 / B-12 (Tur-1 perf) | P-126 | Indeks kolon kopyasi, FK normalizasyonu, kismi indeks plan onbellegi |
+
+Not: `ExecCreateView`'in katalogdaki dangling `SelectStmt` uzerinden sema
+turetmesi (B-10 ailesi) P-126'da kapatildi; `StmtMutated` dalinda AST serbest
+birakma da kaldirildi (sahiplik kataloğa devredilebilir).
+
+## G.2 Kismen / gecersiz cikan iddialar
+
+- **R2-C-2 (fsync hatasi yutuluyor):** Etki abartili. `AwaitDurable`
+  basarisizlikta `FSyncErr` alanini KALICI olarak doldurur; sonraki tum
+  `AwaitDurable` cagrilari ayni hatayi yeniden firlatir. Yani hata
+  buharlasmiyor, ilk istemci yanitindan sonra da gorunur kaliyor. Ek alan
+  eklemek gereksiz bulundu.
+- **R2-A-4 (slab'lar OS'e iade edilmez):** Bilgi duzeyinde; tasarim tercihi
+  olarak korundu.
+
+## G.3 ERTELENENLER ve gerekceleri
+
+| Bulgu | Gerekce |
+|---|---|
+| B-01 (ic ice taramada `FSnapMap` UAF) | Tarama callback'i, `FStreamCb/FStreamUser/FStreamAbort/FStreamFilter` alanlari ve `FSnapMap` backend nesnesinde TEK kopya. Dogru cozum tarama baglamini (context) cagri zinciri boyunca tasimak ya da tarama basina yigin tutmak; her iki secenek `StreamCbRaw` cagiran ~10 yuzeyi ve executor callback sozlesmesini degistirir. Tek oturumluk dilimde guvenli dogrulanamaz. |
+| B-02 (`TryGetIdxSource`/`TryGetMemIndex` kilitsiz) | `TVTableDb` tum baglantilar arasinda paylasilir; bu fonksiyonlara tablo duzeyi bir kilit eklemek mevcut `LockRead` ve backend `FEngCs` kilit sirasiyla ters cevrilme riski tasir. Once kilit hiyerarsisi belgelenmeli (R2-B-3 ile birlikte). |
+| R2-B-2 (`FBatchSet`/`FBatchSetSid` kilitsiz) | Ayni kilit hiyerarsisi calismasina bagli; tek basina kilit eklemek oturum izolasyonu semantigini degistirir. |
+| R2-B-3 (paylasimli `FT` islem durumu) | Mimari: `TVTableDb`'nin oturum-bazli islem durumundan ayrilmasi gerekir. |
+| C-1 / C-3 / C-16 (sayfa LSN damgasi, checkpoint budama) | Cok surecli kalicilik tasarimi; sayfa bicimine alan eklenmesi (surum yukseltmesi) ve kurtarma testleri gerektirir. |
+| R2-F-6 (ariza enjeksiyonu test altyapisi) | Yeni test altyapisi isi; mevcut 20 kapi kapsamini degistirmeden ayri bir calisma olarak ele alinmali. |
+| B1 / R2-E-2 / R2-A-15 (perf adaylari) | Olcum disiplini: >=%2 kazanc dogrulanmadan uygulanmaz; B1 (PK cift sondalama) bir sonraki olcum turunun ilk adayi. |
+| R2-A-16 / R2-A-17 | Dusuk oncelikli, uretim disi yollarda; davranissal risk dusuk ama kazanc da yok. |
+
+## G.4 Dogrulama
+
+Her iki commit oncesi `tests/gates/runall.sh <dizin> -B` ile 20/20 kapi,
+`sqltest --backend=v3` 2885 gecti / 0 kaldi / 33 atlandi, `wherenull` ve
+`chainnull` TEMIZ alindi. (Not: eski derleme dizinlerindeki BAYAT `.ppu`
+birimleri XML bolumunde 21 yanlis hata uretiyordu; taze `-FU` birim dizini
+ile bu hatalar kaybolur. Kapilar bu yuzden taze dizinde kosulmalidir.)
