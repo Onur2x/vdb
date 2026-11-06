@@ -1623,3 +1623,47 @@ sahibi).
 5. **Trunk damgasi tek savunma hatti degil.** Store tarafinda
    `IsTrunkImage`/`IsVdbPageImage` kontrolleri korunmali; yeni damga yazan
    yol eklenirse magic kosulu zorunludur.
+
+---
+
+# EK-K. P-131 — R2-D-YENI-1: INSERT kolon haritasi onbellegi (uygulama kaydi)
+
+Kaynak: EK-H.3 oncelik 1 (R2-D-YENI-1). Commit: `P-131`.
+
+## EK-K.1 Kok neden
+
+`TVTableDb.Insert` batch yolu kolon haritasini yalniz "uzunluk esit + tablo
+adi ayni" kosuluyla dogruluyordu. Ayni islemde (ya da ardisik INSERT'lerde)
+**esit sayida** farkli kolon listeli ikinci bir INSERT bayat haritayi
+kullaniyordu:
+
+- `INSERT t(id,a,b)` ardindan `INSERT t(id,b,a)` -> a ile b yer degisir.
+- `INSERT t(id,c,a)` -> deger a'ya yazilir, c bos kalir.
+
+Hata sessizdir: satir sayisi dogru, icerik yanlis. Oncelik-1 (veri bozulmasi)
+sinifinda.
+
+## EK-K.2 Duzeltme
+
+- Yeni alan `FBatchColMapNames: TStrArray` haritanin kuruldugu kolon adlarini
+  tutar.
+- Her INSERT'te `FBatchColMapValid` yalniz uzunluk + ad esitligi birebir
+  saglanirsa kullanilir; uyusmazlikta harita yeniden kurulur.
+- Temizlik iki yerde: `ResetBatchTableCache` ve `ResetBatchSchemaCaches`.
+- Ham ad karsilastirmasi `FindCol`/`VDbNorm` eslesmesiyle ayni sonucu verir;
+  farkli yazim yalnizca gereksiz yeniden kuruluma yol acar, dogrulugu
+  etkilemez.
+
+## EK-K.3 Dogrulama
+
+- Yeni kapi `tests/gates/colmapchk.lpr`: sirali kolon listesi, kume degisimi
+  ve batch yolu. Duzeltme oncesi 4/6, sonrasi 10/10.
+- Kapi `tests/gates/runall.sh` tablosuna ve CI'ya (Windows adimi + derleme
+  listesi) eklendi.
+- Tam kapi seti taze dizinde: **22/22 GECTI** (`runall.sh tmp64/c1/gates15 -B`).
+- `sqltest --backend=v3`: gecen=2885 kalan=0 atlanan=33.
+
+## EK-K.4 Acik risk
+
+- Ayni oturum kimliginin iki thread'de kullanilmasi desteklenmez; bu onbellek
+  o sozlesmeye dayanir (`dokuman/kilit_sirasi.md` §3).
