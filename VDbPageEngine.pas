@@ -937,21 +937,27 @@ begin
       end;
       FSyncCs.Enter;
       try
-        if err = '' then
-        begin
-          Inc(FSyncCount);
-          if target > FDurableLsn then
-            FDurableLsn := target;
-          { v3.31: surecler arasi bildirim — yalnizca basarili fsync'ten SONRA. }
-          FStore.SetDurableLsn(target);
-        end
-        else
-          FSyncErr := err;
-        FSyncBusy := False;
-        { manual-reset: once uyandir, sonra sifirla. Arada gelen bekleyen
-          yine de dongude FDurableLsn'i gorup cikar. }
-        FSyncEvt.SetEvent;
-        FSyncEvt.ResetEvent;
+        { B-18: SetDurableLsn istisna atarsa bile FSyncBusy temizlenmeli ve
+          bekleyenler uyandirilmali; aksi halde grup fsync kilitli kalir.
+          Istisna asagidaki ic try/finally'den sonra aynen yayilir. }
+        try
+          if err = '' then
+          begin
+            Inc(FSyncCount);
+            if target > FDurableLsn then
+              FDurableLsn := target;
+            { v3.31: surecler arasi bildirim — yalnizca basarili fsync'ten SONRA. }
+            FStore.SetDurableLsn(target);
+          end
+          else
+            FSyncErr := err;
+        finally
+          FSyncBusy := False;
+          { manual-reset: once uyandir, sonra sifirla. Arada gelen bekleyen
+            yine de dongude FDurableLsn'i gorup cikar. }
+          FSyncEvt.SetEvent;
+          FSyncEvt.ResetEvent;
+        end;
       finally
         FSyncCs.Leave;
       end;

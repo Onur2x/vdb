@@ -697,7 +697,19 @@ begin
   if Length(FOutBuf) > 4 * 1024 * 1024 then
     SetLength(FOutBuf, 0);
   if DoSync then
-    VDbFlushStream(FStream);
+  begin
+    try
+      VDbFlushStream(FStream);
+    except
+      { C-14: kayitlar WriteBuffer ile dosyaya zaten yazildi. Tampon
+        durumunu temizle ki yeniden deneme ayni kayitlari ikinci kez
+        yazmasin (4 MB ustu tampon sifirlanmissa sifir yuk yazilirdi). }
+      FBufferCount := 0;
+      BufHashClear;
+      SetLength(FOutBuf, 0);
+      raise;
+    end;
+  end;
   FBufferCount := 0;
   BufHashClear;   // P-71
   FHasContent := True;
@@ -871,7 +883,12 @@ begin
       { v3.2: AS OF icin sinirli kurtarma — pencere basi burada biter.
         Okumayi kes; kalan kayitlar "yirtik kuyruk" DEGILDIR. }
       if (MaxCommits > 0) and (Stats.Commits >= MaxCommits) then
+      begin
+        { C-15: kesilmeden once konumu kaydet; aksi halde sonraki artimsal
+          tarama ayni commit kaydini yeniden okur. }
+        goodPos := FStream.Position;
         Break;
+      end;
     end;
     { v3.29: son TAM dogrulanmis kaydin sonu. Yirtik kuyrukta buradan
       ileri gidilmez; bir sonraki tarama ayni yerden devam eder. }
@@ -948,11 +965,18 @@ begin
 end;
 
 function TVdbPageWal.Bytes: Int64;
+var
+  payLen: Integer;
 begin
   if FStream = nil then
     Exit(0);
+  { C-13: sifreli modda cerceve yuku VDB_ENC_ENVELOPE kadardir. }
+  if FWalEncrypted then
+    payLen := VDB_ENC_ENVELOPE
+  else
+    payLen := VDB_PAGE_SIZE;
   Result := FWrittenBytes +
-    Int64(FBufferCount) * (VDB_PAGE_SIZE + VDB_WAL_REC_HDR);
+    Int64(FBufferCount) * (payLen + VDB_WAL_REC_HDR);
 end;
 
 end.

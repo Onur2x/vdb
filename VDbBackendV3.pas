@@ -974,8 +974,10 @@ begin
   if (FLog = nil) or (not FLog.Enabled) or (not FLogInGroup) then Exit;
   if not FLog.EndGroup(FEng.Store.LSN, seq, ts) then
   begin
-    { Gunluk yazilamadi: VERI kaybi YOK (commit zaten durabil), yalniz
-      PITR/replikasyon bu noktadan sonra guvenilmez. Acikca isaretle. }
+    { Gunluk yazilamadi: VERI kaybi YOK; commit WAL'e yazildi ancak fsync
+      HENUZ yapilmadi -- durabilite CommitBatch sonundaki AwaitDurable ile
+      saglanir. Yalniz PITR/replikasyon bu noktadan sonra guvenilmez.
+      Acikca isaretle. }
     FLogProblem := FLog.LastError;
     if FLogProblem = '' then FLogProblem := 'gunluk yazilamadi';
   end;
@@ -1877,7 +1879,8 @@ var
   oldVal: TBytes;
   s: TWriteSet;
 begin
-  RequireWritable;
+  { B-13: RequireBatchWrite zaten RequireWritable cagirir; cift cagri
+    gereksiz. }
   RequireBatchWrite;
   { v3.6: OwnSet tek kez alinir (ONCEDEN BatchOpen + NoteBefore(OwnSet,..)
     satir basina IKI kilit + IKI sozluk aramasi yapiyordu). }
@@ -2889,6 +2892,9 @@ var
   i: Integer;
   fpair: TPair<Cardinal, TWriteSet>;
   syncLsn: LongWord;
+  { C-6: commit yolunda yakalanan istisna; kilitler birakilip durabilite
+    beklendikten SONRA yeniden yukseltilir. }
+  pendExc, tmpExc: TObject;
 {$IFDEF CPUPROF}
   p0, p1, p2, p3, p4, p5, p6, p7, p8, p9: Int64;
 {$ENDIF}
@@ -2900,6 +2906,7 @@ begin
   s := OwnSet;
   if s = nil then Exit;
   syncLsn := 0;
+  pendExc := nil;
   { v3.18 dilim 6: iyimser modda rezervasyon COMMIT aninda alinir (busy
     timeout boyunca bekler) ve ertelenen tazeleme kapatilir. Kilit sirasi
     BeginBatch ile ayni (once rezervasyon, sonra FEngCs) -- kilitlenme yok.
@@ -3008,22 +3015,29 @@ begin
       p2 := CpuProfNow; CP[1] := CP[1] + (p2 - p1);
 {$ENDIF}
       FDirty := False;
-      LogFinish;
+      { C-6: LogFinish/MaybeCheckpoint istisna atarsa durabilite beklemesi
+        ATLANMAMALI. Istisnayi burada yakala; kilitler birakildiktan sonra
+        AwaitDurable garanti edilir ve hata yeniden yukseltilir. }
+      try
+        LogFinish;
 {$IFDEF CPUPROF}
-      p1 := CpuProfNow; CP[2] := CP[2] + (p1 - p2);
+        p1 := CpuProfNow; CP[2] := CP[2] + (p1 - p2);
 {$ENDIF}
-      { MaybeCheckpoint kendi icinde WAL bariyerini (AwaitDurable) yapar;
-        WAL budanirsa syncLsn zaten durabil hale gelir. }
-      MaybeCheckpoint;
-      { v3.24: VACUUM olduysa syncLsn ESKI motora aitti; yeni motorun WAL'i
-        bos oldugu icin beklemek sonsuz dongu olurdu (olculdu: 70.000
-        fsync/s, ilerleme yok). VACUUM zaten Checkpoint(True) ile her seyi
-        fsync etti. }
-      if MaybeAutoCompact then
-        syncLsn := 0;
+        { MaybeCheckpoint kendi icinde WAL bariyerini (AwaitDurable) yapar;
+          WAL budanirsa syncLsn zaten durabil hale gelir. }
+        MaybeCheckpoint;
+        { v3.24: VACUUM olduysa syncLsn ESKI motora aitti; yeni motorun
+          WAL'i bos oldugu icin beklemek sonsuz dongu olurdu (olculdu:
+          70.000 fsync/s, ilerleme yok). VACUUM zaten Checkpoint(True) ile
+          her seyi fsync etti. }
+        if MaybeAutoCompact then
+          syncLsn := 0;
 {$IFDEF CPUPROF}
-      CP[3] := CP[3] + (CpuProfNow - p1);
+        CP[3] := CP[3] + (CpuProfNow - p1);
 {$ENDIF}
+      except
+        pendExc := TObject(AcquireExceptionObject);
+      end;
     end;
   finally
     FEng.Store.ReleaseDataWrite;
@@ -3032,12 +3046,29 @@ begin
 {$IFDEF CPUPROF}
   p1 := CpuProfNow;
 {$ENDIF}
-  { v3.19: durabilite beklemesi kilitlerin DISINDA. }
+  { v3.19: durabilite beklemesi kilitlerin DISINDA. C-6: commit yolu
+    istisnayla bitse bile (syncLsn <> 0) bekleme GARANTI edilir. }
   if syncLsn <> 0 then
-  begin FEng.AwaitDurable(syncLsn); end;
+  begin
+    try
+      FEng.AwaitDurable(syncLsn);
+    except
+      { Asil commit hatasi varsa o korunur; ikincil AwaitDurable hatasi
+        serbest birakilir. }
+      if pendExc = nil then
+        pendExc := TObject(AcquireExceptionObject)
+      else
+      begin
+        tmpExc := TObject(AcquireExceptionObject);
+        tmpExc.Free;
+      end;
+    end;
+  end;
 {$IFDEF CPUPROF}
   p2 := CpuProfNow; CP[4] := CP[4] + (p2 - p1);
 {$ENDIF}
+  if pendExc <> nil then
+    raise Exception(pendExc);
   finally
     FEng.Store.ReleaseWriteHold;
   end;
@@ -3854,7 +3885,10 @@ end;
 procedure TVdbBackendV3.SwapDbFileWith(const NewFilePath: string;
   const AKey: TBytes; const APassword: string; AHasPassword: Boolean);
 var
-  bak, wal, idx: string;
+  bak, wal, idx, gen: string;
+  gs: TFileStream;
+  z: QWord;
+  genOk: Boolean;
   oldKey: TBytes;
   oldPass: string;
   oldHas: Boolean;
@@ -3888,6 +3922,44 @@ begin
       kalici olmamali: yoksa sonraki acilis onlari bu dosyaya ait sanar. }
     if FileExists(NewFilePath + '.wal') then DeleteFile(NewFilePath + '.wal');
     if FileExists(NewFilePath + '.idx') then DeleteFile(NewFilePath + '.idx');
+    { C-2: yeni dosyanin LSN uzayi bastan baslar; eski `.gen` dosyasindaki
+      offset 8 durabil LSN'i bayat kalirsa AwaitDurable fsync'i ATLAR ve
+      fsync edilmemis commit "durabil" onaylanir. Nesil sayacini (offset 0)
+      KORU; yalniz durabil LSN alanini (offset 8) sifirla. .gen yoksa ya da
+      16 bayttan kisaysa OpenEx alani zaten 0 ile olusturur/genisletir. }
+    gen := FPath + '.gen';
+    if FileExists(gen) then
+    begin
+      genOk := False;
+      try
+        gs := TFileStream.Create(gen, fmOpenReadWrite or fmShareDenyNone);
+        try
+          if gs.Size >= 16 then
+          begin
+            z := 0;
+            gs.Position := 8;
+            gs.WriteBuffer(z, 8);
+            { Sifirlama da kalici olmali; aksi halde cokme sonrasi bayat
+              deger geri gelebilir. }
+            VDbFlushStream(gs);
+          end;
+          genOk := True;
+        finally
+          gs.Free;
+        end;
+      except
+        genOk := False;
+      end;
+      if not genOk then
+      begin
+        { Baska surec .gen'i paylasiyor olabilir; silmek de basarisiz
+          olabilir. Bayat durabil LSN ile DEVAM ETMEK yanlis "durabil"
+          onayi uretir; acik hata ver (cagiran .bak'tan geri doner). }
+        if not DeleteFile(gen) then
+          raise EVdbBackendV3.Create(
+            'dosya degistirme: .gen durabil LSN sifirlanamadi');
+      end;
+    end;
     FEng := NewEngine(FPath);
     try
       FEng.Open(False);

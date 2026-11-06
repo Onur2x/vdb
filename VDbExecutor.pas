@@ -15319,6 +15319,9 @@ var
   retRow: TStrArray;
   hasReturning: Boolean;
   setIdx: Integer;
+  // B-8: RETURNING kolon eslemesi dongu oncesi bir kez hesaplanir.
+  retCi: array of Integer;
+  retCiAll: array of Integer;
   // SQLite uyumu: INSERT OR REPLACE icin SET listesi kurulurken
   Asgn2: TUpdateAssignment;
   prov: Boolean;
@@ -15491,6 +15494,19 @@ begin
       for i := 0 to High(td.Cols) do returningColNames[i] := td.Cols[i].Name;
     end;
     SetLength(returningRows, 0);
+    // B-8: cnames/returningColNames dongu boyunca degismez; satir basina
+    // dogrusal arama yerine bir kez hesaplanan indeksleri kullan.
+    SetLength(retCi, Length(returningColNames));
+    for j := 0 to High(returningColNames) do
+    begin
+      retCi[j] := -1;
+      for setIdx := 0 to High(cnames) do
+        if SameText(cnames[setIdx], returningColNames[j]) then
+        begin retCi[j] := setIdx; Break; end;
+    end;
+    SetLength(retCiAll, Length(returningColNames));
+    for j := 0 to High(returningColNames) do
+      retCiAll[j] := FindColIdx(returningColNames[j], '', allColNames);
   end;
 
   // SQLite uyumu: INSERT OR REPLACE / OR IGNORE.
@@ -15568,10 +15584,7 @@ begin
           SetLength(retRow, Length(returningColNames));
           for j := 0 to High(returningColNames) do
           begin
-            ci := -1;
-            for setIdx := 0 to High(cnames) do
-              if SameText(cnames[setIdx], returningColNames[j]) then
-              begin ci := setIdx; Break; end;
+            ci := retCi[j];
             if ci >= 0 then
               retRow[j] := subRes.Rows[i][ci]
             else
@@ -15614,7 +15627,7 @@ begin
               SetLength(retRow, Length(returningColNames));
               for j := 0 to High(returningColNames) do
               begin
-                ci := FindColIdx(returningColNames[j], '', allColNames);
+                ci := retCiAll[j];
                 if ci >= 0 then retRow[j] := outVals[ci];
               end;
             end;
@@ -15634,7 +15647,7 @@ begin
 
     if (Stmt.ValuesRows.Count > 1) and not FT.Backend.InBatch then
     begin
-      FT.Backend.BeginBatch;
+      FT.BeginBatch;
       try
         for i := 0 to Stmt.ValuesRows.Count - 1 do
         begin
@@ -15678,7 +15691,7 @@ begin
                     SetLength(retRow, Length(returningColNames));
                     for j := 0 to High(returningColNames) do
                     begin
-                      ci := FindColIdx(returningColNames[j], '', allColNames);
+                      ci := retCiAll[j];
                       if ci >= 0 then retRow[j] := outVals[ci];
                     end;
                   end;
@@ -15715,7 +15728,7 @@ begin
                     SetLength(retRow, Length(returningColNames));
                     for j := 0 to High(returningColNames) do
                     begin
-                      ci := FindColIdx(returningColNames[j], '', allColNames);
+                      ci := retCiAll[j];
                       if ci >= 0 then retRow[j] := outVals[ci];
                     end;
                   end;
@@ -15757,7 +15770,7 @@ begin
                     SetLength(retRow, Length(returningColNames));
                     for j := 0 to High(returningColNames) do
                     begin
-                      ci := FindColIdx(returningColNames[j], '', allColNames);
+                      ci := retCiAll[j];
                       if ci >= 0 then retRow[j] := outVals[ci];
                     end;
                   end;
@@ -15768,7 +15781,7 @@ begin
             end;
           end;
         end;
-        FT.Backend.CommitBatch;
+        FT.CommitBatch;
       except
         FT.AbortBatch;
         raise;
@@ -16201,7 +16214,7 @@ begin
     bi := 0;
     if not FT.Backend.InBatch then
     begin
-      FT.Backend.BeginBatch;
+      FT.BeginBatch;
       bi := 1;
     end;
     try
@@ -16210,7 +16223,7 @@ begin
         RlsRequireInsert(tbl, cnames, rows[bi2]);   // R-19
         FT.Insert(tbl, cnames, rows[bi2], @td);   // P-55
       end;
-      if bi = 1 then FT.Backend.CommitBatch;
+      if bi = 1 then FT.CommitBatch;
     except
       if bi = 1 then FT.AbortBatch;
       raise;
@@ -17967,7 +17980,7 @@ begin
 
   if not FT.Backend.InBatch then
   begin
-    FT.Backend.BeginBatch;
+    FT.BeginBatch;
     try
       for i := 0 to High(allRows) do
       begin
@@ -18020,7 +18033,7 @@ begin
           FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teUpdate),
             allRows[i], newVals, colNames, Res, True);
       end;
-      FT.Backend.CommitBatch;
+      FT.CommitBatch;
       // F-36: AFTER UPDATE STATEMENT tetikleyiciler (tum satirlardan sonra)
       if hasRowTrig then
         FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teUpdate), nil, nil, [], Res, False);
@@ -18211,7 +18224,7 @@ begin
     begin
       if not FT.Backend.InBatch then
       begin
-        FT.Backend.BeginBatch;
+        FT.BeginBatch;
         try
           for i := 0 to toDelete.Count - 1 do
           begin
@@ -18226,7 +18239,7 @@ begin
               FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete),
                 allRows[toDelete[i]], nil, allColNames, Res, True);
           end;
-          FT.Backend.CommitBatch;
+          FT.CommitBatch;
           // F-36: AFTER DELETE STATEMENT tetikleyiciler (tum satirlardan sonra)
           if hasRowTrig then
             FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete), nil, nil, [], Res, False);

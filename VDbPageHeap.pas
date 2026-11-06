@@ -43,6 +43,9 @@ const
   VDB_LEN_MASK      = $7FFFFFFF;   // tasma bayragi disindaki uzunluk
   VDB_MAX_INLINE    = 1000;   // bundan buyuk degerler tasma zincirine
   VDB_OVF_CHUNK     = 4000;   // zincir sayfasi basina veri bayti
+  { R-A-4: bozuk/kendine donen tasma zincirinde sonsuz dongu yerine
+    guvenli basarisizlik icin adim ust siniri. }
+  VDB_OVF_MAX_STEPS = 1000000;
   { Bosluk ipucu yigininin ust siniri. Asilirsa yigin bosaltilir ve
     bir sonraki yerlesim hatasinda heap yeniden taranir. }
   VDB_HEAP_SPACE_HINT_MAX = 8192;
@@ -443,7 +446,7 @@ end;
 procedure TVdbHeap.WriteOverflow(Data: PByte; DataLen: Integer; out FirstPage: LongWord);
 var
   total, nChunks, i, ofs, chunk, slot: Integer;
-  pageNo, nextNo: LongWord;
+  pageNo, nextNo, curNo: LongWord;
   P: PVdbPage;
   cell: TBytes;
 begin
@@ -452,34 +455,59 @@ begin
   if nChunks < 1 then nChunks := 1;
   nextNo := 0;
   FirstPage := 0;
-  { Sondan basa yaz: her sayfa bir sonrakini bilir, tek pin yeter. }
-  for i := nChunks - 1 downto 0 do
-  begin
-    ofs := i * VDB_OVF_CHUNK;
-    chunk := total - ofs;
-    if chunk > VDB_OVF_CHUNK then chunk := VDB_OVF_CHUNK;
-    if chunk < 0 then chunk := 0;
-    if not FStore.AllocPage(VDB_PAGE_OVERFLOW, pageNo, P) then
-      raise EVdbHeap.Create('tasma sayfasi ayrilamadi');
-    Inc(FOvfPages);
-    if pageNo >= LongWord(Length(FPageType)) then
-      SetLength(FPageType, pageNo + 64);
-    FPageType[pageNo] := 2;
-    SetLength(cell, 4 + chunk);
-    Move(nextNo, cell[0], 4);
-    if chunk > 0 then
-      Move((Data + ofs)^, cell[4], chunk);
-    if not PageInsertCell(P, cell[0], Length(cell), slot) then
+  curNo := 0;
+  try
+    { Sondan basa yaz: her sayfa bir sonrakini bilir, tek pin yeter. }
+    for i := nChunks - 1 downto 0 do
     begin
-      FStore.Release(pageNo, False);
-      FStore.FreePage(pageNo);
-      Dec(FOvfPages);
-      raise EVdbHeap.Create('tasma sayfasina sigmadi (ic hata)');
+      ofs := i * VDB_OVF_CHUNK;
+      chunk := total - ofs;
+      if chunk > VDB_OVF_CHUNK then chunk := VDB_OVF_CHUNK;
+      if chunk < 0 then chunk := 0;
+      curNo := 0;
+      if not FStore.AllocPage(VDB_PAGE_OVERFLOW, pageNo, P) then
+        raise EVdbHeap.Create('tasma sayfasi ayrilamadi');
+      curNo := pageNo;   // ayrildi, henuz zincire baglanmadi
+      Inc(FOvfPages);
+      if pageNo >= LongWord(Length(FPageType)) then
+        SetLength(FPageType, pageNo + 64);
+      FPageType[pageNo] := 2;
+      SetLength(cell, 4 + chunk);
+      Move(nextNo, cell[0], 4);
+      if chunk > 0 then
+        Move((Data + ofs)^, cell[4], chunk);
+      if not PageInsertCell(P, cell[0], Length(cell), slot) then
+      begin
+        curNo := 0;   // Release/FreePage burada; except tekrar denemesin
+        FStore.Release(pageNo, False);
+        FStore.FreePage(pageNo);
+        Dec(FOvfPages);
+        raise EVdbHeap.Create('tasma sayfasina sigmadi (ic hata)');
+      end;
+      FStore.Release(pageNo, True);
+      nextNo := pageNo;
+      curNo := 0;
     end;
-    FStore.Release(pageNo, True);
-    nextNo := pageNo;
+    FirstPage := nextNo;
+  except
+    { R-A-3/R-A-4: yarida kalan zincir sahipsiz kalmasin; o ana kadar
+      ayrilan sayfalari serbest birak. }
+    try
+      if curNo <> 0 then
+      begin
+        FStore.Release(curNo, False);
+        FStore.FreePage(curNo);
+        if FOvfPages > 0 then Dec(FOvfPages);
+        if curNo < LongWord(Length(FPageType)) then
+          FPageType[curNo] := 0;
+      end;
+      if nextNo <> 0 then
+        FreeOverflow(nextNo);
+    except
+      { Geri alma en iyi cabadir; asil istisnayi maskeleme. }
+    end;
+    raise;
   end;
-  FirstPage := nextNo;
 end;
 
 function TVdbHeap.ReadOverflow(FirstPage: LongWord; Len: Integer;
@@ -488,7 +516,7 @@ var
   pageNo, nextNo: LongWord;
   P: PVdbPage;
   d: PByte;
-  dl, got, take: Integer;
+  dl, got, take, steps: Integer;
   e: string;
 begin
   Result := False;
@@ -507,8 +535,18 @@ begin
     FLastErr := 'tasma zinciri bos (ilk sayfa 0)';
     Exit;
   end;
+  steps := 0;
   while pageNo <> 0 do
   begin
+    { R-A-4: dongu/cevrim korumasi - bozuk zincirde sonsuz dongu yerine
+      guvenli basarisizlik. }
+    Inc(steps);
+    if steps > VDB_OVF_MAX_STEPS then
+    begin
+      FLastErr := Format('tasma zinciri cok uzun (sinir %d, sayfa %d)',
+        [VDB_OVF_MAX_STEPS, pageNo]);
+      Exit;
+    end;
     if not FStore.GetPage(pageNo, P) then
     begin
       FLastErr := Format('tasma sayfasi %d okunamadi', [pageNo]);
@@ -558,11 +596,16 @@ var
   pageNo, nextNo: LongWord;
   P: PVdbPage;
   d: PByte;
-  dl: Integer;
+  dl, steps: Integer;
 begin
   pageNo := FirstPage;
+  steps := 0;
   while pageNo <> 0 do
   begin
+    { R-A-4: dongu/cevrim korumasi - sinir asilirsa serbest birakmayi
+      durdur (sonsuz dongu/veri bozulmasi yerine guvenli cikis). }
+    Inc(steps);
+    if steps > VDB_OVF_MAX_STEPS then Exit;
     if not FStore.GetRawPage(pageNo, P) then Exit;
     nextNo := 0;
     if PageGetCell(P, 0, d, dl) and (dl >= 4) then

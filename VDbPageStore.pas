@@ -182,6 +182,9 @@ type
         Uygulama tek surec oldugunu BILIYORSA acar. }
       FExclusiveAccess: Boolean;
       FWriteCs: TRTLCriticalSection;
+      { R-A-11: FWriteCs yalnizca basariyla baslatildiysa True. Yarim
+        kalan kurulumda Destroy tanimsiz DoneCriticalSection cagirmasin. }
+      FWriteCsInit: Boolean;
       { v3.16: islem kapsamli paylasimli kilit derinligi (yazan oturum). }
       FReadDepth: Integer;
       { v3.16: meta sayfanin (sayfa 0) son gorulen HAM 4 KB imaji. Tam
@@ -654,6 +657,11 @@ var
   i, need: Integer;
 begin
   inherited Create;
+  { R-A-11: kilit yuvasi govdenin basinda kurulur; boylece kurulumun
+    geri kalani hata verse bile Destroy guvenli temizlik yapar. }
+  FWriteCsInit := False;
+  InitCriticalSection(FWriteCs);
+  FWriteCsInit := True;
   FPath := APath;
   if APoolPages < 8 then APoolPages := 8;
   if APoolPages > VDB_MAX_POOL then APoolPages := VDB_MAX_POOL;
@@ -677,8 +685,7 @@ begin
   FTxnId := 1;
   FTxnDirtyCount := 0;
   FIterations := VDB_ENC_ITER;
-  { v3.16: yazma kilidi yuvasi + kilit durumu. }
-  InitCriticalSection(FWriteCs);
+  { v3.16: kilit durumu. }
   FWriteDepth := 0;
   FLockedShared := False;
   FLockedExcl := False;
@@ -701,7 +708,8 @@ begin
     FreeAndNil(FRoPages);
   end;
   FRoCount := 0;
-  DoneCriticalSection(FWriteCs);
+  if FWriteCsInit then
+    DoneCriticalSection(FWriteCs);
   inherited Destroy;
 end;
 

@@ -345,6 +345,9 @@ type
     // guncellenir (O(1)) ve denetimi siralamaya BAGLAMAZ.
     // Yalniz UNIQUE kolonlar icin tutulur (bellek sinirli).
     FIdxDirty: TList<Int64>;                         // bekleyen degisikligi olan indeksler
+    // B-3: FIdxDirty.IndexOf(k) dogrusal taramasi yerine son eklenen anahtar
+    // onbellegi. -1 = gecersiz. Liste elemani SILINDIGINDE/CLEAR'da sifirlanir.
+    FLastDirtyIdx: Int64;
     // R-22 Full: surmekte olan CONCURRENTLY insalari (kayit defteri).
     // Yalniz ANA thread erisir; is parcaciklari kendi dizileriyle ugrasir.
     FConcBuilders: TList<TVdbConcRec>;
@@ -357,6 +360,10 @@ type
     FBatchTableCached: Boolean;
     FBatchTableDef: TTableDef;
     FOpenTDef: TTableDef; // P-30: batch disi Insert icin anlik sema (pointer hedef)
+    // B-4: FOpenTDef tek girdili onbellegi - tablo adi degismedikce ve sema
+    // degismedikce GetTable'in tam TTableDef kopyasi yeniden yapilmaz.
+    // Gecersiz kilma: ResetBatchTableCache, MarkSchema, LoadSchema.
+    FOpenTDefValid: Boolean;
     // P-31: auto-inc sayac onbellegi. Her satirda FAutoInc sozlugune yazmak
     // yerine Int64 uzerinde calisir; Commit/Abort'ta tek seferde yazdirilir.
     // P-64: onbellek artik batch DISINDA da kullanilir (non-batch INSERT).
@@ -5653,6 +5660,7 @@ procedure ParseLines(Lines: TStrings);
 
 begin
   FTables.Clear; FById.Clear; FNextId := 1;
+  FOpenTDefValid := False;   // B-4: sema yeniden yuklendi
   SetLength(FIntentDrop, 0);
   sl := TStringList.Create; parts := TStringList.Create; cp := TStringList.Create;
   try
@@ -5985,6 +5993,7 @@ procedure TVTableDb.MarkSchema;
 begin
   { v3.4: sema tek kayitlik GLOBAL durumdur; coklu yazmada DDL reddedilir. }
   RequireSoleTxn('DDL');
+  FOpenTDefValid := False;   // B-4: sema degisti, non-batch Insert onbellegi bayat
   if FKvB.InBatch then
     FSchemaDirty := True
   else
@@ -6379,6 +6388,8 @@ begin
   SetLength(FBatchVals, 0);   // P-26
   FPrefixCacheName := '';     // P-56
   FPrefixCacheVal := 0;
+  FOpenTDefValid := False;    // B-4
+  FLastDirtyIdx := -1;        // B-3
 end;
 
 procedure TVTableDb.BeginBatch;
@@ -7097,7 +7108,18 @@ begin
       raise EVDbException.Create(ecNotNullViolation,
         'partition anahtari NULL olamaz: ' + T.PartCol);
   end;
-  key := VDbHashKey(T.Name, Pk);
+  { B-11: Insert'teki P-56 prefix onbellegi. Ayni tabloya ardisik
+    PUT/UPDATE'larda VDbNorm+UTF8Encode+tablo-kismi FNV tekrarlanmaz.
+    Saf-ASCII pk'da Insert ile ayni hizli yol; sonuc VDbHashKey ile birebir. }
+  if FPrefixCacheName <> T.Name then
+  begin
+    FPrefixCacheName := T.Name;
+    FPrefixCacheVal := VDbHashKeyPrefix(T.Name);
+  end;
+  if (Length(Pk) > 0) and VDbIsPureAscii(Pk) then
+    key := VDbHashKeyBytes(FPrefixCacheVal, PByte(@Pk[1]), Length(Pk))
+  else
+    key := VDbHashKey(T.Name, Pk);
   if FKvB.Get(key, oldB) then
   begin
     // DIKKAT: kararÄ±n esas belirleyicisi exPk'dir; TID karÅŸÄ±laÅŸtÄ±rmasÄ±
@@ -7113,8 +7135,10 @@ begin
   // (fmCreate) â€” yani hem ise yaramiyor hem her satirda dosya aciyordu.
   // Gercek dayaniklilik: batch basina tek fsync + BATCHEND + recovery.
   FKvB.Put(key, b);
-  // Indeksleri guncelle (cok kolonlu destekli)
-  IdxAddRow(T, Vals, Pk, -1);
+  // Indeksleri guncelle (cok kolonlu destekli).
+  // B-11: Insert'teki P-65 HasIdxWork kapisi - is yoksa cagri tamamen atlanir.
+  if HasIdxWork(T) then
+    IdxAddRow(T, Vals, Pk, -1);
 end;
 
 procedure TVTableDb.SetFkAction(const Table, Column, RefTable: string;
@@ -7831,7 +7855,14 @@ begin
     // yazilirsa eski NULL sahibi ezilir. BuildOneIndex zaten bos
     // anahtari atiyordu; bu yolun da ayni davranisi olmali.
     if (key <> '') and FIdxUniq.TryGetValue(k, m) then m.AddOrSetValue(key, Pk);
-    if FIdxDirty.IndexOf(k) < 0 then FIdxDirty.Add(k);
+    // B-3: son eklenen anahtar onbellegi - ardisik satirlarda ayni indeks
+    // anahtari icin O(kirli liste) IndexOf taramasi atlanir. Onbellek
+    // FIdxDirty'den eleman silinen/clear edilen TUM noktalarda -1 yapilir.
+    if FLastDirtyIdx <> k then
+    begin
+      if FIdxDirty.IndexOf(k) < 0 then FIdxDirty.Add(k);
+      FLastDirtyIdx := k;
+    end;
   end;
 end;
 
@@ -7969,6 +8000,7 @@ begin
   end;
   m := FIdxDirty.IndexOf(k);
   if m >= 0 then FIdxDirty.Delete(m);
+  FLastDirtyIdx := -1;   // B-3: liste degisti
 end;
 
 procedure TVTableDb.BuildIdxEntries(const T: TTableDef; IdxPos: Integer;
@@ -9392,6 +9424,7 @@ begin
   FIdxCtype.Clear;
   FreeIdxUniqMaps;
   FIdxDirty.Clear;
+  FLastDirtyIdx := -1;   // B-3: liste bosaldi
 end;
 
 // Satir Pk'sini tek dize anahtarina cevirir (tampon ici; diskte tutulmaz).
@@ -9566,6 +9599,7 @@ begin
     FIdxOps.Remove(k);
     i := FIdxDirty.IndexOf(k);
     if i >= 0 then FIdxDirty.Delete(i);
+    FLastDirtyIdx := -1;   // B-3: liste degisti
     Exit;
   end;
 
@@ -9577,6 +9611,7 @@ begin
   FIdxOps.Remove(k);
   i := FIdxDirty.IndexOf(k);
   if i >= 0 then FIdxDirty.Delete(i);
+  FLastDirtyIdx := -1;   // B-3: liste degisti
   Exit;
 end;
 
@@ -10454,7 +10489,16 @@ begin
     end
     else
     begin
-      FOpenTDef := GetTable(Table);
+      { B-4: tek girdili sema onbellegi. Ayni tabloya ardisik batch disi
+        INSERT'lerde GetTable'in tam TTableDef kayit kopyasi atlanir.
+        Gecerlilik: ad eslesmesi + sema nesli (FOpenTDefValid, MarkSchema /
+        ResetBatchTableCache / LoadSchema tarafindan sifirlanir). }
+      if (not FOpenTDefValid) or (FOpenTDef.Name <> VDbNorm(Table)) then
+      begin
+        FOpenTDef := GetTable(Table);
+        FOpenTDefValid := True;
+        FPrefixCacheName := '';   // tazelenen sema: prefix + P-67 bayraklari yeniden hesaplansin
+      end;
       tp := @FOpenTDef;
       { P-56: ayni tabloya ardisik INSERT'lerde prefix onbellegi. }
       if FPrefixCacheName <> FOpenTDef.Name then
