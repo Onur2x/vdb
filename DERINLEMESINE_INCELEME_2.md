@@ -1565,3 +1565,61 @@ kenara alinarak yapildi (stash), ardindan geri yuklendi. C-16 su an
    genisletmesi) gerekir; planlayici bugun bunu tetiklemiyor.
 3. **R4 oturum bazli AutoInc.** `FAutoInc` su an tablo basina tek sayac;
    oturum ayrimi kalici bicim/sema degisikligi ister.
+
+# EK-J — C-1/C-3/C-16 uygulama kaydi (2026-11-07)
+
+Kapsam: EK-H.3'te 2. sirada onerilen "C-1 + C-3/C-16" kalemi; ayrica
+R2-C-YENI-1 ve R2-C-YENI-2. Dort ajanla yurutuldu (bir teshis + uc dosya
+sahibi).
+
+## EK-J.1 Kok neden: freelist trunk sayfasi damgalanmasi
+
+- `TVDbPageHdr` 24 bayt, `LSN` alani offset 20'de. Freelist trunk sayfalari
+  (`VFT1`) VDbPage bicimi DEGILDIR: `VDB_TRUNK_HDR = 16`, girdiler 16'dan
+  baslar; dolayisiyla offset 20 = `TrunkEntry(1)`.
+- C-16 damgasi "meta haric tum sayfalar"a yazildiginda trunk'in ikinci
+  serbest-sayfa girdisi LSN ile eziliyordu. `PageSeal` CRC'yi bozulmus
+  icerik uzerinden tazeledigi icin dogrulama geciyor, `AllocPage` ise
+  `cnt >= 2` iken LSN'i sayfa numarasi saniyordu (sessiz veri kaybi).
+- Belirti: `dropchk` mod 3 "freelist trunk CRC tutmadi"; mod 1/2'de eksik
+  satir sayisi.
+- Duzeltme: damga yalniz gercek VDbPage imajlarina (`PageHdr^.Magic =
+  VDB_PAGE_MAGIC`). Uygulandigi yerler: `VDbPageWal.AppendFrame`,
+  `VDbPageEngine.AddPending` (iki yol), `VDbPageStore.Release/ReleaseIdx`.
+
+## EK-J.2 Katmanlar
+
+| Kalem | Yer | Ozet |
+|---|---|---|
+| C-16 yazma | `VDbPageWal`, `VDbPageStore` | Damga yalniz VDbPage imajlarina; `StaleOnDisk` disk imajini magic + kendi PageNo + CRC ile dogrular; disk LSN'i yeni imajdan buyukse yazma atlanir. |
+| C-16 okuma | `VDbPageStore` | `CheckFreshRead`: disk imaji LSN'i `ViewLsn`'den buyukse `EVdbPageStale`; `GetPageInternal`/`GetPageIdx` bunu yakalayip `TryRefreshAfterStale` ile bir kez yeniden dener; pinli/kirli cercevede guvenli red. |
+| C-1 | `VDbPageEngine`, `VDbPageWal` | Checkpoint, Truncate'ten once artimsal WAL taramasiyla baska sureclerin onayli imajlarini dosyaya indirir; `Truncate` govdede checkpoint LSN'inden ileri gecerli kayit varsa HIC budamaz, tamponu temizlemez. AS OF (`FRecoverLimit > 0`) modunda budama yok. |
+| C-3 | `VDbPageStore` | `InstallPage`: yerel kirli ve `TxnMark <> 0` cerceve hicbir LSN kosuluyla ezilmez; `DropCache` kirli cerceveleri korur; `LoadFrame(AImage)` kirli isaretlenir. |
+| R2-C-YENI-1 | `VDbPageWal` | `Refresh`/`Recover` `FWrittenLsn`'i yalniz yukari ilerletir; `SyncDurable` fsync yoksa acik hata verir; yarim `Commit` yazimi geri kirpilir. |
+| R2-C-YENI-2 | `VDbPageWal` | WAL basligina 16 bayt `DBID`; veri dosyasinin meta bilgisinden turetilir. Govdeli yabanci WAL acik hata, bos yabanci WAL basligi yazilabilir oturumda tazelenir. |
+
+## EK-J.3 Dogrulama
+
+- Tam kapi seti taze dizinde: **21/21 GECTI** (`runall.sh tmp64/c1/gates13 -B`);
+  `dropchk` 100000 satir mod 1/2/3 dahil.
+- `wherenull` / `chainnull`: `gecen=hepsi kalan=0` — TEMIZ.
+- Ajanlarin hedefli kosulari: waltest 16/16, staletest hepsi gecti,
+  pagechk/storechk/heapchk/crashtest/pitrchk/prochk/logchk/snapchk temiz.
+- `sqltest --backend=v3`: taze dizinde tam yesil.
+
+## EK-J.4 Acik riskler
+
+1. **DBID gucu.** Kimlik `FCreated + magic + surum`ten turetilir; ayni
+   saniyede yeniden yaratilan DB'de cakisabilir. UUID'ye gecis onerilir.
+2. **`EVdbPageStale` yayilimi.** `FOnRefreshed` atanmamis ya da pinli cerceve
+   varsa istisna yukari cikar; motorun ust katmaninda beklenmeyen hata olarak
+   gorunebilir. Bugunku kapilar temiz; yeni okuma noktalari eklenirse gozden
+   gecirilmeli.
+3. **StaleOnDisk maliyeti.** Her tahliye/flush'ta bir disk okumasi (sifreli
+   yolda AEAD cozumu) yapar; dogruluk icin bilincli tercih. Sicak yolda
+   olcum yapilmadi.
+4. **Truncate "hepsi ya da hicbiri".** Checkpoint'in otesinde kayit varsa
+   WAL kucultulmez; alan geri kazanimi sonraki checkpoint'e kalir.
+5. **Trunk damgasi tek savunma hatti degil.** Store tarafinda
+   `IsTrunkImage`/`IsVdbPageImage` kontrolleri korunmali; yeni damga yazan
+   yol eklenirse magic kosulu zorunludur.
