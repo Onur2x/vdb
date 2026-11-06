@@ -1441,3 +1441,72 @@ Her iki commit oncesi `tests/gates/runall.sh <dizin> -B` ile 20/20 kapi,
 `chainnull` TEMIZ alindi. (Not: eski derleme dizinlerindeki BAYAT `.ppu`
 birimleri XML bolumunde 21 yanlis hata uretiyordu; taze `-FU` birim dizini
 ile bu hatalar kaybolur. Kapilar bu yuzden taze dizinde kosulmalidir.)
+
+---
+
+# EK-H — Dogrulama turu (2026-11-06): P-126/P-127 duzeltmelerinin denetimi
+
+Yontem: 4 bagimsiz dogrulama ajani (bellek / dogruluk / eszamanlilik / cokme),
+salt okunur. Her bulgu icin karar: **TAM / KISMEN / YOK / YENI-RISK**.
+Denetlenen commit'ler: `104cd86` (P-126), `2fcf91d` (P-127), ustte `ef41f04`.
+
+## EK-H.1 Karar tablosu
+
+| Bulgu | Karar | Kanit (guncel) |
+|---|---|---|
+| R2-A-1 SlabBits kilitsiz RMW | **TAM** | RMW artik `MMLock` icinde (`VDbMM.pas:160-182`); tek yazma noktasi, ic ice kilit yok |
+| R2-A-5 VDbPool sayac kacagi | **TAM** | Kira 1:1 eslesme, `FMySlot > 0` korumali azaltma (`VDbPool.pas:298-302,313-319,486`) |
+| R2-A-8 VDbCdc FSeen buyume | **TAM** | `FMaxSeen=100000` + FIFO budama (`VDbCdc.pas:351-363`) |
+| R2-A-11 PgWire portal bellegi | **TAM** | `Portals.Clear` Sync'te (`VDbPgWire.pas:1929`, ayrica `1675,1916,1942`) |
+| R2-A-12 COPY gecici dosya TOCTOU | **TAM** | PID token + atomik sayac + tik (`VDbPgWire.pas:1210-1224`); silme yalniz kendi dosyasi (`1338`) |
+| R2-A-4 dogrulanmamis `len` on-tahsis | **YOK** | `VDbPageHeap.pas:530, 914-916, 1545-1547` ~2 GB on-tahsis + sinir-disi `Move` aynen |
+| R2-D-1 PutRow P-67 bayrak bayatligi | **TAM** | `FPutPrefixName` ayri onbellek (`VDbTable.pas:7418-7429`); `FPrefixCacheName` tum yazim noktalari (`10773-10785, 10811-10821, 10836-10853`) bayraklarla birlikte |
+| D-1a + R2-F-1 DDL-inside-batch bayat onbellek | **TAM** | `MarkSchema` -> `ResetBatchSchemaCaches` (`6230, 6630-6652`); ALTER + CREATE/DROP INDEX + TABLE + view/MV + RENAME + FK dahil her DDL |
+| R2-D-2 indeks varyanti | **TAM** | MarkSchema sonrasi taze `T.Idx` (`10286 -> 10804-10808`); `HasIdxWork` Idx sayisini anahtar alir (`8119`); CONCURRENTLY batch reddi (`10180`) |
+| R2-D-3 FK kaskad simetrisizlik | **TAM** | `CheckRestrict` commit `TVTableDb.CommitBatch` (`7650-7652`) — abort ile simetrik |
+| R2-C-1 yarim VACUUM -> sonsuz fsync | **TAM** | `ALsn > WrittenLsn -> bekleme yok` (`VDbPageEngine.pas:885-892`); kalanti: `syncLsn` istisna yolunda hala sifirlanmiyor (`VDbBackendV3.pas:3040-3041`) |
+| R2-C-3 hayalet commit | **KISMEN** | `Commit(DoSync=True)` yolunda geri kirpma (`VDbPageWal.pas:712-725`); grup-commit + C-6 istisna yollari acik |
+| R2-C-2 ikincil fsync yutulmesi | **YOK** | `tmpExc.Free` ile yutuluyor (`VDbBackendV3.pas:3058-3073`) |
+| R2-B-4 FLastDirtyIdx | **KISMEN** | Tek giris noktasi (`VDbBackendV3.pas:8128-8154`) yapisi dogru; `FlushIdxPending` hala okuma kilidinde yaziyor (`10095-10096 -> 9937,9947`) |
+| R2-B-5 VDbPool sahiplik/UAF | **KISMEN** | `FOwners` denetimi (`VDbPool.pas:56-61,433,460-471`); instance-bazli named mutex (`220`) + capraz-thread `CloseEngine` (`247-268`) degismedi |
+| B-06 VerifyNoConflict FAlien | **KISMEN** | `VDbBackendV3.pas:1793-1869` degismedi |
+| B-01 FSnapMap UAF (KRITIK) | **YOK** | `FStream*` alanlari hala `FEngCs`'ten once yaziliyor (`VDbBackendV3.pas:2572-2575`); FSnapMap tek alan (`273,2042`); yigin tabanli tarama baglami yok — **EK-G'de bilincli ertelendi** |
+| B-02 lazy indeks kilitsiz yazim (KRITIK) | **YOK** | `VDbTable.pas:9990-10145` kilit korumasiz; `LockRead` altinda cagri (`VDbSql.pas:3212-3234`) — **EK-G'de bilincli ertelendi** |
+| R2-B-2 FBatchSet kilitsiz okuma | **YOK** | `VDbBackendV3.pas:1495-1496,1546`; `FBatchSetSid` commit'te sifirlanmiyor (`2999,3101`) — **EK-G'de bilincli ertelendi** |
+| R2-B-3 FT.BeginBatch RequireSoleTxn | **YOK** | `VDbTable.pas:6654-6663` — **EK-G'de bilincli ertelendi** |
+| B-05 FHoldDepth | **YOK** | `VDbPageStore.pas:1613-1617` aynen |
+| B-07 ReadBytesAt kilit sizintisi | **YOK** | SH sizintisi hata yolunda (`VDbPageStore.pas:2063-2076`) |
+| C-1 onayli sayfalarin budanmasi (KRITIK) | **YOK** | Truncate filtresiz (`VDbPageWal.pas:971-993`); Flush yalniz kirli (`VDbPageStore.pas:2743-2749`) |
+| C-3 + C-16 sayfa LSN damgasi (KRITIK) | **YOK** | Damga yalniz deklare (`VDbPage.pas:65`) ve hep 0 (`:196`); okuma yolu denetimsiz (`VDbPageStore.pas:2255-2282`) |
+| C-2 kalintisi (`.gen` devralma) | **YOK** | DROP+CREATE dosyalari silmiyor (`VDbSql.pas:3645-3649`); >=16 bayt `.gen` devraliniyor (`VDbPageStore.pas:1845-1865`) |
+| D-Y1/Y2 SUM/AVG Double | **YOK** | Hala `Double` (`VDbExecutor.pas:1495, 8691, 8753, 10568`); Int64/Kahan yolu yok |
+
+**Ozet: 12 TAM, 4 KISMEN, 11 YOK.** "Hepsi duzeldi" iddiasi P-126/P-127'nin
+kendi kapsam (R2-A-12, R2-C-1/3/4 + R2-A/B/D/E/F guvenli kumeleri) icin
+dogru; bilincli ertelenenler (B-01, B-02, R2-B-2, R2-B-3 — EK-G) ve
+C-1, C-3/C-16, R2-A-4, D-Y1/Y2, R2-C-2, B-05, B-07 acik kalmistir.
+
+## EK-H.2 Dogrulama turunda YENI bulgular
+
+| # | Siddet | Bulgu | Yer |
+|---|---|---|---|
+| R2-D-YENI-1 | YUKSEK | Kolon haritasi onbellegi yalniz uzunluk + tablo adi ile dogrulaniyor → ayni transaction'da farkli kolon listeli iki INSERT bayat haritayla sessiz yanlis kolona yazar | `VDbTable.pas:10875-10887` |
+| R2-D-YENI-2 | YUKSEK | MV satir sayaci kalici yazilmiyor → yeniden acilista MV bos gorunur, REFRESH eski satirlari silemez | `VDbTable.pas:11945-11948, 12031` |
+| R2-C-YENI-1 | YUKSEK | `Refresh`'in `FWrittenLsn := FLSN` yazimi R2-C-1 erken cikisiyla yarisip fsync'i sessiz atlayabilir → yanlis durabil onaji | `VDbPageWal.pas:485-487` + `VDbPageEngine.pas:885-892` |
+| R2-C-YENI-2 | YUKSEK | DROP+CREATE'de kalan eski `.wal` kurtarmada yeni DB'ye uygulanabilir (C-2 kalintisindan agir) | `VDbSql.pas:3645-3649` |
+| R2-B-YENI-1 | ORTA | VDbPool `Release` hata yolunda ornek+slot+mutex sizintisi; TID yeniden kullanimi | `VDbPool.pas` |
+| R2-B-YENI-2 | ORTA | `MMReallocMem` bozuk basta `nil` donup eski isaretciyi birakir | `VDbMM.pas` |
+
+Notlar: `MMLock` tekrarli degil (gelecekte ic ice tahsis deadlock'u);
+`AcquireSlot` artisi-kiralama arasi cokme sayimi dusuk birakir; R2-A-12'de
+PID-geri-donusumu teorik pencere. Yeni kilit sirasi (AB-BA) yok; performans
+gerilemesi olculemedi (statik denetim).
+
+## EK-H.3 Oneirilen siradaki is (guncel)
+
+1. **R2-D-YENI-1** kolon haritasi onbellegi — yanlis kolona yazim, oncelik 1.
+2. **C-1 + C-3/C-16** (cok surecli kalici kayip; sayfa LSN damgasi dogrulamasi).
+3. **R2-C-YENI-1/2** durabil onaji yanlisi + eski `.wal` devralma.
+4. **B-01 + B-02 + R2-B-2 + R2-B-3** (EK-G'de ertelendi; hala KRITIK).
+5. **R2-A-4** page-heap `len` sinir denetimi; **R2-C-2** fsync yutulmesi.
+6. D-Y1/Y2 SUM/AVG hassasiyeti; B-05/B-07 kilit sizintilari.
