@@ -55,7 +55,7 @@ interface
 
 uses
   SysUtils, DateUtils, Classes, SyncObjs, Generics.Collections, VDbTypes, VDbCore, VDbTable, VDbSql, VDbAst,
-  VDbParser, VDbNet, VDbErr, VDbTls;
+  VDbParser, VDbNet, VDbErr, VDbTls, VDbSync, VDbXPrims;
 
 type
   TVdbPgServer = class;
@@ -1206,16 +1206,21 @@ begin
   end;
 end;
 
+var
+  GPgCopySeq: Integer = 0;
+
 function PgTempCopyPath: string;
 var
-  i: Integer;
+  seq: Integer;
 begin
-  i := 0;
-  repeat
-    Result := IncludeTrailingPathDelimiter(GetTempDir) + 'vdb_pgcopy_' +
-      IntToStr(GetTickCount64) + '_' + IntToStr(i) + '.tmp';
-    Inc(i);
-  until not FileExists(Result);
+  { R2-A-12: ad SURECLER ARASI benzersiz olmali (VDbProcessToken) ve surec
+    icinde ATOMIK sayacla ayrilmali. Boylece iki baglanti ayni milisaniyede
+    ayni adi uretemez; eski FileExists tabanli TOCTOU dongusu gereksiz kalir
+    (yarisan ikinci baglanti birincinin dosyasini kirpamaz/silemez). }
+  seq := InterlockedIncrement(GPgCopySeq);
+  Result := IncludeTrailingPathDelimiter(GetTempDir) + 'vdb_pgcopy_' +
+    VDbProcessToken + '_' + IntToStr(GetTickCount64) + '_' +
+    IntToStr(seq) + '.tmp';
 end;
 
 function HandlePgCopyIn(S: TVdbPgIo; FSql: TVSql;

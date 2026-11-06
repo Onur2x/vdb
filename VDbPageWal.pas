@@ -644,6 +644,7 @@ function TVdbPageWal.Commit(DoSync: Boolean; LSN: LongWord): Boolean;
 var
   i, total, off, payLen: Integer;
   magic, zero, crc: LongWord;
+  startPos: Int64;
 begin
   Result := False;
   if FStream = nil then
@@ -662,6 +663,7 @@ begin
     sonrasi konum sondadir; Refresh/Recover/ReadHeader disaridan gelir. }
   if not FAtEnd then
     FStream.Seek(0, soEnd);
+  startPos := FStream.Position;   // R2-C-3: geri kirpma noktasi
   off := 0;
   magic := VDB_WAL_REC_FRAME;
   zero := 0;
@@ -707,6 +709,19 @@ begin
       FBufferCount := 0;
       BufHashClear;
       SetLength(FOutBuf, 0);
+      { R2-C-3: fsync basarisiz -> istemci commit'i BASARISIZ goruyor. Dosyada
+        kalan tam commit kaydi kurtarmada "hayalet commit" olarak uygulanirdi.
+        Bu commit'e ait yazilan bolumu geri kirp (tek yazar varsayimi: WAL'e
+        yazim dis kilit/mutex ile serilestirilir). }
+      try
+        FStream.Size := startPos;
+        FStream.Seek(0, soEnd);
+        Dec(FWrittenBytes, off);
+        FAtEnd := True;
+      except
+        { Kirpma da basarisizsa ASIL hatayi maskeleme; FSyncErr kalici
+          oldugu icin sonraki commit'ler de hata verir. }
+      end;
       raise;
     end;
   end;
@@ -924,6 +939,9 @@ var
   st: TVdbWalStats;
   oldLSN: LongWord;
   oldWritten: LongWord;
+  oldScanPos: Int64;
+  oldScanHdrLsn: LongWord;
+  oldAtEnd: Boolean;
 begin
   if (FStream = nil) or (not FHasContent) then
     Exit(0);
@@ -931,12 +949,22 @@ begin
     son commit'e ceker; canli WAL'de bu yan etki istenmez. }
   oldLSN := FLSN;
   oldWritten := FWrittenLsn;
+  { R2-C-4: Recover artimsal tarama imlecini (FScanPos/FScanHdrLsn) de
+    degistirir. Sayim yalniz okuma amaclidir; imlec geri konmazsa eszamanli
+    artimsal tazeleme (StoreRefreshed) yanlis konumdan surer ve kayit
+    atlayabilir. Bu yuzden TUM tarama durumu geri yuklenir. }
+  oldScanPos := FScanPos;
+  oldScanHdrLsn := FScanHdrLsn;
+  oldAtEnd := FAtEnd;
   try
     Recover(nil, st);
     Result := st.Commits;
   finally
     FLSN := oldLSN;
     FWrittenLsn := oldWritten;
+    FScanPos := oldScanPos;
+    FScanHdrLsn := oldScanHdrLsn;
+    FAtEnd := oldAtEnd;
   end;
 end;
 

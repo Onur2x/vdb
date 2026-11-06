@@ -883,6 +883,13 @@ begin
     `.gen` eslemesindeki durabil LSN, son basarili fsync'in hedefidir;
     monoton artar ve yalnizca fsync BASARILI olduktan sonra yazilir. }
   if ALsn = 0 then Exit;
+  { R2-C-1: hedef LSN cagiranin gordugu WAL uzayinda olmali. Dosya degisimi
+    (VACUUM/compact) sonrasi eski uzaydan gelen hedef bu motorda ASLA
+    karsilanamaz; beklemek sonsuz fsync dongusudur. Bu uzayda hedefe kadar
+    yazilmis kayit yoksa dayaniklilik hedefi anlamsizdir -> bekleme yok.
+    (Checkpoint sonrasi WrittenLsn = CheckpointLSN olur; checkpoint veriyi
+    zaten fsync ettigi icin eski hedefin atlanmasi dogrudur.) }
+  if ALsn > FWal.WrittenLsn then Exit;
   while True do
   begin
     leader := False;
