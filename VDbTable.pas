@@ -411,6 +411,7 @@ type
     // Ayni tabloya ardisik INSERT'lerde FindCol + provided[] tahsisi atlanir.
     FBatchColMapValid: Boolean;
     FBatchColMap: TIntArray;
+    FBatchColMapNames: TStrArray;  // R2-D-YENI-1: haritanin kuruldugu kolon adlari
     FColMapTable: string;   // P-63: eslemin hangi tablo icin gecerli oldugu
     // P-32: batch tablosunun lazy PK indeksi var mi? IdxAddRow'da FPkIdx
     // ContainsKey aramasini atlamak icin. FBatchTableCached ile ayni gecerlilikte.
@@ -6691,6 +6692,7 @@ begin
   FBatchHasGenerated := False;  // P-67
   FBatchColMapValid := False;
   SetLength(FBatchColMap, 0);
+  SetLength(FBatchColMapNames, 0);
   FColMapTable := '';       // P-63
   SetLength(FBatchVals, 0);   // P-26
   FPrefixCacheName := '';     // P-56
@@ -6722,6 +6724,7 @@ begin
   FBatchHasGenerated := False;
   FBatchColMapValid := False;
   SetLength(FBatchColMap, 0);
+  SetLength(FBatchColMapNames, 0);
   FColMapTable := '';
   FPrefixCacheName := '';
   FPrefixCacheVal := 0;
@@ -11274,6 +11277,7 @@ var
   n: Integer;      // P-65: EncodeRowInto yazim uzunlugu
   exTid: Word;
   inBatch: Boolean;
+  mapOk: Boolean;           // R2-D-YENI-1
 {$IFDEF APPLPROF}
   tp0, tp1, tp2: Int64;
 {$ENDIF}
@@ -11393,8 +11397,23 @@ begin
   tp1 := tp0;
 {$ENDIF}
 
-  if FBatchColMapValid and (Length(FBatchColMap) = Length(ColNames)) and
-     (FColMapTable = tp^.Name) then
+  { R2-D-YENI-1: onbellegin dogrulamasi yalniz uzunluk + tablo adi ile
+    yapiliyordu; ayni islemde farkli kolon listeli iki INSERT (esit sayida)
+    bayat haritayla sessiz yanlis kolona yazar. Simdi haritanin kuruldugu
+    kolon adlari birebir karsilastirilir; uyusmazlikta yeniden kurulur
+    (ham ad esitligi FindCol'un VDbNorm eslesmesiyle ayni sonucu verir;
+    farkli yazim gereksiz yeniden kurulumdan baska bir sey degildir). }
+  mapOk := FBatchColMapValid and (Length(FBatchColMap) = Length(ColNames)) and
+     (Length(FBatchColMapNames) = Length(ColNames)) and
+     (FColMapTable = tp^.Name);
+  if mapOk then
+    for i := 0 to High(ColNames) do
+      if FBatchColMapNames[i] <> ColNames[i] then
+      begin
+        mapOk := False;
+        Break;
+      end;
+  if mapOk then
   begin
     { P-34: tüm kolonlar sağlanıyorsa varsayılan doldurma döngüsü atlanıyor.
       İkinci döngü zaten her kolonu StrVals'ten yazar; eski string'lerin
@@ -11412,6 +11431,7 @@ begin
     SetLength(provided, Length(tp^.Cols));
     for i := 0 to High(vals) do begin vals[i] := ''; provided[i] := False; end;
     SetLength(FBatchColMap, Length(ColNames));
+    SetLength(FBatchColMapNames, Length(ColNames));   // R2-D-YENI-1
     for i := 0 to High(ColNames) do
     begin
       ci := FindCol(tp^, ColNames[i]);
@@ -11421,6 +11441,7 @@ begin
       vals[ci] := StrVals[i];
       provided[ci] := True;
       FBatchColMap[i] := ci;
+      FBatchColMapNames[i] := ColNames[i];            // R2-D-YENI-1
     end;
     FBatchColMapValid := True;
     FColMapTable := tp^.Name;

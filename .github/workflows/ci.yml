@@ -55,6 +55,7 @@ jobs:
             'tests/sql/sqltest', 'tests/gates/pagechk', 'tests/gates/storechk',
             'tests/gates/heapchk', 'tests/gates/crashtest', 'tests/gates/idxchk',
             'tests/gates/backendchk', 'tests/gates/v3sqlchk', 'tests/gates/migchk',
+            'tests/gates/colmapchk',
             'vdbmig', 'tests/gates/factorychk', 'tests/gates/logchk',
             'tests/gates/pitrchk', 'tests/gates/btreechk', 'tests/gates/replchk',
             'tests/gates/lockchk', 'tests/gates/snapchk', 'tests/gates/prochk',
@@ -177,6 +178,21 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'backendchk kalan > 0'
+            exit 1
+          }
+
+      - name: Kolon haritasi onbellegi kapisi (colmapchk)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbcolmapchk'
+          $out = & .\tests\gates\colmapchk.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'KOLON HARITASI ONBELLEGI DOGRULANDI') {
+            Write-Error 'colmapchk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'colmapchk kalan > 0'
             exit 1
           }
 
