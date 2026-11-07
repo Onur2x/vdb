@@ -2359,12 +2359,74 @@ Ayni oturum, donusumlu BASE/NEW, her kosu taze dizin:
    doldurur ne nesli artirir, bu pencerede deger karsilastirmasi da esit
    gorur. Kapatmak icin store `.gen` (`ReadGen`) tabanli global damga
    (konservatif) veya kayit basina surum gerekir; ayri is.
-2. **Autocommit UPDATE on-okumasi** `BeginBatch`'ten ONCE calisir
-   (VDbExecutor.pas); write-set kapali oldugu icin izlenmez. Tek
-   statement'lik otomatik commit'te ayni pencere acik kalir. Duzeltme
-   yurutucu akisinda degisiklik ister; ayri is.
+2. **Autocommit UPDATE on-okumasi** `BeginBatch`'ten ONCE calisiyordu
+   (VDbExecutor.pas); write-set kapali oldugu icin izlenmiyordu. EK-T'de
+   (P-145) duzeltildi: yurutucu kendi write-set'ini on-okumadan once acar.
+   `ExecFastPointUpdate/Delete` ve `TVTableDb.UpdateWhere/DeleteWhere`
+   hizli yollari hala kapsam disinda.
 3. 4096 ustunde anahtar hassasiyeti kaybolur; buyuk okumali islemlerde
    anahtar bazli olmayan (daha cok) cakisma gorulebilir. Veri kaybi yok.
 4. Yabanci commit YOKKEN maliyet yalnizca okuma basina bir harita
    eklemesidir; cok buyuk nokta-okuma islemlerinde (<=4096) islem basina
    ~0,2 ms mertebesinde tek seferlik harita buyumesi olabilir.
+
+---
+
+# EK-T. P-145 — autocommit UPDATE/DELETE on-okuma penceresi
+
+Kapsam: EK-S.5 risk 2. Tek statement'lik otomatik commit'li UPDATE/DELETE
+yolunda yurutucu aday satirlari ONCE okuyup SONRA `BeginBatch` aciyordu.
+Okuma write-set kapaliyken yapildigi icin P-144 okuma kumesine girmiyor,
+araya giren yabanci commit NoteBefore'da ayni degeri goruyor ve sessiz
+guncelleme kaybi olusuyordu.
+
+## EK-T.1 Cozum
+
+- `ExecUpdate` / `ExecDelete` (VDbExecutor.pas): `ownBatch :=
+  not FT.Backend.InBatch;` ve `BeginBatch` on-okumadan (NarrowRows /
+  ScanRowsPart) ONCE. Commit/abort yalniz `ownBatch` dalinda; explicit
+  transaction siniri degismez. DELETE'te eslesen satir yoksa `AbortBatch`
+  ile nesil artmadan kapanir. Hata yolunda yalniz kendi actigimiz kume
+  abort edilir; `AbortBatch` ikinci istisnasi asil hatayi maskelemez.
+- `RecordRead` (VDbBackendV3.pas): ayni anahtar tekrar okunursa EN ESKI
+  gozlem korunur. Boylece `TVTableDb.Delete` icindeki ic `ReadRow` esigi
+  yukseltip pencereyi maskelemez; daha eski esik yalnizca ek (konservatif)
+  cakisma uretir.
+- `VerifyNoConflict`: `ScanGen` esigi artik yalniz anahtar kaydi yokken
+  degil, HER ZAMAN `min` ile dikkate alinir (tam tarama ile bulunan
+  satirlarda per-key kayit olmayabilir).
+- Test dikisi: `VdbDmlProbe` (VDbExecutor.pas, varsayilan nil) BEFORE/AFTER
+  iki gozlem noktasi. nil iken uretim yolu degismez.
+
+## EK-T.2 Kapi
+
+`tests/gates/genchk.lpr` yeni `BolumAutocommit` (11 kontrol; genchk toplami
+39/0): on-okuma->yazim arasi yabanci commit cakisma verir; yabanci commit
+yokken ayni UPDATE basarili (yanlis pozitif kontrolu); yabanci commit
+on-okumadan ONCE ise cakisma yok (4b); DELETE indeks dilimi ve tam tarama
+icin ayni pencere. Basari: "AUTOCOMMIT ON-OKUMA PENCERESI DOGRULANDI".
+
+Negatif kanit (HEAD executor+backend kopyasi, cwd golgeleme): `gecen=28
+kalan=6`; yeni bolum duzeltme olmadan deterministik olarak kaliyor.
+
+Regresyon: v3sqlchk 238/0, autoincc 15/0, commitfailchk 21/0,
+sqltest --backend=v3 2885/0 (33 atlandi), tam kapi seti 34/34.
+
+## EK-T.3 Performans
+
+Ajan olcumu (20.000 satir, 5 autocommit UPDATE + 1 DELETE, 6 degisimli tur,
+taze dizin): UPDATE ~%33, DELETE ~%29 daha hizli; regresyon yok. Beklenen
+yon maliyet artisiydi; hizlanmanin nedeni bu isin kapsaminda incelenmedi
+ve bagimsiz olarak dogrulanmadi. Onemli olan: sicak yolda regresyon yok.
+
+## EK-T.4 Acik riskler
+
+1. `ExecFastPointUpdate` / `ExecFastPointDelete` (`WHERE pk = literal`)
+   hic batch acmaz ve cakisma denetimi yapmaz; bu hizli yolda on-okuma
+   penceresi AYNEN durur.
+2. `TVTableDb.UpdateWhere` / `DeleteWhere` (tablo API) adaylari
+   `BeginBatch`'ten once okuyor; ayni pencere tablo API'sinde de var.
+3. "En eski gozlem" ve "ScanGen her zaman min" kurallari yalnizca EK
+   cakisma uretebilir (konservatif yon); mevcut kapilarda ornek cikmadi.
+4. Surec/backend'ler arasi pencere (EK-S.5 risk 1) hala acik; tasarim
+   `tmp64/cxproc_design.md`.

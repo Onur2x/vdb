@@ -1993,7 +1993,7 @@ end;
 
 procedure TVdbBackendV3.RecordRead(S: TWriteSet; Key: QWord);
 var
-  rg: Int64;
+  rg, rg0: Int64;
 begin
   { Yalnizca write-set ACIKKEN cagrilir; islem disi okuma yolu buraya
     girmez. FEngCs cagiran tarafindan tutulur; FCommitGen/StartGen sabit. }
@@ -2014,6 +2014,12 @@ begin
     S.ReadOverflow := True;
     Exit;
   end;
+  { P-145: ayni anahtar birden fazla okunursa EN ESKI gozlem korunur.
+    Aksi halde araya giren yabanci commit sonrasi yapilan ic okuma
+    (or. TVTableDb.Delete icindeki ReadRow) esigi guncelleyip
+    on-okuma penceresini maskeler. Daha eski esik yalnizca DAHA
+    konservatif cakisma uretir; pencereyi genisletmez. }
+  if S.ReadGen.TryGetValue(Key, rg0) and (rg0 <= rg) then Exit;
   S.ReadGen.AddOrSetValue(Key, rg);
 end;
 
@@ -2095,11 +2101,13 @@ begin
       en konservatif esik StartGen'dir. }
     obsGen := capGen;
     hasRead := S.ReadGen.TryGetValue(key, rg);
-    if hasRead then
-    begin
-      if rg < obsGen then obsGen := rg;
-    end
-    else if (S.ScanGen >= 0) and (S.ScanGen < obsGen) then
+    if hasRead and (rg < obsGen) then obsGen := rg;
+    { P-145: anahtar okumasi bulunsa bile tarama nesli esigi ASLA
+      yukseltmez. On-okuma tam tarama ile yapildiysa anahtar icin
+      per-key kayit yoktur; yazim icindeki ic okuma daha yeni bir nesil
+      yazmis olabilir. Ilk tarama yabanci commit'ten onceyse pencere
+      aciktir (konservatif yon: yalnizca ek cakisma). }
+    if (S.ScanGen >= 0) and (S.ScanGen < obsGen) then
       obsGen := S.ScanGen;
     if S.ReadOverflow and (S.StartGen < obsGen) then
       obsGen := S.StartGen;

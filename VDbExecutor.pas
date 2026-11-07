@@ -41,6 +41,20 @@ const
   // quicksortta derinlik log2(N); 64 cerverek. Yine de asilirsa dizi
   // disina yazilmamasi icin sinir denetimi vardir.
   VDB_SORT_STACK_MAX = 64;
+  { P-145: autocommit UPDATE/DELETE on-okuma penceresi kapi kancasi.
+    Yalnizca test kapisi (genchk) tarafindan atanir; nil iken maliyet iki
+    isaretci denetimidir. Asamalar:
+      VDB_DML_PROBE_BEFORE = on-okumadan hemen once
+      VDB_DML_PROBE_AFTER  = on-okumadan hemen sonra, yazimdan once }
+  VDB_DML_PROBE_BEFORE = 0;
+  VDB_DML_PROBE_AFTER  = 1;
+
+type
+  TVdbDmlProbe = procedure(Stage: Integer) of object;
+
+var
+  { P-145: nil iken uretim yolu degismez. }
+  VdbDmlProbe: TVdbDmlProbe = nil;
 
 type
   { NOT: TByteArray burada YENIDEN tanimlaniyordu. VDbTypes zaten
@@ -18096,6 +18110,9 @@ var
   aliasEff: string;
   n, fi: Integer;
   jr: TStrArray;
+  // P-145: otomatik commit'li tek statement'lik UPDATE kendi write-set'ini
+  // on-okumadan ONCE acar (bkz. asagidaki aciklama).
+  ownBatch: Boolean;
 begin
   // F-33: View guncellenebilirlik kontrolü
   baseTable := '';
@@ -18177,6 +18194,16 @@ begin
     daraltilir (PK nokta / indeks dilimi); bulunamazsa tam tarama.
     IsExact: daraltma WHERE'in tamamini kapsiyorsa döngüde RowMatches
     tekrar edilmez (PK noktada zaten NarrowRows icinde uygulanir). }
+  { P-145: OTOMATIK COMMIT'LI TEK STATEMENT'LIK UPDATE. On-okuma
+    (NarrowRows/ScanRowsPart) write-set ACIKKEN yapilmalidir; aksi halde
+    okuma kumesine (ReadGen/ScanGen) girmez, araya giren yabanci commit
+    NoteBefore'da deger karsilastirmasi esit gorunerek sessiz guncelleme
+    kaybina yol acar (EK-S.5 risk 2). Explicit transaction'da (InBatch)
+    dis write-set'e dokunulmaz; rollback sinirini cagiran yonetir. }
+  ownBatch := not FT.Backend.InBatch;
+  if ownBatch then FT.BeginBatch;
+  try
+  if Assigned(VdbDmlProbe) then VdbDmlProbe(VDB_DML_PROBE_BEFORE);
   isExact := False;
   if not NarrowRows(td, Stmt.WhereClause, colNames, colTypes, pks, allRows, isExact) then
   begin
@@ -18184,6 +18211,7 @@ begin
     // R-13 Full: partition pruning (UPDATE/DELETE taramalari da kullanir)
     FT.ScanRowsPart(Stmt.Table, pks, allRows, PartTargetsOf(td, Stmt.WhereClause));
   end;
+  if Assigned(VdbDmlProbe) then VdbDmlProbe(VDB_DML_PROBE_AFTER);
 
   SetLength(allColNames, Length(td.Cols));
   for i := 0 to High(td.Cols) do allColNames[i] := td.Cols[i].Name;
@@ -18301,10 +18329,8 @@ begin
     (Length(FT.TriggersFor(Stmt.Table, Byte(ttAfter), Byte(teUpdate))) > 0);
   hasRls := FT.RlsApplies(Stmt.Table);
 
-  if not FT.Backend.InBatch then
+  if ownBatch then
   begin
-    FT.BeginBatch;
-    try
       for i := 0 to High(allRows) do
       begin
 
@@ -18360,10 +18386,6 @@ begin
       // F-36: AFTER UPDATE STATEMENT tetikleyiciler (tum satirlardan sonra)
       if hasRowTrig then
         FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teUpdate), nil, nil, [], Res, False);
-    except
-      FT.AbortBatch;
-      raise;
-    end;
   end
   else
   begin
@@ -18421,6 +18443,16 @@ begin
       if hasRowTrig then
         FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teUpdate), nil, nil, [], Res, False);
   end;
+  except
+    { P-145: kendi actigimiz write-set'i hata yolunda kapat. Explicit
+      transaction'da (ownBatch=False) dokunulmaz; rollback cagirana aittir.
+      AbortBatch ikinci bir istisna firlatirsa asil hatayi maskelemesin. }
+    if ownBatch then
+    begin
+      try FT.AbortBatch; except end;
+    end;
+    raise;
+  end;
 
   // R-04: RETURNING - sonuclari Res'e aktar
   if hasReturning then
@@ -18462,6 +18494,9 @@ var
   // F-33: VIEW desteği
   baseTable: string;
   viewColMap: TStrArray;
+  // P-145: otomatik commit'li tek statement'lik DELETE kendi write-set'ini
+  // on-okumadan ONCE acar.
+  ownBatch: Boolean;
 begin
   // F-33: View guncellenebilirlik kontrolü
   baseTable := '';
@@ -18511,6 +18546,13 @@ begin
     tabloda ~1 saniye suruyordu. Simdi PK nokta / indeks dilimi denenir.
     IsExact: daraltma WHERE'in tamamini kapsiyorsa döngüde RowMatches
     tekrar edilmez. }
+  { P-145: OTOMATIK COMMIT'LI TEK STATEMENT'LIK DELETE. On-okuma write-set
+    ACIKKEN yapilmalidir (UPDATE ile ayni gerekce, EK-S.5 risk 2). Explicit
+    transaction'da (InBatch) dis write-set'e dokunulmaz. }
+  ownBatch := not FT.Backend.InBatch;
+  if ownBatch then FT.BeginBatch;
+  try
+  if Assigned(VdbDmlProbe) then VdbDmlProbe(VDB_DML_PROBE_BEFORE);
   isExact := False;
   if not NarrowRows(td, Stmt.WhereClause, colNames, colTypes, pks, allRows, isExact) then
   begin
@@ -18518,6 +18560,7 @@ begin
     // R-13 Full: partition pruning (UPDATE/DELETE taramalari da kullanir)
     FT.ScanRowsPart(Stmt.Table, pks, allRows, PartTargetsOf(td, Stmt.WhereClause));
   end;
+  if Assigned(VdbDmlProbe) then VdbDmlProbe(VDB_DML_PROBE_AFTER);
 
   // Tetikleyici / RLS meta verisi DELETE boyunca degismez: bir kez bak,
   // yoksa satir basina FireTriggers + Rls* cagrisini tamamen atla (sicak yol).
@@ -18545,53 +18588,37 @@ begin
     rCount := toDelete.Count;
     if rCount > 0 then
     begin
-      if not FT.Backend.InBatch then
+      for i := 0 to toDelete.Count - 1 do
       begin
-        FT.BeginBatch;
-        try
-          for i := 0 to toDelete.Count - 1 do
-          begin
-
-            // F-36: BEFORE DELETE ROW tetikleyiciler (satir silinmeden once)
-            if hasRowTrig then
-              FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teDelete),
-                allRows[toDelete[i]], nil, allColNames, Res, True);
-            FT.Delete(Stmt.Table, pks[toDelete[i]]);
-            // F-36: AFTER DELETE ROW tetikleyiciler (satir silindikten sonra)
-            if hasRowTrig then
-              FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete),
-                allRows[toDelete[i]], nil, allColNames, Res, True);
-          end;
-          FT.CommitBatch;
-          // F-36: AFTER DELETE STATEMENT tetikleyiciler (tum satirlardan sonra)
-          if hasRowTrig then
-            FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete), nil, nil, [], Res, False);
-        except
-          FT.AbortBatch;
-          raise;
-        end;
-      end
-      else
-      begin
-        for i := 0 to toDelete.Count - 1 do
-        begin
-          // F-36: BEFORE DELETE ROW tetikleyiciler (satir silinmeden once)
-          if hasRowTrig then
-            FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teDelete),
-              allRows[toDelete[i]], nil, allColNames, Res, True);
-          FT.Delete(Stmt.Table, pks[toDelete[i]]);
-          // F-36: AFTER DELETE ROW tetikleyiciler (satir silindikten sonra)
-          if hasRowTrig then
-            FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete),
-              allRows[toDelete[i]], nil, allColNames, Res, True);
-        end;
-        // F-36: AFTER DELETE STATEMENT tetikleyiciler (tum satirlardan sonra)
+        // F-36: BEFORE DELETE ROW tetikleyiciler (satir silinmeden once)
         if hasRowTrig then
-          FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete), nil, nil, [], Res, False);
+          FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teDelete),
+            allRows[toDelete[i]], nil, allColNames, Res, True);
+        FT.Delete(Stmt.Table, pks[toDelete[i]]);
+        // F-36: AFTER DELETE ROW tetikleyiciler (satir silindikten sonra)
+        if hasRowTrig then
+          FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete),
+            allRows[toDelete[i]], nil, allColNames, Res, True);
       end;
-    end;
+      if ownBatch then FT.CommitBatch;
+      // F-36: AFTER DELETE STATEMENT tetikleyiciler (tum satirlardan sonra)
+      if hasRowTrig then
+        FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete), nil, nil, [], Res, False);
+    end
+    else if ownBatch then
+      { P-145: eslesen satir yok; write-set'i gen artirmadan kapat. }
+      FT.AbortBatch;
   finally
     toDelete.Free;
+  end;
+  except
+    { P-145: kendi actigimiz write-set'i hata yolunda kapat; explicit
+      transaction'a (ownBatch=False) dokunulmaz. }
+    if ownBatch then
+    begin
+      try FT.AbortBatch; except end;
+    end;
+    raise;
   end;
 
   // R-04: RETURNING - silinen satir degerlerini dondur
