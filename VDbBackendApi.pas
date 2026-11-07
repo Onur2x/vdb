@@ -97,6 +97,12 @@ type
     { v3.3: veri iceriginin surum damgasi. Zone map onbellegi bu damgaya
       baglidir: damga degistiyse harita gecersizdir. v2: DataSeqValue. }
     function DataStamp: QWord;
+    { R3: cagiran is parcacigi motor kilidini (v3: FEngCs) TUTUYOR mu?
+      Tembel indeks insasi FIdxBuildCs'i FEngCs'ten SONRA alir; FEngCs
+      tutulurken FIdxBuildCs istenirse baska bir is parcacigiyla ters
+      cevrilme (ABBA) olusabilir. VDbTable bu bayrakla insayi atlar ve
+      cagiran tam taramaya duser. v2: kilit yok -> her zaman False. }
+    function EngineGateHeld: Boolean;
     { v3.1: tablo basina canli satir sayisi (O(1) olabilir). Tam tarama ile
       AYNI yuklem. Acik kaplama veya desteklenmeyen yol -> -1 (cagiran
       tarama yapar). v2: -1 (dogrulanmis onbellek TVDb tarafindadir). }

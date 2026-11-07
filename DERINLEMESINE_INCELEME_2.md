@@ -1950,8 +1950,8 @@ INSERT ~%1-2 hizli (IndexOf atlamasi), SELECT medyan +%0.4. Ikisi de
 2. Tek surec FSize beklemesi 10 ms dilimlidir; `FAvail.SetEvent` kacarsa
    bir dilim gecikme olur, dogruluk etkilenmez.
 3. `FIdxDirtyGen` Int64; teorik tasma 2^63 mutasyondan sonra.
-4. R1 (`Src.Skip` omru) ve R3 (`FIdxBuildCs <-> FEngCs`) arayuz
-   sozlesmesi gerektirdigi icin bu dalgada ele alinmadi.
+4. R1 (`Src.Skip` omru) EK-Q'da, R3 (`FIdxBuildCs <-> FEngCs`) EK-P'de
+   cozuldu; ikisi de kilit hiyerarsisini degistirmedi.
 
 ---
 
@@ -2061,6 +2061,92 @@ calisma dizini repo koku OLMAMALI.
 3. `.gen` 24 bayta cikti; eski dosyalar acilista otomatik yukseltilir.
    Kimlik karsilastirmasi ozellikle ag paylasimlarinda `.gen` ile DB
    dosyasinin birlikte kopyalanmasini gerektirir.
+
+---
+
+# EK-P. R3 — FEngCs / FIdxBuildCs ters cevrilmesi
+
+Kapsam: EK-I.3/EK-I.4'te ertelenen R3. Kilit sirasi
+`FLock -> FIdxBuildCs -> FEngCs -> FIdxCs` idi; ic ice akis (nested
+stream) alt sorgusu `FEngCs` TUTULURKEN tembel indeks insasi isterse
+`FIdxBuildCs` alinir; ters yonde baska bir parcacik `FIdxBuildCs` tutup
+`FEngCs` bekliyorsa ABBA kilitlenmesi olusur.
+
+## EK-P.1 Kok neden
+
+`TVdbBackendV3.ScanRawIterAll` tarama boyunca `FEngCs` tutar; geri
+cagirim icinde degerlendirilen ifade/alt sorgu `TVSql` uzerinden
+`TVTableDb.TryGetIdxSource` cagirabilir. Indeks bellekte yoksa bu yol
+`FIdxBuildCs.Enter` yapar; insa taramasi da `FKvB.ScanAll` ile `FEngCs`
+ister. `FIdxBuildCs -> FEngCs` normal yondur; ayni anda baska bir
+parcacik `FEngCs -> FIdxBuildCs` isterse dongu kapanir. Bugun planlayici
+insayi `FEngCs` disinda yaptigi icin tetiklenmiyordu; yeni bir ic ice
+insa noktasi riski gercege cevirirdi.
+
+## EK-P.2 Secilen cozum
+
+Yapisal engel (secenek a): `FEngCs` tutulurken `FIdxBuildCs` ALINMAZ.
+- `IVDbBackend.EngineGateHeld` eklendi: v3 `TVdbGate.HeldByCurrentThread`
+  (threadvar yigin; paylasilan `FDepth` guvenilmez), v2 daima False.
+- `TVTableDb.EngGateHeldNow` dort `FIdxBuildCs` alma noktasinin onunde
+  kontrol edilir: `IdxEntryCount`, `TryGetIdxSource`, `TryGetMemIndex`
+  normal yol ve PK yolu. Kilit tutulurken insa atlanir; `TryGetIdxSource`
+  False doner ve cagiran tam taramaya duser (dogruluk korunur).
+- Sicak yolda maliyet yok: kontroller `hasSkip`/`hasMem` kisa devresi
+  ardindadir; indeks bellekteyken cagrilmaz.
+- Hiyerarsi belgelendi (VDbTable kilit yorumu): `FEngCs` tutulurken
+  `FIdxBuildCs` alinmaz; tek yon `FIdxBuildCs -> FEngCs` kalir ve ABBA
+  yapisal olarak imkansizdir.
+
+Secenek (b) — derinlik kontrolu + acik hata — reddedildi: mesru ic ice
+sorgulari hataya cevirirdi; (a) davranisi bozmadan yalniz tembel insayi
+erteler.
+
+## EK-P.3 Kapi ve negatif kanit
+
+`tests/gates/nestidx.lpr` ters cevrilmeyi deterministik kurar:
+1. A parcacigi `ScanRawIterAll` ile `FEngCs` alir; ilk geri cagirimda
+   durur ve ana parcaciga haber verir.
+2. B parcacigi b tablosunun w indeksini tembel kurar; `FIdxBuildCs`
+   alip insa taramasinda `FEngCs` bekler.
+3. A alt sorgu gibi k indeksini ister. Duzeltme yoksa A `FIdxBuildCs`,
+   B `FEngCs` bekler: kilitlenme. Duzeltme varsa A insa yapmaz (False),
+   B ilerler ve insa tamamlanir.
+
+20 sn bekci (normal islem < 1 sn) kilitlenmede kapiyi `Halt(1)` ile
+dusurur. Negatif kanit: duzeltme oncesi HEAD kaynagindan derlenen ikili
+`KILITLENME` yazip 1 ile cikti; duzeltme sonrasi 3 OK + basari dizesi +
+0. Kapi `runall.sh` ve CI matrisine eklendi (`nestidx.lpi`).
+
+## EK-P.4 Tam set
+
+R3 worktree'sinde (R1 oncesi agac): **32/32** (`gecen=32 kalan=0`;
+31 mevcut kapi + nestidx). Birlesik agacta (R1 + R3) tam kosu sistem
+bellek baskisi nedeniyle yarıda durduruldu; o kosuda gecen kapilar:
+pagechk, storechk, heapchk, crashtest, dropchk, idxchk. Birlesik agacta
+ayrica hedefli dogrulama yapildi: nestidx 3/0, skipchk 4/0,
+v3sqlchk 238/0. Tam set (33 kapi) birlesik agacta ayrica kosulmalidir.
+
+## EK-P.5 Performans
+
+v3 sorgu yolu, ayni oturumda, 7 seri kosu (donusumlu pre/post), 20k
+satir, 2000 tekrar: PK nokta okuma, indeksli COUNT, tam tarama COUNT.
+Medyan fark: -%1.4, -%1.5, -%0.6 (post daha hizli). En iyi kosu
+(min-of-7) da her olcude post lehine (-%2.1, -%3.5, -%0.4). %2
+gerileme esigi asilmadi; farklar olcum gurultusu icinde.
+
+## EK-P.6 Acik riskler
+
+1. `FEngCs` tutulurken kurulmamis bir indekse ilk erisim tam taramaya
+   duser (yalniz performans; sonraki erisimler normal insa eder).
+2. Ayni kosulda `IdxEntryCount` -1 doner; `SHOW INDEXES` akis geri
+   cagirimi icinde calistirilirsa sayi bilinmiyor gorunur (dogruluk
+   etkilenmez).
+3. Yeni bir tembel insa noktasi eklenirse `EngGateHeldNow` kontrolu de
+   eklenmelidir; `FIdxBuildCs` `TVTableDb` icinde private oldugundan
+   disaridan bypass edilemez.
+4. v2 `EngineGateHeld` daima False; v2'ye `FEngCs` benzeri bir kapi
+   eklenirse guncellenmelidir.
 
 ---
 

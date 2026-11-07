@@ -63,7 +63,7 @@ jobs:
             'vdbmig', 'tests/gates/factorychk', 'tests/gates/logchk',
             'tests/gates/pitrchk', 'tests/gates/btreechk', 'tests/gates/replchk',
             'tests/gates/lockchk', 'tests/gates/snapchk', 'tests/gates/prochk',
-            'tests/gates/concurchk')
+            'tests/gates/concurchk', 'tests/gates/nestidx')
           foreach ($p in $projs) {
             $o = & $env:LAZBUILD -B "$p.lpi" 2>&1 | Out-String
             if ($LASTEXITCODE -ne 0) {
@@ -581,6 +581,28 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'concurchk kalan > 0'
+            exit 1
+          }
+
+      - name: Ic ice indeks kilidi kapisi (nestidx)
+        shell: pwsh
+        run: |
+          # R3: FEngCs tutulurken FIdxBuildCs istenirse ABBA kilitlenmesi.
+          # Kapi deterministik olarak ters cevrilmeyi kurar; 20 sn zaman
+          # asimindan once bitmelidir.
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbnestidx'
+          $out = & .\tests\gates\nestidx.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'IC ICE INDEKS KILIDI DOGRULANDI') {
+            $tail = ($out -split "`r?`n" | Where-Object { $_.Trim() -ne '' } |
+              Select-Object -Last 25) -join ' || '
+            $tail = $tail -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+            Write-Host "::error title=nestidx::$tail"
+            Write-Error 'nestidx basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'nestidx kalan > 0'
             exit 1
           }
 

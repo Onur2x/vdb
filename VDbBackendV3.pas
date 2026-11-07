@@ -73,6 +73,10 @@ type
     procedure Leave;
     function Depth: Integer;
     function MaxDepth: Integer;
+    { R3: bu kilidi TUTAN is parcacigi bu mu? FDepth paylasilan alandir
+      (baska is parcaciginin derinligini de gosterir); ters cevrilme
+      denetimi yalniz KENDI threadvar yiginina bakmalidir. }
+    function HeldByCurrentThread: Boolean;
   end;
 
   { P-70: yazma kumesi icin anahtar -> indeks haritasi. FPC TDictionary
@@ -588,6 +592,9 @@ type
     { v3.4: acik yazma islemi 0 veya 1 tane mi? (DDL/SAVEPOINT kosulu) }
     function SoleWriter: Boolean;
     function StoreGenStamp: Int64;
+    { R3: cagiran is parcacigi FEngCs'i tutuyor mu (kilit ters cevrilmesi
+      denetimi). Tembel indeks insasi bu durumda FIdxBuildCs ALMAZ. }
+    function EngineGateHeld: Boolean;
 
     { v3.2: ALTER DATABASE KEY — dosya yeni parola ile yeniden sifrelenir.
       Acik parti varken reddedilir; islem atomiktir (tmp + .bak). }
@@ -1047,6 +1054,18 @@ begin
   Result := FMaxDepth;
 end;
 
+function TVdbGate.HeldByCurrentThread: Boolean;
+var
+  i: Integer;
+begin
+  { Yalniz bu is parcaciginin yiginina bakilir; FDepth paylasilan bir
+    alandir ve baska bir sahibin derinligini yansitabilir. }
+  for i := 0 to VdbGateHeldN - 1 do
+    if VdbGateHeld[i] = Self then
+      Exit(True);
+  Result := False;
+end;
+
 procedure TVdbGate.Enter;
 var
   i: Integer;
@@ -1109,6 +1128,13 @@ end;
 function TVdbBackendV3.DebugLockDepth: Integer;
 begin
   Result := FEngCs.Depth;
+end;
+
+function TVdbBackendV3.EngineGateHeld: Boolean;
+begin
+  { R3: yalniz BU is parcaciginin tuttugu kilit sayilir; baska bir
+    parcacigin FEngCs sahipligi tembel insayi engellememelidir. }
+  Result := FEngCs.HeldByCurrentThread;
 end;
 
 procedure TVdbBackendV3.StoreReadEnter;

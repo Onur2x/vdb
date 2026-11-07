@@ -374,7 +374,12 @@ type
       FIdxCs tutulurken FKvB / GetTable / ScanRows / FIdxBuildCs / FLock
       ALINMAZ; yalnizca bellek ici sozluk/dizi islemleri yapilir.
       FIdxBuildCs tembel indeks insasini seri kiler ve FIdxCs'ten ONCE
-      alinir; insa suresince tutulur, tarama FIdxCs YOKKEN yapilir. }
+      alinir; insa suresince tutulur, tarama FIdxCs YOKKEN yapilir.
+      R3 DEGISMEZI: FEngCs TUTULURKEN FIdxBuildCs ALINMAZ. Ic ice akis
+      alt sorgusu motor kilidi altindayken tembel insa isterse insa
+      ATLANIR (EngGateHeldNow) ve cagiran tam taramaya duser. Boylece
+      FEngCs -> FIdxBuildCs ters cevrilmesi (ABBA) yapisal olarak
+      imkansizdir; FIdxBuildCs -> FEngCs yonu tek yondur. }
     FIdxCs: TCriticalSection;
     FIdxBuildCs: TCriticalSection;
     { P-129: CONCURRENTLY kayit defteri (FConcBuilders) icin kisa kilit.
@@ -673,6 +678,10 @@ type
     // lazy PK indeksi kurulmus). Tek girdili onbellek — bakiniz FHasIdxWork*.
     function HasIdxWork(const T: TTableDef): Boolean;
     procedure BuildPkIdx(const T: TTableDef; out E: TIdxEntries);
+    { R3: cagiran is parcacigi motor kilidini (FEngCs) tutuyor mu?
+      Tembel insa noktalari bu durumda FIdxBuildCs ALMAZ; aksi halde
+      FEngCs -> FIdxBuildCs ters cevrilmesi kilitlenme uretir. }
+    function EngGateHeldNow: Boolean;
     { Kurucularin ortak alan kurulumu (Sprint 2.7). }
     procedure InitCore;
     // Satirin TUM indekslerine ait anahtarlarini hesaplar (cok kolonlu destek)
@@ -8758,6 +8767,13 @@ begin
   SortIdxEntries(E, T.Cols[T.PkIndex].Ctype);
 end;
 
+function TVTableDb.EngGateHeldNow: Boolean;
+begin
+  { v2 backend'i her zaman False doner; v3'te yalniz FEngCs'i TUTAN
+    is parcacigi True gorur (bkz. TVdbGate.HeldByCurrentThread). }
+  Result := Assigned(FKvB) and FKvB.EngineGateHeld;
+end;
+
 procedure TVTableDb.BuildOneIndex(const T: TTableDef; IdxPos: Integer);
 var
   e: TIdxEntries;
@@ -9246,7 +9262,8 @@ begin
   end;
   // Indeksler TENBEL kurulur; "kac kayit var" sorusu bunu yine de
   // yanitlayabilmelidir, yoksa SHOW INDEXES ilk acikta -1 gosterirdi.
-  if not hasMem then
+  // R3: FEngCs tutulurken FIdxBuildCs ALINMAZ (ters cevrilme yok).
+  if (not hasMem) and (not EngGateHeldNow) then
   begin
     FIdxBuildCs.Enter;   // B-02: tembel insayi seri kil
     try
@@ -10446,7 +10463,10 @@ begin
 
   // B-02: asama B - tembel insa seri kilitle (FIdxBuildCs) yapilir.
   // Insa FIdxCs TUTULMADAN calisir; FIdxBuildCs -> FIdxCs sirasi korunur.
-  if not hasSkip then
+  // R3: FEngCs TUTULURKEN insa yapilmaz. Aksi halde FEngCs -> FIdxBuildCs
+  // ters cevrilmesi, FIdxBuildCs tutan baska bir parcacigin FEngCs
+  // beklemesiyle kilitlenir. Kaynak sunulmaz: cagiran tam taramaya duser.
+  if (not hasSkip) and (not EngGateHeldNow) then
   begin
     FIdxBuildCs.Enter;
     try
@@ -10620,9 +10640,10 @@ begin
     end;
     hasMem := True;
   end;
-  if not hasMem then
+  if (not hasMem) and (not EngGateHeldNow) then
   begin
     // B-02: asama B - tembel insa seri kilitle; tarama FIdxCs YOKKEN.
+    // R3: FEngCs tutulurken bu blok CALISMAZ (kaynak sunulmaz).
     FIdxBuildCs.Enter;
     try
       FIdxCs.Enter;
@@ -10695,6 +10716,9 @@ begin
       end;
       if (not hasMem) or dirty then
       begin
+        // R3: FEngCs tutulurken insa yapilamaz. Bellekteki dizi yok ya
+        // da bayatsa kaynak SUNULMAZ; cagiran tam taramaya duser.
+        if EngGateHeldNow then Exit(False);
         // B-02: asama B - BuildPkIdx (tarama) FIdxCs YOKKEN.
         FIdxBuildCs.Enter;
         try

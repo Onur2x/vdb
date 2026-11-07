@@ -64,6 +64,9 @@ type
     procedure BeginWrite;   // P-58b: v2'de no-op (tek yazici, dosya kilidi yok)
     procedure EndWrite;     // P-58b
     function GetInBatch: Boolean;
+    { R3: v2 satir-kayit motorunda tek yazici/dis dosya kilidi vardir;
+      FEngCs benzeri bir gate ve FIdxBuildCs ters cevrilmesi YOKTUR. }
+    function EngineGateHeld: Boolean;
     function SoleWriter: Boolean;
     function StoreGenStamp: Int64;
 
@@ -303,6 +306,12 @@ end;
 function TVDbBackendV2.GetInBatch: Boolean;
 begin
   Result := FDb.InBatch;
+end;
+
+function TVDbBackendV2.EngineGateHeld: Boolean;
+begin
+  { v2: FEngCs gate'i yok; tembel indeks insasi bu ters cevrilmeye girmez. }
+  Result := False;
 end;
 
 function TVDbBackendV2.SoleWriter: Boolean;
