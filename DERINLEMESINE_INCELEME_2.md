@@ -1950,8 +1950,9 @@ INSERT ~%1-2 hizli (IndexOf atlamasi), SELECT medyan +%0.4. Ikisi de
 2. Tek surec FSize beklemesi 10 ms dilimlidir; `FAvail.SetEvent` kacarsa
    bir dilim gecikme olur, dogruluk etkilenmez.
 3. `FIdxDirtyGen` Int64; teorik tasma 2^63 mutasyondan sonra.
-4. R1 (`Src.Skip` omru) EK-Q'da, R3 (`FIdxBuildCs <-> FEngCs`) EK-P'de
-   cozuldu; ikisi de kilit hiyerarsisini degistirmedi.
+4. R1 (`Src.Skip` omru) EK-Q'da, R3 (`FIdxBuildCs <-> FEngCs`) EK-P'de,
+   R4 (AutoInc monoton geri alma) ve D-Y4 (tasma) EK-R'de cozuldu;
+   hicbiri kilit hiyerarsisini degistirmedi.
 
 ---
 
@@ -2203,3 +2204,73 @@ eski 2,98/3,39 ms; yeni 2,83/2,86 ms. Regresyon yok (gurultu icinde).
    boyle bir kacis yok).
 4. `_AddRef` ile sozluge ekleme arasinda istisna olusursa nesne sizar;
    bu aralikta istisna ureten cagri yok.
+
+---
+
+# EK-R. R4 — AutoInc monoton geri alma ve D-Y4 tasma denetimi
+
+Kapsam: EK-I.5'te ertelenen R4 ve D-Y4.
+`RestoreSchemaSnapshot` (AbortBatch) `FAutoInc` sozlugunu de
+`FSnapAutoInc` yedeginden AYNEN geri yukluyordu. A oturumu `BEGIN`
+(yedek alinir), B oturumu ayni tabloya INSERT edip sayaci ilerletir,
+A `ROLLBACK` ederse B'nin ilerlettigi sayac ezilir; sonraki INSERT daha
+once dagitilmis bir identity degerini IKINCI kez verebilir. Satir hala
+duruyorsa deger karsilastirmasi kurtarir, ancak dagitilan satir
+silinmisse (AutoInc icin normal) kurtarma yoktur: sessiz cift dagitim.
+
+D-Y4: `AutoIncOf(T)+1` / `MaxPkInt(T)+1` isaretli Int64 tasmasinda
+sessizce sarip negatife donuyordu.
+
+## EK-R.1 Cozum
+
+- AutoInc MONOTON sayactir: geri alma DUSURMEZ. Restore sirasinda her
+  anahtar icin `max(mevcut, yedek)` uygulanir (`cur < kvA.Value` ise
+  yedek yazilir). Geri alinan islemin urettigi degerler yalnizca bosluk
+  birakir.
+- Once `FlushAutoIncCache` cagrilir; aksi halde henuz sozluge yazilmamis
+  bir artis `max()` tarafindan gorulmez ve yine ezilirdi.
+- Geri alinan islemde olusup yine dusen tablolarin `TableId` anahtarlari
+  geri yuklenen semada yoktur; `FNextId` geri alindigi icin ileride ayni
+  TableId'yi alan yeni tabloya yuksek sayac miras kalmasin diye bu
+  anahtarlar silinir. Semada hala var olan tablolarin sayaci korunur.
+- `VDbNextCounter(Cur, What, Tbl)`: `Cur >= High(Int64)` ise acik
+  `ecLimit` hatasi; aksi halde `Cur + 1`. 11 cagri noktasi
+  (`AutoIncOf`/`MaxPkInt` +1) bu yardimciya gecirildi.
+- Kalici bicim, sema ve API degismedi (oturum bazli sayac icin bicim
+  degisikligi gerekmedi).
+
+## EK-R.2 Kapi ve negatif kanit
+
+`tests/gates/autoincc.lpr`:
+1. A BEGIN; B INSERT (id=1) + COMMIT; B DELETE id=1; A ROLLBACK;
+   C INSERT -> id=2 olmali (1 degeri ikinci kez dagitilmamali).
+2. Yeniden acilis sonrasi INSERT -> 2,3.
+3. Acik id=Int64 max yazilir; sonraki otomatik INSERT acik hata
+   (`Int64 sinirina`) vermeli, satir eklenmemeli.
+Basari: "AUTOINC OTURUM YALITIMI DOGRULANDI", 15/0.
+
+Negatif kanit (duzeltmesiz VDbTable.pas, ajan calisma agacinda):
+`kalan=4` — yeniciden dagitilan id=1 (yeniden kullanim) ve tasmada
+sessiz sarma (hata yok).
+
+Hedefli regresyon: `v3sqlchk` 238/0, `genchk` 14/0, `skipchk` 4/0,
+`nestidx` 3/0, `autoincc` 15/0. Tam kapı seti: **34/34**.
+
+## EK-R.3 Performans
+
+R4/D-Y4 yolu yalnizca ROLLBACK ve identity uretimi kenar yollarindadir;
+sicak okuma/yazma yolunda degisiklik yok. Ajan olcumu: +%0,23 (esik
+%2'nin altinda; gurultu icinde).
+
+## EK-R.4 Acik riskler
+
+1. Monoton birlesim, geri alinan islemin dagittigi degerleri "tuketilmis"
+   sayar; bosluklar kalicidir (AutoInc sozlesmesi bunu kabul eder).
+2. `max()` semadaki TUM tablolar icin uygulanir; yedek alindiktan sonra
+   baska oturumun ilerlettigi sayac korunur, ama yedekte HIC bulunmayan
+   (islem icinde olusup commit edilmemis) bir tablonun anahtari semada
+   yoksa silinir; ayni TableId'yi alan yeni tablo temiz sayacla baslar.
+3. Tasima hatasi `ecLimit`; istemciler bu kodu bilinen hata olarak
+   ele almalidir (yeni hata kodu eklenmedi).
+4. B-06 kalan penceresi (read -> NoteBefore) bu isin kapsami disinda;
+   tasarim `tmp64/ryeni_design.md` (EK-S icin karar bekliyor).

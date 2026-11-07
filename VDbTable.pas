@@ -6345,6 +6345,17 @@ begin
   if FKvB.InBatch and (not FSnapActive) then SnapshotSchema;
 end;
 
+function VDbNextCounter(const Cur: Int64; const What, Tbl: string): Int64;
+// D-Y4: AutoInc / MaxPkInt uzerinde `+1` ONCESI tasma denetimi.
+// Isaretli Int64 tasmasi sessizce sarmasindansa ACIK hata verilir.
+begin
+  if Cur >= High(Int64) then
+    raise EVDbException.CreateFmt(ecLimit,
+      '%s: %s sayaci Int64 sinirina ulasti (%d); yeni deger uretilemez',
+      [Tbl, What, Cur]);
+  Result := Cur + 1;
+end;
+
 function TVTableDb.AutoIncOf(const T: TTableDef): Int64;
 // P-17a: sicak sayac okuma. Sozlukte kayit yoksa sema kaydi alanindan
 // gelir (CREATE/LOAD sonrasi ilk yazim, view'lar, eski semalar).
@@ -6427,11 +6438,11 @@ begin
       end
       else
       begin
-        iv := AutoIncOf(T) + 1;
+        iv := VDbNextCounter(AutoIncOf(T), 'AutoInc', T.Name);
         // Identity PK ise eski dosyadaki yuksek degerlerle cakismayi engelle.
         if (T.PkIndex = i) and
            ReadRow(T.Name, IntToStr(iv), dummy) then
-          iv := MaxPkInt(T) + 1;
+          iv := VDbNextCounter(MaxPkInt(T), 'MaxPkInt', T.Name);
         Vals[i] := IntToStr(iv);
         BumpAutoInc(T, iv);
       end;
@@ -6495,6 +6506,9 @@ var
   kvT: TPair<string, TTableDef>;
   kvI: TPair<Word, string>;
   kvA: TPair<Word, Int64>;   // P-17a
+  cur: Int64;
+  stale: TArray<Word>;
+  i: Integer;
 begin
   if not FSnapActive then Exit;
   // R2-B-3: yalniz yedegin sahibi oturum geri yukleyebilir.
@@ -6505,12 +6519,33 @@ begin
     FTables.AddOrSetValue(kvT.Key, kvT.Value);
   for kvI in FSnapById do
     FById.AddOrSetValue(kvI.Key, kvI.Value);
-  // P-17a: sayac sozlugunu de geri al (sayilar geri alinmaz; sozluk
-  // snapshot'u tam durumudur).
-  FAutoInc.Clear;
+  { R4 (2026-11-07): AutoInc MONOTON bir sayactir; geri alma sayaci
+    DUSUREMEZ. Yedek alindiktan sonra baska bir oturumun ilerlettigi
+    deger korunur: her anahtar icin max(mevcut, yedek). Geri alinan
+    islemin urettigi degerler yalnizca BOSLUK birakir; AutoInc'te bu
+    normaldir. Boylece "baska oturumun artisini ezme" sorunu kalici
+    bicim/sema degisikligi (oturum bazli sayac) OLMADAN cozulur.
+    ONCE onbellegi sozluge yazdir: aksi halde henuz yazilmamis bir artis
+    asagidaki max() tarafindan GORULMEZ ve yine ezilirdi. }
+  FlushAutoIncCache;
   if FSnapAutoInc <> nil then
     for kvA in FSnapAutoInc do
-      FAutoInc.AddOrSetValue(kvA.Key, kvA.Value);
+      if (not FAutoInc.TryGetValue(kvA.Key, cur)) or (cur < kvA.Value) then
+        FAutoInc.AddOrSetValue(kvA.Key, kvA.Value);
+  { Geri alinan islemde olusup yine dusen tablolarin TableId'leri geri
+    yuklenen semada YOKTUR. Bu anahtarlar kalirsa FNextId geri alindigi
+    icin ileride ayni TableId'yi alan YENI bir tabloya yuksek sayac miras
+    kalir. Yalniz semada bulunmayan anahtarlari sil; baska oturumun
+    ILERLETTIGI (semada hala var olan tabloya ait) sayac korunur. }
+  SetLength(stale, 0);
+  for kvA in FAutoInc do
+    if not FById.ContainsKey(kvA.Key) then
+    begin
+      SetLength(stale, Length(stale) + 1);
+      stale[High(stale)] := kvA.Key;
+    end;
+  for i := 0 to High(stale) do
+    FAutoInc.Remove(stale[i]);
   FBatchAutoIncValid := False;   // P-64: geri yuklenen degerler onbellegi bayatlatir
   FNextId := FSnapNextId;
   FSchemaDirty := FSnapDirty;
@@ -11570,7 +11605,7 @@ begin
   if tp^.PkIndex < 0 then
   begin
     // P-17a: sayac ayri sozlukte; sema kaydi (TTableDef) bastan yazilmaz.
-    iv := AutoIncOf(tp^) + 1;
+    iv := VDbNextCounter(AutoIncOf(tp^), 'AutoInc', tp^.Name);
     pk := '@' + IntToStr(iv);
     BumpAutoInc(tp^, iv);
   end
@@ -11582,9 +11617,9 @@ begin
       if pk = '' then
       begin
         // oto-sayac; eski DB'de sayac geride kalmissa veriyle uzlastir
-        iv := AutoIncOf(tp^) + 1;
+        iv := VDbNextCounter(AutoIncOf(tp^), 'AutoInc', tp^.Name);
         if ReadRow(tp^.Name, IntToStr(iv), dummyVals) then
-          iv := MaxPkInt(tp^) + 1;
+          iv := VDbNextCounter(MaxPkInt(tp^), 'MaxPkInt', tp^.Name);
         vals[tp^.PkIndex] := IntToStr(iv);
         pk := vals[tp^.PkIndex];
         BumpAutoInc(tp^, iv);
@@ -12796,7 +12831,7 @@ begin
   if t.PkIndex < 0 then
   begin
     // P-17a: bkz. Insert — sema kaydi yerine ayri sayac sozlugü.
-    iv := AutoIncOf(t) + 1;
+    iv := VDbNextCounter(AutoIncOf(t), 'AutoInc', t.Name);
     pk := '@' + IntToStr(iv);
     BumpAutoInc(t, iv);
   end
@@ -12807,9 +12842,9 @@ begin
     begin
       if pk = '' then
       begin
-        iv := AutoIncOf(t) + 1;
+        iv := VDbNextCounter(AutoIncOf(t), 'AutoInc', t.Name);
         if ReadRow(t.Name, IntToStr(iv), dummyVals) then
-          iv := MaxPkInt(t) + 1;
+          iv := VDbNextCounter(MaxPkInt(t), 'MaxPkInt', t.Name);
         vals[t.PkIndex] := IntToStr(iv);
         pk := vals[t.PkIndex];
         BumpAutoInc(t, iv);
@@ -12949,7 +12984,7 @@ begin
   if t.PkIndex < 0 then
   begin
     // P-17a: bkz. Insert — sema kaydi yerine ayri sayac sozlugü.
-    iv := AutoIncOf(t) + 1;
+    iv := VDbNextCounter(AutoIncOf(t), 'AutoInc', t.Name);
     pk := '@' + IntToStr(iv);
     BumpAutoInc(t, iv);
   end
@@ -12960,9 +12995,9 @@ begin
     begin
       if pk = '' then
       begin
-        iv := AutoIncOf(t) + 1;
+        iv := VDbNextCounter(AutoIncOf(t), 'AutoInc', t.Name);
         if ReadRow(t.Name, IntToStr(iv), dummyVals) then
-          iv := MaxPkInt(t) + 1;
+          iv := VDbNextCounter(MaxPkInt(t), 'MaxPkInt', t.Name);
         vals[t.PkIndex] := IntToStr(iv);
         pk := vals[t.PkIndex];
         BumpAutoInc(t, iv);

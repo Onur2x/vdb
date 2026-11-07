@@ -63,7 +63,7 @@ jobs:
             'vdbmig', 'tests/gates/factorychk', 'tests/gates/logchk',
             'tests/gates/pitrchk', 'tests/gates/btreechk', 'tests/gates/replchk',
             'tests/gates/lockchk', 'tests/gates/snapchk', 'tests/gates/prochk',
-            'tests/gates/concurchk', 'tests/gates/nestidx')
+            'tests/gates/concurchk', 'tests/gates/nestidx', 'tests/gates/autoincc')
           foreach ($p in $projs) {
             $o = & $env:LAZBUILD -B "$p.lpi" 2>&1 | Out-String
             if ($LASTEXITCODE -ne 0) {
@@ -197,6 +197,21 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'colmapchk kalan > 0'
+            exit 1
+          }
+
+      - name: AutoInc oturum yalitimi kapisi (autoincc)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbautoincc'
+          $out = & .\tests\gates\autoincc.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'AUTOINC OTURUM YALITIMI DOGRULANDI') {
+            Write-Error 'autoincc basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'autoincc kalan > 0'
             exit 1
           }
 
