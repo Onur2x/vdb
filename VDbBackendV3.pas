@@ -137,27 +137,35 @@ type
 
   { R-yeni: okuma kumesi slot'u. Deger 0 = BOS; dolu slotta nesil + 1
     saklanir. Boylece ayri durum dizisi gerekmez ve her sondalama TEK
-    cache satirina dokunur (olculen ek maliyetin ana kaynagi buydu). }
+    cache satirina dokunur (olculen ek maliyetin ana kaynagi buydu).
+    P-146: StoreGen = okuma anindaki CANLI `.gen` degeri (backend'ler
+    arasi okuma damgasi). Yalnizca iyimser kumelerde doldurulur. }
   TVdbKvGenSlot = record
     Key: QWord;
     Val: Int64;
+    StoreGen: QWord;
   end;
 
   { R-yeni: okuma kumesi icin anahtar -> commit nesli haritasi. P-70
     TVdbKvIdxMap deseninin Int64 degerli kardesidir: duz acik sondalama;
-    TDictionary'nin ~126 B/anahtar maliyeti YOK (16 B/slot, yuk <= 3/4).
+    TDictionary'nin ~126 B/anahtar maliyeti YOK (24 B/slot, yuk <= 3/4).
     Yalnizca acik yazma kumesi varken yapilan nokta okumalarinda kullanilir. }
   TVdbKvGenMap = class
   private
     FSlots: array of TVdbKvGenSlot;
     FCap: Integer;          // kapasite (2'nin kuvveti; 0 = tablo yok)
     FCount: Integer;
-    procedure PutFree(Key: QWord; Val: Int64);
+    procedure PutFree(Key: QWord; Val: Int64; AStoreGen: QWord);
     procedure Grow;
   public
     function TryGetValue(Key: QWord; out Value: Int64): Boolean;
+    { P-146: deger ile birlikte okuma anindaki store neslini de dondurur. }
+    function TryGetValueEx(Key: QWord; out Value: Int64;
+      out AStoreGen: QWord): Boolean;
     { Anahtar varsa degerini gunceller, yoksa ekler (son okuma gecerlidir). }
     procedure AddOrSetValue(Key: QWord; Value: Int64);
+    { P-146: deger ve store neslini birlikte yazar (tek sondalama). }
+    procedure AddOrSetValueEx(Key: QWord; Value: Int64; AStoreGen: QWord);
     procedure Clear;
     function Count: Integer;
     function Capacity: Integer;
@@ -279,6 +287,12 @@ type
           anahtar hassasiyetini kaybeder ve konservatif olarak StartGen'e
           duser (pencere yine kapanir). }
         ReadOverflow: Boolean;
+        { P-146: write-set acikken yapilan ilk TARAMANIN canli store nesli;
+          0 = yok. Per-key damgasi olmayan anahtarlarda konservatif esik. }
+        StoreScanGen: QWord;
+        { P-146: okuma kumesi tasdigi anda alinan canli store nesli; 0 = yok.
+          Tasma sonrasi kaydedilemeyen anahtarlarda konservatif esik. }
+        StoreOverflowStamp: QWord;
         { v3.6: "artik before-image GEREKLI" bayragi. Yalnizca biz acikken
           BASKA bir oturum commit ederse True olur (o commit'ten sonra motor
           degerleri degismis olabilir). Bayrak True olana kadar satir basina
@@ -1489,7 +1503,7 @@ end;
 
 { ------------------------------------------ R-yeni: okuma nesli haritasi }
 
-procedure TVdbKvGenMap.PutFree(Key: QWord; Val: Int64);
+procedure TVdbKvGenMap.PutFree(Key: QWord; Val: Int64; AStoreGen: QWord);
 var
   h: LongWord;
 begin
@@ -1498,6 +1512,7 @@ begin
     h := (h + 1) and LongWord(FCap - 1);
   FSlots[h].Key := Key;
   FSlots[h].Val := Val;
+  FSlots[h].StoreGen := AStoreGen;
 end;
 
 procedure TVdbKvGenMap.Grow;
@@ -1515,7 +1530,7 @@ begin
   for i := 0 to High(oldSlots) do
     if oldSlots[i].Val <> 0 then
     begin
-      PutFree(oldSlots[i].Key, oldSlots[i].Val);
+      PutFree(oldSlots[i].Key, oldSlots[i].Val, oldSlots[i].StoreGen);
       Inc(FCount);
     end;
 end;
@@ -1539,6 +1554,33 @@ begin
 end;
 
 procedure TVdbKvGenMap.AddOrSetValue(Key: QWord; Value: Int64);
+begin
+  AddOrSetValueEx(Key, Value, 0);
+end;
+
+function TVdbKvGenMap.TryGetValueEx(Key: QWord; out Value: Int64;
+  out AStoreGen: QWord): Boolean;
+var
+  h: LongWord;
+begin
+  Result := False;
+  AStoreGen := 0;
+  if FCap = 0 then Exit;
+  h := LongWord(KvMix64(Key)) and LongWord(FCap - 1);
+  while FSlots[h].Val <> 0 do
+  begin
+    if FSlots[h].Key = Key then
+    begin
+      Value := FSlots[h].Val - 1;
+      AStoreGen := FSlots[h].StoreGen;
+      Exit(True);
+    end;
+    h := (h + 1) and LongWord(FCap - 1);
+  end;
+end;
+
+procedure TVdbKvGenMap.AddOrSetValueEx(Key: QWord; Value: Int64;
+  AStoreGen: QWord);
 var
   h: LongWord;
 begin
@@ -1551,12 +1593,14 @@ begin
     if FSlots[h].Key = Key then
     begin
       FSlots[h].Val := Value;
+      FSlots[h].StoreGen := AStoreGen;
       Exit;
     end;
     h := (h + 1) and LongWord(FCap - 1);
   end;
   FSlots[h].Key := Key;
   FSlots[h].Val := Value;
+  FSlots[h].StoreGen := AStoreGen;
   Inc(FCount);
 end;
 
@@ -1595,6 +1639,8 @@ begin
   ReadGen := TVdbKvGenMap.Create;
   ScanGen := -1;
   ReadOverflow := False;
+  StoreScanGen := 0;
+  StoreOverflowStamp := 0;
 end;
 
 destructor TVdbBackendV3.TWriteSet.Destroy;
@@ -1634,6 +1680,8 @@ begin
   ReadGen.Clear;
   ScanGen := -1;
   ReadOverflow := False;
+  StoreScanGen := 0;
+  StoreOverflowStamp := 0;
   ValLen := 0;   // ValBuf kapasitesi korunur, yalnizca uzunluk sifirlanir
   Session := ASession;
   StartGen := 0;
@@ -1994,12 +2042,18 @@ end;
 procedure TVdbBackendV3.RecordRead(S: TWriteSet; Key: QWord);
 var
   rg, rg0: Int64;
+  sg, sg0: QWord;
 begin
   { Yalnizca write-set ACIKKEN cagrilir; islem disi okuma yolu buraya
     girmez. FEngCs cagiran tarafindan tutulur; FCommitGen/StartGen sabit. }
   if S = nil then Exit;
   { Tasma sonrasi anahtar hassasiyeti kayboldu; yeni kayit gereksiz. }
   if S.ReadOverflow then Exit;
+  { P-146: CANLI store nesli yalnizca iyimser kumede alinir. Paylasimli
+    okuma kilidi ve FEngCs zaten tutuluyor; eslenmis sayac okumasi tek
+    bellek erisimidir. Seri kumede rezervasyon baska commit'i engelledigi
+    icin bu damga gereksizdir ve alinmaz. }
+  if S.Optimistic then sg := FEng.Store.ReadGen else sg := 0;
   { R-yeni: gozlem NESLI. Okuma anindaki FCommitGen kaydedilir; snapshot
     goruntusu sabitlenmis olsa bile (SnapView) islem yeni bir yabanci
     commit'i ancak BUNDAN SONRA gelen bir nesille gorur. Boylece hedef
@@ -2010,17 +2064,24 @@ begin
   if S.ReadGen.Count >= RYENI_MAX_READS then
   begin
     { Ust sinir asildi: bundan sonra anahtar hassasiyeti birakilir ve
-      konservatif (StartGen) esik kullanilir. Harita buyumez. }
+      konservatif (StartGen) esik kullanilir. Harita buyumez. P-146:
+      tasma ANINDAKI store nesli kaydedilir; tasma sonrasi kaydedilemeyen
+      anahtarlar icin konservatif esik olur. Ilk deger korunur (en eski
+      gozlem daha konservatiftir). }
     S.ReadOverflow := True;
+    if S.Optimistic and (S.StoreOverflowStamp = 0) then
+      S.StoreOverflowStamp := sg;
     Exit;
   end;
   { P-145: ayni anahtar birden fazla okunursa EN ESKI gozlem korunur.
     Aksi halde araya giren yabanci commit sonrasi yapilan ic okuma
     (or. TVTableDb.Delete icindeki ReadRow) esigi guncelleyip
     on-okuma penceresini maskeler. Daha eski esik yalnizca DAHA
-    konservatif cakisma uretir; pencereyi genisletmez. }
-  if S.ReadGen.TryGetValue(Key, rg0) and (rg0 <= rg) then Exit;
-  S.ReadGen.AddOrSetValue(Key, rg);
+    konservatif cakisma uretir; pencereyi genisletmez.
+    P-146: StoreGen de ayni kayda AIT oldugu icin en eski Val ile
+    birlikte korunur (aksi halde damga degerden yeni kalirdi). }
+  if S.ReadGen.TryGetValueEx(Key, rg0, sg0) and (rg0 <= rg) then Exit;
+  S.ReadGen.AddOrSetValueEx(Key, rg, sg);
 end;
 
 procedure TVdbBackendV3.RecordScan(S: TWriteSet);
@@ -2032,6 +2093,11 @@ begin
   { R-yeni: ilk taramanin gozlem nesli (RecordRead ile ayni gerekce). }
   g := FCommitGen;
   S.ScanGen := g;
+  { P-146: tarama ile okunan anahtarlarin per-key damgasi yoktur; ilk
+    taramanin canli store nesli konservatif esik olur. Yalnizca iyimser
+    kumede anlamlidir. }
+  if S.Optimistic and (S.StoreScanGen = 0) then
+    S.StoreScanGen := FEng.Store.ReadGen;
 end;
 
 procedure TVdbBackendV3.NoteBefore(S: TWriteSet; Key: QWord);
@@ -2072,10 +2138,19 @@ var
   hasBefore: Boolean;
   hasRead: Boolean;
   capGen, obsGen, rg: Int64;
+  curStore, stamp, sg: QWord;
 begin
   if S = nil then Exit;
   { v3.6: ne before-image ne yabanci commit varsa yapacak is yok. }
   if (S.Before.Count = 0) and (FAlien.Count = 0) then Exit;
+  { P-146: BACKEND'LER/SURECLER ARASI OKUMA DAMGASI. Donguden ONCE tek bir
+    CANLI `.gen` okunur (GenStamp onbellegi degil; baska backend'in commit'i
+    aninda gorunur). Bu noktada WriteHold ve AcquireDataWrite tutuldugu
+    icin deger sabittir. Yalnizca iyimser kumede denetlenir: seri kumede
+    rezervasyon baska yazari zaten disarida tutar. curStore = 0 ise
+    (esleme/sayac yok) denetim atlanir, eski davranis korunur. }
+  curStore := 0;
+  if S.Optimistic then curStore := FEng.Store.ReadGen;
   { FAlien genellikle bos; anahtar basina sozluk aramasindan kacin. }
   alienVar := FAlien.Count > 0;
   for i := 0 to S.Order.Count - 1 do
@@ -2100,7 +2175,7 @@ begin
       tarama nesli (ScanGen) konservatif esik olur. Okuma kumesi tasmissa
       en konservatif esik StartGen'dir. }
     obsGen := capGen;
-    hasRead := S.ReadGen.TryGetValue(key, rg);
+    hasRead := S.ReadGen.TryGetValueEx(key, rg, sg);
     if hasRead and (rg < obsGen) then obsGen := rg;
     { P-145: anahtar okumasi bulunsa bile tarama nesli esigi ASLA
       yukseltmez. On-okuma tam tarama ile yapildiysa anahtar icin
@@ -2111,6 +2186,32 @@ begin
       obsGen := S.ScanGen;
     if S.ReadOverflow and (S.StartGen < obsGen) then
       obsGen := S.StartGen;
+    { P-146: STORE DAMGASI DENETIMI (mevcut esik mantigina EK; onu
+      degistirmez). Okuma anindaki canli `.gen` damgasindan SONRA baska bir
+      backend/surec commit ettiyse sessiz guncelleme kaybi riski vardir:
+      ABA'da deger karsilastirmasi esit gorunur, FAlien ise yalnizca ayni
+      backend'i gorur. Anahtar basina kayit yoksa (tarama/tasma) en kucuk
+      POZITIF esik (StoreScanGen, StoreOverflowStamp) konservatif olarak
+      kullanilir; ikisi de yoksa anahtar hic okunmamistir -> denetim yok. }
+    if S.Optimistic and (curStore > 0) then
+    begin
+      if hasRead then
+        stamp := sg
+      else
+      begin
+        stamp := 0;
+        if (S.StoreScanGen > 0) and
+           ((stamp = 0) or (S.StoreScanGen < stamp)) then
+          stamp := S.StoreScanGen;
+        if (S.StoreOverflowStamp > 0) and
+           ((stamp = 0) or (S.StoreOverflowStamp < stamp)) then
+          stamp := S.StoreOverflowStamp;
+      end;
+      if (stamp > 0) and (curStore > stamp) then
+        raise EVdbBackendV3.CreateFmt(
+          'yazma cakismasi: $%.16x baska bir oturum tarafindan degistirildi ' +
+          '(islem geri alindi)', [key]);
+    end;
     if alienVar and FAlien.TryGetValue(key, gen) and (gen > obsGen) then
       raise EVdbBackendV3.CreateFmt(
         'yazma cakismasi: $%.16x baska bir oturum tarafindan degistirildi ' +

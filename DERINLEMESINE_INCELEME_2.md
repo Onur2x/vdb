@@ -2354,11 +2354,11 @@ Ayni oturum, donusumlu BASE/NEW, her kosu taze dizin:
 
 ## EK-S.5 Acik riskler
 
-1. **Surec/backend'ler arasi pencere KAPALI KALIR.** `FCommitGen` ve
-   `FAlien` backend-yereldir; ayri backend/surec commit'i ne FAlien'i
-   doldurur ne nesli artirir, bu pencerede deger karsilastirmasi da esit
-   gorur. Kapatmak icin store `.gen` (`ReadGen`) tabanli global damga
-   (konservatif) veya kayit basina surum gerekir; ayri is.
+1. **Surec/backend'ler arasi pencere** `FCommitGen`/`FAlien` backend-yerel
+   oldugu icin acikti. EK-U'da (P-146) store `.gen` tabanli global okuma
+   damgasi ile kapatildi; bedeli iyimser islemlerde anahtar hassasiyeti
+   olmamasidir (okumadan sonraki her yabanci commit abort uretir).
+   Kayit basina surum/MVCC meta daha hassas ama buyuk ayri is.
 2. **Autocommit UPDATE on-okumasi** `BeginBatch`'ten ONCE calisiyordu
    (VDbExecutor.pas); write-set kapali oldugu icin izlenmiyordu. EK-T'de
    (P-145) duzeltildi: yurutucu kendi write-set'ini on-okumadan once acar.
@@ -2430,3 +2430,77 @@ ve bagimsiz olarak dogrulanmadi. Onemli olan: sicak yolda regresyon yok.
    cakisma uretebilir (konservatif yon); mevcut kapilarda ornek cikmadi.
 4. Surec/backend'ler arasi pencere (EK-S.5 risk 1) hala acik; tasarim
    `tmp64/cxproc_design.md`.
+
+---
+
+# EK-U. P-146 — surec/backend'ler arasi okuma -> yazma penceresi
+
+Kapsam: EK-S.5 risk 1. Tasarim: `tmp64/cxproc_design.md`. A oturumu K'yi
+okur; BASKA bir backend ornegi/surec K'yi commit eder; A K'yi yazar.
+`FCommitGen`/`FAlien` backend-yerel oldugu icin deger karsilastirmasi
+(ozellikle ABA'da) esit gorunuyor ve yabanci commit sessizce eziliyordu.
+
+## EK-U.1 Cozum
+
+- `TVdbKvGenSlot`: `Key, Val, StoreGen` (24 B/slot). `TryGetValueEx` /
+  `AddOrSetValueEx` tek sondalama; eski API delege eder.
+- `RecordRead`: yalniz `S.Optimistic` iken okuma aninda canli
+  `FEng.Store.ReadGen` (eslenmis `.gen` sayaci; GenStamp onbellegi
+  DEGIL) alinir. P-145 "en eski gozlem" kurali StoreGen ile birlikte
+  korunur (damga degerden yeni kalmaz).
+- `RecordScan`: iyimser ilk taramada `StoreScanGen`; tasma aninda
+  `StoreOverflowStamp` (ilk deger). Per-key kaydi olmayan anahtarda esik
+  en kucuk pozitif damgadir.
+- `VerifyNoConflict`: donguden ONCE tek canli `curStore := ReadGen`
+  (WriteHold + AcquireDataWrite tutuluyor, sabit). Mevcut
+  CapGen/ReadGen/ScanGen/ReadOverflow/FAlien mantigi DEGISMEZ; EK olarak
+  `stamp > 0` ve `curStore > stamp` ise "yazma cakismasi ... baska bir
+  oturum tarafindan degistirildi". `curStore = 0` ise denetim yok.
+- `Optimistic=False` ise ne kayit ne denetim: seri kumede rezervasyon
+  baska yazari zaten disarida tutar.
+- Kilit sirasi degismedi, yeni kilit yok, disk bicimi degismedi. Tek API
+  degisikligi: `TVDbPageStore.ReadGen` public (canli sayac okumasi).
+
+## EK-U.2 Kapi
+
+`tests/gates/genchk.lpr` yeni `BolumCrossBackend` (12 kontrol; genchk
+toplami 51/0): iki ayri `TVdbBackendV3` ayni dosya/ayni surec; B
+rezervasyonu tutarken A iyimser baslar (`LockHoldDepth = 0` ile
+dogrulanir), A K1=v0 okur, B v1 -> v0 commit eder (ABA), A v2 yazar ->
+cakisma; A yazimi uygulanmaz (v0). 4b (okumadan once yabanci commit)
+cakisma vermez; blind write cakisma vermez; okumadan SONRA ilgisiz
+commit konservatif cakisma verir (tasarim).
+
+Negatif kanit (HEAD backend + page store kopyasi, notr cwd, HEAD once):
+`gecen=46 kalan=5`; cekirdekte A'nin v2'si kalir (sessiz guncelleme
+kaybi).
+
+Regresyon: v3sqlchk 238/0, concurchk 30/0, commitfailchk 21/0,
+lockchk 36/0, sqltest 2885/0, tam kapi seti 34/34.
+
+## EK-U.3 Performans
+
+Ayni oturum, donusumlu BASE/NEW, 5 tur, taze dizin, n=100000:
+islem disi Get 2,0510 -> 2,0522 us (+%0,06); iyimser Get 2,0260 ->
+2,0342 us (+%0,41). Ikisi de %2 esiginin altinda.
+
+Yanlis pozitif maliyeti (2000 tur, iki backend): A K1'i okuduktan sonra
+B BASKA bir anahtari commit ederse abort 2000/2000 (%100); yabanci
+commit yokken 0/2000. BASE'de 0/2000 (sessiz ezme).
+
+## EK-U.4 Acik riskler
+
+1. **Global sayac, anahtar hassasiyeti yok.** Iyimser islemde okumadan
+   sonra gelen HERHANGI bir yabanci commit abort uretir; yogun cok-yazar
+   is yukunde retry orani ciddi artabilir. Bu bilincli konservatif
+   tercihtir (sessiz veri kaybi yerine abort).
+2. Basarisiz commit'in finally'si ve checkpoint/kapanis da sayaci
+   ilerletir; yalnizca fazla cakisma uretir (kacirma yok).
+3. `FExclusiveAccess=True` rezervasyon kilidini atlar; "seri islem
+   yalnizdir" varsayimi gecersiz olur. Cok backend ile kullanilmamali.
+4. Unix: `FGenMap` yok; `ReadGen` sistem cagrisi ile okunur, yirtik
+   okuma/esazmanlilik degerlendirilmedi (hedef i386-win32).
+5. Kapi ayni surecte iki backend ornegi ile kosuyor; ayri surec ayni
+   eslenmis dosya + bolge kilidi yolunu kullanir ama ayrica kosulmadi.
+6. Autocommit hizli yollari (`ExecFastPointUpdate/Delete`,
+   `UpdateWhere/DeleteWhere`) hala kapsam disi (EK-T.4).

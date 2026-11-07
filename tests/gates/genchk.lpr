@@ -691,6 +691,141 @@ begin
     WriteLn('AUTOCOMMIT ON-OKUMA PENCERESI DOGRULANAMADI');
 end;
 
+{ ------------------------------------------------- Bolum 5: P-146 }
+
+{ AYRI TVdbBackendV3 ornekleri = ayri motor, ayri onbellek, ayri
+  FCommitGen/FAlien ve ayri store handle'i; `.gen` eslemesi ayni fiziksel
+  dosya bolumunu paylasir. Ayri surec GEREKMEZ: dosya-bolgesi kilitleri
+  surec ayrimi yapmaz, ayni surecteki farkli handle da birbiriyle cakisir
+  (tasarim Bolum 5.1). Rezervasyon B'de tutulurken A'nin BeginBatch'i
+  iyimser moda duser; FCommitGen/FAlien backend-yerel oldugu icin HEAD'de
+  bu pencere sessizce kacar. }
+procedure BolumCrossBackend(const Dir: string);
+var
+  db: string;
+  seed, beB, beA: TVdbBackendV3;
+  cakisti: Boolean;
+  msg: string;
+  oncekiFail: Integer;
+begin
+  WriteLn('--- P-146: surec/backend''ler arasi okuma->yazma penceresi ---');
+  oncekiFail := gFail;
+  db := IncludeTrailingPathDelimiter(Dir) + 'cxproc.odb';
+  SilYanDosyalar(db);
+  SilDosya(db + '.gen');
+  SilDosya(db);
+
+  { Tohum: K1 = v0, K2 = sabit (tek commit). }
+  gSid := 10;
+  seed := TVdbBackendV3.Create(db, True, 512);
+  try
+    seed.BeginBatch;
+    seed.Put(1, B('v0'));
+    seed.Put(2, B('sabit'));
+    seed.CommitBatch;
+  finally
+    seed.Free;
+  end;
+
+  beB := TVdbBackendV3.Create(db, False, 512);
+  beA := TVdbBackendV3.Create(db, False, 512);
+  try
+    { --- Cekirdek: capraz backend ABA penceresi --- }
+    { B rezervasyonu tutar; A'nin rezervasyon denemesi basarisiz olur ve
+      islem iyimser acilir (LockHoldDepth = 0 bunu dogrular). }
+    gSid := 10;
+    beB.BeginBatch;
+    gSid := 1;
+    beA.BeginBatch;
+    Ok('1: A iyimser basladi (rezervasyon B''de)',
+      beA.Engine.Store.LockHoldDepth = 0,
+      IntToStr(beA.Engine.Store.LockHoldDepth));
+    Ok('1: A K1=v0 okur', Oku(beA, 1) = 'v0', Oku(beA, 1));
+    { B: v0 -> v1 -> v0 (ABA); iki ayri commit, `.gen` iki kez ilerler. }
+    gSid := 10;
+    beB.Put(1, B('v1'));
+    beB.CommitBatch;
+    beB.BeginBatch;
+    beB.Put(1, B('v0'));
+    beB.CommitBatch;
+    { A okudugu degeri yazar. Deger karsilastirmasi ABA sonrasi esit gorunur
+      (v0); bunu YALNIZCA canli store damgasi ayirt eder. }
+    gSid := 1;
+    beA.Put(1, B('v2'));
+    cakisti := CommitCakisma(beA, msg);
+    Ok('1: capraz backend read->write penceresi cakisma verir', cakisti, msg);
+    beA.AbortBatch;
+    gSid := 10;
+    Ok('1: A yazimi uygulanmadi (v0 korunur)', Oku(beA, 1) = 'v0',
+      Oku(beA, 1));
+
+    { --- 4b capraz backend: yabanci commit OKUMADAN ONCE --- }
+    gSid := 10;
+    beB.BeginBatch;
+    gSid := 1;
+    beA.BeginBatch;
+    { B, A'nin okumasindan ONCE ilgisiz anahtari commit eder. }
+    gSid := 10;
+    beB.Put(2, B('x'));
+    beB.CommitBatch;
+    gSid := 1;
+    Ok('2: A K1 okur (4b)', Oku(beA, 1) = 'v0', Oku(beA, 1));
+    beA.Put(1, B('v4'));
+    cakisti := CommitCakisma(beA, msg);
+    Ok('2: 4b: okumadan onceki yabanci commit cakisma VERMEZ',
+      (not cakisti) and (msg = ''), msg);
+    if cakisti then beA.AbortBatch;
+    Ok('2: 4b: son yazar degeri korunur', Oku(beA, 1) = 'v4', Oku(beA, 1));
+
+    { --- Sinir 1: okunmayan anahtar (blind write) --- }
+    gSid := 10;
+    beB.BeginBatch;
+    gSid := 1;
+    beA.BeginBatch;
+    gSid := 10;
+    beB.Put(2, B('z'));            // ilgisiz anahtar; K1'e dokunmaz
+    beB.CommitBatch;
+    gSid := 1;
+    beA.Put(1, B('v6'));           // K1 OKUNMADAN yazilir
+    cakisti := CommitCakisma(beA, msg);
+    Ok('3: okunmayan anahtara blind write cakisma VERMEZ',
+      (not cakisti) and (msg = ''), msg);
+    if cakisti then beA.AbortBatch;
+    Ok('3: blind write degeri korunur', Oku(beA, 1) = 'v6', Oku(beA, 1));
+
+    { --- Sinir 2 (bilincli konservatif): okumadan SONRA ilgisiz commit --- }
+    { Tasarim geregi store sayaci GLOBALDIR; anahtar hassasiyeti yoktur.
+      A K1'i okuduktan sonra B BASKA bir anahtari commit ederse bile
+      cakisma beklenir (veri kaybi yerine konservatif abort). }
+    gSid := 10;
+    beB.BeginBatch;
+    gSid := 1;
+    beA.BeginBatch;
+    Ok('4: A K1 okur (konservatif)', Oku(beA, 1) = 'v6', Oku(beA, 1));
+    gSid := 10;
+    beB.Put(2, B('y'));            // K1'e DOKUNMAZ
+    beB.CommitBatch;
+    gSid := 1;
+    beA.Put(1, B('v7'));
+    cakisti := CommitCakisma(beA, msg);
+    Ok('4: konservatif: ilgisiz commit sonrasi cakisma verir (tasarim)',
+      cakisti, msg);
+    beA.AbortBatch;
+    gSid := 10;
+    Ok('4: konservatif: A yazimi uygulanmadi', Oku(beA, 1) = 'v6',
+      Oku(beA, 1));
+  finally
+    gSid := 0;
+    beA.Free;
+    beB.Free;
+  end;
+
+  if gFail = oncekiFail then
+    WriteLn('CAPRAZ BACKEND OKUMA PENCERESI DOGRULANDI')
+  else
+    WriteLn('CAPRAZ BACKEND OKUMA PENCERESI DOGRULANAMADI');
+end;
+
 var
   dir: string;
 
@@ -708,6 +843,7 @@ begin
     BolumB06(dir);
     BolumReadSet(dir);
     BolumAutocommit(dir);
+    BolumCrossBackend(dir);
   finally
     VdbSessionIdFunc := nil;
   end;

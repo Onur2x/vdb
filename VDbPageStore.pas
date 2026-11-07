@@ -311,7 +311,6 @@ type
     { v3.16: yazma ilkelleri icin guvenlik agi (bkz. FAutoWrite). }
     procedure EnsureIoWrite;
     { v3.16: `<db>.gen` degisiklik sayaci. }
-    function ReadGen: QWord;
     procedure BumpGen;
     { v3.25: sayaci bellek eslemesinden okumak icin. }
     procedure MapGen;
@@ -404,6 +403,11 @@ type
       okumasidir (diskte yoklama yapmaz). Baska bir surec commit ettiginde
       deger degisir; sema katmani bunu tazelik damgasi olarak kullanir. }
     function GenStamp: QWord;
+    { P-146: `.gen` degisiklik sayacinin CANLI degeri. GenStamp'tan farkli
+      olarak onbellekli FSigGen'i DEGIL, eslenmis sayfayi okur; bu yuzden
+      baska bir backend/surecin commit'i ANINDA gorunur. Backend'ler arasi
+      okuma damgasi icin public. }
+    function ReadGen: QWord;
 
     { v3.31 SURECLER ARASI GRUP FSYNC. `.gen` eslemesinde offset 8'de
       paylasilan durabil LSN: bir process'in fsync'i bu LSN'e kadar olan
