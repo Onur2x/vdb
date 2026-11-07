@@ -245,8 +245,12 @@ begin
 end;
 
 procedure TVDbPool.CloseEngine;
-{ Motoru kapatir. Cagiran, FMutex hala tutuyorken cagirir. }
+{ Motoru kapatir. Cagiran, FMutex hala tutuyorken cagirir.
+  R2-B-6: yalniz cok surec modunda havuzun actigi motor vardir. Tek
+  surec modunda FTb cagirandan gelir ve burada ASLA nil yapilmaz /
+  serbest birakilmaz. }
 begin
+  if FShm = nil then Exit;
   FTb := nil;
   if FOwnedTb <> nil then
   begin
@@ -396,39 +400,89 @@ end;
 
 function TVDbPool.Acquire: TVSql;
 var
-  W: TWaitResult;
-  HaveSlot: Boolean;
   Locked: Boolean;
+  Deadline: Int64;
+  WaitMs: Integer;
 begin
-  { R-12: 1) paylasilan SHM'den slot kirala -> surec kapasitesi sinirli.
-             2) isimli mutex al -> motor dosyasi ozel kilitli, sirali
-                erisim sart. }
-  HaveSlot := AcquireSlot;
-  if not HaveSlot then
-    raise EVDbException.CreateFmt(ecPoolTimeout,
-      'TVDbPool: paylasilan slot yok (%d ms, kapasite=%d)',
-      [FTimeoutMs, FSize]);
+  { R-12: 1) isimli mutex al -> motor dosyasi ozel kilitli, sirali
+                erisim sart.
+             2) paylasilan SHM'den slot kirala -> surec kapasitesi sinirli.
+    R2-B-5: slot, mutex'ten SONRA kiralanir. FMySlot havuz (surec) bazli
+    TEK alandir; mutex'i bekleyen ikinci thread onu ezerse sahip
+    thread'in Release'inde yanlis slot birakilir, isimli mutex ve motor
+    tutulu kalirdi. Mutex once alininca ayni anda tek thread kiralama
+    yapar; FMySlot'un sahibi ile mutex'in sahibi ayni thread olur. }
   Locked := False;
   try
     { R2-A-5: mutex Enter da hata yoluna dahil. Kilit alinamazsa
-      kiralanan slot asagidaki except'ta birakilir. }
+      asagidaki except'ta temizlik yapilir. }
     if FMutex <> nil then
     begin
       FMutex.Enter;
       Locked := True;
     end;
-    OpenEngine;   // cok surec modunda motoru simdi ac
+    if not AcquireSlot then
+      raise EVDbException.CreateFmt(ecPoolTimeout,
+        'TVDbPool: paylasilan slot yok (%d ms, kapasite=%d)',
+        [FTimeoutMs, FSize]);
+    { R2-B-6: motor yalniz cok surec modunda burada acilir. Tek surec
+      modunda motor cagirandan gelir (constructor ATableDb); burada
+      yeniden acmak verilen motoru terk edip cwd'de bos bir veritabani
+      acmak demekti. }
+    if FShm <> nil then
+      OpenEngine;
   except
-    { R2-B-YENI-1: temizlik zinciri. FMutex.Leave hata verse bile
-      ReleaseSlot calisir; kiralanan slot sizmaz. }
+    { R2-B-YENI-1: temizlik zinciri. Once slot, sonra mutex birakilir
+      (alma sirasinin tersi). Boylece mutex birakildiktan sonra baska
+      bir thread FMySlot'u ezmeden once bu thread kendi slotunu
+      birakir; FMutex.Leave hata verse bile ReleaseSlot calisir. }
     try
-      if Locked then FMutex.Leave;
-    finally
       ReleaseSlot;
+    finally
+      if Locked then FMutex.Leave;
     end;
     raise;
   end;
   try
+    if FShm = nil then
+    begin
+      { R2-B-6: tek surec modunda FSize siniri. Onceki surum her
+        Acquire'da sinirsiz TVSql uretiyordu (FIdle yalniz isim olarak
+        duruyordu). Burada FOut < FSize olana kadar FAvail beklenir;
+        Release FOut'u dusurup FAvail'i uyandirir. TVSql.Create ve
+        sahiplik kaydi, sayac rezervasyonu ile ayni FLock blogunda
+        yapilir; boylece paralel Acquire'lar FSize'i asamaz. }
+      Deadline := VdbTickMs + FTimeoutMs;
+      while True do
+      begin
+        FLock.Enter;
+        try
+          if FClosed then
+            raise EVDbException.Create(ecPoolClosed,
+              'TVDbPool: havuz kapali');
+          if FOut < FSize then
+          begin
+            Result := TVSql.Create(FTb);
+            FOwners.AddOrSetValue(Pointer(Result),
+              THandle(GetCurrentThreadId));
+            Inc(FOut);
+            Exit;
+          end;
+        finally
+          FLock.Leave;
+        end;
+        WaitMs := Deadline - VdbTickMs;
+        if WaitMs <= 0 then
+          raise EVDbException.CreateFmt(ecPoolTimeout,
+            'TVDbPool: havuz dolu (%d ms, kapasite=%d)',
+            [FTimeoutMs, FSize]);
+        { Otomatik-sifirlanan olayda SetEvent'ler ust uste binerse
+          uyandirma kaybolabilir; en fazla 10 ms bekleyip FOut'u
+          yeniden denetlemek kayipsizligi garanti eder. }
+        if WaitMs > 10 then WaitMs := 10;
+        FAvail.WaitFor(WaitMs);
+      end;
+    end;
     FLock.Enter;
     try
       if FClosed then
@@ -442,14 +496,15 @@ begin
     end;
   except
     { R2-B-YENI-1: CloseEngine veya FMutex.Leave hata verse bile
-      sonraki adim ve slot birakma denenir. }
+      sonraki adim ve slot birakma denenir. Birakma sirasi LIFO:
+      once slot, sonra mutex. }
     try
       CloseEngine;
     finally
       try
-        if Locked then FMutex.Leave;
-      finally
         ReleaseSlot;
+      finally
+        if Locked then FMutex.Leave;
       end;
     end;
     raise;
@@ -520,32 +575,40 @@ begin
     try
       if Owned and (FOut > 0) then Dec(FOut);
       OutCount := FOut;
+      { R2-B-6: tek surec modunda FSize bekleyicilerini uyandir. }
+      if Owned then FAvail.SetEvent;
     finally
       FLock.Leave;
     end;
 
-    { Temizlik kosulu:
-      - Ya bu cagri kiralamayi tamamliyor (Owned) ya da disarida
-        canli ornek yok (OutCount = 0).
+    { Temizlik kosulu (R2-B-5):
+      - Bu cagri gercekten bu havuzun, bu thread'e ait bir ornegini
+        birakmis olmali (Owned). Sahipsiz Release(nil) veya baska
+        thread'in cagrisi motor/mutex'i baskasinin altindan cekmez;
+        isimli mutex thread-sahipli oldugundan Release(nil) ile
+        FMutex.Leave cagirmak da yasaktir.
+      - Disarida canli ornek kalmamis olmali (OutCount = 0). Boylece
+        baska thread'in canli TVSql'i varken FTb serbest birakilmaz
+        (use-after-free onlenir).
       - Cok surec modunda ayrica bu surec bir slot tutuyor olmali.
-      Baska thread'in canli ornegi varken (OutCount > 0) motor/mutex
-      onun altindan cekilmez; dogru sahip kendi Release'inde temizler.
-      Boylece yanlis Release UAF yaratmaz, sahipsiz kalan kiralama ise
-      sizmaz. Tek surec modunda CloseEngine/ReleaseSlot zaten no-op'tur
+      Tek surec modunda CloseEngine/ReleaseSlot zaten no-op'tur
       (FOwnedKv/FShm nil); kosul yine de ayni UAF korumasini verir. }
-    DoCleanup := (Owned or (OutCount = 0)) and
+    DoCleanup := Owned and (OutCount = 0) and
       ((FShm = nil) or (FMySlot > 0));
     if DoCleanup then
     begin
-      { R-12 sirasi: motoru kapat -> isimli mutex'i birak -> SHM
-        slotunu birak. Her adim, oncekiler hata verse bile denenir. }
+      { R-12 sirasi: motoru kapat -> SHM slotunu birak -> isimli
+        mutex'i birak. Slot, mutex hala tutulurken birakilir; aksi
+        halde mutex'i devralan thread FMySlot'u ezip bu thread'in
+        ReleaseSlot'u yanlis slotu birakirdi. Her adim, oncekiler
+        hata verse bile denenir. }
       try
         CloseEngine;
       finally
         try
-          if FMutex <> nil then FMutex.Leave;
-        finally
           ReleaseSlot;
+        finally
+          if FMutex <> nil then FMutex.Leave;
         end;
       end;
     end;

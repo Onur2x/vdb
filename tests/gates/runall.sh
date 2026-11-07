@@ -124,6 +124,7 @@ derle tests/gates/mvchk.lpr mvchk && kos mvchk "MATERIALIZED VIEW KALICILIGI DOG
 derle tests/gates/aggchk.lpr aggchk && kos aggchk "AGGREGATE HASSASIYETI DOGRULANDI" "$WORK/aggchk"
 derle tests/gates/mmchk.lpr mmchk && kos mmchk "MM SOZLESMESI DOGRULANDI"
 derle tests/gates/poolchk.lpr poolchk && kos poolchk "HAVUZ HATA YOLU DOGRULANDI" "$WORK/poolchk"
+derle tests/gates/poolsafe.lpr poolsafe && kos poolsafe "HAVUZ SAHIPLIK SOZLESMESI DOGRULANDI" "$WORK/poolsafe"
 derle tests/gates/readlockchk.lpr readlockchk && kos readlockchk "OKUMA KILIDI SIZINTISI YOK" "$WORK/readlockchk"
 derle tests/gates/commitfailchk.lpr commitfailchk && kos commitfailchk "COMMIT HATA YOLLARI DOGRULANDI" "$WORK/commitfailchk"
 derle tests/gates/v3sqlchk.lpr v3sqlchk && kos v3sqlchk "V3 SQL KATMANI DOGRULANDI" "$WORK/v3sqlchk" 1200
