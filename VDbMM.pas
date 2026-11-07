@@ -219,6 +219,18 @@ begin
 end;
 
 function MMReallocMem(var P: Pointer; Size: PtrUInt): Pointer;
+{ Sozlesme (Delphi/FPC ReallocMem ile birebir):
+    - P = nil, Size = 0  -> nil (tahsis yapilmaz).
+    - P = nil, Size > 0  -> yeni blok; basarisizsa nil.
+    - Size = 0           -> blok serbest, P := nil, sonuc nil.
+    - Hata (OOM / bozuk slab basligi) -> sonuc nil ve P DEGISMEZ;
+      eski blok gecerli kalir. Cagiran eski isaretcisini kullanmaya
+      devam edebilir; yarim Move / cift serbest olmaz.
+
+  R2-B-YENI-2: bozuk baslikta "sessizce P'yi koruyup nil donme" davranisi
+  artik bilincli ve belgelenmis sozlesmedir; ek olarak P=nil/Size=0
+  birlesimi de sozlesmeye uygun hale getirildi (onceki surum 1 baytlik
+  blok donduruyordu). }
 var
   oldSize: PtrUInt;
   newP: Pointer;
@@ -227,6 +239,7 @@ var
 begin
   if P = nil then
   begin
+    if Size = 0 then Exit(nil);
     P := MMGetMem(Size);
     Exit(P);
   end;
@@ -244,13 +257,15 @@ begin
     // halde bozuk baslik ClassSize[slab^.SizeClass] ile sinir disi okuma yapar.
     sc := slab^.SizeClass;
     if (slab^.Magic <> SLAB_MAGIC) or (sc < 0) or (sc >= NUM_CLASSES) then
-      // Sahiplik bitmap'te ama sinif bilinmiyor: eski bloga dokunmadan basarisiz
-      // don; cagiran eski isaretcisini korur, heap bozulmaz, dev Move olmaz.
+      // Hata sozlesmesi: P korunur, nil doner. Blok bizim ama boyu
+      // bilinmiyor; oldugu gibi birakmak tek guvenli secenek.
       Exit(nil);
     oldSize := ClassSize[sc];
     if Size <= oldSize then Exit(P);
     newP := MMGetMem(Size);
-    if newP = nil then Exit(nil);
+    if newP = nil then
+      // Hata sozlesmesi: P korunur (eski blok serbest BIRAKILMAZ).
+      Exit(nil);
     Move(P^, newP^, oldSize);
     MMFreeMem(P);
     P := newP;

@@ -419,8 +419,13 @@ begin
     end;
     OpenEngine;   // cok surec modunda motoru simdi ac
   except
-    if Locked then FMutex.Leave;
-    ReleaseSlot;
+    { R2-B-YENI-1: temizlik zinciri. FMutex.Leave hata verse bile
+      ReleaseSlot calisir; kiralanan slot sizmaz. }
+    try
+      if Locked then FMutex.Leave;
+    finally
+      ReleaseSlot;
+    end;
     raise;
   end;
   try
@@ -436,9 +441,17 @@ begin
       FLock.Leave;
     end;
   except
-    CloseEngine;
-    if Locked then FMutex.Leave;
-    ReleaseSlot;
+    { R2-B-YENI-1: CloseEngine veya FMutex.Leave hata verse bile
+      sonraki adim ve slot birakma denenir. }
+    try
+      CloseEngine;
+    finally
+      try
+        if Locked then FMutex.Leave;
+      finally
+        ReleaseSlot;
+      end;
+    end;
     raise;
   end;
 end;
@@ -451,45 +464,96 @@ procedure TVDbPool.Release(Sql: TVSql);
 
   R2-B-5: havuzun uretmedigi / baska thread'den Release edilen ornek
   icin motoru ve mutex'i baska thread'in altindan cekmek yerine acik
-  hata (ecInvalidArgument) verilir. Boylece use-after-free onlenir. }
+  hata (ecInvalidArgument) verilir. Boylece use-after-free onlenir.
+
+  R2-B-YENI-1: her erken cikis/istisna yolu tek temizlik zincirine
+  baglanir. Sahiplik dogrulamasi hata verse de, Sql.Free veya
+  FMutex.Leave istisna firlatsa da kiralanan slot birakilir ve motor
+  kapatilir. Boylece ornek+slot+mutex 1:1 kalir. }
 var
   Owner: THandle;
+  Owned: Boolean;
+  OutCount: Integer;
+  Err: EVDbException;
+  DoCleanup: Boolean;
 begin
+  Owned := False;
+  Err := nil;
+  OutCount := 0;
+
   if Sql <> nil then
   begin
     FLock.Enter;
     try
       if not FOwners.TryGetValue(Pointer(Sql), Owner) then
-        raise EVDbException.Create(ecInvalidArgument,
-          'TVDbPool: havuzun uretmedigi ornek Release edildi');
-      if Owner <> THandle(GetCurrentThreadId) then
-        raise EVDbException.Create(ecInvalidArgument,
-          'TVDbPool: ornek farkli thread''den Release ediliyor');
-      FOwners.Remove(Pointer(Sql));
-    finally
-      FLock.Leave;
-    end;
-    // Cok surec modunda TVSql ornegi is parcasi basina olusturulur;
-    // burada serbest birakilir.
-    Sql.Free;
-    FLock.Enter;
-    try
-      if FOut > 0 then Dec(FOut);
+        Err := EVDbException.Create(ecInvalidArgument,
+          'TVDbPool: havuzun uretmedigi ornek Release edildi')
+      else if Owner <> THandle(GetCurrentThreadId) then
+        Err := EVDbException.Create(ecInvalidArgument,
+          'TVDbPool: ornek farkli thread''den Release ediliyor')
+      else
+      begin
+        { R2-B-YENI-1 / TID yeniden kullanimi: anahtar ornek
+          isaretcisidir, TID degil. Ayni adreste AYNI ANDA iki canli
+          ornek olamaz; bir thread olup TID'si yeni bir thread'e
+          verilse bile yalnizca eski, hala yasayan ve o thread'e
+          birakilmis ornege erisilebilir. Acquire her yeni ornekte
+          AddOrSetValue ile kaydi tazeler. Bu yuzden TID karsilastirmasi
+          yeterlidir (ek nesil/sayac gerekmez). }
+        FOwners.Remove(Pointer(Sql));
+        Owned := True;
+      end;
     finally
       FLock.Leave;
     end;
   end;
-  { R2-B-5: sahipsiz Release(nil). Bu ornekte kiralanmis slot yoksa
-    motor zaten kapalidir ve FMutex.Leave sahipsiz cagrilinca
-    EPrimsError firlatir. Tek surec modunda (FShm = nil) davranis
-    degismez. }
-  if (FShm <> nil) and (FMySlot <= 0) then Exit;
-  { R-12: sirasi: motoru kapat -> isimli mutex'i birak -> SHM slotunu
-    birak. Motori kapatmadan mutex birakilirsa baska surec dosyayi
-    acamaz. }
-  CloseEngine;
-  if FMutex <> nil then FMutex.Leave;
-  ReleaseSlot;
+
+  { Tek temizlik zinciri: Sql.Free istisnasi bile asagidaki finally'ye
+    girer. }
+  try
+    if Owned then
+      // Cok surec modunda TVSql ornegi is parcasi basina olusturulur;
+      // burada serbest birakilir.
+      Sql.Free;
+  finally
+    FLock.Enter;
+    try
+      if Owned and (FOut > 0) then Dec(FOut);
+      OutCount := FOut;
+    finally
+      FLock.Leave;
+    end;
+
+    { Temizlik kosulu:
+      - Ya bu cagri kiralamayi tamamliyor (Owned) ya da disarida
+        canli ornek yok (OutCount = 0).
+      - Cok surec modunda ayrica bu surec bir slot tutuyor olmali.
+      Baska thread'in canli ornegi varken (OutCount > 0) motor/mutex
+      onun altindan cekilmez; dogru sahip kendi Release'inde temizler.
+      Boylece yanlis Release UAF yaratmaz, sahipsiz kalan kiralama ise
+      sizmaz. Tek surec modunda CloseEngine/ReleaseSlot zaten no-op'tur
+      (FOwnedKv/FShm nil); kosul yine de ayni UAF korumasini verir. }
+    DoCleanup := (Owned or (OutCount = 0)) and
+      ((FShm = nil) or (FMySlot > 0));
+    if DoCleanup then
+    begin
+      { R-12 sirasi: motoru kapat -> isimli mutex'i birak -> SHM
+        slotunu birak. Her adim, oncekiler hata verse bile denenir. }
+      try
+        CloseEngine;
+      finally
+        try
+          if FMutex <> nil then FMutex.Leave;
+        finally
+          ReleaseSlot;
+        end;
+      end;
+    end;
+  end;
+
+  { Sahiplik hatasi temizlikten SONRA bildirilir; kaynaklar sizmaz. }
+  if Err <> nil then
+    raise Err;
 end;
 
 procedure TVDbPool.Close;
