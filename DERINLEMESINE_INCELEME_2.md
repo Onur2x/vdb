@@ -2363,7 +2363,7 @@ Ayni oturum, donusumlu BASE/NEW, her kosu taze dizin:
    (VDbExecutor.pas); write-set kapali oldugu icin izlenmiyordu. EK-T'de
    (P-145) duzeltildi: yurutucu kendi write-set'ini on-okumadan once acar.
    `ExecFastPointUpdate/Delete` ve `TVTableDb.UpdateWhere/DeleteWhere`
-   hizli yollari hala kapsam disinda.
+   hizli yollari EK-V'de (P-147) ayni desenle kapatildi.
 3. 4096 ustunde anahtar hassasiyeti kaybolur; buyuk okumali islemlerde
    anahtar bazli olmayan (daha cok) cakisma gorulebilir. Veri kaybi yok.
 4. Yabanci commit YOKKEN maliyet yalnizca okuma basina bir harita
