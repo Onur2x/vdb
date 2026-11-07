@@ -139,6 +139,11 @@ type
           paralel Recs girisi O(1) guncellenir; ApplyBatch artik satir basina
           Map aramasi yapmaz. }
         Idx: Integer;
+        { B-06: before-image'in yakalandigi andaki FCommitGen. Yabanci
+          defter denetimi bu nesle gore yapilir: yabanci commit bundan
+          SONRA geldiyse cakisma, ONCE geldiyse (before-image o commit'in
+          degerini tasiyorsa) yoktur. Yalniz Before kayitlarinda anlamlidir. }
+        CapGen: Int64;
       end;
       { v3.2 savepoint gunlugu: bir anahtarin savepoint'ten ONCEKI hali.
         HadBefore=False ise anahtar FBatch'te hic yoktu; geri almada
@@ -1825,6 +1830,9 @@ begin
     if S.Before.ContainsKey(Key) then Exit;
     rec.Present := FEng.TryGet(Key, v);
     rec.Value := v;
+    { B-06: yakalama nesli. FCommitGen FEngCs altinda artar; burada da
+      FEngCs tutuldugu icin deger tutarlidir. }
+    rec.CapGen := FCommitGen;
     S.Before.AddOrSetValue(Key, rec);
   finally
     FEngCs.Leave;
@@ -1839,26 +1847,36 @@ var
   curVal: TBytes;
   gen: Int64;
   same: Boolean;
+  alienVar: Boolean;
+  hasBefore: Boolean;
+  capGen: Int64;
 begin
   if S = nil then Exit;
   { v3.6: ne before-image ne yabanci commit varsa yapacak is yok. }
   if (S.Before.Count = 0) and (FAlien.Count = 0) then Exit;
+  { FAlien genellikle bos; anahtar basina sozluk aramasindan kacin. }
+  alienVar := FAlien.Count > 0;
   for i := 0 to S.Order.Count - 1 do
   begin
     key := S.Order[i];
-    if not S.Before.TryGetValue(key, b) then
-    begin
-      { v3.6: HIZLI YOLDA yazilan anahtar (before-image yok). Biz
-        basladiktan sonra baska bir oturum bu anahtari commit ettiyse
-        cakisma vardir; etmediyse yoktur. Bu, "ilk commit kazanir"
-        kuralinin birebir aynisidir: o commit bizim yazimizdan sonra
-        geldigi icin before-image karsilastirmasi da farkli cikardi. }
-      if FAlien.TryGetValue(key, gen) and (gen > S.StartGen) then
-        raise EVdbBackendV3.CreateFmt(
-          'yazma cakismasi: $%.16x baska bir oturum tarafindan degistirildi ' +
-          '(islem geri alindi)', [key]);
-      Continue;
-    end;
+    { B-06: YABANCI DEFTER DENETIMI her anahtar icin, before-image'li
+      anahtarda da yapilir; ama YAKALAMA NESLINE gore. Before-image yazma
+      aninda (NoteBefore) yakalanir. Yabanci commit bundan SONRA geldiyse
+      onceki deger artik gecersizdir: cakisma (deger karsilastirmasi bunu
+      genelde gorur, ABA'da -- ayni deger yeniden yazildiginda -- gormez;
+      nesil kesin ayirir). Yabanci commit ONCE geldiyse before-image o
+      commit'in degerini TASIR; oturum yeni degeri gorerek yazmistir, bu
+      v3.6 "ilk commit kazanir / deger karsilastirmasi" semantigidir
+      (v3sqlchk 4b). Before-image yoksa esik StartGen'dir (hizli yol).
+      FEngCs cagiran (CommitBatch) tarafindan tutulur. }
+    hasBefore := S.Before.TryGetValue(key, b);
+    if hasBefore then capGen := b.CapGen else capGen := S.StartGen;
+    if alienVar and FAlien.TryGetValue(key, gen) and (gen > capGen) then
+      raise EVdbBackendV3.CreateFmt(
+        'yazma cakismasi: $%.16x baska bir oturum tarafindan degistirildi ' +
+        '(islem geri alindi)', [key]);
+    if not hasBefore then
+      Continue;   { hizli yol: yabanci defter denetimi yukarida yapildi }
     curVal := nil;
     FEngCs.Enter;
     try

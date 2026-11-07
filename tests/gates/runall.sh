@@ -128,6 +128,7 @@ derle tests/gates/poolchk.lpr poolchk && kos poolchk "HAVUZ HATA YOLU DOGRULANDI
 derle tests/gates/poolsafe.lpr poolsafe && kos poolsafe "HAVUZ SAHIPLIK SOZLESMESI DOGRULANDI" "$WORK/poolsafe"
 derle tests/gates/readlockchk.lpr readlockchk && kos readlockchk "OKUMA KILIDI SIZINTISI YOK" "$WORK/readlockchk"
 derle tests/gates/commitfailchk.lpr commitfailchk && kos commitfailchk "COMMIT HATA YOLLARI DOGRULANDI" "$WORK/commitfailchk"
+derle tests/gates/genchk.lpr genchk && kos genchk "DB NESLI VE DURABIL LSN DOGRULANDI" "$WORK/genchk"
 derle tests/gates/v3sqlchk.lpr v3sqlchk && kos v3sqlchk "V3 SQL KATMANI DOGRULANDI" "$WORK/v3sqlchk" 1200
 derle tests/gates/migchk.lpr migchk && kos migchk "V2 -> V3 GOCU DOGRULANDI" "$WORK/migchk" 5000
 derle tests/gates/factorychk.lpr factorychk && kos factorychk "FACTORY DOGRULANDI" "$WORK/factorychk"

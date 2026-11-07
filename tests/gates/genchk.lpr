@@ -1,0 +1,365 @@
+program genchk;
+{ P-139 kapisi.
+  Bolum 1 (C-2): `.gen` ile DB kimligi eslesmesi ve durabil LSN'in
+    gecersiz kilinmasi. Silinip yeniden olusturulan ya da baska bir
+    dosyayla degistirilen veritabaninda eski yuksek durabil LSN
+    KULLANILMAMALI.
+  Bolum 2 (B-06): FAlien (yabanci commit defteri) denetimi before-image
+    OLAN anahtarlarda da calismali; aksi halde kaybolan guncelleme olur.
+    Iyimser oturum, `.gen` rezervasyon kilidi ayri bir handle ile
+    tutularak zorlanir; iki oturum da before-image kaydeder.
+  Kullanim: genchk <dizin> }
+{$mode delphi}{$H+}
+uses
+  { FPC/Unix: cthreads programin EN BASINDA olmali (TEvent/TThread). }
+  {$IFDEF UNIX}cthreads,{$ENDIF}
+  SysUtils, Classes,
+  VDbBackendApi, VDbBackendV3, VDbPageStore, VDbSync;
+
+const
+  { Testte yazilan bayat durabil LSN; gercek commit LSN'lerinden cok buyuk. }
+  STALE_DUR = LongWord($B0000000);
+
+var
+  gSid: Cardinal = 0;
+  gPass: Integer = 0;
+  gFail: Integer = 0;
+
+function SidFunc: Cardinal;
+begin
+  Result := gSid;
+end;
+
+procedure Ok(const Ad: string; Kosul: Boolean; const Ayrinti: string);
+begin
+  if Kosul then
+  begin
+    Inc(gPass);
+    WriteLn('   OK   ', Ad, '   [', Ayrinti, ']');
+  end
+  else
+  begin
+    Inc(gFail);
+    WriteLn('   FAIL ', Ad, '   [', Ayrinti, ']');
+  end;
+end;
+
+function B(const S: string): TBytes;
+begin
+  SetLength(Result, Length(S));
+  if Length(S) > 0 then Move(S[1], Result[0], Length(S));
+end;
+
+function S(const V: TBytes): string;
+begin
+  SetLength(Result, Length(V));
+  if Length(V) > 0 then Move(V[0], Result[1], Length(V));
+end;
+
+function Oku(be: TVdbBackendV3; K: QWord): string;
+var v: TBytes;
+begin
+  if be.Get(K, v) then Result := S(v) else Result := '<yok>';
+end;
+
+{ .gen: 0 = gen sayaci (QWord), 8 = durabil LSN (LongWord), 16 = DB kimligi. }
+procedure ReadGenFile(const Path: string; out Sayac: QWord;
+  out Durabil: LongWord; out Kimlik: QWord);
+var
+  fs: TFileStream;
+  z: LongWord;
+begin
+  Sayac := 0; Durabil := 0; Kimlik := 0;
+  fs := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+  try
+    if fs.Size >= 8 then
+    begin
+      fs.Position := 0;
+      fs.ReadBuffer(Sayac, 8);
+    end;
+    if fs.Size >= 12 then
+    begin
+      fs.Position := 8;
+      fs.ReadBuffer(z, 4);
+      Durabil := z;
+    end;
+    if fs.Size >= VDB_GEN_ID_OFF + 8 then
+    begin
+      fs.Position := VDB_GEN_ID_OFF;
+      fs.ReadBuffer(Kimlik, 8);
+    end;
+  finally
+    fs.Free;
+  end;
+end;
+
+procedure WriteStaleDurable(const Path: string; V: LongWord);
+var
+  fs: TFileStream;
+begin
+  fs := TFileStream.Create(Path, fmOpenReadWrite or fmShareDenyNone);
+  try
+    fs.Position := 8;
+    fs.WriteBuffer(V, 4);
+  finally
+    fs.Free;
+  end;
+end;
+
+procedure SilDosya(const Path: string);
+begin
+  if FileExists(Path) then DeleteFile(Path);
+end;
+
+procedure KopyalaDosya(const Kaynak, Hedef: string);
+var
+  src, dst: TFileStream;
+begin
+  src := TFileStream.Create(Kaynak, fmOpenRead or fmShareDenyNone);
+  try
+    dst := TFileStream.Create(Hedef, fmCreate);
+    try
+      dst.CopyFrom(src, 0);
+    finally
+      dst.Free;
+    end;
+  finally
+    src.Free;
+  end;
+end;
+
+procedure SilYanDosyalar(const Db: string);
+begin
+  SilDosya(Db + '.wal');
+  SilDosya(Db + '.idx');
+  SilDosya(Db + '.undo');
+end;
+
+{ --------------------------------------------------- Bolum 1: C-2 }
+
+procedure BolumC2(const Dir: string);
+var
+  db, gen: string;
+  be: TVdbBackendV3;
+  sayac1, sayac2, id1, id2, id3, id4: QWord;
+  dur1, dur2, dur3, dur4: LongWord;
+  oncekiFail: Integer;
+  db2, wal2: string;
+begin
+  WriteLn('--- C-2: DB nesli / durabil LSN ---');
+  oncekiFail := gFail;
+  db := IncludeTrailingPathDelimiter(Dir) + 'c2a.odb';
+  gen := db + '.gen';
+  SilYanDosyalar(db);
+  SilDosya(gen);
+  SilDosya(db);
+
+  { 1) Ilk olusturma + commit: `.gen` 24 bayt, kimlik ve durabil LSN dolu. }
+  be := TVdbBackendV3.Create(db, True, 512);
+  try
+    be.BeginBatch;
+    be.Put(1, B('a'));
+    be.Put(2, B('b'));
+    be.CommitBatch;
+  finally
+    be.Free;
+  end;
+  ReadGenFile(gen, sayac1, dur1, id1);
+  Ok('yeni DB kimligi uretildi', id1 <> 0, Format('$%.16x', [id1]));
+  Ok('commit sonrasi durabil LSN > 0', dur1 > 0, IntToStr(dur1));
+
+  { 2) Ayni dosyayi yeniden acmak kimligi DEGISTIRMEMELI ve durabil LSN'i
+    sifirlamamali. }
+  be := TVdbBackendV3.Create(db, False, 512);
+  be.Free;
+  ReadGenFile(gen, sayac2, dur2, id2);
+  Ok('yeniden acilista kimlik korunur', id2 = id1,
+    Format('$%.16x / $%.16x', [id2, id1]));
+  Ok('yeniden acilista durabil LSN korunur', (dur2 > 0) and (dur2 >= dur1),
+    IntToStr(dur2));
+
+  { 3) Bayat yuksek LSN yaz; DB dosyasini sil, `.gen` KALSIN; yeniden
+    olustur. Kimlik degismeli, durabil LSN kalici olarak sifirlanmali. }
+  WriteStaleDurable(gen, STALE_DUR);
+  SilYanDosyalar(db);
+  SilDosya(db);
+  be := TVdbBackendV3.Create(db, True, 512);
+  try
+    be.BeginBatch;
+    be.Put(1, B('yeni'));
+    be.CommitBatch;
+  finally
+    be.Free;
+  end;
+  ReadGenFile(gen, sayac2, dur3, id3);
+  Ok('yeniden olusturulan DB yeni kimlik aldi', (id3 <> 0) and (id3 <> id1),
+    Format('$%.16x / eski $%.16x', [id3, id1]));
+  Ok('bayat durabil LSN sifirlandi, commit sonrasi kucuk LSN',
+    (dur3 > 0) and (dur3 < STALE_DUR),
+    Format('%d (bayat %d)', [dur3, STALE_DUR]));
+
+  { 4) Baska bir veritabaninin dosyasi, eski `.gen` korunarak yerine
+    konursa: kimlik uyusmaz -> durabil LSN gecersiz. }
+  db2 := IncludeTrailingPathDelimiter(Dir) + 'c2b.odb';
+  wal2 := db2 + '.gen';
+  SilYanDosyalar(db2);
+  SilDosya(wal2);
+  SilDosya(db2);
+  be := TVdbBackendV3.Create(db2, True, 512);
+  try
+    be.BeginBatch;
+    be.Put(1, B('baska'));
+    be.CommitBatch;
+  finally
+    be.Free;
+  end;
+  WriteStaleDurable(gen, STALE_DUR);
+  SilYanDosyalar(db);
+  SilDosya(db);
+  KopyalaDosya(db2, db);
+  be := TVdbBackendV3.Create(db, False, 512);
+  be.Free;
+  ReadGenFile(gen, sayac2, dur4, id4);
+  Ok('degistirilen DB dosyasinin kimligi benimsendi', id4 <> id3,
+    Format('$%.16x / eski $%.16x', [id4, id3]));
+  Ok('kimlik uyusmazliginda bayat durabil LSN sifirlandi',
+    dur4 < STALE_DUR, Format('%d (bayat %d)', [dur4, STALE_DUR]));
+
+  if gFail = oncekiFail then
+    WriteLn('DB NESLI VE DURABIL LSN DOGRULANDI')
+  else
+    WriteLn('DB NESLI VE DURABIL LSN DOGRULANAMADI');
+end;
+
+{ --------------------------------------------------- Bolum 2: B-06 }
+
+procedure BolumB06(const Dir: string);
+var
+  db, gen: string;
+  be: TVdbBackendV3;
+  cakisti: Boolean;
+  msg: string;
+  oncekiFail: Integer;
+begin
+  WriteLn('--- B-06: FAlien cakisma denetimi ---');
+  oncekiFail := gFail;
+  db := IncludeTrailingPathDelimiter(Dir) + 'b06.odb';
+  gen := db + '.gen';
+  SilYanDosyalar(db);
+  SilDosya(gen);
+  SilDosya(db);
+  be := TVdbBackendV3.Create(db, True, 512);
+  try
+    gSid := 0;
+    be.BeginBatch;
+    be.Put(1, B('v0'));
+    be.Put(2, B('sabit'));
+    be.CommitBatch;
+
+    { B-06 senaryosu (tek surec, uc oturum). Before-image'in YAKALAMA
+      NESLI ile yabanci commit sirasi ayirt edilir:
+
+      (a) Yabanci commit before-image'den SONRA gelirse deger artik
+          gecersizdir; commit DURMALIDIR. Deger karsilastirmasi bunu
+          cogunlukla yakalar; ABA durumunda (yabanci commit AYNI degeri
+          yeniden yazdi) yakalayamaz -- nesil kesin ayirir. }
+
+    gSid := 1;
+    be.BeginBatch;
+    be.Put(3, B('s1'));             // ilgisiz yazim (abort ile geri donmeli)
+    gSid := 2;
+    be.BeginBatch;
+    be.Put(2, B('x'));
+    be.CommitBatch;                 // S1'i before-image'e zorlar, FAlien[2]
+    gSid := 1;
+    be.Put(1, B('v1'));             // before-image = v0, CapGen = g1
+    gSid := 3;
+    be.BeginBatch;
+    be.Put(1, B('v0'));             // ABA: ayni deger yeniden yazilir
+    be.CommitBatch;                 // FAlien[1] = g2 > CapGen
+    gSid := 1;
+    cakisti := False;
+    msg := '';
+    try
+      be.CommitBatch;               // nesil denetimi cakisma vermeli
+    except
+      on E: Exception do
+      begin
+        msg := E.Message;
+        cakisti := Pos('cakisma', msg) > 0;
+      end;
+    end;
+    Ok('capture sonrasi yabanci commit (ABA) cakisma verir', cakisti, msg);
+    be.AbortBatch;
+    gSid := 0;
+    Ok('S1 yazimi uygulanmadi (deger v0)', Oku(be, 1) = 'v0', Oku(be, 1));
+    Ok('S1 ilgisiz yazimi geri alindi', Oku(be, 3) = '<yok>', Oku(be, 3));
+
+    { (b) v3.6/v3sqlchk 4b semantigi: yabanci commit before-image'den
+          ONCE geldiyse oturum yeni degeri gorur; cakisma YOKTUR ve son
+          yazar kazanir. }
+    gSid := 1;
+    be.BeginBatch;
+    gSid := 2;
+    be.BeginBatch;
+    be.Put(1, B('v5'));
+    be.CommitBatch;                 // S1'i uyarir, FAlien[1] = g
+    gSid := 1;
+    be.Put(1, B('v6'));             // before-image = v5, CapGen = g
+    cakisti := False;
+    msg := '';
+    try
+      be.CommitBatch;
+    except
+      on E: Exception do
+      begin
+        msg := E.Message;
+        cakisti := Pos('cakisma', msg) > 0;
+      end;
+    end;
+    Ok('capture oncesi yabanci commit cakisma VERMEZ (4b)', not cakisti, msg);
+    gSid := 0;
+    Ok('son yazar degeri korunur', Oku(be, 1) = 'v6', Oku(be, 1));
+
+    { Kontrol: cakisma yokken tek oturumluk commit calisir (yanlis pozitif
+      yok). }
+    gSid := 0;
+    be.BeginBatch;
+    be.Put(3, B('son'));
+    be.CommitBatch;
+    Ok('kontrol: temiz commit basarili', Oku(be, 3) = 'son', Oku(be, 3));
+  finally
+    gSid := 0;
+    be.Free;
+  end;
+
+  if gFail = oncekiFail then
+    WriteLn('FALIEN CAKISMA DENETIMI DOGRULANDI')
+  else
+    WriteLn('FALIEN CAKISMA DENETIMI DOGRULANAMADI');
+end;
+
+var
+  dir: string;
+
+begin
+  if ParamCount < 1 then
+  begin
+    WriteLn(StdErr, 'kullanim: genchk <dizin>');
+    Halt(2);
+  end;
+  dir := ParamStr(1);
+  ForceDirectories(dir);
+  VdbSessionIdFunc := @SidFunc;
+  try
+    BolumC2(dir);
+    BolumB06(dir);
+  finally
+    VdbSessionIdFunc := nil;
+  end;
+  WriteLn(Format('SONUC: gecen=%d kalan=%d', [gPass, gFail]));
+  if gFail = 0 then
+    WriteLn('TEMIZ')
+  else
+    Halt(1);
+end.

@@ -68,6 +68,15 @@ const
   VDB_META_KEYCHECK = 56;   // 16 bayt
   VDB_META_FLAGS    = 72;   // LongWord
   VDB_META_FLAG_ENC = 1;
+  { C-2: veritabani kimligi (QWord). Olusturulurken uretilir ve `.gen`
+    dosyasindaki kopyasiyla karsilastirilir; uyusmazsa durabil LSN
+    gecersiz sayilir (bkz. OpenEx). }
+  VDB_META_DBID     = 76;   // QWord
+
+  { `.gen` duzeni: 0 = degisiklik sayaci (QWord, 8), 8 = durabil LSN
+    (LongWord + 4 bos), 16 = DB kimligi (QWord, 8). }
+  VDB_GEN_SIZE      = 24;
+  VDB_GEN_ID_OFF    = 16;
 
   { Freelist trunk sayfasi (ham 4096 bayt, VDbPage basligi KULLANILMAZ). }
   VDB_TRUNK_MAGIC  = $31544656;   // 'VFT1'
@@ -145,6 +154,9 @@ type
         dosyasindadir (WAL budanmistir) -> tam yeniden yukleme gerekir. }
       FViewLsn: LongWord;
       FCreated: Int64;
+      { C-2: meta sayfadan okunan DB kimligi (0 = eski dosya, henuz
+        uretilmemis). `.gen` kimligi ile eslesmezse durabil LSN sifirlanir. }
+      FDbId: QWord;
       FReads: Int64;
       FWrites: Int64;
       FEvictions: Int64;
@@ -567,6 +579,25 @@ implementation
 
 { ------------------------------------------------------------------ yardimci }
 
+{ C-2: yeni DB kimligi. Surec ici sayac + rastgele + saat + PID karisimi;
+  ayni saniyede olusturulan iki veritabani bile farkli kimlik alir. }
+var
+  GDbIdSeq: QWord = 0;
+
+function NewDbStoreId: QWord;
+begin
+  Inc(GDbIdSeq);
+  { Global RNG'ye (RandSeed) YAZILMAZ: kitaplik, uygulamanin rastgele
+    dizisini degistirmemeli. Benzersizlik PID + saat + surec ici sayac
+    + RandSeed'in o anki degerinden karisimla saglanir; surec ici sayac
+    ayni milisaniyedeki iki olusturmayi bile ayirir. }
+  Result := QWord(GetTickCount64) * QWord(6364136223846793005)
+    xor (QWord(StrToInt64Def(VDbProcessToken, 0)) shl 17)
+    xor (GDbIdSeq * QWord(2654435761))
+    xor QWord(RandSeed);
+  if Result = 0 then Result := 1;
+end;
+
 function TVDbPageStore.OffsetOf(PageNo: LongWord): Int64;
 begin
   if FEncrypted then
@@ -856,6 +887,7 @@ begin
   Move(buf[20], FFreeCount, SizeOf(FFreeCount));
   Move(buf[24], FLSN, SizeOf(FLSN));
   Move(buf[28], FCreated, SizeOf(FCreated));
+  Move(buf[VDB_META_DBID], FDbId, SizeOf(FDbId));
   CheckEncryptionOnOpen(buf);
   fileLen := FStream.Size;
   if fileLen < RequiredFileSize(FPageCount) then
@@ -908,6 +940,7 @@ begin
   Move(FFreeCount, buf[20], SizeOf(FFreeCount));
   Move(FLSN, buf[24], SizeOf(FLSN));
   Move(FCreated, buf[28], SizeOf(FCreated));
+  Move(FDbId, buf[VDB_META_DBID], SizeOf(FDbId));
   if FEncrypted then
   begin
     if Length(FSalt) = VDB_ENC_SALT_LEN then
@@ -1204,11 +1237,11 @@ begin
   {$IFDEF WINDOWS}
   FGenMap := nil;
   FGenMapH := 0;
-  { v3.31: 8 -> 16 bayt. Offset 0 = gen sayaci, offset 8 = durabil LSN. }
-  if FGenStream.Size < 16 then Exit;
-  h := CreateFileMapping(FGenStream.Handle, nil, PAGE_READWRITE, 0, 16, nil);
+  { C-2: 24 bayt. Offset 0 = gen sayaci, 8 = durabil LSN, 16 = DB kimligi. }
+  if FGenStream.Size < VDB_GEN_SIZE then Exit;
+  h := CreateFileMapping(FGenStream.Handle, nil, PAGE_READWRITE, 0, VDB_GEN_SIZE, nil);
   if h = 0 then Exit;
-  p := MapViewOfFile(h, FILE_MAP_READ or FILE_MAP_WRITE, 0, 0, 16);
+  p := MapViewOfFile(h, FILE_MAP_READ or FILE_MAP_WRITE, 0, 0, VDB_GEN_SIZE);
   if p = nil then
   begin
     CloseHandle(h);
@@ -1786,7 +1819,7 @@ var
   t0: QWord;
   needUpgrade: Boolean;
   ver32: LongWord;
-  z: QWord;
+  z, storedId: QWord;
 begin
   if FStream <> nil then Exit;
   exists := FileExists(FPath);
@@ -1856,7 +1889,19 @@ begin
       FPhysSize := FStream.Size;
       FReadOnly := AReadOnly;
       if exists then
-        LoadMeta
+      begin
+        LoadMeta;
+        { C-2: eski (kimliksiz) dosyada kimlik BIR KEZ uretilip meta
+          sayfaya yazilir. Salt-okunur oturum yazmadigi icin kimlik 0
+          kalir; `.gen` dogrulamasi boyle bir dosyada durabil LSN'i
+          sifirlar (guvenli taraf). }
+        if (not AReadOnly) and (FDbId = 0) then
+        begin
+          FDbId := NewDbStoreId;
+          SaveMeta;
+          VDbFlushStream(FStream);
+        end;
+      end
       else
         begin
           SetupEncryptionForCreate;
@@ -1865,6 +1910,7 @@ begin
           FFreeCount := 0;
           FLSN := 1;
           FCreated := DateTimeToUnix(Now, False);
+          FDbId := NewDbStoreId;
           FStream.Size := RequiredFileSize(1);
           FPhysSize := FStream.Size;
           SaveMeta;
@@ -1891,10 +1937,29 @@ begin
       end;
       if FGenStream <> nil then
       begin
-        { v3.31: 8 -> 16 bayt (offset 8 = durabil LSN). Eski 8 baytlik
-          dosya buyutulur; gen sayaci korunur, durabil LSN 0'dan baslar
-          (fazladan fsync, guvenli). }
-        if FGenStream.Size < 16 then
+        { C-2: `.gen` 24 bayt: 0 gen sayaci, 8 durabil LSN, 16 DB kimligi.
+          Kimlik meta sayfadaki FDbId ile eslesmiyorsa dosya BASKA (veya
+          yeniden olusturulmus) bir veritabanina aittir: durabil LSN
+          GECERSIZDIR, kalici olarak sifirlanir. Eski 16 baytlik dosya
+          buyutulur; gen sayaci korunur, LSN sifirlanir (fazladan fsync). }
+        if FGenStream.Size >= VDB_GEN_SIZE then
+        begin
+          FSigGen := ReadGen;
+          FGenStream.Position := VDB_GEN_ID_OFF;
+          storedId := 0;
+          if FGenStream.Read(storedId, SizeOf(storedId)) <> SizeOf(storedId) then
+            storedId := 0;
+          if (FDbId = 0) or (storedId <> FDbId) then
+          begin
+            z := 0;
+            FGenStream.Position := 8;
+            FGenStream.WriteBuffer(z, 8);  { durabil LSN = 0 }
+            FGenStream.Position := VDB_GEN_ID_OFF;
+            FGenStream.WriteBuffer(FDbId, 8);
+            VDbFlushStream(FGenStream);
+          end;
+        end
+        else
         begin
           if FGenStream.Size < 8 then
           begin
@@ -1904,12 +1969,15 @@ begin
           end
           else
             FSigGen := ReadGen;
+          { v3.x: 8/16 -> 24 bayt. Uzayan bolge sifir olmali; acikca yaz. }
+          FGenStream.Size := VDB_GEN_SIZE;
           FGenStream.Position := 8;
           z := 0;
           FGenStream.WriteBuffer(z, 8);  { durabil LSN = 0 }
-        end
-        else
-          FSigGen := ReadGen;
+          FGenStream.Position := VDB_GEN_ID_OFF;
+          FGenStream.WriteBuffer(FDbId, 8);
+          VDbFlushStream(FGenStream);
+        end;
         { v3.25: sayac eslemesi (yalniz okuma hizlandirmasi). }
         MapGen;
         { v3.16: her YAZAR oturum acilisi sayaci bir kez ilerletir: acilis
@@ -3118,6 +3186,7 @@ begin
   Move(FFreeCount, Buf[20], SizeOf(FFreeCount));
   Move(FLSN, Buf[24], SizeOf(FLSN));
   Move(FCreated, Buf[28], SizeOf(FCreated));
+  Move(FDbId, Buf[VDB_META_DBID], SizeOf(FDbId));
   if FEncrypted then
   begin
     if Length(FSalt) = VDB_ENC_SALT_LEN then

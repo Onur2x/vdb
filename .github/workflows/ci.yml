@@ -59,6 +59,7 @@ jobs:
             'tests/gates/aggchk', 'tests/gates/mmchk', 'tests/gates/poolchk',
             'tests/gates/poolsafe', 'tests/gates/idxcache',
             'tests/gates/readlockchk', 'tests/gates/commitfailchk',
+            'tests/gates/genchk',
             'vdbmig', 'tests/gates/factorychk', 'tests/gates/logchk',
             'tests/gates/pitrchk', 'tests/gates/btreechk', 'tests/gates/replchk',
             'tests/gates/lockchk', 'tests/gates/snapchk', 'tests/gates/prochk',
@@ -315,6 +316,25 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'commitfailchk kalan > 0'
+            exit 1
+          }
+
+      - name: DB nesli ve FAlien kapisi (genchk)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbgenchk'
+          $out = & .\tests\gates\genchk.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'DB NESLI VE DURABIL LSN DOGRULANDI') {
+            Write-Error 'genchk C-2 bolumu basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'FALIEN CAKISMA DENETIMI DOGRULANDI') {
+            Write-Error 'genchk B-06 bolumu basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'genchk kalan > 0'
             exit 1
           }
 

@@ -1952,3 +1952,112 @@ INSERT ~%1-2 hizli (IndexOf atlamasi), SELECT medyan +%0.4. Ikisi de
 3. `FIdxDirtyGen` Int64; teorik tasma 2^63 mutasyondan sonra.
 4. R1 (`Src.Skip` omru) ve R3 (`FIdxBuildCs <-> FEngCs`) arayuz
    sozlesmesi gerektirdigi icin bu dalgada ele alinmadi.
+
+---
+
+# EK-O. P-139 — DB nesli (C-2) ve yabanci commit denetimi (B-06)
+
+Kapsam: `.gen` dosyasinin DB kimligi tasimamasi (C-2) ve
+`VerifyNoConflict` icindeki FAlien denetiminin before-image'li
+anahtarlari atlamasi (B-06). Ilk ajan teslimi B-06 icin fazla temkinli
+bir kural getirdi ve `v3sqlchk` 4b'yi kirdi; nihai surum yakalama
+nesli (CapGen) ile iki davranisi da kapsar.
+
+## EK-O.1 C-2 — kok neden
+
+`.gen` 16 baytti: 0 = degisiklik sayaci, 8 = durabil LSN. DB kimligi
+yoktu. DB dosyasi silinip ayni `.gen` korunarak yeniden olusturuldugunda
+ya da yerine baska bir DB dosyasi kondugunda eski yuksek durabil LSN
+korunuyor; `AwaitDurable`, `DurableLsn >= ALsn` kosulunu saglayip
+fsync'i ATLIYORDU. Dayaniklilik sessizce kayboluyordu.
+
+Olcum (duzeltme oncesi page store, c2probe): ilk commit dur=2, bayat
+`$B0000000` yazilir, DB silinip yeniden olusturulur -> dur=2952790016
+(bayat korunur). Duzeltilmis surumde ayni senaryoda dur=2.
+
+## EK-O.2 C-2 — duzeltme
+
+- Meta sayfa: `VDB_META_DBID = 76` (QWord). `VDB_META_KEYCHECK` 56-71 ve
+  `VDB_META_FLAGS` 72-75 alanlarindan sonra; CRC `VDB_PAGE_BODY_END`
+  kapsaminda oldugu icin kimlik de korunur.
+- `.gen`: `VDB_GEN_SIZE = 24`, `VDB_GEN_ID_OFF = 16`. MapGen 24 bayt
+  esler; 8/16 baytlik eski dosyalar acilista uzatilir ve kimlik yazilir.
+- `OpenEx`: meta kimligi ile `.gen` kimligi karsilastirilir. Kimlik 0 ya
+  da uyusmazsa durabil LSN KALICI olarak 0'lanir, guncel kimlik yazilir.
+  Eski dosya yukseltmesinde de LSN sifirlanir (guvenli taraf).
+- `NewDbStoreId`: PID + `GetTickCount64` + surec ici sayac + `RandSeed`
+  degeri. `Randomize`/`Random` CAGRILMAZ; boylece kitaplik uygulamanin
+  global rastgele dizisini degistirmez. Surec ici sayac ayni
+  milisaniyedeki iki olusturmayi ayirir.
+
+## EK-O.3 B-06 — sorun ve iki yanlis yaklasim
+
+Sorun: `VerifyNoConflict` FAlien denetimini yalniz before-image'i
+OLMAYAN anahtarlarda yapiyordu. Before-image yazma aninda (NoteBefore)
+yakalandigi icin, yabanci commit'in yazdigi AYNI deger sonradan yeniden
+yazilirsa (ABA) deger karsilastirmasi esit gorur ve commit gecer:
+yabanci yazim sessizce kaybolur. HEAD backend'inde kapida 3 FAIL
+(S1'in v1'i ezildi, ilgisiz yazimi da uygulandi).
+
+Yanlis yaklasim 1 (ilk ajan): denetimi HER anahtar icin `gen > StartGen`
+ile yapmak. Bu, yabanci commit'ten SONRA yazip yeni degeri goren oturumu
+da durdurur ve belgelenmis v3.6 "ilk commit kazanir / deger
+karsilastirmasi" semantigini bozar: `v3sqlchk` 4b 3 FAIL.
+
+Yanlis yaklasim 2: denetimi tamamen geri almak. ABA ile sessiz kaybi acik
+birakir (HEAD davranisi).
+
+## EK-O.4 B-06 — nihai duzeltme (yakalama nesli)
+
+- `TBatchRec.CapGen: Int64` — before-image'in yakalandigi andaki
+  `FCommitGen`. `NoteBefore` FEngCs altinda yazar; `CommitBatch` sayaci
+  ayni kilit altinda artirir.
+- `VerifyNoConflict`: her anahtar icin esik `CapGen` (before-image varsa)
+  ya da `StartGen` (hizli yol). `FAlien[key] > esik` ise cakisma.
+  - Yabanci commit yakalamadan SONRA -> cakisma (deger karsilastirmasi
+    cogunlukla yakalar; ABA'yi nesil kesin ayirir).
+  - Yabanci commit yakalamadan ONCE -> before-image o degeri tasir;
+    4b semantigi korunur, son yazar kazanir.
+- `alienVar := FAlien.Count > 0` bir kez hesaplanir; defter bossa anahtar
+  basina sozluk aramasi yok. Kilit sirasi degismedi.
+
+Sinir: uygulama degeri OKUYUP yazma arasina dusen yabanci commit
+(read -> NoteBefore penceresi) backend tarafindan ayirt edilemez; bunun
+icin okuma kumesi izleme gerekir (R-yeni). Yakalama nesli bu pencereyi
+kapatmaz, ama ABA dahil yakalama sonrasi her durumu kesin ayirir.
+
+## EK-O.5 Kapi ve dogrulama
+
+Yeni kapi `tests/gates/genchk.lpr` (C-2 8 + B-06 6 = 14/0), `runall.sh`
+ve CI matrisine baglandi.
+
+Negatif kanit (temiz dizin, gercek HEAD backend + yeni page store):
+
+| senaryo | HEAD backend | yeni backend |
+|---|---|---|
+| ABA: yakalama sonrasi yabanci commit | gecer (YANLIS: v1 ezildi) | cakisma |
+| 4b: yakalama oncesi yabanci commit | gecer | gecer |
+
+Tam kapı seti (taze dizin, `-B`): **31/31**, `SONUC: gecen=31 kalan=0`.
+Onemli olanlar: v3sqlchk 238/0, genchk 14/0, commitfailchk 21/0,
+crashtest 11/0, pitrchk 21/0, replchk 37/0, poolchk 17/0, poolsafe 44/0.
+
+## EK-O.6 Olcum tuzagi (ders)
+
+Ilk "HEAD de ayni 3 FAIL'i veriyor" sonucu GECERSIZDI: FPC `-Fu`
+yollarindan once CALISMA DIZININI tarar; repoda derlerken calisma
+agacindaki duzeltilmis `VDbBackendV3.pas` baglanmisti. Kaynaksiz bir cwd
++ `-Fusrc` (HEAD kopyasi once) ile yeniden derlenince HEAD 238/0 gecti ve
+hatalarin tamamen P-139'dan geldigi anlasildi. Kapi karsilastirmalarinda
+calisma dizini repo koku OLMAMALI.
+
+## EK-O.7 Acik riskler
+
+1. Salt-okunur acilista eski (kimliksiz) dosyada kimlik yazilamaz;
+   `FDbId = 0` kalir ve `.gen` dogrulamasi durabil LSN'i sifirlar
+   (guvenli taraf, yalniz fazladan fsync).
+2. Okuyup-yazma arasindaki pencerede kalan guncelleme kaybi (bkz.
+   EK-O.4 sinir) okuma kumesi izleme gerektirir; bu dalgada ele alinmadi.
+3. `.gen` 24 bayta cikti; eski dosyalar acilista otomatik yukseltilir.
+   Kimlik karsilastirmasi ozellikle ag paylasimlarinda `.gen` ile DB
+   dosyasinin birlikte kopyalanmasini gerektirir.
