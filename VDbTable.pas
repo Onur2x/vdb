@@ -350,6 +350,13 @@ type
     // B-3: FIdxDirty.IndexOf(k) dogrusal taramasi yerine son eklenen anahtar
     // onbellegi. -1 = gecersiz. Liste elemani SILINDIGINDE/CLEAR'da sifirlanir.
     FLastDirtyIdx: Int64;
+    // R2-B-4: FIdxDirty'nin nesil sayaci. Liste HER degistiginde (ekleme,
+    // silme, temizleme) artar; onbellek (anahtar, nesil) ciftiyle dogrulanir.
+    // Boylece "son anahtar hala listede" varsayimi tek bir sayaca baglanir:
+    // ileride bir silme yolu FLastDirtyIdx'i sifirlamayi unutsa bile nesil
+    // uyusmaz ve IndexOf yeniden calisir (dogruluk once gelir).
+    FIdxDirtyGen: Int64;
+    FLastDirtyGen: Int64;
     { B-02: indeks onbellegi kilitleri. KILIT SIRASI:
       FLock -> FIdxBuildCs -> FEngCs -> FIdxCs (yaprak).
       FIdxCs tutulurken FKvB / GetTable / ScanRows / FIdxBuildCs / FLock
@@ -5408,6 +5415,8 @@ begin
   FIdxCtype := TDictionary<Int64, Byte>.Create;
   FIdxUniq := TDictionary<Int64, TDictionary<string, string>>.Create;
   FIdxDirty := TList<Int64>.Create;
+  FIdxDirtyGen := 0;                        // R2-B-4: nesil sayaci
+  FLastDirtyGen := 0;                       // R2-B-4: onbellek nesli
   FIdxCs := TCriticalSection.Create;        // B-02: yaprak kilit
   FIdxBuildCs := TCriticalSection.Create;   // B-02: tembel insa kilidi
   FPkIdx := TDictionary<Word, TIdxEntries>.Create;
@@ -8302,16 +8311,24 @@ procedure TVTableDb.AddDirty(const k: Int64);
 // ilerletilir; liste elemani silen her yol RemoveDirty/ClearDirty'den
 // gectigi icin "FLastDirtyIdx daima listede VAR olan bir anahtardir"
 // degismezi yapisal olarak korunur (tek girdilik onbellek yaniltilamaz).
+// Nesil sayaci bu degismezi ayrica dogrular: onbellek yalniz (anahtar,
+// nesil) cifti guncelken kullanilir; herhangi bir liste mutasyonu nesli
+// artirir ve IndexOf yeniden calisir.
 begin
   { B-02: ayni thread'de ic ice giris serbesttir (IdxAddRow FIdxCs
     tutarken cagirir). "Yaprak" kurali BASKA kilitlerin alinmamasidir;
     kendi kendine yeniden giris degildir. }
   FIdxCs.Enter;
   try
-    if FLastDirtyIdx <> k then
+    if (FLastDirtyIdx <> k) or (FLastDirtyGen <> FIdxDirtyGen) then
     begin
-      if FIdxDirty.IndexOf(k) < 0 then FIdxDirty.Add(k);
+      if FIdxDirty.IndexOf(k) < 0 then
+      begin
+        FIdxDirty.Add(k);
+        Inc(FIdxDirtyGen);
+      end;
       FLastDirtyIdx := k;
+      FLastDirtyGen := FIdxDirtyGen;
     end;
   finally
     FIdxCs.Leave;
@@ -8327,6 +8344,7 @@ begin
     i := FIdxDirty.IndexOf(k);
     if i >= 0 then FIdxDirty.Delete(i);
     FLastDirtyIdx := -1;   // B-3: liste degisti
+    Inc(FIdxDirtyGen);     // R2-B-4: nesil dogrulamasi
   finally
     FIdxCs.Leave;
   end;
@@ -8338,6 +8356,7 @@ begin
   try
     FIdxDirty.Clear;
     FLastDirtyIdx := -1;   // B-3: liste bosaldi
+    Inc(FIdxDirtyGen);     // R2-B-4: nesil dogrulamasi
   finally
     FIdxCs.Leave;
   end;

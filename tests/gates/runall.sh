@@ -118,6 +118,7 @@ derle tests/gates/dropchk.lpr dropchk && \
     kos dropchk "TEMIZ: bozulma yok" "$WORK/dropchk" 100000 "$m"
   done
 derle tests/gates/idxchk.lpr idxchk && kos idxchk "KALICI DIZIN DOGRULANDI" "$WORK/idxchk" 50000
+derle tests/gates/idxcache.lpr idxcache && kos idxcache "INDEKS ONBELLEGI TUTARLILIGI DOGRULANDI" "$WORK/idxcache"
 derle tests/gates/backendchk.lpr backendchk && kos backendchk "BACKEND DIKISI DOGRULANDI" "$WORK/backendchk" 5000
 derle tests/gates/colmapchk.lpr colmapchk && kos colmapchk "KOLON HARITASI ONBELLEGI DOGRULANDI" "$WORK/colmapchk"
 derle tests/gates/mvchk.lpr mvchk && kos mvchk "MATERIALIZED VIEW KALICILIGI DOGRULANDI" "$WORK/mvchk"
