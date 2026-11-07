@@ -516,7 +516,7 @@ var
   pageNo, nextNo: LongWord;
   P: PVdbPage;
   d: PByte;
-  dl, got, take, steps: Integer;
+  dl, got, take, steps, cap: Integer;
   e: string;
 begin
   Result := False;
@@ -527,7 +527,9 @@ begin
     Result := True;
     Exit;
   end;
-  SetLength(Value, Len);
+  { R2-A-4: Len bozuksa (ornegin ~2 GB) tumunu on-tahsis etmek yerine
+    zincirden gercekten okunan kadar buyut; sonunda got = Len dogrulanir
+    ve eksikse deger bosaltilir. }
   got := 0;
   pageNo := FirstPage;
   if pageNo = 0 then
@@ -579,16 +581,39 @@ begin
     end;
     Move(d^, nextNo, 4);
     take := dl - 4;
-    if got + take > Len then take := Len - got;
+    { R2-A-4: sinir aritmetigi tasmasiz. got her zaman Len'i asmaz;
+      once kalan miktarla sinirla, sonra toplama yap. }
+    if take > Len - got then take := Len - got;
     if take > 0 then
+    begin
+      { Kapasiteyi ikiye katlayarak buyut (cok sayfali gercek degerlerde
+        O(n^2) yeniden ayirmayi onler); Len'i asla asma. }
+      if got + take > Length(Value) then
+      begin
+        if Length(Value) = 0 then
+          SetLength(Value, got + take)
+        else
+        begin
+          cap := Length(Value) * 2;
+          if cap < got + take then cap := got + take;
+          if cap > Len then cap := Len;
+          SetLength(Value, cap);
+        end;
+      end;
       Move((d + 4)^, Value[got], take);
+    end;
     Inc(got, take);
     FStore.Release(pageNo, False);
     pageNo := nextNo;
+    { Istenen uzunluk doldu: kalan (varsa) zincir okunmaz. }
+    if got >= Len then Break;
   end;
   Result := got = Len;
   if not Result then
+  begin
+    SetLength(Value, 0);
     FLastErr := Format('tasma eksik: %d/%d bayt', [got, Len]);
+  end;
 end;
 
 procedure TVdbHeap.FreeOverflow(FirstPage: LongWord);
@@ -909,6 +934,14 @@ begin
     Move((d + VDB_CELL_HDR)^, first, 4);
     FStore.Release(L.PageNo, False);
     Result := ReadOverflow(first, len, Value);
+    Exit;
+  end;
+  { R2-A-4: hucre uzunlugu hucre boyunu asamaz. Bozuk sayfada len'in
+    ~2 GB on-tahsis ve sayfa disi Move uretmesi yerine guvenli
+    basarisizlik (sessiz yanlis veri yok). }
+  if len > LongWord(dl - VDB_CELL_HDR) then
+  begin
+    FStore.Release(L.PageNo, False);
     Exit;
   end;
   SetLength(Value, len);
@@ -1450,7 +1483,10 @@ begin
     if PageGetCell(P, L.Slot, d, dl) and (dl >= VDB_CELL_HDR) then
     begin
       Move((d + 8)^, len, 4);
-      if ((len and VDB_OVF_FLAG) = 0) and (Integer(len) = DataLen) then
+      { R2-A-4: yerinde yazmadan once hucrenin gercek kapasitesini de
+        dogrula; bozuk len sayfa disina yazmaya yol acmaz. }
+      if ((len and VDB_OVF_FLAG) = 0) and (Integer(len) = DataLen) and
+         (DataLen <= dl - VDB_CELL_HDR) then
       begin
         if DataLen > 0 then
           Move(Data^, (d + VDB_CELL_HDR)^, DataLen);
@@ -1542,6 +1578,12 @@ begin
       FStore.Release(FDir[idx].Loc.PageNo, False);
     Exit;
   end;
+  { R2-A-4: ayni hucre-boyu sinir denetimi (bkz. ReadCellAt). }
+  if len > LongWord(dl - VDB_CELL_HDR) then
+  begin
+    FStore.Release(FDir[idx].Loc.PageNo, False);
+    Exit;
+  end;
   SetLength(Value, len);
   if len > 0 then
     Move((d + VDB_CELL_HDR)^, Value[0], len);
@@ -1603,6 +1645,8 @@ begin
           Move((d + VDB_CELL_HDR)^, ogOvf[j], 4);
           Continue;
         end;
+        { R2-A-4: bozuk len sayfa disi okumaya yol acmaz. }
+        if len > LongWord(dl - VDB_CELL_HDR) then Continue;
         SetLength(v, len);
         if len > 0 then
           Move((d + VDB_CELL_HDR)^, v[0], len);
@@ -1664,6 +1708,9 @@ begin
         end;
         { Sayfa bu dongu boyunca PINLI: isaretci dogrudan sayfa icindeki
           hucreye bakar, kopya/tahsis YOK. }
+        { R2-A-4: isaretci+uzunluk callback'e verilmeden once hucre
+          boyu denetlenir; bozuk len sayfa disina tasmaz. }
+        if len > LongWord(dl - VDB_CELL_HDR) then Continue;
         Cb(key, d + VDB_CELL_HDR, Integer(len));
       end;
     finally
@@ -1727,6 +1774,8 @@ begin
           Move((d + VDB_CELL_HDR)^, ogOvf[j], 4);
           Continue;
         end;
+        { R2-A-4: bkz. ScanAllRaw. }
+        if len > LongWord(dl - VDB_CELL_HDR) then Continue;
         Cb(key, d + VDB_CELL_HDR, Integer(len), pno);
       end;
     finally

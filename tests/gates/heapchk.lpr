@@ -598,6 +598,205 @@ begin
   end;
 end;
 
+{ ========================================= 6b) bozuk inline hucre uzunlugu }
+
+type
+  { R2-A-4: toplu tarama yollarinin bozuk hucreyi atladigini sayar. }
+  TCorruptScanSink = class
+  public
+    N: Integer;
+    BadLen: Integer;
+    MaxSeen: Integer;
+    procedure Say(Key: QWord; const Value: TBytes);
+    procedure SayRaw(Key: QWord; Data: PByte; Len: Integer);
+    procedure SayRawPaged(Key: QWord; Data: PByte; Len: Integer;
+      PageNo: LongWord);
+  end;
+
+procedure TCorruptScanSink.Say(Key: QWord; const Value: TBytes);
+begin
+  Inc(N);
+  if Length(Value) > MaxSeen then MaxSeen := Length(Value);
+  if Length(Value) > 4096 then Inc(BadLen);
+end;
+
+procedure TCorruptScanSink.SayRaw(Key: QWord; Data: PByte; Len: Integer);
+begin
+  Inc(N);
+  if Len > MaxSeen then MaxSeen := Len;
+  if Len > 4096 then Inc(BadLen);
+end;
+
+procedure TCorruptScanSink.SayRawPaged(Key: QWord; Data: PByte; Len: Integer;
+  PageNo: LongWord);
+begin
+  SayRaw(Key, Data, Len);
+end;
+
+{ R2-A-4: hucre uzunlugu alani bozulursa okuma yolu (a) sayfa disina
+  tasmamali, (b) dev on-tahsis denememeli, (c) sessiz yanlis veri
+  dondurmemeli. CRC de tazelenir: gercek "sessiz" bozulma taklit edilir. }
+procedure TestCorruptInlineLen(D: string; BadLen: LongWord; const Tag: string);
+var
+  st: TVDbPageStore;
+  hp: TVdbHeap;
+  v, got: TBytes;
+  pno, heapPage: LongWord;
+  P: PVdbPage;
+  cd: PByte;
+  dl, cellLen: Integer;
+  cellOff: PtrUInt;
+  okAfter, oom: Boolean;
+  sink: TCorruptScanSink;
+  path: string;
+begin
+  path := D + PathDelim + 'corrupt_inline.odb';
+  if FileExists(path) then DeleteFile(path);
+
+  { 1) Tek inline kayit yaz, temiz kapat. }
+  st := TVDbPageStore.Create(path, 32);
+  try
+    st.Open(True);
+    hp := TVdbHeap.Create(st);
+    try
+      hp.Open;
+      MakeVal(11, 400, 5, v);
+      if not hp.Insert(11, v) then
+      begin
+        Fail(Tag + ': 400 baytlik inline kayit eklenemedi');
+        Exit;
+      end;
+      hp.Flush(True);
+    finally
+      hp.Free;
+    end;
+    st.Close;
+  finally
+    st.Free;
+  end;
+
+  { 2) Heap sayfasini ve hucre 0'in sayfa ici ofsetini bul. }
+  heapPage := 0;
+  cellOff := 0;
+  cellLen := 0;
+  st := TVDbPageStore.Create(path, 32);
+  try
+    st.Open(False);
+    for pno := 1 to st.PageCount - 1 do
+      if st.GetPage(pno, P) then
+      begin
+        if (heapPage = 0) and (PageTypeOf(P) = VDB_PAGE_HEAP) and
+           PageGetCell(P, 0, cd, dl) then
+        begin
+          heapPage := pno;
+          cellOff := PtrUInt(cd) - PtrUInt(P);
+          cellLen := dl;
+        end;
+        st.Release(pno, False);
+      end;
+  finally
+    st.Close;
+    st.Free;
+  end;
+  if (heapPage = 0) or (cellLen < VDB_CELL_HDR) then
+  begin
+    Fail(Tag + ': heap sayfasi/hucre bulunamadi');
+    Exit;
+  end;
+
+  { 3) Diskte len alanini boz, CRC'yi tazele (sessiz bozulma). }
+  st := TVDbPageStore.Create(path, 32);
+  try
+    st.Open(False);
+    if not st.GetPage(heapPage, P) then
+    begin
+      Fail(Tag + ': bozulacak sayfa acilamadi');
+      st.Close;
+      Exit;
+    end;
+    Move(BadLen, PByte(PtrUInt(P) + cellOff + 8)^, 4);
+    PageSeal(P);
+    st.Release(heapPage, True);
+    st.Flush(True);
+    st.Close;
+  finally
+    st.Free;
+  end;
+
+  { 4) Yeniden ac: bozuk len reddedilmeli; sessiz yanlis veri YOK. }
+  st := TVDbPageStore.Create(path, 32);
+  try
+    st.Open(False);
+    hp := TVdbHeap.Create(st);
+    try
+      okAfter := False;
+      oom := False;
+      try
+        hp.Open;
+        okAfter := hp.TryGet(11, got);
+      except
+        on EOutOfMemory do
+        begin
+          Fail(Tag + ': bozuk len dev on-tahsis denedi (sinir denetimi yok)');
+          okAfter := False;
+          oom := True;
+        end;
+        on E: Exception do
+        begin
+          WriteLn(Format('        (beklenen) %s', [E.Message]));
+          okAfter := False;
+        end;
+      end;
+      if oom then
+        { tani yukarida yazildi; ek OK/Fail yok }
+      else if okAfter and ValEq(v, got) then
+        Fail(Tag + ': bozuk len dogru veri dondurdu (guard calismadi)')
+      else if okAfter then
+        Fail(Tag + ': bozuk len SESSIZCE YANLIS veri dondurdu')
+      else
+        Ok(Tag + ': bozuk len okumasi reddedildi (sinir denetimi)');
+
+      { Toplu okuma yollari da ayni hucreyi guvenle atlamali. }
+      sink := TCorruptScanSink.Create;
+      try
+        try
+          hp.ScanAll(sink.Say);
+          hp.ScanAllRaw(sink.SayRaw);
+          hp.ScanAllRawPaged(sink.SayRawPaged, nil, 0);
+        except
+          on E: Exception do
+          begin
+            Fail(Format('%s: toplu tarama istisna: %s', [Tag, E.Message]));
+            sink.BadLen := -1;
+          end;
+        end;
+        if sink.BadLen = 0 then
+        begin
+          if sink.N <> 0 then
+            Fail(Format('%s: toplu tarama bozuk hucreyi yayinladi (%d kayit)',
+              [Tag, sink.N]))
+          else
+            Ok(Tag + ': toplu tarama yollari bozuk hucreyi atladi');
+        end
+        else if sink.BadLen < 0 then
+        begin
+          { istisna yukarida raporlandi }
+        end
+        else
+          Fail(Format('%s: toplu tarama %d kayitta dev uzunluk gordu',
+            [Tag, sink.BadLen]));
+      finally
+        sink.Free;
+      end;
+    finally
+      hp.Free;
+    end;
+  finally
+    st.Close;
+    st.Free;
+  end;
+end;
+
 { ============================================================ 7) tumunu sil }
 
 procedure TestDeleteAll(D: string);
@@ -663,6 +862,8 @@ begin
   TestRandom(D, 5000, NOps, 987654321);
   TestOverflow(D);
   TestCorruptOverflow(D);
+  TestCorruptInlineLen(D, 3000, 'len=3000 (sayfa disi okuma)');
+  TestCorruptInlineLen(D, $7FFFF000, 'len=2GB (dev on-tahsis)');
   TestDeleteAll(D);
 
   WriteLn('');
