@@ -2504,3 +2504,70 @@ commit yokken 0/2000. BASE'de 0/2000 (sessiz ezme).
    eslenmis dosya + bolge kilidi yolunu kullanir ama ayrica kosulmadi.
 6. Autocommit hizli yollari (`ExecFastPointUpdate/Delete`,
    `UpdateWhere/DeleteWhere`) hala kapsam disi (EK-T.4).
+
+---
+
+# EK-W. P-148 - ayri surec okuma penceresi kapisi
+
+Kapsam: EK-U.4 risk 5. EK-U kapisi ayni surecte iki backend ornegi
+kullaniyordu; gercek ayri surec yolunu (eslenmis `.gen` dosyasi + bolge
+rezervasyon kilidi) yalnizca tasarim duzeyinde dogruluyordu. Bu ek,
+P-146 mekanizmasini iki GERCEK islemle sinar.
+
+## EK-W.1 Protokol
+
+- Ebeveyn once K1=v0 ve K2=sabit tohumlar, backend'i acar ve
+  `BeginBatch` ile yazar rezervasyonunu (`.gen` LockFileEx) tutar.
+  Cocuk surec ayni dosyayi acar; rezervasyon ebeveynde oldugu icin
+  `BeginBatch` iyimser moda duser (`Optimistic=1`, `LockHoldDepth=0`).
+- Iletisim isimli sinyallerle (dosya varligi, sabit uyku yok):
+  `cocuk_hazir` -> ebeveyn yabanci commit -> `ebeveyn_bitti` -> cocuk
+  yazar. Ebeveyn cocugu `TProcess` ile baslatir ve zaman asimiyla
+  (`HAZIR_MS=30000`, `BITTI_MS=60000`, `SUREC_MS=60000`) bekler.
+- Cocuk sonucu `cocuk_sonuc` dosyasina yazar; cikis kodlari:
+  0 basarili, 3 iyimser, 5 bekledi, 4 beklenmedi, 6 hata.
+
+## EK-W.2 Senaryolar
+
+1. `s_aba` (a): cocuk K1'i okur, sinyal verir; ebeveyn K1'i v1 yapip
+   v0'a geri commit eder (ABA). Cocuk v2 yazmayi dener -> cakisma
+   (`$0000000000000001 ... baska bir oturum tarafindan degistirildi`)
+   ve islem geri alinir. Son deger v0; sessiz guncelleme kaybi yok.
+2. `s_unrel` (b): cocuk K1'i okur; ebeveyn ILGISIZ K2'yi commit eder.
+   Global sayac nedeniyle cocuk yine konservatif cakisma alir; son
+   deger v0 (tasarim geregi abort, kayip yok).
+3. `s_pre` (c, 4b): cocuk once sinyal verir, ebeveyn commit eder,
+   cocuk SONRA okur ve yazar. Okuma yabanci commit'ten sonra oldugu
+   icin cakisma YOK; cocuk yazimi uygulanir (K1=v4).
+4. (d) Her senaryoda cocuk surec temiz kapanir (cikis 0), sonuc
+   dosyasi yazilir, sinyal dosyalari silinir; cocuk sonrasi taze
+   backend yazar kilidini serbest bulur ve commit edebilir.
+
+Kapi ciktisi: `AYRI SUREC OKUMA PENCERESI DOGRULANDI`, son satir
+`SONUC: gecen=33 kalan=0`.
+
+## EK-W.3 Negatif kanit
+
+P-146 oncesi backend kopyasi (`git show 8a7c9d3:VDbBackendV3.pas`,
+`TryGetValueEx` icermez) golge dizinde derlendi; kaynak arama sirasinda
+eski kopya once geldi (notr cwd, `-Fu` yolu). Ayni kapi:
+`gecen=27 kalan=6`; `s_aba` ve `s_unrel` cakisma yakalamaz
+(`cakisti=0 commit_ok=1`) ve K1=v2 kalir; sessiz guncelleme kaybi
+olusur. HEAD kaynaklariyla ayni kapi 33/0 gecer; dolayisiyla kontrol
+anlamli bicimde ayrisir.
+
+## EK-W.4 Kararlilik ve tam set
+
+Yeni kapi ardisik 3 kez ayni dizinde kosuldu: her seferinde
+`gecen=33 kalan=0`, FAIL yok, ayni basari dizesi. Tam set
+(`tests/gates/runall.sh <dizin> -B`): **35/35**, `kalan=0`.
+
+## EK-W.5 Acik riskler
+
+1. Kapi i386-win32 uzerinde kosar; Unix'te `.gen` sistem cagrisi ve
+   `flock` yolu ayni protokolle ayrica kosulmadi.
+2. Konservatif davranis (ilgisiz commit -> abort) EK-U.4 risk 1 ile
+   aynen gecerlidir; kapi bunu beklenen davranis olarak dogrular.
+3. Zaman asimlari sabittir; cok yavas/yuklu CI makinesinde
+   `HAZIR_MS/BITTI_MS` degerleri yetersiz kalirsa kapi hata verir
+   (sessiz gecmez).

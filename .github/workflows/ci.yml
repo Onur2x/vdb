@@ -63,7 +63,8 @@ jobs:
             'vdbmig', 'tests/gates/factorychk', 'tests/gates/logchk',
             'tests/gates/pitrchk', 'tests/gates/btreechk', 'tests/gates/replchk',
             'tests/gates/lockchk', 'tests/gates/snapchk', 'tests/gates/prochk',
-            'tests/gates/concurchk', 'tests/gates/nestidx', 'tests/gates/autoincc')
+            'tests/gates/concurchk', 'tests/gates/nestidx', 'tests/gates/autoincc',
+            'tests/gates/xprocc')
           foreach ($p in $projs) {
             $o = & $env:LAZBUILD -B "$p.lpi" 2>&1 | Out-String
             if ($LASTEXITCODE -ne 0) {
@@ -618,6 +619,28 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'nestidx kalan > 0'
+            exit 1
+          }
+
+      - name: Ayri surec okuma penceresi kapisi (xprocc)
+        shell: pwsh
+        run: |
+          # P-148: ebeveyn yazar rezervasyonunu tutarken cocuk surec
+          # iyimser okuma yapar; ebeveynin ABA commit'i (v1 -> v0) cocukta
+          # cakisma uretmelidir ve sessiz guncelleme kaybi olmamalidir.
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbxprocc'
+          $out = & .\tests\gates\xprocc.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'AYRI SUREC OKUMA PENCERESI DOGRULANDI') {
+            $tail = ($out -split "`r?`n" | Where-Object { $_.Trim() -ne '' } |
+              Select-Object -Last 25) -join ' || '
+            $tail = $tail -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+            Write-Host "::error title=xprocc::$tail"
+            Write-Error 'xprocc basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'xprocc kalan > 0'
             exit 1
           }
 

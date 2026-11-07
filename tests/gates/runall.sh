@@ -143,6 +143,7 @@ derle tests/gates/snapchk.lpr snapchk && kos snapchk "kalan=0" "$WORK/snapchk"
 derle tests/gates/prochk.lpr prochk && kos prochk "kalan=0" "$WORK/prochk"
 derle tests/gates/concurchk.lpr concurchk && kos concurchk "ESZAMANLILIK DOGRULANDI" "$WORK/concurchk"
 derle tests/gates/nestidx.lpr nestidx && kos nestidx "IC ICE INDEKS KILIDI DOGRULANDI" "$WORK/nestidx"
+derle tests/gates/xprocc.lpr xprocc && kos xprocc "AYRI SUREC OKUMA PENCERESI DOGRULANDI" "$WORK/xprocc"
 derle tests/sql/sqltest.lpr sqltest && kos sqltest "TUM SQL TESTLERI GECTI" "$WORK/sqltest" --backend=v3
 
 echo "================================"
