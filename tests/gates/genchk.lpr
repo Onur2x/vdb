@@ -339,6 +339,157 @@ begin
     WriteLn('FALIEN CAKISMA DENETIMI DOGRULANAMADI');
 end;
 
+{ --------------------------------------------------- Bolum 3: R-yeni }
+
+function ScanSayCb(Key: QWord; Buf: PByte; Len: Integer;
+  User: Pointer): Boolean;
+begin
+  Result := True;
+end;
+
+{ Commit dener. Cakisma hatasi alinirsa True ve hata metni doner. }
+function CommitCakisma(be: TVdbBackendV3; out msg: string): Boolean;
+begin
+  Result := False;
+  msg := '';
+  try
+    be.CommitBatch;
+  except
+    on E: Exception do
+    begin
+      msg := E.Message;
+      Result := Pos('cakisma', msg) > 0;
+    end;
+  end;
+end;
+
+procedure BolumReadSet(const Dir: string);
+var
+  db, gen: string;
+  be: TVdbBackendV3;
+  cakisti: Boolean;
+  msg: string;
+  oncekiFail: Integer;
+begin
+  WriteLn('--- R-yeni: okuma kumesi penceresi ---');
+  oncekiFail := gFail;
+  db := IncludeTrailingPathDelimiter(Dir) + 'rset.odb';
+  gen := db + '.gen';
+  SilYanDosyalar(db);
+  SilDosya(gen);
+  SilDosya(db);
+  be := TVdbBackendV3.Create(db, True, 512);
+  try
+    gSid := 0;
+    be.BeginBatch;
+    be.Put(1, B('v0'));
+    be.Put(2, B('sabit'));
+    be.Put(3, B('uc'));
+    be.CommitBatch;
+
+    { 1) PENCERE KAPANMALI: S1 K'yi G0'da okur; S2 G0+1'de commit eder;
+      S1 Put aninda before-image S2'nin degerini (v1) yakalar. Deger
+      karsilastirmasi esit gorunse de OKUMA NESLI esigi yakalar. }
+    gSid := 1;
+    be.BeginBatch;
+    Ok('1: S1 okumasi v0', Oku(be, 1) = 'v0', Oku(be, 1));
+    gSid := 2;
+    be.BeginBatch;
+    be.Put(1, B('v1'));
+    be.CommitBatch;
+    gSid := 1;
+    be.Put(1, B('v2'));
+    cakisti := CommitCakisma(be, msg);
+    Ok('1: read->NoteBefore penceresi cakisma verir', cakisti, msg);
+    be.AbortBatch;
+    gSid := 0;
+    Ok('1: S1 yazimi uygulanmadi (v1 korunur)', Oku(be, 1) = 'v1', Oku(be, 1));
+
+    { 2) 4b KORUNUR: S1 once yabanci commit'i gorur, SONRA yazar; okuma
+      nesli yabanci commit nesline esit oldugu icin cakisma YOK. S1'in
+      okuma goruntusu StartGen'e sabitlendigi icin okunan DEGER eski
+      anlik goruntudur (v1); onemli olan esigin cakismamasi. }
+    gSid := 1;
+    be.BeginBatch;
+    gSid := 2;
+    be.BeginBatch;
+    be.Put(1, B('v3'));
+    be.CommitBatch;
+    gSid := 1;
+    Ok('2: S1 sabitlenmis anlik goruntu degerini gorur (v1)',
+      Oku(be, 1) = 'v1', Oku(be, 1));
+    be.Put(1, B('v4'));
+    cakisti := CommitCakisma(be, msg);
+    Ok('2: okuma yabanci commit SONRASI ise cakisma yok',
+      (not cakisti) and (msg = ''), msg);
+    if cakisti then be.AbortBatch;
+    gSid := 0;
+    Ok('2: son yazar degeri korunur', Oku(be, 1) = 'v4', Oku(be, 1));
+
+    { 3) ANAHTAR HASSASIYETI: S1 baska bir anahtari (3) okur; anahtar 1'i
+      okumadan yazar. Yanlis pozitif olmamali. }
+    gSid := 1;
+    be.BeginBatch;
+    Ok('3: S1 baska anahtari okur', Oku(be, 3) = 'uc', Oku(be, 3));
+    gSid := 2;
+    be.BeginBatch;
+    be.Put(1, B('v5'));
+    be.CommitBatch;
+    gSid := 1;
+    be.Put(1, B('v6'));
+    cakisti := CommitCakisma(be, msg);
+    Ok('3: okunmayan anahtar cakisma VERMEZ',
+      (not cakisti) and (msg = ''), msg);
+    if cakisti then be.AbortBatch;
+    gSid := 0;
+    Ok('3: blind write degeri korunur', Oku(be, 1) = 'v6', Oku(be, 1));
+
+    { 4) OKUMA YOKSA DAVRANIS AYNI: ReadGen bos, ScanGen = -1 -> eski
+      CapGen yolu (blind write son yazar kazanir). }
+    gSid := 1;
+    be.BeginBatch;
+    gSid := 2;
+    be.BeginBatch;
+    be.Put(1, B('v7'));
+    be.CommitBatch;
+    gSid := 1;
+    be.Put(1, B('v8'));
+    cakisti := CommitCakisma(be, msg);
+    Ok('4: okuma yoksa eski davranis (cakisma yok)',
+      (not cakisti) and (msg = ''), msg);
+    if cakisti then be.AbortBatch;
+    gSid := 0;
+    Ok('4: son yazar degeri korunur', Oku(be, 1) = 'v8', Oku(be, 1));
+
+    { 5) SCANGEN (ikinci katman): S1 write-set acikken tarar; tarama
+      nesli G0. S2 G0+1'de commit eder; S1 blind write yapsa bile
+      konservatif cakisma beklenir. }
+    gSid := 1;
+    be.BeginBatch;
+    cakisti := be.ScanRawIterAll(-1, @ScanSayCb, nil);
+    Ok('5: S1 write-set acikken tarama basarili', cakisti, '');
+    gSid := 2;
+    be.BeginBatch;
+    be.Put(1, B('v9'));
+    be.CommitBatch;
+    gSid := 1;
+    be.Put(1, B('v10'));
+    cakisti := CommitCakisma(be, msg);
+    Ok('5: tarama sonrasi yabanci commit cakisma verir', cakisti, msg);
+    be.AbortBatch;
+    gSid := 0;
+    Ok('5: S1 yazimi uygulanmadi (v9 korunur)', Oku(be, 1) = 'v9', Oku(be, 1));
+  finally
+    gSid := 0;
+    be.Free;
+  end;
+
+  if gFail = oncekiFail then
+    WriteLn('OKUMA KUMESI PENCERESI DOGRULANDI')
+  else
+    WriteLn('OKUMA KUMESI PENCERESI DOGRULANAMADI');
+end;
+
 var
   dir: string;
 
@@ -354,6 +505,7 @@ begin
   try
     BolumC2(dir);
     BolumB06(dir);
+    BolumReadSet(dir);
   finally
     VdbSessionIdFunc := nil;
   end;

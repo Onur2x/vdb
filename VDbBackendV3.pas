@@ -39,6 +39,14 @@ const
     sonrasi replay suresini buyutur. }
   VDB_V3_CHECKPOINT_BYTES = 8 * 1024 * 1024;
 
+  { R-yeni: nokta okuma kumesi (anahtar -> son okuma nesli) ust siniri.
+    Asilinca yeni anahtar izlenmez ve VerifyNoConflict konservatif olarak
+    StartGen'e duser (pencere YINE kapanir; anahtar hassasiyeti kaybolur).
+    4096 slot ~128 KB'dir ve cache'te kalir; buyuk okuma islemlerinde
+    (100k+) haritayi sismekten boyle kacinilir. Olcum: 100k okumali tek
+    islemde ust sinir yokken +%5, 4096 ile olcum gurultusu icinde. }
+  RYENI_MAX_READS = 4096;
+
 type
   EVdbBackendV3 = class(Exception);
 
@@ -125,6 +133,34 @@ type
     function Count: Integer;
     function Capacity: Integer;
     function GetEnumerator: TVdbKvIdxEnum;
+  end;
+
+  { R-yeni: okuma kumesi slot'u. Deger 0 = BOS; dolu slotta nesil + 1
+    saklanir. Boylece ayri durum dizisi gerekmez ve her sondalama TEK
+    cache satirina dokunur (olculen ek maliyetin ana kaynagi buydu). }
+  TVdbKvGenSlot = record
+    Key: QWord;
+    Val: Int64;
+  end;
+
+  { R-yeni: okuma kumesi icin anahtar -> commit nesli haritasi. P-70
+    TVdbKvIdxMap deseninin Int64 degerli kardesidir: duz acik sondalama;
+    TDictionary'nin ~126 B/anahtar maliyeti YOK (16 B/slot, yuk <= 3/4).
+    Yalnizca acik yazma kumesi varken yapilan nokta okumalarinda kullanilir. }
+  TVdbKvGenMap = class
+  private
+    FSlots: array of TVdbKvGenSlot;
+    FCap: Integer;          // kapasite (2'nin kuvveti; 0 = tablo yok)
+    FCount: Integer;
+    procedure PutFree(Key: QWord; Val: Int64);
+    procedure Grow;
+  public
+    function TryGetValue(Key: QWord; out Value: Int64): Boolean;
+    { Anahtar varsa degerini gunceller, yoksa ekler (son okuma gecerlidir). }
+    procedure AddOrSetValue(Key: QWord; Value: Int64);
+    procedure Clear;
+    function Count: Integer;
+    function Capacity: Integer;
   end;
 
   TVdbBackendV3 = class(TInterfacedObject, IVDbBackend)
@@ -231,6 +267,18 @@ type
           oldugu durumda kaydedilir. Bu alan, "ben basladiktan sonra baska
           oturum commit etti mi" sorusunu yanitlar. }
         StartGen: Int64;
+        { R-yeni: bu oturum acikken YAPILAN nokta okumalarinin (Get/Exists)
+          anahtar -> son okuma nesli haritasi. Kendi yazimizi geri okuma
+          (Map-hit) izlenmez. Yalnizca write-set acikken dolar; islem disi
+          okuma yolunda maliyet SIFIRDIR (S = nil dallanmasi). }
+        ReadGen: TVdbKvGenMap;
+        { R-yeni: write-set acikken yapilan ilk TARAMANIN nesli; -1 = yok.
+          Tarama satir basina izlenmez, tek alanliktir (ikinci katman). }
+        ScanGen: Int64;
+        { R-yeni: okuma kumesi ust siniri asildi. True ise VerifyNoConflict
+          anahtar hassasiyetini kaybeder ve konservatif olarak StartGen'e
+          duser (pencere yine kapanir). }
+        ReadOverflow: Boolean;
         { v3.6: "artik before-image GEREKLI" bayragi. Yalnizca biz acikken
           BASKA bir oturum commit ederse True olur (o commit'ten sonra motor
           degerleri degismis olabilir). Bayrak True olana kadar satir basina
@@ -459,6 +507,11 @@ type
     { v3.4: anahtarin ILK yazimdan onceki motor degerini saklar (cakisma
       denetimi icin). }
     procedure NoteBefore(S: TWriteSet; Key: QWord);
+    { R-yeni: write-set acikken yapilan motor/snapshot nokta okumasini
+      kaydeder (FEngCs cagiran tarafindan tutulur). }
+    procedure RecordRead(S: TWriteSet; Key: QWord); inline;
+    { R-yeni: write-set acikken yapilan taramanin neslini bir kez kaydeder. }
+    procedure RecordScan(S: TWriteSet); inline;
     { v3.4: commit ONCESI cakisma denetimi. Hicbir sey uygulanmadan once
       tum anahtarlar karsilastirilir; boylece yarim uygulama olmaz. }
     procedure VerifyNoConflict(S: TWriteSet);
@@ -1434,6 +1487,96 @@ begin
   Result := TVdbKvIdxEnum.Create(Self);
 end;
 
+{ ------------------------------------------ R-yeni: okuma nesli haritasi }
+
+procedure TVdbKvGenMap.PutFree(Key: QWord; Val: Int64);
+var
+  h: LongWord;
+begin
+  h := LongWord(KvMix64(Key)) and LongWord(FCap - 1);
+  while FSlots[h].Val <> 0 do
+    h := (h + 1) and LongWord(FCap - 1);
+  FSlots[h].Key := Key;
+  FSlots[h].Val := Val;
+end;
+
+procedure TVdbKvGenMap.Grow;
+var
+  ncap, i: Integer;
+  oldSlots: array of TVdbKvGenSlot;
+begin
+  ncap := FCap * 2;
+  if ncap = 0 then ncap := 256;
+  oldSlots := FSlots;
+  FSlots := nil;
+  FCap := ncap;
+  SetLength(FSlots, ncap);
+  FCount := 0;
+  for i := 0 to High(oldSlots) do
+    if oldSlots[i].Val <> 0 then
+    begin
+      PutFree(oldSlots[i].Key, oldSlots[i].Val);
+      Inc(FCount);
+    end;
+end;
+
+function TVdbKvGenMap.TryGetValue(Key: QWord; out Value: Int64): Boolean;
+var
+  h: LongWord;
+begin
+  Result := False;
+  if FCap = 0 then Exit;
+  h := LongWord(KvMix64(Key)) and LongWord(FCap - 1);
+  while FSlots[h].Val <> 0 do
+  begin
+    if FSlots[h].Key = Key then
+    begin
+      Value := FSlots[h].Val - 1;
+      Exit(True);
+    end;
+    h := (h + 1) and LongWord(FCap - 1);
+  end;
+end;
+
+procedure TVdbKvGenMap.AddOrSetValue(Key: QWord; Value: Int64);
+var
+  h: LongWord;
+begin
+  if (FCap = 0) or (FCount * 4 >= FCap * 3) then
+    Grow;
+  Inc(Value);   // 0 rezerve: bos slot
+  h := LongWord(KvMix64(Key)) and LongWord(FCap - 1);
+  while FSlots[h].Val <> 0 do
+  begin
+    if FSlots[h].Key = Key then
+    begin
+      FSlots[h].Val := Value;
+      Exit;
+    end;
+    h := (h + 1) and LongWord(FCap - 1);
+  end;
+  FSlots[h].Key := Key;
+  FSlots[h].Val := Value;
+  Inc(FCount);
+end;
+
+procedure TVdbKvGenMap.Clear;
+begin
+  if FCount = 0 then Exit;
+  FillChar(FSlots[0], FCap * SizeOf(TVdbKvGenSlot), 0);
+  FCount := 0;
+end;
+
+function TVdbKvGenMap.Count: Integer;
+begin
+  Result := FCount;
+end;
+
+function TVdbKvGenMap.Capacity: Integer;
+begin
+  Result := FCap;
+end;
+
 { ------------------------------------------------ v3.4: oturum yazma kumesi }
 
 constructor TVdbBackendV3.TWriteSet.Create(ASession: Cardinal);
@@ -1449,6 +1592,9 @@ begin
   TagDelta := TDictionary<Integer, Int64>.Create;
   Savepoints := TList<TSavepointRec>.Create;
   StartGen := 0;
+  ReadGen := TVdbKvGenMap.Create;
+  ScanGen := -1;
+  ReadOverflow := False;
 end;
 
 destructor TVdbBackendV3.TWriteSet.Destroy;
@@ -1463,6 +1609,7 @@ begin
   Savepoints.Free;
   TagDelta.Free;
   Before.Free;
+  ReadGen.Free;
   Recs.Free;
   Order.Free;
   Map.Free;
@@ -1484,6 +1631,9 @@ begin
   Recs.Clear;
   Order.Clear;
   Map.Clear;
+  ReadGen.Clear;
+  ScanGen := -1;
+  ReadOverflow := False;
   ValLen := 0;   // ValBuf kapasitesi korunur, yalnizca uzunluk sifirlanir
   Session := ASession;
   StartGen := 0;
@@ -1518,8 +1668,10 @@ begin
   try
     { Buyuk partiler havuzda TUTULMAZ: konteyner kapasitesi kalici olarak
       sisirilmis kalmasin (200k satirlik partiden sonra bellek sismesi). }
+    { R-yeni: buyuk OKUMA kumesi de havuzda tutulmaz; aksi halde bir
+      milyonluk okuma haritasi islem sonrasi kalici olarak siserdi. }
     keep := (FSetPool <> nil) and (FSetPool.Count < 8) and
-      (S.Map.Capacity <= 16384);
+      (S.Map.Capacity <= 16384) and (S.ReadGen.Capacity <= 16384);
     if keep then
       FSetPool.Add(S);
   finally
@@ -1839,6 +1991,43 @@ begin
   RequireWritable;
 end;
 
+procedure TVdbBackendV3.RecordRead(S: TWriteSet; Key: QWord);
+var
+  rg: Int64;
+begin
+  { Yalnizca write-set ACIKKEN cagrilir; islem disi okuma yolu buraya
+    girmez. FEngCs cagiran tarafindan tutulur; FCommitGen/StartGen sabit. }
+  if S = nil then Exit;
+  { Tasma sonrasi anahtar hassasiyeti kayboldu; yeni kayit gereksiz. }
+  if S.ReadOverflow then Exit;
+  { R-yeni: gozlem NESLI. Okuma anindaki FCommitGen kaydedilir; snapshot
+    goruntusu sabitlenmis olsa bile (SnapView) islem yeni bir yabanci
+    commit'i ancak BUNDAN SONRA gelen bir nesille gorur. Boylece hedef
+    pencere (okuma -> yabanci commit -> yazma) yakalanir; yabanci commit
+    ZATEN olmusken yapilan okuma v3.6 4b semantigini bozmaz (esik alien
+    nesliyle esitlenir, deger karsilastirmasi devreye girer). }
+  rg := FCommitGen;
+  if S.ReadGen.Count >= RYENI_MAX_READS then
+  begin
+    { Ust sinir asildi: bundan sonra anahtar hassasiyeti birakilir ve
+      konservatif (StartGen) esik kullanilir. Harita buyumez. }
+    S.ReadOverflow := True;
+    Exit;
+  end;
+  S.ReadGen.AddOrSetValue(Key, rg);
+end;
+
+procedure TVdbBackendV3.RecordScan(S: TWriteSet);
+var
+  g: Int64;
+begin
+  if S = nil then Exit;
+  if S.ScanGen >= 0 then Exit;
+  { R-yeni: ilk taramanin gozlem nesli (RecordRead ile ayni gerekce). }
+  g := FCommitGen;
+  S.ScanGen := g;
+end;
+
 procedure TVdbBackendV3.NoteBefore(S: TWriteSet; Key: QWord);
 var
   rec: TBatchRec;
@@ -1875,7 +2064,8 @@ var
   same: Boolean;
   alienVar: Boolean;
   hasBefore: Boolean;
-  capGen: Int64;
+  hasRead: Boolean;
+  capGen, obsGen, rg: Int64;
 begin
   if S = nil then Exit;
   { v3.6: ne before-image ne yabanci commit varsa yapacak is yok. }
@@ -1897,7 +2087,23 @@ begin
       FEngCs cagiran (CommitBatch) tarafindan tutulur. }
     hasBefore := S.Before.TryGetValue(key, b);
     if hasBefore then capGen := b.CapGen else capGen := S.StartGen;
-    if alienVar and FAlien.TryGetValue(key, gen) and (gen > capGen) then
+    { R-yeni: esik min(CapGen, okuma nesli). Uygulama anahtari yakalama
+      anindan DAHA ESKI bir nesilde okuduysa, o arada gelen yabanci commit
+      NoteBefore'un gordugu degerle ayni olsa bile cakismadir (sessiz
+      guncelleme kaybi). ReadGen'de anahtar yoksa write-set acikken yapilan
+      tarama nesli (ScanGen) konservatif esik olur. Okuma kumesi tasmissa
+      en konservatif esik StartGen'dir. }
+    obsGen := capGen;
+    hasRead := S.ReadGen.TryGetValue(key, rg);
+    if hasRead then
+    begin
+      if rg < obsGen then obsGen := rg;
+    end
+    else if (S.ScanGen >= 0) and (S.ScanGen < obsGen) then
+      obsGen := S.ScanGen;
+    if S.ReadOverflow and (S.StartGen < obsGen) then
+      obsGen := S.StartGen;
+    if alienVar and FAlien.TryGetValue(key, gen) and (gen > obsGen) then
       raise EVdbBackendV3.CreateFmt(
         'yazma cakismasi: $%.16x baska bir oturum tarafindan degistirildi ' +
         '(islem geri alindi)', [key]);
@@ -2213,7 +2419,14 @@ begin
     { v3.15: acik islemde BASKA oturum commit ettiyse kendi anlik goruntumuz
       gecerlidir; motor degeri okunmaz. }
     if (s <> nil) and s.SnapDirty and SnapView(s, Key, pres, Value) then
+    begin
+      { R-yeni: okuma kumesi — snapshot gozlemi. }
+      RecordRead(s, Key);
       Exit(pres);
+    end;
+    { R-yeni: motor gozlemi (write-set acikken). Kendi yazimizi geri okuma
+      yukaridaki Map-hit erken donuslerindedir ve IZLENMEZ. }
+    if s <> nil then RecordRead(s, Key);
     Result := FEng.TryGet(Key, Value);
   finally
     FEngCs.Leave;
@@ -2317,8 +2530,14 @@ begin
     begin
       tmp := nil;
       if SnapView(s, Key, pres, tmp) then
+      begin
+        RecordRead(s, Key);
         Exit(pres);
+      end;
     end;
+    { R-yeni: varlik okumasi da yazma kararini etkiler; motor gozlemi
+      olarak izlenir (Map-hit erken donusleri izlenmez). }
+    if s <> nil then RecordRead(s, Key);
     Result := FEng.Contains(Key);
   finally
     FEngCs.Leave;
@@ -2395,6 +2614,9 @@ begin
     FScanFilter := TableFilter;
     { v3.9: oturumun yazma kumesi tarama boyunca sabit (kilit zaten bizde). }
     FScanSet := OwnSet;
+    { R-yeni: write-set acikken ilk taramanin nesli (satir basina maliyet
+      yok). Izin verilen ikinci katman; PK disi WHERE penceresini kapatir. }
+    RecordScan(FScanSet);
     { v3.15: snapshot gorunurlugu — motordan farkli anahtarlar bir kez
       hesaplanir (yalnizca baska oturum commit ettiyse). }
     SnapBuild(FScanSet);
@@ -2689,6 +2911,8 @@ begin
     FStreamAbort := False;
     FStreamFilter := TableFilter;
     if Length(FStreamTagBuf) < 8 then SetLength(FStreamTagBuf, 8);
+    { R-yeni: tarama nesli (ikinci katman). }
+    RecordScan(OwnSet);
     SnapBuild(OwnSet);
     FEng.ScanAllRaw(StreamCbRaw);
     if FStreamAbort then Exit(False);
@@ -2774,6 +2998,9 @@ begin
   if BatchOpen then Exit(False);
   FEngCs.Enter;
   try
+    { R-yeni: tarama nesli (ikinci katman). BatchOpen yukarida elendigi
+      icin pratikte S = nil; yine de tek noktadan kaydedilir. }
+    RecordScan(OwnSet);
     { B-01: yalniz kilit ALTINDA yaz; onceki baglami kaydet, cikista geri
       yukle. Ic tarama dis taramanin geri cagirimini/abort bayragini ezmez. }
     savedCb := FStreamPageCb;

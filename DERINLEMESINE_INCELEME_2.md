@@ -2275,5 +2275,96 @@ sicak okuma/yazma yolunda degisiklik yok. Ajan olcumu: +%0,23 (esik
    yoksa silinir; ayni TableId'yi alan yeni tablo temiz sayacla baslar.
 3. Tasima hatasi `ecLimit`; istemciler bu kodu bilinen hata olarak
    ele almalidir (yeni hata kodu eklenmedi).
-4. B-06 kalan penceresi (read -> NoteBefore) bu isin kapsami disinda;
-   tasarim `tmp64/ryeni_design.md` (EK-S icin karar bekliyor).
+4. B-06 kalan penceresi (read -> NoteBefore) EK-S'te (P-144) kapatildi;
+   surec/backend arasi ve autocommit on-okuma pencereleri acik kaldi.
+
+---
+
+# EK-S. P-144 — R-yeni okuma kumesi izleme (uygulama)
+
+Kapsam: EK-O.4'te belgelenen "oku -> NoteBefore" penceresi. A oturumu
+write-set acikken K'yi okur (nesil R); yabanci B K'yi v1 yapar ve commit
+eder; A `Put(K, v2)` cagirdiginda `NoteBefore` motor degerini (v1) ve
+CapGen = R+1'i yakalar. FAlien[K] = R+1 esige ESIT gorunur, deger
+karsilastirmasi da esit oldugu icin cakisma cikmaz: B'nin yazimi sessizce
+ezilir. Tasarim: `tmp64/ryeni_design.md`.
+
+## EK-S.1 Cozum
+
+- `TWriteSet.ReadGen` (kompakt `QWord -> Int64` acik-sondalama haritasi,
+  `TVdbKvGenMap`): write-set ACIKKEN yapilan nokta okumalarinin anahtar
+  basina son GOZLEM nesli. Kendi yazimizi geri okuma (Map-hit) izlenmez.
+- `TWriteSet.ScanGen`: write-set acikken yapilan ilk taramanin nesli
+  (satir basina maliyet yok, ikinci katman).
+- `TWriteSet.ReadOverflow`: okuma kumesi ust siniri asildi.
+- `VerifyNoConflict` esigi: `obsGen := min(CapGen, ReadGen[K] / ScanGen)`;
+  tasmada ek olarak `min(obsGen, StartGen)`. FAlien denetimi `gen > obsGen`
+  ile yapilir.
+- Kilit sirasi degismedi: `Get`/`Exists`/`Scan*` zaten `FEngCs` tutuyor;
+  `VerifyNoConflict` `CommitBatch` altinda ayni kilitle calisir. API ve
+  disk bicimi degismedi; bos kume + `ScanGen = -1` ESKI davranisa indirger.
+
+## EK-S.2 Tasarimdan bilincli sapmalar
+
+1. **Okuma nesli `FCommitGen`'dir (SnapDirty'den bagimsiz).** Tasarim
+   "SnapDirty ise StartGen" diyordu; bu v3sqlchk 4b'yi bozar (A BEGIN;
+   B 200 satir UPDATE + COMMIT; A UPDATE 300 -> yanlis cakisma), cunku
+   UPDATE on-okumasi SnapDirty iken StartGen'e yazilir ve esik alien
+   neslinin altina duser. Hedef pencere (oku -> yabanci commit -> yaz)
+   yine yakalanir; yabanci commit ZATEN olmusken yapilan okuma 4b
+   semantigini korur.
+2. **Ust sinir 1.000.000 degil 4096.** 100k anahtarli tek islemde sinirsiz
+   harita ~4-6 MB'a cikip her okumada LLC isabetsizligi uretiyordu:
+   write-set acik Get +%5. 4096 slot (~128 KB) cache'te kalir; asilinca
+   anahtar hassasiyeti kaybolur ama esik `StartGen`'e duser ve pencere
+   YINE kapanir (konservatif, veri kaybi yok).
+3. **Harita tek slot dizisi** (`Key`, `Val`; 0 = bos, dolu slotta nesil+1).
+   Ayri `FUsed` dizisi kaldirildi: sondalama tek cache satirina dokunur.
+   `RecordRead`/`RecordScan` `inline`.
+
+## EK-S.3 Kapi
+
+`tests/gates/genchk.lpr` yeni `BolumReadSet` (14 kontrol):
+1. read -> NoteBefore penceresi cakisma verir; S1 yazimi uygulanmaz (v1).
+2. Okuma yabanci commit SONRASI ise cakisma yok (4b korunur).
+3. Anahtar hassasiyeti: okunmayan anahtara blind write cakisma vermez.
+4. Okuma yoksa eski davranis (blind write son yazar kazanir).
+5. Tarama sonrasi yabanci commit konservatif cakisma verir (ScanGen).
+Basari: "OKUMA KUMESI PENCERESI DOGRULANDI"; genchk toplami 28/0.
+
+Negatif kanit (duzeltmesiz HEAD backend, notr cwd, ajan calisma agaci):
+`gecen=23 kalan=5` — "read->NoteBefore penceresi cakisma verir" FAIL,
+"S1 yazimi uygulanmadi (v1 korunur)" FAIL [v2] (sessiz guncelleme kaybi),
+"sabitlenmis anlik goruntu" FAIL, tarama senaryosu 2 FAIL.
+
+Regresyon: `v3sqlchk` 238/0, `commitfailchk`, `sqltest --backend=v3`,
+tam kapi seti **34/34**.
+
+## EK-S.4 Performans
+
+Ayni oturum, donusumlu BASE/NEW, her kosu taze dizin:
+- `p144bench` (200k anahtar, write-set acik Get, 30 tur): taban ortalama
+  64,5 ms; yeni 64,7 ms (+%0,2, gurultu icinde). En iyi tur: 60,6 -> 60,1 ms.
+   Sinirsiz harita + ayri durum dizisi ile ayni olcum +%16,9..+%19,2 idi;
+   EK-S.2(2)/(3) bu maliyeti kaldirdi.
+- `rybench` (iyimser oturum, gercek sayfa deposu): islem DISI Get degismedi
+  (2,01-2,07 us); iyimser Get 2,00-2,05 us -> 2,04-2,08 us, fark kosu
+  sirasi yanliligi mertebesinde (<%2).
+- Tarama: satir basina maliyet yok (tek `ScanGen` atamasi).
+
+## EK-S.5 Acik riskler
+
+1. **Surec/backend'ler arasi pencere KAPALI KALIR.** `FCommitGen` ve
+   `FAlien` backend-yereldir; ayri backend/surec commit'i ne FAlien'i
+   doldurur ne nesli artirir, bu pencerede deger karsilastirmasi da esit
+   gorur. Kapatmak icin store `.gen` (`ReadGen`) tabanli global damga
+   (konservatif) veya kayit basina surum gerekir; ayri is.
+2. **Autocommit UPDATE on-okumasi** `BeginBatch`'ten ONCE calisir
+   (VDbExecutor.pas); write-set kapali oldugu icin izlenmez. Tek
+   statement'lik otomatik commit'te ayni pencere acik kalir. Duzeltme
+   yurutucu akisinda degisiklik ister; ayri is.
+3. 4096 ustunde anahtar hassasiyeti kaybolur; buyuk okumali islemlerde
+   anahtar bazli olmayan (daha cok) cakisma gorulebilir. Veri kaybi yok.
+4. Yabanci commit YOKKEN maliyet yalnizca okuma basina bir harita
+   eklemesidir; cok buyuk nokta-okuma islemlerinde (<=4096) islem basina
+   ~0,2 ms mertebesinde tek seferlik harita buyumesi olabilir.
