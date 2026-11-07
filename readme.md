@@ -104,29 +104,35 @@ API details and SQL usage: [usage.md](usage.md)
 
 ## Test status
 
-Last verified state (2026-10-19):
+Last verified state (2026-11-07, `v3` backend):
 
 | Gate | Result |
 |---|---|
-| `sqltest` | 2527 / 2527 |
-| `crashtest` | 8 / 8 (zero data loss) |
-| `rawchk` | 29 / 29 |
-| `mrowchk` | 0 errors |
-| `fuzzchk` | 3000 / 3000 |
-| `sqlite_diff` | 4000 / 4000 |
-| `hashchk` | 80 / 80 |
-| `copychk` | 17 / 17 |
-| `zonechk` | 0 errors |
-| `skipchk` | 0 errors |
-| `countchk` | 120 / 120 |
+| `sqltest --backend=v3` | 2885 / 0 / 33 |
+| `genchk` | 81 / 81 |
+| `xprocc` | 33 / 33 |
+| `v3sqlchk` | 238 / 238 |
+| `concurchk` | 30 / 30 |
+| `commitfailchk` | 21 / 21 |
+| `lockchk` | 36 / 36 |
+| `autoincc` | 15 / 15 |
+| `dropchk` (modes 1-3) | 3 / 3 |
+| all other gates (24 programs) | pass |
 
-Only the `sqltest` suite remains in the repository; the other gates were
-one-off verification tools removed during cleanup. Their results are recorded
-above.
+That is **35 gate runs** in total: the 32 gate programs under `tests/gates`
+(`dropchk` runs in three modes) plus `sqltest --backend=v3`. The other gates
+are `pagechk`, `storechk`, `heapchk`, `crashtest`, `idxchk`, `idxcache`,
+`backendchk`, `colmapchk`, `skipchk`, `mvchk`, `aggchk`, `mmchk`, `poolchk`,
+`poolsafe`, `readlockchk`, `migchk`, `factorychk`, `logchk`, `pitrchk`,
+`btreechk`, `replchk`, `snapchk`, `prochk` and `nestidx`.
 
 ```bash
-lazbuild -B sqltest.lpi
-sqltest.exe C:\temp\vdbtest
+# Linux / macOS / Git Bash: build and run every gate
+tests/gates/runall.sh C:\temp\vdbgates
+
+# or run the SQL suite alone
+lazbuild -B tests/sql/sqltest.lpi
+tests/sql/sqltest.exe C:\temp\vdbtest --backend=v3
 ```
 
 ---
@@ -193,6 +199,25 @@ transaction go to the WAL; measured 63,373 → 8,252 B per commit), bulk INSERT
 1.32 µs). What is left on autocommit is the durability floor: a single fsync
 measures **0.330 ms**. File size did not change. Measurements and root causes:
 [speedtest.md](speedtest.md#9-v30-page-engine--v2-and-v3-on-the-same-scale-2026-10-25).
+
+### SQLite comparison (200,000 rows, median of 3, 2026-11-07)
+
+`tests/bench/sqlitecmp.lpr` runs VDB v3 and SQLite 3.54.0 in the same process,
+same data, same SQL, same disk. SQLite uses `journal_mode=DELETE` and
+`synchronous=FULL`; VDB uses its defaults.
+
+| Workload | VDB | SQLite | VDB/SQLite |
+|---|---:|---:|---:|
+| PK point / range SELECT | 22.2 / 30.5 us | 49.5 / 52.3 us | **0.45x / 0.58x (faster)** |
+| `COUNT(*)` | 0.05 ms | 6.23 ms | **0.002x (faster)** |
+| Autocommit PK UPDATE / DELETE | 0.52 / 0.43 ms | 1.81 / 1.80 ms | **0.29x / 0.24x (faster)** |
+| Bulk INSERT | 10.78 us/row | 0.83 us/row | 13.0x slower |
+| `SUM/AVG` / `GROUP BY` / `ORDER BY ... LIMIT` | 59.5 / 118.9 / 461.7 ms | 13.9 / 51.8 / 56.1 ms | 4.3x / 2.3x / 8.2x slower |
+| File size (200k rows) | 17.7 MB | 10.3 MB | 1.72x larger |
+
+VDB is ahead in 5 of 13 timed stages and behind in 8. Full method, per-stage
+spread and root-cause discussion:
+[speedtest.md section 10](speedtest.md#10-sqlite-comparison-after-p-144p-148-2026-11-07).
 
 ---
 

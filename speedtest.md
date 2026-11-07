@@ -430,3 +430,118 @@ A separate harness from `benchcmp`; do not mix the numbers:
 | PK read | 0.47 µs/row | 0.40 µs/row |
 | Raw scan (copying) | — | 11.3 ms |
 | Raw scan (zero-copy) | — | **9.1 ms** |
+
+## 10. SQLite comparison after P-144..P-148 (2026-11-07)
+
+A single executable, `tests/bench/sqlitecmp.lpr`, measures VDB v3 and SQLite
+3.54.0 in the **same process** with `QueryPerformanceCounter`, on the **same
+machine and disk**, using the **same deterministic data and the same statement
+order**. Nothing below is estimated; every number comes from a real run.
+
+### Method
+
+* Data: 200,000 rows, `musteri (id INTEGER PRIMARY KEY, ad TEXT, yas INTEGER,
+  bakiye FLOAT, notu TEXT)`, generated deterministically from the row number.
+* Both engines run in subdirectories of one work directory passed on the
+  command line (the program refuses to run without it).
+* SQLite: `PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;` (its honest
+  durable setting). VDB: engine defaults.
+* Every stage runs **three times**; the table reports the **median**. A
+  separate, unmeasured warmup round (plus a full unmeasured read pass over the
+  real 200k data set) runs first.
+* SQLite point statements are prepared once per stage; VDB has no prepare API,
+  so each `Exec` parses the statement. This is the engines' public interface;
+  it slightly favours SQLite on the point stages.
+* `ms` is the median duration of the **whole round workload**; `us/op` divides
+  it by the operations in that round. Single-query stages execute 5 queries per
+  round, so their `us/op` is per query.
+
+Environment: Windows 11, `i386-win32`, FPC 3.2.4, SQLite 3.54.0 (`sqlite3.dll`
+3.54.0), same physical disk. Run date 2026-11-07 21:22:45.
+
+### Results (median of three rounds)
+
+| Stage | VDB ms | SQLite ms | VDB/SQLite | VDB us/op | SQLite us/op |
+|---|---:|---:|---:|---:|---:|
+| 1. Bulk INSERT (one transaction, 200k rows) | 2155.47 | 165.86 | 13.00x slower | 10.78 | 0.83 |
+| 3. PK point SELECT (2000 keys) | 44.30 | 99.04 | 0.45x faster | 22.15 | 49.52 |
+| 4. Range SELECT `BETWEEN` (2000 queries, COUNT) | 60.94 | 104.63 | 0.58x faster | 30.47 | 52.31 |
+| 5. Full scan `COUNT(*)` | 0.05 | 31.15 | 0.002x faster | 10.60 | 6230.40 |
+| 6. `SUM(id), AVG(id)` | 297.74 | 69.58 | 4.28x slower | 59548.40 | 13916.40 |
+| 7. `GROUP BY yas` (COUNT + AVG) | 594.54 | 259.25 | 2.29x slower | 118907.80 | 51849.80 |
+| 8. `ORDER BY bakiye DESC LIMIT 100` | 2308.61 | 280.45 | 8.23x slower | 461721.40 | 56090.40 |
+| 9. Non-indexed `WHERE yas > 70` | 343.50 | 62.71 | 5.48x slower | 68700.00 | 12541.20 |
+| 10. PK point UPDATE (2000, autocommit) | 1030.70 | 3610.38 | 0.29x faster | 515.35 | 1805.19 |
+| 11. Bulk UPDATE (all 200k rows) | 1524.76 | 113.01 | 13.49x slower | 7.62 | 0.57 |
+| 12. PK point DELETE (2000, autocommit) | 857.70 | 3604.53 | 0.24x faster | 428.85 | 1802.26 |
+| 13. Bulk DELETE (20k subset per round) | 286.97 | 5.08 | 56.49x slower | 14.77 | 0.26 |
+| 14. Reopen (open + close) | 312.96 | 0.33 | 945.51x slower | 312963.00 | 331.00 |
+
+**File size on disk** (after the bulk insert, before mutations):
+
+| Engine | Total | Breakdown | Per row |
+|---|---:|---|---:|
+| VDB v3 | 17,737,534 B | `.odb` 15,540,224 + `.idx` 2,193,190 + `.wal` 4,096 | 88.69 B |
+| SQLite | 10,285,056 B | `.db` 10,285,056 + journal 0 | 51.43 B |
+
+VDB is **1.72x** larger on disk for this row shape.
+
+**Round-to-round spread** (max-min as a percentage of the median): mostly
+below 5 %. The exceptions are the deliberately tiny `COUNT(*)` (54.7 %, the
+whole round is ~50 us), bulk DELETE (40.0 % / 83.4 %), reopen (19.6 % /
+223.6 %, sub-millisecond SQLite open), and point UPDATE (12.9 %). Run-to-run,
+VDB bulk INSERT was stable at 2135-2155 ms across four runs, while SQLite
+INSERT varied between 166 and 281 ms; the table uses the low-spread run.
+
+### Same results on both engines
+
+The first measured round produced identical answers:
+
+| Check | VDB | SQLite |
+|---|---:|---:|
+| PK point SELECT rows | 2000 | 2000 |
+| Range SELECT rows | 202000 | 202000 |
+| `COUNT(*)` | 200000 | 200000 |
+| `SUM(id)` | 20000100000 | 20000100000 |
+| `GROUP BY` rows | 60 | 60 |
+| `ORDER BY` rows | 100 | 100 |
+| Non-indexed COUNT | 23331 | 23331 |
+| PK point DELETE affected | 2000 | 2000 |
+| Bulk UPDATE affected | 200000 | 200000 |
+| Bulk DELETE affected | 19427 | 19427 |
+
+### Where VDB wins and where it loses
+
+**VDB is ahead in 5 stages, behind in 8.** It wins exactly where its design
+targets point work and counters:
+
+* **PK point SELECT**: 22.15 us vs 49.52 us (0.45x), and **range SELECT**:
+  30.47 us vs 52.31 us per query (0.58x). The v3 keyspace hash plus the
+  per-table counter make these lookups cheap.
+* **`COUNT(*)`**: ~10 us vs 6.23 ms (0.002x). v3 answers a bare `COUNT(*)`
+  from its live per-table counter instead of scanning.
+* **Autocommit PK UPDATE/DELETE**: ~0.5 and ~0.43 ms/op vs ~1.80 ms/op
+  (0.29x / 0.24x). Each SQLite statement here is its own transaction with
+  `synchronous=FULL` and a rollback journal, so it pays an fsync per operation;
+  VDB's autocommit path is cheaper on this workload.
+
+**VDB is behind on bulk writes and analytical scans:**
+
+* **Bulk INSERT** 13.0x, **bulk UPDATE** 13.5x and **bulk DELETE** 56.5x
+  slower. VDB writes page images and maintains its row store and `.idx`; SQLite
+  moves compact B-tree pages. Per row the gap is 10.78 vs 0.83 us on INSERT.
+* **`SUM/AVG`** 4.3x, **`GROUP BY`** 2.3x, **non-indexed WHERE** 5.5x and
+  **`ORDER BY ... LIMIT`** 8.2x slower. These stages decode rows to text and
+  run the aggregate/sort path in the upper SQL layer; SQLite's compact row
+  format and B-tree are a better fit for full scans and sorting.
+* **Reopen** is 313 ms vs 0.33 ms. VDB loads the derived `.idx` and seeds its
+  counters at open; SQLite's open is lazy and defers schema/read work to the
+  first query. This is an architectural difference, not a like-for-like
+  lazy-open comparison.
+
+**Honest summary:** after P-144..P-148, VDB is the faster engine for point
+lookups, short range scans, `COUNT(*)` and autocommit single-row updates and
+deletes in this workload, and the slower engine for bulk write paths, full
+aggregate scans, sorting and reopen. File size is 1.72x SQLite's. The next
+targets suggested by this table are the bulk update/delete path and the
+aggregate/sort path.

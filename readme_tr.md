@@ -130,31 +130,35 @@ API ayrıntıları ve SQL kullanımı: [kullanim.md](kullanim.md)
 
 ## Test durumu
 
-Son doğrulanan durum (2026-10-25, `v3` dalı):
+Son doğrulanan durum (2026-11-07, `v3` arka ucu):
 
 | Kapı | Sonuç |
 |---|---|
-| `sqltest` (v2 motoru) | **3116 / 0 / 0** |
-| `sqltest --backend=v3` | **2347 / 0 / 52** (52 atla: v2'ye özgü yollar) |
-| `crashtest` | 11 / 11 (veri kaybı yok) |
-| `pagechk` | 21 / 21 |
-| `storechk` | 15 / 15 |
-| `heapchk` | 20 / 20 |
-| `idxchk` | 17 / 17 |
-| `backendchk` | 108 / 108 |
-| `v3sqlchk` | 131 / 131 |
-| `migchk` | 13 / 13 |
-| `factorychk` | 13 / 13 |
+| `sqltest --backend=v3` | 2885 / 0 / 33 |
+| `genchk` | 81 / 81 |
+| `xprocc` | 33 / 33 |
+| `v3sqlchk` | 238 / 238 |
+| `concurchk` | 30 / 30 |
+| `commitfailchk` | 21 / 21 |
+| `lockchk` | 36 / 36 |
+| `autoincc` | 15 / 15 |
+| `dropchk` (mod 1-3) | 3 / 3 |
+| diğer kapılar (24 program) | geçti |
 
-`atlanan=52` sessiz yeşil değildir: yalnız v2 motorunun veri dosyası / WAL /
-arşiv / SAVEPOINT yollarını kullanan testler sayılır ve raporlanır. v3'te de
-koşan beş test (PK'siz tablo, UNIQUE indeks, RBAC kalıcılığı, RLS kalıcılığı,
-GENERATED/IDENTITY, `SHOW STATS`) 2026-10-25'te bu listeye taşındı.
+Bu toplam **35 kapı koşusudur**: `tests/gates` altındaki 32 kapı programı
+(`dropchk` üç modda koşar) ve `sqltest --backend=v3`. Diğer kapılar:
+`pagechk`, `storechk`, `heapchk`, `crashtest`, `idxchk`, `idxcache`,
+`backendchk`, `colmapchk`, `skipchk`, `mvchk`, `aggchk`, `mmchk`, `poolchk`,
+`poolsafe`, `readlockchk`, `migchk`, `factorychk`, `logchk`, `pitrchk`,
+`btreechk`, `replchk`, `snapchk`, `prochk` ve `nestidx`.
 
 ```bash
-lazbuild -B sqltest.lpi
-sqltest.exe C:\temp\vdbtest                  # v2 motoru
-sqltest.exe C:\temp\vdbtest --backend=v3     # v3 sayfa motoru
+# Linux / macOS / Git Bash: tüm kapıları derle ve koş
+tests/gates/runall.sh C:\temp\vdbgates
+
+# yalnız SQL paketi
+lazbuild -B tests/sql/sqltest.lpi
+tests/sql/sqltest.exe C:\temp\vdbtest --backend=v3
 ```
 
 ---
@@ -222,6 +226,25 @@ sayfalar; ölçülen WAL hacmi 63.373 → 8.252 B/commit), toplu INSERT
 **0,330 ms** ölçüldü. Dosya boyutu değişmedi.
 Kök nedenler ve tüm ölçümler:
 [hiztesti.md](hiztesti.md#9-v30-sayfa-motoru--aynı-tartıda-v2-karşılaştırması-2026-10-25).
+
+### SQLite karşılaştırması (200.000 satır, 3 turun medyanı, 2026-11-07)
+
+`tests/bench/sqlitecmp.lpr` VDB v3 ile SQLite 3.54.0'ı aynı süreçte, aynı
+veriyle, aynı SQL ile ve aynı diskte koşar. SQLite
+`journal_mode=DELETE` ve `synchronous=FULL` kullanır; VDB varsayılanları.
+
+| İş yükü | VDB | SQLite | VDB/SQLite |
+|---|---:|---:|---:|
+| PK nokta / aralık SELECT | 22,2 / 30,5 us | 49,5 / 52,3 us | **0,45x / 0,58x (hızlı)** |
+| `COUNT(*)` | 0,05 ms | 6,23 ms | **0,002x (hızlı)** |
+| Autocommit PK UPDATE / DELETE | 0,52 / 0,43 ms | 1,81 / 1,80 ms | **0,29x / 0,24x (hızlı)** |
+| Toplu INSERT | 10,78 us/satır | 0,83 us/satır | 13,0x yavaş |
+| `SUM/AVG` / `GROUP BY` / `ORDER BY ... LIMIT` | 59,5 / 118,9 / 461,7 ms | 13,9 / 51,8 / 56,1 ms | 4,3x / 2,3x / 8,2x yavaş |
+| Dosya boyu (200k satır) | 17,7 MB | 10,3 MB | 1,72x büyük |
+
+VDB ölçülen 13 aşamadan 5'inde önde, 8'inde geride. Tam yöntem, aşama
+yayılımları ve kök nedenler:
+[hiztesti.md bölüm 53](hiztesti.md#53-p-144p-148-sonrası-sqlite-karşılaştırması-07112026).
 
 ---
 

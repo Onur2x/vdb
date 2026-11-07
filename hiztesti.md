@@ -2704,3 +2704,117 @@ saglandi. Ayni tam sayi degeri tekrarlayan is yuklerinde (id=k=y gibi)
 etkili.
 
 Dogrulama: sqltest 3287/0/0, wherenull TEMIZ, chainnull TEMİZ.
+
+## 53. P-144..P-148 sonrası SQLite karşılaştırması (07.11.2026)
+
+Bu bölüm, speedtest.md bölüm 10'un Türkçe karşılığıdır. Tek bir çalıştırılabilir
+dosya, `tests/bench/sqlitecmp.lpr`, VDB v3 ile SQLite 3.54.0'ı **aynı süreçte**,
+`QueryPerformanceCounter` ile, **aynı makinede ve aynı diskte**, **aynı
+deterministik veri ve aynı cümle sırası** ile ölçer. Aşağıdaki değerlerin
+tamamı gerçek koşudan gelir; tahmin yoktur.
+
+### Yöntem
+
+* Veri: 200.000 satır, `musteri (id INTEGER PRIMARY KEY, ad TEXT, yas INTEGER,
+  bakiye FLOAT, notu TEXT)`, satır numarasından deterministik üretilir.
+* İki motor da komut satırında verilen tek bir çalışma dizininin alt
+  dizinlerinde koşar (program argümansız çalışmaz).
+* SQLite: `PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;` (dürüst
+  dayanıklılık ayarı). VDB: motor varsayılanları.
+* Her aşama **üç kez** koşar; tabloda **medyan** verilir. Önce ayrı ve
+  ölçülmeyen bir ısınma turu, ardından gerçek 200k veri üzerinde tam bir
+  ölçülmeyen okuma turu çalışır.
+* SQLite nokta cümleleri aşama başına bir kez hazırlanır; VDB'de prepare
+  arabirimi yoktur, her `Exec` cümleyi ayrıştırır. Bu, motorların kamusal
+  arabirimidir ve nokta aşamalarında SQLite'ı bir miktar kayırır.
+* `ms`, **tüm tur iş yükünün** medyan süresidir; `us/op` bunu turdaki işlem
+  sayısına böler. Tek sorguluk aşamalarda tur başına 5 sorgu koşar, yani
+  `us/op` sorgu başınadır.
+
+Ortam: Windows 11, `i386-win32`, FPC 3.2.4, SQLite 3.54.0 (`sqlite3.dll`
+3.54.0), aynı fiziksel disk. Koşu tarihi 07.11.2026 21:22:45.
+
+### Sonuçlar (üç turun medyanı)
+
+| Aşama | VDB ms | SQLite ms | VDB/SQLite | VDB us/op | SQLite us/op |
+|---|---:|---:|---:|---:|---:|
+| 1. Toplu INSERT (tek transaction, 200k satır) | 2155.47 | 165.86 | 13.00x yavaş | 10.78 | 0.83 |
+| 3. PK nokta SELECT (2000 anahtar) | 44.30 | 99.04 | 0.45x hızlı | 22.15 | 49.52 |
+| 4. Aralık SELECT `BETWEEN` (2000 sorgu, COUNT) | 60.94 | 104.63 | 0.58x hızlı | 30.47 | 52.31 |
+| 5. Tam tarama `COUNT(*)` | 0.05 | 31.15 | 0.002x hızlı | 10.60 | 6230.40 |
+| 6. `SUM(id), AVG(id)` | 297.74 | 69.58 | 4.28x yavaş | 59548.40 | 13916.40 |
+| 7. `GROUP BY yas` (COUNT + AVG) | 594.54 | 259.25 | 2.29x yavaş | 118907.80 | 51849.80 |
+| 8. `ORDER BY bakiye DESC LIMIT 100` | 2308.61 | 280.45 | 8.23x yavaş | 461721.40 | 56090.40 |
+| 9. İndekssiz `WHERE yas > 70` | 343.50 | 62.71 | 5.48x yavaş | 68700.00 | 12541.20 |
+| 10. PK nokta UPDATE (2000, autocommit) | 1030.70 | 3610.38 | 0.29x hızlı | 515.35 | 1805.19 |
+| 11. Toplu UPDATE (200k satırın tamamı) | 1524.76 | 113.01 | 13.49x yavaş | 7.62 | 0.57 |
+| 12. PK nokta DELETE (2000, autocommit) | 857.70 | 3604.53 | 0.24x hızlı | 428.85 | 1802.26 |
+| 13. Toplu DELETE (tur başına 20k alt küme) | 286.97 | 5.08 | 56.49x yavaş | 14.77 | 0.26 |
+| 14. Yeniden açma (open + close) | 312.96 | 0.33 | 945.51x yavaş | 312963.00 | 331.00 |
+
+**Diskteki dosya boyu** (toplu INSERT sonrası, mutasyonlardan önce):
+
+| Motor | Toplam | Döküm | Satır başına |
+|---|---:|---|---:|
+| VDB v3 | 17.737.534 B | `.odb` 15.540.224 + `.idx` 2.193.190 + `.wal` 4.096 | 88.69 B |
+| SQLite | 10.285.056 B | `.db` 10.285.056 + journal 0 | 51.43 B |
+
+Bu satır biçimi için VDB diskte **1.72x** daha büyük.
+
+**Tur içi yayılım** (maks-min, medyana yüzde): çoğu aşama %5'in altında.
+İstisnalar: kasıtlı olarak çok küçük olan `COUNT(*)` (%54.7, tüm tur ~50 us),
+toplu DELETE (%40.0 / %83.4), yeniden açma (%19.6 / %223.6, milisaniye altı
+SQLite açılışı) ve nokta UPDATE (%12.9). Koşular arasında VDB toplu INSERT
+dört koşuda 2135-2155 ms ile kararlıydı; SQLite INSERT 166-281 ms arasında
+değişti; tablo düşük yayılımlı koşuyu kullanır.
+
+### İki motorda aynı sonuçlar
+
+İlk ölçülen tur aynı yanıtları üretti:
+
+| Kontrol | VDB | SQLite |
+|---|---:|---:|
+| PK nokta SELECT satırı | 2000 | 2000 |
+| Aralık SELECT satırı | 202000 | 202000 |
+| `COUNT(*)` | 200000 | 200000 |
+| `SUM(id)` | 20000100000 | 20000100000 |
+| `GROUP BY` satırı | 60 | 60 |
+| `ORDER BY` satırı | 100 | 100 |
+| İndekssiz COUNT | 23331 | 23331 |
+| PK nokta DELETE etkilenen | 2000 | 2000 |
+| Toplu UPDATE etkilenen | 200000 | 200000 |
+| Toplu DELETE etkilenen | 19427 | 19427 |
+
+### VDB nerede önde, nerede geride
+
+**VDB 5 aşamada önde, 8 aşamada geride.** Tam olarak nokta işi ve sayaçlar
+için tasarlandığı yerlerde kazanıyor:
+
+* **PK nokta SELECT**: 22.15 us / 49.52 us (0.45x) ve **aralık SELECT**:
+  sorgu başına 30.47 us / 52.31 us (0.58x). v3 anahtar uzayı hash'i ve tablo
+  başına sayaç bu aramaları ucuzlatır.
+* **`COUNT(*)`**: ~10 us / 6.23 ms (0.002x). v3 çıplak `COUNT(*)`'i canlı
+  tablo sayacından yanıtlar, tarama yapmaz.
+* **Autocommit PK UPDATE/DELETE**: işlem başına ~0.5 ve ~0.43 ms / ~1.80 ms
+  (0.29x / 0.24x). SQLite'ta buradaki her cümle kendi transaction'ıdır;
+  `synchronous=FULL` ve rollback journal ile işlem başına fsync öder. VDB'nin
+  autocommit yolu bu iş yükünde daha ucuzdur.
+
+**VDB toplu yazma ve analitik taramalarda geride:**
+
+* **Toplu INSERT** 13.0x, **toplu UPDATE** 13.5x, **toplu DELETE** 56.5x
+  yavaş. VDB sayfa imajları yazar, satır deposunu ve `.idx`'i korur; SQLite
+  kompakt B-tree sayfaları taşır. INSERT'te satır başına fark 10.78 us / 0.83 us.
+* **`SUM/AVG`** 4.3x, **`GROUP BY`** 2.3x, **indekssiz WHERE** 5.5x ve
+  **`ORDER BY ... LIMIT`** 8.2x yavaş. Bu aşamalar satırları metne çözer ve
+  üst SQL katmanında aggregate/sıralama yolunu kullanır; SQLite'ın kompakt
+  satır biçimi ve B-tree'si tam tarama ile sıralamaya daha uygundur.
+* **Yeniden açma** 313 ms / 0.33 ms. VDB türetilmiş `.idx`'i yükler ve
+  sayaçlarını doldurur; SQLite'ın açılışı tembeldir ve şema/okuma işini ilk
+  sorguya bırakır. Bu, elmayla elma bir karşılaştırma değil, mimari farktır.
+
+**Dürüst özet:** P-144..P-148 sonrasında bu iş yükünde VDB nokta aramalarında,
+kısa aralık taramalarında, `COUNT(*)`'ta ve autocommit tek satır UPDATE/DELETE
+işlemlerinde daha hızlı; toplu yazma yollarında, tam tarama aggregate'lerinde,
+sıralamada ve yeniden açmada daha yavaş. Dosya boyu SQLite'ın 1.72 katı. Tabloya
+göre sonraki hedefler toplu update/delete yolu ile aggregate/sıralama yoludur.
