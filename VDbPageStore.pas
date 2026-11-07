@@ -337,6 +337,14 @@ type
       atlanir (bkz. FExclusiveAccess). Varsayilan False. }
     property ExclusiveAccess: Boolean read FExclusiveAccess write FExclusiveAccess;
 
+    { Test/teshis: VDbSync kilit defterinde bu depo handle'i icin tutulan
+      kilit var mi? Hicbir kilidi degistirmez. B-07 hata yolu sizinti
+      kapisi bunu kullanir. }
+    function LockBookProbe(out AShared: Boolean): Boolean;
+    { Test/teshis: acik yazma islemi rezervasyon derinligi (FHoldDepth).
+      Artirma/azaltma 1:1 olmalidir; kapanista sifirlanir. }
+    property LockHoldDepth: Integer read FHoldDepth;
+
     { v3.16: surecler arasi cok yazarlilik.
       Giris: paylasimli kilit birakilir, tam kilit ABusyMs boyunca denenir,
       alininca meta imgasi karsilastirilir ve gerekirse onbellek tazelenir.
@@ -698,6 +706,9 @@ begin
   FIterations := VDB_ENC_ITER;
   { v3.16: kilit durumu. }
   FWriteDepth := 0;
+  FReadDepth := 0;
+  { B-05: rezervasyon derinligi de nesne olusturulurken sifirdir. }
+  FHoldDepth := 0;
   FLockedShared := False;
   FLockedExcl := False;
   FAutoWrite := False;
@@ -1491,6 +1502,15 @@ begin
   Result := FWriteDepth > 0;
 end;
 
+function TVDbPageStore.LockBookProbe(out AShared: Boolean): Boolean;
+begin
+  { B-07 test: depo handle'i icin VDbSync defterinde tutulan kilit var mi?
+    Yalnizca defter okunur; OS kilidi alinmaz/birakilmaz. }
+  AShared := False;
+  if FStream = nil then Exit(False);
+  Result := VDbLockHeld(FStream, AShared);
+end;
+
 procedure TVDbPageStore.ReleaseWrite;
 var
   t0: QWord;
@@ -1550,6 +1570,8 @@ end;
   basindaki tazeleme islem sonuna kadar gecerlidir (kayip guncelleme
   riski BU dilimde ARTMAZ). }
 procedure TVDbPageStore.AcquireWriteHold;
+var
+  gotHold: Boolean;
 begin
   if FStream = nil then
     raise EVdbPageStore.Create('kapali veritabani: yazma kilidi alinamaz');
@@ -1573,17 +1595,24 @@ begin
         'yazar rezervasyonu kurulamadi: degisiklik sayaci yok: ' + FPath);
     LockReserve;
     FReserved := True;
+    gotHold := False;
     try
       { v3.21: rezervasyon bizdeyken baska bir yazar commit edemez; nesil
         degismediyse tam kilit turu gereksiz (bkz. TryAcquireWriteHold). }
       if ReadGen <> FSigGen then
         RefreshUnderExclusive;
-    except
-      UnlockGen;
-      FReserved := False;
-      raise;
+      { B-05: derinlik YALNIZ rezervasyon basariyla kurulduktan sonra
+        artar; artirma ile rezervasyon 1:1 kalir. }
+      FHoldDepth := 1;
+      gotHold := True;
+    finally
+      { Istisna FHoldDepth := 1 oncesine duserse rezervasyon sizmaz. }
+      if not gotHold then
+      begin
+        UnlockGen;
+        FReserved := False;
+      end;
     end;
-    FHoldDepth := 1;
   finally
     LeaveCriticalSection(FWriteCs);
   end;
@@ -1615,6 +1644,8 @@ end;
   cagiran iyimser moda gecer (NeedBefore + BeginDeferRefresh) ve commit
   aninda rezervasyonu bekler. }
 function TVDbPageStore.TryAcquireWriteHold: Boolean;
+var
+  gotHold: Boolean;
 begin
   Result := False;
   if FStream = nil then Exit;
@@ -1635,6 +1666,7 @@ begin
     if FGenStream = nil then Exit;
     if not VDbLockGenReserve(FGenStream) then Exit;
     FReserved := True;
+    gotHold := False;
     try
       { v3.21: rezervasyon bizdeyken baska bir yazar COMMIT EDEMEZ (.gen
         neslini yalniz yazar artirir). Nesil degismediyse tam kilit turu
@@ -1642,13 +1674,17 @@ begin
         cagrisi) gereksizdir; olculen kazanc ~10 us/commit. }
       if ReadGen <> FSigGen then
         RefreshUnderExclusive;
-    except
-      UnlockGen;
-      FReserved := False;
-      raise;
+      { B-05: derinlik YALNIZ rezervasyon kurulduktan sonra artar. }
+      FHoldDepth := 1;
+      Result := True;
+      gotHold := True;
+    finally
+      if not gotHold then
+      begin
+        UnlockGen;
+        FReserved := False;
+      end;
     end;
-    FHoldDepth := 1;
-    Result := True;
   finally
     LeaveCriticalSection(FWriteCs);
   end;
@@ -1948,6 +1984,10 @@ begin
       FLockedShared := False;
       FLockedExcl := False;
       FWriteDepth := 0;
+      { B-05: tutulan rezervasyon derinligi kapanista kalmasin. Aksi
+        halde yeniden acilan ayni nesnede FHoldDepth > 0 gorulup
+        rezervasyon ALINMADAN yazma yoluna girilir (sayac sizintisi). }
+      FHoldDepth := 0;
     end;
   finally
     DropCache;
@@ -1970,6 +2010,8 @@ begin
   FLockedShared := False;
   FLockedExcl := False;
   FWriteDepth := 0;
+  { B-05: bkz. Close - kapanistan sonra derinlik sifir olmali. }
+  FHoldDepth := 0;
   FMetaDirty := False;
   DropCache;
 end;
@@ -2056,40 +2098,44 @@ var
 begin
   tries := 0;
   selfShared := False;
-  repeat
-    ok := True;
-    err := '';
-    try
-      FStream.Position := Pos;
-      FStream.ReadBuffer(Buf, Len);
-    except
-      on E: Exception do
-      begin
-        ok := False;
-        err := E.Message;
+  { B-07: gecici paylasimli kilit HER cikista birakilir. Once temizlik
+    yalniz basari yolundaydi; hata raise'i bu blogu atliyor ve veri
+    akisinda SH kilit sizintisi birakiyordu (sonraki tam kilit yukseltmesi
+    kilitlenebilir, kilit defterinde sahte "Shared" kaydi kalirdi). }
+  try
+    repeat
+      ok := True;
+      err := '';
+      try
+        FStream.Position := Pos;
+        FStream.ReadBuffer(Buf, Len);
+      except
+        on E: Exception do
+        begin
+          ok := False;
+          err := E.Message;
+        end;
       end;
-    end;
-    if ok then Break;
-    Inc(tries);
-    if (tries <= 8) and ((not FLockedExcl) and (not FLockedShared)) then
-    begin
-      { Kilidi al (yazar bitene kadar bekler), sonra tekrar dene. }
-      if TakeSharedLock then
+      if ok then Break;
+      Inc(tries);
+      if (tries <= 8) and ((not FLockedExcl) and (not FLockedShared)) then
       begin
-        selfShared := True;
-        Continue;
+        { Kilidi al (yazar bitene kadar bekler), sonra tekrar dene. }
+        if TakeSharedLock then
+        begin
+          selfShared := True;
+          Continue;
+        end;
       end;
-    end;
-    raise EVdbPageStore.Create(Format(
-      'sayfa %d okunamadi (konum %d, dosya boyu %d, mantiksal sayfa %d,' +
-      ' kilit paylasimli=%d tam=%d, deneme %d): %s',
-      [PageNo, Pos, FStream.Size, FPageCount, Ord(FLockedShared),
-       Ord(FLockedExcl), tries, err]));
-  until False;
-  if selfShared then
-  begin
-    VDbUnlockStream(FStream);
-    selfShared := False;
+      raise EVdbPageStore.Create(Format(
+        'sayfa %d okunamadi (konum %d, dosya boyu %d, mantiksal sayfa %d,' +
+        ' kilit paylasimli=%d tam=%d, deneme %d): %s',
+        [PageNo, Pos, FStream.Size, FPageCount, Ord(FLockedShared),
+         Ord(FLockedExcl), tries, err]));
+    until False;
+  finally
+    if selfShared then
+      VDbUnlockStream(FStream);
   end;
 end;
 
