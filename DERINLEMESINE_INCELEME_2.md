@@ -1849,3 +1849,106 @@ atama ile deger donusumu kullanildi.
 3. GROUP BY/pencerede cikti tip tespiti planin kolon tipine (`Ctx.Ct` /
    `P.Col`) baglidir; ifade tabanli aggregate'ler eski Double yolunda kalir
    (kapsam disi).
+
+---
+
+# EK-N. P-138 / P-140 — havuz sahipligi, FSize siniri ve indeks onbellegi
+
+Kapsam: bagimsiz inceleme R2-B-5 (havuzda sahiplik izleme), R2-B-6
+(tek surecte FSize siniri) ve R2-B-4 (indeks kirli onbellegi).
+Uc kalem de dar kapsamli tutuldu: yeni alan + mevcut kilit bloklari
+icinde mutasyon; kilit hiyerarsisi (FLock -> FConcCs -> FIdxBuildCs ->
+FEngCs -> FIdxCs) degismedi.
+
+## EK-N.1 P-138 — R2-B-5: havuz sahipligi
+
+Kok neden: poolchk'in ortaya cikardigi iki sizinti.
+
+1. `Release` cagrisi herhangi bir TVSql icin calisiyordu; yabanci bir
+   nesne (ya da ayni nesne ikinci kez) verildiginde `FOut` yanlis
+   azaliyor, havuz "bos" sanip yeni baglanti acabiliyordu.
+2. xproc modunda islem sonunda slot/mutex birakma sirasi tutarsizdi:
+   hata yolunda mutex tutulmusken slot birakilabiliyordu.
+
+Duzeltme:
+- Tek alan `FMySlot: Integer` — Acquire basarili oldugunda is parcaciginin
+  slotunu kaydeder. Sira: `FMutex.Enter` -> `AcquireSlot` -> (xproc ise)
+  `OpenEngine`. Hata yolunda ters sira: `ReleaseSlot` -> `FMutex.Leave`.
+- `Acquire` sahiplik haritasina `FOwners[TVSql] = GetCurrentThreadId`
+  yazar. `Release` once `FOwners.TryGetValue` ile sahipligi dogrular;
+  sahibi degilse ya da kayit yoksa hicbir sayaci degistirmeden cikar.
+- Temizlik kosulu artik `DoCleanup := Owned and (OutCount = 0) and
+  ((FShm = nil) or (FMySlot > 0))`. xproc modunda mutex tum islem
+  boyunca tutuldugu icin `OutCount > 1` olamaz; tek surec modunda
+  `DoCleanup` cagrisi no-op'tur (asagidaki `CloseEngine` degisikligi).
+
+`Release(nil)`: ayni dogrulama `nil` icin de calisir ve sessizce cikar.
+Uretim kodunda `Release(nil)` cagiran yok; yalniz poolchk/poolsafe
+testleri bu sozlesmeyi sinar.
+
+## EK-N.2 P-138 — R2-B-6: tek surecte FSize siniri
+
+Eski davranis: tek surec modunda FSize yalniz xproc paylasimli karsi
+tarafindan uygulaniyordu; ayni surecte eszamanli `Acquire` sinirsiz
+TVSql uretebiliyordu.
+
+Duzeltme:
+- `OpenEngine` yalniz `FShm <> nil` iken cagrilir (xproc).
+- `CloseEngine` basa `if FShm = nil then Exit;` aldi; tek surecte FTb
+  korunur, `DoCleanup` zararsiz.
+- Tek surec yolu: `Deadline := VdbTickMs + FTimeoutMs`. Her turda FLock
+  altinda `if FOut < FSize` ise yeni TVSql verilir; degilse
+  `FAvail.WaitFor(min(WaitMs, 10))` ile beklenir (uyandirma kaybina
+  karsi 10 ms dilim), sonra timeout kontrolu; asilirsa `ecPoolTimeout`.
+- `Release` basarili oldugunda `FAvail.SetEvent` ile bekleyenleri uyandirir.
+
+## EK-N.3 P-140 — R2-B-4: indeks kirli onbellegi nesli
+
+Kok neden: `AddDirty` icindeki tek girdilik onbellek (`FLastDirtyIdx`)
+yalniz anahtar karsilastirmasiyla dogrulaniyordu. Ayni anahtar silinip
+yeniden eklendiginde (ya da liste tamamen temizlendiginde) onbellek
+bayat kalabiliyor ve `FIdxDirty.IndexOf` atlanarak kirlilik isareti
+kayboluyordu. Bugun `RemoveDirty`/`ClearDirty` `FLastDirtyIdx`
+sifirlamadigi icin bu yol tetiklenmiyor; ama sozlesme sessiz bir
+kayma noktasiydi.
+
+Duzeltme: nesil sayaci.
+- `FIdxDirtyGen: Int64` her liste mutasyonunda (`AddDirty` ekleme yolu,
+  `RemoveDirty`, `ClearDirty`) artar.
+- `FLastDirtyGen: Int64` onbellegin gordugu nesli tutar. Onbellek yalniz
+  `(FLastDirtyIdx = k) and (FLastDirtyGen = FIdxDirtyGen)` iken kullanilir;
+  aksi halde `IndexOf` yeniden calisir ve yeni anahtar eklenirse
+  `FIdxDirtyGen` bir kez daha artar.
+
+Grep ile dogrulandi: `FIdxDirty` mutasyonlari yalniz bu uc prosedurde.
+
+## EK-N.4 Kapilar
+
+| kapi | sonuc |
+|---|---|
+| poolsafe (tek surec + xproc) | 44/0, TEMIZ |
+| idxcache (4 thread + DROP/CREATE) | 28/0, TEMIZ |
+| poolchk | gecti |
+| idxchk | 19/0 |
+| concurchk | 30/0 |
+| btreechk | 30/0 |
+| lockchk | 36/0 |
+
+Yeni kapilar `runall.sh` ve CI matrisine baglandi. Ayni commit'te
+`idxcache` bagimsiz olarak iki taze dizinde calistirildi.
+
+## EK-N.5 Performans
+
+INSERT ~%1-2 hizli (IndexOf atlamasi), SELECT medyan +%0.4. Ikisi de
+%2 esiginin altinda; geri alma gerekmedi.
+
+## EK-N.6 Acik riskler
+
+1. `FMySlot` tek alan: ayni VDbPool nesnesine ic ice iki Acquire
+   (reentrant) cagrisi olursa ikinci cagri ilk sahiplik kaydini ezer.
+   Reentrant kullanim sozlesmede yok; ayrica korunmuyor.
+2. Tek surec FSize beklemesi 10 ms dilimlidir; `FAvail.SetEvent` kacarsa
+   bir dilim gecikme olur, dogruluk etkilenmez.
+3. `FIdxDirtyGen` Int64; teorik tasma 2^63 mutasyondan sonra.
+4. R1 (`Src.Skip` omru) ve R3 (`FIdxBuildCs <-> FEngCs`) arayuz
+   sozlesmesi gerektirdigi icin bu dalgada ele alinmadi.
