@@ -1759,3 +1759,93 @@ Windows adimlari) baglandi. Her biri taze dizinde tek tek kosuldu
    cagirana commit hatasi olarak doner.
 3. `MMReallocMem` hata yolunda bellek sizdirmez ama cagiranin `P` ile eski
    blogu kullanmaya devam etmesi beklenir (Delphi sozlesmesi).
+
+---
+
+# EK-M. P-137 — D-Y1/Y2: SUM/AVG hassasiyeti (uygulama kaydi)
+
+Kaynak: EK-H.3 acik kalem (D-Y1/D-Y2). Tek kaynak dosya: `VDbExecutor.pas`.
+
+## EK-M.1 Kok neden
+
+Tum aggregate yollari toplami `Double` uzerinde biriktiriyordu. `Int64`
+degerler 2^53'u astiginda tek tek temsil edilemedigi icin toplam sessizce
+kayiyordu:
+
+- `SUM(v)` = 18014398509481986 -> eski cikti `1.8014398509482E16`
+  (son basamaklar kayip).
+- `AVG` ayni sekilde yaklasik; 2000 satirlik 1e15 olcekli ornekte sonuc
+  `0.5` yerine `0` cikabiliyordu.
+
+Hata sinifi: sessiz sayisal bozulma (veri kaybi degil, yanlis sonuc).
+
+## EK-M.2 Duzeltme
+
+**VCT_INT.** Birikim `SumI: Int64` uzerinde yapilir (`VDbAggAccInt`).
+Isaretli tasma `SumI > High(Int64) - V` / `SumI < Low(Int64) - V` ile
+onceden yakalanir; baslarsa `Ovf := True` ve kalan toplam `SumF: Double`
+uzerinde (eski davranis) surdurulur. Ozel istisna uretilmez; mevcut
+hata/float sozlesmesi korunur.
+
+**Cikti.** `SUM`: `Ovf = False` ise `IntToStr(SumI)` (kucuk degerlerde
+`VDbFloatToStr` ile birebir ayni: `30`, `-5`, `0`); tasmada
+`VDbFloatToStr(SumF)`.
+
+**AVG.** Toplam Int64 ise tam toplam kullanilir. `|SumI| <= 2^53` iken
+dogrudan bolum; ustunde `q := SumI div Cnt` sonrasi
+`q + (SumI - q*Cnt)/Cnt` ile Double'a kayipsiz yakin aktarim. Cikti yine
+FLOAT metin bicimi (`VDbFloatToStr`), yani sozlesme degismedi.
+
+**VCT_FLOAT.** `Double` birikim + Kahan telafisi (`VDbAggAccFloat`).
+`1000 x 0.1` toplami naif yolda 99.9999999999986 iken Kahan ile tam 100.
+Ondalik bicim degismedi. FLOAT disi/ifade tabanli yollar eski Double
+yolunda kalir.
+
+**FPC tuzagi.** `Double(Int64)` bit-cast oldugu icin yalnizca `* 1.0` ve
+atama ile deger donusumu kullanildi.
+
+**Duzeltilen hesap noktalari.**
+1. Genel yol `EvalAggregateValue` (HAVING/DISTINCT/FILTER dahil).
+2. Pencere (window) aggregate yolu.
+3. Hizli akis `TryStreamAgg` / `TAggPlan` / `VdbAggRawCb` + paralel worker
+   sifirlama ve birlestirme.
+4. Paralel merge yolu (Int64 tasma ve karisik Double durumlari).
+5. JOIN aggregate: `TJaPlan` / `AccOne` / `TryJoinAgg`.
+6. Stream GROUP BY: `NewGroup` sifirlama / `VdbStreamGroupCb` /
+   `AggPlanValue`.
+
+## EK-M.3 Dogrulama
+
+- Yeni kapi `tests/gates/aggchk.lpr` (16/0): 2^53 ustu Int64 SUM, hizli
+  ve genel yol esitligi, GROUP BY (g=1 iki satir 18014398509481986, g=2
+  9007199254740994, g=3 karisik isaret 2), pencere SUM, 2000 satirlik AVG
+  = 0.5, kucuk veri AVG=20/SUM=60, FLOAT 1000x0.1 -> SUM=100 AVG=0.1
+  (Kahan), basit FLOAT 7/2.333..., JOIN SUM 18014398509481986.
+- Baseline karsilastirmasi: HEAD ayni SUM icin
+  `1.8014398509482E16`, yeni surum `18014398509481986`.
+- Entegre tam kapi seti taze dizinde (`runall.sh tmp64/p137full/gates -B`):
+  **28/28 GECTI**, `sqltest --backend=v3` dahil. Mevcut sqltest
+  beklentileriyle uyumlu.
+
+## EK-M.4 Performans
+
+5 esli kosu, taze veri dizinleri (base = HEAD, cur = yeni):
+
+| senaryo | base | cur | fark |
+|---|---|---|---|
+| sumavg | 18824 us | 19074 us | +%1.33 (medyan +28 us, +%0.15) |
+| groupby | 107103 us | 106035 us | ~-%1.0 |
+| where (genel yol) | 966164 us | 868510 us | ~-%10 |
+
+%2 sinirini asan gerileme yok; geri alma gerekmedi.
+
+## EK-M.5 Acik riskler
+
+1. Int64 tasmasi baslarsa tamlik kaybolur ve eski Double davranisina
+   dusulur; bu bilincli ve eski sozlesmeyle uyumlu. Cok buyuk karisik
+   isaretli toplamlar yine yaklasik olabilir.
+2. AVG bolum+kalan teknigi toplam cok buyukken tek ulp mertebesinde goreli
+   hata verir; 1e15 olcekli testte sonuc tam.
+3. GROUP BY/pencerede cikti tip tespiti planin kolon tipine (`Ctx.Ct` /
+   `P.Col`) baglidir; ifade tabanli aggregate'ler eski Double yolunda kalir
+   (kapsam disi).
