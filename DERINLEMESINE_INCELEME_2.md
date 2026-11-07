@@ -1547,10 +1547,10 @@ kenara alinarak yapildi (stash), ardindan geri yuklendi. C-16 su an
 
 | # | Bulgu | Karar |
 |---|---|---|
-| R1 | `Src.Skip` odunc omru: okuyucu yinelerken baska yol listeyi degistirip serbest birakabilir | **ERTELENDI** — kalici cozum referans sayimi/kopya; EK-I.4 |
+| R1 | `Src.Skip` odunc omru: okuyucu yinelerken baska yol listeyi degistirip serbest birakabilir | **DUZELTILDI** — P-141 referans sayimi; EK-Q |
 | R2 | `PollConcurrentIndexes` kilitsiz defter (cift `Free`) | **DUZELTILDI** — P-129 `FConcCs` |
-| R3 | `FIdxBuildCs` <-> `FEngCs` ters cevrilmesi (ic ice akis alt sorgusu) | **ERTELENDI** — bugun planlayici insayi `FEngCs` disinda yapiyor; yeni ic ice insa noktasi eklenirse risk |
-| R4 | `RestoreSchemaSnapshot` baska oturumun AutoInc'ini ezme | **ERTELENDI** — DDL/DML `FLock` yazma ile serilesiyor; oturum bazli sayac ayri is |
+| R3 | `FIdxBuildCs` <-> `FEngCs` ters cevrilmesi (ic ice akis alt sorgusu) | **DUZELTILDI** — P-142 `EngineGateHeld`; EK-P |
+| R4 | `RestoreSchemaSnapshot` baska oturumun AutoInc'ini ezme | **DUZELTILDI** — P-143 monoton max birlesimi; EK-R |
 | R5 | `Destroy`'ta `FBatchSet` temizlenmemesi | **DUZELTILDI** — kapanista `FBatchSet := nil; FBatchSetSid := 0` |
 | R6 | "`FIdxCs` yaprak degil yinelemeli" metin celiskisi | **DUZELTILDI** — kod yorumu + belge: ayni thread'de ic ice giris serbest, "yaprak" baska kilitlerin alinmamasidir |
 | R7 | `PollConcurrentIndexes` FIdxCs altinda agir is | **KISMEN** — UNIQUE haritasi icin liste kopyasi `FIdxCs` altinda kaliyor (bellek ici, O(n)); skip/siralama/flush zaten kilit disinda |
@@ -1560,11 +1560,14 @@ kenara alinarak yapildi (stash), ardindan geri yuklendi. C-16 su an
 1. **R1 `Src.Skip` yasam suresi.** Skip listesine referans sayimi eklemek
    veya okuyucuya kopya vermek `TryGetIdxSource` sozlesmesini ve tum
    cagiranlari degistirir; tek noktada guvenli yapilamaz.
+   (Cozuldu: P-141, EK-Q — `TIdxSource.Keep` ile cagiranlar degismeden.)
 2. **R3 ic ice insa kilidi.** `FEngCs` tutulurken `FIdxBuildCs` alinmasini
    engellemek icin gate derinligine `TVTableDb`'den erisim (arayuz
    genisletmesi) gerekir; planlayici bugun bunu tetiklemiyor.
+   (Cozuldu: P-142, EK-P — `IVDbBackend.EngineGateHeld` eklendi.)
 3. **R4 oturum bazli AutoInc.** `FAutoInc` su an tablo basina tek sayac;
    oturum ayrimi kalici bicim/sema degisikligi ister.
+   (Cozuldu: P-143, EK-R — bicim degisikligi olmadan monoton max birlesimi.)
 
 # EK-J — C-1/C-3/C-16 uygulama kaydi (2026-11-07)
 
