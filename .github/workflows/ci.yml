@@ -56,6 +56,8 @@ jobs:
             'tests/gates/heapchk', 'tests/gates/crashtest', 'tests/gates/idxchk',
             'tests/gates/backendchk', 'tests/gates/v3sqlchk', 'tests/gates/migchk',
             'tests/gates/colmapchk', 'tests/gates/mvchk',
+            'tests/gates/mmchk', 'tests/gates/poolchk',
+            'tests/gates/readlockchk', 'tests/gates/commitfailchk',
             'vdbmig', 'tests/gates/factorychk', 'tests/gates/logchk',
             'tests/gates/pitrchk', 'tests/gates/btreechk', 'tests/gates/replchk',
             'tests/gates/lockchk', 'tests/gates/snapchk', 'tests/gates/prochk',
@@ -208,6 +210,65 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'mvchk kalan > 0'
+            exit 1
+          }
+
+      - name: Bellek yoneticisi sozlesmesi kapisi (mmchk)
+        shell: pwsh
+        run: |
+          $out = & .\tests\gates\mmchk.exe 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'MM SOZLESMESI DOGRULANDI') {
+            Write-Error 'mmchk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'mmchk kalan > 0'
+            exit 1
+          }
+
+      - name: Havuz hata yolu kapisi (poolchk)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbpoolchk'
+          $out = & .\tests\gates\poolchk.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'HAVUZ HATA YOLU DOGRULANDI') {
+            Write-Error 'poolchk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'poolchk kalan > 0'
+            exit 1
+          }
+
+      - name: Okuma kilidi sizintisi kapisi (readlockchk)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbreadlockchk'
+          $out = & .\tests\gates\readlockchk.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'OKUMA KILIDI SIZINTISI YOK') {
+            Write-Error 'readlockchk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'readlockchk kalan > 0'
+            exit 1
+          }
+
+      - name: Commit hata yollari kapisi (commitfailchk)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbcommitfailchk'
+          $out = & .\tests\gates\commitfailchk.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'COMMIT HATA YOLLARI DOGRULANDI') {
+            Write-Error 'commitfailchk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'commitfailchk kalan > 0'
             exit 1
           }
 
