@@ -34,7 +34,7 @@ unit VDbPageWal;
 interface
 
 uses
-  SysUtils, Classes, VDbPage, VDbCrc32, VDbSync, VDbPageCrypto;
+  SysUtils, Classes, SyncObjs, VDbPage, VDbCrc32, VDbSync, VDbPageCrypto;
 
 const
   VDB_WAL_MAGIC       = $334C5756;   // 'VWL3'
@@ -167,6 +167,24 @@ type
       konum kullanmaz ve DOSYA duzeyinde calisir, yani ikinci handle ile
       yapilan fsync birinci handle'in yazdiklarini da diske indirir. }
     FSyncStream: TFileStream;
+    { R2-C-3 (kalan): GRUP COMMIT'te fsync Commit icinde yapilmaz; kayitlar
+      Commit(False) ile yazilir, fsync sonradan SyncDurable'da cekilir.
+      fsync basarisiz olursa istemci commit'i BASARISIZ gorur ama kayitlar
+      dosyada kalirsa kurtarma onlari "hayalet commit" olarak uygular.
+      Bu yuzden son BASARILI durabilite noktasindan sonra yazilmis ilk
+      commit'in dosya konumu isaretlenir; SyncDurable hatasinda oraya geri
+      kirpilir. FUnsyncedBaseValid=False iken isaret yoktur.
+      FWrittenLsn'e DOKUNULMAZ: R2-C-YENI-1 geregi yalniz ileri gider; geri
+      cekmek eszamanli bekleyenlerin AwaitDurable erken cikisina (yanlis
+      basarili commit) yol acardi. }
+    FUnsyncedStartPos: Int64;
+    FUnsyncedBaseValid: Boolean;
+    FSyncFault: Boolean;   // R2-C-3 test kancasi
+    { R2-C-3: WAL yazimi ile geri kirpma ayni anda calismamali. fsync'in
+      kendisi (FSyncStream) kilit DISINDA yapilir; grup commit'in amaci
+      fsync sirasinda baska thread'lerin yazabilmesidir. Bu kilit yalniz
+      FStream uzerindeki yazim/kesme islemlerini siralar. }
+    FWriteCs: TCriticalSection;
     { R2-C-YENI-2: dogrulanmis/verilmis veritabani kimligi. Ilk Open'da
       turetilir ve oturum boyunca onbellekte kalir (Refresh sicak yoldur;
       her tazelemede veri dosyasini yeniden acmak istemeyiz). }
@@ -239,6 +257,9 @@ type
     procedure SyncDurable;
     { FIILEN yazilmis son LSN (0 = WAL'de yazilmis kayit yok). }
     property WrittenLsn: LongWord read FWrittenLsn;
+    { R2-C-3 test kancasi: True iken fsync yerine hata verilir. Yalniz
+      kapi/test kodu kullanir; normal akista daima False. }
+    procedure DebugSetSyncFault(AValue: Boolean);
     { v3.31: WAL basligindaki checkpoint LSN'i. Veri dosyasi bu LSN'e kadar
       guncel; onbellek bunun gerisindeyse tam tazeleme (DropCache) gerekir. }
     property HeaderLsn: LongWord read FHeaderLsn;
@@ -550,6 +571,10 @@ begin
   FWrittenBytes := 0;
   FScanPos := 0;
   FScanHdrLsn := 0;
+  FUnsyncedStartPos := 0;
+  FUnsyncedBaseValid := False;
+  FSyncFault := False;
+  FWriteCs := TCriticalSection.Create;
 end;
 
 procedure TVdbPageWal.SetEncryptionKey(const AKey, ASalt: TBytes);
@@ -570,6 +595,7 @@ begin
   except
     { yikici hata firlatmaz }
   end;
+  FWriteCs.Free;
   inherited Destroy;
 end;
 
@@ -579,6 +605,9 @@ var
 begin
   if FStream <> nil then Exit;
   FReadOnlyMode := AReadOnly;
+  { R2-C-3: yeni gorunumde onceki nesnenin isaretli bolgesi devralinmaz. }
+  FUnsyncedBaseValid := False;
+  FUnsyncedStartPos := 0;
   hasFile := False;
   if FileExists(FPath) then
   begin
@@ -816,9 +845,15 @@ begin
   BufHashClear;   // P-71
 end;
 
+procedure TVdbPageWal.DebugSetSyncFault(AValue: Boolean);
+begin
+  FSyncFault := AValue;
+end;
+
 procedure TVdbPageWal.SyncDurable;
 var
   S: TFileStream;
+  capPos: Int64;
 begin
   { v3.19 GRUP COMMIT: kayitlar zaten yazildi (Commit(False)); burada yalniz
     isletim sisteminin tamponlari diske indirilir. Tek lider cagirir.
@@ -832,14 +867,77 @@ begin
       onayi olurdu. Yazilabilir WAL'de bu kanal Open'da kurulur; yoklugu
       gercek bir hatadir. }
     raise EVdbWal.Create('WAL fsync kanali yok (durabilite dogrulanamaz)');
-  VDbFlushStream(S);
+  { R2-C-3: fsync'in KAPSADIGI son konum. Bu ana kadar tamamlanmis
+    yazimlar fsync baslamadan once disk onbellegine girmistir; sirasinda
+    yazilanlar garanti degildir. }
+  FWriteCs.Enter;
+  try
+    capPos := FWrittenBytes;
+  finally
+    FWriteCs.Leave;
+  end;
+  try
+    if FSyncFault then
+      raise EVdbWal.Create('WAL fsync hatasi (test kancasi)')
+    else
+      VDbFlushStream(S);
+  except
+    { R2-C-3 (kalan): fsync basarisiz -> istemci commit'i BASARISIZ goruyor,
+      ama kayitlar dosyada. Kurtarma bunlari "hayalet commit" olarak
+      uygulardi. Son basarili durabilite noktasindan sonra yazilan TUM
+      bolumu geri kirp. Eszamanli yazimlar da bu bolgeye dahildir; motor
+      FSyncErr'i kalici oldugundan onlarin cagiranlari da hata alir.
+      FWrittenLsn GERI CEKILMEZ (R2-C-YENI-1): eszamanli bekleyen bir
+      AwaitDurable erken cikip basarisiz commit'i basarili sanmamali. }
+    FWriteCs.Enter;
+    try
+      if FUnsyncedBaseValid then
+      begin
+        try
+          FStream.Size := FUnsyncedStartPos;
+          FStream.Seek(0, soEnd);
+          FWrittenBytes := FUnsyncedStartPos;
+          FAtEnd := True;
+          { Geriye yalniz baslik kaldiysa govde de bos demektir. }
+          if FUnsyncedStartPos <= VDB_PAGE_SIZE then
+            FHasContent := False;
+          FUnsyncedBaseValid := False;
+        except
+          { En iyi caba; asil fsync hatasini maskeleme. Isaret korunur ki
+            sonraki deneme kirpmayi yeniden denesin. }
+        end;
+      end;
+    finally
+      FWriteCs.Leave;
+    end;
+    raise;
+  end;
+  { Basarili fsync: capPos'a kadar durabil. Daha SONRA yazilan kayitlar
+    varsa isaret oradan (ya da daha yeni bir isaret varsa o noktadan)
+    devam eder. ONEMLI: var olan isaret capPos'tan YENIYSE geri cekilmez;
+    aksi halde sonraki bir fsync hatasi, bu kez BASARILI raporlanmis bir
+    commit'i de geri kirparak sessiz veri kaybina yol acardi. }
+  FWriteCs.Enter;
+  try
+    if FWrittenBytes > capPos then
+    begin
+      if (not FUnsyncedBaseValid) or (FUnsyncedStartPos < capPos) then
+        FUnsyncedStartPos := capPos;
+      FUnsyncedBaseValid := True;
+    end
+    else
+      FUnsyncedBaseValid := False;
+  finally
+    FWriteCs.Leave;
+  end;
 end;
 
 function TVdbPageWal.Commit(DoSync: Boolean; LSN: LongWord): Boolean;
 var
   i, total, off, payLen: Integer;
   magic, zero, crc: LongWord;
-  startPos: Int64;
+  startPos, writeEnd: Int64;
+  baseSet: Boolean;
 begin
   Result := False;
   if FStream = nil then
@@ -854,11 +952,6 @@ begin
   total := FBufferCount * (VDB_WAL_REC_HDR + payLen) + VDB_WAL_REC_HDR;
   if Length(FOutBuf) < total then
     SetLength(FOutBuf, total + 8192);
-  { P-57: konum zaten sondaysa Seek atlaniyor. Tek surecli modda Commit
-    sonrasi konum sondadir; Refresh/Recover/ReadHeader disaridan gelir. }
-  if not FAtEnd then
-    FStream.Seek(0, soEnd);
-  startPos := FStream.Position;   // R2-C-3: geri kirpma noktasi
   off := 0;
   magic := VDB_WAL_REC_FRAME;
   zero := 0;
@@ -886,25 +979,50 @@ begin
   crc := WalCrc(FOutBuf[off], 16, FOutBuf[off], 0);
   Move(crc, FOutBuf[off + 16], 4);
   Inc(off, VDB_WAL_REC_HDR);
+  baseSet := False;
+  FWriteCs.Enter;
   try
-    FStream.WriteBuffer(FOutBuf[0], off);
-  except
-    { R2-C-3 artigi: yazim yarida kaldiysa dosyada kesik/bayat bir kuyruk
-      kalir. Sonraki commit onun ARDINA eklenir; kurtarma kesik kayitta
-      durdugu icin SONRAKI commit'ler de gorunmez olurdu (sessiz kayip).
-      Bu commit'e ait bolumu geri kirp; tampon korunur (cagiran tekrar
-      deneyebilir). }
-    try
-      FStream.Size := startPos;
+    { P-57: konum zaten sondaysa Seek atlaniyor. Tek surecli modda Commit
+      sonrasi konum sondadir; Refresh/Recover/ReadHeader disaridan gelir. }
+    if not FAtEnd then
       FStream.Seek(0, soEnd);
-      FAtEnd := True;
-    except
-      { En iyi caba; asil hatayi maskeleme. }
+    startPos := FStream.Position;   // R2-C-3: geri kirpma noktasi
+    { R2-C-3 (kalan): grup commit (DoSync=False) yolunda fsync sonradan
+      SyncDurable'da yapilir. Son basarili durabilite noktasindan sonraki
+      ILK yazimin basini isaretle; fsync hatasinda oraya geri kirpilir. }
+    if (not DoSync) and (not FUnsyncedBaseValid) then
+    begin
+      FUnsyncedStartPos := startPos;
+      FUnsyncedBaseValid := True;
+      baseSet := True;
     end;
-    raise;
+    try
+      FStream.WriteBuffer(FOutBuf[0], off);
+    except
+      { R2-C-3 artigi: yazim yarida kaldiysa dosyada kesik/bayat bir kuyruk
+        kalir. Sonraki commit onun ARDINA eklenir; kurtarma kesik kayitta
+        durdugu icin SONRAKI commit'ler de gorunmez olurdu (sessiz kayip).
+        Bu commit'e ait bolumu geri kirp; tampon korunur (cagiran tekrar
+        deneyebilir). }
+      try
+        FStream.Size := startPos;
+        FStream.Seek(0, soEnd);
+        FWrittenBytes := startPos;
+        FAtEnd := True;
+      except
+        { En iyi caba; asil hatayi maskeleme. }
+      end;
+      { Yalniz BU commit icin konulan isaret geri alinir; daha onceki
+        durabil olmayan bolgenin isareti korunur. }
+      if baseSet then FUnsyncedBaseValid := False;
+      raise;
+    end;
+    FAtEnd := True;   // P-57: konum artik dosya sonunda
+    Inc(FWrittenBytes, off);   // P-61: boyut sayaci
+    writeEnd := FWrittenBytes;
+  finally
+    FWriteCs.Leave;
   end;
-  FAtEnd := True;   // P-57: konum artik dosya sonunda
-  Inc(FWrittenBytes, off);   // P-61: boyut sayaci
   { Cok buyuk islemlerden sonra tamponu birak: aksi halde WAL nesnesi omru
     boyunca onlarca MB tutulur. Normal commit'lerde tampon yeniden kullanilir. }
   if Length(FOutBuf) > 4 * 1024 * 1024 then
@@ -912,7 +1030,10 @@ begin
   if DoSync then
   begin
     try
-      VDbFlushStream(FStream);
+      if FSyncFault then
+        raise EVdbWal.Create('WAL fsync hatasi (test kancasi)')
+      else
+        VDbFlushStream(FStream);
     except
       { C-14: kayitlar WriteBuffer ile dosyaya zaten yazildi. Tampon
         durumunu temizle ki yeniden deneme ayni kayitlari ikinci kez
@@ -924,16 +1045,44 @@ begin
         kalan tam commit kaydi kurtarmada "hayalet commit" olarak uygulanirdi.
         Bu commit'e ait yazilan bolumu geri kirp (tek yazar varsayimi: WAL'e
         yazim dis kilit/mutex ile serilestirilir). }
+      FWriteCs.Enter;
       try
-        FStream.Size := startPos;
-        FStream.Seek(0, soEnd);
-        Dec(FWrittenBytes, off);
-        FAtEnd := True;
-      except
-        { Kirpma da basarisizsa ASIL hatayi maskeleme; FSyncErr kalici
-          oldugu icin sonraki commit'ler de hata verir. }
+        try
+          FStream.Size := startPos;
+          FStream.Seek(0, soEnd);
+          FWrittenBytes := startPos;
+          FAtEnd := True;
+          { Eszamanli bir yazarin isareti bu kesme noktasinin OTESINDEYSE
+            o bolge de silindi; isaret gecersizdir (aksi halde sonraki
+            geri kirpma dosyayi sifirla uzatirdi). }
+          if FUnsyncedBaseValid and (FUnsyncedStartPos > startPos) then
+            FUnsyncedBaseValid := False;
+        except
+          { Kirpma da basarisizsa ASIL hatayi maskeleme; FSyncErr kalici
+            oldugu icin sonraki commit'ler de hata verir. }
+        end;
+      finally
+        FWriteCs.Leave;
       end;
       raise;
+    end;
+    { R2-C-3: fsync BASARILI. writeEnd'e kadar olan her sey durabil; bu
+      noktaya kadarki isaret temizlenir. fsync SIRASINDA baska thread'in
+      yazdigi kayitlar (FWrittenBytes > writeEnd) garanti kapsaminda
+      degildir: onlar icin isaret writeEnd'den baslatilir. Var olan isaret
+      writeEnd'den YENIYSE korunur (bkz. SyncDurable ayni kural). }
+    FWriteCs.Enter;
+    try
+      if FWrittenBytes > writeEnd then
+      begin
+        if (not FUnsyncedBaseValid) or (FUnsyncedStartPos < writeEnd) then
+          FUnsyncedStartPos := writeEnd;
+        FUnsyncedBaseValid := True;
+      end
+      else
+        FUnsyncedBaseValid := False;
+    finally
+      FWriteCs.Leave;
     end;
   end;
   FBufferCount := 0;
@@ -1286,6 +1435,9 @@ begin
   { Yalniz GUVENLI budama yolunda bekleyen tampon atilir (zaten diske
     yazildi; asagida govde silinip baslik yeniden yazilacak). }
   FBufferCount := 0;
+  { R2-C-3: govde silinip fsync edilecegi icin bekleyen durabilite
+    isareti anlamsizlasir. }
+  FUnsyncedBaseValid := False;
   BufHashClear;   // P-71
   FLSN := CheckpointLSN;
   FHeaderLsn := CheckpointLSN;

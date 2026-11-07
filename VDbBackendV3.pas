@@ -287,6 +287,9 @@ type
       FLog: TVdbChangeLog;
       FLogInGroup: Boolean;
       FLogProblem: string;
+      { R2-C-2: C-6 istisna yolunda birincil commit hatasinin yaninda
+        olusan ikincil durabilite (fsync) hatasi. Bos = sorun yok. }
+      FLastCommitProblem: string;
       FLogBaseSeq: Int64;
       { v4 replikasyon: uygulama penceresinde yerel gunluge yazim kapali. }
       FLogSuspended: Boolean;
@@ -596,6 +599,11 @@ type
     procedure SetAutoCompactMinBytes(AValue: Int64);
     function GetAutoCompactCount: Int64;
     function GetLastAutoCompactError: string;
+    { R2-C-2: son CommitBatch'te olusan commit/durabilite sorunlari.
+      Bos = son commit temiz. Birlesik hata metni yukari da firlatilir;
+      bu erisim, istisnayi yakalayan ust katmanin yarim durumu
+      raporlayabilmesi icindir. }
+    function GetLastCommitProblem: string;
     function AutoCompact(out OldBytes, NewBytes: Int64;
       MaxDeadRatio: Double; MinBytes: Int64): Boolean;
     { v4: gunluk / PITR }
@@ -2985,6 +2993,7 @@ var
   { C-6: commit yolunda yakalanan istisna; kilitler birakilip durabilite
     beklendikten SONRA yeniden yukseltilir. }
   pendExc, tmpExc: TObject;
+  msg: string;
 {$IFDEF CPUPROF}
   p0, p1, p2, p3, p4, p5, p6, p7, p8, p9: Int64;
 {$ENDIF}
@@ -3019,6 +3028,9 @@ begin
     dosyanin baska surecler icin kapanmasi). }
   try
   FEngCs.Enter;
+  { R2-C-2: yeni commit denemesi onceki teshis metnini temizler. FEngCs
+    altinda yazilir; GetLastCommitProblem de ayni kilit altinda okur. }
+  FLastCommitProblem := '';
   { v3.18: VERI kilidi YALNIZ bu pencerede (uygulama + motor commit).
     Islem boyunca tutulan sey yalniz YAZAR REZERVASYONUDUR; bu yuzden
     uzun bir islem okuyuculari bloklamaz (olculdu: 2 sn'lik islem
@@ -3146,14 +3158,45 @@ begin
     try
       FEng.AwaitDurable(syncLsn);
     except
-      { Asil commit hatasi varsa o korunur; ikincil AwaitDurable hatasi
-        serbest birakilir. }
+      { R2-C-2: ikincil AwaitDurable (fsync) hatasi ARTIK YUTULMAZ.
+        ONCEDEN `tmpExc.Free` ile sessizce atiliyordu: istemci yalniz
+        gunluk hatasini gorup "veri WAL'de durabil" sanabilirdi; oysa fsync
+        yapilmamistir ve cokmede onayli veri kaybolabilir. Iki hata da
+        birlesik metinle yukari tasinir ve FLastCommitProblem'de saklanir. }
       if pendExc = nil then
-        pendExc := TObject(AcquireExceptionObject)
+      begin
+        pendExc := TObject(AcquireExceptionObject);
+        FEngCs.Enter;
+        try
+          if pendExc is Exception then
+            FLastCommitProblem := 'durabilite hatasi: ' + Exception(pendExc).Message
+          else
+            FLastCommitProblem := 'durabilite hatasi: ' + pendExc.ClassName;
+        finally
+          FEngCs.Leave;
+        end;
+      end
       else
       begin
         tmpExc := TObject(AcquireExceptionObject);
+        if pendExc is Exception then
+          msg := Exception(pendExc).Message
+        else
+          msg := pendExc.ClassName;
+        msg := 'commit hatasi: ' + msg;
+        if tmpExc is Exception then
+          msg := msg + '; durabilite hatasi: ' + Exception(tmpExc).Message
+        else
+          msg := msg + '; durabilite hatasi: ' + tmpExc.ClassName;
+        pendExc.Free;
         tmpExc.Free;
+        FEngCs.Enter;
+        try
+          FLastCommitProblem := msg;
+        finally
+          FEngCs.Leave;
+        end;
+        pendExc := EVdbBackendV3.Create(msg);
       end;
     end;
   end;
@@ -3905,6 +3948,17 @@ end;
 function TVdbBackendV3.GetLastAutoCompactError: string;
 begin
   Result := FLastAutoCompactError;
+end;
+
+function TVdbBackendV3.GetLastCommitProblem: string;
+begin
+  { Yazma noktalari FEngCs altinda; okuma da ayni kilitle serilestirilir. }
+  FEngCs.Enter;
+  try
+    Result := FLastCommitProblem;
+  finally
+    FEngCs.Leave;
+  end;
 end;
 
 function TVdbBackendV3.AutoCompactBody(out OldBytes, NewBytes: Int64;
