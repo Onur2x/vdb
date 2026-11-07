@@ -1667,3 +1667,95 @@ sinifinda.
 
 - Ayni oturum kimliginin iki thread'de kullanilmasi desteklenmez; bu onbellek
   o sozlesmeye dayanir (`dokuman/kilit_sirasi.md` §3).
+
+---
+
+# EK-L. P-133..P-136 — R2 dalga 2 (uygulama kaydi)
+
+Kaynak: EK-H.3 oncelik sirasi (R2-A-4, B-05/B-07, R2-B-YENI-1/2, R2-C-2/R2-C-3).
+Dort ayri commit; her biri kendi kapisiyla dogrulandi.
+
+## EK-L.1 P-133 — R2-A-4: page-heap `len` sinir denetimi
+
+**Kok neden.** Hucre basligindaki `len` alani, sayfa boyutuna karsi
+dogrulanmadan `SetLength`/`Move` yoluna giriyordu. Bozuk ya da kotu niyetli bir
+`len` (or. `$7FFFF000`) yaklasik 2 GB on-tahsis ve sayfa disi bellek okumasina
+yol aciyordu. `ReadOverflow` ayrica tek adimda buyutuyordu.
+
+**Duzeltme.**
+- `ReadCellAt`, `Update`, `TryGet`/`ReadCellByDir`, `ScanAll`, `ScanAllRaw`,
+  `ScanAllRawPaged` yollarinda `len > dl - VDB_CELL_HDR` denetimi; ihlalde
+  istisna, tahsis yok.
+- `ReadOverflow`: `SetLength(Value, 0)` ile basla, ikiye katlayarak buyut,
+  `take > Len - got` ile tasmasiz sinir uygula.
+
+**Dogrulama.** `heapchk` icinde `TCorruptScanSink` + `TestCorruptInlineLen`;
+bozuk `len` (3000 ve `$7FFFF000`) diske yazilip CRC `PageSeal` ile tazelendi.
+Sonuc 24/0.
+
+## EK-L.2 P-134 — B-05/B-07: kilit ve tutma derinligi sizintilari
+
+**B-05.** `AcquireWriteHold`/`TryAcquireWriteHold` kapanis yolunda
+`FHoldDepth` sifirlanmiyordu; hata sonrasi yeniden denemeler defteri
+sistematik olarak sizdiriyordu.
+- `gotHold` bayrakli try/finally; tutma alinmissa her cikista birakilir.
+- `Constructor` icinde `FReadDepth := 0; FHoldDepth := 0`.
+- `Close`/`CloseNoFlush` sonunda `FHoldDepth := 0`.
+- Teshis icin `LockBookProbe(out AShared)` ve `LockHoldDepth` eklendi.
+
+**B-07.** `ReadBytesAt` hata yolunda `selfShared` SH kilidi birakilmiyordu;
+dongu try/finally icine alindi.
+
+**Dogrulama.** `readlockchk`: 4 sayfali DB, `AcquireWriteHold` + hata retry
+yolu, kilit defteri kontrolu. 11/0; negatif kontrol (duzeltme geri alinmis
+gibi davranan varyant) 9/2 — kapi gercekten yakaliyor.
+
+## EK-L.3 P-135 — R2-B-YENI-1/2: havuza ve MM'ye sozlesme
+
+**R2-B-YENI-1 (VDbPool).** `Release` hata yolunda slot, motor ve mutex
+sizdiriliyordu; `Acquire` except yollari da ayni riski tasiyordu.
+- Tek temizlik zinciri: `Sql.Free` + `FOut` + `CloseEngine -> FMutex.Leave ->
+  ReleaseSlot` ic ice try/finally; birincil hata `Err` degiskeninde tutulup
+  temizlikten sonra yukseltiliyor.
+- Temizlik kosulu `(Owned or OutCount = 0) and ((FShm = nil) or (FMySlot > 0))`.
+
+**R2-B-YENI-2 (VDbMM).** `MMReallocMem` Delphi `ReallocMem` sozlesmesine
+uyduruldu: `P = nil` ya da `Size = 0` -> `nil`; hata -> `nil`, `P` degismez.
+Sicak yol (`MMGetMem`/`MMFreeMem`) degistirilmedi.
+
+**Dogrulama.** `poolchk` 17/0 ("HAVUZ HATA YOLU DOGRULANDI"); `mmchk` 18/0
+("MM SOZLESMESI DOGRULANDI").
+
+## EK-L.4 P-136 — R2-C-2/R2-C-3: fsync hatasi ve yarim commit
+
+**R2-C-2.** `AcquireExceptionObject`/`tmpExc.Free` kalibi fsync hatasini
+yutuyordu; cagiran taraf commit'i basarili saniyordu.
+- Alan `FLastCommitProblem: string` + `GetLastCommitProblem: string`.
+- Ikincil hata birincil ile birlestirilip `EVdbBackendV3` olarak yukseltiliyor.
+
+**R2-C-3 (kalan).** Grup commit'te fsync hatasi sonrasi yarim kalan bolge
+WAL'da duruyordu.
+- `FUnsyncedStartPos`, `FUnsyncedBaseValid`, `FWriteCs`,
+  `FSyncFault`/`DebugSetSyncFault` eklendi.
+- `Commit(DoSync = False)` son durabilite noktasini isaretler; fsync hatasinda
+  `FStream.Size := FUnsyncedStartPos` ile yarim bolge kirpilir.
+- `FWrittenLsn` asla geri cekilmez (R2-C-YENI-1 uyumu).
+- `Open`/`Truncate` isaret durumunu sifirlar.
+
+**Dogrulama.** `commitfailchk` 21/21 ("COMMIT HATA YOLLARI DOGRULANDI").
+
+## EK-L.5 Kapi altyapisi
+
+Dort yeni kapi `tests/gates/runall.sh` tablosuna ve CI'ya (derleme listesi +
+Windows adimlari) baglandi. Her biri taze dizinde tek tek kosuldu
+(18/0, 17/0, 11/0, 21/0).
+
+## EK-L.6 Acik riskler
+
+1. `LockBookProbe`/`LockHoldDepth` ve `DebugSetSyncFault` teshis/test
+   yuzeyidir; uretim yolunda cagrilmamalidir.
+2. Fsync hatasi sonrasi kirpma yalnizca son basarili fsync'ten sonraki
+   senkronsuz bolgeyi atar; fsync edilmis bolge korunur. Kesilen kayitlar
+   cagirana commit hatasi olarak doner.
+3. `MMReallocMem` hata yolunda bellek sizdirmez ama cagiranin `P` ile eski
+   blogu kullanmaya devam etmesi beklenir (Delphi sozlesmesi).
