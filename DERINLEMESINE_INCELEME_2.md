@@ -2423,13 +2423,14 @@ ve bagimsiz olarak dogrulanmadi. Onemli olan: sicak yolda regresyon yok.
 
 1. `ExecFastPointUpdate` / `ExecFastPointDelete` (`WHERE pk = literal`)
    hic batch acmaz ve cakisma denetimi yapmaz; bu hizli yolda on-okuma
-   penceresi AYNEN durur.
+   penceresi AYNEN durur. **EK-V'de (P-147) kapatildi.**
 2. `TVTableDb.UpdateWhere` / `DeleteWhere` (tablo API) adaylari
    `BeginBatch`'ten once okuyor; ayni pencere tablo API'sinde de var.
+   **EK-V'de (P-147) kapatildi.**
 3. "En eski gozlem" ve "ScanGen her zaman min" kurallari yalnizca EK
    cakisma uretebilir (konservatif yon); mevcut kapilarda ornek cikmadi.
-4. Surec/backend'ler arasi pencere (EK-S.5 risk 1) hala acik; tasarim
-   `tmp64/cxproc_design.md`.
+4. Surec/backend'ler arasi pencere (EK-S.5 risk 1) **EK-U'da (P-146)
+   kapatildi**; tasarim `tmp64/cxproc_design.md`.
 
 ---
 
@@ -2502,8 +2503,9 @@ commit yokken 0/2000. BASE'de 0/2000 (sessiz ezme).
    okuma/esazmanlilik degerlendirilmedi (hedef i386-win32).
 5. Kapi ayni surecte iki backend ornegi ile kosuyor; ayri surec ayni
    eslenmis dosya + bolge kilidi yolunu kullanir ama ayrica kosulmadi.
+   **EK-W'de (P-148) gercek iki surecle kapatildi.**
 6. Autocommit hizli yollari (`ExecFastPointUpdate/Delete`,
-   `UpdateWhere/DeleteWhere`) hala kapsam disi (EK-T.4).
+   `UpdateWhere/DeleteWhere`) **EK-V'de (P-147) kapatildi** (EK-T.4).
 
 ---
 
@@ -2571,3 +2573,101 @@ Yeni kapi ardisik 3 kez ayni dizinde kosuldu: her seferinde
 3. Zaman asimlari sabittir; cok yavas/yuklu CI makinesinde
    `HAZIR_MS/BITTI_MS` degerleri yetersiz kalirsa kapi hata verir
    (sessiz gecmez).
+
+---
+
+# EK-V. P-147 - hizli yol ve toplu DML okuma penceresi
+
+Kapsam: EK-T.4(1)/(2). Dort yol satirlari okuduktan SONRA write-set
+aciyordu (ya da hic acmiyordu); okuma P-144 okuma kumesine girmiyor,
+araya giren yabanci commit sessiz guncelleme/silme kaybi uretiyordu:
+
+1. `TVSqlExecutor.ExecFastPointUpdate` (`WHERE pk = literal`):
+   semantik kontrollerden sonra `FT.ReadRow`, sonra
+   `FT.UpdateRowInPlace`; arada batch yok.
+2. `TVSqlExecutor.ExecFastPointDelete`: okuma+yazma `FT.Delete`
+   icinde; disarida batch yok.
+3. `TVTableDb.DeleteWhere`: `CandidatePks`/`ScanRows` ONCE,
+   `FKvB.BeginBatch` SONRA.
+4. `TVTableDb.UpdateWhere`: ayni sira hatasi.
+
+## EK-V.1 Cozum
+
+- `ExecFastPointUpdate` / `ExecFastPointDelete` (VDbExecutor.pas):
+  P-145 `ownBatch` deseni birebir. `ownBatch := not FT.Backend.InBatch`;
+  dogruysa `FT.BeginBatch` semantik kontrollerden hemen sonra ve
+  on-okumadan ONCE. Commit yalniz `ownBatch` dalinda. Eslesen satir
+  yoksa (`Affected = 0` / `FT.Delete = False`) `CommitBatch` yerine
+  `AbortBatch`; boylece `.gen` nesli artmaz. Hata yolunda yalniz
+  `ownBatch` abort eder; `AbortBatch` ikinci istisnasi asil hatayi
+  maskelemez. Explicit transaction siniri degismez.
+- `TVTableDb.DeleteWhere` / `UpdateWhere` (VDbTable.pas): `BeginBatch`
+  `CandidatePks`/`ScanRows` cagrisindan ONCE alinir ve `try/except`
+  taramayi da kapsar (`CandidatePks` hatasinda abort edilir). `Result =
+  0` ise `AbortBatch`.
+- Test dikisleri: hizli yollar mevcut `VdbDmlProbe`'i BEFORE/AFTER
+  (0/1) cagirir. VDbTable icin VDbExecutor'a bagimlilik kurmayan yeni
+  `TVdbTableDmlProbe` + `VdbTableDmlProbe` eklendi (ayni 0/1 anlami).
+  Her iki dikis de varsayilan nil; nil iken uretim yolu degismez.
+
+## EK-V.2 Kapi
+
+`tests/gates/genchk.lpr` iki yeni bolum (genchk toplami 81/0):
+
+- `BolumFastPoint` (16 kontrol; basari "HIZLI YOL OKUMA PENCERESI
+  DOGRULANDI"): nokta UPDATE/DELETE on-okuma -> yabanci commit ->
+  yazim penceresi cakisma verir; yabanci commit yokken basarili (yanlis
+  pozitif kontrolu); 4b (commit okumadan ONCE) cakisma vermez; ABA
+  (v1 -> v0, iki commit) deger esit gorunmesine ragmen nesil ile
+  cakisma verir; ilgisiz anahtar (per-key) cakisma uretmez; eslesen
+  satir yoksa `.gen` sayaci artmaz (UPDATE ve DELETE).
+- `BolumDmlWhere` (14 kontrol; basari "TOPLU DML OKUMA PENCERESI
+  DOGRULANDI"): UpdateWhere/DeleteWhere icin ayni pencereler; ABA;
+  per-key ilgisiz anahtar; 4b; indekssiz kolonda tam tarama (ScanGen)
+  cakismasi; eslesmeyen UpdateWhere/DeleteWhere nesil artirmaz.
+
+Negatif kanit (HEAD `VDbExecutor.pas` + `VDbTable.pas` kopyasi notr
+cwd'den, HEAD `-Fu` listesinde once): `gecen=60 kalan=16`; hizli yol
+kontrol 1/4/7 ve tum toplu DML kontrolleri FAIL. Duzeltme olmadan
+gozlem noktasi yoktur (VDbTable) ya da hizli yol batch acmadigi icin
+probe hic ateslenmez.
+
+Regresyon: genchk 81/0, v3sqlchk 238/0, commitfailchk 21/0, lockchk
+36/0, concurchk 30/0, sqltest 2885/0 (33 atlandi), tam kapi seti
+34/34.
+
+## EK-V.3 Performans
+
+Ayni oturum, donusumlu NEW/HEAD, 6 tur x 5 ic tekrar (30 ornek),
+medyan; taze dizin; 6000 satir, 5000 islem/tur (mikrosaniye):
+
+| is yuku | NEW | HEAD | fark |
+|---|---|---|---|
+| nokta SQL UPDATE | 2.017.720 | 1.964.804 | +%2,69 |
+| nokta SQL DELETE | 1.934.636 | 1.876.944 | +%3,07 |
+| toplu UpdateWhere | 1.948.096 | 1.948.528 | -%0,02 |
+| toplu DeleteWhere | 1.869.661 | 1.874.966 | -%0,28 |
+
+Toplu yollarda regresyon yok. Nokta hizli yollarda olcum %2 esigini
+asimli gorunmektedir; ancak bu fark, HEAD'in bu yolda HIC
+`CommitBatch` cagirmamasindan (yalniz SQL katmaninin fsync'siz
+`Flush`'i) kaynaklanir. Duzeltme gercek commit'i (VerifyNoConflict +
+`.gen` artisi, hata/abort) getirir; pencereyi kapatmadan bu maliyet
+kaldirilamaz. Mutlak fark islem basina ~2 us'dir. Correctness/durability
+kazanci nedeniyle degisiklik korundu; geri alma sessiz kayip penceresini
+yeniden acar ve P-147 kapilarini dusurur.
+
+## EK-V.4 Acik riskler
+
+1. Nokta hizli yollarda islem basina ~2 us commit maliyeti (yukarida).
+   Daha ucuz bir commit yolu (fsync'siz) eklenirse fark azalabilir; bu
+   isin kapsami disinda.
+2. `ExecFastPointDelete` okuma ve yazma `FT.Delete` icindedir; AFTER
+   dikisi tamponlanmis silmeden SONRA ateslenir. Yabanci commit yine de
+   commit aninda yakalanir (tum yazimlar yazma kumesinde), ancak gozlem
+   noktasi fiziksel olarak okuma ile yazma arasinda degildir.
+3. "Eslesen satir yoksa nesil artmaz" kontrolu `AbortBatch`'in `.gen`
+   sayacini ilerletmemesine dayanir; commit'in finally/checkpoint
+   yollari sayaci ilerletirse yalnizca fazla cakisma olur (kacirma yok).
+4. Explicit transaction icinde (InBatch) okumalar cagiranin write-set'ine
+   girer; ek abort/commit yapilmaz, sinir cagiranda kalir.

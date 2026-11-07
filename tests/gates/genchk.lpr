@@ -504,6 +504,11 @@ type
     Did: Boolean;
     S2: TVSql;
     HariciDeger: string;
+    { P-147: esnek yabanci islem. SqlHarici dolu ise aynen calistirilir;
+      Aba True ise iki ardisik commit (HariciDeger -> AbaGeri) yapilir. }
+    SqlHarici: string;
+    Aba: Boolean;
+    AbaGeri: string;
     procedure Run(Stage: Integer);
   end;
 
@@ -513,11 +518,52 @@ begin
   Did := True;                       { yeniden giris korumasi }
   gSid := 2;
   try
-    { Yabanci oturum ayni satiri gunceller ve commit eder. }
-    S2.Exec(Format('UPDATE t SET v=''%s'' WHERE id >= 1', [HariciDeger]));
+    if SqlHarici <> '' then
+      S2.Exec(SqlHarici)
+    else if Aba then
+    begin
+      { ABA: deger v1 -> v0; iki ayri commit, deger karsilastirmasi
+        sonunda esit gorunur. }
+      S2.Exec(Format('UPDATE t SET v=''%s'' WHERE id >= 1', [HariciDeger]));
+      S2.Exec(Format('UPDATE t SET v=''%s'' WHERE id >= 1', [AbaGeri]));
+    end
+    else
+      { Yabanci oturum ayni satiri gunceller ve commit eder. }
+      S2.Exec(Format('UPDATE t SET v=''%s'' WHERE id >= 1', [HariciDeger]));
   finally
     gSid := 1;
   end;
+end;
+
+{ P-147: `.gen` sayacini (offset 0) dogrudan dosyadan okur. }
+function GenSayac(const DbPath: string): QWord;
+var
+  dur: LongWord;
+  kimlik: QWord;
+begin
+  ReadGenFile(DbPath + '.gen', Result, dur, kimlik);
+end;
+
+{ P-147: tek kosullu WHERE grubu. }
+function WSingle(Col: Integer; Ctype: Byte; const Op, Val: string): TWhereGroups;
+begin
+  SetLength(Result, 1);
+  SetLength(Result[0], 1);
+  Result[0][0].Col := Col;
+  Result[0][0].Ctype := Ctype;
+  Result[0][0].Op := Op;
+  Result[0][0].Val := Val;
+end;
+
+{ P-147: duz deger atamasi (SET <col> = <lit>). }
+function SetLit(Col: Integer; const Val: string): VDbTable.TSetExprs;
+begin
+  SetLength(Result, 1);
+  Result[0].Kind := 0;
+  Result[0].ColA := Col;
+  Result[0].ColB := -1;
+  Result[0].Op := #0;
+  Result[0].Lit := Val;
 end;
 
 function SqlDene(Sq: TVSql; const Sql: string; out msg: string): Boolean;
@@ -691,6 +737,399 @@ begin
     WriteLn('AUTOCOMMIT ON-OKUMA PENCERESI DOGRULANAMADI');
 end;
 
+{ ------------------------------------- Bolum P-147: hizli nokta DML }
+
+procedure BolumFastPoint(const Dir: string);
+var
+  db: string;
+  be: IVdbBackend;
+  tb1, tb2: TVTableDb;
+  sq1, sq2: TVSql;
+  pr: TAutocommitProbe;
+  basarili, cakisti: Boolean;
+  msg: string;
+  oncekiFail: Integer;
+  s0, s1: QWord;
+  v1, v2: string;
+begin
+  WriteLn('--- P-147: hizli yol (nokta DML) on-okuma penceresi ---');
+  oncekiFail := gFail;
+  db := IncludeTrailingPathDelimiter(Dir) + 'p147fast.odb';
+  SilYanDosyalar(db);
+  SilDosya(db + '.gen');
+  SilDosya(db);
+  gSid := 0;
+  be := TVdbBackendV3.Create(db, True, 512);
+  tb1 := nil; tb2 := nil; sq1 := nil; sq2 := nil; pr := nil;
+  try
+    tb1 := TVTableDb.CreateBackend(be);
+    tb1.Open(Dir);
+    sq1 := TVSql.Create(tb1);
+    gSid := 1;
+    SqlDene(sq1, 'CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)', msg);
+    SqlDene(sq1, 'INSERT INTO t VALUES (1, ''v0'')', msg);
+    SqlDene(sq1, 'INSERT INTO t VALUES (2, ''sabit'')', msg);
+    tb2 := TVTableDb.CreateBackend(be);
+    tb2.Open(Dir);
+    sq2 := TVSql.Create(tb2);
+
+    pr := TAutocommitProbe.Create;
+    pr.S2 := sq2;
+    pr.Etkin := False;
+
+    {$IF DECLARED(VdbDmlProbe)}
+    VdbDmlProbe := pr.Run;
+    try
+      { 1) NOKT A UPDATE: on-okuma -> yabanci commit -> yazim penceresi.
+        Hizli yol batch acmadiginda okuma izlenmez ve sessiz kayip olur;
+        duzeltmede cakisma beklenir. }
+      gSid := 1;
+      pr.Etkin := True; pr.FireStage := 1; pr.Did := False;
+      pr.Aba := False;
+      pr.SqlHarici := 'UPDATE t SET v=''v1'' WHERE id = 1';
+      basarili := SqlDene(sq1, 'UPDATE t SET v=''v2'' WHERE id = 1', msg);
+      cakisti := (not basarili) and (Pos('cakisma', msg) > 0);
+      Ok('1: nokta UPDATE on-okuma penceresi cakisma verir', cakisti, msg);
+      Ok('1: S1 yazimi uygulanmadi', SqlDeger(sq1,
+        'SELECT v FROM t WHERE id = 1') = 'v1',
+        SqlDeger(sq1, 'SELECT v FROM t WHERE id = 1'));
+
+      { 2) YANLIS POZITIF KONTROLU: yabanci commit yokken basarili. }
+      gSid := 1;
+      pr.Etkin := False;
+      basarili := SqlDene(sq1, 'UPDATE t SET v=''v3'' WHERE id = 1', msg);
+      Ok('2: yabanci commit yokken nokta UPDATE basarili',
+        basarili and (msg = ''), msg);
+      Ok('2: kontrol degeri uygulandi', SqlDeger(sq1,
+        'SELECT v FROM t WHERE id = 1') = 'v3',
+        SqlDeger(sq1, 'SELECT v FROM t WHERE id = 1'));
+
+      { 3) 4b: yabanci commit on-okumadan ONCE -> cakisma yok. }
+      gSid := 1;
+      pr.Etkin := True; pr.FireStage := 0; pr.Did := False;
+      pr.SqlHarici := 'UPDATE t SET v=''v4'' WHERE id = 1';
+      basarili := SqlDene(sq1, 'UPDATE t SET v=''v5'' WHERE id = 1', msg);
+      Ok('3: yabanci commit on-okumadan ONCE ise cakisma yok (4b)',
+        basarili and (msg = ''), msg);
+      Ok('3: S1 yazimi uygulandi', SqlDeger(sq1,
+        'SELECT v FROM t WHERE id = 1') = 'v5',
+        SqlDeger(sq1, 'SELECT v FROM t WHERE id = 1'));
+
+      { 4) ABA: deger v1 -> v5 (iki commit). Deger karsilastirmasi esit
+        gorunur; yalnizca nesil ayirt eder. }
+      gSid := 1;
+      pr.Etkin := True; pr.FireStage := 1; pr.Did := False;
+      pr.SqlHarici := ''; pr.Aba := True;
+      pr.HariciDeger := 'v1'; pr.AbaGeri := 'v5';
+      basarili := SqlDene(sq1, 'UPDATE t SET v=''v6'' WHERE id = 1', msg);
+      cakisti := (not basarili) and (Pos('cakisma', msg) > 0);
+      Ok('4: ABA (v1->v5) nesil ile cakisma verir', cakisti, msg);
+      Ok('4: ABA sonrasi S1 yazimi uygulanmadi', SqlDeger(sq1,
+        'SELECT v FROM t WHERE id = 1') = 'v5',
+        SqlDeger(sq1, 'SELECT v FROM t WHERE id = 1'));
+
+      { 5) ILGISIZ ANAHTAR: yabanci commit id=2'ye dokunur; S1 id=1
+        yazar. Per-key kural: cakisma YOK. }
+      gSid := 1;
+      pr.Aba := False;
+      pr.Etkin := True; pr.FireStage := 1; pr.Did := False;
+      pr.SqlHarici := 'UPDATE t SET v=''x'' WHERE id = 2';
+      basarili := SqlDene(sq1, 'UPDATE t SET v=''v7'' WHERE id = 1', msg);
+      Ok('5: ilgisiz anahtar commit''i cakisma uretmez (per-key)',
+        basarili and (msg = ''), msg);
+      Ok('5: ilgisiz anahtar uygulandi', SqlDeger(sq1,
+        'SELECT v FROM t WHERE id = 2') = 'x',
+        SqlDeger(sq1, 'SELECT v FROM t WHERE id = 2'));
+
+      { 6) ESLESEN SATIR YOK: nesil artmamali. }
+      gSid := 1;
+      pr.Etkin := False;
+      s0 := GenSayac(db);
+      basarili := SqlDene(sq1, 'UPDATE t SET v=''zz'' WHERE id = 999', msg);
+      s1 := GenSayac(db);
+      Ok('6: eslesmeyen nokta UPDATE nesil artirmaz',
+        basarili and (s0 = s1), Format('%d -> %d', [s0, s1]));
+
+      { 7) NOKT A DELETE: ayni pencere. }
+      gSid := 1;
+      pr.Etkin := True; pr.FireStage := 1; pr.Did := False;
+      pr.SqlHarici := 'UPDATE t SET v=''vd'' WHERE id = 1';
+      basarili := SqlDene(sq1, 'DELETE FROM t WHERE id = 1', msg);
+      cakisti := (not basarili) and (Pos('cakisma', msg) > 0);
+      Ok('7: nokta DELETE on-okuma penceresi cakisma verir', cakisti, msg);
+      v1 := SqlDeger(sq1, 'SELECT v FROM t WHERE id = 1');
+      Ok('7: satir silinmedi', v1 = 'vd', v1);
+
+      { 8) ESLESEN SATIR YOK: nesil artmamali. }
+      gSid := 1;
+      pr.Etkin := False;
+      s0 := GenSayac(db);
+      basarili := SqlDene(sq1, 'DELETE FROM t WHERE id = 999', msg);
+      s1 := GenSayac(db);
+      Ok('8: eslesmeyen nokta DELETE nesil artirmaz',
+        basarili and (s0 = s1), Format('%d -> %d', [s0, s1]));
+
+      { 9) DELETE 4b: yabanci commit on-okumadan ONCE -> basarili. }
+      gSid := 1;
+      pr.Etkin := True; pr.FireStage := 0; pr.Did := False;
+      pr.SqlHarici := 'UPDATE t SET v=''ve'' WHERE id = 1';
+      basarili := SqlDene(sq1, 'DELETE FROM t WHERE id = 1', msg);
+      Ok('9: DELETE 4b bozulmadi (commit once ise cakisma yok)',
+        basarili and (msg = ''), msg);
+      v2 := SqlDeger(sq1, 'SELECT v FROM t WHERE id = 1');
+      Ok('9: satir silindi', v2 = '<yok>', v2);
+    finally
+      VdbDmlProbe := nil;
+    end;
+    {$ELSE}
+    Ok('P-147 hizli yol on-kosulu: VdbDmlProbe tanimli', False,
+      'kaynaka P-147 yamasi uygulanmamis');
+    Ok('1: nokta UPDATE on-okuma penceresi cakisma verir', False,
+      'atlandi (gozlem noktasi yok)');
+    Ok('2: yabanci commit yokken nokta UPDATE basarili', False,
+      'atlandi (gozlem noktasi yok)');
+    Ok('3: yabanci commit on-okumadan ONCE ise cakisma yok (4b)', False,
+      'atlandi (gozlem noktasi yok)');
+    Ok('4: ABA (v1->v5) nesil ile cakisma verir', False,
+      'atlandi (gozlem noktasi yok)');
+    Ok('5: ilgisiz anahtar commit''i cakisma uretmez (per-key)', False,
+      'atlandi (gozlem noktasi yok)');
+    Ok('6: eslesmeyen nokta UPDATE nesil artirmaz', False,
+      'atlandi (gozlem noktasi yok)');
+    Ok('7: nokta DELETE on-okuma penceresi cakisma verir', False,
+      'atlandi (gozlem noktasi yok)');
+    Ok('8: eslesmeyen nokta DELETE nesil artirmaz', False,
+      'atlandi (gozlem noktasi yok)');
+    Ok('9: DELETE 4b bozulmadi (commit once ise cakisma yok)', False,
+      'atlandi (gozlem noktasi yok)');
+    {$ENDIF}
+  finally
+    {$IF DECLARED(VdbDmlProbe)}
+    VdbDmlProbe := nil;
+    {$ENDIF}
+    gSid := 0;
+    if pr <> nil then pr.Free;
+    if sq2 <> nil then sq2.Free;
+    if sq1 <> nil then sq1.Free;
+    if tb2 <> nil then begin tb2.Close; tb2.Free; end;
+    if tb1 <> nil then begin tb1.Close; tb1.Free; end;
+    be := nil;
+  end;
+
+  if gFail = oncekiFail then
+    WriteLn('HIZLI YOL OKUMA PENCERESI DOGRULANDI')
+  else
+    WriteLn('HIZLI YOL OKUMA PENCERESI DOGRULANAMADI');
+end;
+
+{ ------------------------------------ Bolum P-147: toplu DML (table API) }
+
+procedure BolumDmlWhere(const Dir: string);
+var
+  db: string;
+  be: IVdbBackend;
+  tb1, tb2: TVTableDb;
+  sq1, sq2: TVSql;
+  pr: TAutocommitProbe;
+  basarili, cakisti: Boolean;
+  msg: string;
+  oncekiFail: Integer;
+  s0, s1: QWord;
+  n: Integer;
+  v: string;
+
+  procedure Baslat(EtkinMi: Boolean; Stage: Integer; const HariciSql: string);
+  begin
+    pr.Etkin := EtkinMi;
+    pr.FireStage := Stage;
+    pr.Did := False;
+    pr.Aba := False;
+    pr.SqlHarici := HariciSql;
+    gSid := 1;
+  end;
+
+  procedure UpdEt(const SetVal, KosulVal: string);
+  begin
+    basarili := True; msg := '';
+    try
+      n := tb1.UpdateWhere('t', ['v'], SetLit(1, SetVal),
+        WSingle(1, VCT_STR, '=', KosulVal));
+    except
+      on E: Exception do
+      begin
+        basarili := False;
+        msg := E.Message;
+      end;
+    end;
+  end;
+
+  procedure UpdPk(const SetVal, PkVal: string);
+  begin
+    basarili := True; msg := '';
+    try
+      n := tb1.UpdateWhere('t', ['v'], SetLit(1, SetVal),
+        WSingle(0, VCT_INT, '=', PkVal));
+    except
+      on E: Exception do
+      begin
+        basarili := False;
+        msg := E.Message;
+      end;
+    end;
+  end;
+
+  procedure DelPk(const PkVal: string);
+  begin
+    basarili := True; msg := '';
+    try
+      n := tb1.DeleteWhere('t', WSingle(0, VCT_INT, '=', PkVal));
+    except
+      on E: Exception do
+      begin
+        basarili := False;
+        msg := E.Message;
+      end;
+    end;
+  end;
+
+begin
+  WriteLn('--- P-147: toplu DML (UpdateWhere/DeleteWhere) on-okuma penceresi ---');
+  oncekiFail := gFail;
+  db := IncludeTrailingPathDelimiter(Dir) + 'p147where.odb';
+  SilYanDosyalar(db);
+  SilDosya(db + '.gen');
+  SilDosya(db);
+  gSid := 0;
+  be := TVdbBackendV3.Create(db, True, 512);
+  tb1 := nil; tb2 := nil; sq1 := nil; sq2 := nil; pr := nil;
+  try
+    tb1 := TVTableDb.CreateBackend(be);
+    tb1.Open(Dir);
+    sq1 := TVSql.Create(tb1);
+    gSid := 1;
+    SqlDene(sq1, 'CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)', msg);
+    SqlDene(sq1, 'INSERT INTO t VALUES (1, ''v0'')', msg);
+    SqlDene(sq1, 'INSERT INTO t VALUES (2, ''sabit'')', msg);
+    tb2 := TVTableDb.CreateBackend(be);
+    tb2.Open(Dir);
+    sq2 := TVSql.Create(tb2);
+
+    pr := TAutocommitProbe.Create;
+    pr.S2 := sq2;
+    pr.Etkin := False;
+
+    {$IF DECLARED(VdbTableDmlProbe)}
+    VdbTableDmlProbe := pr.Run;
+    try
+      { 1) UpdateWhere: aday okumasi -> yabanci commit -> yazim. }
+      Baslat(True, 1, 'UPDATE t SET v=''v1'' WHERE id = 1');
+      UpdPk('v2', '1');
+      cakisti := (not basarili) and (Pos('cakisma', msg) > 0);
+      Ok('1: UpdateWhere on-okuma penceresi cakisma verir', cakisti, msg);
+      v := SqlDeger(sq1, 'SELECT v FROM t WHERE id = 1');
+      Ok('1: S1 yazimi uygulanmadi', v = 'v1', v);
+
+      { 2) DeleteWhere: ayni pencere. }
+      Baslat(True, 1, 'UPDATE t SET v=''vd'' WHERE id = 1');
+      DelPk('1');
+      cakisti := (not basarili) and (Pos('cakisma', msg) > 0);
+      Ok('2: DeleteWhere on-okuma penceresi cakisma verir', cakisti, msg);
+      v := SqlDeger(sq1, 'SELECT v FROM t WHERE id = 1');
+      Ok('2: satir silinmedi', v = 'vd', v);
+
+      { 3) ABA: deger v1 -> vd. }
+      Baslat(True, 1, '');
+      pr.Aba := True;
+      pr.HariciDeger := 'v1';
+      pr.AbaGeri := 'vd';
+      UpdPk('v6', '1');
+      cakisti := (not basarili) and (Pos('cakisma', msg) > 0);
+      Ok('3: UpdateWhere ABA nesil ile cakisma verir', cakisti, msg);
+      v := SqlDeger(sq1, 'SELECT v FROM t WHERE id = 1');
+      Ok('3: ABA sonrasi S1 yazimi uygulanmadi', v = 'vd', v);
+
+      { 4) ILGISIZ ANAHTAR (per-key konservatif kural). }
+      Baslat(True, 1, 'UPDATE t SET v=''x'' WHERE id = 2');
+      UpdPk('v7', '1');
+      Ok('4: ilgisiz anahtar commit''i cakisma uretmez',
+        basarili and (msg = ''), msg);
+      v := SqlDeger(sq1, 'SELECT v FROM t WHERE id = 2');
+      Ok('4: ilgisiz anahtar uygulandi', v = 'x', v);
+
+      { 5) 4b: yabanci commit on-okumadan ONCE. }
+      Baslat(True, 0, 'UPDATE t SET v=''v4'' WHERE id = 1');
+      UpdPk('v5', '1');
+      Ok('5: yabanci commit on-okumadan ONCE ise cakisma yok (4b)',
+        basarili and (msg = ''), msg);
+      v := SqlDeger(sq1, 'SELECT v FROM t WHERE id = 1');
+      Ok('5: S1 yazimi uygulandi', v = 'v5', v);
+
+      { 6) TAM TARAMA yolu (indekssiz kolon): ScanGen ile cakisma. }
+      Baslat(True, 1, 'UPDATE t SET v=''vs'' WHERE id = 1');
+      UpdEt('v8', 'v5');
+      cakisti := (not basarili) and (Pos('cakisma', msg) > 0);
+      Ok('6: UpdateWhere tam tarama penceresi cakisma verir', cakisti, msg);
+      v := SqlDeger(sq1, 'SELECT v FROM t WHERE id = 1');
+      Ok('6: S1 yazimi uygulanmadi', v = 'vs', v);
+
+      { 7) ESLESEN SATIR YOK: nesil artmamali (UpdateWhere + DeleteWhere). }
+      Baslat(False, 0, '');
+      s0 := GenSayac(db);
+      UpdPk('zz', '999');
+      basarili := basarili and (n = 0);
+      s1 := GenSayac(db);
+      Ok('7: eslesmeyen UpdateWhere nesil artirmaz',
+        basarili and (s0 = s1), Format('%d -> %d', [s0, s1]));
+
+      gSid := 1;
+      s0 := GenSayac(db);
+      DelPk('999');
+      basarili := basarili and (n = 0);
+      s1 := GenSayac(db);
+      Ok('7b: eslesmeyen DeleteWhere nesil artirmaz',
+        basarili and (s0 = s1), Format('%d -> %d', [s0, s1]));
+    finally
+      VdbTableDmlProbe := nil;
+    end;
+    {$ELSE}
+    Ok('P-147 toplu DML on-kosulu: VdbTableDmlProbe tanimli', False,
+      'kaynaka P-147 yamasi uygulanmamis');
+    Ok('1: UpdateWhere on-okuma penceresi cakisma verir', False,
+      'atlandi (gozlem noktasi yok)');
+    Ok('2: DeleteWhere on-okuma penceresi cakisma verir', False,
+      'atlandi (gozlem noktasi yok)');
+    Ok('3: UpdateWhere ABA nesil ile cakisma verir', False,
+      'atlandi (gozlem noktasi yok)');
+    Ok('4: ilgisiz anahtar commit''i cakisma uretmez', False,
+      'atlandi (gozlem noktasi yok)');
+    Ok('5: yabanci commit on-okumadan ONCE ise cakisma yok (4b)', False,
+      'atlandi (gozlem noktasi yok)');
+    Ok('6: UpdateWhere tam tarama penceresi cakisma verir', False,
+      'atlandi (gozlem noktasi yok)');
+    Ok('7: eslesmeyen UpdateWhere nesil artirmaz', False,
+      'atlandi (gozlem noktasi yok)');
+    Ok('7b: eslesmeyen DeleteWhere nesil artirmaz', False,
+      'atlandi (gozlem noktasi yok)');
+    {$ENDIF}
+  finally
+    {$IF DECLARED(VdbTableDmlProbe)}
+    VdbTableDmlProbe := nil;
+    {$ENDIF}
+    gSid := 0;
+    if pr <> nil then pr.Free;
+    if sq2 <> nil then sq2.Free;
+    if sq1 <> nil then sq1.Free;
+    if tb2 <> nil then begin tb2.Close; tb2.Free; end;
+    if tb1 <> nil then begin tb1.Close; tb1.Free; end;
+    be := nil;
+  end;
+
+  if gFail = oncekiFail then
+    WriteLn('TOPLU DML OKUMA PENCERESI DOGRULANDI')
+  else
+    WriteLn('TOPLU DML OKUMA PENCERESI DOGRULANAMADI');
+end;
+
 { ------------------------------------------------- Bolum 5: P-146 }
 
 { AYRI TVdbBackendV3 ornekleri = ayri motor, ayri onbellek, ayri
@@ -843,6 +1282,8 @@ begin
     BolumB06(dir);
     BolumReadSet(dir);
     BolumAutocommit(dir);
+    BolumFastPoint(dir);
+    BolumDmlWhere(dir);
     BolumCrossBackend(dir);
   finally
     VdbSessionIdFunc := nil;

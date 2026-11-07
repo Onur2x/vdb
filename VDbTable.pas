@@ -43,7 +43,21 @@ const
   VDB_SCHEMA_KEY: QWord = 0;
   VDB_SCHEMA_TAG = 'VSCH1';
 
+  { P-147: toplu DML (DeleteWhere/UpdateWhere) on-okuma penceresi kapi
+    kancasi. Yalnizca test kapisi (genchk) tarafindan atanir; nil iken
+    maliyet iki isaretci denetimidir. Asamalar VDbExecutor'daki
+    VdbDmlProbe ile ayni anlamdadir:
+      VDB_TABLE_DML_PROBE_BEFORE = aday/tarama okumasindan hemen once
+      VDB_TABLE_DML_PROBE_AFTER  = okumadan hemen sonra, yazimdan once }
+  VDB_TABLE_DML_PROBE_BEFORE = 0;
+  VDB_TABLE_DML_PROBE_AFTER  = 1;
 
+type
+  TVdbTableDmlProbe = procedure(Stage: Integer) of object;
+
+var
+  { P-147: nil iken uretim yolu degismez. }
+  VdbTableDmlProbe: TVdbTableDmlProbe = nil;
 
 type
   TIdxDef = record
@@ -11814,12 +11828,20 @@ begin
   // SQL katmanindan BEGIN ile gelen bir transaction varsa ic ice batch ACMA.
   // Kendi batch'imizi biz baslatti ise commit de biz yapariz.
   ownBatch := not FKvB.InBatch;
-  // ONCEDEN: ScanRows -> HER ZAMAN tam tarama (WHERE id=5 bile 641 ms).
-  // Simdi: WHERE daraltabiliyorsa yalniz o satirlar okunur.
-  if not CandidatePks(t, Groups, pks, rows) then
-    ScanRows(t.Name, pks, rows);
+  { P-147: write-set aday/tarama okumasindan ONCE acilir; aksi halde
+    okuma kumesi izlenmez ve araya giren yabanci commit sessiz silme
+    kaybi uretir. Explicit transaction'da (InBatch) dis write-set'e
+    dokunulmaz. }
   if ownBatch then FKvB.BeginBatch;
   try
+    if Assigned(VdbTableDmlProbe) then
+      VdbTableDmlProbe(VDB_TABLE_DML_PROBE_BEFORE);
+    // ONCEDEN: ScanRows -> HER ZAMAN tam tarama (WHERE id=5 bile 641 ms).
+    // Simdi: WHERE daraltabiliyorsa yalniz o satirlar okunur.
+    if not CandidatePks(t, Groups, pks, rows) then
+      ScanRows(t.Name, pks, rows);
+    if Assigned(VdbTableDmlProbe) then
+      VdbTableDmlProbe(VDB_TABLE_DML_PROBE_AFTER);
     for i := 0 to High(pks) do
     begin
       if not VDbMatchGroups(rows[i], Groups) then Continue;
@@ -11828,9 +11850,15 @@ begin
       FKvB.Delete(VDbHashKey(t.Name, pks[i]));
       Inc(Result);
     end;
-    if ownBatch then FKvB.CommitBatch;
+    if ownBatch then
+    begin
+      { Eslesen satir yoksa write-set'i gen artirmadan kapat. }
+      if Result > 0 then FKvB.CommitBatch else FKvB.AbortBatch;
+    end;
   except
-    if ownBatch then AbortBatch;
+    { AbortBatch ikinci bir istisna firlatirsa asil hatayi maskelemesin. }
+    if ownBatch then
+      try AbortBatch; except end;
     raise;
   end;
 end;
@@ -12387,14 +12415,22 @@ begin
   // SQL katmanindan BEGIN ile gelen bir transaction varsa ic ice batch ACMA.
   // Kendi batch'imizi biz baslatti ise commit de biz yapariz.
   ownBatch := not FKvB.InBatch;
-  // ONCEDEN: ScanRows -> HER ZAMAN tam tarama. `WHERE id = 5` yazsan bile
-  // tum tablo bellege cekiliyordu (100.000 satirda 641 ms; 5000 UPDATE
-  // = ~53 DAKIKA). Simdi: WHERE daraltabiliyorsa yalniz o satirlar okunur
-  // (PK nokta arama O(1), indeks dilimi O(dilim)).
-  if not CandidatePks(t, Groups, pks, rows) then
-    ScanRows(t.Name, pks, rows);
+  { P-147: write-set aday/tarama okumasindan ONCE acilir; aksi halde
+    okuma kumesi izlenmez ve araya giren yabanci commit sessiz guncelleme
+    kaybi uretir. Explicit transaction'da (InBatch) dis write-set'e
+    dokunulmaz. }
   if ownBatch then FKvB.BeginBatch;
   try
+    if Assigned(VdbTableDmlProbe) then
+      VdbTableDmlProbe(VDB_TABLE_DML_PROBE_BEFORE);
+    // ONCEDEN: ScanRows -> HER ZAMAN tam tarama. `WHERE id = 5` yazsan bile
+    // tum tablo bellege cekiliyordu (100.000 satirda 641 ms; 5000 UPDATE
+    // = ~53 DAKIKA). Simdi: WHERE daraltabiliyorsa yalniz o satirlar okunur
+    // (PK nokta arama O(1), indeks dilimi O(dilim)).
+    if not CandidatePks(t, Groups, pks, rows) then
+      ScanRows(t.Name, pks, rows);
+    if Assigned(VdbTableDmlProbe) then
+      VdbTableDmlProbe(VDB_TABLE_DML_PROBE_AFTER);
     for i := 0 to High(pks) do
     begin
       if not VDbMatchGroups(rows[i], Groups) then Continue;
@@ -12416,9 +12452,15 @@ begin
       // PreReadVals: rows[i] satiri zaten okunmus; ikinci ReadRow yok.
       if UpdateRowInPlace(t.Name, pks[i], newVals, oldVals) then Inc(Result);
     end;
-    if ownBatch then FKvB.CommitBatch;
+    if ownBatch then
+    begin
+      { Eslesen satir yoksa write-set'i gen artirmadan kapat. }
+      if Result > 0 then FKvB.CommitBatch else FKvB.AbortBatch;
+    end;
   except
-    if ownBatch then AbortBatch;
+    { AbortBatch ikinci bir istisna firlatirsa asil hatayi maskelemesin. }
+    if ownBatch then
+      try AbortBatch; except end;
     raise;
   end;
 end;

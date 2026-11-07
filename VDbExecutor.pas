@@ -17804,6 +17804,8 @@ var
   phNumbered: Boolean;
   tbl, pkCol, pkVal: string;
   td: TTableDef;
+  // P-147: hizli yol kendi write-set'ini on-okumadan ONCE acar.
+  ownBatch: Boolean;
 
   procedure SkipWs;
   begin
@@ -17889,12 +17891,33 @@ begin
   // R-18: genel yolun cagirdigi AYNI metot, AYNI sira.
   FT.RequirePriv(tbl, Ord(pkDelete));
 
-  // Tek satir: INSERT seridindeki gibi batch YOK. PK/UNIQUE/FK kaskadi,
-  // RESTRICT, IdxDelRow, CheckRowWritable — hepsi FT.Delete icerisinde.
-  if FT.Delete(tbl, pkVal) then
-    Res.Affected := 1
-  else
-    Res.Affected := 0;
+  { P-147: nokta DELETE'in on-okumasi FT.Delete ICINDE yapilir. Batch
+    onceden acilmazsa ReadRow okuma kumesine girmez ve araya giren
+    yabanci commit CommitBatch'te gorulmez (sessiz silme kaybi). Bu
+    yuzden write-set on-okumadan ONCE acilir. Explicit transaction'da
+    (InBatch) dis write-set'e dokunulmaz; siniri cagiran yonetir. }
+  ownBatch := not FT.Backend.InBatch;
+  if ownBatch then FT.BeginBatch;
+  try
+    if Assigned(VdbDmlProbe) then VdbDmlProbe(VDB_DML_PROBE_BEFORE);
+    // PK/UNIQUE/FK kaskadi, RESTRICT, IdxDelRow, CheckRowWritable -
+    // hepsi FT.Delete icerisinde.
+    if FT.Delete(tbl, pkVal) then
+      Res.Affected := 1
+    else
+      Res.Affected := 0;
+    if Assigned(VdbDmlProbe) then VdbDmlProbe(VDB_DML_PROBE_AFTER);
+    if ownBatch then
+    begin
+      { Eslesen satir yoksa write-set'i gen artirmadan kapat. }
+      if Res.Affected > 0 then FT.CommitBatch else FT.AbortBatch;
+    end;
+  except
+    { AbortBatch ikinci bir istisna firlatirsa asil hatayi maskelemesin. }
+    if ownBatch then
+      try FT.AbortBatch; except end;
+    raise;
+  end;
 
   Res.LastTable := tbl;
   Res.Msg := 'OK';
@@ -17913,6 +17936,8 @@ var
   setCols, setVals, oldVals, newVals: TStrArray;
   nset: Integer;
   td: TTableDef;
+  // P-147: hizli yol kendi write-set'ini on-okumadan ONCE acar.
+  ownBatch: Boolean;
 
   procedure SkipWs;
   begin
@@ -18033,9 +18058,19 @@ begin
   // R-18: genel yolun cagirdigi AYNI metot, AYNI sira.
   FT.RequirePriv(tbl, Ord(pkUpdate));
 
+  { P-147: nokta UPDATE'in ReadRow'u write-set ACIKKEN yapilmalidir;
+    aksi halde okuma kumesine girmez (araya giren yabanci commit sessiz
+    guncelleme kaybi uretir). Explicit transaction'da (InBatch) dis
+    write-set'e dokunulmaz. }
+  ownBatch := not FT.Backend.InBatch;
+  if ownBatch then FT.BeginBatch;
+  try
   // Satiri oku; yoksa 0 satir (genel yol ile ayni).
+  if Assigned(VdbDmlProbe) then VdbDmlProbe(VDB_DML_PROBE_BEFORE);
   if not FT.ReadRow(tbl, pkVal, oldVals) then
   begin
+    { Eslesen satir yok; write-set'i gen artirmadan kapat. }
+    if ownBatch then FT.AbortBatch;
     Res.Affected := 0;
     Res.LastTable := tbl;
     Res.Msg := 'OK';
@@ -18044,6 +18079,7 @@ begin
     Result := True;
     Exit;
   end;
+  if Assigned(VdbDmlProbe) then VdbDmlProbe(VDB_DML_PROBE_AFTER);
 
   // Yeni satir: eskisinin kopyasi + literal SET degerleri (sira ile; son
   // yazan kazanir — genel yolun döngü davranisiyla ayni).
@@ -18065,11 +18101,23 @@ begin
   else
     Res.Affected := 0;
 
+  if ownBatch then
+  begin
+    { Eslesen satir yoksa gen artirmadan kapat. }
+    if Res.Affected > 0 then FT.CommitBatch else FT.AbortBatch;
+  end;
+
   Res.LastTable := tbl;
   Res.Msg := 'OK';
   SetLength(Res.Fields, 0);
   SetLength(Res.Rows, 0);
   Result := True;
+  except
+    { AbortBatch ikinci bir istisna firlatirsa asil hatayi maskelemesin. }
+    if ownBatch then
+      try FT.AbortBatch; except end;
+    raise;
+  end;
 end;
 
 { ------------------------------------------------------------
