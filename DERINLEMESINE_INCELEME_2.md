@@ -2061,3 +2061,59 @@ calisma dizini repo koku OLMAMALI.
 3. `.gen` 24 bayta cikti; eski dosyalar acilista otomatik yukseltilir.
    Kimlik karsilastirmasi ozellikle ag paylasimlarinda `.gen` ile DB
    dosyasinin birlikte kopyalanmasini gerektirir.
+
+---
+
+# EK-Q. R1 — indeks kaynagi omru (referans sayimi)
+
+Kapsam: EK-I.3/EK-I.4'te ertelenen R1. `TryGetIdxSource` kilidi
+biraktiktan sonra ciplak bir `TIdxSkip` isaretcisi donduruyordu; ayni
+anda baska bir yol (DROP INDEX, CREATE INDEX/BuildOneIndex,
+SetIdxSkipFromEntries takasi, DropTable, FreeIdxSkips) bu nesneyi
+serbest birakabiliyordu. Okuyucu kaynagi yinelemeye devam ederse
+use-after-free olusuyordu (~7 VDbExecutor cagri noktasi).
+
+## EK-Q.1 Cozum
+
+- `TIdxSkip` artik `TInterfacedObject` tabanli (referans sayimi).
+- `FSkipIdx` sozlugu her nesne icin bir TABAN referans tutar:
+  `SetIdxSkipFromEntries` Create/Load sonrasi `_AddRef`; sozlukten
+  cikarmanin alti noktasi `.Free` yerine `_Release`.
+- `TIdxSource` kaydina yonetilen `Keep: IInterface` alani eklendi.
+  Kaydin her kopyasi otomatik AddRef/_Release yapar; son okuyucu
+  birakana kadar nesne yasar. Cagri noktalari degismedi.
+- `TryGetIdxSource` basari dalinda referans `FIdxCs` ALTINDA alinir ve
+  sozluk yeniden dogrulanir (arada indeks kaldirilmis/yeniden kurulmus
+  olabilir). Kilit hiyerarsisi degismedi (FIdxCs yaprak).
+
+## EK-Q.2 Kapi
+
+`tests/gates/skipchk.lpr`: 300 tur; yazici CREATE INDEX + tembel insa
+tetikler, okuyucu `TryGetIdxSource` ile kaynagi alip yineler, yazici tam
+o anda DROP INDEX + DELETE yapar, okuyucu drop sonrasi 40 kez daha
+sayim/aralik dogrular (800 beklenir). Basari:
+"INDEKS KAYNAK OMRU DOGRULANDI", 4/0, iki taze dizinde kararli.
+
+Negatif kanit (duzeltmesiz HEAD VDbTable.pas, ayri cwd):
+`aralik sayisi=0 beklenen=800`, `gecen=1 kalan=3`, "IHLAL".
+
+Tam kapı seti: **32/32**.
+
+## EK-Q.3 Performans
+
+Isinmis indeksli SELECT taramasi (20.000 satir, 3000 sorgu):
+eski 2,98/3,39 ms; yeni 2,83/2,86 ms. Regresyon yok (gurultu icinde).
+
+## EK-Q.4 Acik riskler
+
+1. `TryGetIdxSource` basari yolunda `FIdxCs` bir kez daha alinir;
+   cok yuksek QPS'li nokta sorgularinda teorik ek yuk (olcumde ihmal
+   edilebilir).
+2. `TIdxSource` kayit duzeni degisti (managed alan); depo ici tum
+   kullanicilar ayni birimden derlenir, harici ABI tuketicisi varsa
+   yeniden derlemelidir.
+3. Omur, kaydin kapsamina baglidir; `Src.Skip` ciplak bir degiskene
+   kopyalanip kayittan uzun yasatilirsa koruma saglanmaz (depo icinde
+   boyle bir kacis yok).
+4. `_AddRef` ile sozluge ekleme arasinda istisna olusursa nesne sizar;
+   bu aralikta istisna ureten cagri yok.

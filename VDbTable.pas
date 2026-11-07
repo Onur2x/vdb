@@ -114,7 +114,13 @@ type
     function ExactCompare(const AKey, BKey: string): Integer;
   end;
 
-  TIdxSkip = class
+  { R1: TInterfacedObject tabani REFERANS SAYIMI icindir. FSkipIdx sozlugu
+    bir TABAN referans tutar (_AddRef, insa sonrasi); TryGetIdxSource ise
+    dondurdugu TIdxSource.Keep alanina bir referans daha ekler. Boylece
+    okuyucu kaynagi yinelerken baska bir yol indeksi kaldirsa bile nesne
+    son okuyucu birakana kadar yasamaya devam eder (use-after-free yok).
+    Sozlukten cikarma .Free degil _Release cagirmalidir. }
+  TIdxSkip = class(TInterfacedObject)
   public
     List: TVDbBTree;
     Cmp: TIdxSkipCmp;
@@ -135,8 +141,14 @@ type
     function CompareVal(const A, B: string): Integer;
   end;
 
-  { Bir indeksin okuma kaynagi: yeni yol skiplist, eski/yedek yol dizi. }
+  { Bir indeksin okuma kaynagi: yeni yol skiplist, eski/yedek yol dizi.
+
+    Keep (R1): Skip'e ait yasam referansi. Alan yonetilen (managed) oldugu
+    icin kaydin her kopyasi AddRef/_Release yapar; kayit kapsamdan ciktiginda
+    referans otomatik birakilir. Cagiranlarin ek bir serbest birakma cagrisi
+    yapmasina gerek yoktur; boylece TryGetIdxSource sozlesmesi korunur. }
   TIdxSource = record
+    Keep: IInterface;
     Skip: TIdxSkip;
     Arr: TIdxEntries;
     Ctype: Byte;
@@ -8565,7 +8577,7 @@ begin
   end;
   if FSkipIdx.TryGetValue(k, sk) then
   begin
-    sk.Free;
+    sk._Release;   // R1: taban referansi birak
     FSkipIdx.Remove(k);
   end;
   FIdxCtype.Remove(k);
@@ -9758,7 +9770,7 @@ begin
         FMemIdx.Remove(IdxKey(t.TableId, nt.Idx[i].Col));
         if FSkipIdx.ContainsKey(IdxKey(t.TableId, nt.Idx[i].Col)) then
         begin
-          FSkipIdx[IdxKey(t.TableId, nt.Idx[i].Col)].Free;
+          FSkipIdx[IdxKey(t.TableId, nt.Idx[i].Col)]._Release;   // R1
           FSkipIdx.Remove(IdxKey(t.TableId, nt.Idx[i].Col));
         end;
       end;
@@ -10318,7 +10330,7 @@ begin
   FIdxCs.Enter;   // B-02
   try
     if FSkipIdx = nil then Exit;
-    for kv in FSkipIdx do kv.Value.Free;
+    for kv in FSkipIdx do kv.Value._Release;   // R1
     FSkipIdx.Clear;
   finally
     FIdxCs.Leave;
@@ -10350,9 +10362,10 @@ begin
   // altinda uzun is yapilmaz. Sonuc kisa sureligine takas edilir.
   sk := TIdxSkip.Create(ct, cts);
   sk.LoadFromEntries(E);
+  sk._AddRef;   // R1: sozlugun taban referansi (cikarmada _Release)
   FIdxCs.Enter;   // B-02
   try
-    if FSkipIdx.TryGetValue(k, old) then old.Free;
+    if FSkipIdx.TryGetValue(k, old) then old._Release;   // R1
     FSkipIdx.AddOrSetValue(k, sk);
   finally
     FIdxCs.Leave;
@@ -10385,6 +10398,7 @@ var
   needFlush, hasSkip, hasMem, hasCt: Boolean;   // B-02
 begin
   Result := False;
+  Src.Keep := nil;   // R1: managed alan; cagiran serbest birakmaz
   Src.Skip := nil;
   SetLength(Src.Arr, 0);
   k := IdxKey(TableId, ColIdx);
@@ -10477,13 +10491,29 @@ begin
 
   if hasSkip then
   begin
-    // NOT (B-02): Src.Skip isaretcisi kilit BIRAKTIKTAN sonra da yineleme
-    // icin kullanilir. Bu sozlesme korunur: skip listesine mutasyon yalniz
-    // FLock YAZMA kilidi altinda yapilir; okuyucular okuma kilidi tutar.
-    Src.Skip := sk;
-    Src.Ctype := sk.Cmp.Ctype;
-    Src.NParts := IdxNPartsByKey(k);
-    Exit(True);
+    // R1: yasam referansi FIdxCs ALTINDA alinir. Onceki aramadan bu yana
+    // indeks kaldirilmis/yeniden kurulmus olabilir; bu yuzden sozluk burada
+    // yeniden dogrulanir. Src.Keep (managed IInterface) kaydin her
+    // kopyasinda AddRef/_Release yapar; son okuyucu birakana kadar nesne
+    // yasar. Boylece Src.Skip kilit BIRAKTIKTAN sonra da guvenle yinelenir.
+    hasSkip := False;
+    FIdxCs.Enter;
+    try
+      if FSkipIdx.TryGetValue(k, sk) then
+      begin
+        Src.Keep := sk;   // R1: okuyucunun yasam referansi
+        hasSkip := True;
+      end;
+    finally
+      FIdxCs.Leave;
+    end;
+    if hasSkip then
+    begin
+      Src.Skip := sk;
+      Src.Ctype := sk.Cmp.Ctype;
+      Src.NParts := IdxNPartsByKey(k);
+      Exit(True);
+    end;
   end;
   // PK lazy index / dizi yedegi: eski yolu kullan.
   if TryGetMemIndex(TableId, ColIdx, e) then
@@ -10869,7 +10899,7 @@ begin
           FMemIdx.Remove(IdxKeyPos(t, j));
           if FSkipIdx.ContainsKey(IdxKeyPos(t, j)) then
           begin
-            FSkipIdx[IdxKeyPos(t, j)].Free;
+            FSkipIdx[IdxKeyPos(t, j)]._Release;   // R1
             FSkipIdx.Remove(IdxKeyPos(t, j));
           end;
           FIdxCtype.Remove(IdxKeyPos(t, j));
@@ -11208,7 +11238,7 @@ begin
       FMemIdx.Remove(IdxKey(t.TableId, t.Idx[j].Col));
       if FSkipIdx.ContainsKey(IdxKey(t.TableId, t.Idx[j].Col)) then
       begin
-        FSkipIdx[IdxKey(t.TableId, t.Idx[j].Col)].Free;
+        FSkipIdx[IdxKey(t.TableId, t.Idx[j].Col)]._Release;   // R1
         FSkipIdx.Remove(IdxKey(t.TableId, t.Idx[j].Col));
       end;
     end;

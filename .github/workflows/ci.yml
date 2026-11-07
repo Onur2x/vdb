@@ -55,7 +55,7 @@ jobs:
             'tests/sql/sqltest', 'tests/gates/pagechk', 'tests/gates/storechk',
             'tests/gates/heapchk', 'tests/gates/crashtest', 'tests/gates/idxchk',
             'tests/gates/backendchk', 'tests/gates/v3sqlchk', 'tests/gates/migchk',
-            'tests/gates/colmapchk', 'tests/gates/mvchk',
+            'tests/gates/colmapchk', 'tests/gates/skipchk', 'tests/gates/mvchk',
             'tests/gates/aggchk', 'tests/gates/mmchk', 'tests/gates/poolchk',
             'tests/gates/poolsafe', 'tests/gates/idxcache',
             'tests/gates/readlockchk', 'tests/gates/commitfailchk',
@@ -197,6 +197,21 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'colmapchk kalan > 0'
+            exit 1
+          }
+
+      - name: Indeks kaynak omru kapisi (skipchk)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbskipchk'
+          $out = & .\tests\gates\skipchk.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'INDEKS KAYNAK OMRU DOGRULANDI') {
+            Write-Error 'skipchk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'skipchk kalan > 0'
             exit 1
           }
 

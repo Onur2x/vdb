@@ -121,6 +121,7 @@ derle tests/gates/idxchk.lpr idxchk && kos idxchk "KALICI DIZIN DOGRULANDI" "$WO
 derle tests/gates/idxcache.lpr idxcache && kos idxcache "INDEKS ONBELLEGI TUTARLILIGI DOGRULANDI" "$WORK/idxcache"
 derle tests/gates/backendchk.lpr backendchk && kos backendchk "BACKEND DIKISI DOGRULANDI" "$WORK/backendchk" 5000
 derle tests/gates/colmapchk.lpr colmapchk && kos colmapchk "KOLON HARITASI ONBELLEGI DOGRULANDI" "$WORK/colmapchk"
+derle tests/gates/skipchk.lpr skipchk && kos skipchk "INDEKS KAYNAK OMRU DOGRULANDI" "$WORK/skipchk"
 derle tests/gates/mvchk.lpr mvchk && kos mvchk "MATERIALIZED VIEW KALICILIGI DOGRULANDI" "$WORK/mvchk"
 derle tests/gates/aggchk.lpr aggchk && kos aggchk "AGGREGATE HASSASIYETI DOGRULANDI" "$WORK/aggchk"
 derle tests/gates/mmchk.lpr mmchk && kos mmchk "MM SOZLESMESI DOGRULANDI"
