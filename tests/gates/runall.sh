@@ -121,6 +121,7 @@ derle tests/gates/idxchk.lpr idxchk && kos idxchk "KALICI DIZIN DOGRULANDI" "$WO
 derle tests/gates/backendchk.lpr backendchk && kos backendchk "BACKEND DIKISI DOGRULANDI" "$WORK/backendchk" 5000
 derle tests/gates/colmapchk.lpr colmapchk && kos colmapchk "KOLON HARITASI ONBELLEGI DOGRULANDI" "$WORK/colmapchk"
 derle tests/gates/mvchk.lpr mvchk && kos mvchk "MATERIALIZED VIEW KALICILIGI DOGRULANDI" "$WORK/mvchk"
+derle tests/gates/aggchk.lpr aggchk && kos aggchk "AGGREGATE HASSASIYETI DOGRULANDI" "$WORK/aggchk"
 derle tests/gates/mmchk.lpr mmchk && kos mmchk "MM SOZLESMESI DOGRULANDI"
 derle tests/gates/poolchk.lpr poolchk && kos poolchk "HAVUZ HATA YOLU DOGRULANDI" "$WORK/poolchk"
 derle tests/gates/readlockchk.lpr readlockchk && kos readlockchk "OKUMA KILIDI SIZINTISI YOK" "$WORK/readlockchk"

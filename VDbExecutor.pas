@@ -1486,20 +1486,95 @@ begin
             (S = 'PERCENTILE_DISC') or (S = 'PERCENTILE');
 end;
 
+{ D-Y1/Y2: SUM/AVG hassasiyeti.
+  VCT_INT kolonlarda toplam Int64 olarak biriktirilir. Int64 tasarsa
+  eski davranisa (Double birikim) dusulur; boylece mevcut hata/float
+  sozlesmesi korunur. VCT_FLOAT kolonlarda Double + Kahan telafisi
+  kullanilir; cikti bicimi (VDbFloatToStr) degismez. }
+procedure VDbAggAccInt(var SumI: Int64; var Ovf: Boolean;
+  var SumF: Double; V: Int64);
+begin
+  if Ovf then
+  begin
+    SumF := SumF + V * 1.0;
+    Exit;
+  end;
+  // Isaretli toplama tasmasi onceden kontrol edilir (sarma yok).
+  if ((V > 0) and (SumI > High(Int64) - V)) or
+     ((V < 0) and (SumI < Low(Int64) - V)) then
+  begin
+    Ovf := True;
+    SumF := SumI * 1.0 + V * 1.0;
+  end
+  else
+    Inc(SumI, V);
+end;
+
+procedure VDbAggAccFloat(var Sum, Comp: Double; V: Double);
+var
+  y, t: Double;
+begin
+  // Kahan (compensated) toplama: uzun toplamlarda yuvarlama birikimini
+  // azaltir. Kisa/tek degerli toplamlarda sonuc eski davranisla aynidir.
+  y := V - Comp;
+  t := Sum + y;
+  Comp := (t - Sum) - y;
+  Sum := t;
+end;
+
+{ Int64 toplamin metin karsiligi. Tasma durumunda Double'a dusulmus
+  toplam eski bicimle yazilir. Kucuk degerlerde IntToStr ciktisi
+  VDbFloatToStr ile birebir aynidir ('30', '-5', '0'). }
+function VDbAggIntToStr(SumI: Int64; Ovf: Boolean; SumF: Double): string;
+begin
+  if Ovf then Result := VDbFloatToStr(SumF)
+  else Result := IntToStr(SumI);
+end;
+
+{ AVG ciktisi (sozlesme: FLOAT metin). Toplam Int64 ise tam toplam
+  kullanilir; 2^53 ustunde bolum/kalan ayrimi ile hassasiyet korunur. }
+function VDbAggAvgToStr(SumI: Int64; Cnt: Int64; Ovf: Boolean;
+  SumF: Double): string;
+var
+  q: Int64;
+  avg: Double;
+begin
+  if Cnt <= 0 then Exit('');
+  if Ovf then
+  begin
+    Result := VDbFloatToStr(SumF / Cnt);
+    Exit;
+  end;
+  if (SumI >= -9007199254740992) and (SumI <= 9007199254740992) then
+  begin
+    avg := SumI;             // atama ile donusum (bit cast degil)
+    Result := VDbFloatToStr(avg / Cnt);
+  end
+  else
+  begin
+    q := SumI div Cnt;
+    avg := q;
+    avg := avg + (SumI - q * Cnt) / Cnt;
+    Result := VDbFloatToStr(avg);
+  end;
+end;
+
 function TVSqlExecutor.EvalAggregateValue(fn: TSqlFuncCallNode;
   const SrcRows: TStrMatrix; Idx: TList<Integer>;
   const ACNames: TStrArray; const ACTypes: TByteArray): string;
 var
   k, ci, avgCnt: Integer;
-  cntI: Int64;
-  sumF, fv: Double;
+  cntI, sumI, iv: Int64;
+  sumF, sumC, fv: Double;
+  ovf: Boolean;
   minV, maxV, colVal: string;
   aggCt: Byte;
   // F-11: DISTINCT â€” tekrarli degerler bir kez sayilir. Hash kova ile
   // O(N); NULL degerler DISTINCT kumesine GIRMEZ (SQL standardi).
   seen: TDictionary<string, Byte>;
 begin
-  cntI := 0; sumF := 0; avgCnt := 0; minV := ''; maxV := '';
+  cntI := 0; sumI := 0; sumF := 0; sumC := 0; ovf := False;
+  avgCnt := 0; minV := ''; maxV := '';
   if fn.IsDistinct then
     seen := TDictionary<string, Byte>.Create
   else
@@ -1546,9 +1621,28 @@ begin
         if seen.ContainsKey(colVal) then Continue
         else seen.Add(colVal, 0);
       Inc(cntI);
-      if VDbParseFloat(colVal, fv) then
+      // D-Y1/Y2: INTEGER kolonda SUM/AVG Int64 ile tam biriktirilir.
+      if ((fn.FuncName = 'SUM') or (fn.FuncName = 'AVG')) and
+         (aggCt = VCT_INT) then
       begin
-        sumF := sumF + fv;
+        if VDbParseInt(colVal, iv) then
+        begin
+          VDbAggAccInt(sumI, ovf, sumF, iv);
+          Inc(avgCnt);
+        end
+        else if VDbParseFloat(colVal, fv) then
+        begin
+          VDbAggAccFloat(sumF, sumC, fv);
+          Inc(avgCnt);
+        end;
+      end
+      else if VDbParseFloat(colVal, fv) then
+      begin
+        // FLOAT: Kahan telafisi. Diger tiplerde eski Double davranisi.
+        if aggCt = VCT_FLOAT then
+          VDbAggAccFloat(sumF, sumC, fv)
+        else
+          sumF := sumF + fv;
         Inc(avgCnt);
       end;
       if (minV = '') or VDbCmpVal(colVal, minV, '<', aggCt) then minV := colVal;
@@ -1557,10 +1651,25 @@ begin
   end;
   if fn.FuncName = 'COUNT' then Result := IntToStr(cntI)
   else if fn.FuncName = 'SUM' then
-    if cntI > 0 then Result := VDbFloatToStr(sumF) else Result := ''
+  begin
+    if cntI > 0 then
+    begin
+      if aggCt = VCT_INT then
+        Result := VDbAggIntToStr(sumI, ovf, sumF)
+      else
+        Result := VDbFloatToStr(sumF);
+    end
+    else Result := '';
+  end
   else if fn.FuncName = 'AVG' then
   begin
-    if avgCnt > 0 then Result := VDbFloatToStr(sumF / avgCnt)
+    if avgCnt > 0 then
+    begin
+      if aggCt = VCT_INT then
+        Result := VDbAggAvgToStr(sumI, avgCnt, ovf, sumF)
+      else
+        Result := VDbFloatToStr(sumF / avgCnt);
+    end
     else Result := '';
   end
   else if fn.FuncName = 'MIN' then Result := minV
@@ -8207,8 +8316,10 @@ var
   orderKeys: TStrArray;
   v, wv, dv, frameVal: string;
   ct: Byte;
-  cnt: Int64;
+  cnt, sumI, iv: Int64;
   sum: Double;
+  sumC: Double;
+  ovf: Boolean;
   navg: Integer;
   mn, mx: string;
   fv: Double;
@@ -8412,7 +8523,8 @@ begin
             ct := AggCtype;
             for k := 0 to High(ord) do
             begin
-              cnt := 0; sum := 0; navg := 0; mn := ''; mx := '';
+              cnt := 0; sum := 0; sumI := 0; sumC := 0; ovf := False;
+              navg := 0; mn := ''; mx := '';
               if WN.FrameType = '' then
                 kkEnd := High(ord)
               else
@@ -8427,19 +8539,47 @@ begin
                 v := EvalExpr(WN.Arg, Rows[ord[kk]], ColNames, ColTypes);
                 if v = '' then Continue;
                 Inc(cnt);
-                if VDbParseFloat(v, fv) then
+                // D-Y1/Y2: INTEGER cercevede Int64 tam toplam.
+                if ct = VCT_INT then
                 begin
-                  sum := sum + fv;
+                  if VDbParseInt(v, iv) then
+                  begin
+                    VDbAggAccInt(sumI, ovf, sum, iv);
+                    Inc(navg);
+                  end
+                  else if VDbParseFloat(v, fv) then
+                  begin
+                    VDbAggAccFloat(sum, sumC, fv);
+                    Inc(navg);
+                  end;
+                end
+                else if VDbParseFloat(v, fv) then
+                begin
+                  if ct = VCT_FLOAT then
+                    VDbAggAccFloat(sum, sumC, fv)
+                  else
+                    sum := sum + fv;
                   Inc(navg);
                 end;
                 if (mn = '') or VDbCmpVal(v, mn, '<', ct) then mn := v;
                 if (mx = '') or VDbCmpVal(v, mx, '>', ct) then mx := v;
               end;
               if WN.FuncName = 'COUNT' then wv := IntToStr(cnt)
-              else if WN.FuncName = 'SUM' then wv := VDbFloatToStr(sum)
+              else if WN.FuncName = 'SUM' then
+              begin
+                if ct = VCT_INT then wv := VDbAggIntToStr(sumI, ovf, sum)
+                else wv := VDbFloatToStr(sum);
+              end
               else if WN.FuncName = 'AVG' then
               begin
-                if navg > 0 then wv := VDbFloatToStr(sum / navg) else wv := '';
+                if navg > 0 then
+                begin
+                  if ct = VCT_INT then
+                    wv := VDbAggAvgToStr(sumI, navg, ovf, sum)
+                  else
+                    wv := VDbFloatToStr(sum / navg);
+                end
+                else wv := '';
               end
               else if WN.FuncName = 'MIN' then wv := mn
               else if WN.FuncName = 'MAX' then wv := mx
@@ -8688,7 +8828,10 @@ type
     Fn: TSqlFuncCallNode;
     Col: Integer;            // -1 = COUNT(*)
     Cnt, AvgCnt: Int64;
-    SumF: Double;
+    SumF: Double;            // FLOAT toplam; Int64 tasmasinda yedek
+    SumC: Double;            // Kahan telafisi (VCT_FLOAT)
+    SumI: Int64;             // VCT_INT tam toplam (D-Y1)
+    Ovf: Boolean;            // Int64 tasmasi -> Double yedegi
     MinI, MaxI: Int64;       // VCT_INT icin
     MinF, MaxF: Double;      // VCT_FLOAT icin
     HasMin, HasMax: Boolean;
@@ -8749,8 +8892,7 @@ begin
           if not VDbIntFromPayload(@Buf[ctx.FOff[c]], ctx.FLen[c], iv) then
             Exit(False);
           // DIKKAT: Double(iv) mode-delphi'de BIT CAST'tir (denormal
-          // cantan); deger donusumu atama/carpmayla olur (P-12 sqltest).
-          fv := iv * 1.0;   // StrToFloat(IntToStr(iv)) ile birebir ayni
+          // cantan); deger donusumu toplama sirasinda olur.
         end;
       VCT_FLOAT:
         begin
@@ -8768,7 +8910,14 @@ begin
     // Kanonik bicimler VDbParseFloat'ta her zaman cozulur (NaN/Inf elendi)
     Inc(ctx.Plans[j].Cnt);
     Inc(ctx.Plans[j].AvgCnt);
-    ctx.Plans[j].SumF := ctx.Plans[j].SumF + fv;
+    // D-Y1/Y2: INTEGER tam Int64, FLOAT Kahan, BOOL eski Double.
+    if ctx.Ct[c] = VCT_INT then
+      VDbAggAccInt(ctx.Plans[j].SumI, ctx.Plans[j].Ovf,
+        ctx.Plans[j].SumF, iv)
+    else if ctx.Ct[c] = VCT_FLOAT then
+      VDbAggAccFloat(ctx.Plans[j].SumF, ctx.Plans[j].SumC, fv)
+    else
+      ctx.Plans[j].SumF := ctx.Plans[j].SumF + fv;
     if fn.FuncName = 'MIN' then
     begin
       if not ctx.Plans[j].HasMin then
@@ -8856,6 +9005,9 @@ begin
       pc.Ctxs[i].Plans[j].Cnt := 0;
       pc.Ctxs[i].Plans[j].AvgCnt := 0;
       pc.Ctxs[i].Plans[j].SumF := 0;
+      pc.Ctxs[i].Plans[j].SumC := 0;
+      pc.Ctxs[i].Plans[j].SumI := 0;
+      pc.Ctxs[i].Plans[j].Ovf := False;
       pc.Ctxs[i].Plans[j].MinI := 0;
       pc.Ctxs[i].Plans[j].MaxI := 0;
       pc.Ctxs[i].Plans[j].MinF := 0;
@@ -9080,7 +9232,27 @@ begin
       begin
         Inc(plans[j].Cnt, pc.Ctxs[w].Plans[j].Cnt);
         Inc(plans[j].AvgCnt, pc.Ctxs[w].Plans[j].AvgCnt);
-        plans[j].SumF := plans[j].SumF + pc.Ctxs[w].Plans[j].SumF;
+        // D-Y1/Y2: INTEGER planlarda Int64 birlestir; tasma yedegi Double.
+        if (c >= 0) and (ct[c] = VCT_INT) then
+        begin
+          if pc.Ctxs[w].Plans[j].Ovf then
+          begin
+            if not plans[j].Ovf then
+            begin
+              plans[j].Ovf := True;
+              plans[j].SumF := plans[j].SumF + plans[j].SumI * 1.0;
+            end;
+            plans[j].SumF := plans[j].SumF + pc.Ctxs[w].Plans[j].SumF;
+          end
+          else
+            VDbAggAccInt(plans[j].SumI, plans[j].Ovf, plans[j].SumF,
+              pc.Ctxs[w].Plans[j].SumI);
+        end
+        else
+        begin
+          plans[j].SumF := plans[j].SumF + pc.Ctxs[w].Plans[j].SumF;
+          plans[j].SumC := plans[j].SumC + pc.Ctxs[w].Plans[j].SumC;
+        end;
         if pc.Ctxs[w].Plans[j].HasMin then
         begin
           if not plans[j].HasMin then
@@ -9149,13 +9321,25 @@ begin
     else if fn.FuncName = 'SUM' then
     begin
       if plans[j].Cnt > 0 then
-        Res.Rows[0][j] := VDbFloatToStr(plans[j].SumF)
+      begin
+        if (plans[j].Col >= 0) and (ct[plans[j].Col] = VCT_INT) then
+          Res.Rows[0][j] := VDbAggIntToStr(plans[j].SumI, plans[j].Ovf,
+            plans[j].SumF)
+        else
+          Res.Rows[0][j] := VDbFloatToStr(plans[j].SumF);
+      end
       else Res.Rows[0][j] := '';
     end
     else if fn.FuncName = 'AVG' then
     begin
       if plans[j].AvgCnt > 0 then
-        Res.Rows[0][j] := VDbFloatToStr(plans[j].SumF / plans[j].AvgCnt)
+      begin
+        if (plans[j].Col >= 0) and (ct[plans[j].Col] = VCT_INT) then
+          Res.Rows[0][j] := VDbAggAvgToStr(plans[j].SumI, plans[j].AvgCnt,
+            plans[j].Ovf, plans[j].SumF)
+        else
+          Res.Rows[0][j] := VDbFloatToStr(plans[j].SumF / plans[j].AvgCnt);
+      end
       else Res.Rows[0][j] := '';
     end
     else if fn.FuncName = 'MIN' then
@@ -9196,7 +9380,10 @@ type
     Fn: TSqlFuncCallNode;
     Col: Integer;            // -1 = COUNT(*); digeri birlesik satir indeksi
     Cnt, AvgCnt: Int64;
-    SumF: Double;
+    SumF: Double;            // FLOAT toplam; Int64 tasmasinda yedek
+    SumC: Double;            // Kahan telafisi (VCT_FLOAT)
+    SumI: Int64;             // VCT_INT tam toplam (D-Y1)
+    Ovf: Boolean;            // Int64 tasmasi -> Double yedegi
     MinV, MaxV: string;      // EvalAggregateValue: ham deger
     AggCt: Byte;
   end;
@@ -9365,6 +9552,7 @@ var
   procedure AccOne(var Pl: TJaPlan; const V: string);
   var
     fv: Double;
+    iv: Int64;
   begin
     if Pl.Col < 0 then
     begin
@@ -9373,9 +9561,26 @@ var
     end;
     if V = '' then Exit;           // NULL: sayilmaz
     Inc(Pl.Cnt);
-    if VDbParseFloat(V, fv) then
+    // D-Y1/Y2: INTEGER kolonda Int64 tam toplam.
+    if Pl.AggCt = VCT_INT then
     begin
-      Pl.SumF := Pl.SumF + fv;
+      if VDbParseInt(V, iv) then
+      begin
+        VDbAggAccInt(Pl.SumI, Pl.Ovf, Pl.SumF, iv);
+        Inc(Pl.AvgCnt);
+      end
+      else if VDbParseFloat(V, fv) then
+      begin
+        VDbAggAccFloat(Pl.SumF, Pl.SumC, fv);
+        Inc(Pl.AvgCnt);
+      end;
+    end
+    else if VDbParseFloat(V, fv) then
+    begin
+      if Pl.AggCt = VCT_FLOAT then
+        VDbAggAccFloat(Pl.SumF, Pl.SumC, fv)
+      else
+        Pl.SumF := Pl.SumF + fv;
       Inc(Pl.AvgCnt);
     end;
     if (Pl.MinV = '') or VDbCmpVal(V, Pl.MinV, '<', Pl.AggCt) then
@@ -9542,6 +9747,9 @@ begin
       plans[j].Cnt := 0;
       plans[j].AvgCnt := 0;
       plans[j].SumF := 0;
+      plans[j].SumC := 0;
+      plans[j].SumI := 0;
+      plans[j].Ovf := False;
       plans[j].MinV := '';
       plans[j].MaxV := '';
       plans[j].AggCt := VCT_STR;
@@ -9793,13 +10001,25 @@ begin
       else if fn.FuncName = 'SUM' then
       begin
         if plans[j].Cnt > 0 then
-          Res.Rows[0][j] := VDbFloatToStr(plans[j].SumF)
+        begin
+          if plans[j].AggCt = VCT_INT then
+            Res.Rows[0][j] := VDbAggIntToStr(plans[j].SumI, plans[j].Ovf,
+              plans[j].SumF)
+          else
+            Res.Rows[0][j] := VDbFloatToStr(plans[j].SumF);
+        end
         else Res.Rows[0][j] := '';
       end
       else if fn.FuncName = 'AVG' then
       begin
         if plans[j].AvgCnt > 0 then
-          Res.Rows[0][j] := VDbFloatToStr(plans[j].SumF / plans[j].AvgCnt)
+        begin
+          if plans[j].AggCt = VCT_INT then
+            Res.Rows[0][j] := VDbAggAvgToStr(plans[j].SumI, plans[j].AvgCnt,
+              plans[j].Ovf, plans[j].SumF)
+          else
+            Res.Rows[0][j] := VDbFloatToStr(plans[j].SumF / plans[j].AvgCnt);
+        end
         else Res.Rows[0][j] := '';
       end
       else if fn.FuncName = 'MIN' then
@@ -10478,6 +10698,9 @@ var
       st^.Plans[k].Cnt := 0;
       st^.Plans[k].AvgCnt := 0;
       st^.Plans[k].SumF := 0;
+      st^.Plans[k].SumC := 0;
+      st^.Plans[k].SumI := 0;
+      st^.Plans[k].Ovf := False;
       st^.Plans[k].MinI := 0;
       st^.Plans[k].MaxI := 0;
       st^.Plans[k].MinF := 0;
@@ -10565,7 +10788,6 @@ begin
           begin
             C^.Failed := True; Exit(False);
           end;
-          fv := iv * 1.0;
         end;
       VCT_FLOAT:
         begin
@@ -10588,7 +10810,14 @@ begin
     end;
     Inc(st^.Plans[j].Cnt);
     Inc(st^.Plans[j].AvgCnt);
-    st^.Plans[j].SumF := st^.Plans[j].SumF + fv;
+    // D-Y1/Y2: INTEGER tam Int64, FLOAT Kahan, BOOL eski Double.
+    if C^.Ct[ci] = VCT_INT then
+      VDbAggAccInt(st^.Plans[j].SumI, st^.Plans[j].Ovf,
+        st^.Plans[j].SumF, iv)
+    else if C^.Ct[ci] = VCT_FLOAT then
+      VDbAggAccFloat(st^.Plans[j].SumF, st^.Plans[j].SumC, fv)
+    else
+      st^.Plans[j].SumF := st^.Plans[j].SumF + fv;
     if st^.Plans[j].Fn.FuncName = 'MIN' then
     begin
       if not st^.Plans[j].HasMin then
@@ -10855,11 +11084,25 @@ var
     if P.Fn.FuncName = 'COUNT' then Exit(IntToStr(P.Cnt));
     if P.Fn.FuncName = 'SUM' then
     begin
-      if P.Cnt > 0 then Exit(VDbFloatToStr(P.SumF)) else Exit('');
+      if P.Cnt > 0 then
+      begin
+        if (P.Col >= 0) and (P.Col <= High(Ct)) and (Ct[P.Col] = VCT_INT) then
+          Exit(VDbAggIntToStr(P.SumI, P.Ovf, P.SumF))
+        else
+          Exit(VDbFloatToStr(P.SumF));
+      end
+      else Exit('');
     end;
     if P.Fn.FuncName = 'AVG' then
     begin
-      if P.AvgCnt > 0 then Exit(VDbFloatToStr(P.SumF / P.AvgCnt)) else Exit('');
+      if P.AvgCnt > 0 then
+      begin
+        if (P.Col >= 0) and (P.Col <= High(Ct)) and (Ct[P.Col] = VCT_INT) then
+          Exit(VDbAggAvgToStr(P.SumI, P.AvgCnt, P.Ovf, P.SumF))
+        else
+          Exit(VDbFloatToStr(P.SumF / P.AvgCnt));
+      end
+      else Exit('');
     end;
     if P.Fn.FuncName = 'MIN' then
     begin

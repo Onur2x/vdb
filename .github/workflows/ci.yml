@@ -56,7 +56,7 @@ jobs:
             'tests/gates/heapchk', 'tests/gates/crashtest', 'tests/gates/idxchk',
             'tests/gates/backendchk', 'tests/gates/v3sqlchk', 'tests/gates/migchk',
             'tests/gates/colmapchk', 'tests/gates/mvchk',
-            'tests/gates/mmchk', 'tests/gates/poolchk',
+            'tests/gates/aggchk', 'tests/gates/mmchk', 'tests/gates/poolchk',
             'tests/gates/readlockchk', 'tests/gates/commitfailchk',
             'vdbmig', 'tests/gates/factorychk', 'tests/gates/logchk',
             'tests/gates/pitrchk', 'tests/gates/btreechk', 'tests/gates/replchk',
@@ -210,6 +210,21 @@ jobs:
           }
           if ($out -notmatch 'kalan=0') {
             Write-Error 'mvchk kalan > 0'
+            exit 1
+          }
+
+      - name: Aggregate hassasiyeti kapisi (aggchk)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vdbaggchk'
+          $out = & .\tests\gates\aggchk.exe $dir 2>&1 | Out-String
+          $out | Write-Host
+          if ($out -notmatch 'AGGREGATE HASSASIYETI DOGRULANDI') {
+            Write-Error 'aggchk basarisiz'
+            exit 1
+          }
+          if ($out -notmatch 'kalan=0') {
+            Write-Error 'aggchk kalan > 0'
             exit 1
           }
 
