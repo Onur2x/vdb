@@ -178,7 +178,14 @@ uses
     sistemi buyuk/kucuk harf duyarlidir; Windows'ta yanlis harf
     kopyasinin sessizce calismasi CI'da linux/macos kapilarini
     dusuruyordu). }
-  DCPcrypt2, DCPblockciphers, DCPrijndael, DCPsha256, VDbKdf;
+  DCPcrypt2, DCPblockciphers, DCPrijndael, DCPsha256, VDbKdf,
+  { ADIM 2B (SAHIP KARARI R-5): etkin provider soyutlamasi. VARSAYILAN
+    builtin'dir ve o durumda asagidaki YEREL saf-Pascal kod calisir; bu
+    yuzden VDbCryptoBuiltin buraya ASLA `uses` EDILMEZ (builtin birimi
+    facade'e delege ettigi icin dongu/ozyineleme olurdu). OpenSSL birimi
+    yalniz acik opt-in'de (VDB_CRYPTO_PROVIDER=openssl veya
+    VDbCryptoSelectProvider) devreye girer; kayit icin `uses` gerekir. }
+  VDbCryptoTypes, VDbCryptoProvider, VDbCryptoOpenSSL;
 
 { M6: Unix'te DPAPI yok; anahtar dosyasi yalnizca dosya izinleriyle
   korunur. .colkey'i sahibine okuma/yazma ile sinirla (0600). }
@@ -202,6 +209,51 @@ const
 type
   TTDCP_sha256Class = class of TDCP_sha256;
   TTDCP_rijndaelClass = class of TDCP_rijndael;
+
+{ ------------------- ADIM 2B: provider dispatch kancasi -------------------
+  Kural (ADR 3 adim 2 + EK-B/R-5):
+    * Etkin provider NIL ya da 'builtin' ise -> nil doner ve cagiran
+      YEREL saf-Pascal yolu kullanir. builtin dalinda provider'a geri
+      cagri YOKTUR; boylece VDbCryptoBuiltin -> VDbCrypt -> provider ->
+      VDbCryptoBuiltin ozyinelemesi matematiksel olarak imkansizdir.
+    * Varsayilan ad BIR KEZ cozumlenir (VDbCryptoDefaultProviderName:
+      ortam degiskeni varsa o, yoksa 'builtin'). Hicbir DLL varsayilan
+      olarak aranmaz/yuklenmez.
+    * Acik opt-in (openssl) kullanilamiyorsa secim BASARISIZ olur ve
+      temiz hata firlar; sessiz builtin dususu YOK (K6 + R-5/c). }
+var
+  GProvLock: TCriticalSection = nil;
+  GProvResolved: Boolean = False;
+
+function CryptoExternalProvider: TVDbCryptoProvider;
+var
+  nm, err: string;
+  p: TVDbCryptoProvider;
+begin
+  Result := nil;
+  if GProvLock = nil then Exit;   { initialization'dan once cagri: yerel yol }
+  GProvLock.Acquire;
+  try
+    if not GProvResolved then
+    begin
+      nm := VDbCryptoDefaultProviderName;
+      if nm <> VDB_PROVIDER_BUILTIN then
+      begin
+        { ACIK opt-in: basarisizlik gizlenmez. }
+        if not VDbCryptoSelectProvider(nm, err) then
+          raise EVdbCryptError.Create(
+            'kripto provider secilemedi (' + nm + '): ' + err,
+            VDB_CRYPTO_ERR);
+      end;
+      GProvResolved := True;
+    end;
+    p := VDbCryptoActiveProvider;
+    if (p <> nil) and (p.Name <> VDB_PROVIDER_BUILTIN) then
+      Result := p;
+  finally
+    GProvLock.Release;
+  end;
+end;
 
 {$IFDEF MSWINDOWS}
 type
@@ -277,7 +329,10 @@ var
   h: TDCP_sha256;
   cls: TTDCP_sha256Class;
   i: Integer;
+  p: TVDbCryptoProvider;
 begin
+  p := CryptoExternalProvider;
+  if p <> nil then Exit(p.HmacSHA256(Key, Data));
   if Length(Key) > 64 then
     raise EVdbCryptError.Create('HMAC anahtari cok uzun', VDB_CRYPTO_ERR);
   FillChar(kPad, SizeOf(kPad), 0);
@@ -319,7 +374,10 @@ var
   h: TDCP_sha256;
   cls: TTDCP_sha256Class;
   dig: array[0..31] of Byte;
+  p: TVDbCryptoProvider;
 begin
+  p := CryptoExternalProvider;
+  if p <> nil then Exit(p.HashSHA256(Data));
   cls := TDCP_sha256;
   h := cls.Create(nil);
   try
@@ -513,10 +571,13 @@ var
   iv0: array[0..15] of Byte;
   j0, h, g, ej0: TBytes;
   i: Integer;
+  p: TVDbCryptoProvider;
 begin
   Result := False;
   Cipher := nil;
   Tag := nil;
+  p := CryptoExternalProvider;
+  if p <> nil then Exit(p.AeadSeal(Key, Nonce, Plain, Aad, Cipher, Tag));
   if (Length(Key) <> VDB_KEY_LEN) or (Length(Nonce) <> VDB_AEAD_NONCE_LEN) then
     Exit;
   dcpFillChar(kSt, SizeOf(kSt), 0);
@@ -553,9 +614,12 @@ var
   j0, h, g, ej0: TBytes;
   i: Integer;
   diff: Byte;
+  p: TVDbCryptoProvider;
 begin
   Result := False;
   Plain := nil;
+  p := CryptoExternalProvider;
+  if p <> nil then Exit(p.AeadOpen(Key, Nonce, Cipher, Tag, Aad, Plain));
   if (Length(Key) <> VDB_KEY_LEN) or (Length(Nonce) <> VDB_AEAD_NONCE_LEN) or
      (Length(Tag) <> VDB_AEAD_TAG_LEN) then
     Exit;
@@ -738,6 +802,7 @@ var
   blk: array[0..3] of Byte;
   blkno, it, k: Integer;
   ofs: Integer;
+  p: TVDbCryptoProvider;
 begin
   { RFC 8018 PBKDF2:
       U_1 = PRF(P, S || INT(i))
@@ -746,6 +811,9 @@ begin
     PRF = HMAC-SHA256 (ciktisi tam 32 bayt). }
   if (Iter < 1) or (DkLen < 1) then
     raise EVdbCryptError.Create('PBKDF2: gecersiz parametre', VDB_CRYPTO_ERR);
+
+  p := CryptoExternalProvider;
+  if p <> nil then Exit(p.Pbkdf2Sha256(Pass, Salt, Iter, DkLen));
 
   SetLength(Result, DkLen);
   blkno := 1;
@@ -1502,11 +1570,14 @@ begin
 end;
 
 initialization
+  GProvLock := TCriticalSection.Create;
   FColKeysLock := TCriticalSection.Create;
   FColKeys := TDictionary<QWord, TBytes>.Create;
 
 finalization
   FColKeys.Free;
   FColKeysLock.Free;
+  GProvLock.Free;
+  GProvLock := nil;
 
 end.

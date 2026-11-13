@@ -11,11 +11,18 @@ unit VDbCryptoProvider;
   pointer kaydinda her yeni alan tum tasiyicilarda elle senkron
   ister.
 
-  SECIM KURALI (K1/K6, skill 3.1 satir 81): otomatik/gizli FALLBACK
-  YOK. Varsayilan provider OpenSSL'dir; OpenSSL kullanilamiyorsa
-  secim BASARISIZ OLUR ve denen DLL adlarini + VDB_CRYPTO_DLL ipucunu
-  soyleyen temiz hata doner - builtin KENDILIGINDEN devreye girmez.
-  builtin yalniz ACIK opt-in'dir: VDbCryptoSelectProvider(VDB_PROVIDER_BUILTIN).
+  SECIM KURALI (SAHIB KARARI R-5 / ADR EK-B, 2026-11-13 - K1'in
+  "OpenSSL birincil" onceligini DEGISTIRDI; skill 3.1 satir 81'in
+  "otomatik/gizli fallback YOK" kurali hala yururlukte):
+  VARSAYILAN provider = BUILTIN (saf Pascal, sifir harici DLL;
+  readme.md:3-4 sozu). VDbCryptoOpenSSL yalniz ACIK OPT-IN'dir:
+    (a) VDbCryptoSelectProvider(VDB_PROVIDER_OPENSSL) cagrisi, VEYA
+    (b) VDB_CRYPTO_PROVIDER=openssl ortam degiskeni (esdeger opt-in;
+        VDbCrypt facade'i ilk primitif cagrisinda bir kez cozumler).
+  OpenSSL ACIKCA secildi de kullanilamiyorsa secim BASARISIZ OLUR ve
+  denen DLL adlarini + VDB_CRYPTO_DLL ipucunu soyleyen temiz hata
+  doner - sessiz builtin dususu YOK (K6). Acik secim olmadikca
+  OpenSSL DLL'i hic aranmaz/yuklenmez (R-5/b).
 
   ADIM 1 KAPSAM NOTU (ADR 3 adim 1 = "dual path, henuz hicbir caller
   tasinmaz"): sozlesme Adim 1'in gerektirdigi kadardir - Hash/Hmac/
@@ -109,6 +116,11 @@ function VDbCryptoRegisterProviderClass(const AName: string;
 { Kayitli provider adlarini virgul ile listeler (hata mesajlarinda). }
 function VDbCryptoProviderNames: string;
 
+{ Proje varsayilani provider Adi (SAHIB KARARI R-5): VDB_CRYPTO_PROVIDER
+  ortam degiskeni varsa onun degeri (acik opt-in kanali), yoksa
+  'builtin'. Hicbir kutuphane yuklemez/dogrulamaz; yalniz Adir. }
+function VDbCryptoDefaultProviderName: string;
+
 { Adiyla provider ornegi yaratir/hazirlar. Basarisizsa AErr temiz hata:
   OpenSSL icin "kullanilamiyor, denen: ..., VDB_CRYPTO_DLL ayarla".
   ORNEK cagiran tarafin mulkiyetindedir; Free ile serbest birakilir. }
@@ -119,7 +131,10 @@ function VDbCryptoCreateProvider(const AName: string;
   etkin provider DEGISMEZ ve AErr dolar - builtin'e otomatik gecis YOK. }
 function VDbCryptoSelectProvider(const AName: string; out AErr: string): Boolean;
 
-{ Varsayilan secim = OpenSSL (K1). OpenSSL yoksa False + temiz hata. }
+{ Proje varsayilanini secer: builtin (SAHIB KARARI R-5).
+  VDB_CRYPTO_PROVIDER=openssl ise bu ACIK opt-in olarak OpenSSL'i secer;
+  OpenSSL kullanilamiyorsa False + temiz hata (sessiz builtin dususu YOK,
+  K6 - hata yalniz OpenSSL ACIKCA secildiginde uretilir, R-5/c). }
 function VDbCryptoSelectDefaultProvider(out AErr: string): Boolean;
 
 { Etkin provider veya nil. Cagiran nil ise crypto KAPALI demektir;
@@ -294,10 +309,20 @@ begin
   Result := True;
 end;
 
+function VDbCryptoDefaultProviderName: string;
+begin
+  Result := Trim(SysUtils.GetEnvironmentVariable('VDB_CRYPTO_PROVIDER'));
+  if Result = '' then
+    Result := VDB_PROVIDER_BUILTIN;  { R-5: varsayilan builtin - sifir DLL }
+end;
+
 function VDbCryptoSelectDefaultProvider(out AErr: string): Boolean;
 begin
-  { K1: varsayilan OpenSSL. Builtin'e otomatik gecis YOK. }
-  Result := VDbCryptoSelectProvider(VDB_PROVIDER_OPENSSL, AErr);
+  { SAHIB KARARI R-5 / ADR EK-B madde 1: varsayilan provider = builtin.
+    Adim 1'deki OpenSSL varsayilanindan farklidir; K1 onceligi gecersiz.
+    VDB_CRYPTO_PROVIDER ortam degiskeni varsa ACIK opt-in'dir ve
+    basarisizlikta temiz hata doner - otomatik builtin fallback YOK. }
+  Result := VDbCryptoSelectProvider(VDbCryptoDefaultProviderName, AErr);
 end;
 
 function VDbCryptoActiveProvider: TVDbCryptoProvider;
