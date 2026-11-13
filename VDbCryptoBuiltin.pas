@@ -1,26 +1,22 @@
 unit VDbCryptoBuiltin;
-{ VDbCryptoBuiltin - proje-ici (DCP tabanli) kripto provider'i, Adim 1.
+{ VDbCryptoBuiltin - proje-ici, TAMAMEN saf Pascal kripto provider'i (Adim 1).
 
-   Durum: GECIS BIRIMI. Bu sinif yeni primitif URETMaz; mevcut VDbCrypt
-   (V1 cagri yuzeyi) ve VDbKdf (Argon2id) fonksiyonlarina incecik bir
-   delegasyondur. Amac, provider sozlesmesini yerinde dogrulamak ve
-   builtin vektorlerini (ADR 3. adim 4 KAT'iyla ayni kaynak) OpenSSL
-   karsilastirmasina hazir tutmaktir.
+   Durum: VARSAYILAN provider (SAHIB KARARI R-5). Bu sinif yeni primitif
+   URETmez; primitifler saf Pascal cekirdekten gelir:
+     AES-256 / SHA-256 / HMAC-SHA256 -> VDbCryptoCore (FIPS-197,
+       FIPS 180-4, RFC 2104) - ADIM 4'te DCPcrypt tamamen kaldirildi.
+     Argon2id / BLAKE2b               -> VDbKdf.
+   Bu birim yalnizca provider sozlesmesini (VDbCryptoProvider) bu
+   cekirdege baglar. Harici DLL YOK; DCPcrypt bagimliligi YOK.
 
-   Bagimlilik zinciri (transitive DCP!):
-     VDbCryptoBuiltin -> VDbCrypt -> dcpcrypt (TCipher_AES/THash_SHA2/
-     THash_HMAC) ve -> VDbKdf (BLAKE2b/Argon2id, DCP degil).
-   ADR K1 kurali geregi vdbapi SON cagri noktasindan bu birime HIC
-   zincirlenmemelidir; ancak Adim 1'de vdbapi.lpi'ye eklenmesinin
-   nedeni K5'tir: selftest runner iki somut provider birimini de
-   derlemek ZORUNDADIR. Kalici degil - Adim 2/3'te facade baglari
-   netlesince tekrar degerlendirilir.
-   VDbCrypt uzerindeki ek yuzey (Encrypt/Decrypt legacy, keyfile,
-   kolon sifre) BILEREK tasinmiyor: provider sozlesmesi ADR 2'deki
-   9 yetegini disina cikmaz.
+   Neden VDbCrypt'e delege: VDbCrypt'in yerel (builtin) yol govdeleri
+   zaten bu cekirdegi kullanir ve tek dogruluk kaynagi orada tutulur.
+   Dongu riski yoktur cunku VDbCrypt, VDbCryptoBuiltin'i `uses` ETMEZ
+   (bkz. VDbCrypt implementation uses notu).
 
-   Opt-in: varsayilan provider OpenSSL'dir; builtin yalnizca acik
-   VDbCryptoSelectProvider(VDB_PROVIDER_BUILTIN) ile secilir (K6).
+   Opt-in: varsayilan provider builtin'dir (R-5). OpenSSL yalnizca acik
+   VDbCryptoSelectProvider(VDB_PROVIDER_OPENSSL) veya
+   VDB_CRYPTO_PROVIDER=openssl ile secilir (K6).
 
    K6 madde 3: bu birim HICbir OpenSSL sembolu cagirmaz; salt mevcut
    Pascal fonksiyonlarini sarar.

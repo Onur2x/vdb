@@ -53,7 +53,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 (cmd ile elle:)
 
 ```bat
-fpc -MObjFPC -Scghi -O1 -g -l -vewnhibq -FuD:\veritabani -FuD:\veritabani\dcpcrypt -FuD:\veritabani\dcpcrypt\Ciphers -FuD:\veritabani\dcpcrypt\Hashes "-FUD:\veritabani\tests\crypto_fixtures\lib" gen_fixtures.lpr
+fpc -MObjFPC -Scghi -O1 -g -l -vewnhibq -FuD:\veritabani "-FUD:\veritabani\tests\crypto_fixtures\lib" gen_fixtures.lpr
 ```
 
 Exe cwd'ye (`gen_fixtures.exe`) duser; `*.exe` zaten .gitignore'da.

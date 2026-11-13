@@ -12,7 +12,7 @@ program selftest_runner;
    (VDbCryptoSelfTest) saglayici-bagimsizdir.
 
    Build (FPC 3.2.4, from repo root; -Fu/-FU bayraklari yola bitisik):
-     fpc -FuD:\veritabani -FuD:\veritabani\dcpcrypt -FuD:\veritabani\dcpcrypt\Ciphers -FuD:\veritabani\dcpcrypt\Hashes -FUD:\veritabani\tests\crypto_selftest\lib D:\veritabani\tests\crypto_selftest\selftest_runner.lpr
+     fpc -FuD:\veritabani -FUD:\veritabani\tests\crypto_selftest\lib D:\veritabani\tests\crypto_selftest\selftest_runner.lpr
 
    Exit kodu: FAIL sayisi (0 = yesil). PROVIDER SECILEMEZSE 97 -
    "ortamda kullanilabilir libcrypto yok" ile "vektor basarisiz"

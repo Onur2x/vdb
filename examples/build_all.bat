@@ -32,7 +32,7 @@ if not exist "%FPC%" echo UYARI: fpc.exe bulunamadi - PATH'e ekleyin veya FPC de
 if not exist "%LAZBUILD%" echo UYARI: lazbuild.exe bulunamadi - PATH'e ekleyin veya LAZBUILD degiskenini duzeltin.
 
 REM TR: Birim yollari (ornekler icin) / Unit paths (for examples)
-set UNITS=-Fu.. -Fu..\..\ -Fu..\..\dcpcrypt -Fu..\..\dcpcrypt\Ciphers -Fu..\..\dcpcrypt\Hashes
+set UNITS=-Fu.. -Fu..\..
 
 REM TR: Basari sayaci / Success counter
 set PASS=0

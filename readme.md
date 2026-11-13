@@ -232,8 +232,7 @@ sqltest.lpi/lpr     SQL test suite
 vdbapi.*            DLL / C API project
 examples/           Sample projects
 yonetim/            GUI admin
-dcpcrypt/           Encryption dependency
-dokuman/            These documents (not tracked)
+docs/               Architecture, engineering and migration notes
 ```
 
 ---
@@ -241,7 +240,9 @@ dokuman/            These documents (not tracked)
 ## Requirements
 
 - Lazarus 4.6+ / Free Pascal 3.2.4
-- DCPcrypt (bundled in `dcpcrypt/`)
+- No third-party crypto dependency: AES-256, SHA-256, HMAC, PBKDF2 and
+  Argon2id are implemented in pure Object Pascal inside the repository
+  (`VDbCryptoCore.pas`, `VDbKdf.pas`). No external DLL is required.
 - Windows: `lazbuild`; Linux/macOS: `fpc` + `lazbuild`
 
 ---

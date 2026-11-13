@@ -64,9 +64,6 @@ echo "vdbapi kutuphanesi derleniyor: $TARGET (.$LIBEXT)"
   -O2 \
   $TFLAG \
   -Fu"$DIR" \
-  -Fu"$DIR/dcpcrypt" \
-  -Fu"$DIR/dcpcrypt/Ciphers" \
-  -Fu"$DIR/dcpcrypt/Hashes" \
   -FU"$OUTDIR" \
   -FE"$DIR" \
   "$DIR/vdbapi.lpr"

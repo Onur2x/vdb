@@ -44,7 +44,7 @@
       <UnitOutputDirectory Value="lib\vdbcli"/>
     </SearchPaths>
     <Other>
-      <CustomOptions Value="-Fu. -Fu.\dcpcrypt -Fu.\dcpcrypt\Ciphers -Fu.\dcpcrypt\Hashes -Fu.\dcpcrypt\lib\i386-win32"/>
+      <CustomOptions Value="-Fu."/>
     </Other>
   </CompilerOptions>
 </CONFIG>

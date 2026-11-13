@@ -44,7 +44,7 @@
     </Target>
     <SearchPaths>
       <IncludeFiles Value="$(ProjOutDir)"/>
-      <OtherUnitFiles Value="..\..;..\..\dcpcrypt;..\..\dcpcrypt\Ciphers;..\..\dcpcrypt\Hashes"/>
+      <OtherUnitFiles Value="..\.."/>
       <UnitOutputDirectory Value="lib\$(TargetCPU)-$(TargetOS)"/>
     </SearchPaths>
     <Linking>
@@ -53,7 +53,7 @@
       </Debugging>
     </Linking>
     <Other>
-      <CustomOptions Value="-Fu..\.. -Fu..\..\dcpcrypt -Fu..\..\dcpcrypt\Ciphers -Fu..\..\dcpcrypt\Hashes"/>
+      <CustomOptions Value="-Fu..\.."/>
     </Other>
   </CompilerOptions>
 </CONFIG>

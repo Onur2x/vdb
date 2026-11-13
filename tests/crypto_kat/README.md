@@ -9,14 +9,13 @@ Vektör kaynakları ve dürüstlük notları: [`Vectors.md`](Vectors.md).
 ## Derleme (FPC 3.2.4)
 
 ```bat
-fpc -FuD:\veritabani -FuD:\veritabani\dcpcrypt -FuD:\veritabani\dcpcrypt\Ciphers -FuD:\veritabani\dcpcrypt\Hashes -FUD:\veritabani\tests\crypto_kat\lib D:\veritabani\tests\crypto_kat\kat_runner.lpr
+fpc -FuD:\veritabani -FUD:\veritabani\tests\crypto_kat\lib D:\veritabani\tests\crypto_kat\kat_runner.lpr
 ```
 
 > Not: `-Fu`/`-FU` bayrakları FPC'de yola **bitişik** yazılmalıdır; `-Fu D:\...`
 > (boşluklu) biçiminde yollar kaynak dosya sanılıp unit arama yolu boş kalır.
 
-- `-Fu ...dcpcrypt*` : VDbCrypt, dcpcrypt (TDCP_rijndael / SHA-256) birimlerine
-  bağımlı — üç yol da gerekli.
+- `-Fu D:\veritabani` : VDbCrypt ve saf Pascal çekirdek birimlerine bağımlı.
 - `-FU ...lib\` : üretilen .ppu/.o dosyaları `lib\` içinde kalır.
 - Linux'ta Argon2id iş parçacıkları için `ccthreads` zaten `{$ifdef UNIX}` ile
   bağlanır.

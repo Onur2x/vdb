@@ -5,8 +5,10 @@
   calismadiklari FPC ve .NET P/Invoke ile ayri ayri dogrulandi:
     * BCrypt + AES-256-GCM    -> STATUS_INVALID_PARAMETER (0xC000000D)
     * CryptoAPI CryptCreateHash -> Win32 87 (MD5 dahil TUM algoritmalar)
-  Uzerine guvenilemedigi icin primitifler DCPcrypt'ten (MIT, saf
-  Pascal) alinmistir; bkz. `dcpcrypt` klasoru.
+  Uzerine guvenilemedigi icin primitifler artik TAMAMEN kendi saf Pascal
+  cekirdegimizden gelir: AES-256/SHA-256/HMAC-SHA256 `VDbCryptoCore`
+  biriminde (FIPS-197 / FIPS 180-4 / RFC 2104). Harici DLL veya harici
+  bagimlilik YOK; DCPcrypt bagimliligi ADIM 4'te kaldirildi.
 
   KURULUM (M6, yeni yazimlar):
     kayit = 'VDBAEAD1' (8) || nonce(12) || AES-256-GCM(duz) || Tag(16)
@@ -116,8 +118,7 @@ function VDbCryptHmacSha256(const Key: TBytes; const Data: TBytes): TBytes;
 function VDbCryptSha256(const Data: TBytes): TBytes;
 
 { Testler icin: AES-256 tek blok ECB (FIPS-197 Appendix C.3 vektoru).
-  DCPcrypt'in Init ve EncryptECB parametreleri open array oldugu icin
-  tum tamponlar STATIK dizi olarak veriliyor (bkz. tuzak 8). }
+  Cekirdek VDbCryptoCore'da; blok tamponlari 16 baytlik statik dizilerdir. }
 function VDbCryptAes256Block(const Key, Block: TBytes): TBytes;
 
 { M6: AES-256-GCM (AEAD). GcmSeal/Open ham GCM'dir (test vektorleri ve
@@ -178,7 +179,10 @@ uses
     sistemi buyuk/kucuk harf duyarlidir; Windows'ta yanlis harf
     kopyasinin sessizce calismasi CI'da linux/macos kapilarini
     dusuruyordu). }
-  DCPcrypt2, DCPblockciphers, DCPrijndael, DCPsha256, VDbKdf,
+  { ADIM 4 (DCPcrypt kaldirildi): AES-256/SHA-256/HMAC artik kendi saf
+    Pascal cekirdegimizde - VDbCryptoCore. Bu birim HICBIR VDb* birimini
+    uses etmez, boylece VDbCryptoBuiltin ile dongu olusmaz. }
+  VDbCryptoCore, VDbKdf,
   { ADIM 2B (SAHIP KARARI R-5): etkin provider soyutlamasi. VARSAYILAN
     builtin'dir ve o durumda asagidaki YEREL saf-Pascal kod calisir; bu
     yuzden VDbCryptoBuiltin buraya ASLA `uses` EDILMEZ (builtin birimi
@@ -205,10 +209,6 @@ const
   PROV_RSA_AES = 24;
   CRYPT_VERIFYCONTEXT = $F0000000;
 {$ENDIF}
-
-type
-  TTDCP_sha256Class = class of TDCP_sha256;
-  TTDCP_rijndaelClass = class of TDCP_rijndael;
 
 { ------------------- ADIM 2B: provider dispatch kancasi -------------------
   Kural (ADR 3 adim 2 + EK-B/R-5):
@@ -324,81 +324,29 @@ end;
 
 function VDbCryptHmacSha256(const Key, Data: TBytes): TBytes;
 var
-  kPad: array[0..63] of Byte;
-  inner, outer: array[0..31] of Byte;
-  h: TDCP_sha256;
-  cls: TTDCP_sha256Class;
-  i: Integer;
   p: TVDbCryptoProvider;
 begin
   p := CryptoExternalProvider;
   if p <> nil then Exit(p.HmacSHA256(Key, Data));
+  { 64 bayttan uzun anahtar burada reddedilir: EVdbCryptError sozlesmesi
+    korunuyor (cekirdek ayni kurali uygular ama farkli hata tipi atar). }
   if Length(Key) > 64 then
     raise EVdbCryptError.Create('HMAC anahtari cok uzun', VDB_CRYPTO_ERR);
-  FillChar(kPad, SizeOf(kPad), 0);
-  for i := 1 to Length(Key) do
-    kPad[i - 1] := Key[i - 1];
-  for i := 1 to 64 do
-    kPad[i - 1] := kPad[i - 1] xor $36;
-  { DCPcrypt siniflari kendi Create metotlarini bildirmiyor; TComponent'inkini
-    miras aliyorlar. Dogrudan `TDCP_sha256.Create` bir **sinif metodi
-    referansi** olarak ele alindiginda FPC onu TComponent olarak tipler.
-    Bu yuzden sinif-referansi degiskeni uzerinden cagrilir. }
-  cls := TDCP_sha256;
-  h := cls.Create(nil);
-  try
-    h.Init;
-    h.Update(kPad, 64);
-    if Length(Data) > 0 then
-      h.Update(Data[0], LongWord(Length(Data)));
-    h.Final(inner);
-    FillChar(kPad, SizeOf(kPad), 0);
-    for i := 1 to Length(Key) do
-      kPad[i - 1] := Key[i - 1];
-    for i := 1 to 64 do
-      kPad[i - 1] := kPad[i - 1] xor $5C;
-    h.Init;
-    h.Update(kPad, 64);
-    h.Update(inner, SizeOf(inner));
-    h.Final(outer);
-  finally
-    h.Free;
-  end;
-  FillChar(kPad, SizeOf(kPad), 0);
-  SetLength(Result, VDB_TAG_LEN);
-  Move(outer, Result[0], VDB_TAG_LEN);
+  Result := VDbHmacSha256(Key, Data);
 end;
 
 function VDbCryptSha256(const Data: TBytes): TBytes;
 var
-  h: TDCP_sha256;
-  cls: TTDCP_sha256Class;
-  dig: array[0..31] of Byte;
   p: TVDbCryptoProvider;
 begin
   p := CryptoExternalProvider;
   if p <> nil then Exit(p.HashSHA256(Data));
-  cls := TDCP_sha256;
-  h := cls.Create(nil);
-  try
-    h.Init;
-    if Length(Data) > 0 then
-      h.Update(Data[0], LongWord(Length(Data)));
-    h.Final(dig);
-  finally
-    h.Free;
-  end;
-  SetLength(Result, 32);
-  Move(dig, Result[0], 32);
-  FillChar(dig, SizeOf(dig), 0);
+  Result := VDbSha256(Data);
 end;
 
 function VDbCryptAes256Block(const Key, Block: TBytes): TBytes;
 var
-  aes: TDCP_rijndael;
-  ccls: TTDCP_rijndaelClass;
-  kSt: array[0..VDB_KEY_LEN - 1] of Byte;
-  iv: array[0..15] of Byte;
+  ctx: TVdbAes256Ctx;
   blkIn, blkOut: array[0..15] of Byte;
   i, n: Integer;
 begin
@@ -408,29 +356,20 @@ begin
       VDB_CRYPTO_ERR);
   n := Length(Block);
   if n > 16 then n := 16;
-  dcpFillChar(kSt, SizeOf(kSt), 0);
-  dcpFillChar(iv, SizeOf(iv), 0);
-  dcpFillChar(blkIn, SizeOf(blkIn), 0);
-  dcpFillChar(blkOut, SizeOf(blkOut), 0);
-  Move(Key[0], kSt[0], VDB_KEY_LEN);
+  FillChar(blkIn, SizeOf(blkIn), 0);
+  FillChar(blkOut, SizeOf(blkOut), 0);
   if n > 0 then
     Move(Block[0], blkIn[0], n);
-  ccls := TDCP_rijndael;
-  aes := ccls.Create(nil);
-  try
-    aes.Init(kSt, 256, @iv[0]);
-    aes.EncryptECB(blkIn[0], blkOut[0]);
-  finally
-    aes.Free;
-  end;
-  dcpFillChar(kSt, SizeOf(kSt), 0);
+  VDbAes256ExpandKey(Key, ctx);
+  VDbAes256EncryptBlock(ctx, @blkIn[0], @blkOut[0]);
+  FillChar(ctx, SizeOf(ctx), 0);
   SetLength(Result, 16);
   for i := 0 to 15 do
     Result[i] := blkOut[i];
 end;
 
 { ---------------------------------------------------------------- M6 AEAD
-  AES-256-GCM (NIST SP 800-38D). DCPcrypt yalnizca AES blok saglar;
+  AES-256-GCM (NIST SP 800-38D). AES blok sifreleme VDbCryptoCore'dan;
   GCM'in GHASH/CTR katmani burada saf Pascal. Kayit zarf bicimi:
 
     'VDBAEAD1' (8) || nonce (12) || sifreli metin (n) || tag (16)
@@ -453,8 +392,8 @@ begin
   if (Length(X) <> 16) or (Length(Y) <> 16) then
     raise EVdbCryptError.Create('GF(2^128) girdisi 16 bayt olmali',
       VDB_CRYPTO_ERR);
-  dcpFillChar(z, SizeOf(z), 0);
-  dcpFillChar(v, SizeOf(v), 0);
+  FillChar(z, SizeOf(z), 0);
+  FillChar(v, SizeOf(v), 0);
   Move(Y[0], v[0], 16);
   for i := 0 to 127 do
   begin
@@ -472,14 +411,14 @@ begin
   Move(z[0], Result[0], 16);
 end;
 
-function AesBlockOf(Aes: TDCP_rijndael; const B: array of Byte): TBytes;
+function AesBlockOf(const Ctx: TVdbAes256Ctx; const B: array of Byte): TBytes;
 var
   bi, bo: array[0..15] of Byte;
 begin
-  dcpFillChar(bi, SizeOf(bi), 0);
-  dcpFillChar(bo, SizeOf(bo), 0);
+  FillChar(bi, SizeOf(bi), 0);
+  FillChar(bo, SizeOf(bo), 0);
   Move(B[0], bi[0], 16);
-  Aes.EncryptECB(bi[0], bo[0]);
+  VDbAes256EncryptBlock(Ctx, @bi[0], @bo[0]);
   SetLength(Result, 16);
   Move(bo[0], Result[0], 16);
 end;
@@ -497,7 +436,7 @@ var
     q := 0;
     while q < Length(Data) do
     begin
-      dcpFillChar(blk[0], 16, 0);
+      FillChar(blk[0], 16, 0);
       m := Length(Data) - q;
       if m > 16 then m := 16;
       Move(Data[q], blk[0], m);
@@ -511,12 +450,12 @@ var
 
 begin
   SetLength(y, 16);
-  dcpFillChar(y[0], 16, 0);
+  FillChar(y[0], 16, 0);
   SetLength(blk, 16);
   Feed(Aad);
   Feed(Cipher);
   SetLength(lenblk, 16);
-  dcpFillChar(lenblk[0], 16, 0);
+  FillChar(lenblk[0], 16, 0);
   n := Length(Aad) * 8;
   for i := 0 to 7 do
     lenblk[7 - i] := Byte((QWord(n) shr (i * 8)) and $FF);
@@ -542,7 +481,7 @@ begin
   end;
 end;
 
-function GcmCtrXor(Aes: TDCP_rijndael; const J0, Data: TBytes): TBytes;
+function GcmCtrXor(const Ctx: TVdbAes256Ctx; const J0, Data: TBytes): TBytes;
 var
   ctr, ks: TBytes;
   i, p, n: Integer;
@@ -553,7 +492,7 @@ begin
   while p < Length(Data) do
   begin
     Inc32(ctr);
-    ks := AesBlockOf(Aes, ctr);
+    ks := AesBlockOf(Ctx, ctr);
     n := Length(Data) - p;
     if n > 16 then n := 16;
     for i := 0 to n - 1 do
@@ -565,9 +504,7 @@ end;
 function VDbCryptGcmSeal(const Key, Nonce, Plain, Aad: TBytes;
   out Cipher, Tag: TBytes): Boolean;
 var
-  aes: TDCP_rijndael;
-  ccls: TTDCP_rijndaelClass;
-  kSt: array[0..VDB_KEY_LEN - 1] of Byte;
+  ctx: TVdbAes256Ctx;
   iv0: array[0..15] of Byte;
   j0, h, g, ej0: TBytes;
   i: Integer;
@@ -580,36 +517,26 @@ begin
   if p <> nil then Exit(p.AeadSeal(Key, Nonce, Plain, Aad, Cipher, Tag));
   if (Length(Key) <> VDB_KEY_LEN) or (Length(Nonce) <> VDB_AEAD_NONCE_LEN) then
     Exit;
-  dcpFillChar(kSt, SizeOf(kSt), 0);
-  dcpFillChar(iv0, SizeOf(iv0), 0);
-  Move(Key[0], kSt[0], VDB_KEY_LEN);
-  ccls := TDCP_rijndael;
-  aes := ccls.Create(nil);
-  try
-    aes.Init(kSt, 256, @iv0[0]);
-    h := AesBlockOf(aes, iv0);
-    SetLength(j0, 16);
-    Move(Nonce[0], j0[0], VDB_AEAD_NONCE_LEN);
-    j0[12] := 0; j0[13] := 0; j0[14] := 0; j0[15] := 1;
-    Cipher := GcmCtrXor(aes, j0, Plain);
-    g := GHashOf(h, Aad, Cipher);
-    ej0 := AesBlockOf(aes, j0);
-    SetLength(Tag, VDB_AEAD_TAG_LEN);
-    for i := 0 to VDB_AEAD_TAG_LEN - 1 do
-      Tag[i] := ej0[i] xor g[i];
-  finally
-    aes.Free;
-    dcpFillChar(kSt, SizeOf(kSt), 0);
-  end;
+  FillChar(iv0, SizeOf(iv0), 0);
+  VDbAes256ExpandKey(Key, ctx);
+  h := AesBlockOf(ctx, iv0);
+  SetLength(j0, 16);
+  Move(Nonce[0], j0[0], VDB_AEAD_NONCE_LEN);
+  j0[12] := 0; j0[13] := 0; j0[14] := 0; j0[15] := 1;
+  Cipher := GcmCtrXor(ctx, j0, Plain);
+  g := GHashOf(h, Aad, Cipher);
+  ej0 := AesBlockOf(ctx, j0);
+  SetLength(Tag, VDB_AEAD_TAG_LEN);
+  for i := 0 to VDB_AEAD_TAG_LEN - 1 do
+    Tag[i] := ej0[i] xor g[i];
+  FillChar(ctx, SizeOf(ctx), 0);
   Result := True;
 end;
 
 function VDbCryptGcmOpen(const Key, Nonce, Cipher, Tag, Aad: TBytes;
   out Plain: TBytes): Boolean;
 var
-  aes: TDCP_rijndael;
-  ccls: TTDCP_rijndaelClass;
-  kSt: array[0..VDB_KEY_LEN - 1] of Byte;
+  ctx: TVdbAes256Ctx;
   iv0: array[0..15] of Byte;
   j0, h, g, ej0: TBytes;
   i: Integer;
@@ -623,30 +550,25 @@ begin
   if (Length(Key) <> VDB_KEY_LEN) or (Length(Nonce) <> VDB_AEAD_NONCE_LEN) or
      (Length(Tag) <> VDB_AEAD_TAG_LEN) then
     Exit;
-  dcpFillChar(kSt, SizeOf(kSt), 0);
-  dcpFillChar(iv0, SizeOf(iv0), 0);
-  Move(Key[0], kSt[0], VDB_KEY_LEN);
-  ccls := TDCP_rijndael;
-  aes := ccls.Create(nil);
-  try
-    aes.Init(kSt, 256, @iv0[0]);
-    h := AesBlockOf(aes, iv0);
-    SetLength(j0, 16);
-    Move(Nonce[0], j0[0], VDB_AEAD_NONCE_LEN);
-    j0[12] := 0; j0[13] := 0; j0[14] := 0; j0[15] := 1;
-    g := GHashOf(h, Aad, Cipher);
-    ej0 := AesBlockOf(aes, j0);
-    diff := 0;
-    for i := 0 to VDB_AEAD_TAG_LEN - 1 do
-      diff := diff or (ej0[i] xor g[i] xor Tag[i]);
-    if diff <> 0 then
-      Exit;
-    Plain := GcmCtrXor(aes, j0, Cipher);
-    Result := True;
-  finally
-    aes.Free;
-    dcpFillChar(kSt, SizeOf(kSt), 0);
+  FillChar(iv0, SizeOf(iv0), 0);
+  VDbAes256ExpandKey(Key, ctx);
+  h := AesBlockOf(ctx, iv0);
+  SetLength(j0, 16);
+  Move(Nonce[0], j0[0], VDB_AEAD_NONCE_LEN);
+  j0[12] := 0; j0[13] := 0; j0[14] := 0; j0[15] := 1;
+  g := GHashOf(h, Aad, Cipher);
+  ej0 := AesBlockOf(ctx, j0);
+  diff := 0;
+  for i := 0 to VDB_AEAD_TAG_LEN - 1 do
+    diff := diff or (ej0[i] xor g[i] xor Tag[i]);
+  if diff <> 0 then
+  begin
+    FillChar(ctx, SizeOf(ctx), 0);
+    Exit;
   end;
+  Plain := GcmCtrXor(ctx, j0, Cipher);
+  FillChar(ctx, SizeOf(ctx), 0);
+  Result := True;
 end;
 
 function VDbCryptIsAead(const Cipher: TBytes): Boolean;
@@ -1072,13 +994,11 @@ function VDbCryptEncryptLegacy(const Key, Plain: TBytes;
   araclari icin tutulur; normal yazma yolu VDbCryptEncrypt'tir. }
 var
   iv, kEnc, kMac, body, tag, lenB, outTmp: TBytes;
-  aes: TDCP_rijndael;
-  ccls: TTDCP_rijndaelClass;
+  ctr: TVdbAes256Ctr;
   plainLen, padded: LongWord;
   p, n: Integer;
   blkIn, blkOut: array[0..15] of Byte;
   ivComp: array[0..15] of Byte;
-  kEncStat: array[0..VDB_KEY_LEN - 1] of Byte;
 begin
   OutCipher := nil;
   DeriveKeys(Key, kEnc, kMac);
@@ -1095,38 +1015,25 @@ begin
 
   Move(iv[0], ivComp[0], VDB_IV_LEN);
   SetLength(outTmp, padded);
-  ccls := TDCP_rijndael;
-  aes := ccls.Create(nil);
-  try
-    { ONEMLI: Init'in Key parametresi open array. Bu ortamda (FPC 3.2.2,
-      i386) dinamik dizi (TBytes) verildiginde anahtar YANLIS okunuyor -
-      ayni anahtar/IV/düz metin statik dizi ile verildiginde tamamen
-      farkli sifreli metin uretiyor (48/48 bayt farkli, bagimsiz
-      ctr.lpr olcumuyle kanitlandi). Bu yuzden once statik tampona
-      kopyaliyoruz. }
-    Move(kEnc[0], kEncStat[0], VDB_KEY_LEN);
-    aes.Init(kEncStat, 256, @ivComp[0]);
-    { 2026-10-05: DCPcrypt'in blok tamponu STATIK dizi ile besleniyor.
-      Dinamik dizi tamponu dogrudan verildiginde cozme sonucu
-      tutarsiz cikiyordu (uzunluk dogru, baytlar yanlis; etiket
-      dogrulamasi gectigi icin IV/anahtar ayniydi). Blok blok, statik
-      tamponla islemmek bu belirsizligi tamamen ortadan kaldirir ve
-      ayni zamanda bellege tek seferde dokunmaz. }
-    p := 0;
-    while p < Integer(padded) do
-    begin
-      n := Integer(padded) - p;
-      if n > 16 then n := 16;
-      dcpFillChar(blkIn, SizeOf(blkIn), 0);
-      dcpFillChar(blkOut, SizeOf(blkOut), 0);
-      Move(body[p], blkIn[0], n);
-      aes.EncryptCTR(blkIn[0], blkOut[0], 16);
-      Move(blkOut[0], outTmp[p], n);
-      Inc(p, 16);
-    end;
-  finally
-    aes.Free;
+  { ADIM 4: AES-256-CTR artik VDbCryptoCore'da. Blok blok islem ve
+    statik tampon kalibi KORUNUYOR: eski DCP yoluyla bit-birebir ayni
+    sifreli metni uretmek zorundayiz (eski kayitlar acilabilmeli).
+    VDbAes256CtrCrypt her cagrida 16 bayt isler ve counter'i big-endian
+    bir artirir - DCP EncryptCTR ile ayni. }
+  VDbAes256CtrInit(kEnc, @ivComp[0], ctr);
+  p := 0;
+  while p < Integer(padded) do
+  begin
+    n := Integer(padded) - p;
+    if n > 16 then n := 16;
+    FillChar(blkIn, SizeOf(blkIn), 0);
+    FillChar(blkOut, SizeOf(blkOut), 0);
+    Move(body[p], blkIn[0], n);
+    VDbAes256CtrCrypt(ctr, @blkIn[0], @blkOut[0], 16);
+    Move(blkOut[0], outTmp[p], n);
+    Inc(p, 16);
   end;
+  FillChar(ctr, SizeOf(ctr), 0);
 
   SetLength(lenB, 4);
   lenB[0] := Byte(plainLen and $FF);
@@ -1170,13 +1077,11 @@ function VDbCryptDecrypt(const Key, Cipher: TBytes;
   out OutPlain: TBytes): Boolean;
 var
   kEnc, kMac, body, tag, beklenen, lenB, outTmp: TBytes;
-  aes: TDCP_rijndael;
-  ccls: TTDCP_rijndaelClass;
+  ctr: TVdbAes256Ctr;
   plainLen, padded: LongWord;
   p, n: Integer;
   blkIn, blkOut: array[0..15] of Byte;
   ivComp: array[0..15] of Byte;
-  kEncStat: array[0..VDB_KEY_LEN - 1] of Byte;
   bodyOff: Integer;
 begin
   OutPlain := nil;
@@ -1231,28 +1136,22 @@ begin
 
   Move(Cipher[0], ivComp[0], VDB_IV_LEN);
   SetLength(outTmp, padded);
-  ccls := TDCP_rijndael;
-  aes := ccls.Create(nil);
-  try
-    { Sifrelemedeki ile ayni neden: open-array Key parametresine
-      dinamik dizi verilemez, statik tampon kullanilir. }
-    Move(kEnc[0], kEncStat[0], VDB_KEY_LEN);
-    aes.Init(kEncStat, 256, @ivComp[0]);
-    p := 0;
-    while p < Integer(padded) do
-    begin
-      n := Integer(padded) - p;
-      if n > 16 then n := 16;
-      dcpFillChar(blkIn, SizeOf(blkIn), 0);
-      dcpFillChar(blkOut, SizeOf(blkOut), 0);
-      Move(body[p], blkIn[0], n);
-      aes.DecryptCTR(blkIn[0], blkOut[0], 16);
-      Move(blkOut[0], outTmp[p], n);
-      Inc(p, 16);
-    end;
-  finally
-    aes.Free;
+  { ADIM 4: DCP DecryptCTR yerine VDbCryptoCore CTR akisi. CTR'de
+    sifreleme ve cozme ayni islemdir; counter semantigi DCP ile ayni. }
+  VDbAes256CtrInit(kEnc, @ivComp[0], ctr);
+  p := 0;
+  while p < Integer(padded) do
+  begin
+    n := Integer(padded) - p;
+    if n > 16 then n := 16;
+    FillChar(blkIn, SizeOf(blkIn), 0);
+    FillChar(blkOut, SizeOf(blkOut), 0);
+    Move(body[p], blkIn[0], n);
+    VDbAes256CtrCrypt(ctr, @blkIn[0], @blkOut[0], 16);
+    Move(blkOut[0], outTmp[p], n);
+    Inc(p, 16);
   end;
+  FillChar(ctr, SizeOf(ctr), 0);
   SetLength(OutPlain, plainLen);
   if plainLen > 0 then
     Move(outTmp[0], OutPlain[0], plainLen);

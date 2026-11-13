@@ -11,7 +11,7 @@ performans için [hiztesti.md](hiztesti.md).
 Gereksinimler:
 
 - Lazarus 4.6+ / Free Pascal 3.2.4
-- `dcpcrypt/` klasörü (depoda gelir)
+- Harici şifreleme bağımlılığı yok (saf Pascal çekirdek depoda)
 
 ```bash
 # SQL test paketi

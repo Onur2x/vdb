@@ -35,7 +35,7 @@
 | `VDbBTree.pas` / `VDbIdxFile.pas` / `VDbSkipList.pas` / `VDbRange.pas` | index yapıları; `.odb.idx` türetilmiş cache |
 
 ### 4. Kripto & güvenlik
-`VDbCrypt` (cephes: GCM/CBC/HMAC/SHA/CRC32/CSPRNG + DCPcrypt tüketimi) · `VDbKdf` (BLAKE2b+Argon2id) · `VDbCrc32` · `VDbTls` (OpenSSL dinamik wrapper) · `VDbPgWire` (PG sunucu protokolü + SCRAM-SHA-256) — ayrıntı: `docs/engineering/BASELINE.md` §5, kripto planı: `docs/engineering/DCPCRYPT_USAGE_INVENTORY.md`.
+`VDbCrypt` (cephes: GCM/CBC/HMAC/SHA/CRC32/CSPRNG) · `VDbCryptoCore` (saf Pascal AES-256/CTR + SHA-256/HMAC çekirdeği) · `VDbKdf` (BLAKE2b+Argon2id) · `VDbCrc32` · `VDbTls` (OpenSSL dinamik wrapper) · `VDbPgWire` (PG sunucu protokolü + SCRAM-SHA-256) — ayrıntı: `docs/engineering/BASELINE.md` §5, kripto planı: `docs/engineering/DCPCRYPT_USAGE_INVENTORY.md`.
 
 ### 5. Dağıtık / değişiklik yakalama
 `VDbReplication` (v2 snapshot-streaming) · `VDbReplV3` (v3, kısmi) · `VDbCdc` (değişim akışı) · `VDbSync.pas` (kendi cross-process senkron primitifleri — OS bağımlılığı burada) · `VDbChangeLog` (mantıksal log/audit).
@@ -52,7 +52,7 @@
 ## Bağımlılık yönü (ihlal edilmemesi gereken kurallar)
 - `VDbParser/VDbAst → VDbExecutor → VDbCore/VDbTable → storage` — ters ok yok.
 - Kripto **yalnız** `VDbCrypt/VDbKdf/VDbPageCrypto/VDbTls` üzerinden; storage SQL tanımaz.
-- `dcpcrypt` üçüncü-parti izi yalnız `VDbCrypt` + `VDbPgWire(base64)` — kaldırma planı orada.
+- Üçüncü-parti kripto bağımlılığı **yoktur**: AES-256/SHA-256/HMAC `VDbCryptoCore`'da, Argon2id/BLAKE2b `VDbKdf`'de saf Pascal'dır (DCPcrypt PHASE-1 adım 4'te kaldırıldı).
 - `VDbSync/VDbPlatform` dışındaki unit'ler doğrudan WinAPI çağırmamalı (audit görevi: `Windows`/`Linux` uses taraması — henüz yapılmadı, backlog'da).
 
 ## Bilinen teknik borç odakları

@@ -11,7 +11,7 @@ performance see [speedtest.md](speedtest.md).
 Requirements:
 
 - Lazarus 4.6+ / Free Pascal 3.2.4
-- `dcpcrypt/` (bundled in the repository)
+- No external crypto dependency (pure Pascal core ships in the repository)
 
 ```bash
 # SQL test suite

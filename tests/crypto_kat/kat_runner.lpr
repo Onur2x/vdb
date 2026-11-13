@@ -3,7 +3,7 @@ program kat_runner;
   against official RFC/NIST vectors (see Vectors.md for provenance).
 
   Build (FPC 3.2.4, from repo root; -Fu/-FU bayrakları yola bitişik):
-    fpc -FuD:\veritabani -FuD:\veritabani\dcpcrypt -FuD:\veritabani\dcpcrypt\Ciphers -FuD:\veritabani\dcpcrypt\Hashes -FUD:\veritabani\tests\crypto_kat\lib D:\veritabani\tests\crypto_kat\kat_runner.lpr
+    fpc -FuD:\veritabani -FUD:\veritabani\tests\crypto_kat\lib D:\veritabani\tests\crypto_kat\kat_runner.lpr
 
   Exit code: number of failed checks (0 = everything sealed green). }
 

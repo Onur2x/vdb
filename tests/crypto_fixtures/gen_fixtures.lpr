@@ -51,7 +51,7 @@ program gen_fixtures;
 
   Derleme (FPC 3.2.4 i386-win32, cwd = bu klasor; -Fu bayraklari yola BITISIK
   yazilmali, bosluklu bicim sessizce bozuyor):
-    fpc -MObjFPC -Scghi -O1 -g -l -vewnhibq -FuD:\veritabani -FuD:\veritabani\dcpcrypt -FuD:\veritabani\dcpcrypt\Ciphers -FuD:\veritabani\dcpcrypt\Hashes "-FUD:\veritabani\tests\crypto_fixtures\lib" gen_fixtures.lpr
+    fpc -MObjFPC -Scghi -O1 -g -l -vewnhibq -FuD:\veritabani "-FUD:\veritabani\tests\crypto_fixtures\lib" gen_fixtures.lpr
 
   Argon2 fixture (t=3, m=65536 KiB, p=4) saf Pascal'da birkac saniye surer;
   PBKDF2-200000 (store) de saniye mertebesindedir. Bu NORMALDIR.

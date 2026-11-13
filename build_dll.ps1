@@ -4,7 +4,7 @@
 # -------------------------------
 # Motor saf FPC RTL'e indirgendi; LazUtils/FileUtil bagimliligi ARTIK
 # YOKTUR. Bu yuzden `-Fu<lazutils>` satiri kaldirildi ve derleme yalnizca
-# motor birimleri + dcpcrypt ile yapilir. Ayni kaynak (vdbapi.lpr)
+# motor birimleri ile yapilir (harici bagimlilik yoktur). Ayni kaynak (vdbapi.lpr)
 # Linux/macOS'ta libvdbapi.so / libvdbapi.dylib uretir (bkz. build_lib.sh).
 #
 # Neden ayri bir betik? Lazarus'un .lpi XML'inde kutuphane turunun
@@ -54,12 +54,7 @@ Write-Host "vdbapi.dll derleniyor (i386-win32)... FPC=$fpc" -ForegroundColor Cya
 # otomatik degiskendir ve digerlerini ezdi.
 $fpcArgs = @(
     '-O2',                        # optimize
-    "-Fu$dir",                    # motor birimleri
-    # VDbCore -> VDbCrypt -> DCPcrypt. Bu yollar eklenmezse
-    # "Can't find unit dcpcrypt2 used by VDbCrypt" ile derleme duser.
-    "-Fu$dir\dcpcrypt",
-    "-Fu$dir\dcpcrypt\Ciphers",
-    "-Fu$dir\dcpcrypt\Hashes",
+    "-Fu$dir",                    # motor birimleri (saf Pascal; harici bagimlilik yok)
     "-FU$outDir",                 # .o/.ppu cikti
     "-FE$dir",                    # .dll cikti
     "$dir\vdbapi.lpr"             # kaynak (TEK kaynak dosyasi son arg olmali)

@@ -95,7 +95,7 @@
       <!-- 2026-10-04: bayat -FuD:\veritabani kaldirildi (bu makinede
            boyle bir dizin yok). Birim yolu artik SearchPaths/OtherUnitFiles
            icinde .. ile tanimli. -->
-      <CustomOptions Value="-Fu.. -FuC:\lazarus\components\paketler\DCPcrypt -FuC:\lazarus\components\paketler\DCPcrypt\lib\i386-win32"/>
+      <CustomOptions Value="-Fu.."/>
     </Other>
   </CompilerOptions>
 </CONFIG>

@@ -262,7 +262,7 @@ vdbmig.lpi/lpr      v2 -> v3 göç aracı (bkz. GOC_V2_V3.md)
 vdbapi.*            DLL / C API projesi
 examples/           Örnek projeler (hepsi VDbFactory ile v3 açar)
 yonetim/            GUI yönetici (v3; v2 dosyasında vdbmig yönlendirir)
-dcpcrypt/           Şifreleme bağımlılığı
+docs/               Mimari, mühendislik ve göç notları
 dokuman/            Bu dokümanlar (Git dışı)
 ```
 
@@ -271,7 +271,9 @@ dokuman/            Bu dokümanlar (Git dışı)
 ## Gereksinimler
 
 - Lazarus 4.6+ / Free Pascal 3.2.4
-- DCPcrypt (`dcpcrypt/` klasöründe gelir)
+- Üçüncü parti şifreleme bağımlılığı yok: AES-256, SHA-256, HMAC,
+  PBKDF2 ve Argon2id depo içinde saf Object Pascal ile yazılmıştır
+  (`VDbCryptoCore.pas`, `VDbKdf.pas`). Harici DLL gerekmez.
 - Windows: `lazbuild`; Linux/macOS: `fpc` + `lazbuild`
 
 ---
