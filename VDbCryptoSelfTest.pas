@@ -76,7 +76,9 @@ const
   VEC_HMAC6_KEY  =
     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' +
     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' +
-    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' +
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' +
+    'aaaaaa';  { 4x64+6 = 262 hex = 131 bayt 0xAA — RFC 4231 Case 6 }
   VEC_HMAC6_DATA =
     '54657374205573696e67204c6172676572205468616e20426c6f636b2d53697a' +
     '65204b6579202d2048617368204b6579204669727374';
