@@ -1,0 +1,12 @@
+# VDB SCRAM-SHA-256 verifier fixture - TEST fixture, production entropy degil
+# Turetim: VDbPgWire.AddUser formulu (PBKDF2-SHA256 + HMAC "Client Key" + SHA256 + HMAC "Server Key")
+# iter clamp: [15000, 1000000] (VDbPgWire.pas); fixture degeri clamp tabani
+user=vdbtest
+password=scram-fixture-pass
+salt_b64=YGFiY2RlZmdoaWprbG1ubw==
+salt_hex=606162636465666768696a6b6c6d6e6f
+iterations=15000
+storedkey_b64=KuWI/awWmvLG1Myz6yOLIJAaMvmFBFP4rqvPwGjySCg=
+storedkey_hex=2ae588fdac169af2c6d4ccb3eb238b20901a32f9850453f8aeabcfc068f24828
+serverkey_b64=LNqMc1WWIh2TJHIpw7zF9mtW1tGUxOJ2qi1KQ7H8WLY=
+serverkey_hex=2cda8c735596221d93247229c3bcc5f66b56d6d194c4e276aa2d4a43b1fc58b6

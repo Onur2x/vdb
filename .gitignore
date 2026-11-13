@@ -131,3 +131,8 @@ startup_error.txt
 /*.s
 *.exp
 
+# Kripto uyumluluk fixture'lari — test kapisi olarak izlenir (2026-11-13)
+# *.key/*.odb/*.wal/*.idx global ignore'larindan SONRA gelmeli.
+!tests/crypto_fixtures/fixtures/
+!tests/crypto_fixtures/fixtures/**
+
