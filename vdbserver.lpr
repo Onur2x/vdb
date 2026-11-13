@@ -13,11 +13,17 @@ program vdbserver;
     --require-tls             TLS'siz baglantilari reddet (--tls ister).
     --trust                   Hic --user yoksa acik (trust) kabulune izin
                               ver. Kullanici tanimliysa SCRAM zaten zorunlu.
+    --host ADRES              (R-4) Dinleme arayuzu (noktali IPv4).
+                              Varsayilan 0.0.0.0. --trust ile yalniz
+                              loopback kabul edilir; disa acik adres
+                              reddedilir.
     --metrics PORT            (P-182) Prometheus /metrics ucu; ayri port.
+                              --trust modunda o da yalniz loopback'e
+                              baglanir.
 
   Calisirken stdin'den satir okur; "stop" satiri veya EOF ile temiz kapanir.
-  READY port=<n> auth=<scram|trust> tls=<on|off> satiri basariyla
-  dinlemeye baslandigini bildirir.
+  READY port=<n> bind=<adres> auth=<scram|trust> tls=<on|off> satiri
+  basariyla dinlemeye baslandigini bildirir.
 
   Cikis kodlari: 0 = normal, 1 = calisma hatasi, 2 = kullanim hatasi.
 }
@@ -26,12 +32,13 @@ program vdbserver;
 
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
-  SysUtils, Classes, VDbPgWire, VDbMetricsHttp;
+  SysUtils, Classes, VDbNet, VDbPgWire, VDbMetricsHttp;
 
 procedure Kullanim;
 begin
   WriteLn('kullanim: vdbserver <dizin> <port> [--user K:P] [--tls CERT KEY]');
-  WriteLn('                    [--require-tls] [--trust] [--metrics PORT]');
+  WriteLn('                    [--require-tls] [--trust] [--host ADRES]');
+  WriteLn('                    [--metrics PORT]');
 end;
 
 var
@@ -43,6 +50,7 @@ var
   i, cpos: Integer;
   kullaniciVar: Boolean;
   guven: Boolean; { P-186 }
+  hostOpt, bindHost: string; { R-4 }
 
 begin
   if ParamCount < 2 then
@@ -63,6 +71,7 @@ begin
   try
     kullaniciVar := False;
     guven := False; { P-186 }
+    hostOpt := '';  { R-4: bos = varsayilan }
     i := 3;
     while i <= ParamCount do
     begin
@@ -107,6 +116,21 @@ begin
       else if line = '--require-tls' then
         srv.RequireTls := True
       else if line = '--trust' then guven := True { P-186 }
+      else if line = '--host' then
+      begin
+        if i = ParamCount then
+        begin
+          Kullanim;
+          Halt(2);
+        end;
+        Inc(i);
+        hostOpt := Trim(ParamStr(i));
+        if hostOpt = '' then
+        begin
+          WriteLn('--host: bos adres');
+          Halt(2);
+        end;
+      end
       else if line = '--metrics' then
       begin
         if i = ParamCount then
@@ -143,24 +167,47 @@ begin
         'erisime bilincli izin verin.');
       Halt(2);
     end;
+    { R-4 (skill §7.2): acik (trust) mod yalniz loopback'e baglanir.
+      Acik adres istenmisse REDDET — sessizce loopback'e dusmek, operatorun
+      "disari actim" sanmasina yol acardi. Adres istenmemisse sunucu
+      kendisi 127.0.0.1'e cekilir ve bunu yuksek sesle duyurur. }
+    bindHost := VdbResolveListenHost(hostOpt, not kullaniciVar, err);
+    if bindHost = '' then
+    begin
+      WriteLn(StdErr, 'HATA: ', err);
+      WriteLn(StdErr,
+        'Acik (trust) mod yalniz loopback adresine baglanabilir; ',
+        'disa acik bir sunucu icin en az bir --user K:P tanimlayin.');
+      Halt(2);
+    end;
+    srv.BindHost := bindHost;
     if not srv.Start(err) then
     begin
       WriteLn('HATA: ', err);
       Halt(1);
     end;
-    Write('READY port=', srv.Port);
+    Write('READY port=', srv.Port, ' bind=', bindHost);
     if kullaniciVar then Write(' auth=scram') else Write(' auth=trust');
     if srv.TlsActive then WriteLn(' tls=on') else WriteLn(' tls=off');
     { P-185: trust modu sesli uyari — READY satinin stdout akisi
     bozulmadan stderr'e yazilir. }
     if not kullaniciVar then
+    begin
       WriteLn(StdErr,
-        'UYARI: --trust ile acik erisim — her ag kullanicisi kimlik ',
-        'dogrulamadan erisir. Uretimde en az bir --user K:P vermeyi dusunun.');
+        'UYARI: --trust ile acik (kimlik dogrulamasiz) erisim etkin. ',
+        'Sunucu yalniz ', bindHost, ' adresine baglandi; uzaktan erisim ',
+        'kapalidir. Uretimde en az bir --user K:P vermeyi dusunun.');
+      if bindHost <> '127.0.0.1' then
+        WriteLn(StdErr,
+          'UYARI: trust modunda loopback disi adres kullaniliyor — bu ',
+          'kombinasyon uretim icin onerilmez.');
+    end;
     if mport <> 0 then
     begin
       mprov := srv.MetricsSnapshot;
-      msrv := TVdbMetricsHttpServer.Create(Word(mport), mprov);
+      { R-4: trust modunda /metrics de ayni (loopback) arayuze baglanir;
+        metrikler kimlik dogrulamasiz okunabilir. }
+      msrv := TVdbMetricsHttpServer.Create(Word(mport), mprov, bindHost);
       if msrv.Start then
         WriteLn('METRICS port=', mport)
       else

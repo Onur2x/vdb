@@ -59,9 +59,30 @@ const
 type
   TVdbSocket = TSocket;
 
-{ Dinleme soketi kurar (tum arayuzler, SO_REUSEADDR acik — testler
-  ardisik ayni portla yeniden baslayabilsin diye). Hata: VDB_SOCK_INVALID. }
-function VdbTcpListen(APort: Word; ABacklog: Integer = 16): TVdbSocket;
+{ Dinleme soketi kurar (tum arayuzler = 0.0.0.0, SO_REUSEADDR acik —
+  testler ardisik ayni portla yeniden baslayabilsin diye).
+  Hata: VDB_SOCK_INVALID. }
+function VdbTcpListen(APort: Word; ABacklog: Integer = 16): TVdbSocket; overload;
+
+{ R-4: yalniz AHost arayuzune baglanan dinleme soketi. AHost noktali
+  IPv4 gosterimidir ('127.0.0.1', '0.0.0.0', LAN adresi); bos = 0.0.0.0.
+  Ad cozumlemesi YAPILMAZ — adlari VdbResolveListenHost cevirir.
+  Cozulemeyen adres sessizce 0.0.0.0'a dusmez. Hata: VDB_SOCK_INVALID. }
+function VdbTcpListen(const AHost: string; APort: Word;
+  ABacklog: Integer = 16): TVdbSocket; overload;
+
+{ R-4: AHost yalniz loopback mi? 'localhost', '::1' ve 127.0.0.0/8
+  evet; '0.0.0.0', bos dizgi, LAN/WAN adresleri hayir. Karar VERIR,
+  DNS sorgulamaz — boylece hosts dosyasi olmayan makinede de ayni
+  sonucu verir. }
+function VdbHostIsLoopback(const AHost: string): Boolean;
+
+{ R-4: dinleme adresini cozer. ATrustOnlyLoopback=True (kimlik dogrulama
+  kapali acik mod) iken istenen adres loopback degilse AErr dolar ve
+  sonuc bos olur — cagiran baslatmayi REDDEDER. Istek bos ise trust
+  modunda '127.0.0.1', aksi halde '0.0.0.0'. }
+function VdbResolveListenHost(const ARequested: string;
+  ATrustOnlyLoopback: Boolean; out AErr: string): string;
 
 { Baglantiyi kabul eder (ENGELLEME). Istemgi kapattiginda/hatada
   VDB_SOCK_INVALID doner. }
@@ -128,10 +149,17 @@ end;
 {$ENDIF}
 
 function VdbTcpListen(APort: Word; ABacklog: Integer): TVdbSocket;
+begin
+  Result := VdbTcpListen('0.0.0.0', APort, ABacklog);
+end;
+
+function VdbTcpListen(const AHost: string; APort: Word;
+  ABacklog: Integer): TVdbSocket;
 var
   s: TVdbSocket;
   addr: TInetSockAddr;
   one: Integer;
+  h: string;
 begin
   Result := VDB_SOCK_INVALID;
   s := fpSocket(AF_INET, SOCK_STREAM, 0);
@@ -145,7 +173,19 @@ begin
   addr.sin_port := htons(APort);
   { StrToHostAddr DEGIL: o HOST bayt duzeni dondurur. sockaddr isteyen
     ag cagrilarinda ag (network) duzeni gereklidir -> StrToNetAddr. }
-  addr.sin_addr := StrToNetAddr('0.0.0.0');
+  h := Trim(AHost);
+  if h = '' then h := '0.0.0.0';
+  addr.sin_addr := StrToNetAddr(h);
+  if addr.sin_addr.s_addr = 0 then
+  begin
+    { '0.0.0.0' ile cozulemeyen ad ayni degeri verir; ikincisini
+      'her arayuz' diye sessizce kabul etmek R-4'u delerdi. }
+    if (h <> '0.0.0.0') and (h <> '0') then
+    begin
+      CloseSocket(s);
+      Exit;
+    end;
+  end;
   if fpBind(s, psockaddr(@addr), tsocklen(SizeOf(addr))) <> 0 then
   begin
     CloseSocket(s);
@@ -157,6 +197,65 @@ begin
     Exit;
   end;
   Result := s;
+end;
+
+function VdbHostIsNumericV4(const AHost: string): Boolean;
+var
+  i, dots: Integer;
+begin
+  Result := False;
+  if (AHost = '') or (Length(AHost) > 15) then Exit;
+  dots := 0;
+  for i := 1 to Length(AHost) do
+    if AHost[i] = '.' then Inc(dots)
+    else if not (AHost[i] in ['0'..'9']) then Exit;
+  Result := dots = 3;
+end;
+
+function VdbHostIsLoopback(const AHost: string): Boolean;
+var
+  h: string;
+begin
+  h := LowerCase(Trim(AHost));
+  if (h = 'localhost') or (h = '::1') or (h = '[::1]') then Exit(True);
+  Result := VdbHostIsNumericV4(h) and (Copy(h, 1, 4) = '127.');
+end;
+
+function VdbResolveListenHost(const ARequested: string;
+  ATrustOnlyLoopback: Boolean; out AErr: string): string;
+var
+  h: string;
+begin
+  AErr := '';
+  h := LowerCase(Trim(ARequested));
+  if h = '' then
+  begin
+    if ATrustOnlyLoopback then Result := '127.0.0.1' else Result := '0.0.0.0';
+    Exit;
+  end;
+  { Tasima katmani IPv4'tur (AF_INET). Ad cozumlemesi burada YAPILMAZ:
+    tek destekli ad 'localhost'tur ve acikca IPv4 loopback'e eslenir.
+    Boylece DNS/hosts dosyasina bagli, makineden makineye degisen bir
+    guvenlik karari olusmaz. }
+  if (h = 'localhost') or (h = '::1') or (h = '[::1]') then
+  begin
+    Result := '127.0.0.1';
+    Exit;
+  end;
+  if (Pos(':', h) > 0) or ((h <> '0.0.0.0') and (not VdbHostIsNumericV4(h))) then
+  begin
+    AErr := 'gecersiz dinleme adresi (IPv4 noktali gosterim bekleniyor): ' + h;
+    Result := '';
+    Exit;
+  end;
+  if ATrustOnlyLoopback and (not VdbHostIsLoopback(h)) then
+  begin
+    AErr := 'acik (trust) mod yalniz loopback adresine baglanabilir; ' +
+      'istenen adres: ' + h;
+    Result := '';
+    Exit;
+  end;
+  Result := h;
 end;
 
 function VdbTcpAccept(AListen: TVdbSocket): TVdbSocket;

@@ -36,6 +36,7 @@ type
   TVdbMetricsHttpServer = class
   private
     FPort: Word;
+    FHost: string;
     FProvider: TVdbMetricsProvider;
     FListen: TVdbSocket;
     FThread: TThread;
@@ -43,7 +44,9 @@ type
     FStop: Boolean;
     procedure Serve;
   public
-    constructor Create(APort: Word; AProvider: TVdbMetricsProvider);
+    { R-4: AHost noktali IPv4 dinleme arayuzu; bos = '0.0.0.0'. }
+    constructor Create(APort: Word; AProvider: TVdbMetricsProvider;
+      const AHost: string = '0.0.0.0');
     destructor Destroy; override;
     { Dinlemeye baslar. Port kullanilamiyorsa False. }
     function Start: Boolean;
@@ -144,10 +147,12 @@ begin
 end;
 
 constructor TVdbMetricsHttpServer.Create(APort: Word;
-  AProvider: TVdbMetricsProvider);
+  AProvider: TVdbMetricsProvider; const AHost: string);
 begin
   inherited Create;
   FPort := APort;
+  FHost := AHost;
+  if FHost = '' then FHost := '0.0.0.0';
   FProvider := AProvider;
   FListen := VDB_SOCK_INVALID;
   FThread := nil;
@@ -165,7 +170,7 @@ function TVdbMetricsHttpServer.Start: Boolean;
 begin
   Result := False;
   if FRunning then Exit(True);
-  FListen := VdbTcpListen(FPort);
+  FListen := VdbTcpListen(FHost, FPort);
   if FListen = VDB_SOCK_INVALID then Exit;
   FRunning := True;
   FStop := False;

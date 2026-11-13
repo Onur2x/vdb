@@ -142,6 +142,9 @@ type
     FAuth: TDictionary<string, TVdbPgScramUser>;
     FAuthLock: TCriticalSection;
     FRequireTls: Boolean;
+    { R-4: dinleme arayuzu. Varsayilan '0.0.0.0' (tum arayuzler); acik
+      (trust) modda cagiran '127.0.0.1' verir. Start'tan once ayarlanir. }
+    FBindHost: string;
     function GetAuthRequired: Boolean;
     procedure SetMaxConns(AValue: Integer);
     procedure AddConn(AConn: TVdbPgConn);
@@ -176,6 +179,8 @@ type
     { True ise TLS'siz baglanti kimlik dogrulamadan once reddedilir.
       TLS sertifikasi ayarlanmamissa Start basarisiz olur. }
     property RequireTls: Boolean read FRequireTls write FRequireTls;
+    { R-4: dinleme arayuzu (noktali IPv4). Varsayilan '0.0.0.0'. }
+    property BindHost: string read FBindHost write FBindHost;
     property Ready: Boolean read FReady;
     property Port: Word read FPort;
     property LastError: string read FLastErr;
@@ -2303,6 +2308,7 @@ begin
   FAuth := TDictionary<string, TVdbPgScramUser>.Create;
   FAuthLock := TCriticalSection.Create;
   FRequireTls := False;
+  FBindHost := '0.0.0.0';
 end;
 
 procedure TVdbPgServer.SetMaxConns(AValue: Integer);
@@ -2468,10 +2474,11 @@ begin
       end;
     end;
   end;
-  FListen := VdbTcpListen(FPort);
+  FListen := VdbTcpListen(FBindHost, FPort);
   if FListen = VDB_SOCK_INVALID then
   begin
-    AErr := 'dinleme kurulamadi (port ' + IntToStr(FPort) + ')';
+    AErr := 'dinleme kurulamadi (' + FBindHost + ':' +
+      IntToStr(FPort) + ')';
     CloseTls;
     CloseEngine;
     Exit;
