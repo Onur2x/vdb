@@ -8,6 +8,10 @@
 
 **API adlandırma düzeltmesi:** `DCPCRYPT_USAGE_INVENTORY.md` §3'te geçen `EVP_aead_aes_256_gcm`, BoringSSL'in tek-atımlık AEAD API'sidir; **OpenSSL'de bu sembol yoktur**. Bu ADR OpenSSL'in gerçek API'sini kullanır: `EVP_aes_256_gcm()` (EVP_CIPHER) + `EVP_CIPHER_CTX_*` + `EVP_CTRL_GCM_*`, MAC için `HMAC()`, PBKDF2 için `PKCS5_PBKDF2_HMAC()`.
 
+> **SAHİP KARARI (2026-11-13, bu ADR'nin üstündedir — K1'in "OpenSSL birincil" önceliğini değiştirir):**
+> VDB **saf native, bağımlılıksız, harici DLL'siz** bir veritabanıdır (readme.md:3-4 temel sözü; kullanıcı talimatı 2026-11-13). Bu yüzden **built-in provider birincil (default) provider'dır** — yani depoda satır satır duran ve KAT ile mühürlenmiş kendi kodumuz: `VDbCrypt.pas` GCM/HMAC/PBKDF2 + `VDbKdf.pas` BLAKE2b/Argon2id (RFC 9106 vektörlü). OpenSSL yalnız **opsiyonel hızlandırma/doğrulama provider'ıdır** ve hiçbir zorunlu akış OpenSSL'e bağlı çalışmaz. Provider seçimi konfigürasyonladır; default'ta hiçbir dış DLL aranmaz, yüklenmez, istenmez.
+> Bu karar K6'nın "DLL yok → crypto kapalı" maddesini **geçersiz kılar** (yerine: DLL yok → builtin zaten çalışıyor, kimse bir şey fark etmez); K5'in çift-provider KAT'ı iki koşulda geçer: OpenSSL DLL'i varsa cross-check, yoksa builtin tek başına (mevcut kapı). DCPcrypt kaldırma gerekçesi (skill §0.4: bakımsız vendored stack) değişmez; kaldırmadan sonra builtin yolun AES/SHA-256 çekirdeği `VDbCryptoBuiltin` içine taşınmış KAT-mühdar kendi kodumuzdur (INVENTORY §6 "kod kopyalanır" satırı), harici bağımlılık değildir.
+
 ---
 
 ## 1. Bağlam ve Kuvvetli Durum
@@ -205,3 +209,16 @@ Bu ADR'nin kararları **şunlar kanıtlanmadan uygulanmış sayılmaz** (her mad
 ---
 
 *Bu ADR, EK A.5 madde 2 (`CRYPTO_ARCHITECTURE_ADR`) teslimidir; sıradaki görevler: madde 3 `CRYPTO_TEST_HARNESS` (KAT vektörleri + round-trip fikstürleri), madde 4 `CRYPTO_PROVIDER_IMPLEMENTATION`, madde 5-6 kaldırma — §3'teki adımlarla birebir.*
+
+---
+
+## EK-B — Sahip Kararı: Saf-Pascal / Sıfır-Dış-DLL Sözleşmesi (2026-11-13)
+
+**Karar (bağlayıcı, proje sahibi):** VDB saf native, yalnız Free Pascal kaynak kodundan derlenen, **harici DLL/DPK bağımlılığı olmayan** bir veritabanıdır. Temel sözleşme readme.md:3-4'tedir ("written in pure Free Pascal. It needs no external DLL"). Bu karar bu ADR'deki provider önceliğini değiştirir (banner'a işlendi).
+
+**Sonuçları:**
+1. **Varsayılan provider = built-in** (K1 önceliği geçersiz). Sağlayıcı seçimi Adım 2B'de çevrilir; `VDbCryptoOpenSSL` kalır ama yalnızca açık opt-in/opsiyonel.
+2. **TLS sunucu özelliği istisna değildir — opsiyonel özelliktir:** `vdbserver --tls` kullanıcının kendi makinesindeki OpenSSL'i *kullanıcının isteğiyle* dinamik yükler; çekirdek veritabanı ve şifreleme bundan bağımsızdır, DLL yoksa özellik temiz hatayla kapalıdır (bugünkü davranış sözleşmeyle uyumlu).
+3. **Kabul edilen risk (dürüst kayıt):** built-in GCM/Argon2 saf-Pascal yolları cache-zamanı yan kanallarına OpenSSL kadar sert değildir ve bağımsız kripto incelemesinden geçmemiştir. Bu risk kabul edilmiştir; hafifletme: NIST/RFC KAT mührü (yapıldı), cross-provider aynı-şifre-metni testi (OpenSSL bulunan test makinesinde zorunlu gate), ileride bağımsız inceleme TODO'su.
+4. **Doğrulama stratejisi değişmez:** KAT seti + fixture round-trip'leri built-in için her gate'te; OpenSSL cross-check bulunan ortamda ek gate. Selftest OpenSSL'suz da tam geçmeli (exit 0).
+5. **Sırada ne değişmiyor:** dcpcrypt kaldırma (Adım 3-4) aynen uygulanır — vendored klasör gider, çekirdek AES/SHA-256 kodu attribution ile kendi birimlerimize taşınır; Base64 kendi unit'imize; sonuç **daha az** dosya/daha az üçüncü-parti izi, saf Pascal.

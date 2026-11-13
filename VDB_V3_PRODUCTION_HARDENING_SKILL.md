@@ -759,6 +759,7 @@ Correctness, durability, integrity, and recoverability take precedence over mini
 - **R-2 (KDF tek politika):** Yeni yazımlarda parola tabanlı tüm türetmeler tek KDF politikasına bağlanır (hedef: Argon2id; PBKDF2 yalnız eski formatları okumak için salt-okunur kalır). Format versiyon alanı KDF kimliğini taşır.
 - **R-3 (Doğrulanamayan iddia etiketi):** `tests/` veya CI kanıtına bağlanamış her "geçiyor" iddiası README/dokümanda `unverified` sayılır; release gate'te geçerli sayılmaz.
 - **R-4 (Sunucu production koruması):** `vdbserver` `--trust` ile açılırsa yalnız loopback bind + açılışta kalın log uyarısı; `-h` ile dışa açık + trust = reddet. Auth başarısızlığında throttling/lockout (§7.1) implementasyona girer.
+- **R-5 (Saf-Pascal / sıfır-dış-DLL sözleşmesi — SAHİP KARARI 2026-11-13, §0.4'teki "maintained provider" önceliğini değiştirir):** Çekirdek veritabanı ve şifreleme YALNIZ depo içindeki Free Pascal kaynak koduyla çalışmalıdır; hiçbir zorunlu akış harici DLL (OpenSSL dahil) yükleyemez/istemeden arayamaz. Varsayılan crypto provider = built-in (KAT-mühdar kendi kodumuz); OpenSSL yalnız opt-in cross-check/hızlandırma ve kullanıcı-isteğine-bağlı TLS özelliği olabilir. §3'ün "provider" mekanizması kalır, öncelik değişir. Kanıt kapısı: hiçbir DLL olmayan temiz makinede tüm sqltest + crypto gate'leri geçmeli. Ayrıntı: `docs/architecture/CRYPTO_ADR.md` EK-B.
 
 ## A.5 Güncellenmiş ilk-görev sırası (§16'nın yerine geçer)
 
