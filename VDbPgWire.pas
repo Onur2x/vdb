@@ -57,7 +57,7 @@ interface
 uses
   SysUtils, DateUtils, Classes, SyncObjs, Generics.Collections, VDbTypes, VDbCore, VDbTable, VDbSql, VDbAst,
   VDbParser, VDbNet, VDbErr, VDbTls, VDbSync, VDbXPrims, VDbCrypt, VDbBackendApi,
-  VDbFactory, DCPbase64;
+  VDbFactory, VDbBase64;
 
 type
   TVdbPgServer = class;
@@ -873,14 +873,19 @@ end;
 function PgB64Enc(const B: TBytes): AnsiString;
 begin
   if Length(B) = 0 then Exit('');
-  Result := Base64EncodeStr(PgAnsi(B));
+  Result := VDbBase64Encode(B);
 end;
 
 function PgB64Dec(const S: AnsiString): TBytes;
 begin
   Result := nil;
   if (S = '') or ((Length(S) mod 4) <> 0) then Exit;
-  Result := PgBytes(Base64DecodeStr(S));
+  try
+    Result := VDbBase64Decode(S);
+  except
+    on E: EVdbBase64Error do
+      Result := nil;
+  end;
 end;
 
 function PgXorBytes(const A, B: TBytes): TBytes;
