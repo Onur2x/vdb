@@ -1,0 +1,457 @@
+unit VDbMonitor;
+
+{ R-23: Diger motor birimleri gibi delphi modu (out parametreleri,
+  varsayilan parametre degerleri ve record icinde anonim record dizisi
+  icin). Bu satir olmadan `fpc` vakfa modda MonitorConfig(out C: ...)
+  derlenmiyor. }
+{$mode delphi}{$H+}
+
+{ R-24 Monitoring — VDB motoru icin temel istatistik ve izleme.
+  Bu birim kalici diske DOSYA.EDB (uydur).apnd
+  kayitlari yazir ve baslangic, total komut sayisi, ortalama sutunlarla
+  izleme servisine raporlar.
+
+  Hedefler:
+    - SQL komutu cagrisi (`VDbSql.Exec`), sureyi ve sonucu
+      izlemek.
+    - Rustumsuz dizin (`INSERT`lerle) ve parametreizi almak
+      (tam veri, yalnizca sema kontrol etmez).
+
+  Temizlik:
+    - Okuma gunluge veziye gerek yok; yazma oncesi gunluge
+      sadece client-side izi veri.
+
+  Veri katmani (`VDbCore`, `VDbDataSet` vs.) bu birimi gunluge yazmak
+  yerine bilgileri sanal bir arayuz’a toplayabilir.
+}
+
+interface
+
+type
+  TVDbMonitorConfig = record
+    FileName: string;
+    FlushIntervalMs: Integer;
+    MaxBufferSize: Integer;
+  end;
+
+  TVDbMonitorStats = record
+    CommandCount: UInt64;
+    TotalDurationUs: UInt64;
+    MaxDurationUs: UInt64;
+  end;
+
+  { H8: en sik tekrarlanan degerler (MCV). Skew'li esitliklerde
+    RowCount/DistinctCount ortalamasi gercek satir sayisini gizler. }
+  TVDbMCVEntry = record
+    Value: string;
+    Count: Int64;
+  end;
+
+  { R-15: Cost-Based Optimizer — tablo istatistikleri }
+  TVDbTableStats = record
+    TableName: string;
+    RowCount: Int64;
+    AvgRowLen: Integer;
+    IndexCount: Integer;
+    LastAnalyze: Int64;
+    // Column stats (basit: kolon adı -> distinct count)
+    ColStats: array of record
+      ColName: string;
+      DistinctCount: Int64;
+      NullCount: Int64;
+      MinVal: string;
+      MaxVal: string;
+      MCV: array of TVDbMCVEntry;
+    end;
+  end;
+
+type
+  PTVDbMonitorConfig = ^TVDbMonitorConfig;
+  PTVDbMonitorStats = ^TVDbMonitorStats;
+
+// Dış API
+function MonitorConfig(out C: TVDbMonitorConfig): Boolean;
+function UpdateConfig(C: TVDbMonitorConfig): Boolean;
+function RecordCommand(Sql: string; DurationUs: Int64; DBId: Integer): Boolean;
+function GetStats(out S: TVDbMonitorStats): Boolean;
+function FlushStats: Boolean;
+function FlushBufferToFile: Boolean;
+// R-15: Cost-Based Optimizer — tablo istatistikleri (genişletilmiş)
+function RecordTableStats(const TableName: string; RowCount: Int64; AvgRowLen: Integer; IndexCount: Integer;
+  const ColNames, ColDistinct, ColNulls, ColMins, ColMaxs, ColMCVs: array of string): Boolean;
+function GetTableStats(const TableName: string; out S: TVDbTableStats): Boolean;
+// H8: MCV paketleme / sorgulama yardimcilari.
+function VdbStatsPackMCV(const Values: array of string; const Counts: array of Int64): string;
+function VdbStatsMCVLookup(const S: TVDbTableStats; const ColName, Value: string;
+  out Count: Int64): Boolean;
+function VdbStatsMCVInfo(const S: TVDbTableStats; const ColName: string;
+  out Total: Int64; out Entries: Integer): Boolean;
+// R-24: ANALYZE edilmis tekil tablo sayisi (SHOW STATS icin)
+function AnalyzedTableCount: Integer;
+
+implementation
+
+uses SysUtils, Classes, VDbPlatform;
+
+const
+  VDB_MONITOR_FILE_EXT = '.edb';
+  VDB_MONITOR_FILE_PREFIX = '.mon';
+
+var
+  GConfig: TVDbMonitorConfig;
+  GStats: TVDbMonitorStats;
+  GBuffer: TStringList;
+  { R-15 Full: tablo istatistikleri komut gunlugu tamponundan AYRI tutulur.
+    Aksi halde GBuffer MaxBufferSize'a ulasip FlushBufferToFile ile
+    temizlendiginde ANALYZE istatistikleri kaybolur ve CBO deterministik
+    olmaz. }
+  GTableStats: TStringList;
+
+function MonitorConfig(out C: TVDbMonitorConfig): Boolean;
+begin
+  Result := True;
+  C := GConfig;
+end;
+
+function UpdateConfig(C: TVDbMonitorConfig): Boolean;
+begin
+  Result := True;
+  GConfig := C;
+end;
+
+function RecordCommand(Sql: string; DurationUs: Int64; DBId: Integer): Boolean;
+var
+  ts: string;
+begin
+  Result := True;
+  // R-24 (2026-10-13): global sayaclara kayit ARTIK GERCEK.
+  // Not: burada bir onceki turda `if False` ile devre disi birakilmis
+  // bir MUTASYON KALINTISI vardi (sayaclar hic artmiyordu, hicbir test
+  // GStats'i gozlemlemedigi icin yagmurlu gun hatasi kalmisti). T105
+  // (SHOW STATS) artik sayaclari dogrudan gozlemliyor.
+  // Negatif sure olamaz: saat geriye adim atarsa (eski duvar-saati tik'i)
+  // QWord alanlara devasa deger yazilip max_us bozuluyordu. Savunmali kelepce.
+  if DurationUs < 0 then DurationUs := 0;
+  Inc(GStats.CommandCount);
+  Inc(GStats.TotalDurationUs, UInt64(DurationUs));
+  if UInt64(DurationUs) > GStats.MaxDurationUs then
+    GStats.MaxDurationUs := UInt64(DurationUs);
+  // Gunluk dosyasina YAZMA yalnizca acikca etkinlestirilmisken yapilir
+  // (GConfig.FileName = '' iken tampanda '.mon.edb' adli bir dosya
+  // olusurdu — test klasorlerine gereksiz dosya birakmamak icin).
+  if GConfig.FileName <> '' then
+  begin
+    ts := IntToStr(VdbTickMs);
+    GBuffer.Add(ts + '|' + IntToStr(DurationUs) + '|' + IntToStr(DBId) + '|' + Sql);
+    if GBuffer.Count >= GConfig.MaxBufferSize then FlushBufferToFile;
+  end;
+end;
+
+function GetStats(out S: TVDbMonitorStats): Boolean;
+begin
+  Result := True;
+  S := GStats;
+end;
+
+function FlushStats: Boolean;
+begin
+  Result := True;
+end;
+
+function FlushBufferToFile: Boolean;
+var
+  fn: string;
+  f: TextFile;
+  i: Integer;
+begin
+  fn := GConfig.FileName + VDB_MONITOR_FILE_EXT;
+  AssignFile(f, fn);
+  if FileExists(fn) then
+    Append(f)
+  else
+    Rewrite(f);
+  for i := 0 to GBuffer.Count - 1 do
+    Writeln(f, GBuffer[i]);
+  CloseFile(f);
+  GBuffer.Clear;
+  Result := True;
+end;
+
+function StatsHexEncode(const S: string): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 1 to Length(S) do
+    Result := Result + IntToHex(Ord(S[i]), 2);
+end;
+
+function StatsHexDecode(const S: string): string;
+var
+  i, n, b: Integer;
+  raw: AnsiString;
+begin
+  n := Length(S) div 2;
+  SetLength(raw, n);
+  for i := 0 to n - 1 do
+  begin
+    b := StrToIntDef('$' + Copy(S, i * 2 + 1, 2), -1);
+    if (b < 0) or (b > 255) then
+    begin
+      Result := '';
+      Exit;
+    end;
+    raw[i + 1] := AnsiChar(b);
+  end;
+  Result := string(raw);
+end;
+
+function VdbStatsPackMCV(const Values: array of string;
+  const Counts: array of Int64): string;
+var
+  i, n: Integer;
+begin
+  Result := '';
+  n := Length(Values);
+  if Length(Counts) < n then n := Length(Counts);
+  for i := 0 to n - 1 do
+  begin
+    if Values[i] = '' then Continue;
+    if Result <> '' then Result := Result + '^';
+    Result := Result + StatsHexEncode(Values[i]) + '~' + IntToStr(Counts[i]);
+  end;
+end;
+
+procedure StatsUnpackMCV(const APacked: string; var Entries: array of TVDbMCVEntry;
+  out N: Integer);
+var
+  parts, kv: TStringList;
+  i, p: Integer;
+begin
+  N := 0;
+  if APacked = '' then Exit;
+  parts := TStringList.Create;
+  try
+    parts.Delimiter := '^';
+    parts.DelimitedText := APacked;
+    for i := 0 to parts.Count - 1 do
+    begin
+      p := Pos('~', parts[i]);
+      if p <= 1 then Continue;
+      if N > High(Entries) then Break;
+      kv := TStringList.Create;
+      try
+        kv.Delimiter := '~';
+        kv.DelimitedText := parts[i];
+        if kv.Count < 2 then Continue;
+        Entries[N].Value := StatsHexDecode(kv[0]);
+        Entries[N].Count := StrToInt64Def(kv[1], 0);
+        if Entries[N].Value <> '' then Inc(N);
+      finally
+        kv.Free;
+      end;
+    end;
+  finally
+    parts.Free;
+  end;
+end;
+
+function VdbStatsMCVLookup(const S: TVDbTableStats; const ColName, Value: string;
+  out Count: Int64): Boolean;
+var
+  i, j: Integer;
+begin
+  Result := False;
+  Count := 0;
+  for i := 0 to High(S.ColStats) do
+    if SameText(S.ColStats[i].ColName, ColName) then
+    begin
+      for j := 0 to High(S.ColStats[i].MCV) do
+        if S.ColStats[i].MCV[j].Value = Value then
+        begin
+          Count := S.ColStats[i].MCV[j].Count;
+          Exit(True);
+        end;
+      Exit;
+    end;
+end;
+
+function VdbStatsMCVInfo(const S: TVDbTableStats; const ColName: string;
+  out Total: Int64; out Entries: Integer): Boolean;
+var
+  i, j: Integer;
+begin
+  Result := False;
+  Total := 0;
+  Entries := 0;
+  for i := 0 to High(S.ColStats) do
+    if SameText(S.ColStats[i].ColName, ColName) then
+    begin
+      for j := 0 to High(S.ColStats[i].MCV) do
+      begin
+        Inc(Total, S.ColStats[i].MCV[j].Count);
+        Inc(Entries);
+      end;
+      Exit(True);
+    end;
+end;
+
+// R-15: Cost-Based Optimizer — tablo istatistikleri (genişletilmiş)
+function RecordTableStats(const TableName: string; RowCount: Int64; AvgRowLen: Integer; IndexCount: Integer;
+  const ColNames, ColDistinct, ColNulls, ColMins, ColMaxs, ColMCVs: array of string): Boolean;
+var
+  i: Integer;
+  colStats, one: string;
+begin
+  Result := True;
+  // Kolon istatistiklerini tek string'e paketle: col1:distinct,null,min,max[,mcv];...
+  colStats := '';
+  for i := 0 to High(ColNames) do
+  begin
+    if colStats <> '' then colStats := colStats + ';';
+    one := Format('%s:%s,%s,%s,%s',
+      [ColNames[i], ColDistinct[i], ColNulls[i], ColMins[i], ColMaxs[i]]);
+    if (i <= High(ColMCVs)) and (ColMCVs[i] <> '') then
+      one := one + ',' + ColMCVs[i];
+    colStats := colStats + one;
+  end;
+  // Format: TableName|RowCount|AvgRowLen|IndexCount|LastAnalyze|ColStats
+  GTableStats.Add(Format('TBLSTATS:%s|%d|%d|%d|%d|%s',
+    [TableName, RowCount, AvgRowLen, IndexCount, VdbTickMs, colStats]));
+end;
+
+function GetTableStats(const TableName: string; out S: TVDbTableStats): Boolean;
+var
+  i, j, k, nMcv: Integer;
+  ts: string;
+  parts, colParts, statParts: TStringList;
+  mcvTmp: array[0..63] of TVDbMCVEntry;
+begin
+  Result := False;
+  S.TableName := '';
+  S.RowCount := 0;
+  S.AvgRowLen := 0;
+  S.IndexCount := 0;
+  S.LastAnalyze := 0;
+  SetLength(S.ColStats, 0);
+
+  for i := GTableStats.Count - 1 downto 0 do
+  begin
+    ts := GTableStats[i];
+    if ts.StartsWith('TBLSTATS:') then
+    begin
+      ts := Copy(ts, 10, Length(ts) - 9);
+      parts := TStringList.Create;
+      try
+        parts.Delimiter := '|';
+        parts.DelimitedText := ts;
+        if parts.Count >= 6 then
+        begin
+          if SameText(parts[0], TableName) then
+          begin
+            S.TableName := parts[0];
+            S.RowCount := StrToIntDef(parts[1], 0);
+            S.AvgRowLen := StrToIntDef(parts[2], 0);
+            S.IndexCount := StrToIntDef(parts[3], 0);
+            S.LastAnalyze := StrToInt64Def(parts[4], 0);
+
+            // Parse column stats: col1:distinct,null,min,max;col2:...
+            SetLength(S.ColStats, 0);
+            colParts := TStringList.Create;
+            try
+              colParts.Delimiter := ';';
+              colParts.DelimitedText := parts[5];
+              SetLength(S.ColStats, colParts.Count);
+              for j := 0 to colParts.Count - 1 do
+              begin
+                statParts := TStringList.Create;
+                try
+                  statParts.Delimiter := ':';
+                  statParts.DelimitedText := colParts[j];
+                  if statParts.Count >= 2 then
+                  begin
+                    S.ColStats[j].ColName := statParts[0];
+                    statParts.Delimiter := ',';
+                    statParts.DelimitedText := statParts[1];
+                    // R-15: paket bicimi "distinct,null,min,max" = 4 alan.
+                    // Eski kod >= 5 ariyordu; bu yuzden DistinctCount/NullCount
+                    // HICBIR ZAMAN dolmuyordu (CBO secicilik = 0).
+                    if statParts.Count >= 4 then
+                    begin
+                      S.ColStats[j].DistinctCount := StrToIntDef(statParts[0], 0);
+                      S.ColStats[j].NullCount := StrToIntDef(statParts[1], 0);
+                      S.ColStats[j].MinVal := statParts[2];
+                      S.ColStats[j].MaxVal := statParts[3];
+                      SetLength(S.ColStats[j].MCV, 0);
+                      if statParts.Count >= 5 then
+                      begin
+                        nMcv := 0;
+                        StatsUnpackMCV(statParts[4], mcvTmp, nMcv);
+                        SetLength(S.ColStats[j].MCV, nMcv);
+                        for k := 0 to nMcv - 1 do
+                          S.ColStats[j].MCV[k] := mcvTmp[k];
+                      end;
+                    end;
+                  end;
+                finally
+                  statParts.Free;
+                end;
+              end;
+            finally
+              colParts.Free;
+            end;
+
+            Result := True;
+            Break;
+          end;
+        end;
+      finally
+        parts.Free;
+      end;
+    end;
+  end;
+end;
+
+// R-24: ANALYZE edilmis tekil tablo sayisi (SHOW STATS: tables_analyzed)
+function AnalyzedTableCount: Integer;
+var
+  i, p: Integer;
+  ts, nm: string;
+  seen: TStringList;
+begin
+  Result := 0;
+  seen := TStringList.Create;
+  try
+    seen.Sorted := True;
+    seen.Duplicates := dupIgnore;
+    for i := 0 to GTableStats.Count - 1 do
+    begin
+      ts := GTableStats[i];
+      if not ts.StartsWith('TBLSTATS:') then Continue;
+      ts := Copy(ts, 10, Length(ts) - 9);
+      p := Pos('|', ts);
+      if p < 1 then Continue;
+      nm := Copy(ts, 1, p - 1);
+      if nm <> '' then seen.Add(nm);
+    end;
+    Result := seen.Count;
+  finally
+    seen.Free;
+  end;
+end;
+
+initialization
+  GBuffer := TStringList.Create;
+  GTableStats := TStringList.Create;
+  GConfig.FileName := '';
+  GConfig.FlushIntervalMs := 5000;
+  GConfig.MaxBufferSize := 1000;
+  GStats.CommandCount := 0;
+  GStats.TotalDurationUs := 0;
+  GStats.MaxDurationUs := 0;
+
+finalization
+  GBuffer.Free;
+  GTableStats.Free;
+
+end.

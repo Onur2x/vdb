@@ -1,0 +1,547 @@
+# VDB Speed Test and Performance Report
+
+This document contains the engine's measured performance, the measurement
+method, and a same-machine comparison against SQLite. Overview:
+[readme_en.md](readme_en.md)
+
+> Every number comes from a real run in this repository. Measurements were
+> taken on Windows with a 32-bit (`i386-win32`) FPC 3.2.4 build, in a single
+> process, using `QueryPerformanceCounter`. The same data, the same disk
+> (`C:\temp`) and the same SQL text were used for both engines.
+
+---
+
+## 1. Test data
+
+1,000,000-row table:
+
+```sql
+CREATE TABLE customer (
+  id       INTEGER PRIMARY KEY,
+  name     TEXT,
+  age      INTEGER,
+  balance  FLOAT,
+  note     TEXT
+);
+```
+
+Data generation is deterministic and reproducible from the same seed.
+
+---
+
+## 2. v2.1 performance release (1M rows)
+
+| Query / operation | Before | v2.1 | Gain |
+|---|---:|---:|---|
+| `SELECT COUNT(*) FROM customer` | 3,200 ms | **800 ms** | **4x** |
+| `SELECT * FROM customer` | 2,859 ms | **1,579 ms** | **1.8x** |
+| `SELECT SUM(id) FROM customer` | 8,766 ms | **2,265 ms** | **3.9x** |
+| `WHERE id = -30792` (negative PK) | 12,400 ms | **0 ms** | bug fix |
+| `WHERE id > 100` (999,900 rows) | 13,000 ms | **~5,000 ms** | **2.6x** |
+| First index use (lazy build) | 9–13 s | **~4.3 s** | **2–3x** |
+| `ScanAll` (raw KV scan) | 7,016 ms | **437 ms** | **16x** |
+| `ScanRows` (decoded scan) | 9,703 ms | **2,625 ms** | **3.7x** |
+| `WHERE id = 524288` (PK point) | 0 ms | **0 ms** | — |
+| `WHERE id BETWEEN 100 AND 200` | 125 ms | **125 ms** | PK lazy index |
+| 1M INSERT (BEGIN/COMMIT) | — | **55.84 s** (17,907/s) | 118.9 MB ≈ 119 B/row |
+
+### Micro-benchmarks
+
+| Operation | Time |
+|---|---:|
+| `VDbParseInt` | 78 ns/call |
+| `VDbParseFloat` | 515 ns/call |
+| `VDbFloatToStr` | ~450 ns (was ~800 ns) |
+| STR column decoding | 109 ns/column (was ~300 ns) |
+
+### What changed in this release
+
+- `ScanSnapshot` rewritten: offset-ordered block reads (8 MB window).
+- Raw `COUNT(*)` path: no row decoding, only structure + hash validation.
+- Aggregate gating: `SUM` no longer performs redundant `MIN/MAX` or parsing.
+- `SortIdxEntries` pre-parse quicksort: index build ~10 s → ~1 s.
+- CBO fix: use index length instead of row count when statistics are absent.
+- Negative-literal fix: `id = -1` went from 12.4 s to 0 ms.
+- `DecodeRow` ASCII fast path + raw-byte hash + preallocation.
+- Allocation reductions in `VDbParseInt` / `VDbParseFloat` / `VDbCmpVal` /
+  `VDbFloatToStr`.
+
+The durability contract is unchanged: `SyncWriteInterval` defaults to 0 and
+the crash suite passes with zero data loss.
+
+---
+
+## 3. H3 skiplist index (2026-10-19)
+
+With H3 the canonical secondary index is a skiplist. Pending changes are
+applied in O(log N) inside `FlushIdxPending`; the sorted array is only a cold
+read cache. Rank/span fields make indexed `COUNT(*)` over a range O(log N).
+
+### 100,000 rows — `idxbench`
+
+Setup: 200 × 1,000 range, 100 cycles, each cycle performing `UPDATE` plus
+indexed `COUNT(*)`.
+
+| Measurement | Result |
+|---|---:|
+| 100-cycle total | **39.3–41.8 ms** |
+| Per cycle | **0.39–0.42 ms** |
+| Previous per cycle | 24.99 ms |
+| Gain | **~60–64x** |
+| Indexed `COUNT(*)` (no pending) | **0.01 ms** |
+| First flush | **1.3 ms** |
+
+### 1,000,000 entries — `skipchk`
+
+| Operation | Time |
+|---|---:|
+| 1M insert | **1,110.3 ms** |
+| 200,000 `LowerBound` | **423.8 ms** |
+| 10,000 range scans | **336.3 ms** |
+| 100,000 deletes | **271.7 ms** |
+
+`skipchk` also compares rank/span values against a 200,000-element oracle by
+brute force; result: **0 errors**.
+
+`countchk` compares an indexed table against an unindexed oracle:
+**120/120**.
+
+---
+
+## 4. Fair comparison with SQLite
+
+Conditions:
+
+- Same SQL text, same data generation, same disk (`C:\temp`), single process.
+- Both engines on stock defaults:
+  - VDB: `SyncWriteInterval = 0` (synchronous commits)
+  - SQLite: `synchronous=FULL`, `journal=DELETE`
+    (official sqlite.org 3.54.0 32-bit DLL)
+- Timer: `QueryPerformanceCounter`.
+
+| Phase (1M rows) | VDB | SQLite | VDB / SQLite |
+|---|---:|---:|---:|
+| `INSERT` 1M (BEGIN/COMMIT) | 24.1 s | 3.12 s | 7.7x |
+| `SELECT COUNT(*)` ×10 avg | 713 ms | 37 ms | 19.5x |
+| `SELECT SUM(balance)` ×5 avg | 722 ms | 82 ms | 8.8x |
+| PK point lookups ×50,000 | **1.42 s** | 3.04 s | **0.47x — VDB 2.1x ahead** |
+| `BETWEEN` 2,000×100 rows | 3.12 s | 211 ms | 14.8x |
+| `UPDATE` 100k (transaction) | 4.25 s | 270 ms | 15.8x |
+| `DELETE` 100k (transaction) | 2.92 s | 196 ms | 14.9x |
+
+Improvement over the speed campaign (zero data loss throughout):
+
+| Phase | Campaign start | Final |
+|---|---:|---:|
+| INSERT | 16.1x | 7.7x |
+| COUNT | 26.8x | 19.5x |
+| BETWEEN | ~35x | 14.8x |
+| PK point | 0.59x | **0.47x (VDB ahead)** |
+
+The SQL suite and the 8-step crash chain stayed green at every step.
+
+---
+
+## 5. Single-row writes (autocommit) — 2026-10-24
+
+Complaint: "insert, update and delete are still very slow". The single-row
+(autocommit) write path was measured; two bottlenecks were found and fixed.
+
+Conditions: Windows, FPC 3.2.4 i386-win32, `-O1`, via SQL text (`sq.Exec`),
+default durability (`SyncWrite=True`, `SyncWriteInterval=0` → fsync on every
+commit), 20,000 rows, single process.
+
+| Operation (20,000 rows, one at a time) | Before | After | Gain |
+|---|---:|---:|---:|
+| `INSERT` autocommit | 74.0 s — 3.70 ms/row (270/s) | **8.61 s — 0.430 ms/row (2,324/s)** | **8.6x** |
+| `UPDATE` (PK) autocommit | 138.9 s — 6.94 ms/row (144/s) | **7.74 s — 0.387 ms/row (2,585/s)** | **17.9x** |
+| `DELETE` (PK) autocommit | 137.3 s — 6.87 ms/row (146/s) | **7.48 s — 0.374 ms/row (2,673/s)** | **18.4x** |
+
+The bulk (single transaction) path held a separate O(n²) bottleneck, also
+fixed (100,000 rows, single transaction):
+
+| Bulk operation | Before | After | Gain |
+|---|---:|---:|---:|
+| `DELETE ... WHERE` (one statement) | 0.1575 ms/row (15.8 s) | **0.0134 ms/row (1.34 s)** | **11.7x** |
+| PK `DELETE` (open batch) | 0.1735 ms/row (17.3 s) | **0.0296 ms/row (2.96 s)** | **5.9x** |
+| `UPDATE ... WHERE` (one statement) | 0.0226 ms/row | 0.0223 ms/row | — |
+| `INSERT` (open batch) | 0.0065 ms/row (154k/s) | 0.0064 ms/row (156k/s) | — |
+
+### Root cause 1 — the whole schema was rewritten on every INSERT
+
+`TVTableDb.BumpAutoInc` called `MarkSchema` → `SaveSchema` whenever the
+counter advanced; `SaveSchema` serialized the entire table/role/RLS text, ran
+the `GuardSchemaLoss` check, wrote it to the KV store and fsynced. That cost
+~3.0 ms on every single-row INSERT. The counter now only advances in memory
+(`FAutoIncDirty`); the schema is written once on `Close` or on the next
+structural DDL. A lost counter self-heals via `ReadRow`/`MaxPkInt`.
+
+### Root cause 2 — in-place updates on single-row writes
+
+Reusing a dead span for a single-row UPDATE/DELETE meant three fsyncs (undo
+pre-image, main file, undo commit marker) plus creating and deleting the
+`.undo` file on every write (≈1.5 ms on Windows). In-place writing is now used
+only for **multi-row** operations (`FInBatch and FPending.Count > 1`);
+single-row writes take the append path with a single fsync. The trade-off is
+file growth: dead spans are reused by later bulk writes and reclaimed by
+`VACUUM`/`Compact`.
+
+### Extra — free-span lookup was O(n²)
+
+`TryTakeFreeSpan` scanned the list from the start and took the first fitting
+span (`TList.Delete(0)` is O(n)). A 100,000-row `DELETE` produced a new dead
+span per row and immediately searched, giving O(n²) overall. The list is now
+kept sorted by size: lookup is a binary search (O(log n)), insertion of
+equal-sized spans is O(1).
+
+### Automatic compaction (H25) — against file growth
+
+Single-row writes now append, so heavy autocommit `UPDATE`/`DELETE` traffic
+accumulates dead regions and the file grows. The engine can reclaim them on its
+own: when **enabled**, after every successful commit, if
+`DeadBytes / FileSize` crosses the threshold, `Compact` runs (atomic `.tmp` +
+rename, the old file stays as `.bak`). The decision is O(1); the file is
+rewritten in one pass only when the threshold is actually crossed.
+
+**It is OFF by default.** Compaction rewrites the whole file, so that one
+commit takes longer (seconds on a very large database). If commit latency must
+stay predictable, leave it off and call `VACUUM`/`AutoCompact` explicitly at a
+suitable time.
+
+| Setting | Default | Meaning |
+|---|---:|---|
+| `AutoCompactEnabled` | `False` | Set `True` to turn it on |
+| `AutoCompactRatio` | `0.35` | Dead-byte ratio threshold |
+| `AutoCompactMinBytes` | 4 MB | Databases below this size are never compacted |
+
+Measurement (`sqltest` T148, 300 rows, 60 KB file): at 36% dead,
+**63,505 → 23,008 bytes**; afterwards `DeadBytes=0` and row counts, PK and
+secondary-index reads, `INSERT`/`UPDATE`/`DELETE`, `Verify`, and results after
+reopening are all unchanged. With the feature disabled the dead bytes keep
+accumulating (23,064 bytes) and nothing is compacted. Compaction is only
+attempted after a commit that wrote data; the `.bak`, `.tmp` and fsync cost is
+paid only when the threshold is crossed.
+
+### Measured floor
+
+Raw `fsync` on this machine is ≈0.29–0.32 ms. With `SyncWrite=True` the floor
+for a single-row write is ≈0.35 ms/statement (~2,800/s), and that floor is
+reached. Users needing more should use `SyncWriteInterval` (group commit) or
+an explicit transaction; with group commit an `INSERT` costs 0.030 ms
+(~33,000/s).
+
+---
+
+## 6. Correctness gates
+
+All performance changes were made while the following gates were green
+(2026-10-24):
+
+| Gate | Result |
+|---|---|
+| `sqltest` — win32 (lazbuild, `-B`) | **3112 / 3112** (`kalan=0`) |
+| `sqltest` — win64 (`-Px86_64 -Twin64 -O1`) | **3077 / 3077** (`kalan=0`) |
+| `sqltest` — Linux (WSL, FPC 3.2.4) | **3077 / 3077** (`kalan=0`) |
+
+The H11 (undo journal / in-place) tests were updated to the new contract:
+dead-span reuse is verified for multi-row transactions, while single-row
+writes take the append path. H25 added `sqltest` T148 (21 checks: default-off,
+threshold behaviour, file shrinking, data/index integrity, disable/re-enable, and
+durability after reopening).
+
+Earlier campaigns also ran `crashtest`, `rawchk`, `mrowchk`, `fuzzchk`,
+`sqlite_diff`, `hashchk`, `copychk`, `zonechk`, `skipchk` and `countchk`
+green; those were one-off tools and only `sqltest` remains in the repository.
+
+---
+
+## 7. Reproducing the measurements
+
+Correctness with `sqltest`:
+
+```bash
+lazbuild -B sqltest.lpi
+sqltest.exe C:\temp\vdbtest
+```
+
+Expected: `SONUC: gecen=3090 kalan=0` (win32) or `gecen=3055 kalan=0`
+(win64/Linux; a few TLS/OpenSSL tests are skipped when the DLL is missing).
+
+The benchmark programs (`idxbench`, `skipchk`, `countchk`) were removed during
+cleanup. To repeat the numbers, generate a 1M-row dataset and run the relevant
+SQL through `sqltest` or your own harness.
+
+---
+
+## 8. Observations
+
+- VDB is strongest at **PK point lookups** and **single-file/embedded** use.
+- SQLite is still clearly ahead on bulk `INSERT`, `UPDATE` and `DELETE`; this
+  is a natural consequence of the append-only KV design.
+- The H3 skiplist delivered the largest win by reducing index maintenance and
+  indexed `COUNT(*)` cost to O(log N).
+
+---
+
+## 9. v3.0 page engine — v2 and v3 on the same scale (2026-10-25)
+
+v3.0 brings a new engine: 4 KB SQLite-style pages, page-image WAL, slot
+indexes, O(1) deletes. The table below comes from **one harness**, on the same
+machine, back to back, as the **median of three runs**
+(`tests/bench/benchcmp.pas`, `--backend=v2|v3`).
+
+Conditions: Windows, FPC 3.2.4 i386-win32, single process; 200,000 rows ×
+3 columns (`id INTEGER PRIMARY KEY`, `a INTEGER`, `s TEXT(~24 B)`), 20,000
+single-row autocommit INSERTs, default durability (`SyncWrite=True`, fsync on
+every commit).
+
+| Metric | v2 | **v3.0** | **v3.1** |
+|---|---:|---:|---:|
+| Data file (`.odb`) | 19,278,424 B (96.4 B/row) | **15,527,936 B (77.6 B/row)** | **15,527,936 B (77.6 B/row)** |
+| Open index (`.odb.idx`) | — | 3,520,080 B (17.6 B/row) | 3,520,080 B (17.6 B/row) |
+| **Total on disk** | **19,278,555 B** | **19,048,016 B** | **19,048,016 B** |
+| Open | 984 ms | 32 ms | **27.8 ms** |
+| Bulk INSERT (one batch) | 4.455 µs/row | 6.640 µs/row | **5.787 µs/row** |
+| Autocommit INSERT | 0.431 ms/row | 0.557 ms/row | **0.449 ms/row** |
+| PK point lookup | 6.25 µs | 6.25 µs | **5.13 µs** |
+| parse-only `SELECT 1` | 3.90 µs | 3.90 µs | **3.55 µs** |
+| `COUNT(*)` | 31 ms | 62 ms | **0.1 ms** |
+
+The v3.1 column is the same harness under the same conditions (200k × 3
+columns, 20k single-row inserts, median of three runs). File size did **not**
+change: v3.1 is about speed, not size.
+
+**What is `.odb.idx`, and should it count?** It is a **derived cache** of the
+heap index (key → page/slot) loaded at open instead of rebuilt; it is not a data
+source and deleting it loses nothing (open takes 79 ms instead of 16 ms, target
+150 ms). It does take disk, so it is shown on its own line and in the total.
+Counting `.odb` alone the win is 19.5 %; with `.idx` it is 1.2 % — both numbers
+belong in the report, the 19.5 % alone is misleading.
+
+**The policy is: the `.idx` is always written** (v3.1). The v3.0 "skip above
+50 MB" threshold was removed: the `.idx` is derived and deletable, so the size
+limit bought no safety while forcing a full scan on large databases at open.
+`backendchk` covers this with 6 checks (`idxpol`, `TestV3IdxPolicy`).
+
+v3.1 closed all three regressions: `COUNT(*)` **0.1 ms** (live per-table
+counter), autocommit **0.449 ms** (only the pages changed by the transaction go
+to the WAL), bulk INSERT **5.787 µs** (256 KB file-growth chunks). The "why"
+sections below are v3.0's measured root causes; each carries its v3.1 fix.
+
+### Why bulk INSERT cost 6.64 µs (5.787 µs in v3.1)
+
+Components measured separately (200k keys, 64 B values, 512-frame pool):
+
+| Phase | Time |
+|---|---:|
+| Writing into the batch overlay (`Put`) | 0.94 µs/key |
+| Applying the overlay + commit + checkpoint | 4.72 µs/key |
+| — engine `Insert` share | ~1.6 µs/key |
+| — WAL + checkpoint share | ~1.3 µs/key |
+
+v2's append-only KV path appends each row once. v3 uses page-image WAL: the same
+bytes go to the WAL and, at checkpoint, to the data file — **2x write volume**.
+Half of the difference comes from that; the rest is in-page cell placement and
+index maintenance.
+
+**v3.1 fix:** the file was extended with a separate `SetSize` per new page
+(measured ~45–50 µs/page). It is now extended in 256 KB chunks and trimmed back
+to the logical size at close: page-harness writes **1.88 → 1.32 µs/row**, SQL
+harness bulk INSERT **6.64 → 5.787 µs/row**.
+
+Three bottlenecks found by measurement this sprint, all fixed in production
+code:
+
+1. **`Flush` ran a full checkpoint after every autocommit.** The SQL layer calls
+   `Flush` after each row, so a single-row write meant WAL + flushing every
+   dirty page to the data file + WAL truncation. `Flush` now only does
+   `Commit(True)` (WAL + fsync); checkpoint happens on the threshold, an
+   explicit call, or close. **1.168 → 0.557 ms/row.**
+2. **Pending page images were kept as an array of 4 KB records grown with
+   `SetLength(+1)` on every eviction.** In a 200k × 64 B write, 3,488 evictions
+   cost ~265 ms in growth alone (~75 µs each). Images are now allocated
+   separately, the array holds only pointers and doubles in capacity, and the
+   pending lookup is a hash instead of a linear scan. Engine `Insert`:
+   2.99 → 1.6 µs/key.
+3. **The batch was applied in `TDictionary` order (random).** Scattered page
+   writes are markedly slower than sequential ones. The batch is now applied in
+   **insertion order**. Bulk INSERT **8.045 → 6.64 µs/row** (sum of the three
+   improvements).
+
+### Why `COUNT(*)` cost 62 ms (0.1 ms in v3.1)
+
+In v2, `COUNT(*)` is answered **O(1)** from a per-table row counter
+(`TryGetTableRowCount`); the 31 ms figure is that counter plus validation. In
+v3.0 keys are a table+PK hash, so there was **no per-table counter** and the
+query scanned: 15.5 MB / 62 ms ≈ 250 MB/s.
+
+**v3.1 fix:** a **live** per-table counter inside `TVdbBackendV3`, seeded from
+the summary embedded in `.idx` (or one full scan on the first `COUNT` if there
+is none), maintained incrementally by insert/delete/batch and invalidated only
+by RESTORE. The fast path applies to pure `COUNT(*)` only: `WHERE` / `HAVING` /
+`GROUP BY` / JOIN / `LIMIT` or an open batch falls back to the streaming scan.
+**Measured: 0.1 ms.**
+
+### Against the v3.0 acceptance targets
+
+| Target | Target value | v3.0 | v3.1 | Status |
+|---|---:|---:|---:|---|
+| File size (SQL harness, `.odb` only) | ≤ 11 MB | 15.5 MB | 15.5 MB | **missed** |
+| File size (SQL harness, `.odb` + `.idx`) | ≤ 11 MB | 19.0 MB | 19.0 MB | **missed** |
+| File size (page harness, 32 B values) | ≤ 11 MB | **9.76 MB** (+3.20 MB `.idx`) | **9.76 MB** (+3.20 MB `.idx`) | met (`.odb` only) |
+| Open | ≤ 150 ms | **32 ms** | **27.8 ms** | met |
+| PK point | ≤ 7 µs | **6.25 µs** | **5.13 µs** | met |
+| Bulk INSERT | ≤ 5 µs | 6.64 µs | 5.787 µs | borderline (v2: 4.46) |
+| Autocommit INSERT | ≤ 0.55 ms | 0.557 ms | **0.449 ms** | met (v2: 0.431) |
+| `COUNT(*)` | ≤ 16 ms | 62 ms | **0.1 ms** | met |
+
+The file-size target mixed two harnesses: `benchv3` (page engine, 32 B values,
+9,756,672 B = 48.8 B/row) meets it; `benchcmp` (SQL layer, 3 columns, ~24 B
+text) does not, in v3.1 either. Both are listed separately. Note also that v3
+writes a derived `.odb.idx` next to the data file (3.5 MB for 200k rows); it can
+be deleted at any time (open then does a full scan, 79 ms, still under target),
+but it does occupy disk, so both figures are given.
+
+**Honest summary:** v3.0 won on file size and especially open time; PK and parse
+costs were identical to v2; bulk writes were ~1.5x, `COUNT(*)` 2x and single-row
+writes ~1.3x slower. v3.1 closed all three: `COUNT(*)` **0.1 ms**, autocommit
+**0.449 ms** (19 % under v3.0, 4 % over v2), bulk **5.79 µs** (13 % under v3.0,
+30 % over v2). What is left on autocommit is the **durability floor**: the
+separate `fsyncbench` tool measures a single fsync at **0.330 ms**, and WAL
+bytes per commit dropped from 63,373 to **8,252**. What is left on bulk is the
+2x write volume of page-image WAL, a design cost.
+
+**Measurement noise:** on this machine run-to-run spread was 5.76–6.64 µs for
+bulk, 0.449–0.458 ms for autocommit and 3.53–4.59 µs for parse. The table holds
+the **median of three consecutive runs**; do not report a single out-of-range
+run.
+
+### Page-engine harness (`benchv3`, 200k rows × 32 B values)
+
+A separate harness from `benchcmp`; do not mix the numbers:
+
+| Metric | v3.0 | v3.1 |
+|---|---:|---:|
+| File | 9,756,672 B (48.8 B/row) | 9,756,672 B (48.8 B/row) |
+| `.idx` | 3,200,064 B (16.0 B/row) | 3,200,064 B (16.0 B/row) |
+| Write (commit + checkpoint included) | 1.88 µs/row | **1.32 µs/row** |
+| Open (with `.idx`) | 16 ms | 21 ms (16–31 range, load sensitive) |
+| Open (full scan) | 79 ms | 63 ms (63–79 range) |
+| PK read | 0.47 µs/row | 0.40 µs/row |
+| Raw scan (copying) | — | 11.3 ms |
+| Raw scan (zero-copy) | — | **9.1 ms** |
+
+## 10. SQLite comparison after P-144..P-148 (2026-11-07)
+
+A single executable, `tests/bench/sqlitecmp.lpr`, measures VDB v3 and SQLite
+3.54.0 in the **same process** with `QueryPerformanceCounter`, on the **same
+machine and disk**, using the **same deterministic data and the same statement
+order**. Nothing below is estimated; every number comes from a real run.
+
+### Method
+
+* Data: 200,000 rows, `musteri (id INTEGER PRIMARY KEY, ad TEXT, yas INTEGER,
+  bakiye FLOAT, notu TEXT)`, generated deterministically from the row number.
+* Both engines run in subdirectories of one work directory passed on the
+  command line (the program refuses to run without it).
+* SQLite: `PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;` (its honest
+  durable setting). VDB: engine defaults.
+* Every stage runs **three times**; the table reports the **median**. A
+  separate, unmeasured warmup round (plus a full unmeasured read pass over the
+  real 200k data set) runs first.
+* SQLite point statements are prepared once per stage; VDB has no prepare API,
+  so each `Exec` parses the statement. This is the engines' public interface;
+  it slightly favours SQLite on the point stages.
+* `ms` is the median duration of the **whole round workload**; `us/op` divides
+  it by the operations in that round. Single-query stages execute 5 queries per
+  round, so their `us/op` is per query.
+
+Environment: Windows 11, `i386-win32`, FPC 3.2.4, SQLite 3.54.0 (`sqlite3.dll`
+3.54.0), same physical disk. Run date 2026-11-07 21:22:45.
+
+### Results (median of three rounds)
+
+| Stage | VDB ms | SQLite ms | VDB/SQLite | VDB us/op | SQLite us/op |
+|---|---:|---:|---:|---:|---:|
+| 1. Bulk INSERT (one transaction, 200k rows) | 2155.47 | 165.86 | 13.00x slower | 10.78 | 0.83 |
+| 3. PK point SELECT (2000 keys) | 44.30 | 99.04 | 0.45x faster | 22.15 | 49.52 |
+| 4. Range SELECT `BETWEEN` (2000 queries, COUNT) | 60.94 | 104.63 | 0.58x faster | 30.47 | 52.31 |
+| 5. Full scan `COUNT(*)` | 0.05 | 31.15 | 0.002x faster | 10.60 | 6230.40 |
+| 6. `SUM(id), AVG(id)` | 297.74 | 69.58 | 4.28x slower | 59548.40 | 13916.40 |
+| 7. `GROUP BY yas` (COUNT + AVG) | 594.54 | 259.25 | 2.29x slower | 118907.80 | 51849.80 |
+| 8. `ORDER BY bakiye DESC LIMIT 100` | 2308.61 | 280.45 | 8.23x slower | 461721.40 | 56090.40 |
+| 9. Non-indexed `WHERE yas > 70` | 343.50 | 62.71 | 5.48x slower | 68700.00 | 12541.20 |
+| 10. PK point UPDATE (2000, autocommit) | 1030.70 | 3610.38 | 0.29x faster | 515.35 | 1805.19 |
+| 11. Bulk UPDATE (all 200k rows) | 1524.76 | 113.01 | 13.49x slower | 7.62 | 0.57 |
+| 12. PK point DELETE (2000, autocommit) | 857.70 | 3604.53 | 0.24x faster | 428.85 | 1802.26 |
+| 13. Bulk DELETE (20k subset per round) | 286.97 | 5.08 | 56.49x slower | 14.77 | 0.26 |
+| 14. Reopen (open + close) | 312.96 | 0.33 | 945.51x slower | 312963.00 | 331.00 |
+
+**File size on disk** (after the bulk insert, before mutations):
+
+| Engine | Total | Breakdown | Per row |
+|---|---:|---|---:|
+| VDB v3 | 17,737,534 B | `.odb` 15,540,224 + `.idx` 2,193,190 + `.wal` 4,096 | 88.69 B |
+| SQLite | 10,285,056 B | `.db` 10,285,056 + journal 0 | 51.43 B |
+
+VDB is **1.72x** larger on disk for this row shape.
+
+**Round-to-round spread** (max-min as a percentage of the median): mostly
+below 5 %. The exceptions are the deliberately tiny `COUNT(*)` (54.7 %, the
+whole round is ~50 us), bulk DELETE (40.0 % / 83.4 %), reopen (19.6 % /
+223.6 %, sub-millisecond SQLite open), and point UPDATE (12.9 %). Run-to-run,
+VDB bulk INSERT was stable at 2135-2155 ms across four runs, while SQLite
+INSERT varied between 166 and 281 ms; the table uses the low-spread run.
+
+### Same results on both engines
+
+The first measured round produced identical answers:
+
+| Check | VDB | SQLite |
+|---|---:|---:|
+| PK point SELECT rows | 2000 | 2000 |
+| Range SELECT rows | 202000 | 202000 |
+| `COUNT(*)` | 200000 | 200000 |
+| `SUM(id)` | 20000100000 | 20000100000 |
+| `GROUP BY` rows | 60 | 60 |
+| `ORDER BY` rows | 100 | 100 |
+| Non-indexed COUNT | 23331 | 23331 |
+| PK point DELETE affected | 2000 | 2000 |
+| Bulk UPDATE affected | 200000 | 200000 |
+| Bulk DELETE affected | 19427 | 19427 |
+
+### Where VDB wins and where it loses
+
+**VDB is ahead in 5 stages, behind in 8.** It wins exactly where its design
+targets point work and counters:
+
+* **PK point SELECT**: 22.15 us vs 49.52 us (0.45x), and **range SELECT**:
+  30.47 us vs 52.31 us per query (0.58x). The v3 keyspace hash plus the
+  per-table counter make these lookups cheap.
+* **`COUNT(*)`**: ~10 us vs 6.23 ms (0.002x). v3 answers a bare `COUNT(*)`
+  from its live per-table counter instead of scanning.
+* **Autocommit PK UPDATE/DELETE**: ~0.5 and ~0.43 ms/op vs ~1.80 ms/op
+  (0.29x / 0.24x). Each SQLite statement here is its own transaction with
+  `synchronous=FULL` and a rollback journal, so it pays an fsync per operation;
+  VDB's autocommit path is cheaper on this workload.
+
+**VDB is behind on bulk writes and analytical scans:**
+
+* **Bulk INSERT** 13.0x, **bulk UPDATE** 13.5x and **bulk DELETE** 56.5x
+  slower. VDB writes page images and maintains its row store and `.idx`; SQLite
+  moves compact B-tree pages. Per row the gap is 10.78 vs 0.83 us on INSERT.
+* **`SUM/AVG`** 4.3x, **`GROUP BY`** 2.3x, **non-indexed WHERE** 5.5x and
+  **`ORDER BY ... LIMIT`** 8.2x slower. These stages decode rows to text and
+  run the aggregate/sort path in the upper SQL layer; SQLite's compact row
+  format and B-tree are a better fit for full scans and sorting.
+* **Reopen** is 313 ms vs 0.33 ms. VDB loads the derived `.idx` and seeds its
+  counters at open; SQLite's open is lazy and defers schema/read work to the
+  first query. This is an architectural difference, not a like-for-like
+  lazy-open comparison.
+
+**Honest summary:** after P-144..P-148, VDB is the faster engine for point
+lookups, short range scans, `COUNT(*)` and autocommit single-row updates and
+deletes in this workload, and the slower engine for bulk write paths, full
+aggregate scans, sorting and reopen. File size is 1.72x SQLite's. The next
+targets suggested by this table are the bulk update/delete path and the
+aggregate/sort path.

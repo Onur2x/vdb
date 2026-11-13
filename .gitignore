@@ -1,0 +1,133 @@
+# ============================================
+# VDB - Git Ignore
+# ============================================
+
+# Derleme artıkları / Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+*.ppu
+*.a
+*.compiled
+*.res
+*.or
+*.rsj
+
+# Lazarus / FPC
+lib/
+backup/
+*.lps
+*.lpi.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# İşletim sistemi / OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Loglar / Logs
+*.log
+build_*.log
+
+# Test verileri / Test data
+*.odb
+*.wal
+*.idx
+*.colkey
+*.key
+*.bak
+*_onceki
+
+# Geçici / Temp
+*.tmp
+*.temp
+*.cache
+
+# Yedek klasörü / Backup folder (dahil etme)
+yedek2/
+
+# v3 oncesi yerel yedekler (2026-10-24)
+/YEDEK/
+/--help/
+/bench_live.pas
+
+# mtakip projesi (farklı proje / different project)
+mtakip/
+
+# webadmin projesi (farklı proje / different project)
+webadmin/
+
+db/
+.agents/
+.claude/
+data/
+
+
+
+
+# Yerel dokumanlar / Local docs (Git'e eklenmez / not tracked)
+dokuman/
+MDLER/
+ESKI/
+
+# Sadece kaynak kodları tut / Keep only source
+!*.pas
+!*.lpr
+!*.lpi
+!*.md
+!*.h
+!*.sh
+!*.bat
+!*.cmd
+!LICENSE
+!README*
+
+# Calisma zamani / runtime (yonetim uygulamasi + test artiklari)
+test_run/
+test_run_out.txt
+ayar.txt
+tema.txt
+*.out
+err.txt
+trace.txt
+startup_error.txt
+
+# Depoda tutulmayan uygulama/demo/test projeleri (2026-10-20)
+# Cekirdek kutuphane + sqltest + vdbapi (C API) kalir.
+/guimain.*
+/vdbgui.*
+/vdbwebapi.*
+/vdbcomponents.*
+/vdboldtext.*
+/vdbtestext.*
+/build_testext.ps1
+/environmentoptions.xml
+/packagefiles.xml
+
+# Örnek 12 üretilen demo verisi / generated demo data
+/examples/12_milyon_demo/milyon_demo_db/
+/examples/12_milyon_demo/seed_result.txt
+
+# Yerel deneme dosyalari (v3 hazirligi, 2026-10-24) — !*.pas kuralindan SONRA
+# gelmeli, aksi halde yeniden izlenir.
+/bench_live.pas
+
+# Yerel calisma dizinleri (v3 olcum/test artiklari) — Git disinda kalir
+/tmp64/
+/tmpv/
+/tasks/
+/gc/
+/gcc/
+
+# FPC asmlist dump'lari ve linker artifactlari (2026-11-13, V3 baseline)
+/*.s
+*.exp
+
