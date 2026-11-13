@@ -50,7 +50,7 @@ unit vdbapi_core;
 interface
 
 uses
-  SysUtils, Classes, SyncObjs, VDbCore, VDbTable, VDbSql, VDbErr,
+  SysUtils, Classes, SyncObjs, VDbCore, VDbBackendApi, VDbTable, VDbSql, VDbErr,
   VDbCdc, VDbTimeTravel, VDbParallel;
 
 const
