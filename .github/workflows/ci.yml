@@ -17,7 +17,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Reproducible pipeline: sabit FPC/Lazarus surumu.
+  # Windows: sabit Lazarus/FPC surumu (setup-lazarus bu surumu destekliyor).
+  # Linux: Ubuntu deposundaki fpc (3.2.2) yeterli; kapilar lazbuild kullanmaz.
   LAZARUS_VERSION: "4.4"
 
 jobs:
@@ -33,18 +34,46 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup FPC / Lazarus
+      - name: Setup FPC / Lazarus (Windows)
+        if: runner.os == 'Windows'
         # gcarreno/setup-lazarus v3 (commit'e pinli)
         uses: gcarreno/setup-lazarus@3ee9d77e0c771b37c1069f218cb68bd5ce7c30fe
         with:
           lazarus-version: ${{ env.LAZARUS_VERSION }}
           with-cache: true
 
+      # Linux'ta lazbuild gerekmiyor: tum kapilar saf fpc ile derlenir.
+      # Ucuncu-taraf kurulum action'i yerine depo paketi kullanilir; boylece
+      # ariza nedeni dogrudan logda gorunur.
+      - name: Setup FPC (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -u
+          if ! sudo apt-get update > apt-update.log 2>&1; then
+            tail -n 30 apt-update.log
+            tail -n 5 apt-update.log | while IFS= read -r line; do
+              echo "::error::apt-get update: $line"
+            done
+            exit 1
+          fi
+          if ! sudo apt-get install -y fpc > apt-install.log 2>&1; then
+            tail -n 40 apt-install.log
+            tail -n 5 apt-install.log | while IFS= read -r line; do
+              echo "::error::apt-get install fpc: $line"
+            done
+            exit 1
+          fi
+
       - name: Toolchain versions
         shell: bash
         run: |
           fpc -iV
-          lazbuild --version | head -n 1
+          if command -v lazbuild >/dev/null 2>&1; then
+            lazbuild --version | head -n 1
+          else
+            echo "lazbuild yok (bu platformda gerekmiyor)"
+          fi
 
       - name: Build library projects (Windows)
         if: runner.os == 'Windows'
@@ -58,16 +87,35 @@ jobs:
       - name: Build shared library (Unix)
         if: runner.os != 'Windows'
         shell: bash
-        run: ./build_lib.sh
+        run: |
+          bash build_lib.sh
 
       - name: Build and run gates
         shell: bash
-        run: ./tests/run_gates.sh
+        run: |
+          set +e
+          bash tests/run_gates.sh > gates.out 2>&1
+          rc=$?
+          cat gates.out
+          if [ "$rc" -ne 0 ]; then
+            # Basarisiz adimlar check-run anotasyonu olarak da yazilir;
+            # boylece log indirme yetkisi olmadan da hata gorulebilir.
+            grep -E '^(BUILD FAIL|FAIL|MISSING)' gates.out | head -n 10 |
+              while IFS= read -r line; do echo "::error::$line"; done
+            tail -n 15 gates.out | while IFS= read -r line; do
+              echo "::error::tail: $line"
+            done
+          fi
+          exit "$rc"
 
       - name: Upload gate logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: gate-logs-${{ matrix.os }}
-          path: build/gates/*.log
+          path: |
+            build/gates/*.log
+            gates.out
+            apt-update.log
+            apt-install.log
           if-no-files-found: ignore

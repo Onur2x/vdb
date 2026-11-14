@@ -44,13 +44,19 @@ Kosullu kapilar:
 `.github/workflows/ci.yml` — `ubuntu-latest` + `windows-latest`:
 
 1. `actions/checkout`
-2. `gcarreno/setup-lazarus` (Lazarus 4.4 / FPC 3.2.2, **commit SHA'sina
-   pinli**; surum yukseltmesi bilincli bir PR'dir)
-3. Surum dokumu (`fpc -iV`, `lazbuild --version`)
+2. Windows: `gcarreno/setup-lazarus` (Lazarus 4.4 / FPC 3.2.2,
+   **commit SHA'sina pinli**; surum yukseltmesi bilincli bir PR'dir).
+   Unix: `apt-get install fpc` (Ubuntu deposu, FPC 3.2.2). Linux'ta
+   `lazbuild` gerekmez, bu yuzden ucuncu-taraf kurulum action'i yerine
+   depo paketi kullanilir; ariza nedeni dogrudan logda gorunur.
+3. Surum dokumu (`fpc -iV`, varsa `lazbuild --version`)
 4. Windows: `lazbuild vdbapi|vdbcli|vdbmig|vdbserver.lpi`
-   Unix: `./build_lib.sh` (paylasilan kutuphane)
-5. `./tests/run_gates.sh`
-6. Basarisizlikta `build/gates/*.log` artifact olarak yuklenir
+   Unix: `bash build_lib.sh` (paylasilan kutuphane)
+5. `bash tests/run_gates.sh`
+6. Basarisizlikta `build/gates/*.log`, `gates.out` ve apt loglari artifact
+   olarak yuklenir. Ayrica ilk 10 hata satiri ve kuyruk **check-run
+   anotasyonu** olarak yazilir; log indirme yetkisi olmayan bir okuyucu da
+   ariza nedenini gorebilir.
 
 `fail-fast: false`: bir platformun kirilmasi digerinin sonucunu gizlemez.
 
@@ -85,6 +91,13 @@ kaldirildi:
   macOS `.dylib`) eklendi; `SIGPIPE` surec duzeyinde yok sayilir (karsi
   taraf el sikismasini kesince OpenSSL yazma yolu sureci oldurmesin).
 - Test programlari Unix'te `cthreads` thread driver'ini `uses` eder.
+- `tests/run_gates.sh` Git Bash/MSYS altinda `fpc`'ye **native Windows
+  yolu** verir (`cygpath -w`). Aksi halde native `fpc.exe` POSIX yolunu
+  (`/d/repo`) surucu-goreli (`\d\repo`) sanip `Path does not exist` ile
+  duser. Bu, ilk CI kosusunda Windows isini kirian gercek nedendi.
+- Betik, kaynak dizindeki eski `gen_fixtures` ikilisini derlemeden once
+  siler: bayat ikili `fixtures_builtin` kapisini yanlislikla PASS
+  gosterebiliyordu.
 
 ## 6. Bilinen sinirlar
 
@@ -92,6 +105,14 @@ kaldirildi:
   ile bulur; CI'da bu degiskenler tanimli olmadigi icin kapi 77 ile atlar.
   Bu **TLS dogrulamasinin CI'da kosmadigi** anlamina gelir; yerelde
   kosulmustur (6/6).
-- GitHub Actions'ta ilk kosu bu depo icin henuz yapilmadi; matris
-  tanimi kanit degil, niyettir. Yerel kanit: Windows 11 kapi seti +
-  WSL x86_64 Linux kapi seti (bkz. `docs/engineering/BASELINE.md`).
+- Ilk GitHub Actions kosusu (`a8526b2`, run 433) **basarisiz** oldu:
+  `gates (ubuntu-latest)` "Setup FPC / Lazarus" adiminda, `gates
+  (windows-latest)` "Build and run gates" adiminda dustu. Windows nedeni
+  yerelde birebir yeniden uretildi ve duzeltildi (yukaridaki `cygpath`
+  maddesi). Ubuntu nedeninin adim logu anonim erisimle okunamadi
+  (GitHub log indirme kimlik dogrulamasi istiyor); bu yuzden o adim
+  ucuncu-taraf action'dan bagimsiz, ciktisini acikca loglayan `apt-get`
+  kurulumuna cevrildi. **Yeni kosunun sonucu henuz dogrulanmadi** —
+  yesil oldugu iddia edilmiyor.
+- Yerel kanit: Windows 11 kapi seti (Git Bash, 10 kapi) + WSL x86_64
+  Linux kapi seti (11 kapi), bkz. `docs/engineering/BASELINE.md`.

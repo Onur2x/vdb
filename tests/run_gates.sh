@@ -23,9 +23,27 @@ WORK=${1:-"$ROOT/build/gates"}
 FPC=${FPC:-fpc}
 
 EXE=""
+NATIVE_PATH=0
 case "$(uname -s 2>/dev/null || echo unknown)" in
-  MINGW*|MSYS*|CYGWIN*) EXE=".exe" ;;
+  MINGW*|MSYS*|CYGWIN*)
+    EXE=".exe"
+    # Git Bash/MSYS kabugu POSIX yolu verir (/d/repo); derleyici ise
+    # native Windows ikilisidir ve /d/repo'yu surucu-goreli \d\repo sanar
+    # ("Path does not exist"). fpc'ye verilen yollari cygpath ile cevir.
+    if command -v cygpath >/dev/null 2>&1; then
+      NATIVE_PATH=1
+    fi
+    ;;
 esac
+
+# npath: kabuk islemleri icin POSIX, fpc argumanlari icin native yol.
+npath() {
+  if [ "$NATIVE_PATH" -eq 1 ]; then
+    cygpath -w -- "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
 
 mkdir -p "$WORK"
 FAILED=0
@@ -38,7 +56,8 @@ build_gate() {
   mkdir -p "$out/lib"
   log="$WORK/$name.build.log"
   if "$FPC" -MObjFPC -Scghi -O1 -g -l -vewnhibq \
-      "-Fu$ROOT" "-FU$out/lib" "-FE$out" "$src" >"$log" 2>&1; then
+      "-Fu$(npath "$ROOT")" "-FU$(npath "$out/lib")" "-FE$(npath "$out")" \
+      "$(npath "$src")" >"$log" 2>&1; then
     echo "BUILD OK   $name"
     return 0
   fi
@@ -84,8 +103,11 @@ skip_gate() {
 # crypto_fixtures fixture'lari exe'nin yaninda arar; bu yuzden o kapi
 # kaynak dizinine derlenir, digerleri $WORK altina.
 FI=$ROOT/tests/crypto_fixtures
+# Eski ikili kalmis olabilir; bayat exe "PASS" yanilsamasi uretir.
+rm -f "$FI/gen_fixtures$EXE"
 if "$FPC" -MObjFPC -Scghi -O1 -g -l -vewnhibq \
-    "-Fu$ROOT" "-FU$FI/lib" "-FE$FI" "$FI/gen_fixtures.lpr" \
+    "-Fu$(npath "$ROOT")" "-FU$(npath "$FI/lib")" "-FE$(npath "$FI")" \
+    "$(npath "$FI/gen_fixtures.lpr")" \
     >"$WORK/gen_fixtures.build.log" 2>&1; then
   echo "BUILD OK   crypto_fixtures"
 else
