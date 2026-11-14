@@ -1367,8 +1367,8 @@ var
   key: QWord;
   len: LongWord;
   ovf: Boolean;
-  heapPages, ovfPages, ovfWalk, keys: Integer;
-  chain, ovfNo, nextNo: LongWord;
+  heapPages, ovfPages, ovfWalk, keys, trunkPages: Integer;
+  chain, ovfNo, nextNo, cur: LongWord;
   fi: Integer;
   got: Int64;
 begin
@@ -1394,6 +1394,7 @@ begin
   heapPages := 0;
   ovfPages := 0;
   keys := 0;
+  trunkPages := 0;
   freeSet := TDictionary<LongWord, Boolean>.Create;
   keySet := TDictionary<QWord, Boolean>.Create;
   chainSet := TDictionary<LongWord, Boolean>.Create;
@@ -1421,7 +1422,21 @@ begin
         Report := Format('sayfa %d okunamadi', [pno]);
         Exit(False);
       end;
+      { Birakma sayfasi sabitlenir: dongu degiskeni (pno) ic dallarda
+        artirilabildigi icin Release'e pno vermek yanlis cerceveyi
+        birakirdi. }
+      cur := pno;
       try
+        { Freelist trunk sayfalari VDbPage basligi tasimaz (kendi
+          VDB_TRUNK_MAGIC/CRC duzeni vardir). Bunlar dogrulanmis zincirde
+          zaten gezildi; sayfa taramasinda "taninmiyor" diye REDDEDILMEMELI.
+          (P-4 regresyonu: DELETE sonrasi Verify yanlis "bozuk" diyordu.) }
+        if FStore.IsTrunkPage(P) then
+        begin
+          Inc(trunkPages);
+          Inc(pno);
+          Continue;
+        end;
         Move(P^[0], magic, SizeOf(magic));
         if magic <> VDB_PAGE_MAGIC then
         begin
@@ -1546,7 +1561,7 @@ begin
           end;
         end;
       finally
-        FStore.Release(pno, False);
+        FStore.Release(cur, False);
       end;
       Inc(pno);
     end;
@@ -1569,8 +1584,9 @@ begin
       Exit(False);
     end;
 
-    Report := Format('sayfa=%d serbest=%d heap=%d tasma=%d anahtar=%d lsn=%d',
-      [FStore.PageCount, Length(freePages), heapPages, ovfPages, keys, FStore.LSN]);
+    Report := Format('sayfa=%d serbest=%d heap=%d tasma=%d trunk=%d anahtar=%d lsn=%d',
+      [FStore.PageCount, Length(freePages), heapPages, ovfPages, trunkPages, keys,
+       FStore.LSN]);
     Result := True;
   finally
     chainSet.Free;

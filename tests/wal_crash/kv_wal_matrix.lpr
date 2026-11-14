@@ -102,6 +102,26 @@ begin
   end;
 end;
 
+{ Bayti SABIT degerle ezmek yerine XOR'lar: hedef bayt zaten o degerdeyse
+  "bozma" hicbir sey degistirmez ve kapi sessizce yanlis PASS/FAIL uretir
+  (olculdu: k4_crc, CRC bayti $FF iken kayit saglam kaliyordu). }
+procedure XorPatchFile(const AFile: string; AOffset: Int64; AMask: Byte);
+var
+  S: TFileStream;
+  b: Byte;
+begin
+  S := TFileStream.Create(AFile, fmOpenReadWrite or fmShareDenyNone);
+  try
+    S.Position := AOffset;
+    S.ReadBuffer(b, 1);
+    b := b xor AMask;
+    S.Position := AOffset;
+    S.WriteBuffer(b, 1);
+  finally
+    S.Free;
+  end;
+end;
+
 procedure ShrinkFile(const AFile: string; ANewSize: Int64);
 var
   S: TFileStream;
@@ -239,7 +259,7 @@ end;
 { ------------------------------ K4 / K5 ----------------------------------- }
 
 function CorruptionCase(const AName: string; AOffset: Int64;
-  const ABytes: array of Byte): Boolean;
+  const ABytes: array of Byte; AXor: Boolean = False): Boolean;
 var
   dir, wp, v: string;
   Db: TVDb;
@@ -253,7 +273,10 @@ begin
   finally
     Db.Free;
   end;
-  PatchFile(wp, AOffset, ABytes);
+  if AXor then
+    XorPatchFile(wp, AOffset, ABytes[0])
+  else
+    PatchFile(wp, AOffset, ABytes);
 
   Result := False;
   Db := TVDb.Create;
@@ -274,7 +297,7 @@ var
   b: array[0..0] of Byte;
 begin
   b[0] := $FF;
-  CorruptionCase('k4_crc', OFF_CRC, b);
+  CorruptionCase('k4_crc', OFF_CRC, b, True);
 end;
 
 procedure K5_BadMagic;
