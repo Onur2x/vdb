@@ -1,0 +1,18 @@
+# Kabuk betikleri ve CI tanimi her platformda LF kalmali; aksi halde
+# Windows'ta checkout edilen dosya CRLF olur ve bash/WSL "bad interpreter"
+# ya da "\r: command not found" ile kirilir.
+*.sh            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+
+# Pascal kaynagi: depoda LF, Windows'ta CRLF calisma kopyasi sorun degil.
+*.pas           text
+*.lpr           text
+*.lpi           text
+*.inc           text
+
+# Ikili/dokunulmaz
+*.exe           binary
+*.dll           binary
+*.ppu           binary
+*.o             binary
