@@ -16,3 +16,9 @@
 *.dll           binary
 *.ppu           binary
 *.o             binary
+
+# Test fixture verisi bayt duzeyinde sabittir: fixtures kapisi dosyalarin
+# sha256'sini pinler ve SCRAM dogrulayicisini dosya iceriginden yeniden
+# turetir. core.autocrlf=true olan Windows checkout'unda CRLF'e cevrilirse
+# bu iki kontrol kirilir (gercekten kirildi: CI run 43552816622).
+tests/crypto_fixtures/fixtures/** -text
