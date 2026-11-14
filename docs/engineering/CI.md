@@ -142,6 +142,13 @@ kaldirildi:
   `.gitattributes` icinde `tests/crypto_fixtures/fixtures/** -text`.
   Temiz klonda dogrulandi: duzeltme oncesi 20/2 FAIL (CI ile ayni),
   sonrasi 22/0 PASS.
-- Yerel kanit (bu commit): Git Bash/Windows 12 kapi PASS (tls_client SKIP),
-  WSL x86_64 Linux **13 kapi PASS** (tls_client 6/0 dahil).
+- Dorduncu kosu (`3997bbe`, run 43555965650): **iki platform da YESIL**
+  (Ubuntu + Windows `success`). CRLF duzeltmesi ve `cygpath`
+  duzeltmesi boylece CI'da dogrulandi.
+- Besinci kosu (`0381d53`, run 43558258898): **iki platform da YESIL**
+  (`success`). Bu kosu Phase 4 `backup_restore` kapisini (B0-B24) ilk kez
+  CI'da kosturdu.
+- Yerel kanit (bu commit): Git Bash/Windows **13 kapi** PASS (tls_client
+  SKIP), WSL x86_64 Linux **14 kapi** PASS (tls_client 6/0 dahil).
   `sql_matrix`: 61 PASS, 0 FAIL (iki platformda).
+  `backup_restore`: 25 PASS, 0 FAIL (iki platformda).
