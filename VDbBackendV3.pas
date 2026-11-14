@@ -4762,6 +4762,7 @@ var
   src, dst: TFileStream;
   hdr: array[0..75] of Byte;
   magic, ver, flags: LongWord;
+  rep: string;
   i: Integer;
 begin
   RequireWritable;
@@ -4802,6 +4803,13 @@ begin
   else if FEng.Store.Encrypted then
     raise EVdbBackendV3.Create(
       'RESTORE: kaynak sifresiz, hedef sifreli');
+
+  { V3 Phase-4: imaj sayfa butunlugu DOGRULANMADAN canli dosyanin uzerine
+    yazilmamali. Aksi halde bozuk bir yedek sessizce geri yuklenir; veritabani
+    acilista patlar ya da bozuk sayfalarla calisir. Bugune kadar RestoreFrom
+    yalniz basligi (magic/ver/sifreleme) kontrol ediyordu. }
+  if not FEng.Store.VerifyBackupImage(SrcPath, rep) then
+    raise EVdbBackendV3.Create('RESTORE: ' + rep);
 
   { Calisan durumu diske indir; sonra motoru kapat. }
   FEngCs.Enter;

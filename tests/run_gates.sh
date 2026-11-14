@@ -128,6 +128,7 @@ build_gate crypto_selftest "$ROOT/tests/crypto_selftest/selftest_runner.lpr"
 build_gate crypto_kat    "$ROOT/tests/crypto_kat/kat_runner.lpr"
 build_gate wal_crash     "$ROOT/tests/wal_crash/wal_crash_matrix.lpr"
 build_gate kv_wal        "$ROOT/tests/wal_crash/kv_wal_matrix.lpr"
+build_gate backup_restore "$ROOT/tests/backup_restore/backup_restore.lpr"
 build_gate server_harden "$ROOT/tests/server_harden/server_harden.lpr"
 build_gate auth_throttle "$ROOT/tests/server_harden/auth_throttle.lpr"
 build_gate tls_client    "$ROOT/tests/tls_client/tls_client_gate.lpr"
@@ -145,6 +146,7 @@ run_gate fixtures_builtin "$FI"                gen_fixtures verify
 run_gate crypto_kat     "$WORK/crypto_kat"     kat_runner
 run_gate wal_crash      "$WORK/wal_crash"      wal_crash_matrix
 run_gate kv_wal         "$WORK/kv_wal"         kv_wal_matrix
+run_gate backup_restore "$WORK/backup_restore" backup_restore
 run_gate server_harden  "$WORK/server_harden"  server_harden
 run_gate auth_throttle  "$WORK/auth_throttle"  auth_throttle
 
