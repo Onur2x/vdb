@@ -143,4 +143,8 @@ startup_error.txt
 
 # Test kapilarinin gecici calisma dizinleri
 /tests/*/tmp/
+/build/
+# run_gates.sh, crypto_fixtures kapisini kaynak dizinine derler (fixture'lari
+# exe yaninda arar); uzantisiz Unix ciktisi izlenmez.
+/tests/crypto_fixtures/gen_fixtures
 

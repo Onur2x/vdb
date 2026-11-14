@@ -1,0 +1,73 @@
+name: CI
+
+# V3 sertlestirme: cekirdek kapi matrisi (Windows + Linux).
+# Ayrinti: docs/engineering/CI.md
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Reproducible pipeline: sabit FPC/Lazarus surumu.
+  LAZARUS_VERSION: "4.4"
+
+jobs:
+  gates:
+    name: gates (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup FPC / Lazarus
+        # gcarreno/setup-lazarus v3 (commit'e pinli)
+        uses: gcarreno/setup-lazarus@3ee9d77e0c771b37c1069f218cb68bd5ce7c30fe
+        with:
+          lazarus-version: ${{ env.LAZARUS_VERSION }}
+          with-cache: true
+
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          fpc -iV
+          lazbuild --version | head -n 1
+
+      - name: Build library projects (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          for p in vdbapi vdbcli vdbmig vdbserver; do
+            echo "--- $p.lpi"
+            lazbuild "$p.lpi" || exit 1
+          done
+
+      - name: Build shared library (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./build_lib.sh
+
+      - name: Build and run gates
+        shell: bash
+        run: ./tests/run_gates.sh
+
+      - name: Upload gate logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-logs-${{ matrix.os }}
+          path: build/gates/*.log
+          if-no-files-found: ignore
