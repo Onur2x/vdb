@@ -28,6 +28,8 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `btree_integrity` | B+Tree silme/denge/doluluk + yaprak zinciri Next/Prev (bkz. `BTREE_INTEGRITY.md`) |
 | `perf_baseline` | B+Tree/SQL performans tavanlari + olcekleme orani + dogruluk (bkz. `PERF_BASELINE.md`) |
 | `single_file` | "tek dosya" sozlesmesi: temiz kapanistan sonra dizinde yalniz `<ad>.odb`; tek dosya kopyasi acilir/yazilir; `BACKUP TO` tek dosya (bkz. `ON_DISK_LAYOUT.md`) |
+| `region_stream` | `TRegionStream` dosya-ici pencere: mantiksal uzunluk, fsync, sinir kontrolu (v4 icin yazildi, motorda kullanilmiyor) |
+| `multiproc` | iki **gercek surec**: es zamanli yazar + bayat onbellek tazeleme, `SIGKILL`/`TerminateProcess` sonrasi kurtarma, RO yazmayi reddetme (bkz. `STORAGE_AUDIT.md` §21.3) |
 | `crypto_core` | saf Pascal AES/GCM/SHA/HMAC cekirdegi |
 | `crypto_base64` | base64 kodlayici/cozucu |
 | `fixtures_builtin` | eski `.odb`/anahtar fixture'lari **builtin** provider ile acilir |
@@ -211,3 +213,27 @@ kaldirildi:
   `DeleteFile(AnsiString)` i386 FPC 3.2.4'te derlenmiyor
   (`expected "PChar"`) — WSL'de ayni hata cikmadigi icin yalniz Windows
   kosusu yakaladi; cozum `SysUtils.DeleteFile(...)`.
+- Ondorduncu kosu (PHASE-11 commit'i): **yerel kanit** WSL x86_64 Linux
+  **21 kapi** PASS, Git Bash/Windows i386 **20 kapi** PASS (`tls_client`
+  SKIP). Iki yeni kapi eklendi: `region_stream` (13/0, tasarim araci) ve
+  `multiproc` (**17 PASS, 0 FAIL**). `multiproc` iki gercek isletim sistemi
+  sureci calistirir: es zamanli yazar, bir surec yazarken **acik kalan**
+  diger oturumun yeni commit'leri gormesi (`gen` sayaci +
+  `RefreshIfStaleForce`), `SIGKILL`/`TerminateProcess` sonrasi onayli
+  commit'lerin korunmasi ve kilidin kalici bloklamamasi, `VERIFY`
+  temizligi, salt-okunur oturumun yazmayi reddetmesi.
+  **Yan bulgu (duzeltildi):** salt-okunur acilis `.gen` yoksa onu
+  **yaratiyordu** (`VDbOpenStreamNoFlock(..., create=True)`) ve RO kapanis
+  onu silmedigi icin tek dosyali bir veritabani salt-okunur acildiginda
+  dizinde ikinci dosya kaliyordu. Artik RO oturum `.gen` olusturmaz ve
+  dosyaya yazmaz, yalniz sayaci okur (`VDbPageStore.pas`).
+  **Belgelenen tasarim gercegi:** yazma kilidi oturum boyu **tutulmaz**,
+  islem basina alinir; iki yazar oturumu ayni anda acilabilir. Bu yuzden
+  "ikinci yazar reddedilir" yanlis bir beklentidir; dogru iddia "es
+  zamanli yazarlar serilestirilir ve bayat onbellek tazelenir"dir
+  (`STORAGE_AUDIT.md` §21.3).
+  Diger kapilar degismedi: `sql_stubs` 25/0, `sql_matrix` 61/0,
+  `sql_fuzz` 5/0, `sql_differential` 33/0 (`pg=not-run`), `wal_crash`,
+  `kv_wal`, `backup_restore` 25/0, `page_integrity` 14/0,
+  `btree_integrity` 152/0, `perf_baseline` 16/0, `single_file` 35/0,
+  `server_harden` 24/0, `auth_throttle` 16/0, `tls_client` 6/0.

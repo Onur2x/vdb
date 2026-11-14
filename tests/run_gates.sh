@@ -135,6 +135,7 @@ build_gate btree_integrity "$ROOT/tests/btree_integrity/btree_integrity.lpr"
 build_gate perf_baseline  "$ROOT/tests/perf_baseline/perf_baseline.lpr"
 build_gate single_file    "$ROOT/tests/single_file/single_file.lpr"
 build_gate region_stream  "$ROOT/tests/region_stream/region_stream.lpr"
+build_gate multiproc      "$ROOT/tests/multiproc/multiproc.lpr"
 build_gate server_harden "$ROOT/tests/server_harden/server_harden.lpr"
 build_gate auth_throttle "$ROOT/tests/server_harden/auth_throttle.lpr"
 build_gate tls_client    "$ROOT/tests/tls_client/tls_client_gate.lpr"
@@ -160,6 +161,7 @@ run_gate btree_integrity "$WORK/btree_integrity" btree_integrity
 run_gate perf_baseline  "$WORK/perf_baseline"  perf_baseline
 run_gate single_file    "$WORK/single_file"    single_file
 run_gate region_stream  "$WORK/region_stream"  region_stream
+run_gate multiproc      "$WORK/multiproc"      multiproc
 run_gate server_harden  "$WORK/server_harden"  server_harden
 run_gate auth_throttle  "$WORK/auth_throttle"  auth_throttle
 

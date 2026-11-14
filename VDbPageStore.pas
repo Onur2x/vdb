@@ -2216,6 +2216,13 @@ begin
           sayac dosyasi da yazarlar arasi paylasilir. }
         FGenStream := VDbOpenStreamNoFlock(FPath + '.gen', False, False);
       except
+        { SALT-OKUNUR OTURUM DOSYA OLUSTURMAZ: `.gen` yoksa nil kalir
+          (motor her yerde nil kontrolu yapiyor). Eskiden burada
+          create=True ile dosya yaratiliyordu; tek dosyali bir veritabani
+          salt-okunur acildiginda dizinde ikinci dosya birakiyordu. }
+        if AReadOnly then
+          FGenStream := nil
+        else
         try
           FGenStream := VDbOpenStreamNoFlock(FPath + '.gen', False, True);
         except
@@ -2224,6 +2231,18 @@ begin
       end;
       if FGenStream <> nil then
       begin
+        if AReadOnly then
+        begin
+          { SALT-OKUNUR: `.gen` dosyasina YAZILMAZ (kimlik senkronu, bolge
+            buyutme, sayac artirma hepsi yazma). Yalniz sayac okunur; boylece
+            "salt-okunur inceleme veritabanini degistirmez" kurali korunur. }
+          if FGenStream.Size >= 8 then
+            FSigGen := ReadGen
+          else
+            FSigGen := 0;
+        end
+        else
+        begin
         { C-2: `.gen` 24 bayt: 0 gen sayaci, 8 durabil LSN, 16 DB kimligi.
           Kimlik meta sayfadaki FDbId ile eslesmiyorsa dosya BASKA (veya
           yeniden olusturulmus) bir veritabanina aittir: durabil LSN
@@ -2274,6 +2293,7 @@ begin
           de bildirilmis olur. Maliyet: oturum basina 8 bayt. }
         if not AReadOnly then
           BumpGen;
+        end;
       end;
       { v3.31: onbellek bos, diskteki meta kadar taze. Kurtarma bunu
         SetViewLsn ile ilerletecek (bkz. TVdbPageEngine.Open). }

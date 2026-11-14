@@ -35,6 +35,16 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   kapatildi (freelist trunk yanlis pozitifi; bozuk yedek uzerine sessiz
   yazma) — `docs/engineering/BACKUP_RESTORE.md`.
 - **Sayfa/indeks butunlugu** kapisi `page_integrity` (I0-I13).
+- **Coklu surec kapisi** `multiproc` (17 kontrol, iki gercek isletim sistemi
+  sureci): es zamanli yazar + bayat onbellek tazeleme, `SIGKILL` /
+  `TerminateProcess` sonrasi onayli commit'lerin korunmasi ve kilidin kalici
+  bloklamamasi, `VERIFY` temizligi, salt-okunur oturumun yazmayi reddetmesi.
+  Belgelendi: yazma kilidi **islem basina** alinir, oturum boyu tutulmaz, bu
+  yuzden iki yazar oturumu ayni anda acilabilir — `STORAGE_AUDIT.md` §21.3.
+- **Duzeltildi:** salt-okunur acilis `.gen` yoksa onu **yaratiyordu** ve RO
+  kapanis silmedigi icin tek dosyali bir veritabani salt-okunur acildiginda
+  dizinde ikinci dosya kaliyordu. Artik RO oturum `.gen` olusturmaz, dosyaya
+  yazmaz; yalniz degisiklik sayacini okur.
 
 ### SQL
 
