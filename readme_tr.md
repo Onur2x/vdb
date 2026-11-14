@@ -285,7 +285,7 @@ vdbcli.*            Komut satırı
 vdbserver.*         TCP sunucu
 examples/           Örnek projeler (hepsi VDbFactory ile v3 açar)
 yonetim/            GUI yönetici (v3; v2 dosyasında vdbmig yönlendirir)
-docs/               Mimari, mühendislik ve göç notları
+docs/               Mimari, mühendislik, güvenlik ve göç notları
 dokuman/            Yerel doküman kopyaları (Git dışı)
 ```
 
@@ -301,6 +301,30 @@ dokuman/            Yerel doküman kopyaları (Git dışı)
 
 ---
 
+## Güvenlik
+
+- [SECURITY.md](SECURITY.md) — güvenlik açığı nasıl bildirilir (GitHub
+  Security Advisories) ve hangi risklerin bilinçli olarak kabul edildiği.
+- [docs/security/THREAT_MODEL.md](docs/security/THREAT_MODEL.md) — güven
+  sınırları, STRIDE tablosu ve her kalemin kod kanıtıyla **risk register**
+  (`R-01`…). Açık kalemler arasında VDBS protokolünde bellek DoS'u
+  (R-01), VDBS'te TLS ve giriş hız sınırı olmaması (R-02, R-03) ve sorgu
+  maliyet limiti bulunmaması (R-06) var.
+- [docs/security/SBOM.md](docs/security/SBOM.md) +
+  [docs/security/vdb.cdx.json](docs/security/vdb.cdx.json) — bileşen
+  envanteri (CycloneDX). Üçüncü parti paket grafiği yok; tek opsiyonel
+  yüzeyler OpenSSL (isteğe bağlı kripto provider / TLS) ve kullanıcı
+  eklentileridir.
+- [CHANGELOG.md](CHANGELOG.md) — v3 sertleştirme serisinde ne değişti.
+
+Bu proje "production ready" veya güvenlik denetiminden geçmiş olarak
+etiketlenmez. builtin kripto yolları saf Pascal'dır: bağımsız incelemeden
+geçmemiştir ve cache-timing yan kanallarına karşı OpenSSL kadar sert
+değildir (kabul edilmiş risk R-07, `docs/architecture/CRYPTO_ADR.md` EK-B).
+
+---
+
 ## Lisans
 
 Açık kaynak. Ayrıntılar için `LICENSE` dosyasına bakın.
+Üçüncü taraf bildirimleri: [NOTICE](NOTICE).

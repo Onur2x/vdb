@@ -284,7 +284,7 @@ vdbserver.*         TCP server
 vdbmig.*            v2 -> v3 migration tool
 examples/           Sample projects
 yonetim/            GUI admin
-docs/               Architecture, engineering and migration notes
+docs/               Architecture, engineering, security and migration notes
 ```
 
 ---
@@ -299,6 +299,29 @@ docs/               Architecture, engineering and migration notes
 
 ---
 
+## Security
+
+- [SECURITY.md](SECURITY.md) — how to report a vulnerability (GitHub
+  Security Advisories) and which risks are already accepted.
+- [docs/security/THREAT_MODEL.md](docs/security/THREAT_MODEL.md) — trust
+  boundaries, STRIDE table, and a risk register (`R-01`…) with the code
+  evidence for each item. Open items include RAM DoS in the VDBS protocol,
+  no TLS or login throttling in VDBS, and no query cost limits.
+- [docs/security/SBOM.md](docs/security/SBOM.md) +
+  [docs/security/vdb.cdx.json](docs/security/vdb.cdx.json) — component
+  inventory (CycloneDX). No third-party package graph: the only optional
+  surfaces are OpenSSL (opt-in crypto provider / TLS) and user-supplied
+  plugins.
+- [CHANGELOG.md](CHANGELOG.md) — what changed in the v3 hardening series.
+
+This project does not claim to be "production ready" or security-audited.
+The builtin crypto paths are pure Pascal: they have not been independently
+reviewed and are not as hardened against cache-timing side channels as
+OpenSSL (accepted risk R-07, `docs/architecture/CRYPTO_ADR.md` EK-B).
+
+---
+
 ## License
 
 Open source. See the `LICENSE` file for details.
+Third-party notices: [NOTICE](NOTICE).

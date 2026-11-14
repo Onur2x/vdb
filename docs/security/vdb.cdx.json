@@ -1,0 +1,124 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:6f3a1c2e-5b1f-4a77-9d2a-0a9d1f7b4c11",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-11-14T00:00:00Z",
+    "tools": [
+      {
+        "vendor": "VDB",
+        "name": "manual inventory (docs/security/SBOM.md)",
+        "version": "1"
+      }
+    ],
+    "component": {
+      "type": "library",
+      "bom-ref": "pkg:generic/vdb@1.2",
+      "name": "vdb",
+      "version": "1.2",
+      "description": "Embedded relational database engine in pure Free Pascal; no external DLL required by default.",
+      "licenses": [
+        {
+          "license": {
+            "name": "Public Domain"
+          }
+        }
+      ]
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "pkg:generic/fpc-rtl@3.2",
+      "name": "Free Pascal RTL/FCL",
+      "version": "3.2.x",
+      "description": "Compiler runtime. Units used: SysUtils, Classes, Generics.Collections, DateUtils, SyncObjs, dynlibs, BaseUnix, Windows, fpjson, jsonparser, DB.",
+      "licenses": [
+        {
+          "license": {
+            "name": "LGPL-2.1-or-later WITH FPC-linking-exception"
+          }
+        }
+      ],
+      "properties": [
+        { "name": "vdb:kind", "value": "build-and-link-time" },
+        { "name": "vdb:bundled", "value": "false" }
+      ]
+    },
+    {
+      "type": "framework",
+      "bom-ref": "pkg:generic/lazarus-lcl@4.6",
+      "name": "Lazarus Component Library (LCL)",
+      "version": "4.6.x",
+      "description": "Only needed to rebuild the optional TDataSet bridge (VDbDataSet) and IDE projects; not required by the engine or vdbapi.",
+      "licenses": [
+        {
+          "license": { "name": "LGPL-2.0-or-later WITH LCL-linking-exception" }
+        }
+      ],
+      "properties": [
+        { "name": "vdb:kind", "value": "optional-build-time" },
+        { "name": "vdb:bundled", "value": "false" }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:generic/openssl@3",
+      "name": "OpenSSL libcrypto",
+      "version": "3.x / 1.1.x",
+      "description": "OPTIONAL crypto provider. Loaded with dynlibs only when the caller selects the openssl provider or enables TLS. Default provider is the builtin pure-Pascal implementation.",
+      "licenses": [
+        {
+          "license": { "name": "Apache-2.0" }
+        }
+      ],
+      "properties": [
+        { "name": "vdb:kind", "value": "optional-runtime" },
+        { "name": "vdb:bundled", "value": "false" },
+        { "name": "vdb:loaded-by", "value": "VDbCryptoOpenSSL.pas" }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:generic/openssl@1.1",
+      "name": "OpenSSL libcrypto / libssl",
+      "version": "1.1.x",
+      "description": "OPTIONAL. libssl + libcrypto are both loaded by dynlibs for TLS; legacy fallback target for 1.1 era installs.",
+      "licenses": [
+        {
+          "license": { "name": "OpenSSL" }
+        }
+      ],
+      "properties": [
+        { "name": "vdb:kind", "value": "optional-runtime" },
+        { "name": "vdb:bundled", "value": "false" },
+        { "name": "vdb:loaded-by", "value": "VDbTls.pas" }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:generic/dcpcrypt@2.0",
+      "name": "DCPcrypt 2.0 (algorithm reference only)",
+      "version": "2.0",
+      "description": "MIT licensed Pascal crypto suite (David Barton). The source is NOT in this repository (removed in Phase-1); only AES-256-CTR parameters and behaviour are reproduced in VDbCryptoCore.pas for on-disk bit compatibility.",
+      "licenses": [
+        {
+          "license": { "name": "MIT" }
+        }
+      ],
+      "properties": [
+        { "name": "vdb:kind", "value": "removed-reference-only" },
+        { "name": "vdb:bundled", "value": "false" }
+      ]
+    }
+  ],
+  "dependencies": [
+    { "ref": "pkg:generic/vdb@1.2", "dependsOn": ["pkg:generic/fpc-rtl@3.2"] },
+    { "ref": "pkg:generic/fpc-rtl@3.2", "dependsOn": [] },
+    { "ref": "pkg:generic/lazarus-lcl@4.6", "dependsOn": [] },
+    { "ref": "pkg:generic/openssl@3", "dependsOn": [] },
+    { "ref": "pkg:generic/openssl@1.1", "dependsOn": [] },
+    { "ref": "pkg:generic/dcpcrypt@2.0", "dependsOn": [] }
+  ]
+}
