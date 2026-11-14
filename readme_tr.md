@@ -315,6 +315,10 @@ dokuman/            Yerel doküman kopyaları (Git dışı)
   envanteri (CycloneDX). Üçüncü parti paket grafiği yok; tek opsiyonel
   yüzeyler OpenSSL (isteğe bağlı kripto provider / TLS) ve kullanıcı
   eklentileridir.
+- [docs/engineering/RC_REVIEW.md](docs/engineering/RC_REVIEW.md) — sürüm
+  adayı değerlendirmesi: kapıların neyi kanıtladığı, skill §16 kalemlerinden
+  hangilerinin yalnız kısmen yapıldığı ve hangi risklerin VDBS dağıtımını
+  engellediği.
 - [CHANGELOG.md](CHANGELOG.md) — v3 sertleştirme serisinde ne değişti.
 
 Bu proje "production ready" veya güvenlik denetiminden geçmiş olarak

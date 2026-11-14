@@ -67,6 +67,12 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   duzeltildi: `SAVEPOINT`, `AS OF`/PITR, dosya modu replikasyon, zone map
   ve `ALTER DATABASE KEY` **uygulanmistir ama mevcut kapilarca test
   edilmemektedir**.
+- Guvenlik belgeleri: `docs/security/THREAT_MODEL.md` (STRIDE + R-01..R-12
+  risk kaydi), `SECURITY.md` (GitHub Security Advisories uzerinden ifsa),
+  `docs/security/SBOM.md` + CycloneDX 1.5 `vdb.cdx.json`, kok `NOTICE`.
+- `docs/engineering/RC_REVIEW.md`: surum adayi degerlendirmesi — kapilarin
+  kanitladigi sey, skill §16 kalemlerinin durumu, VDBS risklerinin yayini
+  engelledigi nokta ve yayin oncesi kalan isler.
 
 ### Altyapi
 

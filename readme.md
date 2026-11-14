@@ -312,6 +312,9 @@ docs/               Architecture, engineering, security and migration notes
   inventory (CycloneDX). No third-party package graph: the only optional
   surfaces are OpenSSL (opt-in crypto provider / TLS) and user-supplied
   plugins.
+- [docs/engineering/RC_REVIEW.md](docs/engineering/RC_REVIEW.md) — release
+  candidate assessment: what the gates prove, what skill §16 items are
+  only partly done, and which risks would block a VDBS deployment.
 - [CHANGELOG.md](CHANGELOG.md) — what changed in the v3 hardening series.
 
 This project does not claim to be "production ready" or security-audited.

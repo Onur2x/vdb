@@ -74,9 +74,11 @@ Kosullu kapilar:
   (README'deki komut bu nedenle bayat). SQL davranis kapisi artik
   `sql_stubs` + `sql_matrix`'dir; matrisin kapsami ve bilinen farklari
   `docs/engineering/SQL_COVERAGE.md`'de yazilidir.
-- Kapsam/olcum (coverage), SBOM, imzalama ve provenance **bu fazda yok**
-  (skill §9.3 ileride). SQL ayristirici fuzz'i (`sql_fuzz`) vardir; diger
-  protokol/kapilar icin fuzz yoktur.
+- Kapsam/olcum (coverage) **bu fazda yok**. SBOM (`docs/security/SBOM.md`
+  + `vdb.cdx.json`) ve lisans/atif envanteri (`NOTICE`) artik **var**;
+  imzalama ve provenance **yoktur** cunku bu surumde yayinlanan ikili
+  yoktur (`SBOM.md` imzalama karari). SQL ayristirici fuzz'i (`sql_fuzz`)
+  vardir; diger protokol/kapilar icin fuzz yoktur.
 - macOS/ARM64 matrisi yok; kod Unix dallari uzerinden tasinabilir
   tutulmustur ama macOS'ta kosulmadi.
 - TLS kapisi sertifika uretimi icin `tests/tls_fixtures` (Python
@@ -179,9 +181,16 @@ kaldirildi:
   btree.find 5k **9 ms**, btree.delete 100k **312 ms**, olcek
   25k->50k **59->118 ms (oran 2.00)**, sql.insert 3k **9 662 ms**,
   sql.point-select 3k **1 101 ms**, db dosyasi **102 400 bayt**.
-- Onuncu kosu (bu commit): `single_file` kapisi eklendi; README'lerdeki
-  "tek dosya" ifadesi olculen gercege gore duzeltildi ve
-  `ON_DISK_LAYOUT.md` yazildi. Yerel kanit Git Bash/Windows **18 kapi**
-  PASS (tls_client SKIP), WSL x86_64 Linux **19 kapi** PASS.
-  `single_file`: 22 PASS, 0 FAIL (yalniz `.odb` kopyasi okunur *ve*
-  yazilir; `BACKUP TO` ciktisi tek basina acilir).
+- Onuncu kosu (`7ee3cdc`, run 43586157557): **iki platform da YESIL**
+  (`success`). `single_file` kapisi eklendi; README'lerdeki "tek dosya"
+  ifadesi olculen gercege gore duzeltildi ve `ON_DISK_LAYOUT.md` yazildi.
+  Yerel kanit Git Bash/Windows **18 kapi** PASS (tls_client SKIP),
+  WSL x86_64 Linux **19 kapi** PASS. `single_file`: 22 PASS, 0 FAIL
+  (yalniz `.odb` kopyasi okunur *ve* yazilir; `BACKUP TO` ciktisi tek
+  basina acilir).
+- Onbirinci kosu (`c9df6b8`, run 43598523216): **iki platform da YESIL**
+  (`success`). Bu kosu **yalniz belge** getirdi (`docs/security/`,
+  `SECURITY.md`, `NOTICE`, `CHANGELOG.md`, README guvenlik bolumu); kapi
+  kumesi, kaynak kodu ve CI matrisi degismedi, dolayisiyla kapi sonuclari
+  onuncu kosuyla aynidir. `fail-fast: false` sayesinde iki platform da
+  gercekten kosmustur.
