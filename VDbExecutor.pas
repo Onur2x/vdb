@@ -2957,7 +2957,13 @@ begin
       else
         Exit('');
     end
-    else Exit(lv); // COUNT/SUM/AVG/MIN/MAX: ExecGroupBy'da degerlendirilir
+    else
+      { V3 sertlestirme: ONCEDEN `Exit(lv)` idi, yani bilinmeyen skaler
+        fonksiyon adi ARGUMANINI donduruyordu (or. SELECT pf(9) -> '9').
+        Bu sessiz yanlis sonuctur: artik hata. (TSqlAggNode bu dala
+        girmez; aggregate'ler ayri dugum tipidir.) }
+      raise EVDbException.Create(ecUnsupported,
+        'bilinmeyen fonksiyon: ' + fn.FuncName);
   end;
 
   if Expr is TSqlCaseNode then
@@ -20420,13 +20426,23 @@ begin
 end;
 
 { ------------------------------------------------------------
-  F-36: TRIGGER (stubbed - not fully implemented)
+  F-36: TRIGGER — IMPLEMENTED (aktif).
+  Parser: TVDbParser.ParseCreateTrigger. Handler'lar: ExecCreateTrigger,
+  ExecDropTrigger. Atesleme: FireTriggers -> FireTriggerDef (BEFORE/AFTER/
+  INSTEAD OF; ROW; WHEN kosulu; govdede NEW.kolon = ifade).
+  Ic ice atesleme siniri: 100.
+  SINIR: tetikleyici tanimlari yalniz BELLEKTEDIR (katalog yazimi yok);
+  yeniden acilista kaybolur. Test: tests/sql_stubs.
   ------------------------------------------------------------ }
 { ------------------------------------------------------------
   F-35: STORED PROCEDURE / FUNCTION — IMPLEMENTED (aktif).
   Dispatch: Exec() satir 7335-7339; handler'lar ExecCreateFunction,
   ExecDropFunction, ExecCreateProcedure, ExecDropProcedure, ExecCall.
-  Test: sqltest — F-35 grubu tumu gecti (384/415).
+  Govde yurutme: RunProcBody (CALL -> CallUserProcedure, UDF -> EvalExpr
+  icinde CallUserFunction).
+  SINIR: tanimlar yalniz BELLEKTEDIR; yeniden acilista kaybolur.
+  Test: sqltest — F-35 grubu tumu gecti (384/415); kalici kapilar
+  tests/sql_stubs.
   ------------------------------------------------------------ }
 
 function TVSqlExecutor.EvalExprFor(Expr: TSqlExprNode; const Row: TStrArray): string;
@@ -20813,6 +20829,27 @@ end;
   F-36: TRIGGER ateşleme yardimcilarî
   //---------------------------------------------------------- }
 
+{ V3: tetikleyici WHEN kosulu icin kolon tip vektorunu cozer. Tip
+  bilinmezse VCT_STR (metin karsilastirma) kullanilir. }
+function WhenColTypes(AT: TVTableDb; const ATable: string;
+  const AColNames: TStrArray): TByteArray;
+var
+  td: TTableDef;
+  i, j: Integer;
+begin
+  SetLength(Result, Length(AColNames));
+  for i := 0 to High(AColNames) do
+    Result[i] := VCT_STR;
+  if not AT.TryGetTableDef(ATable, td) then Exit;
+  for i := 0 to High(AColNames) do
+    for j := 0 to High(td.Cols) do
+      if SameText(td.Cols[j].Name, AColNames[i]) then
+      begin
+        Result[i] := td.Cols[j].Ctype;
+        Break;
+      end;
+end;
+
 procedure TVSqlExecutor.FireTriggerDef(const TDef: TTriggerDef;
   Timing: Byte; Event: Byte;
   const OldRow, NewRow: TStrArray;
@@ -20828,6 +20865,7 @@ var
   whenVal: string;
   whenTrue: Boolean;
   newrowstr, colstr, outerstr: string;
+  whenTypes: TByteArray;
 begin
   if (TDef.Body = nil) or (not (Timing in [Byte(Byte(ttBefore)), Byte(Byte(ttAfter)), Byte(Byte(ttInsteadOf))])) then Exit;
 
@@ -20841,12 +20879,18 @@ begin
     whenTrue := True;
     if TDef.WhenCondition <> nil then
     begin
+      { V3: WHEN kosulu TIPLI degerlendirilir. Onceden EvalExprFor nil
+        kolon tipiyle cagriliyordu; karsilastirma METIN olarak yapiliyor
+        ve '5' > '100' True donuyordu (sessiz yanlis sonuc). Kolon
+        tipleri tablo tanimindan cozulur. }
+      whenTypes := WhenColTypes(FT, TDef.TableName, NewColNames);
       savedOuterRow := FOuterRow;
       savedOuterCols := FOuterColNames;
       try
         FOuterRow := NewRow;
         FOuterColNames := NewColNames;
-        whenVal := EvalExprFor(TSqlExprNode(TDef.WhenCondition), NewRow);
+        whenVal := EvalExpr(TSqlExprNode(TDef.WhenCondition), NewRow,
+          NewColNames, whenTypes);
         whenTrue := SameText(whenVal, 'True');
       finally
         FOuterRow := savedOuterRow;
@@ -20887,7 +20931,12 @@ begin
               end
               else
               begin
-                // kolon YeniSatir'da YOK -> SET NEW yoksayilir
+                { V3 sertlestirme: NEW.kolon hedefi bu INSERT/UPDATE
+                  cumlesinin kolon listesinde yoksa atama SESSIZCE
+                  yutuluyordu. Sessiz yanlis sonuc yerine hata. }
+                raise EVDbException.Create(ecUnsupported,
+                  'BEFORE tetikleyici NEW.' + TSqlSetNewStmt(st).ColName +
+                  ': kolon cumlenin kolon listesinde yok: ' + TDef.Name);
               end;
             end;
           end;
@@ -20903,7 +20952,9 @@ begin
           end
           else
           begin
-            // kolon YeniSatir'da YOK -> SET NEW yoksayilir
+            raise EVDbException.Create(ecUnsupported,
+              'BEFORE tetikleyici NEW.' + TSqlSetNewStmt(st).ColName +
+              ': kolon cumlenin kolon listesinde yok: ' + TDef.Name);
           end;
         end;
       finally

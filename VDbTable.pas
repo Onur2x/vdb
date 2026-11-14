@@ -896,7 +896,9 @@ function IdxColsOfTable(TableId: Word; ColIdx: Integer): TIntArray;
     // DIKKAT: imza asagida F-35 bolumunde TEKRAR bildirilir; eski
     // "const Args: TObject" bildirimi kaldirildi (forward declaration
     // not solved hatasi veriyordu).
-    // RETURNING support (stubs)
+    { RETURNING support: UYGULANMIS (stub degil). SQL yolu
+      VDbExecutor'daki INSERT/UPSERT/UPDATE/DELETE RETURNING dallarindan
+      bu iki metoda iner; ayrintili durum: docs/engineering/SQL_STUB_SURFACE.md. }
     function InsertReturning(const Table: string; const ColNames, Values: TStrArray;
       out OutPk: string; out OutVals: TStrArray): Boolean;
     function UpsertRowReturning(const Table: string; const ColNames, Values: TStrArray;
@@ -13020,15 +13022,20 @@ begin
   MarkSchema;
 end;
 
-// F-35: STORED PROCEDURE (stub)
+// F-35: STORED PROCEDURE (katalog API'si; govde CALISTIRMAZ)
+{ Bu metod yalniz katalog sorgusu/API uyumu icindir: prosedur govdesini
+  calistirmaz. Govde yurutme SQL yurutucusunde (TVSql.Exec -> CALL) olur;
+  buradan sessizce bos sonuc donmek "basarili calisti" yanilsamasi
+  uretiyordu (V3 sertlestirme: sessiz yanlis sonuc yasak). }
 procedure TVTableDb.CallProcedure(const ProcName: string; const Args: TStrArray;
   out Results: TStrArray);
 begin
   SetLength(Results, 0);
-  // NOT: ProcedureExists kontrolu executor'da yapilir; bilinmeyen
-  // prosedur sessizce BOS sonuc donmesin diye burada da dogrulanir.
   if not ProcedureExists(ProcName) then
     raise EVDbException.Create(ecTableNotFound, 'prosedur yok: ' + ProcName);
+  raise EVDbException.Create(ecUnsupported,
+    'prosedur govdesi bu API ile calistirilamaz, SQL yolu kullanin (CALL ' +
+    ProcName + '(...))');
 end;
 
 // RETURNING support
@@ -13369,12 +13376,16 @@ begin
   end;
 end;
 
-// F-35: User-defined function / procedure support (stub)
+// F-35: User-defined function / procedure catalog (UYGULANMIS)
 //
-// NOT: Tanimlar OLMAZDA calistirilir; katalog yazimi ve govde
-// yorumlayicisi F-35'in asil isidir. Buradaki katman yalnizca
-// executor'in cagirdigi API yuzeyini tanimlar ve "var/yok" bilgisini
-// tutar. Bilinmeyen ad sessizce bos sonuc DONMEZ: hata verir.
+// Bu katman tanimi (parametreler, govde AST'si) TUTAR ve "var/yok"
+// bilgisini verir; govde YURUTMEsi VDbExecutor'dadir (RunProcBody,
+// CallUserFunction, CallUserProcedure). Bilinmeyen ad sessizce bos sonuc
+// DONMEZ: hata verir.
+//
+// BILINEN SINIR (V3): tanimlar yalniz BELLEKTEDIR; katalog dosyasina
+// yazilmaz, yeniden acilista kaybolur. Ayrinti:
+// docs/engineering/SQL_STUB_SURFACE.md.
 function TVTableDb.FunctionExists(const FuncName: string): Boolean;
 begin
   Result := FFunctions.ContainsKey(VDbNorm(FuncName));
@@ -13656,10 +13667,12 @@ function TVTableDb.ExecuteFunction(const FuncName: string;
 begin
   if not FunctionExists(FuncName) then
     raise EVDbException.Create(ecTableNotFound, 'fonksiyon yok: ' + FuncName);
-  // NOT: govde yorumlayicisi F-35'in asil isidir; su an anlamsiz bir
-  // deger donmek "sessizce yanlis sonuc" uretirdi, bu yuzden hata verir.
+  // Govde yurutme VDbExecutor'dadir; bu katalog API'sinin yurutucuya
+  // erisimi yoktur. Anlamsiz deger donmek "sessizce yanlis sonuc"
+  // uretirdi, bu yuzden hata verir.
   raise EVDbException.Create(ecUnsupported,
-    'fonksiyon govdesi henuz calistirilamiyor: ' + FuncName);
+    'fonksiyon govdesi bu API ile calistirilamaz, SQL yolu kullanin (SELECT ' +
+    FuncName + '(...))');
 end;
 
 function TVTableDb.IsView(const Name: string): Boolean;
