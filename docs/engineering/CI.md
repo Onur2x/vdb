@@ -26,6 +26,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `sql_fuzz` | ayristirici dayaniklilik: 3000 deterministik bozuk girdi, istisna sizintisi/heap buyumesi/sure siniri |
 | `sql_differential` | PostgreSQL diferansiyel korpusu + sapma yonetisimi (bkz. `SQL_DIFFERENTIAL.md`) |
 | `btree_integrity` | B+Tree silme/denge/doluluk + yaprak zinciri Next/Prev (bkz. `BTREE_INTEGRITY.md`) |
+| `perf_baseline` | B+Tree/SQL performans tavanlari + olcekleme orani + dogruluk (bkz. `PERF_BASELINE.md`) |
 | `crypto_core` | saf Pascal AES/GCM/SHA/HMAC cekirdegi |
 | `crypto_base64` | base64 kodlayici/cozucu |
 | `fixtures_builtin` | eski `.odb`/anahtar fixture'lari **builtin** provider ile acilir |
@@ -163,7 +164,16 @@ kaldirildi:
   `backup_restore`: 25 PASS, 0 FAIL (iki platformda).
   `page_integrity`: 14 PASS, 0 FAIL (iki platformda).
   `sql_differential`: 33 PASS, 0 FAIL, `pg=not-run` (psql yok).
-- Sekizinci kosu (bu commit): `btree_integrity` kapisi eklendi; yerel kanit
-  Git Bash/Windows **16 kapi** PASS (tls_client SKIP), WSL x86_64 Linux
-  **17 kapi** PASS (tls_client 6/0 dahil).
-  `btree_integrity`: 152 PASS, 0 FAIL (iki platformda).
+- Sekizinci kosu (`7569cc4`, run 43567310636): **iki platform da YESIL**
+  (`success`). `btree_integrity` kapisi ilk kez CI'da kosturuldu; silme
+  yeniden dengeleme + kok cokertme + `Prev` zinciri CI'da dogrulandi;
+  152 PASS / 0 FAIL. Yerel kanit Git Bash/Windows **16 kapi** PASS
+  (tls_client SKIP), WSL x86_64 Linux **17 kapi** PASS.
+- Dokuzuncu kosu (bu commit): `perf_baseline` kapisi eklendi; yerel kanit
+  Git Bash/Windows **17 kapi** PASS (tls_client SKIP), WSL x86_64 Linux
+  **18 kapi** PASS (tls_client 6/0 dahil). `perf_baseline`: 16 PASS,
+  0 FAIL (iki platformda).
+  Olculen (WSL x86_64, FPC 3.2.2): btree.insert 100k **361 ms**,
+  btree.find 5k **9 ms**, btree.delete 100k **312 ms**, olcek
+  25k->50k **59->118 ms (oran 2.00)**, sql.insert 3k **9 662 ms**,
+  sql.point-select 3k **1 101 ms**, db dosyasi **102 400 bayt**.
