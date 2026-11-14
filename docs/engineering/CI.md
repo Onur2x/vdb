@@ -22,6 +22,8 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | Kapi | Ne dogrular |
 |---|---|
 | `sql_stubs` | RETURNING/TRIGGER/FUNCTION/PROCEDURE yuzeyi; sessiz yanlis sonuc yok |
+| `sql_matrix` | SQL davranis matrisi: DDL/DML/SELECT/JOIN/agregat/transaction/hata yollari + bos tabloda referans dogrulamasi (bkz. `SQL_COVERAGE.md`) |
+| `sql_fuzz` | SQL ayristirici dayanikliligi (sabit tohum, surec ici) |
 | `sql_fuzz` | ayristirici dayaniklilik: 3000 deterministik bozuk girdi, istisna sizintisi/heap buyumesi/sure siniri |
 | `crypto_core` | saf Pascal AES/GCM/SHA/HMAC cekirdegi |
 | `crypto_base64` | base64 kodlayici/cozucu |
@@ -63,11 +65,13 @@ Kosullu kapilar:
 
 ## 4. Kapsam disi (bilerek)
 
-- **`sqltest` yok.** Depoda `sqltest.lpi`/`tests/sql` bulunmuyor
-  (README'deki komut bu nedenle bayat). SQL davranis kapisi olarak bugun
-  yalniz `sql_stubs` var; genis SQL regresyon seti ayri bir is kalemidir.
-- Kapsam/olcum (coverage), fuzz, performans esikleri, SBOM, imzalama ve
-  provenance **bu fazda yok** (skill §9.3 ileride).
+- **`sqltest` (`tests/sql`) yok.** Eski agacla birlikte kaldirildi
+  (README'deki komut bu nedenle bayat). SQL davranis kapisi artik
+  `sql_stubs` + `sql_matrix`'dir; matrisin kapsami ve bilinen farklari
+  `docs/engineering/SQL_COVERAGE.md`'de yazilidir.
+- Kapsam/olcum (coverage), SBOM, imzalama ve provenance **bu fazda yok**
+  (skill §9.3 ileride). SQL ayristirici fuzz'i (`sql_fuzz`) vardir; diger
+  protokol/kapilar icin fuzz yoktur.
 - macOS/ARM64 matrisi yok; kod Unix dallari uzerinden tasinabilir
   tutulmustur ama macOS'ta kosulmadi.
 - TLS kapisi sertifika uretimi icin `tests/tls_fixtures` (Python
@@ -125,5 +129,10 @@ kaldirildi:
   Betik artik derlemeden once `mkdir -p "$FI/lib"` yapar. Ayrica
   basarisizlik anotasyonu artik `Error:`/`Fatal:` satirlarini da tasir;
   onceki surum yalniz "BUILD FAIL <ad>" yazdigi icin kok neden gizlenmisti.
-- Yerel kanit: Windows 11 kapi seti (Git Bash, 11 kapi) + WSL x86_64
-  Linux kapi seti (12 kapi), bkz. `docs/engineering/BASELINE.md`.
+- Ucuncu kosu (`7ae62c2`): `gates (ubuntu-latest)` **basarili** (Linux ilk
+  kez yesil), `gates (windows-latest)` gozlem aninda hala kosuyordu; bu
+  commit'te Windows sonucu **dogrulanmadi**. Not: bu kosu `sql_matrix`
+  kapisini icermez (kapi sonraki commit'te eklendi).
+- Yerel kanit (bu commit): Git Bash/Windows 12 kapi PASS (tls_client SKIP),
+  WSL x86_64 Linux **13 kapi PASS** (tls_client 6/0 dahil).
+  `sql_matrix`: 61 PASS, 0 FAIL (iki platformda).

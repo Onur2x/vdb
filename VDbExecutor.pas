@@ -409,6 +409,13 @@ type
     // P-90: kolon budama — ifade agacindaki tum kolon referanslarini topla
     procedure CollectExprCols(E: TSqlExprNode; const ColNames: TStrArray;
       var Need: array of Boolean);
+    // Phase-5: ifade agacindaki kolon referanslari kapsamda YOKSA
+    // ecColumnNotFound firlatir. Bos satir kumesinde de calisir; boylece
+    // "0 satir" ile "olmayan kolon" karismaz (sessiz yanlis sonuc yok).
+    procedure ValidateExprCols(E: TSqlExprNode; const ColNames: TStrArray;
+      const AFromTable, AFromAlias: string);
+    // Phase-5: bir SELECT'in tum referans yuzeyini dogrular.
+    procedure ValidateStmtRefs(Stmt: TSqlSelectStmt; const ColNames: TStrArray);
     procedure DoSort(var Rows: TStrMatrix; const Keys: TStrArray;
       OrderBy: TList<TOrderItem>;
       const ColNames: TStrArray; const ColTypes: TByteArray;
@@ -1256,6 +1263,260 @@ begin
   end;
   // TSqlLiteralNode, TSqlSubqueryNode — alt ifade yok veya alt sorgu
   // (ayri baglam). Varsayilan: eleme yapma.
+end;
+
+{ ============================================================
+  Phase-5: hazirlik asamasi kolon dogrulamasi
+  ============================================================
+  Neden: ifadeler satir basina degerlendirildigi icin, kolon cozumu
+  HATA olarak ancak en az bir satir varsa ortaya cikiyordu. Bos tabloda
+  "SELECT yok_kolon FROM t" sessizce bos kume, "SELECT SUM(yok) FROM t"
+  ise sessizce bos hucre donduruyordu. Bu, "0 satir" ile "bozuk sorgu"yu
+  ayirt edilemez kilar ve sessiz yanlis sonuctur.
+
+  Davranis: kapsamda olmayan referans -> ecColumnNotFound, satir sayisindan
+  bagimsiz. Nitelikli referansta niteleyici bu tabloya/aliase ait DEGILSE
+  dogrulama atlanir (dis kapsam / korelasyonlu alt sorgu olabilir).
+  Alt sorgu dugumlerine INILMEZ; onlar kendi calistirilmalarinda dogrulanir.
+  ============================================================ }
+procedure TVSqlExecutor.ValidateExprCols(E: TSqlExprNode;
+  const ColNames: TStrArray; const AFromTable, AFromAlias: string);
+var
+  cr: TSqlColumnRefNode;
+  bin: TSqlBinaryOpNode;
+  un: TSqlUnaryOpNode;
+  inn: TSqlInNode;
+  qn: TSqlQuantNode;
+  ag: TSqlAggNode;
+  cas: TSqlCastNode;
+  btw: TSqlBetweenNode;
+  col: TSqlCollateNode;
+  fc: TSqlFuncCallNode;
+  cs: TSqlCaseNode;
+  ni: TSqlNullIfNode;
+  co: TSqlCoalesceNode;
+  jk: TSqlJsonKeyNode;
+  wn: TSqlWindowNode;
+  i: Integer;
+
+  procedure Self_(X: TSqlExprNode);
+  begin
+    ValidateExprCols(X, ColNames, AFromTable, AFromAlias);
+  end;
+
+begin
+  if E = nil then Exit;
+  if E is TSqlColumnRefNode then
+  begin
+    cr := TSqlColumnRefNode(E);
+    if cr.TableQualifier <> '' then
+    begin
+      { Niteleyici bu tabloya mi ait? Degilse dis kapsam (korelasyonlu alt
+        sorgu / LATERAL) olabilir; dogrulama atlanir. }
+      if not (((AFromAlias <> '') and SameText(cr.TableQualifier, AFromAlias)) or
+              ((AFromTable <> '') and SameText(cr.TableQualifier, AFromTable))) then
+        Exit;
+    end;
+    if FindColIdx(cr.ColumnName, cr.TableQualifier, ColNames) < 0 then
+      RaiseEVDbColumnNotFound(cr.ColumnName, ColNames);
+    Exit;
+  end;
+  if E is TSqlBinaryOpNode then
+  begin
+    bin := TSqlBinaryOpNode(E);
+    Self_(bin.Left);
+    Self_(bin.Right);
+    Exit;
+  end;
+  if E is TSqlUnaryOpNode then
+  begin
+    un := TSqlUnaryOpNode(E);
+    Self_(un.Operand);
+    Exit;
+  end;
+  if E is TSqlInNode then
+  begin
+    inn := TSqlInNode(E);
+    Self_(inn.Expr);
+    if inn.List <> nil then
+      for i := 0 to inn.List.Count - 1 do
+        Self_(inn.List[i]);
+    Exit;
+  end;
+  if E is TSqlQuantNode then
+  begin
+    qn := TSqlQuantNode(E);
+    Self_(qn.Left);
+    Exit;
+  end;
+  if E is TSqlAggNode then
+  begin
+    ag := TSqlAggNode(E);
+    Self_(ag.Arg);
+    Self_(ag.Sep);
+    Exit;
+  end;
+  if E is TSqlCastNode then
+  begin
+    cas := TSqlCastNode(E);
+    Self_(cas.Expr);
+    Exit;
+  end;
+  if E is TSqlBetweenNode then
+  begin
+    btw := TSqlBetweenNode(E);
+    Self_(btw.Expr);
+    Self_(btw.LowBound);
+    Self_(btw.HighBound);
+    Exit;
+  end;
+  if E is TSqlCollateNode then
+  begin
+    col := TSqlCollateNode(E);
+    Self_(col.Inner);
+    Exit;
+  end;
+  if E is TSqlFuncCallNode then
+  begin
+    fc := TSqlFuncCallNode(E);
+    Self_(fc.Arg);
+    Self_(fc.Filter);
+    if fc.Args <> nil then
+      for i := 0 to fc.Args.Count - 1 do
+        Self_(fc.Args[i]);
+    Exit;
+  end;
+  if E is TSqlCaseNode then
+  begin
+    cs := TSqlCaseNode(E);
+    Self_(cs.Operand);
+    if cs.Whens <> nil then
+      for i := 0 to cs.Whens.Count - 1 do
+      begin
+        Self_(cs.Whens[i].Cond);
+        Self_(cs.Whens[i].Value);
+      end;
+    Self_(cs.ElseExpr);
+    Exit;
+  end;
+  if E is TSqlNullIfNode then
+  begin
+    ni := TSqlNullIfNode(E);
+    Self_(ni.Arg1);
+    Self_(ni.Arg2);
+    Exit;
+  end;
+  if E is TSqlCoalesceNode then
+  begin
+    co := TSqlCoalesceNode(E);
+    if co.Args <> nil then
+      for i := 0 to co.Args.Count - 1 do
+        Self_(co.Args[i]);
+    Exit;
+  end;
+  if E is TSqlJsonKeyNode then
+  begin
+    jk := TSqlJsonKeyNode(E);
+    Self_(jk.Left);
+    if jk.Keys <> nil then
+      for i := 0 to jk.Keys.Count - 1 do
+        Self_(jk.Keys[i]);
+    Exit;
+  end;
+  if E is TSqlWindowNode then
+  begin
+    wn := TSqlWindowNode(E);
+    Self_(wn.Arg);
+    Self_(wn.Default);
+    if wn.Partitions <> nil then
+      for i := 0 to wn.Partitions.Count - 1 do
+        Self_(wn.Partitions[i]);
+    if wn.OrderBys <> nil then
+      for i := 0 to wn.OrderBys.Count - 1 do
+        Self_(wn.OrderBys[i].Expr);
+    Exit;
+  end;
+end;
+
+procedure TVSqlExecutor.ValidateStmtRefs(Stmt: TSqlSelectStmt;
+  const ColNames: TStrArray);
+var
+  i, j: Integer;
+  aliases: TStrArray;
+  names: TStrArray;
+  fc: TSqlFuncCallNode;
+  ok: Boolean;
+
+  { Cikti alias'lari: GROUP BY / HAVING / ORDER BY alias ile yazilabilir
+    (VDB'de kabul edilen yol). Bu adlar tablo kolonu degildir; dogrulama
+    listesine eklenir. }
+  procedure AddAlias(const AName: string);
+  begin
+    if AName = '' then Exit;
+    SetLength(aliases, Length(aliases) + 1);
+    aliases[High(aliases)] := AName;
+  end;
+
+  function InNames(const AName: string): Boolean;
+  var
+    k: Integer;
+  begin
+    Result := False;
+    for k := 0 to High(names) do
+      if SameText(names[k], AName) then Exit(True);
+  end;
+
+begin
+  if Stmt = nil then Exit;
+
+  // 1) Secim listesi ifadeleri (alias'lar kolon degildir; ifadeye bakilir)
+  if Stmt.Columns <> nil then
+    for i := 0 to Stmt.Columns.Count - 1 do
+    begin
+      ValidateExprCols(Stmt.Columns[i].Expr, ColNames,
+        Stmt.FromTable, Stmt.FromAlias);
+      AddAlias(Stmt.Columns[i].Alias);
+      // Fonksiyon cagrisinin adi da cikti alias'i gibi kullanilabilir
+      if (Stmt.Columns[i].Alias = '') and
+         (Stmt.Columns[i].Expr is TSqlFuncCallNode) then
+      begin
+        fc := TSqlFuncCallNode(Stmt.Columns[i].Expr);
+        AddAlias(fc.FuncName);
+      end;
+    end;
+
+  // 2) Alias'li dogrulama listesi
+  SetLength(names, Length(ColNames) + Length(aliases));
+  for i := 0 to High(ColNames) do names[i] := ColNames[i];
+  for i := 0 to High(aliases) do
+    names[Length(ColNames) + i] := aliases[i];
+
+  // 3) WHERE
+  ValidateExprCols(Stmt.WhereClause, ColNames, Stmt.FromTable, Stmt.FromAlias);
+
+  // 4) GROUP BY: ad veya 1-tabanli konum
+  if Stmt.GroupByCols <> nil then
+    for i := 0 to Stmt.GroupByCols.Count - 1 do
+    begin
+      ok := InNames(Stmt.GroupByCols[i]);
+      if not ok then
+      begin
+        // Sadece sayisal konum ise (1..N) kabul et
+        j := StrToIntDef(Stmt.GroupByCols[i], -1);
+        ok := (j >= 1) and (j <= Stmt.Columns.Count);
+      end;
+      if not ok then
+        RaiseEVDbColumnNotFound(Stmt.GroupByCols[i], ColNames);
+    end;
+
+  // 5) HAVING / QUALIFY (alias kabul edilir)
+  ValidateExprCols(Stmt.HavingClause, names, Stmt.FromTable, Stmt.FromAlias);
+  ValidateExprCols(Stmt.QualifyClause, names, Stmt.FromTable, Stmt.FromAlias);
+
+  // 6) ORDER BY (alias kabul edilir)
+  if Stmt.OrderBy <> nil then
+    for i := 0 to Stmt.OrderBy.Count - 1 do
+      ValidateExprCols(Stmt.OrderBy[i].Expr, names, Stmt.FromTable, Stmt.FromAlias);
 end;
 
 function TVSqlExecutor.FindColIdxInViewSelect(const ColumnName, TableQualifier: string;
@@ -15895,6 +16156,12 @@ begin
       FT.RequirePriv(Stmt.FromTable, Ord(pkSelect));
       BuildColInfo(td, colNames, colTypes);
 
+      { Phase-5: referans dogrulamasi burada, satir okumadan ONCE.
+        Bos tabloda da ecColumnNotFound verilir. View'de kapsam view'in
+        cikti kolonlaridir; o yuzden view dalinda ayrica dogrulanir. }
+      if not td.IsView then
+        ValidateStmtRefs(Stmt, colNames);
+
 
       // F-33: VIEW destegi - view ise SELECT'ini calistir
       if td.IsView then
@@ -15916,6 +16183,9 @@ begin
         for i := 0 to High(colNames) do
           if i <= High(ViewTypes) then colTypes[i] := ViewTypes[i]
           else colTypes[i] := VCT_STR;
+        { Phase-5: view'de kapsam view'in cikti kolonlaridir; dis sorgunun
+          referanslari bu kumeye gore dogrulanir (view bos olsa da). }
+        ValidateStmtRefs(Stmt, colNames);
         allRows := ViewRes.Rows;
         SetLength(pks, 0);
       end
