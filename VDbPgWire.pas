@@ -71,6 +71,14 @@ type
     ServerKey: TBytes;
   end;
 
+  { R-4: kullanici basina kimlik dogrulama cezasi. Sunucu belleğinde
+    tutulur (diske yazilmaz); yeniden baslatma sifirlar. }
+  TVdbPgAuthPenalty = record
+    Failures: Integer;
+    FirstAt: TDateTime;
+    LockedUntil: TDateTime;
+  end;
+
   { M1: ham soket veya TLS oturumu uzerinden okuma/yazma. TLS
     baslatilana kadar tum trafik ham soketten gider; SSLRequest
     geldiginde StartTls ile yukseltilir. }
@@ -145,6 +153,17 @@ type
     { R-4: dinleme arayuzu. Varsayilan '0.0.0.0' (tum arayuzler); acik
       (trust) modda cagiran '127.0.0.1' verir. Start'tan once ayarlanir. }
     FBindHost: string;
+    { R-4: kimlik dogrulama denemesi sinirlama (throttling/lockout).
+      Basarisiz denemeler kullanici basina sayilir; esik asilinca kisa
+      sureli kilit uygulanir. Ayarlar Start'tan once veya calisirken
+      degistirilebilir. }
+    FAuthPenalty: TDictionary<string, TVdbPgAuthPenalty>;
+    FTotalFailures: Integer;
+    FTotalFailStart: TDateTime;
+    FAuthMaxFailures: Integer;
+    FAuthFailureWindowSec: Integer;
+    FAuthLockoutSec: Integer;
+    FAuthGlobalMaxFailures: Integer;
     function GetAuthRequired: Boolean;
     procedure SetMaxConns(AValue: Integer);
     procedure AddConn(AConn: TVdbPgConn);
@@ -171,6 +190,17 @@ type
     procedure AddUser(const AUser, APassword: string;
       AIterations: Integer = 15000);
     procedure ClearUsers;
+    { R-4: kimlik dogrulama denemesi sinirlama. Basarisiz denemeler
+      kullanici basina sayilir; AuthMaxFailures esigi asilinca
+      AuthLockoutSeconds boyunca o kullanici reddedilir. Tum kullanicilar
+      icin toplam deneme AuthGlobalMaxFailures'i asarsa (parola taramasi)
+      herkes gecici olarak kilitlenir. 0 = ilgili sinir devre disi.
+      Cezalar yalniz bellekte tutulur. }
+    procedure NoteAuthFailure(const AUser: string);
+    procedure NoteAuthSuccess(const AUser: string);
+    function AuthLocked(const AUser: string): Boolean;
+    function AuthFailureCount(const AUser: string): Integer;
+    procedure AuthReset;
     { P-182: /metrics ucu icin metin anlik goruntusu. Sunucu hazir degilse
       bos doner. Her cagride kisa omurlu bir TVSql acilir; agirlikli is
       yapmaz (motorda yalniz sayac okunur). }
@@ -181,6 +211,14 @@ type
     property RequireTls: Boolean read FRequireTls write FRequireTls;
     { R-4: dinleme arayuzu (noktali IPv4). Varsayilan '0.0.0.0'. }
     property BindHost: string read FBindHost write FBindHost;
+    property AuthMaxFailures: Integer read FAuthMaxFailures
+      write FAuthMaxFailures;
+    property AuthFailureWindowSeconds: Integer read FAuthFailureWindowSec
+      write FAuthFailureWindowSec;
+    property AuthLockoutSeconds: Integer read FAuthLockoutSec
+      write FAuthLockoutSec;
+    property AuthGlobalMaxFailures: Integer read FAuthGlobalMaxFailures
+      write FAuthGlobalMaxFailures;
     property Ready: Boolean read FReady;
     property Port: Word read FPort;
     property LastError: string read FLastErr;
@@ -1782,6 +1820,7 @@ var
 
   function FailAuth: Boolean;
   begin
+    FServer.NoteAuthFailure(AStartupUser);
     SendPg(FIO, ErrorMsg('kimlik dogrulama basarisiz', '28P01'));
     Result := False;
   end;
@@ -1810,6 +1849,15 @@ begin
   if not FServer.AuthRequired then
   begin
     Result := SendPg(FIO, AuthOkMsg);
+    Exit;
+  end;
+
+  { R-4: kilitliyken SCRAM yuku hic alinmaz; istemciye acik hata doner.
+    Parola dogru olsa bile kilit suresi dolmadan giris yok. }
+  if FServer.AuthLocked(AStartupUser) then
+  begin
+    SendPg(FIO, ErrorMsg('cok fazla basarisiz kimlik dogrulama denemesi; ' +
+      'gecici olarak kilitli', '28P01'));
     Exit;
   end;
 
@@ -1885,6 +1933,7 @@ begin
 
   serverSig := VDbCryptHmacSha256(u.ServerKey, amsgB);
   if not SendPg(FIO, PgMsg('R', NetI32(12) + 'v=' + PgB64Enc(serverSig))) then Exit;
+  FServer.NoteAuthSuccess(AStartupUser);
   Result := SendPg(FIO, AuthOkMsg);
 end;
 
@@ -2307,6 +2356,13 @@ begin
   FTlsKey := '';
   FAuth := TDictionary<string, TVdbPgScramUser>.Create;
   FAuthLock := TCriticalSection.Create;
+  FAuthPenalty := TDictionary<string, TVdbPgAuthPenalty>.Create;
+  FAuthMaxFailures := 5;
+  FAuthFailureWindowSec := 60;
+  FAuthLockoutSec := 30;
+  FAuthGlobalMaxFailures := 200;
+  FTotalFailures := 0;
+  FTotalFailStart := 0;
   FRequireTls := False;
   FBindHost := '0.0.0.0';
 end;
@@ -2325,6 +2381,7 @@ begin
   FConns.Free;
   FConnsLock.Free;
   FAuth.Free;
+  FAuthPenalty.Free;
   FAuthLock.Free;
   inherited;
 end;
@@ -2394,6 +2451,112 @@ begin
   FAuthLock.Enter;
   try
     FAuth.Clear;
+    { Kullanici listesi sifirlanirsa cezalar da anlamsiz kalir. }
+    FAuthPenalty.Clear;
+    FTotalFailures := 0;
+    FTotalFailStart := 0;
+  finally
+    FAuthLock.Leave;
+  end;
+end;
+
+{ R-4: kimlik dogrulama denemesi sinirlama -------------------------------- }
+
+procedure TVdbPgServer.AuthReset;
+begin
+  FAuthLock.Enter;
+  try
+    FAuthPenalty.Clear;
+    FTotalFailures := 0;
+    FTotalFailStart := 0;
+  finally
+    FAuthLock.Leave;
+  end;
+end;
+
+{ Pencere suresi asildiysa sayac sifirlanir. Cagiran FAuthLock'i tutar. }
+function AuthWindowExpired(AStart: TDateTime; AWindowSec: Integer): Boolean;
+begin
+  if AStart <= 0 then Exit(True);
+  if AWindowSec <= 0 then Exit(False);
+  Result := (Now - AStart) * SecsPerDay > AWindowSec;
+end;
+
+procedure TVdbPgServer.NoteAuthFailure(const AUser: string);
+var
+  pen: TVdbPgAuthPenalty;
+  have: Boolean;
+begin
+  if AUser = '' then Exit;
+  FAuthLock.Enter;
+  try
+    if (FAuthGlobalMaxFailures > 0) and
+       AuthWindowExpired(FTotalFailStart, FAuthFailureWindowSec) then
+    begin
+      FTotalFailures := 0;
+      FTotalFailStart := Now;
+    end;
+    if FAuthGlobalMaxFailures > 0 then Inc(FTotalFailures);
+
+    have := FAuthPenalty.TryGetValue(AUser, pen);
+    if (not have) or AuthWindowExpired(pen.FirstAt, FAuthFailureWindowSec) then
+    begin
+      pen.Failures := 0;
+      pen.FirstAt := Now;
+      pen.LockedUntil := 0;
+    end;
+    Inc(pen.Failures);
+    if (FAuthMaxFailures > 0) and (pen.Failures >= FAuthMaxFailures) and
+       (FAuthLockoutSec > 0) then
+      pen.LockedUntil := Now + (FAuthLockoutSec / SecsPerDay);
+    FAuthPenalty.AddOrSetValue(AUser, pen);
+  finally
+    FAuthLock.Leave;
+  end;
+end;
+
+procedure TVdbPgServer.NoteAuthSuccess(const AUser: string);
+begin
+  FAuthLock.Enter;
+  try
+    FAuthPenalty.Remove(AUser);
+  finally
+    FAuthLock.Leave;
+  end;
+end;
+
+function TVdbPgServer.AuthLocked(const AUser: string): Boolean;
+var
+  pen: TVdbPgAuthPenalty;
+begin
+  Result := False;
+  FAuthLock.Enter;
+  try
+    { Parola taramasi korumasi: pencere icinde toplam esik asildiysa
+      kullanici adindan bagimsiz olarak herkes kilitlenir. }
+    if (FAuthGlobalMaxFailures > 0) and (FTotalFailures >= FAuthGlobalMaxFailures)
+       and (not AuthWindowExpired(FTotalFailStart, FAuthFailureWindowSec)) then
+      Exit(True);
+    if not FAuthPenalty.TryGetValue(AUser, pen) then Exit;
+    if pen.LockedUntil <= 0 then Exit;
+    Result := pen.LockedUntil > Now;
+  finally
+    FAuthLock.Leave;
+  end;
+end;
+
+function TVdbPgServer.AuthFailureCount(const AUser: string): Integer;
+var
+  pen: TVdbPgAuthPenalty;
+begin
+  Result := 0;
+  FAuthLock.Enter;
+  try
+    if FAuthPenalty.TryGetValue(AUser, pen) then
+    begin
+      if AuthWindowExpired(pen.FirstAt, FAuthFailureWindowSec) then Exit(0);
+      Result := pen.Failures;
+    end;
   finally
     FAuthLock.Leave;
   end;
