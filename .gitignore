@@ -136,3 +136,11 @@ startup_error.txt
 !tests/crypto_fixtures/fixtures/
 !tests/crypto_fixtures/fixtures/**
 
+# TLS test fixture'lari (CA + sunucu sertifikasi; yalniz test) — 2026-11-14
+# *.key ignore'undan SONRA gelmeli.
+!tests/tls_fixtures/
+!tests/tls_fixtures/**
+
+# Test kapilarinin gecici calisma dizinleri
+/tests/*/tmp/
+

@@ -26,9 +26,15 @@ type
   private
     FCtx: Pointer;
     FIsClient: Boolean;
+    FHostName: string;
+    FVerifyPeer: Boolean;
   public
+    { Sunucu: sertifika+anahtar zorunlu. SSLv2/SSLv3 kapatilir. }
     constructor CreateServer(const ACertFile, AKeyFile: string);
-    constructor CreateClient;
+    { Istemci: A CaFile ZORUNLUDUR; dogrulama kapatilamaz.
+      AHostName verilirse el sikismasi sonrasi sertifika adi da eslesmelidir.
+      Guvenli olmayan bir mod yoktur; CA yoksa istisna atilir. }
+    constructor CreateClient(const ACaFile, AHostName: string);
     destructor Destroy; override;
     function Accept(ASock: TVdbSocket; out ASession: TVdbTlsSession;
       out AErr: string): Boolean;
@@ -59,6 +65,10 @@ uses
 const
   SSL_FILETYPE_PEM = 1;
   SSL_VERIFY_NONE = 0;
+  SSL_VERIFY_PEER = 1;
+  SSL_OP_NO_SSLv2 = $01000000;
+  SSL_OP_NO_SSLv3 = $02000000;
+  X509_V_OK = 0;
   SSL_ERROR_WANT_READ = 2;
   SSL_ERROR_WANT_WRITE = 3;
   SSL_ERROR_ZERO_RETURN = 6;
@@ -73,6 +83,14 @@ type
   TfnCtxCheckKey = function(ACtx: Pointer): Integer; cdecl;
   TfnCtxSetVerify = procedure(ACtx: Pointer; AMode: Integer;
     ACallback: Pointer); cdecl;
+  TfnCtxLoadVerify = function(ACtx: Pointer; const ACaFile,
+    ACaPath: PAnsiChar): Integer; cdecl;
+  TfnCtxSetOptions = function(ACtx: Pointer; AOptions: LongWord): LongWord; cdecl;
+  TfnSslGetVerifyResult = function(ASsl: Pointer): Integer; cdecl;
+  TfnSslGetPeerCert = function(ASsl: Pointer): Pointer; cdecl;
+  TfnX509CheckHost = function(ACert: Pointer; const AName: PAnsiChar;
+    ANameLen: NativeUInt; AFlags: LongWord; APeerName: Pointer): Integer; cdecl;
+  TfnX509Free = procedure(ACert: Pointer); cdecl;
   TfnSslNew = function(ACtx: Pointer): Pointer; cdecl;
   TfnSslFree = procedure(ASsl: Pointer); cdecl;
   TfnBioNewSocket = function(AFd, ACloseFlag: Integer): Pointer; cdecl;
@@ -83,8 +101,13 @@ type
   TfnSslWrite = function(ASsl: Pointer; ABuf: Pointer; ALen: Integer): Integer; cdecl;
   TfnSslShutdown = function(ASsl: Pointer): Integer; cdecl;
   TfnSslGetError = function(ASsl: Pointer; ARet: Integer): Integer; cdecl;
-  TfnErrGetError = function: QWord; cdecl;
-  TfnErrString = procedure(AErr: QWord; ABuf: PAnsiChar; ALen: NativeUInt); cdecl;
+  { ERR_get_error/ERR_error_string_n: unsigned long ABI'si. Windows'ta
+    (win32/win64) 32 bit; Linux x86_64'te 64 bit — bu yuzden NativeUInt.
+    (Eskiden QWord'du: win32'de donus 8 bayt sanilip parametreler kayiyor,
+     hata yolunda erisim ihlali uretiyordu.) }
+  TfnErrGetError = function: NativeUInt; cdecl;
+  TfnErrString = procedure(AErr: NativeUInt; ABuf: PAnsiChar;
+    ALen: NativeUInt); cdecl;
   TfnVoid = procedure; cdecl;
   TfnInt = function: Integer; cdecl;
 
@@ -100,6 +123,12 @@ var
   GCtxUseCert, GCtxUseKey: TfnCtxUseFile;
   GCtxCheckKey: TfnCtxCheckKey;
   GCtxSetVerify: TfnCtxSetVerify;
+  GCtxLoadVerify: TfnCtxLoadVerify;
+  GCtxSetOptions: TfnCtxSetOptions;
+  GSslGetVerifyResult: TfnSslGetVerifyResult;
+  GSslGetPeerCert: TfnSslGetPeerCert;
+  GX509CheckHost: TfnX509CheckHost;
+  GX509Free: TfnX509Free;
   GSslNew: TfnSslNew;
   GSslFree: TfnSslFree;
   GBioNewSocket: TfnBioNewSocket;
@@ -115,7 +144,7 @@ var
 
 function LastOpenSslError: string;
 var
-  e: QWord;
+  e: NativeUInt;
   buf: array[0..255] of AnsiChar;
 begin
   Result := '';
@@ -162,6 +191,14 @@ begin
   GCtxUseKey := TfnCtxUseFile(Sym(hs, 'SSL_CTX_use_PrivateKey_file'));
   GCtxCheckKey := TfnCtxCheckKey(Sym(hs, 'SSL_CTX_check_private_key'));
   GCtxSetVerify := TfnCtxSetVerify(Sym(hs, 'SSL_CTX_set_verify'));
+  GCtxLoadVerify := TfnCtxLoadVerify(Sym(hs, 'SSL_CTX_load_verify_locations'));
+  GCtxSetOptions := TfnCtxSetOptions(Sym(hs, 'SSL_CTX_set_options'));
+  GSslGetVerifyResult := TfnSslGetVerifyResult(Sym(hs, 'SSL_get_verify_result'));
+  GSslGetPeerCert := TfnSslGetPeerCert(Sym(hs, 'SSL_get_peer_certificate'));
+  if not Assigned(GSslGetPeerCert) then
+    GSslGetPeerCert := TfnSslGetPeerCert(Sym(hs, 'SSL_get1_peer_certificate'));
+  GX509CheckHost := TfnX509CheckHost(Sym(hc, 'X509_check_host'));
+  GX509Free := TfnX509Free(Sym(hc, 'X509_free'));
   GSslNew := TfnSslNew(Sym(hs, 'SSL_new'));
   GSslFree := TfnSslFree(Sym(hs, 'SSL_free'));
   GSslSetBio := TfnSslSetBio(Sym(hs, 'SSL_set_bio'));
@@ -294,6 +331,9 @@ begin
   FCtx := GCtxNew(method);
   if FCtx = nil then
     FailCtx('SSL_CTX_new basarisiz: ' + LastOpenSslError);
+  { Guvenli varsayilan: SSLv2/SSLv3 hicbir zaman acilmaz (downgrade yok). }
+  if Assigned(GCtxSetOptions) then
+    GCtxSetOptions(FCtx, SSL_OP_NO_SSLv2 or SSL_OP_NO_SSLv3);
   cert := AnsiString(ACertFile);
   key := AnsiString(AKeyFile);
   if GCtxUseCert(FCtx, PAnsiChar(cert), SSL_FILETYPE_PEM) <> 1 then
@@ -304,9 +344,10 @@ begin
     FailCtx('sertifika/anahtar uyusmuyor: ' + LastOpenSslError);
 end;
 
-constructor TVdbTlsContext.CreateClient;
+constructor TVdbTlsContext.CreateClient(const ACaFile, AHostName: string);
 var
   method: Pointer;
+  ca: AnsiString;
 
   procedure FailCtx(const AMsg: string);
   begin
@@ -322,15 +363,31 @@ begin
   inherited Create;
   FCtx := nil;
   FIsClient := True;
+  FHostName := AHostName;
+  FVerifyPeer := True;
+  if Trim(ACaFile) = '' then
+    FailCtx('TLS istemci: CA dosyasi zorunlu (dogrulamasiz baglanti yok)');
   if not InitLibs then
     FailCtx('OpenSSL yuklenemedi: ' + GInitErr);
+  { Dogrulama kapatilamaz: gerekli semboller yoksa baglanti kurulmaz. }
+  if (not Assigned(GCtxLoadVerify)) or (not Assigned(GSslGetVerifyResult)) then
+    FailCtx('OpenSSL: sertifika dogrulama sembolleri yok (' + ACaFile + ')');
+  if (AHostName <> '') and
+     ((not Assigned(GSslGetPeerCert)) or (not Assigned(GX509CheckHost)) or
+      (not Assigned(GX509Free))) then
+    FailCtx('OpenSSL: sunucu adi dogrulama sembolleri yok');
   method := GClientMethod();
   if method = nil then
     FailCtx('OpenSSL istemci metodu yok');
   FCtx := GCtxNew(method);
   if FCtx = nil then
     FailCtx('SSL_CTX_new basarisiz: ' + LastOpenSslError);
-  GCtxSetVerify(FCtx, SSL_VERIFY_NONE, nil);
+  if Assigned(GCtxSetOptions) then
+    GCtxSetOptions(FCtx, SSL_OP_NO_SSLv2 or SSL_OP_NO_SSLv3);
+  ca := AnsiString(ACaFile);
+  if GCtxLoadVerify(FCtx, PAnsiChar(ca), nil) <> 1 then
+    FailCtx('CA dosyasi yuklenemedi (' + ACaFile + '): ' + LastOpenSslError);
+  GCtxSetVerify(FCtx, SSL_VERIFY_PEER, nil);
 end;
 
 destructor TVdbTlsContext.Destroy;
@@ -381,8 +438,10 @@ end;
 function TVdbTlsContext.Connect(ASock: TVdbSocket;
   out ASession: TVdbTlsSession; out AErr: string): Boolean;
 var
-  ssl, bio: Pointer;
-  r, e: Integer;
+  ssl, bio, cert: Pointer;
+  r, e, vr: Integer;
+  h: AnsiString;
+  hostOk: Boolean;
 
   function FailCtx(const AMsg: string): Boolean;
   begin
@@ -410,6 +469,26 @@ begin
     if (e <> SSL_ERROR_WANT_READ) and (e <> SSL_ERROR_WANT_WRITE) then
       Exit(FailCtx('TLS istemci el sikismasi basarisiz (SSL hata ' +
         IntToStr(e) + '): ' + LastOpenSslError));
+  end;
+  { El sikismasi bitti: sertifika zinciri ve (verildiyse) sunucu adi dogrulanir.
+    Basarisizlikta oturum acilmaz; dogrulamasiz devam yolu yoktur. }
+  if FVerifyPeer then
+  begin
+    vr := GSslGetVerifyResult(ssl);
+    if vr <> X509_V_OK then
+      Exit(FailCtx('TLS sertifika dogrulamasi basarisiz (X509 hata ' +
+        IntToStr(vr) + ')'));
+    if FHostName <> '' then
+    begin
+      cert := GSslGetPeerCert(ssl);
+      if cert = nil then
+        Exit(FailCtx('TLS: sunucu sertifikasi alinamadi'));
+      h := AnsiString(FHostName);
+      hostOk := GX509CheckHost(cert, PAnsiChar(h), Length(h), 0, nil) = 1;
+      GX509Free(cert);
+      if not hostOk then
+        Exit(FailCtx('TLS sunucu adi uyusmuyor: ' + FHostName));
+    end;
   end;
   ASession := TVdbTlsSession.Create(ssl);
   Result := True;
