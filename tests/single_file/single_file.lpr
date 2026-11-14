@@ -306,44 +306,70 @@ begin
     be := nil;
   end;
 
-  { --- 2) Calisirken olusan yan dosyalar (RAPOR, hata degil) --- }
-  WriteLn('BILGI kaynak artefaktlar: ',
+  { --- 2) Yukaridaki blok kapandi: temiz kapanistan SONRA dizin durumu --- }
+  WriteLn('BILGI kapanistan sonra artefaktlar: ',
     ListArtifacts(d1, 'veritabani'));
   Chk('SF3 ana dosya var', FileExists(d1 + 'veritabani.odb'),
     d1 + 'veritabani.odb');
-  Chk('SF4 calisirken birden fazla artefakt var',
-    CountArtifacts(d1, 'veritabani') > 1,
-    'adet=' + IntToStr(CountArtifacts(d1, 'veritabani')));
+  { v3.32: motor artik kapanista .wal / .idx / .gen dosyalarini siler.
+    Bu, "tek dosya" sozunun olculen kanitidir; SF4 tersine cevrildi.
+    (Dizinde ayrica BACKUP TO'nun urettigi yedek.odb var; sayim yalniz
+    veritabani* artefaktlarini kapsar.) }
+  Chk('SF4 temiz kapanistan sonra TEK dosya',
+    CountArtifacts(d1, 'veritabani') = 1,
+    'adet=' + IntToStr(CountArtifacts(d1, 'veritabani')) +
+    ' -> ' + ListArtifacts(d1, 'veritabani'));
+  Chk('SF5 yan dosya (.wal/.idx/.gen) kalmadi',
+    (not FileExists(d1 + 'veritabani.odb.wal')) and
+    (not FileExists(d1 + 'veritabani.odb.idx')) and
+    (not FileExists(d1 + 'veritabani.odb.gen')) and
+    (not DirectoryExists(d1 + 'veritabani.odb.log')),
+    ListArtifacts(d1, ''));
 
-  { --- 5) YALNIZ .odb kopyasi: baska dizine tek dosya --- }
+  { --- 2b) Tek dosya kapanistan sonra da YAZILABILIR --- }
+  Chk('SF6 tek dosya yeniden acilabiliyor',
+    ReadCheck(d1 + 'veritabani.odb', 'SF6', 200), '');
+  Chk('SF7 tek dosyaya yazilabiliyor', WriteMore(d1, 201, 205), '');
+  Chk('SF8 yazma sonrasi yine TEK dosya',
+    CountArtifacts(d1, 'veritabani') = 1,
+    'adet=' + IntToStr(CountArtifacts(d1, 'veritabani')) +
+    ' -> ' + ListArtifacts(d1, 'veritabani'));
+  Chk('SF9 yeniden acilista 205 satir',
+    ReadCheck(d1 + 'veritabani.odb', 'SF9', 205), '');
+
+  { --- 3) YALNIZ .odb kopyasi: baska dizine tek dosya --- }
   d2 := FreshDir('only');
-  Chk('SF5 kopya dizini bos basladi', CountFiles(d2) = 0,
+  Chk('SF10 kopya dizini bos basladi', CountFiles(d2) = 0,
     'adet=' + IntToStr(CountFiles(d2)));
-  Chk('SF6 tek dosya kopyalandi',
+  Chk('SF11 tek dosya kopyalandi',
     CopyOne(d1 + 'veritabani.odb', d2 + 'veritabani.odb'),
     d2 + 'veritabani.odb');
-  Chk('SF7 kopya dizininde TEK dosya', CountFiles(d2) = 1,
+  Chk('SF12 kopya dizininde TEK dosya', CountFiles(d2) = 1,
     'adet=' + IntToStr(CountFiles(d2)) + ' -> ' + ListArtifacts(d2, ''));
 
-  { --- 8) Yalniz .odb: okuma --- }
-  Chk('SF8 yalniz .odb okunabiliyor',
-    ReadCheck(d2 + 'veritabani.odb', 'SF8', 200), '');
+  { --- 4) Yalniz .odb: okuma --- }
+  Chk('SF13 yalniz .odb okunabiliyor',
+    ReadCheck(d2 + 'veritabani.odb', 'SF13', 205), '');
   WriteLn('BILGI yalniz-.odb sonrasi artefaktlar: ', ListArtifacts(d2, 'veritabani'));
 
-  { --- 9) Yalniz .odb: yazma (motor eksik yan dosyalari uretir) --- }
-  Chk('SF9 yalniz .odb dosyaya yazilabiliyor', WriteMore(d2, 201, 210), '');
-  Chk('SF10 yazma sonrasi tekrar acilip dogrulandi',
-    ReadCheck(d2 + 'veritabani.odb', 'SF10', 210), '');
+  { --- 5) Yalniz .odb: yazma --- }
+  Chk('SF14 yalniz .odb dosyaya yazilabiliyor', WriteMore(d2, 206, 215), '');
+  Chk('SF15 yazma sonrasi tekrar acilip dogrulandi',
+    ReadCheck(d2 + 'veritabani.odb', 'SF15', 215), '');
+  Chk('SF16 yazma sonrasi yine TEK dosya', CountFiles(d2) = 1,
+    'adet=' + IntToStr(CountFiles(d2)) + ' -> ' + ListArtifacts(d2, ''));
 
-  { --- 11) BACKUP TO ciktisi tek basina acilir --- }
+  { --- 6) BACKUP TO ciktisi tek basina acilir --- }
   d3 := FreshDir('backup');
   src := bk;
   dst := IncludeTrailingPathDelimiter(d3) + 'yedek.odb';
-  Chk('SF11 yedek kopyalandi', CopyOne(src, dst), dst);
-  Chk('SF12 yedek dizininde TEK dosya', CountFiles(d3) = 1,
+  Chk('SF17 yedek kopyalandi', CopyOne(src, dst), dst);
+  Chk('SF18 yedek dizininde TEK dosya', CountFiles(d3) = 1,
     'adet=' + IntToStr(CountFiles(d3)));
-  Chk('SF13 yedek tek basina okunabiliyor',
-    ReadCheck(d3 + 'yedek.odb', 'SF13', 200), '');
+  Chk('SF19 yedek tek basina okunabiliyor',
+    ReadCheck(d3 + 'yedek.odb', 'SF19', 200), '');
+  Chk('SF20 yedek okunduktan sonra da TEK dosya', CountFiles(d3) = 1,
+    'adet=' + IntToStr(CountFiles(d3)) + ' -> ' + ListArtifacts(d3, ''));
 
   WriteLn;
   WriteLn('SONUC: ', GPass, ' PASS, ', GFail, ' FAIL');

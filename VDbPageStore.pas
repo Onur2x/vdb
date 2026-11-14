@@ -234,6 +234,8 @@ type
         erisiminde bunlar gereksizdir: MREW kilidi zaten yazarlari siralar.
         Uygulama tek surec oldugunu BILIYORSA acar. }
       FExclusiveAccess: Boolean;
+      { v3.32 TEK DOSYA: Close sirasinda `.gen` silinsin mi (bkz. property). }
+      FDropGenOnClose: Boolean;
       FWriteCs: TRTLCriticalSection;
       { R-A-11: FWriteCs yalnizca basariyla baslatildiysa True. Yarim
         kalan kurulumda Destroy tanimsiz DoneCriticalSection cagirmasin. }
@@ -413,6 +415,16 @@ type
     { P-58c: tek surecli erisim modu. True iken dosya kilidi syscall'lari
       atlanir (bkz. FExclusiveAccess). Varsayilan False. }
     property ExclusiveAccess: Boolean read FExclusiveAccess write FExclusiveAccess;
+
+    { v3.32 TEK DOSYA: kapanista `.gen` (surecler arasi sayac + kapsam
+      bolgesi) silinsin mi? Varsayilan False (eski davranis). True iken
+      Close, checkpoint basariliysa ve tam kilit HALA bizdeyken dosyayi
+      siler: o anda baska bir surec veritabanini acik tutamaz (paylasimli
+      kilit de tam kilitle celisir), dolayisiyla acik bir handle'i olan
+      surec varken dosya silinmez. Sonraki acilis `.gen`i yeniden uretir;
+      durabil LSN 0'dan baslar, yani "fsync edilmis" iddiasi daha KOTU
+      degil, yalnizca fazladan bir fsync yapilir. }
+    property DropGenOnClose: Boolean read FDropGenOnClose write FDropGenOnClose;
 
     { Test/teshis: VDbSync kilit defterinde bu depo handle'i icin tutulan
       kilit var mi? Hicbir kilidi degistirmez. B-07 hata yolu sizinti
@@ -898,6 +910,7 @@ begin
   FLockedShared := False;
   FLockedExcl := False;
   FAutoWrite := False;
+  FDropGenOnClose := False;
 end;
 
 destructor TVDbPageStore.Destroy;
@@ -2291,8 +2304,15 @@ begin
 end;
 
 procedure TVDbPageStore.Close;
+var
+  keepExcl: Boolean;
+  genPath: string;
 begin
   if FStream = nil then Exit;
+  { v3.32 TEK DOSYA: `.gen` kapanista silinecekse tam kilidi `.gen`
+    silinene KADAR birakma (bkz. asagidaki finally). }
+  keepExcl := FDropGenOnClose and (not FReadOnly);
+  genPath := FPath + '.gen';
   try
     try
       if not FReadOnly then
@@ -2306,14 +2326,15 @@ begin
         finally
           FWriteDepth := 0;
           FDataWriteDepth := 0;  { P-184 }
-          if FLockedExcl then VDbUnlockStream(FStream);
-          FLockedExcl := False;
-          FLocked := False;
+          if not keepExcl then
+          begin
+            if FLockedExcl then VDbUnlockStream(FStream);
+            FLockedExcl := False;
+            FLocked := False;
+          end;
         end;
       end;
     finally
-      if FLockedShared then VDbUnlockStream(FStream);
-      if FLockedExcl then VDbUnlockStream(FStream);
       { P-84: rezervasyon kapanista birakilmali — Store.Close'un kendi
         AcquireWrite'i .gen EX alir; finally eskiden yalniz .odb kilidini
         birakiyordu. Unix'te sizan EX sonraki oturumun/surecin tum
@@ -2324,6 +2345,22 @@ begin
       FReserved := False;
       UnmapGen;
       FreeAndNil(FGenStream);
+      { v3.32 TEK DOSYA: tam kilit HALA bizdeyken `.gen`i sil. Bu sirada
+        baska bir surec ayni veritabanini acik tutamaz (her okuyucu/yazar
+        paylasimli ya da tam kilit ister ve tam kilit onlarla celisir),
+        dolayisiyla acik handle birakip yarim kalan bir `.gen` olusmaz.
+        Silinemezse (izin/antivirus) yalnizca eski davranisa donulur:
+        dosya kalir, dogruluk bozulmaz. }
+      if keepExcl and (genPath <> '') then
+      begin
+        try
+          if FileExists(genPath) then SysUtils.DeleteFile(genPath);
+        except
+          { yutulur: `.gen` silinememesi bir dogruluk hatasi degildir }
+        end;
+      end;
+      if FLockedShared then VDbUnlockStream(FStream);
+      if FLockedExcl then VDbUnlockStream(FStream);
       FreeAndNil(FStream);
       FLocked := False;
       FLockedShared := False;

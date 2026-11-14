@@ -406,6 +406,10 @@ type
       { v3.19: degisim gunlugu her commit'te fsync edilsin mi? (bkz. asagidaki
         DurableChangeLog ozelligi ve VDbChangeLog.SyncGroups) }
       FDurableChangeLog: Boolean;
+      { v3.32 TEK DOSYA: degisim gunlugu acilsin mi? Varsayilan False.
+        Acikken `<db>.gen` + `<db>.log/` olusur (PITR/replikasyon); kapaliyken
+        dizinde yalniz `.odb` kalir ve PITR/replikasyon net hata verir. }
+      FChangeLogEnabled: Boolean;
       { v4: PITR replay'i sirasinda hedef motor (gecici dosya) ve son
         hata nedeni. Replay geri cagirimi bu alanlari kullanir. }
       FReplayEng: TVdbPageEngine;
@@ -688,6 +692,11 @@ type
       fsync (tam dayaniklilik). False = fsync checkpoint'e ertelenir (SQLite
       synchronous=NORMAL). Olculen fark: fsync ~360 us/islem. }
     property DurableOnFlush: Boolean read FDurableOnFlush write FDurableOnFlush;
+    { v3.32 TEK DOSYA: degisim gunlugu (PITR/replikasyon) acik mi? Varsayilan
+      False: `<db>.gen` ve `<db>.log/` olusmaz, dizinde yalniz `.odb` kalir.
+      Acmadan once veritabani KAPALI olmali (acilista okunur). }
+    property ChangeLogEnabled: Boolean
+      read FChangeLogEnabled write FChangeLogEnabled;
     { P-58c: tek surecli erisim modu. True iken dosya kilidi syscall'lari
       atlanir (LockReserve + LockExclusive + UnlockGen + UnlockStream).
       Uygulama tek surec oldugunu BILIYORSA acar. Varsayilan False. }
@@ -965,6 +974,8 @@ begin
   FBgCkErr := '';
   FBgCkPending := 0;
   FDurableOnFlush := True;   { P-DUR v2: varsayilan tam dayaniklilik }
+  { v3.32 TEK DOSYA: degisim gunlugu varsayilan KAPALI (opt-in). }
+  FChangeLogEnabled := False;
   FPoolPages := APoolPages;
   FEng := NewEngine(ADbPath);
   try
@@ -993,11 +1004,20 @@ begin
   FDurableChangeLog := False;
   FLogProblem := '';
   FLogBaseSeq := 0;
+  { v3.32 TEK DOSYA: degisim gunlugu (PITR/replikasyon altyapisi) artik
+    OPT-IN. Varsayilan kapali oldugu icin `<db>.gen` dosyasi ve `<db>.log/`
+    dizini olusmaz; dizinde yalniz `.odb` kalir. Kapaliyken PITR/replikasyon
+    istekleri net hata verir (LogStatus), sessiz yalan yok. }
   { v3.2: salt-okunur okuyucu degisim gunlugune YAZMAZ ve taban imaji
     uretmez; <db>.log dizini okuyucu tarafindan olusturulmaz. }
   if FReadOnly then
   begin
     FLogProblem := 'salt-okunur oturum: degisim gunlugu kapali';
+    Exit;
+  end;
+  if not FChangeLogEnabled then
+  begin
+    FLogProblem := 'degisim gunlugu kapali (opt-in: ChangeLogEnabled)';
     Exit;
   end;
   OpenChangeLog;

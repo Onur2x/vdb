@@ -27,7 +27,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `sql_differential` | PostgreSQL diferansiyel korpusu + sapma yonetisimi (bkz. `SQL_DIFFERENTIAL.md`) |
 | `btree_integrity` | B+Tree silme/denge/doluluk + yaprak zinciri Next/Prev (bkz. `BTREE_INTEGRITY.md`) |
 | `perf_baseline` | B+Tree/SQL performans tavanlari + olcekleme orani + dogruluk (bkz. `PERF_BASELINE.md`) |
-| `single_file` | "veri tek dosyada" sozlesmesi: yalniz `.odb` kopyasi acilir/yazilir; `BACKUP TO` tek dosya (bkz. `ON_DISK_LAYOUT.md`) |
+| `single_file` | "tek dosya" sozlesmesi: temiz kapanistan sonra dizinde yalniz `<ad>.odb`; tek dosya kopyasi acilir/yazilir; `BACKUP TO` tek dosya (bkz. `ON_DISK_LAYOUT.md`) |
 | `crypto_core` | saf Pascal AES/GCM/SHA/HMAC cekirdegi |
 | `crypto_base64` | base64 kodlayici/cozucu |
 | `fixtures_builtin` | eski `.odb`/anahtar fixture'lari **builtin** provider ile acilir |
@@ -194,3 +194,20 @@ kaldirildi:
   kumesi, kaynak kodu ve CI matrisi degismedi, dolayisiyla kapi sonuclari
   onuncu kosuyla aynidir. `fail-fast: false` sayesinde iki platform da
   gercekten kosmustur.
+- Onikinci kosu (`b86cddb`, run 43600343657): **iki platform da YESIL**
+  (`success`). Bu kosu da **yalniz belge** getirdi (`RC_REVIEW.md`,
+  `CI.md` kosu gecmisi, README/CHANGELOG baglantilari); kapi kumesi
+  degismedi.
+- Onucuncu kosu (PHASE-9 commit'i): **yerel kanit** Git
+  Bash/Windows **18 kapi** PASS (`tls_client` SKIP), WSL x86_64 Linux
+  **19 kapi** PASS. **Tek dosya davranisi degisti**: kapanis artik WAL'i
+  checkpoint ettikten sonra `.wal` ve `.gen` dosyalarini siler, `.idx`
+  yalniz `KeepIdxOnClose` aciksa yazilir, degisim gunlugu varsayilan
+  kapalidir (`ChangeLogEnabled`). `single_file` kapisi 22 -> **35 PASS,
+  0 FAIL** (SF1-SF20: kapanistan sonra dizinde tek dosya, tekrar acma,
+  yazma, `.odb` kopyasi, `BACKUP TO`). `wal_crash`, `kv_wal`,
+  `backup_restore`, `page_integrity`, `perf_baseline` etkilenmedi.
+  **Windows dersi:** `VDbPageStore.pas` icinde nitelenmemis
+  `DeleteFile(AnsiString)` i386 FPC 3.2.4'te derlenmiyor
+  (`expected "PChar"`) — WSL'de ayni hata cikmadigi icin yalniz Windows
+  kosusu yakaladi; cozum `SysUtils.DeleteFile(...)`.

@@ -116,6 +116,22 @@ type
       FCheckpointCount: Int64;
       FCheckpointLastMs: Int64;
       FCheckpointTotalMs: Int64;
+      { v3.32 TEK DOSYA: kapanista `.idx` birakilsin mi? Varsayilan HAYIR.
+        `.idx` bir ONBELLEKTIR: silinmesi veri kaybi degildir, yalnizca bir
+        sonraki acilis tam tarama yapar. Birakilirsa dizinde ikinci dosya
+        kalir (tek dosya sozu bozulur). }
+      FKeepIdxOnClose: Boolean;
+      { v3.32 TEK DOSYA: kapanista BOS `.wal` silinsin mi? Varsayilan EVET.
+        Checkpoint sonrasi WAL'de uygulanacak cerceve yoktur (tum veri
+        `.odb`'de ve fsync'li); dosya yalnizca baslik sayfasidir. }
+      FDropWalOnClose: Boolean;
+      { v3.32 TEK DOSYA: kapanista `.gen` silinsin mi? Varsayilan EVET.
+        `.gen` VERI DEGILDIR: paylasilan degisiklik sayaci + durabil LSN +
+        bayt aralik kilitleri icin kapsam bolgesidir. Kapanista tam
+        kilit bizdeyken silinir; sonraki acilis ayni kimlikle yeniden uretir
+        ve durabil LSN 0'dan baslar (yalnizca fazladan bir fsync; veri
+        bozulmasi yok). Kalirsa dizinde ikinci dosya kalir. }
+      FDropGenOnClose: Boolean;
     procedure InitEngine(const ADbPath: string; APoolPages: Integer);
     { v3.19: Commit'in gercek govdesi. ASyncLsn = WAL'e yazilan en son LSN
       (yazilacak kayit yoksa 0). DoSync=False ise fsync yapilmaz. }
@@ -125,6 +141,9 @@ type
     procedure OnSpill(PageNo: LongWord; P: PVdbPage);
     function OnMiss(PageNo: LongWord; P: PVdbPage): Boolean;
     procedure SetWalStats(const AStats: TVdbWalStats);
+    { v3.32 TEK DOSYA: checkpoint sonrasi yan dosyalari (`.idx`, bos `.wal`)
+      temizler. ACheckpointOk=False ise HICBIR dosyaya dokunmaz. }
+    procedure DropSideFiles(ACheckpointOk: Boolean);
     procedure ApplyRecovered(PageNo: LongWord; P: PVdbPage);
     procedure ApplyRecoveredView(PageNo: LongWord; P: PVdbPage);
     procedure ApplyReadOnly(PageNo: LongWord; P: PVdbPage);
@@ -251,6 +270,16 @@ type
     function KeyFingerprint: string;
     { Dizinin kalici kopyasini simdi yazar (normalde Close yapar). }
     procedure SaveIdx;
+    { v3.32 TEK DOSYA: varsayilan olarak Close temiz bir kapanistan sonra
+      `.odb.idx` ve bos `.odb.wal` dosyalarini siler; dizinde yalniz `.odb`
+      kalir. KeepIdxOnClose=True `.idx`'i geri birakir (daha hizli acilis,
+      ikinci dosya). DropWalOnClose=False WAL'i birakir. }
+    property KeepIdxOnClose: Boolean read FKeepIdxOnClose write FKeepIdxOnClose;
+    property DropWalOnClose: Boolean read FDropWalOnClose write FDropWalOnClose;
+    { DropGenOnClose=True (varsayilan) temiz kapanista `.odb.gen` silinir;
+      sonraki acilis yeniden uretir. False birakirsa durabil LSN korunur
+      (bir sonraki acilis daha az fsync yapar) ama ikinci dosya kalir. }
+    property DropGenOnClose: Boolean read FDropGenOnClose write FDropGenOnClose;
 
     { Sprint 3.1: VERIFY — dosyanin kendisini bastan sona denetler.
       Dizin (bellek) yeniden kurulmaz; yalniz okunur. Denetimler:
@@ -357,6 +386,12 @@ begin
   FDurableLsn := 0;
   FSyncCount := 0;
   FSyncErr := '';
+  { v3.32 TEK DOSYA: varsayilan davranis - temiz kapanistan sonra dizinde
+    yalniz `.odb` kalir. `.idx` silinir (bir sonraki acilis tam tarama
+    yapar), bos `.wal` silinir. Ikisi de kapatilabilir (bkz. property'ler). }
+  FKeepIdxOnClose := False;
+  FDropWalOnClose := True;
+  FDropGenOnClose := True;
 end;
 
 function TVdbPageEngine.NextDataStamp: QWord;
@@ -683,6 +718,37 @@ begin
   else Result := FHeap.IdxTags;
 end;
 
+procedure TVdbPageEngine.DropSideFiles(ACheckpointOk: Boolean);
+var
+  idxPath, walPath: string;
+  walBytes: Int64;
+begin
+  { Checkpoint yapilmadiysa (kilit alinamadi / hata) HICBIR yan dosyaya
+    dokunma: veri WAL'de olabilir. }
+  if not ACheckpointOk then Exit;
+
+  { 1) `.idx` — yalnizca acilis onbellegi. Veri degil. }
+  idxPath := FPath + '.idx';
+  if FKeepIdxOnClose then
+    SaveIdx                     { hizli acilis isteyen acikca istedi }
+  else
+    SysUtils.DeleteFile(idxPath);
+
+  { 2) `.wal` — yalnizca BOS ise silinir. Bosluk olcusu dosya boyutudur:
+    checkpoint sonrasi WAL yalnizca baslik sayfasidir; herhangi bir cerceve
+    kaldiysa dosya daha buyuktur ve SILINMEZ. }
+  if not FDropWalOnClose then Exit;
+  walPath := FPath + '.wal';
+  if not FileExists(walPath) then Exit;
+  try
+    walBytes := VDbFileBytes(walPath);
+  except
+    Exit;
+  end;
+  if walBytes > VDB_PAGE_SIZE then Exit;
+  SysUtils.DeleteFile(walPath);
+end;
+
 procedure TVdbPageEngine.Close;
 var
   closeOk: Boolean;
@@ -711,6 +777,13 @@ begin
       FStore.AcquireDataWrite;
       try
         Checkpoint(True);
+        { v3.32 TEK DOSYA: WAL tutamacini KILIT ALTINDA kapat. Windows'ta
+          acik tutamak varken DeleteFile basarisiz olur; ayrica kapanis
+          ile ayni anda baska bir surec WAL'e yazamasin. FWal.Close
+          idempotenttir (asagida tekrar cagrilir). }
+        if FWal <> nil then
+          FWal.Close;
+        DropSideFiles(True);
         closeOk := True;
       finally
         FStore.ReleaseDataWrite;
@@ -718,19 +791,19 @@ begin
     except
       { Kapanis zinciri kirilmaz. Kilit alinamadiysa checkpoint ATLANIR:
         onaylanmis veri WAL'de kalir ve bir sonraki acilista kurtarilir.
-        Veri kaybina tercih edilen bilincli secim (Oncelik 1). }
+        Veri kaybina tercih edilen bilincli secim (Oncelik 1).
+        Bu yolda yan dosyalara DOKUNULMAZ (DropSideFiles cagrilmaz). }
       closeOk := False;
     end;
-    { Checkpoint sonrasi dizin taze: acilis taramasi atlanabilir. Yalniz
-      checkpoint GERCEKTEN yapildiysa yaz (bayat dizin yazmak, bir sonraki
-      acilista eksik satir demektir). }
-    if closeOk then
-      SaveIdx;
   end;
   FStore.OnSpill := nil;
   FStore.OnMiss := nil;
   ClearPending;
   FreeAndNil(FHeap);
+  { v3.32 TEK DOSYA: `.gen` temizligini store yapar cunku silme, tam
+    kilit hala bizdeyken yapilmalidir (store.Close icinde). Checkpoint
+    atlandiysa (closeOk=False) `.gen` KORUNUR: sonraki acilis onu okur. }
+  FStore.DropGenOnClose := FDropGenOnClose and closeOk;
   FStore.Close;
   if FWal <> nil then
     FWal.Close;

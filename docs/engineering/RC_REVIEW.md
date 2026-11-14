@@ -23,7 +23,7 @@ vermek degil, sinirlari yazmak.
 | B+Tree | `BTREE_INTEGRITY.md`, `btree_integrity` (152 kontrol) |
 | SQL davranisi | `SQL_COVERAGE.md`, `SQL_DIFFERENTIAL.md`, `sql_matrix`, `sql_differential` |
 | Performans | `PERF_BASELINE.md`, `perf_baseline` |
-| Tek dosya sozlesmesi | `ON_DISK_LAYOUT.md`, `single_file` (SF1-SF13) |
+| Tek dosya sozlesmesi | `ON_DISK_LAYOUT.md`, `single_file` (SF1-SF20, 35 kontrol) |
 | Sunucu/TLS/auth | `SERVER_HARDENING.md`, `server_harden`, `auth_throttle`, `tls_client` |
 | Threat model / riskler | `docs/security/THREAT_MODEL.md` (R-01..R-12) |
 | SBOM / lisans / ifsa | `docs/security/SBOM.md`, `vdb.cdx.json`, `NOTICE`, `SECURITY.md` |
@@ -94,30 +94,39 @@ kosar; bu makinede kosmadi.
 
 Skill'in "Single-File Storage Architecture" bolumu **Mode A** der: tum
 kalici icerik tek `.odb` icinde, `.odb.log/` gibi disa gorunen yan dosya
-yok, WAL **icerde** kalir. Olculen gercek bunun tersi:
+yok, WAL **icerde** kalir.
+
+**Durum iki asamali.** Once belgeler gercege gore duzeltildi (yan dosyalar
+gizlenmedi); sonra **A** uygulandi: temiz kapanista yan dosyalar silinir ve
+dizinde yalnizca `<db>.odb` kalir. Olculen davranis:
 
 | | Skill Mode A | Bu depo (olculen) |
 |---|---|---|
 | Veri | tek dosya | tek dosya (`.odb`) |
-| WAL | `.odb` icinde | `.odb.wal` ayri dosya |
-| Acilis onbellegi | icerde | `.odb.idx` |
-| Degisim gunlugu | icerde | `.odb.gen` + `.odb.log/` |
-| Calisirken dosya sayisi | 1 | 5 |
+| WAL | `.odb` icinde | `.odb.wal` **acikken**; temiz kapanista silinir |
+| Acilis onbellegi | icerde | acikken olusmaz; `KeepIdxOnClose=True` ise `.odb.idx` |
+| Degisim gunlugu | icerde | **opt-in**; kapaliyken `.gen`/`.log/` yok |
+| Calisirken dosya sayisi | 1 | 3 (`.odb` + `.wal` + `.gen`) |
+| Temiz kapanistan sonra | 1 | **1** |
 
-**Sahip karari (2026-11-14):** yan dosyalari `.odb` icine gomme (v4 format
-degisikligi) **bu surumde yapilmadi**; bunun yerine belgeler gercege gore
-duzeltildi ve `single_file` kapisi eklendi. Gerekce `ON_DISK_LAYOUT.md` §5:
-WAL'i veri dosyasinin icine almak yarim kalan sayfa yazimi ile gunluk
-kaydini ayni dosyada yaristirir; crash guvenligi geri gider.
+Yani fark artik yalnizca **calisma aninda**: motor acikken WAL ve sayac
+dosyasi yaninda durur, kapaninca silinir. Kalici durum tek dosyadir.
 
-Dolayisiyla **bu surum "profesyonel tek dosya container" iddiasinda
-bulunamaz.** Dogru cumle sudur: *"veri tek `.odb` dosyasindadir; calisma
-durumu (WAL/onbellek/gunluk) yan dosyalardadir; tasinabilir tek dosya icin
-`BACKUP TO` kullanilir."* README'ler bu cumleyi yazar.
+**Neden WAL calisirken ayri?** WAL'i veri dosyasinin icine almak yarim
+kalan sayfa yazimi ile gunluk kaydini ayni dosyada yaristirir; crash
+guvenligi geri gider (SQLite da WAL modunda ayri `-wal` tutar). Bu yuzden
+"gercek tek dosya container" (v4 format: gomulu WAL bolgesi) hala
+yapilmadi ve **acik bir is kalemidir** (`ON_DISK_LAYOUT.md` §7).
+
+Dolayisiyla bu surum sunu soyleyebilir: *"veri tek `.odb` dosyasindadir;
+motor acikken yaninda calisma dosyalari olusur ve temiz kapanista silinir;
+tasinabilir tek dosya icin `BACKUP TO` kullanilir."* README'ler bu cumleyi
+yazar. **"Calisirken de tek fiziksel dosya" iddiasi bu surumde YOKTUR.**
 
 Mode A bir **RC engeli mi?** Urun davranisi acisindan degil (veri kaybi
-yok, kapi var, belge dogru). Ama skill'in kabul kriteri acisindan
-**karsilanmamis bir gereksinimdir** ve v4 isi olarak acik kalir.
+yok, kapi var, belge dogru, kapanista tek dosya). Skill'in kabul kriteri
+acisindan **kismen karsilanmistir**: kalici durum tek dosya, calisma durumu
+degil. v4 container isi acik kalir.
 
 ## 5. Risk register durumu (THREAT_MODEL.md)
 
@@ -181,8 +190,10 @@ sistemiyle denenmesi.
 3. **TLS alt surum pinleme** (R-05) ve idle/query timeout (R-04).
 4. **Canli PostgreSQL diferansiyeli**: `psql` olan bir CI isi
    (`pg=not-run` yerine gercek kosum).
-5. **Tek dosya Mode A (v4)**: yan dosyalari `.odb` icine alma; ayri
-   tasarim + fault injection ister.
+5. **Tek dosya Mode A (v4)**: calisirken WAL + sayac bolgesini `.odb`
+   icine gomme (gomulu WAL bolgesi + `VDB_FILE_VER=6`). Kalici durum artik
+   tek dosya; kalan fark yalnizca calisma anidir. Ayri tasarim + fault
+   injection ister.
 6. **Imzalama/provenance**: ilk ikili yayinlandiginda Sigstore + SLSA.
 7. **Bagimsiz inceleme** (skill §16/15): kripto ve depolama icin.
 

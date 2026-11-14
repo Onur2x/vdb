@@ -52,13 +52,33 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
 - **`perf_baseline` kapisi**: mutlak sure yerine genis tavan + olceklenme
   orani (karesel bozunma tespiti) — `PERF_BASELINE.md`.
 
+### Tek dosya (v3.32)
+
+- **Temiz kapanistan sonra dizinde yalnizca `<db>.odb` kalir.** `Close`
+  sirasi: checkpoint -> WAL handle kapat -> `.idx` sil -> `.wal` sil (yalniz
+  bos ise) -> `FStore.Close` `.gen` sil (tam kilit bizdeyken). Checkpoint
+  atlanirsa yan dosyalara **dokunulmaz**; yarim kalan bir commit'i silmek
+  veri kaybi olurdu.
+- `.gen` **degisim gunlugu degil**, page store'un surecler-arasi sayaci +
+  durabil LSN + bayt aralik kilit bolgesidir; kapanista silinip sonraki
+  acilista ayni kimlikle yeniden uretilir (durabil LSN 0'dan baslar =
+  yalnizca fazladan bir fsync, fail-safe).
+- **Degisim gunlugu (PITR/replikasyon) artik opt-in**: `ChangeLogEnabled`
+  varsayilan `False`; kapaliyken `.log/` ve changelog taban imaji hic
+  olusmaz ve `LogStatus` bunu acikca soyler (sessiz yalan yok).
+- Acilis `.idx` onbellegi olmadan tam tarama yapar; hiz isteyen
+  `KeepIdxOnClose=True` ile eski davranisi secer (o zaman dizinde ikinci
+  dosya kalir). `DropWalOnClose`/`DropGenOnClose` de kapatilabilir.
+- `tests/single_file` 22 -> **35 kontrol** (SF1-SF20): kapanistan sonra tek
+  dosya, tek dosyaya yazma, `.odb` kopyasi, `BACKUP TO` ciktisi.
+
 ### Belgeler
 
-- **"Tek dosya" ifadesi gercege gore duzeltildi**: veri `<db>.odb` icinde,
-  ama calisan bir veritabani `.wal`, `.idx`, `.gen`, `.log/` ile birlikte
-  **bes girdidir**. Yalniz `.odb` kopyasi acilir ve yazilabilir (motor eksik
-  yan dosyalari yeniden uretir); tasinabilir tek dosya icin `BACKUP TO`.
-  `tests/single_file` (22 kontrol) ve `docs/engineering/ON_DISK_LAYOUT.md`.
+- **"Tek dosya" ifadesi once gercege gore duzeltildi**: veri `<db>.odb`
+  icinde, ama calisan bir veritabani `.wal`, `.idx`, `.gen`, `.log/` ile
+  birlikte **bes girdiydi**. Yalniz `.odb` kopyasi acilir ve yazilabilir
+  (motor eksik yan dosyalari yeniden uretir); tasinabilir tek dosya icin
+  `BACKUP TO`. `tests/single_file` ve `docs/engineering/ON_DISK_LAYOUT.md`.
 - README'lerdeki eski/yanlis bilgiler duzeltildi: mimari zincir (v2-only
   anlatimi), derleme komutlari (`sqltest.lpi` yok), ilk sorgu ornegi
   (`TVSql.Create` bir `TVTableDb` alir), export sayisi (57), test tablosu

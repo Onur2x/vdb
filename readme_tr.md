@@ -1,9 +1,10 @@
 # VDB — İlişkisel Veritabanı Motoru
 
 VDB (VeriTabanı), Free Pascal ile yazılmış, harici bir DLL gerektirmeyen
-ilişkisel veritabanı motorudur. Tüm veri tek bir `.odb` dosyasında durur;
-kullanımdaki bir veritabanının yanında çalışma durumu dosyaları da oluşur
-(WAL, açılış önbelleği, değişim günlüğü) — bkz.
+ilişkisel veritabanı motorudur. Tüm veri tek bir `.odb` dosyasında durur.
+Veritabanı açıkken yanında iki yardımcı dosya bulunur (WAL ve paylaşılan
+sayaç); temiz kapanışta ikisi de silinir, yani kapalı veritabanı yeniden tek
+dosyadır — bkz.
 [ON_DISK_LAYOUT.md](docs/engineering/ON_DISK_LAYOUT.md). Masaüstü ve gömülü
 uygulamalar için SQLite'a alternatif olarak geliştirilmiştir.
 
@@ -15,13 +16,13 @@ uygulamalar için SQLite'a alternatif olarak geliştirilmiştir.
 
 **Motor (v3 sayfa motoru, varsayılan):**
 
-- Tek veri dosyası (`.odb`), ayrı sunucu kurulumu gerekmez. Yan dosyalar
-  çalışma durumudur (WAL, `.idx` önbelleği, değişim günlüğü); eksikse motor
-  bunları yeniden üretir.
+- Tek veri dosyası (`.odb`), ayrı sunucu kurulumu gerekmez. Açıkken yanında
+  WAL ve paylaşılan sayaç dosyası bulunur; temiz kapanışta silinirler ve motor
+  bunları eksikse yeniden üretir.
 - 4 KB sayfa, slotted heap, sayfa başına CRC32; çökme sonrası açılışta
   WAL replay ile kurtarma (kill -9 testiyle doğrulanmış).
-- Commit başına yalnız değişen sayfalar WAL'e yazılır; açılışta `.odb.idx`
-  ile hızlı yükleme (bozuksa tam tarama).
+- Commit başına yalnız değişen sayfalar WAL'e yazılır; açılışta varsa
+  `.idx` önbelleği kullanılır (`KeepIdxOnClose`), yoksa tam tarama yapılır.
 - Sayfa düzeyinde AES-256-GCM dosya şifreleme; parolasız açılış reddedilir.
 - `VERIFY`, `BACKUP TO`, `VACUUM` (atomik), `ANALYZE`, `SHOW STATS`.
 - Zengin SQL: JOIN, alt sorgu, CTE, pencere fonksiyonları, `UPSERT`,
@@ -83,12 +84,18 @@ SQL metni → VDbParser → VDbAst → VDbExecutor → VDbTable → IVDbBackend 
 
 ### Disk üzerinde
 
-Tüm veri `<ad>.odb` içindedir; yalnız bu dosya açıldığında da çalışır ve motor
-eksik yan dosyaları yeniden üretir. Kullanımdaki veritabanının yanında ayrıca
-`<ad>.odb.wal` (çökme kurtarma), `<ad>.odb.idx` (açılış hızı önbelleği),
-`<ad>.odb.gen` ve `<ad>.odb.log/` (PITR için değişim günlüğü) bulunur. Klasör
-kopyalarken tümünü birlikte kopyala; taşınabilir tek dosya için `BACKUP TO`
-kullan. Ölçülen boyutlar, gerekçeler ve bunu doğrulayan kapı:
+Tüm veri `<ad>.odb` içindedir. Veritabanı açıkken yanında `<ad>.odb.wal`
+(çökme kurtarma) ve `<ad>.odb.gen` (paylaşılan değişiklik sayacı ve bayt
+aralık kilitleri) bulunur; temiz kapanış WAL'i checkpoint edip ikisini de
+siler, yani kapalı veritabanı yeniden tek dosyadır. Yalnız `.odb` açıldığında
+da çalışır; motor yardımcıları yeniden üretir. Veritabanı açıkken veya
+çökmüşken yalnız `.odb` kopyalamak WAL'deki commit'leri kaybeder — canlı
+taşınabilir kopya için `BACKUP TO` kullan.
+
+Değişim günlüğü (`.odb.log/`, PITR ve replikasyon için) varsayılan olarak
+kapalıdır ve yalnız `ChangeLogEnabled` açılınca oluşur; `KeepIdxOnClose`
+isteğe bağlı olarak `.idx` açılış önbelleğini saklar. Ölçülen boyutlar,
+gerekçeler ve bunu doğrulayan kapı:
 [ON_DISK_LAYOUT.md](docs/engineering/ON_DISK_LAYOUT.md).
 
 ---
@@ -169,7 +176,7 @@ Son doğrulanan durum (2026-11-14, Linux x86_64 ve Windows i386, `tests/run_gate
 | `page_integrity` | 14 / 0 |
 | `btree_integrity` | 152 / 0 |
 | `perf_baseline` | 16 / 0 |
-| `single_file` | 22 / 0 |
+| `single_file` | 35 / 0 |
 | `server_harden` | 24 / 0 |
 | `auth_throttle` | 16 / 0 |
 | `tls_client` | 6 / 0 (Linux; OpenSSL DLL'i olmayan Windows'ta atlanır) |

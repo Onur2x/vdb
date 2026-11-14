@@ -1,9 +1,10 @@
 # VDB — Relational Database Engine
 
 VDB is a relational database engine written in pure Free Pascal. It needs no
-external DLL, and all data lives in a single `.odb` file. A database that is in
-use also keeps side files next to it (WAL, open cache, change log) — see
-[ON_DISK_LAYOUT.md](docs/engineering/ON_DISK_LAYOUT.md). It is designed for
+external DLL, and all data lives in a single `.odb` file. While a database is
+open it keeps two helper files next to it (the WAL and the shared counter);
+both are removed on a clean close, so a closed database is again one file —
+see [ON_DISK_LAYOUT.md](docs/engineering/ON_DISK_LAYOUT.md). It is designed for
 desktop and embedded applications as an alternative to SQLite.
 
 > Turkish version: [readme_tr.md](readme_tr.md)
@@ -14,12 +15,13 @@ desktop and embedded applications as an alternative to SQLite.
 
 **Engine (v3 page engine, the default):**
 
-- One data file (`.odb`); no server installation required. Side files are
-  runtime state (WAL, `.idx` cache, change log) and are regenerated if missing.
+- One data file (`.odb`); no server installation required. While open, the WAL
+  and a shared counter sit next to it; both are removed on a clean close, and
+  the engine recreates them if missing.
 - 4 KB pages, slotted heap, per-page CRC32; WAL replay recovers after a
   crash (verified by a kill -9 gate).
-- Only dirty pages go to the WAL per commit; startup uses `.odb.idx` for a
-  fast load and falls back to a full scan when it is damaged.
+- Only dirty pages go to the WAL per commit; startup can use an `.idx` cache
+  when one is present (`KeepIdxOnClose`) and falls back to a full scan.
 - Page-level AES-256-GCM file encryption; opening without the password is
   refused.
 - `VERIFY`, `BACKUP TO`, `VACUUM` (atomic), `ANALYZE`, `SHOW STATS`.
@@ -83,12 +85,17 @@ SQL text → VDbParser → VDbAst → VDbExecutor → VDbTable → IVDbBackend �
 
 ### On disk
 
-All data lives in `<name>.odb`; opening that file alone works, and the engine
-recreates any missing side file. While a database is in use, the engine also
-keeps `<name>.odb.wal` (crash recovery), `<name>.odb.idx` (open-speed cache),
-`<name>.odb.gen` and `<name>.odb.log/` (change log used for PITR). Copy the
-whole set, or use `BACKUP TO` for a portable single file. Measured sizes,
-reasoning and the gate that verifies it:
+All data lives in `<name>.odb`. While the database is open it also has
+`<name>.odb.wal` (crash recovery) and `<name>.odb.gen` (shared change counter
+and byte-range locks); a clean close checkpoints the WAL and removes both, so
+a closed database is a single file again. Opening `.odb` alone works, and the
+engine recreates the helpers. Copying only `.odb` while the database is open
+or crashed loses WAL commits — use `BACKUP TO` for a live portable copy.
+
+Change logging (`.odb.log/`, used for PITR and replication) is off by default
+and only appears when `ChangeLogEnabled` is set; `KeepIdxOnClose` optionally
+keeps an `.idx` open-speed cache. Measured sizes, reasoning and the gate that
+verifies all of this:
 [ON_DISK_LAYOUT.md](docs/engineering/ON_DISK_LAYOUT.md).
 
 ---
@@ -169,7 +176,7 @@ Last verified state (2026-11-14, Linux x86_64 and Windows i386, `tests/run_gates
 | `page_integrity` | 14 / 0 |
 | `btree_integrity` | 152 / 0 |
 | `perf_baseline` | 16 / 0 |
-| `single_file` | 22 / 0 |
+| `single_file` | 35 / 0 |
 | `server_harden` | 24 / 0 |
 | `auth_throttle` | 16 / 0 |
 | `tls_client` | 6 / 0 (Linux; skipped on Windows without OpenSSL DLL) |
