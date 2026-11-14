@@ -1,7 +1,10 @@
 # VDB — İlişkisel Veritabanı Motoru
 
-VDB (VeriTabanı), Free Pascal ile yazılmış, harici bir DLL gerektirmeyen,
-tek dosyada (`.odb`) çalışan ilişkisel veritabanı motorudur. Masaüstü ve gömülü
+VDB (VeriTabanı), Free Pascal ile yazılmış, harici bir DLL gerektirmeyen
+ilişkisel veritabanı motorudur. Tüm veri tek bir `.odb` dosyasında durur;
+kullanımdaki bir veritabanının yanında çalışma durumu dosyaları da oluşur
+(WAL, açılış önbelleği, değişim günlüğü) — bkz.
+[ON_DISK_LAYOUT.md](docs/engineering/ON_DISK_LAYOUT.md). Masaüstü ve gömülü
 uygulamalar için SQLite'a alternatif olarak geliştirilmiştir.
 
 > İngilizce sürüm: [readme.md](readme.md)
@@ -12,7 +15,9 @@ uygulamalar için SQLite'a alternatif olarak geliştirilmiştir.
 
 **Motor (v3 sayfa motoru, varsayılan):**
 
-- Tek dosya depolama (`.odb`), ayrı sunucu kurulumu gerekmez.
+- Tek veri dosyası (`.odb`), ayrı sunucu kurulumu gerekmez. Yan dosyalar
+  çalışma durumudur (WAL, `.idx` önbelleği, değişim günlüğü); eksikse motor
+  bunları yeniden üretir.
 - 4 KB sayfa, slotted heap, sayfa başına CRC32; çökme sonrası açılışta
   WAL replay ile kurtarma (kill -9 testiyle doğrulanmış).
 - Commit başına yalnız değişen sayfalar WAL'e yazılır; açılışta `.odb.idx`
@@ -29,11 +34,15 @@ uygulamalar için SQLite'a alternatif olarak geliştirilmiştir.
 yanlış sonuç üretmez): TCP sunucusunda v3 motoru (`REPLICATION ... TCP`;
 dosya modu log-shipping çalışır) ve `ARCHIVE WAL RESET` (v3 değişim
 günlüğü kalıcıdır, kapatılamaz — PITR yeteneği korunur).
-`SAVEPOINT` ve kısmi geri alma, `AS OF`/PITR, dosya modu replikasyon,
-zone map/budama ve `ALTER DATABASE KEY` v3'te **çalışır** ve kapı
-testleriyle (`v3sqlchk`, `pitrchk`, `replchk`, `prochk`, `soakchk`)
-doğrulanmıştır. v2 motoru (MVCC) ağaçta **salt-okunur/göç** yolu olarak
-durur.
+
+**Var ama mevcut kapılarla denenmiyor:** `SAVEPOINT` ve kısmi geri alma,
+`AS OF`/PITR, dosya modu replikasyon, zone map/budama ve
+`ALTER DATABASE KEY`. Bunlar v3'te çalışır; ancak eski özellik kapıları
+(`v3sqlchk`, `pitrchk`, `replchk`, `prochk`, `soakchk`) eski `tests/gates`
+ağacıyla birlikte kaldırıldı ve [Test durumu](#test-durumu) bölümündeki
+hiçbir kapı bunları yeniden sınamıyor. Bu listeyi "güvenmeden önce kapı
+yazılmalı" olarak oku. v2 motoru (MVCC) ağaçta **salt-okunur/göç** yolu
+olarak durur.
 
 Yeni uygulama yazıyorsanız: [UYGULAMA_GELISTIRME.md](UYGULAMA_GELISTIRME.md).
 
@@ -65,11 +74,22 @@ SQL metni → VDbParser → VDbAst → VDbExecutor → VDbTable → IVDbBackend 
 | `VDbWal.pas` | v2 write-ahead log (legacy) |
 | `VDbSkipList.pas` | H3 skiplist indeksi (rank/span destekli) |
 | `VDbCrypt.pas` | AES-256, GCM, anahtar yönetimi |
+| `VDbCryptoCore.pas` / `VDbKdf.pas` | Saf Pascal kripto çekirdeği ve KDF'ler (harici DLL yok) |
 | `VDbNet.pas` | VDBS TCP protokolü |
 | `VDbSqlServer.pas` | TCP SQL sunucusu |
 | `VDbClientNet.pas` | TCP SQL istemcisi |
 | `VDbJson.pas` | JSON dışa/içe aktarma |
 | `VDbDataSet.pas` | Lazarus/Delphi `TDataSet` köprüsü |
+
+### Disk üzerinde
+
+Tüm veri `<ad>.odb` içindedir; yalnız bu dosya açıldığında da çalışır ve motor
+eksik yan dosyaları yeniden üretir. Kullanımdaki veritabanının yanında ayrıca
+`<ad>.odb.wal` (çökme kurtarma), `<ad>.odb.idx` (açılış hızı önbelleği),
+`<ad>.odb.gen` ve `<ad>.odb.log/` (PITR için değişim günlüğü) bulunur. Klasör
+kopyalarken tümünü birlikte kopyala; taşınabilir tek dosya için `BACKUP TO`
+kullan. Ölçülen boyutlar, gerekçeler ve bunu doğrulayan kapı:
+[ON_DISK_LAYOUT.md](docs/engineering/ON_DISK_LAYOUT.md).
 
 ---
 
@@ -78,9 +98,9 @@ SQL metni → VDbParser → VDbAst → VDbExecutor → VDbTable → IVDbBackend 
 ### Derleme
 
 ```bash
-# Windows (Lazarus 4.6+, FPC 3.2.4)
-lazbuild -B sqltest.lpi
+# Windows (Lazarus 4.6+, FPC 3.2.4) — C API kütüphanesi
 lazbuild -B vdbapi.lpi
+# diğer projeler: vdbcli.lpi, vdbmig.lpi, vdbserver.lpi
 
 # Linux/macOS
 ./build_lib.sh
@@ -134,36 +154,38 @@ API ayrıntıları ve SQL kullanımı: [kullanim.md](kullanim.md)
 
 ## Test durumu
 
-Son doğrulanan durum (2026-11-07, `v3` arka ucu):
+Son doğrulanan durum (2026-11-14, Linux x86_64 ve Windows i386, `tests/run_gates.sh`):
 
 | Kapı | Sonuç |
 |---|---|
-| `sqltest --backend=v3` | 2887 / 0 / 33 |
-| `genchk` | 81 / 81 |
-| `xprocc` | 33 / 33 |
-| `v3sqlchk` | 238 / 238 |
-| `concurchk` | 30 / 30 |
-| `commitfailchk` | 29 / 29 |
-| `lockchk` | 36 / 36 |
-| `autoincc` | 15 / 15 |
-| `dropchk` (mod 1-3) | 3 / 3 |
-| diğer kapılar (24 program) | geçti |
+| `sql_stubs` | 25 PASS / 0 FAIL |
+| `sql_matrix` | 61 / 0 |
+| `sql_fuzz` | 5 / 0 |
+| `sql_differential` | 33 / 0 (canlı PostgreSQL karşılaştırması koşulmadı: `pg=not-run`) |
+| `crypto_core` / `crypto_base64` / `crypto_kat` / `selftest_builtin` | PASS |
+| `fixtures_builtin` | PASS |
+| `wal_crash` / `kv_wal` | PASS |
+| `backup_restore` | 25 / 0 |
+| `page_integrity` | 14 / 0 |
+| `btree_integrity` | 152 / 0 |
+| `perf_baseline` | 16 / 0 |
+| `single_file` | 22 / 0 |
+| `server_harden` | 24 / 0 |
+| `auth_throttle` | 16 / 0 |
+| `tls_client` | 6 / 0 (Linux; OpenSSL DLL'i olmayan Windows'ta atlanır) |
 
-Bu toplam **35 kapı koşusudur**: `tests/gates` altındaki 32 kapı programı
-(`dropchk` üç modda koşar) ve `sqltest --backend=v3`. Diğer kapılar:
-`pagechk`, `storechk`, `heapchk`, `crashtest`, `idxchk`, `idxcache`,
-`backendchk`, `colmapchk`, `skipchk`, `mvchk`, `aggchk`, `mmchk`, `poolchk`,
-`poolsafe`, `readlockchk`, `migchk`, `factorychk`, `logchk`, `pitrchk`,
-`btreechk`, `replchk`, `snapchk`, `prochk` ve `nestidx`.
+Linux'ta **19 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
+atlanır), Windows'ta **18 kapı** (`tls_client` atlanır). Kapı belgeleri:
+[docs/engineering/](docs/engineering/).
 
 ```bash
 # Linux / macOS / Git Bash: tüm kapıları derle ve koş
-tests/gates/runall.sh C:\temp\vdbgates
-
-# yalnız SQL paketi
-lazbuild -B tests/sql/sqltest.lpi
-tests/sql/sqltest.exe C:\temp\vdbtest --backend=v3
+tests/run_gates.sh /tmp/vdbgates
 ```
+
+`tests/run_gates.sh` tüm kapıları kendisi derler ve koşar.
+`tests/gates/*` ve `tests/sql/sqltest` eski ağaçla birlikte kaldırıldı;
+SQL davranış kapısı artık `sql_stubs` + `sql_matrix`'dir.
 
 ---
 
@@ -256,14 +278,15 @@ yayılımları ve kök nedenler:
 
 ```
 VDb*.pas            Motor birimleri (giriş noktası: VDbFactory.pas)
-sqltest.lpi/lpr     SQL test paketi (v2 + --backend=v3)
-factorychk.lpi/lpr  Uygulama giriş noktası kapısı (v3/v2 politikası)
+tests/              Kalıcı kapılar (tests/run_gates.sh)
 vdbmig.lpi/lpr      v2 -> v3 göç aracı (bkz. GOC_V2_V3.md)
 vdbapi.*            DLL / C API projesi
+vdbcli.*            Komut satırı
+vdbserver.*         TCP sunucu
 examples/           Örnek projeler (hepsi VDbFactory ile v3 açar)
 yonetim/            GUI yönetici (v3; v2 dosyasında vdbmig yönlendirir)
 docs/               Mimari, mühendislik ve göç notları
-dokuman/            Bu dokümanlar (Git dışı)
+dokuman/            Yerel doküman kopyaları (Git dışı)
 ```
 
 ---

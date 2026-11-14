@@ -27,6 +27,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `sql_differential` | PostgreSQL diferansiyel korpusu + sapma yonetisimi (bkz. `SQL_DIFFERENTIAL.md`) |
 | `btree_integrity` | B+Tree silme/denge/doluluk + yaprak zinciri Next/Prev (bkz. `BTREE_INTEGRITY.md`) |
 | `perf_baseline` | B+Tree/SQL performans tavanlari + olcekleme orani + dogruluk (bkz. `PERF_BASELINE.md`) |
+| `single_file` | "veri tek dosyada" sozlesmesi: yalniz `.odb` kopyasi acilir/yazilir; `BACKUP TO` tek dosya (bkz. `ON_DISK_LAYOUT.md`) |
 | `crypto_core` | saf Pascal AES/GCM/SHA/HMAC cekirdegi |
 | `crypto_base64` | base64 kodlayici/cozucu |
 | `fixtures_builtin` | eski `.odb`/anahtar fixture'lari **builtin** provider ile acilir |
@@ -169,7 +170,8 @@ kaldirildi:
   yeniden dengeleme + kok cokertme + `Prev` zinciri CI'da dogrulandi;
   152 PASS / 0 FAIL. Yerel kanit Git Bash/Windows **16 kapi** PASS
   (tls_client SKIP), WSL x86_64 Linux **17 kapi** PASS.
-- Dokuzuncu kosu (bu commit): `perf_baseline` kapisi eklendi; yerel kanit
+- Dokuzuncu kosu (`2bcd8da`, run 43568883549): **iki platform da YESIL**
+  (`success`). `perf_baseline` kapisi eklendi; yerel kanit
   Git Bash/Windows **17 kapi** PASS (tls_client SKIP), WSL x86_64 Linux
   **18 kapi** PASS (tls_client 6/0 dahil). `perf_baseline`: 16 PASS,
   0 FAIL (iki platformda).
@@ -177,3 +179,9 @@ kaldirildi:
   btree.find 5k **9 ms**, btree.delete 100k **312 ms**, olcek
   25k->50k **59->118 ms (oran 2.00)**, sql.insert 3k **9 662 ms**,
   sql.point-select 3k **1 101 ms**, db dosyasi **102 400 bayt**.
+- Onuncu kosu (bu commit): `single_file` kapisi eklendi; README'lerdeki
+  "tek dosya" ifadesi olculen gercege gore duzeltildi ve
+  `ON_DISK_LAYOUT.md` yazildi. Yerel kanit Git Bash/Windows **18 kapi**
+  PASS (tls_client SKIP), WSL x86_64 Linux **19 kapi** PASS.
+  `single_file`: 22 PASS, 0 FAIL (yalniz `.odb` kopyasi okunur *ve*
+  yazilir; `BACKUP TO` ciktisi tek basina acilir).

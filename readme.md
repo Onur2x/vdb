@@ -1,10 +1,11 @@
 # VDB — Relational Database Engine
 
 VDB is a relational database engine written in pure Free Pascal. It needs no
-external DLL and stores a database in a single `.odb` file. It is designed for
+external DLL, and all data lives in a single `.odb` file. A database that is in
+use also keeps side files next to it (WAL, open cache, change log) — see
+[ON_DISK_LAYOUT.md](docs/engineering/ON_DISK_LAYOUT.md). It is designed for
 desktop and embedded applications as an alternative to SQLite.
 
-> This file lives in `dokuman/` and is intentionally not tracked by Git.
 > Turkish version: [readme_tr.md](readme_tr.md)
 
 ---
@@ -13,7 +14,8 @@ desktop and embedded applications as an alternative to SQLite.
 
 **Engine (v3 page engine, the default):**
 
-- Single-file storage (`.odb`); no server installation required.
+- One data file (`.odb`); no server installation required. Side files are
+  runtime state (WAL, `.idx` cache, change log) and are regenerated if missing.
 - 4 KB pages, slotted heap, per-page CRC32; WAL replay recovers after a
   crash (verified by a kill -9 gate).
 - Only dirty pages go to the WAL per commit; startup uses `.odb.idx` for a
@@ -32,9 +34,13 @@ instead of returning silently wrong results): the v3 engine behind the TCP
 server (`REPLICATION ... TCP`; file-mode log shipping works) and
 `ARCHIVE WAL RESET` (the v3 change log is persistent and cannot be turned
 off — PITR capability is preserved).
-`SAVEPOINT` and partial rollback, `AS OF`/PITR, file-mode replication,
-zone maps/pruning and `ALTER DATABASE KEY` **work** on v3 and are verified
-by gate tests (`v3sqlchk`, `pitrchk`, `replchk`, `prochk`, `soakchk`).
+
+**Implemented but not covered by the current gates:** `SAVEPOINT` and partial
+rollback, `AS OF`/PITR, file-mode replication, zone maps/pruning and
+`ALTER DATABASE KEY`. They work on v3, but the old per-feature gates
+(`v3sqlchk`, `pitrchk`, `replchk`, `prochk`, `soakchk`) were removed together
+with the old `tests/gates` tree and nothing in [Test status](#test-status)
+re-tests them. Treat that list as "needs a gate before relying on it".
 The v2 engine (MVCC) stays in the tree as a **read-only/migration** path.
 
 Writing a new application? See [UYGULAMA_GELISTIRME.md](UYGULAMA_GELISTIRME.md)
@@ -45,25 +51,45 @@ Writing a new application? See [UYGULAMA_GELISTIRME.md](UYGULAMA_GELISTIRME.md)
 ## Architecture
 
 ```
-SQL text → VDbParser → VDbAst → VDbExecutor → VDbTable → VDbCore → .odb
+SQL text → VDbParser → VDbAst → VDbExecutor → VDbTable → IVDbBackend → .odb
+                                                            ├─ VDbBackendV3 → VDbPageEngine (v3, default)
+                                                            └─ VDbBackendV2 → VDbCore (v2, read-only/migration)
 ```
 
 | Unit | Role |
 |---|---|
-| `VDbCore.pas` | Append-only key/value engine, locking, file I/O |
+| `VDbFactory.pas` | **Application entry point**: `VdbOpen` / `VdbOpenOrCreate` / `VdbOpenWithPassword` |
+| `VDbBackendApi.pas` | `IVdbBackend` contract (the SQL layer never sees the concrete engine) |
+| `VDbPageEngine.pas` | v3 page engine (4 KB pages, WAL, recovery, `.idx` cache) |
+| `VDbPageStore.pas` | Page store, file growth, byte-range locking |
+| `VDbBackendV3.pas` | v3 implementation of `IVdbBackend` |
+| `VDbBackendV2.pas` | v2 adapter for `IVdbBackend` (migration/legacy) |
+| `VDbCore.pas` | v2 append-only key/value engine — **legacy, read-only** |
 | `VDbTable.pas` | Schema, indexes, FKs, constraints, partitioning |
 | `VDbAst.pas` | Type-safe AST model |
 | `VDbParser.pas` | Tokenizer + recursive-descent parser |
 | `VDbExecutor.pas` | Filtering, JOINs, grouping, sorting, window functions |
 | `VDbSql.pas` | Public facade: `TVSql.Exec` |
-| `VDbWal.pas` | Write-ahead log, replay, checkpoint |
+| `VDbMigrate.pas` | v2 → v3 copy + byte-for-byte verification |
+| `VDbWal.pas` | v2 write-ahead log (legacy) |
 | `VDbSkipList.pas` | H3 skiplist index (rank/span) |
 | `VDbCrypt.pas` | AES-256, GCM, key management |
+| `VDbCryptoCore.pas` / `VDbKdf.pas` | Pure-Pascal crypto core and KDFs (no external DLL) |
 | `VDbNet.pas` | VDBS TCP protocol |
 | `VDbSqlServer.pas` | TCP SQL server |
 | `VDbClientNet.pas` | TCP SQL client |
 | `VDbJson.pas` | JSON import/export |
 | `VDbDataSet.pas` | Lazarus/Delphi `TDataSet` bridge |
+
+### On disk
+
+All data lives in `<name>.odb`; opening that file alone works, and the engine
+recreates any missing side file. While a database is in use, the engine also
+keeps `<name>.odb.wal` (crash recovery), `<name>.odb.idx` (open-speed cache),
+`<name>.odb.gen` and `<name>.odb.log/` (change log used for PITR). Copy the
+whole set, or use `BACKUP TO` for a portable single file. Measured sizes,
+reasoning and the gate that verifies it:
+[ON_DISK_LAYOUT.md](docs/engineering/ON_DISK_LAYOUT.md).
 
 ---
 
@@ -72,9 +98,9 @@ SQL text → VDbParser → VDbAst → VDbExecutor → VDbTable → VDbCore → .
 ### Build
 
 ```bash
-# Windows (Lazarus 4.6+, FPC 3.2.4)
-lazbuild -B sqltest.lpi
+# Windows (Lazarus 4.6+, FPC 3.2.4) - C API library
 lazbuild -B vdbapi.lpi
+# other projects: vdbcli.lpi, vdbmig.lpi, vdbserver.lpi
 
 # Linux/macOS
 ./build_lib.sh
@@ -82,24 +108,45 @@ lazbuild -B vdbapi.lpi
 
 ### First query (Pascal)
 
+New code does not depend on the concrete engine type; the entry point is
+`VDbFactory`. `VdbOpenOrCreate` creates the file as **v3** when it is missing
+and opens it otherwise. An existing **v2** file is refused by default
+(migration: `vdbmig`, see [GOC_V2_V3.md](GOC_V2_V3.md)).
+
 ```pascal
-uses VDbSql;
+uses VDbBackendApi, VDbFactory, VDbTable, VDbSql;
 
 var
+  Be: IVdbBackend;
+  Tb: TVTableDb;
   DB: TVSql;
   R: TSqlResult;
 begin
-  DB := TVSql.Create('database.odb');
+  VdbOpenOrCreate('veritabani.odb', Be);   // out parameter (see note)
+  Tb := TVTableDb.CreateBackend(Be);
+  DB := TVSql.Create(Tb);
   try
+    Tb.Open('.');
     DB.Exec('CREATE TABLE product (id INTEGER PRIMARY KEY, name TEXT, price FLOAT)', R);
     DB.Exec('INSERT INTO product (name, price) VALUES (''Laptop'', 15000)', R);
     DB.Exec('SELECT name, price FROM product WHERE price > 1000', R);
     // R.Cols, R.Rows, R.Data
   finally
     DB.Free;
+    Tb.Free;
+    Be := nil;                             // closes the engine (releases the file lock)
   end;
 end;
 ```
+
+> **Why an `out` parameter?** In FPC 3.2.4 a function **returning** an
+> `IVdbBackend` leaves an extra reference on the result, so `Be := nil` does
+> not close the engine and the same process cannot reopen the file ("file in
+> use"). The `out` parameter form releases the reference exactly. Details are
+> in the `VDbFactory.pas` header.
+
+Encrypted file: `VdbOpenWithPassword(Path, Password, Be)`. Opening without the
+password, or with a wrong one, is refused.
 
 API details and SQL usage: [usage.md](usage.md)
 
@@ -107,36 +154,38 @@ API details and SQL usage: [usage.md](usage.md)
 
 ## Test status
 
-Last verified state (2026-11-07, `v3` backend):
+Last verified state (2026-11-14, Linux x86_64 and Windows i386, `tests/run_gates.sh`):
 
 | Gate | Result |
 |---|---|
-| `sqltest --backend=v3` | 2887 / 0 / 33 |
-| `genchk` | 81 / 81 |
-| `xprocc` | 33 / 33 |
-| `v3sqlchk` | 238 / 238 |
-| `concurchk` | 30 / 30 |
-| `commitfailchk` | 29 / 29 |
-| `lockchk` | 36 / 36 |
-| `autoincc` | 15 / 15 |
-| `dropchk` (modes 1-3) | 3 / 3 |
-| all other gates (24 programs) | pass |
+| `sql_stubs` | 25 PASS / 0 FAIL |
+| `sql_matrix` | 61 / 0 |
+| `sql_fuzz` | 5 / 0 |
+| `sql_differential` | 33 / 0 (live PostgreSQL comparison not run: `pg=not-run`) |
+| `crypto_core` / `crypto_base64` / `crypto_kat` / `selftest_builtin` | PASS |
+| `fixtures_builtin` | PASS |
+| `wal_crash` / `kv_wal` | PASS |
+| `backup_restore` | 25 / 0 |
+| `page_integrity` | 14 / 0 |
+| `btree_integrity` | 152 / 0 |
+| `perf_baseline` | 16 / 0 |
+| `single_file` | 22 / 0 |
+| `server_harden` | 24 / 0 |
+| `auth_throttle` | 16 / 0 |
+| `tls_client` | 6 / 0 (Linux; skipped on Windows without OpenSSL DLL) |
 
-That is **35 gate runs** in total: the 32 gate programs under `tests/gates`
-(`dropchk` runs in three modes) plus `sqltest --backend=v3`. The other gates
-are `pagechk`, `storechk`, `heapchk`, `crashtest`, `idxchk`, `idxcache`,
-`backendchk`, `colmapchk`, `skipchk`, `mvchk`, `aggchk`, `mmchk`, `poolchk`,
-`poolsafe`, `readlockchk`, `migchk`, `factorychk`, `logchk`, `pitrchk`,
-`btreechk`, `replchk`, `snapchk`, `prochk` and `nestidx`.
+That is **19 gates** on Linux (plus two OpenSSL opt-in gates skipped when
+`VDB_CRYPTO_DLL` is unset) and **18 gates** on Windows (`tls_client` skipped).
+Gate documents: [docs/engineering/](docs/engineering/).
 
 ```bash
 # Linux / macOS / Git Bash: build and run every gate
-tests/gates/runall.sh C:\temp\vdbgates
-
-# or run the SQL suite alone
-lazbuild -B tests/sql/sqltest.lpi
-tests/sql/sqltest.exe C:\temp\vdbtest --backend=v3
+tests/run_gates.sh /tmp/vdbgates
 ```
+
+`tests/run_gates.sh` runs and builds every gate itself.
+`tests/gates/*` and `tests/sql/sqltest` were removed with the old tree;
+the SQL behaviour gate is now `sql_stubs` + `sql_matrix`.
 
 ---
 
@@ -228,8 +277,11 @@ spread and root-cause discussion:
 
 ```
 VDb*.pas            Engine units
-sqltest.lpi/lpr     SQL test suite
+tests/              Persistent gates (tests/run_gates.sh)
 vdbapi.*            DLL / C API project
+vdbcli.*            CLI
+vdbserver.*         TCP server
+vdbmig.*            v2 -> v3 migration tool
 examples/           Sample projects
 yonetim/            GUI admin
 docs/               Architecture, engineering and migration notes

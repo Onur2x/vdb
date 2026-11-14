@@ -133,6 +133,7 @@ build_gate backup_restore "$ROOT/tests/backup_restore/backup_restore.lpr"
 build_gate page_integrity "$ROOT/tests/page_integrity/page_integrity.lpr"
 build_gate btree_integrity "$ROOT/tests/btree_integrity/btree_integrity.lpr"
 build_gate perf_baseline  "$ROOT/tests/perf_baseline/perf_baseline.lpr"
+build_gate single_file    "$ROOT/tests/single_file/single_file.lpr"
 build_gate server_harden "$ROOT/tests/server_harden/server_harden.lpr"
 build_gate auth_throttle "$ROOT/tests/server_harden/auth_throttle.lpr"
 build_gate tls_client    "$ROOT/tests/tls_client/tls_client_gate.lpr"
@@ -156,6 +157,7 @@ run_gate backup_restore "$WORK/backup_restore" backup_restore
 run_gate page_integrity "$WORK/page_integrity" page_integrity
 run_gate btree_integrity "$WORK/btree_integrity" btree_integrity
 run_gate perf_baseline  "$WORK/perf_baseline"  perf_baseline
+run_gate single_file    "$WORK/single_file"    single_file
 run_gate server_harden  "$WORK/server_harden"  server_harden
 run_gate auth_throttle  "$WORK/auth_throttle"  auth_throttle
 
