@@ -25,6 +25,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `sql_matrix` | SQL davranis matrisi: DDL/DML/SELECT/JOIN/agregat/transaction/hata yollari + bos tabloda referans dogrulamasi (bkz. `SQL_COVERAGE.md`) |
 | `sql_fuzz` | ayristirici dayaniklilik: 3000 deterministik bozuk girdi, istisna sizintisi/heap buyumesi/sure siniri |
 | `sql_differential` | PostgreSQL diferansiyel korpusu + sapma yonetisimi (bkz. `SQL_DIFFERENTIAL.md`) |
+| `btree_integrity` | B+Tree silme/denge/doluluk + yaprak zinciri Next/Prev (bkz. `BTREE_INTEGRITY.md`) |
 | `crypto_core` | saf Pascal AES/GCM/SHA/HMAC cekirdegi |
 | `crypto_base64` | base64 kodlayici/cozucu |
 | `fixtures_builtin` | eski `.odb`/anahtar fixture'lari **builtin** provider ile acilir |
@@ -154,10 +155,15 @@ kaldirildi:
   (`success`). Bu kosu Phase 4 `page_integrity` kapisini (I0-I13) ilk kez
   CI'da kosturdu; trunk sayfasi yanlis-pozitif duzeltmesi ve `cur`
   Release duzeltmesi CI'da dogrulandi.
-- Yedinci kosu (bu commit): `sql_differential` kapisi eklendi; yerel kanit
-  Git Bash/Windows **15 kapi** PASS (tls_client SKIP), WSL x86_64 Linux
-  **16 kapi** PASS (tls_client 6/0 dahil).
+- Yedinci kosu (`929348c`, run 43564347378): **iki platform da YESIL**
+  (`success`). `sql_differential` kapisi (PostgreSQL korpusu + sapma
+  yonetisimi) ilk kez CI'da kosturuldu; yerel kanit Git Bash/Windows
+  **15 kapi** PASS (tls_client SKIP), WSL x86_64 Linux **16 kapi** PASS.
   `sql_matrix`: 61 PASS, 0 FAIL (iki platformda).
   `backup_restore`: 25 PASS, 0 FAIL (iki platformda).
   `page_integrity`: 14 PASS, 0 FAIL (iki platformda).
   `sql_differential`: 33 PASS, 0 FAIL, `pg=not-run` (psql yok).
+- Sekizinci kosu (bu commit): `btree_integrity` kapisi eklendi; yerel kanit
+  Git Bash/Windows **16 kapi** PASS (tls_client SKIP), WSL x86_64 Linux
+  **17 kapi** PASS (tls_client 6/0 dahil).
+  `btree_integrity`: 152 PASS, 0 FAIL (iki platformda).

@@ -10,13 +10,17 @@
     Next ile baglidir (aralik taramasi icin).
   - Ic dugumler Entries[i] = sag cocugun (Children[i+1]) ALT SINIR anahtari.
   - Ekleme: yaprak bolunmesi + ust dugum bolunmesi, kok bolunmesi.
-  - SILME YENIDEN DENGELENMEZ: girdi yapraktan cikarilir, dugum birlestirme
-    veya anahtar odunc alma YAPILMAZ. Bos yaprak agacta kalir (taramada
-    atlanir). Bu, B+tree arama degismezlerini bozmaz: ayirici anahtar
-    "sag alt agacin alt siniri" olarak GECERLI kalir (silinen anahtar
-    yalnizca alt siniri asagi ceker, yukari cekmez), cunku arama
-    "E >= ayirici -> saga" kuralini kullanir ve yapraklar zincirle baglidir.
-    Ayni davranis, gercek uygulamalarda "lazy delete" olarak bilinir.
+  - SILME YENIDEN DENGELENIR (v4.1): silme yolunda her ust dugum, cocugu
+    minimum dolulugun altina dustuyse once kardesten anahtar ODUNC ALIR
+    (rotate), kardes de doluysa ayiriciyi asagi indirip dugumleri BIRLESTIRIR
+    (merge). Yaprak birlestirmesi Next/Prev zincirini yerinde onarir.
+    Kok tek cocuga indiginde agac cokertilir. Sonuc: bos veya az dolu
+    dugum agacta KALMAZ (kok haric); derinlik ve doluluk sinirlidir.
+    Onceden silme hic yeniden dengelenmiyordu: bos/az dolu yapraklar
+    agacta kaliyor, yaprak sayisi ve derinlik gereksiz buyuyordu.
+  - Minimum doluluk: yaprakta FMaxKeys div 2, ic dugumde
+    (FMaxKeys-1) div 2 anahtar. Birlestirme bu sinirlarla tasmaz
+    (yaprak: 2*(K div 2) <= K; ic: 2*((K-1) div 2)+1 <= K).
   - SubCount: her dugumde alt agactaki girdi sayisi; RankBefore/CountRange
     O(log N) kalir.
 
@@ -38,7 +42,8 @@ type
     IsLeaf: Boolean;
     Entries: TVDbSkipEntryArray;        // yaprak: girdiler; ic: ayiricilar
     Children: array of TVDbBTreeNode;   // yalniz ic dugum
-    Next: TVDbBTreeNode;                // yaprak zinciri
+    Next: TVDbBTreeNode;                // yaprak zinciri (ileri)
+    Prev: TVDbBTreeNode;                // yaprak zinciri (geri; birlestirme icin)
     SubCount: Int64;                    // alt agactaki girdi sayisi
   end;
 
@@ -56,6 +61,12 @@ type
     function InsertRec(N: TVDbBTreeNode; const E: TVDbSkipEntry;
       out SplitEntry: TVDbSkipEntry; out RightNode: TVDbBTreeNode): Boolean;
     function DeleteRec(N: TVDbBTreeNode; const E: TVDbSkipEntry): Boolean;
+    function MinKeysOf(N: TVDbBTreeNode): Integer;
+    procedure RebalanceChild(P: TVDbBTreeNode; Idx: Integer);
+    procedure BorrowLeft(P: TVDbBTreeNode; Idx: Integer);
+    procedure BorrowRight(P: TVDbBTreeNode; Idx: Integer);
+    procedure MergeAt(P: TVDbBTreeNode; Idx: Integer);
+    function GetHeight: Integer;
     function LeftmostLeaf: TVDbBTreeNode;
     function SeekLeaf(const Key: string; ACompare: TVDbSkipKeyCompare;
       LoInc: Boolean): TVDbBTreeNode;
@@ -90,8 +101,11 @@ type
     function All(out Arr: TVDbSkipEntryArray): Integer;
     { Yapi degismezlerini dogrular; '' = sorun yok. Kapi/test icin. }
     function CheckInvariants: string;
+    { Tanilama olcumleri (kapi icin): agac yuksekligi ve yaprak sayisi. }
+    function LeafCount: Integer;
     property Count: Int64 read FCount;
     property MaxKeys: Integer read FMaxKeys;
+    property Height: Integer read GetHeight;
   end;
 
 implementation
@@ -258,6 +272,8 @@ begin
       SetLength(N.Entries, mid);
       N.SubCount := mid;
       nr.Next := N.Next;
+      if nr.Next <> nil then nr.Next.Prev := nr;
+      nr.Prev := N;
       N.Next := nr;
     end;
     Exit;
@@ -313,12 +329,25 @@ end;
 function TVDbBTree.Delete(const Key, Value: string): Boolean;
 var
   e: TVDbSkipEntry;
+  nr: TVDbBTreeNode;
 begin
   e.Key := Key;
   e.Value := Value;
   e.Cov := '';
   Result := DeleteRec(FRoot, e);
-  if Result then Dec(FCount);
+  if not Result then Exit;
+  Dec(FCount);
+  { Kok artik ayirici tasimiyorsa (tek cocuk kaldiysa) agac cokertilir:
+    yukseklik ve "kok haric minimum doluluk" kurali korunur. }
+  while (FRoot <> nil) and (not FRoot.IsLeaf) and
+        (Length(FRoot.Entries) = 0) do
+  begin
+    nr := FRoot.Children[0];
+    FRoot.Children[0] := nil;
+    SetLength(FRoot.Children, 0);
+    FRoot.Free;
+    FRoot := nr;
+  end;
 end;
 
 function TVDbBTree.DeleteRec(N: TVDbBTreeNode; const E: TVDbSkipEntry): Boolean;
@@ -332,13 +361,248 @@ begin
     if not found then Exit(False);
     for i := pos to High(N.Entries) - 1 do
       N.Entries[i] := N.Entries[i + 1];
+    { Son hucrenin string referanslari temizlenir (dizi kisaltilirken
+      kalan slot sizmasin). }
+    if Length(N.Entries) > 0 then
+    begin
+      N.Entries[High(N.Entries)].Key := '';
+      N.Entries[High(N.Entries)].Value := '';
+      N.Entries[High(N.Entries)].Cov := '';
+    end;
     SetLength(N.Entries, Length(N.Entries) - 1);
     Dec(N.SubCount);
     Exit(True);
   end;
   pos := ChildPos(N, E);
   Result := DeleteRec(N.Children[pos], E);
-  if Result then Dec(N.SubCount);
+  if Result then
+  begin
+    Dec(N.SubCount);
+    RebalanceChild(N, pos);
+  end;
+end;
+
+function TVDbBTree.MinKeysOf(N: TVDbBTreeNode): Integer;
+begin
+  if N = nil then Exit(0);
+  if N.IsLeaf then Result := FMaxKeys div 2
+  else Result := (FMaxKeys - 1) div 2;
+  { Cok kucuk FMaxKeys'te (4) formul 1'in altina dusmez ama savunma
+    amacli taban konur: minimum 1 anahtar. }
+  if Result < 1 then Result := 1;
+end;
+
+procedure TVDbBTree.RebalanceChild(P: TVDbBTreeNode; Idx: Integer);
+var
+  C, L, R: TVDbBTreeNode;
+  mn: Integer;
+begin
+  if (P = nil) or (Idx < 0) or (Idx > High(P.Children)) then Exit;
+  C := P.Children[Idx];
+  if C = nil then Exit;
+  mn := MinKeysOf(C);
+  if Length(C.Entries) >= mn then Exit;
+  { 1) Once kardesten odunc al (rotate); dugum sayisi degismez. }
+  if Idx > 0 then
+  begin
+    L := P.Children[Idx - 1];
+    if Length(L.Entries) > MinKeysOf(L) then
+    begin
+      BorrowLeft(P, Idx);
+      Exit;
+    end;
+  end;
+  if Idx < High(P.Children) then
+  begin
+    R := P.Children[Idx + 1];
+    if Length(R.Entries) > MinKeysOf(R) then
+    begin
+      BorrowRight(P, Idx);
+      Exit;
+    end;
+  end;
+  { 2) Kardesler de doluysa ayiriciyi asagi indirip birlestir. }
+  if Idx > 0 then MergeAt(P, Idx - 1)
+  else MergeAt(P, Idx);
+end;
+
+procedure TVDbBTree.BorrowLeft(P: TVDbBTreeNode; Idx: Integer);
+var
+  C, S: TVDbBTreeNode;
+  e: TVDbSkipEntry;
+  sc: TVDbBTreeNode;
+  i: Integer;
+begin
+  C := P.Children[Idx];
+  S := P.Children[Idx - 1];
+  if C.IsLeaf then
+  begin
+    e := S.Entries[High(S.Entries)];
+    S.Entries[High(S.Entries)].Key := '';
+    S.Entries[High(S.Entries)].Value := '';
+    S.Entries[High(S.Entries)].Cov := '';
+    SetLength(S.Entries, Length(S.Entries) - 1);
+    SetLength(C.Entries, Length(C.Entries) + 1);
+    for i := High(C.Entries) downto 1 do
+      C.Entries[i] := C.Entries[i - 1];
+    C.Entries[0] := e;
+    P.Entries[Idx - 1] := C.Entries[0];
+    S.SubCount := Length(S.Entries);
+    C.SubCount := Length(C.Entries);
+    Exit;
+  end;
+  { Ic dugum: ayirici asagi iner, kardesin son cocugu buraya tasinir. }
+  e := S.Entries[High(S.Entries)];
+  S.Entries[High(S.Entries)].Key := '';
+  S.Entries[High(S.Entries)].Value := '';
+  S.Entries[High(S.Entries)].Cov := '';
+  SetLength(S.Entries, Length(S.Entries) - 1);
+  sc := S.Children[High(S.Children)];
+  S.Children[High(S.Children)] := nil;
+  SetLength(S.Children, Length(S.Children) - 1);
+  SetLength(C.Entries, Length(C.Entries) + 1);
+  for i := High(C.Entries) downto 1 do
+    C.Entries[i] := C.Entries[i - 1];
+  C.Entries[0] := P.Entries[Idx - 1];
+  SetLength(C.Children, Length(C.Children) + 1);
+  for i := High(C.Children) downto 1 do
+    C.Children[i] := C.Children[i - 1];
+  C.Children[0] := sc;
+  P.Entries[Idx - 1] := e;
+  Inc(C.SubCount, sc.SubCount);
+  Dec(S.SubCount, sc.SubCount);
+end;
+
+procedure TVDbBTree.BorrowRight(P: TVDbBTreeNode; Idx: Integer);
+var
+  C, S: TVDbBTreeNode;
+  e: TVDbSkipEntry;
+  sc: TVDbBTreeNode;
+  i: Integer;
+begin
+  C := P.Children[Idx];
+  S := P.Children[Idx + 1];
+  if C.IsLeaf then
+  begin
+    e := S.Entries[0];
+    for i := 0 to High(S.Entries) - 1 do
+      S.Entries[i] := S.Entries[i + 1];
+    S.Entries[High(S.Entries)].Key := '';
+    S.Entries[High(S.Entries)].Value := '';
+    S.Entries[High(S.Entries)].Cov := '';
+    SetLength(S.Entries, Length(S.Entries) - 1);
+    SetLength(C.Entries, Length(C.Entries) + 1);
+    C.Entries[High(C.Entries)] := e;
+    P.Entries[Idx] := S.Entries[0];
+    S.SubCount := Length(S.Entries);
+    C.SubCount := Length(C.Entries);
+    Exit;
+  end;
+  { Ic dugum: kardesin ilk cocugu buraya, ayirici yukari cikar. }
+  e := P.Entries[Idx];
+  sc := S.Children[0];
+  for i := 0 to High(S.Children) - 1 do
+    S.Children[i] := S.Children[i + 1];
+  S.Children[High(S.Children)] := nil;
+  SetLength(S.Children, Length(S.Children) - 1);
+  P.Entries[Idx] := S.Entries[0];
+  for i := 0 to High(S.Entries) - 1 do
+    S.Entries[i] := S.Entries[i + 1];
+  S.Entries[High(S.Entries)].Key := '';
+  S.Entries[High(S.Entries)].Value := '';
+  S.Entries[High(S.Entries)].Cov := '';
+  SetLength(S.Entries, Length(S.Entries) - 1);
+  SetLength(C.Entries, Length(C.Entries) + 1);
+  C.Entries[High(C.Entries)] := e;
+  SetLength(C.Children, Length(C.Children) + 1);
+  C.Children[High(C.Children)] := sc;
+  Inc(C.SubCount, sc.SubCount);
+  Dec(S.SubCount, sc.SubCount);
+end;
+
+procedure TVDbBTree.MergeAt(P: TVDbBTreeNode; Idx: Integer);
+var
+  L, R: TVDbBTreeNode;
+  i, nL, nR: Integer;
+begin
+  if (P = nil) or (Idx < 0) or (Idx + 1 > High(P.Children)) then Exit;
+  L := P.Children[Idx];
+  R := P.Children[Idx + 1];
+  nL := Length(L.Entries);
+  nR := Length(R.Entries);
+  if L.IsLeaf then
+  begin
+    SetLength(L.Entries, nL + nR);
+    for i := 0 to nR - 1 do
+      L.Entries[nL + i] := R.Entries[i];
+    L.SubCount := L.SubCount + R.SubCount;
+    SetLength(R.Entries, 0);
+    { Yaprak zinciri yerinde onarilir: R cikar, Prev baglantisi tazelenir. }
+    L.Next := R.Next;
+    if R.Next <> nil then R.Next.Prev := L;
+    R.Next := nil;
+    R.Prev := nil;
+    R.Free;
+  end
+  else
+  begin
+    { Ic dugum: L + ayirici + R anahtarlari. Birlestirme tasmaz:
+      2*((K-1) div 2) + 1 <= K. }
+    SetLength(L.Entries, nL + 1 + nR);
+    L.Entries[nL] := P.Entries[Idx];
+    for i := 0 to nR - 1 do
+      L.Entries[nL + 1 + i] := R.Entries[i];
+    SetLength(R.Entries, 0);
+    nR := Length(R.Children);
+    nL := Length(L.Children);
+    SetLength(L.Children, nL + nR);
+    for i := 0 to nR - 1 do
+      L.Children[nL + i] := R.Children[i];
+    SetLength(R.Children, 0);
+    L.SubCount := L.SubCount + R.SubCount;
+    R.Free;
+  end;
+  { Ayirici ve sag cocuk ust dugumden cikarilir. }
+  for i := Idx to High(P.Entries) - 1 do
+    P.Entries[i] := P.Entries[i + 1];
+  if Length(P.Entries) > 0 then
+  begin
+    P.Entries[High(P.Entries)].Key := '';
+    P.Entries[High(P.Entries)].Value := '';
+    P.Entries[High(P.Entries)].Cov := '';
+  end;
+  SetLength(P.Entries, Length(P.Entries) - 1);
+  for i := Idx + 1 to High(P.Children) - 1 do
+    P.Children[i] := P.Children[i + 1];
+  P.Children[High(P.Children)] := nil;
+  SetLength(P.Children, Length(P.Children) - 1);
+end;
+
+function TVDbBTree.GetHeight: Integer;
+var
+  n: TVDbBTreeNode;
+begin
+  Result := 0;
+  n := FRoot;
+  while n <> nil do
+  begin
+    Inc(Result);
+    if n.IsLeaf then Break;
+    n := n.Children[0];
+  end;
+end;
+
+function TVDbBTree.LeafCount: Integer;
+var
+  n: TVDbBTreeNode;
+begin
+  Result := 0;
+  n := LeftmostLeaf;
+  while n <> nil do
+  begin
+    Inc(Result);
+    n := n.Next;
+  end;
 end;
 
 function TVDbBTree.LeftmostLeaf: TVDbBTreeNode;
@@ -423,26 +687,35 @@ procedure TVDbBTree.LoadSorted(const Arr: TVDbSkipEntryArray);
 var
   cur, nxt: array of TVDbBTreeNode;
   leaf, prev, nd: TVDbBTreeNode;
-  i, j, k, cnt, total: Integer;
+  i, j, k, cnt, total, nLeaf, base, rem, nn, c: Integer;
   sp: TVDbSkipEntry;
 begin
   Clear;
   total := Length(Arr);
   if total = 0 then Exit;
   SetLength(cur, 0);
+  { Yapraklar ESIT dagitilir: son yaprak "artik" olup minimumun altina
+    dusmez; boylece yukleme sonrasi agac da silme sonrasiyla ayni doluluk
+    sozlesmesini saglar. }
+  nLeaf := (total + FMaxKeys - 1) div FMaxKeys;
+  if nLeaf < 1 then nLeaf := 1;
   i := 0;
   prev := nil;
-  while i < total do
+  for k := 0 to nLeaf - 1 do
   begin
-    cnt := total - i;
-    if cnt > FMaxKeys then cnt := FMaxKeys;
+    cnt := total div nLeaf;
+    if k < (total mod nLeaf) then Inc(cnt);
     leaf := TVDbBTreeNode.Create;
     leaf.IsLeaf := True;
     SetLength(leaf.Entries, cnt);
     for j := 0 to cnt - 1 do
       leaf.Entries[j] := Arr[i + j];
     leaf.SubCount := cnt;
-    if prev <> nil then prev.Next := leaf;
+    if prev <> nil then
+    begin
+      prev.Next := leaf;
+      leaf.Prev := prev;
+    end;
     prev := leaf;
     SetLength(cur, Length(cur) + 1);
     cur[High(cur)] := leaf;
@@ -451,12 +724,19 @@ begin
   // ust seviyeler
   while Length(cur) > 1 do
   begin
+    c := Length(cur);
+    { Dugum basina cocuk sayisi esit dagitilir; son dugum eksik cocuklu
+      kalmaz. nn = ceil(c / (K+1)). }
+    nn := (c + FMaxKeys) div (FMaxKeys + 1);
+    if nn < 1 then nn := 1;
     SetLength(nxt, 0);
     i := 0;
-    while i <= High(cur) do
+    for k := 0 to nn - 1 do
     begin
-      cnt := High(cur) - i + 1;
-      if cnt > FMaxKeys + 1 then cnt := FMaxKeys + 1;   // cocuk sayisi
+      cnt := c div nn;
+      if k < (c mod nn) then Inc(cnt);
+      if cnt < 2 then cnt := 2;   // savunma: ic dugum en az 2 cocuk
+      if i + cnt > c then cnt := c - i;
       nd := TVDbBTreeNode.Create;
       nd.IsLeaf := False;
       SetLength(nd.Children, cnt);
@@ -468,10 +748,10 @@ begin
         sp := MinEntry(nd.Children[j]);
         nd.Entries[j - 1] := sp;
       end;
-      k := 0;
+      base := 0;
       for j := 0 to cnt - 1 do
-        Inc(k, nd.Children[j].SubCount);
-      nd.SubCount := k;
+        Inc(base, nd.Children[j].SubCount);
+      nd.SubCount := base;
       SetLength(nxt, Length(nxt) + 1);
       nxt[High(nxt)] := nd;
       Inc(i, cnt);
@@ -639,8 +919,10 @@ function TVDbBTree.CheckInvariants: string;
     x: TVDbBTreeNode;
   begin
     x := N;
-    while not x.IsLeaf do
+    while (x <> nil) and (not x.IsLeaf) do
       x := x.Children[0];
+    if (x = nil) or (Length(x.Entries) = 0) then
+      Exit(Default(TVDbSkipEntry));
     Result := x.Entries[0];
   end;
 
@@ -649,8 +931,10 @@ function TVDbBTree.CheckInvariants: string;
     x: TVDbBTreeNode;
   begin
     x := N;
-    while not x.IsLeaf do
+    while (x <> nil) and (not x.IsLeaf) do
       x := x.Children[High(x.Children)];
+    if (x = nil) or (Length(x.Entries) = 0) then
+      Exit(Default(TVDbSkipEntry));
     Result := x.Entries[High(x.Entries)];
   end;
 
@@ -663,6 +947,9 @@ function TVDbBTree.CheckInvariants: string;
     if N = nil then Exit('nil dugum');
     if N.IsLeaf then
     begin
+      { Kok disinda bos yaprak KALMAZ (silme yeniden dengelenir). }
+      if (Length(N.Entries) = 0) and (N <> FRoot) then
+        Exit('bos yaprak dugum');
       if Int64(Length(N.Entries)) <> N.SubCount then
         Exit(Format('yaprak SubCount %d <> %d', [N.SubCount, Length(N.Entries)]));
       for i := 1 to High(N.Entries) do
@@ -697,25 +984,62 @@ function TVDbBTree.CheckInvariants: string;
       Exit(Format('ic dugum SubCount %d <> %d', [N.SubCount, total]));
   end;
 
+  { Minimum doluluk: kok haric her dugum MinKeysOf kadar anahtar tasir.
+    Bu, silme sonrasi bos/az dolu dugum kalmadiginin dogrudan kanitidir. }
+  function MinWalk(N: TVDbBTreeNode; IsRoot: Boolean): string;
+  var
+    i, need: Integer;
+  begin
+    Result := '';
+    if N = nil then Exit('nil dugum');
+    if not IsRoot then
+    begin
+      need := MinKeysOf(N);
+      if Length(N.Entries) < need then
+        Exit(Format('minimum doluluk ihlali: %d < %d',
+          [Length(N.Entries), need]));
+    end;
+    if not N.IsLeaf then
+    begin
+      if Length(N.Children) < 2 then
+        Exit(Format('ic dugumde %d cocuk (en az 2 olmali)',
+          [Length(N.Children)]));
+      for i := 0 to High(N.Children) do
+      begin
+        Result := MinWalk(N.Children[i], False);
+        if Result <> '' then
+        begin
+          Result := Format('cocuk %d: %s', [i, Result]);
+          Exit;
+        end;
+      end;
+    end;
+  end;
+
 var
-  n: TVDbBTreeNode;
+  n, prevN: TVDbBTreeNode;
   i, cnt: Integer;
 begin
   Result := Walk(FRoot);
   if Result <> '' then Exit;
-  // yaprak zinciri: global sira + sayi
+  Result := MinWalk(FRoot, True);
+  if Result <> '' then Exit;
+  // yaprak zinciri: Prev/Next tutarliligi + global sira + sayi
   cnt := 0;
+  prevN := nil;
   n := LeftmostLeaf;
-  while (n <> nil) and (n.Next <> nil) do
+  while n <> nil do
   begin
-    if Length(n.Entries) > 0 then
-      if Cmp(n.Entries[High(n.Entries)], n.Next.Entries[0]) >= 0 then
+    if not n.IsLeaf then Exit('yaprak zincirinde ic dugum');
+    if n.Prev <> prevN then Exit('yaprak zinciri Prev baglantisi bozuk');
+    if (prevN <> nil) and (Length(prevN.Entries) > 0) and
+       (Length(n.Entries) > 0) then
+      if Cmp(prevN.Entries[High(prevN.Entries)], n.Entries[0]) >= 0 then
         Exit('yaprak zinciri sirasi bozuk');
-    if n.Next.IsLeaf = False then Exit('yaprak zincirinde ic dugum');
     Inc(cnt, Length(n.Entries));
+    prevN := n;
     n := n.Next;
   end;
-  if n <> nil then Inc(cnt, Length(n.Entries));
   if Int64(cnt) <> FCount then
     Exit(Format('zincirde %d girdi, FCount %d', [cnt, FCount]));
 end;

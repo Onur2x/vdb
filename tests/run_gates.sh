@@ -131,6 +131,7 @@ build_gate wal_crash     "$ROOT/tests/wal_crash/wal_crash_matrix.lpr"
 build_gate kv_wal        "$ROOT/tests/wal_crash/kv_wal_matrix.lpr"
 build_gate backup_restore "$ROOT/tests/backup_restore/backup_restore.lpr"
 build_gate page_integrity "$ROOT/tests/page_integrity/page_integrity.lpr"
+build_gate btree_integrity "$ROOT/tests/btree_integrity/btree_integrity.lpr"
 build_gate server_harden "$ROOT/tests/server_harden/server_harden.lpr"
 build_gate auth_throttle "$ROOT/tests/server_harden/auth_throttle.lpr"
 build_gate tls_client    "$ROOT/tests/tls_client/tls_client_gate.lpr"
@@ -152,6 +153,7 @@ run_gate wal_crash      "$WORK/wal_crash"      wal_crash_matrix
 run_gate kv_wal         "$WORK/kv_wal"         kv_wal_matrix
 run_gate backup_restore "$WORK/backup_restore" backup_restore
 run_gate page_integrity "$WORK/page_integrity" page_integrity
+run_gate btree_integrity "$WORK/btree_integrity" btree_integrity
 run_gate server_harden  "$WORK/server_harden"  server_harden
 run_gate auth_throttle  "$WORK/auth_throttle"  auth_throttle
 
