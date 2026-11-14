@@ -129,10 +129,19 @@ kaldirildi:
   Betik artik derlemeden once `mkdir -p "$FI/lib"` yapar. Ayrica
   basarisizlik anotasyonu artik `Error:`/`Fatal:` satirlarini da tasir;
   onceki surum yalniz "BUILD FAIL <ad>" yazdigi icin kok neden gizlenmisti.
-- Ucuncu kosu (`7ae62c2`): `gates (ubuntu-latest)` **basarili** (Linux ilk
-  kez yesil), `gates (windows-latest)` gozlem aninda hala kosuyordu; bu
-  commit'te Windows sonucu **dogrulanmadi**. Not: bu kosu `sql_matrix`
-  kapisini icermez (kapi sonraki commit'te eklendi).
+- Ucuncu kosu (`7ae62c2`, run 43552816622): `gates (ubuntu-latest)`
+  **basarili** (Linux ilk kez yesil); `gates (windows-latest)`
+  **basarisiz** — adim 8 "Build and run gates". Anotasyon kok nedeni
+  gosterdi: `FAIL scram_verifier.txt: sha256 pini` +
+  `AddUser formulu yeniden-turetimi` → `fixtures_builtin (exit 2)`.
+  Kok neden yerelde birebir uretildi: Windows runner'da
+  `core.autocrlf=true` temiz checkout'ta fixture metnini CRLF'e cevirir
+  (666 → 678 bayt); kapi `gen_fixtures verify` kosar (yeniden uretmez) ve
+  pin bayt duzeyindedir. Yerelde gorulmemesinin nedeni, dosyanin
+  generator tarafindan LF ile yeniden yazilmis olmasiydi. Duzeltme:
+  `.gitattributes` icinde `tests/crypto_fixtures/fixtures/** -text`.
+  Temiz klonda dogrulandi: duzeltme oncesi 20/2 FAIL (CI ile ayni),
+  sonrasi 22/0 PASS.
 - Yerel kanit (bu commit): Git Bash/Windows 12 kapi PASS (tls_client SKIP),
   WSL x86_64 Linux **13 kapi PASS** (tls_client 6/0 dahil).
   `sql_matrix`: 61 PASS, 0 FAIL (iki platformda).
