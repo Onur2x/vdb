@@ -148,7 +148,12 @@ kaldirildi:
 - Besinci kosu (`0381d53`, run 43558258898): **iki platform da YESIL**
   (`success`). Bu kosu Phase 4 `backup_restore` kapisini (B0-B24) ilk kez
   CI'da kosturdu.
-- Yerel kanit (bu commit): Git Bash/Windows **13 kapi** PASS (tls_client
-  SKIP), WSL x86_64 Linux **14 kapi** PASS (tls_client 6/0 dahil).
+- Altinci kosu (`a1048e9`, run 43562165305): **iki platform da YESIL**
+  (`success`). Bu kosu Phase 4 `page_integrity` kapisini (I0-I13) ilk kez
+  CI'da kosturdu; trunk sayfasi yanlis-pozitif duzeltmesi ve `cur`
+  Release duzeltmesi CI'da dogrulandi.
+- Yerel kanit (bu commit): Git Bash/Windows **14 kapi** PASS (tls_client
+  SKIP), WSL x86_64 Linux **15 kapi** PASS (tls_client 6/0 dahil).
   `sql_matrix`: 61 PASS, 0 FAIL (iki platformda).
   `backup_restore`: 25 PASS, 0 FAIL (iki platformda).
+  `page_integrity`: 14 PASS, 0 FAIL (iki platformda).
