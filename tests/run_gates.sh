@@ -105,6 +105,9 @@ skip_gate() {
 FI=$ROOT/tests/crypto_fixtures
 # Eski ikili kalmis olabilir; bayat exe "PASS" yanilsamasi uretir.
 rm -f "$FI/gen_fixtures$EXE"
+# Temiz checkout'ta lib dizini YOKTUR; fpc -FU hedefini kendisi yaratmaz.
+# (CI'da tam bu yuzden "BUILD FAIL crypto_fixtures" alindi.)
+mkdir -p "$FI/lib"
 if "$FPC" -MObjFPC -Scghi -O1 -g -l -vewnhibq \
     "-Fu$(npath "$ROOT")" "-FU$(npath "$FI/lib")" "-FE$(npath "$FI")" \
     "$(npath "$FI/gen_fixtures.lpr")" \
@@ -117,6 +120,7 @@ else
 fi
 
 build_gate sql_stubs     "$ROOT/tests/sql_stubs/sql_stubs.lpr"
+build_gate sql_fuzz      "$ROOT/tests/sql_fuzz/sql_fuzz.lpr"
 build_gate crypto_core   "$ROOT/tests/crypto_core/core_smoke.lpr"
 build_gate crypto_base64 "$ROOT/tests/crypto_base64/base64_runner.lpr"
 build_gate crypto_selftest "$ROOT/tests/crypto_selftest/selftest_runner.lpr"
@@ -132,6 +136,7 @@ unset VDB_CRYPTO_PROVIDER 2>/dev/null || true
 unset VDB_CRYPTO_DLL 2>/dev/null || true
 
 run_gate sql_stubs      "$WORK/sql_stubs"      sql_stubs
+run_gate sql_fuzz       "$WORK/sql_fuzz"       sql_fuzz
 run_gate crypto_core    "$WORK/crypto_core"    core_smoke
 run_gate crypto_base64  "$WORK/crypto_base64"  base64_runner
 run_gate fixtures_builtin "$FI"                gen_fixtures verify

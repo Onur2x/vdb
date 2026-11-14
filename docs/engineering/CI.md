@@ -22,6 +22,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | Kapi | Ne dogrular |
 |---|---|
 | `sql_stubs` | RETURNING/TRIGGER/FUNCTION/PROCEDURE yuzeyi; sessiz yanlis sonuc yok |
+| `sql_fuzz` | ayristirici dayaniklilik: 3000 deterministik bozuk girdi, istisna sizintisi/heap buyumesi/sure siniri |
 | `crypto_core` | saf Pascal AES/GCM/SHA/HMAC cekirdegi |
 | `crypto_base64` | base64 kodlayici/cozucu |
 | `fixtures_builtin` | eski `.odb`/anahtar fixture'lari **builtin** provider ile acilir |
@@ -112,7 +113,17 @@ kaldirildi:
   maddesi). Ubuntu nedeninin adim logu anonim erisimle okunamadi
   (GitHub log indirme kimlik dogrulamasi istiyor); bu yuzden o adim
   ucuncu-taraf action'dan bagimsiz, ciktisini acikca loglayan `apt-get`
-  kurulumuna cevrildi. **Yeni kosunun sonucu henuz dogrulanmadi** —
-  yesil oldugu iddia edilmiyor.
-- Yerel kanit: Windows 11 kapi seti (Git Bash, 10 kapi) + WSL x86_64
-  Linux kapi seti (11 kapi), bkz. `docs/engineering/BASELINE.md`.
+  kurulumuna cevrildi.
+- Ikinci GitHub Actions kosusu (`e1c4654`, run "CI" #43551308899):
+  `gates (ubuntu-latest)` **basarisiz**, `gates (windows-latest)` hala
+  kosuyordu. Ubuntu'nun dustugu adim artik okunabildi (check-run
+  anotasyonu): `BUILD FAIL crypto_fixtures` / `MISSING fixtures_builtin`.
+  Kok neden yerelde birebir uretildi: **temiz checkout'ta
+  `tests/crypto_fixtures/lib` dizini yoktur ve `fpc -FU` hedef dizini
+  kendisi yaratmaz** (`Can't create object file .../lib/VDbCryptoCore.o`).
+  WSL'de dizin eski kosulardan kalmis oldugu icin sorun gorunmuyordu.
+  Betik artik derlemeden once `mkdir -p "$FI/lib"` yapar. Ayrica
+  basarisizlik anotasyonu artik `Error:`/`Fatal:` satirlarini da tasir;
+  onceki surum yalniz "BUILD FAIL <ad>" yazdigi icin kok neden gizlenmisti.
+- Yerel kanit: Windows 11 kapi seti (Git Bash, 11 kapi) + WSL x86_64
+  Linux kapi seti (12 kapi), bkz. `docs/engineering/BASELINE.md`.

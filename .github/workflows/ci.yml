@@ -100,7 +100,9 @@ jobs:
           if [ "$rc" -ne 0 ]; then
             # Basarisiz adimlar check-run anotasyonu olarak da yazilir;
             # boylece log indirme yetkisi olmadan da hata gorulebilir.
-            grep -E '^(BUILD FAIL|FAIL|MISSING)' gates.out | head -n 10 |
+            # Derleyici tani satirlari (Error:/Fatal:) de dahil edilir; yalniz
+            # "BUILD FAIL <ad>" satiri kok nedeni gostermiyordu.
+            grep -E '^(BUILD FAIL|FAIL|MISSING)|Error:|Fatal:' gates.out | head -n 20 |
               while IFS= read -r line; do echo "::error::$line"; done
             tail -n 15 gates.out | while IFS= read -r line; do
               echo "::error::tail: $line"
