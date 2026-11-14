@@ -14,7 +14,7 @@ vermek degil, sinirlari yazmak.
 
 | Denetlendi | Nasil |
 |---|---|
-| Kapi kumesi ve ciktisi | `tests/run_gates.sh` (19 kapi), iki platform |
+| Kapi kumesi ve ciktisi | `tests/run_gates.sh` (20 kapi), iki platform |
 | CI matrisi | `.github/workflows/ci.yml`, GitHub Actions kosulari |
 | Kripto yolu | `docs/architecture/CRYPTO_ADR.md` + `crypto_*` kapilari |
 | Depolama dayanikliligi | `WAL_RECOVERY_AUDIT.md`, `wal_crash`, `kv_wal` |
@@ -36,7 +36,7 @@ testi, bagimsiz kripto incelemesi.
 
 ### 2.1 Kapilar
 
-19 kapi, `tests/run_gates.sh`:
+20 kapi, `tests/run_gates.sh`:
 
 | Kapi | Linux (WSL x86_64) | Windows (Git Bash, i386) |
 |---|---|---|
@@ -50,7 +50,8 @@ testi, bagimsiz kripto incelemesi.
 | `page_integrity` | 14 / 0 | 14 / 0 |
 | `btree_integrity` | 152 / 0 | 152 / 0 |
 | `perf_baseline` | 16 / 0 | 16 / 0 |
-| `single_file` | 22 / 0 | 22 / 0 |
+| `single_file` | 35 / 0 | 35 / 0 |
+| `region_stream` | 13 / 0 | 13 / 0 |
 | `server_harden` | 24 / 0 | 24 / 0 |
 | `auth_throttle` | 16 / 0 | 16 / 0 |
 | `tls_client` | 6 / 0 | **SKIP** (OpenSSL DLL yok) |
@@ -203,7 +204,7 @@ sistemiyle denenmesi.
 ## 9. Tekrar uretme
 
 ```sh
-./tests/run_gates.sh                 # 19 kapi, cikti build/gates/
+./tests/run_gates.sh                 # 20 kapi, cikti build/gates/
 ```
 
 Windows (Git Bash) ayni betigi kosar; `tls_client` OpenSSL DLL'i yoksa
