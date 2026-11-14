@@ -115,8 +115,10 @@ dosyasi yaninda durur, kapaninca silinir. Kalici durum tek dosyadir.
 **Neden WAL calisirken ayri?** WAL'i veri dosyasinin icine almak yarim
 kalan sayfa yazimi ile gunluk kaydini ayni dosyada yaristirir; crash
 guvenligi geri gider (SQLite da WAL modunda ayri `-wal` tutar). Bu yuzden
-"gercek tek dosya container" (v4 format: gomulu WAL bolgesi) hala
-yapilmadi ve **acik bir is kalemidir** (`ON_DISK_LAYOUT.md` §7).
+"gercek tek dosya container" (v4 format: gomulu WAL bolgesi) **sahip
+karariyla durduruldu** (2026-11-14): veri kaybi riski kabul edilmedi.
+Tasarim `V4_CONTAINER_DESIGN.md`'de tarihce olarak duruyor; format
+degismedi, `VDB_FILE_VER` hala **5**.
 
 Dolayisiyla bu surum sunu soyleyebilir: *"veri tek `.odb` dosyasindadir;
 motor acikken yaninda calisma dosyalari olusur ve temiz kapanista silinir;
@@ -126,7 +128,8 @@ yazar. **"Calisirken de tek fiziksel dosya" iddiasi bu surumde YOKTUR.**
 Mode A bir **RC engeli mi?** Urun davranisi acisindan degil (veri kaybi
 yok, kapi var, belge dogru, kapanista tek dosya). Skill'in kabul kriteri
 acisindan **kismen karsilanmistir**: kalici durum tek dosya, calisma durumu
-degil. v4 container isi acik kalir.
+degil. "Calisirken de tek dosya" isi sahip karariyla **kapatildi**
+(kabul edilmis urun karari, eksik degil).
 
 ## 5. Risk register durumu (THREAT_MODEL.md)
 
@@ -190,10 +193,10 @@ sistemiyle denenmesi.
 3. **TLS alt surum pinleme** (R-05) ve idle/query timeout (R-04).
 4. **Canli PostgreSQL diferansiyeli**: `psql` olan bir CI isi
    (`pg=not-run` yerine gercek kosum).
-5. **Tek dosya Mode A (v4)**: calisirken WAL + sayac bolgesini `.odb`
-   icine gomme (gomulu WAL bolgesi + `VDB_FILE_VER=6`). Kalici durum artik
-   tek dosya; kalan fark yalnizca calisma anidir. Ayri tasarim + fault
-   injection ister.
+5. **Tek dosya Mode A (v4) — KAPATILDI**: sahip karari (2026-11-14) ile
+   yapilmayacak. Kalici durum tek dosya (`A`, PHASE-9); calisma aninda yan
+   dosya bulunmasi bilincli bir guvenlik tercihidir (bkz.
+   `ON_DISK_LAYOUT.md` §3, `V4_CONTAINER_DESIGN.md`).
 6. **Imzalama/provenance**: ilk ikili yayinlandiginda Sigstore + SLSA.
 7. **Bagimsiz inceleme** (skill §16/15): kripto ve depolama icin.
 

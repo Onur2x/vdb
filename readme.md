@@ -98,6 +98,12 @@ keeps an `.idx` open-speed cache. Measured sizes, reasoning and the gate that
 verifies all of this:
 [ON_DISK_LAYOUT.md](docs/engineering/ON_DISK_LAYOUT.md).
 
+Keeping the WAL in its own file *while the engine is running* is a deliberate
+crash-safety choice, not an unfinished feature: folding it into `.odb` would
+put a half-written page and its log record in the same file. The `.odb` format
+is unchanged (version 5); a v5 file is never converted. Older v3/v4 files open
+and are upgraded to v5 on a writable open, exactly as before.
+
 ---
 
 ## Quick start

@@ -98,6 +98,12 @@ isteğe bağlı olarak `.idx` açılış önbelleğini saklar. Ölçülen boyutl
 gerekçeler ve bunu doğrulayan kapı:
 [ON_DISK_LAYOUT.md](docs/engineering/ON_DISK_LAYOUT.md).
 
+WAL'in **motor çalışırken** ayrı dosyada durması bilinçli bir çökme güvenliği
+tercihidir, yarım kalmış bir özellik değil: WAL'i `.odb` içine gömmek yarım
+yazılmış bir sayfa ile günlük kaydını aynı dosyaya koyar. `.odb` formatı
+değişmedi (sürüm 5); v5 dosya hiçbir zaman dönüştürülmez. Eski v3/v4
+dosyalar açılır ve eskisi gibi yazılabilir açılışta v5'e yükseltilir.
+
 ---
 
 ## Hızlı başlangıç

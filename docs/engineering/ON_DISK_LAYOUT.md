@@ -75,9 +75,43 @@ kapandıktan sonra) `dir` çıktısı da tek satırdır: `veritabani.odb`
 3. `FWal.Close` — WAL tutamacı **kilit altında** kapatılır (Windows açık
    tutamaçlı dosyayı silmez).
 4. `DropSideFiles(True)` — `.idx` silinir, `.wal` **boşsa** silinir.
+5. `FStore.Close` — süreçler arası tam kilit hâlâ bizdeyken `.gen` silinir
+   (`DropGenOnClose`).
 
 Checkpoint herhangi bir nedenle başarısız olursa (`closeOk = False`) yan
 dosyalara **dokunulmaz**: WAL'deki commit'ler tek kurtarma kaynağıdır.
+
+### Her dosya neden atılabilir?
+
+| Dosya | İçinde ne var | Silinirse ne olur |
+|---|---|---|
+| `.wal` | commit'lenmiş ama henüz `.odb`'ye yazılmamış sayfalar | **Yalnız boşken silinir** (`VDbFileBytes <= 4096`, yani sadece başlık). Checkpoint adım 2'de tüm commit'ler `.odb`'ye yazılıp fsync edildiği için boştur. Doluysa `DropSideFiles` **dokunmaz**. |
+| `.idx` | anahtar dizininin kopyası (önbellek) | Kayıp yok: bir sonraki açılış tam tarama yapar (`VDbPageHeap`, `.idx` yoksa taranır). Tek kopya değildir. |
+| `.gen` | değişiklik sayacı, durabil LSN, paylaşım kilitleri | Kalıcı veri yok. Yeniden oluşturulur; dosya kimliği eşleşmezse durabil LSN `0`'a döner — bu yalnızca **fazladan bir fsync** demektir (`FSyncCs` yolunda `DurableLsn` sadece "başkası zaten fsync etti" atlaması için kullanılır). |
+| `.log/`, `.gen` (changelog tabanı) | PITR / replikasyon geçmişi | Varsayılan olarak zaten üretilmez (`ChangeLogEnabled = False`). Açıksa silinmez. |
+
+### Silme başarısız olursa?
+
+Her silme `try ... except` içinde ve **sessizce yutulur**. En kötü durumda
+dosya kalır: bu, eski (çok dosyalı) davranıştır ve veri açısından zararsızdır.
+Örneğin Windows'ta başka bir süreç `.wal` tutamacını açık tutuyorsa
+`DeleteFile` başarısız olur, dosya yerinde kalır. Yani "tek dosya" bir
+iyileştirmedir; tutmazsa geriye düşer, hata üretmez.
+
+### Neden başka süreç araya giremiyor?
+
+`AcquireDataWrite` tam (exclusive) kilit alır. Paylaşımlı kilit tutan bir
+okuyucu varsa kapanış bu kilidi **bekler**; kilit alındıktan sonra başka
+süreç aynı veritabanını açamaz (paylaşımlı kilitler tam kilitle çelişir).
+Bu yüzden adım 2–5 arasında başka bir süreç WAL'e commit ekleyemez.
+
+### Çökme silme sırasında olursa?
+
+Silme **kapanışın en sonunda** ve tüm commit'ler `.odb`'ye yazıldıktan
+sonra yapılır. Yarım kalmış bir silme (örneğin `.wal` silindi, `.gen`
+silinmedi) veri kaybı üretmez: kalan dosya yeniden üretilebilir bir
+yardımcıdır. Tersi durum (`.wal` dolu kaldı) kurtarma tarafından uygulanır.
+
 
 ## 4. Çökme senaryosu: yan dosyalar kalır ve kurtarma onları kullanır
 

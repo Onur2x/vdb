@@ -1,7 +1,19 @@
 # v4 container: calisirken de tek fiziksel dosya
 
-Durum: **tasarim** (kod yok). Onaylanan hedef: motor acikken `<db>.odb`
-yaninda `.wal` ve `.gen` olusmasin; her sey tek dosyada olsun.
+> **DURDURULDU (sahip karari, 2026-11-14).** Bu is **uygulanmayacak**.
+> Sebep: veri kaybi riski kabul edilmedi. Motor acikken WAL ve sayaci ayni
+> dosyaya almak (`VDB_FILE_VER = 6`) iki sey getiriyordu - calisirken tek
+> fiziksel dosya ve daha zor bir cokme modeli - ve karsiliginda tek baslik
+> kopyasi (torn page 0) riskini buyutuyordu. `A` (PHASE-9) zaten **kalici
+> durumu** tek dosya yapti: temiz kapanistan sonra dizinde yalniz `.odb`
+> kalir. Sahip "riskli isler istemiyorum" dedi; bu belge yalnizca tarihce
+> ve ileride yeniden acilirsa baslangic noktasi olarak duruyor.
+>
+> Buna ragmen yazilmis **tek kod parcasi** `VDbRegion.pas` +
+> `tests/region_stream` (13 kontrol): motorda **kullanilmiyor**, bagimsiz ve
+> yesil. Format degismedigi icin `VDB_FILE_VER` **5** kalir.
+>
+> Durum: **tasarim, uygulanmadi.**
 
 Bu belge format degisikliginin (v6) sozlesmesidir. Kod yazmadan once
 yerlesim, cokme sirasi ve geri uyumluluk net olmali; aksi halde yarim
