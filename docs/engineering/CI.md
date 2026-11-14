@@ -23,14 +23,16 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 |---|---|
 | `sql_stubs` | RETURNING/TRIGGER/FUNCTION/PROCEDURE yuzeyi; sessiz yanlis sonuc yok |
 | `sql_matrix` | SQL davranis matrisi: DDL/DML/SELECT/JOIN/agregat/transaction/hata yollari + bos tabloda referans dogrulamasi (bkz. `SQL_COVERAGE.md`) |
-| `sql_fuzz` | SQL ayristirici dayanikliligi (sabit tohum, surec ici) |
 | `sql_fuzz` | ayristirici dayaniklilik: 3000 deterministik bozuk girdi, istisna sizintisi/heap buyumesi/sure siniri |
+| `sql_differential` | PostgreSQL diferansiyel korpusu + sapma yonetisimi (bkz. `SQL_DIFFERENTIAL.md`) |
 | `crypto_core` | saf Pascal AES/GCM/SHA/HMAC cekirdegi |
 | `crypto_base64` | base64 kodlayici/cozucu |
 | `fixtures_builtin` | eski `.odb`/anahtar fixture'lari **builtin** provider ile acilir |
 | `crypto_kat` | NIST KAT vektorleri (AES-GCM, SHA-256, HMAC, Argon2id, Blake2b) |
 | `wal_crash` | WAL yirtik kuyruk/kurtarma matrisi |
 | `kv_wal` | KV katmani WAL kurtarma matrisi |
+| `backup_restore` | yedek/geri yukleme butunlugu + tatbikat (B0-B24) |
+| `page_integrity` | sayfa/heap/freelist bozulma matrisi (I0-I13) |
 | `server_harden` | dinleme adresi, `--trust` sinirlari, TLS zorunlulugu |
 | `auth_throttle` | SCRAM deneme sinirlama/kilit |
 | `selftest_builtin` | provider SelfTest (builtin) |
@@ -152,8 +154,10 @@ kaldirildi:
   (`success`). Bu kosu Phase 4 `page_integrity` kapisini (I0-I13) ilk kez
   CI'da kosturdu; trunk sayfasi yanlis-pozitif duzeltmesi ve `cur`
   Release duzeltmesi CI'da dogrulandi.
-- Yerel kanit (bu commit): Git Bash/Windows **14 kapi** PASS (tls_client
-  SKIP), WSL x86_64 Linux **15 kapi** PASS (tls_client 6/0 dahil).
+- Yedinci kosu (bu commit): `sql_differential` kapisi eklendi; yerel kanit
+  Git Bash/Windows **15 kapi** PASS (tls_client SKIP), WSL x86_64 Linux
+  **16 kapi** PASS (tls_client 6/0 dahil).
   `sql_matrix`: 61 PASS, 0 FAIL (iki platformda).
   `backup_restore`: 25 PASS, 0 FAIL (iki platformda).
   `page_integrity`: 14 PASS, 0 FAIL (iki platformda).
+  `sql_differential`: 33 PASS, 0 FAIL, `pg=not-run` (psql yok).

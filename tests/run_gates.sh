@@ -122,6 +122,7 @@ fi
 build_gate sql_stubs     "$ROOT/tests/sql_stubs/sql_stubs.lpr"
 build_gate sql_matrix    "$ROOT/tests/sql_matrix/sql_matrix.lpr"
 build_gate sql_fuzz      "$ROOT/tests/sql_fuzz/sql_fuzz.lpr"
+build_gate sql_differential "$ROOT/tests/sql_differential/sql_differential.lpr"
 build_gate crypto_core   "$ROOT/tests/crypto_core/core_smoke.lpr"
 build_gate crypto_base64 "$ROOT/tests/crypto_base64/base64_runner.lpr"
 build_gate crypto_selftest "$ROOT/tests/crypto_selftest/selftest_runner.lpr"
@@ -141,6 +142,8 @@ unset VDB_CRYPTO_DLL 2>/dev/null || true
 run_gate sql_stubs      "$WORK/sql_stubs"      sql_stubs
 run_gate sql_matrix     "$WORK/sql_matrix"     sql_matrix
 run_gate sql_fuzz       "$WORK/sql_fuzz"       sql_fuzz
+run_gate sql_differential "$WORK/sql_differential" sql_differential \
+  "$(npath "$ROOT/tests/sql_differential/corpus.txt")"
 run_gate crypto_core    "$WORK/crypto_core"    core_smoke
 run_gate crypto_base64  "$WORK/crypto_base64"  base64_runner
 run_gate fixtures_builtin "$FI"                gen_fixtures verify

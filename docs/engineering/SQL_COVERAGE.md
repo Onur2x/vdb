@@ -149,9 +149,13 @@ Bunlar "hata" degil, **sozlesmenin siniri**dir; hepsi gurultulu davranir
 
 ## 8. Kapsam disi (durust sinirlar)
 
-- **PostgreSQL diferansiyel testi yok.** Beklenen degerler VDB'nin kendi
-  sozlesmesidir; PG'den bilincli sapan yerler yukarida yazilidir. Ayni SQL'i
-  iki motorda kosutlayip karsilastiran bir kosumcu ayri bir is kalemidir.
+- **PostgreSQL diferansiyel korpusu var, canli kosum yok.** Beklenen
+  degerlerin PostgreSQL karsiligi artik `tests/sql_differential/corpus.txt`
+  icinde **kayitli** ve her kosumda olculur (`sql_differential` kapisi);
+  bildirilmemis sapma kapiyi kirar. Ancak bu ortamda `psql` yoktur, bu
+  yuzden pinli PG degerleri canli PostgreSQL'e karsi **dogrulanmadi**;
+  kapi bunu `pg=not-run` olarak acikca raporlar. Ayrinti ve canli kosum
+  yolu: `SQL_DIFFERENTIAL.md`.
 - **Minimize edilmis regresyon korpusu yok.** `sql_fuzz` kapisi
   ayristiricinin dayanikliligini olcer (surec icinde, sabit tohum), ancak
   bulunan her bozuk girdi kalici bir korpusa indirgenmez.

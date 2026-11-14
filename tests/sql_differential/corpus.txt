@@ -1,0 +1,130 @@
+-- VDB V3 - SQL diferansiyel korpusu (PostgreSQL referansli)
+--
+-- Bu dosya, "VDB desteklenen SQL alt kumesi"nin PostgreSQL karsisindaki
+-- durumunu KAYITLI (pinned) bir sozlesme haline getirir. Her durum icin
+-- iki beklenti vardir:
+--   --PG   : PostgreSQL'in ayni SQL icin urettigi izgara
+--   --VDB  : VDB'nin sozlesmesi (izgara ya da error:<kod>)
+-- Izgara bicimi sql_matrix/matrix ile aynidir: hucreler ',' , satirlar '|',
+-- bos sonuc = bos metin.
+--
+-- --KIND anlami (skip governance):
+--   same : VDB ve PostgreSQL AYNI sonucu verir. Iki beklenti farkli ise
+--          korpus TUTARSIZDIR ve kapi FAIL verir.
+--   diff : VDB bilerek sapiyor. --NOTE zorunludur ve sapmanin nedenini
+--          yazar (SQL_COVERAGE.md'deki kayitla ayni olmali).
+-- Bildirilmemis bir sapma (kind=same iken fark) kapiyi kirar; yani sessiz
+-- davranis degisikligi bu dosyaya yazilmadan gecemez.
+--
+-- Canli PostgreSQL dogrulamasi:
+--   sql_differential --emit=<dosya>   -> psql betigi uretir
+--   psql -d postgres -f <dosya> > pg.out
+--   sql_differential --pg=pg.out      -> pinli --PG degerleriyle karsilastirir
+-- psql yoksa canli karsilastirma KOSMAZ ve bunu acikca raporlar; asla
+-- sessizce "gecti" sayilmaz.
+
+--CASE arith_add
+--KIND same
+--PROBE SELECT 1 + 2
+--PG 3
+--VDB 3
+
+--CASE arith_precedence
+--KIND same
+--PROBE SELECT 7 - 2 * 2
+--PG 3
+--VDB 3
+
+--CASE int_div
+--KIND same
+--PROBE SELECT 7 / 2
+--PG 3
+--VDB 3
+
+--CASE agg_basic
+--KIND same
+--SETUP CREATE TABLE t (n INTEGER)
+--SETUP INSERT INTO t (n) VALUES (1),(2),(3)
+--PROBE SELECT COUNT(*), SUM(n), MIN(n), MAX(n) FROM t
+--PG 3,6,1,3
+--VDB 3,6,1,3
+
+--CASE distinct_rows
+--KIND same
+--SETUP CREATE TABLE t (v TEXT)
+--SETUP INSERT INTO t (v) VALUES ('a'),('a'),('b')
+--PROBE SELECT DISTINCT v FROM t ORDER BY v
+--PG a|b
+--VDB a|b
+
+--CASE limit_offset
+--KIND same
+--SETUP CREATE TABLE t (id INTEGER)
+--SETUP INSERT INTO t (id) VALUES (1),(2),(3)
+--PROBE SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1
+--PG 2|3
+--VDB 2|3
+
+--CASE empty_where
+--KIND same
+--SETUP CREATE TABLE t (id INTEGER)
+--SETUP INSERT INTO t (id) VALUES (1)
+--PROBE SELECT id FROM t WHERE id = 99
+--PG
+--VDB
+
+--CASE coalesce_null
+--KIND same
+--PROBE SELECT COALESCE(NULL, 5)
+--PG 5
+--VDB 5
+
+--CASE like_case_sensitive
+--KIND same
+--SETUP CREATE TABLE t (v TEXT)
+--SETUP INSERT INTO t (v) VALUES ('abc'),('Abc')
+--PROBE SELECT COUNT(*) FROM t WHERE v LIKE 'A%'
+--PG 1
+--VDB 1
+
+--CASE null_order_asc
+--KIND diff
+--SETUP CREATE TABLE t (n INTEGER)
+--SETUP INSERT INTO t (n) VALUES (2),(NULL),(1)
+--PROBE SELECT n FROM t ORDER BY n
+--PG 1|2|
+--VDB |1|2
+--NOTE PostgreSQL ASC'de NULL'lari SONA atar (NULLS LAST varsayilan). VDB
+--NOTE NULL'lari basa alir; ORDER BY ... NULLS LAST desteklenmiyor.
+
+--CASE concat_operator
+--KIND same
+--PROBE SELECT 'a' || 'b'
+--PG ab
+--VDB ab
+
+--CASE groupby_alias
+--KIND diff
+--SETUP CREATE TABLE t (n INTEGER)
+--SETUP INSERT INTO t (n) VALUES (1),(1),(2)
+--PROBE SELECT n AS k, COUNT(*) FROM t GROUP BY k ORDER BY k
+--PG 1,2|2,1
+--VDB error:ecColumnNotFound
+--NOTE PostgreSQL GROUP BY cikti alias'ini kabul eder. VDB kabul etmez;
+--NOTE ecColumnNotFound ile gurultulu reddeder (ORDER BY alias'i kabul edilir).
+
+--CASE substr_unsupported
+--KIND diff
+--PROBE SELECT SUBSTR('abcdef', 2, 3)
+--PG bcd
+--VDB error:ecUnsupported
+--NOTE PostgreSQL SUBSTR/SUBSTRING/TRIM sunar. VDB bu skaler fonksiyonlari
+--NOTE uygulamaz; ecUnsupported ile reddeder (sessiz yanlis sonuc yok).
+
+--CASE div_by_zero
+--KIND diff
+--PROBE SELECT 1 / 0
+--PG error:division by zero
+--VDB error:ecMathError
+--NOTE PostgreSQL SQLSTATE 22012 "division by zero" verir. VDB kendi hata
+--NOTE kodunu verir; ikisi de gurultulu, sessiz 0/sonsuz uretimi yok.
