@@ -14,6 +14,7 @@ program tls_client_gate;
 {$mode delphi}{$H+}
 
 uses
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes, VDbNet, VDbTls;
 
 var
@@ -47,11 +48,14 @@ begin
     Exit;
   end;
   base := ExtractFilePath(ExpandFileName(ParamStr(0)));
-  cand[0] := base + 'tls_fixtures\';
-  cand[1] := base + '..\tls_fixtures\';
-  cand[2] := base + '..\..\tests\tls_fixtures\';
-  cand[3] := base + '..\..\..\tests\tls_fixtures\';
-  cand[4] := base + '..\..\..\..\tests\tls_fixtures\';
+  cand[0] := base + 'tls_fixtures' + PathDelim;
+  cand[1] := base + '..' + PathDelim + 'tls_fixtures' + PathDelim;
+  cand[2] := base + '..' + PathDelim + '..' + PathDelim + 'tests' + PathDelim +
+    'tls_fixtures' + PathDelim;
+  cand[3] := base + '..' + PathDelim + '..' + PathDelim + '..' + PathDelim +
+    'tests' + PathDelim + 'tls_fixtures' + PathDelim;
+  cand[4] := base + '..' + PathDelim + '..' + PathDelim + '..' + PathDelim +
+    '..' + PathDelim + 'tests' + PathDelim + 'tls_fixtures' + PathDelim;
   for i := 0 to 4 do
     if FileExists(ExpandFileName(cand[i] + 'ca.crt')) then
     begin

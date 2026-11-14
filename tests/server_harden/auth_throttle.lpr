@@ -2,7 +2,7 @@
 
   Kapsam: TVdbPgServer'in ceza defteri (bellek ici). Ag uzerinden SCRAM
   denemesi yapilmaz; sayac/kilit kararlari dogrudan API ile dogrulanir.
-  Boylece kapı hizli ve deterministiktir; SCRAM akisinin bu API'yi
+  Boylece kapÄ± hizli ve deterministiktir; SCRAM akisinin bu API'yi
   cagirdigi VDbPgWire.DoScramAuth icinde tek satirlik kancalarla sabittir.
 
   Kosum: auth_throttle.exe  (fpc ile derlenir, .lpi gerekmez) }
@@ -10,6 +10,7 @@ program auth_throttle;
 {$mode delphi}{$H+}
 
 uses
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes, VDbPgWire;
 
 var

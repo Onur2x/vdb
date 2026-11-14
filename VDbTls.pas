@@ -60,7 +60,7 @@ function VDbTlsLastError: string;
 implementation
 
 uses
-  {$IFDEF WINDOWS}Windows, {$ENDIF}dynlibs;
+  {$IFDEF WINDOWS}Windows, {$ENDIF}{$IFDEF UNIX}BaseUnix, {$ENDIF}dynlibs;
 
 const
   SSL_FILETYPE_PEM = 1;
@@ -281,6 +281,28 @@ begin
       Exit(True);
     end;
     if LoadPair('ssleay32.dll', 'libeay32.dll', err) then
+    begin
+      GInitOk := True;
+      Exit(True);
+    end;
+    { Unix: sistemde kurulu OpenSSL. Windows'ta bu adlar hizlica
+      basarisiz olur; zararsiz. }
+    if LoadPair('libssl.so.3', 'libcrypto.so.3', err) then
+    begin
+      GInitOk := True;
+      Exit(True);
+    end;
+    if LoadPair('libssl.so.1.1', 'libcrypto.so.1.1', err) then
+    begin
+      GInitOk := True;
+      Exit(True);
+    end;
+    if LoadPair('libssl.so', 'libcrypto.so', err) then
+    begin
+      GInitOk := True;
+      Exit(True);
+    end;
+    if LoadPair('libssl.3.dylib', 'libcrypto.3.dylib', err) then
     begin
       GInitOk := True;
       Exit(True);
@@ -553,6 +575,13 @@ end;
 
 initialization
   GLock := SyncObjs.TCriticalSection.Create;
+  { Karsi taraf el sikismasi sirasinda baglantiyi keserse OpenSSL'in
+    yazma yolu SIGPIPE uretir ve sureci oldurur (Windows'ta yok). TLS
+    kullanilan bir sunucu/istemcide bu bir hata yolu degil, normal
+    senaryodur; sinyali surec duzeyinde yok sayiyoruz. }
+  {$IFDEF UNIX}
+  fpSignal(SIGPIPE, TsignalHandler(SIG_IGN));
+  {$ENDIF}
 
 finalization
   GLock.Free;

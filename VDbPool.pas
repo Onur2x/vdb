@@ -33,7 +33,7 @@ interface
 
 uses
   Classes, SysUtils, SyncObjs, Generics.Collections, VDbTable, VDbSql,
-  VDbAst, VDbErr, VDbXPrims, VDbCore, VDbPlatform;
+  VDbAst, VDbErr, VDbXPrims, VDbCore, VDbPlatform, VDbSync;
   { R-12: VDbCore -> TVDb (motor). VDbXPrims -> SHM + isimli mutex.
     Windows (implementation uses) -> GetCurrentProcessId/ThreadId,
     Interlocked* atomikleri. }
@@ -164,7 +164,7 @@ begin
   FOwners := nil;
   FLock := TCriticalSection.Create;
   // Manuel-reset degil: tek bekleyeni uyandirir (otomatik sifirlanir).
-  FAvail := TEvent.Create(nil, False, False, '');
+  FAvail := TEvent.Create(nil, False, False, VDbEventName('vdb-pool'));
   FIdle := TList<TVSql>.Create;
   FAll := TList<TVSql>.Create;
   FOwners := TDictionary<Pointer, THandle>.Create;
@@ -347,7 +347,7 @@ begin
   FAll := nil;
   FOwners := nil;
   FLock := TCriticalSection.Create;
-  FAvail := TEvent.Create(nil, False, False, '');
+  FAvail := TEvent.Create(nil, False, False, VDbEventName('vdb-pool'));
   FIdle := TList<TVSql>.Create;
   FAll := TList<TVSql>.Create;
   FOwners := TDictionary<Pointer, THandle>.Create;

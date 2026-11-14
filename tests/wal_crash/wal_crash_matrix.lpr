@@ -27,6 +27,7 @@ program wal_crash_matrix;
 {$mode delphi}{$H+}
 
 uses
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes, VDbPage, VDbPageWal;
 
 const

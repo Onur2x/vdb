@@ -23,6 +23,7 @@ program kv_wal_matrix;
 {$mode delphi}{$H+}
 
 uses
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes, VDbCore;
 
 const

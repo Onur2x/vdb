@@ -1,5 +1,5 @@
 program sql_stubs;
-{ V3 sertlestirme — stub yuzey kalici kapisi.
+{ V3 sertlestirme â€” stub yuzey kalici kapisi.
 
   Amac: RETURNING / TRIGGER / FUNCTION / PROCEDURE yuzeylerinde
   (a) gercekten calisan ozelliklerin calistigini KANITLAMAK,
@@ -13,6 +13,7 @@ program sql_stubs;
 {$mode delphi}{$H+}
 
 uses
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes, VDbFactory, VDbBackendApi, VDbTable, VDbSql, VDbErr,
   VDbCore;
 

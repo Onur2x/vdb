@@ -2,11 +2,11 @@ program gen_fixtures;
 { gen_fixtures - VDB kriptografik UYUMLULUK FIXTURE ureticisi (Goc Plani Adim 2A)
 
   AMAC: dcpcrypt -> OpenSSL goci (Adim 2B) ONCESINDE, bugunku (goc-oncesi)
-  kodun urettiği eski-format dosyalarini bit duzeyinde sabitlemek. Goc
+  kodun urettiÄŸi eski-format dosyalarini bit duzeyinde sabitlemek. Goc
   sonrasi `gen_fixtures verify` bu fixture'lari COZEMEZSE GOC KIRICIDIR.
 
-  !! TEST FIXTURE — PRODUCTION ENTROPY DEGIL !!
-  Buradaki tum parola/tuz/nonce degerleri SABITTEST DEGERLERIDIR ve kasıtlı
+  !! TEST FIXTURE â€” PRODUCTION ENTROPY DEGIL !!
+  Buradaki tum parola/tuz/nonce degerleri SABITTEST DEGERLERIDIR ve kasÄ±tlÄ±
   olarak CSPRNG yerine sabitlenmistir (tekrar kosurulabilirlik icin). Bu
   degerler HICBIR gercek veride kullanilmaz/kullanilmamali.
 
@@ -19,12 +19,12 @@ program gen_fixtures;
                              tuz ile, VDbKeyFileWrite ile BIREBIR ayni bicimde
                              elle kurulur. Deterministik.
     key_v2_argon2id_write.key bugunku VDbKeyFileWrite gercek cikisi (RASTGELE
-                             tuz icerir -> byte-reprodüksiyon beklenmez; verify
+                             tuz icerir -> byte-reprodÃ¼ksiyon beklenmez; verify
                              modu VDbKeyFileRead round-trip ile dogrular).
     page_envelope_v1.bin     sayfa zarfi nonce(12)|ct(4096)|tag(16)=4124B,
                              AAD='VDB3PG'|LE32(pageno)|salt(16). Nonce SABIT
                              tutulmak icin ham VDbCryptGcmSeal ile elle
-                             kurulur (VDbPageSeal'in o nonce'la üretecegi
+                             kurulur (VDbPageSeal'in o nonce'la Ã¼retecegi
                              baytlarla birebir aynidir); VDbPageOpen ile
                              round-trip dogrulanir. Deterministik.
     record_envelope_v1.bin   kayit zarfi 'VDBAEAD1'|nonce(12)|ct|tag(16),
@@ -40,7 +40,7 @@ program gen_fixtures;
     store_odb_v1\fixture.odb gercek sifreli depo (TVdbPageEngine, parola ->
                              PBKDF2-200k, sayfa zarfi) + .wal/.gen yan
                              dosyalari. DBID/nonce/LSN RNG icerir ->
-                             byte-reprodüksiyon BEKLENMEZ; kapı: ayni parola
+                             byte-reprodÃ¼ksiyon BEKLENMEZ; kapÄ±: ayni parola
                              ile AC + satirlari dogrula (verify modu).
 
   Kullanim:
@@ -63,11 +63,12 @@ program gen_fixtures;
 {$mode delphi}{$H+}
 
 uses
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes,
   VDbCrypt, VDbKdf, VDbPageCrypto, VDbPageEngine;
 
 { ======================= TEST SABITLERI =======================
-  !! TEST fixture, production entropy degil — bkz. dosya basi. ============ }
+  !! TEST fixture, production entropy degil â€” bkz. dosya basi. ============ }
 const
   PW_MASTER = 'VdbFixt!2026';        { .key v1 + v2 parolasi (>=8 karakter) }
   PW_WRONG  = 'VdbFixt!2026YANLIS';  { negatif test parolasi (v1 icin ucuz) }
@@ -80,7 +81,7 @@ const
   SCRAM_PASS = 'scram-fixture-pass';
   SCRAM_ITER = 15000;   { VDbPgWire.AddUser clamp tabani (>=15000, <=1000000) }
 
-  { sha256 pinleri — `gen_fixtures gen` cikisindaki PINS blogundan yapistirilir.
+  { sha256 pinleri â€” `gen_fixtures gen` cikisindaki PINS blogundan yapistirilir.
     Goc sonrasi (2B) bu hash'ler degisti ise KDF/zarf kodu KIRILMIS demektir. }
   PIN_KEY_V1_SHA256      = 'da99477949f4df280c94e8523fa36e9290015c63d33cc901714af7779de10508';
   PIN_KEY_V2_SHA256      = 'bb781020f2a51434ffb5d1f2471665b6dcbc78aaa567c55d8d6ad21da63829b7';
@@ -107,7 +108,7 @@ var
 { ======================= kucuk yardimcilar ======================= }
 
 function Pat(Count: Integer; Seed: Byte): TBytes;
-{ Deterministik desen baytlari — TEST fixture, production entropy degil. }
+{ Deterministik desen baytlari â€” TEST fixture, production entropy degil. }
 var
   i: Integer;
 begin
@@ -341,7 +342,7 @@ end;
 
 procedure GenKeyV2Handcrafted;
 { v2 .key: 'VDBK' | ver=2 | saltLen | t(LE32) | m(LE32) | p | salt | verifier(32)
-  — VDbKeyFileWrite ile BIREBIR ayni bicim, sabit test tuzla (deterministik). }
+  â€” VDbKeyFileWrite ile BIREBIR ayni bicim, sabit test tuzla (deterministik). }
 var
   key, verifier, buf, salt: TBytes;
   i: Integer;
@@ -367,7 +368,7 @@ begin
 end;
 
 procedure GenKeyV2WritePath;
-{ Bugunku gercek VDbKeyFileWrite cikisi (RASTGELE salt — verify mod fonksiyonel
+{ Bugunku gercek VDbKeyFileWrite cikisi (RASTGELE salt â€” verify mod fonksiyonel
   dogrular; sha256 pinlenmez). Goc-oncesi yazim yolunun CANLI kaniti. }
 var
   key: TBytes;
@@ -406,7 +407,7 @@ begin
 end;
 
 procedure GenRecordLegacy;
-{ Eski CTR+HMAC zarfi (Rastgele IV — verify mod fonksiyonel dogrular). }
+{ Eski CTR+HMAC zarfi (Rastgele IV â€” verify mod fonksiyonel dogrular). }
 var
   env: TBytes;
 begin
@@ -476,7 +477,7 @@ end;
 
 procedure GenStore;
 { Gercek sifreli depo: parola -> PBKDF2-200000 (VDB_ENC_ITER) -> sayfa zarfi.
-  DBID/nonce/LSN RNG icerir; byte-reprodüksiyon beklenmez. }
+  DBID/nonce/LSN RNG icerir; byte-reprodÃ¼ksiyon beklenmez. }
 var
   eng: TVdbPageEngine;
   rows: TRowArray;
@@ -638,7 +639,7 @@ begin
     end;
     if VDbPageOpen(KeyPg, SaltPg, PAGE_PAGENO, env, plain) and
        EqBytes(plain, PlainPg) then
-      Ok(L + ': VDbPageOpen cozdü (nonce|ct|tag, AAD=VDB3PG|LE32|salt, sabit nonce)')
+      Ok(L + ': VDbPageOpen cozdÃ¼ (nonce|ct|tag, AAD=VDB3PG|LE32|salt, sabit nonce)')
     else
       No(L + ': VDbPageOpen round-trip', ' cozme baarisiz veya duz-metin farkli');
     { AAD baglama negatif testi: sayfa numarasi degisirse reddetmeli }
@@ -674,11 +675,11 @@ begin
       Exit;
     end;
     if VDbCryptAeadOpen(KeyRec, env, nil, plain) and EqBytes(plain, RecPlain) then
-      Ok(L + ': VDbCryptAeadOpen cozdü (VDBAEAD1, sabit nonce)')
+      Ok(L + ': VDbCryptAeadOpen cozdÃ¼ (VDBAEAD1, sabit nonce)')
     else
       No(L + ': VDbCryptAeadOpen round-trip', 'cozme baarisiz');
     if VDbCryptDecrypt(KeyRec, env, plain) and EqBytes(plain, RecPlain) then
-      Ok(L + ': VDbCryptDecrypt ayni zarfi cozdü (uyusturmasiz)')
+      Ok(L + ': VDbCryptDecrypt ayni zarfi cozdÃ¼ (uyusturmasiz)')
     else
       No(L + ': VDbCryptDecrypt uyusturmasiz cozme', 'baarisiz');
   except
@@ -703,7 +704,7 @@ begin
   try
     env := LoadBin(p);
     if VDbCryptDecrypt(KeyRec, env, plain) and EqBytes(plain, RecPlain) then
-      Ok(L + ': VDbCryptDecrypt legacy CTR+HMAC zarfi cozdü (rastgele IV, fonksiyonel)')
+      Ok(L + ': VDbCryptDecrypt legacy CTR+HMAC zarfi cozdÃ¼ (rastgele IV, fonksiyonel)')
     else
       No(L + ': VDbCryptDecrypt legacy CTR+HMAC', 'cozme baarisiz');
   except
@@ -868,7 +869,7 @@ var
   key: TBytes;
 begin
   ForceDirectories(FxD);
-  Writeln('== fixture uretimi (gen) — TEST fixture, production entropy degil ==');
+  Writeln('== fixture uretimi (gen) â€” TEST fixture, production entropy degil ==');
   Writeln('Dizin: ', FxD);
   GenKeyV1;                  Writeln('yazildi : key_v1_pbkdf2.key');
   GenKeyV2Handcrafted;       Writeln('yazildi : key_v2_argon2id.key (Argon2id, birkac saniye)');

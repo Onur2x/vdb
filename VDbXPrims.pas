@@ -43,9 +43,10 @@ type
     {$ENDIF}
     FLockName: string;
     FLocked: Boolean;
+    { Iki platformda da tanimli: Destroy kosulsuz cagirir. }
+    procedure ReleaseHandle;
     {$IFDEF WINDOWS}
     procedure CreateHandle;
-    procedure ReleaseHandle;
     function Lock: Boolean;
     procedure Unlock;
     {$ELSE}
@@ -169,8 +170,33 @@ uses
   Windows;
   {$ENDIF}
   {$IFDEF UNIX}
-  BaseUnix, Unix, fcntl, Types, SysUtils;
+  BaseUnix, Unix, Types;
   {$ENDIF}
+
+{$IFDEF UNIX}
+{ V3 tasinabilirlik: `fcntl` adinda bir FPC birimi YOKTUR (Delphi'de var).
+  Kayit kilidi BaseUnix.FpFcntl + FLock kaydi ile yapilir. POSIX sabitleri
+  platforma gore degistigi icin burada acikca tanimlanir (Linux ile BSD/
+  macOS degerleri ayni degildir). Adlar VDB_ onekli ki baska bir birimle
+  cakismasin. }
+const
+  {$IFDEF LINUX}
+  VDB_F_RDLCK = 0;
+  VDB_F_WRLCK = 1;
+  VDB_F_UNLCK = 2;
+  VDB_F_GETLK = 5;
+  VDB_F_SETLK = 6;
+  VDB_F_SETLKW = 7;
+  {$ELSE}
+  { Darwin / FreeBSD / OpenBSD / NetBSD }
+  VDB_F_RDLCK = 1;
+  VDB_F_WRLCK = 3;
+  VDB_F_UNLCK = 2;
+  VDB_F_GETLK = 7;
+  VDB_F_SETLK = 8;
+  VDB_F_SETLKW = 9;
+  {$ENDIF}
+{$ENDIF}
 
 // ==================================================================
 // TCriticalSectionEx
@@ -280,7 +306,7 @@ begin
     FLockDir := ALockDir;
   FLocked := False;
   LPath := IncludeTrailingPathDelimiter(FLockDir) + VDB_LOCK_PREFIX + ALockName + '.lock';
-  FLockFd := FpOpen(PChar(LPath), O_RDWR or O_CREAT or O_TRUNC, 0o644);
+  FLockFd := FpOpen(PChar(LPath), O_RDWR or O_CREAT or O_TRUNC, &644);
   if FLockFd < 0 then
     raise EPrimsError.CreateFmt('TCriticalSectionEx: kilid dosyasi acilamadi %s', [LPath]);
 end;
@@ -289,31 +315,31 @@ procedure TCriticalSectionEx.ReleaseHandle;
 begin
   if FLockFd >= 0 then
   begin
-    Close(FLockFd);
+    fpClose(FLockFd);
     FLockFd := -1;
   end;
 end;
 
 function TCriticalSectionEx.LockUnix(var Errno: Integer): Boolean;
 var
-  L: TFileLock;
+  L: FLock;
   i: Integer;
 begin
   Errno := 0;
-  L.l_type := F_WRLCK;
+  L.l_type := VDB_F_WRLCK;
   L.l_whence := SEEK_SET;
   L.l_start := 0;
   L.l_len := 0;
   for i := 0 to 20 do
   begin
-    if fcntl(FLockFd, F_SETLKW, @L) = 0 then
+    if FpFcntl(FLockFd, VDB_F_SETLKW, L) = 0 then
     begin
       Result := True;
       FLocked := True;
       Exit;
     end;
-    Errno := GetErrno;
-    if Errno = EINTR then
+    Errno := fpGetErrno;
+    if Errno = ESysEINTR then
       Continue
     else
       Break;
@@ -323,15 +349,15 @@ end;
 
 procedure TCriticalSectionEx.UnlockUnix;
 var
-  L: TFileLock;
+  L: FLock;
 begin
   if FLocked then
   begin
-    L.l_type := F_UNLCK;
+    L.l_type := VDB_F_UNLCK;
     L.l_whence := SEEK_SET;
     L.l_start := 0;
     L.l_len := 0;
-    fcntl(FLockFd, F_SETLK, @L);
+    FpFcntl(FLockFd, VDB_F_SETLK, L);
     FLocked := False;
   end;
 end;
@@ -347,12 +373,17 @@ begin
 end;
 
 procedure TCriticalSectionEx.Enter;
+{$IFDEF UNIX}
+var
+  Errno: Integer;
+{$ENDIF}
 begin
   {$IFDEF WINDOWS}
   Lock;
   {$ELSE}
   {$IFDEF UNIX}
-  LockUnix(0);
+  Errno := 0;
+  LockUnix(Errno);
   {$ENDIF}
   {$ENDIF}
 end;
@@ -364,7 +395,7 @@ var
   {$ELSE}
   {$IFDEF UNIX}
   Errno: Integer;
-  L: TFileLock;
+  L: FLock;
   {$ENDIF}
   {$ENDIF}
 begin
@@ -375,14 +406,14 @@ begin
   {$ELSE}
   {$IFDEF UNIX}
   Errno := 0;
-  L.l_type := F_WRLCK;
+  L.l_type := VDB_F_WRLCK;
   L.l_whence := SEEK_SET;
   L.l_start := 0;
   L.l_len := 0;
-  Success := fcntl(FLockFd, F_SETLK, @L) = 0;
+  Success := FpFcntl(FLockFd, VDB_F_SETLK, L) = 0;
   FLocked := Success;
   if not Success then
-    Errno := GetErrno;
+    Errno := fpGetErrno;
   {$ENDIF}
   {$ENDIF}
 end;
@@ -394,7 +425,7 @@ var
   {$ELSE}
   {$IFDEF UNIX}
   Errno: Integer;
-  L: TFileLock;
+  L: FLock;
   Start: Int64;
   {$ENDIF}
   {$ENDIF}
@@ -412,22 +443,22 @@ begin
   {$ELSE}
   {$IFDEF UNIX}
   Errno := 0;
-  L.l_type := F_WRLCK;
+  L.l_type := VDB_F_WRLCK;
   L.l_whence := SEEK_SET;
   L.l_start := 0;
   L.l_len := 0;
   Start := VdbTickMs;
   while True do
   begin
-    if fcntl(FLockFd, F_SETLKW, @L) = 0 then
+    if FpFcntl(FLockFd, VDB_F_SETLKW, L) = 0 then
     begin
       FLocked := True;
       Exit;
     end;
-    Errno := GetErrno;
-    if Errno = EINTR then
+    Errno := fpGetErrno;
+    if Errno = ESysEINTR then
       Continue;
-    if (VdbTickMs - Start) > (AMSec)
+    if (VdbTickMs - Start) > (AMSec) then
       raise EPrimsError.CreateFmt('TCriticalSectionEx: %d ms icinde kilit alinamadi', [AMSec]);
     Sleep(5);
   end;
@@ -506,6 +537,30 @@ end;
 
 {$IFDEF UNIX}
 
+{ V3 tasinabilirlik: FPC 3.2.2'nin BaseUnix birimi shm_open/shm_unlink
+  sarmalayicilarini saglamaz. Linux'ta POSIX shm ad alani /dev/shm altindaki
+  dosyalardir; diger Unix'lerde ayni amac icin gecici dizin kullanilir.
+  Boylece ayrica harici libc sembolu yuklemeye gerek kalmaz (R-5). }
+function VdbShmPath(const AName: PChar): string;
+begin
+  {$IFDEF LINUX}
+  Result := '/dev/shm/' + string(AName);
+  {$ELSE}
+  Result := IncludeTrailingPathDelimiter(GetTempDir(False)) +
+    'vdb_shm_' + string(AName);
+  {$ENDIF}
+end;
+
+function VdbShmOpen(const AName: PChar; AFlags, AMode: cint): cint;
+begin
+  Result := fpOpen(PChar(VdbShmPath(AName)), AFlags, AMode);
+end;
+
+function VdbShmUnlink(const AName: PChar): cint;
+begin
+  Result := fpUnlink(PChar(VdbShmPath(AName)));
+end;
+
 constructor TSharedMemory.Create(AName: string; ASize: Integer);
 begin
   Create(AName, ASize, False);
@@ -514,7 +569,7 @@ end;
 constructor TSharedMemory.Create(AName: string; ASize: Integer; ACreate: Boolean);
 var
   LFlags, LErr: Integer;
-  st: TStatBuf;
+  st: Stat;
   SName: string;
 begin
   inherited Create;
@@ -527,14 +582,14 @@ begin
   LFlags := O_RDWR;
   if ACreate then
     LFlags := LFlags or O_CREAT or O_EXCL;
-  FHandle := shm_open(PChar(SName), LFlags, 0o666);
-  LErr := GetErrno;
+  FHandle := VdbShmOpen(PChar(SName), LFlags, &666);
+  LErr := fpGetErrno;
   if FHandle < 0 then
   begin
-    if ACreate and (LErr = EEXIST) then
+    if ACreate and (LErr = ESysEEXIST) then
     begin
       // Basikasi yaratti: var olanini bagla (owner degiliz).
-      FHandle := shm_open(PChar(SName), O_RDWR, 0o666);
+      FHandle := VdbShmOpen(PChar(SName), O_RDWR, &666);
       if FHandle < 0 then
         raise EPrimsError.CreateFmt('TSharedMemory: shm var olanini baglanamadi %s', [AName]);
       FIsOwner := False;
@@ -545,15 +600,15 @@ begin
   else
     FIsOwner := True;  // O_EXCL ile biz yarattik.
   // Boyut kontrolu: header + slotlar yeterli mi?
-  if fstat(FHandle, st) = 0 then
+  if fpFStat(FHandle, st) = 0 then
   begin
     if UInt64(st.st_size) < ASize then
     begin
-      if ftruncate(FHandle, ASize) < 0 then
+      if fpFTruncate(FHandle, ASize) < 0 then
       begin
-        Close(FHandle);
+        fpClose(FHandle);
         FHandle := -1;
-        raise EPrimsError.CreateFmt('TSharedMemory: shm_truncate basarisiz, hata=%d', [GetErrno]);
+        raise EPrimsError.CreateFmt('TSharedMemory: shm_truncate basarisiz, hata=%d', [fpGetErrno]);
       end;
     end;
   end;
@@ -565,11 +620,11 @@ end;
 procedure TSharedMemory.MapMemory;
 begin
   if FHandle < 0 then Exit;
-  FMemory := mmap(nil, FSize, PROT_READ or PROT_WRITE, MAP_SHARED, FHandle, 0);
+  FMemory := fpMmap(nil, FSize, PROT_READ or PROT_WRITE, MAP_SHARED, FHandle, 0);
   if FMemory = MAP_FAILED then
   begin
     FMemory := nil;
-    raise EPrimsError.CreateFmt('TSharedMemory: mmap basarisiz, hata=%d', [GetErrno]);
+    raise EPrimsError.CreateFmt('TSharedMemory: mmap basarisiz, hata=%d', [fpGetErrno]);
   end;
   FHeader := PPoolHeader(FMemory);
   FSlots := PConnectionSlot(PChar(FMemory) + SizeOf(TPoolHeader));
@@ -590,13 +645,13 @@ begin
     CloseHandle(FHandle);
     {$ELSE}
     {$IFDEF UNIX}
-    if FMemory <> nil then munmap(FMemory, FSize);
+    if FMemory <> nil then fpMunmap(FMemory, FSize);
     if FHandle >= 0 then
     begin
       // SHM ismini silme gorevi atamasina gore; burada sadece
       // descriptor'u kapatiyoruz. (Yapilmasi gereken: session sona eriginde
       // shm_unlink cagrisi.)
-      Close(FHandle);
+      fpClose(FHandle);
     end;
     {$ENDIF}
     {$ENDIF}
@@ -615,7 +670,7 @@ begin
     UnmapViewOfFile(FMemory);
     {$ELSE}
     {$IFDEF UNIX}
-    munmap(FMemory, FSize);
+    fpMunmap(FMemory, FSize);
     {$ENDIF}
     {$ENDIF}
     FMemory := nil;
@@ -836,8 +891,8 @@ begin
     {$IFDEF UNIX}
     if FHandle >= 0 then
     begin
-      Close(FHandle);
-      shm_unlink('vdbshm_' + FName);
+      fpClose(FHandle);
+      VdbShmUnlink(PChar('vdbshm_' + FName));
     end;
     {$ENDIF}
     {$ENDIF}
@@ -862,7 +917,7 @@ begin
   Result := GetCurrentProcessId;
   {$ELSE}
   {$IFDEF UNIX}
-  Result := Cardinal(getpid);
+  Result := Cardinal(fpGetPid);
   {$ENDIF}
   {$ENDIF}
 end;
@@ -873,7 +928,7 @@ begin
   Result := GetCurrentThreadId;
   {$ELSE}
   {$IFDEF UNIX}
-  Result := pthread_self;
+  Result := TThread.CurrentThread.ThreadID;
   {$ENDIF}
   {$ENDIF}
 end;

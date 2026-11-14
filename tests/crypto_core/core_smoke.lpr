@@ -12,6 +12,7 @@ program core_smoke;
 {$mode objfpc}{$H+}
 
 uses
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, VDbCryptoCore;
 
 var

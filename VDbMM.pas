@@ -4,19 +4,24 @@ unit VDbMM;
   icin FPC varsayilan heap'ine karsi hizli yol.
 
   Tasarim:
-  - 64KB'lik VirtualAlloc slab'lari (64KB hizali — bitmap ile slab bulma).
+  - 64KB'lik slab'lar (Windows: VirtualAlloc, Unix: mmap; 64KB hizali).
   - 16 boyut sinifi (16..512 bayt). Her sinif: serbest liste + bump isaretcisi.
   - <=512 bayt: slab'lardan; >512 bayt: orijinal yoneticiden dogrudan.
-  - FreeMem: bitmap ile slab mi diye bak, slab ise serbest listeye ekle,
-    degilse orijinal yoneticinin FreeMem'ine birak.
+  - FreeMem: slab kayit defteri (hash kumesi) ile slab mi diye bak, slab ise
+    serbest listeye ekle, degilse orijinal yoneticinin FreeMem'ine birak.
 
   Senkronizasyon (P-110 v3): InterlockedExchange spinlock. Tek is parcaciginda
   tek LOCK XCHG (~5ns), cok is parcaciginda dogru. Kritik bolumden hizli.
   P-110 v4: MMSingleThreaded=True ise kilit tamamen atlanir (~10ns/tahsis).
 
-  Guvenlik: her slab basliginda dogrulama sihirli sayisi; bitmap yalnizca
+  Guvenlik: her slab basliginda dogrulama sihirli sayisi; kayit defteri yalnizca
   bizim slab'larimizi isaretler; eski tahsisler (kurulumdan once) orijinal
-  yoneticide kalir.}
+  yoneticide kalir.
+
+  TASINABILIRLIK (2026-11): slab ayirma Windows'ta VirtualAlloc, Unix'te
+  fpmmap ile yapilir. Eski 64KB-bitmap (`SlabBits`, `P shr 16`) yalniz 32-bit
+  adres uzayini kapsiyordu; 64-bit hedeflerde tasma yapardi. Yerine tam
+  anahtarli (slab taban adresi) acik adresleme hash kumesi geldi.}
 {$mode delphi}{$H+}
 
 interface
@@ -30,7 +35,11 @@ var
 implementation
 
 uses
+  {$IFDEF MSWINDOWS}
   Windows;
+  {$ELSE}
+  BaseUnix;
+  {$ENDIF}
 
 const
   SLAB_SIZE      = 65536;
@@ -60,7 +69,13 @@ var
   BumpPtr: array[0..NUM_CLASSES-1] of PByte;
   BumpEnd: array[0..NUM_CLASSES-1] of PByte;
 
-  SlabBits: array[0..8191] of Byte;
+  { Slab kayit defteri: 64KB hizali taban adreslerinin (adres shr 16) acik
+    adresleme hash kumesi. 0 = bos yuva. Tablo OldMM ile buyutulur (recursion
+    yok). Slab'lar calisma suresince OS'e iade edilmez; silme yolu yoktur. }
+  SlabKeys: Pointer;               // PtrUInt dizisi (GetMem ile)
+  SlabUsed: PByte;                 // bayrak dizisi
+  SlabCap: Integer = 0;
+  SlabCount: Integer = 0;
   MMLock: LongInt;
   OldMM: TMemoryManager;
 
@@ -95,12 +110,138 @@ begin
   Result := lo;
 end;
 
-function IsOurSlab(P: Pointer): Boolean; inline;
-var
-  idx: PtrUInt;
+// ---------------------------------------------------------------------------
+// Slab kayit defteri. Cagiranlar (MMFreeMem/ReallocMem/MemSize) yabanci
+// isaretcilerle de gelebilir; bu yuzden arama TAM anahtar esitligi ister.
+
+function SlabKeyAt(ABase: Pointer; I: Integer): PtrUInt; inline;
 begin
-  idx := PtrUInt(P) shr 16;
-  Result := (SlabBits[idx shr 3] and (1 shl (idx and 7))) <> 0;
+  Result := PPtrUInt(PByte(ABase) + PtrUInt(I) * SizeOf(PtrUInt))^;
+end;
+
+procedure SlabKeyPut(ABase: Pointer; I: Integer; AKey: PtrUInt); inline;
+begin
+  PPtrUInt(PByte(ABase) + PtrUInt(I) * SizeOf(PtrUInt))^ := AKey;
+end;
+
+function SlabKeyGet(I: Integer): PtrUInt; inline;
+begin
+  Result := SlabKeyAt(SlabKeys, I);
+end;
+
+procedure SlabKeySet(I: Integer; AKey: PtrUInt); inline;
+begin
+  SlabKeyPut(SlabKeys, I, AKey);
+end;
+
+procedure SlabRebuild(ANewCap: Integer);
+var
+  nk: Pointer;
+  nu: PByte;
+  i, j: Integer;
+begin
+  nk := OldMM.GetMem(PtrUInt(ANewCap) * SizeOf(PtrUInt));
+  nu := PByte(OldMM.GetMem(PtrUInt(ANewCap)));
+  if (nk = nil) or (nu = nil) then
+  begin
+    if nk <> nil then OldMM.FreeMem(nk);
+    if nu <> nil then OldMM.FreeMem(nu);
+    Exit;
+  end;
+  FillChar(nu^, ANewCap, 0);
+  if SlabCap > 0 then
+  begin
+    for i := 0 to SlabCap - 1 do
+      if SlabUsed[i] <> 0 then
+      begin
+        j := Integer(SlabKeyGet(i) and PtrUInt(ANewCap - 1));
+        while nu[j] <> 0 do j := (j + 1) and (ANewCap - 1);
+        SlabKeyPut(nk, j, SlabKeyAt(SlabKeys, i));
+        nu[j] := 1;
+      end;
+    OldMM.FreeMem(SlabKeys);
+    OldMM.FreeMem(SlabUsed);
+  end;
+  SlabKeys := nk;
+  SlabUsed := nu;
+  SlabCap := ANewCap;
+end;
+
+function SlabRegister(AKey: PtrUInt): Boolean;
+var
+  i: Integer;
+begin
+  if (SlabCap = 0) or ((SlabCount + 1) * 2 > SlabCap) then
+  begin
+    if SlabCap = 0 then SlabRebuild(1024)
+    else SlabRebuild(SlabCap * 2);
+  end;
+  if SlabCap = 0 then Exit(False);
+  i := Integer(AKey and PtrUInt(SlabCap - 1));
+  while SlabUsed[i] <> 0 do i := (i + 1) and (SlabCap - 1);
+  SlabKeySet(i, AKey);
+  SlabUsed[i] := 1;
+  Inc(SlabCount);
+  Result := True;
+end;
+
+function SlabIsRegistered(AKey: PtrUInt): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  if SlabCap = 0 then Exit;
+  i := Integer(AKey and PtrUInt(SlabCap - 1));
+  while SlabUsed[i] <> 0 do
+  begin
+    if SlabKeyGet(i) = AKey then Exit(True);
+    i := (i + 1) and (SlabCap - 1);
+  end;
+end;
+
+function IsOurSlab(P: Pointer): Boolean;
+begin
+  LockAcquire;
+  Result := SlabIsRegistered(PtrUInt(P) shr 16);
+  LockRelease;
+end;
+
+// ---------------------------------------------------------------------------
+// Platform slab ayirma. Unix'te mmap 64KB hizali olmadigi icin 2 slab
+// ayirip fazlaysini geri birakiriz (onek/sonek sayfa boyunun katidir).
+
+function SlabAlloc: PSlabHdr;
+{$IFDEF MSWINDOWS}
+begin
+  Result := VirtualAlloc(nil, SLAB_SIZE, MEM_COMMIT or MEM_RESERVE,
+    PAGE_READWRITE);
+end;
+{$ELSE}
+var
+  base, aligned: Pointer;
+  pre, post: PtrUInt;
+begin
+  Result := nil;
+  base := fpmmap(nil, SLAB_SIZE * 2, PROT_READ or PROT_WRITE,
+    MAP_PRIVATE or MAP_ANONYMOUS, -1, 0);
+  if base = MAP_FAILED then Exit;
+  aligned := Pointer((PtrUInt(base) + (SLAB_SIZE - 1)) and
+    not PtrUInt(SLAB_SIZE - 1));
+  pre := PtrUInt(aligned) - PtrUInt(base);
+  post := PtrUInt(base) + SLAB_SIZE * 2 - (PtrUInt(aligned) + SLAB_SIZE);
+  if pre > 0 then fpMunmap(base, pre);
+  if post > 0 then fpMunmap(Pointer(PtrUInt(aligned) + SLAB_SIZE), post);
+  Result := PSlabHdr(aligned);
+end;
+{$ENDIF}
+
+procedure SlabRelease(ASlab: PSlabHdr);
+begin
+  {$IFDEF MSWINDOWS}
+  VirtualFree(ASlab, 0, MEM_RELEASE);
+  {$ELSE}
+  fpMunmap(ASlab, SLAB_SIZE);
+  {$ENDIF}
 end;
 
 // ---------------------------------------------------------------------------
@@ -146,8 +287,8 @@ begin
 
   LockRelease;
 
-  // 3) Yeni slab. VirtualAlloc yavas sistem cagrisi oldugu icin kilit disinda.
-  slab := VirtualAlloc(nil, SLAB_SIZE, MEM_COMMIT or MEM_RESERVE, PAGE_READWRITE);
+  // 3) Yeni slab. OS cagrisi yavas oldugu icin kilit disinda.
+  slab := SlabAlloc;
   if slab = nil then
   begin
     Result := OldMM.GetMem(Size);
@@ -167,13 +308,18 @@ begin
     Inc(BumpPtr[sc], ClassSize[sc]);
     if BumpPtr[sc] >= BumpEnd[sc] then BumpPtr[sc] := nil;
     LockRelease;
-    VirtualFree(slab, 0, MEM_RELEASE);
+    SlabRelease(slab);
     Exit;
   end;
-  // R2-A-1: SlabBits guncellemesi oku-yaz-bicim; kilitsiz yapilirsa ayni bayta
-  // dusen iki slab'tan biri bit kaybeder; MMFreeMem blogu yabanci sanip FPC
-  // heap'ine iade eder. Bu yuzden bit seti kilit altinda.
-  SlabBits[idx shr 3] := SlabBits[idx shr 3] or (1 shl (idx and 7));
+  // R2-A-1: kayit defteri guncellemesi de kilit altinda; aksi halde ayni
+  // anahtari goren iki is parcacigi ayni slab'i iki kez yayinlayabilir.
+  if not SlabRegister(idx) then
+  begin
+    LockRelease;
+    SlabRelease(slab);
+    Result := OldMM.GetMem(Size);
+    Exit;
+  end;
   BumpPtr[sc] := PByte(slab) + SLAB_HDR;
   BumpEnd[sc] := PByte(slab) + SLAB_HDR +
     ((SLAB_SIZE - SLAB_HDR) div ClassSize[sc]) * ClassSize[sc];

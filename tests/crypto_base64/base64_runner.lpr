@@ -10,6 +10,7 @@ program base64_runner;
 {$mode delphi}{$H+}
 
 uses
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes, VDbBase64;
 
 var

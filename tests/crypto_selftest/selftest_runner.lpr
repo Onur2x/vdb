@@ -22,7 +22,7 @@ program selftest_runner;
 
 uses
   {$ifdef UNIX}
-  ccthreads,
+  cthreads,
   {$endif}
   SysUtils, Classes,
   VDbCryptoTypes,

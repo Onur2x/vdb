@@ -11,7 +11,7 @@ program kat_runner;
 
 uses
   {$ifdef UNIX}
-  ccthreads,
+  cthreads,
   {$endif}
   SysUtils,
   kat_common,

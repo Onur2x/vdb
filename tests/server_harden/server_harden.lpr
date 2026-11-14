@@ -2,7 +2,7 @@ program server_harden;
 
 { PHASE-2 kalici kapi: R-4 SUNUCU SERTLESTIRME.
 
-  Skill EK-A R-4 / §7.2: acik (trust) mod YALNIZ loopback'e baglanabilir;
+  Skill EK-A R-4 / Â§7.2: acik (trust) mod YALNIZ loopback'e baglanabilir;
   disa acik adres + trust REDDEDILIR (sessizce loopback'e dusmek yok).
   Bu kapi karari hem saf fonksiyon duzeyinde (truth table) hem de gercek
   TVdbPgServer bind/connect yolu uzerinde kanitlar.
@@ -25,6 +25,7 @@ program server_harden;
 {$mode delphi}{$H+}
 
 uses
+  {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes, VDbNet, VDbPgWire;
 
 var

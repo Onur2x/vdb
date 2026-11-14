@@ -60,6 +60,13 @@ procedure VDbUnlockGenReserve(S: THandleStream);
   yetmez: ad SURECLER ARASI benzersiz olmalidir. }
 function VDbProcessToken: string;
 
+{ TEvent adi. Unix'te BOS ad sem_open'u dusurur ("Failed to create OS basic
+  event with name """) — Windows'ta anonim olay calisir, Unix'te calismaz.
+  Bu yuzden iki platformda da surec-ici benzersiz, dosya adi guvenli bir ad
+  uretilir (onek_pid_sayac). Ayni adi ikinci kez kullanmak Windows'ta var
+  olan nesneyi acar; sayac bunu onler. }
+function VDbEventName(const APrefix: string): string;
+
 // 2026-10-25 (Sprint 3.10): CANLI dosyanin boyunu KILIT ALMADAN ogrenir.
 // Neden: Unix'te FPC'nin TFileStream'i paylasim moduna gore flock() uygular;
 // motor dosyayi LOCK_EX ile tuttugu icin ayni dosyayi IKINCI kez acmak
@@ -125,6 +132,7 @@ type
 var
   GLockCs: TRTLCriticalSection;
   GLockInit: Boolean = False;
+  GEventSeq: LongInt = 0;
   GLockSlots: array[0..VDB_LOCK_SLOTS - 1] of TVDbLockSlot;
 
 procedure LockBookInit;
@@ -330,6 +338,12 @@ begin
     Result := '0';
     {$ENDIF}
   {$ENDIF}
+end;
+
+function VDbEventName(const APrefix: string): string;
+begin
+  Result := APrefix + '_' + IntToStr(GetProcessID) + '_' +
+    IntToStr(InterLockedIncrement(GEventSeq));
 end;
 
 function VDbLockGenReserve(S: THandleStream): Boolean;

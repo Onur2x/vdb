@@ -27,7 +27,7 @@ interface
 
 uses
   SysUtils, SyncObjs, Generics.Collections, VDbPage, VDbPageStore,
-  VDbPageHeap, VDbPageWal, VDbIdxFile;
+  VDbPageHeap, VDbPageWal, VDbIdxFile, VDbSync;
 
 const
   { P-156: acilis maliyet ayristirmasi. Open() her asamayi bitirdiginde
@@ -352,7 +352,7 @@ begin
   FDataStamp := QWord(InterLockedIncrement(GEngineSerial)) shl 32 or 1;
   { v3.19 GRUP COMMIT durumu. FSyncEvt manual-reset. }
   FSyncCs := TCriticalSection.Create;
-  FSyncEvt := TEvent.Create(nil, True, False, '');
+  FSyncEvt := TEvent.Create(nil, True, False, VDbEventName('vdb-fsync'));
   FSyncBusy := False;
   FDurableLsn := 0;
   FSyncCount := 0;

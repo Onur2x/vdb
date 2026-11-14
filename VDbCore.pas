@@ -1004,7 +1004,7 @@ begin
   for i := 0 to FCacheMaxBlocks - 1 do
     FCacheSlots[i].Blk := -1;
   FGateLock := TCriticalSection.Create;
-  FGateEvent := TEvent.Create(nil, True, False, '');
+  FGateEvent := TEvent.Create(nil, True, False, VDbEventName('vdb-gate'));
   FGateOpen := False;
   FGateOwner := 0;
   FIndex := TDictionary<QWord, TDbLoc>.Create;
