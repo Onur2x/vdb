@@ -84,14 +84,20 @@ mevcut kapsam:
 | 3 | WAL kaydi yazimi | VAR | `wal_crash` t2 (kesik kayit) |
 | 4 | WAL flush | VAR | `wal_crash` t1 (flush sonrasi kurtarma) |
 | 5 | Commit kaydi yazimi | VAR | `wal_crash` t2/t7 |
-| 6 | Commit kaydi flush | KISMI | ayni senaryo; fsync sonrasi kesme ayri denenmiyor |
-| 7 | Checkpoint basi | YOK | checkpoint ortasinda surec oldurme senaryosu yok |
-| 8 | Checkpoint sayfa yazimi | YOK | ayni |
-| 9 | Checkpoint tamamlanmasi | YOK | ayni |
-| 10 | WAL budama (Truncate) | KISMI | `wal_crash` t6 dolayli; budama ortasinda kesme yok |
+| 6 | Commit kaydi flush | VAR | `crash_points` commit-6 (PRE_SYNC) / commit-7 (POST_SYNC) |
+| 7 | Checkpoint basi | VAR | `crash_points` cp-1 (`CP_BEGIN`) |
+| 8 | Checkpoint sayfa yazimi | VAR | `crash_points` cp-2 (`CP_BEFORE_FLUSH`) / cp-3 (`CP_AFTER_FLUSH`) |
+| 9 | Checkpoint tamamlanmasi | VAR | `crash_points` cp-3 / cp-5 (`CP_DONE`) |
+| 10 | WAL budama (Truncate) | VAR | `crash_points` cp-4 (`CP_AFTER_TRUNC`) |
 
-**Bosluk (G1):** 6-10 icin deterministik "noktada kes" senaryosu yok.
-`SimulateCrash` yalniz islem sonunda cagriliyor.
+**G1 KAPATILDI.** `tests/crash_points` (24 kontrol) checkpoint ve commit'in
+**icine** enjeksiyon noktalari koyar (`VDB_CRASH_STAGE_*` +
+`TVdbPageEngine.CrashAtStage` / `OnCrashPoint`) ve cocuk surecte gercek surec
+olumu yapar (`SIGKILL` / `TerminateProcess`; `Close()` hic calismaz).
+Enjeksiyon uretimde `0` (kapali) kalir; kanca atanmazsa motor **acik hata**
+verir (`EVdbPageEngine`), sessiz devam etmez. Her noktadan sonra: yeniden
+acilis, `VERIFY` temiz, onayli commit'ler duruyor (commit-6 icin kayip
+serbest, tutarsizlik yasak), DB hala yazilabilir.
 
 ### §19.3 WAL yonetimi
 
@@ -287,7 +293,7 @@ sayfa numarasi), heap hucreleri, overflow zincirleri, anahtar tekilligi.
 | 3 | Sayfa tabanli rastgele erisim | VAR | `ReadPageAt` |
 | 4 | WAL dayanikliligi dogrulandi | VAR | `wal_crash`, `kv_wal` |
 | 5 | Cokme kurtarma testleri geciyor | VAR | `wal_crash` |
-| 6 | Checkpoint kurtarma testleri | **KISMI** | G1 |
+| 6 | Checkpoint kurtarma testleri | **VAR** | `crash_points` (cp-1..cp-5, commit-6/7) |
 | 7 | Butunluk denetleyici calisiyor | KISMI | `Verify` var, CLI/mod yok (G6) |
 | 8 | B+Tree butunluk kontrolleri | VAR | `btree_integrity` 152/0 |
 | 9 | Yedek/geri yukleme testleri | VAR | `backup_restore` 25/0 |
@@ -304,7 +310,7 @@ sayfa numarasi), heap hucreleri, overflow zincirleri, anahtar tekilligi.
 | 20 | Mevcut V3 SQL testleri geciyor | VAR | `sql_matrix` 61/0, `sql_stubs` 25/0 |
 | 21 | V2 donmus ve izole | VAR | `VDbCore` yalniz salt-okunur |
 
-**Ozet: 14 VAR, 4 KISMI, 3 YOK.** Bu yuzden skill §27 "tamamlandi" sayilamaz
+**Ozet: 15 VAR, 3 KISMI, 3 YOK.** Bu yuzden skill §27 "tamamlandi" sayilamaz
 ve asagidaki bosluklar kapatilmadan "production" iddia edilmez.
 
 ---
@@ -313,7 +319,7 @@ ve asagidaki bosluklar kapatilmadan "production" iddia edilmez.
 
 | No | Bosluk | Yapilacak |
 |---|---|---|
-| G1 | Checkpoint cokme noktalari (7-9) ve WAL budama (10) | Deterministik "noktada kes" enjeksiyonu + kapi |
+| G1 | ~~Checkpoint cokme noktalari (7-9) ve WAL budama (10)~~ | **KAPATILDI** — `tests/crash_points` 24/0 (deterministik enjeksiyon + gercek surec olumu) |
 | G2 | Onbellek metrikleri eksik (hit ratio, kirli sayfa, flush) | `TVDBStoreStats` genislet, `SHOW STATS`'a ekle, kapi |
 | G3 | Izolasyon/kilit belgesi yok | `docs/engineering/ISOLATION.md` |
 | G4 | ~~Surecler-arasi kilitleme testleri yok~~ | **KAPATILDI** — `tests/multiproc` 17/0 (MP1-MP10) |
@@ -323,5 +329,5 @@ ve asagidaki bosluklar kapatilmadan "production" iddia edilmez.
 | G8 | Limitler tanimsiz, disk dolu denenmedi | Limit tablosu + kontrollu hata + disk dolu simulasyonu |
 | G9 | Platformlar arasi dosya uyumu kanitsiz | Windows'ta yaz, Linux'ta oku (ve tersi) kapisi |
 
-Oncelik: G6 (arac), G1 (dayaniklilik), G7/G9 (uyumluluk), G2/G5 (golge),
-G3/G8 (belge + sinir). G4 kapatildi.
+Oncelik: G6 (arac), G7/G9 (uyumluluk), G2/G5 (golge),
+G3/G8 (belge + sinir). G1 ve G4 kapatildi.

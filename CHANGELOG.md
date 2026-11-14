@@ -45,6 +45,13 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   kapanis silmedigi icin tek dosyali bir veritabani salt-okunur acildiginda
   dizinde ikinci dosya kaliyordu. Artik RO oturum `.gen` olusturmaz, dosyaya
   yazmaz; yalniz degisiklik sayacini okur.
+- **Deterministik cokme noktalari** kapisi `crash_points` (24 kontrol):
+  `VDbPageEngine`'e `VDB_CRASH_STAGE_*` + `CrashAtStage` / `OnCrashPoint`
+  eklendi; checkpoint basi, sayfa yazimi oncesi/sonrasi, WAL budama sonrasi,
+  checkpoint sonu, commit kaydinin fsync oncesi/sonrasi noktalarinda surec
+  **gercekten** oldurulur (`SIGKILL`/`TerminateProcess`). Her noktadan sonra
+  yeniden acilis + `VERIFY` + onayli commit kontrolu yapilir. Enjeksiyon
+  uretimde kapalidir (`0`) ve kanca yoksa acik hata verir.
 
 ### SQL
 

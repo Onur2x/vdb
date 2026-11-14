@@ -30,6 +30,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `single_file` | "tek dosya" sozlesmesi: temiz kapanistan sonra dizinde yalniz `<ad>.odb`; tek dosya kopyasi acilir/yazilir; `BACKUP TO` tek dosya (bkz. `ON_DISK_LAYOUT.md`) |
 | `region_stream` | `TRegionStream` dosya-ici pencere: mantiksal uzunluk, fsync, sinir kontrolu (v4 icin yazildi, motorda kullanilmiyor) |
 | `multiproc` | iki **gercek surec**: es zamanli yazar + bayat onbellek tazeleme, `SIGKILL`/`TerminateProcess` sonrasi kurtarma, RO yazmayi reddetme (bkz. `STORAGE_AUDIT.md` §21.3) |
+| `crash_points` | **deterministik cokme enjeksiyonu**: 7 checkpoint/commit asamasinin ortasinda gercek surec olumu (`SIGKILL`/`TerminateProcess`), sonra yeniden acilis + `VERIFY` + onayli commit kontrolu (bkz. `STORAGE_AUDIT.md` §4) |
 | `crypto_core` | saf Pascal AES/GCM/SHA/HMAC cekirdegi |
 | `crypto_base64` | base64 kodlayici/cozucu |
 | `fixtures_builtin` | eski `.odb`/anahtar fixture'lari **builtin** provider ile acilir |
@@ -237,3 +238,17 @@ kaldirildi:
   `kv_wal`, `backup_restore` 25/0, `page_integrity` 14/0,
   `btree_integrity` 152/0, `perf_baseline` 16/0, `single_file` 35/0,
   `server_harden` 24/0, `auth_throttle` 16/0, `tls_client` 6/0.
+- Onbesinci kosu (PHASE-12 commit'i): **yerel kanit** WSL x86_64 Linux
+  **22 kapi** PASS, Git Bash/Windows i386 **21 kapi** PASS (`tls_client`
+  SKIP). Yeni kapi `crash_points` (**24 PASS, 0 FAIL**) SKILL2 §19.2'nin
+  deterministik cokme noktalarini kapatir: `VDbPageEngine` icine
+  `VDB_CRASH_STAGE_*` sabitleri, `CrashAtStage` ve `OnCrashPoint` kancasi
+  konuldu; test cocuk surecte kancayi **gercek surec olumune**
+  (`SIGKILL`/`TerminateProcess`; `Close()` hic calismaz) baglar.
+  Denenen noktalar: checkpoint basi, sayfa yazimi oncesi/sonrasi, WAL
+  budama sonrasi, checkpoint sonu, commit kaydinin fsync oncesi ve
+  sonrasi. Her noktadan sonra dosya yeniden acilir, `VERIFY` temiz
+  cikar, onayli commit'ler durur (fsync oncesi noktada kayip serbesttir
+  ama tutarsizlik yasaktir) ve DB hala yazilabilir. Enjeksiyon uretimde
+  `0` (kapali) kalir; kanca atanmazsa motor **acik hata** verir, sessizce
+  devam etmez. Diger kapilar degismedi (`multiproc` 17/0 dahil).

@@ -185,12 +185,13 @@ Last verified state (2026-11-14, Linux x86_64 and Windows i386, `tests/run_gates
 | `single_file` | 35 / 0 |
 | `region_stream` | 13 / 0 |
 | `multiproc` | 17 / 0 (two real processes: concurrent writer, stale-cache refresh, SIGKILL) |
+| `crash_points` | 24 / 0 (deterministic crash injection at 7 checkpoint/commit stages) |
 | `server_harden` | 24 / 0 |
 | `auth_throttle` | 16 / 0 |
 | `tls_client` | 6 / 0 (Linux; skipped on Windows without OpenSSL DLL) |
 
-That is **21 gates** on Linux (plus two OpenSSL opt-in gates skipped when
-`VDB_CRYPTO_DLL` is unset) and **20 gates** on Windows (`tls_client` skipped).
+That is **22 gates** on Linux (plus two OpenSSL opt-in gates skipped when
+`VDB_CRYPTO_DLL` is unset) and **21 gates** on Windows (`tls_client` skipped).
 Gate documents: [docs/engineering/](docs/engineering/).
 
 ```bash

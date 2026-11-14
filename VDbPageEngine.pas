@@ -39,8 +39,24 @@ const
   VDB_OPEN_PROBE_HEAP    = 3;   // `.idx` yukleme veya tam tarama
   VDB_OPEN_PROBE_FINISH  = 4;   // son flush/truncate + kilit birakma
 
+  { SKILL2 §19.2: deterministik cokme enjeksiyonu icin checkpoint/commit
+    asamalari. Varsayilan 0 = enjeksiyon kapali; uretimde ASLA acilmaz.
+    Test, `OnCrashPoint` kancasini gercek surec olumune baglar, boylece
+    "tam bu noktada elektrik kesildi" senaryosu birebir denenir. }
+  VDB_CRASH_STAGE_NONE            = 0;
+  VDB_CRASH_STAGE_CP_BEGIN        = 1;  // checkpoint basi (hicbir sey yazilmadi)
+  VDB_CRASH_STAGE_CP_BEFORE_FLUSH = 2;  // pending kuruldu, sayfa yazimi baslamadi
+  VDB_CRASH_STAGE_CP_AFTER_FLUSH  = 3;  // sayfalar diske indi, WAL budanmadi
+  VDB_CRASH_STAGE_CP_AFTER_TRUNC  = 4;  // WAL budandi, durabil LSN yazilmadi
+  VDB_CRASH_STAGE_CP_DONE         = 5;  // checkpoint tamamlandi
+  VDB_CRASH_STAGE_COMMIT_PRE_SYNC = 6;  // commit kaydi WAL'de, fsync yok
+  VDB_CRASH_STAGE_COMMIT_POST_SYNC= 7;  // commit durabil (fsync basarili)
+
 type
   EVdbPageEngine = class(Exception);
+
+  { Cokme kancasi: test buraya surec olduren bir yordam baglar. }
+  TVdbCrashHook = procedure;
 
   { v3.1: `.idx` etiket ozeti saglayicisi (backend tablo sayimlarini verir). }
   TVdbTagSummaryEvent = procedure(out Tags: TVdbIdxTagArray) of object;
@@ -132,7 +148,12 @@ type
         ve durabil LSN 0'dan baslar (yalnizca fazladan bir fsync; veri
         bozulmasi yok). Kalirsa dizinde ikinci dosya kalir. }
       FDropGenOnClose: Boolean;
+      { SKILL2 §19.2: cokme enjeksiyonu (yalniz test). 0 = kapali. }
+      FCrashAtStage: Integer;
+      FOnCrashPoint: TVdbCrashHook;
     procedure InitEngine(const ADbPath: string; APoolPages: Integer);
+    { Cokme enjeksiyonu: FCrashAtStage = AStage ise kancayi cagirir. }
+    procedure CrashPoint(AStage: Integer);
     { v3.19: Commit'in gercek govdesi. ASyncLsn = WAL'e yazilan en son LSN
       (yazilacak kayit yoksa 0). DoSync=False ise fsync yapilmaz. }
     function DoCommit(DoSync: Boolean; out ASyncLsn: LongWord): Boolean;
@@ -186,6 +207,14 @@ type
     { Test: surec olumu simulasyonu. Commit edilmemis degisiklikler ve
       WAL tamponu diske yazilmadan atilir. }
     procedure SimulateCrash;
+
+    { SKILL2 §19.2: DETERMINISTIK cokme noktasi. VDB_CRASH_STAGE_*
+      sabitlerinden biri verilir; checkpoint/commit o asamaya gelince
+      `OnCrashPoint` cagrilir. Uretimde 0 (kapali) kalmalidir. }
+    property CrashAtStage: Integer read FCrashAtStage write FCrashAtStage;
+    { Enjeksiyon kancasi. Atanmazsa enjeksiyon acikken acik hata verilir
+      (sessizce devam etmek "test edildi" yanilsamasi yaratirdi). }
+    property OnCrashPoint: TVdbCrashHook read FOnCrashPoint write FOnCrashPoint;
 
     { P1-3: durabilite (fsync) hatasindan sonra cagrilir. Commit'in
       uyguladigi sayfalar bellekteydi; WAL basarisiz commit bolumunu geri
@@ -809,6 +838,17 @@ begin
     FWal.Close;
 end;
 
+procedure TVdbPageEngine.CrashPoint(AStage: Integer);
+begin
+  if (FCrashAtStage = 0) or (FCrashAtStage <> AStage) then Exit;
+  if Assigned(FOnCrashPoint) then
+    FOnCrashPoint();
+  { Kanca yoksa ya da kanca geri donduyse: enjeksiyon amacina ulasmadi.
+    Sessizce devam etmek "cokme testi gecti" yanilsamasi verirdi. }
+  raise EVdbPageEngine.CreateFmt(
+    'cokme enjeksiyonu: %d. asamada kanca islemi sonlandirmadi', [AStage]);
+end;
+
 procedure TVdbPageEngine.SimulateCrash;
 begin
   FInTxn := False;
@@ -1065,13 +1105,21 @@ begin
     ikinci kez flush ediyordu (commit basina iki FlushFileBuffers). }
   Result := DoCommit(False, syncLsn);
   if DoSync and Result then
+  begin
+    CrashPoint(VDB_CRASH_STAGE_COMMIT_PRE_SYNC);
     AwaitDurable(syncLsn);
+    CrashPoint(VDB_CRASH_STAGE_COMMIT_POST_SYNC);
+  end;
 end;
 
 function TVdbPageEngine.CommitNoSync(out ASyncLsn: LongWord): Boolean;
 begin
   { v3.19: yazar, fsync etmez. Durabilite cagiranin sorumlulugunda. }
   Result := DoCommit(False, ASyncLsn);
+  { SKILL2 §19.2: commit kaydi WAL'e yazildi, fsync YOK. Bu noktada olum
+    commit kaybina yol acabilir (kabul); tutarsizlik YASAK. }
+  if Result then
+    CrashPoint(VDB_CRASH_STAGE_COMMIT_PRE_SYNC);
 end;
 
 procedure TVdbPageEngine.AwaitDurable(ALsn: LongWord);
@@ -1166,6 +1214,9 @@ begin
               FDurableLsn := target;
             { v3.31: surecler arasi bildirim — yalnizca basarili fsync'ten SONRA. }
             FStore.SetDurableLsn(target);
+            { SKILL2 §19.2: commit DURABIL. Buradan sonra olum commit'i
+              kaybettiremez. }
+            CrashPoint(VDB_CRASH_STAGE_COMMIT_POST_SYNC);
           end
           else
             FSyncErr := err;
@@ -1356,6 +1407,7 @@ begin
     raise EVdbPageEngine.Create('motor acik degil');
   { v3.2: salt-okunur oturumda checkpoint yok; disk zaten yazilamaz. }
   if FStore.ReadOnly then Exit(True);
+  CrashPoint(VDB_CRASH_STAGE_CP_BEGIN);
   { Tahliye edilmis sayfalar once dosyaya, sonra onbellekteki kirli
     sayfalar yazilir. InstallPage tahliye tetiklemez.
     Onemli: bir sayfa onbellekte varsa cerceve imaji pending kopyasindan
@@ -1396,7 +1448,9 @@ begin
         end;
       end;
     until (st.Commits = 0) and (FPendingCount = 0);
+  CrashPoint(VDB_CRASH_STAGE_CP_BEFORE_FLUSH);
   FStore.Flush(DoSync);
+  CrashPoint(VDB_CRASH_STAGE_CP_AFTER_FLUSH);
   if DoSync then
   begin
     { v3.19 GRUP COMMIT BARİYERİ: WAL budanmadan once icindeki her sey
@@ -1405,6 +1459,7 @@ begin
       bitene kadar bekle, sonra durabil LSN'i checkpoint LSN'ine cek. }
     AwaitDurable(FWal.WrittenLsn);
     FWal.Truncate(FStore.LSN);
+    CrashPoint(VDB_CRASH_STAGE_CP_AFTER_TRUNC);
     FSyncCs.Enter;
     try
       FDurableLsn := FWal.WrittenLsn;
@@ -1421,6 +1476,7 @@ begin
   Inc(FCheckpointCount);
   FCheckpointLastMs := Int64(GetTickCount - t0);
   Inc(FCheckpointTotalMs, FCheckpointLastMs);
+  CrashPoint(VDB_CRASH_STAGE_CP_DONE);
   Result := True;
 end;
 
