@@ -82,6 +82,27 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   dosyalarin hash'i ve boyutu degismez. Sinirlar belgede: imajlar
   sentetiktir ve yukseltme tek 4 KB'lik yerinde baslik yazimidir
   (kesilirse dosya acilmaz; kurtarma yedekten geri yuklemedir).
+- **Tasinabilirlik** `portability` kapisi (29 kontrol) SKILL2 §26.3'u
+  kapatir: ayni `.odb` dosyasi **iki platform arasinda gercekten tasindi**.
+  Kapi iki modludur — `--write <dizin>` kurar ve platformdan bagimsiz
+  `manifest.txt` yazar, `--read <dizin>` dosyayi **salt-okunur** acip
+  satir sayisini, icerik ozetini, dosya ozetini/boyunu ve `VERIFY`
+  sonucunu dogrular. Olculen: kendi platformunda 29/0; **Windows i386 ->
+  Linux x86_64 13/0** ve **Linux -> Windows 13/0** (ayni imza, temiz
+  `VERIFY`, dosya ozeti degismedi, `.wal`/`.gen` olusmadi).
+  **Bulunan gercek hata:** `VDbTable.SaveSchema` sema metnini RTL'in
+  `sl.Text` ozelligiyle yaziyordu, yani satir sonu **platforma
+  bagimliydi** (Windows CRLF). Windows'ta yazilan bir veritabani Linux'ta
+  aciliyordu ama katalog kaydi 2 bayt uzun oldugu icin ayni veriyi tasiyan
+  iki imaj farkli baytlara sahipti (sayfa 1'de 3697 bayt kayma). Sema
+  artik acikca `#10` ile birlestirilir; okuma yolu hem CRLF hem LF kabul
+  eder, bicim surumu degismedi ve alan/sozdizimi hash'i yoktur. Duzeltme
+  sonrasi bagimsiz uretilen iki imaj **yalnizca 13 baytta** farklidir ve
+  bu baytlar tamamen **ucucu meta**dir: olusturma zamani (28), rastgele DB
+  kimligi (76..83) ve sayfa 0 CRC'si (4092..4095). Kapi `PT6/PT7` ile
+  bunu kilitler (ikinci yazim yalniz ucucu alanlarda farkli; sema
+  kaydinda CR yok). Durust sinir: buyuk-endian makine ve macOS
+  denenmedi.
 
 ### SQL
 

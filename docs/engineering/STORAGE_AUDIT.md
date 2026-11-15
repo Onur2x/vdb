@@ -328,11 +328,37 @@ Durust sinirlar (kanitlanmayanlar):
 
 | Gereksinim | Durum |
 |---|---|
-| Windows <-> Linux dosya tasima | KISMI — ayni `.odb` iki platformda acildi mi **kanit yok** (G9) |
-| macOS | DENENMEDI |
+| Windows <-> Linux dosya tasima | **VAR** — iki yonlu kanit: ayni `.odb` Windows i386'da yazilip Linux x86_64'te acildi (13/0) ve tersi (13/0); satir sayisi 400, icerik ozeti `B9352F5CB8B5F0C5`, `VERIFY` temiz, dosya ozeti aktarimda degismedi |
+| macOS | DENENMEDI — elde macOS makinesi yok; ayni kalici bicim kullanildigi icin *beklenen* sonuc ayni, ama **olculmedi** |
+| Bagimsiz uretilen imajlarin bayt esitligi | **VAR (13 bayt disinda)** — Windows'ta ve Linux'ta ayri ayri uretilen iki 400 satirlik imaj yalnizca 13 baytta farkli: `28..35` olusturma zamani, `76..83` rastgele DB kimligi, `4092..4095` sayfa 0 CRC'si. Yani kalici bicimde **platforma bagli tek bir bayt yok** |
 | Mutlak yol bagimliligi yok | VAR — dosya ici yol saklanmiyor |
 | Isaretci/padding/endian bagimliligi yok | VAR — tum kalici yapi `Move`+sabit ofset, kucuk-endian |
 | Acik serilestirme kurallari | VAR — `VDB_PAGE_*` sabitleri |
+| Satir sonu bagimliligi yok | **VAR** — sema metni `#10` ile yazilir (`VDbTable.SaveSchema`, `sl.Text` yerine acik LF birlestirme). Onceden Windows'ta CRLF yaziliyordu; bu, imajda 2 baytlik platform farki ve okuyucuda kayan ofset uretiyordu. Duzeltildi, `PT7` bunu kilitler |
+
+### §26.3 olcum, durust sinirlariyla
+
+`tests/portability/portability.lpr` iki modda kosar:
+
+| Mod | Ne yapar |
+|---|---|
+| `--write <dizin>` | 400 satirlik DB kurar, `manifest.txt` yazar (satir, icerik ozeti, bayt, dosya ozeti) |
+| `--read <dizin>` | Dosyayi **salt-okunur** acar; satir sayisi + icerik ozeti + dosya ozeti + bayt ayni mi, `VERIFY` temiz mi, yan dosya olustu mu, baslik kimligi ayni mi diye bakar |
+| (argumansiz) | Ayni platformda yaz/oku turu + bayt kopya + **ikinci bagimsiz yazim** ile imaj determinizmi (29 kontrol) |
+
+Olculen sonuc (FPC 3.2.2, Linux x86_64 / FPC i386, Windows):
+
+- Kendi platformunda: `29 PASS / 0 FAIL` (her iki platformda).
+- Capraz: Windows'un yazdigini Linux okur -> `13 PASS / 0 FAIL`; Linux'un yazdigini Windows okur -> `13 PASS / 0 FAIL`.
+- Iki platformda bagimsiz uretilen imajlar arasindaki fark **13 bayt** ve hepsi ucucu meta alanlari.
+
+Sinirlar:
+
+- **Buyuk-endian denenmedi.** Kalici yapi kucuk-endian sabit ofsetlerle yazilir; buyuk-endian bir makinede okunmaz. Bu bir iddia degil, bilinen sinirdir.
+- macOS denenmedi.
+- Kapi, dosyayi tasirken *icerik* ve *butunlugu* dogrular; iki platformda ayni anda kosan bir "paylasilan dosya" senaryosu (ag paylasimi, kilit) kapsam disidir.
+
+**G9 KAPATILDI.**
 
 ---
 
@@ -352,7 +378,7 @@ Durust sinirlar (kanitlanmayanlar):
 | 10 | Eszamanli erisim testleri | VAR | `multiproc` (MP2/MP3/MP5) |
 | 11 | Coklu surec kilitleme testleri | VAR | `multiproc` MP4-MP9 (iki gercek surec) |
 | 12 | Veritabani gecis testleri | **VAR** | `format_compat` 28/0 (v3/v4 yukseltme, v6 red, yarim goc) |
-| 13 | Platformlar arasi dosya uyumu | **YOK** | G9 |
+| 13 | Platformlar arasi dosya uyumu | **VAR** | `portability` 29/0 (ayni platform turu) + iki yonlu gercek aktarim: Win i386 -> Linux x86_64 13/0, Linux -> Win 13/0 |
 | 14 | Benchmark tekrarlanabilir | KISMI | G5 |
 | 15 | Performans regresyon kapilari | VAR | `perf_baseline` |
 | 16 | Disk dolu davranisi test edildi | **YOK** | G8 |
@@ -362,7 +388,7 @@ Durust sinirlar (kanitlanmayanlar):
 | 20 | Mevcut V3 SQL testleri geciyor | VAR | `sql_matrix` 61/0, `sql_stubs` 25/0 |
 | 21 | V2 donmus ve izole | VAR | `VDbCore` yalniz salt-okunur |
 
-**Ozet: 17 VAR, 2 KISMI, 3 YOK.** Bu yuzden skill §27 "tamamlandi" sayilamaz
+**Ozet: 18 VAR, 2 KISMI, 3 YOK.** Bu yuzden skill §27 "tamamlandi" sayilamaz
 ve asagidaki bosluklar kapatilmadan "production" iddia edilmez.
 
 ---
@@ -379,7 +405,7 @@ ve asagidaki bosluklar kapatilmadan "production" iddia edilmez.
 | G6 | ~~Butunluk denetleyici CLI + modlar + salt-okunur~~ | **KAPATILDI** — `vdbcheck` (4 mod, her zaman `CreateReadOnly`) + `tests/integrity_check` 32/0 |
 | G7 | ~~Eski format fixture'lari ve gecis testleri~~ | **KAPATILDI** — `tests/format_compat` 28/0 (sentetik v3/v4 imaj, yukseltme, v6/bozuk/yarim goc reddi) |
 | G8 | Limitler tanimsiz, disk dolu denenmedi | Limit tablosu + kontrollu hata + disk dolu simulasyonu |
-| G9 | Platformlar arasi dosya uyumu kanitsiz | Windows'ta yaz, Linux'ta oku (ve tersi) kapisi |
+| G9 | ~~Platformlar arasi dosya uyumu kanitsiz~~ | **KAPATILDI** — `tests/portability` 29/0 (imaj determinizmi + LF sema) ve iki yonlu gercek aktarim (Win i386 -> Linux x86_64, Linux -> Win), her yonde 13/0 |
 
-Oncelik: G9 (uyumluluk), G5 (golge), G3/G8 (belge + sinir).
-G1, G2, G4, G6 ve G7 kapatildi.
+Oncelik: G5 (golge), G3/G8 (belge + sinir).
+G1, G2, G4, G6, G7 ve G9 kapatildi.

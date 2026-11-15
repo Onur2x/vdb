@@ -298,3 +298,30 @@ kaldirildi:
   yukseltme tek 4 KB'lik **yerinde** baslik yazimidir — kesilirse dosya
   acilmaz, kurtarma "yedekten geri yukle"dir. Diger kapilar degismedi
   (`cache_metrics` 21/0, `integrity_check` 32/0, `crash_points` 24/0 dahil).
+- Ondokuzuncu kosu (PHASE-16 commit'i): **yerel kanit** WSL x86_64 Linux
+  **26 kapi** PASS, Git Bash/Windows i386 **25 kapi** PASS (`tls_client`
+  SKIP). Yeni kapi `portability` (**29 PASS, 0 FAIL**) SKILL2 §26.3'u
+  kapatir. Kapi iki modludur cunku asil iddia **iki platform arasinda
+  gercek dosya aktarimi**dir: `--write <dizin>` veritabanini kurar ve
+  `manifest.txt` yazar (satir sayisi, icerik ozeti, bayt, dosya ozeti),
+  `--read <dizin>` ayni dosyayi **salt-okunur** acar ve manifestteki
+  degerleri dogrular. Argumansiz kosu ayni platformda yaz/oku turu +
+  bayt bayt kopya + ikinci bagimsiz yazim karsilastirmasidir.
+  Olculen (her iki platform, 400 satir): kendi platformunda **29/0**;
+  **Windows i386 -> Linux x86_64 13/0** ve **Linux -> Windows 13/0**
+  (ayni imza `B9352F5CB8B5F0C5`, `VERIFY` temiz, dosya ozeti degismedi,
+  `.wal`/`.gen` olusmadi, baslik sihirli sayisi/surumu/sayfa boyu ayni).
+  **Bulunan gercek hata (duzeltildi):** `VDbTable.SaveSchema` sema metnini
+  RTL'in `sl.Text` ozelligiyle yaziyordu, yani satir sonu **platforma
+  bagimliydi** (Windows CRLF). Bu, katalog kaydinin 2 bayt uzun olmasina ve
+  ayni veriyi tasiyan iki imajin farkli olmasina yol aciyordu (sayfa 1'de
+  3697 bayt kayma, `FreeSpace`/`ContentOff` farkli). Sema artik acikca
+  `#10` ile birlestirilir; okuma yolu hem CRLF hem LF kabul eder ve bicim
+  surumu degismedi. Duzeltmeden sonra bagimsiz uretilen iki imaj
+  **yalnizca 13 baytta** farklidir ve bu 13 bayt tamamen **ucucu
+  meta**dir: olusturma zamani (ofset 28), rastgele DB kimligi (76..83) ve
+  sayfa 0 CRC'si (4092..4095). Kapi bunu `PT6/PT7` ile kilitler.
+  **Durust sinir:** buyuk-endian makine ve macOS denenmedi; kalici yapi
+  kucuk-endian ve sabit ofset varsayar (bkz. `STORAGE_AUDIT.md` §11).
+  Diger kapilar degismedi (`format_compat` 28/0, `cache_metrics` 21/0,
+  `integrity_check` 32/0, `crash_points` 24/0 dahil).

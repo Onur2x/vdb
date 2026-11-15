@@ -6386,7 +6386,20 @@ begin
             IntToStr(FPolicies[i].Cmd) + '|' +
             HexEncFld(FPolicies[i].UsingText) + '|' +
             HexEncFld(FPolicies[i].CheckText));
-    raw := VDB_SCHEMA_TAG + sLineBreak + sl.Text;
+    // Tasinabilirlik (SKILL2 §26.3): kalici sema metni platformdan BAGIMSIZ
+    // olmali. `sl.Text` satir sonu olarak RTL'in LineEnding'ini kullanir
+    // (Windows'ta CRLF, Linux'ta LF); bu yuzden AYNI sema iki platformda
+    // farkli bayt uretiyordu (olculdu: sema hucresi Linux 42, Windows 44
+    // bayt). Simdi sabit #10 yazilir. Okuyucu tarafi (`sl.Text := ...`) hem
+    // CRLF hem LF ayirdigi icin CRLF'li eski dosyalar aynen okunur; bicim
+    // surumu artmaz.
+    raw := VDB_SCHEMA_TAG + #10;
+    for i := 0 to sl.Count - 1 do
+    begin
+      raw := raw + sl[i];
+      if i < sl.Count - 1 then
+        raw := raw + #10;
+    end;
     SetLength(b, Length(raw));
     if Length(raw) > 0 then Move(raw[1], b[0], Length(raw));
     FKvB.Put(VDB_SCHEMA_KEY, b);

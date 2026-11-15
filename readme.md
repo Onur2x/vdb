@@ -167,7 +167,7 @@ API details and SQL usage: [usage.md](usage.md)
 
 ## Test status
 
-Last verified state (2026-11-14, Linux x86_64 and Windows i386, `tests/run_gates.sh`):
+Last verified state (2026-11-15, Linux x86_64 and Windows i386, `tests/run_gates.sh`):
 
 | Gate | Result |
 |---|---|
@@ -189,12 +189,13 @@ Last verified state (2026-11-14, Linux x86_64 and Windows i386, `tests/run_gates
 | `integrity_check` | 32 / 0 (`vdbcheck` 4 modes, read-only proof, corruption categories) |
 | `cache_metrics` | 21 / 0 (hit ratio, dirty pages, flush counters actually move; MetricsText + SHOW STATS) |
 | `format_compat` | 28 / 0 (v3/v4 upgrade, v6 refused, torn migration refused, file untouched) |
+| `portability` | 29 / 0 (own-platform round trip, byte-for-byte copy, second independent write differs only in volatile metadata, schema written with LF) |
 | `server_harden` | 24 / 0 |
 | `auth_throttle` | 16 / 0 |
 | `tls_client` | 6 / 0 (Linux; skipped on Windows without OpenSSL DLL) |
 
-That is **25 gates** on Linux (plus two OpenSSL opt-in gates skipped when
-`VDB_CRYPTO_DLL` is unset) and **24 gates** on Windows (`tls_client` skipped).
+That is **26 gates** on Linux (plus two OpenSSL opt-in gates skipped when
+`VDB_CRYPTO_DLL` is unset) and **25 gates** on Windows (`tls_client` skipped).
 Gate documents: [docs/engineering/](docs/engineering/).
 
 ```bash

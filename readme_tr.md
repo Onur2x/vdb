@@ -167,7 +167,7 @@ API ayrıntıları ve SQL kullanımı: [kullanim.md](kullanim.md)
 
 ## Test durumu
 
-Son doğrulanan durum (2026-11-14, Linux x86_64 ve Windows i386, `tests/run_gates.sh`):
+Son doğrulanan durum (2026-11-15, Linux x86_64 ve Windows i386, `tests/run_gates.sh`):
 
 | Kapı | Sonuç |
 |---|---|
@@ -189,12 +189,13 @@ Son doğrulanan durum (2026-11-14, Linux x86_64 ve Windows i386, `tests/run_gate
 | `integrity_check` | 32 / 0 (`vdbcheck` dört mod, salt-okunur kanıtı, bozulma kategorileri) |
 | `cache_metrics` | 21 / 0 (hit oranı, kirli sayfa, flush sayaçları gerçekten hareket ediyor; MetricsText + SHOW STATS) |
 | `format_compat` | 28 / 0 (v3/v4 yükseltme, v6 reddi, yarım göç reddi, dosya değişmiyor) |
+| `portability` | 29 / 0 (kendi platformunda yaz/oku, bayt bayt kopya, ikinci bağımsız yazım yalnız uçucu meta alanlarında farklı, şema LF ile yazılıyor) |
 | `server_harden` | 24 / 0 |
 | `auth_throttle` | 16 / 0 |
 | `tls_client` | 6 / 0 (Linux; OpenSSL DLL'i olmayan Windows'ta atlanır) |
 
-Linux'ta **25 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
-atlanır), Windows'ta **24 kapı** (`tls_client` atlanır). Kapı belgeleri:
+Linux'ta **26 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
+atlanır), Windows'ta **25 kapı** (`tls_client` atlanır). Kapı belgeleri:
 [docs/engineering/](docs/engineering/).
 
 ```bash
