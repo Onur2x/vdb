@@ -148,6 +148,7 @@ build_gate sql_features    "$ROOT/tests/sql_features/sql_features.lpr"
 build_gate limits          "$ROOT/tests/limits/limits_gate.lpr"
 build_gate cache_pressure  "$ROOT/tests/cache_pressure/cache_pressure.lpr"
 build_gate page_corrupt    "$ROOT/tests/page_corrupt/page_corrupt.lpr"
+build_gate server_failure  "$ROOT/tests/server_failure/server_failure.lpr"
 build_gate server_harden "$ROOT/tests/server_harden/server_harden.lpr"
 build_gate auth_throttle "$ROOT/tests/server_harden/auth_throttle.lpr"
 build_gate tls_client    "$ROOT/tests/tls_client/tls_client_gate.lpr"
@@ -186,6 +187,7 @@ run_gate sql_features   "$WORK/sql_features"    sql_features
 run_gate limits         "$WORK/limits"          limits_gate
 run_gate cache_pressure "$WORK/cache_pressure"  cache_pressure
 run_gate page_corrupt   "$WORK/page_corrupt"    page_corrupt
+run_gate server_failure "$WORK/server_failure"  server_failure
 run_gate server_harden  "$WORK/server_harden"  server_harden
 run_gate auth_throttle  "$WORK/auth_throttle"  auth_throttle
 

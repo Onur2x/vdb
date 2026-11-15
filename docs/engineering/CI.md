@@ -49,6 +49,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `cache_pressure` | **onbellek tukenmesi / tahliye** (SKILL3 §12.1): 8 sayfalik havuzla (~32 KB) havuzdan cok daha buyuk bir tablo uzerinde calisilir. Tam tarama **butun satirlari** dogru okur (tahliye + yeniden yukleme veri kaybetmez), `PoolUsed` havuz boyunu asmaz, miss sayaci gercek tahliyeyi kanitlar, tek islemde 2000 satir guncellemesi (kirli sayfa tahliye yolu) commit edilir ve **yeniden acilista** guncel veri kalicidir; temiz kapanistan sonra yalniz `.odb` kalir |
 | `page_corrupt` | **okuma yolunda sayfa butunlugu** (SKILL3 §5.3/§12.1): normal okuma yolu artik dogrulama yapar. Her veri sayfasinin govdesinde tek bayt bozulmasi, bozuk sihirli sayi ve yanlis sayfa imaji (sayfa 2 imaji sayfa 3'e kopyalanmis) kontrollu `ecCorrupt` uretir; dosyanin saglam kopyasi hala kusursuz taranir (kapi yanlis pozitif uretmez). Sifreli dosyada GCM etiketi zaten dogruluyor |
 | `server_harden` | dinleme adresi, `--trust` sinirlari, TLS zorunlulugu |
+| `server_failure` | **sunucu hata yollari** (SKILL3 §12.1): (a) `MaxConns=1` iken ikinci baglanti `RSP_ERROR` + `kapasite dolu` alip kapanir, birinci baglanti sorguya devam eder; (b) yeni baglantiya 64 bayt cop ($FF) yazilip kapatilir, sunucu yasar; (c) `CMD_QUERY` ardindan sahte **96 MiB** uzunluk oneki gonderilir - v3.39 `VDBS_MAX_RECV_STR` (64 MiB) oneki tahsis yapmadan reddeder, sunucu yasar; (d) acik baglanti varken `Stop` doner ve `Ready=False` olur; (e) `.odb` dosyasi yerinde kalir ve yeniden acilip satirlari okur |
 | `auth_throttle` | SCRAM deneme sinirlama/kilit |
 | `selftest_builtin` | provider SelfTest (builtin) |
 | `tls_client` | istemci CA + sunucu adi dogrulamasi (OpenSSL varsa) |
@@ -417,3 +418,21 @@ kaldirildi:
     ve hala kusursuz taranir (yanlis pozitif yok).
   Diger kapilar degismedi (`cache_pressure` 8/0, `limits` 18/0,
   `sql_features` 32/0, `multi_writer` 12/0, `bench_report` 35/0 dahil).
+- Yirmi dorduncu kosu (PHASE-21 commit'i, SKILL3 §12.1 sunucu hata yollari):
+  **iki platform da YESIL**. Git Bash/Windows **32 kapi** PASS (`tls_client`
+  SKIP), WSL x86_64 Linux **33 kapi** PASS. Bir motor duzeltmesi ve bir
+  yeni kapi:
+  - **v3.39 `VDbNet.VdbRecvStr`**: gelen tek metin cercevesinin uzunluk
+    oneki icin ust sinir yoktu (eski sinir 1 GiB). Kimligi dogrulanmamis
+    bir istemci tek cerceveyle sunucuda ~1 GiB ayirmaya zorlayabiliyordu.
+    `VDBS_MAX_RECV_STR = 64 MiB` eklendi: onek tahsis yapilmadan reddedilir
+    ve yalniz baglanti duser; sunucu ve dosya etkilenmez.
+  - `server_failure` **16 PASS / 0 FAIL**. Olculen: sunucu acilir; el
+    sıkışması (protokol surumu 1 + ad) dogru; giris + `CREATE TABLE` +
+    `INSERT` + `SELECT COUNT(*)`; `MaxConns=1` iken tavan ustu baglanti
+    `RSP_ERROR` + `kapasite dolu` alip kapanir ve mevcut baglanti calismaya
+    devam eder; 64 bayt cop bayt ($FF) sunucuyu oldurmez; `CMD_QUERY` +
+    sahte 96 MiB uzunluk oneki (v3.39 oncesi kabul edilirdi) reddedilir ve
+    sunucu yasar; acik baglanti varken `Stop` doner ve `Ready=False` olur;
+    `.odb` yerinde kalir, yeniden acilir ve satiri okur.
+  Diger kapilar degismedi.

@@ -187,6 +187,23 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   bozuk sihirli sayi ve yanlis sayfa imaji (sayfa 2 imaji sayfa 3'e
   kopyalanmis) kontrollu `ecCorrupt`; dosyanin saglam kopyasi bayt bayt
   degismeden kalir ve hala kusursuz taranir (yanlis pozitif yok).
+- **Duzeltildi - agdan gelen cerceve boyu sinirsizdi** (v3.39, `tests/
+  server_failure` kapisiyla kilitlendi). `VDbNet.VdbRecvStr` uzunluk
+  onekini yalniz 1 GiB'a karsi koruyordu; **kimligi dogrulanmamis** bir
+  istemci tek bir cerceveyle sunucuda ~1 GiB ayirmaya zorlayabiliyordu
+  (bellek tuketimi / hizmet reddi). Artik `VDBS_MAX_RECV_STR = 64 MiB`:
+  onek tahsis yapilmadan reddedilir, yalniz o baglanti duser, sunucu ve
+  dosya etkilenmez. Mesru her SQL cumlesi ve parametre kumesi bu sinirin
+  cok altindadir (PgWire on-kapasi da 64 MiB).
+- **Sunucu hata yollari regresyon kapisi** `server_failure` (16 kontrol,
+  SKILL3 §12.1): sunucu acilir; el sıkışması protokol surumu 1 + ad ile
+  dogru; giris + `CREATE TABLE` + `INSERT` + `SELECT COUNT(*)`;
+  `MaxConns=1` iken tavan ustu baglanti `RSP_ERROR` + `kapasite dolu`
+  alip kapanir ve mevcut baglanti calismaya devam eder; 64 bayt cop bayt
+  ($FF) sunucuyu oldurmez; `CMD_QUERY` + sahte **96 MiB** uzunluk oneki
+  (v3.39 oncesi kabul edilirdi) reddedilir ve sunucu yasar; acik baglanti
+  varken `Stop` doner ve `Ready=False` olur; `.odb` yerinde kalir, yeniden
+  acilir ve satiri okur.
 - **Ozellik regresyon kapisi** `sql_features` (32 kontrol): SKILL3 §9.1/
   §10.1'in "uygulanmis ama test edilmemis" listesini kapatir — `SAVEPOINT` /
   `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` (kismi geri alma gercekten

@@ -42,6 +42,15 @@ const
   VDBS_PROTO_VER = 1;
   VDBS_TERM = $00;          // her yanit cercevesinin son isareti
 
+  { v3.39 / SKILL3 §12.1 (bozuk ag girdisi): gelen tek bir metin
+    cercevesi icin ust sinir. Onceden 1 GB'lik bir uzunluk oneki
+    kabul ediliyordu; kimligi dogrulanmamis bir istemci tek bir
+    cerceveyle sunucuda 1 GB ayirmaya zorlayabiliyordu. 64 MiB,
+    mesru her SQL cumlesi ve parametre kumesi icin fazlasiyla
+    yeterlidir (VDbPgWire'daki on-kapa ile ayni deger). Asimda
+    baglanti kontrollu sekilde duser; sunucu ve dosya etkilenmez. }
+  VDBS_MAX_RECV_STR = 64 * 1024 * 1024;
+
   VDBS_CMD_QUERY = $10;
   VDBS_CMD_PING = $11;
   VDBS_CMD_BYE = $1F;
@@ -419,7 +428,7 @@ var
 begin
   S := '';
   if not VdbRecvU32(ASock, n) then Exit(False);
-  if n > $40000000 then Exit(False);  // 1 GB sinir: bozuk uzunluk korumasi
+  if n > VDBS_MAX_RECV_STR then Exit(False);  // v3.39: bozuk uzunluk korumasi
   if n = 0 then Exit(True);
   SetLength(S, Integer(n));
   Result := VdbRecvAll(ASock, Pointer(S)^, Integer(n));

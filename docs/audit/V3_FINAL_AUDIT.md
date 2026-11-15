@@ -32,6 +32,7 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 | F9 | ORTA | `VDbExecutor` cikti buyumesi | LIMIT'siz tam tarama bellek dolana kadar buyuyordu (kontrolsuz OOM) | 2M satirda kontrollu `ecLimit` (v3.37) | `limits` L4 (parser yolu); tam tarama yolu **testsiz** | KISMI |
 | F10 | DUSUK | `tests/bench_report` BR11 | Indeks testi id tabani `300000`, BR5 rastgele araligiyla cakisiyordu; sahte "duplicate PK" | Taban `2000000` | `bench_report` 35/0 | KAPALI |
 | F11 | **ORTA** | `VDbPageStore.ReadPageAt` | Normal okuma yolu hicbir butunluk denetimi yapmiyordu: `PageVerify`/`PageCheckStruct` yalniz `Verify`/`vdbcheck` tarafindaydi. Diskteki tek bozuk bayt, yanlis sayfa numarasi ya da bozuk sihirli sayi **sessizce** yanlis satirlara cozuluyordu (sessiz veri bozulmasi) | `CheckReadImage` okuma yolunda: trunk atlanir, bos sayfaya izin, sihirli sayi/sayfa kimligi her zaman, CRC `VerifyOnRead` ile (varsayilan acik) `ecCorrupt` (v3.38) | `page_corrupt` 8/0; `page_integrity` I5/I6 ve `integrity_check` IC-B1 hala ayni davranisi dogruluyor | KAPALI |
+| F12 | **ORTA** | `VDbNet.VdbRecvStr` | Agdan gelen metin cercevesinin uzunluk onegi yalniz 1 GiB'a karsi korunuyordu; kimligi **dogrulanmamis** bir istemci sahte onekle sunucuda ~1 GiB ayirmaya zorlayabiliyordu (bellek tuketimi / DoS). Sunucu ayrica 96 MiB'lik onegi kabul edip tahsis deniyordu | `VDBS_MAX_RECV_STR` = 64 MiB; onek **tahsis yapilmadan** reddedilir, yalniz o baglanti duser (v3.39) | `server_failure` SF6 (96 MiB sahte onek + sunucu yasamaya devam) | KAPALI |
 
 ### Kapatilan test bosluklari (SKILL2 §22, SKILL3 §10.1)
 
@@ -50,12 +51,15 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 - `page_corrupt` (8 kontrol) - yeni: okuma yolunda sayfa butunlugu (her veri
   sayfasinda tek bayt bozulmasi, bozuk sihirli sayi, yanlis sayfa imaji ->
   kontrollu `ecCorrupt`; saglam kopya yanlis pozitif uretmez).
+- `server_failure` (16 kontrol) - yeni: sunucu hata yollari (baglanti tavani
+  `kapasite dolu`, cop baytlar, sahte 96 MiB uzunluk oneki, acik baglanti
+  varken `Stop`, dosyanin yeniden acilip okunmasi).
 
 ## Test Results
 
 | Sonuc | Linux | Windows |
 |---|---|---|
-| PASS (kapi) | **32** | **31** |
+| PASS (kapi) | **33** | **32** |
 | FAIL | 0 | 0 |
 | SKIP (`VDB_CRYPTO_DLL` yok) | 2 (`fixtures_openssl`, `selftest_openssl`) | 3 (+`tls_client`) |
 | Calistirilmayan | canli PostgreSQL karsilastirmasi (`sql_differential` `pg=not-run`) | ayni |
@@ -67,7 +71,7 @@ perf_baseline 16/0, single_file 35/0, region_stream 13/0, multiproc 17/0,
 crash_points 24/0, integrity_check 32/0, cache_metrics 21/0,
 format_compat 28/0, portability 29/0, multi_writer 12/0, bench_report 35/0,
 sql_features 32/0, limits 18/0, cache_pressure 8/0, page_corrupt 8/0,
-server_harden 24/0, auth_throttle 16/0,
+server_harden 24/0, server_failure 16/0, auth_throttle 16/0,
 selftest_builtin PASS, tls_client 6/0 (yalniz Linux).
 
 ## Remaining Risks
@@ -84,13 +88,13 @@ bilincli olarak disarida).
 | Bellek tahsis hatasi | YOK |
 | WAL tukenmesi | YOK |
 | Onbellek tukenmesi / tahliye | VAR (`cache_pressure`: 8 sayfalik havuz, kirli tahliye, yeniden acilis) |
-| Asiri baglanti | YOK (`server_harden` yalniz baglama/adres) |
+| Asiri baglanti | VAR (`server_failure` SF4: `MaxConns=1` iken ikinci baglanti `RSP_ERROR` + `kapasite dolu` alir, birincisi calismaya devam eder) |
 | Asiri islem | YOK |
-| Bozuk ag girdisi | YOK |
+| Bozuk ag girdisi | VAR (`server_failure` SF5/SF6: cop baytlar ve sahte 96 MiB uzunluk oneki sunucuyu oldurmez) |
 | Bozuk veritabani / WAL | VAR (`page_integrity`, `integrity_check`, `wal_crash`, `format_compat`) |
 | Gecersiz sifreleme anahtari | VAR (`crypto_fixtures`) |
 | Sayfa numarasi / yirtik yazma bozulmasi | VAR (`page_corrupt`: normal okuma yolu her sayfayi dogrular; `page_integrity`, `integrity_check`) |
-| Sunucu kapanisi | YOK |
+| Sunucu kapanisi | VAR (`server_failure` SF7/SF8: acik baglanti varken `Stop` doner, dosya yeniden acilip okunur) |
 | B+Tree disk sayfa bicimi / 1M satir olcek / VACUUM sonrasi parcalanma | YOK |
 
 **Desteklenmeyen ozellikler**: v4 konteyner bicimi (durduruldu), dis
@@ -114,10 +118,11 @@ karsilastirmasi kosmadi.
 **BETA CANDIDATE**
 
 Gerekce: kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici
-bir regresyon kapisiyla kilitlendi; iki platformda 32/31 kapi yesil; tek
-dosya sozlesmesi, kurtarma, sayfa butunlugu ve tasinabilirlik olculdu. Buna
-karsin disk dolu, bellek tukenmesi, ag girdisi fuzz'u ve sunucu kapanisi gibi
-uretim hatasi yollari test edilmedi; canli PostgreSQL diferansiyeli kosmadi;
+bir regresyon kapisiyla kilitlendi; iki platformda 33/32 kapi yesil; tek
+dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari ve
+tasinabilirlik olculdu. Buna karsin disk dolu, bellek tukenmesi, WAL
+tukenmesi, asiri islem sayisi ve B+Tree olcek/parcalanma gibi uretim
+hatasi yollari test edilmedi; canli PostgreSQL diferansiyeli kosmadi;
 TLS varsayilan olarak kapali. Bu nedenle "PRODUCTION CANDIDATE" degil.
 
 Bu siniflandirma bagimsiz dogrulama (harici denetim, resmi sertifika)

@@ -18,6 +18,7 @@ devam eder; bunu `tests/limits` kapisi olcer (18 kontrol).
 | Sonuc satiri | 2 000 000 | `VDbExecutor` cikti buyume yollari + LIMIT/JOIN/DISTINCT | `ecLimit` |
 | Onbellek (sayfa havuzu) | varsayilan 512, tavan 65 536 (=256 MB) | `VDbPageStore` clamp | sessiz clamp |
 | Baglanti (sunucu) | varsayilan 64, ayar araligi 1..4096 | `VDbSqlServer`, `VDbPgWire` | baglanti reddi |
+| Agdan gelen tek cerceve | 64 MiB | `VDbNet.VdbRecvStr` (`VDBS_MAX_RECV_STR`) | baglanti duser |
 | Indeks derinligi | skiplist 62 seviye; B+Tree dengeli | `VDbSkipList` | - |
 | Es zamanli islem | baglanti tavaniyla sinirli; tek dosyada yazma kilidi islem basina | `VDbPageStore` kilit modeli | kilit hatasi |
 
@@ -34,6 +35,15 @@ basliktaki sayfa numarasi istenenden farkliysa `ecCorrupt`; CRC ise
 `VerifyOnRead` (varsayilan acik) iken denetlenir. Yani diskteki tek bozuk
 bayt yanlis satir uretmek yerine kontrollu hata verir. `tests/page_corrupt`
 kapisi bunu her veri sayfasinda olcer.
+
+**Sunucu tarafinda iki sinir var.** Baglanti sayisi `MaxConns` ile
+sinirlidir (varsayilan 64, ayar araligi 1..4096); tavan asilirsa yeni
+baglanti `RSP_ERROR` + `kapasite dolu` alir ve kapanir, mevcut baglantilar
+calismaya devam eder. Agdan gelen tek bir metin cercevesi ise
+`VDBS_MAX_RECV_STR` (64 MiB) ile sinirlidir: bu, kimligi dogrulanmamis bir
+istemcinin sahte uzunluk onekiyle sunucuda gigabaytlar ayirmasini onler.
+Asimda yalniz o baglanti duser; sunucu ve veritabani dosyasi etkilenmez.
+`tests/server_failure` kapisi bu yollarin hepsini olcer.
 
 ## Bilincli olarak SINIR KOYULMAYAN yerler
 
