@@ -196,12 +196,13 @@ Son doğrulanan durum (2026-11-15, Linux x86_64 ve Windows i386, `tests/run_gate
 | `bench_report` | 35 / 0 (18 kategori, P50/P95/P99/max, CSV+meta, bellek ve WAL boyu, kategori başına doğruluk kontrolü) |
 | `sql_features` | 32 / 0 (SAVEPOINT / ROLLBACK TO / RELEASE, ON CONFLICT DO NOTHING\|DO UPDATE, VACUUM, REINDEX, ANALYZE, CTE, pencere fonksiyonları, ALTER TABLE RENAME) |
 | `limits` | 18 / 0 (aşırı SQL / INSERT / LIMIT `ecLimit` ile reddediliyor, sonrasında veri sağlam, belgelenen tavanlar) |
+| `cache_pressure` | 8 / 0 (8 sayfalık havuzla ~100 sayfalık tablo: tam tarama ve tek işlemde güncelleme doğru kalıyor, havuz boyunu aşmıyor, gerçek tahliye oluyor, yeniden açılışta veri kalıcı) |
 | `server_harden` | 24 / 0 |
 | `auth_throttle` | 16 / 0 |
 | `tls_client` | 6 / 0 (Linux; OpenSSL DLL'i olmayan Windows'ta atlanır) |
 
-Linux'ta **30 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
-atlanır), Windows'ta **29 kapı** (`tls_client` atlanır). Kapı belgeleri:
+Linux'ta **31 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
+atlanır), Windows'ta **30 kapı** (`tls_client` atlanır). Kapı belgeleri:
 [docs/engineering/](docs/engineering/).
 
 ```bash

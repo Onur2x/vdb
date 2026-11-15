@@ -21,6 +21,12 @@ devam eder; bunu `tests/limits` kapisi olcer (18 kontrol).
 | Indeks derinligi | skiplist 62 seviye; B+Tree dengeli | `VDbSkipList` | - |
 | Es zamanli islem | baglanti tavaniyla sinirli; tek dosyada yazma kilidi islem basina | `VDbPageStore` kilit modeli | kilit hatasi |
 
+**Onbellek tukenmesi bir hata degildir.** Havuz tablodan kucuk oldugunda
+motor sayfa tahliye eder (kirli sayfa WAL'e dokulur) ve sonra yeniden
+yukler; bu yol `tests/cache_pressure` kapisi ile olculur (8 sayfalik havuz,
+~100 sayfalik tablo, tam tarama + tek islemde toplu guncelleme + yeniden
+acilis).
+
 ## Bilincli olarak SINIR KOYULMAYAN yerler
 
 - **Onbellek tavani sessiz clamp**: `APoolPages > VDB_MAX_POOL` istegi

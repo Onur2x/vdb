@@ -158,6 +158,14 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   reddedilen islem **satir birakmaz**, tablo sorgulanabilir kalir, kapanistan
   sonra yalniz `.odb` vardir, yeniden acilista veri bozulmamistir; belgelenen
   tavanlarin tutarliligi da olculur. SKILL3 §12'yi kismen kapatir.
+- **Onbellek tukenmesi regresyon kapisi** `cache_pressure` (8 kontrol,
+  SKILL3 §12.1): havuz 8 sayfaya indirilip (~32 KB) havuzdan cok daha buyuk
+  bir tablo uzerinde calisilir. Olculen: tam tarama butun satirlari dogru
+  okur (tahliye + yeniden yukleme sessiz veri kaybi uretmez), `PoolUsed`
+  havuz boyunu asmaz, miss sayaci gercek tahliyeyi kanitlar, tek islemde
+  2000 satirlik guncelleme (kirli sayfa tahliyesi WAL'e dokulur) commit
+  edilir ve yeniden acilista guncel veri kalicidir; kapanistan sonra yalniz
+  `.odb` kalir.
 - **Ozellik regresyon kapisi** `sql_features` (32 kontrol): SKILL3 §9.1/
   §10.1'in "uygulanmis ama test edilmemis" listesini kapatir — `SAVEPOINT` /
   `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` (kismi geri alma gercekten

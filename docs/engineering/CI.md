@@ -46,6 +46,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `page_integrity` | sayfa/heap/freelist bozulma matrisi (I0-I13) |
 | `sql_features` | parser'da olup kapisi olmayan SQL ozellikleri: `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` (kismi geri alma gercekten yalniz sonraki satirlari atar), `ON CONFLICT DO NOTHING\|DO UPDATE` (cift anahtar degeri bozmaz), `VACUUM`/`REINDEX`/`ANALYZE <tablo>` (bakim veriyi korur, indeks aramasi dogru kalir), `WITH` (CTE), `ROW_NUMBER() OVER (ORDER BY ...)`, `ALTER TABLE ... RENAME TO` |
 | `limits` | **kaynak sinirlari** (SKILL2 §25): 4 MiB'tan buyuk SQL, 16 MB'lik INSERT ve 2M ustu `LIMIT` kontrollu `ecLimit` ile reddedilir; reddedilen islem **hicbir satir birakmaz**, ayni veritabani sorgulanmaya devam eder, kapanis temiz (yalniz `.odb`) ve yeniden acilista veri bozulmamis olur; belgelenen tavanlar (`LIMITS.md`) tutarli |
+| `cache_pressure` | **onbellek tukenmesi / tahliye** (SKILL3 §12.1): 8 sayfalik havuzla (~32 KB) havuzdan cok daha buyuk bir tablo uzerinde calisilir. Tam tarama **butun satirlari** dogru okur (tahliye + yeniden yukleme veri kaybetmez), `PoolUsed` havuz boyunu asmaz, miss sayaci gercek tahliyeyi kanitlar, tek islemde 2000 satir guncellemesi (kirli sayfa tahliye yolu) commit edilir ve **yeniden acilista** guncel veri kalicidir; temiz kapanistan sonra yalniz `.odb` kalir |
 | `server_harden` | dinleme adresi, `--trust` sinirlari, TLS zorunlulugu |
 | `auth_throttle` | SCRAM deneme sinirlama/kilit |
 | `selftest_builtin` | provider SelfTest (builtin) |
@@ -381,3 +382,16 @@ kaldirildi:
   Diger kapilar degismedi (`portability` 29/0, `format_compat` 28/0,
   `cache_metrics` 21/0, `integrity_check` 32/0, `crash_points` 24/0,
   `multiproc` 17/0, `multi_writer` 12/0, `bench_report` 35/0 dahil).
+- Yirmi ikinci kosu (PHASE-19 commit'i, SKILL3 §12.1 onbellek tukenmesi):
+  **iki platform da YESIL**. Git Bash/Windows **30 kapi** PASS (`tls_client`
+  SKIP), WSL x86_64 Linux **31 kapi** PASS. Yeni kapi:
+  - `cache_pressure` **8 PASS / 0 FAIL**. Havuz 8 sayfaya (32 KB) indirilip
+    ~100 sayfalik tablo uzerinde calisilir. Olculen: (a) kucuk havuz istegi
+    kabul edilir ve `PoolPages=8` raporlanir; (b) havuzdan buyuk tablo
+    yazilir; (c) tam tarama **butun 2000 satiri** dogru okur (tahliye +
+    yeniden yukleme sessiz veri kaybi uretmez); (d) `PoolUsed` havuz boyunu
+    asmaz; (e) miss sayaci havuz boyunun cok uzerine cikar, yani tahliye
+    gercekten olmustur; (f) tek islemde 2000 satir guncellemesi (kirli
+    sayfa tahliyesi WAL'e dokulur) commit edilir; (g) kapanistan sonra
+    yalniz `.odb` kalir; (h) yeniden acilista guncel veri kalicidir.
+  Diger kapilar degismedi.

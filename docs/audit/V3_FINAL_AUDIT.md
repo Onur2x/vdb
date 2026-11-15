@@ -14,8 +14,8 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 - **Denetim kapsami**: SKILL2 §18-28 ve SKILL3 §5-§15, §19. Depolama
   motoru, WAL/kurtarma, islem izolasyonu, B+Tree, SQL yurutucu, guvenlik,
   kaynak sinirlari, performans, tasinabilirlik, belge.
-- **Kosulan testler**: `tests/run_gates.sh` - Linux **30 kapi**, Windows
-  **29 kapi** (`tls_client` atlanir), tamami PASS.
+- **Kosulan testler**: `tests/run_gates.sh` - Linux **31 kapi**, Windows
+  **30 kapi** (`tls_client` atlanir), tamami PASS.
 
 ## Findings
 
@@ -42,12 +42,16 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
   `ALTER TABLE ... RENAME TO`.
 - `limits` (18 kontrol) - yeni: asiri SQL / asiri INSERT / asiri LIMIT
   kontrollu `ecLimit`, sinir sonrasi veri butunlugu, belgelenen tavanlar.
+- `cache_pressure` (8 kontrol) - yeni: 8 sayfalik havuzla ~100 sayfalik
+  tablo; tahliye + yeniden yukleme veri kaybetmez, `PoolUsed` havuz boyunu
+  asmaz, kirli sayfa tahliyesi commit sonrasi kalicidir (SKILL3 §12.1
+  "cache exhaustion").
 
 ## Test Results
 
 | Sonuc | Linux | Windows |
 |---|---|---|
-| PASS (kapi) | **30** | **29** |
+| PASS (kapi) | **31** | **30** |
 | FAIL | 0 | 0 |
 | SKIP (`VDB_CRYPTO_DLL` yok) | 2 (`fixtures_openssl`, `selftest_openssl`) | 3 (+`tls_client`) |
 | Calistirilmayan | canli PostgreSQL karsilastirmasi (`sql_differential` `pg=not-run`) | ayni |
@@ -58,7 +62,8 @@ backup_restore 25/0, page_integrity 14/0, btree_integrity 152/0,
 perf_baseline 16/0, single_file 35/0, region_stream 13/0, multiproc 17/0,
 crash_points 24/0, integrity_check 32/0, cache_metrics 21/0,
 format_compat 28/0, portability 29/0, multi_writer 12/0, bench_report 35/0,
-sql_features 32/0, limits 18/0, server_harden 24/0, auth_throttle 16/0,
+sql_features 32/0, limits 18/0, cache_pressure 8/0, server_harden 24/0,
+auth_throttle 16/0,
 selftest_builtin PASS, tls_client 6/0 (yalniz Linux).
 
 ## Remaining Risks
@@ -74,7 +79,7 @@ bilincli olarak disarida).
 | Disk dolu (ENOSPC) | YOK - `wal_crash` T9 yalniz fsync hatasini enjekte eder |
 | Bellek tahsis hatasi | YOK |
 | WAL tukenmesi | YOK |
-| Onbellek tukenmesi / tahliye | YOK (`cache_metrics` yalniz sayaclari olcer) |
+| Onbellek tukenmesi / tahliye | VAR (`cache_pressure`: 8 sayfalik havuz, kirli tahliye, yeniden acilis) |
 | Asiri baglanti | YOK (`server_harden` yalniz baglama/adres) |
 | Asiri islem | YOK |
 | Bozuk ag girdisi | YOK |
