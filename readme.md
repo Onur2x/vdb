@@ -197,12 +197,13 @@ Last verified state (2026-11-15, Linux x86_64 and Windows i386, `tests/run_gates
 | `sql_features` | 32 / 0 (SAVEPOINT / ROLLBACK TO / RELEASE, ON CONFLICT DO NOTHING\|DO UPDATE, VACUUM, REINDEX, ANALYZE, CTE, window functions, ALTER TABLE RENAME) |
 | `limits` | 18 / 0 (oversized SQL / INSERT / LIMIT rejected with `ecLimit`, data intact afterwards, documented ceilings) |
 | `cache_pressure` | 8 / 0 (8-page pool over a ~100-page table: full scan and one-transaction update stay correct, pool never exceeds its size, real evictions, data durable after reopen) |
+| `page_corrupt` | 8 / 0 (every data page body byte-flip, bad magic and a wrong page image on the normal read path all raise a controlled `ecCorrupt`; a good copy of the file still scans perfectly) |
 | `server_harden` | 24 / 0 |
 | `auth_throttle` | 16 / 0 |
 | `tls_client` | 6 / 0 (Linux; skipped on Windows without OpenSSL DLL) |
 
-That is **31 gates** on Linux (plus two OpenSSL opt-in gates skipped when
-`VDB_CRYPTO_DLL` is unset) and **30 gates** on Windows (`tls_client` skipped).
+That is **32 gates** on Linux (plus two OpenSSL opt-in gates skipped when
+`VDB_CRYPTO_DLL` is unset) and **31 gates** on Windows (`tls_client` skipped).
 Gate documents: [docs/engineering/](docs/engineering/).
 
 ```bash

@@ -166,6 +166,27 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   2000 satirlik guncelleme (kirli sayfa tahliyesi WAL'e dokulur) commit
   edilir ve yeniden acilista guncel veri kalicidir; kapanistan sonra yalniz
   `.odb` kalir.
+- **Duzeltildi - okuma yolunda sayfa butunlugu denetlenmiyordu** (v3.38,
+  `tests/page_corrupt` kapisiyla kilitlendi). `TVDbPageStore.ReadPageAt`
+  sayfayi dogrudan okuyup onbellege aliyordu; `PageVerify`/`PageCheckStruct`
+  yalnizca `Verify`/`vdbcheck` tarafindan kullaniliyordu. Sonuc: diskte tek
+  bir bozuk bayt (yirtik yazma, bozuk sektor, yanlis sayfa) **sessizce
+  yanlis satirlara** cozuluyordu. Artik okunan her imaj `CheckReadImage` ile
+  dogrulanir: trunk sayfalari atlanir (ham `VFT1`), yeni uzatilmis bos
+  sayfaya izin verilir; sihirli sayi taninmiyorsa, basliktaki sayfa numarasi
+  istenenden farkliysa ya da CRC tutmuyorsa kontrollu `ecCorrupt` doner.
+  `VerifyOnRead` ozelligi (varsayilan acik) yalnizca CRC denetimini kapatir;
+  sayfa kimligi/sihirli sayi denetimi her zaman aciktir. Sifreli dosyada
+  GCM etiketi zaten dogrulama yaptigi icin o yol degismedi. Maliyet: her
+  sikistirilmamis okumada bir CRC32 daha hesaplanir; `bench_report`
+  sayilari bu maliyeti **icerir** (dogrulama kapatilarak ayrica
+  olculmedi).
+- **Bozuk sayfa regresyon kapisi** `page_corrupt` (8 kontrol, SKILL3
+  §5.3/§12.1): saglam dosya tam okunur; `VerifyOnRead` varsayilan acik; her
+  veri sayfasinin govdesindeki tek bayt bozulmasi yakalanir (17/17 sayfa);
+  bozuk sihirli sayi ve yanlis sayfa imaji (sayfa 2 imaji sayfa 3'e
+  kopyalanmis) kontrollu `ecCorrupt`; dosyanin saglam kopyasi bayt bayt
+  degismeden kalir ve hala kusursuz taranir (yanlis pozitif yok).
 - **Ozellik regresyon kapisi** `sql_features` (32 kontrol): SKILL3 §9.1/
   §10.1'in "uygulanmis ama test edilmemis" listesini kapatir — `SAVEPOINT` /
   `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` (kismi geri alma gercekten

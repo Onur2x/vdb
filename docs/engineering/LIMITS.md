@@ -27,6 +27,14 @@ yukler; bu yol `tests/cache_pressure` kapisi ile olculur (8 sayfalik havuz,
 ~100 sayfalik tablo, tam tarama + tek islemde toplu guncelleme + yeniden
 acilis).
 
+**Bozuk sayfa bir hata turudur, sessiz gecmez.** Normal okuma yolu her
+sayfa imajini dogrular (`CheckReadImage`): freelist trunk sayfalari atlanir,
+yeni uzatilmis bos sayfaya izin verilir; sihirli sayi taninmiyorsa ya da
+basliktaki sayfa numarasi istenenden farkliysa `ecCorrupt`; CRC ise
+`VerifyOnRead` (varsayilan acik) iken denetlenir. Yani diskteki tek bozuk
+bayt yanlis satir uretmek yerine kontrollu hata verir. `tests/page_corrupt`
+kapisi bunu her veri sayfasinda olcer.
+
 ## Bilincli olarak SINIR KOYULMAYAN yerler
 
 - **Onbellek tavani sessiz clamp**: `APoolPages > VDB_MAX_POOL` istegi

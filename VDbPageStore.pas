@@ -201,6 +201,14 @@ type
         bakar: FViewLsn < WAL.HeaderLsn ise degisiklikler yalniz veri
         dosyasindadir (WAL budanmistir) -> tam yeniden yukleme gerekir. }
       FViewLsn: LongWord;
+      { v3.38 / SKILL3 §5.3, §12.1: okuma yolunda sayfa butunlugu denetimi.
+        Onceden diskten okunan sayfa HIC dogrulanmadan cozucuye gidiyordu;
+        tek bir bit kaymasi sessizce yanlis satir uretebiliyor ya da
+        cozucuyu cokertiyordu. Sihirli sayi + sayfa numarasi artik HER
+        okumada denetlenir (maliyeti iki kelime karsilastirmasi). CRC
+        denetimi FVerifyOnRead ile acilir; varsayilan True (dogruluk once),
+        kapatilabilir (olcum icin). }
+      FVerifyOnRead: Boolean;
       FCreated: Int64;
       { C-2: meta sayfadan okunan DB kimligi (0 = eski dosya, henuz
         uretilmemis). `.gen` kimligi ile eslesmezse durabil LSN sifirlanir. }
@@ -376,6 +384,11 @@ type
     procedure WritePageAt(PageNo: LongWord; P: PVdbPage);
     function StaleOnDisk(PageNo: LongWord; P: PVdbPage): Boolean;
     procedure CheckFreshRead(PageNo: LongWord; P: PVdbPage);
+    { v3.38 / SKILL3 §5.3: diskten okunan imajin butunlugu. Sihirli sayi
+      ve sayfa numarasi her zaman; CRC `VerifyOnRead` acikken denetlenir.
+      Bozuk sayfa kontrollu `ecCorrupt` istisnasi uretir - yanlis satir
+      uretmek yerine okuma reddedilir. }
+    procedure CheckReadImage(PageNo: LongWord; P: PVdbPage);
     function TryRefreshAfterStale: Boolean;
     procedure ExtendFile(out NewPageNo: LongWord);
     procedure GrowTo(Required: Int64);
@@ -728,6 +741,10 @@ type
     property FreeCount: LongWord read FFreeCount;
     property LSN: LongWord read FLSN;
     property ViewLsn: LongWord read FViewLsn;
+    { v3.38: okunan sayfada CRC de denetlensin mi? Varsayilan True.
+      Kapatmak bozuk sayfayi sessizce kabul etmek demektir; yalniz olcum
+      icin kullanilmalidir. }
+    property VerifyOnRead: Boolean read FVerifyOnRead write FVerifyOnRead;
     { v3.1: meta sayfa diskte bayat mi (sayfa sayisi/freelist degisti)?
       Commit yalnizca True iken meta cercevesi yazar; commit LSN'i WAL commit
       kaydinda tasindigi icin degismemis meta imaji gereksizdi. }
@@ -1013,6 +1030,8 @@ begin
   InitCriticalSection(FWriteCs);
   FWriteCsInit := True;
   FPath := APath;
+  { v3.38: okuma yolunda CRC denetimi varsayilan ACIK. }
+  FVerifyOnRead := True;
   { P-177: on-okuma varsayilanlari - esik asilmadikca paralel yol kapali. }
   FPfThresholdUs := VDB_PF_MIN_READ_US;
   FPfForce := False;
@@ -2724,6 +2743,31 @@ begin
   Result := m = VDB_TRUNK_MAGIC;
 end;
 
+procedure TVDbPageStore.CheckReadImage(PageNo: LongWord; P: PVdbPage);
+var
+  err: string;
+begin
+  { Freelist trunk sayfalari ham bicimlidir ('VFT1'); baslik alanlari
+    VDbPage basligi degildir, bu yuzden denetlenmez. }
+  if IsTrunkImage(P) then Exit;
+  if not IsVdbPageImage(P) then
+  begin
+    { Tamamen sifir sayfa: dosya yeni uzatildi ve sayfa henuz yazilmadi.
+      Bunu bozulma saymak yanlis olur; cagiran PageInit ile dolduracak. }
+    if (P^[0] = 0) and (P^[1] = 0) then Exit;
+    raise EVDbException.CreateFmt(ecCorrupt,
+      'sayfa %d taninmiyor (ne VDbPage ne trunk)', [PageNo]);
+  end;
+  { Basliktaki sayfa numarasi kendi numarasiyla ayni olmali. Uyusmazsa
+    yanlis sayfa okunmus ya da imaj kaymis demektir; ikisi de sessiz veri
+    bozulmasi uretir. }
+  if PageNoOf(P) <> PageNo then
+    raise EVDbException.CreateFmt(ecCorrupt,
+      'sayfa %d: yanlis sayfa imaji (baslikta %d)', [PageNo, PageNoOf(P)]);
+  if FVerifyOnRead and (not PageVerify(P, err)) then
+    raise EVDbException.CreateFmt(ecCorrupt, 'sayfa %d: %s', [PageNo, err]);
+end;
+
 procedure TVDbPageStore.CheckFreshRead(PageNo: LongWord; P: PVdbPage);
 { C-3: disk imajinin LSN'i bu oturumun gorunumunden (ViewLsn) BUYUKSE
   sayfa bu surecin gordugu bir commit'e ait degildir; baska bir surecin
@@ -2798,7 +2842,11 @@ begin
     Move(plain[0], P^, VDB_PAGE_SIZE);
   end
   else
+  begin
     ReadBytesAt(OffsetOf(PageNo), P^, VDB_PAGE_SIZE, PageNo);
+    { v3.38: okunan imaj dogrulanmadan onbellege alinmaz. }
+    CheckReadImage(PageNo, P);
+  end;
   Inc(FReads);
   { C-3: bayat sayfa korlemesine onbellege alinmaz. }
   CheckFreshRead(PageNo, P);

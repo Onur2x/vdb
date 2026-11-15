@@ -47,6 +47,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `sql_features` | parser'da olup kapisi olmayan SQL ozellikleri: `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` (kismi geri alma gercekten yalniz sonraki satirlari atar), `ON CONFLICT DO NOTHING\|DO UPDATE` (cift anahtar degeri bozmaz), `VACUUM`/`REINDEX`/`ANALYZE <tablo>` (bakim veriyi korur, indeks aramasi dogru kalir), `WITH` (CTE), `ROW_NUMBER() OVER (ORDER BY ...)`, `ALTER TABLE ... RENAME TO` |
 | `limits` | **kaynak sinirlari** (SKILL2 §25): 4 MiB'tan buyuk SQL, 16 MB'lik INSERT ve 2M ustu `LIMIT` kontrollu `ecLimit` ile reddedilir; reddedilen islem **hicbir satir birakmaz**, ayni veritabani sorgulanmaya devam eder, kapanis temiz (yalniz `.odb`) ve yeniden acilista veri bozulmamis olur; belgelenen tavanlar (`LIMITS.md`) tutarli |
 | `cache_pressure` | **onbellek tukenmesi / tahliye** (SKILL3 §12.1): 8 sayfalik havuzla (~32 KB) havuzdan cok daha buyuk bir tablo uzerinde calisilir. Tam tarama **butun satirlari** dogru okur (tahliye + yeniden yukleme veri kaybetmez), `PoolUsed` havuz boyunu asmaz, miss sayaci gercek tahliyeyi kanitlar, tek islemde 2000 satir guncellemesi (kirli sayfa tahliye yolu) commit edilir ve **yeniden acilista** guncel veri kalicidir; temiz kapanistan sonra yalniz `.odb` kalir |
+| `page_corrupt` | **okuma yolunda sayfa butunlugu** (SKILL3 §5.3/§12.1): normal okuma yolu artik dogrulama yapar. Her veri sayfasinin govdesinde tek bayt bozulmasi, bozuk sihirli sayi ve yanlis sayfa imaji (sayfa 2 imaji sayfa 3'e kopyalanmis) kontrollu `ecCorrupt` uretir; dosyanin saglam kopyasi hala kusursuz taranir (kapi yanlis pozitif uretmez). Sifreli dosyada GCM etiketi zaten dogruluyor |
 | `server_harden` | dinleme adresi, `--trust` sinirlari, TLS zorunlulugu |
 | `auth_throttle` | SCRAM deneme sinirlama/kilit |
 | `selftest_builtin` | provider SelfTest (builtin) |
@@ -395,3 +396,24 @@ kaldirildi:
     sayfa tahliyesi WAL'e dokulur) commit edilir; (g) kapanistan sonra
     yalniz `.odb` kalir; (h) yeniden acilista guncel veri kalicidir.
   Diger kapilar degismedi.
+- Yirmi ucuncu kosu (PHASE-20 commit'i, SKILL3 §5.3/§12.1 okuma yolu
+  butunlugu): **iki platform da YESIL**. Git Bash/Windows **31 kapi** PASS
+  (`tls_client` SKIP), WSL x86_64 Linux **32 kapi** PASS. Motor degisikligi
+  ve yeni kapi:
+  - **Motor**: `TVDbPageStore.ReadPageAt` okunan sayfa imajini artik
+    `CheckReadImage` ile dogruluyor. Onceden okuma yolu hicbir butunluk
+    denetimi yapmiyordu: tek bir bozuk bayt sessizce yanlis satirlara
+    cozuluyordu (`PageVerify`/`PageCheckStruct` yalniz `Verify`/`vdbcheck`
+    tarafindan kullaniliyordu). Denetim: trunk sayfalari atlanir (ham
+    `VFT1` imaji), yeni uzatilmis bos sayfaya izin verilir; sihirli sayi
+    bozuksa, basliktaki sayfa numarasi istenenden farkliysa ya da CRC
+    tutmuyorsa kontrollu `ecCorrupt`. `VerifyOnRead` ozelligi (varsayilan
+    acik) dogrulamayi kapatabilir; sifreli dosyada GCM etiketi zaten
+    dogruladigi icin o yol degismedi.
+  - `page_corrupt` **8 PASS / 0 FAIL**. Olculen: saglam dosya tam okunur;
+    `VerifyOnRead` varsayilan acik; her veri sayfasinin govdesindeki tek
+    bayt bozulmasi yakalanir (17/17 sayfa); bozuk sihirli sayi ve yanlis
+    sayfa imaji kontrollu `ecCorrupt`; saglam kopya bayt bayt degismemis
+    ve hala kusursuz taranir (yanlis pozitif yok).
+  Diger kapilar degismedi (`cache_pressure` 8/0, `limits` 18/0,
+  `sql_features` 32/0, `multi_writer` 12/0, `bench_report` 35/0 dahil).
