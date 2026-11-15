@@ -20,7 +20,7 @@ devam eder; bunu `tests/limits` kapisi olcer (18 kontrol).
 | Baglanti (sunucu) | varsayilan 64, ayar araligi 1..4096 | `VDbSqlServer`, `VDbPgWire` | baglanti reddi |
 | Agdan gelen tek cerceve | 64 MiB | `VDbNet.VdbRecvStr` (`VDBS_MAX_RECV_STR`) | baglanti duser |
 | Indeks derinligi | skiplist 62 seviye; B+Tree dengeli | `VDbSkipList` | - |
-| Es zamanli islem | baglanti tavaniyla sinirli; tek dosyada yazma kilidi islem basina | `VDbPageStore` kilit modeli | kilit hatasi |
+| Es zamanli islem | oturum basina 1 acik islem (ic ice `BEGIN` sessiz no-op); dosya basina 1 yazar rezervasyonu | `VDbBackendV3.BeginBatch` + `VDbPageStore` kilit modeli | busy suresi asilirsa `mesgul` (`EVdbPageStore`) |
 
 **Onbellek tukenmesi bir hata degildir.** Havuz tablodan kucuk oldugunda
 motor sayfa tahliye eder (kirli sayfa WAL'e dokulur) ve sonra yeniden
@@ -35,6 +35,24 @@ basliktaki sayfa numarasi istenenden farkliysa `ecCorrupt`; CRC ise
 `VerifyOnRead` (varsayilan acik) iken denetlenir. Yani diskteki tek bozuk
 bayt yanlis satir uretmek yerine kontrollu hata verir. `tests/page_corrupt`
 kapisi bunu her veri sayfasinda olcer.
+
+**Disk dolu kontrollu bir hatadir, sessiz veri kaybi degil.** Tum disk
+yazmalari tek noktadan gecer (`WriteBytesChecked`): `THandleStream.Write`
+kisa yazmayi 0'a cevirdigi icin yarim yazma acikca algilanir ve kontrollu
+`ecIOError` uretilir; enjekte edilebilen hata yolu da ayni noktadadir. Dosya
+buyutme (`GrowTo`) basarisiz olursa mantiksal boy artirilmaz. Hata aninda
+sayfa cercevesi **kirli** kalir (temiz isaretlenip veri kaybolmaz), islem
+`ROLLBACK` ile temizlenir, hata giderilince checkpoint ve yeni commit
+calisir. `tests/disk_full` bunu sert hata + yarim yazma senaryosuyla olcer
+ve yeniden acilista tum onayli satirlari + `VERIFY` temizligini dogrular.
+
+**Meta sayfa monotoniktir.** Iki oturum ayni dosyaya yazdiginda geride kalan
+(gorunume gore bayat) oturumun `SaveMeta` cagrisi diskteki **daha yuksek** LSN
+ve sayfa sayisini geri alamaz: yazmadan once diskteki meta okunur ve `LSN`
+ile `FPageCount` yalnizca **yukari** tasinir. Aksi halde LSN gerilemesi
+dosyayi `EVdbPageStale` ile okunamaz hale getiriyor, sayfa sayisi gerilemesi
+ise kapanistaki `TrimToLogical` ile onayli sayfalari kirpiyordu (veri
+kaybi). `tests/txn_limit` (TL6/TL8) bu yolu olcer.
 
 **Sunucu tarafinda iki sinir var.** Baglanti sayisi `MaxConns` ile
 sinirlidir (varsayilan 64, ayar araligi 1..4096); tavan asilirsa yeni
@@ -54,8 +72,15 @@ Asimda yalniz o baglanti duser; sunucu ve veritabani dosyasi etkilenmez.
   kilit nedeniyle checkpoint ertelenirse WAL buyumeye devam eder. Ust sinir
   islem tavaniyla turetilir (en kotu durum ~4 GiB). Bu davranis bilinclidir:
   sert bir WAL tavani, mesru uzun islemleri commit aninda reddederdi.
-- **Islem sayisi tavani yok**: es zamanli islem sayisi baglanti tavaniyla
-  ve tek dosyada yazma kilidiyle sinirlidir.
+- **Islem sayisi tavani yok; sinirlayan kaynak yazar rezervasyonu**:
+  es zamanli islem sayisi baglanti tavaniyla sinirlidir ve dosya
+  basina **tek yazar rezervasyonu** vardir. Bir oturum yazarken digeri
+  `BusyTimeoutMs` kadar bekler; sure asilirsa kontrollu `mesgul` hatasi alir
+  (veri kaybi yok, islem `ROLLBACK` ile temizlenir, rezervasyon birakilinca
+  yeniden denenebilir). Oturum basina en fazla bir acik islem vardir: ic ice
+  `BEGIN`, islem yokken `COMMIT` ve `ROLLBACK` **sessiz no-op**'tur; ikinci
+  bir islem katmani acilmaz. `tests/txn_limit` bunu 300 kisa islem, 75
+  geri alma ve yazar cakismasi senaryosuyla olcer.
 
 ## Kapanis (SKILL2 §25.3)
 

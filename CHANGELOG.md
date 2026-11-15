@@ -204,6 +204,34 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   (v3.39 oncesi kabul edilirdi) reddedilir ve sunucu yasar; acik baglanti
   varken `Stop` doner ve `Ready=False` olur; `.odb` yerinde kalir, yeniden
   acilir ve satiri okur.
+- **Duzeltildi - disk dolu / kisa yazma sessiz kalabiliyordu** (v3.40,
+  `tests/disk_full` kapisiyla kilitlendi). `THandleStream.Write` kisa yazmayi
+  `0`'a cevirdigi icin ENOSPC tek basina sessiz veri kaybina yol acabilirdi.
+  Artik butun sayfa/meta yazmalari tek noktadan (`WriteBytesChecked`) gecer:
+  enjekte edilen hata ya da kisa yazma kontrollu `ecIOError` uretir, cerceve
+  **kirli** kalir (sessizce temiz isaretlenmez), `GrowTo` basarisiz
+  buyumeyi `ecIOError`'a cevirir ve mantiksal boyu artirmaz. Hata
+  giderilince checkpoint ve yeni commit'ler calisir; yeniden acilista tum
+  onayli satirlar okunur ve `VERIFY` temizdir.
+- **Duzeltildi - meta sayfa gerileyebiliyordu** (v3.40, `tests/txn_limit`
+  kapisiyla kilitlendi). Görünümü bayat bir oturum kendi **dusuk** LSN'ini ve
+  sayfa sayisini meta sayfaya yazabiliyordu: LSN gerilemesi yeniden acilista
+  `EVdbPageStale` ile okumayi kilitliyor, sayfa sayisi gerilemesi ise
+  `TrimToLogical` uzerinden onayli sayfalari **kirpabiliyordu**. Artik
+  `SaveMeta` diskteki meta sayfayi okur ve LSN ile sayfa sayisini yalnizca
+  **yukari** tasir (monoton meta kurali); sayfa sayisi buyurse freelist
+  alanlari da diskteki degerden alinir.
+- **Disk dolu regresyon kapisi** `disk_full` (9 kontrol, SKILL3 §12.1):
+  kontrollu yazma, sert hata, kisa yazma, `ROLLBACK`, hata sonrasi yazmanin
+  devami, checkpoint, yeniden acilis ve `VERIFY`.
+- **Islem sayisi / yazar cakismasi regresyon kapisi** `txn_limit` (18
+  kontrol, SKILL3 §12.2): 300 kisa islem ve 300 islemin 75'i geri alinarak
+  commit sayisi birebir dogrulanir; oturum basina tek acik islem vardir ve
+  ic ice `BEGIN`, islem yokken `COMMIT`/`ROLLBACK` belgelenmis sessiz
+  no-op'tur; dosya basina tek yazar rezervasyonu kisa busy suresinde
+  kontrollu `mesgul` hatasi verir, `ROLLBACK` ile temizlenir ve birakilinca
+  islem yeniden tamamlanir; temiz kapanis tek dosya birakir, yeniden
+  acilista 578 satir ve temiz `VERIFY`.
 - **Ozellik regresyon kapisi** `sql_features` (32 kontrol): SKILL3 §9.1/
   §10.1'in "uygulanmis ama test edilmemis" listesini kapatir — `SAVEPOINT` /
   `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` (kismi geri alma gercekten

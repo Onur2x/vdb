@@ -50,6 +50,8 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `page_corrupt` | **okuma yolunda sayfa butunlugu** (SKILL3 §5.3/§12.1): normal okuma yolu artik dogrulama yapar. Her veri sayfasinin govdesinde tek bayt bozulmasi, bozuk sihirli sayi ve yanlis sayfa imaji (sayfa 2 imaji sayfa 3'e kopyalanmis) kontrollu `ecCorrupt` uretir; dosyanin saglam kopyasi hala kusursuz taranir (kapi yanlis pozitif uretmez). Sifreli dosyada GCM etiketi zaten dogruluyor |
 | `server_harden` | dinleme adresi, `--trust` sinirlari, TLS zorunlulugu |
 | `server_failure` | **sunucu hata yollari** (SKILL3 §12.1): (a) `MaxConns=1` iken ikinci baglanti `RSP_ERROR` + `kapasite dolu` alip kapanir, birinci baglanti sorguya devam eder; (b) yeni baglantiya 64 bayt cop ($FF) yazilip kapatilir, sunucu yasar; (c) `CMD_QUERY` ardindan sahte **96 MiB** uzunluk oneki gonderilir - v3.39 `VDBS_MAX_RECV_STR` (64 MiB) oneki tahsis yapmadan reddeder, sunucu yasar; (d) acik baglanti varken `Stop` doner ve `Ready=False` olur; (e) `.odb` dosyasi yerinde kalir ve yeniden acilip satirlari okur |
+| `disk_full` | **disk dolu / kisa yazma** (SKILL3 §12.1): yazma yolu tek noktadan (`WriteBytesChecked`) gecer; enjekte edilen sert hata ve yarim yazma (gercek `ENOSPC` davranisi) kontrollu `ecIOError` uretir, surec cokmez, cerceve **kirli** kalir. Hata + `ROLLBACK` sonrasi onayli satirlar durur, hata giderilince checkpoint ve yeni commit calisir, yeniden acilista tum onayli satirlar okunur ve `VERIFY` temizdir |
+| `txn_limit` | **islem sayisi / yazar cakismasi** (SKILL3 §12.2): 300 kisa islem ve 300 islemin 75'i geri alinarak commit sayisi birebir dogrulanir (sessiz kayip yok). Belgelenen v3 semantigi olculur: ic ice `BEGIN`, islem yokken `COMMIT`/`ROLLBACK` **sessiz no-op**'tur (tek islem katmani). Dosya basina **tek yazar rezervasyonu** vardir: bir oturum tutarken digeri kisa busy suresiyle kontrollu `mesgul` hatasi alir, `ROLLBACK` ile temizlenir, rezervasyon birakilinca ayni islem basariyla tamamlanir; yeniden acilista tum satirlar + `VERIFY` temiz |
 | `auth_throttle` | SCRAM deneme sinirlama/kilit |
 | `selftest_builtin` | provider SelfTest (builtin) |
 | `tls_client` | istemci CA + sunucu adi dogrulamasi (OpenSSL varsa) |
@@ -435,4 +437,30 @@ kaldirildi:
     sahte 96 MiB uzunluk oneki (v3.39 oncesi kabul edilirdi) reddedilir ve
     sunucu yasar; acik baglanti varken `Stop` doner ve `Ready=False` olur;
     `.odb` yerinde kalir, yeniden acilir ve satiri okur.
+  Diger kapilar degismedi.
+- Yirmi besinci kosu (PHASE-22 commit'i, SKILL3 §12.1 disk dolu + §12.2
+  islem sayisi): **iki platform da YESIL**. Git Bash/Windows **34 kapi** PASS
+  (`tls_client` SKIP), WSL x86_64 Linux **35 kapi** PASS (OpenSSL istege
+  bagli iki kapi SKIP). Iki motor duzeltmesi ve iki yeni kapi:
+  - **v3.40 disk dolu / kisa yazma** (`WriteBytesChecked`): butun sayfa ve
+    meta yazmalari tek noktadan gecer; `THandleStream.Write` kisa yazmayi
+    `0`'a cevirdiginden ENOSPC sessiz kalabiliyordu. Enjekte edilen hata ya
+    da kisa yazma kontrollu `ecIOError` uretir, cerceve kirli kalir.
+    `GrowTo` basarisiz buyumeyi `ecIOError`'a cevirir ve mantiksal boyu
+    artirmaz.
+  - **v3.40 monoton meta** (`SaveMeta`): gorunumu bayat bir oturum kendi
+    dusuk LSN'ini ve sayfa sayisini meta sayfaya yazabiliyordu. LSN
+    gerilemesi yeniden acilisi `EVdbPageStale` ile kilitliyor, sayfa sayisi
+    gerilemesi `TrimToLogical` uzerinden onayli sayfalari kirpabiliyordu.
+    Artik meta yalnizca yukari tasinir.
+  - `disk_full` **9 PASS / 0 FAIL**. Olculen: kontrollu yazma; sert yazma
+    hatasi; kisa yazma; `ROLLBACK` sonrasi onayli satirlar; hata sonrasi
+    yazmanin devami; checkpoint; yeniden acilis + `VERIFY`.
+  - `txn_limit` **18 PASS / 0 FAIL**. Olculen: 300 kisa islem ve 300
+    islemin 75'i geri alinarak commit sayisi birebir; oturum basina tek
+    acik islem (ic ice `BEGIN`, islem yokken `COMMIT`/`ROLLBACK` sessiz
+    no-op); dosya basina tek yazar rezervasyonu kisa busy suresinde
+    kontrollu `mesgul`, `ROLLBACK` ile temizlenir ve birakilinca islem
+    tamamlanir; temiz kapanis tek dosya; yeniden acilista 578 satir +
+    temiz `VERIFY`.
   Diger kapilar degismedi.

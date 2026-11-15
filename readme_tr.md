@@ -201,10 +201,12 @@ Son doğrulanan durum (2026-11-15, Linux x86_64 ve Windows i386, `tests/run_gate
 | `server_harden` | 24 / 0 |
 | `server_failure` | 16 / 0 (bağlantı tavanı `kapasite dolu` ile reddediyor, çöp baytlar ve sahte 96 MiB uzunluk öneki sunucuyu öldürmüyor, açık bağlantı varken `Stop` dönüyor, dosya sağlam yeniden açılıyor) |
 | `auth_throttle` | 16 / 0 |
+| `disk_full` | 9 / 0 (kısa yazma ve sert yazma hatası kontrollü `ecIOError` üretiyor, çerçeve kirli kalıyor, `ROLLBACK` ve sonraki commit'ler çalışıyor, hata geçince checkpoint başarılı, yeniden açılış + `VERIFY` temiz) |
+| `txn_limit` | 18 / 0 (300 kısa işlem ve 75 geri alma birebir sayılıyor; iç içe `BEGIN`, işlem yokken `COMMIT` ve `ROLLBACK` belgelenmiş no-op; dosya başına tek yazar rezervasyonu kısa busy süresinde kontrollü `meşgul` veriyor ve bırakılınca işlem tamamlanıyor; yeniden açılışta 578 satır + temiz `VERIFY`) |
 | `tls_client` | 6 / 0 (Linux; OpenSSL DLL'i olmayan Windows'ta atlanır) |
 
-Linux'ta **33 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
-atlanır), Windows'ta **32 kapı** (`tls_client` atlanır). Kapı belgeleri:
+Linux'ta **35 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
+atlanır), Windows'ta **34 kapı** (`tls_client` atlanır). Kapı belgeleri:
 [docs/engineering/](docs/engineering/).
 
 ```bash

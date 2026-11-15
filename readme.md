@@ -201,10 +201,12 @@ Last verified state (2026-11-15, Linux x86_64 and Windows i386, `tests/run_gates
 | `server_failure` | 16 / 0 (connection cap refuses with `kapasite dolu`, garbage bytes and a bogus 96 MiB length prefix do not kill the server, `Stop` with a live connection returns, the file reopens intact) |
 | `server_harden` | 24 / 0 |
 | `auth_throttle` | 16 / 0 |
+| `disk_full` | 9 / 0 (short write / hard write fault raise a controlled `ecIOError`, the frame stays dirty, `ROLLBACK` and later commits work, checkpoint succeeds once the fault clears, reopen + `VERIFY` clean) |
+| `txn_limit` | 18 / 0 (300 short transactions and 75 rollbacks counted exactly; nested `BEGIN`, bare `COMMIT` and bare `ROLLBACK` are documented no-ops; one writer reservation per file gives a controlled `mesgul` under a short busy timeout and completes after release; reopen 578 rows + clean `VERIFY`) |
 | `tls_client` | 6 / 0 (Linux; skipped on Windows without OpenSSL DLL) |
 
-That is **33 gates** on Linux (plus two OpenSSL opt-in gates skipped when
-`VDB_CRYPTO_DLL` is unset) and **32 gates** on Windows (`tls_client` skipped).
+That is **35 gates** on Linux (plus two OpenSSL opt-in gates skipped when
+`VDB_CRYPTO_DLL` is unset) and **34 gates** on Windows (`tls_client` skipped).
 Gate documents: [docs/engineering/](docs/engineering/).
 
 ```bash

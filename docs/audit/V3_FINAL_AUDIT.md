@@ -14,8 +14,8 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 - **Denetim kapsami**: SKILL2 §18-28 ve SKILL3 §5-§15, §19. Depolama
   motoru, WAL/kurtarma, islem izolasyonu, B+Tree, SQL yurutucu, guvenlik,
   kaynak sinirlari, performans, tasinabilirlik, belge.
-- **Kosulan testler**: `tests/run_gates.sh` - Linux **31 kapi**, Windows
-  **30 kapi** (`tls_client` atlanir), tamami PASS.
+- **Kosulan testler**: `tests/run_gates.sh` - Linux **35 kapi**, Windows
+  **34 kapi** (`tls_client` atlanir), tamami PASS.
 
 ## Findings
 
@@ -33,6 +33,8 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 | F10 | DUSUK | `tests/bench_report` BR11 | Indeks testi id tabani `300000`, BR5 rastgele araligiyla cakisiyordu; sahte "duplicate PK" | Taban `2000000` | `bench_report` 35/0 | KAPALI |
 | F11 | **ORTA** | `VDbPageStore.ReadPageAt` | Normal okuma yolu hicbir butunluk denetimi yapmiyordu: `PageVerify`/`PageCheckStruct` yalniz `Verify`/`vdbcheck` tarafindaydi. Diskteki tek bozuk bayt, yanlis sayfa numarasi ya da bozuk sihirli sayi **sessizce** yanlis satirlara cozuluyordu (sessiz veri bozulmasi) | `CheckReadImage` okuma yolunda: trunk atlanir, bos sayfaya izin, sihirli sayi/sayfa kimligi her zaman, CRC `VerifyOnRead` ile (varsayilan acik) `ecCorrupt` (v3.38) | `page_corrupt` 8/0; `page_integrity` I5/I6 ve `integrity_check` IC-B1 hala ayni davranisi dogruluyor | KAPALI |
 | F12 | **ORTA** | `VDbNet.VdbRecvStr` | Agdan gelen metin cercevesinin uzunluk onegi yalniz 1 GiB'a karsi korunuyordu; kimligi **dogrulanmamis** bir istemci sahte onekle sunucuda ~1 GiB ayirmaya zorlayabiliyordu (bellek tuketimi / DoS). Sunucu ayrica 96 MiB'lik onegi kabul edip tahsis deniyordu | `VDBS_MAX_RECV_STR` = 64 MiB; onek **tahsis yapilmadan** reddedilir, yalniz o baglanti duser (v3.39) | `server_failure` SF6 (96 MiB sahte onek + sunucu yasamaya devam) | KAPALI |
+| F13 | **KRITIK** | `VDbPageStore.SaveMeta` | Bayat gorunumlu bir oturum kendi **dusuk** `FLSN` ve `FPageCount` degerini meta sayfaya yaziyordu. Sonuc: (a) yeniden acilista sayfa LSN'i meta gorunum LSN'inden buyuk kalip `EVdbPageStale` ile okuma reddediliyordu, (b) regresen sayfa sayaci `TrimToLogical` uzerinden **onayli sayfalari kirpabiliyordu** (veri kaybi) | Meta sayfa monotonik: `SaveMeta` yazmadan once diskteki meta okunur, LSN ve sayfa sayaci yalniz **artirilir** (`FreeTrunk`/`FreeCount` sayfa sayaci kazaninca esitlenir) (v3.40) | `txn_limit` TL6/TL8 (yazar cakismasi + yeniden acilis 578 satir + `VERIFY`) | KAPALI |
+| F14 | ORTA | `VDbPageStore.WritePageAt` / `SaveMeta` / `InstallPage` / `GrowTo` | Disk doldu (ENOSPC) yolunda `THandleStream.Write` kisa yazmayi `0`'a cevirdigi icin yazma **sessizce** basarisiz olabiliyordu; buyume yolunda ham `EWriteError` siziyordu | Tek yazma noktasi `WriteBytesChecked`: enjekte edilen hata + kisa yazma kontrollu `ecIOError`; cerceve **kirli** kalir; `GrowTo` mantiksal boyu artirmaz (v3.40) | `disk_full` 9/0 | KAPALI |
 
 ### Kapatilan test bosluklari (SKILL2 §22, SKILL3 §10.1)
 
@@ -54,12 +56,22 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 - `server_failure` (16 kontrol) - yeni: sunucu hata yollari (baglanti tavani
   `kapasite dolu`, cop baytlar, sahte 96 MiB uzunluk oneki, acik baglanti
   varken `Stop`, dosyanin yeniden acilip okunmasi).
+- `disk_full` (9 kontrol) - yeni: disk dolu / kisa yazma yolu (yazma hatasi
+  kontrollu `ecIOError`, hata sonrasi cerceve kirli kalir, `ROLLBACK` ve
+  ardindan gelen commit calisir, hata giderilince checkpoint basarili,
+  yeniden acilista tum onayli satirlar + temiz `VERIFY`; SKILL3 §12.1).
+- `txn_limit` (18 kontrol) - yeni: islem sayisi basinci ve yazar cakismasi
+  (ic ice `BEGIN`, islem yokken `COMMIT`/`ROLLBACK` sessiz no-op; 300 kisa
+  islem ve 75 geri almanin commit sayisi birebir dogrulanir; dosya basina tek yazar
+  rezervasyonu -> kisa busy suresiyle kontrollu `mesgul`, `ROLLBACK`,
+  birakilinca yeniden tamamlama; yeniden acilis 578 satir + temiz `VERIFY`;
+  SKILL3 §12.2).
 
 ## Test Results
 
 | Sonuc | Linux | Windows |
 |---|---|---|
-| PASS (kapi) | **33** | **32** |
+| PASS (kapi) | **35** | **34** |
 | FAIL | 0 | 0 |
 | SKIP (`VDB_CRYPTO_DLL` yok) | 2 (`fixtures_openssl`, `selftest_openssl`) | 3 (+`tls_client`) |
 | Calistirilmayan | canli PostgreSQL karsilastirmasi (`sql_differential` `pg=not-run`) | ayni |
@@ -72,6 +84,7 @@ crash_points 24/0, integrity_check 32/0, cache_metrics 21/0,
 format_compat 28/0, portability 29/0, multi_writer 12/0, bench_report 35/0,
 sql_features 32/0, limits 18/0, cache_pressure 8/0, page_corrupt 8/0,
 server_harden 24/0, server_failure 16/0, auth_throttle 16/0,
+disk_full 9/0, txn_limit 18/0,
 selftest_builtin PASS, tls_client 6/0 (yalniz Linux).
 
 ## Remaining Risks
@@ -84,12 +97,12 @@ bilincli olarak disarida).
 
 | Test | Durum |
 |---|---|
-| Disk dolu (ENOSPC) | YOK - `wal_crash` T9 yalniz fsync hatasini enjekte eder |
+| Disk dolu (ENOSPC) | VAR (`disk_full`: kisa yazma/sert yazma hatasi -> kontrollu `ecIOError`, cerceve kirli kalir, `ROLLBACK` sonrasi veri bozulmaz, yeniden acilis + `VERIFY` temiz) |
 | Bellek tahsis hatasi | YOK |
 | WAL tukenmesi | YOK |
 | Onbellek tukenmesi / tahliye | VAR (`cache_pressure`: 8 sayfalik havuz, kirli tahliye, yeniden acilis) |
 | Asiri baglanti | VAR (`server_failure` SF4: `MaxConns=1` iken ikinci baglanti `RSP_ERROR` + `kapasite dolu` alir, birincisi calismaya devam eder) |
-| Asiri islem | YOK |
+| Asiri islem | VAR (`txn_limit`: 300 kisa islem + 75 geri alma birebir dogrulanir; ic ice `BEGIN` / islem yokken `COMMIT`/`ROLLBACK` sessiz no-op; dosya basina tek yazar rezervasyonu, kisa busy suresiyle kontrollu `mesgul` ve birakilinca yeniden tamamlama) |
 | Bozuk ag girdisi | VAR (`server_failure` SF5/SF6: cop baytlar ve sahte 96 MiB uzunluk oneki sunucuyu oldurmez) |
 | Bozuk veritabani / WAL | VAR (`page_integrity`, `integrity_check`, `wal_crash`, `format_compat`) |
 | Gecersiz sifreleme anahtari | VAR (`crypto_fixtures`) |
@@ -118,11 +131,11 @@ karsilastirmasi kosmadi.
 **BETA CANDIDATE**
 
 Gerekce: kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici
-bir regresyon kapisiyla kilitlendi; iki platformda 33/32 kapi yesil; tek
-dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari ve
-tasinabilirlik olculdu. Buna karsin disk dolu, bellek tukenmesi, WAL
-tukenmesi, asiri islem sayisi ve B+Tree olcek/parcalanma gibi uretim
-hatasi yollari test edilmedi; canli PostgreSQL diferansiyeli kosmadi;
+bir regresyon kapisiyla kilitlendi; iki platformda 35/34 kapi yesil; tek
+dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari, disk dolu
+ve islem sayisi basinci ile tasinabilirlik olculdu. Buna karsin bellek
+tukenmesi, WAL tukenmesi ve B+Tree olcek/parcalanma gibi uretim hatasi
+yollari test edilmedi; canli PostgreSQL diferansiyeli kosmadi;
 TLS varsayilan olarak kapali. Bu nedenle "PRODUCTION CANDIDATE" degil.
 
 Bu siniflandirma bagimsiz dogrulama (harici denetim, resmi sertifika)

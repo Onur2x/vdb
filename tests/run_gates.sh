@@ -151,6 +151,8 @@ build_gate page_corrupt    "$ROOT/tests/page_corrupt/page_corrupt.lpr"
 build_gate server_failure  "$ROOT/tests/server_failure/server_failure.lpr"
 build_gate server_harden "$ROOT/tests/server_harden/server_harden.lpr"
 build_gate auth_throttle "$ROOT/tests/server_harden/auth_throttle.lpr"
+build_gate disk_full      "$ROOT/tests/disk_full/disk_full.lpr"
+build_gate txn_limit      "$ROOT/tests/txn_limit/txn_limit.lpr"
 build_gate tls_client    "$ROOT/tests/tls_client/tls_client_gate.lpr"
 
 # --- kosum -----------------------------------------------------------
@@ -190,6 +192,8 @@ run_gate page_corrupt   "$WORK/page_corrupt"    page_corrupt
 run_gate server_failure "$WORK/server_failure"  server_failure
 run_gate server_harden  "$WORK/server_harden"  server_harden
 run_gate auth_throttle  "$WORK/auth_throttle"  auth_throttle
+run_gate disk_full      "$WORK/disk_full"      disk_full
+run_gate txn_limit      "$WORK/txn_limit"      txn_limit
 
 run_gate selftest_builtin "$WORK/crypto_selftest" selftest_runner builtin
 

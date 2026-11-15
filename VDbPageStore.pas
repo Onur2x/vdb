@@ -138,6 +138,16 @@ type
 
   TVdbPageNoArray = array of LongWord;
 
+  { v3.40 / SKILL3 §12.1 (disk dolu): YAZMA HATASI ENJEKSIYONU.
+    Yalniz test icindir; uretimde nil kalir. Donus:
+      = 0  normal yazma
+      > 0  yalniz bu kadar bayt yazilir, sonra kisa yazma hatasi verilir
+           (disk doldugunda gerceklesen durum)
+      < 0  hic yazmadan sabit disk hatasi verilir
+    Amac: disk dolu / kisa yazma yolunun KONTROLLU hata urettigini ve
+    dosyayi sessizce bozmadigini olcebilmek. }
+  TVdbWriteFaultFunc = function(APos: Int64; ALen: Integer): Integer of object;
+
   TVDbStoreStats = record
     PageCount: LongWord;   // dosyadaki toplam sayfa (0 dahil)
     FreeCount: LongWord;   // freelist'teki sayfa sayisi
@@ -331,6 +341,8 @@ type
       FBusyMs: Integer;
       FOnSpill: TVdbPageSpillProc;
       FOnMiss: TVdbPageMissProc;
+      { v3.40: disk dolu/kisa yazma enjeksiyonu (yalniz test). }
+      FOnWriteFault: TVdbWriteFaultFunc;
       FSpillActive: Boolean;
       { P-177: PARALEL SAYFA ON-OKUMA. Slotlar yalnizca cagiran is
         parcacigi tarafindan ele alinir: PrefetchWindow pencereyi doldurup
@@ -381,6 +393,11 @@ type
     { P-177: on-okuma tamponundan tuket; tamponda yoksa False (normal yol). }
     function TryPrefetched(PageNo: LongWord; P: PVdbPage): Boolean;
     procedure ReadBytesAt(Pos: Int64; var Buf; Len: Integer; PageNo: LongWord);
+    { v3.40 / SKILL3 §12.1 (disk dolu): TEK yazma noktasi. Kisa yazmayi
+      (disk doldu) ve enjekte edilen yazma hatasini kontrollu `ecIOError`
+      istisnasina cevirir. Cagiran cerceve KIRLI kalir; sessizce temiz
+      isaretlenmez. }
+    procedure WriteBytesChecked(Pos: Int64; const Buf; Len: Integer);
     procedure WritePageAt(PageNo: LongWord; P: PVdbPage);
     function StaleOnDisk(PageNo: LongWord; P: PVdbPage): Boolean;
     procedure CheckFreshRead(PageNo: LongWord; P: PVdbPage);
@@ -710,6 +727,11 @@ type
 
     { Onbellekte bulunmayan sayfa icin alternatif kaynak (WAL tamponu). }
     property OnMiss: TVdbPageMissProc read FOnMiss write FOnMiss;
+
+    { v3.40 / SKILL3 §12.1: yazma hatasi enjeksiyonu (yalniz test; nil =
+      gercek disk). Bkz. TVdbWriteFaultFunc. }
+    property OnWriteFault: TVdbWriteFaultFunc
+      read FOnWriteFault write FOnWriteFault;
 
     { P-177: PARALEL SAYFA ON-OKUMA. AFirst..ALast araligindaki, cerceve
       onbelleginde OLMAYAN ve Skip ile budanmayan sayfalarin HAM baytlarini
@@ -1254,12 +1276,42 @@ var
   magic, ver: LongWord;
   ps: Word;
   flags: LongWord;
+  hdr: TVDbPageBuf;
+  diskLsn, diskPages: LongWord;
 begin
   { v3.2: salt-okunur oturum meta sayfayi YAZMAZ. }
   if FReadOnly then Exit;
   { v3.16 guvenlik agi: paylasimli kilit altinda yazilamaz -> tam kilide
     yukselt (acilis gibi zaten tam kilitli durumlarda dokunmaz). }
   EnsureIoWrite;
+  { v3.40 / SKILL3 §12: BASKA OTURUMUN DAHA YENI META IMAJI EZILMEZ.
+    Bir yazarin gorunumu bayat olabilir (baska bir surec commit edip
+    kapanmis, `.wal`i budamistir). Bu durumda kendi dusuk LSN'ini ve sayfa
+    sayisini yazmak iki turlu bozulma uretir:
+      - LSN geriye giderse diskteki daha yeni sayfalar `gorunum LSN`den
+        buyuk kalir ve veritabani yeniden acilista OKUNAMAZ hale gelir,
+      - sayfa sayisi geriye giderse onayli sayfalar mantiksal olarak
+        kirpilir (veri kaybi).
+    Bu yuzden meta yazilirken LSN ve sayfa sayisi MONOTON artirilir; disk
+    daha ilerideyse onun degerleri (ve o sayfa sayisina ait freelist basi)
+    benimsenir. Meta sayfa her zaman DUZ metindir (magic okunabilir). }
+  if FStream.Size >= VDB_PAGE_SIZE then
+  begin
+    FStream.Position := 0;
+    FStream.ReadBuffer(hdr, VDB_PAGE_SIZE);
+    if PLongWord(@hdr[0])^ = VDB_FILE_MAGIC then
+    begin
+      diskLsn := PLongWord(@hdr[24])^;
+      if diskLsn > FLSN then FLSN := diskLsn;
+      diskPages := PLongWord(@hdr[12])^;
+      if diskPages > FPageCount then
+      begin
+        FPageCount := diskPages;
+        FFreeTrunk := PLongWord(@hdr[16])^;
+        FFreeCount := PLongWord(@hdr[20])^;
+      end;
+    end;
+  end;
   FillChar(buf, SizeOf(buf), 0);
   magic := VDB_FILE_MAGIC;
   ver := VDB_FILE_VER;
@@ -1287,7 +1339,7 @@ begin
   q := PLongWord(@buf[VDB_PAGE_BODY_END]);
   q^ := crc;
   FStream.Position := 0;
-  FStream.WriteBuffer(buf, VDB_PAGE_SIZE);
+  WriteBytesChecked(0, buf, VDB_PAGE_SIZE);
   { v3.16: yazdigimiz imaj artik "son gorulen" imajdir. }
   if Length(FMetaSig) <> VDB_PAGE_SIZE then
     SetLength(FMetaSig, VDB_PAGE_SIZE);
@@ -2852,6 +2904,36 @@ begin
   CheckFreshRead(PageNo, P);
 end;
 
+procedure TVDbPageStore.WriteBytesChecked(Pos: Int64; const Buf; Len: Integer);
+var
+  allow: Integer;
+begin
+  { v3.40 / SKILL3 §12.1: `THandleStream.Write` kisa yazmayi 0'a cevirir;
+    bu yuzden disk dolu tek basina sessiz kalabilir. Burada hem enjekte
+    edilen hata (yalniz test) hem de kisa yazma ACIKCA hataya cevrilir. }
+  if Assigned(FOnWriteFault) then
+  begin
+    allow := FOnWriteFault(Pos, Len);
+    if allow < 0 then
+      raise EVDbException.CreateFmt(ecIOError,
+        'disk yazma hatasi: konum %d, %d bayt', [Pos, Len]);
+    if (allow > 0) and (allow < Len) then
+    begin
+      { Kisa yazma: gercek disk doldugunda olan budur. Bu kadar bayt
+        yazilir, sonra KONTROLLU hata verilir; cagiran cerceve kirli kalir. }
+      FStream.WriteBuffer(Buf, allow);
+      raise EVDbException.CreateFmt(ecIOError,
+        'disk dolu / kisa yazma: konum %d, %d/%d bayt', [Pos, allow, Len]);
+    end;
+    if allow >= Len then
+    begin
+      FStream.WriteBuffer(Buf, Len);
+      Exit;
+    end;
+  end;
+  FStream.WriteBuffer(Buf, Len);
+end;
+
 procedure TVDbPageStore.WritePageAt(PageNo: LongWord; P: PVdbPage);
 var
   env: TBytes;
@@ -2869,10 +2951,10 @@ begin
     Move(P^, plain[0], VDB_PAGE_SIZE);
     if not VDbPageSeal(FKey, FSalt, PageNo, plain, env) then
       raise EVdbPageStore.Create(Format('sayfa %d sifrelenemedi', [PageNo]));
-    FStream.WriteBuffer(env[0], VDB_ENC_ENVELOPE);
+    WriteBytesChecked(OffsetOf(PageNo), env[0], VDB_ENC_ENVELOPE);
   end
   else
-    FStream.WriteBuffer(P^, VDB_PAGE_SIZE);
+    WriteBytesChecked(OffsetOf(PageNo), P^, VDB_PAGE_SIZE);
   Inc(FWrites);
 end;
 
@@ -3409,7 +3491,16 @@ begin
   EnsureIoWrite;
   { Parca halinde uzat: her sayfa icin ayri SetSize cagrisi yapilmaz. }
   want := Required + VDB_GROW_BYTES;
-  FStream.Size := want;
+  { v3.40 / SKILL3 §12.1: dosya buyutme de disk dolu ile karsilasabilir.
+    Ham `EWriteError` yerine kontrollu `ecIOError`; dosya mantiksal boyu
+    ARTIRILMAZ, yani yarim uzatilmis bir dosya sozlesmesi olusmaz. }
+  try
+    FStream.Size := want;
+  except
+    on E: Exception do
+      raise EVDbException.CreateFmt(ecIOError,
+        'veritabani buyutulemedi (disk dolu?): %s', [E.Message]);
+  end;
   FPhysSize := want;
 end;
 
@@ -4458,7 +4549,7 @@ begin
     end;
     { Meta sayfa her zaman DUZ metindir (sir tutmaz, sifreleme zarfi yok). }
     FStream.Position := 0;
-    FStream.WriteBuffer(P^, VDB_PAGE_SIZE);
+    WriteBytesChecked(0, P^, VDB_PAGE_SIZE);
     LoadMeta;
     Exit;
   end;
