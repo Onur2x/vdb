@@ -126,6 +126,7 @@ serbest, tutarsizlik yasak), DB hala yazilabilir.
 | Gecersizlestirme | VAR | `RefreshIfStale`, `FViewLsn` |
 | Eszamanli erisim | VAR | `FPageCs` + kilit |
 | Bellek limiti | VAR | `VDB_MAX_POOL` |
+| Metrik yayini | VAR | `GetCacheStats` -> `MetricsText` + `SHOW STATS`, `tests/cache_metrics` 21/0 |
 
 ### §20.2 Metrikler
 
@@ -133,11 +134,27 @@ serbest, tutarsizlik yasak), DB hala yazilabilir.
 `page_cache_hits_total`, `page_cache_misses_total`, `page_cache_pages`,
 `page_cache_used`, `page_reads_total`, `page_writes_total`,
 `page_evictions_total`, `wal_commits_total`, `checkpoints_total`,
-`checkpoint_last_ms`, `checkpoint_duration_ms_total`, `wal_torn_tail`.
+`checkpoint_last_ms`, `checkpoint_duration_ms_total`, `wal_torn_tail` ve
+G2 ile eklenenler: `page_cache_hit_ratio` (0..1, dort ondalik),
+`page_cache_dirty_pages` (kirli cerceve sayisi), `page_flushes_total`,
+`page_flush_pages_total`, `page_flush_last_ms`,
+`page_flush_duration_ms_total`.
 
-**Eksik (G2):** hit ratio, **kirli sayfa sayisi**, flush suresi (ayri),
-`SHOW STATS` icinde bu metriklerin gorunmesi ve **sayaclarin gercekten
-hareket ettigini kanitlayan kapi** yok.
+Ayni degerler `SHOW STATS` ciktisinda satir olarak da var: `cache_hits`,
+`cache_misses`, `cache_hit_ratio`, `cache_pool_pages`, `cache_pool_used`,
+`cache_dirty_pages`, `page_flushes`, `page_flush_pages`,
+`page_flush_last_ms`, `page_flush_duration_ms_total`. Motor bunlari
+`IVDbBackend.GetCacheStats` (`TVdbCacheStats`) uzerinden yayinlar; v2
+`Supported=False` doner (v2'nin sayfa cerceve onbellegi yoktur, kendi okuma
+onbellegi ayri raporlanir).
+
+`tests/cache_metrics` (21 kontrol) metriklerin **gercekten hareket
+ettigini** kanitlar: okuma trafigi hit/miss sayaclarini artirir; yazidan
+sonra kirli sayfa > 0, checkpoint'ten sonra = 0; checkpoint flush sayacini
+ve yazilan sayfa sayisini artirir; flush suresi mantiklidir (toplam >= son);
+hit ratio aritmetigi `hits/(hits+misses)` ile uyusur; Prometheus ciktisi ve
+`SHOW STATS` ayni gercek degerleri tasir. Sayaclar oturumluktur (yeniden
+acilista sifirdan baslar). **G2 KAPATILDI.**
 
 ### §20.3 Tek dosya performansi
 
@@ -330,7 +347,7 @@ ve asagidaki bosluklar kapatilmadan "production" iddia edilmez.
 | No | Bosluk | Yapilacak |
 |---|---|---|
 | G1 | ~~Checkpoint cokme noktalari (7-9) ve WAL budama (10)~~ | **KAPATILDI** — `tests/crash_points` 24/0 (deterministik enjeksiyon + gercek surec olumu) |
-| G2 | Onbellek metrikleri eksik (hit ratio, kirli sayfa, flush) | `TVDBStoreStats` genislet, `SHOW STATS`'a ekle, kapi |
+| G2 | ~~Onbellek metrikleri eksik (hit ratio, kirli sayfa, flush)~~ | **KAPATILDI** — `GetCacheStats` + `MetricsText` + `SHOW STATS` + `tests/cache_metrics` 21/0 |
 | G3 | Izolasyon/kilit belgesi yok | `docs/engineering/ISOLATION.md` |
 | G4 | ~~Surecler-arasi kilitleme testleri yok~~ | **KAPATILDI** — `tests/multiproc` 17/0 (MP1-MP10) |
 | G5 | Benchmark kategorileri ve yuzdelikler eksik | `perf_baseline` genislet veya `bench_report` kapisi |
@@ -339,5 +356,5 @@ ve asagidaki bosluklar kapatilmadan "production" iddia edilmez.
 | G8 | Limitler tanimsiz, disk dolu denenmedi | Limit tablosu + kontrollu hata + disk dolu simulasyonu |
 | G9 | Platformlar arasi dosya uyumu kanitsiz | Windows'ta yaz, Linux'ta oku (ve tersi) kapisi |
 
-Oncelik: G7/G9 (uyumluluk), G2/G5 (golge),
-G3/G8 (belge + sinir). G1, G4 ve G6 kapatildi.
+Oncelik: G7/G9 (uyumluluk), G5 (golge),
+G3/G8 (belge + sinir). G1, G2, G4 ve G6 kapatildi.

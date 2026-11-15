@@ -56,6 +56,18 @@ type
     Baglanmamissa 0 doner (= oturum yok; eski global davranis). }
   TVdbSessionIdFunc = function: Cardinal;
 
+  { SKILL2 §20.2 (G2): onbellek metriklerinin MOTORDAN BAGIMSIZ tasiyicisi.
+    `Supported=False` ise alanlar sifirdir ve cagiran (SHOW STATS) bu blogu
+    yazmaz; v2 kendi okuma onbellegini ayri raporlar. }
+  TVdbCacheStats = record
+    Supported: Boolean;
+    Hits, Misses: Int64;
+    PoolPages, PoolUsed, DirtyPages: Integer;
+    FlushCount, FlushPages: Int64;
+    FlushLastMs: Integer;
+    FlushTotalMs: Int64;
+  end;
+
   { M11: yalnizca temel KV islemleri (transaction/WAL/indeks disarida). }
   IVDbKvStore = interface
     ['{6D8B2E71-4C1A-4F6E-9E3B-7A5C0D2F1A44}']
@@ -242,6 +254,11 @@ type
       isabet/iskalama, sayfa okuma/yazma, checkpoint sayaci + sureleri, WAL
       commit sayisi. v2: bos metin (kendi sayaclari GetMetricsText'te). }
     function MetricsText: string;
+
+    { SKILL2 §20.2 (G2): onbellek metrikleri (isabet orani, kirli sayfa,
+      flush sayisi/sayfa/sure). v3 gercek sayaclari doldurur; v2
+      Supported=False doner (v2'nin kendi okuma onbellegi vardir). }
+    function GetCacheStats: TVdbCacheStats;
 
     { Sprint 3.3: VACUUM - canli kayitlari yeni, sikisik bir dosyaya yazar
       ve atomik olarak yerine koyar. Bos sayfalar/olu baytlar dosyadan

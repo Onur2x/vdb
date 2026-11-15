@@ -62,6 +62,16 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   Kapi; bozuk sihirli sayi, bozuk CRC, bozuk freelist girdisi, kesik WAL
   kuyrugu ve kesik dosyayi ayri ayri dener ve her senaryoda dosyanin
   FNV-1a ozeti + boyutunun degismedigini dogrular.
+- **Onbellek metrikleri** `cache_metrics` kapisi (21 kontrol):
+  `TVDbStoreStats` kirli cerceve sayisini (`DirtyPages`) ve flush
+  sayaci/sayfa sayisi/suresini tasir; `IVDbBackend.GetCacheStats`
+  (`TVdbCacheStats`; v2 `Supported=False`) motordan bagimsiz yayin yapar.
+  Ayni degerler Prometheus ciktisinda (`page_cache_hit_ratio`,
+  `page_cache_dirty_pages`, `page_flushes_total`, `page_flush_pages_total`,
+  `page_flush_last_ms`, `page_flush_duration_ms_total`) ve `SHOW STATS`
+  satirlarinda (`cache_hits`, `cache_hit_ratio`, `cache_dirty_pages`,
+  `page_flushes`, ...) gorunur. Kapi metriklerin gercekten hareket
+  ettigini olcer; sabit/sahte deger kapiyi kirar.
 
 ### SQL
 

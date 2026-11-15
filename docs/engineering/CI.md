@@ -32,6 +32,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `multiproc` | iki **gercek surec**: es zamanli yazar + bayat onbellek tazeleme, `SIGKILL`/`TerminateProcess` sonrasi kurtarma, RO yazmayi reddetme (bkz. `STORAGE_AUDIT.md` §21.3) |
 | `crash_points` | **deterministik cokme enjeksiyonu**: 7 checkpoint/commit asamasinin ortasinda gercek surec olumu (`SIGKILL`/`TerminateProcess`), sonra yeniden acilis + `VERIFY` + onayli commit kontrolu (bkz. `STORAGE_AUDIT.md` §4) |
 | `integrity_check` | **butunluk denetleyici** (`vdbcheck`): dort mod (`--quick/--full/--index/--wal`), her zaman salt-okunur; saglam DB dort modda temiz, bozuk sihirli sayi/CRC/freelist girdisi/kesik WAL kuyrugu ayri kategorilerde yakalanir, dosya ozeti degismez (bkz. `STORAGE_AUDIT.md` §8) |
+| `cache_metrics` | **onbellek metrikleri gercekten hareket ediyor mu**: hit/miss okuma trafigiyle artar, kirli sayfa yazidan sonra > 0 / checkpoint'ten sonra = 0, flush sayaci + yazilan sayfa + sure artar, hit ratio aritmetigi dogru, `MetricsText` ve `SHOW STATS` ayni degerleri tasir (bkz. `STORAGE_AUDIT.md` §5) |
 | `crypto_core` | saf Pascal AES/GCM/SHA/HMAC cekirdegi |
 | `crypto_base64` | base64 kodlayici/cozucu |
 | `fixtures_builtin` | eski `.odb`/anahtar fixture'lari **builtin** provider ile acilir |
@@ -268,3 +269,15 @@ kaldirildi:
   Kapi, denetim oncesi/sonrasi dosyanin FNV-1a ozeti + boyutu + dizin
   icerigi ayni oldugunu dogrular; bozuk sihirli sayi, bozuk CRC, bozuk
   freelist girdisi ve kesik WAL kuyrugu ayri ayri sinanir.
+- Onyedinci kosu (PHASE-14 commit'i): **yerel kanit** WSL x86_64 Linux
+  **24 kapi** PASS, Git Bash/Windows i386 **23 kapi** PASS (`tls_client`
+  SKIP). Yeni kapi `cache_metrics` (**21 PASS, 0 FAIL**) SKILL2 §20.2'yi
+  kapatir: `TVDbStoreStats` kirli cerceve sayisini ve flush sayacini/
+  sayfa sayisini/suresini tasir; ayni degerler `IVDbBackend.GetCacheStats`
+  (`TVdbCacheStats`) ile motordan bagimsiz yayinlanir, `MetricsText`
+  (Prometheus) ve `SHOW STATS` (SQL) ayni gercek sayilari gosterir.
+  Kapi sabit metrik yalanini yakalar: her kontrol sayacin **is yapinca
+  arttigini** (ya da is bitince sifira dondugunu) olcer; okuma trafigi
+  hit/miss'i, yazi kirli sayfayi, checkpoint flush sayacini artirir,
+  checkpoint sonrasi kirli sayfa 0'dir. Diger kapilar degismedi
+  (`integrity_check` 32/0, `crash_points` 24/0 dahil).

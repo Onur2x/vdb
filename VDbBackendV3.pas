@@ -848,6 +848,9 @@ type
     procedure RestoreFrom(const SrcPath: string);
     { P-182: v3 motor metrikleri (Prometheus satirlari). }
     function MetricsText: string;
+    { SKILL2 §20.2 (G2): onbellek metrikleri (isabet orani, kirli
+      sayfa, flush sayisi/sayfa/suresi). v3 gercek sayaclari doner. }
+    function GetCacheStats: TVdbCacheStats;
 
     { Sprint 3.3: VACUUM - canli kayitlar yeni ve sikisik dosyaya yazilir,
       atomik olarak yerine konur; bos sayfalar/olu baytlar dosyadan duser.
@@ -4736,6 +4739,19 @@ begin
       Add('vdb_v3_page_reads_total', 'counter', IntToStr(st.Reads));
       Add('vdb_v3_page_writes_total', 'counter', IntToStr(st.Writes));
       Add('vdb_v3_page_evictions_total', 'counter', IntToStr(st.Evictions));
+      { SKILL2 §20.2 (G2): onbellek sagligi. Hit ratio 0..1 (gauge),
+        kirli cerceve sayisi, flush sayaci/sayfa sayisi/suresi. }
+      if (st.PageHits + st.PageMisses) > 0 then
+        Add('vdb_v3_page_cache_hit_ratio', 'gauge',
+          FormatFloat('0.0000', st.PageHits / (st.PageHits + st.PageMisses)))
+      else
+        Add('vdb_v3_page_cache_hit_ratio', 'gauge', '0.0000');
+      Add('vdb_v3_page_cache_dirty_pages', 'gauge', IntToStr(st.DirtyPages));
+      Add('vdb_v3_page_flushes_total', 'counter', IntToStr(st.FlushCount));
+      Add('vdb_v3_page_flush_pages_total', 'counter', IntToStr(st.FlushPages));
+      Add('vdb_v3_page_flush_last_ms', 'gauge', IntToStr(st.FlushLastMs));
+      Add('vdb_v3_page_flush_duration_ms_total', 'counter',
+        IntToStr(st.FlushTotalMs));
       Add('vdb_v3_wal_commits_total', 'counter', IntToStr(FEng.CommitCount));
       Add('vdb_v3_checkpoints_total', 'counter', IntToStr(FEng.CheckpointCount));
       Add('vdb_v3_checkpoint_last_ms', 'gauge', IntToStr(FEng.CheckpointLastMs));
@@ -4751,6 +4767,30 @@ begin
     finally
       sl.Free;
     end;
+  finally
+    FEngCs.Leave;
+  end;
+end;
+
+function TVdbBackendV3.GetCacheStats: TVdbCacheStats;
+var
+  st: TVDbStoreStats;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  if FEng = nil then Exit;
+  FEngCs.Enter;
+  try
+    st := FEng.Store.Stats;
+    Result.Supported := True;
+    Result.Hits := st.PageHits;
+    Result.Misses := st.PageMisses;
+    Result.PoolPages := st.PoolPages;
+    Result.PoolUsed := st.PoolUsed;
+    Result.DirtyPages := st.DirtyPages;
+    Result.FlushCount := st.FlushCount;
+    Result.FlushPages := st.FlushPages;
+    Result.FlushLastMs := st.FlushLastMs;
+    Result.FlushTotalMs := st.FlushTotalMs;
   finally
     FEngCs.Leave;
   end;

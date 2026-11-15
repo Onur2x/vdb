@@ -140,6 +140,14 @@ type
     PageHits: Int64;
     PageMisses: Int64;
     FileBytes: Int64;
+    { SKILL2 §20.2 (G2): onbellek sagligi. DirtyPages = su an diskte
+      olmayan, yalniz bellekte duran kirli cerceve sayisi. Flush* =
+      Flush cagrilarinin sayaci ve suresi (checkpoint maliyeti). }
+    DirtyPages: Integer;
+    FlushCount: Int64;
+    FlushPages: Int64;
+    FlushLastMs: Integer;
+    FlushTotalMs: Int64;
   end;
 
   TVDbPageStore = class
@@ -191,6 +199,12 @@ type
       { P-182: onbellek isabet/iskalama sayaclari (Stats ile yayinlanir). }
       FPageHits: Int64;
       FPageMisses: Int64;
+      { SKILL2 §20.2 (G2): Flush sayaci, yazilan cerceve sayisi ve sure.
+        Yalniz gercekten is yapan Flush'lar sayilir (kirli cerceve vardi). }
+      FPageFlushes: Int64;
+      FPageFlushPages: Int64;
+      FPageFlushLastMs: Integer;
+      FPageFlushTotalMs: Int64;
       FMetaDirty: Boolean;
       { v3.1: meta sayfanin YAPISAL icerigi (sayfa sayisi / freelist) diskte
         bayat mi? Commit yalnizca bu True iken meta cercevesi yazar; yalniz
@@ -3512,9 +3526,12 @@ end;
 
 procedure TVDbPageStore.Flush(DoSync: Boolean);
 var
-  i: Integer;
+  i, written: Integer;
+  t0, ms: QWord;
 begin
   if FStream = nil then Exit;
+  t0 := GetTickCount64;
+  written := 0;
   { v3.31: tazeleme sirasinda yeni sayfa no'su FPageCount'i artirmis olabilir
     ama disk buyutulmemisti (paylasimli kilit). Burada yazma kilidi altinda
     dosya mantiksal boyuna buyutulur; aksi halde WritePageAt EOF'a yazar ve
@@ -3542,12 +3559,23 @@ begin
       begin
         WritePageAt(FFrames[i].PageNo, @FFrames[i].Data);
         FFrames[i].Dirty := False;
+        Inc(written);
       end;
     end;
   if FMetaDirty then
     SaveMeta;
   if DoSync then
     VDbFlushStream(FStream);
+  { SKILL2 §20.2 (G2): yalniz is yapan flush'i say; bos cagrilar
+    (tum cerceveler temiz) sayaci sisirmesin. }
+  if written > 0 then
+  begin
+    Inc(FPageFlushes);
+    Inc(FPageFlushPages, written);
+    ms := GetTickCount64 - t0;
+    FPageFlushLastMs := Integer(ms);
+    Inc(FPageFlushTotalMs, Int64(ms));
+  end;
 end;
 
 procedure TVDbPageStore.DropCache;
@@ -4247,11 +4275,16 @@ end;
 
 function TVDbPageStore.Stats: TVDbStoreStats;
 var
-  i, used: Integer;
+  i, used, dirty: Integer;
 begin
   used := 0;
+  dirty := 0;
   for i := 0 to FPoolPages - 1 do
-    if FFrames[i].PageNo <> 0 then Inc(used);
+    if FFrames[i].PageNo <> 0 then
+    begin
+      Inc(used);
+      if FFrames[i].Dirty then Inc(dirty);
+    end;
   Result.PageCount := FPageCount;
   Result.FreeCount := FFreeCount;
   if FPageCount >= 1 + FFreeCount then
@@ -4265,6 +4298,11 @@ begin
   Result.Evictions := FEvictions;
   Result.PageHits := FPageHits;
   Result.PageMisses := FPageMisses;
+  Result.DirtyPages := dirty;
+  Result.FlushCount := FPageFlushes;
+  Result.FlushPages := FPageFlushPages;
+  Result.FlushLastMs := FPageFlushLastMs;
+  Result.FlushTotalMs := FPageFlushTotalMs;
   { v3.1: MANTIKSAL boy (FPageCount x 4096). Dosya onceden ayrilmis parca
     tasiyabilir; o fazlalik veriye dahil degildir ve kapanista kirpilir. }
   if FStream <> nil then Result.FileBytes := RequiredFileSize(FPageCount)

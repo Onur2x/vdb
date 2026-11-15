@@ -110,6 +110,8 @@ type
     procedure RestoreFrom(const SrcPath: string);
     { P-182: motor metrikleri; v2'de bos (sayaclar GetMetricsText'te). }
     function MetricsText: string;
+    { SKILL2 §20.2 (G2): v2'de sayfa onbellegi yok; Supported=False. }
+    function GetCacheStats: TVdbCacheStats;
 
     { Sprint 3.3: v2 TVDb.Compact'a devreder. }
     procedure Compact(out OldBytes, NewBytes: Int64);
@@ -501,6 +503,14 @@ function TVdbBackendV2.MetricsText: string;
 begin
   { P-182: v2 sayaclari GetMetricsText icinde dogrudan okunur. }
   Result := '';
+end;
+
+function TVdbBackendV2.GetCacheStats: TVdbCacheStats;
+begin
+  { v2'de sayfa cerceve onbellegi yok: alanlar sifir, Supported False.
+    Cagiran blok yazmaz; v2 kendi okuma onbellegini ayri raporlar. }
+  FillChar(Result, SizeOf(Result), 0);
+  Result.Supported := False;
 end;
 
 procedure TVDbBackendV2.Compact(out OldBytes, NewBytes: Int64);

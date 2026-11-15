@@ -23069,6 +23069,7 @@ var
   hits, misses: Int64;
   usedB, maxB: Integer;
   ratio: Double;
+  cs: TVdbCacheStats;
 
   { v3 yolu: satirlari tek tek ekle (satir sayisi motorun gerceklerine gore
     degisir; sabit 13 satir varsayimi v2'ye aittir). }
@@ -23175,6 +23176,27 @@ begin
     AddRow('data_file_bytes', IntToStr(SizeOfFile(FT.Backend.FilePath)));
     AddRow('wal_file_bytes', IntToStr(SizeOfFile(FT.Backend.FilePath + '.wal')));
     AddRow('idx_file_bytes', IntToStr(SizeOfFile(FT.Backend.FilePath + '.idx')));
+    { SKILL2 §20.2 (G2): onbellek metrikleri motorun gercek sayaclarindan.
+      Hit ratio 0..1 (dort ondalik); v2 bu blogu yazmaz (Supported=False),
+      kendi okuma onbellegini asagida raporlar. }
+    cs := FT.Backend.GetCacheStats;
+    if cs.Supported then
+    begin
+      AddRow('cache_hits', IntToStr(cs.Hits));
+      AddRow('cache_misses', IntToStr(cs.Misses));
+      if (cs.Hits + cs.Misses) > 0 then
+        AddRow('cache_hit_ratio',
+          FormatFloat('0.0000', cs.Hits / (cs.Hits + cs.Misses)))
+      else
+        AddRow('cache_hit_ratio', '0.0000');
+      AddRow('cache_pool_pages', IntToStr(cs.PoolPages));
+      AddRow('cache_pool_used', IntToStr(cs.PoolUsed));
+      AddRow('cache_dirty_pages', IntToStr(cs.DirtyPages));
+      AddRow('page_flushes', IntToStr(cs.FlushCount));
+      AddRow('page_flush_pages', IntToStr(cs.FlushPages));
+      AddRow('page_flush_last_ms', IntToStr(cs.FlushLastMs));
+      AddRow('page_flush_duration_ms_total', IntToStr(cs.FlushTotalMs));
+    end;
     { v3.3: son taramada sayfa duzeyi zone map'in budadigi sayfa sayisi. }
     AddRow('zone_pruned_pages', IntToStr(FZonePrunedPages));
     { P-175: plan onbellegi isabet/iska ve otomatik ANALYZE sayaclari.
