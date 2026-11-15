@@ -103,6 +103,39 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   bunu kilitler (ikinci yazim yalniz ucucu alanlarda farkli; sema
   kaydinda CR yok). Durust sinir: buyuk-endian makine ve macOS
   denenmedi.
+- **Duzeltildi - cok yazarli tek dosyada onayli commit kaybi** (olculen,
+  `tests/multi_writer` kapsiyla kilitlendi). Ayni `.odb` dosyasina iki oturum
+  yazdiginda dort ayri hata birlikte veri kaybediyordu:
+  (a) **v3.32** `InstallPage` tazeleme sirasinda, `TxnMark` bu oturuma ait
+  olmayan sayfalari da siliyordu; artik yalniz `TxnMark = FTxnId` olan sayfa
+  dusurulur.
+  (b) **v3.33** ikinci oturumun kapanisi `.gen` dosyasini siliyordu; iki
+  oturum farkli nesil kimligi tasiyip birbirinin onayli sayfalarini eziyordu.
+  Artik surec ici **referans sayaci** (`GGenRefCs`/`GenRefAdd`/`GenRefDrop`/
+  `GenRefOthers`) var; `.gen` yalniz gercekten son oturumda silinir.
+  (c) **v3.34/v3.35** her oturum kendi LSN'ini ilerlettigi icin iki oturum
+  **ayni LSN'i** uretiyordu ve kurtarma `lsn <= MinLSN` kayitlarini atliyordu.
+  WAL kuyrugu artik `FTailPos`/`FTailLsn` ile izlenir (`SyncTail`, `TailLsn`)
+  ve `DoCommit` LSN'i kuyruktan tohumlar.
+  (d) **v3.36** kapanista `DropSideFiles` bos `.wal`i siliyor, diger oturumun
+  acik tutamagi yetim kaliyordu; ayni surecte baska oturum varsa
+  (`OtherOpenSessions`) yan dosyalara artik dokunulmaz. Ayrica `Wal.Commit`
+  her zaman **dosya sonuna** konumlanir; bayat `FAtEnd` konumu yeni commit'i
+  eski kaydin uzerine yazabiliyordu.
+- **Cok yazarli regresyon kapisi** `multi_writer` (12 kontrol): iki oturum
+  sirayla commit eder; WAL commit LSN'leri **kesin artar**; ikinci oturum
+  kapaninca `.wal`/`.gen` korunur; birinci oturum kendi onayli satirlarini
+  gorur; temiz kapanistan sonra yalniz `.odb` kalir; 12/12 satir kalici;
+  yedek + geri yukleme 18/18.
+- **Olculebilir benchmark kapisi** `bench_report` (35 kontrol, 18 kategori):
+  olusturma, acilis, kapanis, sirali/rastgele ekleme ve nokta okuma,
+  guncelleme, silme, indeks olusturma, indeksli arama, aralik sorgusu,
+  islem, eszamanli islem (iki oturum), WAL kurtarma, checkpoint, yedek, geri
+  yukleme. Her kategori icin P50/P95/P99/max, ortalama ve islem/sn; CSV
+  (`bench_report.csv`) + meta (`bench_meta.txt`); FPC heap bellegi ve
+  DB/WAL boyu. Kapi ayrica **dogruluk** kontrol eder (satirlar gercekten
+  kalici mi), yani hizli ama yanlis bir olcum gecemez. `perf_baseline`'in
+  kapsamadigi kategorileri kapatir (SKILL2 §22, `STORAGE_AUDIT.md` §7).
 
 ### SQL
 

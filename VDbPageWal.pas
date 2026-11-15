@@ -190,6 +190,15 @@ type
       her tazelemede veri dosyasini yeniden acmak istemeyiz). }
     FDbId: TBytes;
     FDbIdKnown: Boolean;
+    { v3.35 DUZELTME (olculen veri kaybi): WAL govde kuyrugunun durumu.
+      LSN URETIMI icin baslik YETMEZ: basligi yalnizca Truncate yazar, yani
+      iki oturum ayni dosyaya yazdiginda digerinin ekledigi kayitlar baslikta
+      GORUNMEZ (olcum: iki oturum da lsn=2801 uretti; ikinci oturumun
+      commit'leri kurtarmada `lsn <= MinLSN` diye sessizce atlandi).
+      Govde kuyrugu gercegi tasir: FTailPos = CRC'den gecen son kayittan
+      SONRAKI bayt, FTailLsn = o kayitlarin en buyuk LSN'i. }
+    FTailPos: Int64;
+    FTailLsn: LongWord;
     function DbFilePath: string;
     function DeriveDbId(out AId: TBytes): Boolean;
     procedure EnsureDbId;
@@ -293,6 +302,14 @@ type
     { Checkpoint sonrasi WAL'i bosalt (yalniz baslik kalir). }
     procedure Truncate(CheckpointLSN: LongWord);
 
+    { v3.35: dosya bizden sonra buyuduyse YALNIZ yeni baytlari tarayip
+      kuyruk bilgisini ilerletir (O(yeni bayt), O(WAL) degil). Bozuk/kesik
+      kayitta durur. Commit'in tam yazma kilidi altinda cagrilmalidir. }
+    procedure SyncTail;
+    { v3.35: WAL govdesindeki CRC'den gecen en buyuk LSN (LSN uretimi icin
+      gercek otorite). }
+    property TailLsn: LongWord read FTailLsn;
+
     property Path: string read FPath;
     property BufferedCount: Integer read FBufferCount;
     { WAL dosyasinin su anki boyu (checkpoint esigi icin). }
@@ -300,8 +317,6 @@ type
   end;
 
 implementation
-
-
 
 type
   TPendingArray = array of TVdbPageWal.TPending;
@@ -577,6 +592,9 @@ begin
   FWrittenBytes := 0;
   FScanPos := 0;
   FScanHdrLsn := 0;
+  { v3.35: kuyruk bilgisi yok; ilk SyncTail bastan tarar. }
+  FTailPos := 0;
+  FTailLsn := 0;
   FUnsyncedStartPos := 0;
   FUnsyncedBaseValid := False;
   FSyncFault := False;
@@ -990,8 +1008,13 @@ begin
   try
     { P-57: konum zaten sondaysa Seek atlaniyor. Tek surecli modda Commit
       sonrasi konum sondadir; Refresh/Recover/ReadHeader disaridan gelir. }
-    if not FAtEnd then
-      FStream.Seek(0, soEnd);
+    { v3.36 DUZELTME (olculen veri kaybi): FAtEnd yalnizca BU nesnenin
+      bildigi konumu anlatir. Ayni `.wal` dosyasina yazan baska bir oturum
+      araya kayit eklediyse bu nesnenin konumu BAYATTIR; yeni commit eski
+      kaydin UZERINE yazilir (WAL'de sessiz delik, onayli commit kaybi).
+      Bu yuzden her commit dosya sonuna konumlanir: tek seek maliyeti,
+      karsiliginda kayipsiz kuyruk. }
+    FStream.Seek(0, soEnd);
     startPos := FStream.Position;   // R2-C-3: geri kirpma noktasi
     { R2-C-3 (kalan): grup commit (DoSync=False) yolunda fsync sonradan
       SyncDurable'da yapilir. Son basarili durabilite noktasindan sonraki
@@ -1095,6 +1118,9 @@ begin
   BufHashClear;   // P-71
   FHasContent := True;
   FWrittenLsn := LSN;
+  { v3.35: bu oturumun yazdigi son kayit kuyrugun ucudur. }
+  FTailPos := FStream.Position;
+  FTailLsn := LSN;
   Result := True;
 end;
 
@@ -1314,6 +1340,13 @@ begin
     FWrittenLsn := maxLsn;
   FScanPos := goodPos;
   FScanHdrLsn := hdrLsn;
+  { v3.35: kurtarma govdeyi bastan sona (veya artimsal olarak) taradi;
+    kuyruk konumu da buradan ogrenilir. Yalniz ileri: bozuk kuyrukta
+    goodPos son gecerli kayittan SONRASIDIR, yani guvenli sinirdir. }
+  if goodPos > FTailPos then
+    FTailPos := goodPos;
+  if maxLsn > FTailLsn then
+    FTailLsn := maxLsn;
   Result := True;
 end;
 
@@ -1442,6 +1475,71 @@ begin
   end;
 end;
 
+procedure TVdbPageWal.SyncTail;
+var
+  fileSize, oldPos: Int64;
+  hdr: array[0..VDB_WAL_REC_HDR - 1] of Byte;
+  magic, lsn, payLen, crc, calc: LongWord;
+  expectedLen: LongWord;
+  got: Integer;
+  raw: TBytes;
+begin
+  if FStream = nil then Exit;
+  fileSize := FStream.Size;
+  { Kuyruk bilgisi yoksa ya da baska bir oturum dosyayi KIRPTIYSA
+    (FTailPos dosyanin otesinde) kuyruk bastan baslar. Bos govdede
+    GERCEK LSN kaynagi BASLIKTIR (Truncate oraya checkpoint LSN'ini yazar),
+    dolu govdede ise kuyrugun kendisi. Baslik hic okunmamis olabilir
+    (olcum: B oturumunda walHeader=0) — o yuzden burada okunur. }
+  if (FTailLsn = 0) or (FTailPos < VDB_PAGE_SIZE) or (FTailPos > fileSize) then
+  begin
+    FStream.Position := 0;
+    ReadHeader;
+    if FHeaderLsn > FTailLsn then
+      FTailLsn := FHeaderLsn;
+    FTailPos := VDB_PAGE_SIZE;
+  end;
+  if FTailPos >= fileSize then Exit;
+  oldPos := FStream.Position;
+  try
+    FStream.Position := FTailPos;
+    while FStream.Position + VDB_WAL_REC_HDR <= fileSize do
+    begin
+      got := FStream.Read(hdr[0], VDB_WAL_REC_HDR);
+      if got <> VDB_WAL_REC_HDR then Break;
+      Move(hdr[0], magic, 4);
+      Move(hdr[4], lsn, 4);
+      Move(hdr[8], payLen, 4);
+      Move(hdr[16], crc, 4);
+      if (magic <> VDB_WAL_REC_FRAME) and (magic <> VDB_WAL_REC_COMMIT) then
+        Break;
+      if magic = VDB_WAL_REC_FRAME then
+      begin
+        if FWalEncrypted then expectedLen := VDB_ENC_ENVELOPE
+        else expectedLen := VDB_PAGE_SIZE;
+        if payLen <> expectedLen then Break;
+      end
+      else if payLen <> 0 then
+        Break;
+      calc := WalCrc(hdr[0], 16, hdr[0], 0);
+      if payLen > 0 then
+      begin
+        if payLen > 65536 then Break;
+        SetLength(raw, payLen);
+        got := FStream.Read(raw[0], payLen);
+        if got <> Integer(payLen) then Break;
+        if FWalVer < 2 then
+          calc := WalCrc(hdr[0], 16, raw[0], payLen);
+      end;
+      if calc <> crc then Break;
+      if lsn > FTailLsn then FTailLsn := lsn;
+      FTailPos := FStream.Position;
+    end;
+  finally
+    FStream.Position := oldPos;
+  end;
+end;
+
 procedure TVdbPageWal.Truncate(CheckpointLSN: LongWord);
 var
   safe: Boolean;
@@ -1463,6 +1561,9 @@ begin
       FWrittenLsn := CheckpointLSN;
     if maxLsn > FWrittenLsn then
       FWrittenLsn := maxLsn;
+    { v3.35: kuyruk bilgisi de gorulen en buyuk LSN'e kadar yukseltilir. }
+    if maxLsn > FTailLsn then
+      FTailLsn := maxLsn;
     Exit;
   end;
   { Yalniz GUVENLI budama yolunda bekleyen tampon atilir (zaten diske
@@ -1482,6 +1583,9 @@ begin
     Sifira cekmek YANLIS olur: LSN monoton artar, bekleyen AwaitDurable
     cagrilari eski LSN ile karsilastirir. }
   FWrittenLsn := CheckpointLSN;
+  { v3.35: govde silindigi icin kuyruk bilgisi baslik LSN'ine esitlenir. }
+  FTailPos := VDB_PAGE_SIZE;
+  FTailLsn := CheckpointLSN;
   FStream.Size := VDB_PAGE_SIZE;
   FWrittenBytes := VDB_PAGE_SIZE;   // P-61
   WriteHeader;

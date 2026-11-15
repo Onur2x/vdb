@@ -214,14 +214,16 @@ Artik RO oturum dosya olusturmaz ve `.gen`'e yazmaz (yalniz sayaci okur).
 
 ## 7. §22 Benchmark
 
-`perf_baseline` (16/0) + `PERF_BASELINE.md` su kategorileri olcuyor:
-B+Tree ekleme/arama/silme/olcekleme, SQL ekleme, SQL nokta okuma, DB dosya
-boyutu. Makine/derleyici/O1 bilgisi belgede yazili.
-
-**Eksik (G5):** skill'in saydigi 18 kategoriden **acilis, kapanis, rastgele
-ekleme/okuma, guncelleme, indeks olusturma, aralik sorgusu, islem, yedek,
-geri yukleme** olculmuyor; **P50/P95/P99** yuzdelikleri, bellek kullanimi ve
-WAL boyutu raporlanmiyor.
+`perf_baseline` (16/0) + `PERF_BASELINE.md` ve `bench_report` kapisi (35/0)
+olcuyor. `bench_report` skill'in saydigi **18 kategoriyi** kapsar: olusturma,
+acilis, kapanis, sirali/rastgele ekleme, sirali/rastgele nokta okuma,
+guncelleme, silme, indeks olusturma, indeksli arama, aralik sorgusu, islem,
+eszamanli islem (iki oturum), WAL kurtarma, checkpoint, yedek, geri yukleme.
+Her kategori icin **P50/P95/P99/max**, ortalama ve islem/sn raporlanir; CSV
+(`bench_report.csv`) ve meta (`bench_meta.txt`) dosyalari yazilir. Bellek
+kullanimi (FPC heap) ile DB/WAL boyutu da raporlanir. Ayni kosuda dogruluk
+kontrolleri (satirlarin gercekten kalici oldugu) yapilir, yani "hizli ama
+yanlis" bir olcum kapiyi gecemez.
 
 ---
 
@@ -379,7 +381,7 @@ Sinirlar:
 | 11 | Coklu surec kilitleme testleri | VAR | `multiproc` MP4-MP9 (iki gercek surec) |
 | 12 | Veritabani gecis testleri | **VAR** | `format_compat` 28/0 (v3/v4 yukseltme, v6 red, yarim goc) |
 | 13 | Platformlar arasi dosya uyumu | **VAR** | `portability` 29/0 (ayni platform turu) + iki yonlu gercek aktarim: Win i386 -> Linux x86_64 13/0, Linux -> Win 13/0 |
-| 14 | Benchmark tekrarlanabilir | KISMI | G5 |
+| 14 | Benchmark tekrarlanabilir | **VAR** | `bench_report` 35/0 (18 kategori, P50/P95/P99, CSV+meta, dogruluk kontrolleri) |
 | 15 | Performans regresyon kapilari | VAR | `perf_baseline` |
 | 16 | Disk dolu davranisi test edildi | **YOK** | G8 |
 | 17 | Kaynak tuketimi davranisi test edildi | KISMI | G8 |
@@ -388,7 +390,7 @@ Sinirlar:
 | 20 | Mevcut V3 SQL testleri geciyor | VAR | `sql_matrix` 61/0, `sql_stubs` 25/0 |
 | 21 | V2 donmus ve izole | VAR | `VDbCore` yalniz salt-okunur |
 
-**Ozet: 18 VAR, 2 KISMI, 3 YOK.** Bu yuzden skill §27 "tamamlandi" sayilamaz
+**Ozet: 19 VAR, 1 KISMI, 1 YOK.** Bu yuzden skill §27 "tamamlandi" sayilamaz
 ve asagidaki bosluklar kapatilmadan "production" iddia edilmez.
 
 ---
@@ -401,11 +403,11 @@ ve asagidaki bosluklar kapatilmadan "production" iddia edilmez.
 | G2 | ~~Onbellek metrikleri eksik (hit ratio, kirli sayfa, flush)~~ | **KAPATILDI** — `GetCacheStats` + `MetricsText` + `SHOW STATS` + `tests/cache_metrics` 21/0 |
 | G3 | Izolasyon/kilit belgesi yok | `docs/engineering/ISOLATION.md` |
 | G4 | ~~Surecler-arasi kilitleme testleri yok~~ | **KAPATILDI** — `tests/multiproc` 17/0 (MP1-MP10) |
-| G5 | Benchmark kategorileri ve yuzdelikler eksik | `perf_baseline` genislet veya `bench_report` kapisi |
+| G5 | ~~Benchmark kategorileri ve yuzdelikler eksik~~ | **KAPATILDI** — `tests/bench_report` 35/0 (18 kategori, P50/P95/P99, CSV+meta, dogruluk kontrolleri) |
 | G6 | ~~Butunluk denetleyici CLI + modlar + salt-okunur~~ | **KAPATILDI** — `vdbcheck` (4 mod, her zaman `CreateReadOnly`) + `tests/integrity_check` 32/0 |
 | G7 | ~~Eski format fixture'lari ve gecis testleri~~ | **KAPATILDI** — `tests/format_compat` 28/0 (sentetik v3/v4 imaj, yukseltme, v6/bozuk/yarim goc reddi) |
 | G8 | Limitler tanimsiz, disk dolu denenmedi | Limit tablosu + kontrollu hata + disk dolu simulasyonu |
 | G9 | ~~Platformlar arasi dosya uyumu kanitsiz~~ | **KAPATILDI** — `tests/portability` 29/0 (imaj determinizmi + LF sema) ve iki yonlu gercek aktarim (Win i386 -> Linux x86_64, Linux -> Win), her yonde 13/0 |
 
-Oncelik: G5 (golge), G3/G8 (belge + sinir).
-G1, G2, G4, G6, G7 ve G9 kapatildi.
+Oncelik: G3/G8 (belge + sinir).
+G1, G2, G4, G5, G6, G7 ve G9 kapatildi.

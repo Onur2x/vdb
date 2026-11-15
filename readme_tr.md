@@ -190,12 +190,14 @@ Son doğrulanan durum (2026-11-15, Linux x86_64 ve Windows i386, `tests/run_gate
 | `cache_metrics` | 21 / 0 (hit oranı, kirli sayfa, flush sayaçları gerçekten hareket ediyor; MetricsText + SHOW STATS) |
 | `format_compat` | 28 / 0 (v3/v4 yükseltme, v6 reddi, yarım göç reddi, dosya değişmiyor) |
 | `portability` | 29 / 0 (kendi platformunda yaz/oku, bayt bayt kopya, ikinci bağımsız yazım yalnız uçucu meta alanlarında farklı, şema LF ile yazılıyor) |
+| `multi_writer` | 12 / 0 (tek dosyada iki oturum: WAL LSN kesin artıyor, yan dosyalar ikinci kapanışta korunuyor, kendi satırları kalıyor, 12/12 kalıcı, yedek+geri yükleme 18/18) |
+| `bench_report` | 35 / 0 (18 kategori, P50/P95/P99/max, CSV+meta, bellek ve WAL boyu, kategori başına doğruluk kontrolü) |
 | `server_harden` | 24 / 0 |
 | `auth_throttle` | 16 / 0 |
 | `tls_client` | 6 / 0 (Linux; OpenSSL DLL'i olmayan Windows'ta atlanır) |
 
-Linux'ta **26 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
-atlanır), Windows'ta **25 kapı** (`tls_client` atlanır). Kapı belgeleri:
+Linux'ta **28 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
+atlanır), Windows'ta **27 kapı** (`tls_client` atlanır). Kapı belgeleri:
 [docs/engineering/](docs/engineering/).
 
 ```bash

@@ -4017,7 +4017,10 @@ begin
 {$ENDIF}
   RequireWritable;
   s := OwnSet;
-  if s = nil then Exit;
+  if s = nil then
+  begin
+    Exit;
+  end;
   syncLsn := 0;
   pendExc := nil;
   recErr := '';

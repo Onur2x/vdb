@@ -781,6 +781,16 @@ begin
     dokunma: veri WAL'de olabilir. }
   if not ACheckpointOk then Exit;
 
+  { v3.36 DUZELTME (olculen veri kaybi, BR14/BR17/BR18): ayni surecte AYNI
+    dosyaya acik BASKA bir oturum varsa yan dosyalara DOKUNMA. `.wal`i
+    silmek o oturumun ACIK tutamagini yetim birakir: sonraki commit'ler
+    yeni dosyaya degil silinmis inode'a yazilir, o oturumun checkpoint'i
+    kendi gorunumunu tazeleyemez ve iki oturum birbirinin ONAYLI sayfalarini
+    ezer (olcum: ikinci oturumun 6/12 satiri yok oldu). `.idx` icin de ayni
+    kural: canli oturumun onbellek dosyasi ayaklarinin altindan cekilmez.
+    Tek oturum kurali bozulmaz; dosya yalnizca GERCEKTEN son oturumda gider. }
+  if FStore.OtherOpenSessions > 0 then Exit;
+
   { 1) `.idx` — yalnizca acilis onbellegi. Veri degil. }
   idxPath := FPath + '.idx';
   if FKeepIdxOnClose then
@@ -1306,6 +1316,22 @@ begin
   {$IFDEF CPUPROF}
   d0 := CpuProfNow;
   {$ENDIF}
+  { v3.34/v3.35 DUZELTME (olculen veri kaybi): LSN yalnizca bu oturumun
+    onbelleginden alinamaz. Iki oturum ayni dosyaya yazdiginda her biri kendi
+    FLSN'ini ilerletiyordu; checkpoint WAL'i kirptiginda iki oturum da AYNI
+    LSN'i uretiyordu (olcum: iki oturumun commit'leri de lsn=2801).
+    Kurtarma `lsn <= MinLSN` kayitlarini "zaten veri dosyasinda" sayip
+    atladigi icin ikinci oturumun onayli commit'leri sessizce yok oluyordu.
+    Baslik LSN'i yetmez: basligi yalnizca Truncate yazar, diger oturumun
+    ekledikleri orada gorunmez (olcum: B'de walHeader=0). Bu yuzden otorite
+    WAL GOVDE KUYRUGUDUR: SyncTail yalniz yeni baytlari tarar ve dosyadaki
+    en buyuk gecerli LSN'i verir. Commit zaten tam yazma kilidi altinda
+    (AcquireDataWrite), yani bu okuma yarissizdir. }
+  FWal.SyncTail;
+  if FWal.TailLsn > FStore.LSN then
+    FStore.SetLSN(FWal.TailLsn);
+  if FWal.WrittenLsn > FStore.LSN then
+    FStore.SetLSN(FWal.WrittenLsn);
   LSN := FStore.NextLSN;
 
   { v3.1: YALNIZCA bu islemde degisen sayfalar yazilir.
@@ -1372,6 +1398,7 @@ begin
   {$IFDEF CPUPROF}
   d1 := CpuProfNow; CP[6] := CP[6] + (d1 - d0);
   {$ENDIF}
+
 
   { 5) WAL commit + fsync: artik durabil. Veritabani dosyasina bu noktada
         HICBIR SEY yazilmaz (checkpoint'e kadar). }

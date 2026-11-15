@@ -27,9 +27,11 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `sql_differential` | PostgreSQL diferansiyel korpusu + sapma yonetisimi (bkz. `SQL_DIFFERENTIAL.md`) |
 | `btree_integrity` | B+Tree silme/denge/doluluk + yaprak zinciri Next/Prev (bkz. `BTREE_INTEGRITY.md`) |
 | `perf_baseline` | B+Tree/SQL performans tavanlari + olcekleme orani + dogruluk (bkz. `PERF_BASELINE.md`) |
+| `bench_report` | `perf_baseline`'in kapsamadigi **18 kategori** (olusturma, acilis, kapanis, sirali/rastgele ekleme ve okuma, guncelleme, silme, indeks olusturma/arama, aralik, islem, eszamanli islem, WAL kurtarma, checkpoint, yedek, geri yukleme); her kategori icin P50/P95/P99/max + islem/sn, CSV + meta dosyasi, bellek ve DB/WAL boyu; ayrica kategori basina **dogruluk** kontrolu (hizli ama yanlis olcum kapidan gecemez) |
 | `single_file` | "tek dosya" sozlesmesi: temiz kapanistan sonra dizinde yalniz `<ad>.odb`; tek dosya kopyasi acilir/yazilir; `BACKUP TO` tek dosya (bkz. `ON_DISK_LAYOUT.md`) |
 | `region_stream` | `TRegionStream` dosya-ici pencere: mantiksal uzunluk, fsync, sinir kontrolu (v4 icin yazildi, motorda kullanilmiyor) |
 | `multiproc` | iki **gercek surec**: es zamanli yazar + bayat onbellek tazeleme, `SIGKILL`/`TerminateProcess` sonrasi kurtarma, RO yazmayi reddetme (bkz. `STORAGE_AUDIT.md` §21.3) |
+| `multi_writer` | tek dosyada **iki oturum**: iki yazar sirayla commit eder, WAL LSN kesin artar, ikinci oturum kapaninca `.wal`/`.gen` silinmez, birinci oturum kendi onayli satirlarini korur, temiz kapanistan sonra yalniz `.odb` kalir, 12/12 satir kalici, yedek+geri yukleme 18/18 |
 | `crash_points` | **deterministik cokme enjeksiyonu**: 7 checkpoint/commit asamasinin ortasinda gercek surec olumu (`SIGKILL`/`TerminateProcess`), sonra yeniden acilis + `VERIFY` + onayli commit kontrolu (bkz. `STORAGE_AUDIT.md` §4) |
 | `integrity_check` | **butunluk denetleyici** (`vdbcheck`): dort mod (`--quick/--full/--index/--wal`), her zaman salt-okunur; saglam DB dort modda temiz, bozuk sihirli sayi/CRC/freelist girdisi/kesik WAL kuyrugu ayri kategorilerde yakalanir, dosya ozeti degismez (bkz. `STORAGE_AUDIT.md` §8) |
 | `cache_metrics` | **onbellek metrikleri gercekten hareket ediyor mu**: hit/miss okuma trafigiyle artar, kirli sayfa yazidan sonra > 0 / checkpoint'ten sonra = 0, flush sayaci + yazilan sayfa + sure artar, hit ratio aritmetigi dogru, `MetricsText` ve `SHOW STATS` ayni degerleri tasir (bkz. `STORAGE_AUDIT.md` §5) |
@@ -325,3 +327,24 @@ kaldirildi:
   kucuk-endian ve sabit ofset varsayar (bkz. `STORAGE_AUDIT.md` §11).
   Diger kapilar degismedi (`format_compat` 28/0, `cache_metrics` 21/0,
   `integrity_check` 32/0, `crash_points` 24/0 dahil).
+
+- Yirminci kosu (PHASE-17 commit'i): **iki platform da YESIL**. Yerel kanit
+  Git Bash/Windows **27 kapi** PASS (`tls_client` SKIP), WSL x86_64 Linux
+  **28 kapi** PASS. Iki yeni kapi eklendi:
+  - `multi_writer` **12 PASS / 0 FAIL**. Ayni dosyaya iki oturum yazarken
+    olculen **onayli commit kaybi** siniflarini kilitler: (a) v3.32
+    `InstallPage` artik `TxnMark = FTxnId` olmadan sayfayi silmiyor;
+    (b) v3.33 `.gen` surec ici referans sayaci sayesinde ikinci oturumun
+    kapanisi dosyayi ayaklar altindan cekmiyor; (c) v3.34/v3.35 WAL kuyruk
+    LSN'i (`FTailPos`/`FTailLsn`, `SyncTail`, `TailLsn`) tohumlanip iki
+    oturumun ayni LSN'i uretmesi engellendi; (d) v3.36 `DropSideFiles`
+    baska oturum acikken yan dosyalara dokunmuyor ve WAL commit'i her zaman
+    dosya sonuna konumlanip bayat ekleme konumunu eziyor.
+  - `bench_report` **35 PASS / 0 FAIL**. 18 kategori + P50/P95/P99/max +
+    CSV/meta + bellek/WAL boyu + kategori basina dogruluk kontrolu.
+    Deterministik tohum (20251115); indeksli arama id tabani 300000 ->
+    **2000000** (eski taban `BR5` rastgele araligiyla cakisip sahte
+    "duplicate PK" uretiyordu).
+  Diger kapilar degismedi (`portability` 29/0, `format_compat` 28/0,
+  `cache_metrics` 21/0, `integrity_check` 32/0, `crash_points` 24/0,
+  `multiproc` 17/0 dahil).

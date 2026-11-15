@@ -440,6 +440,11 @@ type
       degil, yalnizca fazladan bir fsync yapilir. }
     property DropGenOnClose: Boolean read FDropGenOnClose write FDropGenOnClose;
 
+    { v3.36: ayni surecte AYNI dosyaya acik BASKA depo sayisi (kendisi
+      haric). Kapanista yan dosya (.wal/.idx) silme karari bunu kullanir:
+      baska oturum varken silmek onun acik tutamagini yetim birakir. }
+    function OtherOpenSessions: Integer;
+
     { Test/teshis: VDbSync kilit defterinde bu depo handle'i icin tutulan
       kilit var mi? Hicbir kilidi degistirmez. B-07 hata yolu sizinti
       kapisi bunu kullanir. }
@@ -759,6 +764,114 @@ end;
 var
   GDbIdSeq: QWord = 0;
 
+{ v3.33 DUZELTME (olculen veri kaybi): `.gen` dosyasi, AYNI SUREC icinde
+  ayni veritabanina acik baska bir depo varken SILINMEMELIDIR.
+
+  Neden: Close, `.gen`i "tam kilit hala bizdeyken" siliyordu ve bunu
+  surecler arasi kilit mantigina dayandiriyordu (baska bir surec ayni
+  dosyayi acik tutuyorsa tam kilidi alamaz). Bu varsayim AYNI SUREC
+  icindeki ikinci oturum icin GECERSIZ: POSIX kilitleri surec basina
+  tutulur, dolayisiyla ayni surecteki iki oturum birbirini kilitle
+  engellemez. Olculen sonuc (bench_report BR14): ana oturum acikken
+  ayni dosyaya ikinci bir oturum acilip kapatildi, `.gen` silindi; ana
+  oturumun FGenStream'i artik var olmayan (unlink edilmis) dosyaya
+  bakiyordu. Yeni oturum `.gen`i 0'dan urettigi icin iki oturum FARKLI
+  gen kimligi tasidi; RefreshIfStaleForce'un `g = FSigGen` hizli yolu
+  hic ateslenmedi, her yazar kendi bayat tam-sayfa imajini WAL'e yazdi
+  ve ikinci oturumun alti onayli satiri sessizce kayboldu.
+
+  Cozum: ayni surecte acik depo sayisini tutan bir sayac. `.gen` yalnizca
+  bu sayac 1 iken (yani son oturum kapanirken) silinir. Boylece acik bir
+  oturumun sayac/kimlik dosyasi ayaklarinin altindan cekilmez; "temiz
+  kapanista tek dosya" sozu son oturum kapandiginda aynen korunur. }
+var
+  GGenRefCs: TRTLCriticalSection;
+  GGenRefInit: Boolean = False;
+  GGenRefKeys: array of string;
+  GGenRefCnts: array of Integer;
+
+procedure GenRefEnsure;
+begin
+  if not GGenRefInit then
+  begin
+    InitCriticalSection(GGenRefCs);
+    GGenRefInit := True;
+  end;
+end;
+
+function GenRefCanon(const APath: string): string;
+begin
+  Result := ExpandFileName(APath);
+  {$IFDEF WINDOWS}
+  { Windows dosya adlari buyuk/kucuk harf duyarsizdir. }
+  Result := LowerCase(Result);
+  {$ENDIF}
+end;
+
+procedure GenRefAdd(const APath: string);
+var
+  i: Integer;
+  k: string;
+begin
+  GenRefEnsure;
+  k := GenRefCanon(APath);
+  EnterCriticalSection(GGenRefCs);
+  try
+    for i := 0 to High(GGenRefKeys) do
+      if GGenRefKeys[i] = k then
+      begin
+        Inc(GGenRefCnts[i]);
+        Exit;
+      end;
+    i := Length(GGenRefKeys);
+    SetLength(GGenRefKeys, i + 1);
+    SetLength(GGenRefCnts, i + 1);
+    GGenRefKeys[i] := k;
+    GGenRefCnts[i] := 1;
+  finally
+    LeaveCriticalSection(GGenRefCs);
+  end;
+end;
+
+procedure GenRefDrop(const APath: string);
+var
+  i: Integer;
+  k: string;
+begin
+  if not GGenRefInit then Exit;
+  k := GenRefCanon(APath);
+  EnterCriticalSection(GGenRefCs);
+  try
+    for i := 0 to High(GGenRefKeys) do
+      if GGenRefKeys[i] = k then
+      begin
+        if GGenRefCnts[i] > 0 then Dec(GGenRefCnts[i]);
+        Exit;
+      end;
+  finally
+    LeaveCriticalSection(GGenRefCs);
+  end;
+end;
+
+{ Bu yolda acik BANA AIT OLMAYAN depo sayisi. >0 ise `.gen` silinmez. }
+function GenRefOthers(const APath: string): Integer;
+var
+  i: Integer;
+  k: string;
+begin
+  Result := 0;
+  if not GGenRefInit then Exit;
+  k := GenRefCanon(APath);
+  EnterCriticalSection(GGenRefCs);
+  try
+    for i := 0 to High(GGenRefKeys) do
+      if (GGenRefKeys[i] = k) and (GGenRefCnts[i] > 1) then
+        Result := GGenRefCnts[i] - 1;
+  finally
+    LeaveCriticalSection(GGenRefCs);
+  end;
+end;
+
 function NewDbStoreId: QWord;
 begin
   Inc(GDbIdSeq);
@@ -925,6 +1038,9 @@ begin
   FLockedExcl := False;
   FAutoWrite := False;
   FDropGenOnClose := False;
+  { v3.33: bu depo yasarken `.gen`in ayaklarimizin altindan silinmesini
+    onlemek icin surec ici kayit. Destroy'da dusurulur. }
+  GenRefAdd(FPath);
 end;
 
 destructor TVDbPageStore.Destroy;
@@ -945,6 +1061,9 @@ begin
   FRoCount := 0;
   if FWriteCsInit then
     DoneCriticalSection(FWriteCs);
+  { v3.33: Close calistiktan SONRA kayittan dusurulur; boylece kendi
+    Close'u hala "son oturum" sayilir ve `.gen`i silebilir. }
+  GenRefDrop(FPath);
   inherited Destroy;
 end;
 
@@ -2337,6 +2456,11 @@ begin
   end;
 end;
 
+function TVdbPageStore.OtherOpenSessions: Integer;
+begin
+  Result := GenRefOthers(FPath);
+end;
+
 procedure TVDbPageStore.Close;
 var
   keepExcl: Boolean;
@@ -2346,6 +2470,13 @@ begin
   { v3.32 TEK DOSYA: `.gen` kapanista silinecekse tam kilidi `.gen`
     silinene KADAR birakma (bkz. asagidaki finally). }
   keepExcl := FDropGenOnClose and (not FReadOnly);
+  { v3.33 DUZELTME (olculen veri kaybi): ayni surecte ayni dosyaya acik
+    BASKA bir depo varsa `.gen`i SILME. Aksi halde o oturumun sayac ve
+    kimlik dosyasi ayaklarinin altindan cekilir; iki oturum farkli gen
+    kimligi tasir, RefreshIfStaleForce hic ateslenmez ve yazarlar
+    birbirinin onayli sayfalarini ezer (bkz. GenRefAdd ustundeki not). }
+  if keepExcl and (GenRefOthers(FPath) > 0) then
+    keepExcl := False;
   genPath := FPath + '.gen';
   try
     try
@@ -4169,11 +4300,22 @@ begin
     if FFrames[idx].Pins > 0 then
       raise EVdbPageStore.Create(Format(
         'InstallPage: sayfa %d pinli (kurtarma sirasinda beklenmiyordu)', [PageNo]));
-    { C-16: bu islemde kirletilmis (TxnMark<>0) cerceve hicbir LSN
-      kosuluyla ezilmez: islenmemis yerel is her zaman korunur. Kirli ama
-      islemsiz cerceve yalniz daha yeni gecerli imajla, temiz cerceve ise
-      her imajla degistirilebilir. }
-    if FFrames[idx].Dirty and (FFrames[idx].TxnMark <> 0) then
+    { C-16: bu islemde kirletilmis cerceve hicbir LSN kosuluyla ezilmez:
+      islenmemis yerel is her zaman korunur. Kirli ama islemsiz cerceve
+      yalniz daha yeni gecerli imajla, temiz cerceve ise her imajla
+      degistirilebilir.
+
+      v3.32 DUZELTME (olculen veri kaybi): kosul eskiden `TxnMark <> 0`
+      idi, yani BITMIS islemlerin isareti de koruma sayiliyordu.
+      EndTxn yalniz FTxnId'yi artirir; cerceve uzerindeki eski isaret
+      temizlenmez. Sonuc: bir kez yazilmis sayfa, ayni surecteki IKINCI
+      oturumun commit'lerini tazelemede HICBIR ZAMAN kabul etmiyordu ve
+      kendi bayat imajini WAL'e yazip diger oturumun onayli satirlarini
+      sessizce siliyordu (probe2: A'nin 5 commit'i, B'nin 6 commit'i
+      kayboldu; istisna da yok). Dogru kosul AKTIF islem kimligidir:
+      yalniz su anki islem kirlettiyse korunur, gecmis islemlerin
+      imajlari WAL'de durabildir ve tazelenebilir. }
+    if FFrames[idx].Dirty and (FFrames[idx].TxnMark = FTxnId) then
       Exit;
     if IsVdbPageImage(P) and FFrames[idx].Dirty and
        (PageHdr(P)^.LSN <= PageHdr(PVdbPage(@FFrames[idx].Data))^.LSN) then
