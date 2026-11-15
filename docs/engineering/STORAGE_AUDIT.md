@@ -264,7 +264,32 @@ kuyrugu (uyari), kesik dosya, CLI sozlesmesi.
 | Desteklenen/eski/yeni/bozuk ayrimi | VAR | `:1035`, `:1041-1044` |
 | Uyumsuz DB'yi sessizce acmama | VAR | v2 -> "MIGRATE TO v3 calistirin" |
 | Gecis acik ve dogrulanmis | KISMI | v3/v4 -> v5 yukseltme **otomatik** (yazilabilir acilista `SaveMeta`); gecis ilerlemesi/geri donusu yok |
-| **Gecis testleri** | **YOK (G7)** | depoda v3/v4 fixture `.odb` dosyasi yok; yukseltme hic denenmedi |
+| **Gecis testleri** | **VAR** | `format_compat` 28/0 (sentetik v3/v4 imaj + yukseltme + red yollari) |
+| Yarim kalmis goc ayrimi | VAR | baslik CRC'si bayat imaj REDDEDILIR ("baslik sayfasi CRC tutmadi"), dosyaya DOKUNULMAZ — `format_compat` FC-G1..G3 |
+
+**G7 KAPATILDI, ama sinirlariyla.** `tests/format_compat` (28 kontrol) su
+ayrimlari kanitlar: v5 acilir; v3/v4 damgali imaj **salt-okunur** acilir,
+okunur ve dosya **degismez** (FC-B3/FC-C2: FNV-1a hash ayni); **yazilabilir**
+acilista baslik 5'e yukselir ve satirlar/VERIFY bozulmaz (FC-B6/B7/B8);
+v6 (daha yeni) hem RO hem yazilabilir acilista REDDEDILIR (FC-D1/D2);
+surum 2 reddedilir (FC-E1); v2 sihirli sayisi net goc hatasi verir
+(FC-F1); taninmayan sihirli sayi, yanlis sayfa boyu, kesik dosya ve
+**yarim yazilmis baslik** reddedilir (FC-F2/H1/H2/G1) ve reddedilen her
+dosyanin hash'i degismez.
+
+Durust sinirlar (kanitlanmayanlar):
+- Imajlar **sentetiktir**: gercek v5 dosyasinin baslik surum alani 3/4
+  yapilip CRC'si yeniden hesaplanarak turetilir. Satir govdesi kendi
+  kendini tanimladigi icin (`[u16 $FFFF]` isareti, `VDbTable.pas`) motorun
+  ayirt ettigi tek sey basliktir; ama gercek bir v3 dosyasindaki eski
+  satir govdeleri bu imajda YOKTUR.
+- Yukseltme **tek 4 KB'lik yerinde baslik yazimidir** (golge kopya yok).
+  Yazim kesilirse dosya ACILMAZ; tanimli kurtarma proseduru **yedekten
+  geri yuklemektir**. Bu risk `format_compat` FC-G1..G3 ile oldugu gibi
+  gosterilir, gizlenmez.
+- Goc ilerlemesi kaydi ve **geri alma (rollback)** yoktur: `v3/v4 -> v5`
+  gecisi veri bicimini degistirmedigi icin geri alma gerektirmez, ama
+  baslik yazimi kesilirse ileri/geri otomatik kurtarma yoktur.
 
 ---
 
@@ -326,7 +351,7 @@ kuyrugu (uyari), kesik dosya, CLI sozlesmesi.
 | 9 | Yedek/geri yukleme testleri | VAR | `backup_restore` 25/0 |
 | 10 | Eszamanli erisim testleri | VAR | `multiproc` (MP2/MP3/MP5) |
 | 11 | Coklu surec kilitleme testleri | VAR | `multiproc` MP4-MP9 (iki gercek surec) |
-| 12 | Veritabani gecis testleri | **YOK** | G7 |
+| 12 | Veritabani gecis testleri | **VAR** | `format_compat` 28/0 (v3/v4 yukseltme, v6 red, yarim goc) |
 | 13 | Platformlar arasi dosya uyumu | **YOK** | G9 |
 | 14 | Benchmark tekrarlanabilir | KISMI | G5 |
 | 15 | Performans regresyon kapilari | VAR | `perf_baseline` |
@@ -337,7 +362,7 @@ kuyrugu (uyari), kesik dosya, CLI sozlesmesi.
 | 20 | Mevcut V3 SQL testleri geciyor | VAR | `sql_matrix` 61/0, `sql_stubs` 25/0 |
 | 21 | V2 donmus ve izole | VAR | `VDbCore` yalniz salt-okunur |
 
-**Ozet: 16 VAR, 2 KISMI, 3 YOK.** Bu yuzden skill §27 "tamamlandi" sayilamaz
+**Ozet: 17 VAR, 2 KISMI, 3 YOK.** Bu yuzden skill §27 "tamamlandi" sayilamaz
 ve asagidaki bosluklar kapatilmadan "production" iddia edilmez.
 
 ---
@@ -352,9 +377,9 @@ ve asagidaki bosluklar kapatilmadan "production" iddia edilmez.
 | G4 | ~~Surecler-arasi kilitleme testleri yok~~ | **KAPATILDI** — `tests/multiproc` 17/0 (MP1-MP10) |
 | G5 | Benchmark kategorileri ve yuzdelikler eksik | `perf_baseline` genislet veya `bench_report` kapisi |
 | G6 | ~~Butunluk denetleyici CLI + modlar + salt-okunur~~ | **KAPATILDI** — `vdbcheck` (4 mod, her zaman `CreateReadOnly`) + `tests/integrity_check` 32/0 |
-| G7 | Eski format fixture'lari ve gecis testleri | v3/v4 imaj uret + yukseltme kapisi |
+| G7 | ~~Eski format fixture'lari ve gecis testleri~~ | **KAPATILDI** — `tests/format_compat` 28/0 (sentetik v3/v4 imaj, yukseltme, v6/bozuk/yarim goc reddi) |
 | G8 | Limitler tanimsiz, disk dolu denenmedi | Limit tablosu + kontrollu hata + disk dolu simulasyonu |
 | G9 | Platformlar arasi dosya uyumu kanitsiz | Windows'ta yaz, Linux'ta oku (ve tersi) kapisi |
 
-Oncelik: G7/G9 (uyumluluk), G5 (golge),
-G3/G8 (belge + sinir). G1, G2, G4 ve G6 kapatildi.
+Oncelik: G9 (uyumluluk), G5 (golge), G3/G8 (belge + sinir).
+G1, G2, G4, G6 ve G7 kapatildi.

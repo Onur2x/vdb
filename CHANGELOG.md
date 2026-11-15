@@ -72,6 +72,16 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   satirlarinda (`cache_hits`, `cache_hit_ratio`, `cache_dirty_pages`,
   `page_flushes`, ...) gorunur. Kapi metriklerin gercekten hareket
   ettigini olcer; sabit/sahte deger kapiyi kirar.
+- **Format uyumlulugu** `format_compat` kapisi (28 kontrol): v5 dosyasi
+  acilir; baslik surumu 3/4 yapilip CRC'si yeniden hesaplanmis sentetik
+  v3/v4 imaji salt-okunur acilir, okunur ve **dosya degismez**; ayni imaj
+  yazilabilir acilista basligi 5'e yukseltir (satirlar ve `VERIFY`
+  bozulmaz). Surum 6 (daha yeni), surum 2, v2 sihirli sayisi, taninmayan
+  sihirli sayi, yanlis sayfa boyu, kesik dosya ve **yarim yazilmis
+  baslik** (surum yazildi, CRC yazilmadi) reddedilir; reddedilen
+  dosyalarin hash'i ve boyutu degismez. Sinirlar belgede: imajlar
+  sentetiktir ve yukseltme tek 4 KB'lik yerinde baslik yazimidir
+  (kesilirse dosya acilmaz; kurtarma yedekten geri yuklemedir).
 
 ### SQL
 

@@ -33,6 +33,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `crash_points` | **deterministik cokme enjeksiyonu**: 7 checkpoint/commit asamasinin ortasinda gercek surec olumu (`SIGKILL`/`TerminateProcess`), sonra yeniden acilis + `VERIFY` + onayli commit kontrolu (bkz. `STORAGE_AUDIT.md` §4) |
 | `integrity_check` | **butunluk denetleyici** (`vdbcheck`): dort mod (`--quick/--full/--index/--wal`), her zaman salt-okunur; saglam DB dort modda temiz, bozuk sihirli sayi/CRC/freelist girdisi/kesik WAL kuyrugu ayri kategorilerde yakalanir, dosya ozeti degismez (bkz. `STORAGE_AUDIT.md` §8) |
 | `cache_metrics` | **onbellek metrikleri gercekten hareket ediyor mu**: hit/miss okuma trafigiyle artar, kirli sayfa yazidan sonra > 0 / checkpoint'ten sonra = 0, flush sayaci + yazilan sayfa + sure artar, hit ratio aritmetigi dogru, `MetricsText` ve `SHOW STATS` ayni degerleri tasir (bkz. `STORAGE_AUDIT.md` §5) |
+| `format_compat` | **format uyumlulugu / goc**: v5 acilir; v3/v4 damgali imaj salt-okunur acilir ve dosya DEGISMEZ, yazilabilir acilista 5'e yukselir (satirlar + `VERIFY` bozulmaz); v6 (daha yeni), surum 2, v2 sihirli sayisi, yanlis sayfa boyu, kesik dosya ve **yarim yazilmis baslik** REDDEDILIR ve reddedilen dosyanin hash'i degismez (bkz. `STORAGE_AUDIT.md` §9) |
 | `crypto_core` | saf Pascal AES/GCM/SHA/HMAC cekirdegi |
 | `crypto_base64` | base64 kodlayici/cozucu |
 | `fixtures_builtin` | eski `.odb`/anahtar fixture'lari **builtin** provider ile acilir |
@@ -281,3 +282,19 @@ kaldirildi:
   hit/miss'i, yazi kirli sayfayi, checkpoint flush sayacini artirir,
   checkpoint sonrasi kirli sayfa 0'dir. Diger kapilar degismedi
   (`integrity_check` 32/0, `crash_points` 24/0 dahil).
+- Onsekizinci kosu (PHASE-15 commit'i): **yerel kanit** WSL x86_64 Linux
+  **25 kapi** PASS, Git Bash/Windows i386 **24 kapi** PASS (`tls_client`
+  SKIP). Yeni kapi `format_compat` (**28 PASS, 0 FAIL**) SKILL2 §24.2/§24.4
+  ayrimlarini kapatir: saglam v5 dosyasi acilir; baslik surum alani 3/4
+  yapilip CRC'si yeniden hesaplanmis **sentetik v3/v4 imaji** salt-okunur
+  acilir, satirlar okunur ve dosya **degismez** (FNV-1a ozeti ayni: RO
+  acilis yukseltme yapmaz); ayni imaj yazilabilir acilista basligi 5'e
+  yukseltir, satir sayisi ve `VERIFY` bozulmaz; **surum 6** (daha yeni),
+  **surum 2**, v2 sihirli sayisi, taninmayan sihirli sayi, yanlis sayfa
+  boyu, kesik dosya ve **yarim yazilmis baslik** (surum yazildi, CRC
+  yazilmadi) REDDEDILIR; reddedilen dosyalarin hash'i ve boyutu degismez.
+  Kapinin durust siniri belgede yazili: imajlar sentetiktir (satir govdesi
+  kendi kendini tanimlar, motorun ayirt ettigi tek sey basliktir) ve
+  yukseltme tek 4 KB'lik **yerinde** baslik yazimidir — kesilirse dosya
+  acilmaz, kurtarma "yedekten geri yukle"dir. Diger kapilar degismedi
+  (`cache_metrics` 21/0, `integrity_check` 32/0, `crash_points` 24/0 dahil).

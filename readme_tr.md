@@ -188,12 +188,13 @@ Son doğrulanan durum (2026-11-14, Linux x86_64 ve Windows i386, `tests/run_gate
 | `crash_points` | 24 / 0 (7 checkpoint/commit aşamasında deterministik çökme enjeksiyonu) |
 | `integrity_check` | 32 / 0 (`vdbcheck` dört mod, salt-okunur kanıtı, bozulma kategorileri) |
 | `cache_metrics` | 21 / 0 (hit oranı, kirli sayfa, flush sayaçları gerçekten hareket ediyor; MetricsText + SHOW STATS) |
+| `format_compat` | 28 / 0 (v3/v4 yükseltme, v6 reddi, yarım göç reddi, dosya değişmiyor) |
 | `server_harden` | 24 / 0 |
 | `auth_throttle` | 16 / 0 |
 | `tls_client` | 6 / 0 (Linux; OpenSSL DLL'i olmayan Windows'ta atlanır) |
 
-Linux'ta **24 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
-atlanır), Windows'ta **23 kapı** (`tls_client` atlanır). Kapı belgeleri:
+Linux'ta **25 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
+atlanır), Windows'ta **24 kapı** (`tls_client` atlanır). Kapı belgeleri:
 [docs/engineering/](docs/engineering/).
 
 ```bash

@@ -140,6 +140,7 @@ build_gate crash_points   "$ROOT/tests/crash_points/crash_points.lpr"
 build_gate vdbcheck        "$ROOT/vdbcheck.lpr"
 build_gate integrity_check "$ROOT/tests/integrity_check/integrity_check.lpr"
 build_gate cache_metrics   "$ROOT/tests/cache_metrics/cache_metrics.lpr"
+build_gate format_compat   "$ROOT/tests/format_compat/format_compat.lpr"
 build_gate server_harden "$ROOT/tests/server_harden/server_harden.lpr"
 build_gate auth_throttle "$ROOT/tests/server_harden/auth_throttle.lpr"
 build_gate tls_client    "$ROOT/tests/tls_client/tls_client_gate.lpr"
@@ -170,6 +171,7 @@ run_gate crash_points   "$WORK/crash_points"   crash_points
 run_gate integrity_check "$WORK/integrity_check" integrity_check \
   "$(npath "$WORK/vdbcheck/vdbcheck$EXE")"
 run_gate cache_metrics  "$WORK/cache_metrics"   cache_metrics
+run_gate format_compat  "$WORK/format_compat"   format_compat
 run_gate server_harden  "$WORK/server_harden"  server_harden
 run_gate auth_throttle  "$WORK/auth_throttle"  auth_throttle
 
