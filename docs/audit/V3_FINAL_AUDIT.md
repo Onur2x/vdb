@@ -34,7 +34,8 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 | F11 | **ORTA** | `VDbPageStore.ReadPageAt` | Normal okuma yolu hicbir butunluk denetimi yapmiyordu: `PageVerify`/`PageCheckStruct` yalniz `Verify`/`vdbcheck` tarafindaydi. Diskteki tek bozuk bayt, yanlis sayfa numarasi ya da bozuk sihirli sayi **sessizce** yanlis satirlara cozuluyordu (sessiz veri bozulmasi) | `CheckReadImage` okuma yolunda: trunk atlanir, bos sayfaya izin, sihirli sayi/sayfa kimligi her zaman, CRC `VerifyOnRead` ile (varsayilan acik) `ecCorrupt` (v3.38) | `page_corrupt` 8/0; `page_integrity` I5/I6 ve `integrity_check` IC-B1 hala ayni davranisi dogruluyor | KAPALI |
 | F12 | **ORTA** | `VDbNet.VdbRecvStr` | Agdan gelen metin cercevesinin uzunluk onegi yalniz 1 GiB'a karsi korunuyordu; kimligi **dogrulanmamis** bir istemci sahte onekle sunucuda ~1 GiB ayirmaya zorlayabiliyordu (bellek tuketimi / DoS). Sunucu ayrica 96 MiB'lik onegi kabul edip tahsis deniyordu | `VDBS_MAX_RECV_STR` = 64 MiB; onek **tahsis yapilmadan** reddedilir, yalniz o baglanti duser (v3.39) | `server_failure` SF6 (96 MiB sahte onek + sunucu yasamaya devam) | KAPALI |
 | F13 | **KRITIK** | `VDbPageStore.SaveMeta` | Bayat gorunumlu bir oturum kendi **dusuk** `FLSN` ve `FPageCount` degerini meta sayfaya yaziyordu. Sonuc: (a) yeniden acilista sayfa LSN'i meta gorunum LSN'inden buyuk kalip `EVdbPageStale` ile okuma reddediliyordu, (b) regresen sayfa sayaci `TrimToLogical` uzerinden **onayli sayfalari kirpabiliyordu** (veri kaybi) | Meta sayfa monotonik: `SaveMeta` yazmadan once diskteki meta okunur, LSN ve sayfa sayaci yalniz **artirilir** (`FreeTrunk`/`FreeCount` sayfa sayaci kazaninca esitlenir) (v3.40) | `txn_limit` TL6/TL8 (yazar cakismasi + yeniden acilis 578 satir + `VERIFY`) | KAPALI |
-| F14 | ORTA | `VDbPageStore.WritePageAt` / `SaveMeta` / `InstallPage` / `GrowTo` | Disk doldu (ENOSPC) yolunda `THandleStream.Write` kisa yazmayi `0`'a cevirdigi icin yazma **sessizce** basarisiz olabiliyordu; buyume yolunda ham `EWriteError` siziyordu | Tek yazma noktasi `WriteBytesChecked`: enjekte edilen hata + kisa yazma kontrollu `ecIOError`; cerceve **kirli** kalir; `GrowTo` mantiksal boyu artirmaz (v3.40) | `disk_full` 9/0 | KAPALI |
+| F14 | ORTA | `VDbPageStore.WritePageAt` / `SaveMeta` / `InstallPage` / `GrowTo` | Disk doldu (ENOSPC) yolunda `THandleStream.Write` kisa yazmayi `0`'a cevirdigi icin yazma **sessizce** basarisiz olabiliyordu; buyume yolunda ham `EWriteError` siziyordu | Tek yazma noktasi `WriteBytesChecked`: enjekte edilen hata + kisa yazma kontrollu `ecIOError`; cerceve **kirli** kalir; `GrowTo` mantiksal boyu artirmaz (v3.40) | `disk_full` 16/0 (sayfa, meta ve WAL yazmalari) | KAPALI |
+| F15 | **KRITIK** | `VDbBackendV3.CommitBatch` / `AbortBatch` / `VDbPageWal.Commit` | (a) WAL commit yazimi `WriteBuffer` ile yapiliyordu; kisa yazma ham `EWriteError` olarak siziyordu. (b) `CommitNoSync` ve `MergeTagDeltas` `pendExc` denetiminin **disinda** oldugu icin WAL yazimi basarisiz oldugunda yazma kumesi kaldirilmis, kurtarma blogu atlanmis ama satirlar hem ayni oturumda gorunup hem sonradan **durabil** olabiliyordu (hayalet commit). (c) Canli tablo sayaci commit'ten **once** artirildigi icin basarisiz commit sayaci sisiriyordu (`COUNT(*)` 130 vs durabil 120) | WAL tek yazma noktasi `WriteChecked` -> kontrollu `ecIOError`, kesik kuyruk geri kirpilir; `CommitNoSync` + `MergeTagDeltas` `pendExc` blogunun icine alindi, basarisizlikta `RecoverAfterDurabilityFailure` (+`FWal.Rollback`) ve `FTagCountsValid := False`; `AbortBatch` kendi `TagDelta`'sini temizler (v3.41) | `disk_full` DF8/DF8b/DF8c (WAL yazma hatasi -> kontrollu `ecIOError`, ayni oturumda `COUNT(*)` = durabil 120, yeniden acilis 160 + `VERIFY`) | KAPALI |
 
 ### Kapatilan test bosluklari (SKILL2 §22, SKILL3 §10.1)
 
@@ -56,10 +57,12 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 - `server_failure` (16 kontrol) - yeni: sunucu hata yollari (baglanti tavani
   `kapasite dolu`, cop baytlar, sahte 96 MiB uzunluk oneki, acik baglanti
   varken `Stop`, dosyanin yeniden acilip okunmasi).
-- `disk_full` (9 kontrol) - yeni: disk dolu / kisa yazma yolu (yazma hatasi
-  kontrollu `ecIOError`, hata sonrasi cerceve kirli kalir, `ROLLBACK` ve
-  ardindan gelen commit calisir, hata giderilince checkpoint basarili,
-  yeniden acilista tum onayli satirlar + temiz `VERIFY`; SKILL3 §12.1).
+- `disk_full` (16 kontrol) - yeni: disk dolu / kisa yazma yolu (sayfa, meta ve
+  **WAL** yazmalarinda hata kontrollu `ecIOError`, hata sonrasi cerceve kirli
+  kalir, basarisiz commit **hayalet satir** birakmaz - ayni oturumda `COUNT(*)`
+  durabil durumla ayni -, `ROLLBACK` ve ardindan gelen commit calisir, hata
+  giderilince checkpoint basarili, yeniden acilista tum onayli satirlar + temiz
+  `VERIFY`; SKILL3 §12.1).
 - `txn_limit` (18 kontrol) - yeni: islem sayisi basinci ve yazar cakismasi
   (ic ice `BEGIN`, islem yokken `COMMIT`/`ROLLBACK` sessiz no-op; 300 kisa
   islem ve 75 geri almanin commit sayisi birebir dogrulanir; dosya basina tek yazar
@@ -84,7 +87,7 @@ crash_points 24/0, integrity_check 32/0, cache_metrics 21/0,
 format_compat 28/0, portability 29/0, multi_writer 12/0, bench_report 35/0,
 sql_features 32/0, limits 18/0, cache_pressure 8/0, page_corrupt 8/0,
 server_harden 24/0, server_failure 16/0, auth_throttle 16/0,
-disk_full 9/0, txn_limit 18/0,
+disk_full 16/0, txn_limit 18/0,
 selftest_builtin PASS, tls_client 6/0 (yalniz Linux).
 
 ## Remaining Risks

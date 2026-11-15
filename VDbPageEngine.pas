@@ -911,6 +911,15 @@ begin
   FStore.DiscardView;
   ClearPending;
   FInTxn := False;
+  { 1b) v3.41 / disk_full DF8 (olculen hayalet satir): basarisiz commit'in
+    cerceveleri WAL'in BELLEK tamponunda kalir -- Commit, cagiran tekrar
+    deneyebilsin diye bilerek korur. Onbellek bosaltildigi icin sonraki
+    okumalar OnMiss kancasiyla TAM O tampondan karsilanir; yani durabil
+    OLMAYAN satirlar ayni oturumda gorunur (COMMIT hata verse bile
+    COUNT(*) artiyordu). Tampon burada temizlenir: gorunum yalniz
+    diskteki durabil tabandan kurulur. }
+  if FWal <> nil then
+    FWal.Rollback;
   { 2) WAL'de KALAN (durabil) kayitlari bastan uygula. Aynen Open yolundaki
     gibi: MinLSN = 0, artimsal degil. Uygulanan imajlar onbellekte KIRLI
     kalir; sonraki checkpoint onlari dosyaya yazar. }

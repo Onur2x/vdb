@@ -221,9 +221,29 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   `SaveMeta` diskteki meta sayfayi okur ve LSN ile sayfa sayisini yalnizca
   **yukari** tasir (monoton meta kurali); sayfa sayisi buyurse freelist
   alanlari da diskteki degerden alinir.
-- **Disk dolu regresyon kapisi** `disk_full` (9 kontrol, SKILL3 §12.1):
-  kontrollu yazma, sert hata, kisa yazma, `ROLLBACK`, hata sonrasi yazmanin
-  devami, checkpoint, yeniden acilis ve `VERIFY`.
+- **Duzeltildi - WAL yazma hatasi ham `EWriteError` siziyordu** (v3.41,
+  `tests/disk_full` DF8/DF9). WAL commit kaydi `WriteBuffer` ile yaziliyordu;
+  disk dolu / kisa yazmada hata ham RTL istisnasi olarak cikiyor ve cagiran
+  bunu `ecIOError` olarak ayirt edemiyordu. Artik WAL'in tek yazma noktasi
+  `WriteChecked`: enjekte edilen hata ve kisa yazma kontrollu `ecIOError`
+  uretir, kesik kuyruk geri kirpilir, `FWrittenBytes`/`FAtEnd` tutarli kalir.
+  Meta sayfa yazimi da ayni enjeksiyonla olculur (DF9).
+- **Duzeltildi - basarisiz commit HAYALET COMMIT birakabiliyordu** (v3.41,
+  KRITIK, `tests/disk_full` DF8). `CommitNoSync` ve etiket sayaci birlestirme
+  `pendExc` denetiminin **disinda** oldugu icin WAL yazimi basarisiz
+  oldugunda yazma kumesi coktan kaldirilmis, durabilite kurtarma blogu
+  atlanmis, satirlar hem ayni oturumda gorunup hem sonradan **durabil**
+  olabiliyordu; canli tablo sayaci da commit'ten once artirildigi icin
+  `COUNT(*)` sisiyordu. Artik ikisi de `pendExc` blogunun icinde;
+  basarisizlikta `RecoverAfterDurabilityFailure` calisir (WAL bellek tamponu
+  `Rollback` ile temizlenir) ve canli sayac `FTagCountsValid := False` ile
+  gecersiz kilinir; `AbortBatch` kendi etiket deltasini temizler. Olculen:
+  `COMMIT` kontrollu `ecIOError`, ayni oturumda `COUNT(*)` = durabil 120,
+  yeniden acilista 160 satir + temiz `VERIFY` (DF8c).
+- **Disk dolu regresyon kapisi** `disk_full` (16 kontrol, SKILL3 §12.1):
+  sayfa/meta/**WAL** yazmalarinda sert hata ve kisa yazma, `ROLLBACK`,
+  hata sonrasi yazmanin devami, hayalet satir birakmama, checkpoint, yeniden
+  acilis ve `VERIFY`.
 - **Islem sayisi / yazar cakismasi regresyon kapisi** `txn_limit` (18
   kontrol, SKILL3 §12.2): 300 kisa islem ve 300 islemin 75'i geri alinarak
   commit sayisi birebir dogrulanir; oturum basina tek acik islem vardir ve

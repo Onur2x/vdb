@@ -4101,8 +4101,12 @@ begin
         yazilan satirlar icin sayac tutarli kalsin. }
       FlushTagRun;
     end;
-    { v3.1: parti ici etiket degisimleri simdi sayaca islenir. }
-    MergeTagDeltas;
+    { v3.41 / SKILL3 12.1 (olculdu: disk_full DF8c): parti ici etiket
+      degisimleri ONCEDEN burada, motor commit'inden ONCE sayaca isleniyordu.
+      Commit basarisiz olunca (or. WAL yazimi disk dolu) sayac +10 kaliyor,
+      `SELECT COUNT(*)` durabil olmayan satirlari sayiyor, oysa motor/heap
+      taramasi ve yeniden acilis onlari gormuyordu. Artik delta yalnizca
+      commit BASARILI olduktan sonra islenir (asagida, CommitNoSync sonrasi). }
     Inc(FCommitGen);
     { v3.15: ancak uygulama basarili olduktan sonra snapshot gecmisine yaz. }
     SnapApplyPending;
@@ -4133,15 +4137,24 @@ begin
         DISINDA, asagida ve GRUP halinde yapilir; boylece ayni anda commit
         eden thread'ler TEK fsync'i paylasir (olculen: fsync commit'in
         ~%60'i; P=4'te 1,05x'ten fazlasi hedeflenir). }
-      FEng.CommitNoSync(syncLsn);
-{$IFDEF CPUPROF}
-      p2 := CpuProfNow; CP[1] := CP[1] + (p2 - p1);
-{$ENDIF}
-      FDirty := False;
-      { C-6: LogFinish/MaybeCheckpoint istisna atarsa durabilite beklemesi
-        ATLANMAMALI. Istisnayi burada yakala; kilitler birakildiktan sonra
-        AwaitDurable garanti edilir ve hata yeniden yukseltilir. }
+      { v3.41 / SKILL3 §12.1 (olculdu: disk_full DF8): WAL commit YAZIMI
+        basarisiz olursa uygulanmis bellek imaji geri alinmazsa, commit
+        "basarisiz" raporlanirken satirlar gorunur kalir ve sonraki
+        checkpoint onlari diske yazar (HAYALET COMMIT). Bu yuzden
+        `CommitNoSync` de ayni yakalama blogunda: pendExc kurulur ve
+        kurtarma asagida (syncLsn = 0 dali) yapilir. }
       try
+        FEng.CommitNoSync(syncLsn);
+{$IFDEF CPUPROF}
+        p2 := CpuProfNow; CP[1] := CP[1] + (p2 - p1);
+{$ENDIF}
+        { v3.41 / SKILL3 12.1: etiket sayaclari YALNIZCA durabil commit
+          sonrasi islenir; basarisiz commit sayaci kirletmez. }
+        MergeTagDeltas;
+        FDirty := False;
+        { C-6: LogFinish/MaybeCheckpoint istisna atarsa durabilite beklemesi
+          ATLANMAMALI. Istisnayi burada yakala; kilitler birakildiktan sonra
+          AwaitDurable garanti edilir ve hata yeniden yukseltilir. }
         LogFinish;
 {$IFDEF CPUPROF}
         p1 := CpuProfNow; CP[2] := CP[2] + (p1 - p2);
@@ -4195,6 +4208,10 @@ begin
             on E2: Exception do
               recErr := 'gorunum kurtarma hatasi: ' + E2.Message;
           end;
+          { v3.41 / SKILL3 12.1: basarisiz commit'in etiket sayaci da
+            gecersizdir; sonraki COUNT(*) durabil tabandan yeniden kurar. }
+          FTagCountsValid := False;
+          if BatchTagDelta <> nil then BatchTagDelta.Clear;
           if pendExc is Exception then
             FLastCommitProblem := 'durabilite hatasi: ' + Exception(pendExc).Message
           else
@@ -4228,6 +4245,10 @@ begin
             on E2: Exception do
               msg := msg + '; gorunum kurtarma hatasi: ' + E2.Message;
           end;
+          { v3.41 / SKILL3 12.1: gecikmeli durabilite hatasinda da sayac
+            gecersizdir. }
+          FTagCountsValid := False;
+          if BatchTagDelta <> nil then BatchTagDelta.Clear;
           FLastCommitProblem := msg;
         finally
           FEngCs.Leave;
@@ -4239,6 +4260,33 @@ begin
 {$IFDEF CPUPROF}
   p2 := CpuProfNow; CP[4] := CP[4] + (p2 - p1);
 {$ENDIF}
+  { v3.41 / SKILL3 §12.1: WAL commit yazimi basarisiz olduysa (syncLsn = 0)
+    diskte durabil bir sey YOK; bellek imaji gecersizdir. Kurtarilmazsa
+    kapanis/checkpoint "basarisiz" commit'in satirlarini yazar (HAYALET
+    COMMIT; olculdu: disk_full DF8). Orijinal istisna (ornegin kontrollu
+    `ecIOError`) tipiyle yeniden yukseltilir. }
+  if (pendExc <> nil) and (syncLsn = 0) then
+  begin
+    if pendExc is Exception then
+      msg := Exception(pendExc).Message
+    else
+      msg := pendExc.ClassName;
+    FEngCs.Enter;
+    try
+      try
+        FEng.RecoverAfterDurabilityFailure;
+      except
+        on E2: Exception do
+          msg := msg + '; gorunum kurtarma hatasi: ' + E2.Message;
+      end;
+      { v3.41 / SKILL3 12.1: WAL yazimi basarisiz; sayac gecersiz. }
+      FTagCountsValid := False;
+      if BatchTagDelta <> nil then BatchTagDelta.Clear;
+      FLastCommitProblem := 'commit hatasi: ' + msg;
+    finally
+      FEngCs.Leave;
+    end;
+  end;
   if pendExc <> nil then
     raise Exception(pendExc);
   finally
@@ -4263,6 +4311,11 @@ begin
   try
     LogAbort;               // yarim islem gunluge SIZMAZ
     FSets.Remove(s.Session);
+    { v3.41 / SKILL3 12.1: iptal edilen partinin etiket deltalari ATILIR.
+      ONCEDEN burada temizlenmiyordu; deltalar bir sonraki basarili commit'te
+      sayaca eklenip `SELECT COUNT(*)`'i sisirebiliyordu. Kume serbest
+      birakilmadan ONCE, kendi delta nesnesi uzerinden temizlenir. }
+    if s.TagDelta <> nil then s.TagDelta.Clear;
     { P-22: onbellek temizle. R2-B-2: once isaretci, sonra SID. }
     FBatchSet := nil;
     FBatchSetSid := 0;

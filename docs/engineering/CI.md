@@ -50,7 +50,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `page_corrupt` | **okuma yolunda sayfa butunlugu** (SKILL3 §5.3/§12.1): normal okuma yolu artik dogrulama yapar. Her veri sayfasinin govdesinde tek bayt bozulmasi, bozuk sihirli sayi ve yanlis sayfa imaji (sayfa 2 imaji sayfa 3'e kopyalanmis) kontrollu `ecCorrupt` uretir; dosyanin saglam kopyasi hala kusursuz taranir (kapi yanlis pozitif uretmez). Sifreli dosyada GCM etiketi zaten dogruluyor |
 | `server_harden` | dinleme adresi, `--trust` sinirlari, TLS zorunlulugu |
 | `server_failure` | **sunucu hata yollari** (SKILL3 §12.1): (a) `MaxConns=1` iken ikinci baglanti `RSP_ERROR` + `kapasite dolu` alip kapanir, birinci baglanti sorguya devam eder; (b) yeni baglantiya 64 bayt cop ($FF) yazilip kapatilir, sunucu yasar; (c) `CMD_QUERY` ardindan sahte **96 MiB** uzunluk oneki gonderilir - v3.39 `VDBS_MAX_RECV_STR` (64 MiB) oneki tahsis yapmadan reddeder, sunucu yasar; (d) acik baglanti varken `Stop` doner ve `Ready=False` olur; (e) `.odb` dosyasi yerinde kalir ve yeniden acilip satirlari okur |
-| `disk_full` | **disk dolu / kisa yazma** (SKILL3 §12.1): yazma yolu tek noktadan (`WriteBytesChecked`) gecer; enjekte edilen sert hata ve yarim yazma (gercek `ENOSPC` davranisi) kontrollu `ecIOError` uretir, surec cokmez, cerceve **kirli** kalir. Hata + `ROLLBACK` sonrasi onayli satirlar durur, hata giderilince checkpoint ve yeni commit calisir, yeniden acilista tum onayli satirlar okunur ve `VERIFY` temizdir |
+| `disk_full` | **disk dolu / kisa yazma** (SKILL3 §12.1): sayfa, meta ve **WAL** yazmalari tek noktadan (`WriteBytesChecked` / `WriteChecked`) gecer; enjekte edilen sert hata ve yarim yazma (gercek `ENOSPC` davranisi) kontrollu `ecIOError` uretir, surec cokmez, cerceve **kirli** kalir. Basarisiz commit **hayalet satir** birakmaz (ayni oturumda `COUNT(*)` durabil durumla ayni). Hata + `ROLLBACK` sonrasi onayli satirlar durur, hata giderilince checkpoint ve yeni commit calisir, yeniden acilista tum onayli satirlar okunur ve `VERIFY` temizdir |
 | `txn_limit` | **islem sayisi / yazar cakismasi** (SKILL3 §12.2): 300 kisa islem ve 300 islemin 75'i geri alinarak commit sayisi birebir dogrulanir (sessiz kayip yok). Belgelenen v3 semantigi olculur: ic ice `BEGIN`, islem yokken `COMMIT`/`ROLLBACK` **sessiz no-op**'tur (tek islem katmani). Dosya basina **tek yazar rezervasyonu** vardir: bir oturum tutarken digeri kisa busy suresiyle kontrollu `mesgul` hatasi alir, `ROLLBACK` ile temizlenir, rezervasyon birakilinca ayni islem basariyla tamamlanir; yeniden acilista tum satirlar + `VERIFY` temiz |
 | `auth_throttle` | SCRAM deneme sinirlama/kilit |
 | `selftest_builtin` | provider SelfTest (builtin) |
@@ -463,4 +463,28 @@ kaldirildi:
     kontrollu `mesgul`, `ROLLBACK` ile temizlenir ve birakilinca islem
     tamamlanir; temiz kapanis tek dosya; yeniden acilista 578 satir +
     temiz `VERIFY`.
+  Diger kapilar degismedi.
+- Yirmi altinci kosu (PHASE-23 commit'i, SKILL3 §12.1 disk dolu - WAL
+  yolu): **iki platform da YESIL**. Git Bash/Windows **34 kapi** PASS
+  (`tls_client` SKIP), WSL x86_64 Linux **35 kapi** PASS (OpenSSL istege
+  bagli iki kapi SKIP). Bu kosuda uc motor duzeltmesi ve `disk_full`
+  kapisinin WAL/meta kapsami dogrulandi:
+  - **v3.41 WAL yazma hatasi** (`VDbPageWal.WriteChecked`): WAL commit
+    kaydi ve basligi tek noktadan yazilir; gercek `EWriteError` ve kisa
+    yazma kontrollu `ecIOError`'a cevrilir, yarim kuyruk `startPos`'a geri
+    kirpilir ve `FWrittenBytes`/`FAtEnd` tutarli kalir.
+  - **v3.41 hayalet commit** (`TVdbBackendV3.CommitBatch`/`AbortBatch`):
+    `CommitNoSync` ve etiket sayaci birlestirme `pendExc` korumasinin
+    DISINDAYDI; WAL yazimi basarisiz oldugunda yazma kumesi coktan
+    silindigi icin kurtarma atlaniyor, satirlar ayni oturumda gorunmeye
+    devam ediyor ve durabil hale gelebiliyordu. Artik ikisi de koruma
+    icinde; hata yolunda `RecoverAfterDurabilityFailure` (+
+    `FWal.Rollback`) calisir ve canli satir sayaci gecersiz kilinir;
+    `AbortBatch` kendi `TagDelta`'sini temizler.
+  - `disk_full` **16 PASS / 0 FAIL** (`9`'dan genisletildi). Yeni olcum:
+    WAL commit yazimi hatasi kontrollu `ecIOError`, basarisiz commit
+    HAYALET satir birakmaz (ayni oturumda `COUNT(*)` = durabil kume),
+    meta sayfa yazimi hatasi checkpoint'te kontrollu hata verir; ardindan
+    checkpoint basarili, yeniden acilis + `VERIFY` temiz.
+  - `txn_limit` **18 PASS / 0 FAIL** (degismedi).
   Diger kapilar degismedi.

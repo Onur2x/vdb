@@ -37,13 +37,16 @@ bayt yanlis satir uretmek yerine kontrollu hata verir. `tests/page_corrupt`
 kapisi bunu her veri sayfasinda olcer.
 
 **Disk dolu kontrollu bir hatadir, sessiz veri kaybi degil.** Tum disk
-yazmalari tek noktadan gecer (`WriteBytesChecked`): `THandleStream.Write`
-kisa yazmayi 0'a cevirdigi icin yarim yazma acikca algilanir ve kontrollu
-`ecIOError` uretilir; enjekte edilebilen hata yolu da ayni noktadadir. Dosya
-buyutme (`GrowTo`) basarisiz olursa mantiksal boy artirilmaz. Hata aninda
-sayfa cercevesi **kirli** kalir (temiz isaretlenip veri kaybolmaz), islem
-`ROLLBACK` ile temizlenir, hata giderilince checkpoint ve yeni commit
-calisir. `tests/disk_full` bunu sert hata + yarim yazma senaryosuyla olcer
+yazmalari tek noktadan gecer (`WriteBytesChecked`; WAL icin `WriteChecked`):
+`THandleStream.Write` kisa yazmayi 0'a cevirdigi icin yarim yazma acikca
+algilanir ve kontrollu `ecIOError` uretilir; enjekte edilebilen hata yolu da
+ayni noktadadir. Dosya buyutme (`GrowTo`) basarisiz olursa mantiksal boy
+artirilmaz. Hata aninda sayfa cercevesi **kirli** kalir (temiz isaretlenip
+veri kaybolmaz), islem `ROLLBACK` ile temizlenir, hata giderilince checkpoint
+ve yeni commit calisir. WAL commit kaydi yazilamazsa kesik kuyruk geri
+kirpilir ve commit **hayalet satir** birakmaz: ayni oturumda `COUNT(*)` de,
+yeniden acilis da durabil satir kumesini gosterir. `tests/disk_full` bunu
+sayfa, meta ve WAL yazmalarinda sert hata + yarim yazma senaryosuyla olcer
 ve yeniden acilista tum onayli satirlari + `VERIFY` temizligini dogrular.
 
 **Meta sayfa monotoniktir.** Iki oturum ayni dosyaya yazdiginda geride kalan

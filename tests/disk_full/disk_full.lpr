@@ -1,25 +1,34 @@
 program disk_full;
-{ v3.40 KALICI REGRESYON KAPISI - SKILL3 §12.1 disk dolu / kisa yazma.
+{ v3.41 KALICI REGRESYON KAPISI - SKILL3 §12.1 disk dolu / kisa yazma.
   Amac: disk doldugunda (ENOSPC) ya da kisa yazmada motorun NE YAPTIGINI
   olcmek. Beklenen:
     - yazma yolu KONTROLLU `ecIOError` verir (surec cokmez),
     - sayfa cercevesi KIRLI kalir (sessizce temiz isaretlenip veri
       kaybolmaz),
     - ayni veritabani hata giderildikten sonra yazmaya devam eder,
-    - yeniden acilista onaylanmis satirlar eksiksizdir ve VERIFY temizdir.
+    - yeniden acilista onaylanmis satirlar eksiksizdir ve VERIFY temizdir,
+    - BASARISIZ commit HAYALET satir birakmaz: ayni oturumda `SELECT
+      COUNT(*)` de, yeniden acilis da ayni durabil satir kumesini gorur.
 
   Disk dolu gercek dunyada `THandleStream.Write` tarafindan 0'a cevrilen
   kisa yazma olarak gorunur; bu yuzden hata ENJEKSIYONU kisa yazma uretir.
-  Enjeksiyon yalniz test icindir (`TVDbPageStore.OnWriteFault`).
+  Enjeksiyon yalniz test icindir (`TVDbPageStore.OnWriteFault`,
+  `TVDbPageWal.OnWriteFault`).
 
   Olculen:
     DF1 kontrol: temel veri kusursuz yazilir/okunur
     DF2 sert yazma hatasi kontrollu `ecIOError` uretir, cokme yok
     DF3 hata + ROLLBACK sonrasi onayli satirlar bozulmaz
     DF4 kisa yazma (disk doldu) kontrollu `ecIOError` uretir
-    DF5 hata giderilince checkpoint basarili olur
+    DF5 hata giderilince checkpoint ve commit basarili olur
     DF6 yeniden acilista TUM onayli satirlar durur, VERIFY temiz
     DF7 hata yolu GERCEKTEN tetiklendi (en az bir yazma cagrisi)
+    DF8 WAL commit yazimi: kisa/disk dolu hatasi kontrollu `ecIOError`
+    DF8b WAL hata yolu gercekten tetiklendi
+    DF8c WAL hatasi sonrasi ayni oturumda onayli satir kumesi bozulmaz
+    DF9 meta sayfa yazimi: kontrollu `ecIOError`, onayli veri korunur
+    DF9b/DF9c hata yolu tetiklendi; hata giderilince checkpoint tamamlanir
+    DF9d meta hatasi onayli satirlari silmez
 
   Derleme: fpc. Cikis kodu = basarisiz kontrol sayisi.
 }
@@ -28,18 +37,22 @@ program disk_full;
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes, VDbFactory, VDbBackendApi, VDbBackendV3, VDbPageEngine,
-  VDbPageStore, VDbPage, VDbTable, VDbSql, VDbErr;
+  VDbPageStore, VDbPageWal, VDbPage, VDbTable, VDbSql, VDbErr;
 
 const
   BASE_ROWS = 120;
   MORE_ROWS = 30;
+  WAL_ROWS = 10;
+  META_ROWS = 10;
 
 type
-  { Yalniz test: yazma hatasi enjeksiyonu. }
+  { Yalniz test: yazma hatasi enjeksiyonu. Ayni sinif hem sayfa deposuna
+    (`OnWriteFault`) hem WAL'e (`Wal.OnWriteFault`) baglanir. }
   TWriteFault = class
   public
     Mode: Integer;    { 0 = normal, 1 = sert hata, 2 = kisa yazma }
-    MinPos: Int64;    { bu konumun altindaki yazmalar (meta) etkilenmez }
+    MinPos: Int64;    { bu konumun altindaki yazmalar etkilenmez }
+    AtPos: Int64;     { >= 0: YALNIZ bu konumdaki yazma etkilenir }
     Hits: Integer;
     function Check(APos: Int64; ALen: Integer): Integer;
   end;
@@ -47,7 +60,9 @@ type
 function TWriteFault.Check(APos: Int64; ALen: Integer): Integer;
 begin
   Result := 0;
-  if (Mode = 0) or (APos < MinPos) then Exit;
+  if Mode = 0 then Exit;
+  if APos < MinPos then Exit;
+  if (AtPos >= 0) and (APos <> AtPos) then Exit;
   Inc(Hits);
   if Mode = 1 then
     Result := -1                       { hic yazma, sabit hata }
@@ -203,7 +218,7 @@ var
   i, rc: Integer;
   raised: Boolean;
   code: string;
-  detail, rep: string;
+  detail, rep, msg: string;
   n: Int64;
 
 begin
@@ -216,6 +231,7 @@ begin
   Fault := TWriteFault.Create;
   Fault.Mode := 0;
   Fault.MinPos := VDB_PAGE_SIZE;
+  Fault.AtPos := -1;
   BeC := nil;
   Be := nil;
 
@@ -311,6 +327,95 @@ begin
           WriteLn('BILGI DF4 rollback: ', E.ClassName, ': ', E.Message);
       end;
 
+      { DF8: WAL yazma yolu. Commit kaydi WAL'e yazilirken disk dolarsa
+        hata KONTROLLU `ecIOError` olmali (ham RTL hatasi degil), kesik
+        kuyruk geri kirpilmali ve onayli satirlar bozulmamali. }
+      BeC.Engine.Store.OnWriteFault := nil;
+      BeC.Engine.Wal.OnWriteFault := Fault.Check;
+      Fault.MinPos := 0;
+      Fault.AtPos := -1;
+      Fault.Hits := 0;
+      Fault.Mode := 1;
+      raised := False;
+      code := '';
+      msg := '';
+      try
+        Sq.Exec('BEGIN');
+        for i := 5001 to 5000 + WAL_ROWS do
+          Sq.Exec('INSERT INTO t (id, v) VALUES (' + IntToStr(i) + ', ''' +
+            StringReplace(ValOf(i), '''', '''''', [rfReplaceAll]) + ''')');
+        Sq.Exec('COMMIT');
+      except
+        on E: EVDbException do
+        begin
+          raised := True;
+          code := VDbErrorName(E.ErrorCode);
+          msg := E.Message;
+        end;
+        on E: Exception do
+        begin
+          raised := True;
+          code := E.ClassName;
+          msg := E.Message;
+        end;
+      end;
+      Chk('DF8 WAL yazma hatasi kontrollu ecIOError',
+        raised and (code = 'ecIOError'), 'kod=' + code + ' mesaj=' + msg);
+      Chk('DF8b WAL hata yolu tetiklendi', Fault.Hits > 0,
+        'cagri=' + IntToStr(Fault.Hits));
+      Fault.Mode := 0;
+      try
+        Sq.Exec('ROLLBACK');
+      except
+        on E: Exception do
+          WriteLn('BILGI DF8 rollback: ', E.ClassName, ': ', E.Message);
+      end;
+
+      n := QInt(Sq, 'SELECT COUNT(*) FROM t');
+      Chk('DF8c WAL hatasi sonrasi onayli satirlar duruyor',
+        n = BASE_ROWS, 'satir=' + IntToStr(n));
+      { DF9: META SAYFA yazma yolu. Yalniz konum 0 (meta) hata verir; sayfa
+        yazimlari ve WAL saglamdir. Checkpoint'te meta yazimi patlamali,
+        hata kontrollu olmali, ardindan hata giderilince checkpoint
+        tamamlanmali ve onayli satirlar korunmali. }
+      BeC.Engine.Wal.OnWriteFault := nil;
+      BeC.Engine.Store.OnWriteFault := Fault.Check;
+      Fault.MinPos := 0;
+      Fault.AtPos := 0;
+      Fault.Hits := 0;
+      Fault.Mode := 1;
+      Sq.Exec('BEGIN');
+      for i := 6001 to 6000 + META_ROWS do
+        Sq.Exec('INSERT INTO t (id, v) VALUES (' + IntToStr(i) + ', ''' +
+          StringReplace(ValOf(i), '''', '''''', [rfReplaceAll]) + ''')');
+      Sq.Exec('COMMIT');
+      raised := False;
+      code := '';
+      try
+        BeC.Engine.Checkpoint(True);
+      except
+        on E: EVDbException do
+        begin
+          raised := True;
+          code := VDbErrorName(E.ErrorCode);
+        end;
+        on E: Exception do
+        begin
+          raised := True;
+          code := E.ClassName;
+        end;
+      end;
+      Chk('DF9 meta sayfa yazma hatasi kontrollu ecIOError',
+        raised and (code = 'ecIOError'), 'kod=' + code);
+      Chk('DF9b meta hata yolu tetiklendi', Fault.Hits > 0,
+        'cagri=' + IntToStr(Fault.Hits));
+      Fault.Mode := 0;
+      Chk('DF9c hata giderilince checkpoint tamamlandi',
+        BeC.Engine.Checkpoint(True), '');
+      n := QInt(Sq, 'SELECT COUNT(*) FROM t');
+      Chk('DF9d meta hatasi onayli satirlari silmedi',
+        n = BASE_ROWS + META_ROWS, 'satir=' + IntToStr(n));
+
       { Hata giderildikten sonra yeni onayli veri eklenebilmeli. }
       Sq.Exec('BEGIN');
       for i := BASE_ROWS + 1 to BASE_ROWS + MORE_ROWS do
@@ -319,13 +424,14 @@ begin
       Sq.Exec('COMMIT');
       n := QInt(Sq, 'SELECT COUNT(*) FROM t');
       Chk('DF5 hata sonrasi yazma devam etti',
-        n = BASE_ROWS + MORE_ROWS, 'satir=' + IntToStr(n));
+        n = BASE_ROWS + META_ROWS + MORE_ROWS, 'satir=' + IntToStr(n));
 
       { DF5b: checkpoint hatasiz tamamlanir. }
       Chk('DF5b checkpoint basarili', BeC.Engine.Checkpoint(True), '');
     finally
       Fault.Mode := 0;
       BeC.Engine.Store.OnWriteFault := nil;
+      BeC.Engine.Wal.OnWriteFault := nil;
       FreeAndNil(Sq);
     end;
   finally
@@ -335,7 +441,7 @@ begin
   end;
 
   { DF6: yeniden acilis + tam VERIFY. }
-  rc := ReopenScan(Dir, Db, BASE_ROWS + MORE_ROWS, detail);
+  rc := ReopenScan(Dir, Db, BASE_ROWS + META_ROWS + MORE_ROWS, detail);
   Chk('DF6 yeniden acilis: tum onayli satirlar duruyor', rc = -1, detail);
   Chk('DF6b VERIFY temiz', VerifyDb(Db, rep), 'rapor=' + rep);
 

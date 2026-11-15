@@ -34,7 +34,7 @@ unit VDbPageWal;
 interface
 
 uses
-  SysUtils, Classes, SyncObjs, VDbPage, VDbCrc32, VDbSync, VDbPageCrypto;
+  SysUtils, Classes, SyncObjs, VDbPage, VDbCrc32, VDbSync, VDbPageCrypto, VDbErr;
 
 const
   VDB_WAL_MAGIC       = $334C5756;   // 'VWL3'
@@ -73,6 +73,15 @@ type
 
   { Kurtarma sirasinda her onaylanmis cerceve icin cagrilir. }
   TVdbWalApplyProc = procedure(PageNo: LongWord; P: PVdbPage) of object;
+
+  { v3.41 / SKILL3 §12.1 (disk dolu): WAL YAZMA HATASI ENJEKSIYONU.
+    Yalniz test icindir; uretimde nil kalir. Donus:
+      = 0  normal yazma
+      > 0  yalniz bu kadar bayt yazilir, sonra kisa yazma hatasi verilir
+      < 0  hic yazmadan sabit disk hatasi verilir
+    Boylece gercek disk doldugunda olusan kisa yazma, WAL commit yolunda
+    KONTROLLU sekilde olculebilir. }
+  TVdbWalWriteFaultFunc = function(APos: Int64; ALen: Integer): Integer of object;
 
   { v3.31: son Recover'in uyguladigi sayfa numaralari (tekillik).
     Delta tazeleme: yalnizca bu sayfalari yeniden indesklemek gerekir. }
@@ -180,6 +189,9 @@ type
     FUnsyncedStartPos: Int64;
     FUnsyncedBaseValid: Boolean;
     FSyncFault: Boolean;   // R2-C-3 test kancasi
+    { v3.41 / SKILL3 §12.1: WAL yazma hatasi enjeksiyonu (yalniz test).
+      nil = gercek disk. Bkz. TVdbWalWriteFaultFunc. }
+    FOnWriteFault: TVdbWalWriteFaultFunc;
     { R2-C-3: WAL yazimi ile geri kirpma ayni anda calismamali. fsync'in
       kendisi (FSyncStream) kilit DISINDA yapilir; grup commit'in amaci
       fsync sirasinda baska thread'lerin yazabilmesidir. Bu kilit yalniz
@@ -208,6 +220,10 @@ type
     function WalBodySafeToPrune(CheckpointLSN: LongWord;
       out AMaxLsn: LongWord): Boolean;
     procedure WriteHeader;
+    { v3.41 / SKILL3 §12.1: WAL'in TEK yazma noktasi. Enjekte edilen hatayi
+      ve kisa yazmayi (disk doldu) kontrollu `ecIOError` istisnasina cevirir.
+      Cagiranlar (Commit/WriteHeader) kesik kuyrugu geri kirpar. }
+    procedure WriteChecked(Pos: Int64; const Buf; Len: Integer);
     procedure ReadHeader;
     procedure AppendBuffer(PageNo: LongWord; P: PVdbPage);
     function BufferedPageIndex(PageNo: LongWord): Integer;
@@ -269,6 +285,10 @@ type
     { R2-C-3 test kancasi: True iken fsync yerine hata verilir. Yalniz
       kapi/test kodu kullanir; normal akista daima False. }
     procedure DebugSetSyncFault(AValue: Boolean);
+    { v3.41 / SKILL3 §12.1: WAL yazma hatasi enjeksiyonu (yalniz test;
+      nil = gercek disk). Bkz. TVdbWalWriteFaultFunc. }
+    property OnWriteFault: TVdbWalWriteFaultFunc
+      read FOnWriteFault write FOnWriteFault;
     { v3.31: WAL basligindaki checkpoint LSN'i. Veri dosyasi bu LSN'e kadar
       guncel; onbellek bunun gerisindeyse tam tazeleme (DropCache) gerekir. }
     property HeaderLsn: LongWord read FHeaderLsn;
@@ -465,7 +485,8 @@ begin
   q := PLongWord(@buf[VDB_PAGE_BODY_END]);
   q^ := VDbCrc32Of(buf, VDB_PAGE_BODY_END);
   FStream.Position := 0;
-  FStream.WriteBuffer(buf, VDB_PAGE_SIZE);
+  { v3.41: WAL basligi da kontrollu yazilir (disk dolu -> ecIOError). }
+  WriteChecked(0, buf, VDB_PAGE_SIZE);
   { P-57: WriteHeader yalniz yeni dosya (Open) ve Truncate'ta cagrilir;
     her ikisinde de dosya boyutu = VDB_PAGE_SIZE, dolayisiyla konum sondadir. }
   FAtEnd := True;
@@ -956,6 +977,58 @@ begin
   end;
 end;
 
+{ v3.41 / SKILL3 §12.1: WAL'in TEK yazma noktasi. `TStream.WriteBuffer`
+  kisa yazmayi sessizce yutabilir ve disk doldugunda HAM `EWriteError`
+  firlatir; ikisi de cagirana "kontrollu hata" olarak gorunmez. Burada
+  enjekte edilen hata (yalniz test) ve gercek RTL yazma hatasi
+  `EVDbException`/`ecIOError`'a cevrilir. Kisa yazmada once yazilabilen
+  kadar bayt yazilir, sonra hata verilir; cagiran (Commit) kesik kuyrugu
+  `startPos`'a geri kirpar, yani yarim kayit WAL'de kalmaz. }
+procedure TVdbPageWal.WriteChecked(Pos: Int64; const Buf; Len: Integer);
+var
+  allow: Integer;
+begin
+  if Assigned(FOnWriteFault) then
+  begin
+    allow := FOnWriteFault(Pos, Len);
+    if allow < 0 then
+      raise EVDbException.CreateFmt(ecIOError,
+        'WAL yazma hatasi (enjekte): konum %d, %d bayt', [Pos, Len]);
+    if (allow > 0) and (allow < Len) then
+    begin
+      try
+        FStream.WriteBuffer(Buf, allow);
+      except
+        on E: Exception do
+          raise EVDbException.CreateFmt(ecIOError,
+            'disk dolu / kisa yazma (WAL): konum %d, %d/%d bayt (%s)',
+            [Pos, allow, Len, E.Message]);
+      end;
+      raise EVDbException.CreateFmt(ecIOError,
+        'disk dolu / kisa yazma (WAL): konum %d, %d/%d bayt',
+        [Pos, allow, Len]);
+    end;
+    if allow >= Len then
+    begin
+      try
+        FStream.WriteBuffer(Buf, Len);
+      except
+        on E: Exception do
+          raise EVDbException.CreateFmt(ecIOError,
+            'WAL yazma hatasi: konum %d, %d bayt (%s)', [Pos, Len, E.Message]);
+      end;
+      Exit;
+    end;
+  end;
+  try
+    FStream.WriteBuffer(Buf, Len);
+  except
+    on E: Exception do
+      raise EVDbException.CreateFmt(ecIOError,
+        'WAL yazma hatasi: konum %d, %d bayt (%s)', [Pos, Len, E.Message]);
+  end;
+end;
+
 function TVdbPageWal.Commit(DoSync: Boolean; LSN: LongWord): Boolean;
 var
   i, total, off, payLen: Integer;
@@ -1026,7 +1099,9 @@ begin
       baseSet := True;
     end;
     try
-      FStream.WriteBuffer(FOutBuf[0], off);
+      { v3.41: kisa yazma / disk dolu kontrollu `ecIOError`'a cevrilir;
+        asagidaki except kesik kuyrugu geri kirpip tamponu korur. }
+      WriteChecked(startPos, FOutBuf[0], off);
     except
       { R2-C-3 artigi: yazim yarida kaldiysa dosyada kesik/bayat bir kuyruk
         kalir. Sonraki commit onun ARDINA eklenir; kurtarma kesik kayitta
