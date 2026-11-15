@@ -37,12 +37,14 @@ server (`REPLICATION ... TCP`; file-mode log shipping works) and
 `ARCHIVE WAL RESET` (the v3 change log is persistent and cannot be turned
 off — PITR capability is preserved).
 
-**Implemented but not covered by the current gates:** `SAVEPOINT` and partial
-rollback, `AS OF`/PITR, file-mode replication, zone maps/pruning and
-`ALTER DATABASE KEY`. They work on v3, but the old per-feature gates
-(`v3sqlchk`, `pitrchk`, `replchk`, `prochk`, `soakchk`) were removed together
-with the old `tests/gates` tree and nothing in [Test status](#test-status)
-re-tests them. Treat that list as "needs a gate before relying on it".
+**Implemented but not covered by the current gates:** `AS OF`/PITR, file-mode
+replication, zone maps/pruning and `ALTER DATABASE KEY`. They work on v3, but
+the old per-feature gates (`pitrchk`, `replchk`, `prochk`) were removed
+together with the old `tests/gates` tree and nothing in
+[Test status](#test-status) re-tests them. Treat that list as "needs a gate
+before relying on it". `SAVEPOINT` / partial rollback used to be on this list;
+`sql_features` now covers them, along with `ON CONFLICT`, `VACUUM`, `REINDEX`,
+`ANALYZE`, CTEs, window functions and `ALTER TABLE ... RENAME`.
 The v2 engine (MVCC) stays in the tree as a **read-only/migration** path.
 
 Writing a new application? See [UYGULAMA_GELISTIRME.md](UYGULAMA_GELISTIRME.md)
@@ -192,12 +194,14 @@ Last verified state (2026-11-15, Linux x86_64 and Windows i386, `tests/run_gates
 | `portability` | 29 / 0 (own-platform round trip, byte-for-byte copy, second independent write differs only in volatile metadata, schema written with LF) |
 | `multi_writer` | 12 / 0 (two sessions on one file: WAL LSN strictly increasing, side files survive a second close, own rows kept, 12/12 durable, backup+restore 18/18) |
 | `bench_report` | 35 / 0 (18 categories, P50/P95/P99/max, CSV+meta, memory and WAL size, correctness checks per category) |
+| `sql_features` | 32 / 0 (SAVEPOINT / ROLLBACK TO / RELEASE, ON CONFLICT DO NOTHING\|DO UPDATE, VACUUM, REINDEX, ANALYZE, CTE, window functions, ALTER TABLE RENAME) |
+| `limits` | 18 / 0 (oversized SQL / INSERT / LIMIT rejected with `ecLimit`, data intact afterwards, documented ceilings) |
 | `server_harden` | 24 / 0 |
 | `auth_throttle` | 16 / 0 |
 | `tls_client` | 6 / 0 (Linux; skipped on Windows without OpenSSL DLL) |
 
-That is **28 gates** on Linux (plus two OpenSSL opt-in gates skipped when
-`VDB_CRYPTO_DLL` is unset) and **27 gates** on Windows (`tls_client` skipped).
+That is **30 gates** on Linux (plus two OpenSSL opt-in gates skipped when
+`VDB_CRYPTO_DLL` is unset) and **29 gates** on Windows (`tls_client` skipped).
 Gate documents: [docs/engineering/](docs/engineering/).
 
 ```bash

@@ -3421,6 +3421,16 @@ begin
   Result := True;
 end;
 
+{ v3.37 / SKILL2 §25.1: tek cumle boyu siniri. Uc giris noktasi (Exec,
+  parametreli Exec, ExecRaw) ayni kapidan gecer; asimda kontrollu ecLimit
+  hatasi doner ve veritabani dosyasina hicbir sey yazilmaz. }
+procedure CheckStmtSize(const Sql: string);
+begin
+  if Length(Sql) > VDB_MAX_SQL_STMT then
+    raise EVDbException.CreateFmt(ecLimit,
+      'SQL cumlesi cok buyuk (%d > %d bayt)', [Length(Sql), VDB_MAX_SQL_STMT]);
+end;
+
 function TVSql.Exec(const Sql: string): TSqlResult;
 var
   st: TStrArray;
@@ -3428,6 +3438,7 @@ var
   stmt: string;
   fastOk: Boolean;
 begin
+  CheckStmtSize(Sql);
   { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
   Result := Default(TSqlResult);
   FExecutor.BeginQuery;   // P-176: sure/iptal olcumu bu cumleden baslar
@@ -3540,6 +3551,7 @@ var
   prevSess: Cardinal;
   fastOk: Boolean;
 begin
+  CheckStmtSize(Sql);
   { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
   Result := Default(TSqlResult);
   Result.Stmts := 1;
@@ -4144,6 +4156,7 @@ var
   i: Integer;
   lit: TSqlLiteralNode;
 begin
+  CheckStmtSize(Sql);
   { FPC 3.2.2 / x86_64: bazi cagri baglamlarinda yonetilen alanli kayit
     donduren fonksiyonun gecici sonucu sifirlanmiyor; onceki cagridan
     kalan (artik serbest birakilmis) dizi isaretcileri SetLength tarafindan

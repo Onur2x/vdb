@@ -14376,6 +14376,12 @@ begin
   begin
     if ctx^.Emitted >= ctx^.OutCap then
     begin
+      { v3.37 / SKILL3 §12: ayni sonuc satiri tavani DirectDecode yolunda da
+        gecerli (tek gecisli okuma en hizli ve en kolay sisirilen yol). }
+      if ctx^.OutCap >= VDB_MAX_RESULT_ROWS then
+        raise EVDbException.CreateFmt(ecLimit,
+          'sonuc kumesi cok buyuk (%d satir siniri; LIMIT kullanin)',
+          [VDB_MAX_RESULT_ROWS]);
       oldCap := ctx^.OutCap;
       if ctx^.OutCap = 0 then ctx^.OutCap := 256
       else ctx^.OutCap := ctx^.OutCap * 2;
@@ -14472,6 +14478,14 @@ begin
   // P-96/P-99: blok buyume + inner dizi on-tahsisi; prow ara tahsisi yok.
   if ctx^.Emitted >= ctx^.OutCap then
   begin
+    { v3.37 / SKILL3 §12: BELGELENMIS sonuc satiri tavani. Onceden
+      LIMIT'siz tam tarama bellek dolana kadar buyuyordu (kontrolsuz
+      EOutOfMemory). Simdi 2M satirda kontrollu `ecLimit`: sorgu durur,
+      veritabani etkilenmez; kullanici LIMIT ile daraltabilir. }
+    if ctx^.OutCap >= VDB_MAX_RESULT_ROWS then
+      raise EVDbException.CreateFmt(ecLimit,
+        'sonuc kumesi cok buyuk (%d satir siniri; LIMIT kullanin)',
+        [VDB_MAX_RESULT_ROWS]);
     oldCap := ctx^.OutCap;
     { P-163: tipli hucre matrisi 32 bayt/hucre; kucuk baslangic katsayisi
       buyume kopyalarini (managed kayit) pahali kilar. }

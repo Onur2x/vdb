@@ -36,14 +36,16 @@ yanlış sonuç üretmez): TCP sunucusunda v3 motoru (`REPLICATION ... TCP`;
 dosya modu log-shipping çalışır) ve `ARCHIVE WAL RESET` (v3 değişim
 günlüğü kalıcıdır, kapatılamaz — PITR yeteneği korunur).
 
-**Var ama mevcut kapılarla denenmiyor:** `SAVEPOINT` ve kısmi geri alma,
-`AS OF`/PITR, dosya modu replikasyon, zone map/budama ve
-`ALTER DATABASE KEY`. Bunlar v3'te çalışır; ancak eski özellik kapıları
-(`v3sqlchk`, `pitrchk`, `replchk`, `prochk`, `soakchk`) eski `tests/gates`
-ağacıyla birlikte kaldırıldı ve [Test durumu](#test-durumu) bölümündeki
-hiçbir kapı bunları yeniden sınamıyor. Bu listeyi "güvenmeden önce kapı
-yazılmalı" olarak oku. v2 motoru (MVCC) ağaçta **salt-okunur/göç** yolu
-olarak durur.
+**Var ama mevcut kapılarla denenmiyor:** `AS OF`/PITR, dosya modu
+replikasyon, zone map/budama ve `ALTER DATABASE KEY`. Bunlar v3'te çalışır;
+ancak eski özellik kapıları (`pitrchk`, `replchk`, `prochk`) eski
+`tests/gates` ağacıyla birlikte kaldırıldı ve [Test durumu](#test-durumu)
+bölümündeki hiçbir kapı bunları yeniden sınamıyor. Bu listeyi "güvenmeden
+önce kapı yazılmalı" olarak oku. `SAVEPOINT` / kısmi geri alma artık bu
+listede değil: `sql_features` kapısı bunları, ayrıca `ON CONFLICT`,
+`VACUUM`, `REINDEX`, `ANALYZE`, CTE, pencere fonksiyonları ve
+`ALTER TABLE ... RENAME` sözdizimini gerçek sonuçlarla ölçüyor. v2 motoru
+(MVCC) ağaçta **salt-okunur/göç** yolu olarak durur.
 
 Yeni uygulama yazıyorsanız: [UYGULAMA_GELISTIRME.md](UYGULAMA_GELISTIRME.md).
 
@@ -192,12 +194,14 @@ Son doğrulanan durum (2026-11-15, Linux x86_64 ve Windows i386, `tests/run_gate
 | `portability` | 29 / 0 (kendi platformunda yaz/oku, bayt bayt kopya, ikinci bağımsız yazım yalnız uçucu meta alanlarında farklı, şema LF ile yazılıyor) |
 | `multi_writer` | 12 / 0 (tek dosyada iki oturum: WAL LSN kesin artıyor, yan dosyalar ikinci kapanışta korunuyor, kendi satırları kalıyor, 12/12 kalıcı, yedek+geri yükleme 18/18) |
 | `bench_report` | 35 / 0 (18 kategori, P50/P95/P99/max, CSV+meta, bellek ve WAL boyu, kategori başına doğruluk kontrolü) |
+| `sql_features` | 32 / 0 (SAVEPOINT / ROLLBACK TO / RELEASE, ON CONFLICT DO NOTHING\|DO UPDATE, VACUUM, REINDEX, ANALYZE, CTE, pencere fonksiyonları, ALTER TABLE RENAME) |
+| `limits` | 18 / 0 (aşırı SQL / INSERT / LIMIT `ecLimit` ile reddediliyor, sonrasında veri sağlam, belgelenen tavanlar) |
 | `server_harden` | 24 / 0 |
 | `auth_throttle` | 16 / 0 |
 | `tls_client` | 6 / 0 (Linux; OpenSSL DLL'i olmayan Windows'ta atlanır) |
 
-Linux'ta **28 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
-atlanır), Windows'ta **27 kapı** (`tls_client` atlanır). Kapı belgeleri:
+Linux'ta **30 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
+atlanır), Windows'ta **29 kapı** (`tls_client` atlanır). Kapı belgeleri:
 [docs/engineering/](docs/engineering/).
 
 ```bash

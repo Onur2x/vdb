@@ -58,6 +58,11 @@ const
   VDB_FLAG_COMPRESSED = 8;
   VDB_FLAG_BLOCKCRC = 16;
   VDB_MAX_VALUE = 16 * 1024 * 1024;
+  { v3.37 / SKILL2 §25.1: tek SQL cumlesi icin ust sinir. 4 MB, elle
+    yazilmis hicbir cumleyi engellemez; yalnizca uretici hatasi ya da kotu
+    niyetli dev bir metnin motoru bellek tuketerek cokertmesini onler.
+    Asildiginda kontrollu `ecLimit` hatasi doner, veritabani etkilenmez. }
+  VDB_MAX_SQL_STMT = 4 * 1024 * 1024;
 
   // File header
   VDB_FILE_MAGIC = $42444F56; // 'VODB' little-endian

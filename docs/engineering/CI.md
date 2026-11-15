@@ -44,6 +44,8 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `kv_wal` | KV katmani WAL kurtarma matrisi |
 | `backup_restore` | yedek/geri yukleme butunlugu + tatbikat (B0-B24) |
 | `page_integrity` | sayfa/heap/freelist bozulma matrisi (I0-I13) |
+| `sql_features` | parser'da olup kapisi olmayan SQL ozellikleri: `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` (kismi geri alma gercekten yalniz sonraki satirlari atar), `ON CONFLICT DO NOTHING\|DO UPDATE` (cift anahtar degeri bozmaz), `VACUUM`/`REINDEX`/`ANALYZE <tablo>` (bakim veriyi korur, indeks aramasi dogru kalir), `WITH` (CTE), `ROW_NUMBER() OVER (ORDER BY ...)`, `ALTER TABLE ... RENAME TO` |
+| `limits` | **kaynak sinirlari** (SKILL2 §25): 4 MiB'tan buyuk SQL, 16 MB'lik INSERT ve 2M ustu `LIMIT` kontrollu `ecLimit` ile reddedilir; reddedilen islem **hicbir satir birakmaz**, ayni veritabani sorgulanmaya devam eder, kapanis temiz (yalniz `.odb`) ve yeniden acilista veri bozulmamis olur; belgelenen tavanlar (`LIMITS.md`) tutarli |
 | `server_harden` | dinleme adresi, `--trust` sinirlari, TLS zorunlulugu |
 | `auth_throttle` | SCRAM deneme sinirlama/kilit |
 | `selftest_builtin` | provider SelfTest (builtin) |
@@ -348,3 +350,34 @@ kaldirildi:
   Diger kapilar degismedi (`portability` 29/0, `format_compat` 28/0,
   `cache_metrics` 21/0, `integrity_check` 32/0, `crash_points` 24/0,
   `multiproc` 17/0 dahil).
+- Yirmi birinci kosu (PHASE-18 commit'i, SKILL3 denetimi): **iki platform da
+  YESIL**. Git Bash/Windows **29 kapi** PASS (`tls_client` SKIP), WSL x86_64
+  Linux **30 kapi** PASS. Iki yeni kapi:
+  - `sql_features` **32 PASS / 0 FAIL**. SKILL3 §9.1/§10.1'in "uygulanmis ama
+    test edilmemis" listesini kapatir: `SAVEPOINT` / `ROLLBACK TO SAVEPOINT`
+    / `RELEASE SAVEPOINT` (kismi geri alma gercekten yalniz sonraki satirlari
+    atar; `RELEASE` sonrasi commit iki satiri da korur), `ON CONFLICT
+    DO NOTHING` / `DO UPDATE` (cift anahtar eski degeri korur / gunceller,
+    satir sayisi artmaz), `VACUUM` / `REINDEX` / `ANALYZE <tablo>` (bakim
+    sonrasi satir sayisi ve indeksli arama dogru), `WITH` (CTE),
+    `ROW_NUMBER() OVER (ORDER BY id)` (1..3), `ALTER TABLE ... RENAME TO`
+    (satirlar tasinir, eski ad kapanir). `ANALYZE` tablo adi ister; bu
+    davranis da kapida kilitli.
+  - `limits` **18 PASS / 0 FAIL**. SKILL2 §25 / SKILL3 §12 kaynak sinirlari:
+    4 MiB'tan buyuk SQL, 16 MB'lik INSERT ve 2M ustu `LIMIT` kontrollu
+    `ecLimit` ile reddedilir; reddedilen islem **satir birakmaz**, tablo
+    sorgulanabilir kalir, kapanistan sonra yalniz `.odb` vardir ve yeniden
+    acilista veri bozulmamistir. Belgelenen tavanlar
+    `docs/engineering/LIMITS.md`'de listelenir ve kapida tutarliligi olculur
+    (`VDB_MAX_PAGES` 16 777 215,
+    `VDB_MAX_DB_BYTES` 1 TiB, `VDB_MAX_TXN_PAGES` 1 048 576,
+    `VDB_MAX_POOL` 65 536, `VDB_MAX_SQL_STMT` 4 MiB, `VDB_MAX_VALUE` 16 MiB,
+    `VDB_MAX_RESULT_ROWS` 2 000 000).
+  Motor tarafinda bu kosuda eklenen sinirlar: `ExtendFile` sayfa/boy tavani
+  ve `GrowTo` boy tavani (`ecLimit`), `MarkPageDirty` islem sayfa tavani
+  (`ecLimit`), `VDbExecutor` cikti buyumesinde 2M satir tavani (`ecLimit`,
+  hem DirectDecode hem genel yol). Denetim raporu:
+  `docs/audit/V3_FINAL_AUDIT.md`.
+  Diger kapilar degismedi (`portability` 29/0, `format_compat` 28/0,
+  `cache_metrics` 21/0, `integrity_check` 32/0, `crash_points` 24/0,
+  `multiproc` 17/0, `multi_writer` 12/0, `bench_report` 35/0 dahil).

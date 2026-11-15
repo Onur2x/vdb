@@ -32,7 +32,7 @@ interface
 
 uses
   SysUtils, Classes, DateUtils, Generics.Collections, VDbCrc32, VDbPage, VDbSync,
-  {$IFDEF WINDOWS}Windows,{$ENDIF} VDbCrypt, VDbPageCrypto, VDbParallel;
+  {$IFDEF WINDOWS}Windows,{$ENDIF} VDbCrypt, VDbPageCrypto, VDbParallel, VDbErr;
 
 const
   VDB_FILE_MAGIC   = $33424456;   // 'VDB3' (little endian)
@@ -48,6 +48,18 @@ const
   VDB_HDR_PAGE     = 0;
   VDB_DEF_POOL     = 512;         // 512 x 4 KB = 2 MB
   VDB_MAX_POOL     = 65536;
+
+  { v3.37 / SKILL2 §25.1, SKILL3 §12: BELGELENMIS ust sinirlar.
+    Amac "sinirsiz" iddiasini kaldirmak: asildiginda motor kontrollu
+    `ecLimit` hatasi dondurur, yarim sayfa/dosya birakmaz.
+    - Sayfa sayisi: LongWord tasmasini onler (2^32 * 4 KB = 16 TiB).
+    - Veritabani boyu: 1 TiB pratik tavan; bundan buyuk dosya zaten
+      platform/FS sinirlarina takilir, burada erken ve net hata verilir.
+    - Islem boyu: tek islemde degisen sayfa sayisi icin tavan; butce
+      disi dev bir islem WAL'i ve bellegi sinirsiz buyutemez. }
+  VDB_MAX_PAGES    = $00FFFFFF;                 // 16 777 215 sayfa
+  VDB_MAX_DB_BYTES = Int64(1024) * 1024 * 1024 * 1024;   // 1 TiB
+  VDB_MAX_TXN_PAGES = 1048576;                  // tek islemde 1M sayfa
 
   { v3.1: dosya buyutme parcasi. Her yeni sayfada ayri SetSize cagrisi
     ~45-50 us suruyordu (200k satirlik yazimda ~200 ms). Artik dosya
@@ -3288,6 +3300,12 @@ begin
       zaten listededir). }
     if FFrames[idx].TxnMark <> FTxnId then
     begin
+      { v3.37 / SKILL3 §12: tek islemde degisen sayfa sayisi tavani.
+        Butce disi dev bir islem WAL'i ve bellegi sinirsiz buyutemez;
+        asimda kontrollu `ecLimit`, islem geri alinabilir kalir. }
+      if FTxnDirtyCount >= VDB_MAX_TXN_PAGES then
+        raise EVDbException.CreateFmt(ecLimit,
+          'islem boyu siniri asildi (%d sayfa)', [Int64(VDB_MAX_TXN_PAGES)]);
       FFrames[idx].TxnMark := FTxnId;
       if FTxnDirtyCount >= Length(FTxnDirty) then
         SetLength(FTxnDirty, FTxnDirtyCount * 2 + 8);
@@ -3300,6 +3318,19 @@ end;
 
 procedure TVDbPageStore.ExtendFile(out NewPageNo: LongWord);
 begin
+  { v3.37 / SKILL3 §12: BELGELENMIS sinirlar. Onceden FPageCount sinirsiz
+    artiyordu; LongWord tasmasi sayfa numaralarini sessizce sarmalayabilir
+    ve iki farkli sayfa ayni numarayi tasirdi (sessiz veri bozulmasi).
+    Simdi kontrollu hata: commit edilmemis islem geri alinir, dosya gecerli
+    kalir. }
+  if FPageCount >= VDB_MAX_PAGES then
+    raise EVDbException.CreateFmt(ecLimit,
+      'sayfa siniri asildi (%d >= %d)', [Int64(FPageCount), Int64(VDB_MAX_PAGES)]);
+  if RequiredFileSize(FPageCount + 1) > VDB_MAX_DB_BYTES then
+    raise EVDbException.CreateFmt(ecLimit,
+      'veritabani boyu siniri asildi (%.0f MB > %.0f MB)',
+      [RequiredFileSize(FPageCount + 1) / (1024.0 * 1024.0),
+       VDB_MAX_DB_BYTES / (1024.0 * 1024.0)]);
   NewPageNo := FPageCount;
   Inc(FPageCount);
   GrowTo(RequiredFileSize(FPageCount));
@@ -3313,6 +3344,13 @@ var
   want: Int64;
 begin
   if Required <= FPhysSize then Exit;
+  { v3.37 / SKILL3 §12: buyume yolunda da belgelenmis tavan. ExtendFile'a
+    ek olarak dogrudan GrowTo cagrilari (checkpoint/pending yazimi) ayni
+    siniri asmaz. }
+  if Required > VDB_MAX_DB_BYTES then
+    raise EVDbException.CreateFmt(ecLimit,
+      'veritabani boyu siniri asildi (%.0f MB > %.0f MB)',
+      [Required / (1024.0 * 1024.0), VDB_MAX_DB_BYTES / (1024.0 * 1024.0)]);
   { v3.2: salt-okunur oturumda dosya BUYUTULMEZ. WAL ile buyuyen sayfalar
     yalnizca bellek katmaninda yasar. }
   if FReadOnly then

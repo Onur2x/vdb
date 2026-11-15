@@ -136,6 +136,41 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   DB/WAL boyu. Kapi ayrica **dogruluk** kontrol eder (satirlar gercekten
   kalici mi), yani hizli ama yanlis bir olcum gecemez. `perf_baseline`'in
   kapsamadigi kategorileri kapatir (SKILL2 §22, `STORAGE_AUDIT.md` §7).
+- **Belgelenmis kaynak sinirlari** (SKILL2 §25, SKILL3 §12): motor artik
+  "sinirsiz" degil. Asimda kontrollu `EVDbException` doner, surec cokmez,
+  dosya gecerli kalir:
+  - `VDbPageStore.ExtendFile` — sayfa sayisi tavani `VDB_MAX_PAGES`
+    (16 777 215) ve veritabani boyu tavani `VDB_MAX_DB_BYTES` (1 TiB);
+    `GrowTo` de ayni boy tavanini zorlar. Onceden `FPageCount` sinirsiz
+    artiyordu; LongWord tasmasi iki farkli sayfaya ayni numarayi verebilirdi.
+  - `VDbPageStore.MarkPageDirty` — tek islemde degisen sayfa tavani
+    `VDB_MAX_TXN_PAGES` (1 048 576). Butce disi dev bir islem WAL'i ve
+    bellegi sinirsiz buyutemez.
+  - `VDbExecutor` cikti buyumesi (hem `DirectDecode` hem genel yol) — 2M
+    satir tavaninda `ecLimit`. Onceden `LIMIT`'siz tam tarama bellek dolana
+    kadar buyuyordu (kontrolsuz OOM).
+  - `VDbSql.CheckStmtSize` — tek cumle boyu `VDB_MAX_SQL_STMT` (4 MiB);
+    `Exec`, parametreli `Exec` ve `ExecRaw` ayni kapidan gecer.
+  Tum tavanlar ve sinir koyulmayan yerlerin gerekcesi
+  `docs/engineering/LIMITS.md`'de.
+- **Sinir regresyon kapisi** `limits` (18 kontrol): 4 MiB'tan buyuk SQL,
+  16 MB'lik INSERT ve 2M ustu `LIMIT` kontrollu `ecLimit` ile reddedilir;
+  reddedilen islem **satir birakmaz**, tablo sorgulanabilir kalir, kapanistan
+  sonra yalniz `.odb` vardir, yeniden acilista veri bozulmamistir; belgelenen
+  tavanlarin tutarliligi da olculur. SKILL3 §12'yi kismen kapatir.
+- **Ozellik regresyon kapisi** `sql_features` (32 kontrol): SKILL3 §9.1/
+  §10.1'in "uygulanmis ama test edilmemis" listesini kapatir — `SAVEPOINT` /
+  `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` (kismi geri alma gercekten
+  yalniz sonraki satirlari atar), `ON CONFLICT DO NOTHING|DO UPDATE` (cift
+  anahtar degeri korur/gunceller, satir sayisi artmaz), `VACUUM`, `REINDEX`,
+  `ANALYZE <tablo>` (bakim sonrasi satir sayisi ve indeksli arama dogru),
+  `WITH` (CTE), `ROW_NUMBER() OVER (ORDER BY ...)`, `ALTER TABLE ... RENAME
+  TO`. Bu ozellikler `readme.md`'de "kapisi yok" olarak isaretliydi; artik
+  var.
+- **Denetim raporu** `docs/audit/V3_FINAL_AUDIT.md` (SKILL3 §18 formati):
+  bulgular (siddet/dosya kok neden/duzeltme/test), kapi sonuclari, kalan
+  riskler ve durust siniflandirma **BETA CANDIDATE** (certified/SIL iddiasi
+  yok).
 
 ### SQL
 
