@@ -52,8 +52,26 @@ const
   VDB_CRASH_STAGE_COMMIT_PRE_SYNC = 6;  // commit kaydi WAL'de, fsync yok
   VDB_CRASH_STAGE_COMMIT_POST_SYNC= 7;  // commit durabil (fsync basarili)
 
+  { SKILL2 §23.2: butunluk denetleyici modlari.
+    quick: baslik + freelist + sayfa kimligi (CRC hesaplanmaz — hizli)
+    full : mevcut tam denetim (CRC + heap hucreleri + tasma zincirleri + indeks)
+    index: sayfa taramasi (CRC'siz) + heap dizini tutarliligi
+    wal  : yalniz WAL kuyrugu incelemesi (sayfalara ve dosyaya dokunmaz) }
+  VDB_VERIFY_MODE_QUICK = 0;
+  VDB_VERIFY_MODE_FULL  = 1;
+  VDB_VERIFY_MODE_INDEX = 2;
+  VDB_VERIFY_MODE_WAL   = 3;
+
 type
   EVdbPageEngine = class(Exception);
+
+  TVdbVerifyMode = (vmQuick, vmFull, vmIndex, vmWal);
+
+const
+  VDB_VERIFY_MODE_NAME: array[TVdbVerifyMode] of string =
+    ('quick', 'full', 'index', 'wal');
+
+type
 
   { Cokme kancasi: test buraya surec olduren bir yordam baglar. }
   TVdbCrashHook = procedure;
@@ -319,6 +337,13 @@ type
           anahtar, anahtar sayisi = Count
       Report: tek satir ozet (sayfa/serbest/heap/tasma/anahtar) veya hata. }
     function Verify(out Report: string): Boolean;
+
+    { SKILL2 §23: modlu denetim. `ADryRun=True` iken DB'ye YAZILMAZ
+      (checkpoint atlanir); acik commit varsa rapor bunu acikca soyler.
+      `vmWal` yalniz WAL kuyrugunu inceler, sayfalara dokunmaz; kesik
+      kuyruk (torn tail) UYARI sayilir, bozulma degil. }
+    function VerifyEx(AMode: TVdbVerifyMode; ADryRun: Boolean;
+      out Report: string): Boolean;
   end;
 
 var
@@ -1481,6 +1506,13 @@ begin
 end;
 
 function TVdbPageEngine.Verify(out Report: string): Boolean;
+begin
+  { Geriye uyum: eski cagiranlar tam denetim + checkpoint davranisini alir. }
+  Result := VerifyEx(vmFull, False, Report);
+end;
+
+function TVdbPageEngine.VerifyEx(AMode: TVdbVerifyMode; ADryRun: Boolean;
+  out Report: string): Boolean;
 var
   pno, i, n: LongWord;
   P: PVdbPage;
@@ -1500,6 +1532,10 @@ var
   chain, ovfNo, nextNo, cur: LongWord;
   fi: Integer;
   got: Int64;
+  doCrc, doHeap, doIndexCheck, doFreeList: Boolean;
+  st: TVdbWalStats;
+  tornS: string;
+  skippedPending: Boolean;
 begin
   Report := '';
   if FStore = nil then
@@ -1509,16 +1545,62 @@ begin
     Report := 'acik islem varken VERIFY yapilamaz';
     Exit(False);
   end;
+
+  { SKILL2 §23.2: mod -> bayrak. Kod COGALTILMAZ; tek govde calisir. }
+  doCrc := AMode = vmFull;
+  doHeap := AMode in [vmFull, vmIndex];
+  doIndexCheck := AMode in [vmFull, vmIndex];
+  doFreeList := AMode <> vmWal;
+  skippedPending := False;
+
+  { --- 0) Yalniz WAL incelemesi: sayfalara ve dosyaya DOKUNMAZ. --- }
+  if AMode = vmWal then
+  begin
+    if FWal = nil then
+    begin
+      Report := 'wal: kapali';
+      Exit(False);
+    end;
+    { WAL dosyasi yok / icerik yok: bu BOZULMA DEGILDIR; temiz kapanis
+      sonrasi `.wal` silinir (tek dosya sozlesmesi). }
+    if not FWal.HasContent then
+    begin
+      Report := Format('wal=%s commit=0 cerceve=0 bayt=0 torn=hayir (icerik yok)',
+        [FWal.Path]);
+      Exit(True);
+    end;
+    if not FWal.Inspect(st) then
+    begin
+      Report := 'wal: okunamadi (baslik/CRC gecersiz)';
+      Exit(False);
+    end;
+    if st.TornTail then tornS := 'evet' else tornS := 'hayir';
+    Report := Format('wal=%s commit=%d cerceve=%d bayt=%d torn=%s',
+      [FWal.Path, st.Commits, st.Frames, st.Bytes, tornS]);
+    if st.TornTail then
+      { Kesik kuyruk UYARIDIR, bozulma degil: cokme sonrasi normaldir ve
+        kurtarma onaylanmis commit'leri korur. Bozulma diye reddetmek
+        yanlis olurdu (§23.3 uyari/bozulma ayrimi). }
+      Report := Report + ' (UYARI: kesik kuyruk; bozulma degil)';
+    Exit(True);
+  end;
+
   { Onaylanmis ama henuz dosyaya gecmemis cerceveler varsa once yaz.
     Boylece dogrulanan sey DISKTEKI gercek durumdur.
     v3.2: salt-okunur oturumda WAL diske YAZILMAZ; dogrulama, WAL imajlari
-    bellek katmaninda dururken depo/heap uzerinden yapilir. }
+    bellek katmaninda dururken depo/heap uzerinden yapilir.
+    SKILL2 §23.3: DRY-RUN'da DB DEGISTIRILMEZ; checkpoint atlanir ve
+    denetlenemeyen acik commit'ler raporda acikca bildirilir. }
   if (not FStore.ReadOnly) and (FWal.HasContent or (FPendingCount > 0)) then
-    if not Checkpoint(True) then
+  begin
+    if ADryRun then
+      skippedPending := True
+    else if not Checkpoint(True) then
     begin
       Report := 'checkpoint basarisiz';
       Exit(False);
     end;
+  end;
 
   heapPages := 0;
   ovfPages := 0;
@@ -1528,14 +1610,17 @@ begin
   keySet := TDictionary<QWord, Boolean>.Create;
   chainSet := TDictionary<LongWord, Boolean>.Create;
   try
-    { --- 1) freelist zinciri --- }
-    if not FStore.VerifyFreeList(freePages, e) then
+    { --- 1) freelist zinciri (wal modunda buraya hic gelinmez) --- }
+    if doFreeList then
     begin
-      Report := 'freelist: ' + e;
-      Exit(False);
+      if not FStore.VerifyFreeList(freePages, e) then
+      begin
+        Report := 'freelist: ' + e;
+        Exit(False);
+      end;
+      for fi := 0 to High(freePages) do
+        freeSet.Add(freePages[fi], True);
     end;
-    for fi := 0 to High(freePages) do
-      freeSet.Add(freePages[fi], True);
 
     { --- 2) tum sayfalar: yapi + CRC --- }
     pno := 1;
@@ -1572,7 +1657,7 @@ begin
           Report := Format('sayfa %d taninmiyor (ne VDbPage ne trunk)', [pno]);
           Exit(False);
         end;
-        if not PageVerify(P, e) then
+        if doCrc and (not PageVerify(P, e)) then
         begin
           Report := Format('sayfa %d bozuk: %s', [pno, e]);
           Exit(False);
@@ -1586,6 +1671,10 @@ begin
           VDB_PAGE_HEAP:
             begin
               Inc(heapPages);
+              { quick modunda hucre yuruyusu YAPILMAZ: CRC'siz hizli
+                denetim yalniz sayfa kimligini ve tipini dogrular. }
+              if doHeap then
+              begin
               n := PageSlotCount(P);
               for i := 0 to n - 1 do
               begin
@@ -1679,6 +1768,7 @@ begin
                   end;
                 end;
               end;
+              end;
             end;
           VDB_PAGE_OVERFLOW:
             Inc(ovfPages);
@@ -1695,7 +1785,7 @@ begin
       Inc(pno);
     end;
 
-    if keys <> FHeap.Count then
+    if doIndexCheck and (keys <> FHeap.Count) then
     begin
       Report := Format('anahtar sayisi tutmuyor: dosyada %d, dizinde %d',
         [keys, FHeap.Count]);
@@ -1704,8 +1794,8 @@ begin
 
     { Tasma sayfalarinin TAMAMI bir hucre zincirine ait olmali. Sayfa
       taramasi ile zincir yuruyusu karsilastirilir; artik kalan tasma
-      sayfasi sessiz cop olurdu. }
-    if ovfPages <> chainSet.Count then
+      sayfasi sessiz cop olurdu. (quick modunda zincir yuruyusu yok.) }
+    if doHeap and (ovfPages <> chainSet.Count) then
     begin
       Report := Format(
         'sahipsiz tasma sayfasi: dosyada %d, zincirlerde %d',
@@ -1713,9 +1803,17 @@ begin
       Exit(False);
     end;
 
-    Report := Format('sayfa=%d serbest=%d heap=%d tasma=%d trunk=%d anahtar=%d lsn=%d',
-      [FStore.PageCount, Length(freePages), heapPages, ovfPages, trunkPages, keys,
-       FStore.LSN]);
+    if doHeap then
+      Report := Format('sayfa=%d serbest=%d heap=%d tasma=%d trunk=%d anahtar=%d lsn=%d',
+        [FStore.PageCount, Length(freePages), heapPages, ovfPages, trunkPages, keys,
+         FStore.LSN])
+    else
+      Report := Format('sayfa=%d serbest=%d heap=%d trunk=%d anahtar=denetlenmedi lsn=%d',
+        [FStore.PageCount, Length(freePages), heapPages, trunkPages, FStore.LSN]);
+    if AMode <> vmFull then
+      Report := Report + ' mod=' + VDB_VERIFY_MODE_NAME[AMode];
+    if skippedPending then
+      Report := Report + ' (dry-run: acik commit denetlenmedi)';
     Result := True;
   finally
     chainSet.Free;

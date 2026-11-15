@@ -211,19 +211,29 @@ WAL boyutu raporlanmiyor.
 ## 8. §23 Butunluk denetleyici
 
 `IVdbBackend.Verify(out Report)` -> `TVdbPageEngine.Verify` su adimlari
-yapiyor (satir 1427+): freelist zinciri, **tum sayfalar** (magic + CRC +
+yapiyor (satir 1483+): freelist zinciri, **tum sayfalar** (magic + CRC +
 sayfa numarasi), heap hucreleri, overflow zincirleri, anahtar tekilligi.
+`Verify` geriye uyum icin `VerifyEx(vmFull, False, Report)` cagirir; modlu
+yol `VerifyEx(AMode, ADryRun, Report)`.
 
 | Gereksinim | Durum |
 |---|---|
 | Baslik, surum, sayfa sinirlari, CRC, freelist | VAR |
 | B+Tree yapisi/sirasi | VAR — `CheckInvariants` (ayri kapi, 152/0) |
-| WAL tutarliligi incelemesi | KISMI — `wal_crash` kapsiyor, `VERIFY` WAL'i raporlamiyor |
-| **Salt-okunur incelemede DB'yi degistirmeme** | **IHLAL** — `Verify` acik commit varsa **checkpoint yapar** (satir 1460). Belgelenmeli veya `ADryRun` eklenmeli (G6) |
-| Modlar (hizli/tam/indeks/WAL/kurtarma) | **YOK** — tek mod |
-| CLI (`VDB integrity-check database.odb`) | **YOK** — `vdbcli` yalniz SQL calistiriyor |
-| Bozuklugu sessizce onarmama | VAR |
+| WAL tutarliligi incelemesi | VAR — `vmWal` (`FWal.Inspect`: commit/cerceve/bayt + kesik kuyruk); kesik kuyruk **UYARI** sayilir, bozulma degil |
+| **Salt-okunur incelemede DB'yi degistirmeme** | **VAR** — `ADryRun=True` checkpoint'i atlar; `vdbcheck` her zaman `CreateReadOnly` acar (yazma yolu yok). Kanit: `integrity_check` denetim oncesi/sonrasi FNV-1a ozeti + boyut + dizin icerigi ayni |
+| Modlar (hizli/tam/indeks/WAL/kurtarma) | VAR — `vmQuick` (CRC'siz), `vmFull`, `vmIndex`, `vmWal` |
+| CLI (`VDB integrity-check database.odb`) | VAR — `vdbcheck [--quick\|--full\|--index\|--wal] [--dry-run] <db>`; cikis 0 temiz / 1 kullanim / 2 bozulma |
+| Bozuklugu sessizce onarmama | VAR — `integrity_check` her bozulma senaryosunda dosya ozetinin degismedigini dogrular |
 | Onarim akisi | YOK (bilincli: onarim uygulanmadi) |
+
+**G6 kapsami (olculen sinirlama):** `vmQuick` ve `vmIndex` CRC hesaplamaz.
+Ancak acilis taramasi (`TVdbPageHeap` `Reindex`) sayfa CRC'sini zaten
+dogruladigi icin CRC bozuk bir sayfa bu modlarda da **acilis aninda**
+yakalanir (`integrity_check` IC-C2). Kapi 32 kontrol: saglam DB dort modda
+temiz + dosya degismedi, bozuk sihirli sayi (sayfa no ile), bozuk CRC,
+bozuk freelist girdisi (ucreti yeniden hesaplanmis gecerli trunk), kesik WAL
+kuyrugu (uyari), kesik dosya, CLI sozlesmesi.
 
 ---
 
@@ -294,7 +304,7 @@ sayfa numarasi), heap hucreleri, overflow zincirleri, anahtar tekilligi.
 | 4 | WAL dayanikliligi dogrulandi | VAR | `wal_crash`, `kv_wal` |
 | 5 | Cokme kurtarma testleri geciyor | VAR | `wal_crash` |
 | 6 | Checkpoint kurtarma testleri | **VAR** | `crash_points` (cp-1..cp-5, commit-6/7) |
-| 7 | Butunluk denetleyici calisiyor | KISMI | `Verify` var, CLI/mod yok (G6) |
+| 7 | Butunluk denetleyici calisiyor | **VAR** | `vdbcheck` (`--quick/--full/--index/--wal`, her zaman salt-okunur) + `integrity_check` 32/0 |
 | 8 | B+Tree butunluk kontrolleri | VAR | `btree_integrity` 152/0 |
 | 9 | Yedek/geri yukleme testleri | VAR | `backup_restore` 25/0 |
 | 10 | Eszamanli erisim testleri | VAR | `multiproc` (MP2/MP3/MP5) |
@@ -310,7 +320,7 @@ sayfa numarasi), heap hucreleri, overflow zincirleri, anahtar tekilligi.
 | 20 | Mevcut V3 SQL testleri geciyor | VAR | `sql_matrix` 61/0, `sql_stubs` 25/0 |
 | 21 | V2 donmus ve izole | VAR | `VDbCore` yalniz salt-okunur |
 
-**Ozet: 15 VAR, 3 KISMI, 3 YOK.** Bu yuzden skill §27 "tamamlandi" sayilamaz
+**Ozet: 16 VAR, 2 KISMI, 3 YOK.** Bu yuzden skill §27 "tamamlandi" sayilamaz
 ve asagidaki bosluklar kapatilmadan "production" iddia edilmez.
 
 ---
@@ -324,10 +334,10 @@ ve asagidaki bosluklar kapatilmadan "production" iddia edilmez.
 | G3 | Izolasyon/kilit belgesi yok | `docs/engineering/ISOLATION.md` |
 | G4 | ~~Surecler-arasi kilitleme testleri yok~~ | **KAPATILDI** — `tests/multiproc` 17/0 (MP1-MP10) |
 | G5 | Benchmark kategorileri ve yuzdelikler eksik | `perf_baseline` genislet veya `bench_report` kapisi |
-| G6 | Butunluk denetleyici CLI + modlar + salt-okunur | `vdbcheck` araci: `--quick/--full/--index/--wal` |
+| G6 | ~~Butunluk denetleyici CLI + modlar + salt-okunur~~ | **KAPATILDI** — `vdbcheck` (4 mod, her zaman `CreateReadOnly`) + `tests/integrity_check` 32/0 |
 | G7 | Eski format fixture'lari ve gecis testleri | v3/v4 imaj uret + yukseltme kapisi |
 | G8 | Limitler tanimsiz, disk dolu denenmedi | Limit tablosu + kontrollu hata + disk dolu simulasyonu |
 | G9 | Platformlar arasi dosya uyumu kanitsiz | Windows'ta yaz, Linux'ta oku (ve tersi) kapisi |
 
-Oncelik: G6 (arac), G7/G9 (uyumluluk), G2/G5 (golge),
-G3/G8 (belge + sinir). G1 ve G4 kapatildi.
+Oncelik: G7/G9 (uyumluluk), G2/G5 (golge),
+G3/G8 (belge + sinir). G1, G4 ve G6 kapatildi.

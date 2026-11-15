@@ -31,6 +31,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `region_stream` | `TRegionStream` dosya-ici pencere: mantiksal uzunluk, fsync, sinir kontrolu (v4 icin yazildi, motorda kullanilmiyor) |
 | `multiproc` | iki **gercek surec**: es zamanli yazar + bayat onbellek tazeleme, `SIGKILL`/`TerminateProcess` sonrasi kurtarma, RO yazmayi reddetme (bkz. `STORAGE_AUDIT.md` §21.3) |
 | `crash_points` | **deterministik cokme enjeksiyonu**: 7 checkpoint/commit asamasinin ortasinda gercek surec olumu (`SIGKILL`/`TerminateProcess`), sonra yeniden acilis + `VERIFY` + onayli commit kontrolu (bkz. `STORAGE_AUDIT.md` §4) |
+| `integrity_check` | **butunluk denetleyici** (`vdbcheck`): dort mod (`--quick/--full/--index/--wal`), her zaman salt-okunur; saglam DB dort modda temiz, bozuk sihirli sayi/CRC/freelist girdisi/kesik WAL kuyrugu ayri kategorilerde yakalanir, dosya ozeti degismez (bkz. `STORAGE_AUDIT.md` §8) |
 | `crypto_core` | saf Pascal AES/GCM/SHA/HMAC cekirdegi |
 | `crypto_base64` | base64 kodlayici/cozucu |
 | `fixtures_builtin` | eski `.odb`/anahtar fixture'lari **builtin** provider ile acilir |
@@ -252,3 +253,18 @@ kaldirildi:
   ama tutarsizlik yasaktir) ve DB hala yazilabilir. Enjeksiyon uretimde
   `0` (kapali) kalir; kanca atanmazsa motor **acik hata** verir, sessizce
   devam etmez. Diger kapilar degismedi (`multiproc` 17/0 dahil).
+- Onaltinci kosu (PHASE-13 commit'i): **yerel kanit** WSL x86_64 Linux
+  **23 kapi** PASS, Git Bash/Windows i386 **22 kapi** PASS (`tls_client`
+  SKIP). Yeni kapi `integrity_check` (**32 PASS, 0 FAIL**) SKILL2 §23'u
+  kapatir: `TVdbPageEngine.VerifyEx(AMode, ADryRun, Report)` dort mod
+  sunar (`vmQuick`, `vmFull`, `vmIndex`, `vmWal`); eski `Verify` geriye
+  uyum icin `VerifyEx(vmFull, False, ...)` cagirir. `ADryRun=True` acik
+  commit checkpoint'ini **atlar**, boylece denetim veritabanini
+  degistirmez. `TVdbPageWal.Inspect` WAL kuyrugunu uygulamadan okur ve
+  tarama durumunu geri yukler; kesik kuyruk **uyari** sayilir, bozulma
+  degil. Yeni arac `vdbcheck [--quick|--full|--index|--wal] [--dry-run]
+  <db>` veritabani **her zaman** `CreateReadOnly` ile acar (yazma yolu
+  yok) ve cikis kodu verir: 0 temiz, 1 kullanim hatasi, 2 bozulma.
+  Kapi, denetim oncesi/sonrasi dosyanin FNV-1a ozeti + boyutu + dizin
+  icerigi ayni oldugunu dogrular; bozuk sihirli sayi, bozuk CRC, bozuk
+  freelist girdisi ve kesik WAL kuyrugu ayri ayri sinanir.

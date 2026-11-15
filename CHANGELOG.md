@@ -52,6 +52,16 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   **gercekten** oldurulur (`SIGKILL`/`TerminateProcess`). Her noktadan sonra
   yeniden acilis + `VERIFY` + onayli commit kontrolu yapilir. Enjeksiyon
   uretimde kapalidir (`0`) ve kanca yoksa acik hata verir.
+- **Butunluk denetleyici** `vdbcheck` (yeni arac) + `integrity_check`
+  kapisi (32 kontrol): `VerifyEx(AMode, ADryRun, Report)` dort mod sunar
+  (`quick`, `full`, `index`, `wal`); eski `Verify` geriye uyum icin tam
+  denetim yapar. `ADryRun=True` acik commit checkpoint'ini atlar, bu yuzden
+  denetim **veritabanini degistirmez**; arac dosyayi her zaman salt-okunur
+  acar ve cikis kodu verir (0 temiz / 1 kullanim / 2 bozulma). WAL kuyrugu
+  uygulanmadan incelenir (`FWal.Inspect`), kesik kuyruk **uyari** sayilir.
+  Kapi; bozuk sihirli sayi, bozuk CRC, bozuk freelist girdisi, kesik WAL
+  kuyrugu ve kesik dosyayi ayri ayri dener ve her senaryoda dosyanin
+  FNV-1a ozeti + boyutunun degismedigini dogrular.
 
 ### SQL
 

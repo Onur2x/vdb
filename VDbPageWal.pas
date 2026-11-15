@@ -284,6 +284,12 @@ type
       AS OF SEQUENCE icin ust sinirdir. }
     function CommitCount: Integer;
 
+    { SKILL2 §23.2: WAL kuyrugunu UYGULAMADAN inceler: cerceve/commit
+      sayisi, bayt, kesik kuyruk (torn tail). `Recover` gibi tarama
+      durumunu degistirir, bu yuzden TUM tarama durumu geri yuklenir;
+      canli WAL'e yan etkisi yoktur. }
+    function Inspect(out AStats: TVdbWalStats): Boolean;
+
     { Checkpoint sonrasi WAL'i bosalt (yalniz baslik kalir). }
     procedure Truncate(CheckpointLSN: LongWord);
 
@@ -1336,6 +1342,33 @@ begin
   try
     Recover(nil, st);
     Result := st.Commits;
+  finally
+    FLSN := oldLSN;
+    FWrittenLsn := oldWritten;
+    FScanPos := oldScanPos;
+    FScanHdrLsn := oldScanHdrLsn;
+    FAtEnd := oldAtEnd;
+  end;
+end;
+
+function TVdbPageWal.Inspect(out AStats: TVdbWalStats): Boolean;
+var
+  oldLSN, oldWritten, oldScanHdrLsn: LongWord;
+  oldScanPos: Int64;
+  oldAtEnd: Boolean;
+begin
+  FillChar(AStats, SizeOf(AStats), 0);
+  Result := False;
+  if FStream = nil then Exit;
+  { CommitCount ile ayni gerekce (R2-C-4): Recover tarama imlecini ve
+    LSN'i degistirir; inceleme yalniz okuma amaclidir, durum geri konur. }
+  oldLSN := FLSN;
+  oldWritten := FWrittenLsn;
+  oldScanPos := FScanPos;
+  oldScanHdrLsn := FScanHdrLsn;
+  oldAtEnd := FAtEnd;
+  try
+    Result := Recover(nil, AStats);
   finally
     FLSN := oldLSN;
     FWrittenLsn := oldWritten;

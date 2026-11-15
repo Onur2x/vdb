@@ -137,6 +137,8 @@ build_gate single_file    "$ROOT/tests/single_file/single_file.lpr"
 build_gate region_stream  "$ROOT/tests/region_stream/region_stream.lpr"
 build_gate multiproc      "$ROOT/tests/multiproc/multiproc.lpr"
 build_gate crash_points   "$ROOT/tests/crash_points/crash_points.lpr"
+build_gate vdbcheck        "$ROOT/vdbcheck.lpr"
+build_gate integrity_check "$ROOT/tests/integrity_check/integrity_check.lpr"
 build_gate server_harden "$ROOT/tests/server_harden/server_harden.lpr"
 build_gate auth_throttle "$ROOT/tests/server_harden/auth_throttle.lpr"
 build_gate tls_client    "$ROOT/tests/tls_client/tls_client_gate.lpr"
@@ -164,6 +166,8 @@ run_gate single_file    "$WORK/single_file"    single_file
 run_gate region_stream  "$WORK/region_stream"  region_stream
 run_gate multiproc      "$WORK/multiproc"      multiproc
 run_gate crash_points   "$WORK/crash_points"   crash_points
+run_gate integrity_check "$WORK/integrity_check" integrity_check \
+  "$(npath "$WORK/vdbcheck/vdbcheck$EXE")"
 run_gate server_harden  "$WORK/server_harden"  server_harden
 run_gate auth_throttle  "$WORK/auth_throttle"  auth_throttle
 
