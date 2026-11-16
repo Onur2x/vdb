@@ -57,10 +57,33 @@ build/gates/sql_differential/sql_differential tests/sql_differential/corpus.txt 
 VDB'nin hata verdiği durumlar (ör. `SUBSTR`) psql betiğine **alınmaz**;
 bunların canlı karşılaştırması yoktur ve raporda sayıları görünür.
 
+### CI işi: `sql_differential_postgres` (v3.48)
+
+Aynı üç adım artık tek bir betikte ve ayrı bir CI işinde toplanmıştır:
+
+```sh
+tests/sql_differential/run_pg.sh \
+  tests/sql_differential/corpus.txt build/pg/sql_differential build/pg/work
+```
+
+`.github/workflows/ci.yml` içindeki `sql_differential_postgres` işi
+`ubuntu-latest` üzerinde `postgres:16` servisini kaldırır, korpusu üretir,
+`psql` ile koşar ve çıktıyı hem pinli `--PG` değerleriyle hem VDB ile
+karşılaştırır. Bu iş **varsayılan kapı koşumuna dahil değildir**; `gates`
+matrisini yavaşlatmaz ve VDB'nin kendi 41/40 kapısını etkilemez.
+
+Betik çıkış kodları bilinçli olarak ayrıdır:
+
+| Kod | Anlam | PASS sayılır mı |
+|---|---|---|
+| 0 | canlı karşılaştırma koştu ve geçti | evet |
+| 77 | `psql` yok veya bağlantı kurulamadı → **SKIP / not-run** | **hayır** |
+| 1 | koştu ve fark buldu | hayır (FAIL) |
+
 ### Dürüst sınır
 
-Bu ortamda `psql` **yoktur** (`where psql` ve WSL `command -v psql` boş).
-Bu yüzden:
+Bu geliştirme ortamında `psql` **yoktur** (`where psql` boş, WSL
+`command -v psql` boş). Bu yüzden:
 
 - Varsayılan kapı koşumu PostgreSQL'e **bağlanmaz**. `--PG` değerleri
   PostgreSQL dokümantasyonuna göre yazılmıştır; canlı ölçüm değildir.
@@ -69,9 +92,13 @@ Bu yüzden:
 - `--emit`/`--pg` yolu **yerelde sentetik bir psql çıktısıyla** uçtan uca
   doğrulanmıştır (55 PASS / 0 FAIL): ayrıştırma, eşleştirme ve iki iddia
   çalışır. Bu, "canlı PostgreSQL'de koştu" kanıtı **değildir**.
-- Canlı koşum, `psql` bulunan bir ortamda yapılmalı ve `--PG` değerleri o
-  koşumun çıktısıyla tazelenmelidir. O ana kadar bu kalem "korpus + kapı
-  hazır, canlı diferansiyel koşulmadı" olarak okunmalıdır.
+- `run_pg.sh` yerelde yalnız **SKIP yolunda** doğrulandı: çıkış kodu 77 ve
+  `SKIP pg-live | psql yok` satırı (bu, PASS değildir). Betiğin psql
+  dalı ve `sql_differential_postgres` CI işi **bu ortamda hiç koşmadı**;
+  ilk gerçek koşum CI'da olacaktır.
+- Canlı koşum yapıldığında `--PG` değerleri o koşumun çıktısıyla
+  tazelenmelidir. O ana kadar bu kalem "korpus + kapı + CI işi hazır,
+  canlı diferansiyel koşulmadı" olarak okunmalıdır.
 
 ## 4. Korpus (14 durum)
 

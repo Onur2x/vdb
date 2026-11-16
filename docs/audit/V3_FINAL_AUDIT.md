@@ -82,6 +82,13 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 | SKIP (`VDB_CRYPTO_DLL` yok) | 2 (`fixtures_openssl`, `selftest_openssl`) | 3 (+`tls_client`) |
 | Calistirilmayan | canli PostgreSQL karsilastirmasi (`sql_differential` `pg=not-run`) | ayni |
 
+Canli PostgreSQL icin ayri bir CI isi vardir (`sql_differential_postgres`,
+`.github/workflows/ci.yml` + `tests/sql_differential/run_pg.sh`); `psql` ya da
+baglanti yoksa **77 (SKIP)** doner ve PASS sayilmaz. Is bu ortamda **hic
+kosmadi** (makinede `psql` yok); `run_pg.sh` yalniz SKIP yolunda dogrulandi. Bu
+yuzden varsayilan kapida `pg=not-run` yazmaya devam eder ve tabloda
+"Calistirilmayan" kalir.
+
 Kapi toplamlari (ikisi de ayni): sql_stubs 25/0, sql_matrix 61/0,
 sql_fuzz 5/0, sql_differential 33/0, crypto_* PASS, wal_crash, kv_wal,
 backup_restore 25/0, page_integrity 14/0, btree_integrity 152/0,

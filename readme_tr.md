@@ -212,7 +212,12 @@ Son doğrulanan durum (2026-11-16, Linux x86_64 ve Windows i386, `tests/run_gate
 | `tls_client` | 6 / 0 (Linux; OpenSSL DLL'i olmayan Windows'ta atlanır) |
 
 Linux'ta **41 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
-atlanır), Windows'ta **40 kapı** (`tls_client` atlanır). Kapı belgeleri:
+atlanır), Windows'ta **40 kapı** (`tls_client` atlanır). Canlı PostgreSQL
+karşılaştırması bu kapılardan **biri değildir**: ayrı bir CI işidir
+(`sql_differential_postgres`, `.github/workflows/ci.yml` +
+`tests/sql_differential/run_pg.sh`), varsayılan kapı matrisinde koşmaz,
+`psql` ya da bağlantı yoksa **77 (SKIP)** döner ve bu ortamda hiç koşmadı
+(varsayılan kapıda `pg=not-run` doğru olmaya devam eder). Kapı belgeleri:
 [docs/engineering/](docs/engineering/).
 
 ```bash

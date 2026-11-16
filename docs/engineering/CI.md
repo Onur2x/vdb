@@ -89,6 +89,35 @@ Kosullu kapilar:
 
 `fail-fast: false`: bir platformun kirilmasi digerinin sonucunu gizlemez.
 
+### Ayri is: `sql_differential_postgres` (v3.48)
+
+Canli PostgreSQL diferansiyeli (SKILL4 §5) **kendi isidir** ve `gates`
+matrisine dahil degildir; boylece PG servisi kapilarin suresini ve
+sonucunu etkilemez:
+
+1. `ubuntu-latest` + `postgres:16` **servisi** (`pg_isready` health check,
+   `POSTGRES_DB=vdb_diff`, kullanici/parola `vdb`).
+2. `apt-get install fpc postgresql-client`.
+3. `sql_differential` saf `fpc` ile derlenir (`build/pg`).
+4. `tests/sql_differential/run_pg.sh` korpusu `--emit` ile psql betigine
+   cevirir, `psql` ile kosar ve ciktiyi `--pg=` ile kapiya verir.
+5. Cikti her zaman artifact olarak yuklenir (`pg-run.out`, `emit.sql`,
+   `pg.out`, `psql.err`).
+
+Cikis kodlari PASS/SKIP/FAIL ayrimini korur:
+
+| Kod | Anlam | Durum |
+|---|---|---|
+| 0 | canli karsilastirma kosuldu ve gecti | PASS |
+| 77 | `psql` yok / baglanti kurulamadi | **SKIP = not-run**, PASS sayilmaz |
+| 1 | kosuldu, fark bulundu | FAIL |
+
+77 durumunda is yesil kalir ama check-run'a `::warning::canli PostgreSQL
+kosmadi (SKIP, PASS sayilmaz)` yazilir; bu satir olmadan "yesil = PG
+dogrulandi" diye okunmamalidir. Bu is **bu ortamda hic kosmadi** (yerelde
+`psql` yok); yerelde yalniz SKIP dali dogrulandi (cikis 77). Ilk gercek
+kosum CI'da olacaktir.
+
 ## 4. Kapsam disi (bilerek)
 
 - **`sqltest` (`tests/sql`) yok.** Eski agacla birlikte kaldirildi

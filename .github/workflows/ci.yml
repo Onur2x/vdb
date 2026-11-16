@@ -121,3 +121,86 @@ jobs:
             apt-update.log
             apt-install.log
           if-no-files-found: ignore
+
+  # SKILL4 §5: canli PostgreSQL diferansiyeli AYRI bir istir. Varsayilan
+  # kapi kosusuna dahil DEGILDIR; PG yoksa veya servis kalkmazsa is
+  # "not-run"/SKIP olur ve asla PASS sayilmaz.
+  sql_differential_postgres:
+    name: sql_differential (live PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: vdb
+          POSTGRES_PASSWORD: vdb
+          POSTGRES_DB: vdb_diff
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: vdb
+      PGPASSWORD: vdb
+      PGDATABASE: vdb_diff
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup FPC (Unix)
+        shell: bash
+        run: |
+          set -u
+          sudo apt-get update > apt-update.log 2>&1
+          sudo apt-get install -y fpc postgresql-client > apt-install.log 2>&1
+
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          fpc -iV
+          psql --version
+
+      - name: Build sql_differential
+        shell: bash
+        run: |
+          mkdir -p build/pg/lib
+          fpc -MObjFPC -Scghi -O1 -g -l -vewnhibq -Fu. \
+            -FUbuild/pg/lib -FEbuild/pg \
+            tests/sql_differential/sql_differential.lpr
+
+      - name: Run live differential
+        shell: bash
+        run: |
+          set +e
+          bash tests/sql_differential/run_pg.sh \
+            tests/sql_differential/corpus.txt \
+            build/pg/sql_differential \
+            build/pg/work > pg-run.out 2>&1
+          rc=$?
+          cat pg-run.out
+          if [ "$rc" -eq 77 ]; then
+            echo "::warning::canli PostgreSQL kosmadi (SKIP, PASS sayilmaz)"
+            exit 0
+          fi
+          if [ "$rc" -ne 0 ]; then
+            grep -E '^FAIL|fark|VDB=|canli PG=' pg-run.out | head -n 30 |
+              while IFS= read -r line; do echo "::error::$line"; done
+          fi
+          exit "$rc"
+
+      - name: Upload differential output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sql-differential-postgres
+          path: |
+            pg-run.out
+            build/pg/work/*.sql
+            build/pg/work/pg.out
+            build/pg/work/psql.err
+          if-no-files-found: ignore

@@ -102,6 +102,20 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   kaldirildi). Durust sinir: satirlar hala 4 KB sayfa yigininda, ikincil
   indeksler bellekteki `TVDbBTree` icinde; disk indeks olcumu bu kapinin
   kapsami disindadir (bkz. `docs/engineering/SQL_SCALE.md`).
+- **Canli PostgreSQL diferansiyeli icin ayri CI isi** (v3.48): yeni
+  `tests/sql_differential/run_pg.sh` ve `.github/workflows/ci.yml` icinde
+  `sql_differential_postgres` isi. Is, `postgres:16` servisini saglik
+  kontrolu ile ayaga kaldirir, `sql_differential` kapisini derler,
+  `run_pg.sh` ile ayni fixture'i PostgreSQL'e gonderir ve donen sonucu
+  `--pg=` ile karsilastirir. Cikis kodlari ayrilir: **0** kostu ve gecti,
+  **77** `psql` yok veya baglanti kurulamadi (**SKIP**, asla PASS
+  sayilmaz), **1** kostu ve fark buldu. Bu is varsayilan kapi matrisinin
+  parcasi degildir; VDB'nin kendi 41/40 kapisini degistirmez ve
+  `sql_differential` kapisi varsayilan kosuda **`pg=not-run`** yazmaya
+  devam eder. Durust sinir: bu ortamda `psql` **yoktur**; `run_pg.sh`
+  burada yalnizca SKIP yolunda (cikis 77, `SKIP pg-live | psql yok`)
+  dogrulandi, `psql` dalı ve CI isi **hic kosmadi** (bkz.
+  `docs/engineering/SQL_DIFFERENTIAL.md`).
 - **Yedek/geri yukleme**: `RestoreFrom` yazmadan once tam sayfa dogrulamasi
   yapar; `Verify`/`VerifyBackup` yalnizca reddeder, onarmaz. Iki gercek hata
   kapatildi (freelist trunk yanlis pozitifi; bozuk yedek uzerine sessiz

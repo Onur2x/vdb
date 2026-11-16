@@ -213,6 +213,11 @@ Last verified state (2026-11-16, Linux x86_64 and Windows i386, `tests/run_gates
 
 That is **41 gates** on Linux (plus two OpenSSL opt-in gates skipped when
 `VDB_CRYPTO_DLL` is unset) and **40 gates** on Windows (`tls_client` skipped).
+The live PostgreSQL comparison is **not** one of those gates: it is a separate
+CI job `sql_differential_postgres` (`.github/workflows/ci.yml` +
+`tests/sql_differential/run_pg.sh`) that never runs in the default gate matrix,
+exits **77 (SKIP)** when `psql` or the connection is unavailable, and has not been
+run in this environment (`pg=not-run` remains the default-gate truth).
 Gate documents: [docs/engineering/](docs/engineering/).
 
 ```bash
