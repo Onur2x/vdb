@@ -55,6 +55,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `oom` | **bellek tukenmesi** (SKILL3 §12.1): `VDbMM`'e yalniz test icin `MMInjectFault` kancasi eklendi (esik ustundeki tahsislerde bir kez `EOutOfMemory`, sonra kapanir). Okuma ve yazma yollari ayri olculur; nil donen tahsis `SetLength` icinde `EAccessViolation`'a donustugu icin **yanlis** bir benzetimdi, gercek heap gibi `EOutOfMemory` atiliyor. **Bulunan gercek hata (F16, KRITIK):** yazma sirasindaki tahsis hatasi dosyada taninmayan sayfa birakiyordu (`EVdbHeap: sayfa N taninmiyor`); `ExtendFile` once buyutup sonra `Inc(FPageCount)` yapar, `AllocPage` yalnizca bu cagrinin actigi sayfayi geri alir. Hata sonrasi oturum yazmaya devam eder, hayalet satir yok, checkpoint ve yeniden acilis 200 satir + temiz `VERIFY` |
 | `btree_scale` | **B+Tree olcek + VACUUM geri kazanma** (SKILL3 §13 olcum-once kurali: "olculebilir bir sorun olmadan spekulatif B+Tree degisikligi yok"): bellekteki `TVDbBTree`'ye 1.000.000 anahtar karisik sirada eklenir; yukseklik **4**, **14.965** yaprak, ortalama doluluk **66/96**, degismezler temiz, `All()` artan, 8.000 rastgele `Find`, `CountRange`/`RankBefore` analitik beklentiyle ayni. Olcek olcusu toplam sure degil **islem basina** maliyettir: 10x veride **3,75x Windows / 4,55x Linux** (karesel agacta ~10x); i386'da 1M anahtar onbellek disina tasindigi icin toplam oran 35-46x cikar ve tek basina yanilticidir. Yarisi silinip yeniden eklenince yaprak sayisi 14.965 -> 14.979 (**1,00x**), yani churn sonrasi yaprak parcalanmasi yok. Diskte 6.000 satir -> %90 sil (dosya kuculmez; `GetDeadBytes` yalniz freelist sayfalarini sayar) -> `VACUUM` **iki platformda da** 1,60 MB'i 151 KB'a indirir (**%90 kazanc**), satir sayisi birebir kalir, sonrasinda 600 satir daha eklemek dosyayi sisirmez, yeniden acilis ve `VERIFY` temiz. Kapi yazilirken **iki gercek motor hatasi** olculdu ve ayni commit'te duzeltildi (v3.43): Unix'te her acilista sizan dosya tanitici (F17) ve basarisiz dosya degistirmeyi basarili bildiren sessiz yutma (F18) - Linux'un yer kazanmadan `VACUUM` kazanci bildirmesinin nedeni buydu |
 | `wal_limit` | **WAL icin sert boy tavani** (SKILL3 §6.3: "Any WAL limit must fail safely without corrupting committed data"): `VDB_WAL_MAX_BYTES` = 64 MiB varsayilan, `WalMaxBytes` ozelligi ile degistirilebilir (0 = kapali). Kapi tavani 300 000 bayta indirir ve su davranisi kilitler: 100 autocommit ekleme tavanin cok altinda kalir ve rahatlatma checkpoint'i **gercekten** calisir (`checkpoint 0 -> 11`); `VAL_LEN=6000` ile 250 satirlik **tek** islem commit aninda `ecLimit` alir ve mesaj tavani adlandirir (`WAL boyu siniri asildi (2090928 bayt > 300000 bayt)`); reddedilen islem **hayalet satir birakmaz** (`COUNT(*)` 100'de kalir), hemen ardindan gelen kucuk yazim basarilidir (ret kilidi yok), WAL tavanin altina doner, onceki onayli satirlar bozulmadan okunur; ayni islem `WalMaxBytes := 0` ile commit edilir (350 satir), acik checkpoint sonrasi yazim devam eder (355 satir, WAL tekrar tavan altinda) ve yeniden acilis 355 satiri + temiz `VERIFY` verir. Sert kontrol `DoCommit` icinde, butun cerceveler tampona girdikten ve `FWal.Bytes` kesinlestikten SONRA ama WAL'e tek bayt yazilmadan ONCE yapilir; temizlik backend'in mevcut `RecoverAfterDurabilityFailure` yolundadir (cift kurtarma yok). Iki platformda birebir ayni cikti: **19 PASS / 0 FAIL** |
+| `net_fuzz` | **genis ag fuzz'i** (SKILL3 §6/§11: bozuk ag girdisi sunucuyu dusurmemeli): gercek `TVdbPgServer` (PG wire) loopback'te **trust** modda, `MaxConns=256` (kapasite asla basarisizlik nedeni olmasin diye). 15 saldiri ailesi + tohumlanmis deterministik mutasyon dongusu: startup uzunlugu `70000` ve `2^31-1`, kesik startup, `0`/`4`/`0xFFFFFFFF`, bilinmeyen protokol kodu, 512 rastgele bayt, gecerli startup sonrasi 30 rastgele mesaj tipi, `Q` uzunlugu `64MB+1`, `Q` uzunlugu `3`, ilan edilip kesilen `Q` govdesi, NUL'suz/kontrol baytli/bos sorgu, 20 ardisik `SSLRequest` (her biri `N`, sonra ayni sokette gercek sorgu), 40 kisa cop baglanti, 120 yinelemeli tohumlanmis mutasyon (her 20 yinelemede canlilik kontrolu), bozuk genisletilmis protokol (`P`/`B`/`E`/`D`) ve 4 is parcacigi x 8 eszamanli fuzz. Her saldiridan SONRA gecerli bir istemci startup'i tamamlayip `SELECT 1` calistirir; kapi sunucunun cokmedigini, baglanti kabul etmeye devam ettigini ve gercek sorgu yaniti verdigini boyle olcer. Kapi yazilirken bir **test istemcisi** hatasi ortaya cikti (genisletilmis protokol hatasindan sonra sunucu yalnizca `Sync` bekledigi icin istemci `Z` bekleyip kilitleniyordu; saldiri dizisi her bozuk mesajdan sonra `Sync` gonderir) - sunucu tarafinda degisiklik gerekmedi. Iki platformda birebir ayni: **39 PASS / 0 FAIL** |
 | `auth_throttle` | SCRAM deneme sinirlama/kilit |
 | `selftest_builtin` | provider SelfTest (builtin) |
 | `tls_client` | istemci CA + sunucu adi dogrulamasi (OpenSSL varsa) |
@@ -595,3 +596,39 @@ kaldirildi:
     tasir: acik islem varken checkpoint KIRLI sayfalari diske yazar ve
     yarim islemi kalicilastirirdi.
   - Diger kapilar degismedi (`sql_differential` yine `pg=not-run`).
+- Otuzuncu kosu (PHASE-26 ikinci commit'i, genis ag fuzz'i): **iki
+  platform da YESIL**. Git Bash/Windows **38 kapi** PASS (`tls_client`
+  SKIP), WSL x86_64 Linux **39 kapi** PASS (OpenSSL istege bagli iki kapi
+  SKIP). Yeni kapi `net_fuzz` **39 PASS / 0 FAIL**, iki platformda birebir
+  ayni cikti.
+  - **Yeni kapi `net_fuzz` 39 PASS / 0 FAIL**: onceki en genis ag testi
+    `server_failure` icindeki iki bozuk cerceveydi (SF5: 64 x `$FF`,
+    SF6: `$06000000` uzunluk oneki) ve o kapi **VDB ikili protokolunu**
+    hedefliyordu, PG wire'i degil. Yeni kapi gercek `TVdbPgServer`'i
+    loopback'te trust modda, `MaxConns=256` ile dener (kapasite asla
+    basarisizlik nedeni olmasin; SF4 zaten `MaxConns` sinirini olcuyor).
+  - **Oracle her saldirida ayni**: bozuk girdiden sonra sunucu cokmemeli ve
+    **gecerli** bir istemci startup'i tamamlayip `SELECT 1` yanitini
+    almalidir; kapi "sunucu ayakta" demiyor, gercek sorgu yanitini olcuyor.
+  - **Saldiri aileleri (N1-N15)**: startup uzunlugu `70000` ve `2^31-1`
+    (baslik gonderilir, dev tahsis yapilmaz), kesik startup (100 ilan, 10
+    bayt), `0`/`4`/`0xFFFFFFFF`, bilinmeyen protokol kodu `196609`, 512
+    rastgele bayt, gecerli startup sonrasi 30 rastgele mesaj tipi/govdesi,
+    `Q` uzunlugu `64MB+1`, `Q` uzunlugu `3`, ilan edilip kesilen `Q`
+    govdesi, NUL'suz + kontrol baytli (`$01`, `$1b`, gomulu NUL) + bos
+    sorgu, **20 ardisik `SSLRequest`** (her biri `N` yaniti, sonra ayni
+    sokette gercek startup + sorgu), 40 kisa cop baglanti (accept/temizlik
+    yolu), 120 yinelemeli **tohumlanmis** mutasyon dongusu (kendi LCG'si,
+    `Randomize`/uyku yok; her 20 yinelemede canlilik kontrolu, en az 100
+    baglanti sarti), bozuk genisletilmis protokol (`P` bos, `P` 2 OID ilan
+    edip 4 bayt gonderme, `B` olmayan statement'a baglanma, bos `E`/`D`)
+    ve 4 is parcacigi x 8 eszamanli fuzz.
+  - **Kapi yazilirken bulunan hata test istemcisindeydi, sunucuda degil**:
+    genisletilmis protokol hatasindan sonra sunucu `skipUntilSync` ile
+    yalnizca `Sync` bekler ve `Z` gondermez; istemci `Z` bekledigi icin
+    N14 kilitlendi. Duzeltme: her bozuk mesajdan sonra `Sync` gonderilir ve
+    sonra gercek sorgu ile toparlanma dogrulanir. Sunucu davranisi **dogru**
+    cikti, bu yuzden motor tarafinda degisiklik yapilmadi; kapinin degeri
+    tam olarak bu davranisi kilitlemesidir.
+  - `MaybeCheckpoint`, `DoCommit` ve `wal_limit` degismedi; diger kapilar
+    ayni (`sql_differential` yine `pg=not-run`).

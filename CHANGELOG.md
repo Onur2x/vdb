@@ -25,6 +25,20 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   kullanici ile yanlis parola ayni hatayi verir.
 - **Desteklenmeyen yollar sessiz yanlis sonuc uretmez**: uygulanmamis SQL
   yuzeyi `ecUnsupported` ile reddedilir (`docs/engineering/SQL_STUB_SURFACE.md`).
+- **Genis ag fuzz'i** (v3.45): yeni `net_fuzz` kapisi gercek PG wire
+  sunucusunu loopback'te trust modunda, `MaxConns=256` ile (kapasite asla
+  basarisizlik nedeni olmasin diye) 15 saldiri ailesi + tohumlanmis
+  deterministik mutasyon dongusuyle dener: startup uzunluklari `70000` ve
+  `2^31-1`, kesik startup, `0`/`4`/`0xFFFFFFFF`, bilinmeyen protokol kodu,
+  512 rastgele bayt, gecerli startup sonrasi 30 rastgele mesaj tipi, `Q`
+  uzunlugu `64MB+1`, `Q` uzunlugu `3`, ilan edilip kesilen `Q` govdesi,
+  NUL'suz/kontrol baytli/bos sorgu, 20 ardisik `SSLRequest` (her biri `N`)
+  ve ayni sokette gercek sorgu, 40 kisa cop baglanti, 120 yinelemeli
+  tohumlanmis mutasyon (her 20 yinelemede canlilik kontrolu), bozuk
+  genisletilmis protokol (`P`/`B`/`E`/`D`, her birinden sonra `Sync` ve
+  gercek sorgu) ve 4 is parcacigi x 8 eszamanli fuzz. Her saldiridan SONRA
+  gecerli bir istemci startup'i tamamlayip `SELECT 1` calistirmalidir;
+  kapi 39 kontrol, iki platformda birebir ayni.
 
 ### Dayaniklilik
 

@@ -14,8 +14,8 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 - **Denetim kapsami**: SKILL2 §18-28 ve SKILL3 §5-§15, §19. Depolama
   motoru, WAL/kurtarma, islem izolasyonu, B+Tree, SQL yurutucu, guvenlik,
   kaynak sinirlari, performans, tasinabilirlik, belge.
-- **Kosulan testler**: `tests/run_gates.sh` - Linux **38 kapi**, Windows
-  **37 kapi** (`tls_client` atlanir), tamami PASS.
+- **Kosulan testler**: `tests/run_gates.sh` - Linux **39 kapi**, Windows
+  **38 kapi** (`tls_client` atlanir), tamami PASS.
 
 ## Findings
 
@@ -77,7 +77,7 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 
 | Sonuc | Linux | Windows |
 |---|---|---|
-| PASS (kapi) | **37** | **36** |
+| PASS (kapi) | **39** | **38** |
 | FAIL | 0 | 0 |
 | SKIP (`VDB_CRYPTO_DLL` yok) | 2 (`fixtures_openssl`, `selftest_openssl`) | 3 (+`tls_client`) |
 | Calistirilmayan | canli PostgreSQL karsilastirmasi (`sql_differential` `pg=not-run`) | ayni |
@@ -91,6 +91,7 @@ format_compat 28/0, portability 29/0, multi_writer 12/0, bench_report 35/0,
 sql_features 32/0, limits 18/0, cache_pressure 8/0, page_corrupt 8/0,
 server_harden 24/0, server_failure 16/0, auth_throttle 16/0,
 disk_full 16/0, txn_limit 18/0, oom 9/0, btree_scale 15/0, wal_limit 19/0,
+net_fuzz 39/0,
 selftest_builtin PASS, tls_client 6/0 (yalniz Linux).
 
 ## Remaining Risks
@@ -109,7 +110,7 @@ bilincli olarak disarida).
 | Onbellek tukenmesi / tahliye | VAR (`cache_pressure`: 8 sayfalik havuz, kirli tahliye, yeniden acilis) |
 | Asiri baglanti | VAR (`server_failure` SF4: `MaxConns=1` iken ikinci baglanti `RSP_ERROR` + `kapasite dolu` alir, birincisi calismaya devam eder) |
 | Asiri islem | VAR (`txn_limit`: 300 kisa islem + 75 geri alma birebir dogrulanir; ic ice `BEGIN` / islem yokken `COMMIT`/`ROLLBACK` sessiz no-op; dosya basina tek yazar rezervasyonu, kisa busy suresiyle kontrollu `mesgul` ve birakilinca yeniden tamamlama) |
-| Bozuk ag girdisi | VAR (`server_failure` SF5/SF6: cop baytlar ve sahte 96 MiB uzunluk oneki sunucuyu oldurmez) |
+| Bozuk ag girdisi | VAR (`net_fuzz`: gercek PG wire sunucusu loopback'te trust modda, `MaxConns=256` ile 15 saldiri ailesi + 120 yinelemeli tohumlanmis mutasyon + 4 eszamanli is parcacigi; her saldiridan sonra gecerli istemci startup'i tamamlayip `SELECT 1` yaniti alir. Ayrica `server_failure` SF5/SF6 ikili protokolde cop baytlar ve sahte 96 MiB uzunluk oneki) |
 | Bozuk veritabani / WAL | VAR (`page_integrity`, `integrity_check`, `wal_crash`, `format_compat`) |
 | Gecersiz sifreleme anahtari | VAR (`crypto_fixtures`) |
 | Sayfa numarasi / yirtik yazma bozulmasi | VAR (`page_corrupt`: normal okuma yolu her sayfayi dogrular; `page_integrity`, `integrity_check`) |
@@ -139,13 +140,14 @@ karsilastirmasi kosmadi.
 **BETA CANDIDATE**
 
 Gerekce: kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici
-bir regresyon kapisiyla kilitlendi; iki platformda 38/37 kapi yesil; tek
-dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari, disk dolu,
+bir regresyon kapisiyla kilitlendi; iki platformda 39/38 kapi yesil; tek
+dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari, bozuk ag
+girdisi (genis fuzz), disk dolu,
 islem sayisi basinci, bellek tukenmesi, WAL sert boy tavani, B+Tree
 olcek/parcalanma ve VACUUM geri kazanimi ile tasinabilirlik olculdu. Olcum
 kapisinin kendisi iki kritik hata buldu (F17 Unix fd sizintisi, F18 sahte
 basarili dosya degistirme); ikisi de kapatildi ve ayni kapiyla kilitlendi.
-Buna karsin genis ag fuzz'i ve ayri B+Tree disk sayfa bicimi yok; canli
+Buna karsin ayri B+Tree disk sayfa bicimi yok; canli
 PostgreSQL diferansiyeli kosmadi; TLS varsayilan olarak kapali. Bu nedenle
 "PRODUCTION CANDIDATE" degil.
 

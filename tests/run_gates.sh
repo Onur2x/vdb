@@ -156,6 +156,7 @@ build_gate txn_limit      "$ROOT/tests/txn_limit/txn_limit.lpr"
 build_gate oom            "$ROOT/tests/oom/oom.lpr"
 build_gate btree_scale    "$ROOT/tests/btree_scale/btree_scale.lpr"
 build_gate wal_limit      "$ROOT/tests/wal_limit/wal_limit.lpr"
+build_gate net_fuzz       "$ROOT/tests/net_fuzz/net_fuzz.lpr"
 build_gate tls_client    "$ROOT/tests/tls_client/tls_client_gate.lpr"
 
 # --- kosum -----------------------------------------------------------
@@ -200,6 +201,7 @@ run_gate txn_limit      "$WORK/txn_limit"      txn_limit
 run_gate oom            "$WORK/oom"            oom
 run_gate btree_scale    "$WORK/btree_scale"    btree_scale
 run_gate wal_limit      "$WORK/wal_limit"      wal_limit
+run_gate net_fuzz       "$WORK/net_fuzz"       net_fuzz
 
 run_gate selftest_builtin "$WORK/crypto_selftest" selftest_runner builtin
 
