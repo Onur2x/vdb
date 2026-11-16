@@ -204,10 +204,11 @@ Last verified state (2026-11-15, Linux x86_64 and Windows i386, `tests/run_gates
 | `disk_full` | 16 / 0 (short write / hard write fault on page, meta and **WAL** writes all raise a controlled `ecIOError`; the frame stays dirty, `ROLLBACK` and later commits work, a failed commit leaves **no ghost rows** in the same session (`COUNT(*)` equals the durable state), checkpoint succeeds once the fault clears, reopen + `VERIFY` clean) |
 | `txn_limit` | 18 / 0 (300 short transactions and 75 rollbacks counted exactly; nested `BEGIN`, bare `COMMIT` and bare `ROLLBACK` are documented no-ops; one writer reservation per file gives a controlled `mesgul` under a short busy timeout and completes after release; reopen 578 rows + clean `VERIFY`) |
 | `oom` | 9 / 0 (an allocation failure surfaces as a controlled `EOutOfMemory` on both the read and the write path; page allocation is atomic, so a failed growth never publishes a page number, a failed commit leaves no ghost rows, checkpoint succeeds and a reopen returns 200 rows with a clean `VERIFY`) |
+| `btree_scale` | 15 / 0 (1,000,000 keys in one in-memory B+Tree: height 4, 14,965 leaves, 66/96 average leaf fill, invariants clean, `All()` ascending, 8,000 random finds, `CountRange`/`RankBefore` analytic, per-operation cost grows only 3.75x on Windows / 4.55x on Linux for 10x data; deleting half and re-inserting keeps leaves at 1.00x; on disk 6,000 rows -> delete 90% -> `VACUUM` reclaims 1.45 MB of 1.60 MB **on both platforms** (1,601,536 -> 151,552 bytes), count stays exact, re-insert does not balloon the file, reopen + `VERIFY` clean. The gate caught two real engine defects fixed in v3.43: a file descriptor leaked on every UNIX open, and a failed file swap that still reported success — which is why Linux used to report a `VACUUM` gain while reclaiming nothing) |
 | `tls_client` | 6 / 0 (Linux; skipped on Windows without OpenSSL DLL) |
 
-That is **36 gates** on Linux (plus two OpenSSL opt-in gates skipped when
-`VDB_CRYPTO_DLL` is unset) and **35 gates** on Windows (`tls_client` skipped).
+That is **37 gates** on Linux (plus two OpenSSL opt-in gates skipped when
+`VDB_CRYPTO_DLL` is unset) and **36 gates** on Windows (`tls_client` skipped).
 Gate documents: [docs/engineering/](docs/engineering/).
 
 ```bash

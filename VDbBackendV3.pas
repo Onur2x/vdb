@@ -5368,9 +5368,25 @@ begin
           FTagCountsValid := False;
         end;
       except
-        FreeAndNil(FEng);
+        on E2: Exception do
+        begin
+          FreeAndNil(FEng);
+          { v3.43 DUZELTME (olculen hata): geri donus de patlarsa sessiz
+            kalmak backend'i FEng=nil ile birakirdi; acik hata ver. }
+          raise EVdbBackendV3.Create(
+            'dosya degistirme basarisiz ve eski dosya geri kurulamadi: ' +
+            E2.ClassName + ': ' + E2.Message);
+        end;
       end;
+      if FEng = nil then
+        raise EVdbBackendV3.Create(
+          'dosya degistirme basarisiz: eski dosya geri kurulamadi: ' + FPath);
     end;
+    { v3.43 DUZELTME (olculen hata): bu `except` hatayi YUTUYORDU. Dosya
+      degistirme (VACUUM/RESTORE/REKEY) basarisiz oldugunda cagiran basari
+      saniyordu: Linux'ta VACUUM hicbir sey yapmadan "basarili" donuyor ve
+      eski boyut bildiriliyordu. Simdi hata yukari tasinir. }
+    raise;
   end;
 end;
 

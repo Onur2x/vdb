@@ -204,10 +204,11 @@ Son doğrulanan durum (2026-11-15, Linux x86_64 ve Windows i386, `tests/run_gate
 | `disk_full` | 16 / 0 (sayfa, meta ve **WAL** yazmalarında kısa yazma ve sert yazma hatası kontrollü `ecIOError` üretiyor; çerçeve kirli kalıyor, `ROLLBACK` ve sonraki commit'ler çalışıyor, başarısız commit aynı oturumda **hayalet satır** bırakmıyor (`COUNT(*)` durabil durumla aynı), hata geçince checkpoint başarılı, yeniden açılış + `VERIFY` temiz) |
 | `txn_limit` | 18 / 0 (300 kısa işlem ve 75 geri alma birebir sayılıyor; iç içe `BEGIN`, işlem yokken `COMMIT` ve `ROLLBACK` belgelenmiş no-op; dosya başına tek yazar rezervasyonu kısa busy süresinde kontrollü `meşgul` veriyor ve bırakılınca işlem tamamlanıyor; yeniden açılışta 578 satır + temiz `VERIFY`) |
 | `oom` | 9 / 0 (tahsis hatası hem okuma hem yazma yolunda kontrollü `EOutOfMemory` olarak yüzeye çıkıyor; sayfa ayırma atomik, başarısız büyüme sayfa numarası yayınlamıyor, başarısız commit hayalet satır bırakmıyor, checkpoint başarılı ve yeniden açılışta 200 satır + temiz `VERIFY`) |
+| `btree_scale` | 15 / 0 (tek bellekteki B+Tree'de 1.000.000 anahtar: yükseklik 4, 14.965 yaprak, ortalama yaprak doluluğu 66/96, değişmezler temiz, `All()` artan, 8.000 rastgele `Find`, `CountRange`/`RankBefore` analitik beklentiyle aynı, 10x veride işlem başına maliyet yalnız 3,75x Windows'ta / 4,55x Linux'ta; yarısını silip yeniden eklemek yaprak sayısını 1,00x tutuyor; diskte 6.000 satır -> %90 sil -> `VACUUM` **iki platformda da** 1,60 MB'ın 1,45 MB'ını geri kazanıyor (1.601.536 -> 151.552 bayt), sayı birebir kalıyor, yeniden ekleme dosyayı şişirmiyor, yeniden açılış + `VERIFY` temiz. Kapı iki gerçek motor hatasını yakaladı ve v3.43'te düzeltildi: Unix'te her açılışta sızan dosya tanıtıcısı ve başarısız dosya değişimini başarılı bildiren sessiz hata — Linux'un yer kazanmadan `VACUUM` kazancı bildirmesinin nedeni buydu) |
 | `tls_client` | 6 / 0 (Linux; OpenSSL DLL'i olmayan Windows'ta atlanır) |
 
-Linux'ta **36 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
-atlanır), Windows'ta **35 kapı** (`tls_client` atlanır). Kapı belgeleri:
+Linux'ta **37 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
+atlanır), Windows'ta **36 kapı** (`tls_client` atlanır). Kapı belgeleri:
 [docs/engineering/](docs/engineering/).
 
 ```bash

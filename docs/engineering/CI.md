@@ -53,6 +53,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `disk_full` | **disk dolu / kisa yazma** (SKILL3 §12.1): sayfa, meta ve **WAL** yazmalari tek noktadan (`WriteBytesChecked` / `WriteChecked`) gecer; enjekte edilen sert hata ve yarim yazma (gercek `ENOSPC` davranisi) kontrollu `ecIOError` uretir, surec cokmez, cerceve **kirli** kalir. Basarisiz commit **hayalet satir** birakmaz (ayni oturumda `COUNT(*)` durabil durumla ayni). Hata + `ROLLBACK` sonrasi onayli satirlar durur, hata giderilince checkpoint ve yeni commit calisir, yeniden acilista tum onayli satirlar okunur ve `VERIFY` temizdir |
 | `txn_limit` | **islem sayisi / yazar cakismasi** (SKILL3 §12.2): 300 kisa islem ve 300 islemin 75'i geri alinarak commit sayisi birebir dogrulanir (sessiz kayip yok). Belgelenen v3 semantigi olculur: ic ice `BEGIN`, islem yokken `COMMIT`/`ROLLBACK` **sessiz no-op**'tur (tek islem katmani). Dosya basina **tek yazar rezervasyonu** vardir: bir oturum tutarken digeri kisa busy suresiyle kontrollu `mesgul` hatasi alir, `ROLLBACK` ile temizlenir, rezervasyon birakilinca ayni islem basariyla tamamlanir; yeniden acilista tum satirlar + `VERIFY` temiz |
 | `oom` | **bellek tukenmesi** (SKILL3 §12.1): `VDbMM`'e yalniz test icin `MMInjectFault` kancasi eklendi (esik ustundeki tahsislerde bir kez `EOutOfMemory`, sonra kapanir). Okuma ve yazma yollari ayri olculur; nil donen tahsis `SetLength` icinde `EAccessViolation`'a donustugu icin **yanlis** bir benzetimdi, gercek heap gibi `EOutOfMemory` atiliyor. **Bulunan gercek hata (F16, KRITIK):** yazma sirasindaki tahsis hatasi dosyada taninmayan sayfa birakiyordu (`EVdbHeap: sayfa N taninmiyor`); `ExtendFile` once buyutup sonra `Inc(FPageCount)` yapar, `AllocPage` yalnizca bu cagrinin actigi sayfayi geri alir. Hata sonrasi oturum yazmaya devam eder, hayalet satir yok, checkpoint ve yeniden acilis 200 satir + temiz `VERIFY` |
+| `btree_scale` | **B+Tree olcek + VACUUM geri kazanma** (SKILL3 §13 olcum-once kurali: "olculebilir bir sorun olmadan spekulatif B+Tree degisikligi yok"): bellekteki `TVDbBTree`'ye 1.000.000 anahtar karisik sirada eklenir; yukseklik **4**, **14.965** yaprak, ortalama doluluk **66/96**, degismezler temiz, `All()` artan, 8.000 rastgele `Find`, `CountRange`/`RankBefore` analitik beklentiyle ayni. Olcek olcusu toplam sure degil **islem basina** maliyettir: 10x veride **3,75x Windows / 4,55x Linux** (karesel agacta ~10x); i386'da 1M anahtar onbellek disina tasindigi icin toplam oran 35-46x cikar ve tek basina yanilticidir. Yarisi silinip yeniden eklenince yaprak sayisi 14.965 -> 14.979 (**1,00x**), yani churn sonrasi yaprak parcalanmasi yok. Diskte 6.000 satir -> %90 sil (dosya kuculmez; `GetDeadBytes` yalniz freelist sayfalarini sayar) -> `VACUUM` **iki platformda da** 1,60 MB'i 151 KB'a indirir (**%90 kazanc**), satir sayisi birebir kalir, sonrasinda 600 satir daha eklemek dosyayi sisirmez, yeniden acilis ve `VERIFY` temiz. Kapi yazilirken **iki gercek motor hatasi** olculdu ve ayni commit'te duzeltildi (v3.43): Unix'te her acilista sizan dosya tanitici (F17) ve basarisiz dosya degistirmeyi basarili bildiren sessiz yutma (F18) - Linux'un yer kazanmadan `VACUUM` kazanci bildirmesinin nedeni buydu |
 | `auth_throttle` | SCRAM deneme sinirlama/kilit |
 | `selftest_builtin` | provider SelfTest (builtin) |
 | `tls_client` | istemci CA + sunucu adi dogrulamasi (OpenSSL varsa) |
@@ -515,3 +516,50 @@ kaldirildi:
   - `disk_full` **16 PASS / 0 FAIL**, `txn_limit` **18 PASS / 0 FAIL**
     (degismedi; ayni kosuda yeniden dogrulandi).
   Diger kapilar degismedi.
+- Yirmi sekizinci kosu (PHASE-25 commit'i, SKILL3 §13 B+Tree olcek + VACUUM):
+  **iki platform da YESIL**. Git Bash/Windows **36 kapi** PASS
+  (`tls_client` SKIP), WSL x86_64 Linux **37 kapi** PASS (OpenSSL istege
+  bagli iki kapi SKIP). Kapi once yalniz olcum olarak yazildi; Linux'ta
+  BS11 kirmizi cikinca **iki gercek motor hatasi** olculdu ve duzeltildi
+  (v3.43) - yani SKILL3'un "olculebilir sorun olmadan degisiklik yok"
+  kurali tam olarak isini yapti: sorun olculdu, sonra duzeltildi.
+  - **F17 (KRITIK): Unix'te her acilis bir dosya tanitici sizdiriyordu.**
+    `VDbSync.VDbOpenStreamNoFlock` fd'yi `FpOpen` ile acip
+    `THandleStream`'e sariyordu; FPC'nin `THandleStream.Destroy` handle'i
+    KAPATMAZ. Windows'ta belirti vermez; WSL `/mnt/d` (9p) uzerinde ise
+    sinsi: acik handle'i olan bir dosyanin `rename`'i True doner ama
+    tembel uygulanir (dosya iki adin altinda da gorunmez). Bu yuzden
+    `VACUUM`'in `.bak` degisimi yeni dosyayi acamadi, eskisini geri
+    koydu ve **VACUUM hic yer kazanmadi** (BS11 `eski=1601536
+    yeni=1449984`). Duzeltme: `TVDbFdStream = class(THandleStream)` +
+    `Destroy`'da `FpClose(Handle)` (repodaki tek `THandleStream.Create`).
+  - **F18 (KRITIK): basarisiz dosya degistirme sessizce basarili
+    gorunuyordu.** `SwapDbFileWith`'in dis `except`'i hatayi yutuyordu;
+    `.bak` geri kurulumu basarisiz olsa bile `Compact`/`RESTORE`/`REKEY`
+    normal donuyor, VACUUM sahte `kazanc` sayilari basiyordu (F17 ile
+    birlesince Linux'ta tam olarak bu oldu). Artik acik hata firlatilir ve
+    hata yukari tasinir; backend `FEng=nil` ile kilitsiz birakilmaz.
+  - **Yeni kapi `btree_scale` 15 PASS / 0 FAIL** (BS1-BS14), iki
+    platformda da: bellekte 1.000.000 anahtar (karisik sirada) ->
+    yukseklik **4**, **14.965** yaprak, ortalama doluluk **66/96**,
+    degismezler temiz, `All()` artan, 8.000/8.000 `Find`,
+    `CountRange(k100000..k199999)=100000`, `RankBefore(k500000)=500000`.
+  - Olcek (platform adiyla): Windows 100k **219 ms**, 1M **8.203 ms**;
+    Linux 100k **281 ms**, 1M **12.789 ms**. Toplam oran 35-46x
+    YANILTICI (i386/x86_64'te 1M anahtar onbellek disina tasar); dogru
+    olcu **islem basina** maliyet: Windows **3,75x**, Linux **4,55x**,
+    karesel agacta ~10x olurdu. Esik 6.
+  - Churn: 500.000 silme 1.265 ms (Windows) / 1.466 ms (Linux),
+    yukseklik 4'te kalir; yarisi yeniden eklenince yaprak 14.965 ->
+    14.979 (**1,00x**) - yaprak parcalanmasi yok.
+  - Disk (iki platformda da ayni): 6.000 satir 1.449.984 bayt mantiksal /
+    1.601.536 fiziksel; %90 silinince dosya KUCULMEZ (belgelenen
+    davranis, `oluBayt=0` cunku `GetDeadBytes` yalniz freelist
+    sayfalarini sayar); `VACUUM` 1.601.536 -> 151.552 bayt (**%90
+    kazanc**); satir sayisi 600 birebir, degerler dogru; yeniden 600
+    satir eklenince 294.912 bayt (tavan 1.449.984, sisme yok); yeniden
+    acilis + `VERIFY` temiz (`sayfa=72 serbest=0 heap=71 tasma=0
+    trunk=0 anahtar=1201 lsn=5`).
+  - `oom` **9 PASS / 0 FAIL**, `disk_full` **16 PASS / 0 FAIL**,
+    `txn_limit` **18 PASS / 0 FAIL** (degismedi; ayni kosuda yeniden
+    dogrulandi).

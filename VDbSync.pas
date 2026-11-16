@@ -421,6 +421,30 @@ begin
 end;
 {$ENDIF}
 
+{$IFDEF UNIX}
+type
+  { v3.43 DUZELTME (olculen hata): FPC'nin THandleStream'i handle'i KAPATMAZ.
+    Once `FpOpen` ile alinan fd `THandleStream.Create(fd)` ile sarilip
+    `Free` ediliyordu; fd acik kaliyor ve UNIX'te her acilis/kapanis bir fd
+    siziyordu. Olculdu: FreeAndNil'den sonra /proc/self/fd hala dosyayi
+    gosteriyor. Sonuc: (a) uzun omurlu sunucuda fd tukenmesi, (b) dosya
+    hala acikken yapilan rename (VACUUM/RESTORE/REKEY) drvfs/9p gibi
+    dosya sistemlerinde ERTELENIR — rename basarili doner ama dosya iki
+    adin hicbirinde gorunmez, SwapDbFileWith yeni dosyayi acamaz ve VACUUM
+    sessizce hicbir sey yapmaz. Bu alt sinif fd'yi kapatir. }
+  TVDbFdStream = class(THandleStream)
+  public
+    destructor Destroy; override;
+  end;
+
+destructor TVDbFdStream.Destroy;
+begin
+  if Handle >= 0 then
+    FpClose(Handle);
+  inherited Destroy;
+end;
+{$ENDIF}
+
 function VDbOpenStreamNoFlock(const APath: string; AReadOnly: Boolean;
   ACreate: Boolean): THandleStream;
 {$IFDEF UNIX}
@@ -440,7 +464,7 @@ begin
   if fd < 0 then
     raise EFOpenError.CreateFmt(
       'Unable to open file "%s": %s', [APath, SysErrorMessage(fpGetErrno)]);
-  Result := THandleStream.Create(fd);
+  Result := TVDbFdStream.Create(fd);   // v3.43: kapanista fd'yi kapatir
   {$ELSE}
   if AReadOnly then
     Result := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone)

@@ -14,8 +14,8 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 - **Denetim kapsami**: SKILL2 §18-28 ve SKILL3 §5-§15, §19. Depolama
   motoru, WAL/kurtarma, islem izolasyonu, B+Tree, SQL yurutucu, guvenlik,
   kaynak sinirlari, performans, tasinabilirlik, belge.
-- **Kosulan testler**: `tests/run_gates.sh` - Linux **36 kapi**, Windows
-  **35 kapi** (`tls_client` atlanir), tamami PASS.
+- **Kosulan testler**: `tests/run_gates.sh` - Linux **37 kapi**, Windows
+  **36 kapi** (`tls_client` atlanir), tamami PASS.
 
 ## Findings
 
@@ -37,6 +37,8 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 | F14 | ORTA | `VDbPageStore.WritePageAt` / `SaveMeta` / `InstallPage` / `GrowTo` | Disk doldu (ENOSPC) yolunda `THandleStream.Write` kisa yazmayi `0`'a cevirdigi icin yazma **sessizce** basarisiz olabiliyordu; buyume yolunda ham `EWriteError` siziyordu | Tek yazma noktasi `WriteBytesChecked`: enjekte edilen hata + kisa yazma kontrollu `ecIOError`; cerceve **kirli** kalir; `GrowTo` mantiksal boyu artirmaz (v3.40) | `disk_full` 16/0 (sayfa, meta ve WAL yazmalari) | KAPALI |
 | F15 | **KRITIK** | `VDbBackendV3.CommitBatch` / `AbortBatch` / `VDbPageWal.Commit` | (a) WAL commit yazimi `WriteBuffer` ile yapiliyordu; kisa yazma ham `EWriteError` olarak siziyordu. (b) `CommitNoSync` ve `MergeTagDeltas` `pendExc` denetiminin **disinda** oldugu icin WAL yazimi basarisiz oldugunda yazma kumesi kaldirilmis, kurtarma blogu atlanmis ama satirlar hem ayni oturumda gorunup hem sonradan **durabil** olabiliyordu (hayalet commit). (c) Canli tablo sayaci commit'ten **once** artirildigi icin basarisiz commit sayaci sisiriyordu (`COUNT(*)` 130 vs durabil 120) | WAL tek yazma noktasi `WriteChecked` -> kontrollu `ecIOError`, kesik kuyruk geri kirpilir; `CommitNoSync` + `MergeTagDeltas` `pendExc` blogunun icine alindi, basarisizlikta `RecoverAfterDurabilityFailure` (+`FWal.Rollback`) ve `FTagCountsValid := False`; `AbortBatch` kendi `TagDelta`'sini temizler (v3.41) | `disk_full` DF8/DF8b/DF8c (WAL yazma hatasi -> kontrollu `ecIOError`, ayni oturumda `COUNT(*)` = durabil 120, yeniden acilis 160 + `VERIFY`) | KAPALI |
 | F16 | **KRITIK** | `VDbPageStore.ExtendFile` / `AllocPage` | Sayfa ayirma iki adimda **gorunur** hale geliyordu: `ExtendFile` once `FPageCount`'u artirip sonra dosyayi buyutuyordu, `AllocPage` ise sayfa numarasini yayinladiktan sonra okuyup baslatiyordu. Arada gelen bir tahsis (`EOutOfMemory`, gercek heap davranisi) sayfa numarasini **taninmayan bir sayfa** olarak dosyada birakiyordu; yeniden acilis taramasi `EVdbHeap: sayfa N taninmiyor (ne VDbPage ne trunk)` ile dosyayi acamiyordu | `ExtendFile` once buyutur, **sonra** `Inc(FPageCount)` yapar; `AllocPage` `GetPageInternal`/`PageInit` hatasinda yalnizca bu cagrinin actigi sayfayi geri alir (`FPageCount`, `FFreshPage`). Freelist'ten gelen sayfa sizinti olarak kalir, ama disaridaki imaji gecerli sayfa/trunk oldugu icin bozulma degildir (v3.42) | `oom` 9/0 (okuma + yazma yolunda enjekte `EOutOfMemory`, hayalet satir yok, yeniden acilis + `VERIFY` temiz) | KAPALI |
+| F17 | **KRITIK** | `VDbSync.VDbOpenStreamNoFlock` (UNIX dali) | fd `FpOpen` ile aciliyor, `THandleStream` ile sariliyordu; FPC'nin `THandleStream.Destroy` handle'i **kapatmaz**, yani acilan her veritabani kapanistan sonra da acik kaliyordu (surec basina bir fd sizintisi). Windows'ta belirti vermez; WSL `/mnt/d` (9p) uzerinde acik handle'li dosyanin `rename`'i `True` doner ama **tembel** uygulanir (dosya iki ad altinda da gorunmez), bu yuzden VACUUM'un `.bak` takasi yeni dosyayi acamayip eski dosyaya donuyordu | UNIX yolunda `TVDbFdStream = class(THandleStream)`, `Destroy` icinde `FpClose(Handle)`; `Open` `TVDbFdStream.Create(fd)` dondurur (depodaki tek `THandleStream.Create` cagrisiydi) (v3.43) | `btree_scale` BS11 (Linux drvfs ve Windows ayni: `eski=1601536 yeni=151552`, yeniden acilis `sayfa=72`) | KAPALI |
+| F18 | **KRITIK** | `TVdbBackendV3.SwapDbFileWith` | Dis `except` blogu hatayi **yutuyordu**: `.bak`'tan geri donus de basarisiz olsa `Compact`/`RESTORE`/`REKEY` normal donuyordu. F17 ile birlesince Linux'ta VACUUM hic yer kazanmadigi halde "kazandi" sayilari raporlaniyordu (sahte basari) | Geri donus basarisizsa acik `EVdbBackendV3` hatasi; hata yukari tasinir, backend `FEng=nil` ile kilitsiz birakilmaz (v3.43) | `btree_scale` BS11/BS12 (her iki platformda `1601536 -> 151552`, `COUNT` 600, `VERIFY` temiz); `backup_restore` 25/0 | KAPALI |
 
 ### Kapatilan test bosluklari (SKILL2 §22, SKILL3 §10.1)
 
@@ -75,7 +77,7 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 
 | Sonuc | Linux | Windows |
 |---|---|---|
-| PASS (kapi) | **36** | **35** |
+| PASS (kapi) | **37** | **36** |
 | FAIL | 0 | 0 |
 | SKIP (`VDB_CRYPTO_DLL` yok) | 2 (`fixtures_openssl`, `selftest_openssl`) | 3 (+`tls_client`) |
 | Calistirilmayan | canli PostgreSQL karsilastirmasi (`sql_differential` `pg=not-run`) | ayni |
@@ -88,7 +90,7 @@ crash_points 24/0, integrity_check 32/0, cache_metrics 21/0,
 format_compat 28/0, portability 29/0, multi_writer 12/0, bench_report 35/0,
 sql_features 32/0, limits 18/0, cache_pressure 8/0, page_corrupt 8/0,
 server_harden 24/0, server_failure 16/0, auth_throttle 16/0,
-disk_full 16/0, txn_limit 18/0, oom 9/0,
+disk_full 16/0, txn_limit 18/0, oom 9/0, btree_scale 15/0,
 selftest_builtin PASS, tls_client 6/0 (yalniz Linux).
 
 ## Remaining Risks
@@ -112,7 +114,9 @@ bilincli olarak disarida).
 | Gecersiz sifreleme anahtari | VAR (`crypto_fixtures`) |
 | Sayfa numarasi / yirtik yazma bozulmasi | VAR (`page_corrupt`: normal okuma yolu her sayfayi dogrular; `page_integrity`, `integrity_check`) |
 | Sunucu kapanisi | VAR (`server_failure` SF7/SF8: acik baglanti varken `Stop` doner, dosya yeniden acilip okunur) |
-| B+Tree disk sayfa bicimi / 1M satir olcek / VACUUM sonrasi parcalanma | YOK |
+| 1M anahtar olcek (bellekteki B+Tree) | VAR (`btree_scale` BS1-BS8: 1.000.000 anahtar, yukseklik 4, 14.965 yaprak, doluluk 66/96; islem basina maliyet 10x veride 3,75x Windows / 4,55x Linux - karesel degil; yarisi silinip yeniden eklenince yaprak sayisi 14.965 -> 14.979 = 1,00x) |
+| VACUUM sonrasi geri kazanma / parcalanma | VAR (`btree_scale` BS9-BS14: 6.000 satir 1.601.536 bayt; %90 silme dosyayi kucultmez (sayfalar yeniden kullanilir), `VACUUM` **iki platformda da** 1.601.536 -> 151.552 bayt = %90 kazanc; sayim birebir, yeniden ekleme sismez, yeniden acilis + `VERIFY` temiz. Bu kapi ayrica F17/F18'i ortaya cikardi: Linux VACUUM'u yer kazanmadan basarili gorunuyordu) |
+| Ayri B+Tree disk sayfa bicimi | YOK (tablo satirlari bellekteki `TVDbBTree` uzerinde durur - bkz. `docs/engineering/BTREE_INTEGRITY.md` §6; ayri indeks dosyasi `VDbIdxFile` bu kapsamda olculmedi) |
 
 **Desteklenmeyen ozellikler**: v4 konteyner bicimi (durduruldu), dis
 bagimlilik yok (saf native, harici DLL yok - OpenSSL istege bagli).
@@ -135,12 +139,15 @@ karsilastirmasi kosmadi.
 **BETA CANDIDATE**
 
 Gerekce: kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici
-bir regresyon kapisiyla kilitlendi; iki platformda 36/35 kapi yesil; tek
-dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari, disk dolu
-ve islem sayisi basinci ile tasinabilirlik olculdu. Buna karsin bellek
-tukenmesi, WAL tukenmesi ve B+Tree olcek/parcalanma gibi uretim hatasi
-yollari test edilmedi; canli PostgreSQL diferansiyeli kosmadi;
-TLS varsayilan olarak kapali. Bu nedenle "PRODUCTION CANDIDATE" degil.
+bir regresyon kapisiyla kilitlendi; iki platformda 37/36 kapi yesil; tek
+dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari, disk dolu,
+islem sayisi basinci, bellek tukenmesi, B+Tree olcek/parcalanma ve VACUUM
+geri kazanimi ile tasinabilirlik olculdu. Olcum kapisinin kendisi iki kritik
+hata buldu (F17 Unix fd sizintisi, F18 sahte basarili dosya degistirme);
+ikisi de kapatildi ve ayni kapiyla kilitlendi. Buna karsin WAL boyu icin sert bir
+tavan, genis ag fuzz'i ve ayri B+Tree disk sayfa bicimi yok; canli PostgreSQL
+diferansiyeli kosmadi; TLS varsayilan olarak kapali. Bu nedenle "PRODUCTION
+CANDIDATE" degil.
 
 Bu siniflandirma bagimsiz dogrulama (harici denetim, resmi sertifika)
 olmadigi icin "certified"/"SIL"/"formal compliance" iddiasi icermez.

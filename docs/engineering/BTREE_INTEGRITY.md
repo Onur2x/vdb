@@ -86,3 +86,63 @@ FPC 3.2.4 aynı sayı).
   yükleme yolu vardır).
 - Performans taban çizgisi `p6-perf-baseline` kalemindedir; bu belge
   yalnızca yapısal doğruluk ve doluluk ölçer.
+
+## 6. Ölçek ölçümü (`btree_scale`, PHASE-25)
+
+SKILL3 §13 kuralı: *"Ölçülebilir bir sorun olmadan spekülatif B+Tree
+değişikliği yapma."* Bu yüzden `tests/btree_scale` **ağaç yapısını
+değiştirmez**; yalnızca ölçer. Ölçüm sırasında `TVDbBTree`'de yapısal bir
+kusur çıkmadı, bu yüzden ağaca müdahale edilmedi — ama kapı **iki gerçek
+motor hatasını** yakaladı (aşağıda F17/F18) ve ikisi de aynı sürümde
+düzeltildi.
+
+| Ölçüm | Windows i386 / FPC 3.2.4 | Linux x86_64 / FPC 3.2.2 |
+|---|---|---|
+| 1.000.000 anahtar, karışık sırada ekleme | **8.203 ms** | **12.789 ms** |
+| 100.000 anahtar (aynı yol) | **219 ms** | **281 ms** |
+| Ölçek (işlem başına maliyet) | **3,75x** | **4,55x** |
+| Yükseklik / yaprak / doluluk | **4** / **14.965** / **66/96** | aynı |
+| `All()` / `Find` / `CountRange` / `RankBefore` | 1.000.000 artan, 8.000/8.000 bulundu, aralık ve sıra analitik beklentiyle aynı | aynı |
+| 500.000 silme (her ikinci anahtar) | 1.265 ms, `Count=500000`, yükseklik 4'te kalır | 1.466 ms, aynı sonuç |
+| Yeniden ekleme sonrası yaprak sayısı | 14.965 → 14.979 (**1,00x**) — churn sonrası yaprak parçalanması yok | aynı |
+
+**Toplam süre oranı (35-46x) tek başına yanıltıcıdır** ve bu yüzden eşik
+olarak kullanılmaz: 1M anahtar önbellek dışına taşar, işlem başına maliyet
+3,75x (Windows) / 4,55x (Linux) büyür. Karesel bir ağaçta işlem başına
+maliyet veriyle doğru orantılı olurdu (10x veride ~10x), bu yüzden kapı
+bunu ölçer. Sayılar mutlak bir garanti değil, bu makinelerdeki
+reproducible ölçümdür; başka donanımda farklı çıkar.
+
+### Diskte ölçek + VACUUM
+
+| Adım | Sonuç (iki platformda da aynı) |
+|---|---|
+| 6.000 satır yaz | 1.449.984 bayt mantıksal / 1.601.536 bayt fiziksel |
+| %90 sil (600 satır kalır) | Dosya **küçülmez** (belgelenen davranış; `GetDeadBytes` yalnız freelist sayfalarını sayar, `oluBayt=0`) |
+| `VACUUM` | 1.601.536 → **151.552** bayt (**%90 kazanç**) |
+| VACUUM sonrası | `COUNT(*)` = 600 birebir, kalan değerler doğru |
+| VACUUM sonrası 600 satır daha ekle | 294.912 bayt (tavan 1.449.984) — dosya şişmez |
+| Yeniden açılış + `VERIFY` | Temiz (`sayfa=72 serbest=0 heap=71 tasma=0 trunk=0 anahtar=1201 lsn=5`) |
+
+### Bu ölçümün yakaladığı iki motor hatası (v3.43)
+
+- **F17 — Unix'te her açılış bir dosya tanıtıcısı sızdırıyordu.** `VDbSync.VDbOpenStreamNoFlock`
+  fd'yi `FpOpen` ile açıp `THandleStream`'e sarıyordu; FPC'nin
+  `THandleStream.Destroy` handle'ı **kapatmaz**. Windows'ta belirti yok;
+  WSL `/mnt/d` (9p) üzerinde açık handle'lı bir dosyanın `rename`'i `True`
+  döner ama tembel uygulanır (dosya iki ad altında da görünmez). Bu yüzden
+  VACUUM'un `.bak` değişimi yeni dosyayı açamadı, eskisini geri koydu ve
+  **VACUUM yer kazanmadı** (BS11 `eski=1601536 yeni=1449984`). Düzeltme:
+  `TVDbFdStream = class(THandleStream)` + `Destroy`'da `FpClose(Handle)`.
+- **F18 — başarısız dosya değiştirme sessizce başarılı görünüyordu.**
+  `SwapDbFileWith`'in dış `except`'i hatayı yutuyordu; `.bak` geri kurulumu
+  başarısız olsa bile `Compact`/`RESTORE`/`REKEY` normal dönüyor ve VACUUM
+  sahte `kazanç` sayıları basıyordu. Artık açık hata fırlatılır, hata
+  yukarı taşınır ve backend `FEng=nil` ile kilitsiz bırakılmaz.
+
+**Dürüst sınır:** diskteki ölçüm tablo satırlarının kullandığı bellekteki
+ağaç (`VDbTable` içindeki `TVDbBTree`) üzerindendir; ayrı bir **disk
+üzerindeki B+tree sayfa biçimi yoktur** ve bu ölçüm onu kanıtlamaz.
+VACUUM'un geri kazanması sayfa deposunun (heap) yeniden yazılmasıyla
+olur, indeks sayfası bölünmesiyle değil.
+

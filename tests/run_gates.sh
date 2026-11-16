@@ -154,6 +154,7 @@ build_gate auth_throttle "$ROOT/tests/server_harden/auth_throttle.lpr"
 build_gate disk_full      "$ROOT/tests/disk_full/disk_full.lpr"
 build_gate txn_limit      "$ROOT/tests/txn_limit/txn_limit.lpr"
 build_gate oom            "$ROOT/tests/oom/oom.lpr"
+build_gate btree_scale    "$ROOT/tests/btree_scale/btree_scale.lpr"
 build_gate tls_client    "$ROOT/tests/tls_client/tls_client_gate.lpr"
 
 # --- kosum -----------------------------------------------------------
@@ -196,6 +197,7 @@ run_gate auth_throttle  "$WORK/auth_throttle"  auth_throttle
 run_gate disk_full      "$WORK/disk_full"      disk_full
 run_gate txn_limit      "$WORK/txn_limit"      txn_limit
 run_gate oom            "$WORK/oom"            oom
+run_gate btree_scale    "$WORK/btree_scale"    btree_scale
 
 run_gate selftest_builtin "$WORK/crypto_selftest" selftest_runner builtin
 

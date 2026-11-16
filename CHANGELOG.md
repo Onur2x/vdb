@@ -265,6 +265,45 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   actigi sayfayi geri alir (`FPageCount`, `FFreshPage`). Kapi: hata
   sonrasi oturum yazmaya devam eder, hayalet satir yok, checkpoint
   basarili, yeniden acilis 200 satir ve temiz `VERIFY`.
+- **B+Tree olcek ve VACUUM geri kazanma kapisi** `btree_scale` (15 kontrol,
+  SKILL3 §13 olcum-once kurali: "olculebilir bir sorun olmadan spekulatif
+  B+Tree degisikligi yok"): bellekteki `TVDbBTree`'ye 1.000.000 anahtar
+  karisik sirada eklenir — yukseklik **4**, **14.965** yaprak, ortalama
+  doluluk **66/96**, degismezler temiz, `All()` artan, 8.000 rastgele
+  `Find`, `CountRange`/`RankBefore` analitik beklentiyle ayni. Olcek olcusu
+  toplam sure degil **islem basina** maliyettir: 10x veride 3,75x Windows /
+  4,55x Linux (karesel agacta ~10x); 1M anahtar onbellek disina tasindigi
+  icin toplam oran 35-46x cikar ve tek basina yanilticidir. Yarisi silinip yeniden
+  eklenince yaprak sayisi 14.965 -> 14.979 (**1,00x**) kalir, yani churn
+  sonrasi yaprak parcalanmasi olmaz. Diskte 6.000 satir yazilir, %90'i
+  silinir (dosya kuculmez; `GetDeadBytes` yalniz freelist sayfalarini
+  sayar, sayfa ici olu alani degil — belgelenmis sinir), `VACUUM` 1,60 MB
+  dosyayi 151 KB'a indirir (**%90 kazanc**), satir sayisi birebir kalir,
+  sonrasinda 600 satir daha eklemek dosyayi sisirmez, yeniden acilis ve
+  `VERIFY` temizdir. Kapi yazilirken **iki gercek hata** olculdu (asagida
+  F17/F18): Linux'ta VACUUM hic yer kazanmiyordu ama "kazandi" diyordu.
+- **Duzeltildi - Unix'te her acilis bir dosya tanitici sizdiriyordu**
+  (v3.43, KRITIK; `tests/btree_scale` BS11 ile ortaya cikti).
+  `VDbOpenStreamNoFlock` fd'yi `FpOpen` ile aciyor, sonra `THandleStream`
+  ile sariyordu; FPC'nin `THandleStream.Destroy` handle'i **kapatmaz**.
+  Sonuc: acilan her veritabani dosyasi kapanistan sonra da acik kaliyordu
+  (surec basina bir fd; uzun omurlu sunucuda tukenme riski). Windows'ta
+  belirti vermez, ama WSL `/mnt/d` (9p) uzerinde **sinsi**: acik handle'li
+  dosyanin `rename`'i `True` doner ama tembel uygulanir — dosya iki ad
+  altinda da gorunmez. Bu yuzden VACUUM'un `.bak` takasi "basarili" gorunup
+  yeni dosya acilamadiginda eski dosya geri kuruluyor, yani **VACUUM hic
+  yer kazanmiyordu** (BS11: `eski=1601536 yeni=1449984`). Cozum: UNIX
+  yolunda `TVDbFdStream = class(THandleStream)` ve `Destroy` icinde
+  `FpClose(Handle)` (depodaki tek `THandleStream.Create` cagrisiydi).
+  Duzeltmeden sonra Linux (drvfs) ve Windows ayni sonucu verir:
+  `1601536 -> 151552`, yeniden acilis `sayfa=72`.
+- **Duzeltildi - basarisiz dosya degistirme sessizce basarili
+  gorunuyordu** (v3.43, KRITIK; ayni kapi). `SwapDbFileWith`'in dis
+  `except` blogu hatayi **yutuyordu**: `.bak`'tan geri donus de basarisiz
+  olsa `Compact`/`RESTORE`/`REKEY` normal donuyor, VACUUM "kazanc"
+  sayilari yanlis raporlaniyordu. Artik geri donus basarisizsa acik
+  `EVdbBackendV3` hatasi verilir ve hata yukari tasinir; ayrica backend
+  `FEng=nil` ile kilitsiz birakilmaz.
 - **Ozellik regresyon kapisi** `sql_features` (32 kontrol): SKILL3 §9.1/
   §10.1'in "uygulanmis ama test edilmemis" listesini kapatir — `SAVEPOINT` /
   `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` (kismi geri alma gercekten
