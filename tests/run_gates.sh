@@ -159,6 +159,7 @@ build_gate wal_limit      "$ROOT/tests/wal_limit/wal_limit.lpr"
 build_gate net_fuzz       "$ROOT/tests/net_fuzz/net_fuzz.lpr"
 build_gate btree_disk     "$ROOT/tests/btree_disk/btree_disk.lpr"
 build_gate sql_scale      "$ROOT/tests/sql_scale/sql_scale.lpr"
+build_gate sql_index_scale "$ROOT/tests/sql_index_scale/sql_index_scale.lpr"
 build_gate tls_client    "$ROOT/tests/tls_client/tls_client_gate.lpr"
 
 # --- kosum -----------------------------------------------------------
@@ -206,6 +207,7 @@ run_gate wal_limit      "$WORK/wal_limit"      wal_limit
 run_gate net_fuzz       "$WORK/net_fuzz"       net_fuzz
 run_gate btree_disk     "$WORK/btree_disk"     btree_disk
 run_gate sql_scale      "$WORK/sql_scale"      sql_scale
+run_gate sql_index_scale "$WORK/sql_index_scale" sql_index_scale
 
 run_gate selftest_builtin "$WORK/crypto_selftest" selftest_runner builtin
 

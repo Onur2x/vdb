@@ -116,6 +116,41 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   burada yalnizca SKIP yolunda (cikis 77, `SKIP pg-live | psql yok`)
   dogrulandi, `psql` dalı ve CI isi **hic kosmadi** (bkz.
   `docs/engineering/SQL_DIFFERENTIAL.md`).
+- **SQL indeks olcegi ve disk tasarimi** (v3.49): yeni kapi
+  `tests/sql_index_scale` (IX1-IX20, 45 kontrol, iki platformda birebir
+  ayni). Kapı 100.000 ve 1.000.000 satirlik tablolarda birincil anahtar
+  nokta okumasini, `UNIQUE` ihlalini, ikincil indeksle esitlik/aralik
+  sorgusunu, indeksli ile indekssiz plani (`Index Scan using t_pkey`,
+  `Index Only Scan using ix_t_w`, `Seq Scan`), karisik ekle/guncelle/sil,
+  `REINDEX`, `VACUUM`, `VACUUM` ve yeniden acilis sonrasi dogrulugu,
+  mukerrer anahtar reddini, `.odb.idx` yan dosyasinin bozulmasinda veri
+  kaybi olmadan tarama ile dogru sonucu, tam `VERIFY` ve bellek/disk
+  olcumunu kapsar. Olculen (Windows/Linux): 1M indeks kurma 1016/1700 ms,
+  1M indeksten nokta okuma 0/1 ms, yeniden acilis sonrasi ilk indeksli
+  sorgu 1203/1586 ms (indeksin bellekte oldugunun dogrudan kaniti),
+  indeks basina satir maliyeti 24/49 B, `.odb.idx` 1M icin 10.985.254 B
+  (iki platformda ayni). Ayrica `SHOW INDEXES` (tablo adi olmadan) artik
+  dosya sonuna kadar okuyup `Beklenmedik dosya sonu` yerine
+  `ecSyntaxError` ile `SHOW INDEXES icin tablo adi gerekir` diyor (F-20).
+  Yeni tasarim belgesi `docs/engineering/DISK_BTREE_DESIGN.md` sayfa
+  duzenini, bolunme/birlestirme planini, WAL entegrasyonunu, cokme
+  kurtarmasini, onbellegi, kilitlemeyi ve bicim surumlemeyi yazar. Durust
+  sinir: **ikincil indeksler hala bellekteki `FMemIdx`/`TVDbBTree`
+  icindedir**, `.odb.idx` yalnizca yeniden uretilebilir bir onbellektir
+  (veri kaynagi degildir) ve `VDbBTreeDisk.pas` bagimsiz/kapili bir
+  bilesen olarak vardir ama v5 motor dosya bicimine **bagli degildir**.
+  Bu nedenle "VDB disk indeksi kullaniyor" demek bugun yanlistir.
+  Ayarlanabilir `.idx` silme davranisi degismedi (varsayilan siler;
+  kapi olcmek icin `KeepIdxOnClose` ile acik katilir).
+- **Kimlik dogrulama cezasi monotonik saat** (v3.49, F-20): `VDbPgWire`
+  icindeki kullanici basina kilit/pencere hesabi duvar saatiyle (`Now`)
+  yapiliyordu. WSL/Linux'ta saat geriye adim atinca kilit gereksiz yere
+  uzuyor, ileri gidince erken acilip parola taramasina kapi aciyordu.
+  `tests/auth_throttle` tam takim kosusunda bu yuzden T3b/T3c/T3d'yi
+  dusurdu (yalitilmis kosuda 5/5 geciyordu). Ceza ve pencere artik
+  `GetTickCount64` tabanli monotonik milisaniye ile olculur; ayarlar,
+  davranis, API ve varsayilanlar aynidir. Kapi duzeltmeden sonra 8/8
+  kosuda 16/16 PASS.
 - **Yedek/geri yukleme**: `RestoreFrom` yazmadan once tam sayfa dogrulamasi
   yapar; `Verify`/`VerifyBackup` yalnizca reddeder, onarmaz. Iki gercek hata
   kapatildi (freelist trunk yanlis pozitifi; bozuk yedek uzerine sessiz

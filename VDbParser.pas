@@ -4766,6 +4766,13 @@ begin
       NextToken(T);
       st := TSqlAdminStmt.Create(admShowIndexes);
       if PeekToken = 'FROM' then NextToken(T);
+      // F-20 (v3.49): tablo adi olmadan 'SHOW INDEXES' yazilirsa ayristirici
+      // dosya sonuna kadar okuyup 'Beklenmedik dosya sonu konum=N' hatasi
+      // veriyordu; mesaj eyleme donuk degildi. admShowIndexes tek tablo
+      // uzerinde calisir, bu yuzden net bir sozdizimi hatasi verilir.
+      if (PeekToken = '') or (PeekToken = ';') then
+        raise EVDbException.Create(ecSyntaxError,
+          'SHOW INDEXES icin tablo adi gerekir (ornek: SHOW INDEXES FROM t)');
       ExpectToken(T); st.TableName := VDbNorm(T);
       Exit(st);
     end;

@@ -58,6 +58,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `net_fuzz` | **genis ag fuzz'i** (SKILL3 §6/§11: bozuk ag girdisi sunucuyu dusurmemeli): gercek `TVdbPgServer` (PG wire) loopback'te **trust** modda, `MaxConns=256` (kapasite asla basarisizlik nedeni olmasin diye). 15 saldiri ailesi + tohumlanmis deterministik mutasyon dongusu: startup uzunlugu `70000` ve `2^31-1`, kesik startup, `0`/`4`/`0xFFFFFFFF`, bilinmeyen protokol kodu, 512 rastgele bayt, gecerli startup sonrasi 30 rastgele mesaj tipi, `Q` uzunlugu `64MB+1`, `Q` uzunlugu `3`, ilan edilip kesilen `Q` govdesi, NUL'suz/kontrol baytli/bos sorgu, 20 ardisik `SSLRequest` (her biri `N`, sonra ayni sokette gercek sorgu), 40 kisa cop baglanti, 120 yinelemeli tohumlanmis mutasyon (her 20 yinelemede canlilik kontrolu), bozuk genisletilmis protokol (`P`/`B`/`E`/`D`) ve 4 is parcacigi x 8 eszamanli fuzz. Her saldiridan SONRA gecerli bir istemci startup'i tamamlayip `SELECT 1` calistirir; kapi sunucunun cokmedigini, baglanti kabul etmeye devam ettigini ve gercek sorgu yaniti verdigini boyle olcer. Kapi yazilirken bir **test istemcisi** hatasi ortaya cikti (genisletilmis protokol hatasindan sonra sunucu yalnizca `Sync` bekledigi icin istemci `Z` bekleyip kilitleniyordu; saldiri dizisi her bozuk mesajdan sonra `Sync` gonderir) - sunucu tarafinda degisiklik gerekmedi. Iki platformda birebir ayni: **39 PASS / 0 FAIL** |
 | `btree_disk` | **ayri B+Tree disk sayfa bicimi** (SKILL3 §13'un son acik kalemi): `VDbBTreeDisk.pas` **bagimsiz** birimdir, v5 motor dosya bicimine, WAL'e ve kurtarmaya **bagli DEGILDIR** (v5 bicimi ve kurtarma davranisi degismez). 4096 baytlik sayfa, 32 baytlik baslik (`PageNo`/`Kind`/`Level`/`NKeys`/`Flags` + sayfa CRC'si), slotlu hucre duzeni sayfa sonundan geriye; yaprak hucresi 16 bayt (`Key:QWord + Val:QWord`), ic hucre 12 bayt (`Key:QWord + Child:LongWord`), ic sayfada 0. hucrenin anahtari kullanilmaz ve en sol cocuktur, yonlendirme "`Key_i <= K` olan en buyuk `i`". **Golge sayfalama**: hicbir sayfa yerinde guncellenmez, degisen sayfalar yeni numaralara kopyalanir ve meta en son yazilir; meta yazimi **commit noktasidir**. Iki A/B meta sayfasi vardir, acilista CRC'den gecen **en yuksek `Seq`** kazanir. Kapi BD1-BD18: 1000 anahtar ekle/oku/guncelle + artan `Walk`, yeniden acilis + temiz `Verify` (dosya kuculmez 57.344 -> 57.344 B), yarisi silinip yeniden acilma, azalan 2000 ve karisik 3000/6000, 6000 `NextAfter` alt-sinir taramasi (sirali listeyle birebir), bolunme agirlikli 6000 anahtar (yukseklik 2, 36 yaprak), churn sonrasi doluluk olcumu (`yaprak=36 hucre=6000 doluluk=96000/147456`, ~%65), sayfa geri kazanimi (75 -> 75 sayfa; sayac sismez), **yirtik meta** (en yeni meta bozulunca onceki 300 anahtarlik agac aynen acilir, yeni 300 anahtar gorunmez), **cokme noktasi** (`OnBeforeMeta` kancasi meta yazimindan hemen once dosyayi kopyalar; kopya onceki 200 anahtari TAM okur = veri kaybi yok), yalniz-CRC bozulmasi (`Verify` FAIL, okuma hala 500/500 bulur), yapisal bozulma (`Verify` FAIL ve okuma yolu kontrollu `EBtdError`, **access violation yok**) ve kesik dosya (`EBtdError`, sessizce yeni agac KURMAZ). Kapi yazilirken **uc gercek kusur** bulundu ve duzeltildi: Windows'ta `fmCreate` ile yeniden acilisin dosyayi **sifirlamasi** (`FileExists` ayrimi, `VDbPageStore` ile ayni desen), kurucu istisna yolunda **cift serbest birakma** (`FreeAndNil` + nil kontrolleri) ve `Verify`'in bozuk sayfada **istisna sizdirmasi**. Iki platformda birebir ayni: **78 PASS / 0 FAIL** |
 | `sql_scale` | **SQL yurutucu olcek olcumu** (SKILL4 §4): iki kademe - 100.000 satir `t(id INTEGER PRIMARY KEY, b INTEGER, v TEXT)` ve 1.000.000 satir `m(id INTEGER PRIMARY KEY, v TEXT)` - uzerinde SS1-SS20 (34 kontrol, iki platformda ayni satir/deger, yalniz sureler farkli). Kapsam: toplu yukleme + `COUNT`, nokta okuma, `WHERE` + projeksiyon, `ORDER BY`/`LIMIT`, `OFFSET`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY` + `HAVING`, 100 satirlik boyut tablosuyla `JOIN`, 1000 satirlik `UPDATE` ve `DELETE`, 300 karisik insert/update/delete, 5000 satirlik islem `COMMIT`/`ROLLBACK` (hayalet satir yok), yeniden acilis + tam `VERIFY`, ve 1M uzerinde LIMIT'li/LIMIT'siz okuma. Olculen: 100k ekleme 656 ms (Windows i386) / 1213 ms (Linux x86_64), dosya 3.997.696 B; 1M ekleme 6547/11849 ms, dosya 37.543.936 B, yigin deltasi 43.084/43.704 KB; 1M LIMIT'siz `SELECT *` 516/900 ms (tum 1M satir doner ve ilk/orta/son deger tek tek dogrulanir), 1M `ORDER BY id LIMIT 100` 859/1212 ms. **Durust olcum siniri**: `yigin_delta_kb` `GetHeapStatus.TotalAllocated` deltasidir, RSS degildir ve blok yeniden kullanimi onu etkiler; aletin kor olmadigi SS20'de 8 MB ayirma ile kanitlanir (7812 KB olculdu). Sonuc kumesi tavani `VDB_MAX_RESULT_ROWS` = 2.000.000'dir (v3.37) ve bu kapida tavanin **altinda** olculur; tavanin ustunu maddelestirmek 32-bit kapida ~GB bellek ister, o yol `tests/limits` L4 ile kapsanir - bu, "2M satir ureten kapi" demek degildir. LIMIT'siz tam taramanin kok nedeni arastirilmadi ve akis (streaming) yoktur. Kapi yeni motor kusuru bulmadi; tek duzeltme kapinin kendi olcum aletiydi (olu `TotalCommitted` metrigi kaldirildi). Bkz. `docs/engineering/SQL_SCALE.md`. |
+| `sql_index_scale` | **SQL indeks olcegi** (SKILL4 §6): 100.000 ve 1.000.000 satirlik tablolarda IX1-IX20 (45 kontrol, iki platformda birebir ayni). Kapsam: birincil anahtar nokta okumasi ve plani (`Index Scan using t_pkey`), indekssiz plan (`Seq Scan`), `CREATE INDEX` ile ikincil indekste esitlik/aralik sorgusu (`Index Only Scan using ix_t_w`), mukerrer anahtar reddi (`ecUniqueViolation`) ve hayalet satir olmamasi, mukerrer `UPDATE` reddi, indeks uzerinden gorunen `UPDATE`/`DELETE`, 300 karisik insert/update/delete, `REINDEX`, `VACUUM`, `VACUUM` ve yeniden acilis sonrasi dogruluk, tam `VERIFY`, `SHOW INDEXES FROM t`, tablo adi olmadan `SHOW INDEXES` icin `ecSyntaxError` (F-19 duzeltmesi), `.odb.idx` yan dosyasinin bozulmasinda veri kaybi olmadan tarama ile dogru sonuc. Olculen (Windows/Linux): 1M `CREATE INDEX ix_m_v` 1016/1700 ms, 1M indeksten nokta okuma 0/1 ms, yeniden acilis sonrasi ilk indeksli sorgu 1203/1586 ms, indeks basina satir maliyeti 24/49 B, `.odb.idx` 1M icin 10.985.254 B (iki platformda ayni). **Durust sinir**: `yigin_delta_kb` `TotalAllocated` deltasidir, RSS degildir ve 100k indeks kurulumunda Windows'ta **-104 KB** cikti (ayirici bloklari yeniden kullandi), bu yuzden yalnizca 1M satir basina maliyet raporlanir. Ikincil indeksler hala bellekteki `FMemIdx`/`TVDbBTree` icindedir, `.odb.idx` yalnizca yeniden uretilebilir bir onbellektir (veri kaynagi degildir) ve `VDbBTreeDisk.pas` v5 motor dosya bicimine bagli degildir; bu kapi disk indeks olcmez. `.idx` varsayilan silme davranisi degismedi, kapi `KeepIdxOnClose` ile acik katilir. Bkz. `docs/engineering/DISK_BTREE_DESIGN.md`. |
 | `auth_throttle` | SCRAM deneme sinirlama/kilit |
 | `selftest_builtin` | provider SelfTest (builtin) |
 | `tls_client` | istemci CA + sunucu adi dogrulamasi (OpenSSL varsa) |
@@ -750,3 +751,50 @@ kaldirildi:
     yigininda ve ikincil indeksler bellekteki `TVDbBTree` icinde, bu
     yuzden bu kosu disk indeks olcmez (bkz.
     `docs/engineering/SQL_SCALE.md`).
+- Otuz ucuncu kosu (v3.49, SQL indeks olcegi + disk tasarimi): **iki
+  platform da YESIL**. Git Bash/Windows **41 kapi** PASS (`tls_client`
+  SKIP), WSL x86_64 Linux **42 kapi** PASS (OpenSSL istege bagli iki kapi
+  SKIP). Yeni kapi `sql_index_scale` **45 PASS / 0 FAIL**, iki platformda
+  birebir ayni. Diger butun kapilar degismedi (`sql_differential` yine
+  `pg=not-run`); parser'a dokunuldugu icin `sql_matrix`, `sql_features`,
+  `sql_stubs` bu kosuda ayni sekilde PASS.
+  - **Kapsam**: 100.000 ve 1.000.000 satirlik tablolarda birincil anahtar
+    nokta okumasi ve plani (`Index Scan using t_pkey`), indekssiz plan
+    (`Seq Scan`), `CREATE INDEX` sonrasi ikincil indekste esitlik/aralik
+    (`Index Only Scan using ix_t_w`), mukerrer anahtar reddi
+    (`ecUniqueViolation`) ve hayalet satir olmamasi, mukerrer `UPDATE`
+    reddi, indeks uzerinden gorunen `UPDATE`/`DELETE`, 300 karisik
+    insert/update/delete, `REINDEX`, `VACUUM`, `VACUUM` ve yeniden acilis
+    sonrasi dogruluk, tam `VERIFY`, `SHOW INDEXES FROM t`, ve `.odb.idx`
+    yan dosyasi bozuldugunda veri kaybi olmadan tarama ile dogru sonuc.
+  - **Olculen (Windows/Linux)**: 100k ekleme 688/1028 ms; 100k
+    `CREATE INDEX` 172/237 ms; 1M ekleme 6625/11083 ms; 1M `CREATE INDEX
+    ix_m_v` 1016/1700 ms; 1M indeksten nokta okuma 0/1 ms; yeniden acilis
+    sonrasi ilk indeksli sorgu 1203/1586 ms; indeks basina satir maliyeti
+    24/49 B; `.odb.idx` 100k 1.083.868 B ve 1M 10.985.254 B (iki
+    platformda ayni).
+  - **Bellek sayisi durustce yorumlanir**: `yigin_delta_kb`
+    `TotalAllocated` deltasidir, RSS degildir; 100k indeks kurulumunda
+    Windows'ta **-104 KB** olctu (ayirici bloklari yeniden kullandi), bu
+    yuzden yalnizca 1M satir basina maliyet raporlanir. Yeniden acilis
+    sonrasi ilk indeksli sorgunun 1,2-1,6 s surmesi, indeksin bellekte
+    oldugunun ve ilk kullanimda yeniden kuruldugunun dogrudan kanitidir.
+  - **F-19 duzeltmesi**: tablo adi olmadan `SHOW INDEXES` artik dosya
+    sonuna kadar okuyup `Beklenmedik dosya sonu konum=N` yerine
+    `ecSyntaxError` ile `SHOW INDEXES icin tablo adi gerekir (ornek: SHOW
+    INDEXES FROM t)` diyor. Kapi bunu IX18a/IX18b'de dogrular.
+  - **Durust sinir**: ikincil indeksler hala bellekteki
+    `FMemIdx`/`TVDbBTree` icindedir; `.odb.idx` yalnizca yeniden
+    uretilebilir bir onbellektir (veri kaynagi **degildir**) ve
+    `VDbBTreeDisk.pas` v5 motor dosya bicimine **bagli degildir**. Bu
+    kapi disk indeks olcmez; "VDB disk indeksi kullaniyor" demek bugun
+    yanlistir. Tasarim `docs/engineering/DISK_BTREE_DESIGN.md` icinde
+    yazildi, 10M kademesi kosmadi. `.idx` varsayilan silme davranisi
+    degismedi; kapi olcmek icin `KeepIdxOnClose` ile acik katilir.
+  - **Bu kosuda bulunan gercek kusur (F-20)**: `auth_throttle` ilk Linux
+    kosusunda T3b/T3c/T3d'yi dusurdu (13/3), yalitilmis kosuda ise 5/5
+    geciyordu. Kok neden `VDbPgWire` icindeki ceza penceresinin duvar
+    saatiyle (`Now`) olculmesiydi; saat geriye adim atinca kilit uzuyor,
+    ileri gidince erken aciliyordu. Ceza/pencere artik `GetTickCount64`
+    tabanli **monotonik** milisaniye ile olculur; ayarlar, API ve
+    davranis aynidir. Duzeltmeden sonra kapi 8/8 kosuda 16/16 PASS.

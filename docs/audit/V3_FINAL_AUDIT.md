@@ -39,6 +39,8 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 | F16 | **KRITIK** | `VDbPageStore.ExtendFile` / `AllocPage` | Sayfa ayirma iki adimda **gorunur** hale geliyordu: `ExtendFile` once `FPageCount`'u artirip sonra dosyayi buyutuyordu, `AllocPage` ise sayfa numarasini yayinladiktan sonra okuyup baslatiyordu. Arada gelen bir tahsis (`EOutOfMemory`, gercek heap davranisi) sayfa numarasini **taninmayan bir sayfa** olarak dosyada birakiyordu; yeniden acilis taramasi `EVdbHeap: sayfa N taninmiyor (ne VDbPage ne trunk)` ile dosyayi acamiyordu | `ExtendFile` once buyutur, **sonra** `Inc(FPageCount)` yapar; `AllocPage` `GetPageInternal`/`PageInit` hatasinda yalnizca bu cagrinin actigi sayfayi geri alir (`FPageCount`, `FFreshPage`). Freelist'ten gelen sayfa sizinti olarak kalir, ama disaridaki imaji gecerli sayfa/trunk oldugu icin bozulma degildir (v3.42) | `oom` 9/0 (okuma + yazma yolunda enjekte `EOutOfMemory`, hayalet satir yok, yeniden acilis + `VERIFY` temiz) | KAPALI |
 | F17 | **KRITIK** | `VDbSync.VDbOpenStreamNoFlock` (UNIX dali) | fd `FpOpen` ile aciliyor, `THandleStream` ile sariliyordu; FPC'nin `THandleStream.Destroy` handle'i **kapatmaz**, yani acilan her veritabani kapanistan sonra da acik kaliyordu (surec basina bir fd sizintisi). Windows'ta belirti vermez; WSL `/mnt/d` (9p) uzerinde acik handle'li dosyanin `rename`'i `True` doner ama **tembel** uygulanir (dosya iki ad altinda da gorunmez), bu yuzden VACUUM'un `.bak` takasi yeni dosyayi acamayip eski dosyaya donuyordu | UNIX yolunda `TVDbFdStream = class(THandleStream)`, `Destroy` icinde `FpClose(Handle)`; `Open` `TVDbFdStream.Create(fd)` dondurur (depodaki tek `THandleStream.Create` cagrisiydi) (v3.43) | `btree_scale` BS11 (Linux drvfs ve Windows ayni: `eski=1601536 yeni=151552`, yeniden acilis `sayfa=72`) | KAPALI |
 | F18 | **KRITIK** | `TVdbBackendV3.SwapDbFileWith` | Dis `except` blogu hatayi **yutuyordu**: `.bak`'tan geri donus de basarisiz olsa `Compact`/`RESTORE`/`REKEY` normal donuyordu. F17 ile birlesince Linux'ta VACUUM hic yer kazanmadigi halde "kazandi" sayilari raporlaniyordu (sahte basari) | Geri donus basarisizsa acik `EVdbBackendV3` hatasi; hata yukari tasinir, backend `FEng=nil` ile kilitsiz birakilmaz (v3.43) | `btree_scale` BS11/BS12 (her iki platformda `1601536 -> 151552`, `COUNT` 600, `VERIFY` temiz); `backup_restore` 25/0 | KAPALI |
+| F19 | DUSUK | `VDbParser` `SHOW INDEXES` (tablo adi yok) | Tablo adi verilmeden yazilan `SHOW INDEXES`, ayristiriciyi dosya sonuna kadar okutup `Beklenmedik dosya sonu konum=N` ile bitiyordu; mesaj yanlis ve teshis edilemezdi | `PeekToken` bos ya da `;` ise kontrollu `ecSyntaxError` + `SHOW INDEXES icin tablo adi gerekir (ornek: SHOW INDEXES FROM t)` (v3.49; `CreateFmt` degil duz `Create`) | `sql_index_scale` IX18a/IX18b | KAPALI |
+| F20 | ORTA | `VDbPgWire` `AuthWindowExpired` / `NoteAuthFailure` / `AuthLocked` | Kimlik dogrulama ceza penceresi ve kilit suresi **duvar saatiyle** (`Now`) olculuyordu; saat geriye adim atinca kilit/pencere gereksiz uzuyor, ileri gidince erken acilip parola taramasina kapi aciyordu. Belirti: `auth_throttle` tam takim kosusunda T3b/T3c/T3d dustu (13/3) ama yalitilmis kosuda 5/5 geciyordu | Ceza ve pencere artik `GetTickCount64` tabanli monotonik ms; `TVdbPgAuthPenalty.FirstAt/LockedUntil` ve `FTotalFailStart` Int64 ms (v3.49). Ayarlar, API, varsayilanlar ayni | `auth_throttle` T3a-T3d; duzeltme sonrasi 8/8 kosuda 16/16 PASS | KAPALI |
 
 ### Kapatilan test bosluklari (SKILL2 §22, SKILL3 §10.1)
 
@@ -77,7 +79,7 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 
 | Sonuc | Linux | Windows |
 |---|---|---|
-| PASS (kapi) | **41** | **40** |
+| PASS (kapi) | **42** | **41** |
 | FAIL | 0 | 0 |
 | SKIP (`VDB_CRYPTO_DLL` yok) | 2 (`fixtures_openssl`, `selftest_openssl`) | 3 (+`tls_client`) |
 | Calistirilmayan | canli PostgreSQL karsilastirmasi (`sql_differential` `pg=not-run`) | ayni |
@@ -98,7 +100,7 @@ format_compat 28/0, portability 29/0, multi_writer 12/0, bench_report 35/0,
 sql_features 32/0, limits 18/0, cache_pressure 8/0, page_corrupt 8/0,
 server_harden 24/0, server_failure 16/0, auth_throttle 16/0,
 disk_full 16/0, txn_limit 18/0, oom 9/0, btree_scale 15/0, wal_limit 19/0,
-net_fuzz 39/0, btree_disk 78/0, sql_scale 34/0,
+net_fuzz 39/0, btree_disk 78/0, sql_scale 34/0, sql_index_scale 45/0,
 selftest_builtin PASS, tls_client 6/0 (yalniz Linux).
 
 ## Remaining Risks
@@ -129,6 +131,7 @@ L4 (LIMIT > tavan -> `ecLimit`) ile kapsanir. Bu bilincli bir sinirdir:
 | VACUUM sonrasi geri kazanma / parcalanma | VAR (`btree_scale` BS9-BS14: 6.000 satir 1.601.536 bayt; %90 silme dosyayi kucultmez (sayfalar yeniden kullanilir), `VACUUM` **iki platformda da** 1.601.536 -> 151.552 bayt = %90 kazanc; sayim birebir, yeniden ekleme sismez, yeniden acilis + `VERIFY` temiz. Bu kapi ayrica F17/F18'i ortaya cikardi: Linux VACUUM'u yer kazanmadan basarili gorunuyordu) |
 | Ayri B+Tree disk sayfa bicimi | KISMI (`tests/btree_disk` BD1-BD18: bagimsiz `VDbBTreeDisk.pas` icin 4096 baytlik sayfa bicimi, golge sayfalama ile atomik commit, yirtik meta geri donusu, cokme noktasinda onceki agacin tam okunmasi, yalniz-CRC ve yapisal bozulma tespiti, sayfa geri kazanimi - iki platformda 78 kontrol, 0 FAIL. **v5 motor dosya bicimine bagli DEGILDIR**: tablo satirlari hala 4 KB sayfa yigini, ikincil indeksler bellekteki `TVDbBTree`; birlesme/yeniden dagitma yok - bkz. `docs/engineering/BTREE_INTEGRITY.md` §7) |
 | SQL olcek (100k / 1M satir) | VAR (`tests/sql_scale` SS1-SS20: iki kademe, 34 kontrol, iki platformda ayni satir/deger. 100k ekleme 656 ms (Windows i386) / 1213 ms (Linux x86_64), dosya 3.997.696 B; 1M ekleme 6547 / 11849 ms, dosya 37.543.936 B; 1M LIMIT'siz `SELECT *` 516 / 900 ms ve tam 1M satir doner (ilk/orta/son deger dogrulanir); `ORDER BY`/`LIMIT`/`OFFSET`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`/`HAVING`, `JOIN`, `UPDATE`/`DELETE`, karisik islem, buyuk islem commit/rollback, yeniden acilis + tam `VERIFY` temiz. Bellek sayisi `TotalAllocated` deltasidir (RSS degil) ve alet SS20'de 8 MB ayirmayla dogrulanir; LIMIT'siz taramanin kok nedeni arastirilmadi, akis (streaming) yoktur. **Tavanin ustu (2M+) maddelestirilmedi** - bkz. yukaridaki F9 notu ve `docs/engineering/SQL_SCALE.md`) |
+| SQL indeks olcegi | VAR (`tests/sql_index_scale` IX1-IX20: 45 kontrol, iki platformda birebir ayni. 100k ve 1M satirda birincil anahtar nokta okumasi ve plani, indekssiz `Seq Scan`, `CREATE INDEX` sonrasi `Index Only Scan`, mukerrer anahtar/`UPDATE` reddi, indeks uzerinden gorunen `UPDATE`/`DELETE`, 300 karisik islem, `REINDEX`, `VACUUM` ve sonrasinda/yeniden acilista dogruluk, tam `VERIFY`, bozuk `.odb.idx` yan dosyasinda veri kaybi olmadan tarama. Olculen (Windows/Linux): 1M `CREATE INDEX` 1016/1700 ms, 1M indeksten nokta okuma 0/1 ms, yeniden acilis sonrasi ilk indeksli sorgu 1203/1586 ms, indeks basina satir maliyeti 24/49 B; 100k kurulumunda Windows'ta yigin deltasi **-104 KB** cikti, bu yuzden yalnizca 1M satir basina maliyet raporlanir. **Durust sinir**: ikincil indeksler hala bellekteki `FMemIdx`/`TVDbBTree` icindedir, `.odb.idx` yalnizca yeniden uretilebilir onbellektir (veri kaynagi degildir) ve `VDbBTreeDisk.pas` v5 motor dosya bicimine **bagli degildir** - bu kapi disk indeks olcmez, "VDB disk indeksi kullaniyor" bugun yanlistir. Tasarim `docs/engineering/DISK_BTREE_DESIGN.md` icinde; 10M kademesi kosmadi) |
 
 **Desteklenmeyen ozellikler**: v4 konteyner bicimi (durduruldu), dis
 bagimlilik yok (saf native, harici DLL yok - OpenSSL istege bagli).
@@ -151,11 +154,13 @@ karsilastirmasi kosmadi.
 **BETA CANDIDATE**
 
 Gerekce: kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici
-bir regresyon kapisiyla kilitlendi; iki platformda 41/40 kapi yesil; tek
+bir regresyon kapisiyla kilitlendi; iki platformda 42/41 kapi yesil; tek
 dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari, bozuk ag
 girdisi (genis fuzz), disk dolu,
 islem sayisi basinci, bellek tukenmesi, WAL sert boy tavani, B+Tree
-olcek/parcalanma, SQL yurutucu olcegi (100k/1M satir) ve VACUUM geri
+olcek/parcalanma, SQL yurutucu olcegi (100k/1M satir), SQL indeks olcegi
+(100k/1M satir, plan dogrulamasi ve bozuk `.odb.idx` yan dosyasinda veri
+kaybi olmamasi) ve VACUUM geri
 kazanimi ile tasinabilirlik olculdu. Olcum
 kapisinin kendisi iki kritik hata buldu (F17 Unix fd sizintisi, F18 sahte
 basarili dosya degistirme); ikisi de kapatildi ve ayni kapiyla kilitlendi.

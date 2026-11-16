@@ -72,11 +72,12 @@ type
   end;
 
   { R-4: kullanici basina kimlik dogrulama cezasi. Sunucu belleğinde
-    tutulur (diske yazilmaz); yeniden baslatma sifirlar. }
+    tutulur (diske yazilmaz); yeniden baslatma sifirlar. Zaman alanlari
+    monotonik saatte (ms) tutulur; duvar saati degil. }
   TVdbPgAuthPenalty = record
     Failures: Integer;
-    FirstAt: TDateTime;
-    LockedUntil: TDateTime;
+    FirstAt: Int64;
+    LockedUntil: Int64;
   end;
 
   { M1: ham soket veya TLS oturumu uzerinden okuma/yazma. TLS
@@ -159,7 +160,7 @@ type
       degistirilebilir. }
     FAuthPenalty: TDictionary<string, TVdbPgAuthPenalty>;
     FTotalFailures: Integer;
-    FTotalFailStart: TDateTime;
+    FTotalFailStart: Int64;
     FAuthMaxFailures: Integer;
     FAuthFailureWindowSec: Integer;
     FAuthLockoutSec: Integer;
@@ -2474,12 +2475,21 @@ begin
   end;
 end;
 
-{ Pencere suresi asildiysa sayac sifirlanir. Cagiran FAuthLock'i tutar. }
-function AuthWindowExpired(AStart: TDateTime; AWindowSec: Integer): Boolean;
+{ R-4: ceza penceresi monotonik saatle olculur. Once duvar saati (`Now`)
+  kullaniliyordu; WSL/Linux'ta saat geriye adim atinca kilit gereksiz
+  yere uzuyor, ileri gidince erken acilip parola taramasina kapi
+  aciyordu. `GetTickCount64` monotiktir, iki yonde de kaymaz. }
+function AuthNowMs: Int64;
 begin
-  if AStart <= 0 then Exit(True);
+  Result := Int64(GetTickCount64);
+end;
+
+{ Pencere suresi asildiysa sayac sifirlanir. Cagiran FAuthLock'i tutar. }
+function AuthWindowExpired(AStartMs: Int64; AWindowSec: Integer): Boolean;
+begin
+  if AStartMs <= 0 then Exit(True);
   if AWindowSec <= 0 then Exit(False);
-  Result := (Now - AStart) * SecsPerDay > AWindowSec;
+  Result := (AuthNowMs - AStartMs) > Int64(AWindowSec) * 1000;
 end;
 
 procedure TVdbPgServer.NoteAuthFailure(const AUser: string);
@@ -2494,7 +2504,7 @@ begin
        AuthWindowExpired(FTotalFailStart, FAuthFailureWindowSec) then
     begin
       FTotalFailures := 0;
-      FTotalFailStart := Now;
+      FTotalFailStart := AuthNowMs;
     end;
     if FAuthGlobalMaxFailures > 0 then Inc(FTotalFailures);
 
@@ -2502,13 +2512,13 @@ begin
     if (not have) or AuthWindowExpired(pen.FirstAt, FAuthFailureWindowSec) then
     begin
       pen.Failures := 0;
-      pen.FirstAt := Now;
+      pen.FirstAt := AuthNowMs;
       pen.LockedUntil := 0;
     end;
     Inc(pen.Failures);
     if (FAuthMaxFailures > 0) and (pen.Failures >= FAuthMaxFailures) and
        (FAuthLockoutSec > 0) then
-      pen.LockedUntil := Now + (FAuthLockoutSec / SecsPerDay);
+      pen.LockedUntil := AuthNowMs + Int64(FAuthLockoutSec) * 1000;
     FAuthPenalty.AddOrSetValue(AUser, pen);
   finally
     FAuthLock.Leave;
@@ -2539,7 +2549,7 @@ begin
       Exit(True);
     if not FAuthPenalty.TryGetValue(AUser, pen) then Exit;
     if pen.LockedUntil <= 0 then Exit;
-    Result := pen.LockedUntil > Now;
+    Result := pen.LockedUntil > AuthNowMs;
   finally
     FAuthLock.Leave;
   end;
