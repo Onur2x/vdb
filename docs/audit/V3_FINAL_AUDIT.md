@@ -77,7 +77,7 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 
 | Sonuc | Linux | Windows |
 |---|---|---|
-| PASS (kapi) | **39** | **38** |
+| PASS (kapi) | **41** | **40** |
 | FAIL | 0 | 0 |
 | SKIP (`VDB_CRYPTO_DLL` yok) | 2 (`fixtures_openssl`, `selftest_openssl`) | 3 (+`tls_client`) |
 | Calistirilmayan | canli PostgreSQL karsilastirmasi (`sql_differential` `pg=not-run`) | ayni |
@@ -91,14 +91,17 @@ format_compat 28/0, portability 29/0, multi_writer 12/0, bench_report 35/0,
 sql_features 32/0, limits 18/0, cache_pressure 8/0, page_corrupt 8/0,
 server_harden 24/0, server_failure 16/0, auth_throttle 16/0,
 disk_full 16/0, txn_limit 18/0, oom 9/0, btree_scale 15/0, wal_limit 19/0,
-net_fuzz 39/0,
+net_fuzz 39/0, btree_disk 78/0, sql_scale 34/0,
 selftest_builtin PASS, tls_client 6/0 (yalniz Linux).
 
 ## Remaining Risks
 
 **Bilinen hatalar**: acik kritik hata yok. F9 kismi: LIMIT'siz dev tarama
-icin tavan kodda var ama 2M satir ureten bir kapi yok (kapi suresi icin
-bilincli olarak disarida).
+icin tavan kodda var (`VDB_MAX_RESULT_ROWS` = 2.000.000) ve 1M satirlik
+LIMIT'siz tam tarama `tests/sql_scale` SS16'da maddeleserek olculdu, ama
+**tavanin ustunu** (2M+) maddelestiren bir kapi yok; o yol `tests/limits`
+L4 (LIMIT > tavan -> `ecLimit`) ile kapsanir. Bu bilincli bir sinirdir:
+32-bit kapi surecinde 2M+ satir ~GB bellek ister.
 
 **Eksik testler** (SKILL3 §12.1'den kalanlar):
 
@@ -118,6 +121,7 @@ bilincli olarak disarida).
 | 1M anahtar olcek (bellekteki B+Tree) | VAR (`btree_scale` BS1-BS8: 1.000.000 anahtar, yukseklik 4, 14.965 yaprak, doluluk 66/96; islem basina maliyet 10x veride 3,75x Windows / 4,55x Linux - karesel degil; yarisi silinip yeniden eklenince yaprak sayisi 14.965 -> 14.979 = 1,00x) |
 | VACUUM sonrasi geri kazanma / parcalanma | VAR (`btree_scale` BS9-BS14: 6.000 satir 1.601.536 bayt; %90 silme dosyayi kucultmez (sayfalar yeniden kullanilir), `VACUUM` **iki platformda da** 1.601.536 -> 151.552 bayt = %90 kazanc; sayim birebir, yeniden ekleme sismez, yeniden acilis + `VERIFY` temiz. Bu kapi ayrica F17/F18'i ortaya cikardi: Linux VACUUM'u yer kazanmadan basarili gorunuyordu) |
 | Ayri B+Tree disk sayfa bicimi | KISMI (`tests/btree_disk` BD1-BD18: bagimsiz `VDbBTreeDisk.pas` icin 4096 baytlik sayfa bicimi, golge sayfalama ile atomik commit, yirtik meta geri donusu, cokme noktasinda onceki agacin tam okunmasi, yalniz-CRC ve yapisal bozulma tespiti, sayfa geri kazanimi - iki platformda 78 kontrol, 0 FAIL. **v5 motor dosya bicimine bagli DEGILDIR**: tablo satirlari hala 4 KB sayfa yigini, ikincil indeksler bellekteki `TVDbBTree`; birlesme/yeniden dagitma yok - bkz. `docs/engineering/BTREE_INTEGRITY.md` §7) |
+| SQL olcek (100k / 1M satir) | VAR (`tests/sql_scale` SS1-SS20: iki kademe, 34 kontrol, iki platformda ayni satir/deger. 100k ekleme 656 ms (Windows i386) / 1213 ms (Linux x86_64), dosya 3.997.696 B; 1M ekleme 6547 / 11849 ms, dosya 37.543.936 B; 1M LIMIT'siz `SELECT *` 516 / 900 ms ve tam 1M satir doner (ilk/orta/son deger dogrulanir); `ORDER BY`/`LIMIT`/`OFFSET`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`/`HAVING`, `JOIN`, `UPDATE`/`DELETE`, karisik islem, buyuk islem commit/rollback, yeniden acilis + tam `VERIFY` temiz. Bellek sayisi `TotalAllocated` deltasidir (RSS degil) ve alet SS20'de 8 MB ayirmayla dogrulanir; LIMIT'siz taramanin kok nedeni arastirilmadi, akis (streaming) yoktur. **Tavanin ustu (2M+) maddelestirilmedi** - bkz. yukaridaki F9 notu ve `docs/engineering/SQL_SCALE.md`) |
 
 **Desteklenmeyen ozellikler**: v4 konteyner bicimi (durduruldu), dis
 bagimlilik yok (saf native, harici DLL yok - OpenSSL istege bagli).
@@ -140,11 +144,12 @@ karsilastirmasi kosmadi.
 **BETA CANDIDATE**
 
 Gerekce: kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici
-bir regresyon kapisiyla kilitlendi; iki platformda 40/39 kapi yesil; tek
+bir regresyon kapisiyla kilitlendi; iki platformda 41/40 kapi yesil; tek
 dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari, bozuk ag
 girdisi (genis fuzz), disk dolu,
 islem sayisi basinci, bellek tukenmesi, WAL sert boy tavani, B+Tree
-olcek/parcalanma ve VACUUM geri kazanimi ile tasinabilirlik olculdu. Olcum
+olcek/parcalanma, SQL yurutucu olcegi (100k/1M satir) ve VACUUM geri
+kazanimi ile tasinabilirlik olculdu. Olcum
 kapisinin kendisi iki kritik hata buldu (F17 Unix fd sizintisi, F18 sahte
 basarili dosya degistirme); ikisi de kapatildi ve ayni kapiyla kilitlendi.
 Buna karsin ayri B+Tree disk sayfa bicimi yalnizca **bagimsiz ve kapili bir

@@ -57,6 +57,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `wal_limit` | **WAL icin sert boy tavani** (SKILL3 §6.3: "Any WAL limit must fail safely without corrupting committed data"): `VDB_WAL_MAX_BYTES` = 64 MiB varsayilan, `WalMaxBytes` ozelligi ile degistirilebilir (0 = kapali). Kapi tavani 300 000 bayta indirir ve su davranisi kilitler: 100 autocommit ekleme tavanin cok altinda kalir ve rahatlatma checkpoint'i **gercekten** calisir (`checkpoint 0 -> 11`); `VAL_LEN=6000` ile 250 satirlik **tek** islem commit aninda `ecLimit` alir ve mesaj tavani adlandirir (`WAL boyu siniri asildi (2090928 bayt > 300000 bayt)`); reddedilen islem **hayalet satir birakmaz** (`COUNT(*)` 100'de kalir), hemen ardindan gelen kucuk yazim basarilidir (ret kilidi yok), WAL tavanin altina doner, onceki onayli satirlar bozulmadan okunur; ayni islem `WalMaxBytes := 0` ile commit edilir (350 satir), acik checkpoint sonrasi yazim devam eder (355 satir, WAL tekrar tavan altinda) ve yeniden acilis 355 satiri + temiz `VERIFY` verir. Sert kontrol `DoCommit` icinde, butun cerceveler tampona girdikten ve `FWal.Bytes` kesinlestikten SONRA ama WAL'e tek bayt yazilmadan ONCE yapilir; temizlik backend'in mevcut `RecoverAfterDurabilityFailure` yolundadir (cift kurtarma yok). Iki platformda birebir ayni cikti: **19 PASS / 0 FAIL** |
 | `net_fuzz` | **genis ag fuzz'i** (SKILL3 §6/§11: bozuk ag girdisi sunucuyu dusurmemeli): gercek `TVdbPgServer` (PG wire) loopback'te **trust** modda, `MaxConns=256` (kapasite asla basarisizlik nedeni olmasin diye). 15 saldiri ailesi + tohumlanmis deterministik mutasyon dongusu: startup uzunlugu `70000` ve `2^31-1`, kesik startup, `0`/`4`/`0xFFFFFFFF`, bilinmeyen protokol kodu, 512 rastgele bayt, gecerli startup sonrasi 30 rastgele mesaj tipi, `Q` uzunlugu `64MB+1`, `Q` uzunlugu `3`, ilan edilip kesilen `Q` govdesi, NUL'suz/kontrol baytli/bos sorgu, 20 ardisik `SSLRequest` (her biri `N`, sonra ayni sokette gercek sorgu), 40 kisa cop baglanti, 120 yinelemeli tohumlanmis mutasyon (her 20 yinelemede canlilik kontrolu), bozuk genisletilmis protokol (`P`/`B`/`E`/`D`) ve 4 is parcacigi x 8 eszamanli fuzz. Her saldiridan SONRA gecerli bir istemci startup'i tamamlayip `SELECT 1` calistirir; kapi sunucunun cokmedigini, baglanti kabul etmeye devam ettigini ve gercek sorgu yaniti verdigini boyle olcer. Kapi yazilirken bir **test istemcisi** hatasi ortaya cikti (genisletilmis protokol hatasindan sonra sunucu yalnizca `Sync` bekledigi icin istemci `Z` bekleyip kilitleniyordu; saldiri dizisi her bozuk mesajdan sonra `Sync` gonderir) - sunucu tarafinda degisiklik gerekmedi. Iki platformda birebir ayni: **39 PASS / 0 FAIL** |
 | `btree_disk` | **ayri B+Tree disk sayfa bicimi** (SKILL3 §13'un son acik kalemi): `VDbBTreeDisk.pas` **bagimsiz** birimdir, v5 motor dosya bicimine, WAL'e ve kurtarmaya **bagli DEGILDIR** (v5 bicimi ve kurtarma davranisi degismez). 4096 baytlik sayfa, 32 baytlik baslik (`PageNo`/`Kind`/`Level`/`NKeys`/`Flags` + sayfa CRC'si), slotlu hucre duzeni sayfa sonundan geriye; yaprak hucresi 16 bayt (`Key:QWord + Val:QWord`), ic hucre 12 bayt (`Key:QWord + Child:LongWord`), ic sayfada 0. hucrenin anahtari kullanilmaz ve en sol cocuktur, yonlendirme "`Key_i <= K` olan en buyuk `i`". **Golge sayfalama**: hicbir sayfa yerinde guncellenmez, degisen sayfalar yeni numaralara kopyalanir ve meta en son yazilir; meta yazimi **commit noktasidir**. Iki A/B meta sayfasi vardir, acilista CRC'den gecen **en yuksek `Seq`** kazanir. Kapi BD1-BD18: 1000 anahtar ekle/oku/guncelle + artan `Walk`, yeniden acilis + temiz `Verify` (dosya kuculmez 57.344 -> 57.344 B), yarisi silinip yeniden acilma, azalan 2000 ve karisik 3000/6000, 6000 `NextAfter` alt-sinir taramasi (sirali listeyle birebir), bolunme agirlikli 6000 anahtar (yukseklik 2, 36 yaprak), churn sonrasi doluluk olcumu (`yaprak=36 hucre=6000 doluluk=96000/147456`, ~%65), sayfa geri kazanimi (75 -> 75 sayfa; sayac sismez), **yirtik meta** (en yeni meta bozulunca onceki 300 anahtarlik agac aynen acilir, yeni 300 anahtar gorunmez), **cokme noktasi** (`OnBeforeMeta` kancasi meta yazimindan hemen once dosyayi kopyalar; kopya onceki 200 anahtari TAM okur = veri kaybi yok), yalniz-CRC bozulmasi (`Verify` FAIL, okuma hala 500/500 bulur), yapisal bozulma (`Verify` FAIL ve okuma yolu kontrollu `EBtdError`, **access violation yok**) ve kesik dosya (`EBtdError`, sessizce yeni agac KURMAZ). Kapi yazilirken **uc gercek kusur** bulundu ve duzeltildi: Windows'ta `fmCreate` ile yeniden acilisin dosyayi **sifirlamasi** (`FileExists` ayrimi, `VDbPageStore` ile ayni desen), kurucu istisna yolunda **cift serbest birakma** (`FreeAndNil` + nil kontrolleri) ve `Verify`'in bozuk sayfada **istisna sizdirmasi**. Iki platformda birebir ayni: **78 PASS / 0 FAIL** |
+| `sql_scale` | **SQL yurutucu olcek olcumu** (SKILL4 §4): iki kademe - 100.000 satir `t(id INTEGER PRIMARY KEY, b INTEGER, v TEXT)` ve 1.000.000 satir `m(id INTEGER PRIMARY KEY, v TEXT)` - uzerinde SS1-SS20 (34 kontrol, iki platformda ayni satir/deger, yalniz sureler farkli). Kapsam: toplu yukleme + `COUNT`, nokta okuma, `WHERE` + projeksiyon, `ORDER BY`/`LIMIT`, `OFFSET`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY` + `HAVING`, 100 satirlik boyut tablosuyla `JOIN`, 1000 satirlik `UPDATE` ve `DELETE`, 300 karisik insert/update/delete, 5000 satirlik islem `COMMIT`/`ROLLBACK` (hayalet satir yok), yeniden acilis + tam `VERIFY`, ve 1M uzerinde LIMIT'li/LIMIT'siz okuma. Olculen: 100k ekleme 656 ms (Windows i386) / 1213 ms (Linux x86_64), dosya 3.997.696 B; 1M ekleme 6547/11849 ms, dosya 37.543.936 B, yigin deltasi 43.084/43.704 KB; 1M LIMIT'siz `SELECT *` 516/900 ms (tum 1M satir doner ve ilk/orta/son deger tek tek dogrulanir), 1M `ORDER BY id LIMIT 100` 859/1212 ms. **Durust olcum siniri**: `yigin_delta_kb` `GetHeapStatus.TotalAllocated` deltasidir, RSS degildir ve blok yeniden kullanimi onu etkiler; aletin kor olmadigi SS20'de 8 MB ayirma ile kanitlanir (7812 KB olculdu). Sonuc kumesi tavani `VDB_MAX_RESULT_ROWS` = 2.000.000'dir (v3.37) ve bu kapida tavanin **altinda** olculur; tavanin ustunu maddelestirmek 32-bit kapida ~GB bellek ister, o yol `tests/limits` L4 ile kapsanir - bu, "2M satir ureten kapi" demek degildir. LIMIT'siz tam taramanin kok nedeni arastirilmadi ve akis (streaming) yoktur. Kapi yeni motor kusuru bulmadi; tek duzeltme kapinin kendi olcum aletiydi (olu `TotalCommitted` metrigi kaldirildi). Bkz. `docs/engineering/SQL_SCALE.md`. |
 | `auth_throttle` | SCRAM deneme sinirlama/kilit |
 | `selftest_builtin` | provider SelfTest (builtin) |
 | `tls_client` | istemci CA + sunucu adi dogrulamasi (OpenSSL varsa) |
@@ -678,3 +679,45 @@ kaldirildi:
     (sessiz `False` bozulmayi gizler ve daha tehlikelidir); sayfa CRC'si
     her okumada zorlanmaz (okuma basina 4 KB CRC maliyeti), CRC `Verify`
     icinde ve acilista meta seciminde kullanilir.
+- Otuz ikinci kosu (v3.47, SQL yurutucu olcek olcumu): **iki platform da
+  YESIL**. Git Bash/Windows **40 kapi** PASS (`tls_client` SKIP), WSL
+  x86_64 Linux **41 kapi** PASS (OpenSSL istege bagli iki kapi SKIP).
+  Yeni kapi `sql_scale` **34 PASS / 0 FAIL**, iki platformda ayni
+  satir/deger (yalniz sureler farkli). Diger butun kapilar degismedi
+  (`sql_differential` yine `pg=not-run`).
+  - **Iki kademe**: 100.000 satir `t(id, b, v)` ve 1.000.000 satir
+    `m(id, v)`. Olculen: 100k ekleme 656 ms (Windows i386) / 1213 ms
+    (Linux x86_64), dosya 3.997.696 B; 1M ekleme 6547 / 11849 ms, dosya
+    37.543.936 B, yigin deltasi 43.084 / 43.704 KB; 1M LIMIT'siz
+    `SELECT *` 516 / 900 ms (tum 1M satir doner), 1M `ORDER BY id
+    LIMIT 100` 859 / 1212 ms, 1M `WHERE id > 999000` 1000 satir.
+  - **Dogruluk, hizdan ayri olculur**: `SUM(id)` = 5.000.050.000,
+    `MIN`/`MAX` = 1/100000, `AVG(id)` = `50000.5`, `GROUP BY b` 10 grup x
+    10.000, `HAVING COUNT(*) > 20000` -> 0 ve `>= 10000` -> 10, `JOIN`
+    100 eslesme, `OFFSET 99997 LIMIT 3` -> 99998..100000. 1M tam
+    taramada ilk/orta/son deger (`m1`, `m500000`, `m1000000`) tek tek
+    dogrulanir; paylasilan/alias satir tamponu olsa bu kontrol duserdi.
+  - **Bellek sayisi durustce yorumlanir**: `yigin_delta_kb`
+    `GetHeapStatus.TotalAllocated` deltasidir, **RSS degildir** ve bos
+    bloklarin yeniden kullanimi onu etkiler. Aletin kor olmadigi kapida
+    kanitlanir (SS20: 8 MB ayirma, 7812 KB olculdu = beklenenin %95'i).
+    LIMIT'siz taramada olculen delta satir basina tam bir isaretci
+    (i386 4 B, x86_64 8 B); bu sayinin kok nedeni **arastirilmadi**,
+    rapor onu "verimlilik" diye yorumlamaz.
+  - **Sonuc kumesi tavani**: `VDB_MAX_RESULT_ROWS` = 2.000.000 (v3.37)
+    tarama/toplama/`DISTINCT`/`JOIN` yollarinda `ecLimit` ile uygulanir.
+    Bu kapi tavanin **altinda** olcer; ustunu maddelestirmek 32-bit
+    kapida ~GB bellek ister, o yol `tests/limits` L4 ile kapsanir. Yani
+    "2M satir ureten bir kapi" yoktur ve olmayan sey oyle yazilmaz.
+  - **Dayaniklilik**: 5000 satirlik islem `COMMIT` sonrasi gorunur,
+    `ROLLBACK` sonrasi hayalet satir yok; buyuk taramalardan sonra
+    `INSERT`/`UPDATE`/`DELETE` calisir (1M'de kalir) ve yeniden acilista
+    tam `VERIFY` temizdir (`sayfa=995 serbest=0 heap=994 tasma=0
+    trunk=0 anahtar=104194 lsn=405` ve `sayfa=9139 serbest=0 heap=9138
+    tasma=0 trunk=0 anahtar=1000001 lsn=2005`).
+  - **Bu kapi yeni motor kusuru bulmadi**; tek duzeltme kapinin kendi
+    olcum aletiydi (olu `TotalCommitted` metrigi kaldirildi, yerine SS20
+    alet dogrulamasi geldi). Durust sinir: satirlar hala 4 KB sayfa
+    yigininda ve ikincil indeksler bellekteki `TVDbBTree` icinde, bu
+    yuzden bu kosu disk indeks olcmez (bkz.
+    `docs/engineering/SQL_SCALE.md`).

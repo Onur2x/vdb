@@ -82,6 +82,26 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   degismez, tablo satirlari hala 4 KB sayfa yigini uzerindedir ve
   ikincil indeksler bellekteki `TVDbBTree`'dir (bkz.
   `docs/engineering/BTREE_INTEGRITY.md` §7).
+- **SQL yurutucu olcek olcumu** (v3.47): yeni kapi `tests/sql_scale`
+  (SS1-SS20, 34 kontrol, iki platformda ayni satir/deger). 100.000 ve
+  1.000.000 satirlik iki kademe olcer: toplu yukleme, nokta okuma, aralik
+  taramasi, `ORDER BY`/`LIMIT`/`OFFSET`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`,
+  `GROUP BY`/`HAVING`, `JOIN`, `UPDATE`/`DELETE`, karisik islem, buyuk
+  islem commit/rollback, yeniden acilis + tam `VERIFY`. Olculen (Windows
+  i386 / Linux x86_64): 100k ekleme 656/1213 ms, dosya 3.997.696 B; 1M
+  ekleme 6547/11849 ms, dosya 37.543.936 B, yigin deltasi 43.084/43.704
+  KB; 1M LIMIT'siz `SELECT *` 516/900 ms (tum 1M satir doner, ilk/orta/son
+  deger dogrulanir) ve 1M `ORDER BY ... LIMIT` 100 satir 859/1212 ms.
+  Sonuc kumesi tavani (`VDB_MAX_RESULT_ROWS` = 2.000.000, v3.37) bu kapida
+  tavanin **altinda** olculur; ustunu maddelestirmek 32-bit kapida ~GB
+  bellek ister, o yol `tests/limits` L4 ile kapsanir. Bellek sayisi
+  `TotalAllocated` deltasidir (RSS degil) ve aletin kendisi SS20'de 8 MB
+  ayirma ile dogrulanir; LIMIT'siz taramanin kok nedeni arastirilmadi ve
+  akis (streaming) yoktur. Bu kapi yeni bir motor kusuru bulmadi; tek
+  duzeltme kapinin kendi olcum aletiydi (olu `TotalCommitted` metrigi
+  kaldirildi). Durust sinir: satirlar hala 4 KB sayfa yigininda, ikincil
+  indeksler bellekteki `TVDbBTree` icinde; disk indeks olcumu bu kapinin
+  kapsami disindadir (bkz. `docs/engineering/SQL_SCALE.md`).
 - **Yedek/geri yukleme**: `RestoreFrom` yazmadan once tam sayfa dogrulamasi
   yapar; `Verify`/`VerifyBackup` yalnizca reddeder, onarmaz. Iki gercek hata
   kapatildi (freelist trunk yanlis pozitifi; bozuk yedek uzerine sessiz
