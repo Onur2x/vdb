@@ -205,10 +205,11 @@ Last verified state (2026-11-15, Linux x86_64 and Windows i386, `tests/run_gates
 | `txn_limit` | 18 / 0 (300 short transactions and 75 rollbacks counted exactly; nested `BEGIN`, bare `COMMIT` and bare `ROLLBACK` are documented no-ops; one writer reservation per file gives a controlled `mesgul` under a short busy timeout and completes after release; reopen 578 rows + clean `VERIFY`) |
 | `oom` | 9 / 0 (an allocation failure surfaces as a controlled `EOutOfMemory` on both the read and the write path; page allocation is atomic, so a failed growth never publishes a page number, a failed commit leaves no ghost rows, checkpoint succeeds and a reopen returns 200 rows with a clean `VERIFY`) |
 | `btree_scale` | 15 / 0 (1,000,000 keys in one in-memory B+Tree: height 4, 14,965 leaves, 66/96 average leaf fill, invariants clean, `All()` ascending, 8,000 random finds, `CountRange`/`RankBefore` analytic, per-operation cost grows only 3.75x on Windows / 4.55x on Linux for 10x data; deleting half and re-inserting keeps leaves at 1.00x; on disk 6,000 rows -> delete 90% -> `VACUUM` reclaims 1.45 MB of 1.60 MB **on both platforms** (1,601,536 -> 151,552 bytes), count stays exact, re-insert does not balloon the file, reopen + `VERIFY` clean. The gate caught two real engine defects fixed in v3.43: a file descriptor leaked on every UNIX open, and a failed file swap that still reported success — which is why Linux used to report a `VACUUM` gain while reclaiming nothing) |
+| `wal_limit` | 19 / 0 (hard WAL ceiling `WalMaxBytes`, default 64 MiB: 100 autocommit inserts stay far under the cap and the relief checkpoint runs (`checkpoint 0 -> 11`); a 250-row **single** transaction at `VAL_LEN=6000` is refused at commit with `ecLimit` and the message names the cap (`WAL boyu siniri asildi (2090928 bayt > 300000 bayt)`); the refused transaction leaves no ghost rows, `COUNT(*)` stays 100, a small write immediately afterwards succeeds (no refusal livelock), the WAL comes back under the cap, every previously committed row still reads correctly, the same transaction commits with `WalMaxBytes := 0`, writes resume after an explicit checkpoint, and a reopen returns 355 rows plus a clean `VERIFY`. Identical output on Windows and Linux) |
 | `tls_client` | 6 / 0 (Linux; skipped on Windows without OpenSSL DLL) |
 
-That is **37 gates** on Linux (plus two OpenSSL opt-in gates skipped when
-`VDB_CRYPTO_DLL` is unset) and **36 gates** on Windows (`tls_client` skipped).
+That is **38 gates** on Linux (plus two OpenSSL opt-in gates skipped when
+`VDB_CRYPTO_DLL` is unset) and **37 gates** on Windows (`tls_client` skipped).
 Gate documents: [docs/engineering/](docs/engineering/).
 
 ```bash

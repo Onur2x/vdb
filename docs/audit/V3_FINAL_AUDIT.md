@@ -14,8 +14,8 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 - **Denetim kapsami**: SKILL2 §18-28 ve SKILL3 §5-§15, §19. Depolama
   motoru, WAL/kurtarma, islem izolasyonu, B+Tree, SQL yurutucu, guvenlik,
   kaynak sinirlari, performans, tasinabilirlik, belge.
-- **Kosulan testler**: `tests/run_gates.sh` - Linux **37 kapi**, Windows
-  **36 kapi** (`tls_client` atlanir), tamami PASS.
+- **Kosulan testler**: `tests/run_gates.sh` - Linux **38 kapi**, Windows
+  **37 kapi** (`tls_client` atlanir), tamami PASS.
 
 ## Findings
 
@@ -90,7 +90,7 @@ crash_points 24/0, integrity_check 32/0, cache_metrics 21/0,
 format_compat 28/0, portability 29/0, multi_writer 12/0, bench_report 35/0,
 sql_features 32/0, limits 18/0, cache_pressure 8/0, page_corrupt 8/0,
 server_harden 24/0, server_failure 16/0, auth_throttle 16/0,
-disk_full 16/0, txn_limit 18/0, oom 9/0, btree_scale 15/0,
+disk_full 16/0, txn_limit 18/0, oom 9/0, btree_scale 15/0, wal_limit 19/0,
 selftest_builtin PASS, tls_client 6/0 (yalniz Linux).
 
 ## Remaining Risks
@@ -105,7 +105,7 @@ bilincli olarak disarida).
 |---|---|
 | Disk dolu (ENOSPC) | VAR (`disk_full`: kisa yazma/sert yazma hatasi -> kontrollu `ecIOError`, cerceve kirli kalir, `ROLLBACK` sonrasi veri bozulmaz, yeniden acilis + `VERIFY` temiz) |
 | Bellek tahsis hatasi | VAR (`oom`: enjekte edilen tahsis hatasi okuma ve yazma yolunda `EOutOfMemory` olarak yuzeye cikar; sayfa ayirma atomik oldugu icin dosyada taninmayan sayfa kalmaz, basarisiz commit hayalet satir birakmaz, yeniden acilis + `VERIFY` temiz) |
-| WAL tukenmesi | YOK |
+| WAL tukenmesi | VAR (`wal_limit`: sert boy tavani `VDB_WAL_MAX_BYTES` 64 MiB; tavani asan tek islem commit aninda `ecLimit` alir, commit kaydi yazilmaz, onceki onayli satirlar korunur, hayalet satir olusmaz, ret sonrasi yazim devam eder, yeniden acilis + `VERIFY` temiz) |
 | Onbellek tukenmesi / tahliye | VAR (`cache_pressure`: 8 sayfalik havuz, kirli tahliye, yeniden acilis) |
 | Asiri baglanti | VAR (`server_failure` SF4: `MaxConns=1` iken ikinci baglanti `RSP_ERROR` + `kapasite dolu` alir, birincisi calismaya devam eder) |
 | Asiri islem | VAR (`txn_limit`: 300 kisa islem + 75 geri alma birebir dogrulanir; ic ice `BEGIN` / islem yokken `COMMIT`/`ROLLBACK` sessiz no-op; dosya basina tek yazar rezervasyonu, kisa busy suresiyle kontrollu `mesgul` ve birakilinca yeniden tamamlama) |
@@ -139,15 +139,15 @@ karsilastirmasi kosmadi.
 **BETA CANDIDATE**
 
 Gerekce: kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici
-bir regresyon kapisiyla kilitlendi; iki platformda 37/36 kapi yesil; tek
+bir regresyon kapisiyla kilitlendi; iki platformda 38/37 kapi yesil; tek
 dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari, disk dolu,
-islem sayisi basinci, bellek tukenmesi, B+Tree olcek/parcalanma ve VACUUM
-geri kazanimi ile tasinabilirlik olculdu. Olcum kapisinin kendisi iki kritik
-hata buldu (F17 Unix fd sizintisi, F18 sahte basarili dosya degistirme);
-ikisi de kapatildi ve ayni kapiyla kilitlendi. Buna karsin WAL boyu icin sert bir
-tavan, genis ag fuzz'i ve ayri B+Tree disk sayfa bicimi yok; canli PostgreSQL
-diferansiyeli kosmadi; TLS varsayilan olarak kapali. Bu nedenle "PRODUCTION
-CANDIDATE" degil.
+islem sayisi basinci, bellek tukenmesi, WAL sert boy tavani, B+Tree
+olcek/parcalanma ve VACUUM geri kazanimi ile tasinabilirlik olculdu. Olcum
+kapisinin kendisi iki kritik hata buldu (F17 Unix fd sizintisi, F18 sahte
+basarili dosya degistirme); ikisi de kapatildi ve ayni kapiyla kilitlendi.
+Buna karsin genis ag fuzz'i ve ayri B+Tree disk sayfa bicimi yok; canli
+PostgreSQL diferansiyeli kosmadi; TLS varsayilan olarak kapali. Bu nedenle
+"PRODUCTION CANDIDATE" degil.
 
 Bu siniflandirma bagimsiz dogrulama (harici denetim, resmi sertifika)
 olmadigi icin "certified"/"SIL"/"formal compliance" iddiasi icermez.

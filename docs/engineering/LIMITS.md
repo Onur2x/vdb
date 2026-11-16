@@ -4,7 +4,8 @@ Bu belge SKILL2 §25 ve SKILL3 §12'nin istedigi **acik sinirlari** listeler.
 Kural: her sinir asildiginda motor **kontrollu** `EVDbException` dondurur
 (`ecLimit` / `ecIOError` / `ecCorrupt`), surec cokmez ve veritabani dosyasi
 gecerli kalir. Sinir denemelerinden sonra ayni veritabani normal calismaya
-devam eder; bunu `tests/limits` kapisi olcer (18 kontrol).
+devam eder; bunu `tests/limits` kapisi olcer (18 kontrol). Sert WAL tavani
+ayri bir kapiyla olculur: `tests/wal_limit` (19 kontrol).
 
 | Sinir | Deger | Nerede zorlanir | Hata |
 |---|---|---|---|
@@ -12,7 +13,7 @@ devam eder; bunu `tests/limits` kapisi olcer (18 kontrol).
 | Sayfa sayisi | 16 777 215 (`$00FFFFFF`) | `VDbPageStore.ExtendFile` | `ecLimit` |
 | Veritabani boyu | 1 TiB | `VDbPageStore.ExtendFile` + `GrowTo` | `ecLimit` |
 | Tek islemde degisen sayfa | 1 048 576 | `VDbPageStore.MarkPageDirty` | `ecLimit` |
-| WAL boyu | turetilmis: 8 MB esik + 4 GiB (islem tavani x 4096) | `MaybeCheckpoint` (8 MB'de checkpoint) + islem tavani | - |
+| WAL boyu | **64 MiB sert tavan** (`VDB_WAL_MAX_BYTES`); 8 MB yumusak esik + 1 048 576 sayfa islem tavani | `VDbPageEngine.DoCommit` (commit kaydindan once, cerceveler tampondayken) | `ecLimit` |
 | Tek SQL cumlesi | 4 MiB | `VDbSql.CheckStmtSize` (`Exec`, parametreli `Exec`, `ExecRaw`) | `ecLimit` |
 | Tek deger | 16 MiB | `VDbTypes.VDB_MAX_VALUE` (API `Put` yolu) | `ecLimit` |
 | Sonuc satiri | 2 000 000 | `VDbExecutor` cikti buyume yollari + LIMIT/JOIN/DISTINCT | `ecLimit` |
@@ -79,15 +80,32 @@ istemcinin sahte uzunluk onekiyle sunucuda gigabaytlar ayirmasini onler.
 Asimda yalniz o baglanti duser; sunucu ve veritabani dosyasi etkilenmez.
 `tests/server_failure` kapisi bu yollarin hepsini olcer.
 
+## WAL sert tavani (v3.44)
+
+`VDB_WAL_MAX_BYTES` (varsayilan **64 MiB**) her commit'in toplam WAL boyu
+icin sert bir tavandir. `VDbPageEngine.DoCommit` bunu butun cerceveler
+tampona girdikten ve `FWal.Bytes` kesinlestikten **sonra**, WAL'e tek bayt
+yazilmadan **once** kontrol eder; asimda commit `ecLimit` ile reddedilir,
+commit kaydi hic yazilmaz, onceki onayli commit'ler durabil kalir ve
+temizlik backend'in mevcut `RecoverAfterDurabilityFailure` yoluna birakilir.
+Normal isleyiste `MaybeCheckpoint` tavanin **yarisinda** senkron bir
+checkpoint calistirir (arka plan modunda bile), boylece kucuk yazimlar
+tavana yaklasmaz; yalnizca tek basina sigmayan bir islem reddedilir.
+
+Islem tavani (1 048 576 degisen sayfa) bunun altinda da baglayicidir:
+1M sayfalik bir islem ~4 GiB WAL uretir ve sert tavan onu commit aninda
+`ecLimit` ile reddeder. Bu bilincli bir tercihtir: tek basina tavana
+sigmayan bir islem **parcalanmalidir**. Tavan `WalMaxBytes` ozelligiyle
+degistirilebilir veya `0` ile kapatilir; `CheckpointBytes`in (yumusak esik)
+belirgin sekilde USTUNDE tutulmalidir, aksi halde her checkpoint sonrasi
+ilk buyuk commit reddedilebilir. Olculen davranis: `tests/wal_limit`
+(19 kontrol, iki platformda ayni) — bkz. `docs/engineering/CI.md`.
+
 ## Bilincli olarak SINIR KOYULMAYAN yerler
 
 - **Onbellek tavani sessiz clamp**: `APoolPages > VDB_MAX_POOL` istegi
   kirpilir, hata verilmez. Bu bir bellek guvenligi siniri; istek reddi
   yerine kucuk havuzla devam etmek daha az surpriz uretir.
-- **WAL sert tavani yok**: 8 MB'de checkpoint tetiklenir; acik islem ya da
-  kilit nedeniyle checkpoint ertelenirse WAL buyumeye devam eder. Ust sinir
-  islem tavaniyla turetilir (en kotu durum ~4 GiB). Bu davranis bilinclidir:
-  sert bir WAL tavani, mesru uzun islemleri commit aninda reddederdi.
 - **Islem sayisi tavani yok; sinirlayan kaynak yazar rezervasyonu**:
   es zamanli islem sayisi baglanti tavaniyla sinirlidir ve dosya
   basina **tek yazar rezervasyonu** vardir. Bir oturum yazarken digeri

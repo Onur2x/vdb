@@ -26,10 +26,17 @@ unit VDbPageEngine;
 interface
 
 uses
-  SysUtils, SyncObjs, Generics.Collections, VDbPage, VDbPageStore,
+  SysUtils, SyncObjs, Generics.Collections, VDbErr, VDbPage, VDbPageStore,
   VDbPageHeap, VDbPageWal, VDbIdxFile, VDbSync;
 
 const
+  { v3.44 / SKILL3 §6.3: WAL icin SERT boy tavani. 8 MB'lik yumusak esik
+    (`VDB_V3_CHECKPOINT_BYTES`) yalnizca "checkpoint dene" der; arka plan
+    modunda, ertelenen checkpoint'te veya checkpoint hatasinda WAL yine de
+    sinirsiz buyuyebiliyordu. Bu tavan bir Commit'in toplam WAL boyunu
+    asmasini ENGELLER: asilirsa commit kaydi yazilmadan `ecLimit` verilir ve
+    geri alinir; onceki commit'ler durabil kalir. 0 = tavan kapali. }
+  VDB_WAL_MAX_BYTES = 64 * 1024 * 1024;   // 64 MB
   { P-156: acilis maliyet ayristirmasi. Open() her asamayi bitirdiginde
     bu kanca cagrilir; nil ise ek maliyet yoktur (yalniz iki QPC okumasi).
     Teshis araclari (tmp64/pp/openprof) asamalari ayirmak icin kullanir. }
@@ -131,6 +138,9 @@ type
       { v3.2: acilista WAL'den yalnizca ilk N commit uygulanir (0 = hepsi).
         AS OF anlik goruntusu kopya uzerinde acilirken kullanilir. }
       FRecoverLimit: Integer;
+      { v3.44 / SKILL3 §6.3: WAL icin sert bayt tavani (0 = kapali).
+        `DoCommit` bunu commit kaydi yazilmadan ONCE kontrol eder. }
+      FWalMaxBytes: Int64;
       { v3.19 GRUP COMMIT: fsync TEK lider tarafindan yapilir, bekleyenler
         ayni fsync'i paylasir. Boylece N thread'in N fsync'i yerine bir
         fsync olur (olculen: fsync tek basina commit'in ~%60'i).
@@ -221,6 +231,11 @@ type
     { v3.2: Open'dan ONCE ayarlanir. N > 0 ise acilista WAL'den yalnizca
       ilk N commit uygulanir (AS OF anlik goruntusu). Varsayilan 0 = hepsi. }
     property RecoverLimit: Integer read FRecoverLimit write FRecoverLimit;
+
+    { v3.44 / SKILL3 §6.3: WAL icin SERT bayt tavani (0 = kapali).
+      `DoCommit` commit kaydindan ONCE kontrol eder; asilirsa `ecLimit`
+      verir ve commit HIC yazilmaz (onceki commit'ler durabil kalir). }
+    property WalMaxBytes: Int64 read FWalMaxBytes write FWalMaxBytes;
 
     { Test: surec olumu simulasyonu. Commit edilmemis degisiklikler ve
       WAL tamponu diske yazilmadan atilir. }
@@ -419,6 +434,7 @@ begin
   FWal := TVdbPageWal.Create(ADbPath + '.wal');
   FInTxn := False;
   FRecoverLimit := 0;
+  FWalMaxBytes := VDB_WAL_MAX_BYTES;
   FPendingIdx := TDictionary<LongWord, Integer>.Create;
   FPendingCount := 0;
   FPendingCap := 0;
@@ -607,7 +623,9 @@ begin
           bir sonraki Flush'te GrowTo ile yapilir.
         * WAL sinirsiz buyumez: her commit MaybeCheckpoint'i cagirir ve
           8 MB'ta Checkpoint(True) WAL'i budar; budama once FStore.Flush(True)
-          ile TUM dosyayi fsync eder.
+          ile TUM dosyayi fsync eder. v3.44: sert tavan (`WalMaxBytes`,
+          varsayilan 64 MB) ayrica `DoCommit` icinde zorlanir; budama
+          ertelense bile tavanı asan bir commit `ecLimit` ile reddedilir.
         * Pending imajlar yalniz onbellege kurulur (InstallPending). }
     FWal.Recover(ApplyRecoveredView, st, FRecoverLimit, FStore.ViewLsn, True);
     SetWalStats(st);
@@ -1305,6 +1323,7 @@ var
   P: PVdbPage;
   meta: TVdbPageBuf;
   changed: Boolean;
+  walNeed: Int64;
 {$IFDEF CPUPROF}
   d0, d1, d2: Int64;
 {$ENDIF}
@@ -1408,6 +1427,22 @@ begin
   d1 := CpuProfNow; CP[6] := CP[6] + (d1 - d0);
   {$ENDIF}
 
+
+  { 4b) v3.44 / SKILL3 §6.3: WAL icin SERT boy tavani. Kontrol TEK dogru
+        yerde: butun cerceveler tampona konulduktan ve `FWal.Bytes` (tampon
+        dahil) gercek boyu verdikten SONRA, ama WAL'e tek bayt yazilmadan
+        ONCE. Sinir asilirsa `ecLimit` verilir; commit kaydi HIC yazilmaz,
+        yani onceki commit'ler durabil kalir ve geriye yarim commit kalmaz.
+        Temizlik backend'in commit sarmalayicisina aittir
+        (`RecoverAfterDurabilityFailure`, syncLsn = 0 durumu) — burada ikinci
+        kez cagirmak cift kurtarma olurdu. }
+  if FWalMaxBytes > 0 then
+  begin
+    walNeed := FWal.Bytes;
+    if walNeed > FWalMaxBytes then
+      raise EVDbException.CreateFmt(ecLimit,
+        'WAL boyu siniri asildi (%d bayt > %d bayt)', [walNeed, FWalMaxBytes]);
+  end;
 
   { 5) WAL commit + fsync: artik durabil. Veritabani dosyasina bu noktada
         HICBIR SEY yazilmaz (checkpoint'e kadar). }

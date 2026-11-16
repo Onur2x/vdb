@@ -30,6 +30,18 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
 
 - **WAL kurtarma denetimi** ve `wal_crash` matrisi; WAL dosyasi hicbir
   yerde silinmez, checkpoint basligi yeniden yazar.
+- **WAL icin SERT boy tavani** (v3.44): `VDB_WAL_MAX_BYTES` (varsayilan
+  64 MiB) ve `WalMaxBytes` ozelligi. Onceden 8 MB'lik esik yalnizca
+  "checkpoint dene" diyordu; arka plan modunda, ertelenen checkpoint'te ya
+  da checkpoint hatasinda WAL sinirsiz buyuyebiliyordu. Artik `DoCommit`
+  butun cerceveler tampona girdikten ve `FWal.Bytes` kesinlestikten SONRA,
+  WAL'e tek bayt yazilmadan ONCE tavanı kontrol eder; asimda commit
+  `ecLimit` ile REDDEDILIR, commit kaydi hic yazilmaz, onceki commit'ler
+  durabil kalir ve temizlik backend'in mevcut `RecoverAfterDurabilityFailure`
+  yoluna birakilir (cift kurtarma yok). Normal isleyiste tavanin
+  **yarisinda** otomatik senkron checkpoint WAL'i budar, boylece kucuk
+  yazimlar tavana hic yaklasmaz; yalnizca tek basina sigmayan bir islem
+  reddedilir. Kapi `wal_limit` (19 kontrol, iki platformda ayni).
 - **Yedek/geri yukleme**: `RestoreFrom` yazmadan once tam sayfa dogrulamasi
   yapar; `Verify`/`VerifyBackup` yalnizca reddeder, onarmaz. Iki gercek hata
   kapatildi (freelist trunk yanlis pozitifi; bozuk yedek uzerine sessiz

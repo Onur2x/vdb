@@ -334,6 +334,10 @@ type
     property BufferedCount: Integer read FBufferCount;
     { WAL dosyasinin su anki boyu (checkpoint esigi icin). }
     function Bytes: Int64;
+    { v3.44: tek WAL cercevesinin disk uzerindeki bayt maliyeti (baslik +
+      yuk). Motor sert boy tavanini onceden hesaplarken `Bytes` ile AYNI
+      formulun tek kaynagi burada kalir. }
+    function FrameBytes: Int64;
   end;
 
 implementation
@@ -1668,6 +1672,17 @@ begin
   FAtEnd := True;
   VDbFlushStream(FStream);
   FHasContent := False;
+end;
+
+function TVdbPageWal.FrameBytes: Int64;
+var
+  payLen: Integer;
+begin
+  if FWalEncrypted then
+    payLen := VDB_ENC_ENVELOPE
+  else
+    payLen := VDB_PAGE_SIZE;
+  Result := Int64(payLen + VDB_WAL_REC_HDR);
 end;
 
 function TVdbPageWal.Bytes: Int64;

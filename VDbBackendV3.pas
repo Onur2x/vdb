@@ -434,6 +434,10 @@ type
       FRowTag: TVDbRowTagFunc;
       FBeforeCommit: TDbCommitHook;
       FCheckpointBytes: Int64;
+      { v3.44 / SKILL3 §6.3: WAL icin SERT bayt tavani. 0 = kapali.
+        Motor acikken hem motorun `WalMaxBytes`ine hem buraya yazilir;
+        motor yeniden kurulursa (Open) deger tekrar uygulanir. }
+      FWalMaxBytes: Int64;
       { P-178: ARKA PLAN CHECKPOINT. Acikken esik asildiginda checkpoint
         commit yolunda DEGIL, kendi is parcaciginda yapilir. Is parcacigi
         kilidi commit ile AYNI sirada alir (once depo yazma kilidi, sonra
@@ -602,6 +606,9 @@ type
     procedure SnapApplyPending;
     function EffectiveCount: Integer;
     procedure MaybeCheckpoint;
+    { v3.44: sert WAL tavani erisimcileri (motor acikken iki tarafa da yazilir). }
+    function GetWalMaxBytes: Int64;
+    procedure SetWalMaxBytes(AValue: Int64);
     { P-178: arka plan checkpoint is parcacigi govdesi. Kilidi commit ile
       AYNI sirada alir; islem/parti acikken ERTELER. }
     procedure RunBackgroundCheckpoint;
@@ -679,6 +686,11 @@ type
     function KeyFingerprint: string;
     { Checkpoint esigi (bayt). 0 = yalnizca kapanis/Flush'ta. }
     property CheckpointBytes: Int64 read FCheckpointBytes write FCheckpointBytes;
+    { v3.44 / SKILL3 §6.3: WAL icin SERT bayt tavani (0 = kapali).
+      Yumusak esikten (`CheckpointBytes`) farki: asildiginda commit
+      REDDEDILIR (`ecLimit`), yani WAL sinirsiz buyuyemez. Tavanin yarisina
+      gelince `MaybeCheckpoint` senkron checkpoint ile WAL'i budar. }
+    property WalMaxBytes: Int64 read GetWalMaxBytes write SetWalMaxBytes;
     { P-178: esik asildiginda checkpoint'i ARKA PLANDA yap. Varsayilan
       False (davranis degismez). Acikken commit, checkpoint I/O'sunu
       beklemez; checkpoint kendi is parcaciginda, ayni kilit sirasiyla
@@ -970,6 +982,8 @@ begin
   FLogPruneErr := '';
   FDirty := False;
   FCheckpointBytes := VDB_V3_CHECKPOINT_BYTES;
+  { v3.44 / SKILL3 §6.3: WAL sert tavani varsayilan ACIK (64 MB). }
+  FWalMaxBytes := VDB_WAL_MAX_BYTES;
   { P-178: arka plan checkpoint varsayilan KAPALI. }
   FCheckpointBg := False;
   FBgCkThread := nil;
@@ -983,6 +997,8 @@ begin
   FEng := NewEngine(ADbPath);
   try
     FEng.Open(ACreate, AReadOnly, ABusyMs);
+    { v3.44: sert WAL tavani her motor kurulusunda uygulanir. }
+    FEng.WalMaxBytes := FWalMaxBytes;
   except
     FreeAndNil(FEng);
     raise;
@@ -2037,18 +2053,52 @@ begin
   end;
 end;
 
-procedure TVdbBackendV3.MaybeCheckpoint;
+function TVdbBackendV3.GetWalMaxBytes: Int64;
 begin
-  if FCheckpointBytes <= 0 then Exit;
-  if FEng.Wal.Bytes < FCheckpointBytes then Exit;
-  { P-178: arka plan modunda commit yalnizca is parcacigini uyandirir;
-    checkpoint I/O'su commit'in kritik bolumunde beklemez. }
-  if FCheckpointBg and (FBgCkThread <> nil) then
+  Result := FWalMaxBytes;
+end;
+
+procedure TVdbBackendV3.SetWalMaxBytes(AValue: Int64);
+begin
+  if AValue < 0 then
+    AValue := 0;
+  FWalMaxBytes := AValue;
+  if FEng <> nil then
+    FEng.WalMaxBytes := AValue;
+end;
+
+procedure TVdbBackendV3.MaybeCheckpoint;
+var
+  hard: Boolean;
+begin
+  if FEng = nil then Exit;
+  { v3.44: SERT tavan icin ERKEN TAHLIYE. Motor tavani asan commit'i
+    REDDETTIGI icin basarili bir commit'ten sonra `Bytes <= tavan` her zaman
+    dogrudur; yani "tavan asildi" durumu pratikte hic olusmaz ve tavan
+    esiginde checkpoint denemek OLu KOD olurdu. Bu yuzden tavanin YARISINA
+    gelince (arka plan modunda bile) senkron checkpoint yapilir: WAL'in
+    durabil kismi budanir, boylece kucuk commit'ler tavana yaklasip
+    reddedilmez. Tek istisna tek basina tavanin uzerinde olan bir islemdir;
+    o commit motor tarafindan `ecLimit` ile reddedilir (veri kaybi yok).
+    Yumusak esik (8 MB) normalde cok daha once devreye girer. }
+  hard := (FWalMaxBytes > 0) and (FEng.Wal.Bytes >= FWalMaxBytes div 2);
+  if not hard then
   begin
-    InterlockedExchange(FBgCkPending, 1);
-    FBgCkThread.Signal;
-    Exit;
+    if FCheckpointBytes <= 0 then Exit;
+    if FEng.Wal.Bytes < FCheckpointBytes then Exit;
+    { P-178: arka plan modunda commit yalnizca is parcacigini uyandirir;
+      checkpoint I/O'su commit'in kritik bolumunde beklemez. }
+    if FCheckpointBg and (FBgCkThread <> nil) then
+    begin
+      InterlockedExchange(FBgCkPending, 1);
+      FBgCkThread.Signal;
+      Exit;
+    end;
   end;
+  { Acik islem varken checkpoint YAPILAMAZ: kirli sayfalar diske iner ve
+    yarim islem kalicilasir. Bu durumda tavan asilmissa bir sonraki commit
+    motorun kontrolunde `ecLimit` ile reddedilir (veri kaybi olmaz). }
+  if FEng.InTxn then Exit;
   FEng.Checkpoint(True);
   { v3.7: "checkpoint sonrasi otomatik budama". Hata commit'i BOZMAZ;
     LastLogPruneError'da gorunur. }
@@ -5341,6 +5391,8 @@ begin
     end;
     { Turetilmis ham anahtar (parola modunda da) yeni dosyaya aittir. }
     FKey := Copy(FEng.Store.Key, 0, Length(FEng.Store.Key));
+    { v3.44: dosya degisiminden sonra sert WAL tavani yeniden uygulanir. }
+    FEng.WalMaxBytes := FWalMaxBytes;
     { v3.1: icerik degismis olabilir (RESTORE/REKEY) -> sayac guvenilmez.
       VACUUM cagirani (Compact) anahtar kumesinin AYNI oldugunu dogrular ve
       bayragi geri kurar. Harita SILINMEZ: bayrak False iken yazma yolu onu

@@ -54,6 +54,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `txn_limit` | **islem sayisi / yazar cakismasi** (SKILL3 §12.2): 300 kisa islem ve 300 islemin 75'i geri alinarak commit sayisi birebir dogrulanir (sessiz kayip yok). Belgelenen v3 semantigi olculur: ic ice `BEGIN`, islem yokken `COMMIT`/`ROLLBACK` **sessiz no-op**'tur (tek islem katmani). Dosya basina **tek yazar rezervasyonu** vardir: bir oturum tutarken digeri kisa busy suresiyle kontrollu `mesgul` hatasi alir, `ROLLBACK` ile temizlenir, rezervasyon birakilinca ayni islem basariyla tamamlanir; yeniden acilista tum satirlar + `VERIFY` temiz |
 | `oom` | **bellek tukenmesi** (SKILL3 §12.1): `VDbMM`'e yalniz test icin `MMInjectFault` kancasi eklendi (esik ustundeki tahsislerde bir kez `EOutOfMemory`, sonra kapanir). Okuma ve yazma yollari ayri olculur; nil donen tahsis `SetLength` icinde `EAccessViolation`'a donustugu icin **yanlis** bir benzetimdi, gercek heap gibi `EOutOfMemory` atiliyor. **Bulunan gercek hata (F16, KRITIK):** yazma sirasindaki tahsis hatasi dosyada taninmayan sayfa birakiyordu (`EVdbHeap: sayfa N taninmiyor`); `ExtendFile` once buyutup sonra `Inc(FPageCount)` yapar, `AllocPage` yalnizca bu cagrinin actigi sayfayi geri alir. Hata sonrasi oturum yazmaya devam eder, hayalet satir yok, checkpoint ve yeniden acilis 200 satir + temiz `VERIFY` |
 | `btree_scale` | **B+Tree olcek + VACUUM geri kazanma** (SKILL3 §13 olcum-once kurali: "olculebilir bir sorun olmadan spekulatif B+Tree degisikligi yok"): bellekteki `TVDbBTree`'ye 1.000.000 anahtar karisik sirada eklenir; yukseklik **4**, **14.965** yaprak, ortalama doluluk **66/96**, degismezler temiz, `All()` artan, 8.000 rastgele `Find`, `CountRange`/`RankBefore` analitik beklentiyle ayni. Olcek olcusu toplam sure degil **islem basina** maliyettir: 10x veride **3,75x Windows / 4,55x Linux** (karesel agacta ~10x); i386'da 1M anahtar onbellek disina tasindigi icin toplam oran 35-46x cikar ve tek basina yanilticidir. Yarisi silinip yeniden eklenince yaprak sayisi 14.965 -> 14.979 (**1,00x**), yani churn sonrasi yaprak parcalanmasi yok. Diskte 6.000 satir -> %90 sil (dosya kuculmez; `GetDeadBytes` yalniz freelist sayfalarini sayar) -> `VACUUM` **iki platformda da** 1,60 MB'i 151 KB'a indirir (**%90 kazanc**), satir sayisi birebir kalir, sonrasinda 600 satir daha eklemek dosyayi sisirmez, yeniden acilis ve `VERIFY` temiz. Kapi yazilirken **iki gercek motor hatasi** olculdu ve ayni commit'te duzeltildi (v3.43): Unix'te her acilista sizan dosya tanitici (F17) ve basarisiz dosya degistirmeyi basarili bildiren sessiz yutma (F18) - Linux'un yer kazanmadan `VACUUM` kazanci bildirmesinin nedeni buydu |
+| `wal_limit` | **WAL icin sert boy tavani** (SKILL3 §6.3: "Any WAL limit must fail safely without corrupting committed data"): `VDB_WAL_MAX_BYTES` = 64 MiB varsayilan, `WalMaxBytes` ozelligi ile degistirilebilir (0 = kapali). Kapi tavani 300 000 bayta indirir ve su davranisi kilitler: 100 autocommit ekleme tavanin cok altinda kalir ve rahatlatma checkpoint'i **gercekten** calisir (`checkpoint 0 -> 11`); `VAL_LEN=6000` ile 250 satirlik **tek** islem commit aninda `ecLimit` alir ve mesaj tavani adlandirir (`WAL boyu siniri asildi (2090928 bayt > 300000 bayt)`); reddedilen islem **hayalet satir birakmaz** (`COUNT(*)` 100'de kalir), hemen ardindan gelen kucuk yazim basarilidir (ret kilidi yok), WAL tavanin altina doner, onceki onayli satirlar bozulmadan okunur; ayni islem `WalMaxBytes := 0` ile commit edilir (350 satir), acik checkpoint sonrasi yazim devam eder (355 satir, WAL tekrar tavan altinda) ve yeniden acilis 355 satiri + temiz `VERIFY` verir. Sert kontrol `DoCommit` icinde, butun cerceveler tampona girdikten ve `FWal.Bytes` kesinlestikten SONRA ama WAL'e tek bayt yazilmadan ONCE yapilir; temizlik backend'in mevcut `RecoverAfterDurabilityFailure` yolundadir (cift kurtarma yok). Iki platformda birebir ayni cikti: **19 PASS / 0 FAIL** |
 | `auth_throttle` | SCRAM deneme sinirlama/kilit |
 | `selftest_builtin` | provider SelfTest (builtin) |
 | `tls_client` | istemci CA + sunucu adi dogrulamasi (OpenSSL varsa) |
@@ -563,3 +564,34 @@ kaldirildi:
   - `oom` **9 PASS / 0 FAIL**, `disk_full` **16 PASS / 0 FAIL**,
     `txn_limit` **18 PASS / 0 FAIL** (degismedi; ayni kosuda yeniden
     dogrulandi).
+- Yirmi dokuzuncu kosu (PHASE-26 commit'i, SKILL3 §6.3 WAL sert boy tavani):
+  **iki platform da YESIL**. Git Bash/Windows **37 kapi** PASS
+  (`tls_client` SKIP), WSL x86_64 Linux **38 kapi** PASS (OpenSSL istege
+  bagli iki kapi SKIP). Yeni kapi `wal_limit` **19 PASS / 0 FAIL**, iki
+  platformda birebir ayni cikti.
+  - **Yeni kapi `wal_limit` 19 PASS / 0 FAIL** (WL0-WL9b): `WalMaxBytes`
+    tavanini 300 000 bayta indirir; 100 autocommit ekleme tavanin cok
+    altinda kalir ve rahatlatma checkpoint'i gercekten calisir
+    (`checkpoint 0 -> 11`, `wal=20580`); `VAL_LEN=6000` ile 250 satirlik
+    tek islem commit aninda `ecLimit` alir
+    (`WAL boyu siniri asildi (2090928 bayt > 300000 bayt)`); reddedilen
+    islem hayalet satir birakmaz (`COUNT(*) = 100`), hemen ardindan gelen
+    kucuk yazim basarilidir (ret kilidi yok), silme sayiyi geri getirir,
+    WAL tavanin altina doner (`wal=49432`); ayni islem `WalMaxBytes := 0`
+    ile commit edilir (350 satir); tavan yeniden acilip acik checkpoint
+    yapildiktan sonra 5 satir daha eklenir (355 satir, `wal=86516`) ve
+    yeniden acilis + `VERIFY` temizdir.
+  - **Tasarim (olculen bir yanlis yol dahil)**: ilk denemede otomatik
+    rahatlatma `MaybeCheckpoint` icinde `Wal.Bytes >= WalMaxBytes`
+    kosuluna baglanmisti; **bu dal olu koddur**, cunku basarili her commit
+    `Bytes <= cap` birakir. Ilk kosu tam olarak bunu gosterdi: tavan 300
+    000 iken 100 autocommit eklemenin 2 cercevelik son commit'i
+    `309040 > 300000` ile reddedildi. Duzeltme: sert kontrol yalniz
+    `DoCommit` icinde (commit kaydi yazilmadan once) kalir; rahatlatma
+    `MaybeCheckpoint` icinde tavanin **yarisinda** tetiklenir
+    (`FWalMaxBytes div 2`), yani kucuk yazimlar tavana hic yaklasmaz ve
+    yalnizca tek basina sigmayan bir islem reddedilir.
+  - `MaybeCheckpoint` ayrica `FEng = nil` ve `FEng.InTxn` korumalarini
+    tasir: acik islem varken checkpoint KIRLI sayfalari diske yazar ve
+    yarim islemi kalicilastirirdi.
+  - Diger kapilar degismedi (`sql_differential` yine `pg=not-run`).
