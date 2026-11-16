@@ -49,6 +49,19 @@ yeniden acilis da durabil satir kumesini gosterir. `tests/disk_full` bunu
 sayfa, meta ve WAL yazmalarinda sert hata + yarim yazma senaryosuyla olcer
 ve yeniden acilista tum onayli satirlari + `VERIFY` temizligini dogrular.
 
+**Bellek tukenmesi kontrollu bir hatadir, sessiz bozulma degil.** Sayfa
+ayirma iki adimlidir ve tek adimda gorunur hale gelmez: `ExtendFile` once
+dosyayi buyutur, **sonra** `FPageCount`'u artirir; `AllocPage` yeni sayfayi
+okuyup baslatamazsa yalnizca bu cagrinin actigi sayfa numarasi geri alinir
+(`FPageCount`, `FFreshPage`). Boylece tahsis hatasi dosyada taninmayan bir
+sayfa birakmaz. `EOutOfMemory` (FPC RTL'in gercek davranisi) yukari cikar,
+islem `ROLLBACK` ile temizlenir, commit edilmemis satir kalici olmaz ve ayni
+oturum yazmaya devam eder. `tests/oom` bunu okuma ve yazma yolu icin ayri
+ayri olcer: enjekte edilen tahsis hatasi `EOutOfMemory` olarak yuzeye cikar
+(nil dondurmek `SetLength` icinde `EAccessViolation` demekti), basarisiz
+commit hayalet satir birakmaz, checkpoint calisir ve yeniden acilis +
+`VERIFY` temizdir.
+
 **Meta sayfa monotoniktir.** Iki oturum ayni dosyaya yazdiginda geride kalan
 (gorunume gore bayat) oturumun `SaveMeta` cagrisi diskteki **daha yuksek** LSN
 ve sayfa sayisini geri alamaz: yazmadan once diskteki meta okunur ve `LSN`

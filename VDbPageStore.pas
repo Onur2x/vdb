@@ -3462,8 +3462,13 @@ begin
       [RequiredFileSize(FPageCount + 1) / (1024.0 * 1024.0),
        VDB_MAX_DB_BYTES / (1024.0 * 1024.0)]);
   NewPageNo := FPageCount;
+  { v3.42: SAYFA SAYISI ANCAK DOSYA BUYUDUKTEN SONRA YAYINLANIR. Onceki
+    sira (Inc -> GrowTo) disk dolu hatasinda FPageCount'u bir artiriyor
+    ama dosyayi buyutmuyordu; kapanista meta daha buyuk bir sayfa sayisi
+    yazar, yeniden acilis ise diski daha kisa bulur. Kontrollu hata
+    verilir ve mantiksal boy ARTMAZ. }
+  GrowTo(RequiredFileSize(FPageCount + 1));
   Inc(FPageCount);
-  GrowTo(RequiredFileSize(FPageCount));
   FFreshPage := NewPageNo;
   FMetaDirty := True;
   FStructDirty := True;
@@ -3776,10 +3781,12 @@ var
   trunk, cnt, nextTrunk: LongWord;
   tp: PVdbPage;
   e: string;
+  extended: Boolean;
 begin
   Result := False;
   P := nil;
   PageNo := 0;
+  extended := False;
   if FStream = nil then
     raise EVdbPageStore.Create('depo acik degil');
 
@@ -3819,14 +3826,37 @@ begin
   if PageNo = 0 then
   begin
     ExtendFile(PageNo);
+    extended := True;
     FMetaDirty := True;
   end;
 
-  { Yeni/geri kazanilmis sayfa: PageInit hemen uzerine yazacagi icin
-    diskteki eski icerik denetlenmez. }
-  if not GetPageInternal(PageNo, False, P) then
-    raise EVdbPageStore.Create(Format('AllocPage: sayfa %d okunamadi', [PageNo]));
-  PageInit(P, PageNo, PageType);
+  { v3.42 / SKILL3 §12.3: AYIRMA ATOMIK OLMALI. Sayfa numarasi FPageCount'a
+    eklendikten sonra GetPageInternal yahut ilk kurulum herhangi bir nedenle
+    hata verebilir (olculdu: bellek tukenmesi -> EOutOfMemory). Eski kod
+    hatayi yukari birakiyor ama sayfayi dosyada HIC baslatilmamis (tamamen
+    sifir) birakiyordu; yeniden acilis taramasi bu sayfayi "ne VDbPage ne
+    trunk" diye reddediyordu (OM7). Simdi yalnizca BU cagrinin actigi son
+    sayfa geri alinir; numara yayinlanmis olmaz, onceki sayfalar etkilenmez.
+    Freelist'ten alinan sayfa icin geri alma yok: diskteki imaji zaten
+    gecerli bir sayfa/trunk, yani en kotu durumda sayfa sizar (bozulma
+    degil). }
+  try
+    if not GetPageInternal(PageNo, False, P) then
+      raise EVdbPageStore.Create(Format('AllocPage: sayfa %d okunamadi', [PageNo]));
+    PageInit(P, PageNo, PageType);
+  except
+    if P <> nil then
+      Release(PageNo, False);
+    if extended and (FPageCount = PageNo + 1) then
+    begin
+      FPageCount := PageNo;
+      if FFreshPage = PageNo then
+        FFreshPage := 0;
+      FMetaDirty := True;
+      FStructDirty := True;
+    end;
+    raise;
+  end;
   Result := True;
 end;
 

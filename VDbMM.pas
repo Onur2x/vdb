@@ -32,14 +32,37 @@ var
     bozulur — yalnizca tek is parcacigi oldugundan emin oldugunda set et. }
   MMSingleThreaded: Boolean;
 
+  { v3.42 / SKILL3 §12.3 (bellek tukenmesi): YALNIZ TEST icin tahsis hatasi
+    enjeksiyonu. Uretimde KAPALIDIR (varsayilan: etkin degil, hicbir cagri
+    yapilmaz). Amac: bellek tukendiginde motorun ne yaptigini olcebilmek --
+    kontrollu istisna mi, surec cokmesi mi, dosya bozulmasi mi.
+
+    Sozlesme:
+      MMInjectFault(AMinSize, ASkip)
+        AMinSize'dan KUCUK tahsisler hic etkilenmez (RTL ic yapilari ve
+        istisna nesneleri korunur). AMinSize'a ESIT/BUYUK tahsislerden ilk
+        ASkip adedi normal gecer, SONRAKI tek tahsis nil doner ve enjeksiyon
+        kendini kapatir (tek atim). Boylece hedef islem disinda ikinci bir
+        beklenmeyen ariza olusmaz.
+      MMInjectClear     enjeksiyonu iptal eder.
+      MMInjectHits      gercekten reddedilen tahsis sayisi.
+      MMInjectActive    enjeksiyon su an kurulu mu. }
+  procedure MMInjectFault(AMinSize: PtrUInt; ASkip: Integer = 0);
+  procedure MMInjectClear;
+  function MMInjectHits: Integer;
+  function MMInjectActive: Boolean;
+
 implementation
 
 uses
+  { v3.42: EOutOfMemory burada (RTL istisna sinifi). }
+  SysUtils
   {$IFDEF MSWINDOWS}
-  Windows;
+  , Windows
   {$ELSE}
-  BaseUnix;
+  , BaseUnix
   {$ENDIF}
+  ;
 
 const
   SLAB_SIZE      = 65536;
@@ -78,6 +101,36 @@ var
   SlabCount: Integer = 0;
   MMLock: LongInt;
   OldMM: TMemoryManager;
+
+  { v3.42: enjeksiyon durumu. InjectMinSize = 0 -> etkin degil. }
+  InjectMinSize: PtrUInt = 0;
+  InjectSkip: Integer = 0;
+  InjectHitsCount: Integer = 0;
+
+procedure MMInjectFault(AMinSize: PtrUInt; ASkip: Integer);
+begin
+  if AMinSize = 0 then AMinSize := 1;
+  if ASkip < 0 then ASkip := 0;
+  InjectMinSize := AMinSize;
+  InjectSkip := ASkip;
+  InjectHitsCount := 0;
+end;
+
+procedure MMInjectClear;
+begin
+  InjectMinSize := 0;
+  InjectSkip := 0;
+end;
+
+function MMInjectHits: Integer;
+begin
+  Result := InjectHitsCount;
+end;
+
+function MMInjectActive: Boolean;
+begin
+  Result := InjectMinSize > 0;
+end;
 
 // ---------------------------------------------------------------------------
 
@@ -255,6 +308,30 @@ var
   idx: PtrUInt;
 begin
   if Size = 0 then Size := 1;
+  { v3.42 / SKILL3 12.3: test enjeksiyonu. Yalnizca MinSize'a esit/buyuk
+    tahsisler hedeflenir; RTL'in kucuk ic bloklari ve istisna nesneleri
+    korunur. Tek atim: nil dondukten sonra enjeksiyon kendini kapatir. }
+  if InjectMinSize > 0 then
+  begin
+    if Size >= InjectMinSize then
+    begin
+      if InjectSkip > 0 then
+        Dec(InjectSkip)
+      else
+      begin
+        InjectMinSize := 0;
+        Inc(InjectHitsCount);
+        { v3.42: nil DONDURMEK YETMEZ. FPC RTL'i (SetLength dahil) tahsisin
+          basarisiz oldugunu nil ile degil ISTISNA ile ogrenir; nil donerse
+          RTL nil isaretciye yazar ve surec EAccessViolation ile duser
+          (olculdu). Gercek FPC yigin yoneticisi de ayni sekilde
+          EOutOfMemory yukseltir; enjeksiyon da onu taklit eder. Enjeksiyon
+          bu noktada zaten kapandi; istisna nesnesinin kendi tahsisi
+          etkilenmez. }
+        raise EOutOfMemory.Create('bellek tukendi (test enjeksiyonu)');
+      end;
+    end;
+  end;
   if Size > MAX_SMALL then
   begin
     Result := OldMM.GetMem(Size);

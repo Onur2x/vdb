@@ -203,10 +203,11 @@ Last verified state (2026-11-15, Linux x86_64 and Windows i386, `tests/run_gates
 | `auth_throttle` | 16 / 0 |
 | `disk_full` | 16 / 0 (short write / hard write fault on page, meta and **WAL** writes all raise a controlled `ecIOError`; the frame stays dirty, `ROLLBACK` and later commits work, a failed commit leaves **no ghost rows** in the same session (`COUNT(*)` equals the durable state), checkpoint succeeds once the fault clears, reopen + `VERIFY` clean) |
 | `txn_limit` | 18 / 0 (300 short transactions and 75 rollbacks counted exactly; nested `BEGIN`, bare `COMMIT` and bare `ROLLBACK` are documented no-ops; one writer reservation per file gives a controlled `mesgul` under a short busy timeout and completes after release; reopen 578 rows + clean `VERIFY`) |
+| `oom` | 9 / 0 (an allocation failure surfaces as a controlled `EOutOfMemory` on both the read and the write path; page allocation is atomic, so a failed growth never publishes a page number, a failed commit leaves no ghost rows, checkpoint succeeds and a reopen returns 200 rows with a clean `VERIFY`) |
 | `tls_client` | 6 / 0 (Linux; skipped on Windows without OpenSSL DLL) |
 
-That is **35 gates** on Linux (plus two OpenSSL opt-in gates skipped when
-`VDB_CRYPTO_DLL` is unset) and **34 gates** on Windows (`tls_client` skipped).
+That is **36 gates** on Linux (plus two OpenSSL opt-in gates skipped when
+`VDB_CRYPTO_DLL` is unset) and **35 gates** on Windows (`tls_client` skipped).
 Gate documents: [docs/engineering/](docs/engineering/).
 
 ```bash

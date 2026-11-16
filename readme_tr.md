@@ -203,10 +203,11 @@ Son doğrulanan durum (2026-11-15, Linux x86_64 ve Windows i386, `tests/run_gate
 | `auth_throttle` | 16 / 0 |
 | `disk_full` | 16 / 0 (sayfa, meta ve **WAL** yazmalarında kısa yazma ve sert yazma hatası kontrollü `ecIOError` üretiyor; çerçeve kirli kalıyor, `ROLLBACK` ve sonraki commit'ler çalışıyor, başarısız commit aynı oturumda **hayalet satır** bırakmıyor (`COUNT(*)` durabil durumla aynı), hata geçince checkpoint başarılı, yeniden açılış + `VERIFY` temiz) |
 | `txn_limit` | 18 / 0 (300 kısa işlem ve 75 geri alma birebir sayılıyor; iç içe `BEGIN`, işlem yokken `COMMIT` ve `ROLLBACK` belgelenmiş no-op; dosya başına tek yazar rezervasyonu kısa busy süresinde kontrollü `meşgul` veriyor ve bırakılınca işlem tamamlanıyor; yeniden açılışta 578 satır + temiz `VERIFY`) |
+| `oom` | 9 / 0 (tahsis hatası hem okuma hem yazma yolunda kontrollü `EOutOfMemory` olarak yüzeye çıkıyor; sayfa ayırma atomik, başarısız büyüme sayfa numarası yayınlamıyor, başarısız commit hayalet satır bırakmıyor, checkpoint başarılı ve yeniden açılışta 200 satır + temiz `VERIFY`) |
 | `tls_client` | 6 / 0 (Linux; OpenSSL DLL'i olmayan Windows'ta atlanır) |
 
-Linux'ta **35 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
-atlanır), Windows'ta **34 kapı** (`tls_client` atlanır). Kapı belgeleri:
+Linux'ta **36 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
+atlanır), Windows'ta **35 kapı** (`tls_client` atlanır). Kapı belgeleri:
 [docs/engineering/](docs/engineering/).
 
 ```bash

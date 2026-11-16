@@ -14,8 +14,8 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 - **Denetim kapsami**: SKILL2 §18-28 ve SKILL3 §5-§15, §19. Depolama
   motoru, WAL/kurtarma, islem izolasyonu, B+Tree, SQL yurutucu, guvenlik,
   kaynak sinirlari, performans, tasinabilirlik, belge.
-- **Kosulan testler**: `tests/run_gates.sh` - Linux **35 kapi**, Windows
-  **34 kapi** (`tls_client` atlanir), tamami PASS.
+- **Kosulan testler**: `tests/run_gates.sh` - Linux **36 kapi**, Windows
+  **35 kapi** (`tls_client` atlanir), tamami PASS.
 
 ## Findings
 
@@ -36,6 +36,7 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 | F13 | **KRITIK** | `VDbPageStore.SaveMeta` | Bayat gorunumlu bir oturum kendi **dusuk** `FLSN` ve `FPageCount` degerini meta sayfaya yaziyordu. Sonuc: (a) yeniden acilista sayfa LSN'i meta gorunum LSN'inden buyuk kalip `EVdbPageStale` ile okuma reddediliyordu, (b) regresen sayfa sayaci `TrimToLogical` uzerinden **onayli sayfalari kirpabiliyordu** (veri kaybi) | Meta sayfa monotonik: `SaveMeta` yazmadan once diskteki meta okunur, LSN ve sayfa sayaci yalniz **artirilir** (`FreeTrunk`/`FreeCount` sayfa sayaci kazaninca esitlenir) (v3.40) | `txn_limit` TL6/TL8 (yazar cakismasi + yeniden acilis 578 satir + `VERIFY`) | KAPALI |
 | F14 | ORTA | `VDbPageStore.WritePageAt` / `SaveMeta` / `InstallPage` / `GrowTo` | Disk doldu (ENOSPC) yolunda `THandleStream.Write` kisa yazmayi `0`'a cevirdigi icin yazma **sessizce** basarisiz olabiliyordu; buyume yolunda ham `EWriteError` siziyordu | Tek yazma noktasi `WriteBytesChecked`: enjekte edilen hata + kisa yazma kontrollu `ecIOError`; cerceve **kirli** kalir; `GrowTo` mantiksal boyu artirmaz (v3.40) | `disk_full` 16/0 (sayfa, meta ve WAL yazmalari) | KAPALI |
 | F15 | **KRITIK** | `VDbBackendV3.CommitBatch` / `AbortBatch` / `VDbPageWal.Commit` | (a) WAL commit yazimi `WriteBuffer` ile yapiliyordu; kisa yazma ham `EWriteError` olarak siziyordu. (b) `CommitNoSync` ve `MergeTagDeltas` `pendExc` denetiminin **disinda** oldugu icin WAL yazimi basarisiz oldugunda yazma kumesi kaldirilmis, kurtarma blogu atlanmis ama satirlar hem ayni oturumda gorunup hem sonradan **durabil** olabiliyordu (hayalet commit). (c) Canli tablo sayaci commit'ten **once** artirildigi icin basarisiz commit sayaci sisiriyordu (`COUNT(*)` 130 vs durabil 120) | WAL tek yazma noktasi `WriteChecked` -> kontrollu `ecIOError`, kesik kuyruk geri kirpilir; `CommitNoSync` + `MergeTagDeltas` `pendExc` blogunun icine alindi, basarisizlikta `RecoverAfterDurabilityFailure` (+`FWal.Rollback`) ve `FTagCountsValid := False`; `AbortBatch` kendi `TagDelta`'sini temizler (v3.41) | `disk_full` DF8/DF8b/DF8c (WAL yazma hatasi -> kontrollu `ecIOError`, ayni oturumda `COUNT(*)` = durabil 120, yeniden acilis 160 + `VERIFY`) | KAPALI |
+| F16 | **KRITIK** | `VDbPageStore.ExtendFile` / `AllocPage` | Sayfa ayirma iki adimda **gorunur** hale geliyordu: `ExtendFile` once `FPageCount`'u artirip sonra dosyayi buyutuyordu, `AllocPage` ise sayfa numarasini yayinladiktan sonra okuyup baslatiyordu. Arada gelen bir tahsis (`EOutOfMemory`, gercek heap davranisi) sayfa numarasini **taninmayan bir sayfa** olarak dosyada birakiyordu; yeniden acilis taramasi `EVdbHeap: sayfa N taninmiyor (ne VDbPage ne trunk)` ile dosyayi acamiyordu | `ExtendFile` once buyutur, **sonra** `Inc(FPageCount)` yapar; `AllocPage` `GetPageInternal`/`PageInit` hatasinda yalnizca bu cagrinin actigi sayfayi geri alir (`FPageCount`, `FFreshPage`). Freelist'ten gelen sayfa sizinti olarak kalir, ama disaridaki imaji gecerli sayfa/trunk oldugu icin bozulma degildir (v3.42) | `oom` 9/0 (okuma + yazma yolunda enjekte `EOutOfMemory`, hayalet satir yok, yeniden acilis + `VERIFY` temiz) | KAPALI |
 
 ### Kapatilan test bosluklari (SKILL2 §22, SKILL3 §10.1)
 
@@ -74,7 +75,7 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 
 | Sonuc | Linux | Windows |
 |---|---|---|
-| PASS (kapi) | **35** | **34** |
+| PASS (kapi) | **36** | **35** |
 | FAIL | 0 | 0 |
 | SKIP (`VDB_CRYPTO_DLL` yok) | 2 (`fixtures_openssl`, `selftest_openssl`) | 3 (+`tls_client`) |
 | Calistirilmayan | canli PostgreSQL karsilastirmasi (`sql_differential` `pg=not-run`) | ayni |
@@ -87,7 +88,7 @@ crash_points 24/0, integrity_check 32/0, cache_metrics 21/0,
 format_compat 28/0, portability 29/0, multi_writer 12/0, bench_report 35/0,
 sql_features 32/0, limits 18/0, cache_pressure 8/0, page_corrupt 8/0,
 server_harden 24/0, server_failure 16/0, auth_throttle 16/0,
-disk_full 16/0, txn_limit 18/0,
+disk_full 16/0, txn_limit 18/0, oom 9/0,
 selftest_builtin PASS, tls_client 6/0 (yalniz Linux).
 
 ## Remaining Risks
@@ -101,7 +102,7 @@ bilincli olarak disarida).
 | Test | Durum |
 |---|---|
 | Disk dolu (ENOSPC) | VAR (`disk_full`: kisa yazma/sert yazma hatasi -> kontrollu `ecIOError`, cerceve kirli kalir, `ROLLBACK` sonrasi veri bozulmaz, yeniden acilis + `VERIFY` temiz) |
-| Bellek tahsis hatasi | YOK |
+| Bellek tahsis hatasi | VAR (`oom`: enjekte edilen tahsis hatasi okuma ve yazma yolunda `EOutOfMemory` olarak yuzeye cikar; sayfa ayirma atomik oldugu icin dosyada taninmayan sayfa kalmaz, basarisiz commit hayalet satir birakmaz, yeniden acilis + `VERIFY` temiz) |
 | WAL tukenmesi | YOK |
 | Onbellek tukenmesi / tahliye | VAR (`cache_pressure`: 8 sayfalik havuz, kirli tahliye, yeniden acilis) |
 | Asiri baglanti | VAR (`server_failure` SF4: `MaxConns=1` iken ikinci baglanti `RSP_ERROR` + `kapasite dolu` alir, birincisi calismaya devam eder) |
@@ -134,7 +135,7 @@ karsilastirmasi kosmadi.
 **BETA CANDIDATE**
 
 Gerekce: kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici
-bir regresyon kapisiyla kilitlendi; iki platformda 35/34 kapi yesil; tek
+bir regresyon kapisiyla kilitlendi; iki platformda 36/35 kapi yesil; tek
 dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari, disk dolu
 ve islem sayisi basinci ile tasinabilirlik olculdu. Buna karsin bellek
 tukenmesi, WAL tukenmesi ve B+Tree olcek/parcalanma gibi uretim hatasi

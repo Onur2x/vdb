@@ -252,6 +252,19 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   kontrollu `mesgul` hatasi verir, `ROLLBACK` ile temizlenir ve birakilinca
   islem yeniden tamamlanir; temiz kapanis tek dosya birakir, yeniden
   acilista 578 satir ve temiz `VERIFY`.
+- **Bellek tukenmesi regresyon kapisi** `oom` (9 kontrol, SKILL3 §12.1):
+  `VDbMM`'e yalniz test icin enjeksiyon kancasi eklendi
+  (`MMInjectFault`/`MMInjectClear`/`MMInjectHits`/`MMInjectActive`; esik
+  ustundeki tahsislerde bir kez `EOutOfMemory` atar, sonra kapanir). Okuma
+  ve yazma yollari ayri olculdu; nil donen tahsis `SetLength` icinde
+  `EAccessViolation`'a donustugu icin **yanlis** bir benzetimdi, gercek
+  heap gibi `EOutOfMemory` atiliyor. **Bulunan gercek hata (F16,
+  KRITIK):** yazma sirasindaki tahsis hatasi dosyada taninmayan sayfa
+  birakiyordu (`EVdbHeap: sayfa N taninmiyor`). `ExtendFile` artik once
+  buyutur, sonra `Inc(FPageCount)` yapar; `AllocPage` yalnizca bu cagrinin
+  actigi sayfayi geri alir (`FPageCount`, `FFreshPage`). Kapi: hata
+  sonrasi oturum yazmaya devam eder, hayalet satir yok, checkpoint
+  basarili, yeniden acilis 200 satir ve temiz `VERIFY`.
 - **Ozellik regresyon kapisi** `sql_features` (32 kontrol): SKILL3 §9.1/
   §10.1'in "uygulanmis ama test edilmemis" listesini kapatir — `SAVEPOINT` /
   `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` (kismi geri alma gercekten

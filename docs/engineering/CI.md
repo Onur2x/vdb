@@ -52,6 +52,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `server_failure` | **sunucu hata yollari** (SKILL3 §12.1): (a) `MaxConns=1` iken ikinci baglanti `RSP_ERROR` + `kapasite dolu` alip kapanir, birinci baglanti sorguya devam eder; (b) yeni baglantiya 64 bayt cop ($FF) yazilip kapatilir, sunucu yasar; (c) `CMD_QUERY` ardindan sahte **96 MiB** uzunluk oneki gonderilir - v3.39 `VDBS_MAX_RECV_STR` (64 MiB) oneki tahsis yapmadan reddeder, sunucu yasar; (d) acik baglanti varken `Stop` doner ve `Ready=False` olur; (e) `.odb` dosyasi yerinde kalir ve yeniden acilip satirlari okur |
 | `disk_full` | **disk dolu / kisa yazma** (SKILL3 §12.1): sayfa, meta ve **WAL** yazmalari tek noktadan (`WriteBytesChecked` / `WriteChecked`) gecer; enjekte edilen sert hata ve yarim yazma (gercek `ENOSPC` davranisi) kontrollu `ecIOError` uretir, surec cokmez, cerceve **kirli** kalir. Basarisiz commit **hayalet satir** birakmaz (ayni oturumda `COUNT(*)` durabil durumla ayni). Hata + `ROLLBACK` sonrasi onayli satirlar durur, hata giderilince checkpoint ve yeni commit calisir, yeniden acilista tum onayli satirlar okunur ve `VERIFY` temizdir |
 | `txn_limit` | **islem sayisi / yazar cakismasi** (SKILL3 §12.2): 300 kisa islem ve 300 islemin 75'i geri alinarak commit sayisi birebir dogrulanir (sessiz kayip yok). Belgelenen v3 semantigi olculur: ic ice `BEGIN`, islem yokken `COMMIT`/`ROLLBACK` **sessiz no-op**'tur (tek islem katmani). Dosya basina **tek yazar rezervasyonu** vardir: bir oturum tutarken digeri kisa busy suresiyle kontrollu `mesgul` hatasi alir, `ROLLBACK` ile temizlenir, rezervasyon birakilinca ayni islem basariyla tamamlanir; yeniden acilista tum satirlar + `VERIFY` temiz |
+| `oom` | **bellek tukenmesi** (SKILL3 §12.1): `VDbMM`'e yalniz test icin `MMInjectFault` kancasi eklendi (esik ustundeki tahsislerde bir kez `EOutOfMemory`, sonra kapanir). Okuma ve yazma yollari ayri olculur; nil donen tahsis `SetLength` icinde `EAccessViolation`'a donustugu icin **yanlis** bir benzetimdi, gercek heap gibi `EOutOfMemory` atiliyor. **Bulunan gercek hata (F16, KRITIK):** yazma sirasindaki tahsis hatasi dosyada taninmayan sayfa birakiyordu (`EVdbHeap: sayfa N taninmiyor`); `ExtendFile` once buyutup sonra `Inc(FPageCount)` yapar, `AllocPage` yalnizca bu cagrinin actigi sayfayi geri alir. Hata sonrasi oturum yazmaya devam eder, hayalet satir yok, checkpoint ve yeniden acilis 200 satir + temiz `VERIFY` |
 | `auth_throttle` | SCRAM deneme sinirlama/kilit |
 | `selftest_builtin` | provider SelfTest (builtin) |
 | `tls_client` | istemci CA + sunucu adi dogrulamasi (OpenSSL varsa) |
@@ -487,4 +488,30 @@ kaldirildi:
     meta sayfa yazimi hatasi checkpoint'te kontrollu hata verir; ardindan
     checkpoint basarili, yeniden acilis + `VERIFY` temiz.
   - `txn_limit` **18 PASS / 0 FAIL** (degismedi).
+  Diger kapilar degismedi.
+- Yirmi yedinci kosu (PHASE-24 commit'i, SKILL3 §12.1 bellek tukenmesi):
+  **iki platform da YESIL**. Git Bash/Windows **35 kapi** PASS
+  (`tls_client` SKIP), WSL x86_64 Linux **36 kapi** PASS (OpenSSL istege
+  bagli iki kapi SKIP). Bu kosuda bir KRITIK kusur bulundu ve kapatildi:
+  - **F16 (KRITIK) - atomik olmayan sayfa ayirma**
+    (`VDbPageStore.ExtendFile`/`AllocPage`): commit sirasinda bir tahsis
+    basarisiz oldugunda sayfa numarasi `FPageCount`'a eklenmis ama sayfa
+    dosyada HIC baslatilmamis oluyordu. Yeniden acilis taramasi bu sifir
+    sayfayi `EVdbHeap: sayfa N taninmiyor (ne VDbPage ne trunk)` diye
+    reddediyordu, yani veritabani ACILMIYORDU. Artik `ExtendFile` once
+    dosyayi buyutur sonra `Inc(FPageCount)` yapar; `AllocPage` yalnizca
+    BU cagrinin actigi sayfayi geri alir (numarayi yayinlamaz). Freelist
+    sayfasi sizinti olarak kalabilir; diskteki imaji gecerli oldugu icin
+    bozulma degil.
+  - **Yeni kapi `oom` 9 PASS / 0 FAIL**: `VDbMM` uzerinde YALNIZ test
+    icin enjeksiyon (`MMInjectFault`/`MMInjectClear`/`MMInjectHits`/
+    `MMInjectActive`; esik ustu tek tahsis `EOutOfMemory` verir, sonra
+    kendini kapatir). Okuma ve yazma yolu ayri olculur; basarisiz commit
+    hayalet satir birakmaz, hata sonrasi yazma devam eder, checkpoint
+    basarili, yeniden acilista 200 satir + temiz `VERIFY`.
+  - Not: enjeksiyonun `nil` dondurmesi YANLIS bir simulasyondu - FPC RTL
+    `SetLength` icinde `nil`'i `EAccessViolation`'a ceviriyor; gercek
+    yigin `EOutOfMemory` firlatir, enjeksiyon da oyle yapar.
+  - `disk_full` **16 PASS / 0 FAIL**, `txn_limit` **18 PASS / 0 FAIL**
+    (degismedi; ayni kosuda yeniden dogrulandi).
   Diger kapilar degismedi.
