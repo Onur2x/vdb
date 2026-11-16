@@ -169,7 +169,7 @@ API details and SQL usage: [usage.md](usage.md)
 
 ## Test status
 
-Last verified state (2026-11-15, Linux x86_64 and Windows i386, `tests/run_gates.sh`):
+Last verified state (2026-11-16, Linux x86_64 and Windows i386, `tests/run_gates.sh`):
 
 | Gate | Result |
 |---|---|
@@ -200,6 +200,7 @@ Last verified state (2026-11-15, Linux x86_64 and Windows i386, `tests/run_gates
 | `page_corrupt` | 8 / 0 (every data page body byte-flip, bad magic and a wrong page image on the normal read path all raise a controlled `ecCorrupt`; a good copy of the file still scans perfectly) |
 | `server_failure` | 16 / 0 (connection cap refuses with `kapasite dolu`, garbage bytes and a bogus 96 MiB length prefix do not kill the server, `Stop` with a live connection returns, the file reopens intact) |
 | `server_harden` | 24 / 0 |
+| `btree_disk` | 78 / 0 (separate on-disk B+Tree page format: standalone `VDbBTreeDisk.pas`, **not wired into** the v5 engine file format, WAL or recovery, so the v5 format and recovery behaviour are unchanged. 4096-byte pages, 32-byte header (`PageNo`/`Kind`/`Level`/`NKeys`/`Flags` plus a per-page CRC), slotted cells packed backwards from the page end, leaf cell 16 bytes (`Key:QWord + Val:QWord`), internal cell 12 bytes (`Key:QWord + Child:LongWord`) with cell 0 unused-key and leftmost-child, routing rule "largest `i` with `Key_i <= K`". **Shadow paging**: no page is updated in place, changed pages are copied to new page numbers up the root path, and the meta page is written last as the **commit point**; two A/B meta pages, the valid one with the highest `Seq` wins. BD1-BD18 cover insert/find/update with an ordered `Walk`, reopen with a clean `Verify` without shrinking the file (57,344 -> 57,344 B), deleting half then reopening, descending 2000 and shuffled 3000/6000, a 6000-probe `NextAfter` lower-bound scan identical to the sorted list, split-heavy 6000 keys (height 2, 36 leaves), churn fill measured honestly (`yaprak=36 hucre=6000 doluluk=96000/147456`, ~65%), page reclamation (75 -> 75 pages, no counter bloat), **torn meta** (corrupting the newest meta still opens the previous 300-key tree with the newer 300 invisible), the **crash point** (`OnBeforeMeta` copies the file just before the meta write; the copy reads all of the previous 200 keys = no data loss), CRC-only corruption (`Verify` fails while reads still find 500/500), structural corruption (`Verify` fails and the read path raises a controlled `EBtdError`, never an access violation) and a truncated file (`EBtdError` instead of silently building a new tree). The gate found and this commit fixed three real defects: Windows `fmCreate` reopening **truncating** the file, a double free in the constructor exception path, and `Verify` leaking exceptions on a corrupt page. Identical output on Windows and Linux) |
 | `auth_throttle` | 16 / 0 |
 | `disk_full` | 16 / 0 (short write / hard write fault on page, meta and **WAL** writes all raise a controlled `ecIOError`; the frame stays dirty, `ROLLBACK` and later commits work, a failed commit leaves **no ghost rows** in the same session (`COUNT(*)` equals the durable state), checkpoint succeeds once the fault clears, reopen + `VERIFY` clean) |
 | `txn_limit` | 18 / 0 (300 short transactions and 75 rollbacks counted exactly; nested `BEGIN`, bare `COMMIT` and bare `ROLLBACK` are documented no-ops; one writer reservation per file gives a controlled `mesgul` under a short busy timeout and completes after release; reopen 578 rows + clean `VERIFY`) |
@@ -209,8 +210,8 @@ Last verified state (2026-11-15, Linux x86_64 and Windows i386, `tests/run_gates
 | `net_fuzz` | 39 / 0 (network fuzz against the real PostgreSQL wire server on loopback in trust mode, `MaxConns=256` so capacity is never the failure mode: 15 attack families plus a seeded deterministic loop, every one followed by a check that a **valid** client still completes startup and runs `SELECT 1` — startup lengths `70000` and `2^31-1`, a truncated startup, lengths `0`/`4`/`0xFFFFFFFF`, an unknown protocol code, 512 random bytes, 30 random message types after a valid startup, `Q` with length `64MB+1`, `Q` with length `3`, a declared-but-truncated `Q` body, NUL-less/control-byte/empty queries, 20 consecutive `SSLRequest`s answered `N` and then a real query on the same socket, 40 short junk connections, a 120-iteration seeded mutation loop with an alive check every 20 iterations, malformed extended protocol (`P`/`B`/`E`/`D`, each followed by `Sync` and then a real query), and 4 threads x 8 concurrent fuzz iterations. Identical output on Windows and Linux) |
 | `tls_client` | 6 / 0 (Linux; skipped on Windows without OpenSSL DLL) |
 
-That is **39 gates** on Linux (plus two OpenSSL opt-in gates skipped when
-`VDB_CRYPTO_DLL` is unset) and **38 gates** on Windows (`tls_client` skipped).
+That is **40 gates** on Linux (plus two OpenSSL opt-in gates skipped when
+`VDB_CRYPTO_DLL` is unset) and **39 gates** on Windows (`tls_client` skipped).
 Gate documents: [docs/engineering/](docs/engineering/).
 
 ```bash

@@ -117,7 +117,7 @@ bilincli olarak disarida).
 | Sunucu kapanisi | VAR (`server_failure` SF7/SF8: acik baglanti varken `Stop` doner, dosya yeniden acilip okunur) |
 | 1M anahtar olcek (bellekteki B+Tree) | VAR (`btree_scale` BS1-BS8: 1.000.000 anahtar, yukseklik 4, 14.965 yaprak, doluluk 66/96; islem basina maliyet 10x veride 3,75x Windows / 4,55x Linux - karesel degil; yarisi silinip yeniden eklenince yaprak sayisi 14.965 -> 14.979 = 1,00x) |
 | VACUUM sonrasi geri kazanma / parcalanma | VAR (`btree_scale` BS9-BS14: 6.000 satir 1.601.536 bayt; %90 silme dosyayi kucultmez (sayfalar yeniden kullanilir), `VACUUM` **iki platformda da** 1.601.536 -> 151.552 bayt = %90 kazanc; sayim birebir, yeniden ekleme sismez, yeniden acilis + `VERIFY` temiz. Bu kapi ayrica F17/F18'i ortaya cikardi: Linux VACUUM'u yer kazanmadan basarili gorunuyordu) |
-| Ayri B+Tree disk sayfa bicimi | YOK (tablo satirlari bellekteki `TVDbBTree` uzerinde durur - bkz. `docs/engineering/BTREE_INTEGRITY.md` §6; ayri indeks dosyasi `VDbIdxFile` bu kapsamda olculmedi) |
+| Ayri B+Tree disk sayfa bicimi | KISMI (`tests/btree_disk` BD1-BD18: bagimsiz `VDbBTreeDisk.pas` icin 4096 baytlik sayfa bicimi, golge sayfalama ile atomik commit, yirtik meta geri donusu, cokme noktasinda onceki agacin tam okunmasi, yalniz-CRC ve yapisal bozulma tespiti, sayfa geri kazanimi - iki platformda 78 kontrol, 0 FAIL. **v5 motor dosya bicimine bagli DEGILDIR**: tablo satirlari hala 4 KB sayfa yigini, ikincil indeksler bellekteki `TVDbBTree`; birlesme/yeniden dagitma yok - bkz. `docs/engineering/BTREE_INTEGRITY.md` §7) |
 
 **Desteklenmeyen ozellikler**: v4 konteyner bicimi (durduruldu), dis
 bagimlilik yok (saf native, harici DLL yok - OpenSSL istege bagli).
@@ -140,16 +140,17 @@ karsilastirmasi kosmadi.
 **BETA CANDIDATE**
 
 Gerekce: kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici
-bir regresyon kapisiyla kilitlendi; iki platformda 39/38 kapi yesil; tek
+bir regresyon kapisiyla kilitlendi; iki platformda 40/39 kapi yesil; tek
 dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari, bozuk ag
 girdisi (genis fuzz), disk dolu,
 islem sayisi basinci, bellek tukenmesi, WAL sert boy tavani, B+Tree
 olcek/parcalanma ve VACUUM geri kazanimi ile tasinabilirlik olculdu. Olcum
 kapisinin kendisi iki kritik hata buldu (F17 Unix fd sizintisi, F18 sahte
 basarili dosya degistirme); ikisi de kapatildi ve ayni kapiyla kilitlendi.
-Buna karsin ayri B+Tree disk sayfa bicimi yok; canli
-PostgreSQL diferansiyeli kosmadi; TLS varsayilan olarak kapali. Bu nedenle
-"PRODUCTION CANDIDATE" degil.
+Buna karsin ayri B+Tree disk sayfa bicimi yalnizca **bagimsiz ve kapili bir
+bilesen** olarak vardir (`VDbBTreeDisk`), v5 motor dosya bicimine bagli
+degildir; canli PostgreSQL diferansiyeli kosmadi; TLS varsayilan olarak
+kapali. Bu nedenle "PRODUCTION CANDIDATE" degil.
 
 Bu siniflandirma bagimsiz dogrulama (harici denetim, resmi sertifika)
 olmadigi icin "certified"/"SIL"/"formal compliance" iddiasi icermez.

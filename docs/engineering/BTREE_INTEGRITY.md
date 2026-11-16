@@ -80,7 +80,9 @@ FPC 3.2.4 aynı sayı).
   kapıda koşulmaz; buradaki ağaç bellekteki `TVDbBTree`'dir.
 - **Eşzamanlı erişim** (birden çok iş parçacığı) kapsam dışıdır; ağaç
   çağıranın kilidi altında kullanılır (`TIdxSkip` sözleşmesi).
-- **Disk tabanlı B+tree sayfa bölünmesi/birleşmesi** ayrı bir kalemdir.
+- **Disk tabanlı B+tree sayfa bölünmesi/birleşmesi** ayrı bir kalemdi;
+  bağımsız bir uygulama §7'de ölçülüyor. Birleştirme/yeniden dağıtma hâlâ
+  yoktur.
 - **Reindex/compaction komutu** yok: denge silme sırasında korunur,
   ayrı bir yeniden inşa adımı gerekmez (yine de `LoadSorted` yeniden
   yükleme yolu vardır).
@@ -141,8 +143,73 @@ reproducible ölçümdür; başka donanımda farklı çıkar.
   yukarı taşınır ve backend `FEng=nil` ile kilitsiz bırakılmaz.
 
 **Dürüst sınır:** diskteki ölçüm tablo satırlarının kullandığı bellekteki
-ağaç (`VDbTable` içindeki `TVDbBTree`) üzerindendir; ayrı bir **disk
-üzerindeki B+tree sayfa biçimi yoktur** ve bu ölçüm onu kanıtlamaz.
-VACUUM'un geri kazanması sayfa deposunun (heap) yeniden yazılmasıyla
-olur, indeks sayfası bölünmesiyle değil.
+ağaç (`VDbTable` içindeki `TVDbBTree`) üzerindendir. Ayrı bir disk
+üzerindeki B+tree sayfa biçimi bu ölçümün kapsamı dışındaydı; artık
+bağımsız bir uygulaması vardır ve §7'de ölçülür, **ama v5 motor dosya
+biçimine bağlı değildir**. VACUUM'un geri kazanması sayfa deposunun
+(heap) yeniden yazılmasıyla olur, indeks sayfası bölünmesiyle değil.
+
+## 7. Ayrı disk sayfa biçimi (`VDbBTreeDisk`, PHASE-27 / v3.46)
+
+Bu bölüm §5'teki kalemi kapatır — **ama tam olarak değil**: ayrı bir disk
+sayfa biçimi artık vardır ve kapıdan geçer, yine de **v5 motor dosya
+biçimine bağlı değildir**.
+
+### Ne yapıldı
+
+`VDbBTreeDisk.pas` kendi başına açılıp doğrulanabilen bir B+Tree sayfa
+biçimi uygular; kapısı `tests/btree_disk` (BD1-BD18).
+
+| Kalem | Değer |
+|---|---|
+| Sayfa boyu | 4096 bayt; 32 bayt başlık (PageNo, Kind, Level, NKeys, Flags, sayfa CRC'si) |
+| Meta | iki kopya (sayfa 0 ve 1); en yüksek `Seq` + geçerli CRC kazanır |
+| Yaprak hücresi | 16 bayt: `Key:QWord` + `Val:QWord` |
+| İç hücre | 12 bayt: `Key:QWord` + `Child:LongWord`; hücre 0 = en sol çocuk |
+| Yönlendirme | "`Key_i <= K` olan en büyük i" |
+| Atomiklik | gölge sayfalama: sayfa yerinde güncellenmez, kökten yaprağa yol yeni sayfalara kopyalanır, **meta en son yazılır** (commit noktası) |
+| Silme | tembel: anahtar çıkar, yalnızca boşalan sayfa düşürülür; yükseklik yalnızca kök tek çocuğa inince azalır |
+
+### Ölçülen (iki platformda aynı: 78 PASS, 0 FAIL)
+
+| Kontrol | Sonuç |
+|---|---|
+| Ekle/oku/güncelle, `Walk` sırası | 1.000 anahtar, kesin artan sıra, `count` birebir |
+| Yeniden açılış | 1.000 anahtar + `Verify` temiz; dosya **küçülmez** (57.344 → 57.344 bayt) |
+| Silme + yeniden açılış | 500 anahtar kalır, silinenler yok, `Verify` temiz |
+| Sıralı/karışık yükleme | azalan 2.000 ve karışık 3.000/6.000 anahtar; hepsi bulunur |
+| `NextAfter` alt-sınır taraması | 6.000 sorgu sıralı listeyle **birebir** |
+| Bölünme ağırlıklı büyüme | 6.000 anahtar, yükseklik 2, 36 yaprak |
+| Churn (sil + yeniden ekle) doluluk | `yaprak=36 hucre=6000 doluluk=96000/147456` (~%65) |
+| Sayfa geri kazanımı | hepsi silinip yeniden eklenince sayfa sayısı 75 → 75 (**şişme yok**) |
+| Yırtık meta | yeni meta sayfası bozulunca **önceki ağaç** aynen açılır (300 anahtar; yeni 300 anahtar görünmez) |
+| Çökme noktası | meta yazımından **hemen önce** alınan kopya önceki ağacı tam okur (200 anahtar) — veri kaybı yok |
+| Yalnız-CRC bozulması | `Verify` FAIL; okuma yolu çalışmaya devam eder (500/500 bulunur) |
+| Yapısal bozulma | `Verify` FAIL; okuma yolu **kontrollü `EBtdError`** atar, erişim ihlali yok |
+| Kesik dosya (<2 sayfa) | sessizce yeni ağaç **kurulmaz**, `EBtdError` |
+
+### Bu kapının bulduğu üç gerçek kusur
+
+1. **Windows'ta her açılış ağacı siliyordu.** `VDbOpenStreamNoFlock(ad, False, True)`
+   Windows'ta `fmCreate`'e karşılık gelir ve dosyayı **sıfırlar** (Unix'te
+   `O_CREAT` sıfırlamaz). Birim artık `FileExists` ile ayırır
+   (`VDbPageStore` ile aynı desen). Kapı olmadan bu sessiz veri kaybıydı.
+2. **Kurucu istisnasında çift serbest.** Yarım kurulmuş nesnede alanlar
+   `nil`'e çekilmediği için FPC'nin otomatik yıkıcısı `FMap`'i ikinci kez
+   serbest bırakıyordu (erişim ihlali). `FreeAndNil` + yıkıcıda `nil`
+   kontrolü.
+3. **`Verify` bozuk dosyada istisna sızdırıyordu.** Doğrulayıcı artık
+   aralık dışı sayfayı bulgu olarak raporlar ve `False` döner.
+
+### Dürüst sınır
+
+- Birim **v5 motor dosya biçimine, WAL'a ve kurtarma yoluna bağlı
+  değildir**; `VDbPageEngine`, `VDbTable` ve SQL yolu onu kullanmaz.
+  Dolayısıyla v5 dosya biçimi ve kurtarma davranışı **değişmedi**.
+- Tablo satırları hâlâ 4 KB sayfa yığını üzerinde, ikincil indeksler
+  hâlâ bellekteki `TVDbBTree` üzerinde durur.
+- Birleştirme/yeniden dağıtma yoktur; tembel silmenin doluluk maliyeti
+  gizlenmez, kapı ölçer (~%65).
+- Motora bağlanması ayrı bir iş kalemidir ve o gün ayrıca kapı + kurtarma
+  çalışması gerekir. Bu belge o iddiayı taşımaz.
 

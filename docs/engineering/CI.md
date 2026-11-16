@@ -56,6 +56,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `btree_scale` | **B+Tree olcek + VACUUM geri kazanma** (SKILL3 §13 olcum-once kurali: "olculebilir bir sorun olmadan spekulatif B+Tree degisikligi yok"): bellekteki `TVDbBTree`'ye 1.000.000 anahtar karisik sirada eklenir; yukseklik **4**, **14.965** yaprak, ortalama doluluk **66/96**, degismezler temiz, `All()` artan, 8.000 rastgele `Find`, `CountRange`/`RankBefore` analitik beklentiyle ayni. Olcek olcusu toplam sure degil **islem basina** maliyettir: 10x veride **3,75x Windows / 4,55x Linux** (karesel agacta ~10x); i386'da 1M anahtar onbellek disina tasindigi icin toplam oran 35-46x cikar ve tek basina yanilticidir. Yarisi silinip yeniden eklenince yaprak sayisi 14.965 -> 14.979 (**1,00x**), yani churn sonrasi yaprak parcalanmasi yok. Diskte 6.000 satir -> %90 sil (dosya kuculmez; `GetDeadBytes` yalniz freelist sayfalarini sayar) -> `VACUUM` **iki platformda da** 1,60 MB'i 151 KB'a indirir (**%90 kazanc**), satir sayisi birebir kalir, sonrasinda 600 satir daha eklemek dosyayi sisirmez, yeniden acilis ve `VERIFY` temiz. Kapi yazilirken **iki gercek motor hatasi** olculdu ve ayni commit'te duzeltildi (v3.43): Unix'te her acilista sizan dosya tanitici (F17) ve basarisiz dosya degistirmeyi basarili bildiren sessiz yutma (F18) - Linux'un yer kazanmadan `VACUUM` kazanci bildirmesinin nedeni buydu |
 | `wal_limit` | **WAL icin sert boy tavani** (SKILL3 §6.3: "Any WAL limit must fail safely without corrupting committed data"): `VDB_WAL_MAX_BYTES` = 64 MiB varsayilan, `WalMaxBytes` ozelligi ile degistirilebilir (0 = kapali). Kapi tavani 300 000 bayta indirir ve su davranisi kilitler: 100 autocommit ekleme tavanin cok altinda kalir ve rahatlatma checkpoint'i **gercekten** calisir (`checkpoint 0 -> 11`); `VAL_LEN=6000` ile 250 satirlik **tek** islem commit aninda `ecLimit` alir ve mesaj tavani adlandirir (`WAL boyu siniri asildi (2090928 bayt > 300000 bayt)`); reddedilen islem **hayalet satir birakmaz** (`COUNT(*)` 100'de kalir), hemen ardindan gelen kucuk yazim basarilidir (ret kilidi yok), WAL tavanin altina doner, onceki onayli satirlar bozulmadan okunur; ayni islem `WalMaxBytes := 0` ile commit edilir (350 satir), acik checkpoint sonrasi yazim devam eder (355 satir, WAL tekrar tavan altinda) ve yeniden acilis 355 satiri + temiz `VERIFY` verir. Sert kontrol `DoCommit` icinde, butun cerceveler tampona girdikten ve `FWal.Bytes` kesinlestikten SONRA ama WAL'e tek bayt yazilmadan ONCE yapilir; temizlik backend'in mevcut `RecoverAfterDurabilityFailure` yolundadir (cift kurtarma yok). Iki platformda birebir ayni cikti: **19 PASS / 0 FAIL** |
 | `net_fuzz` | **genis ag fuzz'i** (SKILL3 §6/§11: bozuk ag girdisi sunucuyu dusurmemeli): gercek `TVdbPgServer` (PG wire) loopback'te **trust** modda, `MaxConns=256` (kapasite asla basarisizlik nedeni olmasin diye). 15 saldiri ailesi + tohumlanmis deterministik mutasyon dongusu: startup uzunlugu `70000` ve `2^31-1`, kesik startup, `0`/`4`/`0xFFFFFFFF`, bilinmeyen protokol kodu, 512 rastgele bayt, gecerli startup sonrasi 30 rastgele mesaj tipi, `Q` uzunlugu `64MB+1`, `Q` uzunlugu `3`, ilan edilip kesilen `Q` govdesi, NUL'suz/kontrol baytli/bos sorgu, 20 ardisik `SSLRequest` (her biri `N`, sonra ayni sokette gercek sorgu), 40 kisa cop baglanti, 120 yinelemeli tohumlanmis mutasyon (her 20 yinelemede canlilik kontrolu), bozuk genisletilmis protokol (`P`/`B`/`E`/`D`) ve 4 is parcacigi x 8 eszamanli fuzz. Her saldiridan SONRA gecerli bir istemci startup'i tamamlayip `SELECT 1` calistirir; kapi sunucunun cokmedigini, baglanti kabul etmeye devam ettigini ve gercek sorgu yaniti verdigini boyle olcer. Kapi yazilirken bir **test istemcisi** hatasi ortaya cikti (genisletilmis protokol hatasindan sonra sunucu yalnizca `Sync` bekledigi icin istemci `Z` bekleyip kilitleniyordu; saldiri dizisi her bozuk mesajdan sonra `Sync` gonderir) - sunucu tarafinda degisiklik gerekmedi. Iki platformda birebir ayni: **39 PASS / 0 FAIL** |
+| `btree_disk` | **ayri B+Tree disk sayfa bicimi** (SKILL3 §13'un son acik kalemi): `VDbBTreeDisk.pas` **bagimsiz** birimdir, v5 motor dosya bicimine, WAL'e ve kurtarmaya **bagli DEGILDIR** (v5 bicimi ve kurtarma davranisi degismez). 4096 baytlik sayfa, 32 baytlik baslik (`PageNo`/`Kind`/`Level`/`NKeys`/`Flags` + sayfa CRC'si), slotlu hucre duzeni sayfa sonundan geriye; yaprak hucresi 16 bayt (`Key:QWord + Val:QWord`), ic hucre 12 bayt (`Key:QWord + Child:LongWord`), ic sayfada 0. hucrenin anahtari kullanilmaz ve en sol cocuktur, yonlendirme "`Key_i <= K` olan en buyuk `i`". **Golge sayfalama**: hicbir sayfa yerinde guncellenmez, degisen sayfalar yeni numaralara kopyalanir ve meta en son yazilir; meta yazimi **commit noktasidir**. Iki A/B meta sayfasi vardir, acilista CRC'den gecen **en yuksek `Seq`** kazanir. Kapi BD1-BD18: 1000 anahtar ekle/oku/guncelle + artan `Walk`, yeniden acilis + temiz `Verify` (dosya kuculmez 57.344 -> 57.344 B), yarisi silinip yeniden acilma, azalan 2000 ve karisik 3000/6000, 6000 `NextAfter` alt-sinir taramasi (sirali listeyle birebir), bolunme agirlikli 6000 anahtar (yukseklik 2, 36 yaprak), churn sonrasi doluluk olcumu (`yaprak=36 hucre=6000 doluluk=96000/147456`, ~%65), sayfa geri kazanimi (75 -> 75 sayfa; sayac sismez), **yirtik meta** (en yeni meta bozulunca onceki 300 anahtarlik agac aynen acilir, yeni 300 anahtar gorunmez), **cokme noktasi** (`OnBeforeMeta` kancasi meta yazimindan hemen once dosyayi kopyalar; kopya onceki 200 anahtari TAM okur = veri kaybi yok), yalniz-CRC bozulmasi (`Verify` FAIL, okuma hala 500/500 bulur), yapisal bozulma (`Verify` FAIL ve okuma yolu kontrollu `EBtdError`, **access violation yok**) ve kesik dosya (`EBtdError`, sessizce yeni agac KURMAZ). Kapi yazilirken **uc gercek kusur** bulundu ve duzeltildi: Windows'ta `fmCreate` ile yeniden acilisin dosyayi **sifirlamasi** (`FileExists` ayrimi, `VDbPageStore` ile ayni desen), kurucu istisna yolunda **cift serbest birakma** (`FreeAndNil` + nil kontrolleri) ve `Verify`'in bozuk sayfada **istisna sizdirmasi**. Iki platformda birebir ayni: **78 PASS / 0 FAIL** |
 | `auth_throttle` | SCRAM deneme sinirlama/kilit |
 | `selftest_builtin` | provider SelfTest (builtin) |
 | `tls_client` | istemci CA + sunucu adi dogrulamasi (OpenSSL varsa) |
@@ -632,3 +633,48 @@ kaldirildi:
     tam olarak bu davranisi kilitlemesidir.
   - `MaybeCheckpoint`, `DoCommit` ve `wal_limit` degismedi; diger kapilar
     ayni (`sql_differential` yine `pg=not-run`).
+- Otuz birinci kosu (PHASE-27, ayri B+Tree disk sayfa bicimi): **iki
+  platform da YESIL**. Git Bash/Windows **39 kapi** PASS (`tls_client`
+  SKIP), WSL x86_64 Linux **40 kapi** PASS (OpenSSL istege bagli iki kapi
+  SKIP). Yeni kapi `btree_disk` **78 PASS / 0 FAIL**, iki platformda
+  birebir ayni cikti. Diger butun kapilar degismedi (`sql_differential`
+  yine `pg=not-run`).
+  - **Yeni birim `VDbBTreeDisk.pas`, ama v5'e BAGLI DEGIL**: bu kosu v5
+    motor dosya bicimini, WAL'i ve kurtarma davranisini **degistirmez**;
+    tablo satirlari hala 4 KB sayfa yigini uzerindedir ve ikincil
+    indeksler hala bellekteki `TVDbBTree`'dir. Burada olculen sey sayfa
+    biciminin kendisidir (bolunme, siralama, atomik commit, yirtik meta
+    geri donusu, cokme noktasi, bozulma tespiti, sayfa geri kazanimi).
+  - **Golge sayfalama (shadow paging) ile atomik commit**: degisen her
+    sayfa yeni bir numaraya kopyalanir, kokten yapraga yol yeniden
+    yazilir, **meta en son** yazilir ve meta yazimi commit noktasidir.
+    Meta'dan once cokme olursa eski agacin sayfalari hic degismemistir;
+    baglanmamis sayfalar acilista erisilemez oldugu icin serbest sayilir
+    ve yeniden kullanilir (sizinti kendiliginden geri kazanilir).
+  - **Yirtik meta**: iki A/B kopyadan CRC'den gecen en yuksek `Seq`
+    kazanir; en yeni kopya bozuksa eskisi kullanilir ve eskisinin agaci
+    da bozulmamis oldugu icin meta yazimi atomiktir. Olculen: 300
+    anahtarlik onceki agac aynen acilir, 301-600 gorunmez.
+  - **Cokme noktasi olcumu**: `OnBeforeMeta` kancasi meta yazimindan
+    hemen once dosyayi kopyalar; kopya acildiginda onceki 200 anahtarin
+    TAMAMI bulunur ve `Verify` temizdir (veri kaybi yok). Asil dosya
+    commit'ten sonra 400 anahtarla devam eder.
+  - **Silme tembel**: yalnizca bosalan sayfa agactan dusurulur, yarim
+    dolu sayfalar birlestirilmez; yukseklik yalnizca kok tek cocuga
+    indiginde azalir. Doluluk maliyeti gizlenmez, olculur: churn sonrasi
+    `yaprak=36 hucre=6000 doluluk=96000/147456` (~%65). Birlestirme/
+    yeniden dagitma yoktur; eklenirse ayri olcum ister.
+  - **Kapi yazilirken bulunan uc gercek kusur** (ucu de ayni commit'te
+    duzeltildi): (1) Windows'ta `VDbOpenStreamNoFlock(..., Create=True)`
+    `fmCreate`'e dustugu icin **her yeniden acilis dosyayi sifirliyordu**
+    - `FileExists` ayrimiyla duzeltildi (`VDbPageStore` ile ayni desen);
+    (2) kurucunun istisna yolunda `FMap`/`FStream` serbest birakilip nil
+    yapilmadigi icin yikici ikinci kez serbest birakiyordu (access
+    violation) - `FreeAndNil` + nil kontrolleri; (3) `Verify` bozuk bir
+    alt-cocuk isaretcisinde istisna sizdiriyordu - artik bunu da bulgu
+    olarak raporlar ve `False` doner.
+  - Bozuk dosyada okuma yolunun siniri belgelendi: `Find`/`NextAfter`/
+    `Walk` aralik disi sayfa numarasinda **kontrollu `EBtdError`** atar
+    (sessiz `False` bozulmayi gizler ve daha tehlikelidir); sayfa CRC'si
+    her okumada zorlanmaz (okuma basina 4 KB CRC maliyeti), CRC `Verify`
+    icinde ve acilista meta seciminde kullanilir.

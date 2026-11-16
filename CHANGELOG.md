@@ -56,6 +56,32 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   **yarisinda** otomatik senkron checkpoint WAL'i budar, boylece kucuk
   yazimlar tavana hic yaklasmaz; yalnizca tek basina sigmayan bir islem
   reddedilir. Kapi `wal_limit` (19 kontrol, iki platformda ayni).
+- **Ayri B+Tree disk sayfa bicimi** (v3.46): yeni ve **bagimsiz**
+  `VDbBTreeDisk.pas`. 4096 baytlik sayfalar, 32 baytlik baslik
+  (`PageNo`/`Kind`/`Level`/`NKeys`/`Flags` + sayfa CRC'si), slotlu hucre
+  duzeni; yaprak hucresi 16 bayt (`Key:QWord` + `Val:QWord`), ic hucre
+  12 bayt (`Key:QWord` + `Child:LongWord`), ic sayfada 0. hucre en sol
+  cocuktur ve yonlendirme "`Key_i <= K` olan en buyuk `i`" kuraliyla
+  yapilir. Iki meta sayfasi (A/B) vardir; **meta yazimi commit
+  noktasidir**. Atomiklik **golge sayfalama** ile saglanir: hicbir sayfa
+  yerinde guncellenmez, degisen sayfalar yeni numaralara kopyalanip
+  kokten yapraga kadar yol yeniden yazilir. Meta'dan once cokme onceki
+  agaci bayt bayt aynen birakir (ulasilamayan sayfalar acilista serbest
+  sayilir), yirtik meta CRC ile yakalanir ve gecerli eski kopya kazanir.
+  Silme tembel: anahtar cikarilir, yalnizca bosalan sayfa dusurulur;
+  birlestirme/yeniden dagitma yoktur, doluluk maliyeti gizlenmez. Kapi
+  `tests/btree_disk` BD1-BD18 (78 kontrol, iki platformda birebir ayni)
+  siralama, bolunme, sayfa geri kazanimi, yirtik meta, cokme noktasi,
+  yalniz-CRC ve yapisal bozulma ile kesik dosyayi olcer. Kapi uc gercek
+  kusur buldu ve kapatti: Windows'ta `fmCreate` ile yeniden acmanin
+  dosyayi **sifirlamasi** (`FileExists` ayrımı, `VDbPageStore` ile ayni
+  desen), kurucu istisna yolunda **cift serbest birakma**
+  (`FreeAndNil`), ve bozuk sayfada `Verify`'in istisna **sizdirmasi**
+  (artik bulgu olarak raporlar). Durust sinir: bu birim v5 motor dosya
+  bicimine, WAL'e ve kurtarma yoluna **bagli degildir**; v5 bicimi
+  degismez, tablo satirlari hala 4 KB sayfa yigini uzerindedir ve
+  ikincil indeksler bellekteki `TVDbBTree`'dir (bkz.
+  `docs/engineering/BTREE_INTEGRITY.md` §7).
 - **Yedek/geri yukleme**: `RestoreFrom` yazmadan once tam sayfa dogrulamasi
   yapar; `Verify`/`VerifyBackup` yalnizca reddeder, onarmaz. Iki gercek hata
   kapatildi (freelist trunk yanlis pozitifi; bozuk yedek uzerine sessiz

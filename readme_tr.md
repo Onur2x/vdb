@@ -169,7 +169,7 @@ API ayrıntıları ve SQL kullanımı: [kullanim.md](kullanim.md)
 
 ## Test durumu
 
-Son doğrulanan durum (2026-11-15, Linux x86_64 ve Windows i386, `tests/run_gates.sh`):
+Son doğrulanan durum (2026-11-16, Linux x86_64 ve Windows i386, `tests/run_gates.sh`):
 
 | Kapı | Sonuç |
 |---|---|
@@ -200,6 +200,7 @@ Son doğrulanan durum (2026-11-15, Linux x86_64 ve Windows i386, `tests/run_gate
 | `page_corrupt` | 8 / 0 (normal okuma yolunda her veri sayfasının gövdesinde bayt bozulması, bozuk sihirli sayı ve yanlış sayfa imajı kontrollü `ecCorrupt` üretiyor; dosyanın sağlam kopyası yine kusursuz taranıyor) |
 | `server_harden` | 24 / 0 |
 | `server_failure` | 16 / 0 (bağlantı tavanı `kapasite dolu` ile reddediyor, çöp baytlar ve sahte 96 MiB uzunluk öneki sunucuyu öldürmüyor, açık bağlantı varken `Stop` dönüyor, dosya sağlam yeniden açılıyor) |
+| `btree_disk` | 78 / 0 (ayrı disk B+Tree sayfa biçimi: bağımsız `VDbBTreeDisk.pas`, v5 motor dosya biçimine, WAL'e ve kurtarmaya **bağlı DEĞİL**, yani v5 biçimi ve kurtarma davranışı değişmiyor. 4096 baytlık sayfa, 32 baytlık başlık (`PageNo`/`Kind`/`Level`/`NKeys`/`Flags` + sayfa CRC'si), slotlu hücreler sayfa sonundan geriye, yaprak hücresi 16 bayt (`Key:QWord + Val:QWord`), iç hücre 12 bayt (`Key:QWord + Child:LongWord`), iç sayfada 0. hücre kullanılmayan anahtar ve en sol çocuk, yönlendirme "`Key_i <= K` olan en büyük `i`". **Gölge sayfalama**: hiçbir sayfa yerinde güncellenmiyor, değişen sayfalar yeni numaralara kopyalanıyor ve meta en son yazılıyor; meta yazımı **commit noktası**. İki A/B meta sayfasından geçerli ve en yüksek `Seq` kazanıyor. BD1-BD18: ekle/oku/güncelle + artan `Walk`, yeniden açılışta temiz `Verify` ve dosya küçülmüyor (57.344 -> 57.344 B), yarısını silip yeniden açma, azalan 2000 ve karışık 3000/6000, 6000 sorguluk `NextAfter` alt-sınır taraması sıralı listeyle birebir, bölünme ağırlıklı 6000 anahtar (yükseklik 2, 36 yaprak), churn sonrası doluluk dürüstçe ölçülüyor (`yaprak=36 hucre=6000 doluluk=96000/147456`, ~%65), sayfa geri kazanımı (75 -> 75 sayfa, sayaç şişmiyor), **yırtık meta** (en yeni meta bozulsa bile önceki 300 anahtarlık ağaç aynen açılıyor, yeni 300 anahtar görünmüyor), **çökme noktası** (`OnBeforeMeta` meta yazımından hemen önce dosyayı kopyalıyor; kopya önceki 200 anahtarın tamamını okuyor = veri kaybı yok), yalnız-CRC bozulması (`Verify` başarısız, okuma hâlâ 500/500 buluyor), yapısal bozulma (`Verify` başarısız ve okuma yolu kontrollü `EBtdError` atıyor, access violation yok) ve kesik dosya (`EBtdError`, sessizce yeni ağaç kurmuyor). Kapı üç gerçek kusur buldu ve bu commit düzeltti: Windows'ta `fmCreate` ile yeniden açılışın dosyayı **sıfırlaması**, kurucu istisna yolunda çift serbest bırakma ve `Verify`'in bozuk sayfada istisna sızdırması. Windows ve Linux'ta birebir aynı çıktı) |
 | `auth_throttle` | 16 / 0 |
 | `disk_full` | 16 / 0 (sayfa, meta ve **WAL** yazmalarında kısa yazma ve sert yazma hatası kontrollü `ecIOError` üretiyor; çerçeve kirli kalıyor, `ROLLBACK` ve sonraki commit'ler çalışıyor, başarısız commit aynı oturumda **hayalet satır** bırakmıyor (`COUNT(*)` durabil durumla aynı), hata geçince checkpoint başarılı, yeniden açılış + `VERIFY` temiz) |
 | `txn_limit` | 18 / 0 (300 kısa işlem ve 75 geri alma birebir sayılıyor; iç içe `BEGIN`, işlem yokken `COMMIT` ve `ROLLBACK` belgelenmiş no-op; dosya başına tek yazar rezervasyonu kısa busy süresinde kontrollü `meşgul` veriyor ve bırakılınca işlem tamamlanıyor; yeniden açılışta 578 satır + temiz `VERIFY`) |
@@ -209,8 +210,8 @@ Son doğrulanan durum (2026-11-15, Linux x86_64 ve Windows i386, `tests/run_gate
 | `net_fuzz` | 39 / 0 (loopback üzerinde, trust modunda gerçek PostgreSQL wire sunucusuna ağ fuzz'ı; `MaxConns=256` seçildi ki kapasite asla başarısızlık nedeni olmasın: 15 saldırı ailesi + tohumlanmış deterministik döngü ve her birinden SONRA **geçerli** bir istemcinin hâlâ startup'ı tamamlayıp `SELECT 1` çalıştırdığı kontrolü — startup uzunlukları `70000` ve `2^31-1`, kesik startup, `0`/`4`/`0xFFFFFFFF` uzunlukları, bilinmeyen protokol kodu, 512 rastgele bayt, geçerli startup sonrası 30 rastgele mesaj tipi, uzunluğu `64MB+1` olan `Q`, uzunluğu `3` olan `Q`, ilan edilip kesilen `Q` gövdesi, NUL'suz/kontrol baytlı/boş sorgu, `N` yanıtı beklenen 20 ardışık `SSLRequest` ve aynı sokette gerçek sorgu, 40 kısa çöp bağlantı, her 20 yinelemede canlılık kontrolü olan 120 yinelemeli tohumlanmış mutasyon döngüsü, bozuk genişletilmiş protokol (`P`/`B`/`E`/`D`, her birinden sonra `Sync` ve ardından gerçek sorgu) ve 4 iş parçacığı x 8 eşzamanlı fuzz yinelemesi. Windows ve Linux'ta birebir aynı çıktı) |
 | `tls_client` | 6 / 0 (Linux; OpenSSL DLL'i olmayan Windows'ta atlanır) |
 
-Linux'ta **39 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
-atlanır), Windows'ta **38 kapı** (`tls_client` atlanır). Kapı belgeleri:
+Linux'ta **40 kapı** (OpenSSL isteğe bağlı iki kapı `VDB_CRYPTO_DLL` yoksa
+atlanır), Windows'ta **39 kapı** (`tls_client` atlanır). Kapı belgeleri:
 [docs/engineering/](docs/engineering/).
 
 ```bash
