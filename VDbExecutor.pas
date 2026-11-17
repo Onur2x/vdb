@@ -202,6 +202,14 @@ type
     // R-03: UPSERT - excluded pseudo-table values
     FExcludedRow: TStrArray;
     FExcludedColNames: TStrArray;
+    { Sprint A (3.3): ON CONFLICT DO UPDATE icin yetki/RLS/trigger
+      baglami. UpsertRowReturning geri cagrisi bu alanlari okur; ic ice
+      upsert'lere karsi her cagrida kaydedilip geri yuklenir. }
+    FUpsertHookTable: string;
+    FUpsertHookNames: TStrArray;
+    FUpsertHookTypes: TByteArray;
+    FUpsertHookHasTrig: Boolean;
+    FUpsertHookRes: TSqlResult;
     // F-03: ic calisan SELECT'in kendi tablosu/alias'i. Tek-tablo yolunda
     // ColNames niteliksiz oldugu icin nitelikli referans (b.id) kapsam
     // denetiminden gecer; bu alan olmadan dis satira yanlis duser.
@@ -348,6 +356,18 @@ type
     procedure BuildUpsertSetValues(Stmt: TSqlInsertStmt;
       const ExcludedVals: TStrArray; const ExcludedCols, AllColNames: TStrArray;
       const Td: TTableDef; out SetValues: TSetValuePairs);
+    { Sprint A (3.3): ON CONFLICT DO UPDATE yolunda UPDATE yetkisi,
+      UPDATE RLS (USING eski / WITH CHECK yeni) ve BEFORE/AFTER UPDATE ROW
+      tetikleyicilerini uygulayan geri cagri. }
+    procedure UpsertWriteHook(APhase: TUpsertNotifyPhase;
+      const AOldVals: TStrArray; var ANewVals: TStrArray);
+    { UpsertRowReturning'i yetki/RLS/trigger baglami kurarak cagirir. }
+    function UpsertWithAuth(const ATable: string;
+      const AColNames, AValues: TStrArray;
+      AOnConflictAction: TOnConflictAction;
+      const AOnConflictTarget: TStrArray;
+      const ASetValues: TSetValuePairs;
+      out AOutPk: string; out AOutVals: TStrArray): Boolean;
     // F-33: view sonucunun kolon tipleri. Kolon adi taban tablonun
     // kolonuyla eslesiyorsa o kolonun tipi, aksi halde VCT_STR.
     function ViewResultTypes(const ViewName: string;
@@ -16843,11 +16863,14 @@ var
   hasInsTrig, rlsApplies, needRls: Boolean;
   // R2-E-6: INSERT ... SELECT satir dongusu icin kendi batch'i
   ownBatch: Boolean;
+  // Sprint A (3.5): AFTER INSERT STATEMENT trigger'i tam bir kez calisir
+  stmtTrigFired: Boolean;
 begin
 
   SetLength(emptyArr1, 0);
   SetLength(emptyArr2, 0);
   rCount := 0;
+  stmtTrigFired := False;
   // F-33: View guncellenebilirlik kontrolü
   baseTable := '';
   viewColMap := nil;
@@ -17122,6 +17145,10 @@ begin
             returningRows[High(returningRows)] := retRow;
           end;
         end;
+        // Sprint A (3.5): AFTER INSERT STATEMENT trigger'i COMMIT'ten ONCE;
+        // hata -> except AbortBatch ile tum statement geri alinir.
+        FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, nil, [], Res, False);
+        stmtTrigFired := True;
         if ownBatch then FT.CommitBatch;
       except
         // AbortBatch ikinci bir istisna firlatirsa asil hatayi maskelemesin.
@@ -17153,7 +17180,7 @@ begin
           // Build SET values for this row (expressions may reference EXCLUDED)
           SetLength(upsertSetValues, Stmt.OnConflictSetExprs.Count);
           BuildUpsertSetValues(Stmt, FExcludedRow, FExcludedColNames, allColNames, td, upsertSetValues);
-          if FT.UpsertRowReturning(Stmt.Table, cnames, subRes.Rows[i],
+          if UpsertWithAuth(Stmt.Table, cnames, subRes.Rows[i],
             onConflictAction, Stmt.OnConflictTarget, upsertSetValues,
             outPk, outVals) then
           begin
@@ -17176,6 +17203,10 @@ begin
             end;
           end;
         end;
+        // Sprint A (3.5): AFTER INSERT STATEMENT trigger'i COMMIT'ten ONCE;
+        // hata -> except AbortBatch ile tum statement geri alinir.
+        FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, nil, [], Res, False);
+        stmtTrigFired := True;
         if ownBatch then FT.CommitBatch;
       except
         // AbortBatch ikinci bir istisna firlatirsa asil hatayi maskelemesin.
@@ -17229,7 +17260,7 @@ begin
               FExcludedRow := [];
               FExcludedColNames := [];
               SetLength(upsertSetValues, 0);
-              if FT.UpsertRowReturning(Stmt.Table, emptyArr1, emptyArr2, onConflictAction,
+              if UpsertWithAuth(Stmt.Table, emptyArr1, emptyArr2, onConflictAction,
                 Stmt.OnConflictTarget, upsertSetValues,
                 outPk, outVals) then
               begin
@@ -17310,12 +17341,13 @@ begin
             begin
               FExcludedRow := strVals;
               FExcludedColNames := cnames;
-              if needRls then
-                RlsRequireInsert(Stmt.Table, cnames, strVals);   // R-19 (upsert)
+              { Sprint A (3.3): INSERT WITH CHECK burada kosulsuz uygulanmaz;
+                catisma varsa UPDATE, yoksa INSERT kontrolu UpsertWithAuth
+                icinde uygulanir. }
               // Build SET values for this row
               SetLength(upsertSetValues, Stmt.OnConflictSetExprs.Count);
               BuildUpsertSetValues(Stmt, FExcludedRow, FExcludedColNames, allColNames, td, upsertSetValues);
-              if FT.UpsertRowReturning(Stmt.Table, cnames, strVals,
+              if UpsertWithAuth(Stmt.Table, cnames, strVals,
                 onConflictAction, Stmt.OnConflictTarget, upsertSetValues,
                 outPk, outVals) then
               begin
@@ -17340,6 +17372,9 @@ begin
             end;
           end;
         end;
+        // Sprint A (3.5): AFTER INSERT STATEMENT trigger'i COMMIT'ten ONCE.
+        FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, nil, [], Res, False);
+        stmtTrigFired := True;
         FT.CommitBatch;
       except
         { B-6: AbortBatch ikinci bir istisna firlatirsa asil hatayi
@@ -17350,6 +17385,12 @@ begin
     end
     else
     begin
+      { Sprint A (3.5): tek satirli VALUES yolu da tek batch'e alinir.
+        Aksi halde AFTER INSERT STATEMENT trigger'i hata verdiginde satir
+        autocommit ile coktan diske yazilmis oluyordu (AT4). }
+      ownBatch := not FT.Backend.InBatch;
+      if ownBatch then FT.BeginBatch;
+      try
       for i := 0 to Stmt.ValuesRows.Count - 1 do
       begin
         if Stmt.ValuesRows[i].Count = 0 then
@@ -17376,7 +17417,7 @@ begin
             FExcludedRow := [];
             FExcludedColNames := [];
             SetLength(upsertSetValues, 0);
-            if FT.UpsertRowReturning(Stmt.Table, emptyArr1, emptyArr2, onConflictAction,
+            if UpsertWithAuth(Stmt.Table, emptyArr1, emptyArr2, onConflictAction,
               Stmt.OnConflictTarget, upsertSetValues,
               outPk, outVals) then
             begin
@@ -17454,11 +17495,11 @@ begin
           begin
             FExcludedRow := strVals;
             FExcludedColNames := cnames;
-            if needRls then
-              RlsRequireInsert(Stmt.Table, cnames, strVals);   // R-19 (upsert)
+            { Sprint A (3.3): INSERT WITH CHECK kosulsuz uygulanmaz; catisma
+              varsa UPDATE, yoksa INSERT kontrolu UpsertWithAuth icinde. }
             SetLength(upsertSetValues, Stmt.OnConflictSetExprs.Count);
             BuildUpsertSetValues(Stmt, FExcludedRow, FExcludedColNames, allColNames, td, upsertSetValues);
-            if FT.UpsertRowReturning(Stmt.Table, cnames, strVals,
+            if UpsertWithAuth(Stmt.Table, cnames, strVals,
               onConflictAction, Stmt.OnConflictTarget, upsertSetValues,
               outPk, outVals) then
             begin
@@ -17483,11 +17524,21 @@ begin
           end;
         end;
       end;
+      // Sprint A (3.5): AFTER INSERT STATEMENT trigger'i, bu yolun kendi
+      // batch'inde COMMIT'ten ONCE calisir.
+      if not stmtTrigFired then
+      begin
+        FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, nil, [], Res, False);
+        stmtTrigFired := True;
+      end;
+      if ownBatch then FT.CommitBatch;
+      except
+        if ownBatch then
+          try FT.AbortBatch; except end;
+        raise;
+      end;
     end;
   end;
-
-  // F-36: AFTER STATEMENT tetikleyiciler (tum satirlardan sonra, bir kez)
-  FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, nil, [], Res, False);
 
   // R-04: RETURNING - sonuclari Res'e aktar
   if hasReturning then
@@ -18689,14 +18740,15 @@ begin
               Format('COPY %s satir %d: %s', [path, lineNo, e.Message]));
         end;
       end;
+      // Sprint A (3.5): AFTER INSERT STATEMENT trigger'i COMMIT'ten ONCE.
+      if hasInsTrig then
+        FireTriggers(tbl, Byte(ttAfter), Byte(teInsert), nil, nil, [], Res, False);
       if ownBatch then FT.CommitBatch;
     except
       if ownBatch then
         try FT.AbortBatch; except end;
       raise;
     end;
-    if hasInsTrig then
-      FireTriggers(tbl, Byte(ttAfter), Byte(teInsert), nil, nil, [], Res, False);
   finally
     if fsh <> nil then fsh.Free;
   end;
@@ -19683,10 +19735,13 @@ begin
           FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teUpdate),
             allRows[i], newVals, colNames, Res, True);
       end;
-      FT.CommitBatch;
-      // F-36: AFTER UPDATE STATEMENT tetikleyiciler (tum satirlardan sonra)
+      // Sprint A (3.5): AFTER UPDATE STATEMENT tetikleyicileri COMMIT'TEN
+      // ONCE calisir. Trigger hata verirse except blogu AbortBatch ile bu
+      // statement'in TUM degisikliklerini geri alir (eskiden commit coktan
+      // yapilmis oluyordu ve hata yalniz AbortBatch cagiriyordu).
       if hasRowTrig then
         FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teUpdate), nil, nil, [], Res, False);
+      FT.CommitBatch;
   end
   else
   begin
@@ -19906,10 +19961,11 @@ begin
           FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete),
             allRows[toDelete[i]], nil, allColNames, Res, True);
       end;
-      if ownBatch then FT.CommitBatch;
-      // F-36: AFTER DELETE STATEMENT tetikleyiciler (tum satirlardan sonra)
+      // Sprint A (3.5): AFTER DELETE STATEMENT tetikleyicileri COMMIT'TEN
+      // ONCE. Hata -> except blogu AbortBatch ile statement geri alinir.
       if hasRowTrig then
         FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teDelete), nil, nil, [], Res, False);
+      if ownBatch then FT.CommitBatch;
     end
     else if ownBatch then
       { P-145: eslesen satir yok; write-set'i gen artirmadan kapat. }
@@ -19984,11 +20040,16 @@ var
   newVals: TStrArray;
   insertVals: TStrArray;
   insertCols: TStrArray;
+  fullVals: TStrArray;
   matchFirst: array of Integer;
   matchCount: array of Integer;
   sMatched: array of Boolean;
   hasInsert: Boolean;
   ownBatch: Boolean;
+  // Sprint A (3.4): MERGE hedefi icin RLS + tetikleyici denetimi
+  hasRls: Boolean;
+  hasUpdTrig, hasDelTrig, hasInsTrig: Boolean;
+  rlsCmd: Byte;
   Asgn: TUpdateAssignment;
 begin
   td := FT.GetTable(Stmt.TargetTable);
@@ -19999,6 +20060,23 @@ begin
   hasInsert := (Length(Stmt.InsertCols) > 0) or (Stmt.InsertValues.Count > 0);
   if hasInsert then
     FT.RequirePriv(Stmt.TargetTable, Ord(pkInsert));
+
+  { Sprint A (3.4): MERGE de diger DML ile ayni RLS/trigger kurallarina
+    tabidir. Hedef satiri gorunmuyorsa eslesmis sayilmaz; yazim yollarinda
+    USING/WITH CHECK ve ROW/STATEMENT tetikleyicileri uygulanir. }
+  hasRls := FT.RlsApplies(Stmt.TargetTable);
+  if Stmt.MatchedDelete then rlsCmd := 4
+  else if Stmt.MatchedAssignments.Count > 0 then rlsCmd := 3
+  else rlsCmd := 1;
+  hasUpdTrig :=
+    (Length(FT.TriggersFor(Stmt.TargetTable, Byte(ttBefore), Byte(teUpdate))) > 0) or
+    (Length(FT.TriggersFor(Stmt.TargetTable, Byte(ttAfter), Byte(teUpdate))) > 0);
+  hasDelTrig :=
+    (Length(FT.TriggersFor(Stmt.TargetTable, Byte(ttBefore), Byte(teDelete))) > 0) or
+    (Length(FT.TriggersFor(Stmt.TargetTable, Byte(ttAfter), Byte(teDelete))) > 0);
+  hasInsTrig :=
+    (Length(FT.TriggersFor(Stmt.TargetTable, Byte(ttBefore), Byte(teInsert))) > 0) or
+    (Length(FT.TriggersFor(Stmt.TargetTable, Byte(ttAfter), Byte(teInsert))) > 0);
 
   BuildColInfo(td, hNames, hTypes);
   if Stmt.TargetAlias <> '' then hNameEff := Stmt.TargetAlias
@@ -20072,6 +20150,10 @@ begin
   SetLength(merged, nAll);
   for i := 0 to High(hRows) do
   begin
+    { Sprint A (3.4): RLS USING ile gizlenen hedef satiri eslesmis
+      sayilmaz; aksi halde gizli satir UPDATE/DELETE edilebiliyordu. }
+    if hasRls and not RlsRowVisible(Stmt.TargetTable, rlsCmd,
+      hRows[i], hNames, hTypes) then Continue;
     for k := 0 to nH - 1 do
     begin
       if k <= High(hRows[i]) then merged[k] := hRows[i][k]
@@ -20102,17 +20184,31 @@ begin
   if ownBatch then FT.BeginBatch;
   rCount := 0;
   try
+    { Sprint A (3.4): BEFORE STATEMENT tetikleyicileri (kullanilan her
+      olay icin). }
+    if hasUpdTrig and (Stmt.MatchedAssignments.Count > 0) then
+      FireTriggers(Stmt.TargetTable, Byte(ttBefore), Byte(teUpdate), nil, nil, [], Res, False);
+    if hasDelTrig and Stmt.MatchedDelete then
+      FireTriggers(Stmt.TargetTable, Byte(ttBefore), Byte(teDelete), nil, nil, [], Res, False);
+    if hasInsTrig and hasInsert then
+      FireTriggers(Stmt.TargetTable, Byte(ttBefore), Byte(teInsert), nil, nil, [], Res, False);
     // 2) WHEN MATCHED
     for i := 0 to High(hRows) do
     begin
       if matchFirst[i] < 0 then Continue;
       if Stmt.MatchedDelete then
       begin
+        if hasDelTrig then
+          FireTriggers(Stmt.TargetTable, Byte(ttBefore), Byte(teDelete),
+            hRows[i], nil, hNames, Res, True);
         if Length(hRows[i]) = Length(td.Cols) then
           FT.DeleteKnown(Stmt.TargetTable, hPks[i], hRows[i])
         else
           FT.Delete(Stmt.TargetTable, hPks[i]);
         Inc(rCount);
+        if hasDelTrig then
+          FireTriggers(Stmt.TargetTable, Byte(ttAfter), Byte(teDelete),
+            hRows[i], nil, hNames, Res, True);
       end
       else if Stmt.MatchedAssignments.Count > 0 then
       begin
@@ -20141,8 +20237,22 @@ begin
               'MERGE UPDATE: PK kolonu guncellenemez: ' + hNames[k]);
           newVals[k] := EvalExpr(TSqlExprNode(Asgn.Expr), merged, mNames, mTypes);
         end;
+        { Sprint A (3.4): UPDATE ROW tetikleyicileri + WITH CHECK. }
+        if hasUpdTrig then
+          FireTriggers(Stmt.TargetTable, Byte(ttBefore), Byte(teUpdate),
+            hRows[i], newVals, hNames, Res, True);
+        if td.PkIndex >= 0 then newVals[td.PkIndex] := hRows[i][td.PkIndex];
+        if hasRls and not RlsCheckRow(Stmt.TargetTable, 3, newVals, hNames, hTypes) then
+          raise EVDbException.CreateFmt(ecPermissionDenied,
+            'RLS politika ihlali: rol "%s" tablo "%s" icin bu satiri yazamaz',
+            [FT.CurrentRole, Stmt.TargetTable]);
         if FT.UpdateRowInPlace(Stmt.TargetTable, hPks[i], newVals, hRows[i]) then
+        begin
           Inc(rCount);
+          if hasUpdTrig then
+            FireTriggers(Stmt.TargetTable, Byte(ttAfter), Byte(teUpdate),
+              hRows[i], newVals, hNames, Res, True);
+        end;
       end;
     end;
 
@@ -20169,10 +20279,44 @@ begin
           else merged[2 * nH + k] := '';
         for k := 0 to Stmt.InsertValues.Count - 1 do
           insertVals[k] := EvalExpr(Stmt.InsertValues[k], merged, mNames, mTypes);
+        { Sprint A (3.4): MERGE INSERT yolu da INSERT ROW tetikleyicileri
+          ve RLS WITH CHECK'e tabidir. Tetikleyici tam satiri gorebilsin
+          diye tum hedef kolonlari doldurulur; yazim yine yalniz secilen
+          kolonlarla yapilir. }
+        SetLength(fullVals, nH);
+        for k := 0 to nH - 1 do fullVals[k] := '';
+        for k := 0 to High(insertCols) do
+        begin
+          ci := FindColIdx(insertCols[k], '', hNames);
+          if (ci >= 0) and (k <= High(insertVals)) then fullVals[ci] := insertVals[k];
+        end;
+        if hasInsTrig then
+          FireTriggers(Stmt.TargetTable, Byte(ttBefore), Byte(teInsert),
+            nil, fullVals, hNames, Res, True);
+        if hasRls and not RlsCheckRow(Stmt.TargetTable, 2, fullVals, hNames, hTypes) then
+          raise EVDbException.CreateFmt(ecPermissionDenied,
+            'RLS politika ihlali: rol "%s" tablo "%s" icin bu satiri yazamaz',
+            [FT.CurrentRole, Stmt.TargetTable]);
+        for k := 0 to High(insertCols) do
+        begin
+          ci := FindColIdx(insertCols[k], '', hNames);
+          if (ci >= 0) and (k <= High(insertVals)) then insertVals[k] := fullVals[ci];
+        end;
         FT.Insert(Stmt.TargetTable, insertCols, insertVals, @td);
         Inc(rCount);
+        if hasInsTrig then
+          FireTriggers(Stmt.TargetTable, Byte(ttAfter), Byte(teInsert),
+            nil, fullVals, hNames, Res, True);
       end;
     end;
+
+    { Sprint A (3.4): AFTER STATEMENT tetikleyicileri COMMIT'ten ONCE. }
+    if hasUpdTrig and (Stmt.MatchedAssignments.Count > 0) then
+      FireTriggers(Stmt.TargetTable, Byte(ttAfter), Byte(teUpdate), nil, nil, [], Res, False);
+    if hasDelTrig and Stmt.MatchedDelete then
+      FireTriggers(Stmt.TargetTable, Byte(ttAfter), Byte(teDelete), nil, nil, [], Res, False);
+    if hasInsTrig and hasInsert then
+      FireTriggers(Stmt.TargetTable, Byte(ttAfter), Byte(teInsert), nil, nil, [], Res, False);
 
     if ownBatch then FT.CommitBatch;
   except
@@ -20434,6 +20578,101 @@ begin
     SetValues[i].ColIdx := FindColIdx(Stmt.OnConflictSetExprs[i].ColName, '', AllColNames);
     SetValues[i].Value := EvalExpr(TSqlExprNode(Stmt.OnConflictSetExprs[i].Expr),
       existing, AllColNames, nil);
+  end;
+end;
+
+{ Sprint A (3.3): ON CONFLICT DO UPDATE yolunda yetki/RLS/trigger.
+  - Catisma VARSA islem bir UPDATE'tir: UPDATE yetkisi + UPDATE RLS
+    (USING eski satir, WITH CHECK yeni satir) + BEFORE/AFTER UPDATE ROW
+    tetikleyicileri uygulanir.
+  - Catisma YOKSA yalniz INSERT WITH CHECK (normal INSERT ile ayni). }
+procedure TVSqlExecutor.UpsertWriteHook(APhase: TUpsertNotifyPhase;
+  const AOldVals: TStrArray; var ANewVals: TStrArray);
+const
+  RLS_WRITE_MSG = 'RLS politika ihlali: rol "%s" tablo "%s" icin bu satiri yazamaz';
+begin
+  case APhase of
+    uupBeforeUpdate:
+      begin
+        // UPDATE yetkisi (INSERT yetkisi ExecInsert basinda zaten soruldu).
+        FT.RequirePriv(FUpsertHookTable, Ord(pkUpdate));
+        // UPDATE ... USING: eski satir gorunur olmali.
+        if not RlsRowVisible(FUpsertHookTable, 3, AOldVals,
+          FUpsertHookNames, FUpsertHookTypes) then
+          raise EVDbException.CreateFmt(ecPermissionDenied, RLS_WRITE_MSG,
+            [FT.CurrentRole, FUpsertHookTable]);
+        // BEFORE UPDATE ROW (NEW'i degistirebilir).
+        if FUpsertHookHasTrig then
+          FireTriggers(FUpsertHookTable, Byte(ttBefore), Byte(teUpdate),
+            AOldVals, ANewVals, FUpsertHookNames, FUpsertHookRes, True);
+        // UPDATE ... WITH CHECK: yeni satir yazilabilir olmali
+        // (BEFORE trigger'in duzenlemesinden SONRA).
+        if not RlsCheckRow(FUpsertHookTable, 3, ANewVals,
+          FUpsertHookNames, FUpsertHookTypes) then
+          raise EVDbException.CreateFmt(ecPermissionDenied, RLS_WRITE_MSG,
+            [FT.CurrentRole, FUpsertHookTable]);
+      end;
+    uupAfterUpdate:
+      begin
+        if FUpsertHookHasTrig then
+          FireTriggers(FUpsertHookTable, Byte(ttAfter), Byte(teUpdate),
+            AOldVals, ANewVals, FUpsertHookNames, FUpsertHookRes, True);
+      end;
+    uupInsertCheck:
+      begin
+        // Catisma yok: INSERT WITH CHECK.
+        if not RlsCheckRow(FUpsertHookTable, 2, ANewVals,
+          FUpsertHookNames, FUpsertHookTypes) then
+          raise EVDbException.CreateFmt(ecPermissionDenied, RLS_WRITE_MSG,
+            [FT.CurrentRole, FUpsertHookTable]);
+      end;
+  end;
+end;
+
+function TVSqlExecutor.UpsertWithAuth(const ATable: string;
+  const AColNames, AValues: TStrArray;
+  AOnConflictAction: TOnConflictAction;
+  const AOnConflictTarget: TStrArray;
+  const ASetValues: TSetValuePairs;
+  out AOutPk: string; out AOutVals: TStrArray): Boolean;
+var
+  td: TTableDef;
+  i: Integer;
+  savTable: string;
+  savNames: TStrArray;
+  savTypes: TByteArray;
+  savHasTrig: Boolean;
+  savRes: TSqlResult;
+begin
+  // Ic ice upsert/trigger DML'ine karsi baglami sakla.
+  savTable := FUpsertHookTable;
+  savNames := FUpsertHookNames;
+  savTypes := FUpsertHookTypes;
+  savHasTrig := FUpsertHookHasTrig;
+  savRes := FUpsertHookRes;
+  td := FT.GetTable(ATable);
+  SetLength(FUpsertHookNames, Length(td.Cols));
+  SetLength(FUpsertHookTypes, Length(td.Cols));
+  for i := 0 to High(td.Cols) do
+  begin
+    FUpsertHookNames[i] := td.Cols[i].Name;
+    FUpsertHookTypes[i] := td.Cols[i].CType;
+  end;
+  FUpsertHookHasTrig :=
+    (Length(FT.TriggersFor(ATable, Byte(ttBefore), Byte(teUpdate))) > 0) or
+    (Length(FT.TriggersFor(ATable, Byte(ttAfter), Byte(teUpdate))) > 0);
+  FUpsertHookTable := ATable;
+  FUpsertHookRes := Default(TSqlResult);
+  try
+    Result := FT.UpsertRowReturning(ATable, AColNames, AValues,
+      AOnConflictAction, AOnConflictTarget, ASetValues,
+      AOutPk, AOutVals, UpsertWriteHook);
+  finally
+    FUpsertHookTable := savTable;
+    FUpsertHookNames := savNames;
+    FUpsertHookTypes := savTypes;
+    FUpsertHookHasTrig := savHasTrig;
+    FUpsertHookRes := savRes;
   end;
 end;
 

@@ -60,6 +60,17 @@ var
   VdbTableDmlProbe: TVdbTableDmlProbe = nil;
 
 type
+  { Sprint A (3.3): ON CONFLICT DO UPDATE yolunda YETKI/RLS/TRIGGER
+    uygulamak icin cagiran (VDbExecutor) tarafindan verilen geri cagri.
+    Var olan satir guncellenirken uupBeforeUpdate (yazimdan ONCE) ve
+    uupAfterUpdate (yazimdan SONRA) ates edilir; cakisma YOKSA yazimdan
+    once uupInsertCheck cagrilir. ANewVals tam tablo kolon sirasindadir ve
+    BEFORE UPDATE tetikleyicisi tarafindan degistirilebilir. }
+  TUpsertNotifyPhase = (uupBeforeUpdate, uupAfterUpdate, uupInsertCheck);
+  TUpsertNotify = procedure(APhase: TUpsertNotifyPhase;
+    const AOldVals: TStrArray; var ANewVals: TStrArray) of object;
+
+type
   TIdxDef = record
     Name: string;   // lower-case
     Col: Integer;   // TTableDef.Cols indexi (ILK kolon = Cols[0], geri uyum)
@@ -905,7 +916,8 @@ function IdxColsOfTable(TableId: Word; ColIdx: Integer): TIntArray;
       const OnConflictAction: TOnConflictAction;
       const OnConflictTarget: TStrArray;
       const SetValues: TSetValuePairs;
-      out OutPk: string; out OutVals: TStrArray): Boolean;
+      out OutPk: string; out OutVals: TStrArray;
+      ANotify: TUpsertNotify = nil): Boolean;
     { Sprint 2.9: ON CONFLICT(<hedef>) icin UNIQUE indeks uzerinden catisan
       satirin PK'sini bulur. PK catismasi yolundan AYRI tutulur: PK'siz
       tabloda ON CONFLICT(a) (a UNIQUE) eskiden hicbir sey yapmiyordu. }
@@ -13202,7 +13214,8 @@ function TVTableDb.UpsertRowReturning(const Table: string; const ColNames, Value
   const OnConflictAction: TOnConflictAction;
   const OnConflictTarget: TStrArray;
   const SetValues: TSetValuePairs;
-  out OutPk: string; out OutVals: TStrArray): Boolean;
+  out OutPk: string; out OutVals: TStrArray;
+  ANotify: TUpsertNotify): Boolean;
 var
   t: TTableDef;
   vals, existingVals, dummyVals: TStrArray;
@@ -13352,6 +13365,17 @@ begin
         // M10: IDENTITY degeri ON CONFLICT DO UPDATE ile degistirilemez.
         VDbCheckIdentityUnchanged(t, existingVals, vals);
 
+        { Sprint A (3.3): catisma VARSA bu bir UPDATE'tir. Yazimdan ONCE
+          UPDATE yetkisi + UPDATE RLS (USING eski satir, WITH CHECK yeni
+          satir) + BEFORE UPDATE ROW tetikleyicileri uygulanir. Hata
+          durumunda satir HENUZ degismemistir. }
+        if Assigned(ANotify) then
+        begin
+          ANotify(uupBeforeUpdate, existingVals, vals);
+          // BEFORE UPDATE tetikleyicisi PK'yi degistiremez.
+          if t.PkIndex >= 0 then vals[t.PkIndex] := pk;
+        end;
+
         // Eski satir indekslerinden sil
         IdxDelRow(t, existingVals, pk, -1);
 
@@ -13364,6 +13388,10 @@ begin
         b := EncodeRow(t.TableId, pk, t, vals);
         FKvB.Put(key, b);
         IdxAddRow(t, vals, pk, -1);
+
+        { Sprint A (3.3): yazim tamamlandi; AFTER UPDATE ROW tetikleyicileri. }
+        if Assigned(ANotify) then
+          ANotify(uupAfterUpdate, existingVals, vals);
 
         OutPk := pk;
         OutVals := vals;
@@ -13379,6 +13407,11 @@ begin
   else
   begin
     // Conflict yok - normal insert
+    { Sprint A (3.3): catisma YOKSA INSERT WITH CHECK burada uygulanir;
+      cagiranin on-kontrolu upsert yolunda kaldirildi (DO UPDATE ile
+      karisiyordu). }
+    if Assigned(ANotify) then
+      ANotify(uupInsertCheck, nil, vals);
     b := EncodeRow(t.TableId, pk, t, vals);
     FKvB.Put(key, b);
     IdxAddRow(t, vals, pk, -1);

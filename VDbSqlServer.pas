@@ -93,7 +93,10 @@ type
     FStopping: Boolean;
     FLastErr: string;
     FServed: Integer;             // islenen QUERY cercevesi (hata dahil)
-    FSessionId: Integer;        // genel oturum durumu (login/logout icin)
+    { Sprint A (3.2): ARTIK YETKI KAYNAGI DEGIL. Yalnizca basarili LOGIN
+      sayaci (telemetri). Bir baglantinin yetkili olup olmadigi SADECE o
+      baglantinin FSessionActive alanindan okunur. }
+    FSessionId: Integer;        // basarili LOGIN sayaci (yetki kaynagi degil)
     FUser: string;              // R-12 devam: auth
     FPass: string;              // R-12 devam
     FMaxConns: Integer;      // R-12 devam: maksimum TCP baglanti
@@ -121,8 +124,8 @@ type
       veya calisirken degistirilebilir; 1..4096 araligina kirpilir. }
     property MaxConns: Integer read FMaxConns write SetMaxConns;
     { P-185: kimlik bilgileri disaridan ayarlanabilir (Start'tan once).
-      Ayanilmazsa Start varsayilan admin/admin123'u koyar (davranis
-      degismez). }
+      Sprint A (3.2): IKISI DE ZORUNLUDUR; ayarlanmazsa Start reddedilir.
+      Sabit bir varsayilan kullanici/parola YOKTUR. }
     property User: string read FUser write FUser;
     property Password: string read FPass write FPass;
   end;
@@ -174,7 +177,10 @@ begin
   FServer := AServer;
   FSock := ASock;
   FSql := TVSql.Create(AServer.Ftb); // KR-7: baglantiya ozel SQL moturu
-  FSessionActive := (AServer.SessionId <> 0); // varsayilan aktif oturum
+  { Sprint A (3.2): HER baglanti KIMLIK DOGRULANMAMIS baslar. Once global
+    SessionId'ye bakiliyordu; varsayilan 1 oldugu icin LOGIN gondermeden
+    QUERY/PREPARE/EXECUTE calisiyordu (kimlik dogrulama atlamasi). }
+  FSessionActive := False;
   FPreparedSql := '';
   AServer.AddConn(Self);
   Start;
@@ -254,10 +260,13 @@ begin
             if not VdbRecvStr(FSock, user) then Break;
             if not VdbRecvStr(FSock, pass) then Break;
             // auth kontrolu
-            if (user = FServer.FUser) and (pass = FServer.FPass) then
+            if (FServer.FUser <> '') and (user = FServer.FUser) and
+               (pass = FServer.FPass) then
             begin
               FSessionActive := True;
-              FServer.FSessionId := 1;  // genel gozlem icin
+              { Sprint A (3.2): global oturumdan YETKI OKUNMAZ. Bu yalniz
+                basarili giris sayacidir; baska baglantiyi etkilemez. }
+              InterlockedIncrement(FServer.FSessionId);
               if not VdbSendU8(FSock, VDBS_RSP_AUTH) then Break;
               if not VdbSendU8(FSock, 0) then Break;   // status: OK
               if not VdbSendU8(FSock, VDBS_TERM) then Break;
@@ -436,6 +445,14 @@ begin
     AErr := 'sunucu zaten aktif';
     Exit;
   end;
+  { Sprint A (3.2): SABIT VARSAYILAN KIMLIK YOK. Once admin/admin123
+    sessizce konuyordu; bu, kimlik bilgisi ayarlamayi unutan bir sunucuyu
+    herkese acik hale getiriyordu. Kimlik ayarlanmadan Start REDDEDILIR. }
+  if (FUser = '') or (FPass = '') then
+  begin
+    AErr := 'kimlik bilgileri ayarlanmadi: Start oncesi User ve Password zorunlu';
+    Exit;
+  end;
   { 1) motor: SOMUT TIP YOK. VdbOpenOrCreate v3 dosyasini acar/olusturur.
     (v2 dosyasi icin VdbOpen(... AllowV2=True) gerekir; sunucu
     varsayilan olarak v3 kullanir - v3 standarttir.) }
@@ -464,11 +481,9 @@ begin
   FReady := True;
   FLastErr := '';
   FServed := 0;
-  FSessionId := 1;     // varsayilan aktif oturum
-  { P-185: varsayilanlar yalniz ayanilanmadiysa — User/Password ile
-    Start'tan once atanan degerler korunur. }
-  if FUser = '' then FUser := 'admin';    // varsayilan oturum bilgileri
-  if FPass = '' then FPass := 'admin123';
+  FSessionId := 0;     // Sprint A (3.2): basarili LOGIN sayaci
+  { Sprint A (3.2): varsayilan admin/admin123 KALDIRILDI. Start yukarida
+    kimlik bilgisi yoksa zaten reddeder; burada kimlik UYDURULMAZ. }
   FAccept := TVdbServerAccept.Create(Self);
   Result := True;
 end;
