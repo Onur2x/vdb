@@ -168,9 +168,9 @@ suresinin karesel bozunmadigini olcuyor. "Tum dosyayi yeniden yazma" yok
 
 | Gereksinim | Durum | Kanit |
 |---|---|---|
-| Izolasyon seviyeleri belgeli | **YOK** | yazili bir izolasyon belgesi yok (G3) |
-| Kilit alma sirasi belgeli | KISMI | `AcquireDataWrite`/`AcquireDataRead` var; sira belgesi yok |
-| Deadlock tespiti | YOK | tek yazar kilidi; deadlock beklenmiyor ama tespit yok |
+| Izolasyon seviyeleri belgeli | **VAR** | `docs/engineering/ISOLATION.md` (G3 kapatildi): varsayilan REPEATABLE READ, READ COMMITTED, SERIALIZABLE kisitli |
+| Kilit alma sirasi belgeli | VAR | `AcquireDataWrite` -> `FEngCs` sirasi `ISOLATION.md` bolum 2.2'de kayitli |
+| Deadlock tespiti | YOK | tek yazar kilidi; sabit kilit sirasi nedeniyle beklenmiyor, tespit yok (`ISOLATION.md` bolum 7) |
 | Islem zaman asimi | KISMI | `BusyMs` bekleme siniri var; islem suresi siniri yok |
 | Windows kilidi | VAR | `LockFileEx` |
 | Linux kilidi | VAR | `flock` |
@@ -424,7 +424,7 @@ ve asagidaki bosluklar kapatilmadan "production" iddia edilmez.
 |---|---|---|
 | G1 | ~~Checkpoint cokme noktalari (7-9) ve WAL budama (10)~~ | **KAPATILDI** — `tests/crash_points` 24/0 (deterministik enjeksiyon + gercek surec olumu) |
 | G2 | ~~Onbellek metrikleri eksik (hit ratio, kirli sayfa, flush)~~ | **KAPATILDI** — `GetCacheStats` + `MetricsText` + `SHOW STATS` + `tests/cache_metrics` 21/0 |
-| G3 | Izolasyon/kilit belgesi yok | `docs/engineering/ISOLATION.md` |
+| G3 | ~~Izolasyon/kilit belgesi yok~~ | **KAPATILDI** — `docs/engineering/ISOLATION.md` (kilit mimarisi, kilit sirasi, REPEATABLE READ/READ COMMITTED/SERIALIZABLE, snapshot gorunurlugu, iyimser mod ve anahtar bazli cakisma, cokme/kilit birakma, olculmeyenler) |
 | G4 | ~~Surecler-arasi kilitleme testleri yok~~ | **KAPATILDI** — `tests/multiproc` 17/0 (MP1-MP10) |
 | G5 | ~~Benchmark kategorileri ve yuzdelikler eksik~~ | **KAPATILDI** — `tests/bench_report` 35/0 (18 kategori, P50/P95/P99, CSV+meta, dogruluk kontrolleri) |
 | G6 | ~~Butunluk denetleyici CLI + modlar + salt-okunur~~ | **KAPATILDI** — `vdbcheck` (4 mod, her zaman `CreateReadOnly`) + `tests/integrity_check` 32/0 |
@@ -432,8 +432,8 @@ ve asagidaki bosluklar kapatilmadan "production" iddia edilmez.
 | G8 | ~~Limitler tanimsiz, disk dolu denenmedi~~ | **KAPATILDI** — `docs/engineering/LIMITS.md` (tek kaynak: degerler, nerede zorlanir, hata kodu) + `docs/engineering/RESOURCE_LIMITS.md` (kapi eslemesi, acik riskler); kontrollu hata ve disk dolu simulasyonu `tests/disk_full` 16/0, sinir kapilari `limits`/`wal_limit`/`txn_limit`/`oom` |
 | G9 | ~~Platformlar arasi dosya uyumu kanitsiz~~ | **KAPATILDI** — `tests/portability` 29/0 (imaj determinizmi + LF sema) ve iki yonlu gercek aktarim (Win i386 -> Linux x86_64, Linux -> Win), her yonde 13/0 |
 
-Oncelik: G3 (izolasyon/kilit belgesi). G1, G2, G4, G5, G6, G7, G8 ve G9
-kapatildi. `docs/engineering/ISOLATION.md` halen yok; SQL izolasyon ve kilit
-modeli bugun yalniz `LIMITS.md` (tek yazar rezervasyonu, `BusyTimeoutMs`) ve
-`docs/engineering/SERVER_HARDENING.md` icinde dagilmis durumda. Bu bir
-belge boslugudur, olculmemis bir davranis degil.
+Oncelik: G3 kapatildi (`docs/engineering/ISOLATION.md`, 2026-11-17). G1, G2,
+G4, G5, G6, G7, G8 ve G9 da kapatildi. Bu bolumdeki dokuz boslugun tamami
+kapanmistir; ISOLATION.md'de kayitli olculmemis alanlar (macOS, ARM64, yuksek
+cakisma gecikmesi, uzun islem bellegi, paylasilan ag dosyasi, sunucu-soak)
+yeni is kalemleri olarak acik kalir.
