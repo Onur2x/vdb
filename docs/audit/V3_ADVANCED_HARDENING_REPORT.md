@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-17
-Surum: v3.51 (soak/F-21/F-22 = v3.50; Sprint F belgeleri bu commit'te)
+Surum: v3.52 (Sprint A + B; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -58,12 +58,46 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 
 ### A.3 Mevcut V3 durumu
 
-- Iki platformda tam kapi seti yesil: **Windows i386 42 kapi**, **Linux
-  x86_64 43 kapi**, FAIL 0. `tls_client` Windows'ta SKIP; OpenSSL istege
-  bagli iki kapi Linux'ta SKIP.
-- Acik kritik hata yok. Kapatilan son iki gercek kusur F-21/F-22 veri
+- Iki platformda tam kapi seti yesil: **Windows i386 44 kapi**, **Linux
+  x86_64 45 kapi**, FAIL 0. Windows'ta `tls_client` bu ortamda OpenSSL DLL'i
+  ile kostu (ayrinti: `CI.md`); OpenSSL istege bagli iki kapi Linux'ta SKIP.
+- Acik kritik hata yok. Kapatilan son gercek kusurlar F-21/F-22 veri
   kaybiydi; ikisi de kalici regresyon kapisiyla kilitlendi (SO15/SO16/SO17).
+  Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
 - V2 **dondurulmus** ve degismedi; v4 konteyner bicimi durduruldu.
+
+### A.4 Denetim sprintleri (ONERILER_VE_HIZLANDIRMA2)
+
+| Sprint | Kapsam | Durum | Cikti |
+|---|---|---|---|
+| A | 3.2 oturum kimligi, 3.3 upsert yetkisi, 3.4 MERGE RLS/trigger, 3.5 AFTER STATEMENT trigger sirasi | Tamam | `sql_authorization` 32/0 (yeni), `sql_atomicity` 23/0 (yeni) |
+| B | SQL atomikligi: INSERT/UPDATE/DELETE/COPY/MERGE statement batch sinirlari, BEFORE STATEMENT trigger'lari | Tamam | `sql_atomicity` 88/0 (19 vaka) |
+
+Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
+`FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
+varsayilani kaldirildi; upsert yolu UPDATE yetkisi/RLS/ROW trigger uygular;
+MERGE normal DML ile ayni RLS ve trigger kurallarina tabidir; AFTER STATEMENT
+trigger'lari commit'ten once ateslenir.
+
+Sprint B dort kusuru kapatti:
+
+- **B1 (veri kalintisi)**: `INSERT` (tum yollar) ve `COPY` icin BEFORE
+  STATEMENT trigger'i **batch acilmadan once** atesleniyordu; govdesindeki DML
+  ana statement hata verse bile kalici olabiliyordu. Artik batch icinde.
+- **B2 (eksik davranis)**: `UPDATE` ve `DELETE` icin BEFORE **STATEMENT**
+  trigger'i **hic ateslenmiyordu** (yalniz satir seviyesi calisiyordu).
+- **B3 (savunma)**: INSTEAD OF INSERT govdesi batch'siz satir satir
+  calisiyordu. **Not**: parser `CREATE TRIGGER` icin yalniz BEFORE/AFTER
+  ayristirir, `INSTEAD OF` uretilemedigi icin bu yol bu surumde ulasilamaz;
+  duzeltme kod savunmasidir ve kapiyla dogrulanamaz.
+- **B4 (veri kaybi)**: 0 satir eslesen `DELETE` dalinda kosulsuz `AbortBatch`
+  cagriliyor, BEFORE STATEMENT trigger'inin yaptigi DML sessizce
+  kayboluyordu; artik trigger calistiysa `CommitBatch`.
+
+Kapinin kendisi dogrulandi: ayni test dosyasi duzeltme ONCESI kaynakla
+(`git archive HEAD`) derlenip kosuldugunda **8 kontrol FAIL** (AT8 x3, AT9 x2,
+AT10, AT18, AT19) ve cikis kodu 1; duzeltilmis agacta **88/0**. Yani kapi
+gercekten kusuru yakaliyor, bos yesil degil.
 
 ---
 
@@ -190,8 +224,8 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
 
 | Platform | Kapi | PASS | FAIL | SKIP | NOT-RUN |
 |---|---|---|---|---|---|
-| Windows i386 (`windows-latest` / Git Bash) | 42 | **42** | 0 | `tls_client` + OpenSSL istege bagli 2 | - |
-| Linux x86_64 (`ubuntu-latest` / WSL x86_64) | 43 | **43** | 0 | OpenSSL istege bagli 2 (`VDB_CRYPTO_DLL` yok) | - |
+| Windows i386 (`windows-latest` / Git Bash) | 44 | **44** | 0 | OpenSSL istege bagli 2 | - |
+| Linux x86_64 (`ubuntu-latest` / WSL x86_64) | 45 | **45** | 0 | OpenSSL istege bagli 2 (`VDB_CRYPTO_DLL` yok) | - |
 | macOS (x86_64 / arm64) | - | - | - | - | **not-run** |
 | linux/arm64 | - | - | - | - | **not-run** |
 | windows/arm64 | - | - | - | - | **not-run** |
@@ -202,8 +236,10 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   `windows-latest` calistirir; `fail-fast: false`. macOS/ARM64 icin job
   **yoktur** cunku hic kosulmadi; dogrulanmamis platformu matrise eklemek
   yesil gorunen ama kanit uretmeyen bir kapi olurdu (`CI.md` bolum 3).
-- Kanit: Windows `gb32.log` (`KOSAN KAPI: 42`, `GATES_EXIT=0`), Linux
-  `lin31.log` (`KOSAN KAPI: 43`, `LIN_EXIT=0`).
+- Kanit: Windows `gatesB.log` (`KOSAN KAPI: 44`, `GATES_EXIT=0`), Linux
+  `linB.log` (`KOSAN KAPI: 45`, `LIN_EXIT=0`).
+- Windows'ta `tls_client` bu kosuda OpenSSL DLL'leri ortamda oldugu icin
+  **kostu** ve gecti; DLL'ler yoksa SKIP'e duser. Linux'ta 6/6 PASS.
 - **NOT-RUN** satirlari "kosmuyor" degil "olculmedi" demektir; bu raporda
   PASS sayilmaz.
 
@@ -253,7 +289,7 @@ tablosundadir. Bu sprintte kapatilanlar:
 Gerekce:
 
 1. Kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici bir
-   regresyon kapisiyla kilitlendi; iki platformda **43/42** kapi yesil, FAIL 0.
+   regresyon kapisiyla kilitlendi; iki platformda **44/45** kapi yesil, FAIL 0.
 2. Tek dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari,
    bozuk ag girdisi, disk dolu, bellek tukenmesi, WAL sert tavani, B+Tree
    olcek/parcalanma, SQL 100k/1M olcegi, SQL indeks olcegi ve VACUUM geri

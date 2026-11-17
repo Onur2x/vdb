@@ -16865,12 +16865,27 @@ var
   ownBatch: Boolean;
   // Sprint A (3.5): AFTER INSERT STATEMENT trigger'i tam bir kez calisir
   stmtTrigFired: Boolean;
+  // Sprint B: BEFORE INSERT STATEMENT trigger'i tam bir kez calisir
+  stmtBefFired: Boolean;
+
+  { Sprint B: BEFORE INSERT FOR EACH STATEMENT, ifadenin kendi batch'i
+    ACILDIKTAN SONRA calisir. Onceden batch'ten once atesleniyordu; trigger
+    govdesindeki DML otomatik commit ile kalici hale geliyor ve ana INSERT
+    hata verse bile geri alinamiyordu. }
+  procedure FireStmtBefore;
+  begin
+    if stmtBefFired then Exit;
+    stmtBefFired := True;
+    FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, nil, [], Res, False);
+  end;
+
 begin
 
   SetLength(emptyArr1, 0);
   SetLength(emptyArr2, 0);
   rCount := 0;
   stmtTrigFired := False;
+  stmtBefFired := False;
   // F-33: View guncellenebilirlik kontrolü
   baseTable := '';
   viewColMap := nil;
@@ -16895,22 +16910,36 @@ begin
 
       if Stmt.SelectSrc <> nil then
       begin
-        // INSERT INTO view SELECT ... : SELECT sonuc satirlari NEW olur
-        ExecSelect(Stmt.SelectSrc, subRes);
-        for j := 0 to High(subRes.Rows) do
-        begin
-          NewRow := subRes.Rows[j];
-          for i := 0 to High(trNames) do
+        { Sprint B: INSTEAD OF govdesindeki DML de ifade basarisiz olursa
+          (veya govde hata verirse) geri alinmali; bu yuzden tek batch. }
+        ownBatch := not FT.Backend.InBatch;
+        if ownBatch then FT.BeginBatch;
+        try
+          // INSERT INTO view SELECT ... : SELECT sonuc satirlari NEW olur
+          ExecSelect(Stmt.SelectSrc, subRes);
+          for j := 0 to High(subRes.Rows) do
           begin
-            FT.GetTriggerDef(trNames[i], def);
-            FireTriggerDef(def, Byte(Byte(ttInsteadOf)), Byte(Byte(teInsert)), nil, NewRow, viewColNames, Res);
+            NewRow := subRes.Rows[j];
+            for i := 0 to High(trNames) do
+            begin
+              FT.GetTriggerDef(trNames[i], def);
+              FireTriggerDef(def, Byte(Byte(ttInsteadOf)), Byte(Byte(teInsert)), nil, NewRow, viewColNames, Res);
+            end;
+            Inc(rCount);
           end;
-          Inc(rCount);
+          if ownBatch then FT.CommitBatch;
+        except
+          if ownBatch then
+            try FT.AbortBatch; except end;
+          raise;
         end;
       end
       else if Stmt.ValuesRows <> nil then
       begin
         // INSERT INTO view (cols) VALUES (...): VALUES degerleri NEW olur
+        ownBatch := not FT.Backend.InBatch;
+        if ownBatch then FT.BeginBatch;
+        try
         for j := 0 to Stmt.ValuesRows.Count - 1 do
         begin
 
@@ -16928,6 +16957,12 @@ begin
             FireTriggerDef(def, Byte(Byte(ttInsteadOf)), Byte(Byte(teInsert)), nil, NewRow, viewColNames, Res);
           end;
           Inc(rCount);
+        end;
+        if ownBatch then FT.CommitBatch;
+        except
+          if ownBatch then
+            try FT.AbortBatch; except end;
+          raise;
         end;
       end;
       Exit;  // INSTEAD OF orijinal INSERT'i iptal etti, govde yeterlidir
@@ -17089,8 +17124,8 @@ begin
     ocaDoUpdate: onConflictAction := ocaDoUpdate;
   end;
 
-  // F-36: BEFORE STATEMENT tetikleyiciler (tum satirlardan once, bir kez)
-  FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, nil, [], Res, False);
+  { Sprint B: BEFORE STATEMENT tetikleyicileri artik her yolun batch'i
+    ACILDIKTAN sonra FireStmtBefore ile ateslenir (bkz. yol bloklari). }
   { B9: tetikleyici meta verisi tek cumle yurutme boyunca degismez.
     INSERT ROW tetikleyicisi yoksa satir basina iki FireTriggers cagrisi
     tamamen bosadir; sonucu dongu oncesi bir kez belirle. Liste bos
@@ -17119,6 +17154,7 @@ begin
       ownBatch := not FT.Backend.InBatch;
       if ownBatch then FT.BeginBatch;
       try
+        FireStmtBefore;
         for i := 0 to High(subRes.Rows) do
         begin
           NewRow := subRes.Rows[i];
@@ -17173,6 +17209,7 @@ begin
       ownBatch := not FT.Backend.InBatch;
       if ownBatch then FT.BeginBatch;
       try
+        FireStmtBefore;
         for i := 0 to High(subRes.Rows) do
         begin
           FExcludedRow := subRes.Rows[i];
@@ -17227,6 +17264,7 @@ begin
     begin
       FT.BeginBatch;
       try
+        FireStmtBefore;
         for i := 0 to Stmt.ValuesRows.Count - 1 do
         begin
           if Stmt.ValuesRows[i].Count = 0 then
@@ -17391,6 +17429,7 @@ begin
       ownBatch := not FT.Backend.InBatch;
       if ownBatch then FT.BeginBatch;
       try
+      FireStmtBefore;
       for i := 0 to Stmt.ValuesRows.Count - 1 do
       begin
         if Stmt.ValuesRows[i].Count = 0 then
@@ -18699,10 +18738,12 @@ begin
     hasInsTrig :=
       (Length(FT.TriggersFor(tbl, Byte(ttBefore), Byte(teInsert))) > 0) or
       (Length(FT.TriggersFor(tbl, Byte(ttAfter), Byte(teInsert))) > 0);
-    if hasInsTrig then
-      FireTriggers(tbl, Byte(ttBefore), Byte(teInsert), nil, nil, [], Res, False);
     ownBatch := not FT.Backend.InBatch;
     if ownBatch then FT.BeginBatch;
+    { Sprint B: BEFORE INSERT STATEMENT trigger'i batch ACILDIKTAN sonra;
+      trigger govdesindeki DML de COPY basarisiz olursa geri alinir. }
+    if hasInsTrig then
+      FireTriggers(tbl, Byte(ttBefore), Byte(teInsert), nil, nil, [], Res, False);
     try
       while True do
       begin
@@ -19556,6 +19597,10 @@ begin
   ownBatch := not FT.Backend.InBatch;
   if ownBatch then FT.BeginBatch;
   try
+  { Sprint B: BEFORE UPDATE FOR EACH STATEMENT trigger'i hic ateslenmiyordu.
+    Artik batch acildiktan sonra, satirlar bulunmadan once bir kez calisir;
+    hatasi AbortBatch ile tum UPDATE'i geri alir. }
+  FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teUpdate), nil, nil, [], Res, False);
   if Assigned(VdbDmlProbe) then VdbDmlProbe(VDB_DML_PROBE_BEFORE);
   isExact := False;
   if not NarrowRows(td, Stmt.WhereClause, colNames, colTypes, pks, allRows, isExact) then
@@ -19853,6 +19898,9 @@ var
   // P-145: otomatik commit'li tek statement'lik DELETE kendi write-set'ini
   // on-okumadan ONCE acar.
   ownBatch: Boolean;
+  // Sprint B: BEFORE DELETE STATEMENT tetiklendi mi (0 satir dalinda batch
+  // AbortBatch yerine CommitBatch ile kapatilir; trigger DML'i korunur).
+  befStmtFired: Boolean;
 begin
   // F-33: View guncellenebilirlik kontrolü
   baseTable := '';
@@ -19908,6 +19956,10 @@ begin
   ownBatch := not FT.Backend.InBatch;
   if ownBatch then FT.BeginBatch;
   try
+  { Sprint B: BEFORE DELETE FOR EACH STATEMENT trigger'i hic ateslenmiyordu.
+    Artik batch acildiktan sonra, satirlar bulunmadan once bir kez calisir. }
+  befStmtFired := Length(FT.TriggersFor(Stmt.Table, Byte(ttBefore), Byte(teDelete))) > 0;
+  FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teDelete), nil, nil, [], Res, False);
   if Assigned(VdbDmlProbe) then VdbDmlProbe(VDB_DML_PROBE_BEFORE);
   isExact := False;
   if not NarrowRows(td, Stmt.WhereClause, colNames, colTypes, pks, allRows, isExact) then
@@ -19968,8 +20020,13 @@ begin
       if ownBatch then FT.CommitBatch;
     end
     else if ownBatch then
-      { P-145: eslesen satir yok; write-set'i gen artirmadan kapat. }
-      FT.AbortBatch;
+    begin
+      { P-145: eslesen satir yok; write-set'i gen artirmadan kapat.
+        Sprint B: BEFORE DELETE STATEMENT trigger'i calistiysa govdesindeki
+        DML korunmalidir; bu durumda AbortBatch degil CommitBatch. }
+      if befStmtFired then FT.CommitBatch
+      else FT.AbortBatch;
+    end;
   finally
     toDelete.Free;
   end;

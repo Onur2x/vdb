@@ -45,6 +45,8 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `backup_restore` | yedek/geri yukleme butunlugu + tatbikat (B0-B24) |
 | `page_integrity` | sayfa/heap/freelist bozulma matrisi (I0-I13) |
 | `sql_features` | parser'da olup kapisi olmayan SQL ozellikleri: `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` (kismi geri alma gercekten yalniz sonraki satirlari atar), `ON CONFLICT DO NOTHING\|DO UPDATE` (cift anahtar degeri bozmaz), `VACUUM`/`REINDEX`/`ANALYZE <tablo>` (bakim veriyi korur, indeks aramasi dogru kalir), `WITH` (CTE), `ROW_NUMBER() OVER (ORDER BY ...)`, `ALTER TABLE ... RENAME TO` |
+| `sql_authorization` | **SQL yetki/RLS/trigger kapisi** (Sprint A, 3.2-3.4): baglanti yetkisiz baslar (kimlik yoksa `Start` reddeder, varsayilan `admin/admin123` kaldirildi); `GRANT`/`REVOKE` sonrasi izinli/izinsiz DML; RLS policy `USING`/`WITH CHECK` (SELECT/INSERT/UPDATE/DELETE); **upsert** yolunun UPDATE yetkisi, RLS ve ROW trigger uygulamasi; **MERGE** hedef satir RLS filtresi + BEFORE/AFTER ROW ve STATEMENT trigger'lari. 32 kontrol, iki platformda 32/0 |
+| `sql_atomicity` | **SQL statement atomikligi kapisi** (Sprint A 3.5 + Sprint B): AFTER/BEFORE **STATEMENT** ve ROW trigger hatalarinda statement'in **tamami** geri alinir, trigger govdesindeki DML de geri alinir; ana tablo/indeks/audit degismez. AT1-AT5: AFTER STATEMENT hatasi (cok satir INSERT, UPDATE, DELETE, tek satir INSERT, COPY). AT6-AT10: BEFORE STATEMENT gercekten atesleniyor + DML'i statement ile kalici; BEFORE INSERT/UPDATE/DELETE hatasi; 0 satir eslesen DELETE'te trigger DML'i korunur (B4). AT11-AT12: BEFORE/AFTER ROW hatasi. AT13: 2. satirda duplicate PK -> hic satir kalmaz. AT14: MERGE AFTER STATEMENT hatasi. AT15: RETURNING tutarliligi (basarili -> satirlar yazilir; hatali -> iz yok). AT16: hatali statement sonrasi yeniden acilista iz yok. AT17: explicit transaction icinde statement hatasi + `ROLLBACK`. AT18/AT19: BEFORE STATEMENT trigger DML'i ana INSERT/COPY hatasiyla geri alinir (B1). 19 vaka, **88 kontrol**, iki platformda 88/0. Kapi duzeltme oncesi kaynakla 8 kontrol FAIL verir (AT8/AT9/AT10/AT18/AT19), yani bos yesil degildir |
 | `limits` | **kaynak sinirlari** (SKILL2 §25): 4 MiB'tan buyuk SQL, 16 MB'lik INSERT ve 2M ustu `LIMIT` kontrollu `ecLimit` ile reddedilir; reddedilen islem **hicbir satir birakmaz**, ayni veritabani sorgulanmaya devam eder, kapanis temiz (yalniz `.odb`) ve yeniden acilista veri bozulmamis olur; belgelenen tavanlar (`LIMITS.md`) tutarli |
 | `cache_pressure` | **onbellek tukenmesi / tahliye** (SKILL3 §12.1): 8 sayfalik havuzla (~32 KB) havuzdan cok daha buyuk bir tablo uzerinde calisilir. Tam tarama **butun satirlari** dogru okur (tahliye + yeniden yukleme veri kaybetmez), `PoolUsed` havuz boyunu asmaz, miss sayaci gercek tahliyeyi kanitlar, tek islemde 2000 satir guncellemesi (kirli sayfa tahliye yolu) commit edilir ve **yeniden acilista** guncel veri kalicidir; temiz kapanistan sonra yalniz `.odb` kalir |
 | `page_corrupt` | **okuma yolunda sayfa butunlugu** (SKILL3 §5.3/§12.1): normal okuma yolu artik dogrulama yapar. Her veri sayfasinin govdesinde tek bayt bozulmasi, bozuk sihirli sayi ve yanlis sayfa imaji (sayfa 2 imaji sayfa 3'e kopyalanmis) kontrollu `ecCorrupt` uretir; dosyanin saglam kopyasi hala kusursuz taranir (kapi yanlis pozitif uretmez). Sifreli dosyada GCM etiketi zaten dogruluyor |
@@ -868,3 +870,26 @@ kaldirildi:
     bolumleriyle yazildi; siniflandirma **BETA CANDIDATE**. Uzun soak
     (1/6/24 saat), ag sunucusu soak'i, disk indeks ve macOS/ARM64
     olculmedi; bunlar acik risk olarak listelenir.
+- Otuz altinci kosu (v3.52, Sprint A + B): **iki platform da YESIL**.
+  Git Bash/Windows **44 kapi** PASS, WSL x86_64 Linux **45 kapi** PASS,
+  FAIL 0 (`gatesB.log`, `linB.log`; `tls_client` Windows'ta OpenSSL DLL'leri
+  ortamda oldugu icin kostu, Linux'ta 6/6).
+  - **Sprint A** (3.2-3.5): oturum kimligi (baglanti yetkisiz baslar, global
+    `FSessionId` yetki kaynagi degil, `admin/admin123` kaldirildi), upsert
+    yolu UPDATE yetkisi/RLS/ROW trigger uygular, MERGE RLS + trigger
+    pariteligi, AFTER STATEMENT trigger'lari commit'ten once. Yeni kapi
+    `sql_authorization` (32/0) ve `sql_atomicity` (Sprint A'da 23/0).
+  - **Sprint B** (SQL atomikligi): `ExecInsert`/`ExecCopy` BEFORE STATEMENT
+    trigger'i batch icinde ateslenir (B1); `ExecUpdate`/`ExecDelete` BEFORE
+    STATEMENT trigger'i artik atesleniyor (B2, eskiden hic yoktu); 0 satir
+    eslesen DELETE'te trigger DML'i korunur (B4, eskiden kosulsuz
+    `AbortBatch`). `INSTEAD OF` govdesi batch'e alindi ama parser bu zamani
+    uretmedigi icin bu yol **ulasilamaz** (B3, kod savunmasi; kapi yok).
+  - **Kapi buyudu**: `sql_atomicity` 5 vaka/23 kontrol -> **19 vaka/88
+    kontrol**. Duzeltme oncesi kaynakla (`git archive HEAD` + ayni test)
+    **8 kontrol FAIL** (AT8 x3, AT9 x2, AT10, AT18, AT19) ve exit 1; yani
+    kapi kusuru gercekten yakaliyor. Duzeltilmis agacta 88/0.
+  - **Durust sinir**: `sql_atomicity` degisiklikleri gomulu motorda olcer;
+    ag sunucusu uzerinden ayni senaryolar kosulmadi. `INSTEAD OF` ve
+    procedure/`IF` iceren trigger govdeleri desteklenmiyor, kapilar bunlari
+    kapsamaz.
