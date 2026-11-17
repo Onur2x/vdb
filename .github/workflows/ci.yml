@@ -2,6 +2,13 @@ name: CI
 
 # V3 sertlestirme: cekirdek kapi matrisi (Windows + Linux).
 # Ayrinti: docs/engineering/CI.md
+#
+# MATRIS KAPSAMI (durust kayit): yalniz ubuntu-latest (x86_64) ve
+# windows-latest (i386) kosar. macOS ve ARM64 (linux/arm64, windows/arm64)
+# icin job YOKTUR cunku bu projede HIC KOSULMADI; "kosmuyor" degil,
+# "olculmedi" demektir. Kanitlanmamis platformlari matrise eklemek yesil
+# gorunen ama dogrulanmamis bir kapi uretirdi. Bkz.
+# docs/audit/V3_ADVANCED_HARDENING_REPORT.md bolum B ve G.
 
 on:
   push:

@@ -91,6 +91,24 @@ Kosullu kapilar:
 
 `fail-fast: false`: bir platformun kirilmasi digerinin sonucunu gizlemez.
 
+### Matris kapsami ve olculmeyen platformlar (v3.51)
+
+Matris **yalniz** `ubuntu-latest` (x86_64) ve `windows-latest` (i386) uzerinde
+kosar. Su platformlar icin **job yoktur ve hic kosulmadi**:
+
+| Platform | Durum | Neden |
+|---|---|---|
+| macOS (x86_64 / arm64) | **not-run** | Bu ortamda macOS makine yok; `run_gates.sh` Unix dalini kullanir ve tasinabilirlik notlari (bkz. §5) macOS icin de yazildi, ama **kapilar macOS'ta kosulmadi**. |
+| linux/arm64 | **not-run** | Yalniz x86_64 Linux olculdu; ARM'da ne derleme ne kapi kosumu yapildi. |
+| windows/arm64 | **not-run** | Ayni sekilde olculmedi. |
+| Buyuk-endian | **not-run** | Kalici yapi kucuk-endian varsayar; `portability` kapisi bunu ayni platformda olcer, endian degistirmez. |
+
+Bu satirlar "kosmuyor" degil **"olculmedi"** demektir ve raporda da boyle
+gecer (`docs/audit/V3_ADVANCED_HARDENING_REPORT.md` bolum B/G). Dogrulanmamis
+bir platformu matrise eklemek, yesil gorunen ama hicbir sey kanitlamayan bir
+kapi uretirdi; bu yuzden eklenmedi. ARM/macOS eklenecekse once gercek bir
+kosum yapilmali, sonra job yazilmalidir.
+
 ### Ayri is: `sql_differential_postgres` (v3.48)
 
 Canli PostgreSQL diferansiyeli (SKILL4 §5) **kendi isidir** ve `gates`
@@ -829,3 +847,24 @@ kaldirildi:
     uzun sureli kaynak sizintisi iddia edilemez. Yigin olcusu RSS degildir.
     Cokme/kurtarma yollari `wal_crash`, `crash_points`, `page_corrupt`
     kapilarinda olculur; soak'ta cokme simule edilmez.
+- Otuz besinci kosu (v3.51, platform kapsami ve son audit): **yeni kapi
+  yok, davranis degisikligi yok**. Bu kosu matrisin **kapsamini** kayda
+  gecirir; kod, kapi listesi ve sonuclar otuz dorduncu kosuyla aynidir
+  (Windows 42 / Linux 43 PASS, 0 FAIL).
+  - **Matris**: yalniz `ubuntu-latest` (x86_64) ve `windows-latest`
+    (i386). `fail-fast: false` korunur; bir platformun kirilmasi digerini
+    gizlemez.
+  - **Olculmeyen platformlar (not-run, job YOK)**: macOS (x86_64/arm64),
+    linux/arm64, windows/arm64, buyuk-endian. Bunlar icin job eklenmedi
+    cunku bu projede **hic kosulmadi**; dogrulanmamis bir platformu
+    matrise eklemek yesil gorunen ama hicbir sey kanitlamayan bir kapi
+    uretirdi. Ayrim bu belgenin bolum 3 tablosunda ve
+    `docs/audit/V3_ADVANCED_HARDENING_REPORT.md` bolum B/H'de yazili.
+  - **Canli PostgreSQL** hala `pg=not-run`: `sql_differential` 33/0
+    kosar ama gercek sunucuya baglanmaz; ayri is
+    `sql_differential_postgres` baglanti yoksa **77 (SKIP)** doner ve
+    PASS sayilmaz.
+  - **Son audit**: `docs/audit/V3_ADVANCED_HARDENING_REPORT.md` A-J
+    bolumleriyle yazildi; siniflandirma **BETA CANDIDATE**. Uzun soak
+    (1/6/24 saat), ag sunucusu soak'i, disk indeks ve macOS/ARM64
+    olculmedi; bunlar acik risk olarak listelenir.
