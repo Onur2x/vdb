@@ -48,6 +48,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `sql_authorization` | **SQL yetki/RLS/trigger kapisi** (Sprint A, 3.2-3.4): baglanti yetkisiz baslar (kimlik yoksa `Start` reddeder, varsayilan `admin/admin123` kaldirildi); `GRANT`/`REVOKE` sonrasi izinli/izinsiz DML; RLS policy `USING`/`WITH CHECK` (SELECT/INSERT/UPDATE/DELETE); **upsert** yolunun UPDATE yetkisi, RLS ve ROW trigger uygulamasi; **MERGE** hedef satir RLS filtresi + BEFORE/AFTER ROW ve STATEMENT trigger'lari. 32 kontrol, iki platformda 32/0 |
 | `sql_atomicity` | **SQL statement atomikligi kapisi** (Sprint A 3.5 + Sprint B): AFTER/BEFORE **STATEMENT** ve ROW trigger hatalarinda statement'in **tamami** geri alinir, trigger govdesindeki DML de geri alinir; ana tablo/indeks/audit degismez. AT1-AT5: AFTER STATEMENT hatasi (cok satir INSERT, UPDATE, DELETE, tek satir INSERT, COPY). AT6-AT10: BEFORE STATEMENT gercekten atesleniyor + DML'i statement ile kalici; BEFORE INSERT/UPDATE/DELETE hatasi; 0 satir eslesen DELETE'te trigger DML'i korunur (B4). AT11-AT12: BEFORE/AFTER ROW hatasi. AT13: 2. satirda duplicate PK -> hic satir kalmaz. AT14: MERGE AFTER STATEMENT hatasi. AT15: RETURNING tutarliligi (basarili -> satirlar yazilir; hatali -> iz yok). AT16: hatali statement sonrasi yeniden acilista iz yok. AT17: explicit transaction icinde statement hatasi + `ROLLBACK`. AT18/AT19: BEFORE STATEMENT trigger DML'i ana INSERT/COPY hatasiyla geri alinir (B1). 19 vaka, **88 kontrol**, iki platformda 88/0. Kapi duzeltme oncesi kaynakla 8 kontrol FAIL verir (AT8/AT9/AT10/AT18/AT19), yani bos yesil degildir |
 | `limits` | **kaynak sinirlari** (SKILL2 §25): 4 MiB'tan buyuk SQL, 16 MB'lik INSERT ve 2M ustu `LIMIT` kontrollu `ecLimit` ile reddedilir; reddedilen islem **hicbir satir birakmaz**, ayni veritabani sorgulanmaya devam eder, kapanis temiz (yalniz `.odb`) ve yeniden acilista veri bozulmamis olur; belgelenen tavanlar (`LIMITS.md`) tutarli |
+| `wal_recovery` | **WAL-before-data ve kurtarma basarisizligi kapisi** (Sprint C, 4.1 + 4.2): checkpoint WAL bariyerini (fsync + durabil LSN dogrulama) veri sayfalari yazilmadan **once** kurar; WAL fsync hata enjeksiyonuyla checkpoint basarisiz olur ve yeniden acilista **hayalet commit gorunmez** (WR1: `COUNT` tabanda kalir, anahtar yok). WR2 `CP_BEFORE_FLUSH` kancasinda `Engine.DurableLsn >= Wal.WrittenLsn` olcer (eski sirada `durable=0 written=3`). Kurtarma basarisizligi motoru **POISONED** yapar: `ecInvalidState` ile backend okumasi, motor okumasi ve yazma reddedilir, `PoisonReason` dolu; kapatip acma temiz baslangic ve yazilabilirlik verir (WR3). Basarili kurtarma durabil satiri korur, fsync edilmemis satiri atar, motoru yeniden yazilabilir kilar (WR4). Normal yol zehirlenmez (WR5). 5 vaka, **27 kontrol**, iki platformda 27/0. Duzeltme oncesi kaynakla derlenen sonda 3 kontrol FAIL (`wr1/durable-kept`, `wr1/no-ghost-row`, `wr2/wal-durable-before-flush`) |
 | `cache_pressure` | **onbellek tukenmesi / tahliye** (SKILL3 §12.1): 8 sayfalik havuzla (~32 KB) havuzdan cok daha buyuk bir tablo uzerinde calisilir. Tam tarama **butun satirlari** dogru okur (tahliye + yeniden yukleme veri kaybetmez), `PoolUsed` havuz boyunu asmaz, miss sayaci gercek tahliyeyi kanitlar, tek islemde 2000 satir guncellemesi (kirli sayfa tahliye yolu) commit edilir ve **yeniden acilista** guncel veri kalicidir; temiz kapanistan sonra yalniz `.odb` kalir |
 | `page_corrupt` | **okuma yolunda sayfa butunlugu** (SKILL3 §5.3/§12.1): normal okuma yolu artik dogrulama yapar. Her veri sayfasinin govdesinde tek bayt bozulmasi, bozuk sihirli sayi ve yanlis sayfa imaji (sayfa 2 imaji sayfa 3'e kopyalanmis) kontrollu `ecCorrupt` uretir; dosyanin saglam kopyasi hala kusursuz taranir (kapi yanlis pozitif uretmez). Sifreli dosyada GCM etiketi zaten dogruluyor |
 | `server_harden` | dinleme adresi, `--trust` sinirlari, TLS zorunlulugu |
@@ -893,3 +894,32 @@ kaldirildi:
     ag sunucusu uzerinden ayni senaryolar kosulmadi. `INSTEAD OF` ve
     procedure/`IF` iceren trigger govdeleri desteklenmiyor, kapilar bunlari
     kapsamaz.
+- Otuz yedinci kosu (v3.53, Sprint C): **iki platform da YESIL**.
+  Git Bash/Windows **45 kapi** PASS, WSL x86_64 Linux **46 kapi** PASS,
+  FAIL 0 (`gatesC.log`, `linC.log`; Windows'ta `tls_client` bu kosuda
+  `VDB_CRYPTO_DLL` yok diye SKIP, Linux'ta 6/0).
+  - **4.1 WAL-before-data**: checkpoint sirasi duzeltildi. Eskiden
+    `FStore.Flush(True)` veri dosyasini fsync ediyor, WAL bariyeri
+    (`AwaitDurable`) **sonra** bekleniyordu; WAL fsync basarisiz olunca
+    dayanikli olmayan commit'in veri sayfalari diskte kaliyor ve yeniden
+    acilista **hayalet commit** goruluyordu. Yeni sira: WAL yaz, WAL fsync,
+    durabil LSN dogrula, sonra veri sayfalari + fsync, sonra WAL'i yalniz
+    durabil checkpoint sinirina kadar buda.
+  - **4.2 POISONED**: `RecoverAfterDurabilityFailure` hicbir istisna
+    yakalamiyordu (hata yalniz `FLastCommitProblem` metniydi). Artik kurtarma
+    hatasi motoru POISONED yapar ve `ecInvalidState` ile tum okuma/yazma
+    reddedilir; kapatip acma temiz baslar. Basarili kurtarma `FSyncErr`
+    alanini temizler (eskiden her sonraki `AwaitDurable` aninda hataya
+    dusuyordu).
+  - **Yeni kapi**: `wal_recovery` 5 vaka **27 kontrol**, iki platformda 27/0.
+    Duzeltme oncesi kaynakla derlenen sonda **3 kontrol FAIL**; ayrica ilk
+    denemede ekledigim bariyer kontrolu yanlis bir invaryanti olcuyordu
+    (`store LSN` ile `durable LSN` karsilastirmasi; WAL bosken mesru
+    checkpoint'leri kiriyordu) ve 5 kapi kirmizi oldu; duzeltme sonrasi
+    hepsi yesil.
+  - **Durust sinir**: `.gen` eslemesindeki durabil-LSN aynasi **yalniz
+    Windows'ta** kurulur (`MapGen` tamamen `{$IFDEF WINDOWS}`); Linux'ta
+    surecler arasi durabil-LSN paylasimi **yoktur**. Kapi bu yuzden motor
+    duzeyindeki `Engine.DurableLsn` degerini olcer (Linux'ta `store=0`
+    beklenen degerdir). Cokme `SimulateCrash` ve hata kancalariyla taklit
+    edilir; gercek elektrik kesintisi dayanikliligi iddia **edilmez**.

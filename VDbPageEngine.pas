@@ -155,6 +155,14 @@ type
       FDurableLsn: LongWord;
       FSyncCount: Int64;
       FSyncErr: string;
+      { Sprint C (4.2): recovery basarisiz olursa motor POISONED olur. Butunluk
+        garanti edilemedigi icin okuma da yazma da reddedilir; yalnizca
+        kapatip yeniden acmak temizler. }
+      FPoisoned: Boolean;
+      FPoisonReason: string;
+      { Sprint C (4.2): test kancasi - RecoverAfterDurabilityFailure basinda
+        istisna firlatir; POISONED yolunu kapida dogrular. }
+      FDebugFailRecovery: Boolean;
       { P-182: /metrics icin motor sayaclari. }
       FCommitCount: Int64;
       FCheckpointCount: Int64;
@@ -257,6 +265,9 @@ type
       (hayalet commit yok). Cagri FEngCs altinda ve islem kapaliyken
       yapilmalidir. }
     procedure RecoverAfterDurabilityFailure;
+    { Sprint C (4.2): gercek kurtarma govdesi; POISONED sarmalayicisi
+      RecoverAfterDurabilityFailure tarafindan cagrilir. }
+    procedure RecoverAfterDurabilityFailureCore;
 
     function Insert(Key: QWord; const Value: TBytes): Boolean; overload;
     function Insert(Key: QWord; Data: PByte; DataLen: Integer): Boolean; overload;
@@ -302,6 +313,10 @@ type
     { v3.19 GRUP COMMIT: yapilan GERCEK fsync sayisi. Kapi, fsync sayisinin
       commit sayisindan cok kucuk oldugunu bununla kanitlar. }
     property DebugSyncCount: Int64 read FSyncCount;
+    { Sprint C: WAL fsync ile ONAYLANMIS son LSN (motor duzeyinde). Store
+      tarafindaki `.gen` eslemesi yalniz Windows'ta kurulur; bu ozellik her
+      platformda dogru degeri verir ve checkpoint bariyeri bunu dogrular. }
+    property DurableLsn: LongWord read FDurableLsn;
     { P-182: /metrics sayaclari. Commit sayisi WAL'e yazilan basarili
       commit'leri sayar; checkpoint sayaci + sureleri Checkpoint basina
       olculur (kapi ve tanilama icin). }
@@ -317,6 +332,14 @@ type
     { P-184 (C-10): bos = temiz kurtarma; dolu = WAL kuyrugu kesik/bozuk
       oldugundan bazi onayli commit'ler uygulanmadi. }
     property WalRecoveryWarning: string read FWalRecoveryWarn;
+    { Sprint C (4.2): kurtarma basarisiz olduysa motor POISONED'dir; yazma ve
+      okuma reddedilir. Neden: PoisonReason. DebugFailRecovery yalnizca
+      kapilar icin. }
+    property Poisoned: Boolean read FPoisoned;
+    property PoisonReason: string read FPoisonReason;
+    procedure DebugFailRecovery(AValue: Boolean);
+    { POISONED ise ecInvalidState firlatir; degilse hicbir sey yapmaz. }
+    procedure EnsureUsable;
     { Acilista `.odb.idx` hizli yolu kullanildi mi? Kullanilmadiysa tam
       tarama yapildi ve FIdxErr nedenini verir (veri kaybi soz konusu degil). }
     property IdxUsed: Boolean read FIdxUsed;
@@ -444,6 +467,9 @@ begin
   FWalStats.TornTail := False;
   FWalStats.Bytes := 0;
   FWalRecoveryWarn := '';
+  FPoisoned := False;
+  FPoisonReason := '';
+  FDebugFailRecovery := False;
   { v3.3: ICERIK damgasi. Her motor ornegi farkli bir ust 32 bit tabani alir,
     boylece yeni bir motor (or. VACUUM/RESTORE sonrasi) eski bir zone map
     damgasiyla CAKISAMAZ. Alt 32 bit yalnizca VERI DEGISTIREN commit'lerde
@@ -918,12 +944,47 @@ begin
     FWal.Close;
 end;
 
+procedure TVdbPageEngine.DebugFailRecovery(AValue: Boolean);
+begin
+  FDebugFailRecovery := AValue;
+end;
+
+procedure TVdbPageEngine.EnsureUsable;
+begin
+  if FPoisoned then
+    raise EVDbException.Create(ecInvalidState,
+      'motor POISONED (kurtarma basarisiz): ' + FPoisonReason);
+end;
+
 procedure TVdbPageEngine.RecoverAfterDurabilityFailure;
 var
   st: TVdbWalStats;
 begin
   if FStore = nil then Exit;
   if FStore.ReadOnly then Exit;
+  { Sprint C (4.2): kurtarma basarisiz olursa motor kullanilamaz duruma
+    gecer. Once POISONED isaretlenir; butunluk garanti edilemedigi icin
+    sonraki okuma/yazma ecInvalidState ile reddedilir. Hata yutulmaz. }
+  try
+    { Sprint C (4.2) test kancasi. }
+    if FDebugFailRecovery then
+      raise EVDbException.Create(ecIOError,
+        'kurtarma hatasi (test kancasi)');
+    RecoverAfterDurabilityFailureCore;
+  except
+    on E: Exception do
+    begin
+      FPoisoned := True;
+      FPoisonReason := E.ClassName + ': ' + E.Message;
+      raise;
+    end;
+  end;
+end;
+
+procedure TVdbPageEngine.RecoverAfterDurabilityFailureCore;
+var
+  st: TVdbWalStats;
+begin
   { 1) Bellekteki imajlar (basarisiz commit'in sayfalari dahil) gecersiz:
     WAL o bolumu geri kirpti. Diskteki durabil taban yeniden yuklenir. }
   FStore.DiscardView;
@@ -955,6 +1016,17 @@ begin
   FIdxUsed := False;
   FIdxErr := '';
   FHeap.Open;
+  { Sprint C (4.2): kurtarma BASARILI olduysa motor yeniden kullanilabilir
+    olmalidir. FSyncErr basarisiz fsync'ten kalmisti ve her yeni
+    AwaitDurable'i aninda hataya dusuruyordu; durabil LSN onbellegi de
+    diskteki durabil tabana cekilir. }
+  FSyncCs.Enter;
+  try
+    FSyncErr := '';
+    FDurableLsn := FStore.DurableLsn;
+  finally
+    FSyncCs.Leave;
+  end;
 end;
 
 { ------------------------------------------------------------ WAL kancalari }
@@ -1079,6 +1151,8 @@ end;
 
 procedure TVdbPageEngine.RequireWritable;
 begin
+  { Sprint C (4.2): POISONED motor yazma kabul etmez. }
+  EnsureUsable;
   if FStore = nil then
     raise EVdbPageEngine.Create('motor acik degil');
   if FStore.ReadOnly then
@@ -1123,37 +1197,45 @@ end;
 
 function TVdbPageEngine.TryGet(Key: QWord; out Value: TBytes): Boolean;
 begin
+  { Sprint C (4.2): POISONED motorda okuma da reddedilir. }
+  EnsureUsable;
   Result := FHeap.TryGet(Key, Value);
 end;
 
 function TVdbPageEngine.Contains(Key: QWord): Boolean;
 begin
+  EnsureUsable;
   Result := FHeap.Contains(Key);
 end;
 
 procedure TVdbPageEngine.ScanAll(Cb: TVdbHeap.TScanProc);
 begin
+  EnsureUsable;
   FHeap.ScanAll(Cb);
 end;
 
 procedure TVdbPageEngine.ScanAllRaw(Cb: TVdbHeap.TScanRawProc);
 begin
+  EnsureUsable;
   FHeap.ScanAllRaw(Cb);
 end;
 
 procedure TVdbPageEngine.ScanAllRawPaged(Cb: TVdbHeap.TScanRawPageProc;
   Skip: PByte; SkipCount: Integer);
 begin
+  EnsureUsable;
   FHeap.ScanAllRawPaged(Cb, Skip, SkipCount);
 end;
 
 function TVdbPageEngine.GetCount: Integer;
 begin
+  EnsureUsable;
   if FHeap = nil then Result := 0 else Result := FHeap.Count;
 end;
 
 function TVdbPageEngine.Stats: TVdbHeapStats;
 begin
+  EnsureUsable;
   Result := FHeap.Stats;
 end;
 
@@ -1161,6 +1243,7 @@ function TVdbPageEngine.Commit(DoSync: Boolean): Boolean;
 var
   syncLsn: LongWord;
 begin
+  EnsureUsable;
   { v3.19: eski sozlesme korunur — Commit(True) yazar VE bekler. }
   { v3.21: TEK fsync. Onceden DoCommit(True) FWal.Commit(True) uzerinden
     stream'i flush ediyor, ardindan AwaitDurable -> SyncDurable AYNI dosyayi
@@ -1176,6 +1259,7 @@ end;
 
 function TVdbPageEngine.CommitNoSync(out ASyncLsn: LongWord): Boolean;
 begin
+  EnsureUsable;
   { v3.19: yazar, fsync etmez. Durabilite cagiranin sorumlulugunda. }
   Result := DoCommit(False, ASyncLsn);
   { SKILL2 §19.2: commit kaydi WAL'e yazildi, fsync YOK. Bu noktada olum
@@ -1499,6 +1583,7 @@ var
 begin
   t0 := GetTickCount;
   Result := False;
+  EnsureUsable;
   if FStore = nil then
     raise EVdbPageEngine.Create('motor acik degil');
   { v3.2: salt-okunur oturumda checkpoint yok; disk zaten yazilamaz. }
@@ -1544,26 +1629,43 @@ begin
         end;
       end;
     until (st.Commits = 0) and (FPendingCount = 0);
+  if DoSync then
+  begin
+    if FWal.WrittenLsn > 0 then
+    begin
+      AwaitDurable(FWal.WrittenLsn);
+      { Bariyer dogrulamasi: WAL'in yazilmis son cercevesi DURABIL olmali.
+        Karsilastirma store LSN'i ile YAPILMAZ: WAL bosken (acilis sonrasi,
+        geri yuklenmis/yedek kopya) store LSN durabil tabandan buyuk olabilir
+        ve bu bir kusur degildir; sayfalar zaten diskte durabildir. }
+      FSyncCs.Enter;
+      try
+        if FDurableLsn < FWal.WrittenLsn then
+          raise EVdbPageEngine.CreateFmt(
+            'checkpoint WAL bariyeri tutarsiz (durable=%u < written=%u)',
+            [Int64(FDurableLsn), Int64(FWal.WrittenLsn)]);
+      finally
+        FSyncCs.Leave;
+      end;
+    end;
+    FSyncCs.Enter;
+    try
+      FSyncErr := '';
+      if FStore.DurableLsn > FDurableLsn then
+        FDurableLsn := FStore.DurableLsn;
+      FStore.SetDurableLsn(FDurableLsn);
+    finally
+      FSyncCs.Leave;
+    end;
+  end;
   CrashPoint(VDB_CRASH_STAGE_CP_BEFORE_FLUSH);
   FStore.Flush(DoSync);
   CrashPoint(VDB_CRASH_STAGE_CP_AFTER_FLUSH);
   if DoSync then
   begin
-    { v3.19 GRUP COMMIT BARİYERİ: WAL budanmadan once icindeki her sey
-      DURABIL olmali; aksi halde fsync'i henuz yapilmamis bir commit'in
-      cerceveleri budanir ve cokme halinde kaybolur. Bekleyen liderler
-      bitene kadar bekle, sonra durabil LSN'i checkpoint LSN'ine cek. }
-    AwaitDurable(FWal.WrittenLsn);
+    { WAL artik yalnizca DURABIL checkpoint sinirina kadar budanir. }
     FWal.Truncate(FStore.LSN);
     CrashPoint(VDB_CRASH_STAGE_CP_AFTER_TRUNC);
-    FSyncCs.Enter;
-    try
-      FDurableLsn := FWal.WrittenLsn;
-      FSyncErr := '';
-      FStore.SetDurableLsn(FWal.WrittenLsn);
-    finally
-      FSyncCs.Leave;
-    end;
   end;
   { v3.16: guvenlik agi kilidini birak (bkz. Commit). }
   FStore.EndIoWrite;

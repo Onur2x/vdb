@@ -147,6 +147,7 @@ build_gate bench_report    "$ROOT/tests/bench_report/bench_report.lpr"
 build_gate sql_features    "$ROOT/tests/sql_features/sql_features.lpr"
 build_gate sql_authorization "$ROOT/tests/sql_authorization/sql_authorization.lpr"
 build_gate sql_atomicity   "$ROOT/tests/sql_atomicity/sql_atomicity.lpr"
+build_gate wal_recovery    "$ROOT/tests/wal_recovery/wal_recovery.lpr"
 build_gate limits          "$ROOT/tests/limits/limits_gate.lpr"
 build_gate cache_pressure  "$ROOT/tests/cache_pressure/cache_pressure.lpr"
 build_gate page_corrupt    "$ROOT/tests/page_corrupt/page_corrupt.lpr"
@@ -198,6 +199,7 @@ run_gate bench_report   "$WORK/bench_report"    bench_report
 run_gate sql_features   "$WORK/sql_features"    sql_features
 run_gate sql_authorization "$WORK/sql_authorization" sql_authorization
 run_gate sql_atomicity  "$WORK/sql_atomicity"   sql_atomicity
+run_gate wal_recovery   "$WORK/wal_recovery"    wal_recovery
 run_gate limits         "$WORK/limits"          limits_gate
 run_gate cache_pressure "$WORK/cache_pressure"  cache_pressure
 run_gate page_corrupt   "$WORK/page_corrupt"    page_corrupt

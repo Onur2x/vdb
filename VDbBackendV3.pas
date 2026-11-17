@@ -559,6 +559,9 @@ type
       ABusyMs: Integer = VDB_DEF_BUSY_MS);
     { v3.2: salt-okunur oturumda yazma denemelerini acik hataya cevirir. }
     procedure RequireWritable;
+    { Sprint C (4.2): motor POISONED ise (kurtarma basarisiz) okuma da
+      yazma da reddedilir; butunluk garanti edilemez. }
+    procedure EnsureEngineUsable;
     function NewEngine(const APath: string): TVdbPageEngine;
     function GetEncrypted: Boolean;
     function GetIsReadOnly: Boolean;
@@ -1412,8 +1415,16 @@ begin
   Result := FBusyMs;
 end;
 
+procedure TVdbBackendV3.EnsureEngineUsable;
+begin
+  if FEng <> nil then
+    FEng.EnsureUsable;
+end;
+
 procedure TVdbBackendV3.RequireWritable;
 begin
+  { Sprint C (4.2): POISONED motor (kurtarma basarisiz) yazma kabul etmez. }
+  EnsureEngineUsable;
   if FReadOnly then
     raise EVdbBackendV3.Create(
       'salt-okunur veritabani: yazma yapilamaz (READONLY acilis)');
@@ -3144,6 +3155,7 @@ var
   s: TWriteSet;
   G0: QWord;
 begin
+  EnsureEngineUsable;
   FEngCs.Enter;
   try
     s := OwnSet;
@@ -3259,6 +3271,7 @@ var
   sid: Cardinal;
   G0: QWord;
 begin
+  EnsureEngineUsable;
   { P-22: write set onbellek — parti icindeki anahtarlari kilitsiz bul.
     R2-B-2: once isaretci, sonra SID okunur (yayin sirasinin tersi);
     ayni oturum kimliginin iki thread'de kullanilmasi desteklenmez. }
@@ -3309,6 +3322,7 @@ end;
 
 function TVdbBackendV3.Count: Integer;
 begin
+  EnsureEngineUsable;
   Result := EffectiveCount;
 end;
 
@@ -3350,6 +3364,7 @@ var
   savedSet: TWriteSet;
   savedUnknown: Boolean;
 begin
+  EnsureEngineUsable;
   { v3.4: tarama tamponlari (FScanKeys/FScanN) BACKEND alanidir; ayni
     backend'i paylasan oturumlar ayni anda tararsa birbirini bozardi.
     Kilit tarama boyunca tutulur. v3.9: geri cagirim ayni is parcaciginda
@@ -3525,6 +3540,7 @@ begin
   ActualSequence := 0;
   Result := False;
   if FEng = nil then Exit;
+  EnsureEngineUsable;
 
   { Taban = son checkpoint'teki dosya; WAL = tabandan beri commit edilmis
     sayfa imajlari. Ikisinin kopyasi uzerinde sinirli kurtarma, N anindaki
@@ -3660,6 +3676,7 @@ var
   savedUnknown: Boolean;
   savedSnap: TDictionary<QWord, TBatchRec>;
 begin
+  EnsureEngineUsable;
   { v3.1: sonuc kumesi ARTIK BIRIKTIRILMEZ; satirlar dogrudan geri cagirima
     akitilir ve sayfa ici hucre KOPYALANMAZ. Eski yol her satirda iki dinamik
     diziyi SetLength(+1) ile buyutuyor (200k satirda O(n^2) kopya + 200k
@@ -3774,6 +3791,7 @@ var
   savedFilter: Integer;
   savedUnknown: Boolean;
 begin
+  EnsureEngineUsable;
   { Toplu yazim acikken bekleyen kayitlarin sayfasi YOKTUR ve harita da
     guvenilmez; cagiran tam taramaya duser. }
   if BatchOpen then Exit(False);
@@ -3968,6 +3986,7 @@ function TVdbBackendV3.CountTable(TableFilter: Integer): Int64;
 var
   cur: Int64;
 begin
+  EnsureEngineUsable;
   Result := -1;
   { Acik kaplama varsa bekleyen degisiklikler sayaca YANSIMAZ; cagiran
     (yurutucu) bu durumda tam tarama yapar. }

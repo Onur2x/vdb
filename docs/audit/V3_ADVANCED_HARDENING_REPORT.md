@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-17
-Surum: v3.52 (Sprint A + B; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Surum: v3.53 (Sprint A + B + C; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -72,6 +72,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 |---|---|---|---|
 | A | 3.2 oturum kimligi, 3.3 upsert yetkisi, 3.4 MERGE RLS/trigger, 3.5 AFTER STATEMENT trigger sirasi | Tamam | `sql_authorization` 32/0 (yeni), `sql_atomicity` 23/0 (yeni) |
 | B | SQL atomikligi: INSERT/UPDATE/DELETE/COPY/MERGE statement batch sinirlari, BEFORE STATEMENT trigger'lari | Tamam | `sql_atomicity` 88/0 (19 vaka) |
+| C | 4.1 WAL-before-data checkpoint sirasi, 4.2 kurtarma basarisizliginda POISONED durumu | Tamam | `wal_recovery` 27/0 (yeni, 5 vaka) |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -99,6 +100,42 @@ Kapinin kendisi dogrulandi: ayni test dosyasi duzeltme ONCESI kaynakla
 AT10, AT18, AT19) ve cikis kodu 1; duzeltilmis agacta **88/0**. Yani kapi
 gercekten kusuru yakaliyor, bos yesil degil.
 
+Sprint C iki kusuru kapatti ve iki yeni sinir getirdi:
+
+- **C1 / 4.1 (WAL-before-data, veri kaybi)**: checkpoint sirasi tersti.
+  `FStore.Flush(True)` veri dosyasini fsync ediyor, WAL bariyeri
+  (`AwaitDurable`) **ondan sonra** bekleniyordu. WAL fsync basarisiz olursa
+  dayanikli olmayan commit'in veri sayfalari diskte kaliyor ve yeniden
+  acilista "hayalet commit" goruluyordu. Yeni sira: WAL yaz, WAL fsync,
+  durabil LSN dogrula, **sonra** veri sayfalarini yaz + fsync, sonra WAL'i
+  yalniz durabil checkpoint sinirina kadar buda.
+- **C2 / 4.2 (kurtarma basarisizligi)**: `RecoverAfterDurabilityFailure`
+  hicbir istisna yakalamiyordu; hata `FLastCommitProblem` metni olarak
+  yutuluyor ve motor yarim kurtarilmis halde kullanilabilir kaliyordu. Artik
+  kurtarma hatasi motoru **POISONED** yapar: `Poisoned`/`PoisonReason`
+  ozellikleri, `ecInvalidState` hata kodu ile tum okuma ve yazma giris
+  noktalari (motor ve backend) reddeder; kapatip acma temiz baslangic verir.
+- **Duzeltme (kurtarma sonrasi kilit)**: basarili kurtarma `FSyncErr`
+  alanini temizlemedigi icin sonraki her `AwaitDurable` aninda hataya
+  dusuyordu; artik basarili kurtarma bu durumu sifirlar.
+- **Durust sinir**: `.gen` eslemesindeki durabil-LSN aynasi yalniz Windows'ta
+  kurulur (`MapGen` tamamen `{$IFDEF WINDOWS}`). Linux'ta bu ayna yoktur;
+  surecler arasi durabil-LSN paylasimi Linux'ta calismaz. Kapi bu yuzden
+  motor duzeyindeki `Engine.DurableLsn` degerini olcer ve store aynasini
+  yalniz raporlar (`store=0` Linux'ta beklenen degerdir).
+- **Durust sinir**: kapi cokmeyi `SimulateCrash` ve hata kancalariyla taklit
+  eder; gercek elektrik kesintisi dayanikliligi iddia edilmez. Gercek surec
+  olumu `crash_points` kapisinda ayrica kosar, ancak isletim sistemi
+  onbellegi fsync edilmemis baytlari koruyabildigi icin o kapi 4.1'i tek
+  basina yakalayamazdi.
+
+`wal_recovery` kapisi 5 vaka / 27 kontrol: hayalet commit yoklugu, checkpoint
+bariyerinin veri yazimindan once kurulmasi, POISONED reddi ve kurtarma
+sonrasi tekrar yazilabilirlik, basarili kurtarmanin durabil satiri koruyup
+fsync edilmemis satiri atmasi, normal yolun zehirlenmemesi. Duzeltme oncesi
+kaynakla derlenen sondada **3 kontrol FAIL** (wr1/durable-kept, wr1/no-ghost-row,
+wr2/wal-durable-before-flush); duzeltilmis agacta 27/0.
+
 ---
 
 ## B. WAL
@@ -113,10 +150,16 @@ gercekten kusuru yakaliyor, bos yesil degil.
 | Recovery | Kesik kuyruk geri kirpilir; `WriteChecked` tek yazma noktasi; commit kaydi yoksa satir durabil olmaz | `wal_crash`, `kv_wal`, `crash_points` 24/0 |
 | WAL reclaim | Kapanista checkpoint basariliysa ve ayni dosyaya acik baska oturum yoksa `.wal`/`.gen` silinir; basarisizsa yan dosyalar korunur (veri kaybi yerine fazladan dosya) | `single_file`, `multi_writer` 12/0 |
 | Crash testleri | Enjekte edilmis cokme noktalari, WAL yazma hatasi, disk dolu | `crash_points` 24/0, `disk_full` 16/0 |
+| WAL-before-data (4.1) | Checkpoint WAL bariyerini (fsync + durabil LSN dogrulama) veri sayfalari yazilmadan **once** kurar; WAL fsync basarisizsa veri dosyasina dokunulmaz, yeniden acilista hayalet commit gorunmez | `wal_recovery` WR1, WR2 |
+| POISONED (4.2) | Kurtarma basarisiz olursa motor `POISONED` olur: okuma ve yazma `ecInvalidState` ile reddedilir; kapatip acma temiz baslangic verir | `wal_recovery` WR3, WR4, WR5 |
 
 **Durust sinir**: WAL ozellikle tek yazar rezervasyonu modeline dayanir;
 cok yazarli yuksek cakisma altinda gecikme davranisi olculmedi. `VDB_WAL_MAX_BYTES=0`
 tavani kapatir; bu modda "sinirsiz WAL" davranisi kasitlidir, koruma yoktur.
+`.gen` eslemesindeki durabil-LSN aynasi yalniz Windows'ta kurulur; Linux'ta
+store aynasi okunamaz (`Engine.DurableLsn` motor duzeyinde dogru calisir).
+`wal_recovery` cokmeyi hata kancalariyla taklit eder; gercek elektrik
+kesintisi dayanikliligi iddia edilmez.
 
 ---
 
