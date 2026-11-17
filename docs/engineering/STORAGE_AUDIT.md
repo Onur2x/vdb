@@ -254,6 +254,29 @@ temiz + dosya degismedi, bozuk sihirli sayi (sayfa no ile), bozuk CRC,
 bozuk freelist girdisi (ucreti yeniden hesaplanmis gecerli trunk), kesik WAL
 kuyrugu (uyari), kesik dosya, CLI sozlesmesi.
 
+### F-22: serbest sayfa / heap yeniden dizinleme kusuru (v3.50, KAPATILDI)
+
+Bu bolumun "freelist" ifadesi eksikti: `FreePage` yalnizca sayfayi serbest
+listeye yazar, **sayfanin diskteki imajini silmez**. Yeniden acilista
+`TVdbHeap.Open` tum sayfalari tarayip serbest listedeki sayfayi gecerli bir
+heap sayfasi olarak **yeniden dizine ekliyordu**. Bosluk ipucu icine satir
+yaziyor, sonra `AllocPage` ayni sayfayi serbest listeden dagitip `PageInit`
+ile sifirliyor ve onayli satirlar **sessizce** kayboluyordu. Olculen: 2.000
+satirdan 104'u, 520 turluk churn'de; kayip icin checkpoint + yeniden acilis
+birlikte gerekiyordu (`COUNT(*)` 2000 derken sayfa taramasi 1896).
+
+Duzeltme: `TVDbPageStore.CollectFreePages` (trunk + girdiler, `cnt-1`
+`LongWord` tasmasi giderildi), `TVdbHeap.Open` serbest sayfalari atlar
+(liste okunamazsa acilis **durmaz**; bozulmayi `Verify`/`VerifyFreeList`
+raporlar, `page_integrity` I11 ve `integrity_check` IC-D1..D3 bunu bekler),
+`SpaceHintScan` yalniz `FPageType = 1` sayfalari ipucu yapar, `AllocPage`
+canli hucre tasiyan sayfayi gurultulu hatayla reddeder. Regresyon: `soak`
+SO16/SO17 (checkpoint ve yeniden acilis sonrasi `COUNT(*)` ==
+`COUNT(*) WHERE id > 0` == `COUNT(DISTINCT id)`).
+
+Ilgili F-21 (dizin doygunlugunda sessiz `Insert` basarisizligi) ayni kapida
+kapatildi; ayrinti `docs/audit/V3_ADVANCED_HARDENING_REPORT.md` bolum I.
+
 ---
 
 ## 9. §24 Format uyumlulugu ve gecis
@@ -406,8 +429,11 @@ ve asagidaki bosluklar kapatilmadan "production" iddia edilmez.
 | G5 | ~~Benchmark kategorileri ve yuzdelikler eksik~~ | **KAPATILDI** — `tests/bench_report` 35/0 (18 kategori, P50/P95/P99, CSV+meta, dogruluk kontrolleri) |
 | G6 | ~~Butunluk denetleyici CLI + modlar + salt-okunur~~ | **KAPATILDI** — `vdbcheck` (4 mod, her zaman `CreateReadOnly`) + `tests/integrity_check` 32/0 |
 | G7 | ~~Eski format fixture'lari ve gecis testleri~~ | **KAPATILDI** — `tests/format_compat` 28/0 (sentetik v3/v4 imaj, yukseltme, v6/bozuk/yarim goc reddi) |
-| G8 | Limitler tanimsiz, disk dolu denenmedi | Limit tablosu + kontrollu hata + disk dolu simulasyonu |
+| G8 | ~~Limitler tanimsiz, disk dolu denenmedi~~ | **KAPATILDI** — `docs/engineering/LIMITS.md` (tek kaynak: degerler, nerede zorlanir, hata kodu) + `docs/engineering/RESOURCE_LIMITS.md` (kapi eslemesi, acik riskler); kontrollu hata ve disk dolu simulasyonu `tests/disk_full` 16/0, sinir kapilari `limits`/`wal_limit`/`txn_limit`/`oom` |
 | G9 | ~~Platformlar arasi dosya uyumu kanitsiz~~ | **KAPATILDI** — `tests/portability` 29/0 (imaj determinizmi + LF sema) ve iki yonlu gercek aktarim (Win i386 -> Linux x86_64, Linux -> Win), her yonde 13/0 |
 
-Oncelik: G3/G8 (belge + sinir).
-G1, G2, G4, G5, G6, G7 ve G9 kapatildi.
+Oncelik: G3 (izolasyon/kilit belgesi). G1, G2, G4, G5, G6, G7, G8 ve G9
+kapatildi. `docs/engineering/ISOLATION.md` halen yok; SQL izolasyon ve kilit
+modeli bugun yalniz `LIMITS.md` (tek yazar rezervasyonu, `BusyTimeoutMs`) ve
+`docs/engineering/SERVER_HARDENING.md` icinde dagilmis durumda. Bu bir
+belge boslugudur, olculmemis bir davranis degil.
