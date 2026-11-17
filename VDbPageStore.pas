@@ -722,6 +722,14 @@ type
     { Freelist'in bas sayfasi (0 = bos). }
     function GetFreeTrunk: LongWord;
 
+    { F-22: serbest listenin TAMAMINI (trunk sayfalari dahil) dondurur.
+      Acilis taramasi bu sayfalari heap sayfasi olarak yeniden dizine
+      eklememelidir; aksi halde serbest bir sayfaya satir yazilip sonra
+      AllocPage ayni sayfayi PageInit ile sifirlayarak onlari sessizce
+      siliyordu (F-22). Zincir/trunk bozuksa False ve Err. }
+    function CollectFreePages(out Pages: TVdbPageNoArray;
+      out Err: string): Boolean;
+
     { Kirli sayfa tahliyesinden once cagrilacak kanca (write-ahead WAL). }
     property OnSpill: TVdbPageSpillProc read FOnSpill write FOnSpill;
 
@@ -3630,6 +3638,67 @@ begin
   Result := FFreeTrunk;
 end;
 
+function TVDbPageStore.CollectFreePages(out Pages: TVdbPageNoArray;
+  out Err: string): Boolean;
+var
+  trunk, cnt, i, entry, nextTrunk: LongWord;
+  P: PVdbPage;
+  e: string;
+begin
+  Result := False;
+  Err := '';
+  Pages := nil;
+  if FStream = nil then
+  begin
+    Err := 'depo acik degil';
+    Exit;
+  end;
+  trunk := FFreeTrunk;
+  while trunk <> 0 do
+  begin
+    if trunk >= FPageCount then
+    begin
+      Err := Format('serbest liste trunk aralik disi: %d (sayfa=%d)',
+        [trunk, FPageCount]);
+      Exit;
+    end;
+    SetLength(Pages, Length(Pages) + 1);
+    Pages[High(Pages)] := trunk;
+    if not GetPageInternal(trunk, False, P) then
+    begin
+      Err := Format('serbest liste trunk okunamadi: %d', [trunk]);
+      Exit;
+    end;
+    try
+      if not TrunkCheck(P, e) then
+      begin
+        Err := Format('serbest liste trunk %d bozuk: %s', [trunk, e]);
+        Exit;
+      end;
+      cnt := TrunkGet(P);
+      { DIKKAT: cnt LongWord; cnt=0 iken 'cnt-1' tasar. }
+      if cnt > 0 then
+        for i := 0 to Integer(cnt) - 1 do
+        begin
+          entry := TrunkEntry(P, i);
+          if (entry = 0) or (entry >= FPageCount) then
+          begin
+            Err := Format('serbest liste girdisi aralik disi: %d (trunk %d)',
+              [entry, trunk]);
+            Exit;
+          end;
+          SetLength(Pages, Length(Pages) + 1);
+          Pages[High(Pages)] := entry;
+        end;
+      nextTrunk := TrunkNext(P);
+    finally
+      Release(trunk, False);
+    end;
+    trunk := nextTrunk;
+  end;
+  Result := True;
+end;
+
 function TVDbPageStore.VerifyFreeList(out FreePages: TVdbPageNoArray;
   out Err: string): Boolean;
 var
@@ -3675,8 +3744,11 @@ begin
           Exit;
         end;
         cnt := TrunkGet(P);
-        for i := 0 to cnt - 1 do
-        begin
+        { DIKKAT: cnt LongWord; cnt=0 iken 'cnt-1' tasar ve bos bir
+          trunk'ta VERIFY yanlislikla 'girdi aralik disi' verirdi. }
+        if cnt > 0 then
+          for i := 0 to Integer(cnt) - 1 do
+          begin
           entry := TrunkEntry(P, i);
           if (entry = 0) or (entry >= FPageCount) then
           begin
@@ -3843,6 +3915,16 @@ begin
   try
     if not GetPageInternal(PageNo, False, P) then
       raise EVdbPageStore.Create(Format('AllocPage: sayfa %d okunamadi', [PageNo]));
+    { F-22 SAVUNMA: serbest listeden alinan bir sayfa BOS olmali. Serbest
+      birakilan sayfa tanimi geregi bostur ve yalnizca FreePage bu listeye
+      yazar; dolu bir heap sayfasinin listeden gelmesi bir tutarsizliktir.
+      Eskiden PageInit onu sessizce sifirlayip satirlari yok ediyordu.
+      Artik veri kaybi yerine yuksek sesle dururuz (VERIFY ile teshis). }
+    if IsVdbPageImage(P) and (PageTypeOf(P) = VDB_PAGE_HEAP) and
+       (PageLiveCount(P) > 0) then
+      raise EVdbPageStore.Create(Format(
+        'freelist tutarsiz: sayfa %d serbest listede ama %d canli hucre tasiyor',
+        [PageNo, PageLiveCount(P)]));
     PageInit(P, PageNo, PageType);
   except
     if P <> nil then

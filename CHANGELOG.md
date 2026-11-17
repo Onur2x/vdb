@@ -131,7 +131,7 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   indeks basina satir maliyeti 24/49 B, `.odb.idx` 1M icin 10.985.254 B
   (iki platformda ayni). Ayrica `SHOW INDEXES` (tablo adi olmadan) artik
   dosya sonuna kadar okuyup `Beklenmedik dosya sonu` yerine
-  `ecSyntaxError` ile `SHOW INDEXES icin tablo adi gerekir` diyor (F-20).
+  `ecSyntaxError` ile `SHOW INDEXES icin tablo adi gerekir` diyor (F-19).
   Yeni tasarim belgesi `docs/engineering/DISK_BTREE_DESIGN.md` sayfa
   duzenini, bolunme/birlestirme planini, WAL entegrasyonunu, cokme
   kurtarmasini, onbellegi, kilitlemeyi ve bicim surumlemeyi yazar. Durust
@@ -151,6 +151,39 @@ ready" iddiasi tasimaz (bkz. `SECURITY.md`, `docs/security/THREAT_MODEL.md`).
   `GetTickCount64` tabanli monotonik milisaniye ile olculur; ayarlar,
   davranis, API ve varsayilanlar aynidir. Kapi duzeltmeden sonra 8/8
   kosuda 16/16 PASS.
+- **Gomulu motor soak kapisi ve iki veri kaybi kusuru** (v3.50): yeni kapi
+  `tests/soak` (SO1-SO17, 20 kontrol) acik `TVDbBackendV3` uzerinde 2.000
+  canli satirlik tabloyu tur bazli churn ile (100 ekle + en eski 100 sil +
+  bir guncelleme) calistirir; varsayilan 25 sn (`VDB_SOAK_SECONDS`, 5..86400),
+  her `VDB_SOAK_CP` turda zorunlu `Checkpoint(True)`, her `VDB_SOAK_REOPEN`
+  turda kapat/ac. Her turda yigin (`TotalAllocated` deltasi, RSS degil),
+  dosya tanitici/sap, is parcacigi, WAL/dizin bayti ve p50/p95 gecikme
+  orneklenir; SO5-SO10 sizinti/tavan kontrolleri, SO11 tam `VERIFY`, SO12-SO13
+  yeniden acilis ve son satir, SO15a-d F-21, SO16/SO17 F-22 regresyonudur.
+  Kapi **iki gercek motor kusuru** buldu ve ikisi de bu surumde duzeltildi:
+  (1) **F-21**: heap dizini canli kayit sayisina gore buyuyordu; silme/ekleme
+  churn'unde mezar taslari butun yuvalari doldurunca `Insert` sessizce
+  `False` donuyor, backend bunu "anahtar var" sanip guncelleme dalina giriyor
+  ve `toplu yazim basarisiz` hatasi veriyordu. Dizin artik canli + mezar
+  tasi dolulugunu (`FUsed`) izler; doygunlukta sessiz `False` yerine
+  `EVdbHeap 'dizin doydu'` atilir.
+  (2) **F-22**: `FreePage` sayfayi yalnizca serbest listeye yazar, diskteki
+  imajini silmez. Yeniden acilista `TVdbHeap.Open` sayfalari tarayip
+  serbest listedeki sayfayi yeniden heap sayfasi olarak dizine ekliyor,
+  ipuclari icine satir yaziyor, sonra `AllocPage` sayfayi serbest listeden
+  dagitip `PageInit` ile canli hucreleri sifirliyordu - onayli satirlar
+  **sessizce kayboluyordu** (olculen: 2.000 satirdan 104'u, 520 turluk
+  churn'de; kayip icin checkpoint + yeniden acilis birlikte gerekiyordu).
+  Duzeltme: yeni `TVDbPageStore.CollectFreePages`, `Open` icinde serbest
+  sayfalari atlar, `SpaceHintScan` serbest sayfayi ipucu olarak kabul etmez
+  ve `AllocPage` canli hucre tasiyan bir sayfayi dagitmayi gurultulu hatayla
+  reddeder. Ayrica `VerifyFreeList`/`CollectFreePages` icindeki `cnt-1`
+  `LongWord` tasma hatasi giderildi. Durust sinir: bu bir **gomulu motor**
+  soak'idir, ag sunucusu soak'i degildir; kapi 25 sn kosar ve gercek
+  1 saat / 6 saat / 24 saat soak **kosulmadi**, bu yuzden uzun sureli
+  kaynak sizintisi iddia edilemez. Dort varyantin dordu de (cp+reopen,
+  yalniz reopen, yalniz cp, hicbiri) Windows'ta 20/20, Linux'ta 12 sn'lik
+  kosuda 20/20 PASS.
 - **Yedek/geri yukleme**: `RestoreFrom` yazmadan once tam sayfa dogrulamasi
   yapar; `Verify`/`VerifyBackup` yalnizca reddeder, onarmaz. Iki gercek hata
   kapatildi (freelist trunk yanlis pozitifi; bozuk yedek uzerine sessiz

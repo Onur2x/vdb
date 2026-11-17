@@ -41,6 +41,8 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 | F18 | **KRITIK** | `TVdbBackendV3.SwapDbFileWith` | Dis `except` blogu hatayi **yutuyordu**: `.bak`'tan geri donus de basarisiz olsa `Compact`/`RESTORE`/`REKEY` normal donuyordu. F17 ile birlesince Linux'ta VACUUM hic yer kazanmadigi halde "kazandi" sayilari raporlaniyordu (sahte basari) | Geri donus basarisizsa acik `EVdbBackendV3` hatasi; hata yukari tasinir, backend `FEng=nil` ile kilitsiz birakilmaz (v3.43) | `btree_scale` BS11/BS12 (her iki platformda `1601536 -> 151552`, `COUNT` 600, `VERIFY` temiz); `backup_restore` 25/0 | KAPALI |
 | F19 | DUSUK | `VDbParser` `SHOW INDEXES` (tablo adi yok) | Tablo adi verilmeden yazilan `SHOW INDEXES`, ayristiriciyi dosya sonuna kadar okutup `Beklenmedik dosya sonu konum=N` ile bitiyordu; mesaj yanlis ve teshis edilemezdi | `PeekToken` bos ya da `;` ise kontrollu `ecSyntaxError` + `SHOW INDEXES icin tablo adi gerekir (ornek: SHOW INDEXES FROM t)` (v3.49; `CreateFmt` degil duz `Create`) | `sql_index_scale` IX18a/IX18b | KAPALI |
 | F20 | ORTA | `VDbPgWire` `AuthWindowExpired` / `NoteAuthFailure` / `AuthLocked` | Kimlik dogrulama ceza penceresi ve kilit suresi **duvar saatiyle** (`Now`) olculuyordu; saat geriye adim atinca kilit/pencere gereksiz uzuyor, ileri gidince erken acilip parola taramasina kapi aciyordu. Belirti: `auth_throttle` tam takim kosusunda T3b/T3c/T3d dustu (13/3) ama yalitilmis kosuda 5/5 geciyordu | Ceza ve pencere artik `GetTickCount64` tabanli monotonik ms; `TVdbPgAuthPenalty.FirstAt/LockedUntil` ve `FTotalFailStart` Int64 ms (v3.49). Ayarlar, API, varsayilanlar ayni | `auth_throttle` T3a-T3d; duzeltme sonrasi 8/8 kosuda 16/16 PASS | KAPALI |
+| F21 | **YUKSEK** | `TVdbHeap` dizin (`DirAdd`/`DirGrow`/`Insert`) | Dizin dolulugu yalniz **canli** anahtar sayisina gore buyuyordu; silme/ekleme churn'unde mezar taslari (tombstone) butun yuvalari doldurunca `Insert` sessizce `False` donuyor, backend bunu "anahtar zaten var" sanip guncelleme dalina giriyor ve `toplu yazim basarisiz: anahtar $...` hatasi veriyordu (sessiz veri kaybi riski) | `FUsed` canli + mezar tasi dolulugunu izler; `DirGrow` rehash sonrasi `FUsed := FCount`; buyume kosulu `(FUsed+1)*4 > FCap*3`; doygunlukta sessiz `False` yerine `EVdbHeap 'dizin doydu: ...'` (v3.50) | `soak` SO15a-SO15d (deterministik dizin doygunlugu: 200 canli satir, 40 tur x 20 ekle/sil, hata=0, yeniden acilista okunur) | KAPALI |
+| F22 | **KRITIK** | `VDbPageStore.FreePage` / `TVdbHeap.Open` / `AllocPage` | Serbest birakilan sayfanin diskteki imaji silinmiyordu. Yeniden acilista `TVdbHeap.Open` tum sayfalari tarayip serbest listedeki sayfayi yeniden **heap sayfasi** olarak dizine ekliyordu; bosluk ipucu icine satir yaziyor, sonra `AllocPage` ayni sayfayi serbest listeden dagitip `PageInit` ile **canli hucreleri sifirliyordu**. Onayli satirlar sessizce kayboluyordu (olculen: 2.000 satirdan 104'u, 520 turluk churn'de; kayip icin checkpoint + yeniden acilis birlikte gerekiyordu; `COUNT(*)` 2000 derken sayfa taramasi 1896) | `TVDbPageStore.CollectFreePages` (trunk + girdiler); `TVdbHeap.Open` serbest sayfalari atlar (liste okunamazsa acilis DURMAZ, bozulmayi `Verify` raporlar); `SpaceHintScan` yalniz `FPageType = 1` sayfalari ipucu yapar; `AllocPage` canli hucre tasiyan sayfayi gurultulu hatayla reddeder; `VerifyFreeList`/`CollectFreePages` icindeki `cnt-1` `LongWord` tasmasi giderildi (v3.50) | `soak` SO16/SO17 (checkpoint ve yeniden acilis sonrasi `COUNT(*)` == `COUNT(*) WHERE id > 0` == `COUNT(DISTINCT id)`), N=520 probe kosusu hata=0 | KAPALI |
 
 ### Kapatilan test bosluklari (SKILL2 §22, SKILL3 §10.1)
 
@@ -79,7 +81,7 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 
 | Sonuc | Linux | Windows |
 |---|---|---|
-| PASS (kapi) | **42** | **41** |
+| PASS (kapi) | **43** | **42** |
 | FAIL | 0 | 0 |
 | SKIP (`VDB_CRYPTO_DLL` yok) | 2 (`fixtures_openssl`, `selftest_openssl`) | 3 (+`tls_client`) |
 | Calistirilmayan | canli PostgreSQL karsilastirmasi (`sql_differential` `pg=not-run`) | ayni |
@@ -101,6 +103,7 @@ sql_features 32/0, limits 18/0, cache_pressure 8/0, page_corrupt 8/0,
 server_harden 24/0, server_failure 16/0, auth_throttle 16/0,
 disk_full 16/0, txn_limit 18/0, oom 9/0, btree_scale 15/0, wal_limit 19/0,
 net_fuzz 39/0, btree_disk 78/0, sql_scale 34/0, sql_index_scale 45/0,
+soak 20/0,
 selftest_builtin PASS, tls_client 6/0 (yalniz Linux).
 
 ## Remaining Risks
@@ -154,7 +157,7 @@ karsilastirmasi kosmadi.
 **BETA CANDIDATE**
 
 Gerekce: kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici
-bir regresyon kapisiyla kilitlendi; iki platformda 42/41 kapi yesil; tek
+bir regresyon kapisiyla kilitlendi; iki platformda 43/42 kapi yesil; tek
 dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari, bozuk ag
 girdisi (genis fuzz), disk dolu,
 islem sayisi basinci, bellek tukenmesi, WAL sert boy tavani, B+Tree
@@ -164,6 +167,12 @@ kaybi olmamasi) ve VACUUM geri
 kazanimi ile tasinabilirlik olculdu. Olcum
 kapisinin kendisi iki kritik hata buldu (F17 Unix fd sizintisi, F18 sahte
 basarili dosya degistirme); ikisi de kapatildi ve ayni kapiyla kilitlendi.
+Gomulu motor soak kapisi da iki gercek veri kaybi kusuru buldu (F21 doygun
+dizinde sessiz `Insert` basarisizligi, F22 serbest listedeki sayfanin
+yeniden acilista heap sayfasi sanilip sifirlanmasi); ikisi de kapatildi ve
+SO15/SO16/SO17 regresyonlariyla kilitlendi. Soak kapisi 25 sn kosar; gercek
+1 saat / 6 saat / 24 saat soak **kosulmadi**, ag sunucusu soak'i kapsam
+disidir, bu yuzden uzun sureli kaynak sizintisi iddia edilmez.
 Buna karsin ayri B+Tree disk sayfa bicimi yalnizca **bagimsiz ve kapili bir
 bilesen** olarak vardir (`VDbBTreeDisk`), v5 motor dosya bicimine bagli
 degildir; canli PostgreSQL diferansiyeli kosmadi; TLS varsayilan olarak

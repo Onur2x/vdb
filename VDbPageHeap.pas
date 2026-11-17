@@ -95,6 +95,14 @@ type
     FDir: array of TDirEntry;   // P-66: AoS — tek dizi, 16 bayt/girdi
     FCap: LongWord;
     FCount: Integer;
+    { F-21 (v3.50): DOLU YUVA SAYACI — canli (Used=1) + mezar tasi (Used=2).
+      Onceden buyume karari yalnizca FCount'a (canli) bakiyordu. Silme+ekleme
+      karisiminda mezar taslari birikir; FCount sabit kaldigi icin dizi
+      buyumez ve tum yuvalar dolunca sondalama zinciri bos yuva bulamaz.
+      Sonuc: Insert SESSIZCE False donuyordu ("anahtar var" saniliyor),
+      arkasindan Update de basarisiz olup 'toplu yazim basarisiz' atiliyordu.
+      Olculen: 2000 canli satir, tur basina 100 sil+100 ekle, 184. turda. }
+    FUsed: LongWord;
     FWritePage: LongWord;
     FHeapPages: LongWord;
     FOvfPages: LongWord;
@@ -330,6 +338,8 @@ begin
     zinciri kapanarak sonsuz donguye girer. Bu yuzden acikca sifirla. }
   FillChar(FDir[0], FCap * SizeOf(TDirEntry), 0);
   FCount := 0;
+  { F-21: mezar taslari yeniden orneklemede atilir; dolu yuva = canli. }
+  FUsed := 0;
   { P-72: TERS HARITA (FPageKeys) ARTIK DOKUNULMAZ. ONCEDEN her buyumede
     silinip DirAdd uzerinden tum anahtarlarla yeniden kuruluyordu — oysa
     yeniden ornekleme anahtarin SAYFA yerini (Loc) degistirmez; haritanin
@@ -346,6 +356,8 @@ begin
         FDir[h] := oldDir[i];
         Inc(FCount);
       end;
+  { F-21: yeniden orneklemeden SONRA dolu yuva = canli (mezar tasi kalmadi). }
+  FUsed := LongWord(FCount);
 {$IFDEF APPLPROF}
   HPGrow := HPGrow + (HPQpc - apt);
 {$ENDIF}
@@ -356,7 +368,9 @@ var
   h: LongWord;
   guard: LongWord;
 begin
-  if (FCap = 0) or ((FCount + 1) * 4 > Integer(FCap) * 3) then
+  { F-21: yuk faktoru CANLI + MEZAR TASI uzerinden hesaplanir. Yalnizca
+    FCount'a bakmak, silme+ekleme karisiminda diziyi doyuma goturuyordu. }
+  if (FCap = 0) or ((FUsed + 1) * 4 > LongWord(FCap) * 3) then
     DirGrow;
   h := DirHash(K);
   guard := 0;
@@ -368,6 +382,7 @@ begin
       raise EVdbHeap.Create(Format(
         'dizin ekleme dongusu (cap=%d, count=%d)', [FCap, FCount]));
   end;
+  if FDir[h].Used = 0 then Inc(FUsed);
   FDir[h].Key := K;
   FDir[h].Loc := L;
   FDir[h].Used := 1;
@@ -393,6 +408,7 @@ begin
   if FCap > 0 then
     FillChar(FDir[0], FCap * SizeOf(TDirEntry), 0);
   FCount := 0;
+  FUsed := 0;
   PageMapClear;
 end;
 
@@ -724,6 +740,9 @@ begin
   for pno := 1 to FStore.PageCount - 1 do
   begin
     if pno = FWritePage then Continue;
+    { F-22: serbest birakilmis sayfa ipucu olamaz (bkz. PlaceCellKV P-75). }
+    if (pno >= LongWord(Length(FPageType))) or (FPageType[pno] <> 1) then
+      Continue;
     if not FStore.GetRawPage(pno, P) then Continue;
     try
       Move(P^[0], magic, SizeOf(magic));
@@ -1079,6 +1098,8 @@ var
   dl: Integer;
   L: TLoc;
   ovf: Boolean;
+  freePages: TVdbPageNoArray;
+  isFree: array of Boolean;
 begin
   DirReset;
   FWritePage := 0;
@@ -1086,8 +1107,27 @@ begin
   FOvfPages := 0;
   lastHeap := 0;
   SetLength(FPageType, FStore.PageCount);
+  { F-22: SERBEST LISTEDEKI SAYFALAR HEAP SAYFASI SAYILMAZ. Serbest
+    birakilan sayfanin diskteki imaji hala gecerli bir heap sayfasidir
+    (FreePage yalnizca serbest listeye yazar, sayfayi silmez). Eskiden
+    acilis taramasi onu yeniden dizine ekliyor, bosluk ipucu/taramasi ile
+    icine satir yaziliyor, sonra AllocPage ayni sayfayi PageInit ile
+    sifirlayarak o satirlari SESSIZCE siliyordu (F-22 veri kaybi). }
+  { F-22: serbest liste OKUNAMIYORSA acilisi DURDURMA. Bozulmayi
+    Verify/VerifyFreeList raporlar (page_integrity I11 ve integrity_check
+    IC-D1..D3 bu mesaji bekler). Serbest listeyi uygulayamadigimiz icin
+    tarama eski davranisa doner; sessiz veri kaybini yine AllocPage'in
+    "canli hucre tasiyan sayfa" savunmasi engeller. }
+  if not FStore.CollectFreePages(freePages, e) then
+    SetLength(freePages, 0);
+  SetLength(isFree, FStore.PageCount);
+  for i := 0 to High(freePages) do
+    if freePages[i] < LongWord(Length(isFree)) then
+      isFree[freePages[i]] := True;
   for pno := 1 to FStore.PageCount - 1 do
   begin
+    if isFree[pno] then
+      Continue;
     if not FStore.GetRawPage(pno, P) then Continue;
     try
       Move(P^[0], magic, SizeOf(magic));
@@ -1414,6 +1454,8 @@ var
   guard: LongWord;
   slot: LongWord;
   found: Boolean;
+  saturated: Boolean;
+  retry: Integer;
 {$IFDEF APPLPROF}
   apt: Int64;
 {$ENDIF}
@@ -1424,36 +1466,61 @@ begin
   Result := False;
   { P-27: tek geciste varlik denetimi + bos slot bulma.
     ONCEDEN: Contains (DirFind) + DirAdd = 2 hash aramasi.
-    SIMDI: tek sondalama — anahtar varsa False, yoksa slot hazir. }
-  if (FCap = 0) or ((FCount + 1) * 4 > Integer(FCap) * 3) then
-    DirGrow;
-  h := DirHash(Key);
-  guard := 0;
-  slot := 0;
-  found := False;
-  while FDir[h].Used <> 0 do
-  begin
-    if (FDir[h].Used = 1) and (FDir[h].Key = Key) then
+    SIMDI: tek sondalama — anahtar varsa False, yoksa slot hazir.
+    F-21: buyume karari mezar taslari dahil DOLU YUVA sayisina gore verilir.
+    Dizi doyarsa (tum yuvalar Used<>0; mezar taslari canli sayaci sismedigi
+    icin eskiden buraya geliniyordu) sessizce False donmek YERINE diziyi
+    buyutup yeniden denenir: mezar taslari boylece temizlenir. }
+  retry := 0;
+  repeat
+    Inc(retry);
+    if (FCap = 0) or ((FUsed + 1) * 4 > LongWord(FCap) * 3) then
+      DirGrow;
+    h := DirHash(Key);
+    guard := 0;
+    slot := 0;
+    found := False;
+    saturated := False;
+    while FDir[h].Used <> 0 do
     begin
-      Exit;                       // anahtar zaten var
+      if (FDir[h].Used = 1) and (FDir[h].Key = Key) then
+      begin
+        Exit;                       // anahtar zaten var
+      end;
+      if (not found) and (FDir[h].Used = 2) then
+      begin
+        slot := h;                  // tombstone — yeniden kullanilabilir
+        found := True;
+      end;
+      h := (h + 1) and (FCap - 1);
+      Inc(guard);
+      if guard > FCap then
+      begin
+        saturated := True;          // bos yuva yok
+        Break;
+      end;
     end;
-    if (not found) and (FDir[h].Used = 2) then
+    if saturated then Continue;     // bir sonraki turda DirGrow
+    if not found then slot := h;    // ilk bos yuva
+    if FDir[slot].Used = 0 then Inc(FUsed);
+    if not InsertRaw(Key, Data, DataLen, L) then
     begin
-      slot := h;                  // tombstone — yeniden kullanilabilir
-      found := True;
+      { Yerlesim istisna atarsa (disk dolu) yuva sayaci geri alinir. }
+      if FDir[slot].Used = 0 then Dec(FUsed);
+      Exit;
     end;
-    h := (h + 1) and (FCap - 1);
-    Inc(guard);
-    if guard > FCap then Exit;
-  end;
-  if not found then slot := h;    // ilk bos yuva
-  if not InsertRaw(Key, Data, DataLen, L) then Exit;
-  FDir[slot].Key := Key;
-  FDir[slot].Loc := L;
-  FDir[slot].Used := 1;
-  Inc(FCount);
-  PageMapAdd(L.PageNo, Key);
-  Result := True;
+    FDir[slot].Key := Key;
+    FDir[slot].Loc := L;
+    FDir[slot].Used := 1;
+    Inc(FCount);
+    PageMapAdd(L.PageNo, Key);
+    Result := True;
+    Break;
+  until retry > 2;
+  if not Result then
+    raise EVdbHeap.Create(Format(
+      'dizin doydu: buyutmeden sonra yuva bulunamadi (cap=%d, count=%d, dolu=%d)',
+      [FCap, FCount, FUsed]));
 {$IFDEF APPLPROF}
   HPIns := HPIns + (HPQpc - apt);
   Inc(HPN);
