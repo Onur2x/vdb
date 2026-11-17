@@ -150,6 +150,7 @@ build_gate sql_atomicity   "$ROOT/tests/sql_atomicity/sql_atomicity.lpr"
 build_gate wal_recovery    "$ROOT/tests/wal_recovery/wal_recovery.lpr"
 build_gate freelist        "$ROOT/tests/freelist/freelist.lpr"
 build_gate limits          "$ROOT/tests/limits/limits_gate.lpr"
+build_gate sql_memory      "$ROOT/tests/sql_memory/sql_memory.lpr"
 build_gate cache_pressure  "$ROOT/tests/cache_pressure/cache_pressure.lpr"
 build_gate page_corrupt    "$ROOT/tests/page_corrupt/page_corrupt.lpr"
 build_gate server_failure  "$ROOT/tests/server_failure/server_failure.lpr"
@@ -203,6 +204,7 @@ run_gate sql_atomicity  "$WORK/sql_atomicity"   sql_atomicity
 run_gate wal_recovery   "$WORK/wal_recovery"    wal_recovery
 run_gate freelist       "$WORK/freelist"        freelist
 run_gate limits         "$WORK/limits"          limits_gate
+run_gate sql_memory     "$WORK/sql_memory"     sql_memory
 run_gate cache_pressure "$WORK/cache_pressure"  cache_pressure
 run_gate page_corrupt   "$WORK/page_corrupt"    page_corrupt
 run_gate server_failure "$WORK/server_failure"  server_failure

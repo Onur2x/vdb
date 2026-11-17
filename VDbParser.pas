@@ -1441,11 +1441,24 @@ begin
 end;
 
 function TVDbParser.ParseUnaryExpr: TSqlExprNode;
-var T: string;
+var
+  T, nxt: string;
+  iv: Int64;
 begin
   if PeekToken = '-' then
   begin
     NextToken(T);
+    { v3.55 (Sprint F): '-<tam sayi>' ISARETIYLE cozulur. Once isaret ayri
+      bir unary dugum olarak uygulaniyordu; bu yuzden -9223372036854775808
+      (Low(Int64), isaretsiz hicbir pozitif Int64'e sigmaz) tam sayi
+      literali olamayip METNE, oradan da FLOAT'a dusuyordu. VDbParseInt
+      zaten '+'/'-' kabul ettigi icin tek cagri yeterli. }
+    nxt := PeekToken;
+    if VDbParseInt('-' + nxt, iv) then
+    begin
+      NextToken(T); // sayiyi tuket
+      Exit(TSqlLiteralNode.CreateInt(iv));
+    end;
     Result := TSqlUnaryOpNode.Create(suoNeg, ParsePrimary);
   end
   else
@@ -1997,8 +2010,11 @@ begin
       begin
         if VDbParseFloat(T2, fv) then Exit(TSqlLiteralNode.CreateFloat(-fv));
       end
-      else if VDbParseInt(T2, iv) then
-        Exit(TSqlLiteralNode.CreateInt(-iv));
+      { v3.55 (Sprint F): isaretli sayi BIRLIKTE cozulur. Once yalniz
+        T2 (isaretsiz) cozuluyordu; bu yuzden -9223372036854775808
+        (Low(Int64)) cozulemeyip float'a dusuyordu. }
+      else if VDbParseInt('-' + T2, iv) then
+        Exit(TSqlLiteralNode.CreateInt(iv));
     end;
     FPos := SavePos; FParamIdx := SaveIdx;
     Exit(ParseUnaryExpr);

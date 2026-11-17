@@ -1534,11 +1534,19 @@ begin
 end;
 
 function VDbParseInt(const S: string; out V: Int64): Boolean;
+{ v3.55 (Sprint F): TASMA DENETIMI. Onceki surum `res * 10 + d` islemini
+  denetlemeden yapiyordu; Int64 araligini asan metin SESSIZCE sarmalayip
+  YANLIS sayi donduruyordu:
+    CAST('9999999999999999999999' AS INTEGER) -> 1864712049423024127
+    CAST('999999999999999999999999' AS INTEGER) -> 2003764205206896639
+  Artik aralik disi metin GECERSIZ sayilir (False) ve cagiran taraf kendi
+  hatasini uretir. -9223372036854775808 (Low(Int64)) gecerli kalir; bu
+  yuzden birikim QWord ile ve isaret basina ayri tavanla yapilir. }
 var
-  i, n, sign: Integer;
-  res: Int64;
-  c: Char;
+  i, n, sign, d: Integer;
+  uq, lim: QWord;
 begin
+  V := 0;
   n := Length(S);
   if n = 0 then Exit(False);
   // Hizli yol: boluksuz tam sayi (en yaygin id durumu)
@@ -1554,15 +1562,25 @@ begin
   else if S[i] = '+' then
     Inc(i);
   if (i > n) or not (S[i] in ['0'..'9']) then Exit(False);
-  res := 0;
+  lim := QWord(High(Int64));
+  if sign < 0 then Inc(lim);   // negatif tavan 2^63
+  uq := 0;
   while (i <= n) and (S[i] in ['0'..'9']) do
   begin
-    res := res * 10 + (Ord(S[i]) - Ord('0'));
+    d := Ord(S[i]) - Ord('0');
+    if uq > (lim - QWord(d)) div 10 then Exit(False);  // tasma
+    uq := uq * 10 + QWord(d);
     Inc(i);
   end;
   while (i <= n) and (S[i] = ' ') do Inc(i);
   if i <= n then Exit(False);
-  V := res * sign;
+  if sign < 0 then
+  begin
+    if uq = QWord(High(Int64)) + 1 then V := Low(Int64)
+    else V := -Int64(uq);
+  end
+  else
+    V := Int64(uq);
   Result := True;
 end;
 

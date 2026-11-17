@@ -48,6 +48,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `sql_authorization` | **SQL yetki/RLS/trigger kapisi** (Sprint A, 3.2-3.4): baglanti yetkisiz baslar (kimlik yoksa `Start` reddeder, varsayilan `admin/admin123` kaldirildi); `GRANT`/`REVOKE` sonrasi izinli/izinsiz DML; RLS policy `USING`/`WITH CHECK` (SELECT/INSERT/UPDATE/DELETE); **upsert** yolunun UPDATE yetkisi, RLS ve ROW trigger uygulamasi; **MERGE** hedef satir RLS filtresi + BEFORE/AFTER ROW ve STATEMENT trigger'lari. 32 kontrol, iki platformda 32/0 |
 | `sql_atomicity` | **SQL statement atomikligi kapisi** (Sprint A 3.5 + Sprint B): AFTER/BEFORE **STATEMENT** ve ROW trigger hatalarinda statement'in **tamami** geri alinir, trigger govdesindeki DML de geri alinir; ana tablo/indeks/audit degismez. AT1-AT5: AFTER STATEMENT hatasi (cok satir INSERT, UPDATE, DELETE, tek satir INSERT, COPY). AT6-AT10: BEFORE STATEMENT gercekten atesleniyor + DML'i statement ile kalici; BEFORE INSERT/UPDATE/DELETE hatasi; 0 satir eslesen DELETE'te trigger DML'i korunur (B4). AT11-AT12: BEFORE/AFTER ROW hatasi. AT13: 2. satirda duplicate PK -> hic satir kalmaz. AT14: MERGE AFTER STATEMENT hatasi. AT15: RETURNING tutarliligi (basarili -> satirlar yazilir; hatali -> iz yok). AT16: hatali statement sonrasi yeniden acilista iz yok. AT17: explicit transaction icinde statement hatasi + `ROLLBACK`. AT18/AT19: BEFORE STATEMENT trigger DML'i ana INSERT/COPY hatasiyla geri alinir (B1). 19 vaka, **88 kontrol**, iki platformda 88/0. Kapi duzeltme oncesi kaynakla 8 kontrol FAIL verir (AT8/AT9/AT10/AT18/AT19), yani bos yesil degildir |
 | `limits` | **kaynak sinirlari** (SKILL2 §25): 4 MiB'tan buyuk SQL, 16 MB'lik INSERT ve 2M ustu `LIMIT` kontrollu `ecLimit` ile reddedilir; reddedilen islem **hicbir satir birakmaz**, ayni veritabani sorgulanmaya devam eder, kapanis temiz (yalniz `.odb`) ve yeniden acilista veri bozulmamis olur; belgelenen tavanlar (`LIMITS.md`) tutarli |
+| `sql_memory` | **SQL sinir ve sayisal uc davranis kapisi** (Sprint F1, 8.2 + 8.4 + 8.5): 26 vaka, **54 kontrol**. SM1-SM7 tam siralamanin (ASC/DESC, NULL ilk/son) **onegi** olarak `ORDER BY ... LIMIT/OFFSET` (tek ve cok anahtar) - streaming kisayolu ile genel yurutucu ayni sonucu verir. SM8 `LIMIT 0`; SM9 negatif `LIMIT`/`OFFSET` -> `ecSyntaxError`; SM10 `OFFSET 1000000000`/`2147483647` -> 0 satir; SM11 tavan asimi (`VDB_MAX_RESULT_ROWS+1`, `LIMIT+OFFSET` toplami) -> `ecLimit` (kismi sonuc yok). SM12-SM14 3VL (`= NULL`, `IS NULL`, `NOT`, `IN`/`NOT IN` NULL'lu, `BETWEEN NULL`) ve `COUNT(col)` 5 / `COUNT(*)` 6 / `AVG` 3.5. SM15 `CAST` 22/24 haneli metin ve `'abc'` -> `ecTypeMismatch` (tasma sessiz sarma **yok**); SM16 Int64 max/min tam; SM17 `-9223372036854775808` literali tam; SM18 `+`/`*` tasmasi -> `ecMathError`; SM19 `1/0` ve `1.0/0.0`; SM20 `ABS` tam sayi hassasiyeti + `ABS(Low(Int64))` -> `ecMathError`; SM26 kolondaki `Low(Int64)` korunur, `SELECT -v` -> `ecMathError`. SM21 ozyinelemeli CTE 100 satir (COUNT/MIN/MAX); SM22 **sinirsiz** ozyineleme -> `ecLimit` (sessiz kesme yok) ve tablo saglam; SM23 `QueryTimeoutMs := 60` ile derin ozyineleme -> `ecQueryTimeout`; SM24 `CancelQuery` -> `ecCancelled`, ardindan `ResetCancel` ve normal sorgu. SM25 kapanis temiz (yalniz `.odb`), yeniden acilista 6 satir ve ayni sira. Iki platformda 54/0. Duzeltme oncesi kaynakla (`git archive HEAD`) derlenen sonda **6 kontrol FAIL** (SM15 x2 CAST sarmasi, SM20 x2 `ABS` float/`ABS(Low)`, SM22 sessiz kesme, SM26 isaret sarmasi) |
 | `wal_recovery` | **WAL-before-data ve kurtarma basarisizligi kapisi** (Sprint C, 4.1 + 4.2): checkpoint WAL bariyerini (fsync + durabil LSN dogrulama) veri sayfalari yazilmadan **once** kurar; WAL fsync hata enjeksiyonuyla checkpoint basarisiz olur ve yeniden acilista **hayalet commit gorunmez** (WR1: `COUNT` tabanda kalir, anahtar yok). WR2 `CP_BEFORE_FLUSH` kancasinda `Engine.DurableLsn >= Wal.WrittenLsn` olcer (eski sirada `durable=0 written=3`). Kurtarma basarisizligi motoru **POISONED** yapar: `ecInvalidState` ile backend okumasi, motor okumasi ve yazma reddedilir, `PoisonReason` dolu; kapatip acma temiz baslangic ve yazilabilirlik verir (WR3). Basarili kurtarma durabil satiri korur, fsync edilmemis satiri atar, motoru yeniden yazilabilir kilar (WR4). Normal yol zehirlenmez (WR5). 5 vaka, **27 kontrol**, iki platformda 27/0. Duzeltme oncesi kaynakla derlenen sonda 3 kontrol FAIL (`wr1/durable-kept`, `wr1/no-ghost-row`, `wr2/wal-durable-before-flush`) |
 | `freelist` | **serbest sayfa listesi butunlugu kapisi** (Sprint D, 5.1): freelist indeksi (trunk zinciri) tembel bit eslemleriyle tutulur (`FFreeBits`/`FTrunkBits`, yalniz `FreeIndexEnsure` zincirden kurar, `FreePage`/`AllocPage` gunceller). FL1 ayni sayfayi ikinci kez serbest birakmayi, FL2 **trunk** sayfasini serbest birakmayi, FL3 **canli hucre tasiyan** heap sayfasini serbest birakmayi reddeder (`EVdbPageStore`); FL4 cok trunk / trunk dolmasi / bos trunk ve `FreeCount` tutarliligini; FL5 trunk zinciri **dongusunde** acik hata verir, sonsuz dongu yok; FL6 yinelenen, FL7 aralik disi serbest girdide acik hata; FL8 bozuk freelist ile **acilis** (heap taramasi) acik hata verir; FL9 saglikli depoda `CollectFreePages` ile `VerifyFreeList` ayni sonucu verir. 9 vaka, **32 kontrol**, iki platformda 32/0. Duzeltme oncesi kaynakla (`git archive HEAD`) derlenen sonda **4 kontrol FAIL** (cift serbest birakma, trunk, canli sayfa, yinelenen girdi) |
 | `cache_pressure` | **onbellek tukenmesi / tahliye** (SKILL3 §12.1): 8 sayfalik havuzla (~32 KB) havuzdan cok daha buyuk bir tablo uzerinde calisilir. Tam tarama **butun satirlari** dogru okur (tahliye + yeniden yukleme veri kaybetmez), `PoolUsed` havuz boyunu asmaz, miss sayaci gercek tahliyeyi kanitlar, tek islemde 2000 satir guncellemesi (kirli sayfa tahliye yolu) commit edilir ve **yeniden acilista** guncel veri kalicidir; temiz kapanistan sonra yalniz `.odb` kalir |
@@ -953,3 +954,35 @@ kaldirildi:
     HEAD soak 20/0, duzeltilmis agac soak 20/0. Kapi **gevsetilmedi**.
   - **Durust sinir**: `VDbBTreeDisk` motora bagli degildir; disk indeks yolu
     hala yoktur (R5 acik). Sprint D motorun indeks yolunu degistirmez.
+- Otuz dokuzuncu kosu (v3.55, Sprint F1): **iki platform da YESIL**.
+  Git Bash/Windows **47 kapi** PASS, WSL x86_64 Linux **48 kapi** PASS,
+  FAIL 0 (`gatesF.log` -> `KOSAN KAPI: 47`, `GATES_EXIT=0`; `linF.log` ->
+  `KOSAN KAPI: 48`, `LIN_EXIT=0`).
+  - **8.5 CAST sessiz sarmasi**: `VDbParseInt` birikimi tasmayi
+    denetlemiyordu; `CAST('9999999999999999999999' AS INTEGER)` sessizce
+    `1864712049423024127` donuyordu (24 hane: `2003764205206896639`).
+    Birikim artik `QWord` + isaret basina tavan (`2^63-1` / `2^63`) ile
+    yapilir; aralik disi metin `ecTypeMismatch` uretir, `Low(Int64)` gecerli.
+  - **8.5 ABS hassasiyeti**: `ABS` once float denedigi icin her tam sayida
+    float donuyordu (`ABS(9223372036854775806)` -> `9.22337203685478E18`).
+    Artik once `VDbParseInt`; `ABS(Low(Int64))` -> `ecMathError`.
+  - **8.5 Low(Int64) isareti**: tekli eksi `Low(Int64)` uzerinde sessizce
+    sariliyordu; artik `ecMathError`. Parser `-<tamsayi>` bicimini isaretle
+    birlikte cozer (`ParsePrimary`'nin isaretli dali onceden ulasilamiyordu).
+  - **8.4 ozyinelemeli CTE**: `VDB_RECUR_MAX` sinirina takilan ozyineleme
+    **kismi sonucu hata vermeden** donduruyordu (`1..100001`). Artik
+    `ecLimit`; dogal bitiste `deltaRows` bosaltilir; tur basina
+    `VDB_MAX_RESULT_ROWS` satir tavani; dongude `TickAbort` (iptal/timeout).
+  - Yeni kapi `sql_memory` 26 vaka **54 kontrol**, iki platformda 54/0;
+    duzeltme oncesi kaynakla **6 kontrol FAIL** (SM15 x2, SM20 x2, SM22,
+    SM26). Kapinin kalan 48 kontrolu 8.2 LIMIT/OFFSET ve 3VL/NULL semantigini
+    **dondurur** (duzeltme oncesinde de dogruydu).
+  - **Olcum kapisi duzeltmesi (durust kayit)**: bu kosuda `perf_baseline`
+    `btree/scale-linear` oranini 4,64 olctu (esik 3,50) ve kirmizi oldu; ayni
+    ikili tek basina 3 kez 1,50 / 1,98 / 2,32 verdi (tam sureler ~50 ms,
+    zamanlayici gurultusu). Olcum artik her boyut icin iki kez kosup **kucuk**
+    degeri alir. **Esik degismedi**; karesel davranis hala yakalanir.
+  - **Durust sinir (F2 acik)**: 8.1 uctan uca streaming, PG portal `maxRows`,
+    COPY OUT streaming, ORDER BY/DISTINCT/GROUP BY **disk spill**, JOIN bellek
+    butcesi/hash birlestirme ve 8.3 `ExecMerge` O(n*m) olcumu **yapilmadi**;
+    sonuc hala `TSqlResult` icinde bellekte toplanir (R8/R13 acik).

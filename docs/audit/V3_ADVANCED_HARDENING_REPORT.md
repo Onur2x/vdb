@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-17
-Surum: v3.54 (Sprint A + B + C + D; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Surum: v3.55 (Sprint A + B + C + D + F1; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -58,8 +58,8 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 
 ### A.3 Mevcut V3 durumu
 
-- Iki platformda tam kapi seti yesil: **Windows i386 46 kapi**, **Linux
-  x86_64 47 kapi**, FAIL 0. Windows'ta `tls_client` bu ortamda OpenSSL DLL'i
+- Iki platformda tam kapi seti yesil: **Windows i386 47 kapi**, **Linux
+  x86_64 48 kapi**, FAIL 0. Windows'ta `tls_client` bu ortamda OpenSSL DLL'i
   ile kostu (ayrinti: `CI.md`); OpenSSL istege bagli iki kapi Linux'ta SKIP.
 - Acik kritik hata yok. Kapatilan son gercek kusurlar F-21/F-22 veri
   kaybiydi; ikisi de kalici regresyon kapisiyla kilitlendi (SO15/SO16/SO17).
@@ -74,6 +74,8 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | B | SQL atomikligi: INSERT/UPDATE/DELETE/COPY/MERGE statement batch sinirlari, BEFORE STATEMENT trigger'lari | Tamam | `sql_atomicity` 88/0 (19 vaka) |
 | C | 4.1 WAL-before-data checkpoint sirasi, 4.2 kurtarma basarisizliginda POISONED durumu | Tamam | `wal_recovery` 27/0 (yeni, 5 vaka) |
 | D | 5.1 freelist butunlugu, 5.2 disk B+Tree sayfa butunlugu, 6.1/6.2 sayfa dogrulama | Tamam | `freelist` 32/0 (yeni, 9 vaka), `btree_disk` 78/0 |
+| F | 8.2 LIMIT/OFFSET sinirlari, 8.4 ozyinelemeli CTE sinirlari + iptal, 8.5 sayisal tasma/CAST/ABS | Tamam (F1) | `sql_memory` 54/0 (yeni, 26 vaka) |
+| F | 8.1 uctan uca streaming, portal maxRows, COPY OUT streaming, JOIN/ORDER BY/DISTINCT/GROUP BY bellek siniri, disk spill | **Acik (F2)** | tasarim isi; `R8`/`R13` |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -177,6 +179,55 @@ Sprint D iki depolama butunlugu acigini kapatti:
 - **Durust sinir**: `VDbBTreeDisk` bagimsiz bir bilesendir; SQL motoruna
   **baglanmamistir**, ikincil indeksler hala bellekte tutulur. D2 bu bilesenin
   kendi sayfa yolu icin gecerlidir, motorun indeks yolu icin degil.
+
+Sprint F iki parcaya ayrildi: **F1 (bu sprintte kapatildi)** 8.2/8.4/8.5
+sinir ve sayisal uc davranislari; **F2 (acik)** 8.1/8.3 mimari bellek
+sinirlari. F1 dort gercek kusur kapatti:
+
+- **F1-a / 8.5 (CAST sessiz sarmasi, yanlis veri)**: `VDbParseInt` birikimi
+  `res * 10 + d` ile **tasmayi denetlemeden** yapiyordu. Int64 araligini asan
+  metin sarmalayip **yanlis sayi** donduruyordu:
+  `CAST('9999999999999999999999' AS INTEGER)` -> `1864712049423024127`,
+  `CAST('999999999999999999999999' AS INTEGER)` -> `2003764205206896639`.
+  Artik birikim `QWord` + isaret basina tavan (`2^63-1` / `2^63`) ile yapilir,
+  aralik disi metin gecersizdir ve `CAST` `ecTypeMismatch` atar.
+  `-9223372036854775808` (`Low(Int64)`) gecerli kalir.
+- **F1-b / 8.5 (ABS hassasiyet kaybi)**: `ABS` ilk olarak `VDbParseFloat`
+  deniyordu; her tam sayi metni float olarak da gecerli oldugu icin **her
+  zaman** float donuyordu: `ABS(9223372036854775806)` -> `9.22337203685478E18`.
+  Artik once `VDbParseInt` denenir; sonuc tam sayi metni olarak doner.
+- **F1-c / 8.5 (Low(Int64) isareti)**: `-v` ve `ABS` `Low(Int64)` uzerinde
+  **sessizce sarmaliyordu** (isaret yanlis kaliyordu). Ikisi de artik
+  `ecMathError` atar. Parser ayrica `-<tam sayi>` bicimini isaretle **birlikte**
+  cozer; `ParsePrimary`'nin negatif dali onceden hic ulasilamiyordu.
+- **F1-d / 8.4 (ozyinelemeli CTE sessiz kesmesi)**: `VDB_RECUR_MAX` (100.000
+  tur) sinirina takilan ozyineleme **kismi sonucu hata vermeden** donduruyordu:
+  `WITH r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r) SELECT n FROM r` ->
+  `1..100001`, hata yok. Artik (a) sinir asimi `ecLimit` atar, (b) dogal bitiste
+  `deltaRows` bosaltilir (yanlis pozitif yok), (c) tur basina `VDB_MAX_RESULT_ROWS`
+  satir tavani uygulanir, (d) dongu `TickAbort` cagirir (iptal edilebilirlik).
+- **Kapi kaniti**: `sql_memory` kapisi 26 vaka / 54 kontrol. Ayni test dosyasi
+  duzeltme **oncesi** kaynakla (`git archive HEAD`) derlenip kosuldugunda
+  **6 kontrol FAIL**: SM15 x2 (CAST 22/24 hane), SM20 x2 (`ABS` float +
+  `ABS(Low)`), SM22 (sonsuz ozyineleme sessiz kesme), SM26 (`-v` sarmasi);
+  duzeltilmis agacta 54/0. Kapinin geri kalan 48 kontrolu 8.2 LIMIT/OFFSET
+  (LIMIT 0, negatif LIMIT/OFFSET, `OFFSET 2147483647`, tavan asimi,
+  ORDER BY+LIMIT'in tam siralamanin **oneki** olmasi: ASC/DESC/cok anahtar/NULL)
+  ve 3VL/NULL semantigini **dondurur**; bunlar duzeltme oncesinde de dogruydu
+  ve gate'e yalnizca kilit olarak girdi.
+- **Durust duzeltme (olcum kapisi)**: `perf_baseline` 47 kapili kosuda
+  `btree/scale-linear` oranini **4,64** olctu ve kirmizi oldu. Ayni ikili tek
+  basina uc kez kosuldugunda **1,50 / 1,98 / 2,32** cikti; yani gerileme degil,
+  tam sureler birkac on ms iken tek bir zamanlayici duraklamasinin sisirmesi.
+  Olcum her boyut icin **iki kez** yapilip **kucuk** olani alinir. **Esik
+  degismedi (3,5)**; karesel davranis hala yakalanir. Bu, kapinin gecmesi icin
+  esik gevsetme **degildir**; olcum gurultusunun alinmasidir.
+- **Durust sinir (F2 acik)**: 8.1 uctan uca satir iteratoru/streaming hatti,
+  PG portal `maxRows`, COPY OUT streaming, ORDER BY/DISTINCT/GROUP BY icin
+  kontrollu **disk spill**, JOIN bellek butcesi ve hash birlestirme
+  **uygulanmadi**. Sonuc hala `TSqlResult` icinde tamamen bellekte toplanir;
+  tavan `VDB_MAX_RESULT_ROWS = 2.000.000`. Ozyinelemeli CTE satir tavani bu
+  tavanla **ayni degeri** kullanir (daha kucuk bir butce yoktur).
 
 ---
 
@@ -309,8 +360,8 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
 
 | Platform | Kapi | PASS | FAIL | SKIP | NOT-RUN |
 |---|---|---|---|---|---|
-| Windows i386 (`windows-latest` / Git Bash) | 46 | **46** | 0 | OpenSSL istege bagli 2 | - |
-| Linux x86_64 (`ubuntu-latest` / WSL x86_64) | 47 | **47** | 0 | OpenSSL istege bagli 2 (`VDB_CRYPTO_DLL` yok) | - |
+| Windows i386 (`windows-latest` / Git Bash) | 47 | **47** | 0 | OpenSSL istege bagli 2 | - |
+| Linux x86_64 (`ubuntu-latest` / WSL x86_64) | 48 | **48** | 0 | OpenSSL istege bagli 2 (`VDB_CRYPTO_DLL` yok) | - |
 | macOS (x86_64 / arm64) | - | - | - | - | **not-run** |
 | linux/arm64 | - | - | - | - | **not-run** |
 | windows/arm64 | - | - | - | - | **not-run** |
@@ -321,10 +372,11 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   `windows-latest` calistirir; `fail-fast: false`. macOS/ARM64 icin job
   **yoktur** cunku hic kosulmadi; dogrulanmamis platformu matrise eklemek
   yesil gorunen ama kanit uretmeyen bir kapi olurdu (`CI.md` bolum 3).
-- Kanit: Windows `gatesD.log` (`KOSAN KAPI: 46`, `GATES_EXIT=0`), Linux
-  `linD.log` (`KOSAN KAPI: 47`, `LIN_EXIT=0`). Sprint D oncesi kanit
-  `gatesB.log` (44) / `linC.log` (46) idi; sayilar her sprint yalniz
-  **eklenen** kapi kadar artar, kapi silinmez.
+- Kanit: Windows `gatesF.log` (`KOSAN KAPI: 47`, `GATES_EXIT=0`), Linux
+  `linF.log` (`KOSAN KAPI: 48`, `LIN_EXIT=0`). Sprint D oncesi kanit
+  `gatesD.log` (46) / `linD.log` (47); daha once `gatesB.log` (44) /
+  `linC.log` (46) idi. Sayilar her sprint yalniz **eklenen** kapi kadar
+  artar, kapi silinmez.
 - Windows'ta `tls_client` bu kosuda OpenSSL DLL'leri ortamda oldugu icin
   **kostu** ve gecti; DLL'ler yoksa SKIP'e duser. Linux'ta 6/6 PASS.
 - **NOT-RUN** satirlari "kosmuyor" degil "olculmedi" demektir; bu raporda
@@ -345,7 +397,8 @@ Her satir: onem, dosya, kok neden, etki, test, durum.
 | R5 | Orta | `VDbBTreeDisk` / motor | Ikincil indeksler bellekte; `.odb.idx` onbellektir. Disk indeks mimarisi tasarlandi, uygulanmadi. Sprint D sayfa dogrulamasini ekledi ama bilesen motora **bagli degil** | `btree_disk` 78/0, `sql_index_scale` 45/0 | **ACIK (tasarim)** |
 | R6 | Orta | `VDbCryptoBuiltin` | `capHmacKeyOver64` yok; >64 B HMAC anahtari reddedilir (sessiz kirpma yok) | `crypto_*`, `selftest_builtin` | **ACIK (bilinen borc, ADR 6)** |
 | R7 | Orta | `VDbPgWire` | TLS varsayilan kapali; operator acmazsa trafik duz metin. mTLS/CRL/OCSP yok | `tls_client` SKIP (Windows) | **ACIK (bilincli opt-in)** |
-| R8 | Orta | `TVdbExecutor` | Streaming yok; 2M+ LIMIT'siz tarama tavani degerinin kendisi maddelestirilmedi (32-bit ~GB bellek) | `limits` L4 18/0 | **KISMI** |
+| R8 | Orta | `TVdbExecutor` | Uctan uca streaming **yok**; sonuc `TSqlResult` icinde tamamen bellekte toplanir, tavan `VDB_MAX_RESULT_ROWS = 2.000.000` (32-bit ~GB bellek). Sprint F1 yalniz 8.2/8.4/8.5 sinirlarini kapatti | `limits` L4 18/0, `sql_memory` 54/0 | **KISMI (F2 acik)** |
+| R13 | Orta | `TVdbExecutor` / `TVdbPgWire` | PG portal `maxRows`, COPY OUT streaming, ORDER BY/DISTINCT/GROUP BY icin **disk spill**, JOIN bellek butcesi ve hash birlestirme uygulanmadi; `8.3`'teki `ExecMerge` O(n*m) olcumu yapilmadi | - | **ACIK (tasarim)** |
 | R9 | Dusuk | `soak` olcum | Heap olcusu `TotalAllocated`, RSS degil; "RSS sizmaz" iddiasi yok | `soak` SO5 | **ACIK (olcum siniri)** |
 | R10 | Dusuk | `bench_report` / `soak` | Gecikme tek makine, `-O1`; SLA degil, donanimlar arasi normallestirilmedi | `bench_report` 35/0 | **ACIK (olcum siniri)** |
 | R11 | Dusuk | Platform matrisi | macOS/ARM64/buyuk-endian **not-run** | - | **ACIK** |
@@ -376,22 +429,25 @@ tablosundadir. Bu sprintte kapatilanlar:
 Gerekce:
 
 1. Kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici bir
-   regresyon kapisiyla kilitlendi; iki platformda **46/47** kapi yesil, FAIL 0.
+   regresyon kapisiyla kilitlendi; iki platformda **47/48** kapi yesil, FAIL 0.
 2. Tek dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari,
    bozuk ag girdisi, disk dolu, bellek tukenmesi, WAL sert tavani, B+Tree
    olcek/parcalanma, SQL 100k/1M olcegi, SQL indeks olcegi ve VACUUM geri
    kazanimi **olculdu**.
-3. Olcum kapilari alti gercek kusur buldu ve kapatti: F17 (Unix fd sizintisi),
-   F18 (sahte basarili VACUUM/dosya degistirme), F21 (sessiz dizin doygunlugu),
-   F22 (serbest sayfanin sifirlanmasi = veri kaybi), Sprint D'de cift/trunk/canli
-   sayfa serbest birakma (freelist) ve disk B+Tree'de bozuk sayfanin sessizce
-   geri kazanilmasi.
+3. Olcum kapilari dort gercek kusur sinifi buldu ve kapatti: F17 (Unix fd
+   sizintisi), F18 (sahte basarili VACUUM/dosya degistirme), F21 (sessiz dizin
+   doygunlugu), F22 (serbest sayfanin sifirlanmasi = veri kaybi); ek olarak
+   Sprint D'de cift/trunk/canli sayfa serbest birakma (freelist) ve disk
+   B+Tree'de bozuk sayfanin sessizce geri kazanilmasi, Sprint F1'de CAST
+   sessiz sarmasi, `ABS` hassasiyet kaybi, `Low(Int64)` isaret sarmasi ve
+   ozyinelemeli CTE'nin sessiz kesilmesi.
 
 **PRODUCTION CANDIDATE degildir** cunku:
 
 - Canli PostgreSQL diferansiyeli **kosmadi** (`pg=not-run`);
 - uzun sureli soak (1h/6h/24h) ve **ag sunucusu soak'i** kosmadi;
 - disk tabanli ikincil indeks **yok** (tasarim var, uygulama yok);
+- uctan uca streaming / disk spill / JOIN bellek butcesi **yok** (Sprint F2);
 - macOS/ARM64 **not-run**;
 - TLS varsayilan kapali ve mTLS/CRL/OCSP yok.
 

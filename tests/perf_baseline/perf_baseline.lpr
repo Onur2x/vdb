@@ -105,6 +105,7 @@ var
   arr: TVDbSkipEntryArray;
   s: string;
   tIns, tFind, tDel, tSmall, tBig: QWord;
+  tSmall2, tBig2: QWord;
   i, okN: Integer;
   ratio: Double;
 begin
@@ -156,13 +157,28 @@ begin
   end;
 
   { Olcek tespiti: 2N anahtar ~2x'ten fazla surmeli degil. Karesel
-    davranis 4x'e yakin olur; esik 3.5x. }
+    davranis 4x'e yakin olur; esik 3.5x.
+
+    v3.55 (Sprint F): tam sureler birkac on ms oldugu icin tek bir
+    zamanlayici/antivirus duraklamasi orani sisirip testi sebepsiz
+    kirmizi yapabiliyordu (ayni ikili tek basina kosuldugunda
+    1.50 / 1.98 / 2.32; suite icinde 4.64). Bu yuzden her boyut IKI kez
+    olculur ve KUCUK olan alinir. ESIK DEGISMEDI (3.5); yalnizca olcum
+    gurultusu alindi, karesel davranis hala yakalanir. }
   GSeed := 777;
   tSmall := BtInsertShuffled(BT_SMALL, T2);
   T2.Free;
   GSeed := 777;
+  tSmall2 := BtInsertShuffled(BT_SMALL, T2);
+  T2.Free;
+  if tSmall2 < tSmall then tSmall := tSmall2;
+  GSeed := 777;
   tBig := BtInsertShuffled(BT_SMALL * 2, T2);
   T2.Free;
+  GSeed := 777;
+  tBig2 := BtInsertShuffled(BT_SMALL * 2, T2);
+  T2.Free;
+  if tBig2 < tBig then tBig := tBig2;
   if tSmall > 0 then ratio := tBig / tSmall else ratio := 1;
   WriteLn('OLCUM btree.scale n1=', BT_SMALL, ' n2=', BT_SMALL * 2,
     ' ms1=', tSmall, ' ms2=', tBig, Format(' oran=%.2f', [ratio]));

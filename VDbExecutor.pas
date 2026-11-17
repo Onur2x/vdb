@@ -1901,7 +1901,15 @@ begin
     suoNeg:
       begin
         if Val = '' then Exit('');
-        if VDbParseInt(Val, iVal) then Result := IntToStr(-iVal)
+        if VDbParseInt(Val, iVal) then
+        begin
+          { v3.55 (Sprint F): -Low(Int64) temsil edilemez; eskiden sessizce
+            sarmalayip AYNI negatif sayiyi donduruyordu (yanlis isaret). }
+          if iVal = Low(Int64) then
+            raise EVDbException.Create(ecMathError,
+              'INTEGER tasmasi: negatif islem tasmaya sebep oldu');
+          Result := IntToStr(-iVal);
+        end
         else if VDbParseFloat(Val, fVal) then Result := VDbFloatToStr(-fVal)
         else Result := Val;
       end;
@@ -2972,8 +2980,19 @@ begin
     end
     else if fn.FuncName = 'ABS' then
     begin
-      if VDbParseFloat(lv, fa) then Exit(VDbFloatToStr(Abs(fa)))
-      else if VDbParseInt(lv, ia) then Exit(IntToStr(Abs(ia)))
+      { v3.55 (Sprint F): ONCE tam sayi. Eskiden ilk deneme VDbParseFloat
+        idi; her tam sayi metni float olarak da gecerli oldugu icin ABS
+        HER ZAMAN float donuyordu ve buyuk tam sayilarda hassasiyet
+        sessizce kayboluyordu: ABS(9223372036854775806) ->
+        9.22337203685478E18. ABS(Low(Int64)) temsil edilemez -> ecMathError. }
+      if VDbParseInt(lv, ia) then
+      begin
+        if ia = Low(Int64) then
+          raise EVDbException.Create(ecMathError,
+            'INTEGER tasmasi: ABS tasmaya sebep oldu');
+        Exit(IntToStr(Abs(ia)));
+      end
+      else if VDbParseFloat(lv, fa) then Exit(VDbFloatToStr(Abs(fa)))
       else Exit(lv);
     end
     // F-25: RANGE fonksiyonlari (degisken argumanli)
@@ -3847,13 +3866,24 @@ begin
       while (guard < VDB_RECUR_MAX) and (Length(deltaRows) > 0) do
       begin
         Inc(guard);
+        { v3.55 (Sprint F): iptal. Her turda bir denetim sayaci artar;
+          TickAbort 1024 turda bir gercek CheckAbort cagirir. Bu satir
+          olmadan uzun/derin ozyineleme IPTAL EDILEMIYORDU (8.4). }
+        TickAbort;
         // calisma tablosunu DELTA olarak yaz
         T.Rows := deltaRows;
         if FCteTables.ContainsKey(Nm) then FCteTables[Nm] := T
         else FCteTables.Add(Nm, T);
 
         stepR := SubResult(W.Select.RightSelect);
-        if Length(stepR.Rows) = 0 then Break;
+        { v3.55 (Sprint F): dogal bitis. deltaRows BOSALTILIR; aksi halde
+          son turun satirlari donguden sonra "hala uretiliyor" sanilip
+          derinlik siniri hatasi YANLIS yere atesler. }
+        if Length(stepR.Rows) = 0 then
+        begin
+          SetLength(deltaRows, 0);
+          Break;
+        end;
 
         SetLength(deltaRows, Length(stepR.Rows));
         for i := 0 to High(stepR.Rows) do
@@ -3881,7 +3911,26 @@ begin
           SetLength(allRows, Length(allRows) + 1);
           allRows[High(allRows)] := step;
         end;
+        { v3.55 (Sprint F): SATIR TAVANI. Derinlik siniri tur sayisini
+          sinirlar ama her tur COK satir uretebilir; tek bir turda 2M
+          satiri asan bir ozyineleme bellek tuketip OOM'a gidiyordu.
+          Sonuc matrisi tavani ile ayni deger kullanilir. }
+        if Length(allRows) > VDB_MAX_RESULT_ROWS then
+          raise EVDbException.CreateFmt(ecLimit,
+            'ozyinelemeli CTE satir siniri asildi (max %d satir)',
+            [VDB_MAX_RESULT_ROWS]);
       end;
+
+      { v3.55 (Sprint F): SESSIZ KESME YOK. Dongu derinlik sinirina
+        takildiysa ve hala uretilecek yeni satir varsa sonuc KISMIDIR;
+        eskiden bu durumda 100001 satir HATA VERMEDEN donuyordu:
+          WITH r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r)
+          SELECT n FROM r   ->  1..100001 (sessiz yanlis sonuc)
+        Artik kontrollu ecLimit. }
+      if (guard >= VDB_RECUR_MAX) and (Length(deltaRows) > 0) then
+        raise EVDbException.CreateFmt(ecLimit,
+          'ozyinelemeli CTE derinlik siniri asildi (max %d tur)',
+          [VDB_RECUR_MAX]);
     finally
       FNoSubCache := savedNoCache;
     end;
