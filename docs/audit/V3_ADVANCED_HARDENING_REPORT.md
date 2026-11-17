@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-17
-Surum: v3.53 (Sprint A + B + C; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Surum: v3.54 (Sprint A + B + C + D; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -58,8 +58,8 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 
 ### A.3 Mevcut V3 durumu
 
-- Iki platformda tam kapi seti yesil: **Windows i386 44 kapi**, **Linux
-  x86_64 45 kapi**, FAIL 0. Windows'ta `tls_client` bu ortamda OpenSSL DLL'i
+- Iki platformda tam kapi seti yesil: **Windows i386 46 kapi**, **Linux
+  x86_64 47 kapi**, FAIL 0. Windows'ta `tls_client` bu ortamda OpenSSL DLL'i
   ile kostu (ayrinti: `CI.md`); OpenSSL istege bagli iki kapi Linux'ta SKIP.
 - Acik kritik hata yok. Kapatilan son gercek kusurlar F-21/F-22 veri
   kaybiydi; ikisi de kalici regresyon kapisiyla kilitlendi (SO15/SO16/SO17).
@@ -73,6 +73,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | A | 3.2 oturum kimligi, 3.3 upsert yetkisi, 3.4 MERGE RLS/trigger, 3.5 AFTER STATEMENT trigger sirasi | Tamam | `sql_authorization` 32/0 (yeni), `sql_atomicity` 23/0 (yeni) |
 | B | SQL atomikligi: INSERT/UPDATE/DELETE/COPY/MERGE statement batch sinirlari, BEFORE STATEMENT trigger'lari | Tamam | `sql_atomicity` 88/0 (19 vaka) |
 | C | 4.1 WAL-before-data checkpoint sirasi, 4.2 kurtarma basarisizliginda POISONED durumu | Tamam | `wal_recovery` 27/0 (yeni, 5 vaka) |
+| D | 5.1 freelist butunlugu, 5.2 disk B+Tree sayfa butunlugu, 6.1/6.2 sayfa dogrulama | Tamam | `freelist` 32/0 (yeni, 9 vaka), `btree_disk` 78/0 |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -135,6 +136,47 @@ sonrasi tekrar yazilabilirlik, basarili kurtarmanin durabil satiri koruyup
 fsync edilmemis satiri atmasi, normal yolun zehirlenmemesi. Duzeltme oncesi
 kaynakla derlenen sondada **3 kontrol FAIL** (wr1/durable-kept, wr1/no-ghost-row,
 wr2/wal-durable-before-flush); duzeltilmis agacta 27/0.
+
+Sprint D iki depolama butunlugu acigini kapatti:
+
+- **D1 / 5.1 (freelist butunlugu, veri kaybi)**: serbest sayfa listesi
+  (trunk zinciri) hicbir zaman dogrulanmiyordu. Ayni sayfa iki kez serbest
+  birakilirsa ya da bir **trunk** sayfasi serbest birakilirsa, ayni fiziksel
+  sayfa iki farkli sahibe verilebiliyor ve birinin satirlari digeri tarafindan
+  ezilebiliyordu. `FreePage` artik (a) zaten serbest olan sayfayi, (b) trunk
+  sayfasini, (c) **canli hucre tasiyan** heap sayfasini reddeder;
+  `AllocPage` F-22 savunmasini ikinci hat olarak korur. Ayni sprintte
+  `CollectFreePages` ve `VerifyFreeList` kurallari hizalandi: zincir dongusu,
+  yinelenen girdi, aralik disi girdi ve `FreeCount` uyusmazligi **acik hata**
+  olarak bildirilir (istisna degil, `False` + `Err` metni).
+- **D2 / 5.2 + 6.1/6.2 (disk B+Tree sayfa butunlugu)**: diskten okunan
+  sayfada CRC, sayfa kimligi ve yapisal tutarlilik dogrulanmiyordu; bozuk bir
+  sayfa sessizce geziliyor ve `MarkReachable` onu **serbest** ilan edip geri
+  kazanabiliyordu. `ReadPage` artik diskten okunan her sayfada `CheckPageStruct`
+  calistirir (CRC + kimlik + yapisal sinir kontrolleri); `MarkReachable` kisa
+  okuma, kotu CRC ve bozuk yapida `EBtdError` atar. **Sozlesme degisikligi**:
+  bozuk B+Tree dosyasi artik **acilmaz**; `BD15`/`BD16` eski sessiz davranisi
+  dogruladigi icin yeniden yazildi (`RestampCrc` ile "CRC gecerli, yapi bozuk"
+  durumu uretiliyor).
+- **Kapi kaniti**: `freelist` kapisi 9 vaka / 32 kontrol (FL1 cift serbest
+  birakma, FL2 trunk serbest birakma, FL3 canli hucreli sayfa, FL4 cok trunk /
+  bos trunk / sayac, FL5 zincir dongusu, FL6 yinelenen girdi, FL7 aralik disi
+  girdi, FL8 bozuk freelist ile acilis, FL9 iki denetleyicinin ayni sonucu).
+  Ayni test dosyasi duzeltme **oncesi** kaynakla (`git archive HEAD`)
+  derlenip kosuldugunda **4 kontrol FAIL** (cift serbest birakma, trunk serbest
+  birakma, canli sayfa, yinelenen girdi); duzeltilmis agacta 32/0. `btree_disk`
+  78/0.
+- **Kendi regresyonumuz (durust kayit)**: Sprint D'nin ilk hali `soak` kapisini
+  kirdi (SO2/SO3/SO12/SO16/SO17, 5 FAIL; `freelist indeksi: girdi aralik disi`).
+  Kok neden `FreeIndexEnsure` icindeki dongu sayacinin `LongWord` olmasiydi:
+  `cnt = 0` iken `Integer(cnt) - 1 = -1`, sayac `LongWord` oldugu icin
+  `$FFFFFFFF`'e donusuyor ve dongu sayfa disindaki cop girdileri okuyordu.
+  Sayac `Integer` yapildi; `CollectFreePages` ve `VerifyFreeList`'teki ayni
+  kalip `if cnt > 0` ile korunmus oldugu icin dokunulmadi. HEAD'agac soak'i
+  20/0, duzeltilmis agac soak'i 20/0.
+- **Durust sinir**: `VDbBTreeDisk` bagimsiz bir bilesendir; SQL motoruna
+  **baglanmamistir**, ikincil indeksler hala bellekte tutulur. D2 bu bilesenin
+  kendi sayfa yolu icin gecerlidir, motorun indeks yolu icin degil.
 
 ---
 
@@ -267,8 +309,8 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
 
 | Platform | Kapi | PASS | FAIL | SKIP | NOT-RUN |
 |---|---|---|---|---|---|
-| Windows i386 (`windows-latest` / Git Bash) | 44 | **44** | 0 | OpenSSL istege bagli 2 | - |
-| Linux x86_64 (`ubuntu-latest` / WSL x86_64) | 45 | **45** | 0 | OpenSSL istege bagli 2 (`VDB_CRYPTO_DLL` yok) | - |
+| Windows i386 (`windows-latest` / Git Bash) | 46 | **46** | 0 | OpenSSL istege bagli 2 | - |
+| Linux x86_64 (`ubuntu-latest` / WSL x86_64) | 47 | **47** | 0 | OpenSSL istege bagli 2 (`VDB_CRYPTO_DLL` yok) | - |
 | macOS (x86_64 / arm64) | - | - | - | - | **not-run** |
 | linux/arm64 | - | - | - | - | **not-run** |
 | windows/arm64 | - | - | - | - | **not-run** |
@@ -279,8 +321,10 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   `windows-latest` calistirir; `fail-fast: false`. macOS/ARM64 icin job
   **yoktur** cunku hic kosulmadi; dogrulanmamis platformu matrise eklemek
   yesil gorunen ama kanit uretmeyen bir kapi olurdu (`CI.md` bolum 3).
-- Kanit: Windows `gatesB.log` (`KOSAN KAPI: 44`, `GATES_EXIT=0`), Linux
-  `linB.log` (`KOSAN KAPI: 45`, `LIN_EXIT=0`).
+- Kanit: Windows `gatesD.log` (`KOSAN KAPI: 46`, `GATES_EXIT=0`), Linux
+  `linD.log` (`KOSAN KAPI: 47`, `LIN_EXIT=0`). Sprint D oncesi kanit
+  `gatesB.log` (44) / `linC.log` (46) idi; sayilar her sprint yalniz
+  **eklenen** kapi kadar artar, kapi silinmez.
 - Windows'ta `tls_client` bu kosuda OpenSSL DLL'leri ortamda oldugu icin
   **kostu** ve gecti; DLL'ler yoksa SKIP'e duser. Linux'ta 6/6 PASS.
 - **NOT-RUN** satirlari "kosmuyor" degil "olculmedi" demektir; bu raporda
@@ -298,7 +342,7 @@ Her satir: onem, dosya, kok neden, etki, test, durum.
 | R2 | **Yuksek** | `tests/soak` | Uzun sureli (1h/6h/24h) kosu yapilmadi; uzun vadeli kaynak sizintisi iddia edilemez. Yalnizca 25 sn'lik kosuda SO5-SO10 tavanlari asilmadi | `soak` 20/0 | **ACIK** |
 | R3 | **Yuksek** | `TVdbPgServer` | Ag sunucusu soak'i ve cok baglantili uzun sureli FD/RAM/thread davranisi olculmedi | - | **ACIK** |
 | R4 | Orta | `net_fuzz` | Sabit seed + sabit uzunluklar; yeni hata sinifi yakalanmayabilir; surekli fuzz yok | `net_fuzz` 39/0 | **ACIK** |
-| R5 | Orta | `VDbBTreeDisk` / motor | Ikincil indeksler bellekte; `.odb.idx` onbellektir. Disk indeks mimarisi tasarlandi, uygulanmadi | `btree_disk` 78/0, `sql_index_scale` 45/0 | **ACIK (tasarim)** |
+| R5 | Orta | `VDbBTreeDisk` / motor | Ikincil indeksler bellekte; `.odb.idx` onbellektir. Disk indeks mimarisi tasarlandi, uygulanmadi. Sprint D sayfa dogrulamasini ekledi ama bilesen motora **bagli degil** | `btree_disk` 78/0, `sql_index_scale` 45/0 | **ACIK (tasarim)** |
 | R6 | Orta | `VDbCryptoBuiltin` | `capHmacKeyOver64` yok; >64 B HMAC anahtari reddedilir (sessiz kirpma yok) | `crypto_*`, `selftest_builtin` | **ACIK (bilinen borc, ADR 6)** |
 | R7 | Orta | `VDbPgWire` | TLS varsayilan kapali; operator acmazsa trafik duz metin. mTLS/CRL/OCSP yok | `tls_client` SKIP (Windows) | **ACIK (bilincli opt-in)** |
 | R8 | Orta | `TVdbExecutor` | Streaming yok; 2M+ LIMIT'siz tarama tavani degerinin kendisi maddelestirilmedi (32-bit ~GB bellek) | `limits` L4 18/0 | **KISMI** |
@@ -332,14 +376,16 @@ tablosundadir. Bu sprintte kapatilanlar:
 Gerekce:
 
 1. Kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici bir
-   regresyon kapisiyla kilitlendi; iki platformda **44/45** kapi yesil, FAIL 0.
+   regresyon kapisiyla kilitlendi; iki platformda **46/47** kapi yesil, FAIL 0.
 2. Tek dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari,
    bozuk ag girdisi, disk dolu, bellek tukenmesi, WAL sert tavani, B+Tree
    olcek/parcalanma, SQL 100k/1M olcegi, SQL indeks olcegi ve VACUUM geri
    kazanimi **olculdu**.
-3. Olcum kapilari dort gercek kusur buldu ve kapatti: F17 (Unix fd sizintisi),
+3. Olcum kapilari alti gercek kusur buldu ve kapatti: F17 (Unix fd sizintisi),
    F18 (sahte basarili VACUUM/dosya degistirme), F21 (sessiz dizin doygunlugu),
-   F22 (serbest sayfanin sifirlanmasi = veri kaybi).
+   F22 (serbest sayfanin sifirlanmasi = veri kaybi), Sprint D'de cift/trunk/canli
+   sayfa serbest birakma (freelist) ve disk B+Tree'de bozuk sayfanin sessizce
+   geri kazanilmasi.
 
 **PRODUCTION CANDIDATE degildir** cunku:
 

@@ -42,7 +42,7 @@ program btree_disk;
 
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
-  SysUtils, Classes, VDbBTreeDisk;
+  SysUtils, Classes, VDbBTreeDisk, VDbCrc32;
 
 const
   BTD_PAGE   = 4096;
@@ -252,6 +252,29 @@ begin
   s0 := MetaPageSeq(AFile, 0);
   s1 := MetaPageSeq(AFile, 1);
   if s1 > s0 then Result := 1 else Result := 0;
+end;
+
+{ Sayfa CRC'sini yeniden damgalar (Sprint D 6.2): yalniz YAPISAL bozulma
+  olcen vaka icin, bozulmanin CRC tarafindan yakalanmamasini saglar.
+  Bicim: hdr +16 = Crc; hesaplanirken Crc alani sifirlanir. }
+procedure RestampCrc(const AFile: string; AOffset: Int64);
+var
+  fs: TFileStream;
+  pg: TBtdPageBuf;
+  crc: LongWord;
+begin
+  fs := TFileStream.Create(AFile, fmOpenReadWrite or fmShareDenyNone);
+  try
+    fs.Position := AOffset;
+    fs.ReadBuffer(pg, BTD_PAGE);
+    FillChar(pg[16], 4, 0);
+    crc := VDbCrc32Of(pg, BTD_PAGE);
+    Move(crc, pg[16], 4);
+    fs.Position := AOffset;
+    fs.WriteBuffer(pg, BTD_PAGE);
+  finally
+    fs.Free;
+  end;
 end;
 
 procedure FlipByte(const AFile: string; AOffset: Int64);
@@ -681,11 +704,12 @@ var
   fs: TFileStream;
   buf: array[0..99] of Byte;
 begin
-  { --- BD15: YALNIZ CRC bozulmasi -------------------------------------
+  { --- BD15: YALNIZ CRC bozulmasi (Sprint D 6.1) ----------------------
     Basligin kullanilmayan kuyruk baytlarindan biri (+24): yapi bozulmaz,
-    yalnizca CRC tutmaz. Boylece "CRC bozulmayi yakaliyor mu, okuma
-    calismaya devam ediyor mu" sorusu yapisal bozulmaya karismadan
-    olculur. }
+    yalnizca CRC tutmaz. Sprint D oncesi bu sayfa acilista sessizce
+    "erisilemez" sayilip serbest listeye dusuruluyordu; artik acilis
+    KONTROLLU bir EBtdError ile reddedilir (veri kaybini gizleyen sessiz
+    fallback yasak). }
   file_ := DbPath('crc.vdb');
   T := TBtdTree.Create(file_);
   T.CommitOnClose := False;
@@ -699,43 +723,40 @@ begin
 
   FlipByte(file_, Int64(rootNo) * BTD_PAGE + 24);
 
-  T := TBtdTree.Create(file_);
-  T.CommitOnClose := False;
+  raised := False;
+  av := False;
+  rep := '';
+  T := nil;
   try
-    raised := False;
-    verifyOk := True;
-    try
-      verifyOk := T.Verify(rep);
-    except
-      on E: Exception do
-      begin
-        raised := True;
-        WriteLn('FAIL BD15a Verify istisna atti: ', E.ClassName, ': ', E.Message);
-      end;
+    T := TBtdTree.Create(file_);
+    T.CommitOnClose := False;
+  except
+    on E: EBtdError do
+    begin
+      raised := True;
+      rep := E.Message;
     end;
-    Chk('BD15a', (not raised) and (not verifyOk),
-      'CRC bozuklugunu Verify FAIL vermeli: ' + rep);
-
-    av := False;
-    try
-      ChkPresent('BD15b', T, 1, 500, True);
-    except
-      on E: Exception do
-      begin
-        av := E is EAccessViolation;
-        Chk('BD15b', False, 'CRC bozulmasi okumayi bozdu: ' + E.Message);
-      end;
+    on E: Exception do
+    begin
+      av := E is EAccessViolation;
+      WriteLn('FAIL BD15a beklenmeyen istisna: ', E.ClassName, ': ', E.Message);
     end;
-    Chk('BD15c', not av, 'okuma yolunda erisim ihlali OLMAMALI');
+  end;
+  try
+    Chk('BD15a', raised, 'CRC bozuk kokte acilis reddedilmeli: ' + rep);
+    Chk('BD15b', not av, 'okuma yolunda erisim ihlali OLMAMALI');
+    Chk('BD15c', Pos('CRC', rep) > 0, 'hata mesaji CRC demeli: ' + rep);
   finally
     T.Free;
   end;
 
-  { --- BD16: YAPISAL bozulma -----------------------------------------
+  { --- BD16: YAPISAL bozulma (Sprint D 6.2) --------------------------
     Ic sayfa hucreleri sayfa sonundan geriye yazilir; en son bayt en ust
-    hucrenin (sol-cocuk isaretcisi) parcasi. Bu bozulma yapisaldir:
-    okuma yolunun KONTROLLU bir EBtdError atmasini, erisim ihlali
-    atmamasini ve dogrulayicinin istisna sizdirmamasini bekliyoruz. }
+    hucrenin (sol-cocuk isaretcisi) parcasi. Bozulma sonrasi CRC YENIDEN
+    damgalanir: boylece sayfa "CRC gecerli ama yapisal olarak bozuk"
+    durumuna gelir ve yalniz yapisal dogrulamanin yakalayabilecegi bir
+    vaka olculur. Beklenti: acilis KONTROLLU EBtdError ile reddedilir,
+    erisim ihlali olmaz. }
   file_ := DbPath('struct.vdb');
   T := TBtdTree.Create(file_);
   T.CommitOnClose := False;
@@ -748,38 +769,30 @@ begin
   end;
 
   FlipByte(file_, Int64(rootNo) * BTD_PAGE + (BTD_PAGE - 1));
+  RestampCrc(file_, Int64(rootNo) * BTD_PAGE);
 
-  T := TBtdTree.Create(file_);
-  T.CommitOnClose := False;
+  raised := False;
+  av := False;
+  rep := '';
+  T := nil;
   try
-    raised := False;
-    verifyOk := True;
-    try
-      verifyOk := T.Verify(rep);
-    except
-      on E: Exception do
-      begin
-        raised := True;
-        WriteLn('FAIL BD16a Verify istisna atti: ', E.ClassName, ': ', E.Message);
-      end;
+    T := TBtdTree.Create(file_);
+    T.CommitOnClose := False;
+  except
+    on E: EBtdError do
+    begin
+      raised := True;
+      rep := E.Message;
     end;
-    Chk('BD16a', (not raised) and (not verifyOk),
-      'yapisal bozulmayi Verify FAIL vermeli: ' + rep);
-
-    av := False;
-    raised := False;
-    try
-      T.Find(1, v);
-    except
-      on E: EBtdError do raised := True;
-      on E: Exception do
-      begin
-        av := E is EAccessViolation;
-        WriteLn('FAIL BD16b beklenmeyen istisna: ', E.ClassName, ': ', E.Message);
-      end;
+    on E: Exception do
+    begin
+      av := E is EAccessViolation;
+      WriteLn('FAIL BD16a beklenmeyen istisna: ', E.ClassName, ': ', E.Message);
     end;
-    Chk('BD16b', (not av) and raised,
-      'yapisal bozulmada okuma KONTROLLU EBtdError atmali');
+  end;
+  try
+    Chk('BD16a', raised, 'yapisal bozulmada acilis reddedilmeli: ' + rep);
+    Chk('BD16b', not av, 'yapisal bozulmada erisim ihlali OLMAMALI');
   finally
     T.Free;
   end;

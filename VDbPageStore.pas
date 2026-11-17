@@ -204,6 +204,15 @@ type
       FPageCount: LongWord;
       FFreeTrunk: LongWord;
       FFreeCount: LongWord;
+      { Sprint D (5.1/5.2): freelist uyeligi. Zincir taramasi her FreePage
+        cagrisinda yapilamayacagi icin uyelik bit kumeleri tutulur:
+        FFreeBits serbest LISTE girdilerini, FTrunkBits trunk sayfalarini
+        isaretler. Ikisi de yalniz FreeIndexEnsure ile zincirden kurulur
+        (tembel) ve zinciri degistiren her yol (FreePage / AllocPage) onlari
+        gunceller. }
+      FFreeBits: TBits;
+      FTrunkBits: TBits;
+      FFreeIndexReady: Boolean;
       FLSN: LongWord;
       { v3.31 DELTA TAZELEME. FLSN meta sayfadaki (yapısal) LSN'dir ve veri-
         yalnız commit'lerde geride kalabilir. FViewLsn ise onbellek + heap
@@ -451,6 +460,13 @@ type
     procedure TrunkInit(P: PVdbPage; PageNo, NextTrunk: LongWord);
     procedure TrunkSeal(P: PVdbPage);
     function TrunkCheck(P: PVdbPage; out Err: string): Boolean;
+    { Sprint D (5.1/5.2): serbest liste uyelik indeksi. FreeIndexEnsure
+      zinciri dongu/yineleme korumali tarar ve bit kumelerini kurar; zincir
+      bozuksa EVdbPageStore firlatir (sessiz onarim YOK). FreeIndexClear
+      indeksi gecersiz kilar (dosya acma/kapama, yeniden baslatma). }
+    procedure FreeIndexClear;
+    procedure FreeIndexEnsure;
+    procedure FreeIndexEnsureSize;
   public
     constructor Create(const APath: string; APoolPages: Integer = VDB_DEF_POOL);
     destructor Destroy; override;
@@ -2333,6 +2349,8 @@ var
   z, storedId: QWord;
 begin
   if FStream <> nil then Exit;
+  { Sprint D (5.1): uyelik indeksi onceki oturumdan kalmis olabilir. }
+  FreeIndexClear;
   exists := FileExists(FPath);
   if not exists and not ACreate then
     raise EVdbPageStore.Create('veritabani dosyasi yok: ' + FPath);
@@ -2419,6 +2437,7 @@ begin
           FPageCount := 1;
           FFreeTrunk := 0;
           FFreeCount := 0;
+          FreeIndexClear;
           FLSN := 1;
           FCreated := DateTimeToUnix(Now, False);
           FDbId := NewDbStoreId;
@@ -2630,6 +2649,7 @@ begin
     end;
   finally
     DropCache;
+    FreeIndexClear;
   end;
 end;
 
@@ -2654,6 +2674,7 @@ begin
   FHoldDepth := 0;
   FMetaDirty := False;
   DropCache;
+  FreeIndexClear;
 end;
 
 { ==================================================== v3.2 salt-okunur katman }
@@ -3633,6 +3654,92 @@ begin
   Result := True;
 end;
 
+{ Sprint D (5.1/5.2): serbest liste uyelik indeksi --------------------- }
+
+procedure TVDbPageStore.FreeIndexClear;
+begin
+  FFreeIndexReady := False;
+  FreeAndNil(FFreeBits);
+  FreeAndNil(FTrunkBits);
+end;
+
+procedure TVDbPageStore.FreeIndexEnsureSize;
+begin
+  if FFreeBits = nil then FFreeBits := TBits.Create;
+  if FTrunkBits = nil then FTrunkBits := TBits.Create;
+  if FFreeBits.Size < Integer(FPageCount) then
+    FFreeBits.Size := Integer(FPageCount);
+  if FTrunkBits.Size < Integer(FPageCount) then
+    FTrunkBits.Size := Integer(FPageCount);
+end;
+
+procedure TVDbPageStore.FreeIndexEnsure;
+var
+  trunk, nextTrunk, cnt, entry: LongWord;
+  { DIKKAT: dongu sayaci Integer. cnt=0 iken 'Integer(cnt)-1' = -1 olur;
+    sayac LongWord olsaydi -1 $FFFFFFFF'e donusur ve dongu sayaci asarak
+    sayfa disindaki cop girdileri "serbest" sanardi (soak: SO2/SO12). }
+  i: Integer;
+  P: PVdbPage;
+  seen: TDictionary<LongWord, Boolean>;
+  e: string;
+begin
+  if FFreeIndexReady then Exit;
+  FreeIndexEnsureSize;
+  FFreeBits.ClearAll;
+  FTrunkBits.ClearAll;
+  FFreeIndexReady := False;   // kurulum yarim kalirsa yeniden kurulsun
+  if FStream = nil then Exit;
+  seen := TDictionary<LongWord, Boolean>.Create;
+  try
+    trunk := FFreeTrunk;
+    while trunk <> 0 do
+    begin
+      if trunk >= FPageCount then
+        raise EVdbPageStore.CreateFmt(
+          'freelist indeksi: trunk aralik disi: %d (sayfa=%d)',
+          [trunk, FPageCount]);
+      if seen.ContainsKey(trunk) then
+        raise EVdbPageStore.CreateFmt(
+          'freelist indeksi: trunk zinciri dongulu: %d', [trunk]);
+      seen.Add(trunk, True);
+      FTrunkBits[trunk] := True;
+      if not GetPageInternal(trunk, False, P) then
+        raise EVdbPageStore.CreateFmt(
+          'freelist indeksi: trunk okunamadi: %d', [trunk]);
+      try
+        if not TrunkCheck(P, e) then
+          raise EVdbPageStore.CreateFmt(
+            'freelist indeksi: trunk %d bozuk: %s', [trunk, e]);
+        cnt := TrunkGet(P);
+        if cnt > LongWord(VDB_TRUNK_MAX) then
+          raise EVdbPageStore.CreateFmt(
+            'freelist indeksi: trunk %d sayaci gecersiz: %d', [trunk, cnt]);
+        for i := 0 to Integer(cnt) - 1 do
+        begin
+          entry := TrunkEntry(P, i);
+          if (entry = 0) or (entry >= FPageCount) then
+            raise EVdbPageStore.CreateFmt(
+              'freelist indeksi: girdi aralik disi: %d (trunk %d)',
+              [entry, trunk]);
+          if seen.ContainsKey(entry) then
+            raise EVdbPageStore.CreateFmt(
+              'freelist indeksi: girdi yineleniyor: %d', [entry]);
+          seen.Add(entry, True);
+          FFreeBits[entry] := True;
+        end;
+        nextTrunk := TrunkNext(P);
+      finally
+        Release(trunk, False);
+      end;
+      trunk := nextTrunk;
+    end;
+  finally
+    seen.Free;
+  end;
+  FFreeIndexReady := True;
+end;
+
 function TVDbPageStore.GetFreeTrunk: LongWord;
 begin
   Result := FFreeTrunk;
@@ -3644,6 +3751,8 @@ var
   trunk, cnt, i, entry, nextTrunk: LongWord;
   P: PVdbPage;
   e: string;
+  seen: TDictionary<LongWord, Boolean>;
+  entryCount: LongWord;
 begin
   Result := False;
   Err := '';
@@ -3653,48 +3762,83 @@ begin
     Err := 'depo acik degil';
     Exit;
   end;
-  trunk := FFreeTrunk;
-  while trunk <> 0 do
-  begin
-    if trunk >= FPageCount then
+  { Sprint D (5.2): VerifyFreeList ile AYNI kurallar. Onceden burada dongu
+    ve yineleme kontrolu yoktu: bozuk bir trunk zinciri (kendine ya da
+    geriye baglanan next) acilisi sonsuz donguye sokuyor ve SetLength
+    sinirsiz buyuyordu; yinelenen girdi ise ayni sayfayi iki kez "serbest"
+    gosterip iki farkli tahsise acik hale getiriyordu. Trunk'lar Pages'e
+    eklenmeye devam eder: heap.Open bu kumeyle trunk sayfalarini taramadan
+    atlar. }
+  seen := TDictionary<LongWord, Boolean>.Create;
+  try
+    entryCount := 0;
+    trunk := FFreeTrunk;
+    while trunk <> 0 do
     begin
-      Err := Format('serbest liste trunk aralik disi: %d (sayfa=%d)',
-        [trunk, FPageCount]);
-      Exit;
-    end;
-    SetLength(Pages, Length(Pages) + 1);
-    Pages[High(Pages)] := trunk;
-    if not GetPageInternal(trunk, False, P) then
-    begin
-      Err := Format('serbest liste trunk okunamadi: %d', [trunk]);
-      Exit;
-    end;
-    try
-      if not TrunkCheck(P, e) then
+      if trunk >= FPageCount then
       begin
-        Err := Format('serbest liste trunk %d bozuk: %s', [trunk, e]);
+        Err := Format('serbest liste trunk aralik disi: %d (sayfa=%d)',
+          [trunk, FPageCount]);
         Exit;
       end;
-      cnt := TrunkGet(P);
-      { DIKKAT: cnt LongWord; cnt=0 iken 'cnt-1' tasar. }
-      if cnt > 0 then
-        for i := 0 to Integer(cnt) - 1 do
+      if seen.ContainsKey(trunk) then
+      begin
+        Err := Format('serbest liste trunk zinciri dongulu: %d', [trunk]);
+        Exit;
+      end;
+      seen.Add(trunk, True);
+      SetLength(Pages, Length(Pages) + 1);
+      Pages[High(Pages)] := trunk;
+      if not GetPageInternal(trunk, False, P) then
+      begin
+        Err := Format('serbest liste trunk okunamadi: %d', [trunk]);
+        Exit;
+      end;
+      try
+        if not TrunkCheck(P, e) then
         begin
-          entry := TrunkEntry(P, i);
-          if (entry = 0) or (entry >= FPageCount) then
-          begin
-            Err := Format('serbest liste girdisi aralik disi: %d (trunk %d)',
-              [entry, trunk]);
-            Exit;
-          end;
-          SetLength(Pages, Length(Pages) + 1);
-          Pages[High(Pages)] := entry;
+          Err := Format('serbest liste trunk %d bozuk: %s', [trunk, e]);
+          Exit;
         end;
-      nextTrunk := TrunkNext(P);
-    finally
-      Release(trunk, False);
+        cnt := TrunkGet(P);
+        { DIKKAT: cnt LongWord; cnt=0 iken 'cnt-1' tasar. }
+        if cnt > 0 then
+          for i := 0 to Integer(cnt) - 1 do
+          begin
+            entry := TrunkEntry(P, i);
+            if (entry = 0) or (entry >= FPageCount) then
+            begin
+              Err := Format('serbest liste girdisi aralik disi: %d (trunk %d)',
+                [entry, trunk]);
+              Exit;
+            end;
+            if seen.ContainsKey(entry) then
+            begin
+              Err := Format('serbest liste girdisi yineleniyor: %d', [entry]);
+              Exit;
+            end;
+            seen.Add(entry, True);
+            SetLength(Pages, Length(Pages) + 1);
+            Pages[High(Pages)] := entry;
+            Inc(entryCount);
+          end;
+        nextTrunk := TrunkNext(P);
+      finally
+        Release(trunk, False);
+      end;
+      trunk := nextTrunk;
     end;
-    trunk := nextTrunk;
+    { Sprint D (5.2): sayac ile zincir karsilastirmasi. Uyusmazlik sessizce
+      yutulmaz; cagiran (heap.Open) listeyi kullanmayi birakir ve acilis
+      taramasi devreye girer. }
+    if entryCount <> FFreeCount then
+    begin
+      Err := Format('serbest liste sayaci tutmuyor: zincirde %d, meta %d',
+        [entryCount, FFreeCount]);
+      Exit;
+    end;
+  finally
+    seen.Free;
   end;
   Result := True;
 end;
@@ -3797,6 +3941,35 @@ begin
     if FFrames[FindFrame(PageNo)].Pins > 0 then
       raise EVdbPageStore.Create(Format('FreePage: sayfa %d hala pinli', [PageNo]));
 
+  { Sprint D (5.1): DOUBLE-FREE korumasi. Onceden ayni sayfa ikinci kez
+    serbest birakilinca sessizce ikinci bir girdi olusuyordu; iki farkli
+    tahsis ayni sayfayi alip birbirinin verisini eziyordu. Trunk sayfalari
+    da normal girdi olarak eklenemez. }
+  FreeIndexEnsure;
+  FreeIndexEnsureSize;
+  if FTrunkBits[PageNo] then
+    raise EVdbPageStore.CreateFmt(
+      'FreePage: sayfa %d zaten freelist trunk sayfasi', [PageNo]);
+  if FFreeBits[PageNo] then
+    raise EVdbPageStore.CreateFmt(
+      'FreePage: sayfa %d zaten serbest listesinde', [PageNo]);
+
+  { Sprint D (5.1): CANLI SAYFA korumasi. Dolu bir heap sayfasi serbest
+    listeye giremez; aksi halde satirlari iki tahsise acik hale gelirdi.
+    AllocPage'daki F-22 kontrolu ayni kuralin ikinci savunmasidir. }
+  if GetPageInternal(PageNo, False, P) then
+  begin
+    if IsVdbPageImage(P) and (PageTypeOf(P) = VDB_PAGE_HEAP) and
+       (PageLiveCount(P) > 0) then
+    begin
+      Release(PageNo, False);
+      raise EVdbPageStore.CreateFmt(
+        'FreePage: sayfa %d hala %d canli hucre tasiyor',
+        [PageNo, PageLiveCount(P)]);
+    end;
+    Release(PageNo, False);
+  end;
+
   trunk := FFreeTrunk;
   if trunk = 0 then
   begin
@@ -3808,6 +3981,7 @@ begin
     TrunkInit(P, PageNo, 0);
     Release(PageNo, True);
     FFreeTrunk := PageNo;
+    FTrunkBits[PageNo] := True;
     FMetaDirty := True;
     FStructDirty := True;
     Exit;
@@ -3819,6 +3993,7 @@ begin
   if not TrunkCheck(P, e) then
   begin
     Release(trunk, False);
+    FFreeIndexReady := False;   // zincir guvenilmez: indeks yeniden kurulacak
     raise EVdbPageStore.Create('freelist bozuk: ' + e);
   end;
 
@@ -3833,6 +4008,7 @@ begin
     TrunkInit(P, PageNo, trunk);
     Release(PageNo, True);
     FFreeTrunk := PageNo;
+    FTrunkBits[PageNo] := True;
     FMetaDirty := True;
     FStructDirty := True;
     Exit;
@@ -3843,6 +4019,7 @@ begin
   TrunkSeal(P);
   Release(trunk, True);
   Inc(FFreeCount);
+  FFreeBits[PageNo] := True;
   FMetaDirty := True;
   FStructDirty := True;
 end;
@@ -3870,6 +4047,7 @@ begin
     if not TrunkCheck(tp, e) then
     begin
       Release(trunk, False);
+      FFreeIndexReady := False;
       raise EVdbPageStore.Create('freelist bozuk: ' + e);
     end;
     cnt := TrunkGet(tp);
@@ -3880,12 +4058,26 @@ begin
       Release(trunk, False);
       PageNo := trunk;
       FFreeTrunk := nextTrunk;
+      if FFreeIndexReady then FTrunkBits[PageNo] := False;
       FMetaDirty := True;
       FStructDirty := True;
       Break;
     end;
     Dec(cnt);
     PageNo := TrunkEntry(tp, cnt);
+    { Sprint D (5.1): girisi indeksten de dusur; ayni sayfa ikinci kez
+      tahsis edilemez. }
+    if FFreeIndexReady then
+    begin
+      if not FFreeBits[PageNo] then
+      begin
+        Release(trunk, False);
+        FFreeIndexReady := False;
+        raise EVdbPageStore.CreateFmt(
+          'freelist tutarsiz: sayfa %d serbest indeksinde yok', [PageNo]);
+      end;
+      FFreeBits[PageNo] := False;
+    end;
     TrunkSetCount(tp, cnt);
     TrunkSeal(tp);
     Release(trunk, True);

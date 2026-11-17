@@ -137,6 +137,11 @@ type
     procedure InitializeNew;
     procedure LoadMeta;
     procedure MarkReachable;
+    { Sprint D (6.2): sayfa yapisal dogrulamasi. CRC gecerli olsa bile
+      NKeys/slot/hucre sinirlari ve anahtar sirasi tutmuyorsa sayfa
+      bozuktur; pointer ve slot degerleri kullanilmaz. }
+    function  CheckPageStruct(const P: TBtdPageBuf; ANo: LongWord;
+      out AErr: string): Boolean;
     procedure WriteMeta;
     procedure ReadPage(ANo: LongWord; var P: TBtdPageBuf);
     procedure PutPage(ANo: LongWord; const P: TBtdPageBuf);
@@ -583,6 +588,7 @@ var
   no: LongWord;
   pg: TBtdPageBuf;
   i: Integer;
+  err: string;
 
   procedure MarkAndPush(ANo: LongWord);
   begin
@@ -606,8 +612,18 @@ begin
     Dec(sp);
     no := stack[sp];
     FStream.Position := Int64(no) * BTD_PAGE_SIZE;
-    if FStream.Read(pg, BTD_PAGE_SIZE) <> BTD_PAGE_SIZE then Continue;
-    if not CrcOk(pg) then Continue;
+    { Sprint D (6.1): eskiden kisa okuma ve CRC hatasi sessizce
+      `Continue` ediliyordu; bozuk bir sayfa "erisilemez" sayilip serbest
+      listeye dusuyor, ustune yeni veri yazilabiliyordu. Artik acik hata. }
+    if FStream.Read(pg, BTD_PAGE_SIZE) <> BTD_PAGE_SIZE then
+      raise EBtdError.CreateFmt(
+        'B+Tree: agac sayfasi %d okunamadi (dosya kesik)', [no]);
+    if not CrcOk(pg) then
+      raise EBtdError.CreateFmt(
+        'B+Tree: agac sayfasi %d CRC bozuk (serbest sayilamaz)', [no]);
+    if not CheckPageStruct(pg, no, err) then
+      raise EBtdError.CreateFmt('B+Tree: agac sayfasi %d bozuk: %s',
+        [no, err]);
     if Hd(pg)^.Kind = BTD_KIND_INTERNAL then
       for i := 0 to Hd(pg)^.NKeys - 1 do
         MarkAndPush(IntChild(pg, i));
@@ -637,9 +653,105 @@ begin
   if not FMap.TryGetValue(ANo, Result) then Result := -1;
 end;
 
+{ Sprint D (6.2): sayfa yapisal dogrulamasi. Slot offset/uzunluk, NKeys,
+  hucre boyu, hucre cakismasi, anahtar sirasi ve ic dugum child sinirlari
+  kontrol edilir. CRC gecerli olsa bile bozuk yapi kabul edilmez. }
+function TBtdTree.CheckPageStruct(const P: TBtdPageBuf; ANo: LongWord;
+  out AErr: string): Boolean;
+var
+  n, i, j: Integer;
+  off, len, cellLen, minOff: Integer;
+  k, pk: QWord;
+  cno: LongWord;
+
+  function Overlaps(AOff, ALen: Integer): Boolean;
+  var
+    q: Integer;
+    o2, l2: Integer;
+  begin
+    Result := False;
+    for q := 0 to i - 1 do
+    begin
+      o2 := Slt(P, q)^.Off;
+      l2 := Slt(P, q)^.Len;
+      if (AOff < o2 + l2) and (o2 < AOff + ALen) then Exit(True);
+    end;
+  end;
+
+begin
+  Result := False;
+  AErr := '';
+  n := Hd(P)^.NKeys;
+  if (Hd(P)^.Kind <> BTD_KIND_INTERNAL) and (Hd(P)^.Kind <> BTD_KIND_LEAF) then
+  begin
+    AErr := Format('sayfa turu gecersiz (%d)', [Hd(P)^.Kind]);
+    Exit;
+  end;
+  if Hd(P)^.Kind = BTD_KIND_LEAF then cellLen := BTD_LEAF_CELL
+  else cellLen := BTD_INT_CELL;
+  minOff := BTD_HDR_SIZE + n * BTD_SLOT_SIZE;
+  if minOff > BTD_PAGE_SIZE then
+  begin
+    AErr := Format('NKeys cok buyuk (%d)', [n]);
+    Exit;
+  end;
+  pk := 0;
+  for i := 0 to n - 1 do
+  begin
+    off := Slt(P, i)^.Off;
+    len := Slt(P, i)^.Len;
+    if len <> cellLen then
+    begin
+      AErr := Format('hucre %d uzunlugu %d (beklenen %d)', [i, len, cellLen]);
+      Exit;
+    end;
+    if off < minOff then
+    begin
+      AErr := Format('hucre %d ofseti %d slot alanina giriyor (min %d)',
+        [i, off, minOff]);
+      Exit;
+    end;
+    if off + len > BTD_PAGE_SIZE then
+    begin
+      AErr := Format('hucre %d sayfa disina tasiyor (%d+%d)', [i, off, len]);
+      Exit;
+    end;
+    if Overlaps(off, len) then
+    begin
+      AErr := Format('hucre %d baska hucreyle cakisiyor', [i]);
+      Exit;
+    end;
+    if Hd(P)^.Kind = BTD_KIND_LEAF then k := LeafKey(P, i)
+    else k := IntKey(P, i);
+    if (i > 0) and (k <= pk) then
+    begin
+      AErr := Format('anahtar sirasi bozuk (hucre %d: %u <= %u)',
+        [i, k, pk]);
+      Exit;
+    end;
+    pk := k;
+    if Hd(P)^.Kind = BTD_KIND_INTERNAL then
+    begin
+      cno := IntChild(P, i);
+      if (cno < BTD_FIRST_DATA) or (cno >= FPageCount) then
+      begin
+        AErr := Format('child %d aralik disi (%d)', [i, cno]);
+        Exit;
+      end;
+      if cno = ANo then
+      begin
+        AErr := Format('child %d kendisini gosteriyor', [i]);
+        Exit;
+      end;
+    end;
+  end;
+  Result := True;
+end;
+
 procedure TBtdTree.ReadPage(ANo: LongWord; var P: TBtdPageBuf);
 var
   idx: Integer;
+  err: string;
 begin
   idx := BufIdx(ANo);
   if idx >= 0 then
@@ -654,6 +766,16 @@ begin
   FStream.Position := Int64(ANo) * BTD_PAGE_SIZE;
   if FStream.Read(P, BTD_PAGE_SIZE) <> BTD_PAGE_SIZE then
     raise EBtdError.CreateFmt('B+Tree: sayfa %d okunamadi', [ANo]);
+  { Sprint D (6.1): diskten okunan her sayfa CRC ve yapisal olarak
+    dogrulanir. Onceden Find/Insert/Delete yolunda hicbir kontrol yoktu;
+    bozuk bir sayfa sessizce gecerli sayilip yanlis sonuc uretebiliyordu. }
+  if Hd(P)^.PageNo <> ANo then
+    raise EBtdError.CreateFmt(
+      'B+Tree: sayfa %d kimligi yanlis (icinde %d)', [ANo, Hd(P)^.PageNo]);
+  if not CrcOk(P) then
+    raise EBtdError.CreateFmt('B+Tree: sayfa %d CRC bozuk', [ANo]);
+  if not CheckPageStruct(P, ANo, err) then
+    raise EBtdError.CreateFmt('B+Tree: sayfa %d bozuk: %s', [ANo, err]);
 end;
 
 { Yeni bir sayfa surumu olusturur (golge sayfalama). }
