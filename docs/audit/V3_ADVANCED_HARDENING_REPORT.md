@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-18
-Surum: v3.59 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Surum: v3.60 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -59,7 +59,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 ### A.3 Mevcut V3 durumu
 
 - Iki platformda tam kapi seti yesil: **Windows i386 48 kapi**, **Linux
-  x86_64 49 kapi**, FAIL 0 (v3.59 kosulari: `gatesI.log` / `linI.log`).
+  x86_64 49 kapi**, FAIL 0 (v3.60 kosulari: `gatesJ.log` / `linJ.log`).
   Windows'ta `tls_client` bu ortamda **SKIP** oldu (OpenSSL DLL'i yok);
   kostugu kosu `gatesE.log`'dur. SKIP PASS sayilmaz (ayrinti: `CI.md`).
 - Acik kritik hata yok. Kapatilan son gercek kusurlar: F-21/F-22 veri
@@ -67,7 +67,8 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   atomikligi** (`sql_atomicity` AT20-AT24), Sprint C2'de **oturum bazli rol**
   ve bilinmeyen rolde **fail-closed** yetki (`sql_authorization` AU8-AU11),
   Sprint D2'de checkpoint hata yolunda **kilit sizintisi** (`disk_full`
-  DF10a-DF10c). Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
+  DF10a-DF10c), Sprint E2'de zaman asimi kurulumunda **fail-open** davranis
+  (`network_limits` NL8). Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
 - Rol degistirme yetkisi ve SCRAM kullanicisi -> SQL rolu eslemesi (SKILL5
   3.1'in yetki denetimi ve 3.2) **hala ACIK**: kimligi dogrulanmis principal
   ile SQL rolu arasinda kalici bir esleme yok ve bu, dosya bicimini
@@ -89,6 +90,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | B2 | 6.1 acik islem icinde statement atomikligi (COMMIT sonrasi yarim yazim) | Tamam | `sql_atomicity` 138/0 (24 vaka; AT20-AT24 yeni) |
 | C2 | 3.1 oturum bazli rol izolasyonu + bilinmeyen rolde fail-closed yetki | Tamam | `sql_authorization` 51/0 (32 -> 51; AU8-AU11 yeni) |
 | D2 | 8.1 checkpoint hata yolunda surecler arasi yazma kilidi sizintisi | Tamam | `disk_full` 19/0 (16 -> 19; DF10a-DF10c yeni) |
+| E2 | 9.1 zaman asimi kurulumu basarisizsa baglanti yine de sunuluyordu (fail-open) | Tamam | `network_limits` 26/0 (22 -> 26; NL8 yeni) |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -412,6 +414,35 @@ Sprint D2 (SKILL5 8.1) **checkpoint hata yolunda kilit sizintisini** kapatti:
   Checkpoint'in kendisi hata verdiginde WAL/veri dosyasi tutarliligi bu
   vakada olculmez (o is `wal_recovery`/POISONED ve DF9 yollarinda).
 
+Sprint E2 (SKILL5 9.1) **zaman asimi kurulumundaki fail-open davranisi** kapatti:
+
+- **Olculen kusur**: `TVdbPgAccept.Execute` kabul ettigi sokette
+  `VdbSockSetTimeouts` cagiriyor ama **donus degerini yutuyordu**. Kurulum
+  basarisiz olsa da baglanti sunuluyor ve o sokette **sinirsiz bloklama**
+  suruyordu; tek bayt gonderip bekleyen istemci slotu/is parcacigini surekli
+  tutabiliyor, `MaxConns` kadar bos soket sunucuyu kalici olarak
+  kapatabiliyordu. Yani Sprint E1'in getirdigi zaman asimi korumasi, en cok
+  gerektigi yerde sessizce devre disi kalabiliyordu.
+- **Duzeltme**: `TVdbPgAccept.Execute` artik **fail-closed**: zaman asimi
+  kurulamazsa baglanti **hic sunulmaz**, protokol mesaji gonderilmeden
+  kapatilir ve slot tuketilmez. Iki zaman asimi da `0` ise (yapilandirmayla
+  bilerek kapatilmis) kurulum basarili sayilir; bu durumda fail-closed
+  devreye girmez. Kapi icin sunucuya **test-only** bir kanca
+  (`SockTimeoutFunc`; uretimde `nil`, varsayilan gercek cagri) eklendi.
+- **Kapi kaniti**: `network_limits` 22 kontrolden **26 kontrole** cikti.
+  Yeni vaka NL8: kanca "kurulum basarisiz" dondurur, istemci baglanip tek
+  bayt bekler; soket kapanir, kapatma 3 s icinde olur, `ConnCount` sifir
+  kalir. Duzeltme **oncesi** kaynakla (HEAD + yalnizca test kancasi;
+  fail-closed blogu cikarilarak) derlenen kapida **1 kontrol FAIL**
+  (NL8: `ConnCount=1`, baglanti sunulmus), duzeltilmis agacta 26/0.
+- **Durust sinir**: baseline kapisi HEAD + test kancasi olarak kuruldu
+  (kanca olmadan kapi derlenemez); fail-closed blogu disinda hicbir sey
+  degistirilmedi. Ayrica NL8'in ilk iki kontrolu (soket kapandi / 3 s
+  icinde) baseline'da da gecer: istemcinin kendi 700 ms okuma zaman asimi
+  "veri gelmedi" sonucunu uretiyor. Ayirt edici olan **slot** kontroludur.
+  Gercek isletim sistemi hatasi (`setsockopt` hatasi) enjekte edilmedi;
+  hata yolu kanca ile taklit edildi.
+
 
 ---
 
@@ -511,7 +542,7 @@ raporlanir.
 | TLS | **Varsayilan kapali** (opt-in). Istemcide CA dosyasi zorunlu; dogrulamasiz baglanti yolu yok | `tls_client` 6/0 (yalniz Linux), `VDbTls.pas` |
 | Baglanti tavani | `MaxConns` 64 (1..4096); asimda yeni baglanti `kapasite dolu` alir, mevcutlar calisir | `server_failure` 16/0 |
 | Cerceve tavani | Agdan gelen tek metin cercevesi 64 MiB (`VDBS_MAX_RECV_STR`); PG telinde `MaxMessageBytes` (varsayilan **64 MiB**) asiminda kontrollu `ErrorResponse` (`SQLSTATE 54000`) ve baglanti kapanisi (Sprint E2) | `net_fuzz` N7, `network_limits` NL4 |
-| Zaman asimi | Baglanti basina `ReadTimeoutMs`/`WriteTimeoutMs`, varsayilan **30000 ms**, 0 = kapali; yavas/yarim acilmis istemci slotu **birakir** (Sprint E1) | `network_limits` NL0-NL3, NL7 |
+| Zaman asimi | Baglanti basina `ReadTimeoutMs`/`WriteTimeoutMs`, varsayilan **30000 ms**, 0 = kapali; yavas/yarim acilmis istemci slotu **birakir** (Sprint E1). Zaman asimi kurulamazsa baglanti **sunulmaz** (fail-closed, Sprint E2) | `network_limits` NL0-NL3, NL7, NL8 |
 | COPY tavani | `COPY ... FROM STDIN` toplam `CopyMaxBytes` **256 MiB** + parca basina tavan; Unix'te gecici dosya `0600` (Sprint E3) | `network_limits` NL5, NL6 |
 | Kapasite sayaci | `ConnCount` kilit altinda, yalniz canli baglantilar (Finished haric); `MaxConns` karari bu sayidan (Sprint E4) | `network_limits` NL1, NL2, NL7, `server_failure` 16/0 |
 
@@ -559,17 +590,18 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   `windows-latest` calistirir; `fail-fast: false`. macOS/ARM64 icin job
   **yoktur** cunku hic kosulmadi; dogrulanmamis platformu matrise eklemek
   yesil gorunen ama kanit uretmeyen bir kapi olurdu (`CI.md` bolum 3).
-- Kanit (en guncel kosu, v3.59): Windows `gatesI.log` (`KOSAN KAPI: 48`,
-  `SUITE_EXIT=0`), Linux `linI.log` (`KOSAN KAPI: 49`, `SUITE_EXIT=0`).
-  Onceki kosu: `gatesH.log` (48) / `linH.log` (49) - C2; ondan once
+- Kanit (en guncel kosu, v3.60): Windows `gatesJ.log` (`KOSAN KAPI: 48`,
+  `SUITE_EXIT=0`), Linux `linJ.log` (`KOSAN KAPI: 49`, `SUITE_EXIT=0`).
+  Onceki kosu: `gatesI.log` (48) / `linI.log` (49) - D2; ondan once
+  `gatesH.log` (48) / `linH.log` (49) - C2; ondan once
   `gatesG.log` (48) / `linG.log` (49) - B2; ondan once
   `gatesE.log` (48) / `linE.log` (49); Sprint E oncesi
   `gatesF.log` (47) / `linF.log` (48); daha once `gatesD.log` (46) /
   `linD.log` (47), ondan once `gatesB.log` (44) / `linC.log` (46) idi.
   Sayilar her sprint yalniz **eklenen** kapi kadar artar, kapi silinmez.
-  Bu sprint yeni kapi **dizini** eklenmedi; `disk_full` kapisi
-  `16` kontrolden `19` kontrole cikti (DF10a-DF10c), kapi sayisi ayni kaldi.
-- Windows `gatesI` kosusunda `tls_client` **SKIP** oldu: ortamda
+  Bu sprint yeni kapi **dizini** eklenmedi; `network_limits` kapisi
+  `22` kontrolden `26` kontrole cikti (NL8), kapi sayisi ayni kaldi.
+- Windows `gatesJ` kosusunda `tls_client` **SKIP** oldu: ortamda
   `VDB_CRYPTO_DLL`/`VDB_SSL_DLL` yok. `tls_client` fikstur dizinini
   `VDB_TLS_FIXTURES` ile bulur; degisken verilmezse kapi exe'nin yanindan
   arar ve bulamaz (daha once ilk denemede FAIL, degisken verilince SKIP).
@@ -648,6 +680,16 @@ tablosundadir. Bu sprintte kapatilanlar:
   icinde basarisiz). Duzeltme: checkpoint govdesi `try ... finally
   FStore.EndIoWrite` ile sarildi, normal yoldaki ikinci cagri kaldirildi.
   Regresyon: DF10a-DF10c (`disk_full` 19/0; duzeltme oncesi kaynakta 4 FAIL).
+- **F-36 (Yuksek, KAPALI, v3.60)**: `TVdbPgAccept.Execute` kabul ettigi
+  sokette `VdbSockSetTimeouts`'in **donus degerini yutuyordu** (fail-open).
+  Zaman asimi kurulamadiginda baglanti yine de sunuluyor ve o sokette
+  **sinirsiz bloklama** suruyordu; tek bayt gonderip bekleyen istemci slotu
+  ve is parcacigini surekli tutabiliyor, `MaxConns` kadar bos soket sunucuyu
+  kalici kapatabiliyordu. Duzeltme: fail-closed - kurulum basarisizsa
+  baglanti protokol mesaji gonderilmeden kapatilir ve slot tuketilmez; iki
+  zaman asimi da `0` ise (bilerek kapatilmis) kurulum basarili sayilir.
+  Regresyon: NL8 (`network_limits` 26/0; HEAD + test kancasi baseline'inda
+  1 FAIL - baglanti sunulmus, `ConnCount=1`).
 
 
 ---

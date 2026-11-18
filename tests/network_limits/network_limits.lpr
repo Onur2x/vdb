@@ -20,6 +20,9 @@ program network_limits;
          gecici dosya kalmaz
     NL6  kucuk COPY sinirlarla calismaya devam eder (regresyon korumasi)
     NL7  Stop, yarim baglanti acikken 5 s icinde doner ve ConnCount=0
+    NL8  zaman asimi KURULAMAZSA baglanti hic sunulmaz (fail-closed):
+         kabul dongusu soketi protokol mesaji gondermeden kapatir ve
+         baglanti slotu tuketilmez; kanca kaldirilinca sunucu normale doner
 
   SINIRLILIK (gizlenmez): yalniz protokol katmani olculur; gercek ag
   gecikmesi uretilmez. TLS el sikismasi zamani ayni SO_RCVTIMEO
@@ -240,6 +243,15 @@ begin
   end;
 end;
 
+{ v3.60 / SKILL5 9.1: zaman asimi kurulumunu BASARISIZ gibi gosteren
+  kanca. Gercek bir sokette setsockopt(SO_RCVTIMEO) hatasi tasinabilir
+  sekilde tetiklenemedigi icin kabul dongusunun fail-closed davranisi
+  boyle olculur. }
+function FailTimeouts(ASock: TVdbSocket; ARecvMs, ASendMs: Integer): Boolean;
+begin
+  Result := False;
+end;
+
 { Basit sorgu calistirir; hata metnini ve ilk DataRow degerini doner. }
 function RunSql(APort: Word; const ASql: string; out AValue: string;
   out AErrText: string): Boolean;
@@ -346,7 +358,9 @@ var
   Dir, err, detail, val, etxt: string;
   started: Boolean;
   i, msgs: Integer;
-  s, sStall: TVdbSocket;
+  s, sStall, s8: TVdbSocket;
+  nl8buf: Byte;
+  nl8got: Integer;
   sawData, sawCopy: Boolean;
   t0: QWord;
   elapsed: QWord;
@@ -544,6 +558,30 @@ begin
   ok := RunSql(GPort, 'SELECT COUNT(*) FROM nl', val, etxt);
   Chk('NL6 kucuk COPY satiri yazildi', ok and (val = '1'),
     'val=' + val + ' err=' + etxt);
+
+  { --- NL8: zaman asimi kurulamazsa baglanti SUNULMAZ (fail-closed) ---- }
+  Srv.SockTimeoutFunc := @FailTimeouts;
+  s8 := VdbTcpConnect('127.0.0.1', GPort);
+  if s8 = VDB_SOCK_INVALID then
+    Chk('NL8 istemci baglandi', False, 'baglanti kurulamadi')
+  else
+  begin
+    VdbSockSetTimeouts(s8, SHORT_TO, SHORT_TO);
+    t0 := NowMs;
+    { Tek bayt bile okunmamali: sunucu protokol mesaji gondermeden kapatir. }
+    nl8got := VdbRecvSome(s8, nl8buf, 1);
+    elapsed := NowMs - t0;
+    Chk('NL8 zaman asimi kurulamazsa baglanti SUNULMADI (soket kapandi)',
+      nl8got <= 0, 'rv=' + IntToStr(nl8got));
+    Chk('NL8 kapatma 3 s icinde', elapsed < 3000, IntToStr(elapsed) + ' ms');
+    VdbSockClose(s8);
+  end;
+  Chk('NL8 basarisiz baglanti slot tuketmedi', Srv.ConnCount = 0,
+    'ConnCount=' + IntToStr(Srv.ConnCount));
+  Srv.SockTimeoutFunc := nil;
+  ok := ValidClient(GPort, etxt);
+  Chk('NL8 kanca kaldirilinca sunucu normal istemciyi kabul ediyor',
+    ok, etxt);
 
   { --- NL7: Stop yarim baglanti acikken doner -------------------------- }
   sStall := VdbTcpConnect('127.0.0.1', GPort);

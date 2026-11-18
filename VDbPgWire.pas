@@ -128,6 +128,14 @@ type
     constructor Create(AServer: TVdbPgServer);
   end;
 
+  { v3.60 / SKILL5 9.1: zaman asimi kurma kancasi. nil ise gercek
+    `VdbSockSetTimeouts` cagrilir. Yalniz test icindir: gercek bir sokette
+    `setsockopt(SO_RCVTIMEO)` hatasini tetiklemenin tasinabilir bir yolu
+    yok; kapinin fail-closed davranisini olcebilmek icin bu kanca gerekir.
+    Uretimde nil kalir, davranis degismez. }
+  TVdbPgSockTimeoutFunc = function(ASock: TVdbSocket;
+    ARecvMs: Integer; ASendMs: Integer): Boolean;
+
   TVdbPgServer = class
   private
     FDir: string;
@@ -140,6 +148,8 @@ type
     Ftb: TVTableDb;
     FConnsLock: TCriticalSection;
     FConns: TList;
+    { v3.60: zaman asimi kurma kancasi (bkz. TVdbPgSockTimeoutFunc). }
+    FSockTimeoutFunc: TVdbPgSockTimeoutFunc;
     FAccept: TVdbPgAccept;
     FReady: Boolean;
     FStopping: Boolean;
@@ -244,6 +254,9 @@ type
     { v3.56: yazma zaman asimi (ms). Istemci yaniti okumadan soketi acik
       tutarsa yazma bloklanmaz. Varsayilan 30000; 0 = sinirsiz. }
     property WriteTimeoutMs: Integer read FWriteTimeoutMs write FWriteTimeoutMs;
+    { v3.60: zaman asimi kurma kancasi (yalniz test). nil = gercek cagri. }
+    property SockTimeoutFunc: TVdbPgSockTimeoutFunc read FSockTimeoutFunc
+      write FSockTimeoutFunc;
     { v3.56: tek bir protokol mesajinin govdesi icin ust sinir. Varsayilan
       64 MiB (eski sabit). Asimda istemciye kontrollu hata gonderilip
       baglanti kapatilir; sunucu calismaya devam eder. }
@@ -2408,6 +2421,8 @@ end;
 procedure TVdbPgAccept.Execute;
 var
   sock: TVdbSocket;
+  tmrOk: Boolean;
+  tmrFn: TVdbPgSockTimeoutFunc;
 begin
   while not FServer.FStopping do
   begin
@@ -2415,10 +2430,30 @@ begin
     if sock = VDB_SOCK_INVALID then Break;
     FServer.GcFinished;   // P-185: bitmis baglantilar slot bosaltir
     { v3.56 / Sprint E: zaman asimlari KABUL ANINDA kurulur; boylece
-      baslangic (startup) ve TLS el sikismasi da korunur. Kurulamazsa
-      baglanti yine de sunulur ama o sokette ESKI sinirsiz bloklama
-      davranisi surer (basarisizlik yutulmaz: RecvAll/SendAll doner). }
-    VdbSockSetTimeouts(sock, FServer.FReadTimeoutMs, FServer.FWriteTimeoutMs);
+      baslangic (startup) ve TLS el sikismasi da korunur.
+      v3.60 / SKILL5 9.1: FAIL-CLOSED. ONCEDEN bu cagrinin donusu
+      YUTULUYORDU: kurulum basarisiz olsa da baglanti sunuluyor ve o
+      sokette sinirsiz bloklama suruyordu; tek bayt gonderip bekleyen
+      istemci slotu/is parcacigini surekli tutabiliyordu (MaxConns kadar
+      bos soket sunucuyu kalici kapatir). Zaman asimi kurulamazsa baglanti
+      HIC sunulmaz: protokol mesaji gondermeden kapatilir. Iki zaman asimi
+      da 0 ise (yapilandirmayla bilerek kapatilmis) kurulum basarili
+      sayilir; bu durumda fail-closed devreye girmez. }
+    { FPC 3.2.4 / Delphi modu: bir yordam degiskenini `<> nil` ile
+      karsilastirmak, AYNI rutinde sonraki cagrisinin imzasini bozuyor
+      ("Wrong number of parameters specified for call to <Procedure
+      Variable>"). Olculdu (kucuk izolasyon programlari): `Assigned()`
+      ayni sorunu YARATMIYOR. Bu yuzden kanca tek cagri noktasina indirildi
+      ve nil denetimi Assigned ile yapiliyor. }
+    tmrFn := FServer.FSockTimeoutFunc;
+    if not Assigned(tmrFn) then
+      tmrFn := @VdbSockSetTimeouts;
+    tmrOk := tmrFn(sock, FServer.FReadTimeoutMs, FServer.FWriteTimeoutMs);
+    if not tmrOk then
+    begin
+      VdbSockClose(sock);
+      Continue;
+    end;
     if FServer.ConnCount >= FServer.FMaxConns then
     begin
       VdbSockClose(sock);   // startup oncesi: protokol mesaji gondermeden kapat
@@ -2438,6 +2473,7 @@ begin
   FListen := VDB_SOCK_INVALID;
   FConnsLock := TCriticalSection.Create;
   FConns := TList.Create;
+  FSockTimeoutFunc := nil;   // v3.60: varsayilan gercek cagri
   FMaxConns := 64;
   { v3.56: varsayilanlar. Mesaj siniri eski 64 MiB sabitinin aynisi;
     COPY toplami ve zaman asimlari YENI (onceden sinirsizdi). }
