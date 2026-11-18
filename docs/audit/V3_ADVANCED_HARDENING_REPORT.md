@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-18
-Surum: v3.57 (Sprint A + B + C + D + F1 + E + B2; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Surum: v3.58 (Sprint A + B + C + D + F1 + E + B2 + C2; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -59,13 +59,19 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 ### A.3 Mevcut V3 durumu
 
 - Iki platformda tam kapi seti yesil: **Windows i386 48 kapi**, **Linux
-  x86_64 49 kapi**, FAIL 0 (v3.57 kosulari: `gatesG.log` / `linG.log`).
+  x86_64 49 kapi**, FAIL 0 (v3.58 kosulari: `gatesH.log` / `linH.log`).
   Windows'ta `tls_client` bu ortamda **SKIP** oldu (OpenSSL DLL'i yok);
   kostugu kosu `gatesE.log`'dur. SKIP PASS sayilmaz (ayrinti: `CI.md`).
 - Acik kritik hata yok. Kapatilan son gercek kusurlar: F-21/F-22 veri
   kaybi (SO15/SO16/SO17), Sprint B2'de acik islem icinde **statement
-  atomikligi** (`sql_atomicity` AT20-AT24). Sprint A/B'de kapatilan yetki ve
-  atomiklik kusurlari `A.4`'te.
+  atomikligi** (`sql_atomicity` AT20-AT24), Sprint C2'de **oturum bazli rol**
+  ve bilinmeyen rolde **fail-closed** yetki (`sql_authorization` AU8-AU11).
+  Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
+- Rol degistirme yetkisi ve SCRAM kullanicisi -> SQL rolu eslemesi (SKILL5
+  3.1'in yetki denetimi ve 3.2) **hala ACIK**: kimligi dogrulanmis principal
+  ile SQL rolu arasinda kalici bir esleme yok ve bu, dosya bicimini
+  degistirmeden yapilamaz. Bu sprint yalnizca sizinti ve fail-open kusurunu
+  kapatti; abartili bir "rol guvenligi tamam" iddiasi kurulmuyor.
 - V2 **dondurulmus** ve degismedi; v4 konteyner bicimi durduruldu.
 
 ### A.4 Denetim sprintleri (ONERILER_VE_HIZLANDIRMA2)
@@ -80,6 +86,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | F | 8.1 uctan uca streaming, portal maxRows, COPY OUT streaming, JOIN/ORDER BY/DISTINCT/GROUP BY bellek siniri, disk spill | **Acik (F2)** | tasarim isi; `R8`/`R13` |
 | E | 7.1/7.2 sunucu okuma-yazma zaman asimi, 7.3 COPY gecici dosya sinir+izin, 7.4 baglanti yasam dongusu | Tamam | `network_limits` 22/0 (yeni, 8 vaka) |
 | B2 | 6.1 acik islem icinde statement atomikligi (COMMIT sonrasi yarim yazim) | Tamam | `sql_atomicity` 138/0 (24 vaka; AT20-AT24 yeni) |
+| C2 | 3.1 oturum bazli rol izolasyonu + bilinmeyen rolde fail-closed yetki | Tamam | `sql_authorization` 51/0 (32 -> 51; AU8-AU11 yeni) |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -331,6 +338,48 @@ kapatti:
   POISONED yolu). Kapsam yalnizca **acik islem** icinde acilir; otomatik
   commit yolunda tek cumle zaten butun olarak uygulanir veya geri alinir.
 
+Sprint C2 (SKILL5 3.1) **oturum bazli rol izolasyonu** ve bilinmeyen rolde
+**fail-closed** yetki acigini kapatti:
+
+- **Olculen kusur (sizinti)**: `TVTableDb` tek nesnedir ve tum baglantilar onu
+  paylasir (`VDbPgWire.pas` bir `Ftb` olusturur, her istemciye ayri `TVSql`
+  verir). Rol tek bir alanda (`FCurrentRole`) tutuldugu icin **bir istemcinin
+  `SET ROLE` cagrisi tum istemcilerin etkin rolunu degistiriyordu**: ikinci
+  baglanti, kendi iradesi disinda birinci baglantinin kisitli roluyle
+  calisiyor ve yazma yetkisini kaybediyordu.
+- **Duzeltme**: rol artik `VDbGetTxnSession` anahtarli bir sozlukte
+  (`FRoleBySession`) tutulur; `EffectiveRole` once oturumun rolune bakar,
+  yoksa gomulu varsayilana duser. `RoleCan`, `RlsApplies`, `RequirePriv` ve
+  `CurrentRole` okumasi bu fonksiyonu kullanir. `SET ROLE` oturum anahtari
+  varsa sozluge yazar; oturum yoksa (gomulu kullanim) eski davranis aynen
+  surer. `DROP ROLE` silinen rolu tum oturumlardan da dusurur; aksi halde o
+  oturumda "bilinmeyen rol" kalir ve asagidaki fail-closed kurali oturumu
+  kilitlerdi.
+- **Ikinci kusur (fail-open)**: eski `RoleCan`, adi `FRoles`'ta bulunmayan bir
+  rol icin **`True`** donuyordu; yani yazim hatasiyla verilen bir rol tam
+  yetki veriyordu. Artik bilinmeyen rol **reddedilir** (`False`).
+- **Kapi kaniti**: `sql_authorization` 32 kontrolden **51 kontrole** cikti.
+  Yeni vakalar: AU8 (iki `TVSql` oturumu tek `TVTableDb` uzerinde; birinde
+  `SET ROLE app` digerinin yazma yetkisini **etkilemez** - asil izolasyon
+  kaniti), AU9 (bilinmeyen rol adi SELECT/INSERT/ALL icin reddedilir; motor
+  kullanici modu serbest kalir), AU10 (oturum kapsami ve `SET ROLE NONE`
+  semantigi), AU11 (`DROP ROLE` oturumdaki rolu temizler). Duzeltme
+  **oncesi** kaynakla (`git archive HEAD` `05136af`) derlenen kapida
+  **5 kontrol FAIL** (AU8 x2 izolasyon, AU9 x3 fail-open), duzeltilmis agacta
+  51/0.
+- **Durust sinir**: bu sprint **sizintiyi** ve **fail-open** kusurunu kapatti.
+  Rol **degistirme yetkisi** (kim hangi role gecebilir) hala uygulanmiyor:
+  kimligi dogrulanmis principal ile SQL rolu arasinda kalici bir esleme
+  (SKILL5 3.2) yok ve bu, kalici sema/dosya bicimi degisikligi gerektirir;
+  bicim v5 degismedi. Bu nedenle "yetkisiz rol yukseltmesi tamamen kapandi"
+  denmiyor. Kisitli bir rolu `SET ROLE NONE` ile birakip motor kullanici
+  moduna donmek mumkundur (PostgreSQL de bunu oturum kullanicisina donus
+  sayar); principal eslemesi olmadan bunu yasaklamak guvenlik eklemez, yalnizca
+  mevcut kullanimi bozar. Denenen bu yasak (olculdu: mevcut AU1-AU7
+  temizliginde `SET ROLE NONE` kullaniliyor) 7 kontrolu dusurdugu icin geri
+  alindi ve sinir olarak belgelendi.
+
+
 ---
 
 ## B. WAL
@@ -477,18 +526,19 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   `windows-latest` calistirir; `fail-fast: false`. macOS/ARM64 icin job
   **yoktur** cunku hic kosulmadi; dogrulanmamis platformu matrise eklemek
   yesil gorunen ama kanit uretmeyen bir kapi olurdu (`CI.md` bolum 3).
-- Kanit (en guncel kosu, v3.57): Windows `gatesG.log` (`KOSAN KAPI: 48`,
-  `SUITE_EXIT=0`), Linux `linG.log` (`KOSAN KAPI: 49`, `SUITE_EXIT=0`).
-  Onceki kosu: `gatesE.log` (48) / `linE.log` (49); Sprint E oncesi
+- Kanit (en guncel kosu, v3.58): Windows `gatesH.log` (`KOSAN KAPI: 48`,
+  `SUITE_EXIT=0`), Linux `linH.log` (`KOSAN KAPI: 49`, `SUITE_EXIT=0`).
+  Onceki kosu: `gatesG.log` (48) / `linG.log` (49) - B2; ondan once
+  `gatesE.log` (48) / `linE.log` (49); Sprint E oncesi
   `gatesF.log` (47) / `linF.log` (48); daha once `gatesD.log` (46) /
   `linD.log` (47), ondan once `gatesB.log` (44) / `linC.log` (46) idi.
   Sayilar her sprint yalniz **eklenen** kapi kadar artar, kapi silinmez.
-  Bu sprint yeni kapi **dizini** eklenmedi; `sql_atomicity` kapisi
-  `88` kontrolden `138` kontrole cikti (AT20-AT24), kapi sayisi ayni kaldi.
-- Windows `gatesG` kosusunda `tls_client` **SKIP** oldu: ortamda
+  Bu sprint yeni kapi **dizini** eklenmedi; `sql_authorization` kapisi
+  `32` kontrolden `51` kontrole cikti (AU8-AU11), kapi sayisi ayni kaldi.
+- Windows `gatesH` kosusunda `tls_client` **SKIP** oldu: ortamda
   `VDB_CRYPTO_DLL`/`VDB_SSL_DLL` yok. `tls_client` fikstur dizinini
   `VDB_TLS_FIXTURES` ile bulur; degisken verilmezse kapi exe'nin yanindan
-  arar ve bulamaz (bu kosuda ilk denemede FAIL, degisken verilince SKIP).
+  arar ve bulamaz (daha once ilk denemede FAIL, degisken verilince SKIP).
   Linux'ta fikstur otomatik bulundu ve kapi **kostu**: 6/6 PASS. Windows'ta
   `tls_client`'in kostugu kosu `gatesE.log`'dur (DLL'ler o ortamda vardi).
   Iki ortam arasindaki bu fark kapi sayisini 48/49 yapar; SKIP PASS sayilmaz.
@@ -542,6 +592,20 @@ tablosundadir. Bu sprintte kapatilanlar:
   (`BeginStmtScope`/`ReleaseStmtScope`/`RollbackStmtScope`) + yazma oturumu
   sabitlemesinin `Exec`/`ExecRaw` govdesinin tamamini sarmasi. Regresyon:
   AT20-AT24 (`sql_atomicity` 138/0).
+- **F-34 (Kritik, KAPALI, v3.58)**: `TVTableDb` tek nesne oldugu icin rol tek
+  alanda tutuluyordu ve **bir baglantinin `SET ROLE` cagrisi tum
+  baglantilarin** etkin rolunu degistiriyordu (yetki sizmasi; ikinci oturum
+  kendi iradesi disinda kisitli rolle calisip yazma yetkisini kaybediyordu).
+  Ayni alanda ikinci kusur: `RoleCan`, `FRoles`'ta bulunmayan bir rol adi icin
+  **`True`** donuyordu (fail-open; yazim hatasi tam yetki veriyordu).
+  Duzeltme: rol `VDbGetTxnSession` anahtarli `FRoleBySession` sozlugunde,
+  `EffectiveRole` once oturuma sonra gomulu varsayilana bakar; bilinmeyen rol
+  artik **reddedilir**; `DROP ROLE` rolu tum oturumlardan dusurur. Regresyon:
+  AU8-AU11 (`sql_authorization` 51/0; duzeltme oncesi kaynakta 5 FAIL).
+  **Kismi**: rol degistirme yetkisi (kim hangi role gecebilir) ve SCRAM
+  kullanicisi -> SQL rolu eslemesi **hala ACIK** (principal eslemesi kalici
+  sema degisikligi gerektirir; bicim v5 degismedi).
+
 
 ---
 

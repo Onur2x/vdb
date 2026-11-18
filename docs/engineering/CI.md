@@ -45,7 +45,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `backup_restore` | yedek/geri yukleme butunlugu + tatbikat (B0-B24) |
 | `page_integrity` | sayfa/heap/freelist bozulma matrisi (I0-I13) |
 | `sql_features` | parser'da olup kapisi olmayan SQL ozellikleri: `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` (kismi geri alma gercekten yalniz sonraki satirlari atar), `ON CONFLICT DO NOTHING\|DO UPDATE` (cift anahtar degeri bozmaz), `VACUUM`/`REINDEX`/`ANALYZE <tablo>` (bakim veriyi korur, indeks aramasi dogru kalir), `WITH` (CTE), `ROW_NUMBER() OVER (ORDER BY ...)`, `ALTER TABLE ... RENAME TO` |
-| `sql_authorization` | **SQL yetki/RLS/trigger kapisi** (Sprint A, 3.2-3.4): baglanti yetkisiz baslar (kimlik yoksa `Start` reddeder, varsayilan `admin/admin123` kaldirildi); `GRANT`/`REVOKE` sonrasi izinli/izinsiz DML; RLS policy `USING`/`WITH CHECK` (SELECT/INSERT/UPDATE/DELETE); **upsert** yolunun UPDATE yetkisi, RLS ve ROW trigger uygulamasi; **MERGE** hedef satir RLS filtresi + BEFORE/AFTER ROW ve STATEMENT trigger'lari. 32 kontrol, iki platformda 32/0 |
+| `sql_authorization` | **SQL yetki/RLS/trigger kapisi** (Sprint A, 3.2-3.4): baglanti yetkisiz baslar (kimlik yoksa `Start` reddeder, varsayilan `admin/admin123` kaldirildi); `GRANT`/`REVOKE` sonrasi izinli/izinsiz DML; RLS policy `USING`/`WITH CHECK` (SELECT/INSERT/UPDATE/DELETE); **upsert** yolunun UPDATE yetkisi, RLS ve ROW trigger uygulamasi; **MERGE** hedef satir RLS filtresi + BEFORE/AFTER ROW ve STATEMENT trigger'lari. **AU8-AU11 (Sprint C2)**: rol **oturum bazlidir** - tek `TVTableDb` uzerindeki iki `TVSql` oturumundan birinin `SET ROLE` cagrisi digerinin yazma yetkisini **etkilemez** (AU8); bilinmeyen rol adi SELECT/INSERT/ALL icin **reddedilir**, motor kullanici modu serbest kalir (AU9, fail-open kapandi); oturum kapsami ve `SET ROLE NONE` semantigi (AU10); `DROP ROLE` silinen rolu oturumdan temizler (AU11). 51 kontrol, iki platformda 51/0. Duzeltme oncesi kaynakla (`git archive HEAD`) derlenen sonda 5 kontrol FAIL (AU8 x2 izolasyon, AU9 x3 fail-open) |
 | `sql_atomicity` | **SQL statement atomikligi kapisi** (Sprint A 3.5 + Sprint B): AFTER/BEFORE **STATEMENT** ve ROW trigger hatalarinda statement'in **tamami** geri alinir, trigger govdesindeki DML de geri alinir; ana tablo/indeks/audit degismez. AT1-AT5: AFTER STATEMENT hatasi (cok satir INSERT, UPDATE, DELETE, tek satir INSERT, COPY). AT6-AT10: BEFORE STATEMENT gercekten atesleniyor + DML'i statement ile kalici; BEFORE INSERT/UPDATE/DELETE hatasi; 0 satir eslesen DELETE'te trigger DML'i korunur (B4). AT11-AT12: BEFORE/AFTER ROW hatasi. AT13: 2. satirda duplicate PK -> hic satir kalmaz. AT14: MERGE AFTER STATEMENT hatasi. AT15: RETURNING tutarliligi (basarili -> satirlar yazilir; hatali -> iz yok). AT16: hatali statement sonrasi yeniden acilista iz yok. AT17: explicit transaction icinde statement hatasi + `ROLLBACK`. AT18/AT19: BEFORE STATEMENT trigger DML'i ana INSERT/COPY hatasiyla geri alinir (B1). **AT20-AT24 (Sprint B2)**: explicit transaction icinde statement hatasindan sonra `COMMIT` yarim yazimi **kalici yapmaz** (AT20); onceki basarili statement'in satiri korunur, hatali statement'in satiri kalmaz (AT21); hatali statement'in anahtari sonraki statement'ta yeniden kullanilabilir, yani kaplama defteri temizlenir (AT22); UNIQUE cakismasiyla yarida kalan `UPDATE` geri alinir, onceki `UPDATE` korunur (AT23); kullanici `SAVEPOINT`'i ortuk kapsamdan etkilenmez, `ROLLBACK TO`/`RELEASE` calisir (AT24). 24 vaka, **138 kontrol**, iki platformda 138/0. Kapi duzeltme oncesi kaynakla derlenen sonda 6 kontrol FAIL verir (AT20 x2, AT21 x2, AT22, AT23 - hepsi COMMIT sonrasi yarim yazim), yani bos yesil degildir. ONEMLI: eski 8 FAIL iddiasi AT8/AT9/AT10/AT18/AT19 icindi; bu sprintte ayni kaynakla olculen guncel deger 6 FAIL'dir |
 | `limits` | **kaynak sinirlari** (SKILL2 §25): 4 MiB'tan buyuk SQL, 16 MB'lik INSERT ve 2M ustu `LIMIT` kontrollu `ecLimit` ile reddedilir; reddedilen islem **hicbir satir birakmaz**, ayni veritabani sorgulanmaya devam eder, kapanis temiz (yalniz `.odb`) ve yeniden acilista veri bozulmamis olur; belgelenen tavanlar (`LIMITS.md`) tutarli |
 | `sql_memory` | **SQL sinir ve sayisal uc davranis kapisi** (Sprint F1, 8.2 + 8.4 + 8.5): 26 vaka, **54 kontrol**. SM1-SM7 tam siralamanin (ASC/DESC, NULL ilk/son) **onegi** olarak `ORDER BY ... LIMIT/OFFSET` (tek ve cok anahtar) - streaming kisayolu ile genel yurutucu ayni sonucu verir. SM8 `LIMIT 0`; SM9 negatif `LIMIT`/`OFFSET` -> `ecSyntaxError`; SM10 `OFFSET 1000000000`/`2147483647` -> 0 satir; SM11 tavan asimi (`VDB_MAX_RESULT_ROWS+1`, `LIMIT+OFFSET` toplami) -> `ecLimit` (kismi sonuc yok). SM12-SM14 3VL (`= NULL`, `IS NULL`, `NOT`, `IN`/`NOT IN` NULL'lu, `BETWEEN NULL`) ve `COUNT(col)` 5 / `COUNT(*)` 6 / `AVG` 3.5. SM15 `CAST` 22/24 haneli metin ve `'abc'` -> `ecTypeMismatch` (tasma sessiz sarma **yok**); SM16 Int64 max/min tam; SM17 `-9223372036854775808` literali tam; SM18 `+`/`*` tasmasi -> `ecMathError`; SM19 `1/0` ve `1.0/0.0`; SM20 `ABS` tam sayi hassasiyeti + `ABS(Low(Int64))` -> `ecMathError`; SM26 kolondaki `Low(Int64)` korunur, `SELECT -v` -> `ecMathError`. SM21 ozyinelemeli CTE 100 satir (COUNT/MIN/MAX); SM22 **sinirsiz** ozyineleme -> `ecLimit` (sessiz kesme yok) ve tablo saglam; SM23 `QueryTimeoutMs := 60` ile derin ozyineleme -> `ecQueryTimeout`; SM24 `CancelQuery` -> `ecCancelled`, ardindan `ResetCancel` ve normal sorgu. SM25 kapanis temiz (yalniz `.odb`), yeniden acilista 6 satir ve ayni sira. Iki platformda 54/0. Duzeltme oncesi kaynakla (`git archive HEAD`) derlenen sonda **6 kontrol FAIL** (SM15 x2 CAST sarmasi, SM20 x2 `ABS` float/`ABS(Low)`, SM22 sessiz kesme, SM26 isaret sarmasi) |
@@ -1089,3 +1089,45 @@ kaldirildi:
     **acik islem** icinde acilir: otomatik commit'li tek cumle zaten
     ya-hep-ya-hic yazilir. Ag sunucusu uzerinden ayni senaryolar
     kosulmadi.
+- Kirk ikinci kosu (v3.58, Sprint C2 - oturum bazli rol izolasyonu):
+  **iki platform da YESIL**. Git Bash/Windows **48 kapi** PASS, WSL x86_64
+  Linux **49 kapi** PASS, FAIL 0 (`gatesH.log` -> `KOSAN KAPI: 48`,
+  `SUITE_EXIT=0`; `linH.log` -> `KOSAN KAPI: 49`, `SUITE_EXIT=0`).
+  Windows'ta `tls_client` SKIP (OpenSSL DLL yok; `VDB_TLS_FIXTURES` verilmezse
+  fikstur bulunamayip FAIL eder - SKIP != PASS), Linux'ta 6/0.
+  - **3.1 rol izolasyonu (F-34, KRITIK, KAPALI)**: `TVTableDb` tek nesnedir
+    ve tum baglantilar onu paylasir (PG wire bir `Ftb` olusturur, her
+    istemciye ayri `TVSql` verir). Rol tek bir alanda (`FCurrentRole`)
+    tutuldugu icin **bir istemcinin `SET ROLE` cagrisi tum istemcilerin
+    etkin rolunu degistiriyordu**; ikinci baglanti kendi iradesi disinda
+    kisitli rolle calisip yazma yetkisini kaybediyordu.
+  - **Ayni alanda ikinci kusur (fail-open)**: `RoleCan`, `FRoles`'ta
+    **bulunmayan** bir rol adi icin `True` donuyordu; yazim hatasiyla verilen
+    rol tam yetki veriyordu. Artik **reddedilir** (`False`).
+  - **Duzeltme**: rol `VDbGetTxnSession` anahtarli `FRoleBySession`
+    sozlugunde tutulur; `EffectiveRole` once oturumun rolune, yoksa gomulu
+    varsayilana duser ve `RoleCan`/`RlsApplies`/`RequirePriv`/`CurrentRole`
+    onu kullanir. `SET ROLE` oturum varsa sozluge yazar (oturum yoksa gomulu
+    davranis aynen surer). `DROP ROLE` silinen rolu **tum oturumlardan**
+    dusurur; yoksa o oturumda "bilinmeyen rol" kalir ve fail-closed kurali
+    oturumu kilitlerdi.
+  - **Kapinin buyumesi**: `sql_authorization` 32 kontrol -> **51 kontrol**.
+    Yeni AU8 (iki `TVSql` oturumu tek `TVTableDb` uzerinde: birinin
+    `SET ROLE app` cagrisi digerinin yazma yetkisini **etkilemez** - asil
+    izolasyon kaniti), AU9 (bilinmeyen rol SELECT/INSERT/ALL icin reddedilir,
+    motor kullanici modu serbest), AU10 (oturum kapsami ve `SET ROLE NONE`
+    semantigi), AU11 (`DROP ROLE` oturumdaki rolu temizler). Duzeltme oncesi
+    kaynakla (`git archive 05136af`, bos cwd'de derlenerek) **5 kontrol FAIL**
+    (AU8 x2 izolasyon, AU9 x3 fail-open) ve exit 1; duzeltilmis agacta 51/0.
+  - **Durust sinir (kismi kapanis)**: bu sprint **sizintiyi** ve
+    **fail-open** kusurunu kapatti. Rol **degistirme yetkisi** (kim hangi
+    role gecebilir) ve SCRAM kullanicisi -> SQL rolu eslemesi (SKILL5 3.1
+    yetki denetimi + 3.2) **hala ACIK**: principal ile SQL rolu arasinda
+    kalici bir esleme yok ve bu, kalici sema/dosya bicimi degisikligi
+    gerektirir; bicim v5 degismedi. Bu nedenle "yetkisiz rol yukseltmesi
+    tamamen kapandi" denmiyor. Kisitli bir rolu `SET ROLE NONE` ile birakip
+    oturum kullanici moduna donmek mumkundur (PostgreSQL de bunu oturum
+    kullanicisina donus sayar). Bu yasak **denendi** ve geri alindi: mevcut
+    AU1-AU7 temizligi `SET ROLE NONE` kullandigi icin 7 kontrolu dusurdu ve
+    principal eslemesi olmadan guvenlik eklemiyordu. Sinir olarak belgelendi.
+

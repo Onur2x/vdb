@@ -528,7 +528,13 @@ type
     // ---- R-18: RBAC katalogu ----
     FRoles: TDictionary<string, TRoleDef>;   // rol adi -> tanim
     FGrants: TList<TGrantDef>;               // izin kayitlari
-    FCurrentRole: string;                    // etkin rol ('' = belirtilmedi)
+    FCurrentRole: string;                    // varsayilan/oturumsuz etkin rol ('' = belirtilmedi)
+    { v3.58: OTURUM BAZLI ROL. `TVTableDb` tek nesnedir ve tum baglantilar
+      (PG wire: her istemci icin ayri TVSql, tek ortak Ftb) onu paylasir.
+      ONCEDEN rol tek bir alanda tutuluyordu: bir istemcinin `SET ROLE`
+      cagrisi TUM istemcilerin etkin rolunu degistiriyordu (yetki sizmasi).
+      Anahtar: VDbGetTxnSession oturum kimligi (0 = oturum yok -> varsayilan). }
+    FRoleBySession: TDictionary<Cardinal, string>;
     // ---- R-19: ROW LEVEL SECURITY katalogu ----
     FRlsOn: TDictionary<string, Boolean>;    // tablo -> RLS acik mi
     FPolicies: TList<TPolicyDef>;            // politikalar
@@ -616,7 +622,11 @@ type
     procedure GrantPriv(const ATable: string; APriv: Byte; const ARole: string);
     procedure RevokePriv(const ATable: string; APriv: Byte; const ARole: string);
     procedure SetCurrentRole(const AName: string);
-    property CurrentRole: string read FCurrentRole write FCurrentRole;
+    { v3.58: etkin rol. Oturumun kendi rolu varsa o, yoksa varsayilan
+      (FCurrentRole). 'TVTableDb' tum baglantilarca paylasildigi icin
+      yetki kararlari bu fonksiyondan gecmelidir. }
+    function EffectiveRole: string;
+    property CurrentRole: string read EffectiveRole write FCurrentRole;
     function RoleCount: Integer;
     function GrantCount: Integer;
     // Ic denetim: rol verilen tablo uzerinde izne sahip mi?
@@ -5621,6 +5631,7 @@ begin
   FRoles := TDictionary<string, TRoleDef>.Create;
   FGrants := TList<TGrantDef>.Create;
   FCurrentRole := '';
+  FRoleBySession := TDictionary<Cardinal, string>.Create;   // v3.58
   FRlsOn := TDictionary<string, Boolean>.Create;   // R-19
   FPolicies := TList<TPolicyDef>.Create;
   FIdxOps := TDictionary<Int64, TList<TIdxOp>>.Create;
@@ -5669,6 +5680,7 @@ begin
   FRowLockCs.Free;
   FRoles.Free;          // R-18
   FGrants.Free;
+  FRoleBySession.Free;  // v3.58
   FRlsOn.Free;          // R-19
   FPolicies.Free;
   FTables.Free;
@@ -7461,6 +7473,7 @@ procedure TVTableDb.DropRole(const AName: string);
 var
   i: Integer;
   nm: string;
+  k: Cardinal;
 begin
   nm := VDbNorm(AName);
   if not FRoles.ContainsKey(nm) then
@@ -7476,6 +7489,12 @@ begin
     else
       Inc(i);
   if FCurrentRole = nm then FCurrentRole := '';
+  { v3.58: oturum bazli roller de dusurulur. Aksi halde rol silindikten
+    sonra o oturumda "bilinmeyen rol" kalir; RoleCan artik bunu REDDETTIGI
+    icin oturum kilitlenirdi (guvenli ama kullanilamaz). }
+  for k in FRoleBySession.Keys do
+    if FRoleBySession[k] = nm then
+      FRoleBySession.Remove(k);
   MarkSchema;
 end;
 
@@ -7531,31 +7550,61 @@ begin
   MarkSchema;
 end;
 
-procedure TVTableDb.SetCurrentRole(const AName: string);
+function TVTableDb.EffectiveRole: string;
+var
+  sid: Cardinal;
 begin
+  { v3.58: oturumun kendi rolu varsa o; yoksa varsayilan (gomulu) rol.
+    `TVTableDb` tum baglantilarca PAYLASILIR (PG wire her istemciye ayni Ftb
+    uzerinde ayri TVSql verir), bu yuzden rol tek bir alanda tutulamaz. }
+  sid := VDbGetTxnSession;
+  if (sid <> 0) and FRoleBySession.TryGetValue(sid, Result) then Exit;
+  Result := FCurrentRole;
+end;
+
+procedure TVTableDb.SetCurrentRole(const AName: string);
+var
+  sid: Cardinal;
+begin
+  { v3.58: OTURUM BAZLI ROL. `TVTableDb` tum baglantilarca paylasilir; rol
+    artik oturum kimligiyle saklanir, boylece bir istemcinin `SET ROLE`
+    cagrisi digerlerini ETKILEMEZ.
+    KAPSAM NOTU: rol degistirme YETKISI burada DENETLENMEZ. Elimizde kimligi
+    dogrulanmis bir principal -> SQL rol eslemesi yok (SKILL5 3.2 hala
+    ACIK). Principal olmadan kisitli bir rolu "geri donulemez" yapmak
+    guvenlik kazandirmaz, yalnizca kullanilabilirligi bozardi (olculdu:
+    mevcut sql_authorization AU1-AU7 temizlik adimlari `SET ROLE NONE`
+    kullaniyor ve PostgreSQL'de de bu oturum kullanici rolune donustur). }
+  sid := VDbGetTxnSession;
   if (AName = '') or (SameText(AName, 'NONE')) then
   begin
-    FCurrentRole := '';
+    if sid <> 0 then FRoleBySession.Remove(sid) else FCurrentRole := '';
     Exit;
   end;
   if not RoleExists(AName) then
     raise EVDbException.Create(ecNotFound, 'rol yok: ' + VDbNorm(AName));
-  FCurrentRole := VDbNorm(AName);
+  if sid <> 0 then
+    FRoleBySession.AddOrSetValue(sid, VDbNorm(AName))
+  else
+    FCurrentRole := VDbNorm(AName);
 end;
 
 function TVTableDb.RoleCan(const ATable: string; APriv: Byte): Boolean;
 var
   g: TRoleDef;
   i: Integer;
-  t: string;
+  t, cur: string;
 begin
+  cur := EffectiveRole;
   // Rol belirtilmemisse motor kullanici modundayiz: her sey serbest.
-  if FCurrentRole = '' then Exit(True);
-  if not FRoles.TryGetValue(FCurrentRole, g) then Exit(True);
+  if cur = '' then Exit(True);
+  { v3.58: BILINMEYEN ROL ARTIK REDDEDILIR. ONCEDEN `Exit(True)` idi: semada
+    olmayan bir rol adi (yazim hatasi, silinmis rol) TUM yetkileri aciyordu. }
+  if not FRoles.TryGetValue(cur, g) then Exit(False);
   if g.Super then Exit(True);
   t := VDbNorm(ATable);
   for i := 0 to FGrants.Count - 1 do
-    if (FGrants[i].Role = FCurrentRole) and
+    if (FGrants[i].Role = cur) and
        ((FGrants[i].Table = t) or (FGrants[i].Table = '*')) and
        ((FGrants[i].Priv = APriv) or (FGrants[i].Priv = Byte(pkAll))) then
       Exit(True);
@@ -7567,7 +7616,7 @@ begin
   if not RoleCan(ATable, APriv) then
     raise EVDbException.CreateFmt(ecPermissionDenied,
       'yetkisiz: rol "%s" tablo "%s" uzerinde %s iznine sahip degil',
-      [FCurrentRole, VDbNorm(ATable), PrivName(APriv)]);
+      [EffectiveRole, VDbNorm(ATable), PrivName(APriv)]);
 end;
 
 { ---- R-19: ROW LEVEL SECURITY ---- }
@@ -7637,11 +7686,13 @@ end;
 function TVTableDb.RlsApplies(const ATable: string): Boolean;
 var
   r: TRoleDef;
+  cur: string;
 begin
   Result := RlsEnabled(ATable);
   if not Result then Exit;
-  if FCurrentRole = '' then Exit(False);
-  if not FRoles.TryGetValue(FCurrentRole, r) then Exit(False);
+  cur := EffectiveRole;   // v3.58: oturum bazli rol
+  if cur = '' then Exit(False);
+  if not FRoles.TryGetValue(cur, r) then Exit(False);
   if r.Super then Exit(False);
 end;
 

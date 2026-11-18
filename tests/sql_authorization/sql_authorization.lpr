@@ -8,7 +8,7 @@ program sql_authorization;
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes, VDbFactory, VDbBackendApi, VDbBackendV3, VDbTable,
-  VDbSql, VDbErr;
+  VDbTypes, VDbSql, VDbErr;
 
 var
   GDir, GDb: string;
@@ -383,6 +383,122 @@ begin
   CloseAll;
 end;
 
+{ v3.58: OTURUM IZOLASYONU. `TVTableDb` tum baglantilarca paylasilir; rol
+  tek alanda tutuldugunda bir istemcinin `SET ROLE` cagrisi herkesin
+  etkin rolunu degistiriyordu. Bu vaka iki ayri TVSql (iki oturum) uzerinden
+  olcer: birinci oturumun rolu ikinciyi ETKILEMEZ. }
+procedure CaseSessionRoleIsolation;
+var
+  Sq2: TVSql;
+  ok: Boolean;
+begin
+  OpenFresh('iso');
+  Sq.Exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+  Sq.Exec('INSERT INTO t (id, v) VALUES (1, ''a'')');
+  Sq.Exec('CREATE ROLE app');
+  Sq.Exec('GRANT SELECT ON TABLE t TO app');
+  Sq2 := TVSql.Create(Tb);
+  try
+    ok := TryExec(Sq, 'SET ROLE app', err);
+    Chk('AU8 birinci oturumda SET ROLE app', ok, err);
+    ok := TryExec(Sq, 'INSERT INTO t (id, v) VALUES (2, ''b'')', err);
+    Chk('AU8 kisitli oturum INSERT edemiyor',
+      (not ok) and (Pos('yetkisiz', err) > 0), err);
+    Chk('AU8 kisitli oturum SELECT edebiliyor',
+      IntQ(Sq, 'SELECT COUNT(*) FROM t') = 1);
+    { Asil ayirt edici olcum: ikinci oturumun rolu degismedi mi? }
+    ok := TryExec(Sq2, 'INSERT INTO t (id, v) VALUES (3, ''c'')', err);
+    Chk('AU8 ikinci oturumun rolu degismedi (izolasyon)', ok, err);
+    Chk('AU8 ikinci oturumun yazimi kalici',
+      IntQ(Sq2, 'SELECT COUNT(*) FROM t') = 2);
+  finally
+    Sq2.Free;
+  end;
+  CloseAll;
+end;
+
+{ v3.58: BILINMEYEN ROL ARTIK REDDEDILIR. ONCEDEN semada olmayan bir rol
+  adi (yazim hatasi / silinmis rol) TUM yetkileri aciyordu. }
+procedure CaseUnknownRoleDenied;
+begin
+  OpenFresh('unk');
+  Sq.Exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+  Sq.Exec('CREATE ROLE app');
+  Sq.Exec('GRANT SELECT ON TABLE t TO app');
+  Tb.CurrentRole := 'yazim_hatasi';
+  Chk('AU9 bilinmeyen rol SELECT yetkisi almiyor',
+    not Tb.RoleCan('t', Byte(pkSelect)));
+  Chk('AU9 bilinmeyen rol INSERT yetkisi almiyor',
+    not Tb.RoleCan('t', Byte(pkInsert)));
+  Chk('AU9 bilinmeyen rol ALL yetkisi almiyor',
+    not Tb.RoleCan('t', Byte(pkAll)));
+  Tb.CurrentRole := '';
+  Chk('AU9 motor kullanici modu serbest',
+    Tb.RoleCan('t', Byte(pkSelect)));
+  CloseAll;
+end;
+
+{ v3.58: OTURUM ROLU SINIRI (durust kayit). Principal -> SQL rol eslemesi
+  olmadigi icin (SKILL5 3.2 ACIK) rol degistirme yetkisi DENETLENMEZ; bu
+  yuzden `SET ROLE NONE` serbesttir (PostgreSQL'de de oturum kullanici
+  rolune donustur). Bu vaka o davranisi kilitler; bir gun principal
+  eklendiginde bu vaka da guncellenmelidir. }
+procedure CaseSetRoleSessionScope;
+var
+  Sq2: TVSql;
+  ok: Boolean;
+begin
+  OpenFresh('esc');
+  Sq.Exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+  Sq.Exec('CREATE ROLE app');
+  Sq.Exec('CREATE ROLE su SUPERUSER');
+  Sq.Exec('GRANT SELECT ON TABLE t TO app');
+  Sq.Exec('SET ROLE app');
+  ok := TryExec(Sq, 'INSERT INTO t (id, v) VALUES (1, ''a'')', err);
+  Chk('AU10 kisitli rol INSERT edemiyor',
+    (not ok) and (Pos('yetkisiz', err) > 0), err);
+  ok := TryExec(Sq, 'SET ROLE NONE', err);
+  Chk('AU10 SET ROLE NONE oturum kullanici rolune donuyor', ok, err);
+  ok := TryExec(Sq, 'INSERT INTO t (id, v) VALUES (1, ''a'')', err);
+  Chk('AU10 donus sonrasi motor kullanici izinli', ok, err);
+  { Super rol izinli; ayri oturumda da rol bagimsiz. }
+  Sq2 := TVSql.Create(Tb);
+  try
+    ok := TryExec(Sq2, 'SET ROLE su', err);
+    Chk('AU10 Super rol atanabiliyor', ok, err);
+    ok := TryExec(Sq2, 'SET ROLE app', err);
+    Chk('AU10 Super rolden baska role gecilebiliyor', ok, err);
+    ok := TryExec(Sq2, 'SET ROLE NONE', err);
+    Chk('AU10 Super rolden NONE yapilabiliyor', ok, err);
+  finally
+    Sq2.Free;
+  end;
+  CloseAll;
+end;
+
+{ v3.58: rol silinince o oturumdaki rol kaydi da dusmeli; aksi halde
+  "bilinmeyen rol" kalir ve RoleCan reddettigi icin oturum kilitlenir. }
+procedure CaseDropRoleClearsSessionRole;
+var
+  ok: Boolean;
+begin
+  OpenFresh('drop');
+  Sq.Exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+  Sq.Exec('CREATE ROLE app');
+  Sq.Exec('GRANT SELECT ON TABLE t TO app');
+  Sq.Exec('SET ROLE app');
+  ok := TryExec(Sq, 'INSERT INTO t (id, v) VALUES (1, ''a'')', err);
+  Chk('AU11 rol silinmeden once INSERT edemiyor',
+    (not ok) and (Pos('yetkisiz', err) > 0), err);
+  { Oturumda rol kaydi varken rol silinir; kayit da temizlenmeli. }
+  ok := TryExec(Sq, 'DROP ROLE app', err);
+  Chk('AU11 DROP ROLE calisti', ok, err);
+  ok := TryExec(Sq, 'INSERT INTO t (id, v) VALUES (1, ''a'')', err);
+  Chk('AU11 silinen rol oturumdan temizlendi (motor kullanici)', ok, err);
+  Chk('AU11 satir yazildi', IntQ(Sq, 'SELECT COUNT(*) FROM t') = 1);
+  CloseAll;
+end;
+
 begin
   GPass := 0;
   GFail := 0;
@@ -414,6 +530,22 @@ begin
   try CaseMergeInsertRls except
     on E: Exception do begin Inc(GFail);
       WriteLn('FAIL AU7 beklenmeyen hata: ', E.ClassName, ': ', E.Message); end;
+  end;
+  try CaseSessionRoleIsolation except
+    on E: Exception do begin Inc(GFail);
+      WriteLn('FAIL AU8 beklenmeyen hata: ', E.ClassName, ': ', E.Message); end;
+  end;
+  try CaseUnknownRoleDenied except
+    on E: Exception do begin Inc(GFail);
+      WriteLn('FAIL AU9 beklenmeyen hata: ', E.ClassName, ': ', E.Message); end;
+  end;
+  try CaseSetRoleSessionScope except
+    on E: Exception do begin Inc(GFail);
+      WriteLn('FAIL AU10 beklenmeyen hata: ', E.ClassName, ': ', E.Message); end;
+  end;
+  try CaseDropRoleClearsSessionRole except
+    on E: Exception do begin Inc(GFail);
+      WriteLn('FAIL AU11 beklenmeyen hata: ', E.ClassName, ': ', E.Message); end;
   end;
   WriteLn;
   WriteLn('SONUC: ', GPass, ' PASS, ', GFail, ' FAIL');
