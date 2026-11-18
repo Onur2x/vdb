@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-18
-Surum: v3.61 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Surum: v3.62 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1 + H; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -59,7 +59,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 ### A.3 Mevcut V3 durumu
 
 - Iki platformda tam kapi seti yesil: **Windows i386 48 kapi**, **Linux
-  x86_64 49 kapi**, FAIL 0 (v3.61 kosulari: `gatesJ.log` / `linJ.log`).
+  x86_64 49 kapi**, FAIL 0 (v3.62 kosulari: `gatesJ.log` / `linJ.log`).
   Windows'ta `tls_client` bu ortamda **SKIP** oldu (OpenSSL DLL'i yok);
   kostugu kosu `gatesE.log`'dur. SKIP PASS sayilmaz (ayrinti: `CI.md`).
 - Acik kritik hata yok. Kapatilan son gercek kusurlar: F-21/F-22 veri
@@ -69,7 +69,9 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   Sprint D2'de checkpoint hata yolunda **kilit sizintisi** (`disk_full`
   DF10a-DF10c), Sprint E2'de zaman asimi kurulumunda **fail-open** davranis
   (`network_limits` NL8), Sprint G1'de PG sunucusunun **guvensiz
-  varsayilanlari** (`server_harden` S12-S15). Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
+  varsayilanlari** (`server_harden` S12-S15), Sprint H'de ozel TCP SQL
+  sunucusunun **guvensiz varsayilanlari, zaman asimi ve parola denemesi
+  siniri** (`server_failure` SF9-SF15). Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
 - Rol degistirme yetkisi ve SCRAM kullanicisi -> SQL rolu eslemesi (SKILL5
   3.1'in yetki denetimi ve 3.2) **hala ACIK**: kimligi dogrulanmis principal
   ile SQL rolu arasinda kalici bir esleme yok ve bu, dosya bicimini
@@ -92,6 +94,8 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | C2 | 3.1 oturum bazli rol izolasyonu + bilinmeyen rolde fail-closed yetki | Tamam | `sql_authorization` 51/0 (32 -> 51; AU8-AU11 yeni) |
 | D2 | 8.1 checkpoint hata yolunda surecler arasi yazma kilidi sizintisi | Tamam | `disk_full` 19/0 (16 -> 19; DF10a-DF10c yeni) |
 | E2 | 9.1 zaman asimi kurulumu basarisizsa baglanti yine de sunuluyordu (fail-open) | Tamam | `network_limits` 26/0 (22 -> 26; NL8 yeni) |
+| G1 | 5.2 PG sunucusu guvensiz varsayilanlar (tum arayuzlerde bind, trust kimlik dogrulama, politika katmanini atlama) | Tamam | `server_harden` 36/0 (25 -> 36; S12-S15 yeni) |
+| H | 5.1/5.2/9.3 ozel TCP SQL sunucusu: tum arayuzlerde bind, duz metin parola icin sinirsiz deneme, zaman asimi yok, kilitsiz baglanti sayimi | Tamam | `server_failure` 30/0 (16 -> 30; SF9-SF15 yeni) |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -591,9 +595,10 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   `windows-latest` calistirir; `fail-fast: false`. macOS/ARM64 icin job
   **yoktur** cunku hic kosulmadi; dogrulanmamis platformu matrise eklemek
   yesil gorunen ama kanit uretmeyen bir kapi olurdu (`CI.md` bolum 3).
-- Kanit (en guncel kosu, v3.61): Windows `gatesJ.log` (`KOSAN KAPI: 48`,
+- Kanit (en guncel kosu, v3.62): Windows `gatesJ.log` (`KOSAN KAPI: 48`,
   `SUITE_EXIT=0`), Linux `linJ.log` (`KOSAN KAPI: 49`, `SUITE_EXIT=0`).
-  Onceki kosu: `gatesI.log` (48) / `linI.log` (49) - D2; ondan once
+  Onceki kosu (v3.61/G1) ayni `gatesJ.log` / `linJ.log` dosyalarina yazdi ve
+  bu kosu tarafindan uzerine yazildi; ondan once `gatesI.log` (48) / `linI.log` (49) - D2; ondan once
   `gatesH.log` (48) / `linH.log` (49) - C2; ondan once
   `gatesG.log` (48) / `linG.log` (49) - B2; ondan once
   `gatesE.log` (48) / `linE.log` (49); Sprint E oncesi
@@ -712,6 +717,38 @@ tablosundadir. Bu sprintte kapatilanlar:
   isletim sistemi bind hatasi veriyor. S15/S15b (yerel trust hala calisir)
   bilerek **ayirt edici degildir**: asiri siki bir duzeltmenin yerel gelistirme
   yolunu kirmadigini korur.
+- **F-38 (Kritik, KAPALI, v3.62)**: ozel TCP SQL sunucusu (`VDbSqlServer`,
+  `TVdbSqlServer`) PG sunucusundan **bagimsiz** ayni guvensiz varsayilanlari
+  tasiyordu ve kimlik dogrulamayi denetimsiz birakiyordu. Dort kusur:
+  (a) `Start` dinlemeyi `VdbTcpListen(FPort)` tek argumanli overload'u ile
+  aciyordu; bu **`'0.0.0.0'`** demektir, yani sunucu farkinda olmadan tum
+  arayuzlerde dinliyor ve parola **acik metin** gidiyordu (protokolde TLS yok);
+  (b) `LOGIN` parolayi `pass = FServer.FPass` ile **duz** karsilastiriyordu ve
+  deneme sayisinda **sinir yoktu** - 30 saniyede sinirsiz parola denemesi
+  mumkundu (PG tarafinda R-4 ceza defteri vardi, burada yoktu); (c) kabul
+  edilen sokette **hic zaman asimi kurulmuyordu**, tek bayt gonderip bekleyen
+  istemci is parcacigini ve baglanti slotunu surekli tutabiliyordu;
+  (d) kapasite karari `FConns.Count`'u **kilitsiz** okuyor ve `GcFinished`'i
+  kabul dongusunde kilitsiz cagiriyordu - bitmis baglanti thread'i listede
+  kalirsa slot hic geri kazanilmiyordu (olculen: kapanan baglanti sonrasi
+  sayim `1`'de kaliyordu). Duzeltme (fail closed): varsayilan bind
+  `'127.0.0.1'` + `ExposureError` politika karari (kimlik dogrulama yok ya da
+  TLS yok ise loopback disi adres **reddedilir**, `AllowInsecureRemote=True`
+  bilincli kacis kapisi) + dinleme adresi `VdbResolveListenHost` ile
+  normalize edilir; parola karsilastirmasi **sabit zamanli** (uzunluk ve icerik
+  XOR birikimi) ve her iki alan icin yapilir; kullanici bazli + global ceza
+  defteri (5 hata / 60 s pencere -> 30 s kilit, 200 global hata) esigi asinca
+  **dogru parola da reddedilir**; soket zaman asimi kabulde kurulur ve
+  kurulamazsa baglanti **sunulmaz** (test kancasi `SockTimeoutFunc`, uretimde
+  nil); baglanti sayimi ve `GcFinished` **kilit altinda**. Bicim v5 degismedi.
+  Regresyon: SF9-SF15 (`server_failure` 30/0). Baseline (HEAD + yalnizca
+  yeni API kabugu; politika/kilit/zaman asimi yok) **7 FAIL**: SF9 varsayilan
+  bind `0.0.0.0`; SF10/SF10b uzak bind politika yerine OS bind'i ile aciliyor;
+  SF12b sessiz baglanti istemci zaman asimina kadar (5000 ms) acik kaliyor;
+  SF13 zaman asimi kancasi yok sayiliyor; SF14b esik asildiktan sonra dogru
+  parola kabul ediliyor; SF15b kapanan baglanti sayimda kaliyor. SF9b/SF11/
+  SF14/SF14c/SF15 bilerek **ayirt edici degildir** (asiri siki duzeltmenin
+  normal yolu kirmadigini korur).
 
 
 ---

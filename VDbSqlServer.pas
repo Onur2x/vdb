@@ -34,14 +34,32 @@ unit VDbSqlServer;
 interface
 
 uses
-  SysUtils, Classes, SyncObjs, VDbTypes, VDbBackendApi, VDbFactory, VDbTable,
-  VDbSql, VDbAst, VDbNet;
+  SysUtils, Classes, SyncObjs, Generics.Collections, VDbTypes, VDbBackendApi,
+  VDbFactory, VDbTable, VDbSql, VDbAst, VDbNet;
 
 { Protokol sabitleri (VDBS_*) VDbNet birimindedir: tasima katmaniyla
   paylasildigi icin hem sunucu hem istemci oradan okur. }
 
 type
   TVdbSqlServer = class;
+
+  { v3.62 / SKILL5 5.2 ve 9.3: zaman asimi kurma kancasi. nil ise gercek
+    `VdbSockSetTimeouts` cagrilir. Yalniz test icindir: gercek bir sokette
+    `setsockopt(SO_RCVTIMEO)` hatasini tetiklemenin tasinabilir bir yolu
+    yok; kabul yolunun fail-closed davranisini olcebilmek icin bu kanca
+    gerekir. Uretimde nil kalir, davranis degismez. }
+  TVdbTcpSockTimeoutFunc = function(ASock: TVdbSocket;
+    ARecvMs: Integer; ASendMs: Integer): Boolean;
+
+  { v3.62 / SKILL5 5.2: kullanici basina kimlik dogrulama cezasi. Bellekte
+    tutulur (diske yazilmaz); yeniden baslatma sifirlar. Zaman alanlari
+    monotonik saatte (ms) tutulur; duvar saati degil. Model PostgreSQL
+    sunucusundaki R-4 ceza defteriyle aynidir. }
+  TVdbTcpAuthPenalty = record
+    Failures: Integer;
+    FirstAt: Int64;
+    LockedUntil: Int64;
+  end;
 
   { Her istemci baglantisi icin bir thread.
     KR-7: Her baglanti kendi TVSql ornegiyle calisir (FSql); ayni Ftb
@@ -100,11 +118,38 @@ type
     FUser: string;              // R-12 devam: auth
     FPass: string;              // R-12 devam
     FMaxConns: Integer;      // R-12 devam: maksimum TCP baglanti
+    { v3.62 / SKILL5 5.2: guvenli varsayilanlar. Eskiden `VdbTcpListen(FPort)`
+      cagrisi TUM IPv4 arayuzlerinde dinliyordu ('0.0.0.0'); artik varsayilan
+      yalniz loopback'tir ve uzak dinleme ACIK bir opt-in ister. Bu protokolde
+      TLS YOKTUR; uzak acmak parolayi acik metin tasir (bkz. ExposureError). }
+    FBindHost: string;
+    FAllowInsecureRemote: Boolean;
+    { v3.62 / SKILL5 9.3: kabul edilen her sokete okuma/yazma zaman asimi.
+      Onceden HIC kurulmuyordu: tek bayt gonderip bekleyen istemci slotu ve
+      is parcacigini sinirsiz tutuyordu. }
+    FReadTimeoutMs: Integer;
+    FWriteTimeoutMs: Integer;
+    FSockTimeoutFunc: TVdbTcpSockTimeoutFunc;
+    { v3.62 / SKILL5 5.2: kimlik dogrulama denemesi sinirlama. }
+    FAuthLock: TCriticalSection;
+    FAuthPenalty: TDictionary<string, TVdbTcpAuthPenalty>;
+    FAuthMaxFailures: Integer;      // kullanici basina (pencere icinde)
+    FAuthFailureWindowSec: Integer; // sayac penceresi
+    FAuthLockoutSec: Integer;       // esik asilinca kilit suresi
+    FAuthGlobalMaxFailures: Integer;// tum kullanicilar toplami (tarama korumasi)
+    FTotalFailures: Integer;
+    FTotalFailStart: Int64;
     procedure SetMaxConns(AValue: Integer);
     procedure AddConn(AConn: TVdbServerConn);
     { P-185: bitmis baglanti thread'lerini topla (AddConn + kabul dongusu). }
     procedure GcFinished;
+    { v3.62: kilit altinda, YALNIZ canli baglantilari sayar (SKILL5 ek
+      bulgu: `FConns.Count` kabul dongusunde KILITSIZ okunuyordu). }
+    function LiveConnCount: Integer;
     procedure CloseEngine;
+    procedure NoteAuthFailure(const AUser: string);
+    procedure NoteAuthSuccess(const AUser: string);
+    function AuthLocked(const AUser: string): Boolean;
   public
     constructor Create(const ADir: string; APort: Word);
     destructor Destroy; override;
@@ -128,9 +173,75 @@ type
       Sabit bir varsayilan kullanici/parola YOKTUR. }
     property User: string read FUser write FUser;
     property Password: string read FPass write FPass;
+    { v3.62 / SKILL5 5.2: dinleme adresi. Varsayilan '127.0.0.1' (loopback).
+      Ad cozumlemesi YAPILMAZ: 'localhost'/::1 IPv4 loopback'e eslenir,
+      diger adlar reddedilir (bkz. VdbResolveListenHost). }
+    property BindHost: string read FBindHost write FBindHost;
+    { Loopback disi dinlemeyi BILINCLI olarak kabul eder. Bu protokolde TLS
+      yoktur; acildiginda parola ag uzerinden ACIK METIN gider. Varsayilan
+      False: uzak bind politika tarafindan reddedilir. }
+    property AllowInsecureRemote: Boolean read FAllowInsecureRemote
+      write FAllowInsecureRemote;
+    { Kabul edilen her sokete uygulanan okuma/yazma zaman asimi (ms).
+      0 = o yonde zaman asimi yok. Varsayilan 30000 (PostgreSQL sunucusuyla
+      ayni). Yalniz YENI kabul edilen baglantilari etkiler. }
+    property ReadTimeoutMs: Integer read FReadTimeoutMs write FReadTimeoutMs;
+    property WriteTimeoutMs: Integer read FWriteTimeoutMs write FWriteTimeoutMs;
+    { v3.62: zaman asimi kurma kancasi. Yalniz test icindir; uretimde nil. }
+    property SockTimeoutFunc: TVdbTcpSockTimeoutFunc read FSockTimeoutFunc
+      write FSockTimeoutFunc;
+    { v3.62 / SKILL5 5.2: kimlik dogrulama sinirlari. 0 = o sinir devre disi.
+      Varsayilanlar PostgreSQL sunucusuyla ayni: 5 / 60 sn / 30 sn / 200. }
+    property AuthMaxFailures: Integer read FAuthMaxFailures
+      write FAuthMaxFailures;
+    property AuthFailureWindowSeconds: Integer read FAuthFailureWindowSec
+      write FAuthFailureWindowSec;
+    property AuthLockoutSeconds: Integer read FAuthLockoutSec
+      write FAuthLockoutSec;
+    property AuthGlobalMaxFailures: Integer read FAuthGlobalMaxFailures
+      write FAuthGlobalMaxFailures;
+    { Kilit altinda okunan CANLI baglanti sayisi (bitmis thread'ler sayilmaz).
+      Kabul dongusundeki kapasite karari da bunu kullanir. }
+    property ConnCount: Integer read LiveConnCount;
+    { Uzak dinleme politikasini denetler: '' = kabul, aksi halde Start'in
+      dondurecegi hata metni. Saf karar; ag ACMAZ. }
+    function ExposureError: string;
+    { Cezalari sifirlar (testler ve yonetici mudahalesi icin). }
+    procedure AuthReset;
   end;
 
 implementation
+
+{ --------------------------------------------------- kimlik dogrulama yardimci }
+
+{ v3.62 / SKILL5 5.2: sabit zamanli karsilastirma. Uzunluk farki erken
+  doner (uzunluk zaten protokolde acik); ICERIK farki erken donmez. Onceki
+  `pass = FPass` karsilastirmasi ilk farkli baytta donuyordu. }
+function TcpConstTimeEq(const A, B: string): Boolean;
+var
+  i: Integer;
+  d: Byte;
+begin
+  if Length(A) <> Length(B) then Exit(False);
+  d := 0;
+  for i := 1 to Length(A) do
+    d := d or (Byte(A[i]) xor Byte(B[i]));
+  Result := d = 0;
+end;
+
+{ R-4 modeli: ceza penceresi monotonik saatle olculur (duvar saati geri
+  adim atinca kilit gereksiz uzar, ileri gidince erken acilir). }
+function TcpAuthNowMs: Int64;
+begin
+  Result := Int64(GetTickCount64);
+end;
+
+function TcpAuthWindowExpired(AStartMs: Int64; AWindowSec: Integer): Boolean;
+begin
+  if AStartMs <= 0 then Exit(True);
+  if AWindowSec <= 0 then Exit(False);
+  Result := (TcpAuthNowMs - AStartMs) > Int64(AWindowSec) * 1000;
+end;
 
 { ------------------------------------------------------------ yanit yazici }
 
@@ -208,6 +319,7 @@ procedure TVdbServerConn.Execute;
 var
   typ: Byte;
   sql, user, pass, sqlP: string;
+  okUser, okPass: Boolean;
   mag: array[0..3] of AnsiChar;
   Res: TSqlResult;
   err: string;
@@ -259,10 +371,17 @@ begin
             user := ''; pass := '';
             if not VdbRecvStr(FSock, user) then Break;
             if not VdbRecvStr(FSock, pass) then Break;
-            // auth kontrolu
-            if (FServer.FUser <> '') and (user = FServer.FUser) and
-               (pass = FServer.FPass) then
+            { v3.62 / SKILL5 5.2: auth kontrolu.
+              (a) Kilitli kullanici PAROLA KARSILASTIRILMADAN reddedilir
+                  (parola taramasi cezayi atlayamaz).
+              (b) Karsilastirma SABIT ZAMANLI ve HER IKI alan icin de yapilir
+                  (yanlis kullanici adi erken donup zaman sizdirmaz).
+              (c) Basarisiz deneme ceza defterine yazilir. }
+            okUser := TcpConstTimeEq(user, FServer.FUser);
+            okPass := TcpConstTimeEq(pass, FServer.FPass);
+            if okUser and okPass and (not FServer.AuthLocked(user)) then
             begin
+              FServer.NoteAuthSuccess(user);
               FSessionActive := True;
               { Sprint A (3.2): global oturumdan YETKI OKUNMAZ. Bu yalniz
                 basarili giris sayacidir; baska baglantiyi etkilemez. }
@@ -274,6 +393,7 @@ begin
             else
             begin
               FSessionActive := False;
+              FServer.NoteAuthFailure(user);
               if not VdbSendU8(FSock, VDBS_RSP_AUTH) then Break;
               if not VdbSendU8(FSock, 1) then Break;   // status: FAIL
               if not VdbSendU8(FSock, VDBS_TERM) then Break;
@@ -371,6 +491,8 @@ end;
 procedure TVdbServerAccept.Execute;
 var
   sock: TVdbSocket;
+  tmrOk: Boolean;
+  tmrFn: TVdbTcpSockTimeoutFunc;
 begin
   while not FServer.FStopping do
   begin
@@ -381,12 +503,33 @@ begin
       VdbSockClose(sock);
       Break;
     end;
+    { v3.62 / SKILL5 5.2 + 9.3: zaman asimlari KABUL ANINDA kurulur; boylece
+      yarim el sikismasi ve yarim login paketi de korunur. ONCEDEN hic
+      kurulmuyordu: tek bayt gonderip bekleyen istemci slotu ve is
+      parcacigini sinirsiz tutuyordu.
+      FAIL-CLOSED: kurulum basarisizsa baglanti HIC sunulmaz (el sikismasi
+      gonderilmez). Iki zaman asimi da 0 ise (bilerek kapatilmis) kurulum
+      basarili sayilir.
+      FPC 3.2.4 / Delphi modu notu: yordam degiskenini `<> nil` ile
+      karsilastirmak ayni rutindeki sonraki cagrisinin imzasini bozuyor;
+      nil denetimi `Assigned` ile yapilir (bkz. VDbPgWire, v3.60). }
+    tmrFn := FServer.FSockTimeoutFunc;
+    if not Assigned(tmrFn) then
+      tmrFn := @VdbSockSetTimeouts;
+    tmrOk := tmrFn(sock, FServer.FReadTimeoutMs, FServer.FWriteTimeoutMs);
+    if not tmrOk then
+    begin
+      VdbSockClose(sock);
+      Continue;
+    end;
     { P-185: kapasite kontrolu ONCESI bitmis baglantilari topla — aksi
       halde yarim kalan thread'ler slot sayilir ve sunucu 'kapasite dolu'
-      kilidine girebilirdi. }
-    FServer.GcFinished;
-    { R-12 devam: kapasite (havuz-slot sayisi) kontrolu }
-    if FServer.FConns.Count >= FServer.FMaxConns then
+      kilidine girebilirdi.
+      v3.62 / SKILL5 ek bulgu: bu kontrol ONCEDEN `FConns.Count` alanini
+      KILITSIZ okuyordu (baska thread AddConn/GcFinished ile listeyi
+      degistirirken veri yarisi). Artik kilit altinda, yalniz CANLI
+      baglantilari sayan LiveConnCount kullanilir. }
+    if FServer.LiveConnCount >= FServer.FMaxConns then
     begin
       // kapasite dolu -> baglanti refet (slot bosalana kadar)
       VdbSendU8(sock, VDBS_RSP_ERROR);
@@ -411,6 +554,23 @@ begin
   FConnsLock := TCriticalSection.Create;
   FConns := TList.Create;
   FMaxConns := 64;
+  { v3.62 / SKILL5 5.2: guvenli varsayilanlar. Eskiden dinleme
+    `VdbTcpListen(FPort)` ile TUM IPv4 arayuzlerinde aciliyordu. }
+  FBindHost := '127.0.0.1';
+  FAllowInsecureRemote := False;
+  { v3.62 / SKILL5 9.3: zaman asimlari (PostgreSQL sunucusuyla ayni). }
+  FReadTimeoutMs := 30000;
+  FWriteTimeoutMs := 30000;
+  FSockTimeoutFunc := nil;   // uretimde gercek VdbSockSetTimeouts
+  { v3.62 / SKILL5 5.2: ceza defteri (R-4 modeli). }
+  FAuthLock := TCriticalSection.Create;
+  FAuthPenalty := TDictionary<string, TVdbTcpAuthPenalty>.Create;
+  FAuthMaxFailures := 5;
+  FAuthFailureWindowSec := 60;
+  FAuthLockoutSec := 30;
+  FAuthGlobalMaxFailures := 200;
+  FTotalFailures := 0;
+  FTotalFailStart := 0;
 end;
 
 procedure TVdbSqlServer.SetMaxConns(AValue: Integer);
@@ -425,6 +585,8 @@ begin
   Stop;
   FConns.Free;
   FConnsLock.Free;
+  FAuthPenalty.Free;
+  FAuthLock.Free;
   inherited;
 end;
 
@@ -437,6 +599,8 @@ begin
 end;
 
 function TVdbSqlServer.Start(out AErr: string): Boolean;
+var
+  rh: string;
 begin
   Result := False;
   AErr := '';
@@ -453,6 +617,16 @@ begin
     AErr := 'kimlik bilgileri ayarlanmadi: Start oncesi User ve Password zorunlu';
     Exit;
   end;
+  { v3.62 / SKILL5 5.2: UZAK DINLEME POLITIKASI — motor/soket ACILMADAN
+    once, fail-closed. Bu protokolde TLS yoktur; loopback disi bind parolayi
+    acik metin tasir, bu yuzden varsayilan olarak reddedilir. }
+  AErr := ExposureError;
+  if AErr <> '' then Exit;
+  { Ad normalizasyonu/dogrulama (localhost -> 127.0.0.1, gecersiz ad reddi).
+    ATrustOnlyLoopback=False: politika yukarida zaten uygulandi; burada
+    yalniz adin IPv4 noktali gosterim oldugu dogrulanir. }
+  rh := VdbResolveListenHost(FBindHost, False, AErr);
+  if AErr <> '' then Exit;
   { 1) motor: SOMUT TIP YOK. VdbOpenOrCreate v3 dosyasini acar/olusturur.
     (v2 dosyasi icin VdbOpen(... AllowV2=True) gerekir; sunucu
     varsayilan olarak v3 kullanir - v3 standarttir.) }
@@ -469,10 +643,10 @@ begin
     end;
   end;
   { 2) dinleme (SENKRON: port musait degilse hemen belli olur) }
-  FListen := VdbTcpListen(FPort);
+  FListen := VdbTcpListen(rh, FPort);
   if FListen = VDB_SOCK_INVALID then
   begin
-    AErr := 'dinleme kurulamadi (port ' + IntToStr(FPort) + ')';
+    AErr := 'dinleme kurulamadi (' + rh + ':' + IntToStr(FPort) + ')';
     CloseEngine;
     Exit;
   end;
@@ -546,6 +720,110 @@ begin
     GcFinished;
   finally
     FConnsLock.Leave;
+  end;
+end;
+
+{ v3.62 / SKILL5 ek bulgu: kapasite karari kilit altinda ve YALNIZ canli
+  baglantilar uzerinden verilir. Kilit, GcFinished'in listeyi degistirmesi
+  ile sayim arasindaki veri yarisini kapatir. }
+function TVdbSqlServer.LiveConnCount: Integer;
+begin
+  Result := 0;
+  FConnsLock.Enter;
+  try
+    GcFinished;
+    Result := FConns.Count;
+  finally
+    FConnsLock.Leave;
+  end;
+end;
+
+{ v3.62 / SKILL5 5.2: uzak dinleme politikasi. Saf karar; ag ACMAZ. }
+function TVdbSqlServer.ExposureError: string;
+begin
+  Result := '';
+  if VdbHostIsLoopback(FBindHost) then Exit;
+  if FAllowInsecureRemote then Exit;
+  Result := 'guvensiz uzak dinleme (' + FBindHost +
+    '): bu protokolde TLS yok, parola acik metin gider; yalniz loopback' +
+    ' onerilir. Bilincli olarak kabul etmek icin AllowInsecureRemote=True' +
+    ' yapin (ve agi guvenilir bir tuvelle/TLS sonlandirici ile koruyun)';
+end;
+
+{ v3.62 / SKILL5 5.2: ceza defteri. Cagiran kilidi tutmaz. }
+procedure TVdbSqlServer.NoteAuthFailure(const AUser: string);
+var
+  pen: TVdbTcpAuthPenalty;
+  have: Boolean;
+begin
+  if AUser = '' then Exit;
+  FAuthLock.Enter;
+  try
+    if (FAuthGlobalMaxFailures > 0) and
+       TcpAuthWindowExpired(FTotalFailStart, FAuthFailureWindowSec) then
+    begin
+      FTotalFailures := 0;
+      FTotalFailStart := TcpAuthNowMs;
+    end;
+    if FAuthGlobalMaxFailures > 0 then Inc(FTotalFailures);
+
+    have := FAuthPenalty.TryGetValue(AUser, pen);
+    if (not have) or TcpAuthWindowExpired(pen.FirstAt, FAuthFailureWindowSec) then
+    begin
+      pen.Failures := 0;
+      pen.FirstAt := TcpAuthNowMs;
+      pen.LockedUntil := 0;
+    end;
+    Inc(pen.Failures);
+    if (FAuthMaxFailures > 0) and (pen.Failures >= FAuthMaxFailures) and
+       (FAuthLockoutSec > 0) then
+      pen.LockedUntil := TcpAuthNowMs + Int64(FAuthLockoutSec) * 1000;
+    FAuthPenalty.AddOrSetValue(AUser, pen);
+  finally
+    FAuthLock.Leave;
+  end;
+end;
+
+procedure TVdbSqlServer.NoteAuthSuccess(const AUser: string);
+begin
+  FAuthLock.Enter;
+  try
+    FAuthPenalty.Remove(AUser);
+  finally
+    FAuthLock.Leave;
+  end;
+end;
+
+function TVdbSqlServer.AuthLocked(const AUser: string): Boolean;
+var
+  pen: TVdbTcpAuthPenalty;
+begin
+  Result := False;
+  FAuthLock.Enter;
+  try
+    { Parola taramasi korumasi: pencere icinde toplam esik asildiysa
+      kullanici adindan bagimsiz olarak herkes kilitlenir. }
+    if (FAuthGlobalMaxFailures > 0) and
+       (FTotalFailures >= FAuthGlobalMaxFailures) and
+       (not TcpAuthWindowExpired(FTotalFailStart, FAuthFailureWindowSec)) then
+      Exit(True);
+    if not FAuthPenalty.TryGetValue(AUser, pen) then Exit;
+    if pen.LockedUntil <= 0 then Exit;
+    Result := pen.LockedUntil > TcpAuthNowMs;
+  finally
+    FAuthLock.Leave;
+  end;
+end;
+
+procedure TVdbSqlServer.AuthReset;
+begin
+  FAuthLock.Enter;
+  try
+    FAuthPenalty.Clear;
+    FTotalFailures := 0;
+    FTotalFailStart := 0;
+  finally
+    FAuthLock.Leave;
   end;
 end;
 

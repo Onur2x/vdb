@@ -54,7 +54,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `cache_pressure` | **onbellek tukenmesi / tahliye** (SKILL3 §12.1): 8 sayfalik havuzla (~32 KB) havuzdan cok daha buyuk bir tablo uzerinde calisilir. Tam tarama **butun satirlari** dogru okur (tahliye + yeniden yukleme veri kaybetmez), `PoolUsed` havuz boyunu asmaz, miss sayaci gercek tahliyeyi kanitlar, tek islemde 2000 satir guncellemesi (kirli sayfa tahliye yolu) commit edilir ve **yeniden acilista** guncel veri kalicidir; temiz kapanistan sonra yalniz `.odb` kalir |
 | `page_corrupt` | **okuma yolunda sayfa butunlugu** (SKILL3 §5.3/§12.1): normal okuma yolu artik dogrulama yapar. Her veri sayfasinin govdesinde tek bayt bozulmasi, bozuk sihirli sayi ve yanlis sayfa imaji (sayfa 2 imaji sayfa 3'e kopyalanmis) kontrollu `ecCorrupt` uretir; dosyanin saglam kopyasi hala kusursuz taranir (kapi yanlis pozitif uretmez). Sifreli dosyada GCM etiketi zaten dogruluyor |
 | `server_harden` | dinleme adresi, `--trust` sinirlari, TLS zorunlulugu. **S12-S15 (Sprint G1, F-37)**: `TVdbPgServer` artik **guvenli varsayilanlarla** gelir - bind varsayilani `127.0.0.1`, uzak (loopback disi) adres ancak kimlik dogrulama **ve** `RequireTls=True` ile kabul edilir (`AllowInsecureRemote=True` bilincli kacis kapisi); `Start` ham adresi degil, `VdbResolveListenHost` ile **cozulmus** adresi dinler ve karar motor/soket acilmadan verilir. **36 kontrol**, iki platformda 36/0; on-kapi (HEAD + yalnizca yeni API kabugu) **6 FAIL** |
-| `server_failure` | **sunucu hata yollari** (SKILL3 §12.1): (a) `MaxConns=1` iken ikinci baglanti `RSP_ERROR` + `kapasite dolu` alip kapanir, birinci baglanti sorguya devam eder; (b) yeni baglantiya 64 bayt cop ($FF) yazilip kapatilir, sunucu yasar; (c) `CMD_QUERY` ardindan sahte **96 MiB** uzunluk oneki gonderilir - v3.39 `VDBS_MAX_RECV_STR` (64 MiB) oneki tahsis yapmadan reddeder, sunucu yasar; (d) acik baglanti varken `Stop` doner ve `Ready=False` olur; (e) `.odb` dosyasi yerinde kalir ve yeniden acilip satirlari okur |
+| `server_failure` | **sunucu hata yollari ve guvenli varsayilanlar** (SKILL3 §12.1, SKILL5 §5.1/§5.2/§9.3): (a) `MaxConns=1` iken ikinci baglanti `RSP_ERROR` + `kapasite dolu` alip kapanir, birinci baglanti sorguya devam eder; (b) yeni baglantiya 64 bayt cop ($FF) yazilip kapatilir, sunucu yasar; (c) `CMD_QUERY` ardindan sahte **96 MiB** uzunluk oneki gonderilir - v3.39 `VDBS_MAX_RECV_STR` (64 MiB) oneki tahsis yapmadan reddeder, sunucu yasar; (d) acik baglanti varken `Stop` doner ve `Ready=False` olur; (e) `.odb` dosyasi yerinde kalir ve yeniden acilip satirlari okur; (f) v3.62 guvenli varsayilanlar: SF9/SF9b varsayilan bind `127.0.0.1` ve kacis kapisi kapali, SF10/SF10b uzak bind politika ile reddedilir ve motor acilmaz, SF11 opt-in politikadan gecer, SF12/SF12b sessiz baglanti sunucu zaman asiminda kapanir, SF13 zaman asimi kurulamazsa baglanti sunulmaz, SF14/SF14b/SF14c esik sonrasi dogru parola reddedilir ve `AuthReset` sonrasi kabul, SF15/SF15b canli baglanti sayimi 1 -> 0 (**30 PASS / 0 FAIL**; on-kapi 7 FAIL) |
 | `disk_full` | **disk dolu / kisa yazma** (SKILL3 §12.1 + SKILL5 8.1): sayfa, meta ve **WAL** yazmalari tek noktadan (`WriteBytesChecked` / `WriteChecked`) gecer; enjekte edilen sert hata ve yarim yazma (gercek `ENOSPC` davranisi) kontrollu `ecIOError` uretir, surec cokmez, cerceve **kirli** kalir. Basarisiz commit **hayalet satir** birakmaz (ayni oturumda `COUNT(*)` durabil durumla ayni). Hata + `ROLLBACK` sonrasi onayli satirlar durur, hata giderilince checkpoint ve yeni commit calisir, yeniden acilista tum onayli satirlar okunur ve `VERIFY` temizdir. **DF10a-DF10c (Sprint D2)**: checkpoint hata yolunda surecler arasi yazma kilidi **sizmaz** - meta yazimina sert hata enjekte edilip checkpoint `ecIOError` ile dusuruldukten sonra **ikinci bir backend** ayni dosyaya yazabilir ve yazdigi satiri okuyabilir. 16 -> **19 kontrol**, iki platformda 19/0. Duzeltme oncesi kaynakla (`git archive a3b97da`) **4 kontrol FAIL** (DF10b/DF10c + DF6/DF6b - sizinti kapanistan sonra da yeniden acilisi kilitliyordu) |
 | `txn_limit` | **islem sayisi / yazar cakismasi** (SKILL3 §12.2): 300 kisa islem ve 300 islemin 75'i geri alinarak commit sayisi birebir dogrulanir (sessiz kayip yok). Belgelenen v3 semantigi olculur: ic ice `BEGIN`, islem yokken `COMMIT`/`ROLLBACK` **sessiz no-op**'tur (tek islem katmani). Dosya basina **tek yazar rezervasyonu** vardir: bir oturum tutarken digeri kisa busy suresiyle kontrollu `mesgul` hatasi alir, `ROLLBACK` ile temizlenir, rezervasyon birakilinca ayni islem basariyla tamamlanir; yeniden acilista tum satirlar + `VERIFY` temiz |
 | `oom` | **bellek tukenmesi** (SKILL3 §12.1): `VDbMM`'e yalniz test icin `MMInjectFault` kancasi eklendi (esik ustundeki tahsislerde bir kez `EOutOfMemory`, sonra kapanir). Okuma ve yazma yollari ayri olculur; nil donen tahsis `SetLength` icinde `EAccessViolation`'a donustugu icin **yanlis** bir benzetimdi, gercek heap gibi `EOutOfMemory` atiliyor. **Bulunan gercek hata (F16, KRITIK):** yazma sirasindaki tahsis hatasi dosyada taninmayan sayfa birakiyordu (`EVdbHeap: sayfa N taninmiyor`); `ExtendFile` once buyutup sonra `Inc(FPageCount)` yapar, `AllocPage` yalnizca bu cagrinin actigi sayfayi geri alir. Hata sonrasi oturum yazmaya devam eder, hayalet satir yok, checkpoint ve yeniden acilis 200 satir + temiz `VERIFY` |
@@ -1237,4 +1237,48 @@ kaldirildi:
     yok durumu `Start` tarafindan ayrica reddedilir (bu daha eski bir yol,
     degismedi). Gercek TLS el sikismasi bu kapida olculmez (`tls_client`
     kapisi ve Linux kosusu kapsar).
+
+- Kirk altinci kosu (v3.62, Sprint H - ozel TCP SQL sunucusu guvenligi):
+  iki platform da YESIL. Git Bash/Windows **48 kapi** PASS, WSL x86_64 Linux
+  **49 kapi** PASS, FAIL 0 (`gatesJ.log` -> `KOSAN KAPI: 48`, `SUITE_EXIT=0`;
+  `linJ.log` -> `KOSAN KAPI: 49`, `SUITE_EXIT=0`). Windows'ta `tls_client`
+  yine **SKIP** (OpenSSL DLL'i yok; SKIP != PASS); Linux'ta kostu: 6/0.
+  - **F-38 (KRITIK, KAPALI)**: ozel TCP SQL sunucusu (`VDbSqlServer`) PG
+    sunucusundan bagimsiz olarak dort noktadan guvensizdi. (a) `Start`
+    dinlemeyi tek argumanli `VdbTcpListen(FPort)` ile aciyordu = `'0.0.0.0'`:
+    farkinda olmadan tum arayuzlerde dinleme; protokolde TLS yok, parola
+    **acik metin**. (b) `LOGIN` parolayi duz `=` ile karsilastiriyor ve deneme
+    sayisinda **sinir yoktu** (PG tarafinda ceza defteri varken burada yok;
+    30 s'de sinirsiz deneme). (c) Kabul edilen sokette **hic zaman asimi
+    kurulmuyordu**: tek bayt gonderip bekleyen istemci is parcacigini ve
+    slotunu tutup `MaxConns` kadar bos soketle sunucuyu kapatabiliyordu.
+    (d) `FConns.Count` **kilitsiz** okunuyor ve `GcFinished` kabul dongusunde
+    kilitsiz cagriliyordu; bitmis thread listede kalirsa slot geri
+    kazanilmiyordu (olculen: baglanti kapandi, sayim `1`'de kaldi).
+  - **Duzeltme**: fail-closed ve guvenli varsayilan. Bind varsayilani
+    `'127.0.0.1'`; `Start` once saf `ExposureError` karari verir (kimlik
+    dogrulama ve/veya TLS yok ise loopback disi adres **reddedilir**;
+    `AllowInsecureRemote=True` varsayilan **False**), sonra ad
+    `VdbResolveListenHost` ile normalize edilir; karar motor/soket acilmadan
+    verilir. Parola **sabit zamanli** karsilastirma (uzunluk + XOR birikimi)
+    ve her iki alan; kullanici bazli + global ceza defteri (5 hata / 60 s ->
+    30 s kilit, 200 global hata) esik asilinca **dogru parola da reddedilir**.
+    Soket zaman asimi kabulde kurulur, kurulamazsa baglanti **sunulmaz**
+    (`SockTimeoutFunc` test kancasi, uretimde nil). Sayim/GC kilit altinda.
+    V2 ve dosya bicimi v5 degismedi.
+  - **Kapi**: `server_failure` 16 -> **30** kontrol (SF9-SF15). SF9 varsayilan
+    bind; SF9b kacis kapisi kapali; SF10/SF10b uzak bind politika ile reddedilir
+    ve motor acilmaz; SF11 opt-in politikadan gecer; SF12/SF12b sessiz baglanti
+    sunucu zaman asiminda kapanir (olculen 797 ms); SF13 zaman asimi
+    kurulamazsa baglanti sunulmaz; SF14/SF14b/SF14c esik sonrasi dogru parola
+    reddedilir, `AuthReset` sonrasi kabul; SF15/SF15b canli sayim 1 -> 0.
+    On-kapi (duzeltme oncesi kurulum: HEAD + yalnizca yeni API kabugu;
+    politika/kilit/zaman asimi yok) **7 FAIL**: SF9, SF10, SF10b, SF12b, SF13,
+    SF14b, SF15b.
+  - **Durust sinir**: SF9b/SF11/SF14/SF14c/SF15 bilerek **ayirt edici
+    degildir**; asiri siki bir duzeltmenin normal yolu kirmadigini korurlar.
+    SF11 yalniz "politika metni yok" kosuluna bakar (adres bu makinede
+    olmadigi icin bind yine basarisiz olur); gercek uzak erisim bu kapida
+    olculmez. Sabit zamanli karsilastirmanin **zamanlama** farki olculmedi;
+    kapi yalniz davranisi (esik, kilit, red) dogrular.
 

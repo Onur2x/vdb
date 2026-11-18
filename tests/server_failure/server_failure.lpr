@@ -16,6 +16,15 @@ program server_failure;
     SF6 bozuk uzunluk oneki (2 GB string) kontrollu reddedilir, sunucu yasar
     SF7 acik baglanti varken Stop doner ve port yeniden kullanilabilir
     SF8 Stop sonrasi veritabani hala okunabilir (veri kaybi yok)
+    SF9  varsayilan bind adresi loopback; uzak dinleme kapali
+    SF10 uzak bind + bilincli opt-in yok -> Start politika ile REDDEDILIR,
+         motor/soket ACILMAZ
+    SF11 AllowInsecureRemote=True -> politika gecer (bilincli kabul)
+    SF12 okuma zaman asimi: sessiz baglanti sunucu tarafinda kapatilir
+    SF13 zaman asimi kurucusu basarisiz olursa baglanti fail-closed kapanir
+    SF14 kimlik cezasi: esik asilinca DOGRU parola da reddedilir; AuthReset
+         acar
+    SF15 ConnCount canli baglanti sayisini kilit altinda verir
 
   Derleme: fpc. Cikis kodu = basarisiz kontrol sayisi.
 }
@@ -31,6 +40,14 @@ const
 
 var
   GPass, GFail: Integer;
+
+{ SF13 icin sahte zaman asimi kurucusu: her zaman basarisiz. Amac sunucunun
+  TMR kurulamadiginda baglantiyi KAPALI tutup tutmadigini olcmek. }
+function FailSockTimeout(ASock: TVdbSocket; ARecvMs: Integer;
+  ASendMs: Integer): Boolean;
+begin
+  Result := False;
+end;
 
 procedure Chk(const AName: string; ACond: Boolean; const ADetail: string);
 begin
@@ -168,6 +185,8 @@ var
   i: Integer;
   junk: array[0..63] of Byte;
   ok: Boolean;
+  t0: QWord;
+  cnt: Integer;
 
 begin
   GPass := 0;
@@ -307,6 +326,150 @@ begin
   finally
     Be := nil;
     BeC := nil;
+  end;
+
+  { --- v3.62 / SKILL5 5.1, 5.2, 9.3: sunucu sertlestirme --- }
+  WriteLn;
+
+  { SF9/SF10/SF11: dinleme politikasi. Karar ag ACMADAN verilir. }
+  Srv := TVdbSqlServer.Create(D, Word(BASE_PORT + 70));
+  try
+    Chk('SF9 varsayilan bind loopback', Srv.BindHost = '127.0.0.1',
+      'bind=' + Srv.BindHost);
+    Chk('SF9b varsayilan uzak dinleme kapali', not Srv.AllowInsecureRemote, '');
+    Srv.BindHost := '192.168.1.20';
+    Srv.User := 'sf';
+    Srv.Password := 'parola123';
+    ok := Srv.Start(err);
+    Chk('SF10 uzak bind politika ile reddedildi',
+      (not ok) and (Pos('guvensiz uzak dinleme', err) = 1), 'hata=' + err);
+    Chk('SF10b politika motoru acmadi', not Srv.Ready, '');
+    { SF11: bilincli opt-in. Politika artik engel degildir; dinleme yine
+      basarisiz olabilir cunku 192.168.1.20 bu makinede yok. }
+    Srv.AllowInsecureRemote := True;
+    Srv.Start(err);
+    Chk('SF11 opt-in ile politika gecti',
+      Pos('guvensiz uzak dinleme', err) = 0, 'hata=' + err);
+  finally
+    FreeAndNil(Srv);
+  end;
+
+  { SF12-SF15: calisan sunucu. Kisa okuma zaman asimi + genis tavan. }
+  Srv := nil;
+  port := 0;
+  for i := 0 to 59 do
+  begin
+    Srv := TVdbSqlServer.Create(D, Word(BASE_PORT + 80 + i));
+    Srv.User := 'sf';
+    Srv.Password := 'parola123';
+    Srv.MaxConns := 16;
+    Srv.ReadTimeoutMs := 800;
+    Srv.WriteTimeoutMs := 4000;
+    if Srv.Start(err) then
+    begin
+      port := Srv.Port;
+      Break;
+    end;
+    FreeAndNil(Srv);
+  end;
+  Chk('SF12 zaman asimi testi icin sunucu acildi',
+    (Srv <> nil) and Srv.Ready, 'port=' + IntToStr(port) + ' ' + err);
+  if Srv = nil then
+  begin
+    WriteLn('SONUC: ', GPass, ' PASS, ', GFail, ' FAIL');
+    Halt(1);
+  end;
+
+  try
+    { SF12: sessiz baglanti. El sikismasi okunur, sonra hicbir sey
+      gonderilmez. Sunucu 800 ms okuma zaman asiminda soketi kapatir.
+      Istemci tarafi 5000 ms bekler: kapanma 3000 ms'den ONCE olculurse
+      gercekten sunucu kapatti demektir (istemci zaman asimi degil). }
+    S2 := Conn(port);
+    ok := (S2 <> VDB_SOCK_INVALID) and ReadHandshake(S2, ver, name);
+    Chk('SF12 sessiz baglanti kuruldu', ok, '');
+    ok := False;
+    t0 := 0;
+    if S2 <> VDB_SOCK_INVALID then
+    begin
+      VdbSockSetTimeouts(S2, 5000, 5000);
+      t0 := GetTickCount64;
+      if not VdbRecvU8(S2, ver) then
+        ok := (GetTickCount64 - t0) < 3000;
+      VdbSockClose(S2);
+    end;
+    Chk('SF12b sessiz baglanti sunucu zaman asiminda kapatildi', ok,
+      'gecen_ms=' + IntToStr(Int64(GetTickCount64 - t0)));
+
+    { SF13: zaman asimi kurucusu basarisiz olursa sunucu soketi kapatmali
+      (fail-closed). Burada el sikismasi HIC gelmemelidir. }
+    Srv.SockTimeoutFunc := @FailSockTimeout;
+    S2 := Conn(port);
+    ok := False;
+    if S2 <> VDB_SOCK_INVALID then
+    begin
+      VdbSockSetTimeouts(S2, 3000, 3000);
+      ok := not ReadHandshake(S2, ver, name);
+      VdbSockClose(S2);
+    end;
+    Chk('SF13 zaman asimi kurulamazsa baglanti kapatildi', ok, '');
+    { Seam'i kaldir: sonraki kontroller normal yoldan gecmeli. }
+    Srv.SockTimeoutFunc := nil;
+
+    { SF14: kimlik cezasi. 5 yanlis paroladan sonra DOGRU parola da
+      reddedilir; AuthReset acar. }
+    for i := 1 to 5 do
+    begin
+      S2 := Conn(port);
+      if S2 <> VDB_SOCK_INVALID then
+      begin
+        ReadHandshake(S2, ver, name);
+        SendLogin(S2, 'sf', 'yanlis' + IntToStr(i));
+        VdbSockClose(S2);
+      end;
+    end;
+    S2 := Conn(port);
+    ok := (S2 <> VDB_SOCK_INVALID) and ReadHandshake(S2, ver, name);
+    Chk('SF14 kilit oncesi baglanti kuruldu', ok, '');
+    ok := False;
+    if S2 <> VDB_SOCK_INVALID then
+    begin
+      ok := SendLogin(S2, 'sf', 'parola123');
+      VdbSockClose(S2);
+    end;
+    Chk('SF14b esik asilinca dogru parola da reddedildi', not ok, '');
+    Srv.AuthReset;
+    S2 := Conn(port);
+    ok := (S2 <> VDB_SOCK_INVALID) and ReadHandshake(S2, ver, name);
+    ok := ok and SendLogin(S2, 'sf', 'parola123');
+    if S2 <> VDB_SOCK_INVALID then VdbSockClose(S2);
+    Chk('SF14c AuthReset sonrasi dogru parola kabul edildi', ok, '');
+
+    { SF15: ConnCount canli sayim (kilit altinda). Baglanti eklendikten
+      sonra 1, kapanip toplandiktan sonra 0 gorulmelidir. }
+    S2 := Conn(port);
+    ok := (S2 <> VDB_SOCK_INVALID) and ReadHandshake(S2, ver, name);
+    cnt := -1;
+    for i := 0 to 20 do
+    begin
+      cnt := Srv.ConnCount;
+      if cnt = 1 then Break;
+      Sleep(50);
+    end;
+    Chk('SF15 ConnCount canli baglanti sayar', ok and (cnt = 1),
+      'sayim=' + IntToStr(cnt));
+    if S2 <> VDB_SOCK_INVALID then VdbSockClose(S2);
+    cnt := -1;
+    for i := 0 to 80 do
+    begin
+      cnt := Srv.ConnCount;
+      if cnt = 0 then Break;
+      Sleep(50);
+    end;
+    Chk('SF15b kapanan baglanti sayimdan dustu', cnt = 0,
+      'sayim=' + IntToStr(cnt));
+  finally
+    FreeAndNil(Srv);
   end;
 
   WriteLn;
