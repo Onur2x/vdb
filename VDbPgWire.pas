@@ -162,9 +162,16 @@ type
     FAuth: TDictionary<string, TVdbPgScramUser>;
     FAuthLock: TCriticalSection;
     FRequireTls: Boolean;
-    { R-4: dinleme arayuzu. Varsayilan '0.0.0.0' (tum arayuzler); acik
-      (trust) modda cagiran '127.0.0.1' verir. Start'tan once ayarlanir. }
+    { R-4: dinleme arayuzu. v3.61'den itibaren varsayilan '127.0.0.1'
+      (yalniz yerel); tum arayuzler icin acikca '0.0.0.0' verilmelidir ve
+      bu durumda kimlik dogrulama + zorunlu TLS sarttir (bkz. F-37).
+      Start'tan once ayarlanir. }
     FBindHost: string;
+    { F-37: uzak (loopback disi) dinlemeyi guvenlik kosullari saglanmadan
+      acmaya izin verir. Varsayilan False. Yalniz TLS'i disarida sonlandiran
+      bir vekil arkasinda bilincli bir kurulum icindir; asla varsayilan
+      olmamalidir. }
+    FAllowInsecureRemote: Boolean;
     { R-4: kimlik dogrulama denemesi sinirlama (throttling/lockout).
       Basarisiz denemeler kullanici basina sayilir; esik asilinca kisa
       sureli kilit uygulanir. Ayarlar Start'tan once veya calisirken
@@ -230,8 +237,18 @@ type
     { True ise TLS'siz baglanti kimlik dogrulamadan once reddedilir.
       TLS sertifikasi ayarlanmamissa Start basarisiz olur. }
     property RequireTls: Boolean read FRequireTls write FRequireTls;
-    { R-4: dinleme arayuzu (noktali IPv4). Varsayilan '0.0.0.0'. }
+    { R-4: dinleme arayuzu (noktali IPv4). Varsayilan '127.0.0.1'.
+      v3.61 / F-37: uzak bir adres, kimlik dogrulama ve zorunlu TLS
+      olmadan reddedilir. }
     property BindHost: string read FBindHost write FBindHost;
+    { F-37: uzak dinlemeyi guvenlik kosullari olmadan acmaya izin verir.
+      Varsayilan False; acmak bilincli bir risk kabuludur. }
+    property AllowInsecureRemote: Boolean read FAllowInsecureRemote
+      write FAllowInsecureRemote;
+    { F-37: mevcut ayarlarla uzak dinlemenin guvenli olup olmadigini
+      bildirir. Bos dize = kabul; degilse Turkce gerekceyi doner.
+      Ag acmadan saf karar verir (kapi bunu dogrudan olcer). }
+    function ExposureError: string;
     property AuthMaxFailures: Integer read FAuthMaxFailures
       write FAuthMaxFailures;
     property AuthFailureWindowSeconds: Integer read FAuthFailureWindowSec
@@ -2494,7 +2511,11 @@ begin
   FTotalFailures := 0;
   FTotalFailStart := 0;
   FRequireTls := False;
-  FBindHost := '0.0.0.0';
+  { F-37: guvenli varsayilanlar. Eskiden '0.0.0.0' (tum arayuzler) ve
+    trust idi; artik yalniz yerel dinlenir ve uzak dinleme icin kimlik
+    dogrulama + zorunlu TLS sarttir. }
+  FBindHost := '127.0.0.1';
+  FAllowInsecureRemote := False;
 end;
 
 procedure TVdbPgServer.SetMaxConns(AValue: Integer);
@@ -2736,6 +2757,28 @@ begin
   end;
 end;
 
+function TVdbPgServer.ExposureError: string;
+begin
+  Result := '';
+  { R-4 / F-37: loopback disi dinleme varsayilan olarak YOK. Uzak dinleme
+    ancak kimlik dogrulama + ZORUNLU TLS ile acilir; AllowInsecureRemote
+    bilincli bir kacis kapisidir (or. TLS'i disarida sonlandiran vekil). }
+  if VdbHostIsLoopback(FBindHost) then Exit;
+  if FAllowInsecureRemote then Exit;
+  if not AuthRequired then
+  begin
+    Result := 'guvensiz uzak dinleme (' + FBindHost +
+      '): kimlik dogrulama yok; AddUser ile kullanici ekleyin ve' +
+      ' zorunlu TLS icin SetTlsFiles + RequireTls kullanin ya da' +
+      ' AllowInsecureRemote=True yapin';
+    Exit;
+  end;
+  if not FRequireTls then
+    Result := 'guvensiz uzak dinleme (' + FBindHost +
+      '): TLS zorunlu degil; SetTlsFiles + RequireTls=True verin ya da' +
+      ' AllowInsecureRemote=True yapin';
+end;
+
 function TVdbPgServer.GetAuthRequired: Boolean;
 begin
   FAuthLock.Enter;
@@ -2747,6 +2790,8 @@ begin
 end;
 
 function TVdbPgServer.Start(out AErr: string): Boolean;
+var
+  rh: string;
 begin
   Result := False;
   AErr := '';
@@ -2755,6 +2800,10 @@ begin
     AErr := 'sunucu zaten aktif';
     Exit;
   end;
+  { F-37: uzak dinleme kimlik dogrulama + zorunlu TLS olmadan reddedilir;
+    motor/soket acilmadan once karar verilir (fail closed). }
+  AErr := ExposureError;
+  if AErr <> '' then Exit;
   if FRequireTls and (FTlsCert = '') then
   begin
     AErr := 'TLS zorunlu ama sertifika ayarlanmadi';
@@ -2794,10 +2843,22 @@ begin
       end;
     end;
   end;
-  FListen := VdbTcpListen(FBindHost, FPort);
+  { R-4 / F-37: dinleme adresi normalizasyonu ve "trust yalniz loopback"
+    kurali burada da uygulanir. Bu kural VdbResolveListenHost'ta vardi ama
+    PG sunucusu onu HIC cagirmiyordu; ham '0.0.0.0' + trust kombinasyonu
+    dogrudan dinlemeye gidiyordu. }
+  rh := VdbResolveListenHost(FBindHost,
+    (not AuthRequired) and (not FAllowInsecureRemote), AErr);
+  if AErr <> '' then
+  begin
+    CloseTls;
+    CloseEngine;
+    Exit;
+  end;
+  FListen := VdbTcpListen(rh, FPort);
   if FListen = VDB_SOCK_INVALID then
   begin
-    AErr := 'dinleme kurulamadi (' + FBindHost + ':' +
+    AErr := 'dinleme kurulamadi (' + rh + ':' +
       IntToStr(FPort) + ')';
     CloseTls;
     CloseEngine;

@@ -53,7 +53,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `freelist` | **serbest sayfa listesi butunlugu kapisi** (Sprint D, 5.1): freelist indeksi (trunk zinciri) tembel bit eslemleriyle tutulur (`FFreeBits`/`FTrunkBits`, yalniz `FreeIndexEnsure` zincirden kurar, `FreePage`/`AllocPage` gunceller). FL1 ayni sayfayi ikinci kez serbest birakmayi, FL2 **trunk** sayfasini serbest birakmayi, FL3 **canli hucre tasiyan** heap sayfasini serbest birakmayi reddeder (`EVdbPageStore`); FL4 cok trunk / trunk dolmasi / bos trunk ve `FreeCount` tutarliligini; FL5 trunk zinciri **dongusunde** acik hata verir, sonsuz dongu yok; FL6 yinelenen, FL7 aralik disi serbest girdide acik hata; FL8 bozuk freelist ile **acilis** (heap taramasi) acik hata verir; FL9 saglikli depoda `CollectFreePages` ile `VerifyFreeList` ayni sonucu verir. 9 vaka, **32 kontrol**, iki platformda 32/0. Duzeltme oncesi kaynakla (`git archive HEAD`) derlenen sonda **4 kontrol FAIL** (cift serbest birakma, trunk, canli sayfa, yinelenen girdi) |
 | `cache_pressure` | **onbellek tukenmesi / tahliye** (SKILL3 §12.1): 8 sayfalik havuzla (~32 KB) havuzdan cok daha buyuk bir tablo uzerinde calisilir. Tam tarama **butun satirlari** dogru okur (tahliye + yeniden yukleme veri kaybetmez), `PoolUsed` havuz boyunu asmaz, miss sayaci gercek tahliyeyi kanitlar, tek islemde 2000 satir guncellemesi (kirli sayfa tahliye yolu) commit edilir ve **yeniden acilista** guncel veri kalicidir; temiz kapanistan sonra yalniz `.odb` kalir |
 | `page_corrupt` | **okuma yolunda sayfa butunlugu** (SKILL3 §5.3/§12.1): normal okuma yolu artik dogrulama yapar. Her veri sayfasinin govdesinde tek bayt bozulmasi, bozuk sihirli sayi ve yanlis sayfa imaji (sayfa 2 imaji sayfa 3'e kopyalanmis) kontrollu `ecCorrupt` uretir; dosyanin saglam kopyasi hala kusursuz taranir (kapi yanlis pozitif uretmez). Sifreli dosyada GCM etiketi zaten dogruluyor |
-| `server_harden` | dinleme adresi, `--trust` sinirlari, TLS zorunlulugu |
+| `server_harden` | dinleme adresi, `--trust` sinirlari, TLS zorunlulugu. **S12-S15 (Sprint G1, F-37)**: `TVdbPgServer` artik **guvenli varsayilanlarla** gelir - bind varsayilani `127.0.0.1`, uzak (loopback disi) adres ancak kimlik dogrulama **ve** `RequireTls=True` ile kabul edilir (`AllowInsecureRemote=True` bilincli kacis kapisi); `Start` ham adresi degil, `VdbResolveListenHost` ile **cozulmus** adresi dinler ve karar motor/soket acilmadan verilir. **36 kontrol**, iki platformda 36/0; on-kapi (HEAD + yalnizca yeni API kabugu) **6 FAIL** |
 | `server_failure` | **sunucu hata yollari** (SKILL3 §12.1): (a) `MaxConns=1` iken ikinci baglanti `RSP_ERROR` + `kapasite dolu` alip kapanir, birinci baglanti sorguya devam eder; (b) yeni baglantiya 64 bayt cop ($FF) yazilip kapatilir, sunucu yasar; (c) `CMD_QUERY` ardindan sahte **96 MiB** uzunluk oneki gonderilir - v3.39 `VDBS_MAX_RECV_STR` (64 MiB) oneki tahsis yapmadan reddeder, sunucu yasar; (d) acik baglanti varken `Stop` doner ve `Ready=False` olur; (e) `.odb` dosyasi yerinde kalir ve yeniden acilip satirlari okur |
 | `disk_full` | **disk dolu / kisa yazma** (SKILL3 §12.1 + SKILL5 8.1): sayfa, meta ve **WAL** yazmalari tek noktadan (`WriteBytesChecked` / `WriteChecked`) gecer; enjekte edilen sert hata ve yarim yazma (gercek `ENOSPC` davranisi) kontrollu `ecIOError` uretir, surec cokmez, cerceve **kirli** kalir. Basarisiz commit **hayalet satir** birakmaz (ayni oturumda `COUNT(*)` durabil durumla ayni). Hata + `ROLLBACK` sonrasi onayli satirlar durur, hata giderilince checkpoint ve yeni commit calisir, yeniden acilista tum onayli satirlar okunur ve `VERIFY` temizdir. **DF10a-DF10c (Sprint D2)**: checkpoint hata yolunda surecler arasi yazma kilidi **sizmaz** - meta yazimina sert hata enjekte edilip checkpoint `ecIOError` ile dusuruldukten sonra **ikinci bir backend** ayni dosyaya yazabilir ve yazdigi satiri okuyabilir. 16 -> **19 kontrol**, iki platformda 19/0. Duzeltme oncesi kaynakla (`git archive a3b97da`) **4 kontrol FAIL** (DF10b/DF10c + DF6/DF6b - sizinti kapanistan sonra da yeniden acilisi kilitliyordu) |
 | `txn_limit` | **islem sayisi / yazar cakismasi** (SKILL3 §12.2): 300 kisa islem ve 300 islemin 75'i geri alinarak commit sayisi birebir dogrulanir (sessiz kayip yok). Belgelenen v3 semantigi olculur: ic ice `BEGIN`, islem yokken `COMMIT`/`ROLLBACK` **sessiz no-op**'tur (tek islem katmani). Dosya basina **tek yazar rezervasyonu** vardir: bir oturum tutarken digeri kisa busy suresiyle kontrollu `mesgul` hatasi alir, `ROLLBACK` ile temizlenir, rezervasyon birakilinca ayni islem basariyla tamamlanir; yeniden acilista tum satirlar + `VERIFY` temiz |
@@ -1200,4 +1200,41 @@ kaldirildi:
     karsilastirmasi ayni rutinde sonraki cagriyi "Wrong number of parameters"
     ile bozuyor; `Assigned()` kullanildi (olculdu). V2 ve dosya bicimi v5
     degismedi.
+
+- Kirk besinci kosu (v3.61, Sprint G1 - PG sunucusu guvensiz varsayilanlari):
+  iki platform da YESIL. Git Bash/Windows **48 kapi** PASS, WSL x86_64 Linux
+  **49 kapi** PASS, FAIL 0 (`gatesJ.log` -> `KOSAN KAPI: 48`, `SUITE_EXIT=0`;
+  `linJ.log` -> `KOSAN KAPI: 49`, `SUITE_EXIT=0`). Windows'ta `tls_client`
+  yine **SKIP** (OpenSSL DLL'i yok; SKIP != PASS); Linux'ta kostu: 6/0.
+  - **F-37 (KRITIK, KAPALI)**: `TVdbPgServer` uc noktadan guvensizdi.
+    (a) `FBindHost` varsayilani `'0.0.0.0'` idi: kutuphane kullanan her surec
+    farkinda olmadan tum arayuzlerde dinliyordu. (b) Kullanici eklenmemisse
+    kimlik dogrulama **trust** idi; agdan gelen herkes `AuthOk` alip tam
+    veritabani erisimi kazaniyordu. (c) `Start`, dinleme adresini **ham**
+    `VdbTcpListen`'e veriyordu ve o anda var olan `VdbResolveListenHost`
+    kuralini ("trust yalniz loopback", ad normalizasyonu) **hic cagirmiyordu** -
+    yani S1-S9'da dogrulanan R-4 politikasi PG sunucusunda etkisizdi.
+  - **Duzeltme**: fail-closed ve guvenli varsayilan. Bind varsayilani
+    `'127.0.0.1'`; `Start` once **saf** `ExposureError` kararini verir
+    (loopback disi adres yalniz kimlik dogrulama **ve** `RequireTls=True` ile
+    kabul edilir; `AllowInsecureRemote=True` varsayilan **False** olan bilincli
+    kacis kapisidir), sonra adi `VdbResolveListenHost` ile normalize eder ve
+    dinlemeye **cozulmus** adresi verir. Red karari motor/soket acilmadan
+    verilir; hata metni istenen adresi ve eksik kosulu icerir. Yerel trust
+    modu (varsayilan loopback) korunur. V2 ve dosya bicimi v5 degismedi.
+  - **Kapi**: `server_harden` 25 -> **36** kontrol (S12-S15). S12 varsayilan
+    bind; S12b loopback+trust kabul; S13/S13b trust ya da TLS'siz uzak adres
+    RED; S13c auth+zorunlu TLS uzak kabul; S13d LAN+auth+TLS'siz RED;
+    S13e/S13f kacis kapisi acilir/kapanir; S14 gercek `Start` uzak adreste
+    **politika** hatasi verir; S14b kacis kapisi politikadan gecer (bind yine
+    basarisiz); S15/S15b varsayilan ayarla trust+loopback hala acilir ve
+    hizmet verir. On-kapi (duzeltme oncesi kurulum: HEAD + yalnizca yeni API
+    kabugu; `ExposureError` bos doner) **6 FAIL**: S12, S13, S13b, S13d,
+    S13f, S14.
+  - **Durust sinir**: S15/S15b bilerek **ayirt edici degildir**; amaclari
+    asiri siki bir duzeltmenin yerel gelistirme yolunu kirmadigini
+    gostermektir. S13c yalniz bayraklara bakar; `RequireTls=True` + sertifika
+    yok durumu `Start` tarafindan ayrica reddedilir (bu daha eski bir yol,
+    degismedi). Gercek TLS el sikismasi bu kapida olculmez (`tls_client`
+    kapisi ve Linux kosusu kapsar).
 

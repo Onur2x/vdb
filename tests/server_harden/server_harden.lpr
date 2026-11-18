@@ -19,6 +19,10 @@ program server_harden;
    S9  cozulemeyen adrese bind  -> dinleme soketi ACILMAZ (sessiz 0.0.0.0 yok)
    S10 gercek sunucu 127.0.0.1'e baglanir ve loopback'ten baglanti kabul eder
    S11 gercek sunucu yerel olmayan adrese baglanmayi reddeder
+   S12 varsayilan bind artik loopback (F-37)
+   S13 uzak dinleme: kimlik dogrulama + ZORUNLU TLS sart (F-37 politika)
+   S14 ayni kural gercek Start yolunda da uygulanir; kacis kapisi calisir
+   S15 varsayilan ayarla (trust + loopback) sunucu hala acilir ve hizmet verir
 
   Cikis kodu = FAIL sayisi. }
 
@@ -196,6 +200,125 @@ begin
   srv.Free;
 end;
 
+{ ------------------------------------------------------------------ S12..S13 }
+
+procedure TestSecureDefaults;
+var
+  srv: TVdbPgServer;
+  dir, e: string;
+begin
+  dir := FreshDir('defaults');
+  srv := TVdbPgServer.Create(dir, 54398);
+  try
+    Chk('S12 varsayilan bind loopback',
+      srv.BindHost = '127.0.0.1', 'bind="' + srv.BindHost + '"');
+    e := srv.ExposureError;
+    Chk('S12b loopback + trust kabul edilir', e = '', e);
+
+    srv.BindHost := '0.0.0.0';
+    e := srv.ExposureError;
+    Chk('S13 trust + tum arayuz RED (kimlik dogrulama yok)',
+      Pos('kimlik dogrulama', e) > 0, e);
+
+    srv.AddUser('politika', 'parola123');
+    e := srv.ExposureError;
+    Chk('S13b auth var + TLS zorunlu degil + tum arayuz RED',
+      Pos('TLS zorunlu degil', e) > 0, e);
+
+    srv.RequireTls := True;
+    e := srv.ExposureError;
+    Chk('S13c auth + zorunlu TLS + tum arayuz kabul', e = '', e);
+
+    srv.RequireTls := False;
+    srv.BindHost := '192.168.1.20';
+    e := srv.ExposureError;
+    Chk('S13d LAN + auth + TLS yok RED',
+      Pos('guvensiz uzak dinleme', e) = 1, e);
+
+    srv.AllowInsecureRemote := True;
+    e := srv.ExposureError;
+    Chk('S13e AllowInsecureRemote bilincli kacis kapisi', e = '', e);
+
+    srv.AllowInsecureRemote := False;
+    e := srv.ExposureError;
+    Chk('S13f kacis kapisi kapatilinca tekrar RED', e <> '', e);
+  finally
+    srv.Free;
+  end;
+end;
+
+{ ------------------------------------------------------------------ S14 }
+
+procedure TestRemoteStartRejected;
+var
+  srv: TVdbPgServer;
+  dir, e: string;
+  ok: Boolean;
+begin
+  dir := FreshDir('remote');
+  srv := TVdbPgServer.Create(dir, 54399);
+  try
+    srv.AddUser('politika', 'parola123');
+    srv.BindHost := '192.168.1.20';
+    ok := srv.Start(e);
+    Chk('S14 uzak + TLS yok Start RED',
+      (not ok) and (Pos('guvensiz uzak dinleme', e) = 1),
+      'ok=' + BoolToStr(ok, True) + ' hata="' + e + '"');
+
+    srv.AllowInsecureRemote := True;
+    ok := srv.Start(e);
+    Chk('S14b kacis kapisi politikadan gecer (bind yine basarisiz)',
+      (not ok) and (Pos('guvensiz uzak dinleme', e) = 0),
+      'ok=' + BoolToStr(ok, True) + ' hata="' + e + '"');
+  finally
+    srv.Free;
+  end;
+end;
+
+{ ------------------------------------------------------------------ S15 }
+
+procedure TestDefaultBindServes;
+var
+  srv: TVdbPgServer;
+  sock: TVdbSocket;
+  dir, err: string;
+  port, i: Integer;
+  started: Boolean;
+begin
+  dir := FreshDir('defbind');
+  srv := nil;
+  port := 0;
+  started := False;
+  err := '';
+  { Trust modu (kullanici yok) VARSAYILAN ayarla: yalniz yerel dinlemeli. }
+  for i := 0 to 59 do
+  begin
+    srv := TVdbPgServer.Create(dir, Word(54400 + i));
+    if srv.Start(err) then
+    begin
+      port := 54400 + i;
+      started := True;
+      Break;
+    end;
+    FreeAndNil(srv);
+  end;
+  Chk('S15 varsayilan ayarla trust+loopback sunucu acilir', started, err);
+  if not started then
+  begin
+    if srv <> nil then srv.Free;
+    Exit;
+  end;
+  try
+    sock := VdbTcpConnect('127.0.0.1', Word(port));
+    Chk('S15b varsayilan bind loopback baglanti kabul eder',
+      sock <> VDB_SOCK_INVALID, 'connect basarisiz');
+    if sock <> VDB_SOCK_INVALID then VdbSockClose(sock);
+  finally
+    srv.Stop;
+    srv.Free;
+  end;
+end;
+
 begin
   GPass := 0;
   GFail := 0;
@@ -205,6 +328,9 @@ begin
   TestListenHost;
   TestServerLoopback;
   TestServerForeignBind;
+  TestSecureDefaults;
+  TestRemoteStartRejected;
+  TestDefaultBindServes;
   WriteLn('SONUC: ', GPass, ' PASS, ', GFail, ' FAIL');
   Halt(GFail);
 end.

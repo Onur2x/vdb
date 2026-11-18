@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-18
-Surum: v3.60 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Surum: v3.61 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -59,7 +59,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 ### A.3 Mevcut V3 durumu
 
 - Iki platformda tam kapi seti yesil: **Windows i386 48 kapi**, **Linux
-  x86_64 49 kapi**, FAIL 0 (v3.60 kosulari: `gatesJ.log` / `linJ.log`).
+  x86_64 49 kapi**, FAIL 0 (v3.61 kosulari: `gatesJ.log` / `linJ.log`).
   Windows'ta `tls_client` bu ortamda **SKIP** oldu (OpenSSL DLL'i yok);
   kostugu kosu `gatesE.log`'dur. SKIP PASS sayilmaz (ayrinti: `CI.md`).
 - Acik kritik hata yok. Kapatilan son gercek kusurlar: F-21/F-22 veri
@@ -68,7 +68,8 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   ve bilinmeyen rolde **fail-closed** yetki (`sql_authorization` AU8-AU11),
   Sprint D2'de checkpoint hata yolunda **kilit sizintisi** (`disk_full`
   DF10a-DF10c), Sprint E2'de zaman asimi kurulumunda **fail-open** davranis
-  (`network_limits` NL8). Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
+  (`network_limits` NL8), Sprint G1'de PG sunucusunun **guvensiz
+  varsayilanlari** (`server_harden` S12-S15). Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
 - Rol degistirme yetkisi ve SCRAM kullanicisi -> SQL rolu eslemesi (SKILL5
   3.1'in yetki denetimi ve 3.2) **hala ACIK**: kimligi dogrulanmis principal
   ile SQL rolu arasinda kalici bir esleme yok ve bu, dosya bicimini
@@ -590,7 +591,7 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   `windows-latest` calistirir; `fail-fast: false`. macOS/ARM64 icin job
   **yoktur** cunku hic kosulmadi; dogrulanmamis platformu matrise eklemek
   yesil gorunen ama kanit uretmeyen bir kapi olurdu (`CI.md` bolum 3).
-- Kanit (en guncel kosu, v3.60): Windows `gatesJ.log` (`KOSAN KAPI: 48`,
+- Kanit (en guncel kosu, v3.61): Windows `gatesJ.log` (`KOSAN KAPI: 48`,
   `SUITE_EXIT=0`), Linux `linJ.log` (`KOSAN KAPI: 49`, `SUITE_EXIT=0`).
   Onceki kosu: `gatesI.log` (48) / `linI.log` (49) - D2; ondan once
   `gatesH.log` (48) / `linH.log` (49) - C2; ondan once
@@ -690,6 +691,27 @@ tablosundadir. Bu sprintte kapatilanlar:
   zaman asimi da `0` ise (bilerek kapatilmis) kurulum basarili sayilir.
   Regresyon: NL8 (`network_limits` 26/0; HEAD + test kancasi baseline'inda
   1 FAIL - baglanti sunulmus, `ConnCount=1`).
+- **F-37 (Kritik, KAPALI, v3.61)**: `TVdbPgServer` **guvensiz varsayilanlarla**
+  geliyordu ve R-4 politika katmanini **atliyordu**. Uc kusur ayni yerdeydi:
+  (a) `FBindHost` varsayilani `'0.0.0.0'` idi - kutuphane kullanan her surec
+  farkinda olmadan **tum arayuzlerde** dinliyordu; (b) kullanici eklenmemisse
+  kimlik dogrulama **trust** idi (`AuthOk` dogrudan gonderiliyordu), yani ag
+  uzerinden gelen herkes tam veritabani erisimi aliyordu; (c) `Start`, o anda
+  var olan `VdbResolveListenHost` kuralini ("trust yalniz loopback") **hic
+  cagirmiyordu** - kural `VDbNet`'te ve `server_harden` S1-S9'da dogrulanmis
+  olmasina ragmen PG sunucusunda etkisizdi. Duzeltme (fail closed):
+  varsayilan bind `'127.0.0.1'`; `Start` once `ExposureError` ile **saf
+  politika** karari verir (loopback disi adres ancak kimlik dogrulama **ve**
+  `RequireTls=True` ile kabul; `AllowInsecureRemote=True` bilincli kacis
+  kapisidir), sonra dinleme adresini `VdbResolveListenHost` ile normalize eder
+  ve `VdbTcpListen`'e **cozulmus** adresi verir. Boylece motor/soket
+  acilmadan reddedilir. Regresyon: S12-S15 (`server_harden` 36/0). Baseline
+  (HEAD + yalnizca yeni API kabugu; `ExposureError` bos doner) **6 FAIL**:
+  S12 varsayilan bind `0.0.0.0`; S13/S13b/S13d uzak+guvensiz kabul; S13f
+  kacis kapisi kapatilamiyor; S14 `Start` uzak adreste politika hatasi yerine
+  isletim sistemi bind hatasi veriyor. S15/S15b (yerel trust hala calisir)
+  bilerek **ayirt edici degildir**: asiri siki bir duzeltmenin yerel gelistirme
+  yolunu kirmadigini korur.
 
 
 ---
