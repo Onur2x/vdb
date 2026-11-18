@@ -79,6 +79,10 @@ type
     FAutoAnalyzeThr: Int64;
     // P-176: sorgu zaman asimi (ms). 0 = kapali (varsayilan).
     FQueryTimeoutMs: Integer;
+    { v3.57: ortuk statement kapsami ic ice girmesin diye derinlik sayaci.
+      Bir SELECT icinden cagrilan DML (trigger/prosedur) AYNI kapsamin
+      icindedir; ikinci bir kapsam acmak gereksiz bellek demekti. }
+    FStmtScopeDepth: Integer;
     function Tok(const S: string; var P: Integer; out T: string): Boolean;
     function PeekWord(const S: string; P: Integer): string;
     function TokAt(const S: string; var P: Integer; out T: string;
@@ -179,6 +183,15 @@ type
     // Bu cumle otomatik transaction (batch) icinde calistirilabilir mi?
     function StmtBatchSafe(const S: string): Boolean;
     function ExecRaw(const Sql: string): TSqlResult;
+    { v3.57: ortuk statement kapsami (explicit transaction icinde statement
+      atomikligi). ExecRawCore eski ExecRaw govdesidir; sarmalayici kapsami
+      acar/kapatir. Kapsam YALNIZCA yazma anahtar sozcukleriyle baslayan
+      cumleler icin ve ic ice girmeden (FStmtScopeDepth=0) acilir: islem
+      denetim cumleleri (BEGIN/COMMIT/ROLLBACK/SAVEPOINT/RELEASE) kapsam
+      DISINDA kalir, aksi halde kapsam kapanisi kullanicinin savepoint'ini
+      de silebilirdi. }
+    function ExecRawCore(const Sql: string): TSqlResult;
+    function StmtScopeApplies(const Sql: string): Boolean;
     // goreli sure olcer (VdbTickMs yalniz Windows'ta var; platform
     // bagimsiz olmak icin TDateTime farkindan hesaplanir)
     procedure SlowMarkStart;
@@ -3443,21 +3456,34 @@ begin
   Result := Default(TSqlResult);
   FExecutor.BeginQuery;   // P-176: sure/iptal olcumu bu cumleden baslar
 
-  { P-154: TEK CUMLELIK LITERAL INSERT — tam sarmalayici atlama.
-    P-59 parametreli INSERT icin ayni atlamayi yapiyordu; literal yol
-    hala SplitStatements + ExecRaw giris islemlerini (Default reseti,
-    WaitForeignTxn, Trace) oduyordu. Komut sayaci ve yavas sorgu halkasi
-    korunur (NoteSlow/RecordCommand).
-    Hizli yol basarisiz olursa (tetikleyici, view, RLS, ayrisim hatasi)
-    sonuc sifirlanir ve normal yol ORIGINAL metinle calisir. }
-  if (Length(Sql) > 13) and ((Sql[1] = 'I') or (Sql[1] = 'i')) and
-     LiteralSingleStmt(Sql, stmt) then
-  begin
-    Result.Stmts := 1;
-    prevSess := VDbGetWriteSession;
-    VDbSetWriteSession(FSessionId);
+  { F-42 + v3.57: oturum kimligini TUM Exec boyunca sabit tut ve bunu HIZLI
+    YOL KARARINDAN ONCE kur. Executor kendi finally'sinda onceki degere
+    dondurur; hizli yollar (literal INSERT, nokta SELECT) Execute'a ugradigi
+    icin kimligi kendileri kurmaz. Bu sarmalayici olmadan hizli yol yazmalari
+    0 kimlikle kalir ve acik bir transaction'in sahibiyle uyusmaz.
+    v3.57: ONCEDEN kimlik asagidaki `not FT.Backend.InBatch` kararindan SONRA
+    kuruluyordu; InBatch o anda cagiranin ORTAM oturumuna bakiyor, acik
+    transaction icinde bile False donebiliyordu. Sonuc: INSERT hizli yola
+    dusup ORTUK statement kapsamini ATLIYOR, hatali cumlenin yazimlari partide
+    kalip COMMIT ile KALICI oluyordu (olculdu: sql_atomicity AT21/AT22). }
+  prevSess := VDbGetWriteSession;
+  VDbSetWriteSession(FSessionId);
+  try
     FT.Backend.WaitForeignTxn(FSessionId);
-    try
+
+    { P-154: TEK CUMLELIK LITERAL INSERT — tam sarmalayici atlama.
+      P-59 parametreli INSERT icin ayni atlamayi yapiyordu; literal yol
+      hala SplitStatements + ExecRaw giris islemlerini (Default reseti,
+      WaitForeignTxn, Trace) oduyordu. Komut sayaci ve yavas sorgu halkasi
+      korunur (NoteSlow/RecordCommand).
+      Hizli yol basarisiz olursa (tetikleyici, view, RLS, ayrisim hatasi)
+      sonuc sifirlanir ve normal yol ORIGINAL metinle calisir.
+      v3.57: acik transaction icinde hizli yol atlanir — statement kapsami
+      yalnizca ExecRaw uzerinden acilir. }
+    if (Length(Sql) > 13) and ((Sql[1] = 'I') or (Sql[1] = 'i')) and
+       (not FT.Backend.InBatch) and LiteralSingleStmt(Sql, stmt) then
+    begin
+      Result.Stmts := 1;
       FT.Lock;
       try
         SetLength(FParams, 0);
@@ -3477,68 +3503,55 @@ begin
         if FT.Backend.Dirty then FT.Backend.Flush;
         Exit;
       end;
-    finally
-      VDbSetWriteSession(prevSess);
+      { Hizli yol basarisiz — sonucu sifirla ve normal yola dus. }
+      Result := Default(TSqlResult);
     end;
-    { Hizli yol basarisiz — sonucu sifirla ve normal yola dus. }
-    Result := Default(TSqlResult);
-  end;
 
-  // KR-7 (MREW): SELECT sorgulari LockRead (paralel), yazma Lock (seri).
-  st := SplitStatements(Sql);
-  if Length(st) = 0 then
-  begin
-    Result.Affected := 0; Result.Msg := ''; Result.LastTable := '';
-    Result.Stmts := 0;
-    SetLength(Result.Fields, 0); SetLength(Result.Rows, 0);
-    Exit;
-  end;
-
-  { F-42: oturum kimligini TUM Exec boyunca sabit tut. Executor kendi
-    finally'sinda onceki degere dondurur; hizli yollar (literal INSERT,
-    nokta SELECT) Execute'a ugradigi icin kimligi kendileri kurmaz.
-    Bu sarmalayici olmadan hizli yol yazmalari 0 kimlikle kalir ve acik
-    bir transaction'in sahibiyle uyusmaz. }
-  prevSess := VDbGetWriteSession;
-  VDbSetWriteSession(FSessionId);
-  FT.Backend.WaitForeignTxn(FSessionId);
-  try
-
-  { P-21: SELECT/WITH disi cumlelerde IsSelectStatement cagrisini ATLA.
-    Tok + UpperCase + try/finally her yazmada ~0.2 us yiyordu. }
-  if (Length(st) = 1) and (Length(st[0]) > 0) and
-     (st[0][1] in ['S', 's', 'W', 'w']) and IsSelectStatement(st[0]) then
-  begin
-    // Tek SELECT: okuma kilidi (paralel calisabilir)
-    SetLength(FParams, 0);
-    FParamIdx := 0;
-    FT.LockRead;
-    try
-      Result := ExecRaw(st[0]);
-      Result.Stmts := 1;
-    finally
-      FT.UnlockRead;
-    end;
-    Exit;
-  end;
-
-  // Coklu cumle veya yazma islemi: yazma kilidi
-  FT.Lock;
-  try
-    SetLength(FParams, 0);
-    FParamIdx := 0;
-    if Length(st) = 1 then
+    // KR-7 (MREW): SELECT sorgulari LockRead (paralel), yazma Lock (seri).
+    st := SplitStatements(Sql);
+    if Length(st) = 0 then
     begin
-      Result := ExecRaw(st[0]);
-      Result.Stmts := 1;
-      // P-DUR: tek cumlelik yazma burada saglama alinir (ExecAllInner kendi yapar).
-      if FT.Backend.Dirty then FT.Backend.Flush;
-    end
-    else
-      Result := ExecAllInner(st);  // KR-7: recursive Lock yok
-  finally
-    FT.Unlock;
-  end;
+      Result.Affected := 0; Result.Msg := ''; Result.LastTable := '';
+      Result.Stmts := 0;
+      SetLength(Result.Fields, 0); SetLength(Result.Rows, 0);
+      Exit;
+    end;
+
+    { P-21: SELECT/WITH disi cumlelerde IsSelectStatement cagrisini ATLA.
+      Tok + UpperCase + try/finally her yazmada ~0.2 us yiyordu. }
+    if (Length(st) = 1) and (Length(st[0]) > 0) and
+       (st[0][1] in ['S', 's', 'W', 'w']) and IsSelectStatement(st[0]) then
+    begin
+      // Tek SELECT: okuma kilidi (paralel calisabilir)
+      SetLength(FParams, 0);
+      FParamIdx := 0;
+      FT.LockRead;
+      try
+        Result := ExecRaw(st[0]);
+        Result.Stmts := 1;
+      finally
+        FT.UnlockRead;
+      end;
+      Exit;
+    end;
+
+    // Coklu cumle veya yazma islemi: yazma kilidi
+    FT.Lock;
+    try
+      SetLength(FParams, 0);
+      FParamIdx := 0;
+      if Length(st) = 1 then
+      begin
+        Result := ExecRaw(st[0]);
+        Result.Stmts := 1;
+        // P-DUR: tek cumlelik yazma burada saglama alinir (ExecAllInner kendi yapar).
+        if FT.Backend.Dirty then FT.Backend.Flush;
+      end
+      else
+        Result := ExecAllInner(st);  // KR-7: recursive Lock yok
+    finally
+      FT.Unlock;
+    end;
   finally
     VDbSetWriteSession(prevSess);
   end;
@@ -3557,17 +3570,23 @@ begin
   Result.Stmts := 1;
   FExecutor.BeginQuery;   // P-176: sure/iptal olcumu bu cumleden baslar
 
-  { P-59: TEK SATIRLIK PARAMETRELI INSERT — tam sarmalayici atlama.
-    SplitStatements, ExecRaw giris islemleri (cift FillChar, cift
-    WaitForeignTxn, Trace, SlowMark, NoteSlow, RecordCommand) ve SELECT
-    kontrolu atlanir. Hizli yol basarisiz olursa normal yola dusulur. }
-  if (Length(Sql) > 13) and ((Sql[1] = 'I') or (Sql[1] = 'i')) and
-     (Pos(';', Sql) = 0) and (Length(Params) > 0) then
-  begin
-    prevSess := VDbGetWriteSession;
-    VDbSetWriteSession(FSessionId);
+  { F-42 + v3.57: kimlik TUM Exec boyunca sabit ve HIZLI YOL KARARINDAN ONCE
+    kurulur (gerekce: birinci overload'daki ayni aciklama — InBatch ortam
+    oturumuna bakip acik transaction icinde False donebiliyordu). }
+  prevSess := VDbGetWriteSession;
+  VDbSetWriteSession(FSessionId);
+  try
     FT.Backend.WaitForeignTxn(FSessionId);
-    try
+
+    { P-59: TEK SATIRLIK PARAMETRELI INSERT — tam sarmalayici atlama.
+      SplitStatements, ExecRaw giris islemleri (cift FillChar, cift
+      WaitForeignTxn, Trace, SlowMark, NoteSlow, RecordCommand) ve SELECT
+      kontrolu atlanir. Hizli yol basarisiz olursa normal yola dusulur.
+      v3.57: acik transaction icinde hizli yol atlanir — statement kapsami
+      yalnizca ExecRaw uzerinden acilir. }
+    if (Length(Sql) > 13) and ((Sql[1] = 'I') or (Sql[1] = 'i')) and
+       (not FT.Backend.InBatch) and (Pos(';', Sql) = 0) and (Length(Params) > 0) then
+    begin
       FT.Lock;
       try
         SetLength(FParams, Length(Params));
@@ -3583,68 +3602,60 @@ begin
       finally
         FT.Unlock;
       end;
-    finally
-      VDbSetWriteSession(prevSess);
-    end;
-    { Hizli yol basarisiz — sonucu sifirla ve normal yola dus. }
-    Result := Default(TSqlResult);
-    Result.Stmts := 1;
-  end;
-
-  // KR-7 (MREW): SELECT sorgulari LockRead (paralel), yazma Lock (seri).
-  st := SplitStatements(Sql);
-  if Length(st) = 0 then
-  begin
-    Result.Affected := 0; Result.Msg := ''; Result.LastTable := '';
-    Result.Stmts := 0;
-    SetLength(Result.Fields, 0); SetLength(Result.Rows, 0);
-    Exit;
-  end;
-
-  prevSess := VDbGetWriteSession;
-  VDbSetWriteSession(FSessionId);
-  FT.Backend.WaitForeignTxn(FSessionId);
-  try
-
-  { P-21: SELECT/WITH disi cumlelerde IsSelectStatement cagrisini ATLA. }
-  if (Length(st) = 1) and (Length(st[0]) > 0) and
-     (st[0][1] in ['S', 's', 'W', 'w']) and IsSelectStatement(st[0]) then
-  begin
-    // Tek SELECT: okuma kilidi (paralel calisabilir)
-    SetLength(FParams, Length(Params));
-    for i := 0 to High(Params) do
-      FParams[i] := Params[i];
-    FParamIdx := 0;
-    FT.LockRead;
-    try
-      Result := ExecRaw(st[0]);
+      { Hizli yol basarisiz — sonucu sifirla ve normal yola dus. }
+      Result := Default(TSqlResult);
       Result.Stmts := 1;
-    finally
-      FT.UnlockRead;
     end;
-    Exit;
-  end;
 
-  // Coklu cumle veya yazma islemi: yazma kilidi
-  FT.Lock;
-  try
-    SetLength(FParams, Length(Params));
-    for i := 0 to High(Params) do
-      FParams[i] := Params[i];
-    FParamIdx := 0;
-    if Length(st) = 1 then
+    // KR-7 (MREW): SELECT sorgulari LockRead (paralel), yazma Lock (seri).
+    st := SplitStatements(Sql);
+    if Length(st) = 0 then
     begin
-      Result := ExecRaw(st[0]);
-      Result.Stmts := 1;
-      // P-DUR: tek cumlelik yazma burada saglama alinir (ExecAllInner kendi yapar).
-      if FT.Backend.Dirty then FT.Backend.Flush;
-    end
-    else
-      Result := ExecAllInner(st);  // KR-7: recursive Lock yok
-  // fazla parametre sessizce yoksayilir; eksik Tok'ta patlar
-  finally
-    FT.Unlock;
-  end;
+      Result.Affected := 0; Result.Msg := ''; Result.LastTable := '';
+      Result.Stmts := 0;
+      SetLength(Result.Fields, 0); SetLength(Result.Rows, 0);
+      Exit;
+    end;
+
+    { P-21: SELECT/WITH disi cumlelerde IsSelectStatement cagrisini ATLA. }
+    if (Length(st) = 1) and (Length(st[0]) > 0) and
+       (st[0][1] in ['S', 's', 'W', 'w']) and IsSelectStatement(st[0]) then
+    begin
+      // Tek SELECT: okuma kilidi (paralel calisabilir)
+      SetLength(FParams, Length(Params));
+      for i := 0 to High(Params) do
+        FParams[i] := Params[i];
+      FParamIdx := 0;
+      FT.LockRead;
+      try
+        Result := ExecRaw(st[0]);
+        Result.Stmts := 1;
+      finally
+        FT.UnlockRead;
+      end;
+      Exit;
+    end;
+
+    // Coklu cumle veya yazma islemi: yazma kilidi
+    FT.Lock;
+    try
+      SetLength(FParams, Length(Params));
+      for i := 0 to High(Params) do
+        FParams[i] := Params[i];
+      FParamIdx := 0;
+      if Length(st) = 1 then
+      begin
+        Result := ExecRaw(st[0]);
+        Result.Stmts := 1;
+        // P-DUR: tek cumlelik yazma burada saglama alinir (ExecAllInner kendi yapar).
+        if FT.Backend.Dirty then FT.Backend.Flush;
+      end
+      else
+        Result := ExecAllInner(st);  // KR-7: recursive Lock yok
+    // fazla parametre sessizce yoksayilir; eksik Tok'ta patlar
+    finally
+      FT.Unlock;
+    end;
   finally
     VDbSetWriteSession(prevSess);
   end;
@@ -4141,7 +4152,87 @@ begin
   Res.Msg := IntToStr(n) + ' veritabani';
 end;
 
+function TVSql.StmtScopeApplies(const Sql: string): Boolean;
+{ v3.57: bu cumle ortuk statement kapsamina alinmali mi?
+  Kosullar: (1) explicit transaction acik (BatchOpen), (2) ic ice degiliz,
+  (3) cumle bir YAZMA cumlesi. Islem denetim cumleleri kapsam DISINDA:
+  BEGIN/COMMIT/END/ROLLBACK/ABORT/SAVEPOINT/RELEASE kapsama alinsaydi
+  kapsam kapanisi kullanicinin savepoint'ini de silebilirdi ve COMMIT
+  sonrasi kapsam kimligi zaten kaybolurdu. DDL de disarida: sema
+  degisikligi kaplamada degil, aninda uygulanir. }
+var
+  p, n: Integer;
+  w: string;
+begin
+  Result := False;
+  if FStmtScopeDepth <> 0 then Exit;
+  if not FT.Backend.InBatch then Exit;
+  n := Length(Sql);
+  p := 1;
+  while (p <= n) and (Sql[p] in [' ', #9, #10, #13]) do Inc(p);
+  if p > n then Exit;
+  w := '';
+  while (p <= n) and (Sql[p] in ['A'..'Z', 'a'..'z']) do
+  begin
+    w := w + UpCase(Sql[p]);
+    Inc(p);
+  end;
+  Result := (w = 'INSERT') or (w = 'UPDATE') or (w = 'DELETE') or
+            (w = 'MERGE') or (w = 'UPSERT') or (w = 'REPLACE') or
+            (w = 'COPY') or (w = 'TRUNCATE') or (w = 'CALL') or
+            (w = 'EXEC') or (w = 'EXECUTE') or (w = 'DO') or (w = 'WITH');
+end;
+
 function TVSql.ExecRaw(const Sql: string): TSqlResult;
+var
+  sid: Integer;
+  ok: Boolean;
+  prevSess: Cardinal;
+begin
+  { v3.57: ORTUK KAPSAM, cumleyi CALISTIRAN oturumun yazma kumesi uzerinde
+    acilmalidir. Savepoints/BatchMap/BatchOrder oturum basina tutulur
+    (OwnSet -> VdbBackendSessionId). VDbSetWriteSession olmadan kapsam
+    varsayilan oturumun kumesine yazilir, cumlenin yazimlari ise FSessionId
+    kumesine gider ve geri alma HICBIR SEY yapmazdi. Olculdu: bu eksiklikle
+    AT21/AT22 (COMMIT sonrasi yarim yazim) dustu. }
+  prevSess := VDbGetWriteSession;
+  VDbSetWriteSession(FSessionId);
+  try
+    { v3.57: KAPSAM KARARI da kimlik sabitlendikten SONRA verilir; InBatch
+      (OwnSet -> VdbBackendSessionId) o anda cumleyi calistiran oturuma
+      bakmalidir. }
+    if not StmtScopeApplies(Sql) then
+    begin
+      Result := ExecRawCore(Sql);
+      Exit;
+    end;
+    { v3.57: statement atomikligi. Kapsam acilamazsa (-1) davranis eskisiyle
+      AYNI kalir; acilirsa hata yolunda YALNIZCA bu cumlenin yazimlari
+      kaplamadan dusurulur ve sonraki COMMIT yarim yazimi kalici YAPAMAZ. }
+    sid := FT.Backend.BeginStmtScope;
+    if sid < 0 then
+    begin
+      Result := ExecRawCore(Sql);
+      Exit;
+    end;
+    Inc(FStmtScopeDepth);
+    ok := False;
+    try
+      Result := ExecRawCore(Sql);
+      ok := True;
+    finally
+      Dec(FStmtScopeDepth);
+      if ok then
+        FT.Backend.ReleaseStmtScope(sid)
+      else
+        FT.Backend.RollbackStmtScope(sid);
+    end;
+  finally
+    VDbSetWriteSession(prevSess);
+  end;
+end;
+
+function TVSql.ExecRawCore(const Sql: string): TSqlResult;
 var
   astStmt: TSqlStmtNode;
   pTest: Integer;

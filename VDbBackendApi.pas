@@ -174,6 +174,22 @@ type
     function RollbackToSavepoint(const Name: string): Boolean;  // False: yok
     function ReleaseSavepoint(const Name: string): Boolean;     // False: yok
 
+    { --- v3.57: ORTUK STATEMENT KAPSAMI (statement atomikligi) ---
+      Explicit transaction icinde bir DML cumlesi yarida hata verirse o
+      cumlenin yazimlari kaplamada KALIYORDU ve sonraki COMMIT bunlari
+      kalici hale getiriyordu. Bu uc metot cumle cevresinde ortuk bir
+      savepoint acar/kapatir:
+        * BeginStmtScope: acik yazma kumesi yoksa -1 (yapilacak is yok).
+        * ReleaseStmtScope: basarili cumleden sonra, veri COMMIT EDILMEZ.
+        * RollbackStmtScope: hata yolunda yalnizca bu cumlenin yazimlarini
+          dusurur; onceki cumlelerin yazimlari korunur.
+      Kimlik bulunamazsa (cumle icinde COMMIT/ROLLBACK) sessizce doner.
+      v3 backend: gercek uygulama; v2 backend: -1 / bos (V2 dondurulmus,
+      davranisi DEGISMEZ). }
+    function BeginStmtScope: Integer;
+    procedure ReleaseStmtScope(AId: Integer);
+    procedure RollbackStmtScope(AId: Integer);
+
     { --- v3.2: ALTER DATABASE KEY (anahtar/parola rotasyonu) ---
       v3: dosya butunu yeni parola ile yeniden sifrelenir (eski kayitlar
       cozulur, yeni anahtarla yazilir; gecici dosya + atomik degistirme).

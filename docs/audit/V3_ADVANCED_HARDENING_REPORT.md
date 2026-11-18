@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-18
-Surum: v3.56 (Sprint A + B + C + D + F1 + E; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Surum: v3.57 (Sprint A + B + C + D + F1 + E + B2; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -59,11 +59,13 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 ### A.3 Mevcut V3 durumu
 
 - Iki platformda tam kapi seti yesil: **Windows i386 48 kapi**, **Linux
-  x86_64 49 kapi**, FAIL 0. Windows'ta `tls_client` bu ortamda OpenSSL DLL'i
-  ile kostu (ayrinti: `CI.md`); OpenSSL istege bagli iki kapi Linux'ta SKIP.
-- Acik kritik hata yok. Kapatilan son gercek kusurlar F-21/F-22 veri
-  kaybiydi; ikisi de kalici regresyon kapisiyla kilitlendi (SO15/SO16/SO17).
-  Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
+  x86_64 49 kapi**, FAIL 0 (v3.57 kosulari: `gatesG.log` / `linG.log`).
+  Windows'ta `tls_client` bu ortamda **SKIP** oldu (OpenSSL DLL'i yok);
+  kostugu kosu `gatesE.log`'dur. SKIP PASS sayilmaz (ayrinti: `CI.md`).
+- Acik kritik hata yok. Kapatilan son gercek kusurlar: F-21/F-22 veri
+  kaybi (SO15/SO16/SO17), Sprint B2'de acik islem icinde **statement
+  atomikligi** (`sql_atomicity` AT20-AT24). Sprint A/B'de kapatilan yetki ve
+  atomiklik kusurlari `A.4`'te.
 - V2 **dondurulmus** ve degismedi; v4 konteyner bicimi durduruldu.
 
 ### A.4 Denetim sprintleri (ONERILER_VE_HIZLANDIRMA2)
@@ -77,6 +79,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | F | 8.2 LIMIT/OFFSET sinirlari, 8.4 ozyinelemeli CTE sinirlari + iptal, 8.5 sayisal tasma/CAST/ABS | Tamam (F1) | `sql_memory` 54/0 (yeni, 26 vaka) |
 | F | 8.1 uctan uca streaming, portal maxRows, COPY OUT streaming, JOIN/ORDER BY/DISTINCT/GROUP BY bellek siniri, disk spill | **Acik (F2)** | tasarim isi; `R8`/`R13` |
 | E | 7.1/7.2 sunucu okuma-yazma zaman asimi, 7.3 COPY gecici dosya sinir+izin, 7.4 baglanti yasam dongusu | Tamam | `network_limits` 22/0 (yeni, 8 vaka) |
+| B2 | 6.1 acik islem icinde statement atomikligi (COMMIT sonrasi yarim yazim) | Tamam | `sql_atomicity` 138/0 (24 vaka; AT20-AT24 yeni) |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -278,6 +281,56 @@ Sprint E (ag katmani) dort gercek sinir kusurunu kapatti:
   VDB'nin `COPY ... FROM STDIN` varsayilan bicimi PostgreSQL text degil
   **csv**'dir; tavan davranisi bu bicimle olculdu. F2 halen aciktir.
 
+Sprint B2 (SKILL5 6.1) acik islem icindeki **statement atomikligi** acigini
+kapatti:
+
+- **B2 / 6.1 (COMMIT sonrasi yarim yazim, veri butunlugu)**: acik bir islemde
+  (`BEGIN`) yarida hata veren bir DML cumlesinin **o ana kadar yazdigi
+  satirlar** yazma kaplamasinda kaliyordu; sonraki `COMMIT` bunlari **kalici**
+  hale getiriyordu. Hata alan istemci "hicbir sey yazilmadi" varsayimiyla
+  devam edebildigi icin bu sessiz veri bozulmasidir. Olculdu (duzeltme oncesi
+  kaynak): tek satirli bir trigger hatasi sonrasi `BEGIN` icinde 2 satir
+  gorunuyor ve `COMMIT` sonrasi da 2 satir kaliyordu.
+- **Cozum**: statement cevresinde **ortuk savepoint** (`BeginStmtScope` /
+  `ReleaseStmtScope` / `RollbackStmtScope`, `IVDbBackend` arayuzunde
+  tanimli). Basarili cumlede kapsam yalnizca kapanir (veri COMMIT EDILMEZ);
+  hata yolunda yalnizca **o cumlenin** yazimlari kaplamadan dusurulur, onceki
+  cumlelerin yazimlari korunur. Kapsam yalnizca yazma cumleleri icin ve acik
+  yazma kumesi varken acilir; islem denetim cumleleri (BEGIN/COMMIT/ROLLBACK/
+  SAVEPOINT/RELEASE) ve DDL kapsam disidir, boylece kapsam kapanisi
+  kullanicinin savepoint'ini silemez. Kapsam kimligi bulunamazsa (cumle
+  icinde COMMIT/ROLLBACK oldu) sessizce donulur ve istisna firlatilmaz:
+  asil hata maskelenmemeli.
+- **Bellek siniri**: ortuk kapsam, yeni anahtarlar icin gunluk girdisi
+  **yazmaz**. Kapsam kapanirken `BatchOrder`/`BatchMap` kayitlari kapsam
+  anindaki uzunluga kirpilarak dusurulur; boylece 200k satirlik toplu INSERT
+  satir basina sozluk girdisi odemez. Maliyet yalnizca gercekten degistirilen
+  eski anahtarlar kadardir.
+- **Ikinci kusur (olcumle bulundu)**: `TVSql.Exec`'in iki overload'unda
+  literal/parametreli INSERT hizli yolu `InBatch` denetimini **oturum
+  sabitlenmeden once** yapiyordu. `InBatch`/`Savepoints`/`BatchMap` oturum
+  basina tutuldugu icin denetim **cagiranin ortam oturumuna** bakiyor, acik
+  islemde `False` donuyor ve hizli yol statement kapsami **acmadan** yaziyordu.
+  Artik yazma oturumu `Exec`/`ExecRaw` govdesinin **tamamini** sarar ve
+  `InBatch` karari dogru oturumla verilir; acik islemde iki hizli yol da
+  atlanir. Bu duzeltme olmadan kapsam yalnizca bazi cumlelerde calisiyordu.
+- **V2 dondurulmus**: `TVdbBackendV2` ucguna da bos uygulama aldi
+  (`BeginStmtScope` = -1). V2 davranisi **degismedi**; V2 yolunda acik
+  islemde statement atomikligi yoktur ve bu bilinen sinirdir.
+- **Kapi kaniti**: `sql_atomicity` 19 vaka / 88 kontrolden **24 vaka / 138
+  kontrol**e cikti. Yeni vakalar: AT20 (trigger hatasi + `COMMIT` sonrasi 0
+  satir), AT21 (basarisiz coklu INSERT sonrasi onceki cumlenin satiri korunur),
+  AT22 (basarisiz cumleden sonra ayni anahtar yeniden eklenebilir; bayat
+  kaplama kaydi yok), AT23 (UNIQUE cakismasiyla yarida kalan UPDATE geri
+  alinir, onceki UPDATE korunur), AT24 (kullanici `SAVEPOINT`'i ortuk
+  kapsamlardan etkilenmez). Duzeltme **oncesi** kaynakla (`git archive HEAD`
+  `4214586`) derlenen kapida **6 kontrol FAIL**, cikis kodu 1; duzeltilmis
+  agacta 138/0. Yani kapi bos yesil degil.
+- **Durust sinir**: kapsam kaplama duzeyinde calisir; diskte yarim kalan bir
+  sayfa yazimi icin ek bir mekanizma degildir (o is `wal_recovery` ve
+  POISONED yolu). Kapsam yalnizca **acik islem** icinde acilir; otomatik
+  commit yolunda tek cumle zaten butun olarak uygulanir veya geri alinir.
+
 ---
 
 ## B. WAL
@@ -424,13 +477,21 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   `windows-latest` calistirir; `fail-fast: false`. macOS/ARM64 icin job
   **yoktur** cunku hic kosulmadi; dogrulanmamis platformu matrise eklemek
   yesil gorunen ama kanit uretmeyen bir kapi olurdu (`CI.md` bolum 3).
-- Kanit: Windows `gatesE.log` (`KOSAN KAPI: 48`, `GATES_EXIT=0`), Linux
-  `linE.log` (`KOSAN KAPI: 49`, `LIN_EXIT=0`). Sprint E oncesi kanit
+- Kanit (en guncel kosu, v3.57): Windows `gatesG.log` (`KOSAN KAPI: 48`,
+  `SUITE_EXIT=0`), Linux `linG.log` (`KOSAN KAPI: 49`, `SUITE_EXIT=0`).
+  Onceki kosu: `gatesE.log` (48) / `linE.log` (49); Sprint E oncesi
   `gatesF.log` (47) / `linF.log` (48); daha once `gatesD.log` (46) /
   `linD.log` (47), ondan once `gatesB.log` (44) / `linC.log` (46) idi.
   Sayilar her sprint yalniz **eklenen** kapi kadar artar, kapi silinmez.
-- Windows'ta `tls_client` bu kosuda OpenSSL DLL'leri ortamda oldugu icin
-  **kostu** ve gecti; DLL'ler yoksa SKIP'e duser. Linux'ta 6/6 PASS.
+  Bu sprint yeni kapi **dizini** eklenmedi; `sql_atomicity` kapisi
+  `88` kontrolden `138` kontrole cikti (AT20-AT24), kapi sayisi ayni kaldi.
+- Windows `gatesG` kosusunda `tls_client` **SKIP** oldu: ortamda
+  `VDB_CRYPTO_DLL`/`VDB_SSL_DLL` yok. `tls_client` fikstur dizinini
+  `VDB_TLS_FIXTURES` ile bulur; degisken verilmezse kapi exe'nin yanindan
+  arar ve bulamaz (bu kosuda ilk denemede FAIL, degisken verilince SKIP).
+  Linux'ta fikstur otomatik bulundu ve kapi **kostu**: 6/6 PASS. Windows'ta
+  `tls_client`'in kostugu kosu `gatesE.log`'dur (DLL'ler o ortamda vardi).
+  Iki ortam arasindaki bu fark kapi sayisini 48/49 yapar; SKIP PASS sayilmaz.
 - **NOT-RUN** satirlari "kosmuyor" degil "olculmedi" demektir; bu raporda
   PASS sayilmaz.
 
@@ -471,6 +532,16 @@ tablosundadir. Bu sprintte kapatilanlar:
   icin checkpoint + yeniden acilis birlikte gerekiyordu). Duzeltme:
   `CollectFreePages`, `Open` atlamasi, `SpaceHintScan` filtresi, `AllocPage`
   savunmasi. Regresyon: SO16/SO17.
+- **F-33 (Kritik, KAPALI, v3.57)**: acik islemde yarida hata veren DML
+  cumlesinin yazdigi satirlar kaplamada kaliyor ve sonraki `COMMIT` bunlari
+  kalici hale getiriyordu (olculen: trigger hatasi sonrasi `BEGIN` icinde 2
+  satir, `COMMIT` sonrasi da 2 satir). Ayni olcum ikinci bir kusur daha
+  gosterdi: `TVSql.Exec` hizli yollari `InBatch` denetimini oturum
+  sabitlenmeden once yapiyordu, bu yuzden acik islemde hizli yol statement
+  kapsami acmadan yaziyordu. Duzeltme: ortuk statement kapsami
+  (`BeginStmtScope`/`ReleaseStmtScope`/`RollbackStmtScope`) + yazma oturumu
+  sabitlemesinin `Exec`/`ExecRaw` govdesinin tamamini sarmasi. Regresyon:
+  AT20-AT24 (`sql_atomicity` 138/0).
 
 ---
 

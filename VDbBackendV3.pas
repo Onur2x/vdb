@@ -237,6 +237,16 @@ type
         OrderLen: Integer;                 // FOrder'in savepoint anindaki uzunlugu
         Journal: TDictionary<QWord, TSavepointKeyRec>;
         TagDelta: TDictionary<Integer, Int64>;  // FBatchTagDelta kopyasi
+        { v3.57: TRUE ise bu kayit kullanici SAVEPOINT'i degil, bir SQL
+          cumlesinin ORTUK kapsamidir (explicit transaction icinde statement
+          atomikligi). Isim aramasi bunlari ATLAR; kapanis Id ile yapilir.
+          Journal'da HadBefore=False kaydi TUTULMAZ: kapsam acilirken alinan
+          OrderLen kirpildiginda o anahtarlar zaten dusuyor (PutPtr ve Delete
+          "Map'te yoksa Order'a ekle" kuralini uygular). Boylece toplu INSERT
+          satir basina gunluk girisi odemez; maliyet yalnizca GERCEKTEN
+          degistirilen eski anahtarlar kadardir. }
+        Internal: Boolean;
+        Id: Integer;
       end;
       { v3.15: SNAPSHOT ISOLATION (okuma gorunurlugu).
         Acik islemi olan bir oturum, BASLADIGI andaki goruntuyu okumalidir.
@@ -369,6 +379,10 @@ type
         yalnizca ortada acik kume varken dolar ve hic kume kalmayinca
         temizlenir. }
       FCommitGen: Int64;
+      { v3.57: ortuk statement kapsamlarinin kimlik sayaci (Internal savepoint
+        Id'si). Yalnizca artar; tasma pratikte imkansiz, tasarsa kimlik
+        aramasi bulamaz ve kapsam sessizce kapanir (veri kaybi yok). }
+      FStmtScopeSeq: Integer;
       FAlien: TDictionary<QWord, Int64>;
       { v3.15: snapshot gecmisi — anahtar basina post-image zinciri. }
       FUndo: TDictionary<QWord, TSnapRec>;
@@ -652,6 +666,9 @@ type
     procedure JournalKey(S: TWriteSet; Key: QWord);
     procedure ClearSavepoints;
     function FindSavepoint(const Name: string): Integer;
+    { v3.57: ortuk statement kapsami yardimcilari. }
+    function FindInternalScope(AId: Integer): Integer;
+    procedure RollbackScopeAt(ix: Integer);
   public
     { ADbPath: .odb dosya yolu. ACreate=True ise yoksa olusturur.
       ABusyMs: yazar kilidi icin bekleme (ms); 0 = bekleme yok.
@@ -817,6 +834,18 @@ type
     procedure Savepoint(const Name: string);
     function RollbackToSavepoint(const Name: string): Boolean;
     function ReleaseSavepoint(const Name: string): Boolean;
+    { v3.57: ORTUK statement kapsami (explicit transaction icinde statement
+      atomikligi). Cagiran: SQL katmani, her yazma cumlesinin cevresinde.
+      Sozlesme:
+        * BeginStmtScope: acik yazma kumesi YOKSA -1 doner (yapilacak is yok).
+        * ReleaseStmtScope: basarili cumleden sonra; veri COMMIT EDILMEZ.
+        * RollbackStmtScope: hata yolunda; yalnizca BU cumlenin yazimlari
+          kaplamadan dusurulur (onceki cumlelerin yazimlari KORUNUR).
+        * Kimlik bulunamazsa (cumle icinde COMMIT/ROLLBACK oldu) sessizce
+          doner. Istisna firlatmaz: asil hatayi maskelememeli. }
+    function BeginStmtScope: Integer;
+    procedure ReleaseStmtScope(AId: Integer);
+    procedure RollbackStmtScope(AId: Integer);
 
     function EnsureColumnKey: QWord;
     function ColumnKeyId: QWord;
@@ -967,6 +996,7 @@ begin
   FUndo := TDictionary<QWord, TSnapRec>.Create;
   FPendSnap := TList<TSnapPend>.Create;
   FCommitGen := 0;
+  FStmtScopeSeq := 0;
   FEngCs := TVdbGate.Create;
   FEngCs.OnFirstEnter := StoreReadEnter;
   FEngCs.OnLastLeave := StoreReadLeave;
@@ -4497,7 +4527,19 @@ begin
   Result := -1;
   if Savepoints = nil then Exit;
   for i := Savepoints.Count - 1 downto 0 do
-    if SameText(Savepoints[i].Name, Name) then
+    { v3.57: ortuk statement kapsamlari kullanici adi tasimaz. }
+    if (not Savepoints[i].Internal) and SameText(Savepoints[i].Name, Name) then
+      Exit(i);
+end;
+
+function TVdbBackendV3.FindInternalScope(AId: Integer): Integer;
+var
+  i: Integer;
+begin
+  Result := -1;
+  if Savepoints = nil then Exit;
+  for i := Savepoints.Count - 1 downto 0 do
+    if Savepoints[i].Internal and (Savepoints[i].Id = AId) then
       Exit(i);
 end;
 
@@ -4545,17 +4587,23 @@ begin
     begin
       je.HadBefore := True;
       je.Rec := S.Recs[idx];
+      sp.Journal.AddOrSetValue(Key, je);
     end
     else
     begin
+      { v3.57: ortuk statement kapsami (Internal) yeni anahtar icin gunluk
+        girisi YAZMAZ. Anahtar birazdan Order'a eklenecek ve kapsam
+        kapanirken OrderLen'e kirpilarak dusurulecek; toplu INSERT'te
+        satir basina sozluk girisi = O(n) bellek demekti. }
+      if sp.Internal then Continue;
       je.HadBefore := False;
       je.Rec.Present := False;
       je.Rec.Value := nil;
       je.Rec.ValOff := -1;
       je.Rec.ValLen := 0;
       je.Rec.Idx := -1;
+      sp.Journal.AddOrSetValue(Key, je);
     end;
-    sp.Journal.AddOrSetValue(Key, je);
   end;
 end;
 
@@ -4570,6 +4618,8 @@ begin
   { SQL standardi: SAVEPOINT acik islem yoksa ORTUK islem baslatir. }
   if not BatchOpen then BeginBatch;
   sp.Name := Name;
+  sp.Internal := False;
+  sp.Id := 0;
   sp.OrderLen := BatchOrder.Count;
   sp.Journal := TDictionary<QWord, TSavepointKeyRec>.Create;
   sp.TagDelta := TDictionary<Integer, Int64>.Create;
@@ -4578,17 +4628,14 @@ begin
   Savepoints.Add(sp);
 end;
 
-function TVdbBackendV3.RollbackToSavepoint(const Name: string): Boolean;
+procedure TVdbBackendV3.RollbackScopeAt(ix: Integer);
 var
-  ix, i: Integer;
+  i: Integer;
   sp: TSavepointRec;
   st: TWriteSet;
   pair: TPair<QWord, TSavepointKeyRec>;
   tp: TPair<Integer, Int64>;
 begin
-  RequireBatchWrite;
-  ix := FindSavepoint(Name);
-  if ix < 0 then Exit(False);
   sp := Savepoints[ix];
   st := OwnSet;
   { 1) Savepoint'ten sonra degisen anahtarlari o andaki haline dondur.
@@ -4618,9 +4665,16 @@ begin
   end;
   { 2) BatchOrder'i savepoint uzunluguna kirp. Girisler yalnizca "BatchMap'te
     yokken" eklendigi ve savepoint disinda silinmedigi icin kirpma tam
-    olarak sonradan eklenen girisleri atar. Recs de es uzunlukta kirpilir. }
+    olarak sonradan eklenen girisleri atar. Recs de es uzunlukta kirpilir.
+    v3.57: kuyruktaki anahtarlar Map'ten ve Before'dan da dusurulur. Kullanici
+    savepoint'inde bu zaten 1. adimda (HadBefore=False) yapiliyordu; ortuk
+    statement kapsaminda gunlukte kayit olmadigi icin TEK yol budur. }
   while BatchOrder.Count > sp.OrderLen do
+  begin
+    if st <> nil then st.Before.Remove(BatchOrder[BatchOrder.Count - 1]);
+    BatchMap.Remove(BatchOrder[BatchOrder.Count - 1]);
     BatchOrder.Delete(BatchOrder.Count - 1);
+  end;
   if st <> nil then
     while st.Recs.Count > sp.OrderLen do
       st.Recs.Delete(st.Recs.Count - 1);
@@ -4637,6 +4691,16 @@ begin
     sp.TagDelta.Free;
     Savepoints.Delete(i);
   end;
+end;
+
+function TVdbBackendV3.RollbackToSavepoint(const Name: string): Boolean;
+var
+  ix: Integer;
+begin
+  RequireBatchWrite;
+  ix := FindSavepoint(Name);
+  if ix < 0 then Exit(False);
+  RollbackScopeAt(ix);
   Result := True;
 end;
 
@@ -4648,8 +4712,6 @@ begin
   RequireBatchWrite;
   ix := FindSavepoint(Name);
   if ix < 0 then Exit(False);
-  { RELEASE veriyi COMMIT ETMEZ; yalnizca geri donme noktasini (ve
-    sonrakileri) dusurur. }
   for i := Savepoints.Count - 1 downto ix do
   begin
     sp := Savepoints[i];
@@ -4658,6 +4720,63 @@ begin
     Savepoints.Delete(i);
   end;
   Result := True;
+end;
+
+{ ------------------------------------------------- v3.57: statement kapsami }
+
+function TVdbBackendV3.BeginStmtScope: Integer;
+var
+  sp: TSavepointRec;
+  pair: TPair<Integer, Int64>;
+begin
+  Result := -1;
+  { Yalnizca ACIK bir yazma kumesi (explicit transaction) varsa anlamlidir;
+    otomatik commit yolunda zaten tam kilit + tek yazim var. }
+  if not BatchOpen then Exit;
+  if Savepoints = nil then Exit;
+  Inc(FStmtScopeSeq);
+  sp.Name := '';
+  sp.Internal := True;
+  sp.Id := FStmtScopeSeq;
+  sp.OrderLen := BatchOrder.Count;
+  sp.Journal := TDictionary<QWord, TSavepointKeyRec>.Create;
+  sp.TagDelta := TDictionary<Integer, Int64>.Create;
+  for pair in BatchTagDelta do
+    sp.TagDelta.AddOrSetValue(pair.Key, pair.Value);
+  Savepoints.Add(sp);
+  Result := sp.Id;
+end;
+
+procedure TVdbBackendV3.ReleaseStmtScope(AId: Integer);
+var
+  ix, i: Integer;
+  sp: TSavepointRec;
+begin
+  ix := FindInternalScope(AId);
+  if ix < 0 then Exit;   { islem icinde COMMIT/ROLLBACK olmus: yapilacak is yok }
+  { Veri COMMIT EDILMEZ; yalnizca geri donme noktasi dusurulur. Kapsam
+    icinde acilmis kayitlar (prosedur govdesindeki SAVEPOINT) da gider. }
+  for i := Savepoints.Count - 1 downto ix do
+  begin
+    sp := Savepoints[i];
+    sp.Journal.Free;
+    sp.TagDelta.Free;
+    Savepoints.Delete(i);
+  end;
+end;
+
+procedure TVdbBackendV3.RollbackStmtScope(AId: Integer);
+var
+  ix: Integer;
+begin
+  ix := FindInternalScope(AId);
+  if ix < 0 then Exit;   { islem icinde COMMIT/ROLLBACK olmus: yapilacak is yok }
+  try
+    RollbackScopeAt(ix);
+  except
+    { Hata yolu: kapsam geri alinamazsa bile ASIL istisna maskelenmemeli
+      (AbortBatch cagrilarindaki B-6 kuralinin aynisi). }
+  end;
 end;
 
 { ------------------------------------------------------ sema / sifreleme }

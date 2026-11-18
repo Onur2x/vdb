@@ -46,7 +46,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `page_integrity` | sayfa/heap/freelist bozulma matrisi (I0-I13) |
 | `sql_features` | parser'da olup kapisi olmayan SQL ozellikleri: `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` (kismi geri alma gercekten yalniz sonraki satirlari atar), `ON CONFLICT DO NOTHING\|DO UPDATE` (cift anahtar degeri bozmaz), `VACUUM`/`REINDEX`/`ANALYZE <tablo>` (bakim veriyi korur, indeks aramasi dogru kalir), `WITH` (CTE), `ROW_NUMBER() OVER (ORDER BY ...)`, `ALTER TABLE ... RENAME TO` |
 | `sql_authorization` | **SQL yetki/RLS/trigger kapisi** (Sprint A, 3.2-3.4): baglanti yetkisiz baslar (kimlik yoksa `Start` reddeder, varsayilan `admin/admin123` kaldirildi); `GRANT`/`REVOKE` sonrasi izinli/izinsiz DML; RLS policy `USING`/`WITH CHECK` (SELECT/INSERT/UPDATE/DELETE); **upsert** yolunun UPDATE yetkisi, RLS ve ROW trigger uygulamasi; **MERGE** hedef satir RLS filtresi + BEFORE/AFTER ROW ve STATEMENT trigger'lari. 32 kontrol, iki platformda 32/0 |
-| `sql_atomicity` | **SQL statement atomikligi kapisi** (Sprint A 3.5 + Sprint B): AFTER/BEFORE **STATEMENT** ve ROW trigger hatalarinda statement'in **tamami** geri alinir, trigger govdesindeki DML de geri alinir; ana tablo/indeks/audit degismez. AT1-AT5: AFTER STATEMENT hatasi (cok satir INSERT, UPDATE, DELETE, tek satir INSERT, COPY). AT6-AT10: BEFORE STATEMENT gercekten atesleniyor + DML'i statement ile kalici; BEFORE INSERT/UPDATE/DELETE hatasi; 0 satir eslesen DELETE'te trigger DML'i korunur (B4). AT11-AT12: BEFORE/AFTER ROW hatasi. AT13: 2. satirda duplicate PK -> hic satir kalmaz. AT14: MERGE AFTER STATEMENT hatasi. AT15: RETURNING tutarliligi (basarili -> satirlar yazilir; hatali -> iz yok). AT16: hatali statement sonrasi yeniden acilista iz yok. AT17: explicit transaction icinde statement hatasi + `ROLLBACK`. AT18/AT19: BEFORE STATEMENT trigger DML'i ana INSERT/COPY hatasiyla geri alinir (B1). 19 vaka, **88 kontrol**, iki platformda 88/0. Kapi duzeltme oncesi kaynakla 8 kontrol FAIL verir (AT8/AT9/AT10/AT18/AT19), yani bos yesil degildir |
+| `sql_atomicity` | **SQL statement atomikligi kapisi** (Sprint A 3.5 + Sprint B): AFTER/BEFORE **STATEMENT** ve ROW trigger hatalarinda statement'in **tamami** geri alinir, trigger govdesindeki DML de geri alinir; ana tablo/indeks/audit degismez. AT1-AT5: AFTER STATEMENT hatasi (cok satir INSERT, UPDATE, DELETE, tek satir INSERT, COPY). AT6-AT10: BEFORE STATEMENT gercekten atesleniyor + DML'i statement ile kalici; BEFORE INSERT/UPDATE/DELETE hatasi; 0 satir eslesen DELETE'te trigger DML'i korunur (B4). AT11-AT12: BEFORE/AFTER ROW hatasi. AT13: 2. satirda duplicate PK -> hic satir kalmaz. AT14: MERGE AFTER STATEMENT hatasi. AT15: RETURNING tutarliligi (basarili -> satirlar yazilir; hatali -> iz yok). AT16: hatali statement sonrasi yeniden acilista iz yok. AT17: explicit transaction icinde statement hatasi + `ROLLBACK`. AT18/AT19: BEFORE STATEMENT trigger DML'i ana INSERT/COPY hatasiyla geri alinir (B1). **AT20-AT24 (Sprint B2)**: explicit transaction icinde statement hatasindan sonra `COMMIT` yarim yazimi **kalici yapmaz** (AT20); onceki basarili statement'in satiri korunur, hatali statement'in satiri kalmaz (AT21); hatali statement'in anahtari sonraki statement'ta yeniden kullanilabilir, yani kaplama defteri temizlenir (AT22); UNIQUE cakismasiyla yarida kalan `UPDATE` geri alinir, onceki `UPDATE` korunur (AT23); kullanici `SAVEPOINT`'i ortuk kapsamdan etkilenmez, `ROLLBACK TO`/`RELEASE` calisir (AT24). 24 vaka, **138 kontrol**, iki platformda 138/0. Kapi duzeltme oncesi kaynakla derlenen sonda 6 kontrol FAIL verir (AT20 x2, AT21 x2, AT22, AT23 - hepsi COMMIT sonrasi yarim yazim), yani bos yesil degildir. ONEMLI: eski 8 FAIL iddiasi AT8/AT9/AT10/AT18/AT19 icindi; bu sprintte ayni kaynakla olculen guncel deger 6 FAIL'dir |
 | `limits` | **kaynak sinirlari** (SKILL2 §25): 4 MiB'tan buyuk SQL, 16 MB'lik INSERT ve 2M ustu `LIMIT` kontrollu `ecLimit` ile reddedilir; reddedilen islem **hicbir satir birakmaz**, ayni veritabani sorgulanmaya devam eder, kapanis temiz (yalniz `.odb`) ve yeniden acilista veri bozulmamis olur; belgelenen tavanlar (`LIMITS.md`) tutarli |
 | `sql_memory` | **SQL sinir ve sayisal uc davranis kapisi** (Sprint F1, 8.2 + 8.4 + 8.5): 26 vaka, **54 kontrol**. SM1-SM7 tam siralamanin (ASC/DESC, NULL ilk/son) **onegi** olarak `ORDER BY ... LIMIT/OFFSET` (tek ve cok anahtar) - streaming kisayolu ile genel yurutucu ayni sonucu verir. SM8 `LIMIT 0`; SM9 negatif `LIMIT`/`OFFSET` -> `ecSyntaxError`; SM10 `OFFSET 1000000000`/`2147483647` -> 0 satir; SM11 tavan asimi (`VDB_MAX_RESULT_ROWS+1`, `LIMIT+OFFSET` toplami) -> `ecLimit` (kismi sonuc yok). SM12-SM14 3VL (`= NULL`, `IS NULL`, `NOT`, `IN`/`NOT IN` NULL'lu, `BETWEEN NULL`) ve `COUNT(col)` 5 / `COUNT(*)` 6 / `AVG` 3.5. SM15 `CAST` 22/24 haneli metin ve `'abc'` -> `ecTypeMismatch` (tasma sessiz sarma **yok**); SM16 Int64 max/min tam; SM17 `-9223372036854775808` literali tam; SM18 `+`/`*` tasmasi -> `ecMathError`; SM19 `1/0` ve `1.0/0.0`; SM20 `ABS` tam sayi hassasiyeti + `ABS(Low(Int64))` -> `ecMathError`; SM26 kolondaki `Low(Int64)` korunur, `SELECT -v` -> `ecMathError`. SM21 ozyinelemeli CTE 100 satir (COUNT/MIN/MAX); SM22 **sinirsiz** ozyineleme -> `ecLimit` (sessiz kesme yok) ve tablo saglam; SM23 `QueryTimeoutMs := 60` ile derin ozyineleme -> `ecQueryTimeout`; SM24 `CancelQuery` -> `ecCancelled`, ardindan `ResetCancel` ve normal sorgu. SM25 kapanis temiz (yalniz `.odb`), yeniden acilista 6 satir ve ayni sira. Iki platformda 54/0. Duzeltme oncesi kaynakla (`git archive HEAD`) derlenen sonda **6 kontrol FAIL** (SM15 x2 CAST sarmasi, SM20 x2 `ABS` float/`ABS(Low)`, SM22 sessiz kesme, SM26 isaret sarmasi) |
 | `wal_recovery` | **WAL-before-data ve kurtarma basarisizligi kapisi** (Sprint C, 4.1 + 4.2): checkpoint WAL bariyerini (fsync + durabil LSN dogrulama) veri sayfalari yazilmadan **once** kurar; WAL fsync hata enjeksiyonuyla checkpoint basarisiz olur ve yeniden acilista **hayalet commit gorunmez** (WR1: `COUNT` tabanda kalir, anahtar yok). WR2 `CP_BEFORE_FLUSH` kancasinda `Engine.DurableLsn >= Wal.WrittenLsn` olcer (eski sirada `durable=0 written=3`). Kurtarma basarisizligi motoru **POISONED** yapar: `ecInvalidState` ile backend okumasi, motor okumasi ve yazma reddedilir, `PoisonReason` dolu; kapatip acma temiz baslangic ve yazilabilirlik verir (WR3). Basarili kurtarma durabil satiri korur, fsync edilmemis satiri atar, motoru yeniden yazilabilir kilar (WR4). Normal yol zehirlenmez (WR5). 5 vaka, **27 kontrol**, iki platformda 27/0. Duzeltme oncesi kaynakla derlenen sonda 3 kontrol FAIL (`wr1/durable-kept`, `wr1/no-ghost-row`, `wr2/wal-durable-before-flush`) |
@@ -1027,3 +1027,65 @@ kaldirildi:
     zaman asimini devralir, ayrica olculmedi); `COPY` varsayilan bicimi
     PostgreSQL text degil **csv**'dir (virgul); Sprint F2 (streaming, disk
     spill) **acik** kalmaya devam eder.
+- Kirk birinci kosu (v3.57, Sprint B2 - acik islemde statement atomikligi):
+  **iki platform da YESIL**. Git Bash/Windows **48 kapi** PASS, WSL x86_64
+  Linux **49 kapi** PASS, FAIL 0 (`gatesG.log` -> `KOSAN KAPI: 48`,
+  `SUITE_EXIT=0`; `linG.log` -> `KOSAN KAPI: 49`, `SUITE_EXIT=0`).
+  Windows'ta `tls_client` SKIP (OpenSSL DLL yok; `VDB_TLS_FIXTURES`
+  verilmezse fikstur bulunamayip FAIL eder - SKIP != PASS), Linux'ta 6/0.
+  - **6.1 acik islemde statement atomikligi (F-33, KRITIK, KAPALI)**:
+    explicit transaction icinde yarida hata veren bir DML cumlesinin
+    yazdigi satirlar kaplamada kaliyordu ve sonraki `COMMIT` bunlari
+    **kalici** hale getiriyordu. Olcum (`txnprobe`): `BEGIN` -> cok satirli
+    INSERT trigger hatasiyla basarisiz -> islem icinde 2 satir -> `COMMIT` ->
+    hala 2 satir. Mevcut kapi bunu **yakalamiyordu**, cunku AT17 yalniz
+    `ROLLBACK` sonrasina bakiyordu. Duzeltme: her yazma cumlesi cevresinde
+    **ortuk savepoint** (`BeginStmtScope`/`ReleaseStmtScope`/
+    `RollbackStmtScope`, `IVDbBackend` uzerinde). Basarili cumle kapsami
+    yalnizca kapatir (veri commit edilmez); hata yolunda **yalniz o
+    cumlenin** yazimlari dusurulur, onceki cumlelerin yazimlari korunur.
+    Kapsam yalnizca yazma anahtar sozcuguyle baslayan cumlelerde, acik
+    yazma kumesi varken ve ic ice girmeden (`FStmtScopeDepth=0`) acilir;
+    islem denetim cumleleri (`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`) ve DDL
+    **disarida** kalir, aksi halde kapsam kapanisi kullanicinin
+    savepoint'ini silebilirdi. Kimlik bulunamazsa sessiz doner ve hata
+    yolu asil istisnayi maskelemez.
+  - **Bellek siniri**: yeni anahtarlar icin gunluk girisi **yazilmaz**;
+    kapsam kapanirken `BatchOrder`/`BatchMap`/`Before` kapsam acilisindaki
+    uzunluga kirpilir. Boylece 200k satirlik toplu INSERT satir basina
+    sozluk girdisi **odemez**; maliyet yalnizca gercekten degistirilen eski
+    anahtarlar kadardir.
+  - **Olcumun buldugu ikinci kusur**: `TVSql.Exec` (iki asiri yukleme de)
+    hizli yol kosulundaki `InBatch` denetimini **yazma oturumu
+    sabitlenmeden once** yapiyordu. `InBatch`/savepoint/`BatchMap` oturum
+    basina oldugu icin acik islemde bu denetim **cagiranin ortam
+    oturumuna** bakiyor, `False` donuyor ve literal/parametreli INSERT hizli
+    yolu statement kapsami **acmadan** yaziyordu. Duzeltme: oturum
+    sabitlemesi `Exec`/`ExecRaw` govdesinin **tamamini** sarar ve acik
+    islemde iki hizli yol da atlanir. Bu kusur yalnizca olcumle bulundu;
+    ilk duzeltme tek basina AT21/AT22'yi yesile cevirmiyordu.
+  - **Kapinin buyumesi**: `sql_atomicity` 19 vaka/88 kontrol -> **24
+    vaka/138 kontrol**. Yeni AT20-AT24: COMMIT sonrasi yarim yazim yok
+    (AT20), onceki statement korunur (AT21), hatali statement'in anahtari
+    sonraki statement'ta yeniden kullanilabilir (AT22), yarida kalan UPDATE
+    geri alinir (AT23), kullanici `SAVEPOINT`'i ortuk kapsamdan etkilenmez
+    (AT24). Duzeltme oncesi kaynakla (`git archive 4214586`, bos cwd'de
+    derlenerek) **6 kontrol FAIL** (AT20 x2, AT21 x2, AT22, AT23) ve exit
+    1; duzeltilmis agacta 138/0.
+  - **Duzenlenen kapi (durust kayit)**: AT23'un ilk hali `UPDATE t SET id=1`
+    kullaniyordu; bu **degisiklik yapilmadan** `PK kolonu guncellenemez`
+    ile dusuyor, yani sahte yesil uretiyordu. Gercek yarim-yazim icin
+    `CREATE UNIQUE INDEX` + `UPDATE ... SET v` cakismasi kullanildi. AT24'un
+    ilk hali backend API'sini dogrudan cagiriyordu (oturum sabitlenmedigi
+    icin yanlis olcum); SQL-only hale getirildi ve `ROLLBACK TO s1`in
+    gercekten bir sey sildigini kanitlayan **basarili** bir ara INSERT
+    eklendi.
+  - **V2 dondurulmus**: `TVdbBackendV2.BeginStmtScope` -1 doner, digerleri
+    bos. V2 davranisi **degismedi**; bedeli, V2 yoluyla acik islemde
+    statement atomikligi **olmamasidir** (bilinen ve belgelenmis sinir).
+  - **Durust sinir**: kapsam kaplama (yazma kumesi) duzeyinde calisir;
+    yarim yazilmis **disk sayfasina** karsi ek koruma degildir (o
+    `wal_recovery`/POISONED ve `page_integrity` konusudur). Kapsam yalnizca
+    **acik islem** icinde acilir: otomatik commit'li tek cumle zaten
+    ya-hep-ya-hic yazilir. Ag sunucusu uzerinden ayni senaryolar
+    kosulmadi.

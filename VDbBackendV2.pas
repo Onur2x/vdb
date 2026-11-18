@@ -76,6 +76,10 @@ type
     procedure Savepoint(const Name: string);
     function RollbackToSavepoint(const Name: string): Boolean;
     function ReleaseSavepoint(const Name: string): Boolean;
+    { v3.57: V2 dondurulmus - ortuk statement kapsami yok (davranis degismez). }
+    function BeginStmtScope: Integer;
+    procedure ReleaseStmtScope(AId: Integer);
+    procedure RollbackStmtScope(AId: Integer);
 
     { v3.2: v2 kayit duzeyi anahtar rotasyonu (TVDb.RekeyWithPassword). }
     procedure Rekey(const NewPassword: string);
@@ -352,6 +356,22 @@ function TVDbBackendV2.ReleaseSavepoint(const Name: string): Boolean;
 begin
   FDb.ReleaseSavepoint(Name);
   Result := True;
+end;
+
+{ v3.57: V2 DONDURULMUS. Ortuk statement kapsami v2'de YOK; davranis
+  degismez (var olan v2 semantigi korunur). v2 yoluyla acik islemde
+  statement atomikligi saglanmaz - bu bilinen ve belgelenmis sinirdir. }
+function TVDbBackendV2.BeginStmtScope: Integer;
+begin
+  Result := -1;
+end;
+
+procedure TVDbBackendV2.ReleaseStmtScope(AId: Integer);
+begin
+end;
+
+procedure TVDbBackendV2.RollbackStmtScope(AId: Integer);
+begin
 end;
 
 procedure TVDbBackendV2.Rekey(const NewPassword: string);

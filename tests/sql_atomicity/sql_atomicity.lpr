@@ -593,6 +593,203 @@ begin
   CloseAll;
 end;
 
+{ v3.57 / SKILL5 6.1: EXPLICIT TRANSACTION icinde yarida hata veren bir
+  statement'in yazimlari once COMMIT ile KALICI hale geliyordu (olculdu:
+  BEGIN; cok satirli INSERT (trigger hatasi); COMMIT -> 2 satir kalici).
+  AT17 yalnizca ROLLBACK sonrasini denetledigi icin bu acigi goremiyordu.
+  Asagidaki AT20-AT24 COMMIT SONRASINI denetler. }
+procedure CaseTxnCommitAfterFail;
+var
+  ok, trig: Boolean;
+begin
+  OpenFresh('txc1');
+  Setup('t', ok);
+  Chk('AT20 tablolar olustu', ok, err);
+  trig := TryExec(Sq,
+    'CREATE TRIGGER ttx20 AFTER INSERT ON t FOR EACH STATEMENT AS ' +
+    'BEGIN INSERT INTO audit (id) VALUES (999); END', err);
+  Chk('AT20 AFTER INSERT STATEMENT trigger olustu', trig, err);
+
+  ok := TryExec(Sq, 'BEGIN', err);
+  Chk('AT20 BEGIN calisti', ok, err);
+  ok := TryExec(Sq,
+    'INSERT INTO t (id, v) VALUES (1, ''a''), (2, ''b'')', err);
+  Chk('AT20 txn icinde statement basarisiz oldu', not ok, err);
+  Chk('AT20 txn icinde ana tablo bos',
+    IntQ(Sq, 'SELECT COUNT(*) FROM t') = 0,
+    'satir=' + IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t')));
+  ok := TryExec(Sq, 'COMMIT', err);
+  Chk('AT20 COMMIT calisti', ok, err);
+  Chk('AT20 COMMIT sonrasi yarim yazim KALICI OLMADI',
+    IntQ(Sq, 'SELECT COUNT(*) FROM t') = 0,
+    'satir=' + IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t')));
+  Chk('AT20 COMMIT sonrasi audit oncesi durumunda',
+    IntQ(Sq, 'SELECT COUNT(*) FROM audit') = 1,
+    'audit=' + IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM audit')));
+  CloseAll;
+end;
+
+{ v3.57: explicit txn icinde BASARILI statement korunur, hatali statement'in
+  yarim yazimi COMMIT ile kalici olmaz. Trigger yok: ihlal, onceden var olan
+  PK ile cakismadan gelir (motorun kendi kisit yolu). }
+procedure CaseTxnGoodStmtSurvives;
+var
+  ok: Boolean;
+begin
+  OpenFresh('txg');
+  ok := TryExec(Sq, 'CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)', err);
+  Chk('AT21 tablo olustu', ok, err);
+  ok := TryExec(Sq, 'INSERT INTO t (id, v) VALUES (5, ''seed'')', err);
+  Chk('AT21 tohum satiri eklendi', ok, err);
+
+  ok := TryExec(Sq, 'BEGIN', err);
+  Chk('AT21 BEGIN calisti', ok, err);
+  ok := TryExec(Sq, 'INSERT INTO t (id, v) VALUES (7, ''ok'')', err);
+  Chk('AT21 iyi statement calisti', ok, err);
+  ok := TryExec(Sq,
+    'INSERT INTO t (id, v) VALUES (8, ''a''), (5, ''dup'')', err);
+  Chk('AT21 kotu statement PK cakismasiyla basarisiz oldu', not ok, err);
+  ok := TryExec(Sq, 'COMMIT', err);
+  Chk('AT21 COMMIT calisti', ok, err);
+  Chk('AT21 kotu statement satiri (id=8) kalici OLMADI',
+    IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 8') = 0,
+    'satir8=' + IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 8')));
+  Chk('AT21 onceki iyi statement satiri korundu (id=7)',
+    IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 7') = 1,
+    'satir7=' + IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 7')));
+  Chk('AT21 toplam satir 2 (5 ve 7)',
+    IntQ(Sq, 'SELECT COUNT(*) FROM t') = 2,
+    'satir=' + IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t')));
+  CloseAll;
+end;
+
+{ v3.57: geri alma sonrasi cakisma defteri temizlenmeli; aksi halde ayni
+  anahtar sonraki statement'ta bosuna cakisma verirdi. }
+procedure CaseTxnRollbackCleansConflict;
+var
+  ok: Boolean;
+begin
+  OpenFresh('txcl');
+  ok := TryExec(Sq, 'CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)', err);
+  Chk('AT22 tablo olustu', ok, err);
+  ok := TryExec(Sq, 'INSERT INTO t (id, v) VALUES (5, ''seed'')', err);
+  Chk('AT22 tohum satiri eklendi', ok, err);
+
+  ok := TryExec(Sq, 'BEGIN', err);
+  Chk('AT22 BEGIN calisti', ok, err);
+  ok := TryExec(Sq,
+    'INSERT INTO t (id, v) VALUES (8, ''a''), (5, ''dup'')', err);
+  Chk('AT22 hatali statement basarisiz oldu', not ok, err);
+  ok := TryExec(Sq, 'INSERT INTO t (id, v) VALUES (8, ''a'')', err);
+  Chk('AT22 ayni anahtar sonraki statement''ta BASARILI', ok, err);
+  ok := TryExec(Sq, 'COMMIT', err);
+  Chk('AT22 COMMIT calisti', ok, err);
+  Chk('AT22 id=8 tek satir kalici',
+    IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 8') = 1,
+    'satir8=' + IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 8')));
+  CloseAll;
+end;
+
+{ v3.57: UPDATE yolu da ayni garanti altinda. Yarida kalan bir UPDATE
+  gercekten olmali: PK kolonu guncellenemedigi icin onceki surum yalnizca
+  dogrulama hatasi veriyordu ve hicbir degisiklik yapmadan dusuyordu (yanlis
+  pozitif). Burada UNIQUE indeks cakismasi ikinci satirda olusur: 1. satir
+  yazilir, 2. satir cakisir -> statement geri alinmali, 1. satir ESKI
+  degerine donmelidir. }
+procedure CaseTxnUpdateCommitAfterFail;
+var
+  ok: Boolean;
+begin
+  OpenFresh('txu');
+  ok := TryExec(Sq, 'CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)', err);
+  Chk('AT23 tablo olustu', ok, err);
+  ok := TryExec(Sq,
+    'INSERT INTO t (id, v) VALUES (1, ''a''), (2, ''b'')', err);
+  Chk('AT23 iki satir eklendi', ok, err);
+  ok := TryExec(Sq, 'CREATE UNIQUE INDEX ux23 ON t (v)', err);
+  Chk('AT23 UNIQUE indeks olustu', ok, err);
+
+  ok := TryExec(Sq, 'BEGIN', err);
+  Chk('AT23 BEGIN calisti', ok, err);
+  ok := TryExec(Sq, 'UPDATE t SET v = ''z'' WHERE id = 1', err);
+  Chk('AT23 iyi UPDATE calisti', ok, err);
+  { 1. satir z -> x yazilir, 2. satir b -> x cakisir. }
+  ok := TryExec(Sq, 'UPDATE t SET v = ''x'' WHERE id IN (1, 2)', err);
+  Chk('AT23 hatali UPDATE indeks cakismasiyla basarisiz oldu', not ok, err);
+  ok := TryExec(Sq, 'COMMIT', err);
+  Chk('AT23 COMMIT calisti', ok, err);
+  Chk('AT23 onceki UPDATE korundu (v=z)',
+    CellQ(Sq, 'SELECT v FROM t WHERE id = 1') = 'z',
+    'v=' + CellQ(Sq, 'SELECT v FROM t WHERE id = 1'));
+  Chk('AT23 hatali UPDATE 2. satiri bozmadi (v=b)',
+    CellQ(Sq, 'SELECT v FROM t WHERE id = 2') = 'b',
+    'v=' + CellQ(Sq, 'SELECT v FROM t WHERE id = 2'));
+  Chk('AT23 toplam satir 2',
+    IntQ(Sq, 'SELECT COUNT(*) FROM t') = 2,
+    'satir=' + IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t')));
+  CloseAll;
+end;
+
+{ v3.57: ortuk statement kapsami kullanicinin SAVEPOINT'ini GOLGELEMEMELI;
+  ROLLBACK TO / RELEASE hala calismali. Test yalnizca SQL kullanir: backend
+  API'sini dogrudan cagirmak yazma oturumunu ayarlamadigi icin yaniltici
+  olurdu. Silent no-op'a karsi koruma: savepoint'ten SONRA BASARILI bir
+  satir eklenir; ROLLBACK TO onu silmezse savepoint kaybolmus demektir. }
+procedure CaseTxnUserSavepointPreserved;
+var
+  ok: Boolean;
+begin
+  OpenFresh('txsp');
+  ok := TryExec(Sq, 'CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)', err);
+  Chk('AT24 tablo olustu', ok, err);
+
+  ok := TryExec(Sq, 'BEGIN', err);
+  Chk('AT24 BEGIN calisti', ok, err);
+  ok := TryExec(Sq, 'INSERT INTO t (id, v) VALUES (10, ''a'')', err);
+  Chk('AT24 ilk satir eklendi', ok, err);
+  ok := TryExec(Sq, 'SAVEPOINT s1', err);
+  Chk('AT24 kullanici SAVEPOINT olustu', ok, err);
+  { Savepoint'ten sonra BASARILI yazim: ROLLBACK TO bunu silmeli. }
+  ok := TryExec(Sq, 'INSERT INTO t (id, v) VALUES (11, ''b'')', err);
+  Chk('AT24 savepoint sonrasi satir eklendi', ok, err);
+  { Yarida kalan statement: ortuk kapsam bunu geri almali. }
+  ok := TryExec(Sq,
+    'INSERT INTO t (id, v) VALUES (13, ''x''), (10, ''dup'')', err);
+  Chk('AT24 hatali statement basarisiz oldu', not ok, err);
+
+  ok := TryExec(Sq, 'ROLLBACK TO SAVEPOINT s1', err);
+  Chk('AT24 ROLLBACK TO s1 calisti (savepoint yasiyor)', ok, err);
+  Chk('AT24 ROLLBACK TO s1 satir 10''u korudu',
+    IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 10') = 1,
+    'satir10=' + IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 10')));
+  Chk('AT24 ROLLBACK TO s1 savepoint sonrasi satiri (id=11) sildi',
+    IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 11') = 0,
+    'satir11=' + IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 11')));
+  Chk('AT24 ROLLBACK TO s1 yarim yazimi (id=13) sildi',
+    IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 13') = 0,
+    'satir13=' + IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 13')));
+
+  ok := TryExec(Sq, 'INSERT INTO t (id, v) VALUES (12, ''c'')', err);
+  Chk('AT24 savepoint sonrasi yeni satir eklendi', ok, err);
+  ok := TryExec(Sq, 'RELEASE SAVEPOINT s1', err);
+  Chk('AT24 RELEASE SAVEPOINT calisti', ok, err);
+  ok := TryExec(Sq, 'COMMIT', err);
+  Chk('AT24 COMMIT calisti', ok, err);
+  Chk('AT24 hatali statement satiri (id=11) yok',
+    IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 11') = 0,
+    'satir11=' + IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 11')));
+  Chk('AT24 sonraki satir (id=12) kalici',
+    IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 12') = 1,
+    'satir12=' + IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 12')));
+  CloseAll;
+  { Yeniden acilis: yarim yazim diskte de yok. }
+  OpenSame;
+  Chk('AT24 yeniden acilista yarim yazim yok',
+    IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 11') = 0,
+    'satir11=' + IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE id = 11')));
+  CloseAll;
+end;
+
 { Sprint B (B1, COPY yolu): ayni garanti COPY icin. }
 procedure CaseCopyBeforeStmtRolledBack;
 var
@@ -712,6 +909,26 @@ begin
   try CaseCopyBeforeStmtRolledBack except
     on E: Exception do begin Inc(GFail);
       WriteLn('FAIL AT19 beklenmeyen hata: ', E.ClassName, ': ', E.Message); end;
+  end;
+  try CaseTxnCommitAfterFail except
+    on E: Exception do begin Inc(GFail);
+      WriteLn('FAIL AT20 beklenmeyen hata: ', E.ClassName, ': ', E.Message); end;
+  end;
+  try CaseTxnGoodStmtSurvives except
+    on E: Exception do begin Inc(GFail);
+      WriteLn('FAIL AT21 beklenmeyen hata: ', E.ClassName, ': ', E.Message); end;
+  end;
+  try CaseTxnRollbackCleansConflict except
+    on E: Exception do begin Inc(GFail);
+      WriteLn('FAIL AT22 beklenmeyen hata: ', E.ClassName, ': ', E.Message); end;
+  end;
+  try CaseTxnUpdateCommitAfterFail except
+    on E: Exception do begin Inc(GFail);
+      WriteLn('FAIL AT23 beklenmeyen hata: ', E.ClassName, ': ', E.Message); end;
+  end;
+  try CaseTxnUserSavepointPreserved except
+    on E: Exception do begin Inc(GFail);
+      WriteLn('FAIL AT24 beklenmeyen hata: ', E.ClassName, ': ', E.Message); end;
   end;
   WriteLn;
   WriteLn('SONUC: ', GPass, ' PASS, ', GFail, ' FAIL');
