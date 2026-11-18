@@ -55,7 +55,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `page_corrupt` | **okuma yolunda sayfa butunlugu** (SKILL3 §5.3/§12.1): normal okuma yolu artik dogrulama yapar. Her veri sayfasinin govdesinde tek bayt bozulmasi, bozuk sihirli sayi ve yanlis sayfa imaji (sayfa 2 imaji sayfa 3'e kopyalanmis) kontrollu `ecCorrupt` uretir; dosyanin saglam kopyasi hala kusursuz taranir (kapi yanlis pozitif uretmez). Sifreli dosyada GCM etiketi zaten dogruluyor |
 | `server_harden` | dinleme adresi, `--trust` sinirlari, TLS zorunlulugu |
 | `server_failure` | **sunucu hata yollari** (SKILL3 §12.1): (a) `MaxConns=1` iken ikinci baglanti `RSP_ERROR` + `kapasite dolu` alip kapanir, birinci baglanti sorguya devam eder; (b) yeni baglantiya 64 bayt cop ($FF) yazilip kapatilir, sunucu yasar; (c) `CMD_QUERY` ardindan sahte **96 MiB** uzunluk oneki gonderilir - v3.39 `VDBS_MAX_RECV_STR` (64 MiB) oneki tahsis yapmadan reddeder, sunucu yasar; (d) acik baglanti varken `Stop` doner ve `Ready=False` olur; (e) `.odb` dosyasi yerinde kalir ve yeniden acilip satirlari okur |
-| `disk_full` | **disk dolu / kisa yazma** (SKILL3 §12.1): sayfa, meta ve **WAL** yazmalari tek noktadan (`WriteBytesChecked` / `WriteChecked`) gecer; enjekte edilen sert hata ve yarim yazma (gercek `ENOSPC` davranisi) kontrollu `ecIOError` uretir, surec cokmez, cerceve **kirli** kalir. Basarisiz commit **hayalet satir** birakmaz (ayni oturumda `COUNT(*)` durabil durumla ayni). Hata + `ROLLBACK` sonrasi onayli satirlar durur, hata giderilince checkpoint ve yeni commit calisir, yeniden acilista tum onayli satirlar okunur ve `VERIFY` temizdir |
+| `disk_full` | **disk dolu / kisa yazma** (SKILL3 §12.1 + SKILL5 8.1): sayfa, meta ve **WAL** yazmalari tek noktadan (`WriteBytesChecked` / `WriteChecked`) gecer; enjekte edilen sert hata ve yarim yazma (gercek `ENOSPC` davranisi) kontrollu `ecIOError` uretir, surec cokmez, cerceve **kirli** kalir. Basarisiz commit **hayalet satir** birakmaz (ayni oturumda `COUNT(*)` durabil durumla ayni). Hata + `ROLLBACK` sonrasi onayli satirlar durur, hata giderilince checkpoint ve yeni commit calisir, yeniden acilista tum onayli satirlar okunur ve `VERIFY` temizdir. **DF10a-DF10c (Sprint D2)**: checkpoint hata yolunda surecler arasi yazma kilidi **sizmaz** - meta yazimina sert hata enjekte edilip checkpoint `ecIOError` ile dusuruldukten sonra **ikinci bir backend** ayni dosyaya yazabilir ve yazdigi satiri okuyabilir. 16 -> **19 kontrol**, iki platformda 19/0. Duzeltme oncesi kaynakla (`git archive a3b97da`) **4 kontrol FAIL** (DF10b/DF10c + DF6/DF6b - sizinti kapanistan sonra da yeniden acilisi kilitliyordu) |
 | `txn_limit` | **islem sayisi / yazar cakismasi** (SKILL3 §12.2): 300 kisa islem ve 300 islemin 75'i geri alinarak commit sayisi birebir dogrulanir (sessiz kayip yok). Belgelenen v3 semantigi olculur: ic ice `BEGIN`, islem yokken `COMMIT`/`ROLLBACK` **sessiz no-op**'tur (tek islem katmani). Dosya basina **tek yazar rezervasyonu** vardir: bir oturum tutarken digeri kisa busy suresiyle kontrollu `mesgul` hatasi alir, `ROLLBACK` ile temizlenir, rezervasyon birakilinca ayni islem basariyla tamamlanir; yeniden acilista tum satirlar + `VERIFY` temiz |
 | `oom` | **bellek tukenmesi** (SKILL3 §12.1): `VDbMM`'e yalniz test icin `MMInjectFault` kancasi eklendi (esik ustundeki tahsislerde bir kez `EOutOfMemory`, sonra kapanir). Okuma ve yazma yollari ayri olculur; nil donen tahsis `SetLength` icinde `EAccessViolation`'a donustugu icin **yanlis** bir benzetimdi, gercek heap gibi `EOutOfMemory` atiliyor. **Bulunan gercek hata (F16, KRITIK):** yazma sirasindaki tahsis hatasi dosyada taninmayan sayfa birakiyordu (`EVdbHeap: sayfa N taninmiyor`); `ExtendFile` once buyutup sonra `Inc(FPageCount)` yapar, `AllocPage` yalnizca bu cagrinin actigi sayfayi geri alir. Hata sonrasi oturum yazmaya devam eder, hayalet satir yok, checkpoint ve yeniden acilis 200 satir + temiz `VERIFY` |
 | `btree_scale` | **B+Tree olcek + VACUUM geri kazanma** (SKILL3 §13 olcum-once kurali: "olculebilir bir sorun olmadan spekulatif B+Tree degisikligi yok"): bellekteki `TVDbBTree`'ye 1.000.000 anahtar karisik sirada eklenir; yukseklik **4**, **14.965** yaprak, ortalama doluluk **66/96**, degismezler temiz, `All()` artan, 8.000 rastgele `Find`, `CountRange`/`RankBefore` analitik beklentiyle ayni. Olcek olcusu toplam sure degil **islem basina** maliyettir: 10x veride **3,75x Windows / 4,55x Linux** (karesel agacta ~10x); i386'da 1M anahtar onbellek disina tasindigi icin toplam oran 35-46x cikar ve tek basina yanilticidir. Yarisi silinip yeniden eklenince yaprak sayisi 14.965 -> 14.979 (**1,00x**), yani churn sonrasi yaprak parcalanmasi yok. Diskte 6.000 satir -> %90 sil (dosya kuculmez; `GetDeadBytes` yalniz freelist sayfalarini sayar) -> `VACUUM` **iki platformda da** 1,60 MB'i 151 KB'a indirir (**%90 kazanc**), satir sayisi birebir kalir, sonrasinda 600 satir daha eklemek dosyayi sisirmez, yeniden acilis ve `VERIFY` temiz. Kapi yazilirken **iki gercek motor hatasi** olculdu ve ayni commit'te duzeltildi (v3.43): Unix'te her acilista sizan dosya tanitici (F17) ve basarisiz dosya degistirmeyi basarili bildiren sessiz yutma (F18) - Linux'un yer kazanmadan `VACUUM` kazanci bildirmesinin nedeni buydu |
@@ -1130,4 +1130,38 @@ kaldirildi:
     kullanicisina donus sayar). Bu yasak **denendi** ve geri alindi: mevcut
     AU1-AU7 temizligi `SET ROLE NONE` kullandigi icin 7 kontrolu dusurdu ve
     principal eslemesi olmadan guvenlik eklemiyordu. Sinir olarak belgelendi.
+
+- Kirk ucuncu kosu (v3.59, Sprint D2 - checkpoint hata yolunda kilit sizintisi):
+  iki platform da YESIL. Git Bash/Windows **48 kapi** PASS, WSL x86_64 Linux
+  **49 kapi** PASS, FAIL 0 (`gatesI.log` -> `KOSAN KAPI: 48`, `SUITE_EXIT=0`;
+  `linI.log` -> `KOSAN KAPI: 49`, `SUITE_EXIT=0`). Windows'ta `tls_client`
+  yine **SKIP** (ortamda OpenSSL DLL'i yok; `VDB_TLS_FIXTURES` verilmezse
+  kapi fikstur yolundan FAIL eder - SKIP != PASS); Linux'ta kostu: 6/0.
+  - **SKILL5 8.1 / F-35 (KRITIK, KAPALI)**: checkpoint sirasindaki ilk sayfa
+    yazimi (`WritePageAt`/`SaveMeta` -> `EnsureIoWrite`) surecler arasi
+    **exclusive dosya kilidini** alir ve `FAutoWrite` kurar; `EndIoWrite`
+    yalnizca **normal yolun sonunda** cagriliyordu. Bu yuzden `AwaitDurable`,
+    durabilite bariyeri dogrulamasi, `FStore.Flush` (disk dolu / IO hatasi)
+    veya `FWal.Truncate` hata verdiginde kilit bu surecte **asili** kaliyordu:
+    diger tum yazarlar busy timeout'a dusuyor, kalici disk-dolu durumunda
+    sizinti kendiliginden temizlenmiyordu. Olculen (duzeltme oncesi kaynak,
+    `git archive a3b97da`): hata sonrasi ikinci backend 400 ms icinde kilit
+    alamadi, hatta kapatip yeniden acma 4000 ms icinde basarisiz.
+  - **Duzeltme**: `TVdbPageEngine.Checkpoint` govdesi `try ... finally
+    FStore.EndIoWrite; end;` ile sarildi; normal yoldaki ikinci cagri
+    kaldirildi (tek birakma noktasi). Kilit her durumda birakilir; sayfa/WAL
+    durumu degismez, yalnizca kilit sahipligi duser. Salt-okunur erken cikis
+    `try` disinda kalir (kilit zaten alinmiyor).
+  - **Kapi**: `disk_full` 16 -> **19** kontrol. DF10a (meta yazimina sert hata
+    -> checkpoint kontrollu `ecIOError`), DF10b (hata sonrasi **ikinci
+    backend** ayni dosyaya yazabilir), DF10c (yazilan satir okunur). Ikinci
+    backend icin ayri tablo (`lockprobe`) kullanildi; boylece DF5/DF6'nin
+    sabit satir sayilari (160) degismedi.
+  - **Durust sinir**: kapi hatayi **enjekte eder** (gercek `ENOSPC` olculmedi)
+    ve ikinci backend **ayni surecte** acilir; kilit dosya tanitici
+    (Windows `LockFileEx` handle / POSIX `flock` open file description)
+    basina oldugu icin bu ayrim icin yeterlidir, ancak ayri bir isletim
+    sistemi sureciyle tekrarlanmadi. Checkpoint hata verdiginde WAL/veri
+    dosyasi tutarliligi bu vakada olculmez (o is `wal_recovery`/POISONED ve
+    DF9 yollarinda). V2 ve dosya bicimi v5 degismedi.
 

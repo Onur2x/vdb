@@ -29,6 +29,9 @@ program disk_full;
     DF9 meta sayfa yazimi: kontrollu `ecIOError`, onayli veri korunur
     DF9b/DF9c hata yolu tetiklendi; hata giderilince checkpoint tamamlanir
     DF9d meta hatasi onayli satirlari silmez
+    DF10a kilit sizintisi senaryosu tetiklendi (checkpoint hata verdi)
+    DF10b hata sonrasi IKINCI backend ayni dosyaya yazabildi (kilit sizmadi)
+    DF10c ikinci backend'in satiri okunuyor
 
   Derleme: fpc. Cikis kodu = basarisiz kontrol sayisi.
 }
@@ -212,11 +215,14 @@ var
   Dir, Db: string;
   BeC: TVdbBackendV3;
   Be: IVdbBackend;
+  Be2: IVdbBackend;
   Tb: TVTableDb;
+  Tb2: TVTableDb;
   Sq: TVSql;
+  Sq2: TVSql;
   Fault: TWriteFault;
   i, rc: Integer;
-  raised: Boolean;
+  raised, busy: Boolean;
   code: string;
   detail, rep, msg: string;
   n: Int64;
@@ -428,6 +434,80 @@ begin
 
       { DF5b: checkpoint hatasiz tamamlanir. }
       Chk('DF5b checkpoint basarili', BeC.Engine.Checkpoint(True), '');
+
+      { DF10 (v3.59 / SKILL5 8.1): CHECKPOINT KILIT SIZINTISI.
+        Checkpoint sirasinda ilk yazim `EnsureIoWrite` uzerinden SURECLER
+        ARASI tam dosya kilidini alir; kilidi birakan `EndIoWrite` ONCEDEN
+        yalnizca normal yolun sonunda cagriliyordu. Meta yazimi hata
+        verdiginde kilit bu surecte asili kaliyor ve DIGER yazarlar commit
+        edemiyordu. Olcum: hata enjekte edilmis checkpoint'ten sonra AYNI
+        dosyayi acan ikinci bir backend yazip commit edebilmelidir.
+        (Ayni surecte ikinci handle bile ayirt edicidir: Windows
+        LockFileEx ve POSIX flock kilidi dosya tanimlayicisi basina tutar,
+        bu yuzden ikinci handle kilidi gercekten bekler.) }
+      Sq.Exec('CREATE TABLE lockprobe (id INTEGER PRIMARY KEY)');
+      Fault.MinPos := 0;
+      Fault.AtPos := 0;      { yalniz meta sayfa yazimi hata verir }
+      Fault.Hits := 0;
+      Fault.Mode := 1;
+      BeC.Engine.Store.OnWriteFault := Fault.Check;
+      raised := False;
+      code := '';
+      try
+        BeC.Engine.Checkpoint(True);
+      except
+        on E: EVDbException do
+        begin
+          raised := True;
+          code := VDbErrorName(E.ErrorCode);
+        end;
+        on E: Exception do
+        begin
+          raised := True;
+          code := E.ClassName;
+        end;
+      end;
+      Chk('DF10a kilit sizintisi senaryosu tetiklendi',
+        raised and (Fault.Hits > 0), 'kod=' + code +
+        ' cagri=' + IntToStr(Fault.Hits));
+      Fault.Mode := 0;
+      BeC.Engine.Store.OnWriteFault := nil;
+
+      Be2 := nil;
+      Tb2 := nil;
+      Sq2 := nil;
+      busy := False;
+      detail := '';
+      try
+        VdbOpenWithBusyTimeout(Db, Be2, 400, False, 512);
+        Tb2 := TVTableDb.CreateBackend(Be2);
+        Tb2.Open(Dir);
+        Sq2 := TVSql.Create(Tb2);
+        Sq2.Exec('BEGIN');
+        Sq2.Exec('INSERT INTO lockprobe (id) VALUES (1)');
+        Sq2.Exec('COMMIT');
+      except
+        on E: Exception do
+        begin
+          busy := True;
+          detail := E.ClassName + ': ' + E.Message;
+        end;
+      end;
+      Chk('DF10b hata sonrasi IKINCI backend ayni dosyaya yazabildi',
+        not busy, detail);
+      n := 0;
+      try
+        if Sq2 <> nil then
+          n := QInt(Sq2, 'SELECT COUNT(*) FROM lockprobe WHERE id = 1');
+      except
+        on E: Exception do
+          detail := E.ClassName + ': ' + E.Message;
+      end;
+      Chk('DF10c ikinci backend satiri okunuyor', n = 1,
+        'satir=' + IntToStr(n));
+      FreeAndNil(Sq2);
+      FreeAndNil(Tb2);
+      Be2 := nil;
     finally
       Fault.Mode := 0;
       BeC.Engine.Store.OnWriteFault := nil;

@@ -1589,6 +1589,16 @@ begin
   { v3.2: salt-okunur oturumda checkpoint yok; disk zaten yazilamaz. }
   if FStore.ReadOnly then Exit(True);
   CrashPoint(VDB_CRASH_STAGE_CP_BEGIN);
+  { v3.59 / SKILL5 8.1: kilit SIZINTISI. Checkpoint sirasinda ilk sayfa
+    yazimi `WritePageAt` -> `EnsureIoWrite` uzerinden SURECLER ARASI tam
+    (exclusive) dosya kilidini alir ve `FAutoWrite` isaretini kurar. Kilidi
+    birakan `EndIoWrite` ONCEDEN yalnizca normal yolun sonunda cagriliyordu:
+    AwaitDurable, bariyer dogrulamasi, Flush (disk dolu / IO hatasi) veya
+    Wal.Truncate hata verdiginde kilit bu surecte ASILI kaliyordu. Sonuc:
+    diger surecler commit edemez (kilit ugruna busy timeout), yani tek bir
+    checkpoint hatasi tum yazarlari kilitler. Kilit artik HER durumda
+    birakilir; sayfa/WAL durumu degismez, yalnizca kilit sahipligi duser. }
+  try
   { Tahliye edilmis sayfalar once dosyaya, sonra onbellekteki kirli
     sayfalar yazilir. InstallPage tahliye tetiklemez.
     Onemli: bir sayfa onbellekte varsa cerceve imaji pending kopyasindan
@@ -1667,8 +1677,8 @@ begin
     FWal.Truncate(FStore.LSN);
     CrashPoint(VDB_CRASH_STAGE_CP_AFTER_TRUNC);
   end;
-  { v3.16: guvenlik agi kilidini birak (bkz. Commit). }
-  FStore.EndIoWrite;
+  { v3.16: guvenlik agi kilidini birak (bkz. Commit). v3.59: artik
+    `finally` icinde TEK yerde; hata yolunda da birakilir. }
   { P-182: checkpoint sayaci + sure (ms). Sure, checkpoint'in tamamini
     kapsar; Front/arka plan checkpoint'leri ayni sayaca yazilir. }
   Inc(FCheckpointCount);
@@ -1676,6 +1686,9 @@ begin
   Inc(FCheckpointTotalMs, FCheckpointLastMs);
   CrashPoint(VDB_CRASH_STAGE_CP_DONE);
   Result := True;
+  finally
+    FStore.EndIoWrite;
+  end;
 end;
 
 function TVdbPageEngine.Verify(out Report: string): Boolean;

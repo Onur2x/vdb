@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-18
-Surum: v3.58 (Sprint A + B + C + D + F1 + E + B2 + C2; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Surum: v3.59 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -59,14 +59,15 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 ### A.3 Mevcut V3 durumu
 
 - Iki platformda tam kapi seti yesil: **Windows i386 48 kapi**, **Linux
-  x86_64 49 kapi**, FAIL 0 (v3.58 kosulari: `gatesH.log` / `linH.log`).
+  x86_64 49 kapi**, FAIL 0 (v3.59 kosulari: `gatesI.log` / `linI.log`).
   Windows'ta `tls_client` bu ortamda **SKIP** oldu (OpenSSL DLL'i yok);
   kostugu kosu `gatesE.log`'dur. SKIP PASS sayilmaz (ayrinti: `CI.md`).
 - Acik kritik hata yok. Kapatilan son gercek kusurlar: F-21/F-22 veri
   kaybi (SO15/SO16/SO17), Sprint B2'de acik islem icinde **statement
   atomikligi** (`sql_atomicity` AT20-AT24), Sprint C2'de **oturum bazli rol**
-  ve bilinmeyen rolde **fail-closed** yetki (`sql_authorization` AU8-AU11).
-  Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
+  ve bilinmeyen rolde **fail-closed** yetki (`sql_authorization` AU8-AU11),
+  Sprint D2'de checkpoint hata yolunda **kilit sizintisi** (`disk_full`
+  DF10a-DF10c). Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
 - Rol degistirme yetkisi ve SCRAM kullanicisi -> SQL rolu eslemesi (SKILL5
   3.1'in yetki denetimi ve 3.2) **hala ACIK**: kimligi dogrulanmis principal
   ile SQL rolu arasinda kalici bir esleme yok ve bu, dosya bicimini
@@ -87,6 +88,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | E | 7.1/7.2 sunucu okuma-yazma zaman asimi, 7.3 COPY gecici dosya sinir+izin, 7.4 baglanti yasam dongusu | Tamam | `network_limits` 22/0 (yeni, 8 vaka) |
 | B2 | 6.1 acik islem icinde statement atomikligi (COMMIT sonrasi yarim yazim) | Tamam | `sql_atomicity` 138/0 (24 vaka; AT20-AT24 yeni) |
 | C2 | 3.1 oturum bazli rol izolasyonu + bilinmeyen rolde fail-closed yetki | Tamam | `sql_authorization` 51/0 (32 -> 51; AU8-AU11 yeni) |
+| D2 | 8.1 checkpoint hata yolunda surecler arasi yazma kilidi sizintisi | Tamam | `disk_full` 19/0 (16 -> 19; DF10a-DF10c yeni) |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -379,6 +381,37 @@ Sprint C2 (SKILL5 3.1) **oturum bazli rol izolasyonu** ve bilinmeyen rolde
   temizliginde `SET ROLE NONE` kullaniliyor) 7 kontrolu dusurdugu icin geri
   alindi ve sinir olarak belgelendi.
 
+Sprint D2 (SKILL5 8.1) **checkpoint hata yolunda kilit sizintisini** kapatti:
+
+- **Olculen kusur**: checkpoint sirasindaki ilk sayfa yazimi
+  (`WritePageAt`/`SaveMeta` -> `EnsureIoWrite`) surecler arasi **tam
+  (exclusive) dosya kilidini** alir ve `FAutoWrite` isaretini kurar. Kilidi
+  birakan `EndIoWrite` **yalnizca normal yolun sonunda** cagriliyordu; bu
+  yuzden `AwaitDurable`, durabilite bariyeri dogrulamasi, `FStore.Flush`
+  (disk dolu / IO hatasi) veya `FWal.Truncate` hata verdiginde kilit bu
+  surecte **asili** kaliyordu. Sonuc: hata veren surec kapanana kadar
+  diger tum surecler commit edemiyor (busy timeout) ve kalici disk-dolu
+  durumunda sizinti kendiliginden temizlenmiyordu.
+- **Duzeltme**: `TVdbPageEngine.Checkpoint` govdesi `try ... finally
+  FStore.EndIoWrite; end;` ile sarildi ve normal yoldaki ikinci cagri
+  kaldirildi (tek birakma noktasi). Kilid artik **her durumda** birakilir;
+  sayfa/WAL durumu degismez, yalnizca kilit sahipligi duser. Salt-okunur
+  erken cikis (`Exit(True)`) `try` disinda kalir (kilit zaten alinmiyor).
+- **Kapi kaniti**: `disk_full` 16 kontrolden **19 kontrole** cikti. Yeni
+  vaka DF10: meta sayfa yazimina sert hata enjekte edilerek checkpoint
+  `ecIOError` ile dusurulur (DF10a), ardindan **ayni dosyaya ikinci bir
+  backend** acilip yazma denenir (400 ms busy timeout) ve satir okunur.
+  Duzeltme **oncesi** kaynakla (`git archive HEAD` `a3b97da`) derlenen
+  kapida **4 kontrol FAIL** (DF10b/DF10c; ek olarak DF6/DF6b - sizinti
+  kapanistan sonra da yeniden acilisi kilitliyordu), duzeltilmis agacta
+  19/0.
+- **Durust sinir**: kapi hatayi **enjekte eder** (gercek `ENOSPC`
+  olculmedi) ve ikinci backend **ayni surecte** acilir; kilit dosya
+  tanitici/handle basina oldugu icin bu, sizintiyi ayirt etmek icin
+  yeterlidir, ancak ayri bir isletim sistemi sureciyle de tekrarlanmadi.
+  Checkpoint'in kendisi hata verdiginde WAL/veri dosyasi tutarliligi bu
+  vakada olculmez (o is `wal_recovery`/POISONED ve DF9 yollarinda).
+
 
 ---
 
@@ -393,7 +426,7 @@ Sprint C2 (SKILL5 3.1) **oturum bazli rol izolasyonu** ve bilinmeyen rolde
 | Checkpoint | `Checkpoint(True)` acik cagriyla ve esik/yumusak sinirda calisir; basarisiz checkpoint yan dosyalara dokunmaz | `soak` SO16, `single_file` 35/0 |
 | Recovery | Kesik kuyruk geri kirpilir; `WriteChecked` tek yazma noktasi; commit kaydi yoksa satir durabil olmaz | `wal_crash`, `kv_wal`, `crash_points` 24/0 |
 | WAL reclaim | Kapanista checkpoint basariliysa ve ayni dosyaya acik baska oturum yoksa `.wal`/`.gen` silinir; basarisizsa yan dosyalar korunur (veri kaybi yerine fazladan dosya) | `single_file`, `multi_writer` 12/0 |
-| Crash testleri | Enjekte edilmis cokme noktalari, WAL yazma hatasi, disk dolu | `crash_points` 24/0, `disk_full` 16/0 |
+| Crash testleri | Enjekte edilmis cokme noktalari, WAL yazma hatasi, disk dolu | `crash_points` 24/0, `disk_full` 19/0 |
 | WAL-before-data (4.1) | Checkpoint WAL bariyerini (fsync + durabil LSN dogrulama) veri sayfalari yazilmadan **once** kurar; WAL fsync basarisizsa veri dosyasina dokunulmaz, yeniden acilista hayalet commit gorunmez | `wal_recovery` WR1, WR2 |
 | POISONED (4.2) | Kurtarma basarisiz olursa motor `POISONED` olur: okuma ve yazma `ecInvalidState` ile reddedilir; kapatip acma temiz baslangic verir | `wal_recovery` WR3, WR4, WR5 |
 
@@ -526,16 +559,17 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   `windows-latest` calistirir; `fail-fast: false`. macOS/ARM64 icin job
   **yoktur** cunku hic kosulmadi; dogrulanmamis platformu matrise eklemek
   yesil gorunen ama kanit uretmeyen bir kapi olurdu (`CI.md` bolum 3).
-- Kanit (en guncel kosu, v3.58): Windows `gatesH.log` (`KOSAN KAPI: 48`,
-  `SUITE_EXIT=0`), Linux `linH.log` (`KOSAN KAPI: 49`, `SUITE_EXIT=0`).
-  Onceki kosu: `gatesG.log` (48) / `linG.log` (49) - B2; ondan once
+- Kanit (en guncel kosu, v3.59): Windows `gatesI.log` (`KOSAN KAPI: 48`,
+  `SUITE_EXIT=0`), Linux `linI.log` (`KOSAN KAPI: 49`, `SUITE_EXIT=0`).
+  Onceki kosu: `gatesH.log` (48) / `linH.log` (49) - C2; ondan once
+  `gatesG.log` (48) / `linG.log` (49) - B2; ondan once
   `gatesE.log` (48) / `linE.log` (49); Sprint E oncesi
   `gatesF.log` (47) / `linF.log` (48); daha once `gatesD.log` (46) /
   `linD.log` (47), ondan once `gatesB.log` (44) / `linC.log` (46) idi.
   Sayilar her sprint yalniz **eklenen** kapi kadar artar, kapi silinmez.
-  Bu sprint yeni kapi **dizini** eklenmedi; `sql_authorization` kapisi
-  `32` kontrolden `51` kontrole cikti (AU8-AU11), kapi sayisi ayni kaldi.
-- Windows `gatesH` kosusunda `tls_client` **SKIP** oldu: ortamda
+  Bu sprint yeni kapi **dizini** eklenmedi; `disk_full` kapisi
+  `16` kontrolden `19` kontrole cikti (DF10a-DF10c), kapi sayisi ayni kaldi.
+- Windows `gatesI` kosusunda `tls_client` **SKIP** oldu: ortamda
   `VDB_CRYPTO_DLL`/`VDB_SSL_DLL` yok. `tls_client` fikstur dizinini
   `VDB_TLS_FIXTURES` ile bulur; degisken verilmezse kapi exe'nin yanindan
   arar ve bulamaz (daha once ilk denemede FAIL, degisken verilince SKIP).
@@ -605,6 +639,15 @@ tablosundadir. Bu sprintte kapatilanlar:
   **Kismi**: rol degistirme yetkisi (kim hangi role gecebilir) ve SCRAM
   kullanicisi -> SQL rolu eslemesi **hala ACIK** (principal eslemesi kalici
   sema degisikligi gerektirir; bicim v5 degismedi).
+- **F-35 (Kritik, KAPALI, v3.59)**: `TVdbPageEngine.Checkpoint` hata yolunda
+  `EndIoWrite` cagrilmadigi icin ilk sayfa yazimindan sonra olusan hata
+  (`AwaitDurable`, durabilite bariyeri, `Flush`, `Wal.Truncate`) surecler
+  arasi **exclusive dosya kilidini bu surecte asili** birakiyordu; diger
+  tum yazarlar busy timeout'a dusuyordu (olculen: hata sonrasi ikinci
+  backend 400 ms icinde kilit alamadi, hatta kapatip yeniden acma 4000 ms
+  icinde basarisiz). Duzeltme: checkpoint govdesi `try ... finally
+  FStore.EndIoWrite` ile sarildi, normal yoldaki ikinci cagri kaldirildi.
+  Regresyon: DF10a-DF10c (`disk_full` 19/0; duzeltme oncesi kaynakta 4 FAIL).
 
 
 ---
