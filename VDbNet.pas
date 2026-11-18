@@ -25,7 +25,11 @@ unit VDbNet;
 interface
 
 uses
-  SysUtils, Classes, Sockets;
+  SysUtils, Classes, Sockets
+{$IFDEF UNIX}
+  , BaseUnix
+{$ENDIF}
+  ;
 
 const
   { TSocket (cint) uzayinda gecersiz soket gosterimi. }
@@ -102,6 +106,17 @@ function VdbTcpConnect(const AHost: string; APort: Word): TVdbSocket;
 
 { ALen baytin TAMAMINI gonderir. Karsi taraf kapatirsa/hata olursa False. }
 function VdbSendAll(ASock: TVdbSocket; const ABuf; ALen: Integer): Boolean;
+
+{ v3.56 / Sprint E: baglanti basina okuma/yazma zaman asimi. 0 = devre
+  disi (eski davranis, sinirsiz bloklama). Windows SO_RCVTIMEO/
+  SO_SNDTIMEO icin DWORD milisaniye bekler; Unix timeval (saniye,
+  mikrosaniye) bekler — fark burada gizlenir. Donus: en az bir secenek
+  kurulabildiyse True.
+
+  Neden gerekli: engellenen bir recv, istemci tek bayt gonderip
+  beklediginde is parcacigini ve baglanti slotunu SONSUZA KADAR tutuyordu
+  (MaxConns kadar bos soket sunucuyu kalici olarak kapatabiliyordu). }
+function VdbSockSetTimeouts(ASock: TVdbSocket; ARecvMs, ASendMs: Integer): Boolean;
 
 { ALen baytin TAMAMINI okur. Karsi taraf erken kapatirsa False. }
 function VdbRecvAll(ASock: TVdbSocket; var ABuf; ALen: Integer): Boolean;
@@ -349,6 +364,58 @@ begin
     Inc(got, n);
   end;
   Result := True;
+end;
+
+{$IFNDEF MSWINDOWS}
+function VdbMsToTimeval(AMs: Integer): TTimeVal;
+begin
+  if AMs < 0 then AMs := 0;
+  Result.tv_sec := AMs div 1000;
+  Result.tv_usec := (AMs mod 1000) * 1000;
+end;
+{$ENDIF}
+
+function VdbSockSetTimeouts(ASock: TVdbSocket; ARecvMs, ASendMs: Integer): Boolean;
+{ Bkz. arayuz. Windows'ta deger DWORD milisaniye; Unix'te timeval
+  (tv_sec, tv_usec) ve 'long' makine kelimesi buyuklugundedir. }
+{$IFDEF MSWINDOWS}
+var
+  rv, sv: DWORD;
+{$ELSE}
+var
+  rv, sv: TTimeVal;
+{$ENDIF}
+  okR, okS: Boolean;
+begin
+  Result := False;
+  if ASock = VDB_SOCK_INVALID then Exit;
+  if (ARecvMs <= 0) and (ASendMs <= 0) then Exit(True);  // devre disi
+  okR := ARecvMs <= 0;
+  okS := ASendMs <= 0;
+  {$IFDEF MSWINDOWS}
+  if ARecvMs > 0 then
+  begin
+    rv := DWORD(ARecvMs);
+    okR := fpSetSockOpt(ASock, SOL_SOCKET, SO_RCVTIMEO, @rv, SizeOf(rv)) = 0;
+  end;
+  if ASendMs > 0 then
+  begin
+    sv := DWORD(ASendMs);
+    okS := fpSetSockOpt(ASock, SOL_SOCKET, SO_SNDTIMEO, @sv, SizeOf(sv)) = 0;
+  end;
+  {$ELSE}
+  if ARecvMs > 0 then
+  begin
+    rv := VdbMsToTimeval(ARecvMs);
+    okR := fpSetSockOpt(ASock, SOL_SOCKET, SO_RCVTIMEO, @rv, SizeOf(rv)) = 0;
+  end;
+  if ASendMs > 0 then
+  begin
+    sv := VdbMsToTimeval(ASendMs);
+    okS := fpSetSockOpt(ASock, SOL_SOCKET, SO_SNDTIMEO, @sv, SizeOf(sv)) = 0;
+  end;
+  {$ENDIF}
+  Result := okR and okS;
 end;
 
 function VdbRecvSome(ASock: TVdbSocket; var ABuf; ALen: Integer): Integer;

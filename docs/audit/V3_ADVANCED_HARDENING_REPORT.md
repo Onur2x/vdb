@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
-Tarih: 2026-11-17
-Surum: v3.55 (Sprint A + B + C + D + F1; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Tarih: 2026-11-18
+Surum: v3.56 (Sprint A + B + C + D + F1 + E; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -58,8 +58,8 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 
 ### A.3 Mevcut V3 durumu
 
-- Iki platformda tam kapi seti yesil: **Windows i386 47 kapi**, **Linux
-  x86_64 48 kapi**, FAIL 0. Windows'ta `tls_client` bu ortamda OpenSSL DLL'i
+- Iki platformda tam kapi seti yesil: **Windows i386 48 kapi**, **Linux
+  x86_64 49 kapi**, FAIL 0. Windows'ta `tls_client` bu ortamda OpenSSL DLL'i
   ile kostu (ayrinti: `CI.md`); OpenSSL istege bagli iki kapi Linux'ta SKIP.
 - Acik kritik hata yok. Kapatilan son gercek kusurlar F-21/F-22 veri
   kaybiydi; ikisi de kalici regresyon kapisiyla kilitlendi (SO15/SO16/SO17).
@@ -76,6 +76,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | D | 5.1 freelist butunlugu, 5.2 disk B+Tree sayfa butunlugu, 6.1/6.2 sayfa dogrulama | Tamam | `freelist` 32/0 (yeni, 9 vaka), `btree_disk` 78/0 |
 | F | 8.2 LIMIT/OFFSET sinirlari, 8.4 ozyinelemeli CTE sinirlari + iptal, 8.5 sayisal tasma/CAST/ABS | Tamam (F1) | `sql_memory` 54/0 (yeni, 26 vaka) |
 | F | 8.1 uctan uca streaming, portal maxRows, COPY OUT streaming, JOIN/ORDER BY/DISTINCT/GROUP BY bellek siniri, disk spill | **Acik (F2)** | tasarim isi; `R8`/`R13` |
+| E | 7.1/7.2 sunucu okuma-yazma zaman asimi, 7.3 COPY gecici dosya sinir+izin, 7.4 baglanti yasam dongusu | Tamam | `network_limits` 22/0 (yeni, 8 vaka) |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -229,6 +230,54 @@ sinirlari. F1 dort gercek kusur kapatti:
   tavan `VDB_MAX_RESULT_ROWS = 2.000.000`. Ozyinelemeli CTE satir tavani bu
   tavanla **ayni degeri** kullanir (daha kucuk bir butce yoktur).
 
+Sprint E (ag katmani) dort gercek sinir kusurunu kapatti:
+
+- **E1 / 7.1-7.2 (yavas istemci = kalici DoS, kullanilabilirlik)**: sunucu
+  soketlerinde okuma/yazma zaman asimi **yoktu**. Kabul edilen her baglanti
+  icin zamanlayici kurulmuyor; bir istemci tek bayt gonderip beklediginde
+  `HandleQuery` sonsuza kadar blokluyor ve baglanti slotu **asla** bosalmiyordu.
+  `MaxConns = 1` iken tek yarim acilmis baglanti sunucuyu kalici olarak
+  kapatabiliyordu. Duzeltme: `VdbSockSetTimeouts` (`VDbNet.pas`,
+  `SO_RCVTIMEO`/`SO_SNDTIMEO`; Windows'ta DWORD ms, Unix'te `timeval`) ve
+  `TVdbPgServer` uzerinde `ReadTimeoutMs`/`WriteTimeoutMs`, varsayilan
+  **30000 ms**, 0 = devre disi (eski davranis). Zaman asimi kabul edilen
+  sokete, is parcacigi baslamadan once uygulanir.
+- **E2 / 7.3 (sessiz cerceve dusurme, teshis edilebilirlik)**: on-kapa asan
+  cerceve yalniz `Break` ile baglantiyi **sessizce** kapatiyordu; istemci
+  nedenini ogrenemiyordu. Artik `MaxMessageBytes` (varsayilan **64 MiB**)
+  asildiginda kontrollu bir `ErrorResponse` (`SQLSTATE 54000`) gonderilir ve
+  baglanti kapatilir. **Durust sinir**: govde okunmaz (bellek sisirilmez);
+  kapanis bilinclidir.
+- **E3 / 7.3 (sinirsiz gecici dosya + izin)**: `COPY ... FROM STDIN` gecici
+  dosyaya yazarken **toplam** boyut siniri yoktu; kimligi dogrulanmis bir
+  istemci diski doldurabiliyordu. Artik `CopyMaxBytes` (varsayilan
+  **256 MiB**) toplam sinir, parca basina ayrica tavan uygulanir; asimda
+  kontrollu hata. Unix'te gecici dosya `fpChmod 0600` ile olusturulur
+  (`BaseUnix`); Windows'ta `GetTempDir` zaten kullaniciya ozeldir.
+- **E4 / 7.4 (kilitlenmeyen kapasite okumasi, veri yarisi)**: kapasite
+  kontrolu `FConns.Count` alanini **kilitsiz** okuyor ve bitmis (Finished)
+  is parcaciklarini da sayiyordu; bu yuzden bos slot varken "kapasite dolu"
+  donulebiliyor ya da tersi olabiliyordu. `GetConnCount` artik kilit altinda
+  ve yalniz canli baglantilari sayar (`ConnCount` ozelligi).
+- **7.4 yasam dongusu incelemesi (kusur bulunmadi)**: `Stop`/`GcFinished`
+  sirasi incelendi; `Stop` once dinleme soketini kapatip kabul dongusunu
+  uyandiriyor, ardindan biten is parcaciklarini topluyor. Bu sirada bir
+  **kusur bulunmadi**; kod degistirilmedi ve "duzeltildi" diye
+  raporlanmaz.
+- **Kapi kaniti**: `network_limits` kapisi 8 vaka / **22 kontrol** (NL0-NL7):
+  zaman asimi kurulumu (okuma/yazma, devre disi, gecersiz soket), yavas
+  istemcinin slotu birakmasi, `MaxConns=1` ile ikinci istemcinin girebilmesi,
+  asiri cercevenin `54000` ile reddedilmesi, `CopyMaxBytes` toplam tavaninin
+  uygulanmasi ve normal baglantinin etkilenmemesi. Duzeltme **oncesi**
+  kaynakla (`git archive HEAD`) derlenen sondada **1 kontrol FAIL**:
+  `H1` yarim startup sonrasi yeni istemci **6031 ms** sonra hala giremiyor
+  (`MaxConns=1`, kalici DoS). Duzeltilmis agacta 22/0.
+- **Durust sinir**: E1-E3 soket duzeyinde olculur; TLS el sikismasi icin
+  **ayri** bir zaman asimi testi yoktur (el sikismasi ayni soket uzerinde
+  kosar, dolayisiyla zaman asimi uygulanir, ama bu ayrica olculmedi).
+  VDB'nin `COPY ... FROM STDIN` varsayilan bicimi PostgreSQL text degil
+  **csv**'dir; tavan davranisi bu bicimle olculdu. F2 halen aciktir.
+
 ---
 
 ## B. WAL
@@ -326,7 +375,10 @@ raporlanir.
 | Kimlik dogrulama | SCRAM-SHA-256 (parola sunucuda saklanmaz); `AuthMaxFailures=5`, pencere 60 sn, **monotonik** `GetTickCount64` (F-20) | `auth_throttle` 16/0 |
 | TLS | **Varsayilan kapali** (opt-in). Istemcide CA dosyasi zorunlu; dogrulamasiz baglanti yolu yok | `tls_client` 6/0 (yalniz Linux), `VDbTls.pas` |
 | Baglanti tavani | `MaxConns` 64 (1..4096); asimda yeni baglanti `kapasite dolu` alir, mevcutlar calisir | `server_failure` 16/0 |
-| Cerceve tavani | Agdan gelen tek metin cercevesi 64 MiB (`VDBS_MAX_RECV_STR`) | `net_fuzz` N7 |
+| Cerceve tavani | Agdan gelen tek metin cercevesi 64 MiB (`VDBS_MAX_RECV_STR`); PG telinde `MaxMessageBytes` (varsayilan **64 MiB**) asiminda kontrollu `ErrorResponse` (`SQLSTATE 54000`) ve baglanti kapanisi (Sprint E2) | `net_fuzz` N7, `network_limits` NL4 |
+| Zaman asimi | Baglanti basina `ReadTimeoutMs`/`WriteTimeoutMs`, varsayilan **30000 ms**, 0 = kapali; yavas/yarim acilmis istemci slotu **birakir** (Sprint E1) | `network_limits` NL0-NL3, NL7 |
+| COPY tavani | `COPY ... FROM STDIN` toplam `CopyMaxBytes` **256 MiB** + parca basina tavan; Unix'te gecici dosya `0600` (Sprint E3) | `network_limits` NL5, NL6 |
+| Kapasite sayaci | `ConnCount` kilit altinda, yalniz canli baglantilar (Finished haric); `MaxConns` karari bu sayidan (Sprint E4) | `network_limits` NL1, NL2, NL7, `server_failure` 16/0 |
 
 **Durust sinir**: `net_fuzz` sabit seed'li, sinirli bir senaryo kumesidir;
 AFL/libFuzzer tarzi surekli fuzz kampanyasi **degildir**. Ag sunucusunun uzun
@@ -360,8 +412,8 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
 
 | Platform | Kapi | PASS | FAIL | SKIP | NOT-RUN |
 |---|---|---|---|---|---|
-| Windows i386 (`windows-latest` / Git Bash) | 47 | **47** | 0 | OpenSSL istege bagli 2 | - |
-| Linux x86_64 (`ubuntu-latest` / WSL x86_64) | 48 | **48** | 0 | OpenSSL istege bagli 2 (`VDB_CRYPTO_DLL` yok) | - |
+| Windows i386 (`windows-latest` / Git Bash) | 48 | **48** | 0 | OpenSSL istege bagli 2 | - |
+| Linux x86_64 (`ubuntu-latest` / WSL x86_64) | 49 | **49** | 0 | OpenSSL istege bagli 2 (`VDB_CRYPTO_DLL` yok) | - |
 | macOS (x86_64 / arm64) | - | - | - | - | **not-run** |
 | linux/arm64 | - | - | - | - | **not-run** |
 | windows/arm64 | - | - | - | - | **not-run** |
@@ -372,11 +424,11 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   `windows-latest` calistirir; `fail-fast: false`. macOS/ARM64 icin job
   **yoktur** cunku hic kosulmadi; dogrulanmamis platformu matrise eklemek
   yesil gorunen ama kanit uretmeyen bir kapi olurdu (`CI.md` bolum 3).
-- Kanit: Windows `gatesF.log` (`KOSAN KAPI: 47`, `GATES_EXIT=0`), Linux
-  `linF.log` (`KOSAN KAPI: 48`, `LIN_EXIT=0`). Sprint D oncesi kanit
-  `gatesD.log` (46) / `linD.log` (47); daha once `gatesB.log` (44) /
-  `linC.log` (46) idi. Sayilar her sprint yalniz **eklenen** kapi kadar
-  artar, kapi silinmez.
+- Kanit: Windows `gatesE.log` (`KOSAN KAPI: 48`, `GATES_EXIT=0`), Linux
+  `linE.log` (`KOSAN KAPI: 49`, `LIN_EXIT=0`). Sprint E oncesi kanit
+  `gatesF.log` (47) / `linF.log` (48); daha once `gatesD.log` (46) /
+  `linD.log` (47), ondan once `gatesB.log` (44) / `linC.log` (46) idi.
+  Sayilar her sprint yalniz **eklenen** kapi kadar artar, kapi silinmez.
 - Windows'ta `tls_client` bu kosuda OpenSSL DLL'leri ortamda oldugu icin
   **kostu** ve gecti; DLL'ler yoksa SKIP'e duser. Linux'ta 6/6 PASS.
 - **NOT-RUN** satirlari "kosmuyor" degil "olculmedi" demektir; bu raporda
@@ -429,7 +481,7 @@ tablosundadir. Bu sprintte kapatilanlar:
 Gerekce:
 
 1. Kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici bir
-   regresyon kapisiyla kilitlendi; iki platformda **47/48** kapi yesil, FAIL 0.
+   regresyon kapisiyla kilitlendi; iki platformda **48/49** kapi yesil, FAIL 0.
 2. Tek dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari,
    bozuk ag girdisi, disk dolu, bellek tukenmesi, WAL sert tavani, B+Tree
    olcek/parcalanma, SQL 100k/1M olcegi, SQL indeks olcegi ve VACUUM geri
@@ -440,7 +492,9 @@ Gerekce:
    Sprint D'de cift/trunk/canli sayfa serbest birakma (freelist) ve disk
    B+Tree'de bozuk sayfanin sessizce geri kazanilmasi, Sprint F1'de CAST
    sessiz sarmasi, `ABS` hassasiyet kaybi, `Low(Int64)` isaret sarmasi ve
-   ozyinelemeli CTE'nin sessiz kesilmesi.
+   ozyinelemeli CTE'nin sessiz kesilmesi, Sprint E'de zaman asimsiz
+   baglantiyla **kalici DoS** (`MaxConns=1`), asiri cercevenin sessiz
+   dusurulmesi, sinirsiz COPY gecici dosyasi ve kilitsiz kapasite okumasi.
 
 **PRODUCTION CANDIDATE degildir** cunku:
 

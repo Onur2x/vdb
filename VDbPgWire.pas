@@ -56,6 +56,7 @@ interface
 
 uses
   SysUtils, DateUtils, Classes, SyncObjs, Generics.Collections, VDbTypes, VDbCore, VDbTable, VDbSql, VDbAst,
+  {$IFDEF UNIX}BaseUnix, {$ENDIF}
   VDbParser, VDbNet, VDbErr, VDbTls, VDbSync, VDbXPrims, VDbCrypt, VDbBackendApi,
   VDbFactory, VDbBase64;
 
@@ -165,6 +166,15 @@ type
     FAuthFailureWindowSec: Integer;
     FAuthLockoutSec: Integer;
     FAuthGlobalMaxFailures: Integer;
+    { v3.56 / Sprint E (7.1 + 7.2 + 7.3): ag kaynak sinirlari. Hepsi
+      Start'tan once veya calisirken degistirilebilir; 0 = ilgili sinir
+      devre disi. Varsayilanlar ESKI davranisi korur (64 MiB mesaj), yalniz
+      zaman asimlari yenidir: onceden HIC yoktu. }
+    FReadTimeoutMs: Integer;
+    FWriteTimeoutMs: Integer;
+    FMaxMessageBytes: Integer;
+    FCopyMaxBytes: Int64;
+    function GetConnCount: Integer;
     function GetAuthRequired: Boolean;
     procedure SetMaxConns(AValue: Integer);
     procedure AddConn(AConn: TVdbPgConn);
@@ -226,9 +236,30 @@ type
     property Served: Integer read FServed;
     property Dir: string read FDir;
     property TlsActive: Boolean read GetTlsActive;
+    { v3.56: baglanti basina okuma zaman asimi (ms). Bu sure icinde bir
+      sonraki mesaj baslamazsa baglanti kontrollu kapatilir; boylece tek
+      bayt gonderip bekleyen istemci slot/is parcacigi tutamaz. Varsayilan
+      30000; 0 = sinirsiz (eski davranis). }
+    property ReadTimeoutMs: Integer read FReadTimeoutMs write FReadTimeoutMs;
+    { v3.56: yazma zaman asimi (ms). Istemci yaniti okumadan soketi acik
+      tutarsa yazma bloklanmaz. Varsayilan 30000; 0 = sinirsiz. }
+    property WriteTimeoutMs: Integer read FWriteTimeoutMs write FWriteTimeoutMs;
+    { v3.56: tek bir protokol mesajinin govdesi icin ust sinir. Varsayilan
+      64 MiB (eski sabit). Asimda istemciye kontrollu hata gonderilip
+      baglanti kapatilir; sunucu calismaya devam eder. }
+    property MaxMessageBytes: Integer read FMaxMessageBytes
+      write FMaxMessageBytes;
+    { v3.56: tek bir COPY ... FROM STDIN isleminin TOPLAM veri siniri
+      (bayt). Varsayilan 256 MiB; 0 = sinirsiz. Asimda gecici dosya
+      silinir, islem geri alinir ve istemciye hata doner. }
+    property CopyMaxBytes: Int64 read FCopyMaxBytes write FCopyMaxBytes;
     { Eszamanli TCP baglanti siniri (varsayilan 64). 1..4096 araligina
       kirpilir; Start'tan once veya calisirken degistirilebilir. }
     property MaxConns: Integer read FMaxConns write SetMaxConns;
+    { v3.56: kilit altinda okunan canli baglanti sayisi (test/gözlem icin).
+      Accept dongusu kapasite kararini da bununla verir; onceden kilit
+      alinmadan FConns.Count okunuyordu. }
+    property ConnCount: Integer read GetConnCount;
   end;
 
 implementation
@@ -263,6 +294,14 @@ type
     NullStr: string;
     Quote: string;
     Header: Boolean;
+  end;
+
+  { v3.56 / Sprint E: bir istek islenirken gecerli ag kaynak sinirlari.
+    Sunucudan gecilir; standalone HandleQuery/HandlePgCopyIn'in sunucuya
+    erisimi olmadigi icin tek tek parametre yerine kayit kullanilir. }
+  TPgLimits = record
+    CopyMaxBytes: Int64;   // 0 = sinirsiz
+    MaxChunk: Integer;     // 0 = sinirsiz
   end;
 
 { ---------------------------------------------------- ag bayt duzeni (BE) }
@@ -1460,15 +1499,34 @@ begin
     IntToStr(seq) + '.tmp';
 end;
 
+{ v3.56 / Sprint E (7.3): gecici dosya izinleri. Windows'ta ACL'ler
+  devralinir (GetTempDir kullaniciya ozel); Unix'te dosya 0600 olur ki
+  ayni makinedeki baska kullanicilar COPY verisini okuyamasin. }
+procedure PgRestrictTempFile(const FileName: string);
+{$IFDEF UNIX}
+begin
+  fpChmod(PChar(FileName), &600);
+end;
+{$ELSE}
+begin
+end;
+{$ENDIF}
+
 function HandlePgCopyIn(S: TVdbPgIo; FSql: TVSql;
-  const Spec: TPgCopySpec; ATerminate: Boolean; out AErr: Boolean): Boolean;
+  const Spec: TPgCopySpec; AMaxBytes: Int64; AMaxChunk: Integer;
+  ATerminate: Boolean; out AErr: Boolean): Boolean;
 // ATerminate=True: basit sorgu -> hata/basari sonunda ReadyForQuery.
 // ATerminate=False: extended protocol -> ReadyForQuery yalnizca Sync'te
 // gonderilir; hata varsa AErr=True ile donulur ve cagiran Sync'e kadar
 // mesaj yutar.
+// AMaxBytes: islem basina TOPLAM veri siniri (0 = sinirsiz). Onceden
+// yalniz parca basina 64 MiB kontrol ediliyordu; istemci sinirsiz sayida
+// parca gondererek diski doldurabiliyordu.
+// AMaxChunk: tek parca siniri (0 = sinirsiz).
 var
   td: TTableDef;
   ncols, i, len, plen: Integer;
+  total: Int64;
   fs: TFileStream;
   path, sql, cols, msg: string;
   b: Byte;
@@ -1504,15 +1562,17 @@ begin
 
   path := PgTempCopyPath;
   fs := nil;
+  total := 0;
   try
     try
       fs := TFileStream.Create(path, fmCreate);
+      PgRestrictTempFile(path);
       while True do
       begin
         if not S.RecvU8(b) then Exit;
         if not RecvI32(S, len) then Exit;
         plen := len - 4;
-        if (plen < 0) or (plen > 64 * 1024 * 1024) then
+        if (plen < 0) or ((AMaxChunk > 0) and (plen > AMaxChunk)) then
           Exit(CopyErr('COPY: gecersiz veri parcasi', nil));
         SetLength(buf, plen);
         // TBytes 0-tabanlidir: buf[1] kullanmak 1 bayt tasma (heap
@@ -1520,7 +1580,13 @@ begin
         if (plen > 0) and not S.RecvAll(buf[0], plen) then Exit;
         case AnsiChar(b) of
           'd':
-            if plen > 0 then fs.WriteBuffer(buf[0], plen);
+            begin
+              Inc(total, plen);
+              if (AMaxBytes > 0) and (total > AMaxBytes) then
+                Exit(CopyErr(Format('COPY toplam boyut siniri asildi (max %d bayt)',
+                  [AMaxBytes]), nil));
+              if plen > 0 then fs.WriteBuffer(buf[0], plen);
+            end;
           'c':
             Break;
           'H':
@@ -1680,7 +1746,7 @@ begin
 end;
 
 function HandleQuery(S: TVdbPgIo; FSql: TVSql; const Sql: string;
-  out AServed: Boolean): Boolean;
+  const ALim: TPgLimits; out AServed: Boolean): Boolean;
 var
   Res: TSqlResult;
   err, errState, cpErr: string;
@@ -1698,7 +1764,8 @@ begin
   if TryParsePgCopy(Sql, CopySpec, cpErr) then
   begin
     if CopySpec.FromStdin then
-      Exit(HandlePgCopyIn(S, FSql, CopySpec, True, dummyErr));
+      Exit(HandlePgCopyIn(S, FSql, CopySpec, ALim.CopyMaxBytes,
+        ALim.MaxChunk, True, dummyErr));
     if CopySpec.ToStdout then
       Exit(HandlePgCopyOut(S, FSql, CopySpec, True, dummyErr));
   end
@@ -1961,6 +2028,7 @@ var
   CopySpec: TPgCopySpec;
   cpErr: string;
   copyOk, copyErr: Boolean;
+  Lim: TPgLimits;
 
   function TakeI16: Integer;
   begin
@@ -2022,12 +2090,24 @@ begin
     if not SendPg(FIO, ReadyMsg) then Exit;
 
     skipUntilSync := False;
+    { v3.56: ag sinirlari baglanti basinda BIR KEZ okunur; boylece tek bir
+      istek icinde sinir degisip tutarsiz kalinmaz. }
+    Lim.CopyMaxBytes := FServer.FCopyMaxBytes;
+    Lim.MaxChunk := FServer.FMaxMessageBytes;
     while not Terminated do
     begin
       if not FIO.RecvU8(typ) then Break;
       if typ = Ord('X') then Break;          // Terminate
       if not RecvI32(FIO, len) then Break;
-      if (len < 4) or (len > 64 * 1024 * 1024) then Break;
+      if (len < 4) or (len > FServer.FMaxMessageBytes) then
+      begin
+        { v3.56 / Sprint E: onceden burada SESSIZCE Break ediliyordu; istemci
+          ne oldugunu bilmiyordu. Artik kontrollu hata gonderilir. Govde
+          okunmaz (zaten sinir asildi), baglanti kapatilir. }
+        SendPg(FIO, ErrorMsg(Format('mesaj boyutu siniri asildi (max %d bayt)',
+          [FServer.FMaxMessageBytes]), '54000'));
+        Break;
+      end;
       SetLength(payload, len - 4);
       if (len - 4) > 0 then
         if not FIO.RecvAll(payload[1], len - 4) then Break;
@@ -2042,7 +2122,7 @@ begin
           SetLength(sql, Length(sql) - 1);
         Stmts.Remove('');
         Portals.Remove('');
-        if not HandleQuery(FIO, FSql, sql, served) then Break;
+        if not HandleQuery(FIO, FSql, sql, Lim, served) then Break;
         if served then InterlockedIncrement(FServer.FServed);
       end
       else if typ = Ord('P') then            // Parse
@@ -2244,7 +2324,9 @@ begin
               pt.Done := True;
               Portals.AddOrSetValue(nm, pt);
               if CopySpec.FromStdin then
-                copyOk := HandlePgCopyIn(FIO, FSql, CopySpec, False, copyErr)
+                copyOk := HandlePgCopyIn(FIO, FSql, CopySpec,
+                  FServer.FCopyMaxBytes, FServer.FMaxMessageBytes, False,
+                  copyErr)
               else
                 copyOk := HandlePgCopyOut(FIO, FSql, CopySpec, False, copyErr);
               if copyErr then
@@ -2332,7 +2414,12 @@ begin
     sock := VdbTcpAccept(FServer.FListen);
     if sock = VDB_SOCK_INVALID then Break;
     FServer.GcFinished;   // P-185: bitmis baglantilar slot bosaltir
-    if FServer.FConns.Count >= FServer.FMaxConns then
+    { v3.56 / Sprint E: zaman asimlari KABUL ANINDA kurulur; boylece
+      baslangic (startup) ve TLS el sikismasi da korunur. Kurulamazsa
+      baglanti yine de sunulur ama o sokette ESKI sinirsiz bloklama
+      davranisi surer (basarisizlik yutulmaz: RecvAll/SendAll doner). }
+    VdbSockSetTimeouts(sock, FServer.FReadTimeoutMs, FServer.FWriteTimeoutMs);
+    if FServer.ConnCount >= FServer.FMaxConns then
     begin
       VdbSockClose(sock);   // startup oncesi: protokol mesaji gondermeden kapat
       Continue;
@@ -2352,6 +2439,12 @@ begin
   FConnsLock := TCriticalSection.Create;
   FConns := TList.Create;
   FMaxConns := 64;
+  { v3.56: varsayilanlar. Mesaj siniri eski 64 MiB sabitinin aynisi;
+    COPY toplami ve zaman asimlari YENI (onceden sinirsizdi). }
+  FReadTimeoutMs := 30000;
+  FWriteTimeoutMs := 30000;
+  FMaxMessageBytes := 64 * 1024 * 1024;
+  FCopyMaxBytes := Int64(256) * 1024 * 1024;
   FTls := nil;
   FTlsCert := '';
   FTlsKey := '';
@@ -2373,6 +2466,24 @@ begin
   if AValue < 1 then AValue := 1;
   if AValue > 4096 then AValue := 4096;
   FMaxConns := AValue;
+end;
+
+function TVdbPgServer.GetConnCount: Integer;
+var
+  i: Integer;
+begin
+  { v3.56: BITMIS is parcaciklari SAYILMAZ. Onceden accept dongusu
+    FConns.Count'a bakiyordu; thread bitmis olsa da GcFinished calisana
+    kadar slot dolu gorunuyordu. Artik sayac gercek (canli) baglanti
+    sayisidir; kapasite karari da bunu kullanir. }
+  Result := 0;
+  FConnsLock.Enter;
+  try
+    for i := 0 to FConns.Count - 1 do
+      if not TVdbPgConn(FConns[i]).Finished then Inc(Result);
+  finally
+    FConnsLock.Leave;
+  end;
 end;
 
 destructor TVdbPgServer.Destroy;

@@ -162,6 +162,7 @@ build_gate oom            "$ROOT/tests/oom/oom.lpr"
 build_gate btree_scale    "$ROOT/tests/btree_scale/btree_scale.lpr"
 build_gate wal_limit      "$ROOT/tests/wal_limit/wal_limit.lpr"
 build_gate net_fuzz       "$ROOT/tests/net_fuzz/net_fuzz.lpr"
+build_gate network_limits "$ROOT/tests/network_limits/network_limits.lpr"
 build_gate btree_disk     "$ROOT/tests/btree_disk/btree_disk.lpr"
 build_gate sql_scale      "$ROOT/tests/sql_scale/sql_scale.lpr"
 build_gate sql_index_scale "$ROOT/tests/sql_index_scale/sql_index_scale.lpr"
@@ -216,6 +217,7 @@ run_gate oom            "$WORK/oom"            oom
 run_gate btree_scale    "$WORK/btree_scale"    btree_scale
 run_gate wal_limit      "$WORK/wal_limit"      wal_limit
 run_gate net_fuzz       "$WORK/net_fuzz"       net_fuzz
+run_gate network_limits "$WORK/network_limits" network_limits
 run_gate btree_disk     "$WORK/btree_disk"     btree_disk
 run_gate sql_scale      "$WORK/sql_scale"      sql_scale
 run_gate sql_index_scale "$WORK/sql_index_scale" sql_index_scale

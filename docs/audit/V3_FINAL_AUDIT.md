@@ -14,8 +14,8 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 - **Denetim kapsami**: SKILL2 §18-28 ve SKILL3 §5-§15, §19. Depolama
   motoru, WAL/kurtarma, islem izolasyonu, B+Tree, SQL yurutucu, guvenlik,
   kaynak sinirlari, performans, tasinabilirlik, belge.
-- **Kosulan testler**: `tests/run_gates.sh` - Linux **39 kapi**, Windows
-  **38 kapi** (`tls_client` atlanir), tamami PASS.
+- **Kosulan testler**: `tests/run_gates.sh` - Linux **49 kapi**, Windows
+  **48 kapi** (`tls_client` atlanir), tamami PASS.
 
 ## Findings
 
@@ -49,6 +49,10 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 | F26 | **ORTA** | `VDbExecutor` `ABS` | `ABS` once `VDbParseFloat` deniyordu; her tamsayi metni float olarak da gecerli oldugu icin **her zaman** float donuyor, buyuk tamsayilarda hassasiyet sessizce kayboluyordu: `ABS(9223372036854775806)` -> `9.22337203685478E18` (tip ve deger degisimi) | Once `VDbParseInt` denenir, sonuc tamsayi metni olarak doner; `Low(Int64)` icin `ecMathError`; float yolu yalniz gercek ondaliklar icin kalir (v3.55) | `sql_memory` SM20 (tam deger, `ABS(Low)` hata, `ABS(-7)=7`), 54/0; duzeltme oncesi 2 kontrol FAIL | KAPALI |
 | F27 | **YUKSEK** | `VDbExecutor` `suoNeg` / `VDbParser.ParseUnaryExpr`/`ParsePrimary` | `Low(Int64)` uzerinde tekli eksi **sessizce sarilip isareti yanlis birakiyordu**; `-9223372036854775808` literali yalniz iki kat sarma sayesinde dogru gorunuyordu. Ayrica parser isareti ayri dugum yaptigi icin `ParsePrimary`'nin isaretli-literal dali **ulasilamiyordu** | `suoNeg` `iVal = Low(Int64)` icin `ecMathError`; parser `-<tamsayi>` bicimini **isaretle birlikte** `VDbParseInt` ile cozer (v3.55) | `sql_memory` SM17 (literal tam), SM26 (kolon degeri korunur, `SELECT -v` -> `ecMathError`), 54/0; duzeltme oncesi SM26 FAIL | KAPALI |
 | F28 | **YUKSEK** | `VDbExecutor.RunRecursiveCte` | `VDB_RECUR_MAX` (100.000 tur) sinirina takilan ozyinelemeli CTE **kismi sonucu hata vermeden** donduruyordu: `WITH r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r) SELECT n FROM r` -> `1..100001`, hata yok (sessiz yanlis sonuc). Ayrica tur dongusu iptal edilemiyor ve tek turda uretilen satirlar tavansiz buyuyordu | Sinir asiminda `ecLimit`; dogal bitiste `deltaRows` bosaltilir (yanlis pozitif yok); tur basina `VDB_MAX_RESULT_ROWS` satir tavani; dongude `TickAbort` (v3.55) | `sql_memory` SM21 (100 satir CTE), SM22 (sonsuz ozyineleme -> `ecLimit`, tablo saglam), SM23 (timeout -> `ecQueryTimeout`), SM24 (`ecCancelled` + `ResetCancel`), 54/0; duzeltme oncesi SM22 FAIL | KAPALI |
+| F29 | **YUKSEK** | `VDbNet` / `TVdbPgAccept.Execute` | Baglanti soketlerinde okuma/yazma zaman asimi **yoktu**. Tek bayt gonderip bekleyen istemci `HandleQuery` icinde sonsuza kadar blokluyor, is parcacigi ve baglanti slotu asla bosalmiyordu; `MaxConns = 1` iken tek yarim baglanti sunucuyu **kalici olarak** kapatabiliyordu (olculen: ikinci istemci 6031 ms sonra hala giremiyor) | `VdbSockSetTimeouts` (`SO_RCVTIMEO`/`SO_SNDTIMEO`; Windows DWORD ms, Unix `timeval`), `ReadTimeoutMs`/`WriteTimeoutMs` varsayilan **30000 ms**, 0 = kapali; zaman asimi kabul aninda kurulur (startup ve TLS el sikismasi dahil) (v3.56) | `network_limits` NL0-NL3/NL7 (22/0); duzeltme oncesi kaynakla `H1` FAIL (6031 ms) | KAPALI |
+| F30 | **ORTA** | `VDbPgWire.HandleQuery` cerceve okuma | On-kapa asan cerceve `Break` ile **sessizce** baglantiyi kapatiyordu; istemci nedenini ogrenemiyordu (teshis edilemez hata) | `MaxMessageBytes` (varsayilan 64 MiB) asiminda kontrollu `ErrorResponse`, `SQLSTATE 54000`; govde okunmaz, baglanti kapatilir (v3.56) | `network_limits` NL4 (54000 hatasi + sunucu ayakta) | KAPALI |
+| F31 | **ORTA** | `VDbPgWire.HandlePgCopyIn` / `PgTempCopyPath` | `COPY ... FROM STDIN` yalniz **parca** basina sinirlaniyordu; istemci sinirsiz sayida parca gondererek gecici dosyayla diski doldurabiliyordu. Unix'te gecici dosya izinleri de kisitlanmiyordu | Toplam `CopyMaxBytes` (varsayilan **256 MiB**) + parca tavani; Unix'te `PgRestrictTempFile` (`fpChmod 0600`) (v3.56) | `network_limits` NL5 (sinir asimi reddedilir, tablo degismez, gecici dosya kalmaz), NL6 (kucuk COPY calisir) | KAPALI |
+| F32 | **ORTA** | `TVdbPgServer` kapasite karari | `FConns.Count` **kilitsiz** okunuyor ve bitmis (`Finished`) is parcaciklari da sayiliyordu; bos slot varken "kapasite dolu" donulebiliyor ya da sayac yaris nedeniyle tutarsiz kalabiliyordu | `GetConnCount` kilit altinda, yalniz canli baglantilar; accept dongusu `ConnCount` kullanir (v3.56) | `network_limits` NL1/NL2/NL7, `server_failure` 16/0 | KAPALI |
 
 ### Kapatilan test bosluklari (SKILL2 §22, SKILL3 §10.1)
 
@@ -87,7 +91,7 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 
 | Sonuc | Linux | Windows |
 |---|---|---|
-| PASS (kapi) | **43** | **42** |
+| PASS (kapi) | **49** | **48** |
 | FAIL | 0 | 0 |
 | SKIP (`VDB_CRYPTO_DLL` yok) | 2 (`fixtures_openssl`, `selftest_openssl`) | 3 (+`tls_client`) |
 | Calistirilmayan | canli PostgreSQL karsilastirmasi (`sql_differential` `pg=not-run`) | ayni |
@@ -105,12 +109,15 @@ backup_restore 25/0, page_integrity 14/0, btree_integrity 152/0,
 perf_baseline 16/0, single_file 35/0, region_stream 13/0, multiproc 17/0,
 crash_points 24/0, integrity_check 32/0, cache_metrics 21/0,
 format_compat 28/0, portability 29/0, multi_writer 12/0, bench_report 35/0,
-sql_features 32/0, limits 18/0, cache_pressure 8/0, page_corrupt 8/0,
-server_harden 24/0, server_failure 16/0, auth_throttle 16/0,
-disk_full 16/0, txn_limit 18/0, oom 9/0, btree_scale 15/0, wal_limit 19/0,
-net_fuzz 39/0, btree_disk 78/0, sql_scale 34/0, sql_index_scale 45/0,
-soak 20/0,
+sql_features 32/0, sql_authorization 32/0, sql_atomicity 88/0,
+wal_recovery 27/0, freelist 32/0, limits 18/0, sql_memory 54/0,
+cache_pressure 8/0, page_corrupt 8/0, server_harden 24/0, server_failure 16/0,
+auth_throttle 16/0, disk_full 16/0, txn_limit 18/0, oom 9/0,
+btree_scale 15/0, wal_limit 19/0, net_fuzz 39/0, network_limits 22/0,
+btree_disk 78/0, sql_scale 34/0, sql_index_scale 45/0, soak 20/0,
 selftest_builtin PASS, tls_client 6/0 (yalniz Linux).
+Kanit: Windows `gatesE.log` (`KOSAN KAPI: 48`, `GATES_EXIT=0`), Linux
+`linE.log` (`KOSAN KAPI: 49`, `LIN_EXIT=0`).
 
 ## Remaining Risks
 
@@ -132,6 +139,8 @@ L4 (LIMIT > tavan -> `ecLimit`) ile kapsanir. Bu bilincli bir sinirdir:
 | Asiri baglanti | VAR (`server_failure` SF4: `MaxConns=1` iken ikinci baglanti `RSP_ERROR` + `kapasite dolu` alir, birincisi calismaya devam eder) |
 | Asiri islem | VAR (`txn_limit`: 300 kisa islem + 75 geri alma birebir dogrulanir; ic ice `BEGIN` / islem yokken `COMMIT`/`ROLLBACK` sessiz no-op; dosya basina tek yazar rezervasyonu, kisa busy suresiyle kontrollu `mesgul` ve birakilinca yeniden tamamlama) |
 | Bozuk ag girdisi | VAR (`net_fuzz`: gercek PG wire sunucusu loopback'te trust modda, `MaxConns=256` ile 15 saldiri ailesi + 120 yinelemeli tohumlanmis mutasyon + 4 eszamanli is parcacigi; her saldiridan sonra gecerli istemci startup'i tamamlayip `SELECT 1` yaniti alir. Ayrica `server_failure` SF5/SF6 ikili protokolde cop baytlar ve sahte 96 MiB uzunluk oneki) |
+| Yavas istemci / zaman asimi | VAR (`network_limits` NL1-NL3/NL7: yarim startup ve kimlik dogrulamasindan sonra yarim mesaj birakan istemci zaman asimiyla duser, slot bosalir, `MaxConns=1` iken yeni istemci girebilir, `Stop` 5 s icinde doner) |
+| COPY toplam boyut siniri | VAR (`network_limits` NL5/NL6: toplam `CopyMaxBytes` asiminda kontrollu hata, tablo degismez, gecici dosya kalmaz; kucuk COPY calismaya devam eder) |
 | Bozuk veritabani / WAL | VAR (`page_integrity`, `integrity_check`, `wal_crash`, `format_compat`) |
 | Gecersiz sifreleme anahtari | VAR (`crypto_fixtures`) |
 | Sayfa numarasi / yirtik yazma bozulmasi | VAR (`page_corrupt`: normal okuma yolu her sayfayi dogrular; `page_integrity`, `integrity_check`) |
@@ -163,9 +172,9 @@ karsilastirmasi kosmadi.
 **BETA CANDIDATE**
 
 Gerekce: kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici
-bir regresyon kapisiyla kilitlendi; iki platformda 43/42 kapi yesil; tek
+bir regresyon kapisiyla kilitlendi; iki platformda 48/49 kapi yesil; tek
 dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari, bozuk ag
-girdisi (genis fuzz), disk dolu,
+girdisi (genis fuzz), ag zaman asimlari ve COPY boyut tavani, disk dolu,
 islem sayisi basinci, bellek tukenmesi, WAL sert boy tavani, B+Tree
 olcek/parcalanma, SQL yurutucu olcegi (100k/1M satir), SQL indeks olcegi
 (100k/1M satir, plan dogrulamasi ve bozuk `.odb.idx` yan dosyasinda veri
@@ -176,7 +185,13 @@ basarili dosya degistirme); ikisi de kapatildi ve ayni kapiyla kilitlendi.
 Gomulu motor soak kapisi da iki gercek veri kaybi kusuru buldu (F21 doygun
 dizinde sessiz `Insert` basarisizligi, F22 serbest listedeki sayfanin
 yeniden acilista heap sayfasi sanilip sifirlanmasi); ikisi de kapatildi ve
-SO15/SO16/SO17 regresyonlariyla kilitlendi. Soak kapisi 25 sn kosar; gercek
+SO15/SO16/SO17 regresyonlariyla kilitlendi. Sprint D cift/trunk/canli sayfa
+serbest birakma ve bozuk disk B+Tree sayfasinin sessizce geri kazanilmasini,
+Sprint F1 CAST/`ABS`/`Low(Int64)` ve ozyinelemeli CTE'nin sessiz kesilmesini,
+Sprint E zaman asimsiz baglantiyla kalici DoS'u (F29), sessiz cerceve
+dusurmeyi (F30), sinirsiz COPY gecici dosyasini (F31) ve kilitsiz kapasite
+okumasini (F32) kapatti; her biri kendi kapisiyla kilitlendi. Soak kapisi 25 sn
+kosar; gercek
 1 saat / 6 saat / 24 saat soak **kosulmadi**, ag sunucusu soak'i kapsam
 disidir, bu yuzden uzun sureli kaynak sizintisi iddia edilmez.
 Buna karsin ayri B+Tree disk sayfa bicimi yalnizca **bagimsiz ve kapili bir
