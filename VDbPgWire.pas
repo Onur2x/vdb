@@ -94,6 +94,16 @@ type
     FSock: TVdbSocket;
     FTls: TVdbTlsSession;
     FTlsErr: string;
+    { v3.69 / SKILL6 05: MUTLAK okuma son tarihi (monotonik ms). 0 = eski
+      davranis (yalniz SO_RCVTIMEO, her recv icin ayri sure). Cagiran
+      taraf her protokol mesajinin BASINDA tazeler; boylece baslik,
+      uzunluk ve govde AYNI son tarihe tabi olur ve istemci kucuk
+      parcalar gondererek toplam sureyi uzatamaz. }
+    FBitisTick: QWord;
+    { v3.69: yazma butcesi (ms). Her SendAll cagrisinda yeniden hesaplanir
+      (now + butce). Bilerek SAKLANMAZ: uzun bir sonuc kumesi yollarken
+      bayat bir son tarih yuzunden yazma basarisiz olmasin. }
+    FSendBudgetMs: Integer;
   public
     constructor Create(ASock: TVdbSocket);
     destructor Destroy; override;
@@ -103,9 +113,15 @@ type
     function RecvU8(out AV: Byte): Boolean;
     function SendU8(AV: Byte): Boolean;
     procedure Shutdown;
+    { v3.69: okuma son tarihini simdiden itibaren AMs yapar. AMs <= 0
+      son tarihi kaldirir (eski davranis). }
+    procedure SetDeadlineMs(AMs: Integer);
+    { v3.69: bu IO uzerinden yazma butcesi. 0 = eski davranis. }
+    procedure SetSendBudgetMs(AMs: Integer);
     property Sock: TVdbSocket read FSock;
     property Tls: TVdbTlsSession read FTls;
     property TlsError: string read FTlsErr;
+    property DeadlineTick: QWord read FBitisTick;
   end;
 
   TVdbPgConn = class(TThread)
@@ -113,6 +129,12 @@ type
     FServer: TVdbPgServer;
     FIO: TVdbPgIo;
     FSql: TVSql;
+    { v3.69 / SKILL6 05: bu baglantiya ozgu BackendKeyData. Onceden her
+      baglantiya (1, 0) gonderiliyordu: istemci CancelRequest gonderdiginde
+      hangi baglantinin iptal edilecegi ayirt EDILEMEZDI. PID once, secret
+      sonra yazilir; HandleCancel ikisini birden dogrular. }
+    FPid: LongInt;
+    FSecret: LongInt;
     function GetSock: TVdbSocket;
     function DoScramAuth(const AStartupUser: string): Boolean;
   protected
@@ -121,6 +143,13 @@ type
     constructor Create(AServer: TVdbPgServer; ASock: TVdbSocket);
     destructor Destroy; override;
     procedure Wake;
+    { v3.69: baska bir is parcacigindan (CancelRequest isleyen kabul
+      parcacigi) cagrilir. Yalnizca atomik bir bayrak kurar; motorun kendi
+      TX/statement sinirlarinda guvenli noktalarda iptal edilir. }
+    procedure RequestCancel;
+    procedure SetBackendKey(APid, ASecret: LongInt);
+    property BackendPid: LongInt read FPid;
+    property BackendSecret: LongInt read FSecret;
     property Sock: TVdbSocket read GetSock;
   end;
 
@@ -209,6 +238,26 @@ type
     FMaxStmtSqlBytes: Int64;
     FMaxPortals: Integer;
     FMaxPortalResultBytes: Int64;
+    { v3.69 / SKILL6 05: CancelRequest destegi. Her baglantiya BENZERSIZ
+      bir backend PID ve tahmin edilemez bir secret verilir; CancelRequest
+      (kod 80877102) geldiginde yalnizca ikisi de eslesen baglanti iptal
+      edilir. FNextBackendPid atomik artar (1000'den baslar), secret
+      kilit altinda xorshift32 ile uretilir (global Random KULLANILMAZ:
+      motorun/uygulamanin rastgele dizisini bozmamak icin). }
+    FNextBackendPid: LongInt;
+    FSecretState: Cardinal;
+    FCancelHits: Integer;
+    { v3.69 / SKILL6 05: sorgu yurutme icin varsayilan statement_timeout
+      (ms). 0 = kapali (eski davranis). Baglanti basinda SQL oturumuna
+      aktarilir; oturum `SET statement_timeout` ile kendisi icin
+      degistirebilir. }
+    FQueryTimeoutMs: Integer;
+    function NextBackendPid: LongInt;
+    function NextSecret: LongInt;
+    { v3.69: CancelRequest islemi. Eslesen baglanti varsa iptal eder ve
+      True doner. Baska bir baglanti ASLA etkilenmez. }
+    function HandleCancel(APid, ASecret: LongInt): Boolean;
+    function GetCancelHits: Integer;
     function GetConnCount: Integer;
     function GetAuthRequired: Boolean;
     procedure SetMaxConns(AValue: Integer);
@@ -326,6 +375,13 @@ type
       istemciye kontrollu hata doner; surec OOM ile olmez. }
     property MaxPortalResultBytes: Int64 read FMaxPortalResultBytes
       write FMaxPortalResultBytes;
+    { v3.69 / SKILL6 05: sorgu yurutme zaman asimi (ms). 0 = kapali.
+      Baglanti basinda SQL oturumuna aktarilir; asimda istemciye
+      SQLSTATE 57014 (query_canceled) doner ve statement geri alinir. }
+    property QueryTimeoutMs: Integer read FQueryTimeoutMs
+      write FQueryTimeoutMs;
+    { v3.69: basarili CancelRequest sayisi (test/gozlem icin). }
+    property CancelHits: Integer read GetCancelHits;
     { Eszamanli TCP baglanti siniri (varsayilan 64). 1..4096 araligina
       kirpilir; Start'tan once veya calisirken degistirilebilir. }
     property MaxConns: Integer read FMaxConns write SetMaxConns;
@@ -379,6 +435,9 @@ type
   TPgLimits = record
     CopyMaxBytes: Int64;   // 0 = sinirsiz
     MaxChunk: Integer;     // 0 = sinirsiz
+    { v3.69 / SKILL6 05: COPY parcalari arasinda MUTLAK okuma son tarihini
+      tazelemek icin (0 = eski davranis). }
+    ReadTimeoutMs: Integer;
   end;
 
 { ---------------------------------------------------- ag bayt duzeni (BE) }
@@ -435,6 +494,21 @@ begin
   FSock := ASock;
   FTls := nil;
   FTlsErr := '';
+  FBitisTick := 0;
+  FSendBudgetMs := 0;
+end;
+
+procedure TVdbPgIo.SetDeadlineMs(AMs: Integer);
+begin
+  if (AMs > 0) and (FSock <> VDB_SOCK_INVALID) then
+    FBitisTick := GetTickCount64 + QWord(AMs)
+  else
+    FBitisTick := 0;
+end;
+
+procedure TVdbPgIo.SetSendBudgetMs(AMs: Integer);
+begin
+  if AMs > 0 then FSendBudgetMs := AMs else FSendBudgetMs := 0;
 end;
 
 destructor TVdbPgIo.Destroy;
@@ -485,36 +559,48 @@ begin
     got := 0;
     while got < ALen do
     begin
+      { SKILL6 05: TLS'te select() kullanilamaz (OpenSSL'in kendi
+        tamponu "hazir" gorunmeyebilir), bu yuzden son tarih her parca
+        ONCESI denetlenir. Tek bir SSL_read'in ust siniri soketin
+        SO_RCVTIMEO'sudur (baglanti kabulunde kurulur); bu, durust sinir
+        olarak dokumante edilir: TLS'te toplam sure
+        "parca sayisi x ReadTimeoutMs" ile degil, parcalar arasinda
+        son tarih denetimiyle sinirlanir. }
+      if (FBitisTick <> 0) and (GetTickCount64 >= FBitisTick) then Exit;
       n := FTls.Read(p + got, ALen - got);
       if n <= 0 then Exit;
       Inc(got, n);
     end;
     Exit(True);
   end;
-  Result := VdbRecvAll(FSock, ABuf, ALen);
+  Result := VdbRecvAllDl(FSock, ABuf, ALen, FBitisTick);
 end;
 
 function TVdbPgIo.SendAll(const ABuf; ALen: Integer): Boolean;
 var
   sent, n: Integer;
   p: PByte;
+  bitis: QWord;
 begin
   Result := False;
   if ALen < 0 then Exit;
   if ALen = 0 then Exit(True);
   p := @ABuf;
+  bitis := 0;
+  if FSendBudgetMs > 0 then bitis := GetTickCount64 + QWord(FSendBudgetMs);
   if FTls <> nil then
   begin
     sent := 0;
     while sent < ALen do
     begin
+      if (bitis <> 0) and (GetTickCount64 >= bitis) then Exit;
       n := FTls.Write(p + sent, ALen - sent);
       if n <= 0 then Exit;
       Inc(sent, n);
     end;
     Exit(True);
   end;
-  Result := VdbSendAll(FSock, ABuf, ALen);
+  Result := VdbSendAllDl(FSock, ABuf, ALen, bitis);
 end;
 
 function TVdbPgIo.RecvU8(out AV: Byte): Boolean;
@@ -883,6 +969,11 @@ begin
     ecDuplicateSavepoint:  Result := '3B001';
     ecSavepointNotFound:   Result := '3B000';
     ecPoolTimeout:         Result := '53300';
+    { v3.69 / SKILL6 05: PG istemcileri iptal/zaman asimini 57014
+      (query_canceled) olarak bekler. Onceden bu ikisi de genel '42000'e
+      dusuyordu; psql/libpq iptal edildigini ayirt edemiyordu. }
+    ecCancelled,
+    ecQueryTimeout:        Result := '57014';
     ecPoolClosed:          Result := '08003';
     ecJsonError:           Result := '22P02';
     ecPermissionDenied:    Result := '42501';
@@ -981,8 +1072,13 @@ end;
 
 { ------------------------------------------------ startup + basit sorgu }
 
+{ v3.69 / SKILL6 05: startup paketinin sonucu. srCancel: istemci
+  CancelRequest (kod 80877102) gonderdi; yanit YOKTUR, baglanti kapanir. }
+type
+  TPgStartupResult = (srStartup, srCancel, srFail);
+
 function ReadStartup(S: TVdbPgIo; ATls: TVdbTlsContext;
-  out AUser: string): Boolean;
+  out AUser: string; out ACancelPid, ACancelSecret: LongInt): TPgStartupResult;
 var
   len, code: LongInt;
   body: AnsiString;
@@ -990,8 +1086,10 @@ var
   k, v: string;
   ok: Boolean;
 begin
-  Result := False;
+  Result := srFail;
   AUser := '';
+  ACancelPid := 0;
+  ACancelSecret := 0;
   while True do
   begin
     if not RecvI32(S, len) then Exit;
@@ -1000,6 +1098,16 @@ begin
     if (len - 4) > 0 then
       if not S.RecvAll(body[1], len - 4) then Exit;
     code := NetToI32(body, 1);
+    if code = 80877102 then
+    begin
+      { CancelRequest: uzunluk TAM 16 olmalidir (4 len + 4 kod + 4 pid +
+        4 secret). Yanit gonderilmez; baglanti hemen kapatilir. Eksik/
+        fazla baytli paket gecersiz sayilir (iptal edilmez). }
+      if (len <> 16) or (Length(body) <> 12) then Exit;
+      ACancelPid := NetToI32(body, 5);
+      ACancelSecret := NetToI32(body, 9);
+      Exit(srCancel);
+    end;
     if code = 80877103 then
     begin
       // SSLRequest: TLS yapilandirilmissa 'S' + el sikismasi, yoksa 'N'.
@@ -1022,13 +1130,13 @@ begin
     while p <= Length(body) do
     begin
       k := ReadCStr(body, p, ok);
-      if not ok then Exit(False);      // F-43: eksik NUL -> paket bozuk
+      if not ok then Exit;             // F-43: eksik NUL -> paket bozuk
       if k = '' then Break;
       v := ReadCStr(body, p, ok);
-      if not ok then Exit(False);
+      if not ok then Exit;
       if k = 'user' then AUser := v;
     end;
-    Exit(True);
+    Exit(srStartup);
   end;
 end;
 
@@ -1607,6 +1715,7 @@ end;
 
 function HandlePgCopyIn(S: TVdbPgIo; FSql: TVSql;
   const Spec: TPgCopySpec; AMaxBytes: Int64; AMaxChunk: Integer;
+  AReadTimeoutMs: Integer;
   ATerminate: Boolean; out AErr: Boolean): Boolean;
 // ATerminate=True: basit sorgu -> hata/basari sonunda ReadyForQuery.
 // ATerminate=False: extended protocol -> ReadyForQuery yalnizca Sync'te
@@ -1662,6 +1771,10 @@ begin
       PgRestrictTempFile(path);
       while True do
       begin
+        { v3.69 / SKILL6 05: her COPY parcasi ("d" mesaji) icin MUTLAK okuma
+          son tarihi tazelenir; yavas ama surekli veri gonderen istemci
+          islemi sinirsiz uzatamaz. }
+        S.SetDeadlineMs(AReadTimeoutMs);
         if not S.RecvU8(b) then Exit;
         if not RecvI32(S, len) then Exit;
         plen := len - 4;
@@ -1858,7 +1971,7 @@ begin
   begin
     if CopySpec.FromStdin then
       Exit(HandlePgCopyIn(S, FSql, CopySpec, ALim.CopyMaxBytes,
-        ALim.MaxChunk, True, dummyErr));
+        ALim.MaxChunk, ALim.ReadTimeoutMs, True, dummyErr));
     if CopySpec.ToStdout then
       Exit(HandlePgCopyOut(S, FSql, CopySpec, True, dummyErr));
   end
@@ -1938,8 +2051,25 @@ begin
   FServer := AServer;
   FIO := TVdbPgIo.Create(ASock);
   FSql := TVSql.Create(AServer.Ftb);
+  FPid := 0;
+  FSecret := 0;
   AServer.AddConn(Self);
   Start;
+end;
+
+procedure TVdbPgConn.SetBackendKey(APid, ASecret: LongInt);
+begin
+  FSecret := ASecret;
+  FPid := APid;      // yayin noktasi: HandleCancel ikisini de gorur
+end;
+
+procedure TVdbPgConn.RequestCancel;
+begin
+  { FSql.CancelQuery yalnizca atomik bir bayrak kurar (InterlockedExchange);
+    baska is parcacigindan cagrilmasi guvenlidir. Iptal, motorun kendi
+    guvenli noktalarinda (TickAbort / CheckAbort) devreye girer; yarim
+    DML commit EDILMEZ, statement geri alinir. }
+  if FSql <> nil then FSql.CancelQuery;
 end;
 
 destructor TVdbPgConn.Destroy;
@@ -2126,6 +2256,9 @@ var
   copyOk, copyErr: Boolean;
   cok: Boolean;
   Lim: TPgLimits;
+  { v3.69 / SKILL6 05 }
+  sr: TPgStartupResult;
+  cpid, csec: LongInt;
   { v3.64 (SKILL5 9.5 + 10.1) }
   totalBytes: Int64;
   stOld: TPgStmt;
@@ -2232,7 +2365,23 @@ begin
   Stmts := nil;
   Portals := nil;
   try
-    if not ReadStartup(FIO, FServer.FTls, user) then Exit;
+    { v3.69 / SKILL6 05: MUTLAK son tarih. Startup fazinin TAMAMI (TLS el
+      sikismasi, SCRAM, paket okumalari) tek bir son tarihe tabidir; ayni
+      sekilde yazmalar da baglanti basina butceyle sinirlidir. Bunlar
+      olmadan zaman asimini yalnizca "her recv icin ayri SO_RCVTIMEO"
+      sagliyordu ve istemci kucuk parcalarla toplami sinirsiz uzatiyordu. }
+    FIO.SetDeadlineMs(FServer.FReadTimeoutMs);
+    FIO.SetSendBudgetMs(FServer.FWriteTimeoutMs);
+    sr := ReadStartup(FIO, FServer.FTls, user, cpid, csec);
+    if sr = srCancel then
+    begin
+      { CancelRequest: yanit YOK, baglanti kapanir. Eslesme yoksa (gecersiz
+        veya kapanmis baglanti) hicbir sey iptal EDILMEZ. }
+      FServer.HandleCancel(cpid, csec);
+      Exit;
+    end;
+    if sr <> srStartup then Exit;
+    FSql.QueryTimeoutMs := FServer.FQueryTimeoutMs;
     Stmts := TDictionary<string, TPgStmt>.Create;
     Portals := TDictionary<string, TPgPortal>.Create;
     // P-180: kullanici tanimliysa SCRAM-SHA-256, degilse AuthOk (trust).
@@ -2261,7 +2410,12 @@ begin
     if not SendPg(FIO, ParamMsg('client_encoding', 'UTF8')) then Exit;
     if not SendPg(FIO, ParamMsg('DateStyle', 'ISO')) then Exit;
     if not SendPg(FIO, ParamMsg('integer_datetimes', 'on')) then Exit;
-    if not SendPg(FIO, BackendKeyMsg(1, 0)) then Exit;
+    { v3.69 / SKILL6 05: BackendKeyData BENZERSIZ. Onceden (1, 0) idi:
+      tum istemciler ayni degerleri goruyordu ve CancelRequest ile hangi
+      baglantinin iptal edilecegi ayirt edilemiyordu. Secret once, PID en
+      son yazilir (yayin noktasi). }
+    SetBackendKey(FServer.NextBackendPid, FServer.NextSecret);
+    if not SendPg(FIO, BackendKeyMsg(FPid, FSecret)) then Exit;
     if not SendPg(FIO, ReadyMsg) then Exit;
 
     skipUntilSync := False;
@@ -2269,8 +2423,12 @@ begin
       istek icinde sinir degisip tutarsiz kalinmaz. }
     Lim.CopyMaxBytes := FServer.FCopyMaxBytes;
     Lim.MaxChunk := FServer.FMaxMessageBytes;
+    Lim.ReadTimeoutMs := FServer.FReadTimeoutMs;
     while not Terminated do
     begin
+      { v3.69 / SKILL6 05: son tarih HER MESAJIN basinda tazelenir; tip
+        bayti, uzunluk ve govde ayni son tarihe tabidir. }
+      FIO.SetDeadlineMs(FServer.FReadTimeoutMs);
       if not FIO.RecvU8(typ) then Break;
       if typ = Ord('X') then Break;          // Terminate
       if not RecvI32(FIO, len) then Break;
@@ -2570,8 +2728,8 @@ begin
               Portals.AddOrSetValue(nm, pt);
               if CopySpec.FromStdin then
                 copyOk := HandlePgCopyIn(FIO, FSql, CopySpec,
-                  FServer.FCopyMaxBytes, FServer.FMaxMessageBytes, False,
-                  copyErr)
+                  FServer.FCopyMaxBytes, FServer.FMaxMessageBytes,
+                  FServer.FReadTimeoutMs, False, copyErr)
               else
                 copyOk := HandlePgCopyOut(FIO, FSql, CopySpec, False, copyErr);
               if copyErr then
@@ -2765,6 +2923,68 @@ begin
   { F-46 (SKILL6 02): rolu eslenmemis kullanici varsayilan olarak
     REDDEDILIR; eskiden dogrulanan her kullanici sinirsiz yetkiye sahipti. }
   FAllowUnmappedUsers := False;
+  { v3.69 / SKILL6 05: CancelRequest destegi. PID sayaci 1000'den baslar
+    (0 ve 1 anlamsiz/eski sabit); secret durumu zamana ve nesne adresine
+    gore tohumlanir. Global Random KULLANILMAZ: motorun rastgele dizisini
+    bozmamak icin kendi xorshift32'si vardir ve yalniz FConnsLock altinda
+    cagrilir. }
+  FNextBackendPid := 1000;
+  FSecretState := Cardinal(Cardinal(GetTickCount64) xor
+    (PtrUInt(Self) shr 4));
+  if FSecretState = 0 then FSecretState := $9E3779B9;
+  FCancelHits := 0;
+  FQueryTimeoutMs := 0;
+end;
+
+function TVdbPgServer.NextBackendPid: LongInt;
+begin
+  Result := InterlockedIncrement(FNextBackendPid);
+end;
+
+function TVdbPgServer.NextSecret: LongInt;
+var
+  x: Cardinal;
+begin
+  { xorshift32: kilit altinda cagrilir; sifir olmayan, tahmin edilmesi zor
+    bir 32 bit deger. Kriptografik bir anahtar DEGILDIR; amac yalnizca
+    baska bir baglantinin iptal edilmesini engellemektir (PostgreSQL'in
+    kendi cancel secret'i da 32 bittir). }
+  x := FSecretState;
+  x := x xor (x shl 13);
+  x := x xor (x shr 17);
+  x := x xor (x shl 5);
+  FSecretState := x;
+  Result := LongInt(x);
+end;
+
+function TVdbPgServer.HandleCancel(APid, ASecret: LongInt): Boolean;
+var
+  i: Integer;
+  c: TVdbPgConn;
+begin
+  Result := False;
+  if (APid <= 0) or (ASecret = 0) then Exit;
+  FConnsLock.Enter;
+  try
+    for i := 0 to FConns.Count - 1 do
+    begin
+      c := TVdbPgConn(FConns[i]);
+      if (c <> nil) and (not c.Finished) and
+         (c.BackendPid = APid) and (c.BackendSecret = ASecret) then
+      begin
+        c.RequestCancel;
+        InterlockedIncrement(FCancelHits);
+        Exit(True);
+      end;
+    end;
+  finally
+    FConnsLock.Leave;
+  end;
+end;
+
+function TVdbPgServer.GetCancelHits: Integer;
+begin
+  Result := InterlockedExchangeAdd(FCancelHits, 0);
 end;
 
 procedure TVdbPgServer.SetMaxConns(AValue: Integer);

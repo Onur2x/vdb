@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-18
-Surum: v3.68 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1 + H + I + J + K + L + M + N; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Surum: v3.69 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1 + H + I + J + K + L + M + N + O; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -58,8 +58,8 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 
 ### A.3 Mevcut V3 durumu
 
-- Iki platformda tam kapi seti yesil: **Windows i386 53 kapi**, **Linux
-  x86_64 54 kapi**, FAIL 0 (v3.65 kosulari: `gatesJ.log` / `linJ.log`).
+- Iki platformda tam kapi seti yesil: **Windows i386 54 kapi**, **Linux
+  x86_64 55 kapi**, FAIL 0 (v3.69 kosulari: `gatesK.log` / `linK.log`).
   Windows'ta `tls_client` bu ortamda **SKIP** oldu (OpenSSL DLL'i yok);
   kostugu kosu `gatesE.log`'dur. SKIP PASS sayilmaz (ayrinti: `CI.md`).
 - Acik kritik hata yok. Kapatilan son gercek kusurlar: F-21/F-22 veri
@@ -90,6 +90,12 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   sizmasi** (`sql_authorization` AU12).
   Sprint N'de **dosya degistirmede (VACUUM/Compact/Restore/Rekey) dizin
   fsync'inin hic yapilmamasi** (`maint_lock` ML6-ML7).
+  Sprint O'da **ag zaman asiminin her recv/send cagrisi icin ayri
+  uygulanmasi** (istemci her zaman asimindan once kucuk bir parca
+  gondererek toplam mesaj suresini sinirsiz uzatabiliyordu) ve
+  **PostgreSQL CancelRequest'in hic islenmemesi** (her baglantiya ayni
+  `BackendKeyData(1, 0)` gonderiliyordu, yani iptal edilebilir bir anahtar
+  yoktu) kapandi (`network_limits` NL9-NL12, `pg_cancel` PC0-PC9).
   Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
 - Rol degistirme yetkisi ve SCRAM kullanicisi -> SQL rolu eslemesi (SKILL5
   3.1'in yetki denetimi ve 3.2) Sprint M'de **kapandi** (`sql_authorization`
@@ -124,6 +130,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | L | SKILL6 01: SERIALIZABLE bayragi **backend genelinde** tutuluyordu (paylasilan `TVTableDb` yuzunden bir baglanti digerinin commit'ini 40001 ile iptal ediyordu); `.gen` okunamazsa "degismedi" varsayimi | Tamam | `serializable_tx` 28/0 (23 -> 28; S16-S20 yeni) |
 | M | SKILL6 02: SCRAM yalniz kimlik dogruluyordu, SQL rolu ile **eslesmiyordu** (dogrulanmis uzak kullanici = motor yoneticisi); bos rol = **sinirsiz yetki**; `SET ROLE NONE` yetki yukselmesiydi; rol uyeligi denetlenmiyordu; oturum kimligi isaretci kirpintisiydi ve rol durumu bir sonraki baglantiya miras kaliyordu | Tamam | `sql_authorization` 62/0 (51 -> 62; AU12 yeni) |
 | N | SKILL6 06: dosya degistirmede (VACUUM/Compact/Restore/Rekey) **dizin fsync'i hic yapilmiyordu**; rename/silme cokme sonrasi kaybolabiliyor, eski WAL geri gelebiliyordu | Tamam | `maint_lock` 19/0 (13 -> 19; ML6-ML7 yeni) |
+| O | SKILL6 05: ag zaman asimi **her recv/send cagrisi icin** ayri uygulaniyordu (damla/drip istemcisi toplam sureyi sinirsiz uzatiyordu); **CancelRequest (80877102) hic islenmiyordu** ve her baglantiya ayni `BackendKeyData(1, 0)` gonderiliyordu | Tamam | `network_limits` 41/0 (26 -> 41; NL9-NL12 yeni), `pg_cancel` 31/0 (yeni, PC0-PC9) |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -650,6 +657,9 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   kontrole buyuttu (AU12), kapi sayisi yine 53 / 54 kaldi. Sprint N
   (SKILL6 06) da yeni kapi dizini eklemedi; `tests/maint_lock` kapisini
   13 -> **19** kontrole buyuttu (ML6-ML7), kapi sayisi 53 / 54 kaldi.
+  Sprint O (SKILL6 05) **iki** kapiyi buyuttu: yeni kapi dizini
+  `tests/pg_cancel` (31 kontrol) ve `tests/network_limits` 26 -> **41**
+  kontrol (NL9-NL12); sayilar Windows 53 -> **54**, Linux 54 -> **55**.
 - Windows `gatesJ` kosusunda `tls_client` **SKIP** oldu: ortamda
   `VDB_CRYPTO_DLL`/`VDB_SSL_DLL` yok. `tls_client` fikstur dizinini
   `VDB_TLS_FIXTURES` ile bulur; degisken verilmezse kapi exe'nin yanindan
@@ -1048,6 +1058,53 @@ tablosundadir. Bu sprintte kapatilanlar:
   fsync garantisine dayanir (POSIX). `tests/crash_points` surec oldurme ile
   calisir ve fsync kaybini **taklit etmez**; bu yuzden ayri bir fsync
   kancasi kullanildi. V2 ve bicim v5 degismedi.
+- **F-47 (Yuksek, KAPALI, v3.69; kod etiketi F-48)**: iki ayri ag kusuru.
+  (1) **Zaman asimi her cagri icin ayriydi**: `VdbRecvAll` (`VDbNet.pas`)
+  ve `TVdbPgIo.RecvAll` (`VDbPgWire.pas`) dongu icinde `fpRecv` cagiriyor,
+  sinir yalniz `SO_RCVTIMEO`/`SO_SNDTIMEO` (varsayilan 30 s) ile her tek
+  cagriya uygulaniyordu. Istemci her 29 saniyede bir bayt gonderirse
+  **toplam** mesaj/startup/COPY suresi sinirsiz uzuyordu (Slowloris/damla);
+  baglanti slotu ve is parcacigi surekli tutuluyordu. (2) **CancelRequest
+  (kod `80877102`) hic islenmiyordu** (`ReadStartup` yalniz 80877103/80877104/
+  196608 taniyordu) ve her baglantiya **ayni** `BackendKeyMsg(1, 0)`
+  gonderiliyordu; yani istemcinin elinde kendi baglantisina ozel bir
+  (pid, secret) cifti yoktu ve iptal protokolu kullanilamazdi. SKILL6 05.
+  Duzeltme: `VdbRecvAllDl`/`VdbSendAllDl` (`VDbNet.pas`) monotonik
+  `GetTickCount64` tabanli **mutlak** son tarih (`ASonTick = 0` -> eski
+  davranis); `select()` ile bekleme 1000 ms'lik dilimlere bolunur (kapanis
+  en gec 1 s'de gorulur). `TVdbPgIo.SetDeadlineMs` her **mesajin** basinda
+  tazelenir (baslik + govde ayni son tarihe tabi), startup/TLS/SCRAM tek
+  son tarih altinda, COPY-In her `d` parcasinda tazelenir; yazma tarafinda
+  `SetSendBudgetMs` her `SendAll` cagrisinda butceyi yeniler (uzun sonuc
+  kumelerinde bayat son tarih olmaz). Her baglantiya **benzersiz**
+  `BackendKeyData` verilir (`FNextBackendPid` = InterlockedIncrement(1000),
+  secret = kilit altinda xorshift32); `ReadStartup` `80877102`i ayristirir
+  (len 16, pid, secret), yanit vermez ve baglantiyi kapatir;
+  `TVdbPgServer.HandleCancel` `FConns`i kilit altinda tarar, **yalniz**
+  pid **ve** secret eslesen baglantinin `TVSql.CancelQuery`'sini cagirir;
+  bilinmeyen pid/yanlis secret **hicbir** baglantiyi iptal etmez. Iptal
+  edilen sorgu `57014` (query_canceled) SQLSTATE'i ile doner
+  (`PgSqlStateOf`: `ecCancelled`, `ecQueryTimeout`).
+  Regresyon: `network_limits` **41/0** (26 -> 41; NL9-NL12 yeni) ve yeni
+  kapi `pg_cancel` **31/0** (PC0-PC9). On-kapi (`git archive HEAD` =
+  `4203135`, yalniz API **seam**'i: `VdbRecvAllDl`/`VdbSendAllDl`
+  bildirilir ve son tarihi **yok sayarak** eski fonksiyonlara delege eder;
+  test dosyalari HEAD'den degil calisma agacindan alinir): `network_limits`
+  **32 PASS / 9 FAIL**, ayirt edici kontroller NL9 (damla 4156 ms'de hala
+  acik), NL10 (2188 ms), NL11 (COPY-In 4171 ms), NL12 (bitmis butceye ragmen
+  yazma kabul edildi: `ok=True`, 1 bayt gitti); `pg_cancel` **3 PASS / 4 FAIL**
+  (on-kapida `BackendKeyData` secret'i 0 oldugu icin baglanti dogrulamasi
+  `BackendKeyData yok` ile erken kesilir - yani iptal anahtari hic yok).
+  **Durust sinir**: (a) Windows'ta loopback uzerinde **engellenen yazma**
+  deterministik uretilemiyor (RCVBUF=4096 iken 16 MiB 16 ms'de kabul edildi),
+  bu yuzden NL12 engellenme anini degil **son tarihin kendisini** olcer
+  (bitmis butcede hic bayt yazilmaz, dolan son tarihte dongu durur, bol
+  butcede yuk tamamen gider); tek bir `fpSend` kendi OS tavanini
+  (`SO_SNDTIMEO`) asabilecegi icin ust sinir 2 s'dir. (b) TLS uzerinde
+  `select()` kullanilamaz; TLS okumasinda son tarih **her parca oncesi**
+  denetlenir, tek `SSL_read`in ust siniri yine `SO_RCVTIMEO`'dur. (c) Iptal
+  **isbirlikci** noktalarda (satir dongusu/TickAbort) etkilidir; bloklayan
+  tek bir disk G/C'sini kesmez. V2 ve bicim v5 degismedi.
 
 
 ---
@@ -1059,7 +1116,7 @@ tablosundadir. Bu sprintte kapatilanlar:
 Gerekce:
 
 1. Kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici bir
-   regresyon kapisiyla kilitlendi; iki platformda **53/54** kapi yesil, FAIL 0.
+   regresyon kapisiyla kilitlendi; iki platformda **54/55** kapi yesil, FAIL 0.
 2. Tek dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari,
    bozuk ag girdisi, disk dolu, bellek tukenmesi, WAL sert tavani, B+Tree
    olcek/parcalanma, SQL 100k/1M olcegi, SQL indeks olcegi ve VACUUM geri

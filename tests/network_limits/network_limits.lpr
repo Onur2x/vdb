@@ -23,6 +23,13 @@ program network_limits;
     NL8  zaman asimi KURULAMAZSA baglanti hic sunulmaz (fail-closed):
          kabul dongusu soketi protokol mesaji gondermeden kapatir ve
          baglanti slotu tuketilmez; kanca kaldirilinca sunucu normale doner
+    NL9  DAMLA (drip) saldirisi: her 100 ms'de bir bayt gondererek toplam
+         sureyi uzatma denemesi MUTLAK mesaj son tarihiyle dusurulur
+    NL10 yarim startup basligi damla damla gonderilir: startup son tarihi
+    NL11 COPY-In govdesi damla damla gonderilir: son tarih + tablo/gecici
+         dosya dokunulmaz
+    NL12 yazma son tarihi: alicisi okumayan sokette VdbSendAllDl, butce
+         dolunca doner (engellenen yazma sinirsiz surmez)
 
   SINIRLILIK (gizlenmez): yalniz protokol katmani olculur; gercek ag
   gecikmesi uretilmez. TLS el sikismasi zamani ayni SO_RCVTIMEO
@@ -34,7 +41,7 @@ program network_limits;
 
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
-  SysUtils, Classes, VDbNet, VDbPgWire;
+  SysUtils, Classes, Sockets, VDbNet, VDbPgWire;
 
 const
   BASE_PORT  = 54520;
@@ -353,6 +360,116 @@ begin
   ForceDirectories(d);
 end;
 
+{ v3.69 / SKILL6 05: damla (drip) istemcisi. ABytes'i ADripMs araliklarla
+  BIRER bayt gonderir ve her turda kisa bir okuma ile sunucunun soketi
+  kapatip kapatmadigini denetler. Sonuc: TRUE = sunucu kapatti (AClosedMs:
+  ilk bayttan itibaren gecen sure). Yazma da basarisiz olursa kapanmis
+  sayilir (RST). }
+function DripUntilClosed(ASock: TVdbSocket; const ABytes: AnsiString;
+  ADripMs, ALimitMs: Integer; out AClosedMs: QWord): Boolean;
+var
+  i: Integer;
+  t0: QWord;
+  b: Byte;
+  rv: Integer;
+begin
+  Result := False;
+  AClosedMs := 0;
+  t0 := NowMs;
+  for i := 1 to Length(ABytes) do
+  begin
+    AClosedMs := NowMs - t0;
+    if AClosedMs > QWord(ALimitMs) then Exit;
+    if not SendRaw(ASock, ABytes[i]) then
+    begin
+      Result := True;
+      Exit;
+    end;
+    Sleep(ADripMs);
+    rv := VdbRecvSome(ASock, b, 1);
+    AClosedMs := NowMs - t0;
+    if rv = 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+{ v3.69 / SKILL6 05: loopback uzerinde bagli TCP soket cifti (alicisi
+  OKUMAYAN taraf) - yazma son tarihini olcmek icin. }
+function MakeTcpPair(out AA, AB: TVdbSocket; out ADetail: string): Boolean;
+var
+  lst, cli: TVdbSocket;
+  sa: TInetSockAddr;
+  n, rbv, rbl: Integer;
+begin
+  Result := False;
+  ADetail := '';
+  AA := VDB_SOCK_INVALID;
+  AB := VDB_SOCK_INVALID;
+  lst := fpSocket(AF_INET, SOCK_STREAM, 0);
+  if lst = VDB_SOCK_INVALID then
+  begin
+    ADetail := 'dinleme soketi acilamadi';
+    Exit;
+  end;
+  n := 4096;
+  fpSetSockOpt(lst, SOL_SOCKET, SO_RCVBUF, @n, SizeOf(n));
+  FillChar(sa, SizeOf(sa), 0);
+  sa.sin_family := AF_INET;
+  sa.sin_port := 0;
+  sa.sin_addr := StrToNetAddr('127.0.0.1');
+  if fpBind(lst, @sa, SizeOf(sa)) <> 0 then
+  begin
+    ADetail := 'bind basarisiz';
+    VdbSockClose(lst);
+    Exit;
+  end;
+  if fpListen(lst, 1) <> 0 then
+  begin
+    ADetail := 'listen basarisiz';
+    VdbSockClose(lst);
+    Exit;
+  end;
+  n := SizeOf(sa);
+  if fpGetSockName(lst, @sa, @n) <> 0 then
+  begin
+    ADetail := 'yerel ad alinamadi';
+    VdbSockClose(lst);
+    Exit;
+  end;
+  cli := fpSocket(AF_INET, SOCK_STREAM, 0);
+  if cli = VDB_SOCK_INVALID then
+  begin
+    ADetail := 'istemci soketi acilamadi';
+    VdbSockClose(lst);
+    Exit;
+  end;
+  { Pencere baglanti kurulurken duyurulur: alici tarafin tamponu kucuk
+    olmali, yoksa Windows tamponu megabaytlara cikarip yazmayi hic
+    engellemez. }
+  n := 4096;
+  fpSetSockOpt(cli, SOL_SOCKET, SO_RCVBUF, @n, SizeOf(n));
+  if fpConnect(cli, @sa, SizeOf(sa)) <> 0 then
+  begin
+    ADetail := 'connect basarisiz';
+    VdbSockClose(cli);
+    VdbSockClose(lst);
+    Exit;
+  end;
+  AA := fpAccept(lst, nil, nil);
+  VdbSockClose(lst);
+  if AA = VDB_SOCK_INVALID then
+  begin
+    ADetail := 'accept basarisiz';
+    VdbSockClose(cli);
+    Exit;
+  end;
+  AB := cli;
+  Result := True;
+end;
+
 var
   Srv: TVdbPgServer;
   Dir, err, detail, val, etxt: string;
@@ -370,6 +487,8 @@ var
   bt: Byte;
   tmpBefore, tmpAfter: Integer;
   connZero: Boolean;
+  drip: AnsiString;
+  big: AnsiString;
 
 begin
   GPass := 0;
@@ -558,6 +677,126 @@ begin
   ok := RunSql(GPort, 'SELECT COUNT(*) FROM nl', val, etxt);
   Chk('NL6 kucuk COPY satiri yazildi', ok and (val = '1'),
     'val=' + val + ' err=' + etxt);
+
+  { --- NL9: damla saldirisi -> MUTLAK mesaj son tarihi ----------------- }
+  { Istemci 'Q' basligiyla 1000 baytlik govde ilan eder, sonra govdeyi
+    HER 100 ms'de BIR BAYT gonderir. Okuma zaman asimi 300 ms: eski kodda
+    SO_RCVTIMEO HER recv icin yeniden basladigi icin (100 < 300) baglanti
+    sinirsiz acik kaliyordu. Mutlak son tarih 300 ms'de kapatmalidir. }
+  Srv.ReadTimeoutMs := 300;
+  if not ConnectStartup(GPort, s, detail) then
+    Chk('NL9 istemci baglandi', False, detail)
+  else
+  begin
+    VdbSockSetTimeouts(s, 100, 100);
+    SendRaw(s, 'Q' + BE32(1004));
+    drip := StringOfChar('x', 200);
+    ok := DripUntilClosed(s, drip, 100, 4000, elapsed);
+    Chk('NL9 damla istemcisi mutlak son tarihte dusuruldu', ok,
+      'gecen ms=' + IntToStr(elapsed));
+    Chk('NL9 kapatma 2 s icinde', ok and (elapsed < 2000),
+      IntToStr(elapsed) + ' ms');
+    VdbSockClose(s);
+  end;
+
+  { --- NL10: yarim startup basligi damla damla ------------------------- }
+  s := VdbTcpConnect('127.0.0.1', GPort);
+  if s = VDB_SOCK_INVALID then
+    Chk('NL10 istemci baglandi', False, 'baglanti kurulamadi')
+  else
+  begin
+    VdbSockSetTimeouts(s, 100, 100);
+    ok := DripUntilClosed(s, BE32(200) + BE32(196608) + 'xy', 100, 4000, elapsed);
+    Chk('NL10 yarim startup damlasi dusuruldu', ok,
+      'gecen ms=' + IntToStr(elapsed));
+    Chk('NL10 kapatma 2 s icinde', ok and (elapsed < 2000),
+      IntToStr(elapsed) + ' ms');
+    VdbSockClose(s);
+  end;
+
+  { --- NL11: COPY-In govdesi damla damla ------------------------------- }
+  tmpBefore := PgCopyTempCount;
+  if not ConnectStartup(GPort, s, detail) then
+    Chk('NL11 istemci baglandi', False, detail)
+  else
+  begin
+    VdbSockSetTimeouts(s, 100, 100);
+    SendMsg(s, 'Q', 'COPY nl FROM STDIN' + #0);
+    ok := ReadToReady(s, etxt, sawData, sawCopy, msgs);
+    Chk('NL11 COPY-In yaniti alindi', sawCopy, 'msgs=' + IntToStr(msgs));
+    if sawCopy then
+    begin
+      SendRaw(s, 'd' + BE32(1004));
+      ok := DripUntilClosed(s, drip, 100, 4000, elapsed);
+      Chk('NL11 yavas COPY-In govdesi dusuruldu', ok,
+        'gecen ms=' + IntToStr(elapsed));
+      Chk('NL11 kapatma 2 s icinde', ok and (elapsed < 2000),
+        IntToStr(elapsed) + ' ms');
+    end;
+    VdbSockClose(s);
+  end;
+  ok := RunSql(GPort, 'SELECT COUNT(*) FROM nl', val, etxt);
+  Chk('NL11 yarim COPY tabloyu degistirmedi', ok and (val = '1'),
+    'val=' + val + ' err=' + etxt);
+  tmpAfter := PgCopyTempCount;
+  Chk('NL11 gecici dosya kalmadi', tmpAfter <= tmpBefore,
+    'once=' + IntToStr(tmpBefore) + ' sonra=' + IntToStr(tmpAfter));
+  Srv.ReadTimeoutMs := 30000;
+
+  { --- NL12: yazma son tarihi ------------------------------------------ }
+  { NOT (durust sinir): Windows loopback'ta ENGELLENEN bir yazma
+    uretilemiyor - olculdu, RCVBUF=4096 iken 16 MiB'lik gonderim 16 ms'de
+    tamponlara kabul edildi. Bu yuzden NL12 "engellenirken son tarih
+    uygulanir"i degil, SON TARIHIN KENDISINI olcer: (a) butcesi bitmis
+    cagri HIC BAYT yazmaz, (b) ayni mutlak son tarih ard arda gonderimlerde
+    uygulanir (yazma durur), (c) bol butce ile ayni yuk tamamen gider. }
+  if not MakeTcpPair(s, s8, detail) then
+    Chk('NL12 soket cifti kuruldu', False, detail)
+  else
+  begin
+    { Yazma tarafina 300 ms OS tavani (sunucu da kabul aninda
+      VdbSockSetTimeouts ile ayni tavani kurar). }
+    VdbSockSetTimeouts(s, 5000, 300);
+    VdbSockSetTimeouts(s8, 200, 5000);
+    big := StringOfChar('x', 64 * 1024);
+
+    { (a) butce zaten bitmis -> yazma YOK }
+    ok := VdbSendAllDl(s, big[1], Length(big), NowMs - 1);
+    Chk('NL12 butcesi bitmis gonderim reddedildi', not ok,
+      'ok=' + BoolToStr(ok, True));
+    msgs := VdbRecvSome(s8, nl8buf, 1);
+    Chk('NL12 butcesi bitmis gonderim HIC bayt yazmadi', msgs <= 0,
+      'okunan=' + IntToStr(msgs));
+
+    { (c) bol butce, kucuk yuk: gonderim tamamlanir }
+    ok := VdbSendAllDl(s, big[1], Length(big), NowMs + 5000);
+    Chk('NL12 bol butce ile gonderim tamamlandi', ok,
+      'ok=' + BoolToStr(ok, True));
+
+    { (b) ayni mutlak son tarih ard arda gonderimlerde: 4000 x 64 KiB
+        (256 MiB) teklif edilir, 50 ms butce, alici OKUMAZ. Yazma
+        sinirsiz engellenmemeli.
+        DURUST SINIR: tek bir fpSend cagrisi kendi OS tavanini
+        (SO_SNDTIMEO = 300 ms) asabilir; bu yuzden ust sinir 2 s'dir,
+        tam olarak 50 ms degil. }
+    t0 := NowMs;
+    elapsed := t0 + 50;
+    ok := True;
+    i := 0;
+    while (i < 4000) and ok do
+    begin
+      ok := VdbSendAllDl(s, big[1], Length(big), elapsed);
+      if ok then Inc(i);
+    end;
+    Chk('NL12 engellenen yazma sinirli surede durdu', not ok,
+      'gonderilen blok=' + IntToStr(i));
+    Chk('NL12 durma 2 s icinde', (not ok) and ((NowMs - t0) < 2000),
+      IntToStr(NowMs - t0) + ' ms');
+    Chk('NL12 tum yuk gonderilemedi', i < 4000,
+      'gonderilen blok=' + IntToStr(i));
+    VdbSockClose(s);
+    VdbSockClose(s8);
+  end;
 
   { --- NL8: zaman asimi kurulamazsa baglanti SUNULMAZ (fail-closed) ---- }
   Srv.SockTimeoutFunc := @FailTimeouts;

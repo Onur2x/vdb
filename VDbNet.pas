@@ -25,6 +25,12 @@ unit VDbNet;
 interface
 
 uses
+{$IFDEF MSWINDOWS}
+  { v3.69 / SKILL6 05: Windows'ta Sockets birimi select/FDSet'i YENIDEN
+    YAYINLAMAZ; bunlar winsock2'de tanimlidir. BILEREK once gelir: ortak
+    adlar (psockaddr vb.) Sockets'ten cozulmeye devam eder. }
+  WinSock2,
+{$ENDIF}
   SysUtils, Classes, Sockets
 {$IFDEF UNIX}
   , BaseUnix
@@ -120,6 +126,20 @@ function VdbSockSetTimeouts(ASock: TVdbSocket; ARecvMs, ASendMs: Integer): Boole
 
 { ALen baytin TAMAMINI okur. Karsi taraf erken kapatirsa False. }
 function VdbRecvAll(ASock: TVdbSocket; var ABuf; ALen: Integer): Boolean;
+
+{ v3.69 / SKILL6 05: MUTLAK (toplam) zaman asimi. ASonTick = 0 ise
+  davranis eskisi gibi kalir (yalniz SO_RCVTIMEO/SO_SNDTIMEO, yani HER
+  okuma cagrisi icin ayri sure). Aksi halde islem select() ile beklenir ve
+  ASonTick (monotonik ms, GetTickCount64) gecildiginde False doner.
+
+  Neden gerekli: SO_RCVTIMEO tek bir recv cagrisina uygulanir. Istemci her
+  zaman asimindan ONCE kucuk bir parca gonderirse toplam mesaj suresi
+  sinirsiz uzuyordu (ornegin her 29 saniyede bir bayt). Bu fonksiyonlar
+  ayni son tarihi tum parcalara uygular. }
+function VdbRecvAllDl(ASock: TVdbSocket; var ABuf; ALen: Integer;
+  ASonTick: QWord): Boolean;
+function VdbSendAllDl(ASock: TVdbSocket; const ABuf; ALen: Integer;
+  ASonTick: QWord): Boolean;
 
 { En fazla ALen bayt okur (kismi okuma normaldir).
   0 = karsi taraf kapatti, <0 = hata. HTTP basligi gibi "bitis
@@ -362,6 +382,95 @@ begin
     n := fpRecv(ASock, p + got, ALen - got, 0);
     if n <= 0 then Exit;  // 0 = karsi taraf kapatii
     Inc(got, n);
+  end;
+  Result := True;
+end;
+
+{ v3.69 / SKILL6 05: SELECT ile "hazir mi" beklemesi. AMs en fazla
+  1000 ms'lik dilimlere bolunur; boylece uzun bir son tarih tek bir
+  bloklamaya donusmez ve soket kapanisi (Stop/Wake -> shutdown) en gec
+  bir saniye icinde gorulur. }
+function VdbWaitSock(ASock: TVdbSocket; AYaz: Boolean; AMs: Integer): Boolean;
+var
+  fds: TFDSet;
+  tv: TTimeVal;
+begin
+  Result := False;
+  if (ASock = VDB_SOCK_INVALID) or (AMs <= 0) then Exit;
+  if AMs > 1000 then AMs := 1000;
+{$IFDEF MSWINDOWS}
+  FD_ZERO(fds);
+  FD_SET(ASock, fds);
+  tv.tv_sec := AMs div 1000;
+  tv.tv_usec := (AMs mod 1000) * 1000;
+  if AYaz then
+    Result := select(0, nil, @fds, nil, @tv) > 0
+  else
+    Result := select(0, @fds, nil, nil, @tv) > 0;
+{$ELSE}
+  fpFD_ZERO(fds);
+  fpFD_SET(ASock, fds);
+  tv.tv_sec := AMs div 1000;
+  tv.tv_usec := (AMs mod 1000) * 1000;
+  if AYaz then
+    Result := fpSelect(ASock + 1, nil, @fds, nil, @tv) > 0
+  else
+    Result := fpSelect(ASock + 1, @fds, nil, nil, @tv) > 0;
+{$ENDIF}
+end;
+
+function VdbRecvAllDl(ASock: TVdbSocket; var ABuf; ALen: Integer;
+  ASonTick: QWord): Boolean;
+var
+  got, n: Integer;
+  p: PByte;
+  kalan: Int64;
+begin
+  if ASonTick = 0 then Exit(VdbRecvAll(ASock, ABuf, ALen));
+  Result := False;
+  if (ASock = VDB_SOCK_INVALID) or (ALen < 0) then Exit;
+  if ALen = 0 then Exit(True);
+  got := 0;
+  p := @ABuf;
+  while got < ALen do
+  begin
+    kalan := Int64(ASonTick) - Int64(GetTickCount64);
+    if kalan <= 0 then Exit;        // MUTLAK son tarih gecti
+    if not VdbWaitSock(ASock, False, Integer(kalan)) then
+      Continue;                      // dilim doldu; son tarih yeniden denetlenir
+    n := fpRecv(ASock, p + got, ALen - got, 0);
+    if n <= 0 then Exit;             // 0 = karsi taraf kapatti
+    Inc(got, n);
+  end;
+  Result := True;
+end;
+
+function VdbSendAllDl(ASock: TVdbSocket; const ABuf; ALen: Integer;
+  ASonTick: QWord): Boolean;
+var
+  sent, n: Integer;
+  p: PByte;
+  kalan: Int64;
+begin
+  if ASonTick = 0 then Exit(VdbSendAll(ASock, ABuf, ALen));
+  Result := False;
+  if (ASock = VDB_SOCK_INVALID) or (ALen < 0) then Exit;
+  if ALen = 0 then Exit(True);
+  sent := 0;
+  p := @ABuf;
+  while sent < ALen do
+  begin
+    kalan := Int64(ASonTick) - Int64(GetTickCount64);
+    if kalan <= 0 then Exit;
+    if not VdbWaitSock(ASock, True, Integer(kalan)) then
+      Continue;
+{$IFDEF LINUX}
+    n := fpSend(ASock, p + sent, ALen - sent, MSG_NOSIGNAL);
+{$ELSE}
+    n := fpSend(ASock, p + sent, ALen - sent, 0);
+{$ENDIF}
+    if n <= 0 then Exit;
+    Inc(sent, n);
   end;
   Result := True;
 end;
