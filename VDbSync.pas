@@ -89,6 +89,33 @@ function VDbFileBytes(const Path: string): Int64;
 function VDbOpenStreamNoFlock(const APath: string; AReadOnly: Boolean;
   ACreate: Boolean): THandleStream;
 
+{ v3.63 (SKILL5 7.1): BAKIM kilidi icin PROBE handle.
+  NEDEN AYRI: FPC'nin TFileStream'i Windows'ta FILE_SHARE_DELETE istemez;
+  bu yuzden acik bir handle, dosyanin RENAME edilmesini engeller. Oysa
+  dosya degistirme (VACUUM/Compact/Restore/Rekey) TAM BUNU yapar: canli
+  dosya kapatilir, .bak'a tasinir, yenisi yerine konur. Bu yardimci acikca
+  FILE_SHARE_DELETE (Windows) isteyerek, probe uzerinde VDbLockStream ile
+  TAM kilit tutulurken rename'in yapilabilmesini saglar.
+  Unix'te rename acik fd'yi etkilemez; fd yalnizca flock tutmak icindir
+  (O_RdWr: kilit icin yazma hakki gerekir).
+  Hata: EFOpenError (cagiran ayni except yolunu kullanir). }
+function VDbOpenProbeStream(const APath: string): THandleStream;
+
+{ v3.63 (SKILL5 7.1): DOSYA KIMLIGI (fiziksel dosya tanitimi).
+  NEDEN: bir oturum veritabanini acik tutarken baska bir surec dosya
+  degistirme (VACUUM/Compact/Restore/Rekey) yaparsa, Unix'te acik fd ESKI
+  inode'a bagli kalir: yol yeni dosyaya bakar ama oturum hala eski dosyaya
+  yazar. Paylasimli kilit bunu yakalamaz cunku kilit yalniz islem suresince
+  tutulur (bkz. ReleaseRead); oturum BOSTA iken hicbir kilit yoktur.
+  Bu yuzden oturum, actigi dosyanin kimligini saklar ve her kilit
+  alisinda yolun kimligiyle karsilastirir: degistiyse FAIL-CLOSED hata
+  verir; sessizce yanlis dosyaya yazmaz.
+  Unix: st_dev + st_ino. Windows: birim seri no + dosya indeksi (rename
+  zaten paylasim modu ile engellenir; yine de kimlik karsilastirmasi
+  dogru kalir).
+  Donus: False = yol okunamadi (cagiran kimligi "bilinmiyor" sayar). }
+function VDbFileIdentity(const APath: string; out AId: QWord): Boolean;
+
 // 2026-10-04: "dosya baska islemde acik" ayrimini yapar.
 // Windows'ta paylasim ihlali ERROR_SHARING_VIOLATION (32) veya
 // ERROR_LOCK_VIOLATION (33) kodunu verir; FPC bunu EFOpenError
@@ -472,6 +499,90 @@ begin
     Result := TFileStream.Create(APath, fmCreate or fmShareDenyNone)
   else
     Result := TFileStream.Create(APath, fmOpenReadWrite or fmShareDenyNone);
+  {$ENDIF}
+end;
+
+function VDbOpenProbeStream(const APath: string): THandleStream;
+{$IFDEF WINDOWS}
+var
+  h: THandle;
+  cp: UINT;
+  ws: WideString;
+  n: Integer;
+{$ELSE}
+var
+  fd: Integer;
+{$ENDIF}
+begin
+  {$IFDEF WINDOWS}
+  { AnsiString -> UTF-16 donusumu RTL ile AYNI kurala gore yapilir
+    (DefaultSystemCodePage; CP_ACP ise sistem kod sayfasi). Boylece probe
+    ayni dosyayi acar; ASCII disi yollarda ad bozulmaz. }
+  cp := DefaultSystemCodePage;
+  if cp = CP_ACP then cp := GetACP;
+  n := MultiByteToWideChar(cp, 0, PAnsiChar(APath), Length(APath), nil, 0);
+  SetLength(ws, n);
+  if n > 0 then
+    MultiByteToWideChar(cp, 0, PAnsiChar(APath), Length(APath),
+      PWideChar(ws), n);
+  h := CreateFileW(PWideChar(ws), GENERIC_READ or GENERIC_WRITE,
+    FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE, nil,
+    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+  if h = INVALID_HANDLE_VALUE then
+    raise EFOpenError.CreateFmt(
+      'Unable to open file "%s": %s', [APath, SysErrorMessage(GetLastError)]);
+  Result := THandleStream.Create(h);
+  {$ELSE}
+  fd := FpOpen(PChar(APath), O_RdWr, 0);
+  if fd < 0 then
+    raise EFOpenError.CreateFmt(
+      'Unable to open file "%s": %s', [APath, SysErrorMessage(fpGetErrno)]);
+  Result := TVDbFdStream.Create(fd);
+  {$ENDIF}
+end;
+
+function VDbFileIdentity(const APath: string; out AId: QWord): Boolean;
+{$IFDEF WINDOWS}
+var
+  h: THandle;
+  cp: UINT;
+  ws: WideString;
+  n: Integer;
+  fi: TBYHandleFileInformation;
+{$ELSE}
+var
+  st: stat;
+{$ENDIF}
+begin
+  AId := 0;
+  {$IFDEF WINDOWS}
+  { Yalniz oznitelik okuma; paylasim modu herkese acik (kimlik sormak
+    dosyayi kilitlememeli). }
+  cp := DefaultSystemCodePage;
+  if cp = CP_ACP then cp := GetACP;
+  n := MultiByteToWideChar(cp, 0, PAnsiChar(APath), Length(APath), nil, 0);
+  SetLength(ws, n);
+  if n > 0 then
+    MultiByteToWideChar(cp, 0, PAnsiChar(APath), Length(APath),
+      PWideChar(ws), n);
+  h := CreateFileW(PWideChar(ws), $0080 { FILE_READ_ATTRIBUTES },
+    FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE, nil,
+    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+  if h = INVALID_HANDLE_VALUE then Exit(False);
+  try
+    Result := GetFileInformationByHandle(h, fi);
+    if Result then
+      AId := (QWord(fi.dwVolumeSerialNumber) shl 48) xor
+             (QWord(fi.nFileIndexHigh) shl 32) xor
+             QWord(fi.nFileIndexLow);
+  finally
+    CloseHandle(h);
+  end;
+  {$ELSE}
+  FillChar(st, SizeOf(st), 0);
+  Result := FpStat(PChar(APath), st) = 0;
+  if Result then
+    AId := (QWord(Cardinal(st.st_dev)) shl 32) xor QWord(Cardinal(st.st_ino));
   {$ENDIF}
 end;
 

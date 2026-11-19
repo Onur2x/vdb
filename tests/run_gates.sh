@@ -136,6 +136,7 @@ build_gate perf_baseline  "$ROOT/tests/perf_baseline/perf_baseline.lpr"
 build_gate single_file    "$ROOT/tests/single_file/single_file.lpr"
 build_gate region_stream  "$ROOT/tests/region_stream/region_stream.lpr"
 build_gate multiproc      "$ROOT/tests/multiproc/multiproc.lpr"
+build_gate maint_lock     "$ROOT/tests/maint_lock/maint_lock.lpr"
 build_gate crash_points   "$ROOT/tests/crash_points/crash_points.lpr"
 build_gate vdbcheck        "$ROOT/vdbcheck.lpr"
 build_gate integrity_check "$ROOT/tests/integrity_check/integrity_check.lpr"
@@ -191,6 +192,7 @@ run_gate perf_baseline  "$WORK/perf_baseline"  perf_baseline
 run_gate single_file    "$WORK/single_file"    single_file
 run_gate region_stream  "$WORK/region_stream"  region_stream
 run_gate multiproc      "$WORK/multiproc"      multiproc
+run_gate maint_lock     "$WORK/maint_lock"     maint_lock
 run_gate crash_points   "$WORK/crash_points"   crash_points
 run_gate integrity_check "$WORK/integrity_check" integrity_check \
   "$(npath "$WORK/vdbcheck/vdbcheck$EXE")"

@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-18
-Surum: v3.62 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1 + H; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Surum: v3.63 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1 + H + I; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -58,8 +58,8 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 
 ### A.3 Mevcut V3 durumu
 
-- Iki platformda tam kapi seti yesil: **Windows i386 48 kapi**, **Linux
-  x86_64 49 kapi**, FAIL 0 (v3.62 kosulari: `gatesJ.log` / `linJ.log`).
+- Iki platformda tam kapi seti yesil: **Windows i386 49 kapi**, **Linux
+  x86_64 50 kapi**, FAIL 0 (v3.63 kosulari: `gatesJ.log` / `linJ.log`).
   Windows'ta `tls_client` bu ortamda **SKIP** oldu (OpenSSL DLL'i yok);
   kostugu kosu `gatesE.log`'dur. SKIP PASS sayilmaz (ayrinti: `CI.md`).
 - Acik kritik hata yok. Kapatilan son gercek kusurlar: F-21/F-22 veri
@@ -71,7 +71,9 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   (`network_limits` NL8), Sprint G1'de PG sunucusunun **guvensiz
   varsayilanlari** (`server_harden` S12-S15), Sprint H'de ozel TCP SQL
   sunucusunun **guvensiz varsayilanlari, zaman asimi ve parola denemesi
-  siniri** (`server_failure` SF9-SF15). Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
+  siniri** (`server_failure` SF9-SF15), Sprint I'de dosya degistirme
+  sirasinda **surecler arasi bakim kilidi ve bayat dosya kimligi**
+  (`maint_lock` ML1-ML5). Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
 - Rol degistirme yetkisi ve SCRAM kullanicisi -> SQL rolu eslemesi (SKILL5
   3.1'in yetki denetimi ve 3.2) **hala ACIK**: kimligi dogrulanmis principal
   ile SQL rolu arasinda kalici bir esleme yok ve bu, dosya bicimini
@@ -96,6 +98,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | E2 | 9.1 zaman asimi kurulumu basarisizsa baglanti yine de sunuluyordu (fail-open) | Tamam | `network_limits` 26/0 (22 -> 26; NL8 yeni) |
 | G1 | 5.2 PG sunucusu guvensiz varsayilanlar (tum arayuzlerde bind, trust kimlik dogrulama, politika katmanini atlama) | Tamam | `server_harden` 36/0 (25 -> 36; S12-S15 yeni) |
 | H | 5.1/5.2/9.3 ozel TCP SQL sunucusu: tum arayuzlerde bind, duz metin parola icin sinirsiz deneme, zaman asimi yok, kilitsiz baglanti sayimi | Tamam | `server_failure` 30/0 (16 -> 30; SF9-SF15 yeni) |
+| I | 7.1/7.2/7.3/7.4 dosya degistirme (VACUUM/Compact/Restore/Rekey) sirasinda surecler arasi bakim kilidi, yazar rezervasyonu, bayat dosya kimligi | Tamam | `maint_lock` 13/0 (yeni, ML1-ML5) |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -595,18 +598,19 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   `windows-latest` calistirir; `fail-fast: false`. macOS/ARM64 icin job
   **yoktur** cunku hic kosulmadi; dogrulanmamis platformu matrise eklemek
   yesil gorunen ama kanit uretmeyen bir kapi olurdu (`CI.md` bolum 3).
-- Kanit (en guncel kosu, v3.62): Windows `gatesJ.log` (`KOSAN KAPI: 48`,
-  `SUITE_EXIT=0`), Linux `linJ.log` (`KOSAN KAPI: 49`, `SUITE_EXIT=0`).
-  Onceki kosu (v3.61/G1) ayni `gatesJ.log` / `linJ.log` dosyalarina yazdi ve
-  bu kosu tarafindan uzerine yazildi; ondan once `gatesI.log` (48) / `linI.log` (49) - D2; ondan once
+- Kanit (en guncel kosu, v3.63): Windows `gatesJ.log` (`KOSAN KAPI: 49`,
+  `SUITE_EXIT=0`), Linux `linJ.log` (`KOSAN KAPI: 50`, `SUITE_EXIT=0`).
+  Onceki kosu (v3.62/H) ayni `gatesJ.log` / `linJ.log` dosyalarina yazdi ve
+  bu kosu tarafindan uzerine yazildi; ondan once `gatesJ.log` (48) / `linJ.log` (49) - G1; ondan once
+  `gatesI.log` (48) / `linI.log` (49) - D2; ondan once
   `gatesH.log` (48) / `linH.log` (49) - C2; ondan once
   `gatesG.log` (48) / `linG.log` (49) - B2; ondan once
   `gatesE.log` (48) / `linE.log` (49); Sprint E oncesi
   `gatesF.log` (47) / `linF.log` (48); daha once `gatesD.log` (46) /
   `linD.log` (47), ondan once `gatesB.log` (44) / `linC.log` (46) idi.
   Sayilar her sprint yalniz **eklenen** kapi kadar artar, kapi silinmez.
-  Bu sprint yeni kapi **dizini** eklenmedi; `network_limits` kapisi
-  `22` kontrolden `26` kontrole cikti (NL8), kapi sayisi ayni kaldi.
+  Sprint I yeni kapi dizini `tests/maint_lock` ekledi (13 kontrol); kapi
+  sayisi Windows 48 -> 49, Linux 49 -> 50.
 - Windows `gatesJ` kosusunda `tls_client` **SKIP** oldu: ortamda
   `VDB_CRYPTO_DLL`/`VDB_SSL_DLL` yok. `tls_client` fikstur dizinini
   `VDB_TLS_FIXTURES` ile bulur; degisken verilmezse kapi exe'nin yanindan
@@ -749,6 +753,45 @@ tablosundadir. Bu sprintte kapatilanlar:
   parola kabul ediliyor; SF15b kapanan baglanti sayimda kaliyor. SF9b/SF11/
   SF14/SF14c/SF15 bilerek **ayirt edici degildir** (asiri siki duzeltmenin
   normal yolu kirmadigini korur).
+- **F-39 (Kritik, KAPALI, v3.63)**: dosya degistirme (VACUUM/Compact/Restore/
+  Rekey) **surecler arasi kilit tasimiyordu**. `SwapDbFileWith` canli dosyayi
+  kapatip `.bak`a tasiyor, yeni dosyayi yerine koyuyordu; kilidi yalnizca
+  surec ici `FEngCs` tutuyordu. Baska bir surec eski dosyayi acik tutuyorsa
+  Linux'ta **acik fd eski inode'a baglidir**: iki surec FARKLI fiziksel
+  dosyalara yazar ve commit "basarili" gorunurken satirlar kaybolur. Bu
+  olculdu: eski kodla cocuk surec bir yazma islemi acikken ebeveyn VACUUM
+  yapti, islem commit etti, **5 satir kayboldu** (`maint_lock` ML2b baseline:
+  `sure_ms=25 hata=` yani bakim basarili). Ikinci kusur: bosta bekleyen
+  salt-okunur oturum dosya degistigini fark etmiyor ve **bayat** veri
+  okuyordu (ML3c baseline: `COUNT=100`, dogrusu 101). Duzeltme (fail closed):
+  (a) `VDbSync.VDbOpenProbeStream` - Windows'ta `FILE_SHARE_DELETE` isteyen
+  handle, yani tam kilit tutarken rename'i engellemez (FPC `TFileStream`
+  bunu istemez ve acik handle'li dosya Windows'ta yeniden adlandirilamaz);
+  (b) `SwapDbFileWith` iki katmanli kilit alir: motor kapanmadan **once**
+  `.gen` uzerindeki yazar rezervasyonu (acik yazma islemi varsa bekler),
+  motor kapandiktan **sonra** canli dosya uzerinde tam kilit; ikisi de
+  `MaintenanceLockMs` (varsayilan 3000 ms) boyunca yoklanir, alinamazsa
+  degistirmeye **baslanmaz** ve `bakim kilidi alinamadi ...` hatasi verilir;
+  kilitler yeni motor acilmadan birakilir (ayni surecte oz-kilitlenme
+  olmasin) ve `except` yolunda her durumda birakilir. SIRA KRITIK: Unix'te
+  `Store.Close` `.gen` dosyasini **siler** (v3.32 tek dosya); rezervasyon
+  yoklamasi motor kapatildiktan sonra yapilsaydi kontrol sessizce atlanirdi -
+  ilk uygulamada tam bu oldu ve Linux'ta bakim 24 ms'de "basarili" oldu.
+  (c) `VDbPageStore` artik dosya kimligini (Windows birim seri no + dosya
+  indeksi, Unix `st_dev`+`st_ino`) acilista saklar ve her kilit aliminda
+  dogrular; dosya degistiyse `veritabani dosyasi degistirildi ...` hatasi
+  verir (bayat okuma yerine fail closed). Bicim v5 degismedi, yan dosya
+  eklenmedi. Regresyon: ML1-ML5 (`maint_lock` 13/0). Baseline (`git archive
+  HEAD` + yalniz `VDbOpenProbeStream` seam'i, cunku kapi bu sembolu
+  kullaniyor): **Windows 12 PASS / 1 FAIL** (yalniz ML2b ayirt eder: hata
+  `dosya degistirme: mevcut dosya .bak yapilamadi`, 15 ms, "bakim kilidi"
+  yok), **Linux 11 PASS / 2 FAIL** (ML2b `sure_ms=25 hata=` - bakim
+  basarili oldu; ML3c `COUNT=100` - bayat okuma). ML2c/ML2e baseline'da da
+  PASS: kaybolan satirlar yeni dosyada hic gorunmedigi icin sayim ayni
+  kalir; bu yuzden kaybi **goren** kontrol ML2b'dir. ML1/ML3a/ML3b/ML4/
+  ML4b/ML4c/ML5 bilerek **ayirt edici degildir** (normal yolun kirilmadigini
+  korur). Kilit yarisi (iki surec ayni anda) ve Windows'ta oz-kilitlenme
+  senaryosu kapida **olculmedi**; ML5 yalniz `.tmp` kalintisina bakar.
 
 
 ---
@@ -760,7 +803,7 @@ tablosundadir. Bu sprintte kapatilanlar:
 Gerekce:
 
 1. Kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici bir
-   regresyon kapisiyla kilitlendi; iki platformda **48/49** kapi yesil, FAIL 0.
+   regresyon kapisiyla kilitlendi; iki platformda **49/50** kapi yesil, FAIL 0.
 2. Tek dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari,
    bozuk ag girdisi, disk dolu, bellek tukenmesi, WAL sert tavani, B+Tree
    olcek/parcalanma, SQL 100k/1M olcegi, SQL indeks olcegi ve VACUUM geri

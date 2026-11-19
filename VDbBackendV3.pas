@@ -369,6 +369,11 @@ type
       { v3.2: cok okuyucu / tek yazici. }
       FReadOnly: Boolean;
       FBusyMs: Integer;
+      { v3.63 (SKILL5 7.1): surecler arasi BAKIM kilidi icin bekleme suresi.
+        Dosya degistirme (Compact/Restore/Rekey) baslamadan once canli
+        dosya uzerinde tam kilit alinir; baska bir surec dosyayi acik
+        tutuyorsa en fazla bu sure beklenir, sonra REDDEDILIR. }
+      FMaintenanceLockMs: Integer;
       { v3.4: oturum kimligi -> o oturumun acik yazma kumesi. }
       FSets: TDictionary<Cardinal, TWriteSet>;
       { v3.6: commit sayaci + "baskasi dokundu" defteri.
@@ -701,6 +706,11 @@ type
     property Engine: TVdbPageEngine read FEng;
     property IsReadOnly: Boolean read FReadOnly;
     property BusyMs: Integer read FBusyMs;
+    { v3.63 (SKILL5 7.1): bakim kilidi bekleme suresi (ms, varsayilan 3000).
+      Dosya degistirme baslamadan once OS seviyesinde tam kilit denenir;
+      alinamazsa degistirmeye BASLANMAZ ve hata doner (fail-closed). }
+    property MaintenanceLockMs: Integer
+      read FMaintenanceLockMs write FMaintenanceLockMs;
     { Sprint 3.4: sayfa sifreleme durumu ve anahtar parmak izi (8 hex). }
     property Encrypted: Boolean read GetEncrypted;
     function KeyFingerprint: string;
@@ -990,6 +1000,8 @@ begin
   FPath := ADbPath;
   FReadOnly := AReadOnly;
   FBusyMs := ABusyMs;
+  { v3.63 (SKILL5 7.1): bakim kilidi varsayilan bekleme suresi. }
+  FMaintenanceLockMs := 3000;
   FSets := TDictionary<Cardinal, TWriteSet>.Create;
   FSetPool := TList<TWriteSet>.Create;
   FAlien := TDictionary<QWord, Int64>.Create;
@@ -5452,6 +5464,11 @@ var
   oldKey: TBytes;
   oldPass: string;
   oldHas: Boolean;
+  { v3.63 (SKILL5 7.1): bakim kilidi probe'u ve bekleme sayaci. }
+  probe: THandleStream;
+  genProbe: THandleStream;
+  t0: QWord;
+  bakimReddi: Boolean;
 begin
   oldKey := FKey;
   oldPass := FPassword;
@@ -5459,12 +5476,75 @@ begin
   bak := FPath + '.bak';
   wal := FPath + '.wal';
   idx := FPath + '.idx';
-  FreeAndNil(FEng);
-  FEng := nil;
-  FKey := Copy(AKey, 0, Length(AKey));
-  FPassword := APassword;
-  FHasPassword := AHasPassword;
+  probe := nil;
+  genProbe := nil;
+  bakimReddi := False;
+  { v3.63 (SKILL5 7.1) SURECLER ARASI BAKIM KILIDI.
+    SORUN: buradaki `FEngCs` yalnizca SUREC ICI kilittir. Dosya degistirme
+    canli dosyayi kapatip rename ederken, BASKA bir surec hala eski inode'u
+    acik tutuyor olabilir; Linux'ta acik fd eski inode'a baglidir, yani o
+    surec artik `.bak` inode'una yazar ve iki surec FARKLI fiziksel
+    dosyalara yazar (sessiz veri kaybi).
+    COZUM iki katmanli:
+    (1) ACIK YAZMA ISLEMI: islem suresince `.gen` uzerindeki yazar
+        rezervasyonu tutulur. O kilidi BIZIM MOTORUMUZ KAPANMADAN once
+        yoklariz (asagidaki ilk blok). SIRA KRITIK: Unix'te Store.Close
+        `.gen`i SILER (v3.32 tek dosya); motoru once kapatsak probe
+        dosyayi hic bulamaz, kontrol sessizce atlanir ve acik bir islem
+        commit etmek uzereyken bakim onu eski inode uzerinde yakalar
+        (olculen Linux hatasi: Compact 24 ms'de basarili oldu, cocuk
+        islem commit etti, 5 satir kayboldu).
+    (2) ACIK OTURUM/HANDLE: motor kapandiktan sonra canli dosya uzerinde
+        OS seviyesinde TAM kilit alinir; acik handle tutan her surec bu
+        kilitle cakisir.
+    Her iki kilit de `FMaintenanceLockMs` boyunca 10 ms araliklarla
+    yoklanir; ALINAMAZSA degistirmeye BASLANMAZ (fail-closed). Kilitler yeni
+    motor acilmadan hemen once birakilir: ayni surecte yeni handle'in
+    kendi kilidi bizimkiyle cakisirdi; birakma ile motorun kilidi arasindaki
+    mikro-pencere de fail-closed'dir (rakip once alirsa `Open` hata verir ve
+    asagidaki `except` ESKI dosyayi geri kurar). }
   try
+    t0 := GetTickCount64;
+    if FileExists(FPath + '.gen') then
+    begin
+      genProbe := VDbOpenProbeStream(FPath + '.gen');
+      while not VDbLockStream(genProbe) do
+      begin
+        if GetTickCount64 - t0 >= QWord(FMaintenanceLockMs) then
+        begin
+          bakimReddi := True;
+          raise EVdbBackendV3.Create(
+            'bakim kilidi alinamadi: acik bir yazma islemi var (' + FPath +
+            '); ' + IntToStr(FMaintenanceLockMs) + ' ms beklendi, dosya ' +
+            'DEGISTIRILMEDI. Islemleri bitirip yeniden deneyin');
+        end;
+        Sleep(10);
+      end;
+    end;
+    FreeAndNil(FEng);
+    FEng := nil;
+    if FileExists(FPath) then
+    begin
+      probe := VDbOpenProbeStream(FPath);
+      while not VDbLockStream(probe) do
+      begin
+        if GetTickCount64 - t0 >= QWord(FMaintenanceLockMs) then
+        begin
+          bakimReddi := True;
+          raise EVdbBackendV3.Create(
+            'bakim kilidi alinamadi: baska bir surec veritabanini acik ' +
+            'tutuyor (' + FPath + '); ' + IntToStr(FMaintenanceLockMs) +
+            ' ms beklendi, dosya DEGISTIRILMEDI. Diger oturumlari ' +
+            'kapatip yeniden deneyin');
+        end;
+        Sleep(10);
+      end;
+    end;
+    { v3.63 (SKILL5 7.1): `.gen` uzerindeki YAZAR REZERVASYONU yukarida,
+      motor kapanmadan ONCE yoklandi — Unix'te Store.Close `.gen`i siler. }
+    FKey := Copy(AKey, 0, Length(AKey));
+    FPassword := APassword;
+    FHasPassword := AHasPassword;
     if FileExists(bak) then DeleteFile(bak);
     if not RenameFile(FPath, bak) then
       raise EVdbBackendV3.Create('dosya degistirme: mevcut dosya .bak yapilamadi');
@@ -5482,6 +5562,14 @@ begin
       kalici olmamali: yoksa sonraki acilis onlari bu dosyaya ait sanar. }
     if FileExists(NewFilePath + '.wal') then DeleteFile(NewFilePath + '.wal');
     if FileExists(NewFilePath + '.idx') then DeleteFile(NewFilePath + '.idx');
+    { v3.63: `.gen` probe'u BURADA birakilir: asagida `.gen` baska bir
+      handle'dan yazilir ve Windows'ta bayt aralik kilidi ayni surecte
+      farkli handle'dan yapilan yazmayi da engeller (oz-kilitlenme). }
+    if genProbe <> nil then
+    begin
+      VDbUnlockStream(genProbe);
+      FreeAndNil(genProbe);
+    end;
     { C-2: yeni dosyanin LSN uzayi bastan baslar; eski `.gen` dosyasindaki
       offset 8 durabil LSN'i bayat kalirsa AwaitDurable fsync'i ATLAR ve
       fsync edilmemis commit "durabil" onaylanir. Nesil sayacini (offset 0)
@@ -5520,6 +5608,13 @@ begin
             'dosya degistirme: .gen durabil LSN sifirlanamadi');
       end;
     end;
+    { v3.63: bakim kilidi, yeni motor acilmadan BIRAKILIR (bkz. ustteki
+      yorum). Buradan sonra koruma motorun kendi `LockExclusive` kilididir. }
+    if probe <> nil then
+    begin
+      VDbUnlockStream(probe);
+      FreeAndNil(probe);
+    end;
     FEng := NewEngine(FPath);
     try
       FEng.Open(False);
@@ -5538,6 +5633,17 @@ begin
     FEng.OnTagSummary := GetTagSummary;
     FTagCountsValid := False;
   except
+    { v3.63: probe her durumda serbest birakilir. }
+    if genProbe <> nil then
+    begin
+      VDbUnlockStream(genProbe);
+      FreeAndNil(genProbe);
+    end;
+    if probe <> nil then
+    begin
+      VDbUnlockStream(probe);
+      FreeAndNil(probe);
+    end;
     { Yarim kalan degistirmede .bak'tan ve ESKI kimlikle don. }
     if FEng = nil then
     begin
@@ -5563,14 +5669,27 @@ begin
           FreeAndNil(FEng);
           { v3.43 DUZELTME (olculen hata): geri donus de patlarsa sessiz
             kalmak backend'i FEng=nil ile birakirdi; acik hata ver. }
+          { v3.63: islem BAKIM KILIDI yuzunden reddedildiyse ana neden
+            odur; eski dosyanin geri kurulamamasinin nedeni de genellikle
+            kilidi tutan diger surectir. Mesajda ikisi de korunur. }
+          if bakimReddi then
+            raise EVdbBackendV3.Create(
+              'bakim kilidi alinamadi ve eski motor yeniden acilamadi: ' +
+              E2.ClassName + ': ' + E2.Message);
           raise EVdbBackendV3.Create(
             'dosya degistirme basarisiz ve eski dosya geri kurulamadi: ' +
             E2.ClassName + ': ' + E2.Message);
         end;
       end;
       if FEng = nil then
+      begin
+        if bakimReddi then
+          raise EVdbBackendV3.Create(
+            'bakim kilidi alinamadi: baska bir surec veritabanini acik ' +
+            'tutuyor (' + FPath + '); dosya DEGISTIRILMEDI');
         raise EVdbBackendV3.Create(
           'dosya degistirme basarisiz: eski dosya geri kurulamadi: ' + FPath);
+      end;
     end;
     { v3.43 DUZELTME (olculen hata): bu `except` hatayi YUTUYORDU. Dosya
       degistirme (VACUUM/RESTORE/REKEY) basarisiz oldugunda cagiran basari

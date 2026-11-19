@@ -32,6 +32,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `region_stream` | `TRegionStream` dosya-ici pencere: mantiksal uzunluk, fsync, sinir kontrolu (v4 icin yazildi, motorda kullanilmiyor) |
 | `multiproc` | iki **gercek surec**: es zamanli yazar + bayat onbellek tazeleme, `SIGKILL`/`TerminateProcess` sonrasi kurtarma, RO yazmayi reddetme (bkz. `STORAGE_AUDIT.md` §21.3) |
 | `multi_writer` | tek dosyada **iki oturum**: iki yazar sirayla commit eder, WAL LSN kesin artar, ikinci oturum kapaninca `.wal`/`.gen` silinmez, birinci oturum kendi onayli satirlarini korur, temiz kapanistan sonra yalniz `.odb` kalir, 12/12 satir kalici, yedek+geri yukleme 18/18 |
+| `maint_lock` | **surecler arasi bakim kilidi** (SKILL5 7.1-7.4). Iki gercek surec: (a) ML1 tek surecte `VACUUM` basarili ve satir sayisi korunur; (b) ML2a-ML2e cocuk surec `BeginBatch` ile **acik yazma islemi** tutarken ebeveyn `Compact` `bakim kilidi alinamadi: acik bir yazma islemi var` ile **reddedilir** (fail-closed), cocuk commit etmesine ragmen 5 satir korunur - cocuk tarafi MARKER'dan once `CHILD wtxn RESERVE-HELD=TRUE` yazarak `.gen` yazar rezervasyonunun gercekten tutuldugunu kanitlar; (c) ML3a-ML3c acik **salt-okunur oturum** varken bakim ya reddedilir (Windows: acik handle rename'i engeller) ya da sonrasinda o oturum `veritabani dosyasi degistirildi ... eski dosyaya bagli` hatasi alir - bayat okuma (COUNT=100) yasak; (d) ML4/ML4b/ML4c ikinci surecten `Compact` sonrasi satirlar korunur ve `Verify` temiz; (e) ML5 `.tmp` kalintisi kalmaz (**13 PASS / 0 FAIL**; on-kapi Windows 12/1, Linux 11/2 - Linux on-kapi Compact'i 25 ms'de basarili kilar ve 5 satiri kaybeder) |
 | `crash_points` | **deterministik cokme enjeksiyonu**: 7 checkpoint/commit asamasinin ortasinda gercek surec olumu (`SIGKILL`/`TerminateProcess`), sonra yeniden acilis + `VERIFY` + onayli commit kontrolu (bkz. `STORAGE_AUDIT.md` §4) |
 | `integrity_check` | **butunluk denetleyici** (`vdbcheck`): dort mod (`--quick/--full/--index/--wal`), her zaman salt-okunur; saglam DB dort modda temiz, bozuk sihirli sayi/CRC/freelist girdisi/kesik WAL kuyrugu ayri kategorilerde yakalanir, dosya ozeti degismez (bkz. `STORAGE_AUDIT.md` §8) |
 | `cache_metrics` | **onbellek metrikleri gercekten hareket ediyor mu**: hit/miss okuma trafigiyle artar, kirli sayfa yazidan sonra > 0 / checkpoint'ten sonra = 0, flush sayaci + yazilan sayfa + sure artar, hit ratio aritmetigi dogru, `MetricsText` ve `SHOW STATS` ayni degerleri tasir (bkz. `STORAGE_AUDIT.md` §5) |
@@ -1281,4 +1282,55 @@ kaldirildi:
     olmadigi icin bind yine basarisiz olur); gercek uzak erisim bu kapida
     olculmez. Sabit zamanli karsilastirmanin **zamanlama** farki olculmedi;
     kapi yalniz davranisi (esik, kilit, red) dogrular.
+
+- Kirk yedinci kosu (v3.63, Sprint I - surecler arasi bakim kilidi):
+  iki platform da YESIL. Git Bash/Windows **49 kapi** PASS, WSL x86_64 Linux
+  **50 kapi** PASS, FAIL 0 (`gatesJ.log` -> `KOSAN KAPI: 49`, `SUITE_EXIT=0`;
+  `linJ.log` -> `KOSAN KAPI: 50`, `SUITE_EXIT=0`). Windows'ta `tls_client`
+  yine **SKIP** (OpenSSL DLL'i yok; SKIP != PASS); Linux'ta kostu: 6/0.
+  - **F-39 (KRITIK, KAPALI)**: dosya degistirme (`VACUUM`/`Compact`/
+    `Restore`/`Rekey` -> `SwapDbFileWith`) yalniz **surec-ici** `FEngCs`
+    kilidiyle korunuyordu. Canli dosya kapatilip `.bak`a rename edilirken
+    baska bir surec eski dosyayi acik tutabiliyordu; **Linux'ta acik fd eski
+    inode'a baglidir**, yani o surec `.bak` inode'una yazmaya devam eder ve
+    iki surec **farkli fiziksel dosyalara** yazar (sessiz veri kaybi).
+    Olculen (iki surec, Linux): cocuk `wtxn` ile 5 satir commit etti,
+    ebeveyn ayni anda `Compact` yapti; Compact **25 ms'de basarili** oldu,
+    cocuk `COMMITTED` bildirdi, 5 satir **kayboldu** (COUNT 100'de kaldi).
+    Ayni senaryonun okuma tarafi: acik salt-okunur oturum `Compact` sonrasi
+    **bayat** veriyi okumaya devam ediyordu (COUNT=100).
+  - **Duzeltme**: iki katmanli, fail-closed bakim kilidi. (a) `.gen`
+    uzerindeki **yazar rezervasyonu** motor kapanmadan **once** yoklanir -
+    Unix'te `Store.Close` `.gen` dosyasini sildigi icin **sira kritiktir**
+    (ilk uygulama gen-probe'u motor kapandiktan sonraya koydu ve Linux'ta
+    hatayi yakalamadi). (b) motor kapandiktan sonra canli dosya uzerinde OS
+    seviyesinde TAM kilit (`VDbOpenProbeStream` + `VDbLockStream`;
+    `FILE_SHARE_DELETE` isteyen handle sayesinde Windows'ta rename
+    engellenmez). Ikisi de `MaintenanceLockMs` (varsayilan 3000) boyunca
+    10 ms araliklarla yoklanir; **alinamazsa degistirmeye baslanmaz** ve
+    `bakim kilidi alinamadi ... dosya DEGISTIRILMEDI` hatasi verilir (motor
+    eski dosyayla geri kurulur). Kilitler yeni motor acilmadan hemen once
+    birakilir (ayni surecte oz-kilitlenme onlenir). Ek olarak
+    `TVdbPageStore` acilistaki dosya kimligini (`VDbFileIdentity`: Windows
+    birim seri no + indeks, Unix dev + inode) saklar ve okuma/yazma
+    kilitlerinde dogrular; kimlik degistiyse `veritabani dosyasi
+    degistirildi ... bu oturum eski dosyaya bagli` hatasi verilir. V2 ve
+    dosya bicimi v5 degismedi.
+  - **Kapi**: yeni `maint_lock` **13** kontrol (ML1-ML5). ML1 tek surecte
+    `VACUUM`; ML2a-ML2e acik yazma islemi varken Compact RED + cocuk commit
+    etmesine ragmen 5 satir korunur (cocuk `RESERVE-HELD=TRUE` ile premisi
+    kanitlar); ML3a-ML3c acik salt-okunur oturum: ya bakim reddedilir
+    (Windows, acik handle rename'i engeller) ya da o oturum fail-closed
+    kimlik hatasi alir; ML4/ML4b/ML4c ikinci surecten Compact sonrasi
+    satirlar korunur ve `Verify` temiz; ML5 `.tmp` kalintisi yok.
+    On-kapi (duzeltme oncesi kurulum: `git archive` HEAD + yalnizca
+    `VDbOpenProbeStream` seam'i) Windows **12 PASS / 1 FAIL** (ML2b:
+    `mevcut dosya .bak yapilamadi`, "bakim kilidi" metni yok, 15 ms),
+    Linux **11 PASS / 2 FAIL** (ML2b: hata bos = Compact basarili = 5 satir
+    kaybi; ML3c: bayat COUNT=100).
+  - **Durust sinir**: ML2c/ML2e sayimlari on-kapida da **gecer** (kaybolan
+    satirlar yeni dosyada gorunmez, sayim ayni kalir); kaybi goren kontrol
+    ML2b'dir. **Kilit yarisi** (ayni anda iki `Compact`) ve Windows
+    **oz-kilitlenme** senaryosu bu kapida olculmedi. Kimlik dogrulamasinin
+    getirdigi ek maliyet olculmedi.
 

@@ -281,6 +281,14 @@ type
         Rezervasyon islemleri siralar; acilis yalniz kisa kritik bolum icin
         tam kilide ihtiyac duyar. }
       FSkipReserve: Boolean;
+      { v3.63 (SKILL5 7.1): ACILAN FIZIKSEL DOSYANIN KIMLIGI. Oturum
+        acikken baska bir surec dosya degistirme (VACUUM/Compact/Restore/
+        Rekey) yaparsa Unix'te acik fd ESKI inode'a bagli kalir; bu kimlik
+        her kilit alisinda yolun kimligiyle karsilastirilir ve farkliysa
+        FAIL-CLOSED hata verilir (sessiz yanlis-dosya yazimi yok).
+        FSigFileIdOk = False ise kimlik bilinmiyor (yok sayilir). }
+      FSigFileId: QWord;
+      FSigFileIdOk: Boolean;
       { P-58c: TEK SURECLI ERISIM. True ise AcquireWrite/ReleaseWrite dosya
         kilidi syscall'larini TAMAMEN atlar (LockReserve + LockExclusive +
         UnlockGen + UnlockStream + RefreshIfStaleForce + BumpGen). Tek surec
@@ -433,6 +441,10 @@ type
     { v3.18: FDeferRefresh bayragini YOK SAYAN tazeleme. Yazma yollari
       bunu kullanir: bayat onbellekle yazmak veri kaybi uretir. }
     procedure RefreshIfStaleForce;
+    { v3.63 (SKILL5 7.1): acilan fiziksel dosyanin kimligi hala AYNI mi?
+      Baska bir surec VACUUM/Compact/Restore/Rekey ile dosyayi degistirdiyse
+      (Unix'te acik fd eski inode'a bagli kalir) fail-closed hata verir. }
+    procedure EnsureFileIdentity;
     { v3.18 DUZELTME — VERI BUTUNLUGU: tazelemeyi VERI dosyasinin tam kilidi
       altinda yapar, sonra kilidi birakir (islemin goruntusu yine sabit
       degildir; yalniz bu okuma penceresi korunur). Rezervasyon (.gen) kilidi
@@ -1541,6 +1553,26 @@ begin
   end;
 end;
 
+procedure TVDbPageStore.EnsureFileIdentity;
+var
+  id: QWord;
+begin
+  { v3.63 (SKILL5 7.1/7.4): SESSIZ VERI KAYBI KORUMASI.
+    Kilit yalniz islem suresince tutulur; oturum BOSTA iken hicbir kilit
+    yoktur. Bu boslukta baska bir surec dosya degistirme yaparsa Unix'te
+    acik fd ESKI inode'a bagli kalir: yol yeni dosyaya bakar, oturum hala
+    eski dosyaya yazar. Kimlik karsilastirmasi bunu yakalar.
+    Kimlik bilinmiyorsa (dosya silinmis / stat hatasi) yok sayilir: bu
+    durumda zaten eski davranis gecerli, ek bir yanlis-pozitif uretmeyiz. }
+  if (FStream = nil) or (not FSigFileIdOk) then Exit;
+  if not VDbFileIdentity(FPath, id) then Exit;
+  if id = FSigFileId then Exit;
+  raise EVdbPageStore.Create(
+    'veritabani dosyasi degistirildi (baska bir surec VACUUM/Compact/' +
+    'Restore/Rekey yapti): ' + FPath + ' — bu oturum eski dosyaya bagli; ' +
+    'veritabani yeniden acilmalidir');
+end;
+
 procedure TVDbPageStore.RefreshIfStale;
 begin
   { v3.18: iyimser yazma islemi acikken (bkz. BeginDeferRefresh) okuma
@@ -1922,6 +1954,10 @@ begin
     FLockedExcl := True;
     FLocked := True;
     try
+      { v3.63 (SKILL5 7.1): kilit ALINDIKTAN sonra kimlik dogrulanir. Baska
+        bir surec bu arada dosyayi degistirdiyse (Unix'te fd ESKI inode'a
+        bagli kalir) sessizce yanlis dosyaya YAZMAK yerine fail-closed. }
+      EnsureFileIdentity;
       RefreshIfStaleForce;
     except
       VDbUnlockStream(FStream);
@@ -2004,6 +2040,9 @@ begin
           'veritabani mesgul: paylasimli kilit alinamadi (baska bir surec ' +
           'tam kilitli): ' + FPath);
       FLocked := True;
+      { v3.63 (SKILL5 7.1): paylasimli kilit alindi; dosya kimligi hala ayni
+        mi? Degistiyse bu oturum ESKI inode'u okuyor demektir - fail-closed. }
+      EnsureFileIdentity;
       RefreshIfStale;
     end;
     FReadDepth := 1;
@@ -2145,6 +2184,8 @@ begin
     FReserved := True;
     gotHold := False;
     try
+      { v3.63 (SKILL5 7.1): rezervasyon alindi; dosya kimligi hala ayni mi? }
+      EnsureFileIdentity;
       { v3.21: rezervasyon bizdeyken baska bir yazar commit edemez; nesil
         degismediyse tam kilit turu gereksiz (bkz. TryAcquireWriteHold). }
       if ReadGen <> FSigGen then
@@ -2385,6 +2426,9 @@ begin
       girisinde (AcquireWrite) paylasimli birakilip tam kilit alinir, cikista
       tersi yapilir. Iki surec ayni anda acabilir ve sirayla yazar.
       Yeni dosyayi olusturan oturum, basligi yazarken TAM kilit tutar. }
+    { v3.63 (SKILL5 7.1): ACILAN FIZIKSEL DOSYANIN KIMLIGI saklanir; her
+      kilit alisinda karsilastirilir (bkz. EnsureFileIdentity). }
+    FSigFileIdOk := VDbFileIdentity(FPath, FSigFileId);
     FLockedShared := False;
     FLockedExcl := False;
     FLocked := False;
