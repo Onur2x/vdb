@@ -55,6 +55,34 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   olarak vardir, v5 motor dosya bicimine **bagli degildir**; ikincil indeksler
   hala bellektedir.
 - **macOS / ARM64 / buyuk-endian**: **not-run** (bolum H).
+- **SKILL6 03 - SQL NULL ile bos metin ayrimi**: **YAPILMADI**. Disk formati
+  bunu zaten kodlayabiliyor (v2/v3 satir govdesinde `lenCode = 0` NULL,
+  `lenCode = 1` sifir uzunluklu metin), ancak bellekteki deger modeli
+  `TStrArray` (duz metin) oldugu icin `DecodeRow` NULL'i `''` yapar ve
+  `EncodeRow` `''`i NULL yazar. `EvalExpr` de `sltNull` icin `''` doner.
+  Ayrimi geri kazanmak icin satir/deger modeline NULL maskesi eklenmeli ve
+  INSERT/UPDATE/SELECT/JOIN/GROUP BY/DISTINCT/ORDER BY/indeks/UNIQUE/CHECK/
+  FK/trigger/RLS/pencere fonksiyonlari ile CSV/JSON/Arrow/Parquet/CDC/
+  replikasyon yollarinin TAMAMI bu maskeyi tasimali. Bu bir veri modeli
+  degisikligidir, tek sprintlik bir yama degildir; yarim birakilirsa veri
+  sessizce yanlis okunur/yazilir. `tests/null_empty/` bu is icin yazilmadi.
+- **SKILL6 04 - gercek akis (streaming)**: **YAPILMADI**. `MaxPortalResultBytes`
+  siniri hala `FSql.Exec` bittikten SONRA denetleniyor (VDbPgWire.pas,
+  `ExecutePortal`), yani bellek siniri gercek bir ust sinir degil, sonuc
+  reddedilirken bellek zaten ayrilmis oluyor. Gercek cozum yurutucu
+  seviyesinde satir yineleyicisi (iterator) ve COPY OUT akisidir; bu da
+  SKILL6 03 ile ayni buyuklukte bir mimari is.
+- **SKILL6 07 - genel hash join / maliyet modeli**: **KISMI**. `SELECT`
+  tarafinda `TryStreamJoin` zaten PK arama, indeks kaynagi ve hash join
+  yollarini secer (`merge_hash` kapisi M1-M13). Acik kalan: `UPDATE ... FROM`
+  hala hedef x kaynak ic ice dongusudur (VDbExecutor.pas, `ExecUpdate`),
+  yani O(N x M). Ayrica maliyet modeli cardinality/distinct/NULL orani/hash
+  bellek maliyeti ile spill-to-disk kararlarini icermiyor.
+- **SKILL6 08 - dis sistem uyumlulugu**: **YAPILMADI**. Arrow/Parquet
+  aktarimi yalniz kendi kodumuzla gidis-donus olarak test ediliyor; NIST CAVP
+  vektorleri, gercek PostgreSQL istemci matrisi (`psql`, JDBC, psycopg) ve
+  SQLite karsilastirmali olcum yok. Bunlar dis arac/veri gerektirir; bu
+  depoda bagimlilik eklenmemesi kurali geregi ayri bir ortamda kosulmalidir.
 
 ### A.3 Mevcut V3 durumu
 
