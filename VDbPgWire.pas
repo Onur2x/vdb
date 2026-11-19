@@ -191,6 +191,15 @@ type
     FWriteTimeoutMs: Integer;
     FMaxMessageBytes: Integer;
     FCopyMaxBytes: Int64;
+    { v3.64 (SKILL5 9.5 + 10.1): portal ve prepared statement kaynak
+      sinirlari. Onceden Stmts/Portals sozlukleri ve TPgPortal.Res
+      sinirsizdi: bir istemci Sync gondermeden binlerce portal acip her
+      birine tam sonuc kumesi koyabiliyordu (baglanti basina sinirsiz
+      bellek). 0 = ilgili sinir devre disi. }
+    FMaxPrepared: Integer;
+    FMaxStmtSqlBytes: Int64;
+    FMaxPortals: Integer;
+    FMaxPortalResultBytes: Int64;
     function GetConnCount: Integer;
     function GetAuthRequired: Boolean;
     procedure SetMaxConns(AValue: Integer);
@@ -283,6 +292,25 @@ type
       (bayt). Varsayilan 256 MiB; 0 = sinirsiz. Asimda gecici dosya
       silinir, islem geri alinir ve istemciye hata doner. }
     property CopyMaxBytes: Int64 read FCopyMaxBytes write FCopyMaxBytes;
+    { v3.64 (SKILL5 9.5): baglanti basina NAMED prepared statement siniri.
+      Varsayilan 512; 0 = sinirsiz. Asimda istemciye kontrollu hata doner,
+      baglanti Sync'e kadar mesaj yutar (protokol bozulmaz). }
+    property MaxPrepared: Integer read FMaxPrepared write FMaxPrepared;
+    { v3.64 (SKILL5 9.5): baglanti basina toplam prepared SQL metni siniri
+      (bayt). Varsayilan 4 MiB; 0 = sinirsiz. Boylece cok sayida kucuk
+      statement da metin olarak sinirsiz birikemez. }
+    property MaxStmtSqlBytes: Int64 read FMaxStmtSqlBytes
+      write FMaxStmtSqlBytes;
+    { v3.64 (SKILL5 9.5): baglanti basina portal siniri. Varsayilan 256;
+      0 = sinirsiz. Sync gondermeden portal acip sonuc tutma saldirisini
+      sinirlar; Sync zaten tum portallari dusurur. }
+    property MaxPortals: Integer read FMaxPortals write FMaxPortals;
+    { v3.64 (SKILL5 9.5 + 10.1): baglanti basina portal SONUC bellegi
+      siniri (bayt, hucre metinleri + kayit basina 8 bayt ust tahmini).
+      Varsayilan 64 MiB; 0 = sinirsiz. Asimda sonuc DERHAL birakilir ve
+      istemciye kontrollu hata doner; surec OOM ile olmez. }
+    property MaxPortalResultBytes: Int64 read FMaxPortalResultBytes
+      write FMaxPortalResultBytes;
     { Eszamanli TCP baglanti siniri (varsayilan 64). 1..4096 araligina
       kirpilir; Start'tan once veya calisirken degistirilebilir. }
     property MaxConns: Integer read FMaxConns write SetMaxConns;
@@ -302,6 +330,10 @@ type
     Res: TSqlResult;
     Err: string;
     ResFmts: array of Integer;   // M1: 0=metin, 1=binary
+    { v3.64 (SKILL5 10.1): Execute maxRows ile parca parca gonderim icin
+      "simdiye kadar gonderilen satir" imleci. Sorgu BIR KEZ calisir; sonraki
+      Execute'lar kaldigi yerden devam eder (PostgreSQL semantigi). }
+    Sent: Integer;
   end;
 
   { M1: prepared statement; ParamOids uzunlugu parametre sayisidir. }
@@ -2059,6 +2091,10 @@ var
   cpErr: string;
   copyOk, copyErr: Boolean;
   Lim: TPgLimits;
+  { v3.64 (SKILL5 9.5 + 10.1) }
+  totalBytes: Int64;
+  stOld: TPgStmt;
+  sentThis: Integer;
 
   function TakeI16: Integer;
   begin
@@ -2089,11 +2125,47 @@ var
     SendPg(FIO, ErrorMsg(Msg));
   end;
 
+  function PortalCellBytes(const P: TPgPortal): Int64;
+  var
+    r, c: Integer;
+  begin
+    { v3.64 (SKILL5 9.5): kaba ama monoton bir tahmin; amac gercek bellek
+      olcumu degil, baglanti basina UST SINIR uygulamaktir. Hucre basina
+      8 bayt kayit/dizi ustu eklenir. }
+    Result := 0;
+    for r := 0 to High(P.Res.Rows) do
+      for c := 0 to High(P.Res.Rows[r]) do
+        Inc(Result, Int64(Length(P.Res.Rows[r][c])) + 8);
+    Inc(Result, Int64(Length(P.Res.Fields)) * 16);
+  end;
+
+  function TotalPortalBytes: Int64;
+  var
+    pp: TPgPortal;
+  begin
+    Result := 0;
+    for pp in Portals.Values do
+      Inc(Result, PortalCellBytes(pp));
+  end;
+
+  function TotalStmtSqlBytes: Int64;
+  var
+    ss: TPgStmt;
+  begin
+    Result := 0;
+    for ss in Stmts.Values do
+      Inc(Result, Int64(Length(ss.Sql)));
+  end;
+
   function ExecutePortal(var P: TPgPortal): Boolean;
+  var
+    old: TPgPortal;
+    total: Int64;
   begin
     Result := False;
     P.Err := '';
     P.Res := Default(TSqlResult);
+    P.Sent := 0;
     try
       P.Res := FSql.Exec(P.Sql, P.Params);
       Result := True;
@@ -2101,6 +2173,24 @@ var
       on E: Exception do P.Err := E.Message;
     end;
     P.Done := True;
+    { v3.64 (SKILL5 9.5): baglanti basina portal sonuc bellegi siniri.
+      Asimda sonuc DERHAL birakilir (P.Res sifirlanir) ki bellek geri
+      kazanilsin, ve istemciye kontrollu hata doner. Bu, gercek streaming
+      yerine durust bir ust sinirdir: sinir asildiginda istek REDDEDILIR. }
+    if (P.Err = '') and (FServer.FMaxPortalResultBytes > 0) then
+    begin
+      total := TotalPortalBytes;
+      if Portals.TryGetValue(nm, old) then
+        Dec(total, PortalCellBytes(old));
+      Inc(total, PortalCellBytes(P));
+      if total > FServer.FMaxPortalResultBytes then
+      begin
+        P.Res := Default(TSqlResult);
+        P.Sent := 0;
+        P.Err := Format('portal sonuc bellegi siniri asildi (%d > %d bayt)',
+          [total, FServer.FMaxPortalResultBytes]);
+      end;
+    end;
   end;
 
 begin
@@ -2177,6 +2267,29 @@ begin
           oid := TakeI32;
           if oid = 0 then oid := 25;
           st.ParamOids[i2] := oid;
+        end;
+        { v3.64 (SKILL5 9.5): prepared statement sayisi ve toplam SQL metni
+          sinirli. Adli olmayan '' statement her Parse'ta degistirilir, bu
+          yuzden "yeni ad" kontrolu ContainsKey ile yapilir. }
+        if (FServer.FMaxPrepared > 0) and (not Stmts.ContainsKey(nm)) and
+           (Stmts.Count >= FServer.FMaxPrepared) then
+        begin
+          ExtFail(Format('prepared statement siniri asildi (max %d)',
+            [FServer.FMaxPrepared]));
+          Continue;
+        end;
+        if FServer.FMaxStmtSqlBytes > 0 then
+        begin
+          totalBytes := TotalStmtSqlBytes;
+          if Stmts.TryGetValue(nm, stOld) then
+            Dec(totalBytes, Int64(Length(stOld.Sql)));
+          Inc(totalBytes, Int64(Length(q)));
+          if totalBytes > FServer.FMaxStmtSqlBytes then
+          begin
+            ExtFail(Format('prepared statement SQL metni siniri asildi ' +
+              '(%d > %d bayt)', [totalBytes, FServer.FMaxStmtSqlBytes]));
+            Continue;
+          end;
         end;
         Stmts.AddOrSetValue(nm, st);
         if not SendPg(FIO, PgMsg('1', '')) then Break;
@@ -2285,6 +2398,17 @@ begin
         pt.Params := params;
         pt.ResFmts := rfmts;
         pt.Done := False;
+        pt.Sent := 0;
+        { v3.64 (SKILL5 9.5): baglanti basina portal siniri. Sync gondermeden
+          portal acip sonuc tutma saldirisi burada kesilir. Ayni adi yeniden
+          baglamak yeni kaynak tuketmez. }
+        if (FServer.FMaxPortals > 0) and (not Portals.ContainsKey(nm)) and
+           (Portals.Count >= FServer.FMaxPortals) then
+        begin
+          ExtFail(Format('portal siniri asildi (max %d)',
+            [FServer.FMaxPortals]));
+          Continue;
+        end;
         Portals.AddOrSetValue(nm, pt);
         if not SendPg(FIO, PgMsg('2', '')) then Break;
       end
@@ -2339,6 +2463,12 @@ begin
       begin
         p := 1;
         nm := ReadCStr(payload, p);
+        { v3.64 (SKILL5 10.1): PostgreSQL Execute govdesi portal adindan SONRA
+          Int32 maxRows tasir. Onceden bu alan HIC okunmuyordu; sonucun tamami
+          her Execute'ta gonderiliyordu. Simdi gercek limit uygulanir
+          (0 = sinirsiz, negatif = 0 gibi). }
+        maxRows := TakeI32;
+        if maxRows < 0 then maxRows := 0;
         if Portals.TryGetValue(nm, pt) then
         begin
           // M1: extended protocol uzerinden COPY. Akis Execute aninda
@@ -2376,10 +2506,27 @@ begin
               ExtFail(pt.Err)
             else
             begin
-              for i2 := 0 to High(pt.Res.Rows) do
-                if not SendPg(FIO, DataRowMsgFmt(pt.Res.Rows[i2], pt.Res.FieldTypes, pt.ResFmts)) then Break;
-              if not SendPg(FIO, CommandMsg(CommandTag(pt.Sql, pt.Res))) then Break;
-              InterlockedIncrement(FServer.FServed);
+              { v3.64 (SKILL5 10.1): maxRows kadar satir gonder; kalan varsa
+                PortalSuspended ('s') yolla ve imleci sakla. Sonraki Execute
+                kaldigi yerden devam eder; sorgu YENIDEN CALISTIRILMAZ.
+                maxRows=0 (eski davranis) tum satirlari gonderir. }
+              sentThis := 0;
+              while (pt.Sent < Length(pt.Res.Rows)) and
+                    ((maxRows = 0) or (sentThis < maxRows)) do
+              begin
+                if not SendPg(FIO, DataRowMsgFmt(pt.Res.Rows[pt.Sent],
+                  pt.Res.FieldTypes, pt.ResFmts)) then Break;
+                Inc(pt.Sent);
+                Inc(sentThis);
+              end;
+              Portals.AddOrSetValue(nm, pt);
+              if pt.Sent >= Length(pt.Res.Rows) then
+              begin
+                if not SendPg(FIO, CommandMsg(CommandTag(pt.Sql, pt.Res))) then Break;
+                InterlockedIncrement(FServer.FServed);
+              end
+              else if not SendPg(FIO, PgMsg('s', '')) then
+                Break;
             end;
           end;
         end
@@ -2400,13 +2547,17 @@ begin
       else if typ = Ord('S') then            // Sync
       begin
         skipUntilSync := False;
-        { R2-A-11: PostgreSQL semantiginde Sync islemi bitirir ve
-          portallar dusurulur. Portal sonuc kumeleri (tum satirlar
-          bellekte) burada serbest birakilir; aksi halde adlandirilmis
-          portalini kapatmayan istemcide baglanti basina sinirsiz
-          birikim olur. Prepared statement'lar oturum omurludur,
-          Stmts korunur. }
-        Portals.Clear;
+        { R2-A-11: PostgreSQL semantiginde Sync islemi bitirir; portallar
+          ISLEM sonunda dusurulur, Sync'te DEGIL.
+          v3.64 (SKILL5 10.1) DUZELTME: burada eskiden `Portals.Clear`
+          cagriliyordu. Bu, Execute maxRows ile parca parca okumayi
+          IMKANSIZ kiliyordu: gercek istemciler (JDBC/FetchSize, libpq)
+          her partiden sonra Sync gonderdigi icin ikinci Execute her zaman
+          "portal yok" aliyordu; maxRows yalniz kagit uzerinde kaliyordu.
+          Bellek sinirsizligi ARTIK MaxPortals + MaxPortalResultBytes ile
+          sinirlanir (asilirsa kontrollu hata), yani Sync'in eski koruma
+          amaci baska (daha kesin) bir mekanizmayla saglanir. Portallar
+          Close, ayni adla yeniden Bind veya baglanti sonunda biter. }
         if not SendPg(FIO, ReadyMsg) then Break;
       end
       else if typ = Ord('H') then            // Flush: hemen gonderiyoruz, no-op
@@ -2498,6 +2649,11 @@ begin
   FWriteTimeoutMs := 30000;
   FMaxMessageBytes := 64 * 1024 * 1024;
   FCopyMaxBytes := Int64(256) * 1024 * 1024;
+  { v3.64 (SKILL5 9.5): portal/prepared statement kaynak sinirlari. }
+  FMaxPrepared := 512;
+  FMaxStmtSqlBytes := Int64(4) * 1024 * 1024;
+  FMaxPortals := 256;
+  FMaxPortalResultBytes := Int64(64) * 1024 * 1024;
   FTls := nil;
   FTlsCert := '';
   FTlsKey := '';

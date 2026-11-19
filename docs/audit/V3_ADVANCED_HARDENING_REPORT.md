@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-18
-Surum: v3.63 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1 + H + I; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Surum: v3.64 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1 + H + I + J; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -58,8 +58,8 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 
 ### A.3 Mevcut V3 durumu
 
-- Iki platformda tam kapi seti yesil: **Windows i386 49 kapi**, **Linux
-  x86_64 50 kapi**, FAIL 0 (v3.63 kosulari: `gatesJ.log` / `linJ.log`).
+- Iki platformda tam kapi seti yesil: **Windows i386 50 kapi**, **Linux
+  x86_64 51 kapi**, FAIL 0 (v3.64 kosulari: `gatesJ.log` / `linJ.log`).
   Windows'ta `tls_client` bu ortamda **SKIP** oldu (OpenSSL DLL'i yok);
   kostugu kosu `gatesE.log`'dur. SKIP PASS sayilmaz (ayrinti: `CI.md`).
 - Acik kritik hata yok. Kapatilan son gercek kusurlar: F-21/F-22 veri
@@ -73,7 +73,9 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   sunucusunun **guvensiz varsayilanlari, zaman asimi ve parola denemesi
   siniri** (`server_failure` SF9-SF15), Sprint I'de dosya degistirme
   sirasinda **surecler arasi bakim kilidi ve bayat dosya kimligi**
-  (`maint_lock` ML1-ML5). Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
+  (`maint_lock` ML1-ML5), Sprint J'de PG portal **`maxRows` imleci ve
+  portal/prepared statement kaynak sinirlari** (`pg_portal_stream` PP1-PP12).
+  Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
 - Rol degistirme yetkisi ve SCRAM kullanicisi -> SQL rolu eslemesi (SKILL5
   3.1'in yetki denetimi ve 3.2) **hala ACIK**: kimligi dogrulanmis principal
   ile SQL rolu arasinda kalici bir esleme yok ve bu, dosya bicimini
@@ -99,6 +101,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | G1 | 5.2 PG sunucusu guvensiz varsayilanlar (tum arayuzlerde bind, trust kimlik dogrulama, politika katmanini atlama) | Tamam | `server_harden` 36/0 (25 -> 36; S12-S15 yeni) |
 | H | 5.1/5.2/9.3 ozel TCP SQL sunucusu: tum arayuzlerde bind, duz metin parola icin sinirsiz deneme, zaman asimi yok, kilitsiz baglanti sayimi | Tamam | `server_failure` 30/0 (16 -> 30; SF9-SF15 yeni) |
 | I | 7.1/7.2/7.3/7.4 dosya degistirme (VACUUM/Compact/Restore/Rekey) sirasinda surecler arasi bakim kilidi, yazar rezervasyonu, bayat dosya kimligi | Tamam | `maint_lock` 13/0 (yeni, ML1-ML5) |
+| J | 9.5 portal/prepared statement kaynak sinirlari, 10.1 Execute `maxRows` ve gercek portal imleci | Tamam | `pg_portal_stream` 22/0 (yeni, PP0-PP12) |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -598,11 +601,11 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   `windows-latest` calistirir; `fail-fast: false`. macOS/ARM64 icin job
   **yoktur** cunku hic kosulmadi; dogrulanmamis platformu matrise eklemek
   yesil gorunen ama kanit uretmeyen bir kapi olurdu (`CI.md` bolum 3).
-- Kanit (en guncel kosu, v3.63): Windows `gatesJ.log` (`KOSAN KAPI: 49`,
-  `SUITE_EXIT=0`), Linux `linJ.log` (`KOSAN KAPI: 50`, `SUITE_EXIT=0`).
-  Onceki kosu (v3.62/H) ayni `gatesJ.log` / `linJ.log` dosyalarina yazdi ve
-  bu kosu tarafindan uzerine yazildi; ondan once `gatesJ.log` (48) / `linJ.log` (49) - G1; ondan once
-  `gatesI.log` (48) / `linI.log` (49) - D2; ondan once
+- Kanit (en guncel kosu, v3.64): Windows `gatesJ.log` (`KOSAN KAPI: 50`,
+  `SUITE_EXIT=0`), Linux `linJ.log` (`KOSAN KAPI: 51`, `SUITE_EXIT=0`).
+  Onceki kosu (v3.63/I) ayni `gatesJ.log` / `linJ.log` dosyalarina yazdi ve
+  bu kosu tarafindan uzerine yazildi (49 / 50); ondan once (v3.62/H)
+  48 / 49; ondan once `gatesI.log` (48) / `linI.log` (49) - D2; ondan once
   `gatesH.log` (48) / `linH.log` (49) - C2; ondan once
   `gatesG.log` (48) / `linG.log` (49) - B2; ondan once
   `gatesE.log` (48) / `linE.log` (49); Sprint E oncesi
@@ -610,7 +613,9 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   `linD.log` (47), ondan once `gatesB.log` (44) / `linC.log` (46) idi.
   Sayilar her sprint yalniz **eklenen** kapi kadar artar, kapi silinmez.
   Sprint I yeni kapi dizini `tests/maint_lock` ekledi (13 kontrol); kapi
-  sayisi Windows 48 -> 49, Linux 49 -> 50.
+  sayisi Windows 48 -> 49, Linux 49 -> 50. Sprint J yeni kapi dizini
+  `tests/pg_portal_stream` ekledi (22 kontrol); sayilar Windows 49 -> 50,
+  Linux 50 -> 51.
 - Windows `gatesJ` kosusunda `tls_client` **SKIP** oldu: ortamda
   `VDB_CRYPTO_DLL`/`VDB_SSL_DLL` yok. `tls_client` fikstur dizinini
   `VDB_TLS_FIXTURES` ile bulur; degisken verilmezse kapi exe'nin yanindan
@@ -791,7 +796,47 @@ tablosundadir. Bu sprintte kapatilanlar:
   kalir; bu yuzden kaybi **goren** kontrol ML2b'dir. ML1/ML3a/ML3b/ML4/
   ML4b/ML4c/ML5 bilerek **ayirt edici degildir** (normal yolun kirilmadigini
   korur). Kilit yarisi (iki surec ayni anda) ve Windows'ta oz-kilitlenme
-  senaryosu kapida **olculmedi**; ML5 yalniz `.tmp` kalintisina bakar.
+  senaryosu kapida **olculmedi**; ML5 yalniz `.tmp` kalintisina bakmaz.
+- **F-40 (Kritik, KAPALI, v3.64)**: PostgreSQL genisletilmis protokolunde
+  (`TVdbPgConn.Execute`) **uc** ayri kaynak/bellege kusuru vardi.
+  (a) `Execute` govdesindeki `Int32 maxRows` alani **hic okunmuyordu**; her
+  `Execute` sonucun **tammini** bastan gonderiyordu, imlec ve
+  `PortalSuspended` yoktu (SKILL5 10.1). (b) `Sync` isleyicisi
+  `Portals.Clear` cagiriyordu; gercek istemciler (JDBC `fetchSize`, libpq)
+  her partiden sonra `Sync` gonderdigi icin ikinci `Execute` her zaman
+  `portal yok` aliyordu - yani `maxRows` uygulansa bile **olu kod** olurdu.
+  Bu, ilk uygulamada olculdu: kapi 12 FAIL verdi ve hata metni
+  `portal yok: po1` idi. (c) `Stmts`/`Portals` sozlukleri ve `TPgPortal.Res`
+  **sinirsizdi**: bir istemci `Sync` gondermeden binlerce portal acip her
+  birine tam sonuc kumesi koyabiliyor, baglanti basina sinirsiz bellek
+  tuketebiliyordu (SKILL5 9.5).
+  Duzeltme: `TPgPortal.Sent` imleci eklendi; `Execute` `maxRows` kadar satir
+  gonderir (0 = sinirsiz, negatif = 0), kalan varsa `PortalSuspended` (`'s'`),
+  tukenince `CommandComplete` yollar; sorgu **yeniden calistirilmaz** ve
+  tukenmis portal 0 satir doner (kopya yok). `Sync` artik portallari
+  **dusurmez** (portal `Close`, ayni adla yeniden `Bind` veya baglanti sonu
+  bitirir); bellek korumasi artik kesin sinirlarla saglanir: `MaxPrepared`
+  (512), `MaxStmtSqlBytes` (4 MiB), `MaxPortals` (256) ve
+  `MaxPortalResultBytes` (64 MiB), hepsi `0` = sinirsiz. Sinir asiminda
+  istemciye kontrollu hata doner ve portal sonucu **derhal birakilir**;
+  sunucu sureci OOM ile olmez. Bicim v5 ve V2 degismedi.
+  Regresyon: yeni `pg_portal_stream` kapisi (PP0-PP12) **22/0**. Baseline
+  (`git archive HEAD` + yalnizca alan/property/varsayilan **seam**'i, yani
+  davranis HEAD): **6 PASS / 16 FAIL**, ayirt edici 16 kontrol:
+  PP1/PP1b/PP1c/PP2/PP2b/PP2c/PP3/PP3b/PP4 (`maxRows` imleci yok, 25 satir
+  tek seferde), PP6a/PP6 (`Sync` portali dusurur), PP10/PP10b (`Describe`
+  oncesi `Sync` portali siliyor), PP7 (portal siniri yok), PP8 (prepared
+  statement siniri yok), PP9 (sonuc bellek siniri yok - 25 satir gonderildi).
+  PP0/PP0b/PP0c/PP5/PP11/PP12 bilerek **ayirt edici degildir** (sunucunun
+  acilmasi, `maxRows=0` yolu ve `Close` sonrasi `portal yok` HEAD'de de
+  gecer).
+  **Durust sinir**: bu, uctan uca (executor duzeyinde) streaming **degildir**;
+  sonuc kumesi bellekte tam olarak uretilir ve imlec onun uzerinde ilerler -
+  sinir asilirsa istek **reddedilir**. Gercek satir yineleyici ve `COPY OUT`
+  streaming hala **ACIK** (SKILL5 10.2). `Sync`'in portallari artik
+  dusurmemesi, kapatilmayan portalin baglanti sonuna kadar yasadigi anlamina
+  gelir; bu `MaxPortals` + `MaxPortalResultBytes` ile sinirlidir, ancak
+  oturum basina bir portal "sizintisina" izin verir.
 
 
 ---
