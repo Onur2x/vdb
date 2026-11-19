@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-18
-Surum: v3.64 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1 + H + I + J; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Surum: v3.65 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1 + H + I + J + K; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -58,8 +58,8 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 
 ### A.3 Mevcut V3 durumu
 
-- Iki platformda tam kapi seti yesil: **Windows i386 50 kapi**, **Linux
-  x86_64 51 kapi**, FAIL 0 (v3.64 kosulari: `gatesJ.log` / `linJ.log`).
+- Iki platformda tam kapi seti yesil: **Windows i386 53 kapi**, **Linux
+  x86_64 54 kapi**, FAIL 0 (v3.65 kosulari: `gatesJ.log` / `linJ.log`).
   Windows'ta `tls_client` bu ortamda **SKIP** oldu (OpenSSL DLL'i yok);
   kostugu kosu `gatesE.log`'dur. SKIP PASS sayilmaz (ayrinti: `CI.md`).
 - Acik kritik hata yok. Kapatilan son gercek kusurlar: F-21/F-22 veri
@@ -74,7 +74,11 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   siniri** (`server_failure` SF9-SF15), Sprint I'de dosya degistirme
   sirasinda **surecler arasi bakim kilidi ve bayat dosya kimligi**
   (`maint_lock` ML1-ML5), Sprint J'de PG portal **`maxRows` imleci ve
-  portal/prepared statement kaynak sinirlari** (`pg_portal_stream` PP1-PP12).
+  portal/prepared statement kaynak sinirlari** (`pg_portal_stream` PP1-PP12),
+  Sprint K'de **SERIALIZABLE'in hic dogrulanmamasi / write skew**
+  (`serializable_tx` S1-S15, P1-P8), PG mesajlarinda **eksik NUL
+  sonlandiricisinin sessizce kabul edilmesi** (`pg_msg_nul` N0-N8) ve
+  `MERGE`in **kaba kuvvet O(hedef x kaynak) eslesmesi** (`merge_hash` M1-M13).
   Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
 - Rol degistirme yetkisi ve SCRAM kullanicisi -> SQL rolu eslemesi (SKILL5
   3.1'in yetki denetimi ve 3.2) **hala ACIK**: kimligi dogrulanmis principal
@@ -102,6 +106,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | H | 5.1/5.2/9.3 ozel TCP SQL sunucusu: tum arayuzlerde bind, duz metin parola icin sinirsiz deneme, zaman asimi yok, kilitsiz baglanti sayimi | Tamam | `server_failure` 30/0 (16 -> 30; SF9-SF15 yeni) |
 | I | 7.1/7.2/7.3/7.4 dosya degistirme (VACUUM/Compact/Restore/Rekey) sirasinda surecler arasi bakim kilidi, yazar rezervasyonu, bayat dosya kimligi | Tamam | `maint_lock` 13/0 (yeni, ML1-ML5) |
 | J | 9.5 portal/prepared statement kaynak sinirlari, 10.1 Execute `maxRows` ve gercek portal imleci | Tamam | `pg_portal_stream` 22/0 (yeni, PP0-PP12) |
+| K | 6.x SERIALIZABLE hic dogrulanmiyor (write skew), 9.x PG mesajinda eksik NUL sessiz kabul, 10.x MERGE kaba kuvvet O(hedef x kaynak) | Tamam | `serializable_tx` 23/0, `pg_msg_nul` 10/0, `merge_hash` 19/0 (yeni) | |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -601,10 +606,11 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   `windows-latest` calistirir; `fail-fast: false`. macOS/ARM64 icin job
   **yoktur** cunku hic kosulmadi; dogrulanmamis platformu matrise eklemek
   yesil gorunen ama kanit uretmeyen bir kapi olurdu (`CI.md` bolum 3).
-- Kanit (en guncel kosu, v3.64): Windows `gatesJ.log` (`KOSAN KAPI: 50`,
-  `SUITE_EXIT=0`), Linux `linJ.log` (`KOSAN KAPI: 51`, `SUITE_EXIT=0`).
-  Onceki kosu (v3.63/I) ayni `gatesJ.log` / `linJ.log` dosyalarina yazdi ve
-  bu kosu tarafindan uzerine yazildi (49 / 50); ondan once (v3.62/H)
+- Kanit (en guncel kosu, v3.65): Windows `gatesJ.log` (`KOSAN KAPI: 53`,
+  `SUITE_EXIT=0`), Linux `linJ.log` (`KOSAN KAPI: 54`, `SUITE_EXIT=0`).
+  Onceki kosu (v3.64/J) ayni `gatesJ.log` / `linJ.log` dosyalarina yazdi ve
+  bu kosu tarafindan uzerine yazildi (50 / 51); ondan once (v3.63/I)
+  49 / 50; ondan once (v3.62/H)
   48 / 49; ondan once `gatesI.log` (48) / `linI.log` (49) - D2; ondan once
   `gatesH.log` (48) / `linH.log` (49) - C2; ondan once
   `gatesG.log` (48) / `linG.log` (49) - B2; ondan once
@@ -615,7 +621,9 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   Sprint I yeni kapi dizini `tests/maint_lock` ekledi (13 kontrol); kapi
   sayisi Windows 48 -> 49, Linux 49 -> 50. Sprint J yeni kapi dizini
   `tests/pg_portal_stream` ekledi (22 kontrol); sayilar Windows 49 -> 50,
-  Linux 50 -> 51.
+  Linux 50 -> 51. Sprint K **uc** yeni kapi dizini ekledi
+  (`tests/serializable_tx` 23, `tests/pg_msg_nul` 10, `tests/merge_hash` 19);
+  sayilar Windows 50 -> 53, Linux 51 -> 54.
 - Windows `gatesJ` kosusunda `tls_client` **SKIP** oldu: ortamda
   `VDB_CRYPTO_DLL`/`VDB_SSL_DLL` yok. `tls_client` fikstur dizinini
   `VDB_TLS_FIXTURES` ile bulur; degisken verilmezse kapi exe'nin yanindan
@@ -837,6 +845,78 @@ tablosundadir. Bu sprintte kapatilanlar:
   dusurmemesi, kapatilmayan portalin baglanti sonuna kadar yasadigi anlamina
   gelir; bu `MaxPortals` + `MaxPortalResultBytes` ile sinirlidir, ancak
   oturum basina bir portal "sizintisina" izin verir.
+- **F-41 (Kritik, KAPALI, v3.65)**: `SET TRANSACTION ISOLATION LEVEL
+  SERIALIZABLE` yalnizca **adi** degistiriyordu. `VDbExecutor.FIsolation`
+  disinda hicbir yerde okunmuyor, commit aninda hicbir dogrulama
+  yapilmiyordu; davranis REPEATABLE READ ile **birebir ayniydi** (VDbAst.pas
+  bu esitligi yorumda zaten kabul ediyordu). Sonuc klasik **write skew**:
+  iki islem ayni snapshot'tan okuyup farkli satirlara yazar, ikisi de commit
+  eder. Tek davranissal kullanim `VDbSql.ExecRawCore`'daki READ COMMITTED
+  snapshot tazelemesiydi.
+  Duzeltme: `IVdbBackend`'e `Serializable` bayragi eklendi (V3 gercek
+  denetim yapar, **V2 saklar ama yok sayar** - V2 donmus). `TWriteSet`
+  baslarken `StartGen` (surec ici commit sayaci) ve yeni `StartStoreGen`
+  (`.gen` sayaci, yani **baska sureclerin** commit'leri de gorulur) alinir.
+  `CommitBatch`, `VerifyNoConflict`'dan sonra ve `ApplyBatch`'den **once**,
+  `FCommitGen` veya `.gen` degistiyse `ecSerializationFailure` (SQLSTATE
+  `40001`) firlatir; yazma uygulanmadigi icin **veri kaybi yok**, kilitler
+  ve rezervasyon normal iptal yolundan birakilir. Executor bayragi `BEGIN`
+  oncesinde ve `SET ...` aninda tasir (`FKvB = nil` eski `TVTableDb.Create(dir)`
+  modunda korunur). Yeni hata kodu `VDbErr`'a, `vdbapi_core`'a
+  (`VDB_E_SQL`) ve PG `SQLSTATE` tablosuna eklendi.
+  Regresyon: yeni `serializable_tx` kapisi **23/0** (S1-S15 API, P1-P8 PG
+  teli). Baseline (`git archive HEAD` + yalnizca enum/`VDbErrorName` seam'i,
+  davranis yok) **15 PASS / 8 FAIL**; ayirt edici: S7 (SERIALIZABLE commit
+  kabul), S8 (`ecNone`), S9 (40001 yok), S11 (**iptal edilen islem yazmis**),
+  P4/P5 (PG'de ErrorResponse ve 40001 yok), P6 (3 satir), P8 (5 satir).
+  REPEATABLE READ ayni ara giriste commit etmeye devam eder (S1/S2), yani
+  eski davranis bozulmadi.
+  **Durust sinir**: bu tam **SSI degildir**; predicate/aralik kilidi yok,
+  araya giren herhangi bir commit islemi iptal eder (muhafazakar, false
+  positive maliyeti yeniden denemedir). Tek surec ici yazma cakismasi zaten
+  eski `yazma cakismasi` hatasiyla yakalaniyordu; 40001 bunun uzerine
+  seri kipte ve **surecler arasi** degisikligi kapatir.
+- **F-42 (Orta, KAPALI, v3.65)**: `VDbPgWire.ReadCStr` sonlandirici NUL
+  yoklugunu **sessizce yutuyordu**: dongu tampon sonunda durup kalan tamponu
+  alan degeri olarak donduruyor, `P` tampon disina cikiyordu. Bozuk
+  `Parse`/`Bind` paketleri protokol ihlali olarak **reddedilmiyordu**;
+  sonlandiricisiz bir prepared statement adi "prepared statement yok" gibi
+  **yanlis teshis** uretiyor, baslangic paketinde eksik NUL kabul ediliyordu.
+  Duzeltme: `ReadCStr(..., out AOk: Boolean)`; NUL yoksa `AOk := False`.
+  Dokuz cagri yerinin hepsi fail-closed: genisletilmis protokolde
+  `ExtFail('... eksik NUL sonlandirici')` (ErrorResponse, `Sync`e kadar
+  yutulur), `ReadStartup` `Exit(False)`, SCRAM `Exit`.
+  Regresyon: yeni `pg_msg_nul` kapisi **10/0** (N0-N8). Baseline
+  (`git archive HEAD`, **seam gerekmedi**) **6 PASS / 4 FAIL**; ayirt edici
+  N2 (baseline `1Z` = ParseComplete donuyor), N3 (hata metninde 'NUL' yok),
+  N5 (baseline yanlis teshis: `prepared statement yok: st5yok`), N7 (eksik
+  sonlandiricili baslangic paketi **kabul ediliyor**, `RSSSSKZ`).
+  N1/N5b/N6/N8 koruyucu kontrollerdir (duzgun paketler eskisi gibi calisir).
+- **F-43 (Orta, KAPALI, v3.65)**: `ExecMerge` eslesmesi kaba kuvvetti -
+  her hedef satiri icin **tum** kaynak satirlari dolasilip `ON` kosulu her
+  cift icin yeniden degerlendiriliyordu, yani `O(hedef x kaynak)`; kod
+  yorumu bunu "indeks/hash yolu YOK" diye zaten kabul ediyordu. Olculen
+  (8000 hedef x 8400 kaynak, `ON t.id = s.id`): tek `MERGE` **130781 ms**,
+  ayni `MERGE` ikinci kez **142672 ms**. Bu bir DoS/yavaslik kusuru: buyuk
+  tablolarda `MERGE` pratikte kullanilamaz ve sunucu is parcacigini
+  dakikalarca tutar.
+  Duzeltme: `ON` kosulu **yalnizca `AND` zinciri + `sboEq` + iki tarafi da
+  kolon referansi** ise hizli yol devreye girer - esitlik anahtarlari
+  kanoniklestirilir (sayisal -> `VDbParseFloat`/`VDbFloatToStr`, boolean ->
+  'True'/'False', digerleri ham), hedef satirlar **siralanir**, her kaynak
+  satiri icin **ikili arama** ile esit aralik bulunur: `O((H+S)logH)`.
+  **Her aday satir yine `ON` kosulunun tamami ile dogrulanir**, yani
+  semantik degismez; RLS gorunurlugu, `hPks` tabanli coklu eslesme hatasi
+  ve `DELETE`in `UPDATE`e ustunlugu aynen korunur. Karmasik `ON` (esitlik
+  disi, fonksiyon, `COLLATE`), metin karsilastirmasi (`VCT_STR` ve
+  `FCurTable <> ''`) ve cozulemeyen referanslarda **eski dongu aynen**
+  calisir (guvenli geri cekilme).
+  Regresyon: yeni `merge_hash` kapisi **19/0**; buyuk `MERGE` **62 ms**
+  (ikinci kosu 47 ms). Baseline (`git archive HEAD`, **seam gerekmedi**)
+  **18 PASS / 1 FAIL**: **yalnizca M2** (10 s siniri) ayirt edicidir
+  (130781 ms); M3-M13 semantik **koruyucu** kontrollerdir ve baseline'da da
+  gecer - hizi olcmezler, eski davranisin bozulmadigini kanitlarlar. Kanit
+  bu nedenle acikca "tek ayirt edici kontrol M2" diye yazilmistir.
 
 
 ---

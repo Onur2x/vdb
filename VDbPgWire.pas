@@ -535,16 +535,28 @@ begin
     (Cardinal(Ord(S[Ofs + 2])) shl 8) or Cardinal(Ord(S[Ofs + 3])));
 end;
 
-function ReadCStr(const Buf: AnsiString; var P: Integer): string;
+function ReadCStr(const Buf: AnsiString; var P: Integer; out AOk: Boolean): string;
+// F-43: protokol alanlari NUL ile sonlanmalidir. ONCEDEN sonlandirici
+// yoksa sessizce tamponun sonuna kadar okunup gecerli sayiliyordu; bozuk
+// bir istemci ayni tampondaki sonraki alanlari yutuyor ve istek yanlis
+// yorumlanabiliyordu. AOk = False: NUL bulunamadi (cagiran reddeder).
 var
   st: Integer;
 begin
   Result := '';
+  AOk := False;
   st := P;
   while (P <= Length(Buf)) and (Buf[P] <> #0) do Inc(P);
+  if P > Length(Buf) then
+  begin
+    // Sonlandirici yok: tamponun geri kalanini alan olarak DONDURME.
+    P := Length(Buf) + 1;
+    Exit;
+  end;
+  AOk := True;
   if P > st then
     Result := Copy(Buf, st, P - st);
-  if P <= Length(Buf) then Inc(P);   // #0'i atla
+  Inc(P);   // #0'i atla
 end;
 
 { -------------------------------------------------------- mesaj uretimi }
@@ -852,6 +864,7 @@ begin
     ecInvalidArgument:     Result := '42601';
     ecUnsupported:         Result := '0A000';
     ecTransactionState:    Result := '25000';
+    ecSerializationFailure: Result := '40001';
     ecDuplicateSavepoint:  Result := '3B001';
     ecSavepointNotFound:   Result := '3B000';
     ecPoolTimeout:         Result := '53300';
@@ -960,6 +973,7 @@ var
   body: AnsiString;
   p: Integer;
   k, v: string;
+  ok: Boolean;
 begin
   Result := False;
   AUser := '';
@@ -992,9 +1006,11 @@ begin
     p := 5;
     while p <= Length(body) do
     begin
-      k := ReadCStr(body, p);
+      k := ReadCStr(body, p, ok);
+      if not ok then Exit(False);      // F-43: eksik NUL -> paket bozuk
       if k = '' then Break;
-      v := ReadCStr(body, p);
+      v := ReadCStr(body, p, ok);
+      if not ok then Exit(False);
       if k = 'user' then AUser := v;
     end;
     Exit(True);
@@ -1946,6 +1962,7 @@ var
   payload, mech, first, bare, serverFirst, clientFinal: AnsiString;
   authMsg, cUser, cNonce, sNonce, saltB64, finNonce, proofB64: AnsiString;
   flag: AnsiChar;
+  cok: Boolean;
   proof, clientSig, clientKey, stored, serverSig, amsgB: TBytes;
 
   function FailAuth: Boolean;
@@ -1997,7 +2014,8 @@ begin
   // SASLInitialResponse: mekanizma cstring + uzunluk + client-first.
   if not ReadClientMsg(payload) then Exit;
   p := 1;
-  mech := ReadCStr(payload, p);
+  mech := ReadCStr(payload, p, cok);
+  if not cok then Exit;             // F-43: eksik NUL -> oturum reddedilir
   if mech <> 'SCRAM-SHA-256' then Exit;
   if p + 3 > Length(payload) then Exit;
   ilen := NetToI32(payload, p);
@@ -2090,6 +2108,7 @@ var
   CopySpec: TPgCopySpec;
   cpErr: string;
   copyOk, copyErr: Boolean;
+  cok: Boolean;
   Lim: TPgLimits;
   { v3.64 (SKILL5 9.5 + 10.1) }
   totalBytes: Int64;
@@ -2248,8 +2267,18 @@ begin
       else if typ = Ord('P') then            // Parse
       begin
         p := 1;
-        nm := ReadCStr(payload, p);
-        q := ReadCStr(payload, p);
+        nm := ReadCStr(payload, p, cok);
+        if not cok then
+        begin
+          ExtFail('Parse mesaji eksik NUL sonlandirici');
+          Continue;
+        end;
+        q := ReadCStr(payload, p, cok);
+        if not cok then
+        begin
+          ExtFail('Parse mesaji eksik NUL sonlandirici');
+          Continue;
+        end;
         declared := TakeI16;
         inferred := VDbCountSqlParams(q);
         if inferred < declared then inferred := declared;
@@ -2297,8 +2326,18 @@ begin
       else if typ = Ord('B') then            // Bind
       begin
         p := 1;
-        nm := ReadCStr(payload, p);          // portal
-        q := ReadCStr(payload, p);           // statement
+        nm := ReadCStr(payload, p, cok);      // portal
+        if not cok then
+        begin
+          ExtFail('Bind mesaji eksik NUL sonlandirici');
+          Continue;
+        end;
+        q := ReadCStr(payload, p, cok);       // statement
+        if not cok then
+        begin
+          ExtFail('Bind mesaji eksik NUL sonlandirici');
+          Continue;
+        end;
         if not Stmts.TryGetValue(q, st) then
         begin
           ExtFail('prepared statement yok: ' + q);
@@ -2418,7 +2457,12 @@ begin
         begin
           kind := AnsiChar(payload[1]);
           p := 2;
-          nm := ReadCStr(payload, p);
+          nm := ReadCStr(payload, p, cok);
+          if not cok then
+          begin
+            ExtFail('mesaj alaninda eksik NUL sonlandirici');
+            Continue;
+          end;
           if kind = 'S' then
           begin
             if not Stmts.TryGetValue(nm, st) then
@@ -2462,7 +2506,12 @@ begin
       else if typ = Ord('E') then            // Execute
       begin
         p := 1;
-        nm := ReadCStr(payload, p);
+        nm := ReadCStr(payload, p, cok);
+        if not cok then
+        begin
+          ExtFail('Execute mesaji eksik NUL sonlandirici');
+          Continue;
+        end;
         { v3.64 (SKILL5 10.1): PostgreSQL Execute govdesi portal adindan SONRA
           Int32 maxRows tasir. Onceden bu alan HIC okunmuyordu; sonucun tamami
           her Execute'ta gonderiliyordu. Simdi gercek limit uygulanir
@@ -2539,7 +2588,12 @@ begin
         begin
           kind := AnsiChar(payload[1]);
           p := 2;
-          nm := ReadCStr(payload, p);
+          nm := ReadCStr(payload, p, cok);
+          if not cok then
+          begin
+            ExtFail('mesaj alaninda eksik NUL sonlandirici');
+            Continue;
+          end;
           if kind = 'S' then Stmts.Remove(nm) else Portals.Remove(nm);
         end;
         if not SendPg(FIO, PgMsg('3', '')) then Break;

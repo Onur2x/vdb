@@ -24,6 +24,8 @@ type
   private
     FDb: TVDb;
     FOwnsDb: Boolean;
+    { F-42: v2 yorumlamaz; yalnizca arayuz sozlesmesini karsilar. }
+    FSerializable: Boolean;
   public
     constructor Create(ADb: TVDb);
     { VDbFactory icin: adaptor kapanirken TVDb'yi de kapatir/serbest
@@ -96,6 +98,8 @@ type
     procedure SetExclusiveAccess(AValue: Boolean);
     procedure WaitForeignTxn(ASessionId: Cardinal);
     procedure RefreshBatchSnapshot;
+    function GetSerializable: Boolean;
+    procedure SetSerializable(AValue: Boolean);
     function GetFilePath: string;
     function GetIsReadOnly: Boolean;
     function GetBusyTimeoutMs: Integer;
@@ -443,6 +447,19 @@ end;
 procedure TVDbBackendV2.RefreshBatchSnapshot;
 begin
   FDb.RefreshBatchSnapshot;
+end;
+
+{ F-42: v2'de SERIALIZABLE dogrulamasi YOKTUR. Deger saklanir ve commit
+  aninda yorumlanmaz; boylece v2 davranisi (dondurulmus) degismez. Gercek
+  dogrulama yalnizca v3 backend'inde uygulanir. }
+function TVDbBackendV2.GetSerializable: Boolean;
+begin
+  Result := FSerializable;
+end;
+
+procedure TVDbBackendV2.SetSerializable(AValue: Boolean);
+begin
+  FSerializable := AValue;
 end;
 
 function TVDbBackendV2.GetFilePath: string;

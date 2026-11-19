@@ -70,7 +70,9 @@ type
     ecLockConflict,         // baska oturumun tuttugu satir kilidi
     // --- P-176 sorgu iptali ---
     ecQueryTimeout,         // sorgu zaman asimi (QueryTimeoutMs asildi)
-    ecCancelled             // kullanici iptali (CancelQuery)
+    ecCancelled,            // kullanici iptali (CancelQuery)
+    // --- F-42 SERIALIZABLE dogrulama ---
+    ecSerializationFailure  // SERIALIZABLE: arada baska islem commit etti (40001)
   );
 
   EVDbException = class(Exception)
@@ -144,6 +146,7 @@ begin
     ecLockConflict:       Result := 'ecLockConflict';
     ecQueryTimeout:       Result := 'ecQueryTimeout';
     ecCancelled:          Result := 'ecCancelled';
+    ecSerializationFailure: Result := 'ecSerializationFailure';
   else
     Result := 'ecGeneral';
   end;

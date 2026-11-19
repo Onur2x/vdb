@@ -31,7 +31,7 @@ interface
 uses
   SysUtils, Classes, SyncObjs, Generics.Collections,
   VDbBackendApi, VDbPage, VDbPageStore, VDbPageHeap, VDbPageWal, VDbPageEngine,
-  VDbIdxFile, VDbSync, VDbCrypt, VDbChangeLog;
+  VDbIdxFile, VDbSync, VDbCrypt, VDbChangeLog, VDbErr;
 
 const
   { Bu boyuttan buyuk WAL'de commit sonrasi checkpoint yapilir. Cok kucuk
@@ -356,6 +356,11 @@ type
           hatayla durur (veri kaybi YOK). Farkli anahtarlar: iki surec de
           commit eder; yazarlar artik TAMAMEN sirali degildir. }
         Optimistic: Boolean;
+        { F-42: BeginBatch anindaki CANLI store commit nesli (`.gen` sayaci).
+          SERIALIZABLE islemde commit aninda bu deger degistiyse arada
+          baska bir islem (baska surec dahil) commit etmistir; commit
+          ecSerializationFailure ile durur. 0 = okunamadi (konservatif). }
+        StartStoreGen: QWord;
         constructor Create(ASession: Cardinal);
         destructor Destroy; override;
         { v3.24: havuzdan geri kullanilacak kume. Konteynerleri ATMAZ,
@@ -369,6 +374,10 @@ type
       { v3.2: cok okuyucu / tek yazici. }
       FReadOnly: Boolean;
       FBusyMs: Integer;
+      { F-42: SERIALIZABLE dogrulamasi (executor tarafindan ayarlanir).
+        Bu backend uzerinden acilan yeni islemler commit aninda arada baska
+        bir islem commit ettiyse ecSerializationFailure (40001) verir. }
+      FSerializable: Boolean;
       { v3.63 (SKILL5 7.1): surecler arasi BAKIM kilidi icin bekleme suresi.
         Dosya degistirme (Compact/Restore/Rekey) baslamadan once canli
         dosya uzerinde tam kilit alinir; baska bir surec dosyayi acik
@@ -867,6 +876,10 @@ type
     procedure SetDurableOnFlush(AValue: Boolean);
     procedure WaitForeignTxn(ASessionId: Cardinal);
     procedure RefreshBatchSnapshot;
+    { F-42: SERIALIZABLE dogrulamasi. }
+    function GetSerializable: Boolean;
+    procedure SetSerializable(AValue: Boolean);
+    property Serializable: Boolean read GetSerializable write SetSerializable;
     function GetFilePath: string;
     procedure SetRowTagFunc(AValue: TVDbRowTagFunc);
 
@@ -1875,6 +1888,7 @@ begin
   ScanScope := -1;
   ScanGlobalStamp := 0;
   StoreOverflowStamp := 0;
+  StartStoreGen := 0;
 end;
 
 destructor TVdbBackendV3.TWriteSet.Destroy;
@@ -1924,6 +1938,7 @@ begin
   NeedBefore := False;
   SnapDirty := False;
   Optimistic := False;
+  StartStoreGen := 0;
 end;
 
 function TVdbBackendV3.AcquireSet(ASession: Cardinal): TWriteSet;
@@ -4079,6 +4094,10 @@ begin
     try
       s := AcquireSet(sid);
       s.StartGen := FCommitGen;
+      { F-42: SERIALIZABLE dogrulamasi icin CANLI store nesli de saklanir.
+        FCommitGen yalnizca bu surec/sunucudaki commit'leri sayar; `.gen`
+        sayaci baska surecin commit'ini de gorur. }
+      s.StartStoreGen := FEng.Store.ReadGen;
       if not gotReserve then
       begin
         s.Optimistic := True;
@@ -4177,6 +4196,20 @@ begin
         'kumesi commit etti; islem yeniden denenmeli');
     { v3.4: cakisma denetimi UYGULAMADAN ONCE yapilir: yarim uygulama yok. }
     VerifyNoConflict(s);
+    { F-42: SERIALIZABLE. Bu islem basladigindan beri BASKA bir islem
+      commit ettiyse (ayni surecte FCommitGen, baska surecte canli `.gen`
+      sayaci degisti) commit REDDEDILIR: 40001, islem yeniden denenmeli.
+      REPEATABLE READ'de bu denetim YOKTUR (bugunku davranis aynen kalir).
+      Kontrol VerifyNoConflict'TAN SONRA ve ApplyBatch'TEN ONCE: hicbir
+      satir uygulanmamis olur (yarim commit yok). ReadGen 0 ise (sayac
+      okunamadi) karsilastirma yanlis eslesebilir; StartStoreGen da 0'dir
+      ve yalnizca gercekten degistiyse durur - konservatif, veri kaybi yok. }
+    if FSerializable and
+       ((FCommitGen <> s.StartGen) or
+        (FEng.Store.ReadGen <> s.StartStoreGen)) then
+      raise EVDbException.Create(ecSerializationFailure,
+        'seri hale getirme hatasi (40001): islem basladiktan sonra baska ' +
+        'bir islem commit etti; islem yeniden denenmeli');
     { v3.6: yabanci anahtar defteri. ONEMLI: ApplyBatch yazma kumesini
       TEMIZLER (Map/Order), bu yuzden kayit ONDAN ONCE alinir. Biz commit
       ederken BASKA bir kume hala aciksa, o kume hizli yolda yazmis olabilir
@@ -4901,6 +4934,16 @@ procedure TVdbBackendV3.RefreshBatchSnapshot;
 begin
   { v3.0'da snapshot/MVCC yok: parti icinde her okuma en guncel kaplamayi
     ve motoru gorur; ilerletilecek gorunurluk penceresi yok. }
+end;
+
+function TVdbBackendV3.GetSerializable: Boolean;
+begin
+  Result := FSerializable;
+end;
+
+procedure TVdbBackendV3.SetSerializable(AValue: Boolean);
+begin
+  FSerializable := AValue;
 end;
 
 function TVdbBackendV3.GetFilePath: string;

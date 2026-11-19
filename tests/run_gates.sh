@@ -138,6 +138,9 @@ build_gate region_stream  "$ROOT/tests/region_stream/region_stream.lpr"
 build_gate multiproc      "$ROOT/tests/multiproc/multiproc.lpr"
 build_gate maint_lock     "$ROOT/tests/maint_lock/maint_lock.lpr"
 build_gate pg_portal_stream "$ROOT/tests/pg_portal_stream/pg_portal_stream.lpr"
+build_gate serializable_tx "$ROOT/tests/serializable_tx/serializable_tx.lpr"
+build_gate pg_msg_nul     "$ROOT/tests/pg_msg_nul/pg_msg_nul.lpr"
+build_gate merge_hash     "$ROOT/tests/merge_hash/merge_hash.lpr"
 build_gate crash_points   "$ROOT/tests/crash_points/crash_points.lpr"
 build_gate vdbcheck        "$ROOT/vdbcheck.lpr"
 build_gate integrity_check "$ROOT/tests/integrity_check/integrity_check.lpr"
@@ -195,6 +198,9 @@ run_gate region_stream  "$WORK/region_stream"  region_stream
 run_gate multiproc      "$WORK/multiproc"      multiproc
 run_gate maint_lock     "$WORK/maint_lock"     maint_lock
 run_gate pg_portal_stream "$WORK/pg_portal_stream" pg_portal_stream
+run_gate serializable_tx "$WORK/serializable_tx" serializable_tx
+run_gate pg_msg_nul     "$WORK/pg_msg_nul"     pg_msg_nul
+run_gate merge_hash     "$WORK/merge_hash"     merge_hash
 run_gate crash_points   "$WORK/crash_points"   crash_points
 run_gate integrity_check "$WORK/integrity_check" integrity_check \
   "$(npath "$WORK/vdbcheck/vdbcheck$EXE")"

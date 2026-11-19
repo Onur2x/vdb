@@ -12791,8 +12791,13 @@ procedure TVSqlExecutor.ExecSetIsolation(Stmt: TSqlSetIsolationStmt;
   out Res: TSqlResult);
 // F-40: oturum yalitim seviyesi. READ COMMITTED her cumle basinda
 // gorunurluk penceresini ilerletir; digerleri batch-basi snapshot kullanir.
+// F-42: SERIALIZABLE'da arada baska islem commit ettiyse commit aninda
+// 40001 (ecSerializationFailure) verilir. Bayrak backend'e burada ve
+// txBegin'de tasinir.
 begin
   FIsolation := Stmt.Level;
+  if FT.Backend <> nil then
+    FT.Backend.Serializable := (Stmt.Level = ilSerializable);
   SetLength(Res.Fields, 1);
   Res.Fields[0] := 'isolation';
   SetLength(Res.Rows, 1);
@@ -20128,7 +20133,13 @@ end;
   birden cok kaynak satiriyla eslesirse SQL standardi gibi hata verilir.
   Ayni WHEN MATCHED icinde hem UPDATE hem DELETE yazilirsa DELETE
   kazanir (parser ikisini ayri bayraklarda tutar).
-  Fiyatlama: ON kosulu O(hedef x kaynak); indeks/hash yolu YOK.
+  F-44: ON kosulu yalnizca `hedef.kolon = kaynak.kolon` esitliklerinin
+  AND zinciri ise hedef satirlar kanonik anahtarla siralanir ve her kaynak
+  satiri ikili aramayla eslesme adaylarina indigirilir (O((H+S)logH)).
+  Adaylar yine TAM ON kosuluyla dogrulanir; boylece sonuc kumeleri
+  birebir aynidir. Karmasik ON (esitsizlik, fonksiyon, sabit, nitelemesiz
+  cift hedef kolonu), COLLATE veya metin kolonunda collation soz konusu
+  oldugunda eski O(hedef x kaynak) dongu kullanilir (davranis degismez).
   ------------------------------------------------------------ }
 procedure TVSqlExecutor.ExecMerge(Stmt: TSqlMergeStmt; out Res: TSqlResult);
 var
@@ -20157,6 +20168,188 @@ var
   hasUpdTrig, hasDelTrig, hasInsTrig: Boolean;
   rlsCmd: Byte;
   Asgn: TUpdateAssignment;
+  // F-44: esitlik ON kosulu icin sirali anahtar yolu
+  eqOk: Boolean;
+  eqNEq: Integer;
+  eqH, eqS: array of Integer;
+  eqCT: array of Byte;
+  vis: array of Boolean;
+  tKeys: array of string;
+  tRows: array of Integer;
+  tOrd: array of Integer;
+  sKey, hKey: string;
+  kLo, kV: Integer;
+
+  { F-44: VDbCmpVal ile AYNI kanonik metin. Sayisal kolonda VDbCmpVal
+    VDbParseFloat kullanir; INT icin VDbCanonVal'in IntToStr yolu BURADA
+    KULLANILMAZ (aksi halde '1' ile '1.0' ayrisir ve eslesme kacirdi). }
+  function MergeCanonVal(const S: string; CT: Byte): string;
+  var
+    fv: Double;
+  begin
+    if S = '' then Exit('');
+    if VDbIsNumericCol(CT) then
+    begin
+      if VDbParseFloat(S, fv) then Exit(VDbFloatToStr(fv));
+      Exit(S);
+    end;
+    if CT = VCT_BOOL then
+    begin
+      if SameText(S, 'True') or (S = '1') then Exit('True');
+      if SameText(S, 'False') or (S = '0') then Exit('False');
+    end;
+    Result := S;
+  end;
+
+  { F-44: ON kosulunu esitlik ciftlerine ayirir. Kosulun TAMAMI bu
+    bicimde degilse False doner ve eski dongu kullanilir. }
+  function MergeCollectEq(Expr: TSqlExprNode): Boolean;
+  var
+    bin: TSqlBinaryOpNode;
+    cr1, cr2: TSqlColumnRefNode;
+    i1, i2, th, ss: Integer;
+    ct: Byte;
+  begin
+    Result := False;
+    if (Expr = nil) or (not (Expr is TSqlBinaryOpNode)) then Exit;
+    bin := TSqlBinaryOpNode(Expr);
+    if bin.Op = sboAnd then
+    begin
+      if not MergeCollectEq(bin.Left) then Exit;
+      if not MergeCollectEq(bin.Right) then Exit;
+      Exit(True);
+    end;
+    if bin.Op <> sboEq then Exit;
+    if not ((bin.Left is TSqlColumnRefNode) and
+            (bin.Right is TSqlColumnRefNode)) then Exit;
+    cr1 := TSqlColumnRefNode(bin.Left);
+    cr2 := TSqlColumnRefNode(bin.Right);
+    i1 := FindColIdx(cr1.ColumnName, cr1.TableQualifier, mNames);
+    i2 := FindColIdx(cr2.ColumnName, cr2.TableQualifier, mNames);
+    if (i1 < 0) or (i2 < 0) then Exit;
+    th := -1;
+    ss := -1;
+    if i1 < nH then th := i1
+    else if i1 < 2 * nH then th := i1 - nH
+    else ss := i1 - 2 * nH;
+    if i2 < nH then
+    begin
+      if th >= 0 then Exit;      // iki taraf da hedef: hash'lenemez
+      th := i2;
+    end
+    else if i2 < 2 * nH then
+    begin
+      if th >= 0 then Exit;
+      th := i2 - nH;
+    end
+    else
+    begin
+      if ss >= 0 then Exit;      // iki taraf da kaynak
+      ss := i2 - 2 * nH;
+    end;
+    if (th < 0) or (ss < 0) then Exit;
+    ct := BinaryOpCtype(bin, mNames, mTypes);
+    { Metin karsilastirmasinda collation devrede olabilir; kanonik anahtar
+      bayt esitligine dayandigi icin o durumda hizli yol KAPALIDIR. }
+    if (ct = VCT_STR) and (FCurTable <> '') then Exit;
+    Inc(eqNEq);
+    SetLength(eqH, eqNEq);
+    SetLength(eqS, eqNEq);
+    SetLength(eqCT, eqNEq);
+    eqH[eqNEq - 1] := th;
+    eqS[eqNEq - 1] := ss;
+    eqCT[eqNEq - 1] := ct;
+    Result := True;
+  end;
+
+  { F-44: tOrd'u tKeys'e gore alttan yukari birlestirmeli siralar.
+    Karsilastirma AnsiString'in ordinal (<) operatorudur; ikili arama da
+    ayni operatoru kullanir. }
+  procedure MergeSortKeys;
+  var
+    n, w, lo, mid, hi, li, ri, p: Integer;
+    tmp: array of Integer;
+  begin
+    n := Length(tOrd);
+    if n < 2 then Exit;
+    SetLength(tmp, n);
+    w := 1;
+    while w < n do
+    begin
+      lo := 0;
+      while lo < n do
+      begin
+        mid := lo + w;
+        if mid > n then mid := n;
+        hi := lo + 2 * w;
+        if hi > n then hi := n;
+        li := lo;
+        ri := mid;
+        p := lo;
+        while (li < mid) and (ri < hi) do
+        begin
+          if tKeys[tOrd[ri]] < tKeys[tOrd[li]] then
+          begin
+            tmp[p] := tOrd[ri];
+            Inc(ri);
+          end
+          else
+          begin
+            tmp[p] := tOrd[li];
+            Inc(li);
+          end;
+          Inc(p);
+        end;
+        while li < mid do
+        begin
+          tmp[p] := tOrd[li];
+          Inc(li);
+          Inc(p);
+        end;
+        while ri < hi do
+        begin
+          tmp[p] := tOrd[ri];
+          Inc(ri);
+          Inc(p);
+        end;
+        lo := lo + 2 * w;
+      end;
+      for p := 0 to n - 1 do tOrd[p] := tmp[p];
+      w := w * 2;
+    end;
+  end;
+
+  function MergeLowerBound(const K: string): Integer;
+  var
+    lo, hi, mid: Integer;
+  begin
+    lo := 0;
+    hi := Length(tOrd);
+    while lo < hi do
+    begin
+      mid := (lo + hi) div 2;
+      if tKeys[tOrd[mid]] < K then lo := mid + 1
+      else hi := mid;
+    end;
+    Result := lo;
+  end;
+
+  function MergeRowKey(const Row: TStrArray; const Cols: array of Integer): string;
+  var
+    e: Integer;
+    v: string;
+  begin
+    Result := '';
+    for e := 0 to High(Cols) do
+    begin
+      if Cols[e] <= High(Row) then v := Row[Cols[e]] else v := '';
+      { NULL iceren esitlik SQL'de UNKNOWN'dur: hicbir satirla eslesmez. }
+      if v = '' then Exit('');
+      v := MergeCanonVal(v, eqCT[e]);
+      Result := Result + IntToStr(Length(v)) + ':' + v + ';';
+    end;
+  end;
+
 begin
   td := FT.GetTable(Stmt.TargetTable);
   if Stmt.MatchedAssignments.Count > 0 then
@@ -20254,6 +20447,74 @@ begin
   end;
   for j := 0 to High(sMatched) do sMatched[j] := False;
   SetLength(merged, nAll);
+
+  { F-44: ON kosulu yalniz esitlik AND-zinciri mi? }
+  eqNEq := 0;
+  eqOk := (Stmt.OnCondition <> nil) and MergeCollectEq(Stmt.OnCondition);
+  if eqNEq = 0 then eqOk := False;
+
+  if eqOk then
+  begin
+    // Hedef satirlari kanonik anahtarla sirala (RLS ile gizlenenler disarida)
+    SetLength(vis, Length(hRows));
+    SetLength(tKeys, 0);
+    SetLength(tRows, 0);
+    for i := 0 to High(hRows) do
+    begin
+      TickAbort;
+      vis[i] := (not hasRls) or RlsRowVisible(Stmt.TargetTable, rlsCmd,
+        hRows[i], hNames, hTypes);
+      if not vis[i] then Continue;
+      hKey := MergeRowKey(hRows[i], eqH);
+      if hKey = '' then Continue;
+      SetLength(tKeys, Length(tKeys) + 1);
+      tKeys[High(tKeys)] := hKey;
+      SetLength(tRows, Length(tRows) + 1);
+      tRows[High(tRows)] := i;
+    end;
+    SetLength(tOrd, Length(tKeys));
+    for i := 0 to High(tOrd) do tOrd[i] := i;
+    MergeSortKeys;
+    // Her kaynak satiri yalniz esit anahtarli hedef adaylarina bakar
+    for j := 0 to High(sRows) do
+    begin
+      TickAbort;
+      sKey := MergeRowKey(sRows[j], eqS);
+      if sKey = '' then Continue;
+      kLo := MergeLowerBound(sKey);
+      for kV := kLo to High(tOrd) do
+      begin
+        if tKeys[tOrd[kV]] <> sKey then Break;
+        i := tRows[tOrd[kV]];
+        for k := 0 to nH - 1 do
+        begin
+          if k <= High(hRows[i]) then merged[k] := hRows[i][k]
+          else merged[k] := '';
+          merged[nH + k] := merged[k];
+        end;
+        for k := 0 to nS - 1 do
+        begin
+          if k <= High(sRows[j]) then merged[2 * nH + k] := sRows[j][k]
+          else merged[2 * nH + k] := '';
+        end;
+        // Aday yine TAM ON kosuluyla dogrulanir (sonuc birebir ayni)
+        if RowMatches(Stmt.OnCondition, merged, mNames, mTypes) then
+        begin
+          sMatched[j] := True;
+          Inc(matchCount[i]);
+          if matchFirst[i] < 0 then matchFirst[i] := j;
+        end;
+      end;
+    end;
+    // Coklu eslesme hatasi ayni sirada (hedef PK sirasi) verilir
+    for i := 0 to High(hRows) do
+      if matchCount[i] > 1 then
+        raise EVDbException.CreateFmt(ecUnsupported,
+          'MERGE: hedef satiri birden cok kaynak satiriyla eslesti (hedef PK=%s)',
+          [hPks[i]]);
+  end
+  else
+  begin
   for i := 0 to High(hRows) do
   begin
     { Sprint A (3.4): RLS USING ile gizlenen hedef satiri eslesmis
@@ -20284,6 +20545,7 @@ begin
       raise EVDbException.CreateFmt(ecUnsupported,
         'MERGE: hedef satiri birden cok kaynak satiriyla eslesti (hedef PK=%s)',
         [hPks[i]]);
+  end;
   end;
 
   ownBatch := not FT.Backend.InBatch;
@@ -21322,7 +21584,13 @@ begin
     // icinde yapilan DDL (CREATE/DROP TABLE, INDEX, ALTER) ROLLBACK ile
     // geri alinir. Dogrudan Kv.BeginBatch cagrilirsa sema yedegi alinmadigi
     // icin "ROLLBACK sonrasi tablo yok" testi basarisiz olur.
-    txBegin:           FT.BeginBatch;
+    txBegin:           begin
+                         { F-42: SERIALIZABLE bayragi islem baslamadan once
+                           backend'e tasinir; commit aninda dogrulanir. }
+                         if FT.Backend <> nil then
+                           FT.Backend.Serializable := (FIsolation = ilSerializable);
+                         FT.BeginBatch;
+                       end;
     txCommit:          begin FT.CommitBatch; FT.UnlockRows(FSessionId); end;
     txRollback:        begin FT.AbortBatch; FT.UnlockRows(FSessionId); end;
     { v3.2 (2026-10-25): SAVEPOINT artik iki backend'de de calisir.

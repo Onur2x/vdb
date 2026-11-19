@@ -232,6 +232,14 @@ type
     { READ COMMITTED icin gorunurluk penceresini ilerletir. v3'te
       snapshot/MVCC yok: no-op. }
     procedure RefreshBatchSnapshot;
+    { F-42: SERIALIZABLE dogrulamasi acik mi? Executor `SET TRANSACTION
+      ISOLATION LEVEL SERIALIZABLE` gordugunde True yapar. v3: commit
+      aninda arada baska islem commit ettiyse ecSerializationFailure
+      (40001) verir. v2: deger saklanir, yorumlanmaz (v2 davranisi
+      degismez). Varsayilan False. }
+    function GetSerializable: Boolean;
+    procedure SetSerializable(AValue: Boolean);
+    property Serializable: Boolean read GetSerializable write SetSerializable;
     { Veri dosyasinin tam yolu (goreli yollarin cozumu icin). }
     function GetFilePath: string;
     property FilePath: string read GetFilePath;

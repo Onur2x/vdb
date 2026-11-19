@@ -273,6 +273,7 @@ begin
     ecMathError,
     ecInvalidArgument:      Result := VDB_E_SQL;
     ecTransactionState,
+    ecSerializationFailure,
     ecInvalidState:         Result := VDB_E_SQL;
     ecLimit,
     ecIOError:              Result := VDB_E_ENGINE;
