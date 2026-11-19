@@ -154,6 +154,9 @@ begin
   begin
     srv := TVdbPgServer.Create(dir, Word(54300 + i));
     srv.AddUser('harden', 'parola123');
+    { F-46: bu kapi kimlik dogrulama davranisini olcer, rol eslemesini
+      degil; rol eslemesiz kullanici eski (kisitlanmamis) yolda kosar. }
+    srv.AllowUnmappedUsers := True;
     srv.BindHost := '127.0.0.1';
     if srv.Start(err) then
     begin

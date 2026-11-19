@@ -356,11 +356,20 @@ type
           hatayla durur (veri kaybi YOK). Farkli anahtarlar: iki surec de
           commit eder; yazarlar artik TAMAMEN sirali degildir. }
         Optimistic: Boolean;
+        { F-45 (SKILL6 01): bu YAZMA KUMESI icin SERIALIZABLE dogrulamasi.
+          BeginBatch'te oturumun bekleyen bayragindan kopyalanir; commit
+          aninda YALNIZ bu kume okunur. Ayni backend'i paylasan diger
+          baglantilarin izolasyon ayari bu karari ETKILEMEZ. }
+        Serializable: Boolean;
         { F-42: BeginBatch anindaki CANLI store commit nesli (`.gen` sayaci).
           SERIALIZABLE islemde commit aninda bu deger degistiyse arada
           baska bir islem (baska surec dahil) commit etmistir; commit
           ecSerializationFailure ile durur. 0 = okunamadi (konservatif). }
         StartStoreGen: QWord;
+        { F-45: StartStoreGen guvenilir okunabildi mi? False ise nesil
+          dogrulanamaz ve SERIALIZABLE commit KONSERVATIF olarak reddedilir;
+          boylece "okunamadi" sessizce "degismedi" sayilmaz. }
+        StartStoreGenOk: Boolean;
         constructor Create(ASession: Cardinal);
         destructor Destroy; override;
         { v3.24: havuzdan geri kullanilacak kume. Konteynerleri ATMAZ,
@@ -374,10 +383,15 @@ type
       { v3.2: cok okuyucu / tek yazici. }
       FReadOnly: Boolean;
       FBusyMs: Integer;
-      { F-42: SERIALIZABLE dogrulamasi (executor tarafindan ayarlanir).
-        Bu backend uzerinden acilan yeni islemler commit aninda arada baska
-        bir islem commit ettiyse ecSerializationFailure (40001) verir. }
-      FSerializable: Boolean;
+      { F-45 (SKILL6 01): SERIALIZABLE artik backend genelinde DEGIL, oturum
+        ve islem bazlidir. Executor BEGIN'den hemen once SetTxIsolation
+        cagirir; bayrak burada OTURUM kimligiyle saklanir, BeginBatch onu
+        yeni yazma kumesine kopyalayip siler. Eski tek alanli tasarim, ayni
+        backend'i paylasan iki baglantinin (PG wire'da her baglanti ayni
+        TVTableDb'yi kullanir) birbirinin izolasyon kararini bozmasina yol
+        aciyordu: bir baglanti SERIALIZABLE sectiginde digerinin READ
+        COMMITTED commit'i yanlislikla 40001 aliyordu. }
+      FPendingSerializable: TDictionary<Cardinal, Boolean>;
       { v3.63 (SKILL5 7.1): surecler arasi BAKIM kilidi icin bekleme suresi.
         Dosya degistirme (Compact/Restore/Rekey) baslamadan once canli
         dosya uzerinde tam kilit alinir; baska bir surec dosyayi acik
@@ -876,10 +890,9 @@ type
     procedure SetDurableOnFlush(AValue: Boolean);
     procedure WaitForeignTxn(ASessionId: Cardinal);
     procedure RefreshBatchSnapshot;
-    { F-42: SERIALIZABLE dogrulamasi. }
-    function GetSerializable: Boolean;
-    procedure SetSerializable(AValue: Boolean);
-    property Serializable: Boolean read GetSerializable write SetSerializable;
+    { F-45 (SKILL6 01): islem bazli SERIALIZABLE bayragi. BEGIN'den hemen
+      once cagrilir; yalniz o oturumun baslatacagi yazma kumesini etkiler. }
+    procedure SetTxIsolation(ASerializable: Boolean);
     function GetFilePath: string;
     procedure SetRowTagFunc(AValue: TVDbRowTagFunc);
 
@@ -1016,6 +1029,7 @@ begin
   { v3.63 (SKILL5 7.1): bakim kilidi varsayilan bekleme suresi. }
   FMaintenanceLockMs := 3000;
   FSets := TDictionary<Cardinal, TWriteSet>.Create;
+  FPendingSerializable := TDictionary<Cardinal, Boolean>.Create;
   FSetPool := TList<TWriteSet>.Create;
   FAlien := TDictionary<QWord, Int64>.Create;
   FUndo := TDictionary<QWord, TSnapRec>.Create;
@@ -1503,6 +1517,7 @@ begin
     for pair in FSets do
       pair.Value.Free;
   FreeAndNil(FSets);
+  FreeAndNil(FPendingSerializable);
   if FSetPool <> nil then
   begin
     for i := 0 to FSetPool.Count - 1 do
@@ -1889,6 +1904,8 @@ begin
   ScanGlobalStamp := 0;
   StoreOverflowStamp := 0;
   StartStoreGen := 0;
+  StartStoreGenOk := False;
+  Serializable := False;
 end;
 
 destructor TVdbBackendV3.TWriteSet.Destroy;
@@ -1939,6 +1956,8 @@ begin
   SnapDirty := False;
   Optimistic := False;
   StartStoreGen := 0;
+  StartStoreGenOk := False;
+  Serializable := False;
 end;
 
 function TVdbBackendV3.AcquireSet(ASession: Cardinal): TWriteSet;
@@ -4071,13 +4090,20 @@ var
   sid: Cardinal;
   gotReserve: Boolean;
   gotDefer: Boolean;
+  gotSer: Boolean;
 begin
   RequireWritable;
   sid := VdbBackendSessionId;
   gotDefer := False;
   FEngCs.Enter;
   try
-    if FSets.TryGetValue(sid, s) then Exit;   // zaten acik
+    if FSets.TryGetValue(sid, s) then
+    begin
+      { F-45: islem zaten aciksa SET TRANSACTION yok sayilir; bekleyen
+        bayrak bir sonraki BEGIN'i yanlislikla etkilemesin diye silinir. }
+      FPendingSerializable.Remove(sid);
+      Exit;   // zaten acik
+    end;
     { v3.16: SURELER ARASI COK YAZARLILIK. Yazarlar SIRAYLA girer: acik
       islem boyunca YAZAR REZERVASYONU tutulur, ayni dosyaya baska bir
       surec yazacaksa busy timeout boyunca bekler.
@@ -4094,10 +4120,20 @@ begin
     try
       s := AcquireSet(sid);
       s.StartGen := FCommitGen;
+      { F-45 (SKILL6 01): SERIALIZABLE bayragi OTURUM bazli bekleyen
+        kayittan bu YAZMA KUMESINE kopyalanir ve kayit silinir. Boylece
+        ayni backend'i paylasan baska bir baglanti SET TRANSACTION
+        SERIALIZABLE yaptiginda bu islem etkilenmez. }
+      s.Serializable := False;
+      if FPendingSerializable.TryGetValue(sid, gotSer) then
+      begin
+        s.Serializable := gotSer;
+        FPendingSerializable.Remove(sid);
+      end;
       { F-42: SERIALIZABLE dogrulamasi icin CANLI store nesli de saklanir.
         FCommitGen yalnizca bu surec/sunucudaki commit'leri sayar; `.gen`
         sayaci baska surecin commit'ini de gorur. }
-      s.StartStoreGen := FEng.Store.ReadGen;
+      s.StartStoreGenOk := FEng.Store.TryReadGen(s.StartStoreGen);
       if not gotReserve then
       begin
         s.Optimistic := True;
@@ -4138,6 +4174,9 @@ var
   pendExc, tmpExc: TObject;
   msg: string;
   recErr: string;
+  { F-45: SERIALIZABLE nesil okumasi (okunamazsa konservatif reddet). }
+  serGenNow: QWord;
+  serGenOk: Boolean;
 {$IFDEF CPUPROF}
   p0, p1, p2, p3, p4, p5, p6, p7, p8, p9: Int64;
 {$ENDIF}
@@ -4196,20 +4235,26 @@ begin
         'kumesi commit etti; islem yeniden denenmeli');
     { v3.4: cakisma denetimi UYGULAMADAN ONCE yapilir: yarim uygulama yok. }
     VerifyNoConflict(s);
-    { F-42: SERIALIZABLE. Bu islem basladigindan beri BASKA bir islem
-      commit ettiyse (ayni surecte FCommitGen, baska surecte canli `.gen`
-      sayaci degisti) commit REDDEDILIR: 40001, islem yeniden denenmeli.
-      REPEATABLE READ'de bu denetim YOKTUR (bugunku davranis aynen kalir).
-      Kontrol VerifyNoConflict'TAN SONRA ve ApplyBatch'TEN ONCE: hicbir
-      satir uygulanmamis olur (yarim commit yok). ReadGen 0 ise (sayac
-      okunamadi) karsilastirma yanlis eslesebilir; StartStoreGen da 0'dir
-      ve yalnizca gercekten degistiyse durur - konservatif, veri kaybi yok. }
-    if FSerializable and
-       ((FCommitGen <> s.StartGen) or
-        (FEng.Store.ReadGen <> s.StartStoreGen)) then
-      raise EVDbException.Create(ecSerializationFailure,
-        'seri hale getirme hatasi (40001): islem basladiktan sonra baska ' +
-        'bir islem commit etti; islem yeniden denenmeli');
+    { F-45 (SKILL6 01): SERIALIZABLE. Yalniz BU yazma kumesi SERIALIZABLE
+      sectiyse denetlenir; ayni backend'i paylasan baska baglantinin
+      izolasyon ayari bu karari ETKILEMEZ. Bu islem basladigindan beri
+      BASKA bir islem commit ettiyse (ayni surecte FCommitGen, baska surecte
+      canli `.gen` sayaci degisti) commit REDDEDILIR: 40001, islem yeniden
+      denenmeli. REPEATABLE READ'de bu denetim YOKTUR (bugunku davranis
+      aynen kalir). Kontrol VerifyNoConflict'TAN SONRA ve ApplyBatch'TEN
+      ONCE: hicbir satir uygulanmamis olur (yarim commit yok).
+      Nesil BASLANGICTA okunamadiysa (StartStoreGenOk=False) veya commit
+      aninda okunamiyorsa "degismedi" VARSAYILMAZ: konservatif olarak
+      reddedilir; boylece dogrulanamayan bir nesil sessizce gecmez. }
+    if s.Serializable then
+    begin
+      serGenOk := FEng.Store.TryReadGen(serGenNow);
+      if (not s.StartStoreGenOk) or (not serGenOk) or
+         (FCommitGen <> s.StartGen) or (serGenNow <> s.StartStoreGen) then
+        raise EVDbException.Create(ecSerializationFailure,
+          'seri hale getirme hatasi (40001): islem basladiktan sonra baska ' +
+          'bir islem commit etti; islem yeniden denenmeli');
+    end;
     { v3.6: yabanci anahtar defteri. ONEMLI: ApplyBatch yazma kumesini
       TEMIZLER (Map/Order), bu yuzden kayit ONDAN ONCE alinir. Biz commit
       ederken BASKA bir kume hala aciksa, o kume hizli yolda yazmis olabilir
@@ -4936,14 +4981,21 @@ begin
     ve motoru gorur; ilerletilecek gorunurluk penceresi yok. }
 end;
 
-function TVdbBackendV3.GetSerializable: Boolean;
+procedure TVdbBackendV3.SetTxIsolation(ASerializable: Boolean);
+var
+  sid: Cardinal;
 begin
-  Result := FSerializable;
-end;
-
-procedure TVdbBackendV3.SetSerializable(AValue: Boolean);
-begin
-  FSerializable := AValue;
+  { F-45 (SKILL6 01): bayrak YALNIZ bu oturum icin saklanir; BEGIN'de
+    ilgili yazma kumesine kopyalanip silinir. Paylasilan tek bir alan
+    olmadigi icin ayni backend'i kullanan diger baglantilar etkilenmez.
+    Kilitli bolge cok kisa: sozluk erisimi disinda is yoktur. }
+  sid := VdbBackendSessionId;
+  FEngCs.Enter;
+  try
+    FPendingSerializable.AddOrSetValue(sid, ASerializable);
+  finally
+    FEngCs.Leave;
+  end;
 end;
 
 function TVdbBackendV3.GetFilePath: string;

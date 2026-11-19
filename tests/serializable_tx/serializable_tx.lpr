@@ -110,6 +110,8 @@ var
   A, B: IVdbBackend;
   TbA, TbB: TVTableDb;
   SqA, SqB: TVSql;
+  { F-45: ayni TVTableDb/backend'i paylasan ek oturumlar (PG wire deseni). }
+  SqC, SqD, SqE: TVSql;
   o, o2: TOutcome;
   n: Integer;
 begin
@@ -191,6 +193,54 @@ begin
   o2 := TryExec(SqB, 'COMMIT');
   Chk('S15 REPEATABLE READ''a donunce araya girme yine kabul',
     o.Ok and o2.Ok, 'a=' + o.Msg + ' b=' + o2.Msg);
+
+  { --- e) PAYLASILAN backend (PG wire'da her baglanti ayni TVTableDb'yi
+    kullanir): bir baglanticinin SERIALIZABLE secimi DIGERINI iptal
+    ETMEMELIDIR. Eski tek alanli tasarimda A yanlislikla 40001 aliyordu. }
+  SqC := TVSql.Create(TbA);
+  SqD := TVSql.Create(TbA);
+  SqE := TVSql.Create(TbA);
+
+  SqC.Exec('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+  SqC.Exec('BEGIN');
+  SqC.Exec('INSERT INTO s (id, v) VALUES (30, ''c'')');
+  { E araya girer ve commit eder -> A'nin islemi sirasinda bir commit olur. }
+  SqE.Exec('BEGIN');
+  SqE.Exec('INSERT INTO s (id, v) VALUES (31, ''e'')');
+  { D ayni backend'de SERIALIZABLE secer (eski kodda paylasilan alani
+    kirletiyordu); hicbir islem baslatmaz. SIRA ONEMLI: bu secim E'nin
+    BEGIN'inden SONRA gelir; eski kodda A'nin COMMIT'i bu yuzden 40001
+    aliyordu. }
+  SqD.Exec('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+  o := TryExec(SqE, 'COMMIT');
+  Chk('S16 paylasilan backend: araya giren commit tamam', o.Ok, o.Msg);
+  o := TryExec(SqC, 'COMMIT');
+  Chk('S17 B''nin SERIALIZABLE secimi A''yi (READ COMMITTED) IPTAL ETMEZ',
+    o.Ok, o.Msg);
+  if not o.Ok then SqC.Exec('ROLLBACK');
+  n := CountQ(SqC, 'SELECT COUNT(*) FROM s WHERE id = 30');
+  Chk('S18 A''nin satiri yazildi (paylasilan alan sizmasi yok)', n = 1,
+    'id=30 sayisi=' + IntToStr(n));
+
+  { --- f) ayni paylasilan backend'de SERIALIZABLE oturum YINE denetlenir:
+    bayrak islem bazli oldugu icin koruma kaybolmadi. }
+  SqD.Exec('BEGIN');
+  SqD.Exec('INSERT INTO s (id, v) VALUES (32, ''d'')');
+  SqE.Exec('BEGIN');
+  SqE.Exec('INSERT INTO s (id, v) VALUES (33, ''e'')');
+  o := TryExec(SqE, 'COMMIT');
+  o2 := TryExec(SqD, 'COMMIT');
+  Chk('S19 paylasilan backend''de SERIALIZABLE yine REDDEDILIR',
+    o.Ok and (not o2.Ok) and (o2.Code = ecSerializationFailure),
+    'e=' + o.Msg + ' d=' + VDbErrorName(o2.Code) + ' ' + o2.Msg);
+  SqD.Exec('ROLLBACK');
+  n := CountQ(SqD, 'SELECT COUNT(*) FROM s WHERE id = 32');
+  Chk('S20 iptal edilen serializable islem satir yazmadi', n = 0,
+    'id=32 sayisi=' + IntToStr(n));
+
+  FreeAndNil(SqE);
+  FreeAndNil(SqD);
+  FreeAndNil(SqC);
 
   FreeAndNil(SqB);
   FreeAndNil(TbB);

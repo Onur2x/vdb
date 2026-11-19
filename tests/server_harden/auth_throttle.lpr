@@ -55,6 +55,9 @@ function NewServer(const AName: string): TVdbPgServer;
 begin
   Result := TVdbPgServer.Create(FreshDir(AName), 54000);
   Result.AddUser('kilit', 'parola123');
+  { F-46: bu kapi yalniz kimlik dogrulama cezasini olcer; rol eslemesi
+    ayrica test edilmez, eski (kisitlanmamis) yol kullanilir. }
+  Result.AllowUnmappedUsers := True;
 end;
 
 procedure TestDefaults;

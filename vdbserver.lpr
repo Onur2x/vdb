@@ -17,6 +17,10 @@ program vdbserver;
                               Varsayilan 0.0.0.0. --trust ile yalniz
                               loopback kabul edilir; disa acik adres
                               reddedilir.
+    --allow-unmapped-users    (F-46) Rolu eslenmemis SCRAM kullanicisina
+                              izin ver. Varsayilan olarak boyle bir
+                              kullanici reddedilir; acmak bilincli bir
+                              yetki feragatidir.
     --metrics PORT            (P-182) Prometheus /metrics ucu; ayri port.
                               --trust modunda o da yalniz loopback'e
                               baglanir.
@@ -36,13 +40,13 @@ uses
 
 procedure Kullanim;
 begin
-  WriteLn('kullanim: vdbserver <dizin> <port> [--user K:P] [--tls CERT KEY]');
+  WriteLn('kullanim: vdbserver <dizin> <port> [--user K:P[:ROL]] [--tls CERT KEY]');
   WriteLn('                    [--require-tls] [--trust] [--host ADRES]');
-  WriteLn('                    [--metrics PORT]');
+  WriteLn('                    [--allow-unmapped-users] [--metrics PORT]');
 end;
 
 var
-  dir, err, line, u, p: string;
+  dir, err, line, u, p, rol: string;
   port, v, mport: Integer;
   srv: TVdbPgServer;
   msrv: TVdbMetricsHttpServer;
@@ -93,6 +97,16 @@ begin
         end;
         u := Copy(p, 1, cpos - 1);
         p := Copy(p, cpos + 1, MaxInt);
+        { F-46 (SKILL6 02): istege bagli ucuncu alan SQL roludur:
+          KULLANICI:PAROLA:ROL. Rol verilmezse kullanici hicbir role
+          baglanmaz ve --allow-unmapped-users yoksa baglanti reddedilir. }
+        rol := '';
+        cpos := Pos(':', p);
+        if cpos > 0 then
+        begin
+          rol := Copy(p, cpos + 1, MaxInt);
+          p := Copy(p, 1, cpos - 1);
+        end;
         { P-185: bos parola reddedilir — 'alice:' kaydi trust ile neredeyse
           ayni kapiyi acar; SCRAM'in hic bir kazanimi kalmaz. }
         if p = '' then
@@ -100,9 +114,11 @@ begin
           WriteLn('--user: parola bos olamaz: ', u);
           Halt(2);
         end;
-        srv.AddUser(u, p);
+        srv.AddUser(u, p, 15000, rol);
         kullaniciVar := True;
       end
+      else if line = '--allow-unmapped-users' then
+        srv.AllowUnmappedUsers := True
       else if line = '--tls' then
       begin
         if i + 2 > ParamCount then

@@ -499,6 +499,81 @@ begin
   CloseAll;
 end;
 
+{ F-46 (SKILL6 02): kimligi dogrulanan principal SQL rolune baglanir.
+  ONCEDEN kimlik dogrulama yalnizca "kim" sorusunu yanitliyordu; dogrulanan
+  her kullanici SINIRSIZ yetkiye (motor yoneticisi) sahipti ve SET ROLE NONE
+  bos rolu geri getirerek yetki YUKSELTMESI yapiyordu. }
+procedure CasePrincipalBinding;
+var
+  Sq2, Sq3: TVSql;
+  ok: Boolean;
+  id1, id2: Cardinal;
+begin
+  OpenFresh('prin');
+  Sq.Exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+  Sq.Exec('INSERT INTO t (id, v) VALUES (1, ''a'')');
+  Sq.Exec('CREATE ROLE app');
+  Sq.Exec('CREATE ROLE other');
+  Sq.Exec('CREATE ROLE su SUPERUSER');
+  Sq.Exec('GRANT SELECT ON TABLE t TO app');
+  { Oturum kimlikleri benzersiz ve sifir degil (eskiden isaretci 32 bite
+    kirpiliyordu). }
+  id1 := Sq.SessionId;
+  Sq3 := TVSql.Create(Tb);
+  try
+    id2 := Sq3.SessionId;
+  finally
+    Sq3.Free;
+  end;
+  Chk('AU12 oturum kimligi sifir degil', id1 <> 0, IntToStr(id1));
+  Chk('AU12 oturum kimlikleri benzersiz', id1 <> id2,
+    IntToStr(id1) + ' / ' + IntToStr(id2));
+  { Rolu eslenmemis principal: FAIL-CLOSED, motor yoneticisi degil. }
+  Sq.BindSessionPrincipal('alice', '');
+  ok := TryExec(Sq, 'SELECT COUNT(*) FROM t', err);
+  Chk('AU12 rolsuz principal SELECT edemiyor',
+    (not ok) and (Pos('yetkisiz', err) > 0), err);
+  ok := TryExec(Sq, 'INSERT INTO t (id, v) VALUES (2, ''b'')', err);
+  Chk('AU12 rolsuz principal INSERT edemiyor',
+    (not ok) and (Pos('yetkisiz', err) > 0), err);
+  { app rolune bagli principal: yalniz SELECT. }
+  Sq.BindSessionPrincipal('alice', 'app');
+  Chk('AU12 principal app roluyle SELECT edebiliyor',
+    IntQ(Sq, 'SELECT COUNT(*) FROM t') = 1);
+  ok := TryExec(Sq, 'INSERT INTO t (id, v) VALUES (2, ''b'')', err);
+  Chk('AU12 principal app roluyle INSERT edemiyor',
+    (not ok) and (Pos('yetkisiz', err) > 0), err);
+  { SET ROLE NONE artik SINIRSIZLIGA donmez; taban role doner. }
+  ok := TryExec(Sq, 'SET ROLE NONE', err);
+  Chk('AU12 principal SET ROLE NONE kabul', ok, err);
+  ok := TryExec(Sq, 'INSERT INTO t (id, v) VALUES (3, ''c'')', err);
+  Chk('AU12 NONE sonrasi hala app taban rolu (yetki yukselmesi yok)',
+    (not ok) and (Pos('yetkisiz', err) > 0), err);
+  { Uye olmadigi role gecis reddedilir. }
+  ok := TryExec(Sq, 'SET ROLE other', err);
+  Chk('AU12 uyesi olmadigi role gecis reddedilir',
+    (not ok) and (Pos('uyeligine sahip degil', err) > 0), err);
+  { Super taban rolde baska role gecis serbest. }
+  Sq.BindSessionPrincipal('bob', 'su');
+  ok := TryExec(Sq, 'SET ROLE app', err);
+  Chk('AU12 super taban rolden baska role gecilebiliyor', ok, err);
+  { Oturum kapaninca principal/rol durumu SILINIR; yeni oturum miras almaz. }
+  Sq2 := TVSql.Create(Tb);
+  try
+    Sq2.BindSessionPrincipal('carol', '');
+  finally
+    Sq2.Free;
+  end;
+  Sq3 := TVSql.Create(Tb);
+  try
+    ok := TryExec(Sq3, 'INSERT INTO t (id, v) VALUES (4, ''d'')', err);
+    Chk('AU12 yeni oturum eski principal rolunu miras almiyor', ok, err);
+  finally
+    Sq3.Free;
+  end;
+  CloseAll;
+end;
+
 begin
   GPass := 0;
   GFail := 0;
@@ -546,6 +621,10 @@ begin
   try CaseDropRoleClearsSessionRole except
     on E: Exception do begin Inc(GFail);
       WriteLn('FAIL AU11 beklenmeyen hata: ', E.ClassName, ': ', E.Message); end;
+  end;
+  try CasePrincipalBinding except
+    on E: Exception do begin Inc(GFail);
+      WriteLn('FAIL AU12 beklenmeyen hata: ', E.ClassName, ': ', E.Message); end;
   end;
   WriteLn;
   WriteLn('SONUC: ', GPass, ' PASS, ', GFail, ' FAIL');

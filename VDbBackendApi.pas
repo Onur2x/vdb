@@ -232,14 +232,14 @@ type
     { READ COMMITTED icin gorunurluk penceresini ilerletir. v3'te
       snapshot/MVCC yok: no-op. }
     procedure RefreshBatchSnapshot;
-    { F-42: SERIALIZABLE dogrulamasi acik mi? Executor `SET TRANSACTION
-      ISOLATION LEVEL SERIALIZABLE` gordugunde True yapar. v3: commit
-      aninda arada baska islem commit ettiyse ecSerializationFailure
-      (40001) verir. v2: deger saklanir, yorumlanmaz (v2 davranisi
-      degismez). Varsayilan False. }
-    function GetSerializable: Boolean;
-    procedure SetSerializable(AValue: Boolean);
-    property Serializable: Boolean read GetSerializable write SetSerializable;
+    { F-45 (SKILL6 01): SERIALIZABLE artik ISLEM bazlidir, backend genelinde
+      paylasilan bir alan DEGILDIR. Cagiran, BEGIN'den hemen once bu metodu
+      cagirir; backend bayragi O OTURUM icin saklar, `BeginBatch` yeni yazma
+      kumesine kopyalar ve siler. `CommitBatch` YALNIZ kendi kumesindeki
+      degeri okur. Boylece ayni backend'i paylasan iki baglanti (PG wire'da
+      her baglanti ayni TVTableDb'yi kullanir) birbirinin izolasyon kararini
+      ETKILEYEMEZ. v2: yok sayilir (v2 davranisi degismez). }
+    procedure SetTxIsolation(ASerializable: Boolean);
     { Veri dosyasinin tam yolu (goreli yollarin cozumu icin). }
     function GetFilePath: string;
     property FilePath: string read GetFilePath;

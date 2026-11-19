@@ -12791,13 +12791,12 @@ procedure TVSqlExecutor.ExecSetIsolation(Stmt: TSqlSetIsolationStmt;
   out Res: TSqlResult);
 // F-40: oturum yalitim seviyesi. READ COMMITTED her cumle basinda
 // gorunurluk penceresini ilerletir; digerleri batch-basi snapshot kullanir.
-// F-42: SERIALIZABLE'da arada baska islem commit ettiyse commit aninda
-// 40001 (ecSerializationFailure) verilir. Bayrak backend'e burada ve
-// txBegin'de tasinir.
+// F-45 (SKILL6 01): SERIALIZABLE artik ISLEM bazlidir. Bayrak burada
+// backend'e YAZILMAZ (paylasilan alan diger baglantilari bozuyordu);
+// yalniz FIsolation saklanir ve BEGIN aninda o islemin yazma kumesine
+// tasinir. Acik islem varsa SET TRANSACTION etkisizdir (SQL gibi).
 begin
   FIsolation := Stmt.Level;
-  if FT.Backend <> nil then
-    FT.Backend.Serializable := (Stmt.Level = ilSerializable);
   SetLength(Res.Fields, 1);
   Res.Fields[0] := 'isolation';
   SetLength(Res.Rows, 1);
@@ -21585,10 +21584,12 @@ begin
     // geri alinir. Dogrudan Kv.BeginBatch cagrilirsa sema yedegi alinmadigi
     // icin "ROLLBACK sonrasi tablo yok" testi basarisiz olur.
     txBegin:           begin
-                         { F-42: SERIALIZABLE bayragi islem baslamadan once
-                           backend'e tasinir; commit aninda dogrulanir. }
+                         { F-45 (SKILL6 01): SERIALIZABLE bayragi ISLEM
+                           bazli olarak backend'e tasinir; backend onu YALNIZ
+                           bu oturumun yazma kumesine kopyalar ve commit
+                           aninda yalniz o kume dogrulanir. }
                          if FT.Backend <> nil then
-                           FT.Backend.Serializable := (FIsolation = ilSerializable);
+                           FT.Backend.SetTxIsolation(FIsolation = ilSerializable);
                          FT.BeginBatch;
                        end;
     txCommit:          begin FT.CommitBatch; FT.UnlockRows(FSessionId); end;

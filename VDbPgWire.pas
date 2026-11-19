@@ -70,6 +70,11 @@ type
     Iterations: Integer;
     StoredKey: TBytes;
     ServerKey: TBytes;
+    { F-46 (SKILL6 02): kimligi dogrulanan kullanici hangi SQL rolune
+      baglanir? Bos ise (ve AllowUnmappedUsers kapaliysa) baglanti
+      reddedilir; eskiden dogrulanan kullanici sinirsiz motor yoneticisi
+      sayiliyordu. }
+    SqlRole: string;
   end;
 
   { R-4: kullanici basina kimlik dogrulama cezasi. Sunucu belleğinde
@@ -172,6 +177,10 @@ type
       bir vekil arkasinda bilincli bir kurulum icindir; asla varsayilan
       olmamalidir. }
     FAllowInsecureRemote: Boolean;
+    { F-46 (SKILL6 02): kullanici listesi tanimliyken bile rolu
+      eslenmemis kullanicilarin baglanmasina izin verir. Varsayilan False
+      (reddet). True yalniz eski davranisi bilincli olarak korumak icindir. }
+    FAllowUnmappedUsers: Boolean;
     { R-4: kimlik dogrulama denemesi sinirlama (throttling/lockout).
       Basarisiz denemeler kullanici basina sayilir; esik asilinca kisa
       sureli kilit uygulanir. Ayarlar Start'tan once veya calisirken
@@ -225,8 +234,14 @@ type
       kimlik dogrulama ZORUNLU olur; hic kullanici yoksa davranis eskisi
       gibi trust'tir. Start'tan once cagrilmalidir. }
     procedure AddUser(const AUser, APassword: string;
-      AIterations: Integer = 15000);
+      AIterations: Integer = 15000; const ASqlRole: string = '');
     procedure ClearUsers;
+    { F-46 (SKILL6 02): kullanici -> SQL rolu eslemesi. ASqlRole bos ise
+      kullanici kimligi dogrulanir ama hicbir role baglanmaz; bu durumda
+      varsayilan olarak baglanti reddedilir (bkz. AllowUnmappedUsers). }
+    function UserRole(const AUser: string): string;
+    property AllowUnmappedUsers: Boolean read FAllowUnmappedUsers
+      write FAllowUnmappedUsers;
     { R-4: kimlik dogrulama denemesi sinirlama. Basarisiz denemeler
       kullanici basina sayilir; AuthMaxFailures esigi asilinca
       AuthLockoutSeconds boyunca o kullanici reddedilir. Tum kullanicilar
@@ -2098,6 +2113,7 @@ var
   p, np, nf, i2, nParams, nFmt, maxRows: Integer;
   declared, inferred, oid, fmt, plen, nResFmt: Integer;
   nm, q, kind: string;
+  role: string;
   pt: TPgPortal;
   st: TPgStmt;
   fmts: array of Integer;
@@ -2221,6 +2237,26 @@ begin
     Portals := TDictionary<string, TPgPortal>.Create;
     // P-180: kullanici tanimliysa SCRAM-SHA-256, degilse AuthOk (trust).
     if not DoScramAuth(user) then Exit;
+    { F-46 (SKILL6 02): kimligi dogrulanan kullanici bir SQL rolune
+      BAGLANIR. Eskiden dogrulama yalnizca "kim" sorusunu yanitliyordu;
+      yetki sinirsizdi (uzak kullanici = motor yoneticisi). Rolu
+      eslenmemis kullanici, AllowUnmappedUsers acikca acilmadikca
+      reddedilir (fail-closed). }
+    if FServer.AuthRequired then
+    begin
+      role := FServer.UserRole(user);
+      if (role = '') and (not FServer.AllowUnmappedUsers) then
+      begin
+        SendPg(FIO, ErrorMsg(
+          'kullanici bir SQL rolune eslenmemis (sunucu sahibi AddUser ile rol vermeli)', '28000'));
+        Exit;
+      end;
+      { Rolu eslenmemis kullaniciya acikca izin verildiyse eski davranis
+        korunur: kimlik dogrulanir ama SQL tarafinda ayrica kisitlanmaz.
+        Bu, bilincli bir yetki feragatidir (varsayilan degil). }
+      if role <> '' then
+        FSql.BindSessionPrincipal(user, role);
+    end;
     if not SendPg(FIO, ParamMsg('server_version', '14.0 (VDB)')) then Exit;
     if not SendPg(FIO, ParamMsg('client_encoding', 'UTF8')) then Exit;
     if not SendPg(FIO, ParamMsg('DateStyle', 'ISO')) then Exit;
@@ -2726,6 +2762,9 @@ begin
     dogrulama + zorunlu TLS sarttir. }
   FBindHost := '127.0.0.1';
   FAllowInsecureRemote := False;
+  { F-46 (SKILL6 02): rolu eslenmemis kullanici varsayilan olarak
+    REDDEDILIR; eskiden dogrulanan her kullanici sinirsiz yetkiye sahipti. }
+  FAllowUnmappedUsers := False;
 end;
 
 procedure TVdbPgServer.SetMaxConns(AValue: Integer);
@@ -2794,7 +2833,7 @@ begin
 end;
 
 procedure TVdbPgServer.AddUser(const AUser, APassword: string;
-  AIterations: Integer);
+  AIterations: Integer; const ASqlRole: string);
 var
   u: TVdbPgScramUser;
   sp, ck: TBytes;
@@ -2815,11 +2854,27 @@ begin
   ck := VDbCryptHmacSha256(sp, PgBytes('Client Key'));
   u.StoredKey := VDbCryptSha256(ck);
   u.ServerKey := VDbCryptHmacSha256(sp, PgBytes('Server Key'));
+  { F-46 (SKILL6 02): kullanici -> SQL rolu baglantisi. Bos rol, "hicbir
+    rol" demektir ve varsayilan olarak baglanti reddedilir. }
+  u.SqlRole := ASqlRole;
   if Length(sp) > 0 then FillChar(sp[0], Length(sp), 0);
   if Length(ck) > 0 then FillChar(ck[0], Length(ck), 0);
   FAuthLock.Enter;
   try
     FAuth.AddOrSetValue(AUser, u);
+  finally
+    FAuthLock.Leave;
+  end;
+end;
+
+function TVdbPgServer.UserRole(const AUser: string): string;
+var
+  u: TVdbPgScramUser;
+begin
+  Result := '';
+  FAuthLock.Enter;
+  try
+    if FAuth.TryGetValue(AUser, u) then Result := u.SqlRole;
   finally
     FAuthLock.Leave;
   end;

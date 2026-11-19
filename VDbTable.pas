@@ -535,6 +535,15 @@ type
       cagrisi TUM istemcilerin etkin rolunu degistiriyordu (yetki sizmasi).
       Anahtar: VDbGetTxnSession oturum kimligi (0 = oturum yok -> varsayilan). }
     FRoleBySession: TDictionary<Cardinal, string>;
+    { F-46 (SKILL6 02): KIMLIGI DOGRULANMIS PRINCIPAL. Kimlik dogrulama
+      (SCRAM) yalnizca "kim" sorusunu yanitliyordu; SQL yetkilendirmesi ise
+      tamamen ayri bir katmandi ve principal ile hic baglanmiyordu. Sonuc:
+      uzaktan kimligi dogrulanmis bir kullanici, hicbir GRANT olmadan motor
+      yoneticisi (FCurrentRole = '') olarak TUM islemleri yapabiliyordu.
+      Artik OTURUM BASINA principal ve onun eslendigi TABAN ROL tutulur.
+      Taban rol, `SET ROLE NONE` ile geri donulen roldur. }
+    FUserBySession: TDictionary<Cardinal, string>;   // sid -> principal
+    FBaseRoleBySession: TDictionary<Cardinal, string>; // sid -> taban rol
     // ---- R-19: ROW LEVEL SECURITY katalogu ----
     FRlsOn: TDictionary<string, Boolean>;    // tablo -> RLS acik mi
     FPolicies: TList<TPolicyDef>;            // politikalar
@@ -627,6 +636,18 @@ type
       yetki kararlari bu fonksiyondan gecmelidir. }
     function EffectiveRole: string;
     property CurrentRole: string read EffectiveRole write FCurrentRole;
+    { F-46 (SKILL6 02): kimligi dogrulanmis principal ile SQL rolunu
+      baglar. Sunucu (PG wire / SQL server) basarili kimlik dogrulamasindan
+      SONRA cagirir. ASqlRole bos ise oturumun rolu yoktur; bu durumda
+      yetki kararlari FAIL-CLOSED olur (motor yoneticisi degildir). }
+    procedure BindSessionPrincipal(ASessionId: Cardinal;
+      const AUser, ASqlRole: string);
+    { F-46: oturum kapanirken principal/rol kayitlarini SILER. Aksi halde
+      ayni oturum kimligi yeniden kullanildiginda yeni bir baglanti eski
+      rolu miras alirdi. `TVSql.Destroy` cagirir. }
+    procedure ReleaseSessionState(ASessionId: Cardinal);
+    function SessionUser(ASessionId: Cardinal): string;
+    function SessionBaseRole(ASessionId: Cardinal): string;
     function RoleCount: Integer;
     function GrantCount: Integer;
     // Ic denetim: rol verilen tablo uzerinde izne sahip mi?
@@ -5632,6 +5653,9 @@ begin
   FGrants := TList<TGrantDef>.Create;
   FCurrentRole := '';
   FRoleBySession := TDictionary<Cardinal, string>.Create;   // v3.58
+  // F-46 (SKILL6 02): principal -> SQL rol eslemesi, oturum basina.
+  FUserBySession := TDictionary<Cardinal, string>.Create;
+  FBaseRoleBySession := TDictionary<Cardinal, string>.Create;
   FRlsOn := TDictionary<string, Boolean>.Create;   // R-19
   FPolicies := TList<TPolicyDef>.Create;
   FIdxOps := TDictionary<Int64, TList<TIdxOp>>.Create;
@@ -5681,6 +5705,8 @@ begin
   FRoles.Free;          // R-18
   FGrants.Free;
   FRoleBySession.Free;  // v3.58
+  FUserBySession.Free;          // F-46
+  FBaseRoleBySession.Free;      // F-46
   FRlsOn.Free;          // R-19
   FPolicies.Free;
   FTables.Free;
@@ -7562,20 +7588,97 @@ begin
   Result := FCurrentRole;
 end;
 
+procedure TVTableDb.BindSessionPrincipal(ASessionId: Cardinal;
+  const AUser, ASqlRole: string);
+begin
+  { F-46 (SKILL6 02): kimligi dogrulanmis principal'i oturuma baglar.
+    Taban rol bos olabilir; o durumda oturum HICBIR sey yapamaz
+    (fail-closed), motor yoneticisi sayilmaz. }
+  if ASessionId = 0 then Exit;
+  FUserBySession.AddOrSetValue(ASessionId, AUser);
+  if ASqlRole = '' then
+  begin
+    FBaseRoleBySession.Remove(ASessionId);
+    FRoleBySession.Remove(ASessionId);
+  end
+  else
+  begin
+    FBaseRoleBySession.AddOrSetValue(ASessionId, VDbNorm(ASqlRole));
+    FRoleBySession.AddOrSetValue(ASessionId, VDbNorm(ASqlRole));
+  end;
+end;
+
+procedure TVTableDb.ReleaseSessionState(ASessionId: Cardinal);
+begin
+  { F-46: oturum kapaninca TUM kimlik/rol durumu silinir. ONCEDEN
+    FRoleBySession girdisi birakiliyordu; ayni kimlik yeniden kullanilirsa
+    yeni baglanti eski rolu MIRAS ALIRDI. }
+  if ASessionId = 0 then Exit;
+  FUserBySession.Remove(ASessionId);
+  FBaseRoleBySession.Remove(ASessionId);
+  FRoleBySession.Remove(ASessionId);
+end;
+
+function TVTableDb.SessionUser(ASessionId: Cardinal): string;
+begin
+  Result := '';
+  if ASessionId = 0 then Exit;
+  FUserBySession.TryGetValue(ASessionId, Result);
+end;
+
+function TVTableDb.SessionBaseRole(ASessionId: Cardinal): string;
+begin
+  Result := '';
+  if ASessionId = 0 then Exit;
+  FBaseRoleBySession.TryGetValue(ASessionId, Result);
+end;
+
 procedure TVTableDb.SetCurrentRole(const AName: string);
 var
   sid: Cardinal;
+  base, nm: string;
+  rd: TRoleDef;
 begin
   { v3.58: OTURUM BAZLI ROL. `TVTableDb` tum baglantilarca paylasilir; rol
     artik oturum kimligiyle saklanir, boylece bir istemcinin `SET ROLE`
     cagrisi digerlerini ETKILEMEZ.
-    KAPSAM NOTU: rol degistirme YETKISI burada DENETLENMEZ. Elimizde kimligi
-    dogrulanmis bir principal -> SQL rol eslemesi yok (SKILL5 3.2 hala
-    ACIK). Principal olmadan kisitli bir rolu "geri donulemez" yapmak
-    guvenlik kazandirmaz, yalnizca kullanilabilirligi bozardi (olculdu:
-    mevcut sql_authorization AU1-AU7 temizlik adimlari `SET ROLE NONE`
-    kullaniyor ve PostgreSQL'de de bu oturum kullanici rolune donustur). }
+    F-46 (SKILL6 02): iki davranis degisikligi.
+    (1) `SET ROLE NONE` artik BOS role degil, oturumun TABAN rolune doner
+        (PostgreSQL'de oturum kullanicisinin rolu). ONCEDEN NONE = '' idi ve
+        '' "sinirsiz" anlamina geldigi icin `SET ROLE NONE` bir YETKI
+        YUKSELTMESI oluyordu.
+    (2) Kimligi dogrulanmis bir principal varsa rol degistirme SERBEST
+        DEGILDIR: yalnizca taban role veya (taban rol super ise) var olan bir
+        role gecilebilir. Uyelik (GRANT role TO role) modeli henuz yok;
+        super olmayan principal yalnizca kendi roluyle calisir. }
   sid := VDbGetTxnSession;
+  if (sid <> 0) and FUserBySession.ContainsKey(sid) then
+  begin
+    base := SessionBaseRole(sid);
+    if (AName = '') or SameText(AName, 'NONE') then
+    begin
+      if base = '' then FRoleBySession.Remove(sid)
+      else FRoleBySession.AddOrSetValue(sid, base);
+      Exit;
+    end;
+    nm := VDbNorm(AName);
+    if not RoleExists(nm) then
+      raise EVDbException.Create(ecNotFound, 'rol yok: ' + nm);
+    if SameText(nm, base) then
+    begin
+      FRoleBySession.AddOrSetValue(sid, nm);
+      Exit;
+    end;
+    if (base <> '') and FRoles.TryGetValue(base, rd) and rd.Super then
+    begin
+      FRoleBySession.AddOrSetValue(sid, nm);
+      Exit;
+    end;
+    raise EVDbException.CreateFmt(ecPermissionDenied,
+      'yetkisiz: "%s" kullanicisi "%s" rolu uyeligine sahip degil',
+      [SessionUser(sid), nm]);
+  end;
+  // Gomulu (principal yok) kullanim: eski davranis korunur.
   if (AName = '') or (SameText(AName, 'NONE')) then
   begin
     if sid <> 0 then FRoleBySession.Remove(sid) else FCurrentRole := '';
@@ -7594,10 +7697,19 @@ var
   g: TRoleDef;
   i: Integer;
   t, cur: string;
+  sidCan: Cardinal;
 begin
   cur := EffectiveRole;
-  // Rol belirtilmemisse motor kullanici modundayiz: her sey serbest.
-  if cur = '' then Exit(True);
+  { F-46 (SKILL6 02): BOS ROL YALNIZCA GOMULU KULLANIMDA SINIRSIZDIR.
+    Bir principal bagliysa (kimligi dogrulanmis uzak kullanici) bos rol =
+    HICBIR yetki. ONCEDEN burada kosulsuz `Exit(True)` vardi: SCRAM ile
+    dogrulanan her istemci, hicbir GRANT olmadan motor yoneticisi oluyordu. }
+  if cur = '' then
+  begin
+    sidCan := VDbGetTxnSession;
+    if (sidCan <> 0) and FUserBySession.ContainsKey(sidCan) then Exit(False);
+    Exit(True);
+  end;
   { v3.58: BILINMEYEN ROL ARTIK REDDEDILIR. ONCEDEN `Exit(True)` idi: semada
     olmayan bir rol adi (yazim hatasi, silinmis rol) TUM yetkileri aciyordu. }
   if not FRoles.TryGetValue(cur, g) then Exit(False);
@@ -7687,11 +7799,21 @@ function TVTableDb.RlsApplies(const ATable: string): Boolean;
 var
   r: TRoleDef;
   cur: string;
+  sidRls: Cardinal;
 begin
   Result := RlsEnabled(ATable);
   if not Result then Exit;
   cur := EffectiveRole;   // v3.58: oturum bazli rol
-  if cur = '' then Exit(False);
+  { F-46 (SKILL6 02): bos rol YALNIZCA gomulu kullanimda RLS'i atlar.
+    Kimligi dogrulanmis bir principal'in rolu yoksa RLS uygulanir
+    (fail-closed): onceden burada kosulsuz `Exit(False)` vardi ve uzak
+    kullanici politikasiz tam tabloyu gorebiliyordu. }
+  if cur = '' then
+  begin
+    sidRls := VDbGetTxnSession;
+    if (sidRls <> 0) and FUserBySession.ContainsKey(sidRls) then Exit;
+    Exit(False);
+  end;
   if not FRoles.TryGetValue(cur, r) then Exit(False);
   if r.Super then Exit(False);
 end;

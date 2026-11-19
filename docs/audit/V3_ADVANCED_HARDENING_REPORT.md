@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-18
-Surum: v3.65 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1 + H + I + J + K; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Surum: v3.67 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1 + H + I + J + K + L + M; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -79,12 +79,24 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   (`serializable_tx` S1-S15, P1-P8), PG mesajlarinda **eksik NUL
   sonlandiricisinin sessizce kabul edilmesi** (`pg_msg_nul` N0-N8) ve
   `MERGE`in **kaba kuvvet O(hedef x kaynak) eslesmesi** (`merge_hash` M1-M13).
+  Sprint L'de **SERIALIZABLE bayraginin backend genelinde tutulmasi** - bir
+  baglanti `SET TRANSACTION ... SERIALIZABLE` dediginde **baska** bir
+  baglantinin READ COMMITTED commit'i 40001 ile iptal ediliyordu
+  (`serializable_tx` S16-S20).
+  Sprint M'de **kimligi dogrulanmis kullanicinin SQL rolu ile eslesmemesi**
+  (dogrulanmis uzak kullanici motor yoneticisi gibi davraniyordu), **bos
+  rolu = sinirsiz yetki**, **`SET ROLE NONE` yetki yukselmesi**, **rol
+  uyeligi denetiminin olmamasi** ve **oturum kimligi/rol durumunun
+  sizmasi** (`sql_authorization` AU12).
   Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
 - Rol degistirme yetkisi ve SCRAM kullanicisi -> SQL rolu eslemesi (SKILL5
-  3.1'in yetki denetimi ve 3.2) **hala ACIK**: kimligi dogrulanmis principal
-  ile SQL rolu arasinda kalici bir esleme yok ve bu, dosya bicimini
-  degistirmeden yapilamaz. Bu sprint yalnizca sizinti ve fail-open kusurunu
-  kapatti; abartili bir "rol guvenligi tamam" iddiasi kurulmuyor.
+  3.1'in yetki denetimi ve 3.2) Sprint M'de **kapandi** (`sql_authorization`
+  AU12): kimligi dogrulanmis principal artik SQL rolune baglanir, bos rol
+  sinirsiz yetki **degildir** ve `SET ROLE NONE` taban role doner. Kalici
+  (veritabaninda saklanan) kullanici/rol katalogu **hala yoktur**; esleme
+  sunucu yapilandirmasindan (`AddUser(..., ASqlRole)` / `--user K:P:ROL`)
+  gelir, yani dosya bicimi degismeden cozulebildi ve rol uyeligi duzdur
+  (rol devralma/zincirleme yok). Bu sinirlar `F-45` paragrafinda yazili.
 - V2 **dondurulmus** ve degismedi; v4 konteyner bicimi durduruldu.
 
 ### A.4 Denetim sprintleri (ONERILER_VE_HIZLANDIRMA2)
@@ -106,7 +118,9 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | H | 5.1/5.2/9.3 ozel TCP SQL sunucusu: tum arayuzlerde bind, duz metin parola icin sinirsiz deneme, zaman asimi yok, kilitsiz baglanti sayimi | Tamam | `server_failure` 30/0 (16 -> 30; SF9-SF15 yeni) |
 | I | 7.1/7.2/7.3/7.4 dosya degistirme (VACUUM/Compact/Restore/Rekey) sirasinda surecler arasi bakim kilidi, yazar rezervasyonu, bayat dosya kimligi | Tamam | `maint_lock` 13/0 (yeni, ML1-ML5) |
 | J | 9.5 portal/prepared statement kaynak sinirlari, 10.1 Execute `maxRows` ve gercek portal imleci | Tamam | `pg_portal_stream` 22/0 (yeni, PP0-PP12) |
-| K | 6.x SERIALIZABLE hic dogrulanmiyor (write skew), 9.x PG mesajinda eksik NUL sessiz kabul, 10.x MERGE kaba kuvvet O(hedef x kaynak) | Tamam | `serializable_tx` 23/0, `pg_msg_nul` 10/0, `merge_hash` 19/0 (yeni) | |
+| K | 6.x SERIALIZABLE hic dogrulanmiyor (write skew), 9.x PG mesajinda eksik NUL sessiz kabul, 10.x MERGE kaba kuvvet O(hedef x kaynak) | Tamam | `serializable_tx` 23/0, `pg_msg_nul` 10/0, `merge_hash` 19/0 (yeni) |
+| L | SKILL6 01: SERIALIZABLE bayragi **backend genelinde** tutuluyordu (paylasilan `TVTableDb` yuzunden bir baglanti digerinin commit'ini 40001 ile iptal ediyordu); `.gen` okunamazsa "degismedi" varsayimi | Tamam | `serializable_tx` 28/0 (23 -> 28; S16-S20 yeni) |
+| M | SKILL6 02: SCRAM yalniz kimlik dogruluyordu, SQL rolu ile **eslesmiyordu** (dogrulanmis uzak kullanici = motor yoneticisi); bos rol = **sinirsiz yetki**; `SET ROLE NONE` yetki yukselmesiydi; rol uyeligi denetlenmiyordu; oturum kimligi isaretci kirpintisiydi ve rol durumu bir sonraki baglantiya miras kaliyordu | Tamam | `sql_authorization` 62/0 (51 -> 62; AU12 yeni) |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -606,10 +620,13 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   `windows-latest` calistirir; `fail-fast: false`. macOS/ARM64 icin job
   **yoktur** cunku hic kosulmadi; dogrulanmamis platformu matrise eklemek
   yesil gorunen ama kanit uretmeyen bir kapi olurdu (`CI.md` bolum 3).
-- Kanit (en guncel kosu, v3.65): Windows `gatesJ.log` (`KOSAN KAPI: 53`,
+- Kanit (en guncel kosu, v3.67): Windows `gatesJ.log` (`KOSAN KAPI: 53`,
   `SUITE_EXIT=0`), Linux `linJ.log` (`KOSAN KAPI: 54`, `SUITE_EXIT=0`).
-  Onceki kosu (v3.64/J) ayni `gatesJ.log` / `linJ.log` dosyalarina yazdi ve
-  bu kosu tarafindan uzerine yazildi (50 / 51); ondan once (v3.63/I)
+  Onceki kosu (v3.66/L) ayni `gatesJ.log` / `linJ.log` dosyalarina yazdi ve
+  bu kosu tarafindan uzerine yazildi (53 / 54 - kapi sayisi degismedi,
+  Sprint M mevcut `sql_authorization` kapisini buyuttu); ondan once (v3.65/K)
+  53 / 54; ondan once (v3.64/J)
+  50 / 51; ondan once (v3.63/I)
   49 / 50; ondan once (v3.62/H)
   48 / 49; ondan once `gatesI.log` (48) / `linI.log` (49) - D2; ondan once
   `gatesH.log` (48) / `linH.log` (49) - C2; ondan once
@@ -623,14 +640,18 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   `tests/pg_portal_stream` ekledi (22 kontrol); sayilar Windows 49 -> 50,
   Linux 50 -> 51. Sprint K **uc** yeni kapi dizini ekledi
   (`tests/serializable_tx` 23, `tests/pg_msg_nul` 10, `tests/merge_hash` 19);
-  sayilar Windows 50 -> 53, Linux 51 -> 54.
+  sayilar Windows 50 -> 53, Linux 51 -> 54. Sprint L (SKILL6 01) yeni kapi
+  dizini eklemedi; `tests/serializable_tx` kapisini 23 -> **28** kontrole
+  buyuttu (S16-S20), kapi sayisi 53 / 54 kaldi. Sprint M (SKILL6 02) da
+  yeni kapi dizini eklemedi; `tests/sql_authorization` kapisini 51 -> **62**
+  kontrole buyuttu (AU12), kapi sayisi yine 53 / 54 kaldi.
 - Windows `gatesJ` kosusunda `tls_client` **SKIP** oldu: ortamda
   `VDB_CRYPTO_DLL`/`VDB_SSL_DLL` yok. `tls_client` fikstur dizinini
   `VDB_TLS_FIXTURES` ile bulur; degisken verilmezse kapi exe'nin yanindan
   arar ve bulamaz (daha once ilk denemede FAIL, degisken verilince SKIP).
   Linux'ta fikstur otomatik bulundu ve kapi **kostu**: 6/6 PASS. Windows'ta
   `tls_client`'in kostugu kosu `gatesE.log`'dur (DLL'ler o ortamda vardi).
-  Iki ortam arasindaki bu fark kapi sayisini 48/49 yapar; SKIP PASS sayilmaz.
+  Iki ortam arasindaki bu fark kapi sayisini 53/54 yapar; SKIP PASS sayilmaz.
 - **NOT-RUN** satirlari "kosmuyor" degil "olculmedi" demektir; bu raporda
   PASS sayilmaz.
 
@@ -917,6 +938,80 @@ tablosundadir. Bu sprintte kapatilanlar:
   (130781 ms); M3-M13 semantik **koruyucu** kontrollerdir ve baseline'da da
   gecer - hizi olcmezler, eski davranisin bozulmadigini kanitlarlar. Kanit
   bu nedenle acikca "tek ayirt edici kontrol M2" diye yazilmistir.
+- **F-44 (Kritik, KAPALI, v3.66; kod etiketi F-45)**: `SERIALIZABLE`
+  secimi **backend genelinde tek bir alanda** (`FSerializable`) tutuluyordu.
+  PG sunucusu **tum baglantilari ayni `TVTableDb`'ye** baglar, yani bir
+  baglanti `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` dediginde bu
+  bayrak **butun oturumlar** icin aciliyordu. Iki yonlu sonuc olculdu:
+  (a) A oturumu READ COMMITTED bir islem acmis ve yazmisken B oturumunun
+  SERIALIZABLE secmesi, A'nin `COMMIT`'ini haksiz yere `40001` ile
+  iptal ediyor ve **A'nin satiri kayboluyordu** (S17/S18); (b) ters yonde
+  B'nin gercek SERIALIZABLE islemi A'nin commit'ini gormuyor, **hic
+  reddedilmiyordu** ve write skew'a acik kaliyordu (S19/S20). Ayrica `.gen`
+  okunamadiginda uretim `0` kabul edilip "arada commit yok" varsayimi
+  yapilabiliyordu (fail-open).
+  Duzeltme: bayrak artik **islem bazli**. `IVdbBackend.SetTxIsolation`
+  cagrisi `BEGIN`'den hemen once yapilir, backend bunu **oturum kimligine
+  gore** (`FPendingSerializable`, `VDbBackendSessionId` = TVSql'in kendi
+  kimligi) saklar; `BeginBatch` bayragi **yalniz o oturumun** yeni yazma
+  kumesine (`TWriteSet.Serializable`) kopyalar ve siler; `CommitBatch`
+  **yalniz kendi kumesine** bakar. `.gen` icin `VDbPageStore.TryReadGen`
+  eklendi: okunamazsa `(not ok)` **muhafazakar reddetme** uretir, "degismedi"
+  varsayimi degil. Reddedilen commit `ecSerializationFailure` (SQLSTATE
+  `40001`) verir ve **hicbir satir uygulanmaz**. V2 bayragi yok sayar
+  (`SetTxIsolation` bos govde), V2 davranisi degismedi.
+  Regresyon: `serializable_tx` **28/0** (S16-S20 yeni). Baseline
+  (`git archive HEAD` = `7b54faa`, **seam gerekmedi**): **24 PASS / 4 FAIL**,
+  ayirt edici dort kontrol tam olarak yukaridaki iki kusur: S17 (READ
+  COMMITTED commit'i haksiz 40001), S18 (satir kayboldu), S19 (gercek
+  SERIALIZABLE reddedilmiyor), S20 (iptal edilen islem satir yazdi).
+  **Durust sinir**: bu tam **SSI degil** - predicate/aralik kilitleri ve
+  okuma kumesi izleme yok; araya giren **herhangi** bir commit SERIALIZABLE
+  islemi iptal eder (muhafazakar, bedeli gereksiz yeniden denemedir, veri
+  kaybi degil). Bu nedenle SERIALIZABLE, PostgreSQL'in SSI'sinden **daha
+  fazla** iptal uretebilir; bunu "PostgreSQL ile ayni" diye sunmuyoruz.
+  Oturum duzeyi `SET SESSION CHARACTERISTICS` hala yok (yalniz `SET
+  TRANSACTION` ve BEGIN ani); **ACIK**.
+- **F-45 (Kritik, KAPALI, v3.67; kod etiketi F-46)**: kimlik dogrulama ile
+  yetkilendirme arasinda **bag yoktu**. (a) SCRAM (`TVdbPgServer.AddUser`)
+  yalnizca parolayi dogruluyor, kullaniciyi bir SQL rolune **eslemiyordu**:
+  dogrulanmis her uzak kullanici bos rolu uzerinden **motor yoneticisi**
+  gibi calisiyordu (SKILL6 02 / SKILL5 3.2). (b) `TVTableDb.RoleCan`
+  icinde `if cur = '' then Exit(True)` vardi, yani **bos rol = sinirsiz
+  yetki** (fail-open); ayni sekilde `RlsApplies` bos rolde satir duzeyi
+  guvenligi **tamamen atliyordu**. (c) `SET ROLE NONE` oturumu bos role
+  donduruyordu - yani **yetki yukselmesi** bir SQL cumlesiyle mumkundu.
+  (d) `SetCurrentRole` yalnizca rolu **var mi** diye bakiyor, uyeligi
+  denetlemiyordu; herhangi bir oturum herhangi bir role gecebiliyordu.
+  (e) `TVSql.Create` oturum kimligini `Cardinal(PtrUInt(Self))` ile
+  **32 bite kirpiyordu** (cakisma riski) ve `TVSql.Destroy` oturumun rol
+  kaydini **silmiyordu**: ayni kimligi alan yeni bir baglanti onceki
+  oturumun rolunu **miras alabiliyordu**.
+  Duzeltme: principal / taban rol / gecerli rol ayrimi eklendi
+  (`FUserBySession`, `FBaseRoleBySession`, `BindSessionPrincipal`,
+  `ReleaseSessionState`, `SessionUser`, `SessionBaseRole`). PG sunucusu
+  dogrulama sonrasi kullaniciyi `AddUser(..., ASqlRole)` ile verilen role
+  **baglar** (`--user K:P:ROL`); esleme yoksa baglanti **fail-closed**
+  reddedilir (SQLSTATE `28000`) ve yalnizca acik `AllowUnmappedUsers` /
+  `--allow-unmapped-users` bayragi eski davranisi geri verir. Principal
+  oturumlarinda bos rol artik **yetki vermez** (`RoleCan` False), RLS
+  **uygulanir**, `SET ROLE NONE` **taban role** doner ve uye olunmayan
+  role gecis `ecPermissionDenied` ile reddedilir (yalniz Super taban rol
+  serbesttir). Oturum kimligi `InterlockedIncrement` tabanli sayac oldu ve
+  `Destroy` tum oturum durumunu siler.
+  Regresyon: `sql_authorization` **62/0** (51 -> 62; AU12 yeni). On-kapi
+  (`git archive HEAD` = `7b54faa`, yalniz API **seam**'i: `BindSessionPrincipal`
+  / `SessionId` no-op olarak eklenir, davranis HEAD): **56 PASS / 6 FAIL**;
+  ayirt edici alti kontrol AU12: rolsuz principal SELECT/INSERT edebiliyor,
+  app rollu principal INSERT yetkisizligi **denetlenmiyor** (PK cakismasina
+  kadar geliyor), `SET ROLE NONE` sonrasi yetki yukselmesi, uye olunmayan
+  role gecis kabul.
+  **Durust sinir**: kullanici/rol **katalogu veritabaninda saklanmaz**;
+  esleme sunucu yapilandirmasindan gelir. Rol uyeligi **duzdur** (rol
+  devralma/zincirleme, `GRANT role TO role` yok); `SET ROLE` yalniz taban
+  rolu veya Super taban rolde herhangi bir rolu secer. `AllowUnmappedUsers`
+  bilincli bir **yetki feragatidir** ve varsayilan **kapalidir**. V2
+  degismedi.
 
 
 ---
@@ -928,7 +1023,7 @@ tablosundadir. Bu sprintte kapatilanlar:
 Gerekce:
 
 1. Kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici bir
-   regresyon kapisiyla kilitlendi; iki platformda **49/50** kapi yesil, FAIL 0.
+   regresyon kapisiyla kilitlendi; iki platformda **53/54** kapi yesil, FAIL 0.
 2. Tek dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari,
    bozuk ag girdisi, disk dolu, bellek tukenmesi, WAL sert tavani, B+Tree
    olcek/parcalanma, SQL 100k/1M olcegi, SQL indeks olcegi ve VACUUM geri

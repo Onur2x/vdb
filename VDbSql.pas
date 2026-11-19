@@ -213,6 +213,13 @@ type
     constructor Create(AT: TVTableDb);
     // F-21: yavas sorgu kayitlari burada serbest birakilir
     destructor Destroy; override;
+    { F-46 (SKILL6 02): sunucu, kimlik dogrulamasi BASARILI olduktan sonra
+      principal'i ve eslendigi SQL rolunu oturuma baglar. Rol bos ise oturum
+      yetkisizdir (fail-closed); motor yoneticisi SAYILMAZ. }
+    procedure BindSessionPrincipal(const AUser, ARole: string);
+    function SessionUser: string;
+    function SessionBaseRole: string;
+    property SessionId: Cardinal read FSessionId;
     function Exec(const Sql: string): TSqlResult; overload;
     // Parametreli SQL: '?' sirayla, `$1`/`$2` ... konumsal olarak
     // Params[i] ile doldurulur. Tirnak/escape derdi yok
@@ -276,14 +283,32 @@ implementation
 uses
   VDbCore, VDbJson, VDbPlatform, VDbMonitor, VDbTrace, VDbMigrate;   // VDbCore: CREATE/DROP DATABASE icin TVDb
 
+var
+  { F-46: oturum kimligi sayaci. Tek bir surecte monoton artar; 0'a donmez. }
+  GSessionSeq: LongInt = 0;
+
+function VDbNextSessionId: Cardinal;
+var n: LongInt;
+begin
+  n := InterlockedIncrement(GSessionSeq);
+  if n <= 0 then
+  begin
+    InterlockedExchange(GSessionSeq, 1);
+    n := 1;
+  end;
+  Result := Cardinal(n);
+end;
+
 constructor TVSql.Create(AT: TVTableDb);
 begin
   inherited Create;
   FT := AT;
-  // F-41: oturum kimligi. Ayni anda yasayan TVSql nesneleri icin nesne
-  // adresi yeterince benzersizdir; kilitler nesne yok edilirken birakilir.
-  FSessionId := Cardinal(PtrUInt(Self));
-  if FSessionId = 0 then FSessionId := 1;
+  { F-46 (SKILL6 02): oturum kimligi ARTIK GLOBAL SAYACTAN gelir.
+    ONCEDEN `Cardinal(PtrUInt(Self))` idi: 32-bit'e kirpilan bir isaretci
+    adresi hem cakisma riski tasiyor hem de oturum kimligini (satir kilitleri,
+    rol kayitlari) tahmin edilebilir bir degeri bagliyordu. Sayac tektir,
+    her TVSql icin farklidir ve 0'a donmez. }
+  FSessionId := VDbNextSessionId;
   // Boolean alanlar Pascal'da OTOMATIK sifirlanmaz. FSetDepth yanlislikla
   // True kalirsa UNION ayristirmasi tamamen atlanir ve sorgu
   // "anlasilamayan ek: SELECT" ile bozulur. AYNI sebEPLE FAutoTx de
@@ -315,6 +340,10 @@ begin
   // F-41: kapanan oturum kendi satir kilitlerini birakir. Acik batch'e
   // DOKUNULMAZ: batch TVDb basina globaldir ve baska bir TVSql'e ait olabilir.
   FT.UnlockRows(FSessionId);
+  { F-46 (SKILL6 02): oturumun KIMLIK/ROL durumu da silinir. ONCEDEN
+    `FRoleBySession` girdisi kaliyordu; ayni kimlik yeniden kullanilirsa yeni
+    baglanti eski rolu miras alirdi. `TVTableDb` tum baglantilarca paylasilir. }
+  FT.ReleaseSessionState(FSessionId);
   // H7: onbellekteki AST'ler sahiplenilir (tek temizleme noktasi).
   FreePlanCache;
   FPlanCache.Free;
@@ -327,6 +356,23 @@ begin
     FSlow[i].Free;
   FSlow.Free;   // F-21
   inherited;
+end;
+
+{ F-46 (SKILL6 02): principal -> SQL rol baglantisi --------------------- }
+
+procedure TVSql.BindSessionPrincipal(const AUser, ARole: string);
+begin
+  FT.BindSessionPrincipal(FSessionId, AUser, ARole);
+end;
+
+function TVSql.SessionUser: string;
+begin
+  Result := FT.SessionUser(FSessionId);
+end;
+
+function TVSql.SessionBaseRole: string;
+begin
+  Result := FT.SessionBaseRole(FSessionId);
 end;
 
 { ------------------------------------------------------------

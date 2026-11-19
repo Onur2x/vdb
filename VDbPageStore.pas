@@ -575,6 +575,10 @@ type
       baska bir backend/surecin commit'i ANINDA gorunur. Backend'ler arasi
       okuma damgasi icin public. }
     function ReadGen: QWord;
+    { F-45 (SKILL6 01): ReadGen ile ayni degeri okur, ancak "okunamadi"
+      durumunu AYIRT eder (True = guvenilir). SERIALIZABLE commit'inde
+      dogrulanamayan nesil konservatif olarak reddedilir. }
+    function TryReadGen(out AGen: QWord): Boolean;
     { P1-1: KAPSAMLI nesil oku/yaz. Scope < 0 ise GLOBAL sayac kullanilir
       (eski davranis). Tablo kimligi verildiginde yalniz o tabloya yapilan
       commit'ler sayaci ilerletir; ilgisiz tablo commit'i yanlis abort
@@ -1760,6 +1764,33 @@ begin
     tazelemeyi ZORLA — 0 hicbir zaman gecerli bir nesil degildir. }
   got := FGenStream.Read(Result, 8);
   if got <> 8 then Result := 0;
+end;
+
+{ F-45 (SKILL6 01): ReadGen "okunamadi" durumunu 0 ile ayni gosterir; 0 da
+  hicbir zaman gecerli bir nesil degildir. SERIALIZABLE commit icin bu ayrim
+  ONEMLIDIR: dogrulanamayan nesil "degismedi" sayilmamali. True = nesil
+  guvenilir okundu; False = sayac yok / kisa okuma (cagiran reddetmeli). }
+function TVDbPageStore.TryReadGen(out AGen: QWord): Boolean;
+var
+  got: Integer;
+begin
+  AGen := 0;
+  Result := False;
+  if FGenStream = nil then Exit;
+  if FGenMap <> nil then
+  begin
+    AGen := PQWord(FGenMap)^;
+    Result := True;
+    Exit;
+  end;
+  FGenStream.Position := 0;
+  got := FGenStream.Read(AGen, 8);
+  if got <> 8 then
+  begin
+    AGen := 0;
+    Exit;
+  end;
+  Result := True;
 end;
 
 procedure TVDbPageStore.BumpGen;
