@@ -14,6 +14,16 @@ procedure VDbFlushStream(S: THandleStream);
 //   True  = dizin girdisi kalici (veya Windows: islem gerekmiyor)
 //   False = dizin fsync yapilamadi -> rename/silme kalici OLMAYABILIR
 // cagiran taraf bunu loglayip karar vermelidir (bkz. VDbCore.ReplaceWith).
+// F-47 (SKILL6 06): test/kapi kancasi. Uretimde nil ve ForceFail False.
+// Kapi, dosya degistirme sirasinda dizin fsync'inin HANGI dizinler icin
+// cagrildigini sayar (Hook) ve basarisizlik yolunu olcmek icin fsync'i
+// zorla basarisiz kilar (ForceFail -> False, hic IO yapmaz). Davranis
+// kancasiz degismez; hook yalnizca gozlem/olcum icindir.
+type
+  TVdbFlushDirHook = procedure(const ADir: string) of object;
+var
+  VdbFlushDirHook: TVdbFlushDirHook;
+  VdbFlushDirForceFail: Boolean;
 function VDbFlushDir(const DirPath: string): Boolean;
 // Ayni dosyayi ikinci kez acmayi engeller (cift-yazma bozulmasina karsi).
 // Unix'te flock, Windows'ta LockFileEx. Kilit alinamazsa False.
@@ -237,6 +247,11 @@ var
   ok: Boolean;
 {$ENDIF}
 begin
+  // F-47 (SKILL6 06): gozlem/olcum kancasi (uretimde nil).
+  if Assigned(VdbFlushDirHook) then
+    VdbFlushDirHook(DirPath);
+  if VdbFlushDirForceFail then
+    Exit(False);
   // Windows: NTFS gunluk sistemi dosya adi/dizin guncellemelerini atomik
   // yonetir; ayrica bir islem gerekmez.
   Result := True;

@@ -32,7 +32,7 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `region_stream` | `TRegionStream` dosya-ici pencere: mantiksal uzunluk, fsync, sinir kontrolu (v4 icin yazildi, motorda kullanilmiyor) |
 | `multiproc` | iki **gercek surec**: es zamanli yazar + bayat onbellek tazeleme, `SIGKILL`/`TerminateProcess` sonrasi kurtarma, RO yazmayi reddetme (bkz. `STORAGE_AUDIT.md` §21.3) |
 | `multi_writer` | tek dosyada **iki oturum**: iki yazar sirayla commit eder, WAL LSN kesin artar, ikinci oturum kapaninca `.wal`/`.gen` silinmez, birinci oturum kendi onayli satirlarini korur, temiz kapanistan sonra yalniz `.odb` kalir, 12/12 satir kalici, yedek+geri yukleme 18/18 |
-| `maint_lock` | **surecler arasi bakim kilidi** (SKILL5 7.1-7.4). Iki gercek surec: (a) ML1 tek surecte `VACUUM` basarili ve satir sayisi korunur; (b) ML2a-ML2e cocuk surec `BeginBatch` ile **acik yazma islemi** tutarken ebeveyn `Compact` `bakim kilidi alinamadi: acik bir yazma islemi var` ile **reddedilir** (fail-closed), cocuk commit etmesine ragmen 5 satir korunur - cocuk tarafi MARKER'dan once `CHILD wtxn RESERVE-HELD=TRUE` yazarak `.gen` yazar rezervasyonunun gercekten tutuldugunu kanitlar; (c) ML3a-ML3c acik **salt-okunur oturum** varken bakim ya reddedilir (Windows: acik handle rename'i engeller) ya da sonrasinda o oturum `veritabani dosyasi degistirildi ... eski dosyaya bagli` hatasi alir - bayat okuma (COUNT=100) yasak; (d) ML4/ML4b/ML4c ikinci surecten `Compact` sonrasi satirlar korunur ve `Verify` temiz; (e) ML5 `.tmp` kalintisi kalmaz (**13 PASS / 0 FAIL**; on-kapi Windows 12/1, Linux 11/2 - Linux on-kapi Compact'i 25 ms'de basarili kilar ve 5 satiri kaybeder) |
+| `maint_lock` | **surecler arasi bakim kilidi** (SKILL5 7.1-7.4). Iki gercek surec: (a) ML1 tek surecte `VACUUM` basarili ve satir sayisi korunur; (b) ML2a-ML2e cocuk surec `BeginBatch` ile **acik yazma islemi** tutarken ebeveyn `Compact` `bakim kilidi alinamadi: acik bir yazma islemi var` ile **reddedilir** (fail-closed), cocuk commit etmesine ragmen 5 satir korunur - cocuk tarafi MARKER'dan once `CHILD wtxn RESERVE-HELD=TRUE` yazarak `.gen` yazar rezervasyonunun gercekten tutuldugunu kanitlar; (c) ML3a-ML3c acik **salt-okunur oturum** varken bakim ya reddedilir (Windows: acik handle rename'i engeller) ya da sonrasinda o oturum `veritabani dosyasi degistirildi ... eski dosyaya bagli` hatasi alir - bayat okuma (COUNT=100) yasak; (d) ML4/ML4b/ML4c ikinci surecten `Compact` sonrasi satirlar korunur ve `Verify` temiz; (e) ML5 `.tmp` kalintisi kalmaz; (f) ML6a/ML6b dizin fsync'inin **cagrildigini ve kapsamini** kanitlar (kanca cagri sayisi + fsync edilen dizinler); (g) ML7a-ML7c fsync **basarisiz** oldugunda bakimin **fail-closed** oldugunu, `.bak`tan geri dondugunu ve verinin korundugunu kanitlar (**19 PASS / 0 FAIL**; on-kapi Windows 16/3, Linux 16/3 - on-kapida ML6a `cagri=0`, ML6b bos dizin listesi, ML7a zorla fsync hatasina ragmen VACUUM "basarili") |
 | `crash_points` | **deterministik cokme enjeksiyonu**: 7 checkpoint/commit asamasinin ortasinda gercek surec olumu (`SIGKILL`/`TerminateProcess`), sonra yeniden acilis + `VERIFY` + onayli commit kontrolu (bkz. `STORAGE_AUDIT.md` §4) |
 | `integrity_check` | **butunluk denetleyici** (`vdbcheck`): dort mod (`--quick/--full/--index/--wal`), her zaman salt-okunur; saglam DB dort modda temiz, bozuk sihirli sayi/CRC/freelist girdisi/kesik WAL kuyrugu ayri kategorilerde yakalanir, dosya ozeti degismez (bkz. `STORAGE_AUDIT.md` §8) |
 | `cache_metrics` | **onbellek metrikleri gercekten hareket ediyor mu**: hit/miss okuma trafigiyle artar, kirli sayfa yazidan sonra > 0 / checkpoint'ten sonra = 0, flush sayaci + yazilan sayfa + sure artar, hit ratio aritmetigi dogru, `MetricsText` ve `SHOW STATS` ayni degerleri tasir (bkz. `STORAGE_AUDIT.md` §5) |
@@ -1512,5 +1512,42 @@ kaldirildi:
     (roller bellekte, sunucu sahibi tanimlar); rol uyeligi **duz**
     (rolun role devri / grant edilmesi yok); `AllowUnmappedUsers`
     varsayilan **kapali** ve acikca feragattir; v2 backend degismedi.
+
+- Elli ikinci kosu (v3.68, Sprint N - dosya degistirmede dizin fsync,
+  SKILL6 06):
+  - **Windows i386 53 kapi**, **Linux x86_64 54 kapi**, FAIL 0
+    (`gatesJ.log` / `linJ.log`, `SUITE_EXIT=0`). Windows'ta `tls_client`
+    yine **SKIP** (OpenSSL DLL yok; SKIP != PASS), Linux'ta 6/0.
+  - Yeni kapi dizini eklenmedi; `maint_lock` 13 -> **19** kontrole buyudu.
+    Kapi sayisi Windows 53 / Linux 54 kaldi (`maint_lock` iki platformda
+    19/0).
+  - **F-46 (YUKSEK, KAPALI; kod etiketi F-47)**: atomik dosya degistirme
+    (`SwapDbFileWith` = VACUUM/Compact/Restore/Rekey) eski dosyayi `.bak`a
+    rename ediyor, yeni dosyayi yerine koyuyor, eski WAL/`.idx`i siliyor ve
+    `.gen` LSN'ini sifirliyordu, ama bu adimlardan sonra **dizin fsync'i
+    yoktu**. Guclu kapanma/cokme sonrasi dizin girdisi diske inmeyebilir:
+    ne canli dosya ne `.bak` yerinde bulunur ya da **silinen eski WAL geri
+    gelip yeni dosyaya uygulanir** (sessiz bozulma).
+  - **Duzeltme (F-46)**: her kritik adimdan sonra `VDbFlushDir` - `.bak`
+    rename'i sonrasi, yeni dosya yerine konduktan sonra (kaynak dizin farkli
+    ise orasi da), eski WAL/`.idx` silindikten sonra, `.gen` LSN
+    sifirlandiktan sonra. `VDbFlushDir` **False** donerse islem basarili
+    sayilmaz: `SwapDbFileWith` hata verir ve `.bak`tan geri doner; geri
+    donus rename'i de fsync edilir ve o da basarisizsa **acik hata** verilir.
+    Windows'ta NTFS gunlugu nedeniyle fsync gerekmez (`VDbFlushDir` True).
+    Test kancalari `VdbFlushDirHook` / `VdbFlushDirForceFail` uretimde
+    `nil` / `False`. V2 ve bicim v5 degismedi.
+  - **Kapi (F-46)**: `maint_lock` **19/0** (ML6a/ML6b fsync cagrisi ve
+    kapsami, ML7a/ML7b/ML7c zorla fsync hatasinda fail-closed + `.bak`tan
+    geri donus + veri korunumu). On-kapi (`git archive HEAD` = `8af4161` +
+    yalniz API seam'i: kanca tipi/degiskenleri bildirilir, `VDbFlushDir`
+    onlari yok sayar; davranis HEAD) **16 PASS / 3 FAIL**; ayirt edici:
+    ML6a (`cagri=0`), ML6b (bos dizin listesi), ML7a (fsync zorla
+    basarisizken VACUUM "basarili").
+  - **Durust sinir (F-46)**: kapi fsync'in **cagrildigini** ve hata yolunun
+    fail-closed oldugunu olcer; gercek **guc kesintisi** bu ortamda
+    uretilemez, dolayisiyla "cokme sonrasi kesin kalici" iddiasi yalniz
+    POSIX dizin fsync garantisine dayanir. `tests/crash_points` surec
+    oldurmeye dayanir ve fsync kaybini **taklit etmez**.
 
 

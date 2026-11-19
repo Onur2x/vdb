@@ -360,6 +360,31 @@ begin
   end;
 end;
 
+{ F-47 (SKILL6 06): dizin fsync cagrilarini sayan kapi kancasi. }
+type
+  TFlushProbe = class
+    Dirs: TStringList;
+    constructor Create;
+    destructor Destroy; override;
+    procedure Hook(const ADir: string);
+  end;
+
+constructor TFlushProbe.Create;
+begin
+  Dirs := TStringList.Create;
+end;
+
+destructor TFlushProbe.Destroy;
+begin
+  Dirs.Free;
+  inherited;
+end;
+
+procedure TFlushProbe.Hook(const ADir: string);
+begin
+  Dirs.Add(ADir);
+end;
+
 var
   d1, db, marker, err, out1, rep: string;
   be: IVdbBackend;
@@ -370,6 +395,8 @@ var
   ok: Boolean;
   o, n: Int64;
   t0: QWord;
+  fp: TFlushProbe;
+  dirOk: Boolean;
 begin
   if (ParamCount >= 1) and (ParamStr(1) <> '') then
   begin
@@ -502,6 +529,57 @@ begin
   Chk('ML5 bakimdan sonra .tmp kalintisi kalmadi',
     CountArtifacts(d1, '*.tmp') = 0,
     'kalan=' + ListArtifacts(d1, '*.tmp'));
+
+  { --- ML6/ML7 (F-47, SKILL6 06): atomik degistirmede dizin fsync --- }
+  fp := TFlushProbe.Create;
+  VdbFlushDirForceFail := False;
+  VdbFlushDirHook := fp.Hook;
+  VdbOpen(db, be, False, True);
+  try
+    ok := TryCompact(be, err, o, n);
+    Chk('ML6a VACUUM sirasinda dizin fsync cagrildi',
+      ok and (fp.Dirs.Count >= 4),
+      'ok=' + BoolToStr(ok, True) + ' cagri=' + IntToStr(fp.Dirs.Count) +
+      ' hata=' + err);
+    dirOk := fp.Dirs.Count > 0;
+    for i := 0 to fp.Dirs.Count - 1 do
+      if not SameText(ExcludeTrailingPathDelimiter(fp.Dirs[i]),
+        ExcludeTrailingPathDelimiter(ExtractFileDir(db))) then
+        dirOk := False;
+    Chk('ML6b fsync yalniz canli dosyanin dizinine yapildi', dirOk,
+      'dizinler=' + fp.Dirs.CommaText);
+    Chk('ML6c fsync sonrasi satirlar korundu', CountRows(be) = 101,
+      'COUNT=' + IntToStr(CountRows(be)));
+  finally
+    be := nil;
+    VdbFlushDirHook := nil;
+  end;
+  { ML7: fsync BASARISIZ olursa degistirme REDDEDILIR ve eski dosya geri
+    kurulur. On-kapi (fsync hic cagrilmaz) burada VACUUM'u basarili sayar. }
+  VdbFlushDirForceFail := True;
+  VdbOpen(db, be, False, True);
+  try
+    ok := TryCompact(be, err, o, n);
+    Chk('ML7a fsync basarisizsa dosya degistirme REDDEDILDI',
+      (not ok) and (Pos('dizin fsync', err) > 0),
+      'ok=' + BoolToStr(ok, True) + ' hata=' + err);
+    Chk('ML7b reddedilen degistirme satirlari korudu', CountRows(be) = 101,
+      'COUNT=' + IntToStr(CountRows(be)));
+  finally
+    be := nil;
+    VdbFlushDirForceFail := False;
+  end;
+  VdbOpen(db, be, False, True);
+  try
+    ok := be.Verify(rep);
+    Chk('ML7c geri donus sonrasi VERIFY temiz ve 101 satir',
+      ok and (CountRows(be) = 101),
+      'verify=' + BoolToStr(ok, True) + ' COUNT=' + IntToStr(CountRows(be)) +
+      ' ' + Copy(rep, 1, 120));
+  finally
+    be := nil;
+  end;
+  fp.Free;
 
   WriteLn('SONUC: ', GPass, ' PASS, ', GFail, ' FAIL');
   if GFail > 0 then Halt(1);

@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-18
-Surum: v3.67 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1 + H + I + J + K + L + M; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Surum: v3.68 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1 + H + I + J + K + L + M + N; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -88,6 +88,8 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   rolu = sinirsiz yetki**, **`SET ROLE NONE` yetki yukselmesi**, **rol
   uyeligi denetiminin olmamasi** ve **oturum kimligi/rol durumunun
   sizmasi** (`sql_authorization` AU12).
+  Sprint N'de **dosya degistirmede (VACUUM/Compact/Restore/Rekey) dizin
+  fsync'inin hic yapilmamasi** (`maint_lock` ML6-ML7).
   Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
 - Rol degistirme yetkisi ve SCRAM kullanicisi -> SQL rolu eslemesi (SKILL5
   3.1'in yetki denetimi ve 3.2) Sprint M'de **kapandi** (`sql_authorization`
@@ -121,6 +123,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | K | 6.x SERIALIZABLE hic dogrulanmiyor (write skew), 9.x PG mesajinda eksik NUL sessiz kabul, 10.x MERGE kaba kuvvet O(hedef x kaynak) | Tamam | `serializable_tx` 23/0, `pg_msg_nul` 10/0, `merge_hash` 19/0 (yeni) |
 | L | SKILL6 01: SERIALIZABLE bayragi **backend genelinde** tutuluyordu (paylasilan `TVTableDb` yuzunden bir baglanti digerinin commit'ini 40001 ile iptal ediyordu); `.gen` okunamazsa "degismedi" varsayimi | Tamam | `serializable_tx` 28/0 (23 -> 28; S16-S20 yeni) |
 | M | SKILL6 02: SCRAM yalniz kimlik dogruluyordu, SQL rolu ile **eslesmiyordu** (dogrulanmis uzak kullanici = motor yoneticisi); bos rol = **sinirsiz yetki**; `SET ROLE NONE` yetki yukselmesiydi; rol uyeligi denetlenmiyordu; oturum kimligi isaretci kirpintisiydi ve rol durumu bir sonraki baglantiya miras kaliyordu | Tamam | `sql_authorization` 62/0 (51 -> 62; AU12 yeni) |
+| N | SKILL6 06: dosya degistirmede (VACUUM/Compact/Restore/Rekey) **dizin fsync'i hic yapilmiyordu**; rename/silme cokme sonrasi kaybolabiliyor, eski WAL geri gelebiliyordu | Tamam | `maint_lock` 19/0 (13 -> 19; ML6-ML7 yeni) |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -644,7 +647,9 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   dizini eklemedi; `tests/serializable_tx` kapisini 23 -> **28** kontrole
   buyuttu (S16-S20), kapi sayisi 53 / 54 kaldi. Sprint M (SKILL6 02) da
   yeni kapi dizini eklemedi; `tests/sql_authorization` kapisini 51 -> **62**
-  kontrole buyuttu (AU12), kapi sayisi yine 53 / 54 kaldi.
+  kontrole buyuttu (AU12), kapi sayisi yine 53 / 54 kaldi. Sprint N
+  (SKILL6 06) da yeni kapi dizini eklemedi; `tests/maint_lock` kapisini
+  13 -> **19** kontrole buyuttu (ML6-ML7), kapi sayisi 53 / 54 kaldi.
 - Windows `gatesJ` kosusunda `tls_client` **SKIP** oldu: ortamda
   `VDB_CRYPTO_DLL`/`VDB_SSL_DLL` yok. `tls_client` fikstur dizinini
   `VDB_TLS_FIXTURES` ile bulur; degisken verilmezse kapi exe'nin yanindan
@@ -1012,6 +1017,37 @@ tablosundadir. Bu sprintte kapatilanlar:
   rolu veya Super taban rolde herhangi bir rolu secer. `AllowUnmappedUsers`
   bilincli bir **yetki feragatidir** ve varsayilan **kapalidir**. V2
   degismedi.
+- **F-46 (Yuksek, KAPALI, v3.68; kod etiketi F-47)**: atomik dosya
+  degistirme (`TVdbBackendV3.SwapDbFileWith`, yani VACUUM/Compact/Restore/
+  Rekey) **dizin girdisini hic fsync etmiyordu**. Sequence eski canli dosyayi
+  `.bak`a rename ediyor, yeni dosyayi yerine koyuyor, eski WAL/`.idx`i
+  siliyor ve `.gen` durabil LSN'ini sifirliyordu; ancak bu rename/silme
+  islemlerinden sonra **dizin fsync'i yoktu** (`VDbFlushDir` repoda vardi ve
+  `VDbPageStore`/`VDbChangeLog`/`VDbCore` kullaniyordu - `VDbBackendV3`
+  kullanmiyordu). Guclu kapanma/cokme sonrasi dizin girdisi diske inmeyebilir:
+  ne canli dosya ne `.bak` yerinde bulunabilir, ya da **silinen eski WAL geri
+  gelip yeni dosyaya uygulanabilir** (sessiz bozulma). SKILL6 06.
+  Duzeltme: her kritik adimdan sonra dizin fsync'i - eski dosya `.bak`
+  yapildiktan sonra, yeni dosya yerine konduktan sonra (kaynak dizin farkli
+  ise orasi da), eski WAL/`.idx` silindikten sonra ve `.gen` LSN
+  sifirlandiktan/silindikten sonra. `VDbFlushDir` **False** donerse islem
+  sessizce "basarili" sayilmaz: `SwapDbFileWith` hata verir ve `.bak`tan
+  geri doner; geri donus rename'inin kendisi de fsync edilir ve o da
+  basarisizsa **acik hata** ile bildirilir (veri kaybi riski gizlenmez).
+  Windows'ta NTFS gunlugu nedeniyle fsync gerekmez (`VDbFlushDir` True
+  doner); bu bir **desteklenmiyor** durumu degil, platform davranisidir.
+  Regresyon: `maint_lock` **19/0** (13 -> 19; ML6-ML7 yeni). On-kapi
+  (`git archive HEAD` = `8af4161`, yalniz API **seam**'i: `VDbFlushDirHook` /
+  `VdbFlushDirForceFail` bildirilir, `VDbFlushDir` onlari yok sayar; davranis
+  HEAD): **16 PASS / 3 FAIL**; ayirt edici uc kontrol: ML6a (fsync **0 kez**
+  cagrildi), ML6b (bos dizin listesi), ML7a (fsync zorla basarisiz kilindiginda
+  bile VACUUM "basarili"). ML7b/ML7c koruyucudur (on-kapida da gecer).
+  **Durust sinir**: kapi, fsync'in **cagrildigini** ve basarisizlik yolunun
+  fail-closed oldugunu olcer; gercek **guc kesintisi** senaryosu bu ortamda
+  uretilemez, dolayisiyla "cokme sonrasi kesin kalici" iddiasi yalniz dizin
+  fsync garantisine dayanir (POSIX). `tests/crash_points` surec oldurme ile
+  calisir ve fsync kaybini **taklit etmez**; bu yuzden ayri bir fsync
+  kancasi kullanildi. V2 ve bicim v5 degismedi.
 
 
 ---

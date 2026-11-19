@@ -5564,6 +5564,18 @@ var
   genProbe: THandleStream;
   t0: QWord;
   bakimReddi: Boolean;
+  liveDir, newDir: string;
+  geriDonusFsync: Boolean;
+  { F-47 (SKILL6 06): dizin girdisini kalici hale getirir. Basarisizlikta
+    HATA verir: Unix'te fsync yapilamadiysa rename/silme cokme sonrasi
+    kaybolabilir; "basarili" demek veri kaybi riskini gizler. }
+  procedure FlushDir(const ADir, AWhat: string);
+  begin
+    if ADir = '' then Exit;
+    if not VDbFlushDir(ADir) then
+      raise EVdbBackendV3.Create(
+        'dosya degistirme: dizin fsync basarisiz (' + AWhat + '): ' + ADir);
+  end;
 begin
   oldKey := FKey;
   oldPass := FPassword;
@@ -5571,9 +5583,12 @@ begin
   bak := FPath + '.bak';
   wal := FPath + '.wal';
   idx := FPath + '.idx';
+  liveDir := ExtractFileDir(FPath);
+  newDir := ExtractFileDir(NewFilePath);
   probe := nil;
   genProbe := nil;
   bakimReddi := False;
+  geriDonusFsync := True;
   { v3.63 (SKILL5 7.1) SURECLER ARASI BAKIM KILIDI.
     SORUN: buradaki `FEngCs` yalnizca SUREC ICI kilittir. Dosya degistirme
     canli dosyayi kapatip rename ederken, BASKA bir surec hala eski inode'u
@@ -5643,9 +5658,15 @@ begin
     if FileExists(bak) then DeleteFile(bak);
     if not RenameFile(FPath, bak) then
       raise EVdbBackendV3.Create('dosya degistirme: mevcut dosya .bak yapilamadi');
+    { F-47 (SKILL6 06): `.bak` rename'i kalici olmali; aksi halde cokme
+      sonrasi ne canli dosya ne .bak yerinde bulunabilir. }
+    FlushDir(liveDir, 'eski dosya .bak yapildi');
     try
       if not RenameFile(NewFilePath, FPath) then
         raise EVdbBackendV3.Create('dosya degistirme: yeni dosya yerine konamadi');
+      FlushDir(liveDir, 'yeni dosya yerine kondu');
+      if newDir <> liveDir then
+        FlushDir(newDir, 'yeni dosya kaynak dizinden cikti');
     except
       RenameFile(bak, FPath);
       raise;
@@ -5657,6 +5678,11 @@ begin
       kalici olmamali: yoksa sonraki acilis onlari bu dosyaya ait sanar. }
     if FileExists(NewFilePath + '.wal') then DeleteFile(NewFilePath + '.wal');
     if FileExists(NewFilePath + '.idx') then DeleteFile(NewFilePath + '.idx');
+    { F-47 (SKILL6 06): silinen yan dosyalar da dizin fsync'i ister; aksi
+      halde cokme sonrasi ESKI WAL geri gelip yeni dosyaya uygulanabilir. }
+    FlushDir(liveDir, 'eski WAL/.idx silindi');
+    if newDir <> liveDir then
+      FlushDir(newDir, 'gecici WAL/.idx silindi');
     { v3.63: `.gen` probe'u BURADA birakilir: asagida `.gen` baska bir
       handle'dan yazilir ve Windows'ta bayt aralik kilidi ayni surecte
       farkli handle'dan yapilan yazmayi da engeller (oz-kilitlenme). }
@@ -5703,6 +5729,9 @@ begin
             'dosya degistirme: .gen durabil LSN sifirlanamadi');
       end;
     end;
+    { F-47 (SKILL6 06): .gen iceriginin sifirlanmasi/silinmesi de kalici
+      olmali; bayat durabil LSN cokme sonrasi fsync'i atlatir. }
+    FlushDir(liveDir, '.gen durabil LSN sifirlandi');
     { v3.63: bakim kilidi, yeni motor acilmadan BIRAKILIR (bkz. ustteki
       yorum). Buradan sonra koruma motorun kendi `LockExclusive` kilididir. }
     if probe <> nil then
@@ -5750,6 +5779,10 @@ begin
         begin
           if FileExists(FPath) then DeleteFile(FPath);
           RenameFile(bak, FPath);
+          { F-47 (SKILL6 06): geri donus rename'i de kalici olmali. Burada
+            hata YUKSELTILMEZ (zaten hata yolundayiz); sonuc yalniz
+            yutulmaz, asagidaki hata metni basarisizliga gore secilir. }
+          geriDonusFsync := VDbFlushDir(liveDir);
         end;
         if FileExists(FPath) then
         begin
@@ -5785,6 +5818,15 @@ begin
         raise EVdbBackendV3.Create(
           'dosya degistirme basarisiz: eski dosya geri kurulamadi: ' + FPath);
       end;
+      { F-47 (SKILL6 06): eski dosya geri kuruldu AMA geri donus rename'i
+        dizin fsync'i ile kalici hale getirilemedi. Bilmek onemli: cokme
+        sonrasi bu geri donus kaybolabilir. Sessizce yutmak yerine yukari
+        tasinir (islem zaten basarisiz; veri kaybi riski gizlenmez). }
+      if not geriDonusFsync then
+        raise EVdbBackendV3.Create(
+          'dosya degistirme basarisiz ve geri donus rename''i kalici hale ' +
+          'getirilemedi (dizin fsync): eski dosya acildi ancak cokme ' +
+          'sonrasi kaybolabilir: ' + FPath);
     end;
     { v3.43 DUZELTME (olculen hata): bu `except` hatayi YUTUYORDU. Dosya
       degistirme (VACUUM/RESTORE/REKEY) basarisiz oldugunda cagiran basari
