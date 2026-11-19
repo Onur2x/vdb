@@ -19560,6 +19560,164 @@ var
   // P-145: otomatik commit'li tek statement'lik UPDATE kendi write-set'ini
   // on-okumadan ONCE acar (bkz. asagidaki aciklama).
   ownBatch: Boolean;
+
+  { Sprint P / SKILL6 07: UPDATE ... FROM icin hash join.
+    ONCEDEN hedef x kaynak KARTEZYEN dongusuydu (O(N x M)): 100.000 satirlik
+    hedef ve 10.000 satirlik kaynakta 1e9 RowMatches cagrisi. Simdi WHERE'in
+    UST DUZEY AND conjunct'larindan "hedef.kolon = kaynak.kolon" biciminde
+    olanlar hash anahtari olarak kullanilir; her hedef satiri yalniz kendi
+    kovasindaki adaylarla denenir.
+
+    SEMANTIK AYNEN KORUNUR: kovadaki adaylar kaynak SIRASINA gore gezilir,
+    ilk RowMatches kazanir (SQLite'in "coklu eslesmede tek satir" davranisi)
+    ve RowMatches yine WHERE'in TAMAMINI degerlendirir. Hash anahtari yalniz
+    GEREKLI bir kosuldur, yeterli degildir; bu yuzden yanlis eslesme
+    uretemez, yalnizca aday sayisini azaltir.
+
+    GUVENLIK KAPISI: yalniz VCT_STR esitligi ve collation'siz kolonlar.
+    Sayisal kolonda '01' = '1', BOOL'de TRUE = 1 oldugu icin ham metin
+    hash'i yanlis sonuc verirdi; collation varsa karsilastirma dil
+    duyarlidir. Bu durumlarda conjunct anahtar SAYILMAZ; hic uygun conjunct
+    yoksa eski kartezyen dongu aynen calisir. }
+  hTgtCols, hSrcCols: TIntArray;
+
+  procedure UfCollectEq(E: TSqlExprNode);
+  var
+    b: TSqlBinaryOpNode;
+    cl, cr: TSqlColumnRefNode;
+    li, ri, ti, si, q, tw, fw: Integer;
+  begin
+    if E = nil then Exit;
+    if not (E is TSqlBinaryOpNode) then Exit;
+    b := TSqlBinaryOpNode(E);
+    if b.Op = sboAnd then
+    begin
+      UfCollectEq(b.Left);
+      UfCollectEq(b.Right);
+      Exit;
+    end;
+    if b.Op <> sboEq then Exit;
+    if not ((b.Left is TSqlColumnRefNode) and (b.Right is TSqlColumnRefNode)) then Exit;
+    if BinaryOpCtype(b, jNames, jTypes) <> VCT_STR then Exit;
+    if (ColCollation(b.Left, jNames) <> '') or (ColCollation(b.Right, jNames) <> '') then Exit;
+    cl := TSqlColumnRefNode(b.Left);
+    cr := TSqlColumnRefNode(b.Right);
+    li := FindColIdx(cl.ColumnName, cl.TableQualifier, jNames);
+    ri := FindColIdx(cr.ColumnName, cr.TableQualifier, jNames);
+    if (li < 0) or (ri < 0) then Exit;
+    tw := Length(td.Cols);
+    fw := Length(fromNames);
+    ti := -1;
+    si := -1;
+    if li < 2 * tw then ti := li mod tw
+    else if li < 2 * tw + fw then si := li - 2 * tw;
+    if ri < 2 * tw then
+    begin
+      if ti < 0 then ti := ri mod tw;
+    end
+    else if ri < 2 * tw + fw then
+    begin
+      if si < 0 then si := ri - 2 * tw;
+    end;
+    if (ti < 0) or (si < 0) then Exit;
+    for q := 0 to High(hTgtCols) do
+      if (hTgtCols[q] = ti) and (hSrcCols[q] = si) then Exit;
+    SetLength(hTgtCols, Length(hTgtCols) + 1);
+    hTgtCols[High(hTgtCols)] := ti;
+    SetLength(hSrcCols, Length(hSrcCols) + 1);
+    hSrcCols[High(hSrcCols)] := si;
+  end;
+
+  { FNV-1a: anahtar yalniz kova secimi icin; carpisma RowMatches ile
+    dogrulanir. Uzunluk onekli parcalar sayesinde anahtar tekildir. }
+  function UfHash(const S: string): Cardinal;
+  var q: Integer;
+  begin
+    Result := 2166136261;
+    for q := 1 to Length(S) do
+      Result := (Result xor Cardinal(Ord(S[q]))) * 16777619;
+  end;
+
+  { True: hash yolu uygulandi (sonuc bos olabilir). False: uygun conjunct
+    yok, cagiran eski kartezyen donguyu calistirmali. }
+  function UfBuildJoin: Boolean;
+  var
+    hHead, hNext: TIntArray;
+    hN, hMask, hSlot, fs, q, rn: Integer;
+    key, v: string;
+    ok: Boolean;
+    jr2: TStrArray;
+  begin
+    Result := False;
+    if Length(hTgtCols) = 0 then Exit;
+    Result := True;
+    hN := 16;
+    while hN < 2 * (Length(fromRows) + 1) do hN := hN * 2;
+    hMask := hN - 1;
+    SetLength(hHead, hN);
+    for q := 0 to hN - 1 do hHead[q] := -1;
+    SetLength(hNext, Length(fromRows));
+    { Azalan sirada basa ekleme: her kova ARTRAN kaynak sirasinda gezilir
+      (ilk eslesen kazanir kurali korunur). }
+    for fs := High(fromRows) downto 0 do
+    begin
+      key := '';
+      ok := True;
+      for q := 0 to High(hSrcCols) do
+      begin
+        if hSrcCols[q] > High(fromRows[fs]) then
+        begin ok := False; Break; end;
+        v := fromRows[fs][hSrcCols[q]];
+        if v = '' then
+        begin ok := False; Break; end;   // NULL hicbir esitlikte eslesmez
+        key := key + IntToStr(Length(v)) + ':' + v;
+      end;
+      if not ok then Continue;
+      hSlot := Integer(UfHash(key) and Cardinal(hMask));
+      hNext[fs] := hHead[hSlot];
+      hHead[hSlot] := fs;
+    end;
+    for fs := 0 to High(allRows) do
+    begin
+      key := '';
+      ok := True;
+      for q := 0 to High(hTgtCols) do
+      begin
+        if hTgtCols[q] > High(allRows[fs]) then
+        begin ok := False; Break; end;
+        v := allRows[fs][hTgtCols[q]];
+        if v = '' then
+        begin ok := False; Break; end;
+        key := key + IntToStr(Length(v)) + ':' + v;
+      end;
+      if not ok then Continue;
+      q := hHead[Integer(UfHash(key) and Cardinal(hMask))];
+      while q >= 0 do
+      begin
+        SetLength(jr2, 2 * Length(td.Cols) + Length(fromNames));
+        for rn := 0 to High(td.Cols) do
+        begin
+          if rn <= High(allRows[fs]) then jr2[rn] := allRows[fs][rn] else jr2[rn] := '';
+          jr2[Length(td.Cols) + rn] := jr2[rn];
+        end;
+        for rn := 0 to High(fromNames) do
+          if rn <= High(fromRows[q]) then
+            jr2[2 * Length(td.Cols) + rn] := fromRows[q][rn]
+          else
+            jr2[2 * Length(td.Cols) + rn] := '';
+        if RowMatches(Stmt.WhereClause, jr2, jNames, jTypes) then
+        begin
+          SetLength(joinedRows, Length(joinedRows) + 1);
+          joinedRows[High(joinedRows)] := jr2;
+          SetLength(joinedPks, Length(joinedPks) + 1);
+          joinedPks[High(joinedPks)] := pks[fs];
+          Break;
+        end;
+        q := hNext[q];
+      end;
+    end;
+  end;
+
 begin
   // F-33: View guncellenebilirlik kontrolü
   baseTable := '';
@@ -19725,28 +19883,34 @@ begin
 
     SetLength(joinedRows, 0);
     SetLength(joinedPks, 0);
-    for i := 0 to High(allRows) do
+    hTgtCols := nil;
+    hSrcCols := nil;
+    UfCollectEq(Stmt.WhereClause);
+    if not UfBuildJoin then
     begin
-      for fi := 0 to High(fromRows) do
+      for i := 0 to High(allRows) do
       begin
-        SetLength(jr, 2 * Length(td.Cols) + Length(fromNames));
-        for n := 0 to High(td.Cols) do
+        for fi := 0 to High(fromRows) do
         begin
-          if n <= High(allRows[i]) then jr[n] := allRows[i][n] else jr[n] := '';
-          jr[Length(td.Cols) + n] := jr[n];   // nitelikli adlar icin kopya
-        end;
-        for n := 0 to High(fromNames) do
-          if n <= High(fromRows[fi]) then
-            jr[2 * Length(td.Cols) + n] := fromRows[fi][n]
-          else
-            jr[2 * Length(td.Cols) + n] := '';
-        if RowMatches(Stmt.WhereClause, jr, jNames, jTypes) then
-        begin
-          SetLength(joinedRows, Length(joinedRows) + 1);
-          joinedRows[High(joinedRows)] := jr;
-          SetLength(joinedPks, Length(joinedPks) + 1);
-          joinedPks[High(joinedPks)] := pks[i];
-          Break;
+          SetLength(jr, 2 * Length(td.Cols) + Length(fromNames));
+          for n := 0 to High(td.Cols) do
+          begin
+            if n <= High(allRows[i]) then jr[n] := allRows[i][n] else jr[n] := '';
+            jr[Length(td.Cols) + n] := jr[n];   // nitelikli adlar icin kopya
+          end;
+          for n := 0 to High(fromNames) do
+            if n <= High(fromRows[fi]) then
+              jr[2 * Length(td.Cols) + n] := fromRows[fi][n]
+            else
+              jr[2 * Length(td.Cols) + n] := '';
+          if RowMatches(Stmt.WhereClause, jr, jNames, jTypes) then
+          begin
+            SetLength(joinedRows, Length(joinedRows) + 1);
+            joinedRows[High(joinedRows)] := jr;
+            SetLength(joinedPks, Length(joinedPks) + 1);
+            joinedPks[High(joinedPks)] := pks[i];
+            Break;
+          end;
         end;
       end;
     end;

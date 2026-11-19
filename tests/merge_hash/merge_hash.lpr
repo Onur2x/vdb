@@ -17,6 +17,11 @@ const
   BIG_N = 8000;      { hedef satir sayisi (eslesen) }
   BIG_EXTRA = 400;   { yalniz kaynakta olan satirlar -> INSERT }
   BOUND_MS = 10000;  { buyuk MERGE icin ust sinir }
+  { Sprint P / F-48: UPDATE ... FROM esitlik birlestirmesi }
+  UF_T = 4000;       { hedef satir sayisi }
+  UF_S = 2500;       { kaynak satir sayisi }
+  UF_BOUND_MS = 4000; { hash yolunun ust siniri (eski yol ~milyonlarca
+                        RowMatches cagrisi yapiyordu) }
 
 var
   GDir, GDb: string;
@@ -314,6 +319,145 @@ begin
   CloseAll;
 end;
 
+{ Sprint P / F-48: UPDATE ... FROM esitlik birlestirmesi. ONCEDEN hedef x
+  kaynak kartezyen donguydu (O(N x M)); artik ust duzey AND icindeki
+  kolon = kolon esitlikleri hash anahtari olur, her aday yine TAM WHERE
+  ile dogrulanir. Bu bolum hem hizi (U3) hem semantigin korundugunu
+  (U1/U2/U4-U10) olcer. }
+procedure CaseUpdateFromPerf;
+var
+  i: Integer;
+  t0, ms: QWord;
+  n, na: Int64;
+begin
+  OpenFresh('ufperf');
+  Sq.Exec('CREATE TABLE ut (id INTEGER PRIMARY KEY, k TEXT, v TEXT)');
+  Sq.Exec('CREATE TABLE us (id INTEGER, k TEXT, v TEXT)');
+  Sq.Exec('BEGIN');
+  for i := 1 to UF_T do
+    Sq.Exec('INSERT INTO ut (id, k, v) VALUES (' + IntToStr(i) +
+      ', ''k' + IntToStr(i) + ''', ''a'')');
+  for i := 1 to UF_S do
+    Sq.Exec('INSERT INTO us (id, k, v) VALUES (' + IntToStr(i) +
+      ', ''k' + IntToStr(i) + ''', ''u'')');
+  Sq.Exec('COMMIT');
+
+  t0 := GetTickCount64;
+  Sq.Exec('UPDATE ut SET v = us.v FROM us WHERE ut.k = us.k');
+  ms := GetTickCount64 - t0;
+
+  n := IntQ(Sq, 'SELECT COUNT(*) FROM ut WHERE v = ''u''');
+  na := IntQ(Sq, 'SELECT COUNT(*) FROM ut WHERE v = ''a''');
+  Chk('U1 eslesen satirlar guncellendi', n = UF_S, 'n=' + IntToStr(n));
+  Chk('U2 eslesmeyen hedef satirlari korundu', na = UF_T - UF_S,
+    'n=' + IntToStr(na));
+  Chk('U3 esitlik anahtarli birlestirme sinirli surede bitti',
+    (n = UF_S) and (ms <= UF_BOUND_MS),
+    'sure=' + IntToStr(ms) + 'ms sinir=' + IntToStr(UF_BOUND_MS) + 'ms');
+  CloseAll;
+end;
+
+procedure CaseUpdateFromFirst;
+begin
+  OpenFresh('uffirst');
+  Sq.Exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+  Sq.Exec('CREATE TABLE s (id INTEGER, v TEXT)');
+  Sq.Exec('INSERT INTO t (id, v) VALUES (1, ''a'')');
+  Sq.Exec('INSERT INTO s (id, v) VALUES (1, ''b'')');
+  Sq.Exec('INSERT INTO s (id, v) VALUES (1, ''z'')');
+  Sq.Exec('UPDATE t SET v = s.v FROM s WHERE t.id = s.id');
+  Chk('U4 ilk eslesen kaynak satiri kazanir',
+    CellQ(Sq, 'SELECT v FROM t WHERE id = 1') = 'b',
+    'v=' + CellQ(Sq, 'SELECT v FROM t WHERE id = 1'));
+  Chk('U4b kopya hedef satiri olusmadi',
+    IntQ(Sq, 'SELECT COUNT(*) FROM t') = 1,
+    'n=' + IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t')));
+  CloseAll;
+end;
+
+procedure CaseUpdateFromNull;
+begin
+  OpenFresh('ufnull');
+  Sq.Exec('CREATE TABLE t (id INTEGER, k TEXT, v TEXT)');
+  Sq.Exec('CREATE TABLE s (k TEXT, v TEXT)');
+  Sq.Exec('INSERT INTO t (id, k, v) VALUES (1, NULL, ''a'')');
+  Sq.Exec('INSERT INTO s (k, v) VALUES (NULL, ''z'')');
+  Sq.Exec('UPDATE t SET v = s.v FROM s WHERE t.k = s.k');
+  Chk('U5 NULL anahtar eslesmedi',
+    CellQ(Sq, 'SELECT v FROM t WHERE id = 1') = 'a',
+    'v=' + CellQ(Sq, 'SELECT v FROM t WHERE id = 1'));
+  CloseAll;
+end;
+
+procedure CaseUpdateFromNumeric;
+begin
+  OpenFresh('ufnum');
+  Sq.Exec('CREATE TABLE nt (id INTEGER, v TEXT)');
+  Sq.Exec('CREATE TABLE ns (id TEXT, v TEXT)');
+  Sq.Exec('INSERT INTO nt (id, v) VALUES (5, ''a'')');
+  Sq.Exec('INSERT INTO ns (id, v) VALUES (''05'', ''z'')');
+  Sq.Exec('UPDATE nt SET v = ns.v FROM ns WHERE nt.id = ns.id');
+  Chk('U6 sayisal denk anahtar eslesti (hash kullanilmaz)',
+    CellQ(Sq, 'SELECT v FROM nt WHERE id = 5') = 'z',
+    'v=' + CellQ(Sq, 'SELECT v FROM nt WHERE id = 5'));
+  CloseAll;
+end;
+
+procedure CaseUpdateFromNonEq;
+begin
+  OpenFresh('ufneq');
+  Sq.Exec('CREATE TABLE t (id INTEGER, v TEXT)');
+  Sq.Exec('CREATE TABLE s (id INTEGER, v TEXT)');
+  Sq.Exec('INSERT INTO t (id, v) VALUES (1, ''a'')');
+  Sq.Exec('INSERT INTO t (id, v) VALUES (2, ''a'')');
+  Sq.Exec('INSERT INTO s (id, v) VALUES (1, ''q'')');
+  Sq.Exec('UPDATE t SET v = s.v FROM s WHERE t.id > s.id');
+  Chk('U7 esitlik-disi WHERE eski yolda dogru sonuc verdi',
+    (CellQ(Sq, 'SELECT v FROM t WHERE id = 2') = 'q') and
+    (CellQ(Sq, 'SELECT v FROM t WHERE id = 1') = 'a'),
+    'id1=' + CellQ(Sq, 'SELECT v FROM t WHERE id = 1') +
+    ' id2=' + CellQ(Sq, 'SELECT v FROM t WHERE id = 2'));
+  CloseAll;
+end;
+
+procedure CaseUpdateFromMulti;
+begin
+  OpenFresh('ufmulti');
+  Sq.Exec('CREATE TABLE kt (id INTEGER, k TEXT, v TEXT)');
+  Sq.Exec('CREATE TABLE ks (id INTEGER, k TEXT, v TEXT)');
+  Sq.Exec('INSERT INTO kt (id, k, v) VALUES (1, ''a'', ''p'')');
+  Sq.Exec('INSERT INTO kt (id, k, v) VALUES (2, ''b'', ''p'')');
+  Sq.Exec('INSERT INTO ks (id, k, v) VALUES (1, ''a'', ''m'')');
+  Sq.Exec('INSERT INTO ks (id, k, v) VALUES (2, ''x'', ''m'')');
+  Sq.Exec('UPDATE kt SET v = ks.v FROM ks ' +
+    'WHERE kt.id = ks.id AND kt.k = ks.k');
+  Chk('U8 coklu kolon: tam eslesen guncellendi',
+    CellQ(Sq, 'SELECT v FROM kt WHERE id = 1') = 'm',
+    'v=' + CellQ(Sq, 'SELECT v FROM kt WHERE id = 1'));
+  Chk('U8b coklu kolon: kismi eslesme guncellenmedi',
+    CellQ(Sq, 'SELECT v FROM kt WHERE id = 2') = 'p',
+    'v=' + CellQ(Sq, 'SELECT v FROM kt WHERE id = 2'));
+  CloseAll;
+end;
+
+procedure CaseUpdateFromSubquery;
+begin
+  OpenFresh('ufsub');
+  Sq.Exec('CREATE TABLE st (id INTEGER, v TEXT)');
+  Sq.Exec('CREATE TABLE ss (id INTEGER, v TEXT)');
+  Sq.Exec('INSERT INTO st (id, v) VALUES (1, ''a'')');
+  Sq.Exec('INSERT INTO st (id, v) VALUES (2, ''a'')');
+  Sq.Exec('INSERT INTO ss (id, v) VALUES (1, ''s'')');
+  Sq.Exec('UPDATE st SET v = q.v FROM (SELECT id, v FROM ss) q ' +
+    'WHERE st.id = q.id');
+  Chk('U9 alt sorgu kaynagi birlestirildi',
+    (CellQ(Sq, 'SELECT v FROM st WHERE id = 1') = 's') and
+    (CellQ(Sq, 'SELECT v FROM st WHERE id = 2') = 'a'),
+    'id1=' + CellQ(Sq, 'SELECT v FROM st WHERE id = 1') +
+    ' id2=' + CellQ(Sq, 'SELECT v FROM st WHERE id = 2'));
+  CloseAll;
+end;
+
 begin
   GPass := 0;
   GFail := 0;
@@ -398,6 +542,83 @@ begin
     begin
       Inc(GFail);
       WriteLn('FAIL M13 senaryosu coktu ', E.ClassName, ': ', E.Message);
+      try CloseAll; except end;
+    end;
+  end;
+  try
+    CaseUpdateFromPerf;
+  except
+    on E: Exception do
+    begin
+      Inc(GFail);
+      WriteLn('FAIL U1 UPDATE FROM olcek senaryosu coktu ', E.ClassName,
+        ': ', E.Message);
+      try CloseAll; except end;
+    end;
+  end;
+  try
+    CaseUpdateFromFirst;
+  except
+    on E: Exception do
+    begin
+      Inc(GFail);
+      WriteLn('FAIL U4 UPDATE FROM ilk-eslesen senaryosu coktu ', E.ClassName,
+        ': ', E.Message);
+      try CloseAll; except end;
+    end;
+  end;
+  try
+    CaseUpdateFromNull;
+  except
+    on E: Exception do
+    begin
+      Inc(GFail);
+      WriteLn('FAIL U5 UPDATE FROM NULL senaryosu coktu ', E.ClassName,
+        ': ', E.Message);
+      try CloseAll; except end;
+    end;
+  end;
+  try
+    CaseUpdateFromNumeric;
+  except
+    on E: Exception do
+    begin
+      Inc(GFail);
+      WriteLn('FAIL U6 UPDATE FROM sayisal senaryosu coktu ', E.ClassName,
+        ': ', E.Message);
+      try CloseAll; except end;
+    end;
+  end;
+  try
+    CaseUpdateFromNonEq;
+  except
+    on E: Exception do
+    begin
+      Inc(GFail);
+      WriteLn('FAIL U7 UPDATE FROM esitlik-disi senaryosu coktu ', E.ClassName,
+        ': ', E.Message);
+      try CloseAll; except end;
+    end;
+  end;
+  try
+    CaseUpdateFromMulti;
+  except
+    on E: Exception do
+    begin
+      Inc(GFail);
+      WriteLn('FAIL U8 UPDATE FROM coklu kolon senaryosu coktu ', E.ClassName,
+        ': ', E.Message);
+      try CloseAll; except end;
+    end;
+  end;
+  try
+    CaseUpdateFromSubquery;
+  except
+    on E: Exception do
+    begin
+      Inc(GFail);
+      WriteLn('FAIL U9 UPDATE FROM alt sorgu senaryosu coktu ', E.ClassName,
+        ': ', E.Message);
       try CloseAll; except end;
     end;
   end;

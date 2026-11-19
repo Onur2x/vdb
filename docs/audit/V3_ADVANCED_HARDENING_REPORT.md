@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-18
-Surum: v3.69 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1 + H + I + J + K + L + M + N + O; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Surum: v3.70 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1 + H + I + J + K + L + M + N + O + P; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -74,10 +74,13 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   SKILL6 03 ile ayni buyuklukte bir mimari is.
 - **SKILL6 07 - genel hash join / maliyet modeli**: **KISMI**. `SELECT`
   tarafinda `TryStreamJoin` zaten PK arama, indeks kaynagi ve hash join
-  yollarini secer (`merge_hash` kapisi M1-M13). Acik kalan: `UPDATE ... FROM`
-  hala hedef x kaynak ic ice dongusudur (VDbExecutor.pas, `ExecUpdate`),
-  yani O(N x M). Ayrica maliyet modeli cardinality/distinct/NULL orani/hash
-  bellek maliyeti ile spill-to-disk kararlarini icermiyor.
+  yollarini secer (`merge_hash` kapisi M1-M13). Sprint P'de `UPDATE ... FROM`
+  tarafi da **esitlik anahtarli hash birlestirmesine** cevrildi
+  (`merge_hash` U1-U9; 4000 x 2500 satir 13063 ms -> 16 ms). Acik kalan:
+  maliyet modeli cardinality/distinct/NULL orani/hash bellek maliyeti ile
+  spill-to-disk kararlarini icermiyor; `UPDATE ... FROM` icinde esitlik
+  conjunct'i yoksa (esitlik-disi WHERE) ve collation/sayisal denklik
+  gerektiren durumlarda eski kartezyen yol guvenlik agi olarak duruyor.
 - **SKILL6 08 - dis sistem uyumlulugu**: **YAPILMADI**. Arrow/Parquet
   aktarimi yalniz kendi kodumuzla gidis-donus olarak test ediliyor; NIST CAVP
   vektorleri, gercek PostgreSQL istemci matrisi (`psql`, JDBC, psycopg) ve
@@ -87,7 +90,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 ### A.3 Mevcut V3 durumu
 
 - Iki platformda tam kapi seti yesil: **Windows i386 54 kapi**, **Linux
-  x86_64 55 kapi**, FAIL 0 (v3.69 kosulari: `gatesK.log` / `linK.log`).
+  x86_64 55 kapi**, FAIL 0 (v3.70 kosulari: `gatesL.log` / `linL.log`).
   Windows'ta `tls_client` bu ortamda **SKIP** oldu (OpenSSL DLL'i yok);
   kostugu kosu `gatesE.log`'dur. SKIP PASS sayilmaz (ayrinti: `CI.md`).
 - Acik kritik hata yok. Kapatilan son gercek kusurlar: F-21/F-22 veri
@@ -124,6 +127,10 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   **PostgreSQL CancelRequest'in hic islenmemesi** (her baglantiya ayni
   `BackendKeyData(1, 0)` gonderiliyordu, yani iptal edilebilir bir anahtar
   yoktu) kapandi (`network_limits` NL9-NL12, `pg_cancel` PC0-PC9).
+  Sprint P'de **`UPDATE ... FROM` esitlik birlestirmesinin kaba kuvvet
+  O(hedef x kaynak) kartezyen dongu olmasi** kapandi (`merge_hash` U1-U9);
+  eski yolda 4000 x 2500 satirlik guncelleme **13063 ms** suruyordu, yeni
+  hash yolunda **16 ms**.
   Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
 - Rol degistirme yetkisi ve SCRAM kullanicisi -> SQL rolu eslemesi (SKILL5
   3.1'in yetki denetimi ve 3.2) Sprint M'de **kapandi** (`sql_authorization`
@@ -159,6 +166,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | M | SKILL6 02: SCRAM yalniz kimlik dogruluyordu, SQL rolu ile **eslesmiyordu** (dogrulanmis uzak kullanici = motor yoneticisi); bos rol = **sinirsiz yetki**; `SET ROLE NONE` yetki yukselmesiydi; rol uyeligi denetlenmiyordu; oturum kimligi isaretci kirpintisiydi ve rol durumu bir sonraki baglantiya miras kaliyordu | Tamam | `sql_authorization` 62/0 (51 -> 62; AU12 yeni) |
 | N | SKILL6 06: dosya degistirmede (VACUUM/Compact/Restore/Rekey) **dizin fsync'i hic yapilmiyordu**; rename/silme cokme sonrasi kaybolabiliyor, eski WAL geri gelebiliyordu | Tamam | `maint_lock` 19/0 (13 -> 19; ML6-ML7 yeni) |
 | O | SKILL6 05: ag zaman asimi **her recv/send cagrisi icin** ayri uygulaniyordu (damla/drip istemcisi toplam sureyi sinirsiz uzatiyordu); **CancelRequest (80877102) hic islenmiyordu** ve her baglantiya ayni `BackendKeyData(1, 0)` gonderiliyordu | Tamam | `network_limits` 41/0 (26 -> 41; NL9-NL12 yeni), `pg_cancel` 31/0 (yeni, PC0-PC9) |
+| P | SKILL6 07: `UPDATE ... FROM` esitlik birlestirmesi **kaba kuvvet O(hedef x kaynak)** kartezyen donguydu (4000 x 2500 satirda 13063 ms) | Tamam | `merge_hash` 30/0 (19 -> 30; U1-U9 yeni) |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -688,13 +696,15 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   Sprint O (SKILL6 05) **iki** kapiyi buyuttu: yeni kapi dizini
   `tests/pg_cancel` (31 kontrol) ve `tests/network_limits` 26 -> **41**
   kontrol (NL9-NL12); sayilar Windows 53 -> **54**, Linux 54 -> **55**.
+  Sprint P (SKILL6 07) yeni kapi dizini eklemedi; `tests/merge_hash`
+  kapisini 19 -> **30** kontrole buyuttu (U1-U9), kapi sayisi 54 / 55 kaldi.
 - Windows `gatesJ` kosusunda `tls_client` **SKIP** oldu: ortamda
   `VDB_CRYPTO_DLL`/`VDB_SSL_DLL` yok. `tls_client` fikstur dizinini
   `VDB_TLS_FIXTURES` ile bulur; degisken verilmezse kapi exe'nin yanindan
   arar ve bulamaz (daha once ilk denemede FAIL, degisken verilince SKIP).
   Linux'ta fikstur otomatik bulundu ve kapi **kostu**: 6/6 PASS. Windows'ta
   `tls_client`'in kostugu kosu `gatesE.log`'dur (DLL'ler o ortamda vardi).
-  Iki ortam arasindaki bu fark kapi sayisini 53/54 yapar; SKIP PASS sayilmaz.
+  Iki ortam arasindaki bu fark kapi sayisini 54/55 yapar; SKIP PASS sayilmaz.
 - **NOT-RUN** satirlari "kosmuyor" degil "olculmedi" demektir; bu raporda
   PASS sayilmaz.
 
@@ -1133,6 +1143,35 @@ tablosundadir. Bu sprintte kapatilanlar:
   denetlenir, tek `SSL_read`in ust siniri yine `SO_RCVTIMEO`'dur. (c) Iptal
   **isbirlikci** noktalarda (satir dongusu/TickAbort) etkilidir; bloklayan
   tek bir disk G/C'sini kesmez. V2 ve bicim v5 degismedi.
+
+- **F-48 (Orta/Yuksek, KAPALI, v3.70; kod etiketi Sprint P)**: `UPDATE ...
+  FROM` esitlik birlestirmesi **kaba kuvvetti**. `ExecUpdate`
+  (`VDbExecutor.pas`) hedef satirlari kaynak satirlariyla **kartezyen**
+  dolasiyordu (`for i ... for fi ... RowMatches`), ilk eslesende duruyordu;
+  4000 hedef x 2500 kaynak satirinda ~6.9 milyon tam WHERE degerlendirmesi
+  yapiliyordu (**olculen 13063 ms**). SKILL6 07. Duzeltme: WHERE'in ust
+  duzey `AND` dallarindan **yalniz guvenli** esitlikler cikarilir
+  (`sboEq` + iki tarafi da kolon referansi; `BinaryOpCtype = VCT_STR` ve iki
+  tarafta collation bos - sayisal denklik `'01' = '1'`, `VCT_BOOL`,
+  dil-duyarli collation **anahtar sayilmaz**), anahtar uzunluk-onekli
+  parcalardan kurulur (FNV-1a hash), kaynak tarafi hash tablosuna **azalan
+  sirada basa eklenir** ki kova artan `fi` sirasinda gezilsin ve "ilk eslesen
+  kaynak satiri kazanir" semantigi korunsun; NULL (bos) anahtar hicbir
+  esitlikte eslesmedigi icin atlanir; her adayda **tam WHERE** yeniden
+  degerlendirilir (hash yalniz on filtre). Uygun conjunct yoksa eski
+  kartezyen yol **aynen** calisir (esitlik-disi WHERE, sayisal/collation
+  durumlari icin guvenlik agi). Regresyon: `merge_hash` **30/0**
+  (19 -> 30; U1-U9). On-kapi (`git archive HEAD` = `ab103aa`, test dosyasi
+  calisma agacindan): **29 PASS / 1 FAIL**, tek ayirt edici **U3** =
+  `sure=13063ms sinir=4000ms`; yeni kodda **16 ms**. Ayni yuk altinda
+  ~815x hizlanma. U1/U2/U4-U9 on-kapida da gecer (eski yol **dogru** idi,
+  yalniz yavasti) - bu yuzden ayirt edici olan tek kontrol sure siniridir,
+  sonuc dogrulugu kontrolleri regresyon korumasidir. **Durust sinir**: bu
+  degisiklik bir **maliyet modeli degil**, tek bir guvenli durumda hash
+  yoludur; cardinality/distinct/NULL orani/hash bellek tahmini ve
+  spill-to-disk karari hala yok, `UPDATE ... FROM` icinde tek tablo/alt
+  sorgu kaynagi disinda (JOIN) parser zaten hata veriyor. V2 ve bicim v5
+  degismedi.
 
 
 ---
