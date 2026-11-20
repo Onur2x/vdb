@@ -944,6 +944,12 @@ type
     // pgwire bunu gercek PostgreSQL OID'lerine cevirir.
     FieldTypes: TByteArray;
     Rows: TStrMatrix;
+    // v3.71 / SKILL6 03 (F-49) asama 2: satir bazli NULL maskesi. Rows ile
+    // ayni sekilde indekslenir; RowNulls[i][j] = True ise hucre NULL'dur ve
+    // Rows[i][j] BOS METIN tutar (NULL'in metin karsiligi). Uzunluk 0 =
+    // maske BILINMIYOR; o zaman eski davranis gecerlidir ('' = NULL).
+    // Bu alan additive'dir: maske tasimayan yollar bos birakir.
+    RowNulls: TNullMatrix;
     // P-163 (P0-10): tipli sonuc kanali. TVSql.ExecTyped isteginde hizli
     // yol hucreleri string'e cevirmeden TypedRows'a yazar ve Rows bos kalir.
     // Basarisiz/eski yollarda ExecTyped Rows'tan donusturur ve yine

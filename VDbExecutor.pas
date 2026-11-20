@@ -132,6 +132,15 @@ type
     // R-20: acik `... COLLATE <ad>` yazildiysa True. Bu durumda kolonun
     // varsayilan collation'i ONUN USTUNE YAZILMAZ (acik COLLATE kazanir).
     FExplicitColl: Boolean;
+    // v3.71 / SKILL6 03 (F-49) asama 2: su an degerlendirilen satirin NULL
+    // maskesi (satir degerleriyle ayni indeks). Uzunluk 0 = maske
+    // bilinmiyor -> eski davranis ('' = NULL). Yalniz SQL deger modelidir;
+    // saklama katmani VDbTable.TNullMatrix kullanir.
+    FCurNulls: TNulArr;
+    // EvalExpr'in SON cagrisinin NULL (SQL UNKNOWN) sonucu olup olmadigi.
+    // Deger kanali string kaldigi icin NULL ayri bir bayrakla tasinir.
+    // Cagiran her ifade once FLastNull'i okumali, sonra degeri kullanmali.
+    FLastNull: Boolean;
     // P5-2: iliskisiz alt sorgu sonuclari (cumle basi onbellek; ayni ic
     // sorgu disaridaki her satir icin bir kez calisir). Anahtar = AST dugumu.
     FSubCache: TDictionary<Pointer, TSqlResult>;
@@ -2503,6 +2512,8 @@ var
   ct: Byte;
   idx, i, ci, nd: Integer;
   matched: Boolean;
+  { F-49 asama 2: iki tarafin NULL (UNKNOWN) durumu. }
+  lnull, rnull: Boolean;
   fa, fb, fc, fd, fe, fg: Double;
   ia: Int64;
   hasNull: Boolean;
@@ -2536,6 +2547,9 @@ begin
     Iade edilen gecici, onceki cagridan kalma (serbest birakilmis) bir
     dize isaretcisi tasiyabilir; atama onu finalize edip yigini bozar. }
   Result := '';
+  { F-49 asama 2: her cagri kendi NULL durumunu bildirir. Cagiran ifade
+    degeri kullanmadan once FLastNull'i okumalidir. }
+  FLastNull := False;
   if Expr = nil then Exit('');
 
   { v3.14: TAM SAYI zinciri hizli yolu. Yalniz +,-,* ve INT kolon/tam sayi
@@ -2552,6 +2566,13 @@ begin
   if Expr is TSqlLiteralNode then
   begin
     lit := TSqlLiteralNode(Expr);
+    { F-49 asama 2: SQL NULL sabiti. Degeri '' ama NULL oldugu
+      FLastNull ile bildirilir. }
+    if lit.LitType = sltNull then
+    begin
+      FLastNull := True;
+      Exit('');
+    end;
     Exit(lit.AsString);
   end;
 
@@ -2654,7 +2675,17 @@ begin
         if (idx >= 0) and (idx < Length(FProcRow)) then Exit(FProcRow[idx]);
       end;
     idx := FindColIdx(colRef.ColumnName, colRef.TableQualifier, ColNames);
-    if (idx >= 0) and (idx < Length(Row)) then Exit(Row[idx]);
+    if (idx >= 0) and (idx < Length(Row)) then
+    begin
+      { F-49 asama 2: satirin NULL maskesi varsa hucre NULL'dur. Metin
+        kanali bos string tasir; NULL'u ayri bayrakla bildiririz. }
+      if (idx < Length(FCurNulls)) and FCurNulls[idx] then
+      begin
+        FLastNull := True;
+        Exit('');
+      end;
+      Exit(Row[idx]);
+    end;
     if (colRef.TableQualifier <> '') and (FOuterRow <> nil) and (FOuterColNames <> nil) then
     begin
       idx := FindColIdx(colRef.ColumnName, colRef.TableQualifier, FOuterColNames);
@@ -2669,7 +2700,9 @@ begin
   begin
     bin := TSqlBinaryOpNode(Expr);
     lv := EvalExpr(bin.Left, Row, ColNames, ColTypes);
+    lnull := FLastNull;
     rv := EvalExpr(bin.Right, Row, ColNames, ColTypes);
+    rnull := FLastNull;
     ct := BinaryOpCtype(bin, ColNames, ColTypes);
     // R-20: metin kolonu ve karsilastirma tarafi bir kolon referansi ise
     // o kolonun varsayilan collation'i uygulanir. ACIK COLLATE yazilmissa
@@ -2682,7 +2715,42 @@ begin
     end
     else if not FExplicitColl then
       FCurCollation := '';
-    Result := EvalBinary(bin.Op, lv, rv, ct);
+    if lnull or rnull then
+    begin
+      { F-49 asama 2: uc degerli mantik. NULL operand -> sonuc UNKNOWN
+        (WHERE'de elenir), ancak AND/OR'da kesin deger kazanir:
+        UNKNOWN AND FALSE = FALSE, UNKNOWN OR TRUE = TRUE. }
+      Result := '';
+      FLastNull := True;
+      if bin.Op = sboAnd then
+      begin
+        if (not lnull) and (SameText(lv, 'False') or (lv = '0')) then
+        begin
+          Result := 'False';
+          FLastNull := False;
+        end
+        else if (not rnull) and (SameText(rv, 'False') or (rv = '0')) then
+        begin
+          Result := 'False';
+          FLastNull := False;
+        end;
+      end
+      else if bin.Op = sboOr then
+      begin
+        if (not lnull) and (SameText(lv, 'True') or (lv = '1')) then
+        begin
+          Result := 'True';
+          FLastNull := False;
+        end
+        else if (not rnull) and (SameText(rv, 'True') or (rv = '1')) then
+        begin
+          Result := 'True';
+          FLastNull := False;
+        end;
+      end;
+    end
+    else
+      Result := EvalBinary(bin.Op, lv, rv, ct);
     if not FExplicitColl then
     begin
       FCurCollation := '';
@@ -2707,6 +2775,22 @@ begin
   begin
     un := TSqlUnaryOpNode(Expr);
     lv := EvalExpr(un.Operand, Row, ColNames, ColTypes);
+    { F-49 asama 2: IS NULL / IS NOT NULL artik NULL BAYRAGINA bakar;
+      '' ile NULL ayrimi korunur. Diger tekli islemler NULL'u yayar. }
+    if un.Op in [suoIsNull, suoIsNotNull] then
+    begin
+      if un.Op = suoIsNull then
+      begin
+        if FLastNull then Result := 'True' else Result := 'False';
+      end
+      else
+      begin
+        if FLastNull then Result := 'False' else Result := 'True';
+      end;
+      FLastNull := False;
+      Exit(Result);
+    end;
+    if FLastNull then Exit('');
     Exit(EvalUnary(un.Op, lv));
   end;
 
