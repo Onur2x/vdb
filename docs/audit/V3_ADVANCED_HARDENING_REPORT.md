@@ -55,17 +55,26 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   olarak vardir, v5 motor dosya bicimine **bagli degildir**; ikincil indeksler
   hala bellektedir.
 - **macOS / ARM64 / buyuk-endian**: **not-run** (bolum H).
-- **SKILL6 03 - SQL NULL ile bos metin ayrimi**: **YAPILMADI**. Disk formati
-  bunu zaten kodlayabiliyor (v2/v3 satir govdesinde `lenCode = 0` NULL,
-  `lenCode = 1` sifir uzunluklu metin), ancak bellekteki deger modeli
-  `TStrArray` (duz metin) oldugu icin `DecodeRow` NULL'i `''` yapar ve
-  `EncodeRow` `''`i NULL yazar. `EvalExpr` de `sltNull` icin `''` doner.
-  Ayrimi geri kazanmak icin satir/deger modeline NULL maskesi eklenmeli ve
-  INSERT/UPDATE/SELECT/JOIN/GROUP BY/DISTINCT/ORDER BY/indeks/UNIQUE/CHECK/
-  FK/trigger/RLS/pencere fonksiyonlari ile CSV/JSON/Arrow/Parquet/CDC/
-  replikasyon yollarinin TAMAMI bu maskeyi tasimali. Bu bir veri modeli
-  degisikligidir, tek sprintlik bir yama degildir; yarim birakilirsa veri
-  sessizce yanlis okunur/yazilir. `tests/null_empty/` bu is icin yazilmadi.
+- **SKILL6 03 - SQL NULL ile bos metin ayrimi**: **KISMI (asama 1 yazildi)**.
+  Disk formati bunu zaten kodlayabiliyor (v2/v3 satir govdesinde
+  `lenCode = 0` NULL, `lenCode = 1` sifir uzunluklu metin), ancak bellekteki
+  deger modeli `TStrArray` (duz metin) oldugu icin `DecodeRow` NULL'i `''`
+  yapar ve `EncodeRow` `''`i NULL yazar. `EvalExpr` de `sltNull` icin `''`
+  doner. Asama 1 (v3.71) depolama katmanina maskeyi ekledi: `TNulArr`,
+  `TNullMatrix`, `EncodeRowEx(..., const Nulls)`, `DecodeRowEx(..., out Nulls)`,
+  `ScanRowsEx` / `ScanRowsPartEx(..., out Nulls)`; maske
+  verildiginde `''` artik gercek bos metin olarak yazilir, `NULL` ise
+  `lenCode = 0` kalir. Maske `nil`/bos iken davranis BIT BAZI aynidir; bu yuzden
+  bugun hicbir cagiran maske gecmiyor ve SQL semantigi DEGISMEDI
+  (`format_compat` 28/0, dosya bicimi degismedi). Kalan is
+  (asama 2): yurutucude satir maskesi (`FCurNulls`) + `EvalExpr` icin
+  out-of-band `FLastNull`, uc degerli mantik, `IS NULL`, `COUNT(kolon)`,
+  UNIQUE, GROUP BY/DISTINCT, ORDER BY NULLS FIRST/LAST, PG wire `-1`,
+  CSV, `TypedRows` icin `vckNull`; ardindan INSERT/UPDATE/SELECT/JOIN/
+  indeks/trigger/RLS/pencere ile CSV/JSON/Arrow/Parquet/CDC/replikasyon
+  yollarinin TAMAMI maskeyi tasimali. Bu bir veri modeli degisikligidir;
+  yarim birakilirsa veri sessizce yanlis okunur/yazilir. `tests/null_empty/`
+  henuz yazilmadi.
 - **SKILL6 04 - gercek akis (streaming)**: **YAPILMADI**. `MaxPortalResultBytes`
   siniri hala `FSql.Exec` bittikten SONRA denetleniyor (VDbPgWire.pas,
   `ExecutePortal`), yani bellek siniri gercek bir ust sinir degil, sonuc

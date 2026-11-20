@@ -203,6 +203,14 @@ type
   // her cift icin TAM OLARAK BIR giris birakir -> mukerrer imkansiz.
   TStrArray = array of string;
   TStrMatrix = array of TStrArray;
+  { v3.71 / SKILL6 03 (F-49): NULL ile sifir uzunluklu metni ayiran
+    paralel maske. Nulls[i] = True ise satirin i. kolonu NULL'dur;
+    False ve Vals[i] = '' ise deger GERCEK bos metindir. Uzunlugu 0 olan
+    maske "bilinmiyor" demektir: o durumda eski davranis (Vals[i] = ''
+    -> NULL) gecerlidir; boylece maske tasimayan eski cagri yerleri
+    birebir eski davranisi korur. }
+  TNulArr = array of Boolean;
+  TNullMatrix = array of TNulArr;
   TColArray = array of TColDef;
   // WHERE: OR'lanmis AND gruplari (DNF). OR yoksa tek grup.
   // UPDATE ... SET degeri.
@@ -835,11 +843,22 @@ type
     function CandidatePks(const T: TTableDef; const Groups: TWhereGroups;
       out Pks: TStrArray; out Rows: TStrMatrix): Boolean;
     function ScanRows(const Table: string; out Pks: TStrArray; out Rows: TStrMatrix): Integer;
+    { v3.71 / SKILL6 03 (F-49): NULL maskesi ile tarama. Rows[i] metin
+      kanalidir; Nulls[i][j] = True ise o hucre NULL'dur (Rows[i][j] = ''
+      ise "bos metin" degil "NULL" demektir). Ayni satir kumesi, ayni pk
+      sirasi. Maske satirlari arasinda daima ayrilir (Rows ile ayni uzunluk).
+      Cagiran maske ile yazarsa (EncodeRowEx) bos metin korunur. }
+    function ScanRowsEx(const Table: string; out Pks: TStrArray;
+      out Rows: TStrMatrix; out Nulls: TNullMatrix): Integer;
     // R-13 Full: bolme filtreli tarama (partition pruning). Hedef kumesi
     // DISINDAKI satirlar hic materialize edilmez; sonuc kumesi degismez
     // (WHERE tum aday satirlarda yeniden dogrulanir - ust kume garantisi).
     function ScanRowsPart(const Table: string; out Pks: TStrArray;
       out Rows: TStrMatrix; const Targets: TPartTargets): Integer;
+    { v3.71 / SKILL6 03 (F-49): bolme filtreli tarama + NULL maskesi. }
+    function ScanRowsPartEx(const Table: string; out Pks: TStrArray;
+      out Rows: TStrMatrix; out Nulls: TNullMatrix;
+      const Targets: TPartTargets): Integer;
     { v3.2: AS OF — sayfa imajli WAL'de Sequence commit'i sonundaki tutarli
       goruntuden tabloyu okur. True: satirlar kuruldu; ActualSequence < 0 ise
       WAL penceresi BOS (gecmis yok, cagiran acik hata verir). False: bu
@@ -4171,7 +4190,8 @@ begin
 end;
 
 function EncodeRowInto(var b: TBytes; TableId: Word; const Pk: string;
-  const T: TTableDef; const Vals: TStrArray): Integer;
+  const T: TTableDef; const Vals: TStrArray;
+  const Nulls: TNulArr = nil): Integer;
 // P-17b (2026-10-16): WIRE FORMAT BIREBIR ayni (DecodeRow/PeekRawRow/CRC
 // yeni durumu bilmiyor); tahsis baskisi azaltildi. ONCE: INT/FLOAT alan
 // basina SetLength(sv,8), BOOL'da TBytes.Create, metin alaninda
@@ -4194,6 +4214,19 @@ var
   u: QWord;           // P-33: satir ici PutIntCompact
   tmp: array[0..9] of Byte;
   n, j: Integer;
+  hasNulls: Boolean;
+  isNull: Boolean;
+
+  { v3.71 / SKILL6 03: bu kolon NULL mu? Maske varsa YALNIZ maske
+    belirler (sifir uzunluklu metin gercek deger olur); maske yoksa eski
+    kural: bos deger NULL'dir. }
+  function ColIsNull(AIdx: Integer): Boolean; inline;
+  begin
+    if hasNulls then
+      Result := Nulls[AIdx]
+    else
+      Result := (AIdx >= Length(Vals)) or (Vals[AIdx] = '');
+  end;
 
   procedure Grow(Need: Integer); inline;
   var n: Integer;
@@ -4419,6 +4452,9 @@ var
 var
   initCap: Integer;
 begin
+  { v3.71 / SKILL6 03: maske YALNIZ tam uzunluktaysa gecerlidir; kismi
+    maske sessizce yanlis NULL uretmesin diye yok sayilir. }
+  hasNulls := (Length(Nulls) > 0) and (Length(Nulls) >= Length(T.Cols));
   initCap := 16 + Length(Pk) * 2 + Length(T.Cols) * 16;
   if initCap < 64 then initCap := 64;
   // P-65: kapasiteyi koru — yalnizca yetmiyorsa buyut.
@@ -4433,11 +4469,12 @@ begin
   begin
     Grow(2);
     b[p] := T.Cols[i].Ctype; Inc(p);
+    isNull := ColIsNull(i);
     { M6: sifreli kolon. Yalnizca metin/BLOB kolonlarina izin verilir;
-      NULL/bos deger sifrelenmez (motorun string modelinde ikisi ayni). }
+      NULL deger sifrelenmez (sifir uzunluklu metin ARTIK gercek degerdir). }
     if T.Cols[i].Encrypted then
     begin
-      if (i < Length(Vals)) and (Vals[i] <> '') then
+      if not isNull and (i < Length(Vals)) then
       begin
         if T.Cols[i].Ctype = VCT_BLOB then
           raw := VDbS2B(Vals[i])
@@ -4455,7 +4492,7 @@ begin
     end;
     case T.Cols[i].Ctype of
       VCT_INT:
-        if (i < Length(Vals)) and (Vals[i] <> '') then
+        if not isNull and (i < Length(Vals)) and (Vals[i] <> '') then
         begin
           { P-33: dogrulama burada — VDbNormValue artik INT icin parse etmiyor. }
           if not VDbParseInt(Vals[i], iv) then
@@ -4491,14 +4528,14 @@ begin
         end
         else begin b[p] := 0; Inc(p); end;
       VCT_FLOAT:
-        if (i < Length(Vals)) and (Vals[i] <> '') and VDbParseFloat(Vals[i], fv) then
+        if not isNull and (i < Length(Vals)) and (Vals[i] <> '') and
+          VDbParseFloat(Vals[i], fv) then
         begin PutLenCode(8); Grow(8); Move(fv, b[p], 8); Inc(p, 8); end
         else PutLenCode(-1);
       VCT_BOOL:
         begin
-          // BOS DEGER = NULL (vlen = -1). Once kontrol etmek gerekiyor:
-          // aksi halde NULL satiri 'False' olarak kalici yazilirdi.
-          if (i >= Length(Vals)) or (Vals[i] = '') then
+          // NULL ise vlen = -1. Maske varsa NULL'u YALNIZ maske belirler.
+          if isNull or (i >= Length(Vals)) or (Vals[i] = '') then
             PutLenCode(-1)
           else
           begin
@@ -4509,7 +4546,7 @@ begin
           end;
         end;
     else
-      if (i < Length(Vals)) and (Vals[i] <> '') then
+      if not isNull and (i < Length(Vals)) then
       begin
         if T.Cols[i].Ctype = VCT_BLOB then
         begin
@@ -4567,7 +4604,19 @@ begin
   // EncodeRowInto mevcut tampona yazar ve onceki pending degeri bozulur.
   // Result := nil paylasilan tamponu birakir; her cagri taze dizi alir.
   Result := nil;
-  n := EncodeRowInto(Result, TableId, Pk, T, Vals);
+  n := EncodeRowInto(Result, TableId, Pk, T, Vals, nil);
+  SetLength(Result, n);
+end;
+
+function EncodeRowEx(TableId: Word; const Pk: string; const T: TTableDef;
+  const Vals: TStrArray; const Nulls: TNulArr): TBytes;
+// v3.71 / SKILL6 03 (F-49): NULL maskesini koruyan kodlama. Bos metin
+// (Nulls[i] = False, Vals[i] = '') artik gercek deger olarak yazilir.
+var
+  n: Integer;
+begin
+  Result := nil;
+  n := EncodeRowInto(Result, TableId, Pk, T, Vals, Nulls);
   SetLength(Result, n);
 end;
 
@@ -4671,13 +4720,16 @@ begin
   Result := True;
 end;
 
-function DecodeRow(const B: TBytes; out TableId: Word; out Pk: string; out Vals: TStrArray): Boolean;
+function DecodeRowEx(const B: TBytes; out TableId: Word; out Pk: string;
+  out Vals: TStrArray; out Nulls: TNulArr): Boolean;
 // Satiri kayitli sira ile cozer. Alanlar eski semaya gore yazilmis
 // olabilir; ALTER TABLE sirasinda cagricilar SrcCts ile kesisim
 // dondurum yapar.
 // P-111: VdbRowPkOf'in ayri santiye taramasi kaldirildi — pk ya satir
 // govdesinden (H.PkFromCol < 0) ya da H.PkFromCol kolonundan cikarilir.
 // Kolon pk'si icin Pk = Vals[H.PkFromCol] (tum tiplerde bicim birebir).
+// v3.71 / SKILL6 03 (F-49): NULL bilgisi artik KAYBOLMAZ — Nulls[i] True
+// ise kolon NULL'dir ve Vals[i] = '' olmasi "bos metin" demek DEGILDIR.
 var
   H: TVdbRowHdr;
   p: Integer;
@@ -4711,6 +4763,7 @@ begin
     Pk := '';   // kolon pk'si dongude doldurulacak
   cc := H.ColCount;
   SetLength(Vals, cc);
+  SetLength(Nulls, cc);
   p := H.ColOff;
   for i := 0 to cc - 1 do
   begin
@@ -4720,6 +4773,7 @@ begin
     if vl = -1 then
     begin
       Vals[i] := '';
+      Nulls[i] := True;
       if i = H.PkFromCol then Pk := '';
       Continue;
     end;
@@ -4758,6 +4812,16 @@ begin
     Inc(p, vl);
   end;
   Result := True;
+end;
+
+function DecodeRow(const B: TBytes; out TableId: Word; out Pk: string;
+  out Vals: TStrArray): Boolean;
+// v3.71: eski imza — NULL maskesini ATAR (geriye uyum). NULL bilgisi
+// gereken yollar DecodeRowEx kullanmalidir.
+var
+  dummy: TNulArr;
+begin
+  Result := DecodeRowEx(B, TableId, Pk, Vals, dummy);
 end;
 
 function VDbPeekRawRow(const B: TBytes; ColCount: Integer;
@@ -12322,6 +12386,12 @@ begin
   Result := ScanRowsPart(Table, Pks, Rows, Default(TPartTargets));
 end;
 
+function TVTableDb.ScanRowsEx(const Table: string; out Pks: TStrArray;
+  out Rows: TStrMatrix; out Nulls: TNullMatrix): Integer;
+begin
+  Result := ScanRowsPartEx(Table, Pks, Rows, Nulls, Default(TPartTargets));
+end;
+
 function VDbPartHash(const S: string): QWord;
 { R-13 Full: HASH bolme icin deterministik 64-bit FNV-1a. Ayni deger
   (ayni string bicimiyle) her zaman ayni bolume duser. }
@@ -12448,8 +12518,9 @@ begin
   end;
 end;
 
-function TVTableDb.ScanRowsPart(const Table: string; out Pks: TStrArray;
-  out Rows: TStrMatrix; const Targets: TPartTargets): Integer;
+function TVTableDb.ScanRowsPartEx(const Table: string; out Pks: TStrArray;
+  out Rows: TStrMatrix; out Nulls: TNullMatrix;
+  const Targets: TPartTargets): Integer;
 var
   t: TTableDef;
   keys: TQWordArray;
@@ -12457,6 +12528,7 @@ var
   tid: Word;
   pk: string;
   vals: TStrArray;
+  nls: TNulArr;
   raw: TValArray;
   i, n: Integer;
   pci: Integer;       // R-13 Full: bolme kolonu indeksi (-1 = filtre yok)
@@ -12478,6 +12550,7 @@ begin
   // yol aciyordu.
   SetLength(Pks, Length(keys));
   SetLength(Rows, Length(keys));
+  SetLength(Nulls, Length(keys));
   n := 0;
   hashPrefix := VDbHashKeyPrefix(t.Name);   // P-111: bir kez
   for i := 0 to High(keys) do
@@ -12488,7 +12561,7 @@ begin
     // olabilecek tek bir bozuk kayit, SELECT/UPDATE/DELETE sonuclarini
     // sessizce eksik donduruyordu ("satir kayip" ama hata yok).
     // Artik net hata: veri bozulmus, yedekten geri yuklenmeli.
-    if not DecodeRow(raw[i], tid, pk, vals) then
+    if not DecodeRowEx(raw[i], tid, pk, vals, nls) then
       raise EVDbException.CreateFmt(ecCorrupt,
         'VDb: kayit cozulemedi (tablo=%s, anahtar=%d). Veritabani bozulmus; ' +
         'yedekten geri yukleyin.', [t.Name, k]);
@@ -12520,11 +12593,20 @@ begin
         if not hit then Continue;
       end;
     end;
-    Pks[n] := pk; Rows[n] := vals; Inc(n);
+    Pks[n] := pk; Rows[n] := vals; Nulls[n] := nls; Inc(n);
   end;
   SetLength(Pks, n);
   SetLength(Rows, n);
+  SetLength(Nulls, n);
   Result := n;
+end;
+
+function TVTableDb.ScanRowsPart(const Table: string; out Pks: TStrArray;
+  out Rows: TStrMatrix; const Targets: TPartTargets): Integer;
+var
+  nls: TNullMatrix;
+begin
+  Result := ScanRowsPartEx(Table, Pks, Rows, nls, Targets);
 end;
 
 function TVTableDb.ScanRowsAt(const Table: string; Sequence: Integer;
