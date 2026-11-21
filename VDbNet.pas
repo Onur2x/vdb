@@ -107,6 +107,19 @@ function VdbResolveListenHost(const ARequested: string;
   VDB_SOCK_INVALID doner. }
 function VdbTcpAccept(AListen: TVdbSocket): TVdbSocket;
 
+{ SKILL10: engellemeyen accept. AListen once VdbSockSetNonBlocking ile
+  non-blocking yapilmalidir. Bekleyen baglanti yoksa VDB_SOCK_INVALID
+  doner ve AWouldBlock=True olur (hata DEGIL); gercek hata ile ayrimi
+  icin tek yol budur. Boylece kabul dongusu Stop bayragini 200 ms
+  icinde gorebilir; bloklu accept'i baska bir is parcacigindan
+  kapatmaya (Windows'ta guvenilmez) GEREK KALMAZ. }
+function VdbTcpAcceptNb(AListen: TVdbSocket;
+  out AWouldBlock: Boolean): TVdbSocket;
+
+{ SKILL10: soketi bloklamayan (non-blocking) kipe alir/geri alir.
+  Windows: ioctlsocket(FIONBIO); Unix: fcntl(O_NONBLOCK). }
+function VdbSockSetNonBlocking(ASock: TVdbSocket; AOn: Boolean): Boolean;
+
 { AHost:APort'a baglanir (ENGELLEME). Hata: VDB_SOCK_INVALID. }
 function VdbTcpConnect(const AHost: string; APort: Word): TVdbSocket;
 
@@ -137,9 +150,14 @@ function VdbRecvAll(ASock: TVdbSocket; var ABuf; ALen: Integer): Boolean;
   sinirsiz uzuyordu (ornegin her 29 saniyede bir bayt). Bu fonksiyonlar
   ayni son tarihi tum parcalara uygular. }
 function VdbRecvAllDl(ASock: TVdbSocket; var ABuf; ALen: Integer;
-  ASonTick: QWord): Boolean;
+  ASonTick: QWord; AStopFlag: PInteger = nil): Boolean;
 function VdbSendAllDl(ASock: TVdbSocket; const ABuf; ALen: Integer;
-  ASonTick: QWord): Boolean;
+  ASonTick: QWord; AStopFlag: PInteger = nil): Boolean;
+
+{ SKILL10: SELECT ile "hazir mi" beklemesi (en fazla 1000 ms'lik dilim).
+  Kabul dongusu bunu kullanir; boylece bloklayan accept olmadan Stop
+  bayragi en gec ~200 ms icinde gorulur. }
+function VdbWaitSock(ASock: TVdbSocket; AYaz: Boolean; AMs: Integer): Boolean;
 
 { En fazla ALen bayt okur (kismi okuma normaldir).
   0 = karsi taraf kapatti, <0 = hata. HTTP basligi gibi "bitis
@@ -191,6 +209,44 @@ begin
   fpSetSockOpt(s, SOL_SOCKET, SO_NOSIGPIPE, @one, SizeOf(one));
 end;
 {$ENDIF}
+
+{$IFDEF UNIX}
+const
+  { SKILL10: FPC BaseUnix bu sabitleri O_NONBLOCK adiyla vermez;
+    degerler Linux ve BSD/Darwin icin ayri ayri dogrulanmistir. }
+  VDB_F_GETFL = 3;      // Linux ve BSD: F_GETFL
+  VDB_F_SETFL = 4;      // Linux ve BSD: F_SETFL
+  {$IFDEF DARWIN}
+  VDB_O_NONBLOCK = $0004;
+  {$ELSE}
+  VDB_O_NONBLOCK = $0800;
+  {$ENDIF}
+{$ENDIF}
+
+function VdbSockSetNonBlocking(ASock: TVdbSocket; AOn: Boolean): Boolean;
+{$IFDEF MSWINDOWS}
+var
+  arg: u_long;
+{$ELSE}
+var
+  flags: cint;
+{$ENDIF}
+begin
+  Result := False;
+  if ASock = VDB_SOCK_INVALID then Exit;
+{$IFDEF MSWINDOWS}
+  if AOn then arg := 1 else arg := 0;
+  Result := ioctlsocket(ASock, FIONBIO, arg) = 0;
+{$ELSE}
+  flags := FpFcntl(ASock, VDB_F_GETFL, 0);
+  if flags < 0 then Exit;
+  if AOn then
+    flags := flags or VDB_O_NONBLOCK
+  else
+    flags := flags and (not VDB_O_NONBLOCK);
+  Result := FpFcntl(ASock, VDB_F_SETFL, flags) = 0;
+{$ENDIF}
+end;
 
 function VdbTcpListen(APort: Word; ABacklog: Integer): TVdbSocket;
 begin
@@ -315,6 +371,34 @@ begin
   {$ENDIF}
 end;
 
+function VdbTcpAcceptNb(AListen: TVdbSocket;
+  out AWouldBlock: Boolean): TVdbSocket;
+var
+  dummy: TInetSockAddr;
+  dl: tsocklen;
+  e: Integer;
+begin
+  AWouldBlock := False;
+  dl := SizeOf(dummy);
+  Result := fpAccept(AListen, psockaddr(@dummy), @dl);
+  if Result = VDB_SOCK_INVALID then
+  begin
+    { SKILL10: non-blocking accept'te "bekleyen baglanti yok" bir HATA
+      degildir; ayirt edilmezse kabul dongusu sunucuyu durdururdu. }
+    {$IFDEF MSWINDOWS}
+    e := WSAGetLastError;
+    AWouldBlock := (e = WSAEWOULDBLOCK) or (e = WSAEINTR);
+    {$ELSE}
+    e := fpgeterrno;
+    AWouldBlock := (e = ESysEAGAIN) or (e = ESysEINTR);
+    {$ENDIF}
+    Exit;
+  end;
+  {$IFDEF DARWIN}
+  VdbNoSigPipe(Result);
+  {$ENDIF}
+end;
+
 function VdbTcpConnect(const AHost: string; APort: Word): TVdbSocket;
 var
   s: TVdbSocket;
@@ -420,13 +504,15 @@ begin
 end;
 
 function VdbRecvAllDl(ASock: TVdbSocket; var ABuf; ALen: Integer;
-  ASonTick: QWord): Boolean;
+  ASonTick: QWord; AStopFlag: PInteger): Boolean;
 var
   got, n: Integer;
   p: PByte;
   kalan: Int64;
+  dilim: Integer;
 begin
-  if ASonTick = 0 then Exit(VdbRecvAll(ASock, ABuf, ALen));
+  if (ASonTick = 0) and (AStopFlag = nil) then
+    Exit(VdbRecvAll(ASock, ABuf, ALen));
   Result := False;
   if (ASock = VDB_SOCK_INVALID) or (ALen < 0) then Exit;
   if ALen = 0 then Exit(True);
@@ -434,25 +520,37 @@ begin
   p := @ABuf;
   while got < ALen do
   begin
-    kalan := Int64(ASonTick) - Int64(GetTickCount64);
-    if kalan <= 0 then Exit;        // MUTLAK son tarih gecti
-    if not VdbWaitSock(ASock, False, Integer(kalan)) then
-      Continue;                      // dilim doldu; son tarih yeniden denetlenir
+    { SKILL10: iptal bayragi her dilimde denetlenir. Windows'ta
+      shutdown() bloklu select()'i uyandirmaz (olculdu); bu yuzden
+      Stop yalnizca bayrakla zamaninda donebilir. }
+    if (AStopFlag <> nil) and (AStopFlag^ <> 0) then Exit;
+    if ASonTick <> 0 then
+    begin
+      kalan := Int64(ASonTick) - Int64(GetTickCount64);
+      if kalan <= 0 then Exit;        // MUTLAK son tarih gecti
+      if kalan > 200 then dilim := 200 else dilim := Integer(kalan);
+    end
+    else
+      dilim := 200;                   // bayrak var, son tarih yok
+    if not VdbWaitSock(ASock, False, dilim) then
+      Continue;                       // dilim doldu; son tarih yeniden denetlenir
     n := fpRecv(ASock, p + got, ALen - got, 0);
-    if n <= 0 then Exit;             // 0 = karsi taraf kapatti
+    if n <= 0 then Exit;              // 0 = karsi taraf kapatti
     Inc(got, n);
   end;
   Result := True;
 end;
 
 function VdbSendAllDl(ASock: TVdbSocket; const ABuf; ALen: Integer;
-  ASonTick: QWord): Boolean;
+  ASonTick: QWord; AStopFlag: PInteger): Boolean;
 var
   sent, n: Integer;
   p: PByte;
   kalan: Int64;
+  dilim: Integer;
 begin
-  if ASonTick = 0 then Exit(VdbSendAll(ASock, ABuf, ALen));
+  if (ASonTick = 0) and (AStopFlag = nil) then
+    Exit(VdbSendAll(ASock, ABuf, ALen));
   Result := False;
   if (ASock = VDB_SOCK_INVALID) or (ALen < 0) then Exit;
   if ALen = 0 then Exit(True);
@@ -460,9 +558,16 @@ begin
   p := @ABuf;
   while sent < ALen do
   begin
-    kalan := Int64(ASonTick) - Int64(GetTickCount64);
-    if kalan <= 0 then Exit;
-    if not VdbWaitSock(ASock, True, Integer(kalan)) then
+    if (AStopFlag <> nil) and (AStopFlag^ <> 0) then Exit;
+    if ASonTick <> 0 then
+    begin
+      kalan := Int64(ASonTick) - Int64(GetTickCount64);
+      if kalan <= 0 then Exit;
+      if kalan > 200 then dilim := 200 else dilim := Integer(kalan);
+    end
+    else
+      dilim := 200;
+    if not VdbWaitSock(ASock, True, dilim) then
       Continue;
 {$IFDEF LINUX}
     n := fpSend(ASock, p + sent, ALen - sent, MSG_NOSIGNAL);

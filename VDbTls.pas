@@ -36,21 +36,27 @@ type
       Guvenli olmayan bir mod yoktur; CA yoksa istisna atilir. }
     constructor CreateClient(const ACaFile, AHostName: string);
     destructor Destroy; override;
+    { SKILL10: ASonTick = mutlak son tarih (GetTickCount64 tabani, 0 = eski
+      davranis). Verilirse el sikismasi bu tarihi ASAMAZ. }
     function Accept(ASock: TVdbSocket; out ASession: TVdbTlsSession;
-      out AErr: string): Boolean;
+      out AErr: string; ASonTick: QWord = 0): Boolean;
     function Connect(ASock: TVdbSocket; out ASession: TVdbTlsSession;
-      out AErr: string): Boolean;
+      out AErr: string; ASonTick: QWord = 0): Boolean;
     property IsClient: Boolean read FIsClient;
   end;
 
   TVdbTlsSession = class
   private
     FSSL: Pointer;
+    FSock: TVdbSocket;
   public
-    constructor Create(ASSL: Pointer);
+    constructor Create(ASSL: Pointer; ASock: TVdbSocket = VDB_SOCK_INVALID);
     destructor Destroy; override;
-    function Read(ABuf: Pointer; ALen: Integer): Integer;
-    function Write(ABuf: Pointer; ALen: Integer): Integer;
+    { Donus: >0 okunan, 0 temiz kapanis, -1 hata, -2 son tarih asimi.
+      ASonTick verilirse tek bir SSL_read VDB_TLS_SLICE_MS'ten fazla
+      bloklamaz ve toplam sure son tarihi asamaz. }
+    function Read(ABuf: Pointer; ALen: Integer; ASonTick: QWord = 0): Integer;
+    function Write(ABuf: Pointer; ALen: Integer; ASonTick: QWord = 0): Integer;
     procedure Shutdown;
   end;
 
@@ -72,6 +78,13 @@ const
   SSL_ERROR_WANT_READ = 2;
   SSL_ERROR_WANT_WRITE = 3;
   SSL_ERROR_ZERO_RETURN = 6;
+  SSL_ERROR_SYSCALL = 5;
+
+  { SKILL10: bir OpenSSL cagrisinin tek seferde bloklayabilecegi ust sinir.
+    Son tarih bundan kucukse kalan sure kullanilir; boylece TLS el sikismasi,
+    SSL_read ve SSL_write MUTLAK son tarihe uyar (eskiden tek bir cagri
+    soketin SO_RCVTIMEO'su kadar, yani ReadTimeoutMs=30000 ms, bloklayabiliyordu). }
+  VDB_TLS_SLICE_MS = 500;
 
 type
   TfnOpenSslInit = function(AOpts: QWord; ASettings: Pointer): Integer; cdecl;
@@ -420,8 +433,24 @@ begin
   inherited Destroy;
 end;
 
+{ SKILL10: tek bir OpenSSL cagrisi icin soket zaman asimini, kalan toplam
+  sureyle sinirla. Boylece TLS el sikismasi/SSL_read/SSL_write mutlak son
+  tarihi asamaz. ASonTick = 0 ise eski davranis (dokunulmaz). }
+procedure TlsSliceTimeouts(ASock: TVdbSocket; ASonTick: QWord);
+var
+  kalan: Int64;
+  dilim: Integer;
+begin
+  if (ASonTick = 0) or (ASock = VDB_SOCK_INVALID) then Exit;
+  kalan := Int64(ASonTick) - Int64(GetTickCount64);
+  if kalan <= 0 then Exit;
+  if kalan > VDB_TLS_SLICE_MS then dilim := VDB_TLS_SLICE_MS
+  else dilim := Integer(kalan);
+  VdbSockSetTimeouts(ASock, dilim, dilim);
+end;
+
 function TVdbTlsContext.Accept(ASock: TVdbSocket;
-  out ASession: TVdbTlsSession; out AErr: string): Boolean;
+  out ASession: TVdbTlsSession; out AErr: string; ASonTick: QWord): Boolean;
 var
   ssl, bio: Pointer;
   r, e: Integer;
@@ -446,19 +475,30 @@ begin
   GSslSetBio(ssl, bio, bio);
   while True do
   begin
+    { SKILL10: el sikismasi mutlak son tarihe uyar; tek bir SSL_accept
+      kisaltilmis soket zaman asimindan fazla bloklayamaz. }
+    if (ASonTick <> 0) and (GetTickCount64 >= ASonTick) then
+      Exit(FailCtx('TLS el sikismasi zaman asimi'));
+    TlsSliceTimeouts(ASock, ASonTick);
     r := GSslAccept(ssl);
     if r = 1 then Break;
     e := GSslGetError(ssl, r);
     if (e <> SSL_ERROR_WANT_READ) and (e <> SSL_ERROR_WANT_WRITE) then
+    begin
+      { Kisaltilmis zaman asimi SSL_ERROR_SYSCALL olarak donebilir; son
+        tarih gelmediyse tekrar denenir. }
+      if (e = SSL_ERROR_SYSCALL) and (ASonTick <> 0) and
+         (GetTickCount64 < ASonTick) then Continue;
       Exit(FailCtx('TLS el sikismasi basarisiz (SSL hata ' + IntToStr(e) + '): ' +
         LastOpenSslError));
+    end;
   end;
-  ASession := TVdbTlsSession.Create(ssl);
+  ASession := TVdbTlsSession.Create(ssl, ASock);
   Result := True;
 end;
 
 function TVdbTlsContext.Connect(ASock: TVdbSocket;
-  out ASession: TVdbTlsSession; out AErr: string): Boolean;
+  out ASession: TVdbTlsSession; out AErr: string; ASonTick: QWord): Boolean;
 var
   ssl, bio, cert: Pointer;
   r, e, vr: Integer;
@@ -485,12 +525,20 @@ begin
   GSslSetBio(ssl, bio, bio);
   while True do
   begin
+    { SKILL10: istemci el sikismasi da mutlak son tarihe uyar. }
+    if (ASonTick <> 0) and (GetTickCount64 >= ASonTick) then
+      Exit(FailCtx('TLS istemci el sikismasi zaman asimi'));
+    TlsSliceTimeouts(ASock, ASonTick);
     r := GSslConnect(ssl);
     if r = 1 then Break;
     e := GSslGetError(ssl, r);
     if (e <> SSL_ERROR_WANT_READ) and (e <> SSL_ERROR_WANT_WRITE) then
+    begin
+      if (e = SSL_ERROR_SYSCALL) and (ASonTick <> 0) and
+         (GetTickCount64 < ASonTick) then Continue;
       Exit(FailCtx('TLS istemci el sikismasi basarisiz (SSL hata ' +
         IntToStr(e) + '): ' + LastOpenSslError));
+    end;
   end;
   { El sikismasi bitti: sertifika zinciri ve (verildiyse) sunucu adi dogrulanir.
     Basarisizlikta oturum acilmaz; dogrulamasiz devam yolu yoktur. }
@@ -512,16 +560,17 @@ begin
         Exit(FailCtx('TLS sunucu adi uyusmuyor: ' + FHostName));
     end;
   end;
-  ASession := TVdbTlsSession.Create(ssl);
+  ASession := TVdbTlsSession.Create(ssl, ASock);
   Result := True;
 end;
 
 { ---------------------------------------------------------------- oturum }
 
-constructor TVdbTlsSession.Create(ASSL: Pointer);
+constructor TVdbTlsSession.Create(ASSL: Pointer; ASock: TVdbSocket);
 begin
   inherited Create;
   FSSL := ASSL;
+  FSock := ASock;
 end;
 
 destructor TVdbTlsSession.Destroy;
@@ -535,34 +584,47 @@ begin
   inherited Destroy;
 end;
 
-function TVdbTlsSession.Read(ABuf: Pointer; ALen: Integer): Integer;
+function TVdbTlsSession.Read(ABuf: Pointer; ALen: Integer; ASonTick: QWord): Integer;
 var
   r, e: Integer;
 begin
   if (FSSL = nil) or (ALen <= 0) then Exit(0);
   while True do
   begin
+    { SKILL10: MUTLAK son tarih. Eski kod yalnizca WANT_READ/WANT_WRITE
+      dongusunde bekliyordu ve tek bir SSL_read soketin tam zaman asimi
+      (varsayilan 30 s) kadar bloklayabiliyordu. }
+    if (ASonTick <> 0) and (GetTickCount64 >= ASonTick) then Exit(-2);
+    TlsSliceTimeouts(FSock, ASonTick);
     r := GSslRead(FSSL, ABuf, ALen);
     if r > 0 then Exit(r);
     e := GSslGetError(FSSL, r);
     if (e = SSL_ERROR_WANT_READ) or (e = SSL_ERROR_WANT_WRITE) then
       Continue;
+    if (e = SSL_ERROR_SYSCALL) and (ASonTick <> 0) and
+       (GetTickCount64 < ASonTick) then
+      Continue;   // kisaltilmis zaman asimi: son tarih gelmedi, tekrar dene
     if e = SSL_ERROR_ZERO_RETURN then Exit(0);
     Exit(-1);
   end;
 end;
 
-function TVdbTlsSession.Write(ABuf: Pointer; ALen: Integer): Integer;
+function TVdbTlsSession.Write(ABuf: Pointer; ALen: Integer; ASonTick: QWord): Integer;
 var
   r, e: Integer;
 begin
   if (FSSL = nil) or (ALen <= 0) then Exit(0);
   while True do
   begin
+    if (ASonTick <> 0) and (GetTickCount64 >= ASonTick) then Exit(-2);
+    TlsSliceTimeouts(FSock, ASonTick);
     r := GSslWrite(FSSL, ABuf, ALen);
     if r > 0 then Exit(r);
     e := GSslGetError(FSSL, r);
     if (e = SSL_ERROR_WANT_READ) or (e = SSL_ERROR_WANT_WRITE) then
+      Continue;
+    if (e = SSL_ERROR_SYSCALL) and (ASonTick <> 0) and
+       (GetTickCount64 < ASonTick) then
       Continue;
     Exit(-1);
   end;

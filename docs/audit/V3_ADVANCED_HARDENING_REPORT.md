@@ -150,13 +150,29 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   sinir, kapi bunu gecmez saymaz); gercek PostgreSQL istemci matrisi
   (`psql`, JDBC, Npgsql) bu ortamda **kurulu degildir ve kosmadi** -
   `server_version = 14.0` bir uyumluluk sertifikasi **degildir**.
+- **SKILL09 - NULL operator semantigi**: **TAMAM (v3.74, Sprint T)**.
+  `IN`/`NOT IN`, `IN` alt sorgusu, `ANY`/`ALL` ve `BETWEEN` yollarinda NULL
+  ile `''` ayrimi tamamlandi: sol islenen NULL -> **UNKNOWN**, `''` gercek
+  deger, liste/alt sorguda NULL -> eslesme yoksa **UNKNOWN** (hem `IN` hem
+  `NOT IN`), `ANY` bos kume False, `ALL` bos kume True. `null_empty` 41 ->
+  **126/0** (NE52-NE136, 85 yeni kontrol); on-kapi `git archive 2ccbecb`
+  **85 PASS / 41 FAIL** - ayirt edici. Ayrinti: F-52.
+- **SKILL10 - sunucu durdurma ve TLS mutlak son tarihi**: **TAMAM (v3.74,
+  Sprint U)**. `Stop` yarim baglantida **29703 ms** yerine **312 ms**;
+  kabul once durur, baglantilar uyandirilip beklenir, motor ancak butun
+  baglanti is parcaciklari bittikten sonra kapanir; dinleme non-blocking +
+  `VdbTcpAcceptNb`; TLS el sikismasi ve `SSL_read`/`SSL_write` 500 ms
+  dilimli mutlak son tarih; CancelRequest siriti `VDbCryptRandom` CSPRNG,
+  RNG yoksa `28000` (fail-closed). `network_limits` Windows **97/0 / 4
+  SKIP**, Linux **110/0 / 0 SKIP** (NL13-NL24 eklendi). Ayrinti: F-53.
 
 ### A.3 Mevcut V3 durumu
 
-- Iki platformda tam kapi seti yesil: **Windows i386 60 PASS**, **Linux
-  x86_64 60 PASS**, FAIL 0 (v3.73 kosulari: `gatesP.log` / `linP.log`;
+- Tam kapi seti yesil: **Linux x86_64 60 PASS**, **Windows i386 59 PASS**,
+  FAIL 0 (v3.74 kosulari: `gatesQ.log` / `linQ.log`;
+  v3.73 kaniti: `gatesP.log` / `linP.log`;
   Linux'ta `tls_client` gercekten kosar - 6/0, Windows'ta SKIP;
-  Linux'ta `interop_external` pyarrow yoklugundan SKIP).
+  iki platformda da `interop_external` pyarrow yoklugundan SKIP).
   Windows'ta `tls_client` bu ortamda **SKIP** oldu (OpenSSL DLL'i yok);
   kostugu kosu `gatesE.log`'dur. SKIP PASS sayilmaz (ayrinti: `CI.md`).
 - Acik kritik hata yok. Kapatilan son gercek kusurlar: F-21/F-22 veri
@@ -207,6 +223,17 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   maskesi) uctan uca baglandi; `tests/null_empty` kapisi 41 kontrole
   buyudu ve on-kapi `a30676e` uzerinde **30 PASS / 11 FAIL** verirken simdi
   **41 PASS / 0 FAIL**.
+  Sprint T'de **`IN`/`NOT IN`, `IN` alt sorgusu, `ANY`/`ALL` ve `BETWEEN`
+  yollarinda NULL ile `''` ayriminin eksik olmasi** kapandi: `''` artik
+  NULL sayilmaz, liste/alt sorgudaki NULL **UNKNOWN** uretir (hem `IN` hem
+  `NOT IN`) ve uc degerli mantik bos kume dahil uygulanir (`null_empty`
+  NE52-NE136; 41 -> 126, on-kapi 85/41). Sprint U'da **`Stop`in yarim
+  baglantida ~30 s beklemesi**, **TLS el sikismasi/`SSL_read`/`SSL_write`
+  icin mutlak son tarih olmamasi** ve **CancelRequest siritinin xorshift32
+  ile uretilmesi** kapandi: olculen `Stop` 29703 ms -> **312 ms**, TLS son
+  tarihi `-2` ile bildirilir, sirit `VDbCryptRandom` CSPRNG'dir ve RNG
+  yoksa baglanti `28000` ile reddedilir (`network_limits` NL13-NL24;
+  41 -> 97, 4 SKIP).
   Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
 - Rol degistirme yetkisi ve SCRAM kullanicisi -> SQL rolu eslemesi (SKILL5
   3.1'in yetki denetimi ve 3.2) Sprint M'de **kapandi** (`sql_authorization`
@@ -245,7 +272,9 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | P | SKILL6 07: `UPDATE ... FROM` esitlik birlestirmesi **kaba kuvvet O(hedef x kaynak)** kartezyen donguydu (4000 x 2500 satirda 13063 ms) | Tamam | `merge_hash` 30/0 (19 -> 30; U1-U9 yeni) |
 | Q | SKILL6 03: **SQL NULL ile bos metin ayni degerdi** (`'' IS NULL` TRUE donuyordu, `'' = ''` UNKNOWN cikiyordu, `COUNT(kolon)` NULL satirlari sayiyordu); depolama maskesi (asama 1), ifade semantigi (2a), okuma maskesi (2b) ve yazma maskesi (2c) uctan uca baglandi; hizli INSERT seridi ile `ALTER TABLE ADD COLUMN` kusurlari kapandi | Tamam | `null_empty` 41/0 (14 -> 41; NE20-NE51 yeni); on-kapi `a30676e` 30/11 |
 | R | SKILL6 04: portal **tek seferde maddeselestiriyordu** (maxRows yalniz dilimleme; COPY OUT tam sonuc bellekte); gercek satir yineleyicisi yoktu | Tamam | `pg_portal_stream` 35/0 (22 -> 35; PS0, PS1-PS10 yeni); on-kapi `e31d186` 33/2 (dusen: PS4, PS7a) |
-| S | SKILL6 08: Arrow okuyucu `Date.unit`/`Time.unit` sema varsayilanini **SECOND/DAY** saniyordu; Arrow semasinda varsayilan MILLISECOND oldugu icin pyarrow `date64[ms]`/`time32[ms]` icin `unit` alanini **hic yazmaz** ve VDB degeri 1000 kat kaydiriyordu (`00:00:00`, `0000-00-00`). Ayrica Arrow/Parquet, bagimsiz kripto ve SQLite uyumlulugu icin kalici kapi yoktu (yalniz kendi kodumuzla gidis-donus) | Tamam | `interop_format` 21/0, `interop_external` 8/0 (on-kapi **6/2**, ayirt edici X4+X8), `crypto_interop` 33/0, `crypto_interop_ext` 25/0, `bench_sqlite` 24/0; F-51 |
+| S | SKILL6 08: Arrow okuyucu `Date.unit`/`Time.unit` sema varsayilanini **SECOND/DAY** saniyordu; Arrow semasinda varsayilan MILLISECOND oldugu icin pyarrow `date64[ms]`/`time32[ms]` icin `unit` alanini **hic yazmaz** ve VDB degeri 1000 kat kaydiriyordu (`00:00:00`, `0000-00-00`). Ayrica Arrow/Parquet, bagimsiz kripto ve SQLite uyumlulugu icin kalici kapi yoktu (yalniz kendi kodumuzla gidis-donus) | Tamam | `interop_format` 21/0, `interop_external` 8/0 (on-kapi **6/2**, ayirt edici X4+X8; suite kosusunda pyarrow yok -> SKIP), `crypto_interop` 33/0, `crypto_interop_ext` 25/0, `bench_sqlite` 24/0; F-51 |
+| T | SKILL09: `IN`/`NOT IN`, `IN` alt sorgusu, `ANY`/`ALL` ve `BETWEEN` yollarinda **NULL ile `''` ayrimi yoktu** (`''` NULL sayiliyor, liste/alt sorgu NULL maskesi tasinmiyor, uc degerli mantik uygulanmiyordu) | Tamam | `null_empty` 126/0 (41 -> 126; NE52-NE136 yeni); on-kapi `2ccbecb` 85/41; F-52 |
+| U | SKILL10: `Stop` yarim `startup`/baglantida **~30 s** bekliyordu (olculen **29703 ms**); TLS el sikismasi ve `SSL_read`/`SSL_write` mutlak son tarih tasimiyordu; CancelRequest siriti **xorshift32** ile uretiliyordu | Tamam | `network_limits` Windows 97/0 + 4 SKIP, Linux 110/0 + 0 SKIP (NL13-NL24 yeni); ayni NL7 **29703 ms -> 312 ms**; F-53 |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -1374,6 +1403,49 @@ tablosundadir. Bu sprintte kapatilanlar:
   0=0000-00-00 beklenen=2026-03-01`), diger alti kontrol koruyucudur.
   `interop_format` 21/0 ve `format_compat` 28/0 degismedi (bicim v5 bit
   bazi ayni).
+
+- **F-52 (ORTA, TAMAM, v3.74; kod etiketi SKILL09)**: **`IN`/`NOT IN`,
+  `IN` alt sorgusu, `ANY`/`ALL` ve `BETWEEN` yollarinda NULL ile bos metin
+  ayrimi yoktu.** `TSqlInNode` sol islenenin NULL olup olmadigini
+  `FLastNull` yerine degerin bos olmasiyla karistiriyordu: `''` NULL
+  sayiliyor, `x IN (...)` listesinde NULL ogeler icin NULL maskesi
+  tasinmiyor ve uc degerli mantik uygulanmiyordu; ayni hata `IN` alt
+  sorgu yolu, `ANY`/`ALL` (`TSqlQuantNode`) ve `BETWEEN` icin de
+  gecerliydi. Sonuc: `NULL IN (...)` FALSE donebiliyor, NULL iceren
+  listede `NOT IN` yanlislikla TRUE uretiyor ve `''` ile NULL ayni kefeye
+  konuyordu. **Duzeltme**: sol islenen NULL ise sonuc **UNKNOWN**; `''`
+  gercek deger olarak karsilastirilir ve `IN` onbellek sozlugune **gercek
+  anahtar** olarak girer, NULL ayri bir bayrakta tutulur (`FInSetNull`);
+  liste veya alt sorguda NULL varsa ve eslesme yoksa sonuc **UNKNOWN**
+  (hem `IN` hem `NOT IN`); `ANY` bos kume False, `ALL` bos kume True.
+  Kapi: `tests/null_empty` **126/0** (NE52-NE136, 85 yeni kontrol);
+  on-kapi (`git archive 2ccbecb`) **85 PASS / 41 FAIL** - ayirt edici.
+  Bicim v5 ve V2 degismedi.
+
+- **F-53 (YUKSEK, TAMAM, v3.74; kod etiketi SKILL10)**: **Sunucu yarim
+  baglantida ~30 s duruyordu (olculen 29703 ms), TLS el sikismasi ve
+  `SSL_read`/`SSL_write` mutlak son tarih tasimiyordu ve CancelRequest
+  siriti xorshift32 ile uretiliyordu.** `TVdbPgServer.Stop` once dinleme
+  soketini kapatip kabul is parcacigini bloklu `accept` icinde birakiyor,
+  sonra baglantilari beklerken her biri icin ayri `SO_RCVTIMEO` suresini
+  tuketiyordu; TLS dilimleri zaman asimini tek bir `SSL_read` cagrisina
+  birakiyordu ve sirit tahmin edilebilir bir xorshift32 durumundan
+  geliyordu. **Duzeltme**: `Stop` once `FStopping` isaretini koyar, kabul
+  is parcacigini uyandirip **dinleme soketini kapatmadan once** bekler,
+  sonra `FConns` listesini kilit altinda alip her baglantiyi `Wake`
+  (`RequestCancel` + `shutdown`) ile uyandirir, bekler ve motoru ancak
+  butun baglanti is parcaciklari bittikten sonra kapatir; dinleme soketi
+  non-blocking olur ve `VdbTcpAcceptNb` ile 200 ms'lik `VdbWaitSock`
+  dilimlerinde yoklanir; `VdbRecvAllDl`/`VdbSendAllDl` durdurma bayragini
+  her dilimde denetler; TLS el sikismasi ve okuma/yazma 500 ms dilimli
+  mutlak son tarih kullanir ve suresi dolunca `-2` doner; CancelRequest
+  siriti `VDbCryptRandom` CSPRNG'den gelir, RNG basarisizsa baglanti
+  `28000` ile reddedilir (fail-closed). Kapi: `tests/network_limits`
+  Windows **97/0 + 4 SKIP**, Linux **110/0 + 0 SKIP** (NL13-NL24 yeni);
+  ayni NL7 reproducer'i on-kapi
+  (`git archive 0c00225`) **29703 ms**, yeni agac **312 ms**. Durust
+  sinir: TLS son tarihi tek bir `SSL_read`/`SSL_write` cagrisini kesemez;
+  ust sinir `SO_RCVTIMEO`/`SO_SNDTIMEO`'dur.
 
 
 ---

@@ -20,6 +20,13 @@ set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 WORK=${1:-"$ROOT/build/gates"}
+# WORK goreli verilirse mutlak yola cevir. integrity_check kapisi vdbcheck
+# yolunu alt surece arguman olarak verir; alt surec kendi calisma dizinine
+# gectigi icin goreli yol bulunamaz (EProcess: Executable not found).
+case "$WORK" in
+  /*|[A-Za-z]:[\\/]*) ;;
+  *) WORK="$ROOT/$WORK" ;;
+esac
 FPC=${FPC:-fpc}
 
 EXE=""

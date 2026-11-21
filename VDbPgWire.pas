@@ -104,6 +104,17 @@ type
       (now + butce). Bilerek SAKLANMAZ: uzun bir sonuc kumesi yollarken
       bayat bir son tarih yuzunden yazma basarisiz olmasin. }
     FSendBudgetMs: Integer;
+    { SKILL10: TLS'te tek bir OpenSSL cagrisi icin soket zaman asimlari
+      gecici olarak kisaltilir; islem bitince sunucu yapilandirmasina
+      (FReadMs/FSendMs) geri donulur. }
+    FReadMs: Integer;
+    FSendMs: Integer;
+    { SKILL10: baska bir is parcacigi (Stop) bu IO'yu iptal ettiginde 1
+      olur. Windows'ta shutdown() bloklu select()'i uyandirmadigi icin
+      okuma/yazma donguleri bu bayragi her dilimde denetler; boylece Stop
+      is parcaciginin okuma zaman asimini (30 s) beklemez. }
+    FWake: Integer;
+    procedure RestoreSockTimeouts;
   public
     constructor Create(ASock: TVdbSocket);
     destructor Destroy; override;
@@ -241,11 +252,11 @@ type
     { v3.69 / SKILL6 05: CancelRequest destegi. Her baglantiya BENZERSIZ
       bir backend PID ve tahmin edilemez bir secret verilir; CancelRequest
       (kod 80877102) geldiginde yalnizca ikisi de eslesen baglanti iptal
-      edilir. FNextBackendPid atomik artar (1000'den baslar), secret
-      kilit altinda xorshift32 ile uretilir (global Random KULLANILMAZ:
-      motorun/uygulamanin rastgele dizisini bozmamak icin). }
+      edilir. FNextBackendPid atomik artar (1000'den baslar).
+      SKILL10: secret artik OS CSPRNG'den gelir (VDbCryptRandom); eski
+      xorshift32 kriptografik degildi ve durumu tahmin edilebiliyordu.
+      RNG basarisiz olursa NextSecret 0 doner ve baglanti REDDEDILIR. }
     FNextBackendPid: LongInt;
-    FSecretState: Cardinal;
     FCancelHits: Integer;
     { v3.69 / SKILL6 05: sorgu yurutme icin varsayilan statement_timeout
       (ms). 0 = kapali (eski davranis). Baglanti basinda SQL oturumuna
@@ -511,10 +522,20 @@ begin
   FTlsErr := '';
   FBitisTick := 0;
   FSendBudgetMs := 0;
+  FReadMs := 0;
+  FSendMs := 0;
+  FWake := 0;
+end;
+
+procedure TVdbPgIo.RestoreSockTimeouts;
+begin
+  if FSock = VDB_SOCK_INVALID then Exit;
+  VdbSockSetTimeouts(FSock, FReadMs, FSendMs);
 end;
 
 procedure TVdbPgIo.SetDeadlineMs(AMs: Integer);
 begin
+  if AMs > 0 then FReadMs := AMs else FReadMs := 0;
   if (AMs > 0) and (FSock <> VDB_SOCK_INVALID) then
     FBitisTick := GetTickCount64 + QWord(AMs)
   else
@@ -523,7 +544,16 @@ end;
 
 procedure TVdbPgIo.SetSendBudgetMs(AMs: Integer);
 begin
-  if AMs > 0 then FSendBudgetMs := AMs else FSendBudgetMs := 0;
+  if AMs > 0 then
+  begin
+    FSendBudgetMs := AMs;
+    FSendMs := AMs;
+  end
+  else
+  begin
+    FSendBudgetMs := 0;
+    FSendMs := 0;
+  end;
 end;
 
 destructor TVdbPgIo.Destroy;
@@ -551,12 +581,17 @@ begin
   if (ACtx = nil) or (FTls <> nil) or (FSock = VDB_SOCK_INVALID) then Exit;
   if not VdbSendU8(FSock, Ord('S')) then Exit;
   sess := nil;
-  if not ACtx.Accept(FSock, sess, err) then
+  { SKILL10: el sikismasi da MUTLAK son tarihe tabi; eskiden TLS el
+    sikismasi sure sinirsizdi (son tarih yalnizca sonraki okumalarda
+    denetleniyordu). }
+  if not ACtx.Accept(FSock, sess, err, FBitisTick) then
   begin
     FTlsErr := err;
+    RestoreSockTimeouts;
     Exit;
   end;
   FTls := sess;
+  RestoreSockTimeouts;
   Result := True;
 end;
 
@@ -572,23 +607,28 @@ begin
   if FTls <> nil then
   begin
     got := 0;
-    while got < ALen do
-    begin
-      { SKILL6 05: TLS'te select() kullanilamaz (OpenSSL'in kendi
-        tamponu "hazir" gorunmeyebilir), bu yuzden son tarih her parca
-        ONCESI denetlenir. Tek bir SSL_read'in ust siniri soketin
-        SO_RCVTIMEO'sudur (baglanti kabulunde kurulur); bu, durust sinir
-        olarak dokumante edilir: TLS'te toplam sure
-        "parca sayisi x ReadTimeoutMs" ile degil, parcalar arasinda
-        son tarih denetimiyle sinirlanir. }
-      if (FBitisTick <> 0) and (GetTickCount64 >= FBitisTick) then Exit;
-      n := FTls.Read(p + got, ALen - got);
-      if n <= 0 then Exit;
-      Inc(got, n);
+    try
+      while got < ALen do
+      begin
+        { SKILL10: TLS okumasi artik MUTLAK son tarihe uyar. Once yalnizca
+          her parca oncesi denetlenirdi ve tek bir SSL_read soketin
+          SO_RCVTIMEO'su (ReadTimeoutMs, varsayilan 30 s) kadar
+          bloklayabiliyordu; bu yuzden TLS baglantisi toplam sureyi
+          uzatabiliyordu. Artik FTls.Read tek cagrida en fazla
+          VDB_TLS_SLICE_MS bloklar ve son tarihi asmaz (-2). }
+        if FWake <> 0 then Exit;
+        if (FBitisTick <> 0) and (GetTickCount64 >= FBitisTick) then Exit;
+        n := FTls.Read(p + got, ALen - got, FBitisTick);
+        if n = -2 then Exit;          // son tarih asimi
+        if n <= 0 then Exit;
+        Inc(got, n);
+      end;
+    finally
+      RestoreSockTimeouts;
     end;
     Exit(True);
   end;
-  Result := VdbRecvAllDl(FSock, ABuf, ALen, FBitisTick);
+  Result := VdbRecvAllDl(FSock, ABuf, ALen, FBitisTick, @FWake);
 end;
 
 function TVdbPgIo.SendAll(const ABuf; ALen: Integer): Boolean;
@@ -606,16 +646,24 @@ begin
   if FTls <> nil then
   begin
     sent := 0;
-    while sent < ALen do
-    begin
-      if (bitis <> 0) and (GetTickCount64 >= bitis) then Exit;
-      n := FTls.Write(p + sent, ALen - sent);
-      if n <= 0 then Exit;
-      Inc(sent, n);
+    try
+      while sent < ALen do
+      begin
+        { SKILL10: yazma da mutlak butceye uyar; tek bir SSL_write
+          VDB_TLS_SLICE_MS'ten fazla bloklamaz. }
+        if FWake <> 0 then Exit;
+        if (bitis <> 0) and (GetTickCount64 >= bitis) then Exit;
+        n := FTls.Write(p + sent, ALen - sent, bitis);
+        if n = -2 then Exit;
+        if n <= 0 then Exit;
+        Inc(sent, n);
+      end;
+    finally
+      RestoreSockTimeouts;
     end;
     Exit(True);
   end;
-  Result := VdbSendAllDl(FSock, ABuf, ALen, bitis);
+  Result := VdbSendAllDl(FSock, ABuf, ALen, bitis, @FWake);
 end;
 
 function TVdbPgIo.RecvU8(out AV: Byte): Boolean;
@@ -630,6 +678,9 @@ end;
 
 procedure TVdbPgIo.Shutdown;
 begin
+  { SKILL10: bayrak ONCE kurulur. Windows'ta bloklu select() shutdown() ile
+    uyanmadigi olculdu; donguler bayragi dilim basinda gorup cikar. }
+  InterlockedExchange(FWake, 1);
   if FSock <> VDB_SOCK_INVALID then
     VdbSockShutdown(FSock);
 end;
@@ -2149,6 +2200,11 @@ end;
 
 procedure TVdbPgConn.Wake;
 begin
+  { SKILL10: yalniz soketi kapatmak yetmez. Is parcacigi uzun bir sorgu
+    yurutuyorsa soketi okumuyordur; sorgu iptal bayragi da kurulur
+    (motor guvenli noktalarinda durur). Ikisi de baska is parcacigindan
+    guvenlidir. }
+  RequestCancel;
   if FIO <> nil then
     FIO.Shutdown;
 end;
@@ -2315,6 +2371,8 @@ var
   { v3.69 / SKILL6 05 }
   sr: TPgStartupResult;
   cpid, csec: LongInt;
+  { SKILL10: CSPRNG basarisizsa baglanti reddedilir (zayif secret yok). }
+  bkSecret: LongInt;
   { v3.64 (SKILL5 9.5 + 10.1) }
   totalBytes: Int64;
   stOld: TPgStmt;
@@ -2508,8 +2566,15 @@ begin
     { v3.69 / SKILL6 05: BackendKeyData BENZERSIZ. Onceden (1, 0) idi:
       tum istemciler ayni degerleri goruyordu ve CancelRequest ile hangi
       baglantinin iptal edilecegi ayirt edilemiyordu. Secret once, PID en
-      son yazilir (yayin noktasi). }
-    SetBackendKey(FServer.NextBackendPid, FServer.NextSecret);
+      son yazilir (yayin noktasi).
+      SKILL10: secret OS CSPRNG'den; uretilemezse baglanti reddedilir. }
+    bkSecret := FServer.NextSecret;
+    if bkSecret = 0 then
+    begin
+      SendPg(FIO, ErrorMsg('guvenli oturum anahtari uretilemedi', '28000'));
+      Exit;
+    end;
+    SetBackendKey(FServer.NextBackendPid, bkSecret);
     if not SendPg(FIO, BackendKeyMsg(FPid, FSecret)) then Exit;
     if not SendPg(FIO, ReadyMsg) then Exit;
 
@@ -2970,12 +3035,26 @@ procedure TVdbPgAccept.Execute;
 var
   sock: TVdbSocket;
   tmrOk: Boolean;
+  wouldBlock: Boolean;
   tmrFn: TVdbPgSockTimeoutFunc;
 begin
   while not FServer.FStopping do
   begin
-    sock := VdbTcpAccept(FServer.FListen);
-    if sock = VDB_SOCK_INVALID then Break;
+    { SKILL10: BLOKLAMAYAN kabul. select() ile en fazla 200 ms beklenir;
+      Stop bayragi bu pencerede gorulur ve is parcacigi kendi kendine
+      cikar. accept yine de non-blocking oldugu icin "select hazir dedi
+      ama baglanti dustu" yarisinda bile kilitlenme olmaz. }
+    if not VdbWaitSock(FServer.FListen, False, 200) then Continue;
+    sock := VdbTcpAcceptNb(FServer.FListen, wouldBlock);
+    if sock = VDB_SOCK_INVALID then
+    begin
+      if wouldBlock then Continue;   // bekleyen baglanti yok
+      Break;                          // gercek hata / dinleme kapandi
+    end;
+    { Kabul edilen soket non-blocking kipini DEVRALMAMALI; acikca
+      bloklamaya donulur (Windows'ta devralma davranisi surumlere gore
+      degisir). }
+    VdbSockSetNonBlocking(sock, False);
     FServer.GcFinished;   // P-185: bitmis baglantilar slot bosaltir
     { v3.56 / Sprint E: zaman asimlari KABUL ANINDA kurulur; boylece
       baslangic (startup) ve TLS el sikismasi da korunur.
@@ -3056,14 +3135,10 @@ begin
     REDDEDILIR; eskiden dogrulanan her kullanici sinirsiz yetkiye sahipti. }
   FAllowUnmappedUsers := False;
   { v3.69 / SKILL6 05: CancelRequest destegi. PID sayaci 1000'den baslar
-    (0 ve 1 anlamsiz/eski sabit); secret durumu zamana ve nesne adresine
-    gore tohumlanir. Global Random KULLANILMAZ: motorun rastgele dizisini
-    bozmamak icin kendi xorshift32'si vardir ve yalniz FConnsLock altinda
-    cagrilir. }
+    (0 ve 1 anlamsiz/eski sabit).
+    SKILL10: secret durumu artik saklanmaz; her secret OS CSPRNG'den
+    bagimsiz uretilir (bkz. NextSecret). }
   FNextBackendPid := 1000;
-  FSecretState := Cardinal(Cardinal(GetTickCount64) xor
-    (PtrUInt(Self) shr 4));
-  if FSecretState = 0 then FSecretState := $9E3779B9;
   FCancelHits := 0;
   FQueryTimeoutMs := 0;
 end;
@@ -3075,17 +3150,37 @@ end;
 
 function TVdbPgServer.NextSecret: LongInt;
 var
+  b: TBytes;
   x: Cardinal;
 begin
-  { xorshift32: kilit altinda cagrilir; sifir olmayan, tahmin edilmesi zor
-    bir 32 bit deger. Kriptografik bir anahtar DEGILDIR; amac yalnizca
-    baska bir baglantinin iptal edilmesini engellemektir (PostgreSQL'in
-    kendi cancel secret'i da 32 bittir). }
-  x := FSecretState;
-  x := x xor (x shl 13);
-  x := x xor (x shr 17);
-  x := x xor (x shl 5);
-  FSecretState := x;
+  { SKILL10: OS CSPRNG (VDbCryptRandom: Windows CryptGenRandom,
+    Unix /dev/urandom). Eski xorshift32 kriptografik degildi; 32 bit
+    durumu gozlemlenen secret'lardan geri cozulebiliyordu.
+    Fail-closed: RNG yoksa/hata verirse 0 doner; cagiran baglantiyi
+    reddeder. Zayif bir degere DUSULMEZ. }
+  Result := 0;
+  try
+    if not VDbCryptRandom(b, 4) then Exit;
+  except
+    Exit;
+  end;
+  if Length(b) < 4 then Exit;
+  x := Cardinal(b[0]) or (Cardinal(b[1]) shl 8) or
+       (Cardinal(b[2]) shl 16) or (Cardinal(b[3]) shl 24);
+  if x = 0 then
+  begin
+    { x = 0 HandleCancel tarafindan 'secret yok' sayilir; tekrar dene. }
+    b := nil;
+    try
+      if not VDbCryptRandom(b, 4) then Exit;
+    except
+      Exit;
+    end;
+    if Length(b) < 4 then Exit;
+    x := Cardinal(b[0]) or (Cardinal(b[1]) shl 8) or
+         (Cardinal(b[2]) shl 16) or (Cardinal(b[3]) shl 24);
+    if x = 0 then Exit;
+  end;
   Result := LongInt(x);
 end;
 
@@ -3481,6 +3576,11 @@ begin
     CloseEngine;
     Exit;
   end;
+  { SKILL10: kabul dongusu non-blocking accept kullanir; dinleme soketi
+    bloklamaz. Stop, accept is parcacigini kapatmaya calismadan (Windows'ta
+    guvenilmez) yalniz FStopping bayragiyla ve kisa bir bekleme ile
+    durdurabilir. Kurulamazsa eski bloklu davranis surer. }
+  VdbSockSetNonBlocking(FListen, True);
   FStopping := False;
   FReady := True;
   FLastErr := '';
@@ -3496,17 +3596,22 @@ var
 begin
   if not FReady then Exit;
   FStopping := True;
-  if FListen <> VDB_SOCK_INVALID then
-  begin
-    { Unix: engellenmis accept'i once shutdown uyandirir. }
-    VdbSockShutdown(FListen);
-    VdbSockClose(FListen);
-    FListen := VDB_SOCK_INVALID;
-  end;
+  { SKILL10: SIRA onemli. Eskiden dinleme soketi once kapatilip sonra
+    accept is parcacigi bekleniyordu; Windows'ta bloklu accept her zaman
+    uyanmiyor ve baska bir is parcacigi accept'te iken soketi kapatmak
+    handle yeniden kullanimi yarisina acikti (NL7 ~30 s). Artik accept
+    dongusu non-blocking accept + 200 ms dilimlerle FStopping'i kendisi
+    gorur; bu yuzden ONCE beklenir, soket SONRA kapatilir. }
   if FAccept <> nil then
   begin
     FAccept.WaitFor;
     FreeAndNil(FAccept);
+  end;
+  if FListen <> VDB_SOCK_INVALID then
+  begin
+    VdbSockShutdown(FListen);
+    VdbSockClose(FListen);
+    FListen := VDB_SOCK_INVALID;
   end;
   FConnsLock.Enter;
   try

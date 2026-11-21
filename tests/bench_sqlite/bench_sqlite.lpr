@@ -185,6 +185,36 @@ begin
   Result := M.Values[AKey];
 end;
 
+{ SKILL10: kapi yeniden kosulabilir olmali. V3 veritabani bir DIZINDIR;
+  FileExists onu gormez, bu yuzden ikinci kosuda "tablo var: bench"
+  hatasi alinirdi. Bu yardimci hem dosyayi hem dizini siler. }
+procedure WipePath(const APath: string);
+var
+  sr: TSearchRec;
+  sub: string;
+begin
+  if DirectoryExists(APath) then
+  begin
+    sub := IncludeTrailingPathDelimiter(APath);
+    if FindFirst(sub + '*', faAnyFile, sr) = 0 then
+    begin
+      repeat
+        if (sr.Name <> '.') and (sr.Name <> '..') then
+        begin
+          if (sr.Attr and faDirectory) <> 0 then
+            WipePath(sub + sr.Name)
+          else
+            SysUtils.DeleteFile(sub + sr.Name);
+        end;
+      until FindNext(sr) <> 0;
+      FindClose(sr);
+    end;
+    RemoveDir(APath);
+  end
+  else if FileExists(APath) then
+    SysUtils.DeleteFile(APath);
+end;
+
 procedure WalkVdb(const ADb: string; out L: TStringList);
 var
   Be: IVdbBackend;
@@ -196,7 +226,7 @@ var
   rows, vals: string;
   cnt, s, gsum, gcnt, point: Int64;
 begin
-  if FileExists(ADb) then SysUtils.DeleteFile(ADb);
+  WipePath(ADb);
   VdbOpen(ADb, Be, True, False);
   Tb := TVTableDb.CreateBackend(Be);
   try
@@ -341,6 +371,7 @@ begin
 
   dbPath := GDir + 'vdb_bench.vdb';
   pyOut := GDir + 'sqlite_bench.db';
+  WipePath(pyOut);
   L := TStringList.Create;
   P := TStringList.Create;
   try

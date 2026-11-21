@@ -393,6 +393,11 @@ begin
     WriteLn('FAIL arguman | vdbcheck yolu verilmedi');
     Halt(1);
   end;
+  if not FileExists(GChecker) then
+  begin
+    WriteLn('FAIL arguman | vdbcheck bulunamadi: ' + GChecker);
+    Halt(1);
+  end;
 
   { ---------------- A: saglam veritabani ---------------- }
   A := IncludeTrailingPathDelimiter(D + 'a');
