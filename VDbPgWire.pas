@@ -393,6 +393,13 @@ type
 
 implementation
 
+const
+  { SKILL6 04: portal basina tek seferde cekilen satir sayisi. Bellek
+    ust siniri bu pencereyle sinirlidir; istemci yavas ise geri basinc
+    soket gonderiminden gelir (bir sonraki parca ancak gonderim bitince
+    cekilir). }
+  VDB_PORTAL_CHUNK = 256;
+
 type
   TPgPortal = record
     Sql: string;
@@ -400,7 +407,13 @@ type
     // F-49 (SKILL6 03): hangi parametreler Bind'de NULL (-1) geldi.
     ParamsNull: TNulArr;
     Done: Boolean;
+    { SKILL6 04: Res artik TUM sonuc degil, YALNIZCA su anki tampon
+      parcasidir (en fazla VDB_PORTAL_CHUNK satir). Gercek satirlar
+      Cur imlecinden parca parca cekilir. }
     Res: TSqlResult;
+    BufPos: Integer;             // tamponda gonderilmis satir
+    Cur: TVdbRowCursor;          // akis imleci (nil = henuz acilmadi)
+    Bytes: Int64;                // imlecte canli tutulan tahmini bayt
     Err: string;
     ResFmts: array of Integer;   // M1: 0=metin, 1=binary
     { v3.64 (SKILL5 10.1): Execute maxRows ile parca parca gonderim icin
@@ -1875,6 +1888,8 @@ var
   i, j, n: Integer;
   sql, line: string;
   Res: TSqlResult;
+  Cur: TVdbRowCursor;
+  part: TSqlResult;
 
   function CopyErr(const Msg: string; E: Exception): Boolean;
   begin
@@ -1898,17 +1913,24 @@ begin
   end;
 
   Res := Default(TSqlResult);
+  part := Default(TSqlResult);
+  Cur := nil;
+  try
   if Spec.IsQuery then
   begin
     try
-      Res := FSql.Exec(Spec.Query);
+      { SKILL6 04: COPY OUT artik satirlari imlecten parca parca uretir;
+        tum sonuc bellekte tutulmaz. }
+      Cur := FSql.OpenCursor(Spec.Query, nil, nil);
+      if Cur = nil then Exit(CopyErr('COPY: sorgu calistirilamadi', nil));
+      Cur.NextChunk(256, part);
     except
       on E: Exception do
         Exit(CopyErr(E.Message, E));
     end;
-    if Length(Res.Fields) = 0 then
+    if Length(Cur.FFields) = 0 then
       Exit(CopyErr('COPY: sorgu kolon dondurmedi', nil));
-    names := Res.Fields;
+    names := Cur.FFields;
   end
   else
   begin
@@ -1937,7 +1959,10 @@ begin
     sql := sql + ' FROM ' + Spec.TableName;
 
     try
-      Res := FSql.Exec(sql);
+      { SKILL6 04: tablo COPY OUT da imlec uzerinden akar. }
+      Cur := FSql.OpenCursor(sql, nil, nil);
+      if Cur = nil then Exit(CopyErr('COPY: sorgu calistirilamadi', nil));
+      Cur.NextChunk(256, part);
     except
       on E: Exception do
         Exit(CopyErr(E.Message, E));
@@ -1951,15 +1976,24 @@ begin
     if not SendPg(S, PgMsg('d', line + #10)) then Exit;
   end;
   n := 0;
-  for i := 0 to High(Res.Rows) do
+  i := 0;
+  while True do
   begin
-    SetLength(row, Length(names));
-    for j := 0 to High(row) do
-      if j <= High(Res.Rows[i]) then row[j] := Res.Rows[i][j]
-      else row[j] := '';
-    line := PgCopyLine(row, Spec);
-    if not SendPg(S, PgMsg('d', line + #10)) then Exit;
-    Inc(n);
+    while i <= High(part.Rows) do
+    begin
+      SetLength(row, Length(names));
+      for j := 0 to High(row) do
+        if j <= High(part.Rows[i]) then row[j] := part.Rows[i][j]
+        else row[j] := '';
+      line := PgCopyLine(row, Spec);
+      { Geri basinc: SendPg bloklayan soket yazimidir; istemci yavas ise
+        bir sonraki parca ancak bu gonderim bitince cekilir. }
+      if not SendPg(S, PgMsg('d', line + #10)) then Exit;
+      Inc(n);
+      Inc(i);
+    end;
+    if (Cur = nil) or (not Cur.NextChunk(256, part)) then Break;
+    i := 0;
   end;
   if not SendPg(S, PgMsg('c', '')) then Exit;
   if not SendPg(S, CommandMsg('COPY ' + IntToStr(n))) then Exit;
@@ -1967,6 +2001,9 @@ begin
     Result := SendPg(S, ReadyMsg)
   else
     Result := True;
+  finally
+    if Cur <> nil then Cur.Free;
+  end;
 end;
 
 function HandleQuery(S: TVdbPgIo; FSql: TVSql; const Sql: string;
@@ -2281,6 +2318,7 @@ var
   { v3.64 (SKILL5 9.5 + 10.1) }
   totalBytes: Int64;
   stOld: TPgStmt;
+  ptOld: TPgPortal;
   sentThis: Integer;
 
   function TakeI16: Integer;
@@ -2316,14 +2354,18 @@ var
   var
     r, c: Integer;
   begin
-    { v3.64 (SKILL5 9.5): kaba ama monoton bir tahmin; amac gercek bellek
-      olcumu degil, baglanti basina UST SINIR uygulamaktir. Hucre basina
-      8 bayt kayit/dizi ustu eklenir. }
-    Result := 0;
-    for r := 0 to High(P.Res.Rows) do
-      for c := 0 to High(P.Res.Rows[r]) do
-        Inc(Result, Int64(Length(P.Res.Rows[r][c])) + 8);
-    Inc(Result, Int64(Length(P.Res.Fields)) * 16);
+    { SKILL6 04: canli bellek tahmini. Akisli imlecte yalniz su anki
+      tampon parcasi sayilir; maddeselestirilmis imlecte tum sonuc imlecte
+      tutuldugu icin LiveBytes kullanilir. Hucre basina 8 bayt dizi ustu. }
+    if P.Cur <> nil then
+      Exit(P.Cur.LiveBytes);
+    begin
+      Result := 0;
+      for r := 0 to High(P.Res.Rows) do
+        for c := 0 to High(P.Res.Rows[r]) do
+          Inc(Result, Int64(Length(P.Res.Rows[r][c])) + 8);
+      Inc(Result, Int64(Length(P.Res.Fields)) * 16);
+    end;
   end;
 
   function TotalPortalBytes: Int64;
@@ -2344,44 +2386,74 @@ var
       Inc(Result, Int64(Length(ss.Sql)));
   end;
 
+  { SKILL6 04: portali acar — sorguyu CALISTIRMAZ, yalniz imlec kurar.
+    Satirlar PullPortalChunk ile parca parca cekilir. }
   function ExecutePortal(var P: TPgPortal): Boolean;
-  var
-    old: TPgPortal;
-    total: Int64;
   begin
     Result := False;
     P.Err := '';
     P.Res := Default(TSqlResult);
+    P.BufPos := 0;
     P.Sent := 0;
+    P.Bytes := 0;
+    P.Done := False;
+    if P.Cur <> nil then FreeAndNil(P.Cur);
     try
       // F-49 (SKILL6 03): NULL parametreler gercek NULL olarak baglanir.
       if Length(P.ParamsNull) > 0 then
-        P.Res := FSql.Exec(P.Sql, P.Params, P.ParamsNull)
+        P.Cur := FSql.OpenCursor(P.Sql, P.Params, P.ParamsNull)
       else
-        P.Res := FSql.Exec(P.Sql, P.Params);
-      Result := True;
+        P.Cur := FSql.OpenCursor(P.Sql, P.Params, nil);
+      Result := P.Cur <> nil;
     except
-      on E: Exception do P.Err := E.Message;
+      on E: Exception do
+      begin
+        P.Err := E.Message;
+        P.Done := True;
+        Result := False;
+      end;
     end;
-    P.Done := True;
-    { v3.64 (SKILL5 9.5): baglanti basina portal sonuc bellegi siniri.
-      Asimda sonuc DERHAL birakilir (P.Res sifirlanir) ki bellek geri
-      kazanilsin, ve istemciye kontrollu hata doner. Bu, gercek streaming
-      yerine durust bir ust sinirdir: sinir asildiginda istek REDDEDILIR. }
-    if (P.Err = '') and (FServer.FMaxPortalResultBytes > 0) then
+  end;
+
+  { SKILL6 04: bir sonraki tampon parcasini ceker. False = veri bitti.
+    Bellek siniri URETIM SIRASINDA uygulanir: parca cekildikten hemen
+    sonra canli bayt olculur; asilirsa imlec DERHAL birakilir. }
+  function PullPortalChunk(var P: TPgPortal): Boolean;
+  var
+    chunk: TSqlResult;
+    live, total: Int64;
+    old: TPgPortal;
+  begin
+    Result := False;
+    P.Res := Default(TSqlResult);
+    P.BufPos := 0;
+    if P.Done or (P.Cur = nil) then Exit;
+    if not P.Cur.NextChunk(VDB_PORTAL_CHUNK, chunk) then
     begin
+      P.Done := True;
+      Exit;
+    end;
+    P.Res := chunk;
+    if FServer.FMaxPortalResultBytes > 0 then
+    begin
+      live := PortalCellBytes(P);
       total := TotalPortalBytes;
       if Portals.TryGetValue(nm, old) then
         Dec(total, PortalCellBytes(old));
-      Inc(total, PortalCellBytes(P));
-      if total > FServer.FMaxPortalResultBytes then
+      Inc(total, live);
+      if (live > FServer.FMaxPortalResultBytes) or
+         (total > FServer.FMaxPortalResultBytes) then
       begin
         P.Res := Default(TSqlResult);
-        P.Sent := 0;
+        P.BufPos := 0;
+        if P.Cur <> nil then FreeAndNil(P.Cur);
+        P.Done := True;
         P.Err := Format('portal sonuc bellegi siniri asildi (%d > %d bayt)',
           [total, FServer.FMaxPortalResultBytes]);
+        Exit;
       end;
     end;
+    Result := True;
   end;
 
 begin
@@ -2672,6 +2744,9 @@ begin
             [FServer.FMaxPortals]));
           Continue;
         end;
+        { SKILL6 04: ayni adla yeniden Bind eski imleci serbest birakir. }
+        if Portals.TryGetValue(nm, ptOld) then
+          if ptOld.Cur <> nil then ptOld.Cur.Free;
         Portals.AddOrSetValue(nm, pt);
         if not SendPg(FIO, PgMsg('2', '')) then Break;
       end
@@ -2709,9 +2784,16 @@ begin
             end
             else
             begin
-              if not pt.Done then
+              { SKILL6 04: Describe artik sonucu TAMAMEN calistirmaz;
+                imleci acar ve yalnizca ilk tampon parcasini ceker. }
+              if pt.Cur = nil then
               begin
                 ExecutePortal(pt);
+                Portals.AddOrSetValue(nm, pt);
+              end;
+              if (pt.Err = '') and (Length(pt.Res.Fields) = 0) and (not pt.Done) then
+              begin
+                PullPortalChunk(pt);
                 Portals.AddOrSetValue(nm, pt);
               end;
               if pt.Err <> '' then
@@ -2770,7 +2852,7 @@ begin
           end
           else
           begin
-            if not pt.Done then
+            if pt.Cur = nil then
             begin
               ExecutePortal(pt);
               Portals.AddOrSetValue(nm, pt);
@@ -2779,22 +2861,31 @@ begin
               ExtFail(pt.Err)
             else
             begin
-              { v3.64 (SKILL5 10.1): maxRows kadar satir gonder; kalan varsa
-                PortalSuspended ('s') yolla ve imleci sakla. Sonraki Execute
-                kaldigi yerden devam eder; sorgu YENIDEN CALISTIRILMAZ.
-                maxRows=0 (eski davranis) tum satirlari gonderir. }
+              { SKILL6 04: satirlar imlecten PARCA PARCA cekilir; tampon
+                tukenince bir sonraki parca istenir. maxRows dolunca imlec
+                saklanir ve PortalSuspended ('s') yollanir; sonraki Execute
+                kaldigi yerden devam eder (sorgu YENIDEN CALISTIRILMAZ).
+                maxRows=0 tum satirlari gonderir (yine parca parca). }
               sentThis := 0;
-              while (pt.Sent < Length(pt.Res.Rows)) and
-                    ((maxRows = 0) or (sentThis < maxRows)) do
+              while (maxRows = 0) or (sentThis < maxRows) do
               begin
-                if not SendPg(FIO, DataRowMsgFmt(pt.Res.Rows[pt.Sent],
-                  pt.Res.FieldTypes, pt.ResFmts, PgRowNulls(pt.Res, pt.Sent))) then Break;
+                if pt.BufPos >= Length(pt.Res.Rows) then
+                begin
+                  if pt.Done then Break;
+                  if not PullPortalChunk(pt) then Break;
+                end;
+                if not SendPg(FIO, DataRowMsgFmt(pt.Res.Rows[pt.BufPos],
+                  pt.Res.FieldTypes, pt.ResFmts, PgRowNulls(pt.Res, pt.BufPos))) then Break;
+                Inc(pt.BufPos);
                 Inc(pt.Sent);
                 Inc(sentThis);
               end;
               Portals.AddOrSetValue(nm, pt);
-              if pt.Sent >= Length(pt.Res.Rows) then
+              if pt.Err <> '' then
+                ExtFail(pt.Err)
+              else if pt.Done and (pt.BufPos >= Length(pt.Res.Rows)) then
               begin
+                pt.Res.Affected := pt.Sent;
                 if not SendPg(FIO, CommandMsg(CommandTag(pt.Sql, pt.Res))) then Break;
                 InterlockedIncrement(FServer.FServed);
               end
@@ -2818,7 +2909,14 @@ begin
             ExtFail('mesaj alaninda eksik NUL sonlandirici');
             Continue;
           end;
-          if kind = 'S' then Stmts.Remove(nm) else Portals.Remove(nm);
+          if kind = 'S' then Stmts.Remove(nm)
+          else
+          begin
+            { SKILL6 04: portal kapaninca imleci DERHAL birak. }
+            if Portals.TryGetValue(nm, pt) then
+              if pt.Cur <> nil then pt.Cur.Free;
+            Portals.Remove(nm);
+          end;
         end;
         if not SendPg(FIO, PgMsg('3', '')) then Break;
       end
@@ -2848,6 +2946,10 @@ begin
       end;
     end;
   finally
+    { SKILL6 04: portal imlecleri baglanti sonunda serbest birakilir. }
+    if Portals <> nil then
+      for pt in Portals.Values do
+        if pt.Cur <> nil then pt.Cur.Free;
     Portals.Free;
     Stmts.Free;
     FreeAndNil(FIO);

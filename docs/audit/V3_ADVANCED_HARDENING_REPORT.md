@@ -110,12 +110,16 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   `HasNulls` bilgisine ancak tablo bir kez maskeli yazildiktan sonra
   sahip olur. Bu sinirlar veri kaybi degil, gosterim/okuma kapsamidir ve
   `CI.md`de kayitlidir.
-- **SKILL6 04 - gercek akis (streaming)**: **YAPILMADI**. `MaxPortalResultBytes`
-  siniri hala `FSql.Exec` bittikten SONRA denetleniyor (VDbPgWire.pas,
-  `ExecutePortal`), yani bellek siniri gercek bir ust sinir degil, sonuc
-  reddedilirken bellek zaten ayrilmis oluyor. Gercek cozum yurutucu
-  seviyesinde satir yineleyicisi (iterator) ve COPY OUT akisidir; bu da
-  SKILL6 03 ile ayni buyuklukte bir mimari is.
+- **SKILL6 04 - gercek akis (streaming)**: **TAMAM (Sprint R)**. Portal
+  sonucu artik `FSql.Exec` ile tumuyle maddesellestirilmiyor: `TVdbRowCursor`
+  yurutucu seviyesinde sayfa pencereli parca uretir, `Execute` parca basina
+  `PortalSuspended` doner ve ayni imlec kaldigi yerden devam eder. COPY OUT
+  (sorgu ve tablo bicimi) de imlecten akar. `MaxPortalResultBytes` artik
+  **uretim sirasinda** uygulanir; asimda istek reddedilir ve imlec birakilir.
+  Desteklenmeyen sekiller (ORDER BY, GROUP BY, DISTINCT, JOIN, UNION, pencere,
+  alt sorgu, NULL tasiyan tablo, KV deposu, toplu yazim) tek seferlik genel
+  yola duser; bu **durust sinirdir** ve bellek siniri o yollarda hala sonuc
+  uretildikten sonra denetlenir. Ayrinti: F-50.
 - **SKILL6 07 - genel hash join / maliyet modeli**: **KISMI**. `SELECT`
   tarafinda `TryStreamJoin` zaten PK arama, indeks kaynagi ve hash join
   yollarini secer (`merge_hash` kapisi M1-M13). Sprint P'de `UPDATE ... FROM`
@@ -134,7 +138,8 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 ### A.3 Mevcut V3 durumu
 
 - Iki platformda tam kapi seti yesil: **Windows i386 55 kapi**, **Linux
-  x86_64 56 kapi**, FAIL 0 (v3.71 kosulari: `gatesN.log` / `linN.log`).
+  x86_64 56 kapi**, FAIL 0 (v3.72 kosulari: `gatesO.log` / `linO.log`;
+  Linux'ta `tls_client` gercekten kosar - 6/0, Windows'ta SKIP).
   Windows'ta `tls_client` bu ortamda **SKIP** oldu (OpenSSL DLL'i yok);
   kostugu kosu `gatesE.log`'dur. SKIP PASS sayilmaz (ayrinti: `CI.md`).
 - Acik kritik hata yok. Kapatilan son gercek kusurlar: F-21/F-22 veri
@@ -205,7 +210,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | C | 4.1 WAL-before-data checkpoint sirasi, 4.2 kurtarma basarisizliginda POISONED durumu | Tamam | `wal_recovery` 27/0 (yeni, 5 vaka) |
 | D | 5.1 freelist butunlugu, 5.2 disk B+Tree sayfa butunlugu, 6.1/6.2 sayfa dogrulama | Tamam | `freelist` 32/0 (yeni, 9 vaka), `btree_disk` 78/0 |
 | F | 8.2 LIMIT/OFFSET sinirlari, 8.4 ozyinelemeli CTE sinirlari + iptal, 8.5 sayisal tasma/CAST/ABS | Tamam (F1) | `sql_memory` 54/0 (yeni, 26 vaka) |
-| F | 8.1 uctan uca streaming, portal maxRows, COPY OUT streaming, JOIN/ORDER BY/DISTINCT/GROUP BY bellek siniri, disk spill | **Acik (F2)** | tasarim isi; `R8`/`R13` |
+| F | 8.1 uctan uca streaming, portal maxRows, COPY OUT streaming, JOIN/ORDER BY/DISTINCT/GROUP BY bellek siniri, disk spill | **Kismi (F2)** - portal/COPY OUT akisi kapandi (Sprint R) | `R8`/`R13` |
 | E | 7.1/7.2 sunucu okuma-yazma zaman asimi, 7.3 COPY gecici dosya sinir+izin, 7.4 baglanti yasam dongusu | Tamam | `network_limits` 22/0 (yeni, 8 vaka) |
 | B2 | 6.1 acik islem icinde statement atomikligi (COMMIT sonrasi yarim yazim) | Tamam | `sql_atomicity` 138/0 (24 vaka; AT20-AT24 yeni) |
 | C2 | 3.1 oturum bazli rol izolasyonu + bilinmeyen rolde fail-closed yetki | Tamam | `sql_authorization` 51/0 (32 -> 51; AU8-AU11 yeni) |
@@ -222,6 +227,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | O | SKILL6 05: ag zaman asimi **her recv/send cagrisi icin** ayri uygulaniyordu (damla/drip istemcisi toplam sureyi sinirsiz uzatiyordu); **CancelRequest (80877102) hic islenmiyordu** ve her baglantiya ayni `BackendKeyData(1, 0)` gonderiliyordu | Tamam | `network_limits` 41/0 (26 -> 41; NL9-NL12 yeni), `pg_cancel` 31/0 (yeni, PC0-PC9) |
 | P | SKILL6 07: `UPDATE ... FROM` esitlik birlestirmesi **kaba kuvvet O(hedef x kaynak)** kartezyen donguydu (4000 x 2500 satirda 13063 ms) | Tamam | `merge_hash` 30/0 (19 -> 30; U1-U9 yeni) |
 | Q | SKILL6 03: **SQL NULL ile bos metin ayni degerdi** (`'' IS NULL` TRUE donuyordu, `'' = ''` UNKNOWN cikiyordu, `COUNT(kolon)` NULL satirlari sayiyordu); depolama maskesi (asama 1), ifade semantigi (2a), okuma maskesi (2b) ve yazma maskesi (2c) uctan uca baglandi; hizli INSERT seridi ile `ALTER TABLE ADD COLUMN` kusurlari kapandi | Tamam | `null_empty` 41/0 (14 -> 41; NE20-NE51 yeni); on-kapi `a30676e` 30/11 |
+| R | SKILL6 04: portal **tek seferde maddeselestiriyordu** (maxRows yalniz dilimleme; COPY OUT tam sonuc bellekte); gercek satir yineleyicisi yoktu | Tamam | `pg_portal_stream` 35/0 (22 -> 35; PS0, PS1-PS10 yeni); on-kapi `e31d186` 33/2 (dusen: PS4, PS7a) |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -368,12 +374,14 @@ sinirlari. F1 dort gercek kusur kapatti:
   Olcum her boyut icin **iki kez** yapilip **kucuk** olani alinir. **Esik
   degismedi (3,5)**; karesel davranis hala yakalanir. Bu, kapinin gecmesi icin
   esik gevsetme **degildir**; olcum gurultusunun alinmasidir.
-- **Durust sinir (F2 acik)**: 8.1 uctan uca satir iteratoru/streaming hatti,
-  PG portal `maxRows`, COPY OUT streaming, ORDER BY/DISTINCT/GROUP BY icin
-  kontrollu **disk spill**, JOIN bellek butcesi ve hash birlestirme
-  **uygulanmadi**. Sonuc hala `TSqlResult` icinde tamamen bellekte toplanir;
-  tavan `VDB_MAX_RESULT_ROWS = 2.000.000`. Ozyinelemeli CTE satir tavani bu
-  tavanla **ayni degeri** kullanir (daha kucuk bir butce yoktur).
+- **Durust sinir (F2 kismen acik)**: 8.1'in portal `maxRows` ve COPY OUT
+  streaming ayaklari **Sprint R'de (SKILL6 04) kapandi**: portal ve COPY OUT
+  artik `TVdbRowCursor` uzerinden gercek satir akisindan beslenir (F-50).
+  Acik kalan: ORDER BY/DISTINCT/GROUP BY icin kontrollu **disk spill**, JOIN
+  bellek butcesi ve hash birlestirme **uygulanmadi**; akisli olmayan
+  sekillerde sonuc hala `TSqlResult` icinde tamamen bellekte toplanir, tavan
+  `VDB_MAX_RESULT_ROWS = 2.000.000`. Ozyinelemeli CTE satir tavani bu tavanla
+  **ayni degeri** kullanir (daha kucuk bir butce yoktur).
 
 Sprint E (ag katmani) dort gercek sinir kusurunu kapatti:
 
@@ -614,7 +622,7 @@ kesintisi dayanikliligi iddia edilmez.
 | RAM | `TotalAllocated` deltasi (**RSS degil**); alet SS20'de 8 MB ayirmayla dogrulanir | `sql_scale` SS20 |
 | LIMIT'siz tavan | `VDB_MAX_RESULT_ROWS = 2.000.000`; asimda `ecLimit`, kismi sonuc donmez | `limits` L4 18/0 |
 | OOM | Enjekte edilen tahsis hatasi okuma ve yazma yolunda `EOutOfMemory`; sayfa ayirma atomik, taninmayan sayfa kalmaz, basarisiz commit hayalet satir birakmaz | `oom` 9/0 |
-| Streaming | **YOK**. Yurutucu sonuc kumesini biriktirir; bu yuzden 2M+ satirlik LIMIT'siz tarama kapiya baglanmadi (32-bit surecte ~GB bellek) | `docs/engineering/SQL_SCALE.md` |
+| Streaming | **KISMI**. PG portal ve `COPY OUT` **gercek satir akisindan** beslenir (`TVdbRowCursor`, SKILL6 04 / Sprint R); gomulu `Exec` yolu ve akisli olmayan sekiller (ORDER BY/GROUP BY/DISTINCT/JOIN/UNION/pencere/alt sorgu) sonuc kumesini biriktirir. Bu yuzden 2M+ satirlik LIMIT'siz tarama hala kapiya baglanmadi (32-bit surecte ~GB bellek) | `docs/engineering/SQL_SCALE.md`, `pg_portal_stream` 35/0 |
 
 **Durust sinir**: F9 kismi kapali kalir - tavan **degerinin kendisi** (2M+)
 maddelestirilmedi. Streaming olmadigi icin cok buyuk sonuc kumesi bellek
@@ -780,8 +788,8 @@ Her satir: onem, dosya, kok neden, etki, test, durum.
 | R5 | Orta | `VDbBTreeDisk` / motor | Ikincil indeksler bellekte; `.odb.idx` onbellektir. Disk indeks mimarisi tasarlandi, uygulanmadi. Sprint D sayfa dogrulamasini ekledi ama bilesen motora **bagli degil** | `btree_disk` 78/0, `sql_index_scale` 45/0 | **ACIK (tasarim)** |
 | R6 | Orta | `VDbCryptoBuiltin` | `capHmacKeyOver64` yok; >64 B HMAC anahtari reddedilir (sessiz kirpma yok) | `crypto_*`, `selftest_builtin` | **ACIK (bilinen borc, ADR 6)** |
 | R7 | Orta | `VDbPgWire` | TLS varsayilan kapali; operator acmazsa trafik duz metin. mTLS/CRL/OCSP yok | `tls_client` SKIP (Windows) | **ACIK (bilincli opt-in)** |
-| R8 | Orta | `TVdbExecutor` | Uctan uca streaming **yok**; sonuc `TSqlResult` icinde tamamen bellekte toplanir, tavan `VDB_MAX_RESULT_ROWS = 2.000.000` (32-bit ~GB bellek). Sprint F1 yalniz 8.2/8.4/8.5 sinirlarini kapatti | `limits` L4 18/0, `sql_memory` 54/0 | **KISMI (F2 acik)** |
-| R13 | Orta | `TVdbExecutor` / `TVdbPgWire` | PG portal `maxRows`, COPY OUT streaming, ORDER BY/DISTINCT/GROUP BY icin **disk spill**, JOIN bellek butcesi ve hash birlestirme uygulanmadi; `8.3`'teki `ExecMerge` O(n*m) olcumu yapilmadi | - | **ACIK (tasarim)** |
+| R8 | Orta | `TVdbExecutor` | `FSql.Exec` sonucu hala `TSqlResult` icinde tamamen bellekte toplar, tavan `VDB_MAX_RESULT_ROWS = 2.000.000` (32-bit ~GB bellek). SKILL6 04 akisi yalniz `TVdbRowCursor` uzerinden PG portal ve COPY OUT'a bagladi; gomulu `Exec` yolu maddeselestirmeye devam eder. Sprint F1 yalniz 8.2/8.4/8.5 sinirlarini kapatti | `limits` L4 18/0, `sql_memory` 54/0, `pg_portal_stream` 35/0 | **KISMI (akisli portal kapali; `Exec` acik)** |
+| R13 | Orta | `TVdbExecutor` / `TVdbPgWire` | PG portal `maxRows` ve COPY OUT artik **imlecten** akar (SKILL6 04); ancak ORDER BY/DISTINCT/GROUP BY/JOIN/UNION/pencere/alt sorgu, NULL tasiyan tablo, KV deposu ve toplu acilis tek seferlik genel yola duser ve orada butce ancak maddeselestirme SONRASI denetlenir. Disk spill, JOIN bellek butcesi ve hash birlestirme hala yok; `8.3`'teki `ExecMerge` O(n*m) olcumu yapilmadi | `pg_portal_stream` 35/0 | **KISMI (akisli sekillerde kapali; genel yol acik)** |
 | R9 | Dusuk | `soak` olcum | Heap olcusu `TotalAllocated`, RSS degil; "RSS sizmaz" iddiasi yok | `soak` SO5 | **ACIK (olcum siniri)** |
 | R10 | Dusuk | `bench_report` / `soak` | Gecikme tek makine, `-O1`; SLA degil, donanimlar arasi normallestirilmedi | `bench_report` 35/0 | **ACIK (olcum siniri)** |
 | R11 | Dusuk | Platform matrisi | macOS/ARM64/buyuk-endian **not-run** | - | **ACIK** |
@@ -969,10 +977,11 @@ tablosundadir. Bu sprintte kapatilanlar:
   PP0/PP0b/PP0c/PP5/PP11/PP12 bilerek **ayirt edici degildir** (sunucunun
   acilmasi, `maxRows=0` yolu ve `Close` sonrasi `portal yok` HEAD'de de
   gecer).
-  **Durust sinir**: bu, uctan uca (executor duzeyinde) streaming **degildir**;
-  sonuc kumesi bellekte tam olarak uretilir ve imlec onun uzerinde ilerler -
-  sinir asilirsa istek **reddedilir**. Gercek satir yineleyici ve `COPY OUT`
-  streaming hala **ACIK** (SKILL5 10.2). `Sync`'in portallari artik
+  **Durust sinir (Sprint J hali)**: o zaman bu, uctan uca (executor duzeyinde)
+  streaming **degildi**; sonuc kumesi bellekte tam olarak uretilir ve imlec
+  onun uzerinde ilerlerdi - sinir asilirsa istek **reddedilirdi**. Bu sinir
+  **Sprint R'de (SKILL6 04) kapandi**: portal ve `COPY OUT` artik
+  `TVdbRowCursor` uzerinden gercek satir akisindan beslenir (F-50). `Sync`'in portallari artik
   dusurmemesi, kapatilmayan portalin baglanti sonuna kadar yasadigi anlamina
   gelir; bu `MaxPortals` + `MaxPortalResultBytes` ile sinirlidir, ancak
   oturum basina bir portal "sizintisina" izin verir.
@@ -1272,6 +1281,45 @@ tablosundadir. Bu sprintte kapatilanlar:
   `HasNulls` isaretlenene kadar eski kurala tabidir. Bunlar gosterim/okuma
   kapsami olup veri kaybi degildir. V2 ve bicim v5 degismedi.
 
+- **F-50 (Orta, TAMAM, v3.72; kod etiketi Sprint R)**: **PG portal ve COPY OUT
+  gercek satir akisi**. Onceden portal `Execute` sonucu **tamamen**
+  maddeselestirip yalniz `maxRows` kadarini dilimliyor, `COPY OUT` da tam
+  sonucu bellekte kuruyordu; yani `maxRows` bir bellek siniri degildi.
+  Artik `TVdbRowCursor` (`VDbExecutor.pas`) **sayfa pencereli parca**
+  uretir: `TryStreamSelectChunk(Stmt, td, Cursor, AResumePage, ASkipQual,
+  AMaxRows, out Res)`. `TryStreamSelect` eski imzasi `Cursor = nil` ile
+  delege eder; `ExecSelect` tek bir `TryStreamProbe` cagrisi yapar, boylece
+  ayni sorgu icin **tek tarama** garantidir. Ilk parcadan sonra imlec
+  `FResumePage`/`FSkipQual` ile ayni sayfadan devam eder: onceki sayfalar
+  `zSkip[]` ile atlanir, devam sayfasinda ilk `FSkipQual` ham geri cagri
+  sayacla gecirilir (sayfa icinde geri cagri sirasi deterministiktir).
+  `ctx.Offset := 0; ctx.Limit := -1` kurulur; OFFSET/LIMIT'i imlec
+  parcalar arasinda uygular. Portal parcasi `VDB_PORTAL_CHUNK = 256`
+  satirdir ve geri basinc bloklayan soket gonderiminden gelir.
+  `MaxPortalResultBytes` her uretilen parcada ve imlecin canli baytinda
+  denetlenir; asilirsa istek kontrollu RED alir ve imlec birakilir.
+  `Describe` imleci acar ama yalniz ilk parcayi ceker; `COPY OUT` (sorgu
+  ve tablo bicimi) imlecten akar (`try/finally` ile imlec her durumda
+  serbest birakilir). Devam ettirilemeyen imlec **sessizce kesilmez**,
+  `ecUnsupported` ile "akisli imlec devam ettirilemedi (depo durumu
+  degisti)" verir. **Yan bulgu ve duzeltme**: `CreateTable` yerel
+  `TTableDef` kaydinda `HasNulls` acikca sifirlanmiyordu; FPC yalniz
+  managed alanlari sifirladigi icin yeni tablolar rastgele "NULL tasiyor"
+  sayiliyor ve **tum** akis hizli yollari kapaniyordu (`t.HasNulls :=
+  False` eklendi). **Durust sinir**: ORDER BY, GROUP BY, DISTINCT, JOIN,
+  UNION, pencere islevi, alt sorgu, NULL tasiyan tablo (`HasNulls`), KV
+  deposu ve toplu acilis (`BatchOpen`) tek seferlik genel yola duser; bu
+  sekillerde butce maddeselestirme **sonrasi** denetlenir. Imlec modu bolge
+  haritasi (zone map) **yayinlamaz** (`ctx.ZoneOn := False`), cunku devam
+  eden parca geri cagri atladigi icin min/max daralirdi; var olan gecerli
+  haritanin `zSkip` budamasi yine kullanilir. Kapi:
+  **`tests/pg_portal_stream` 35 kontrol (PP0-PP12, PS0-PS10) 35 PASS / 0
+  FAIL**; on-kapi (ayni 35 kontrol, `git archive HEAD`, `e31d186`) **33
+  PASS / 2 FAIL**. Ayirt edici iki kontrol: **PS7a** (maddeselestirilen 800
+  satir 245043 bayt > 120000 butce -> RED) ve **PS4** (`maxRows=1` ile 25
+  adimda 25 tekil satir beklenirken 24 gelir). Diger 33 kontrol
+  koruyucudur (HEAD'de de gecer). V2 ve bicim v5 degismedi.
+
 
 ---
 
@@ -1302,7 +1350,8 @@ Gerekce:
 - Canli PostgreSQL diferansiyeli **kosmadi** (`pg=not-run`);
 - uzun sureli soak (1h/6h/24h) ve **ag sunucusu soak'i** kosmadi;
 - disk tabanli ikincil indeks **yok** (tasarim var, uygulama yok);
-- uctan uca streaming / disk spill / JOIN bellek butcesi **yok** (Sprint F2);
+- uctan uca streaming yalniz PG portal ve COPY OUT icin var; gomulu
+  `Exec`, disk spill ve JOIN bellek butcesi **yok** (Sprint F2);
 - macOS/ARM64 **not-run**;
 - TLS varsayilan kapali ve mTLS/CRL/OCSP yok.
 

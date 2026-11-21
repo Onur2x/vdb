@@ -38,6 +38,11 @@ const
   TEST_USER  = 'ppstream';
   PORT_TRIES = 40;
   NROWS      = 25;
+  NBIG       = 800;
+  BIGPAD     = 280;
+
+type
+  TIdList = array of string;
 
 var
   GPass, GFail: Integer;
@@ -60,6 +65,26 @@ begin
       WriteLn('FAIL ', AName);
   end;
   Flush(Output);
+end;
+
+{ SKILL6 04: akis kapisi yardimcilari (kimlik listesinde tekil ekleme). }
+function AddUnique(var A: TIdList; const V: string): Boolean;
+var
+  k: Integer;
+begin
+  for k := 0 to High(A) do
+    if A[k] = V then Exit(False);
+  SetLength(A, Length(A) + 1);
+  A[High(A)] := V;
+  Result := True;
+end;
+
+function IdInRange(const V: string): Boolean;
+var
+  n: Integer;
+begin
+  n := StrToIntDef(V, -1);
+  Result := (n >= 1) and (n <= NROWS);
 end;
 
 function BE32(AValue: LongWord): AnsiString;
@@ -132,6 +157,7 @@ type
     NDataRow: Integer;
     NSuspend: Integer;
     NComplete: Integer;
+    NCopyData: Integer;     // COPY OUT 'd' mesajlari
   end;
 
 { DataRow govdesinden ilk kolonun metnini cikarir. }
@@ -179,6 +205,7 @@ begin
         end;
       's': Inc(L.NSuspend);
       'C': Inc(L.NComplete);
+      'd': Inc(L.NCopyData);
       'G': Exit(True);
       'Z': Exit(True);
     end;
@@ -270,11 +297,13 @@ var
   Srv: TVdbPgServer;
   D: string;
   err, det, vals: string;
+  detB: string;
   s: TVdbSocket;
   L: TMsgLog;
-  i, j, portIdx: Integer;
-  ok: Boolean;
+  i, j, k, portIdx: Integer;
+  ok, okB: Boolean;
   rowList: string;
+  ids: TIdList;
 
 begin
   GPass := 0;
@@ -323,7 +352,38 @@ begin
         FillChar(L, SizeOf(L), 0);
         ok := SendMsg(s, 'Q', vals + #0) and ReadUntilReady(s, L) and
               (L.ErrText = '');
-        if not ok then det := 'INSERT: ' + L.ErrText;
+        if not ok then
+          det := 'INSERT: ' + L.ErrText
+        else
+        begin
+          { SKILL6 04: akis kapisi icin buyuk tablo (800 satir x ~285 bayt). }
+          okB := False;
+          detB := '';
+          FillChar(L, SizeOf(L), 0);
+          if SendMsg(s, 'Q', 'CREATE TABLE big (id INTEGER, pad TEXT)' + #0) and
+             ReadUntilReady(s, L) and (L.ErrText = '') then
+          begin
+            okB := True;
+            k := 0;
+            while okB and (k < NBIG) do
+            begin
+              vals := 'INSERT INTO big VALUES ';
+              for i := k + 1 to k + 100 do
+              begin
+                if i > k + 1 then vals := vals + ',';
+                vals := vals + '(' + IntToStr(i) + ',''b' + IntToStr(i) +
+                  StringOfChar('x', BIGPAD) + ''')';
+              end;
+              FillChar(L, SizeOf(L), 0);
+              okB := SendMsg(s, 'Q', vals + #0) and ReadUntilReady(s, L) and
+                     (L.ErrText = '');
+              if not okB then detB := 'BIG INSERT: ' + L.ErrText;
+              Inc(k, 100);
+            end;
+          end
+          else
+            detB := 'BIG CREATE: ' + L.ErrText;
+        end;
       end
       else
         det := 'CREATE: ' + L.ErrText;
@@ -335,6 +395,15 @@ begin
     det := 'baglanti: ' + det;
   Chk('PP0b 25 satir hazir', ok, det);
   if not ok then
+  begin
+    Srv.Stop;
+    FreeAndNil(Srv);
+    WriteLn('SONUC: ', GPass, ' PASS, ', GFail, ' FAIL');
+    Halt(1);
+  end;
+
+  Chk('PS0 akis tablosu hazir (800 satir)', okB, detB);
+  if not okB then
   begin
     Srv.Stop;
     FreeAndNil(Srv);
@@ -515,6 +584,179 @@ begin
           (L.NDataRow = 0),
           'hata=' + L.ErrText + ' satir=' + IntToStr(L.NDataRow));
         Srv.MaxPortalResultBytes := Int64(64) * 1024 * 1024;
+
+        { ================= SKILL6 04: AKISLI PORTAL =================
+          Asagidaki sorgularda ORDER BY YOK; bu yuzden motorun imlec
+          (satir akisi) yolu kullanilir. Siralama VARSAYILMAZ; yalnizca
+          kimlik kumesi ve tekil olma dogrulanir. }
+
+        { PS1: ilk parca }
+        ids := nil;
+        FillChar(L, SizeOf(L), 0);
+        ok := SendMsg(s, 'P', ParseMsg('sb1', 'SELECT id FROM t')) and
+              SendMsg(s, 'B', BindMsg('pb1', 'sb1')) and
+              SendMsg(s, 'E', ExecuteMsg('pb1', 7)) and
+              ExtRoundTrip(s, L);
+        for j := 0 to High(L.Rows) do
+          if not AddUnique(ids, L.Rows[j]) then ok := False;
+        for j := 0 to High(ids) do
+          if not IdInRange(ids[j]) then ok := False;
+        Chk('PS1 akisli portal 7 satir + suspended',
+          ok and (L.NDataRow = 7) and (L.NSuspend = 1) and
+          (L.NComplete = 0) and (Length(ids) = 7),
+          'satir=' + IntToStr(L.NDataRow) + ' hata=' + L.ErrText);
+
+        { PS2: devam eden parca — tekrar/gap yok }
+        FillChar(L, SizeOf(L), 0);
+        ok := SendMsg(s, 'E', ExecuteMsg('pb1', 7)) and ExtRoundTrip(s, L);
+        for j := 0 to High(L.Rows) do
+          if not AddUnique(ids, L.Rows[j]) then ok := False;
+        Chk('PS2 akisli portal devam 7 satir (tekrar yok)',
+          ok and (L.NDataRow = 7) and (L.NSuspend = 1) and
+          (L.NComplete = 0) and (Length(ids) = 14),
+          'satir=' + IntToStr(L.NDataRow) + ' tekil=' + IntToStr(Length(ids)));
+
+        { PS3: kalan tum satirlar -> CommandComplete }
+        FillChar(L, SizeOf(L), 0);
+        ok := SendMsg(s, 'E', ExecuteMsg('pb1', 0)) and ExtRoundTrip(s, L);
+        for j := 0 to High(L.Rows) do
+          if not AddUnique(ids, L.Rows[j]) then ok := False;
+        Chk('PS3 akisli portal kalan 11 satir + CommandComplete',
+          ok and (L.NDataRow = 11) and (L.NComplete = 1) and
+          (L.NSuspend = 0) and (Length(ids) = NROWS),
+          'satir=' + IntToStr(L.NDataRow) + ' tekil=' + IntToStr(Length(ids)));
+
+        { PS4: maxRows=1 -> 25 adim, her adim 1 satir; 26. adim bitis }
+        ids := nil;
+        FillChar(L, SizeOf(L), 0);
+        ok := SendMsg(s, 'B', BindMsg('pb2', 'sb1')) and ExtRoundTrip(s, L);
+        for k := 1 to NROWS do
+        begin
+          if not ok then Break;
+          FillChar(L, SizeOf(L), 0);
+          ok := SendMsg(s, 'E', ExecuteMsg('pb2', 1)) and ExtRoundTrip(s, L);
+          if not (ok and (L.NDataRow = 1) and (L.NSuspend = 1) and
+                  (L.NComplete = 0)) then
+            ok := False
+          else if not AddUnique(ids, L.Rows[0]) then
+            ok := False;
+        end;
+        FillChar(L, SizeOf(L), 0);
+        ok := ok and SendMsg(s, 'E', ExecuteMsg('pb2', 1)) and
+              ExtRoundTrip(s, L);
+        Chk('PS4 maxRows=1 x25 -> 1 satir/adim, tekil 25',
+          ok and (Length(ids) = NROWS) and (L.NDataRow = 0) and
+          (L.NComplete = 1),
+          'tekil=' + IntToStr(Length(ids)) + ' son=' +
+          IntToStr(L.NDataRow) + ' hata=' + L.ErrText);
+
+        { PS5: Sync sonrasi imlec korunur }
+        ids := nil;
+        FillChar(L, SizeOf(L), 0);
+        ok := SendMsg(s, 'B', BindMsg('pb3', 'sb1')) and ExtRoundTrip(s, L);
+        FillChar(L, SizeOf(L), 0);
+        ok := ok and SendMsg(s, 'E', ExecuteMsg('pb3', 5)) and
+              ExtRoundTrip(s, L);
+        for j := 0 to High(L.Rows) do
+          if not AddUnique(ids, L.Rows[j]) then ok := False;
+        FillChar(L, SizeOf(L), 0);
+        ok := ok and SendMsg(s, 'E', ExecuteMsg('pb3', 5)) and
+              ExtRoundTrip(s, L);
+        for j := 0 to High(L.Rows) do
+          if not AddUnique(ids, L.Rows[j]) then ok := False;
+        Chk('PS5 Sync sonrasi imlec devam eder (5+5 tekil)',
+          ok and (L.NDataRow = 5) and (Length(ids) = 10) and
+          (L.NSuspend = 1),
+          'tekil=' + IntToStr(Length(ids)) + ' hata=' + L.ErrText);
+
+        { PS6: 8 eszamanli akisli portal bagimsiz ilerler }
+        ok := True;
+        for k := 1 to 8 do
+        begin
+          FillChar(L, SizeOf(L), 0);
+          if not (SendMsg(s, 'B', BindMsg('pcon' + IntToStr(k), 'sb1')) and
+                  SendMsg(s, 'E', ExecuteMsg('pcon' + IntToStr(k), 3)) and
+                  ExtRoundTrip(s, L) and (L.NDataRow = 3) and
+                  (L.ErrText = '')) then
+            ok := False;
+        end;
+        for k := 1 to 8 do
+        begin
+          FillChar(L, SizeOf(L), 0);
+          if not (SendMsg(s, 'E', ExecuteMsg('pcon' + IntToStr(k), 0)) and
+                  ExtRoundTrip(s, L) and (L.NDataRow = 22) and
+                  (L.NComplete = 1)) then
+            ok := False;
+        end;
+        Chk('PS6 8 eszamanli akisli portal bagimsiz calisir', ok, '');
+
+        { PS7: AYIRT EDICI butce kapisi. 800 satir x ~285 bayt.
+          Akisli yolda canli bellek tek parca (~78 KB) -> 120 KB sinirin
+          ALTINDA kalir. Ayni sonuc ORDER BY ile maddesellesirse ~240 KB
+          -> sinir asilir. Yani akis gercekten calismazsa PS7a duser. }
+        Srv.MaxPortalResultBytes := 120000;
+        FillChar(L, SizeOf(L), 0);
+        ok := SendMsg(s, 'P', ParseMsg('sb2', 'SELECT id, pad FROM big')) and
+              SendMsg(s, 'B', BindMsg('pb7', 'sb2')) and
+              SendMsg(s, 'E', ExecuteMsg('pb7', 0)) and
+              ExtRoundTrip(s, L);
+        Chk('PS7a akisli buyuk sonuc butce icinde akar',
+          ok and (L.ErrText = '') and (L.NDataRow = NBIG) and
+          (L.NComplete = 1),
+          'satir=' + IntToStr(L.NDataRow) + ' hata=' + L.ErrText);
+
+        FillChar(L, SizeOf(L), 0);
+        ok := SendMsg(s, 'P',
+                ParseMsg('sb3', 'SELECT id, pad FROM big ORDER BY id')) and
+              SendMsg(s, 'B', BindMsg('pb8', 'sb3')) and
+              SendMsg(s, 'E', ExecuteMsg('pb8', 0)) and
+              ExtRoundTrip(s, L);
+        Chk('PS7b ayni sonuc ORDER BY ile maddesel -> butce RED',
+          ok and (Pos('portal sonuc bellegi siniri', L.ErrText) > 0) and
+          (L.NDataRow = 0),
+          'satir=' + IntToStr(L.NDataRow) + ' hata=' + L.ErrText);
+
+        Srv.MaxPortalResultBytes := 20000;
+        FillChar(L, SizeOf(L), 0);
+        ok := SendMsg(s, 'B', BindMsg('pb9', 'sb2')) and
+              SendMsg(s, 'E', ExecuteMsg('pb9', 0)) and
+              ExtRoundTrip(s, L);
+        Chk('PS7c akisli yolda da butce uygulanir (parca > sinir)',
+          ok and (Pos('portal sonuc bellegi siniri', L.ErrText) > 0) and
+          (L.NDataRow = 0),
+          'satir=' + IntToStr(L.NDataRow) + ' hata=' + L.ErrText);
+        Srv.MaxPortalResultBytes := Int64(64) * 1024 * 1024;
+
+        { PS8/PS9: COPY OUT iki bicimde de imlecten akar }
+        FillChar(L, SizeOf(L), 0);
+        ok := SendMsg(s, 'Q', 'COPY (SELECT id FROM big) TO STDOUT' + #0) and
+              ReadUntilReady(s, L);
+        Chk('PS8 COPY OUT sorgu akisli (800 CopyData)',
+          ok and (L.ErrText = '') and (L.NCopyData = NBIG) and
+          (L.NComplete = 1),
+          'kopya=' + IntToStr(L.NCopyData) + ' hata=' + L.ErrText);
+
+        FillChar(L, SizeOf(L), 0);
+        ok := SendMsg(s, 'Q', 'COPY big TO STDOUT' + #0) and
+              ReadUntilReady(s, L);
+        Chk('PS9 COPY OUT tablo akisli (800 CopyData)',
+          ok and (L.ErrText = '') and (L.NCopyData = NBIG) and
+          (L.NComplete = 1),
+          'kopya=' + IntToStr(L.NCopyData) + ' hata=' + L.ErrText);
+
+        { PS10: Close imleci hemen birakir }
+        FillChar(L, SizeOf(L), 0);
+        ok := SendMsg(s, 'B', BindMsg('pb10', 'sb2')) and
+              SendMsg(s, 'E', ExecuteMsg('pb10', 10)) and
+              ExtRoundTrip(s, L);
+        FillChar(L, SizeOf(L), 0);
+        ok := ok and SendMsg(s, 'C', 'Ppb10' + #0) and ExtRoundTrip(s, L);
+        FillChar(L, SizeOf(L), 0);
+        ok := ok and SendMsg(s, 'E', ExecuteMsg('pb10', 10)) and
+              ExtRoundTrip(s, L);
+        Chk('PS10 Close imleci birakir (portal yok)',
+          ok and (Pos('portal yok', L.ErrText) > 0),
+          'hata=' + L.ErrText);
       end;
     finally
       VdbSockClose(s);

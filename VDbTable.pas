@@ -11717,6 +11717,10 @@ begin
   t.IsMaterializedView := False;
   t.SelectStmt := nil;
   t.SelectText := '';
+  { SKILL6 03 (F-49): HasNulls da managed olmayan bir alan; yerel record'da
+    acikca sifirlanmazsa stack copu kalir ve yeni tablo rastgele "NULL
+    tasiyor" sayilir. Bu da TUM akis hizli yollarini kapatir. }
+  t.HasNulls := False;
   t.FRowEstimate := 1000;      // R-15: varsayılan tahmin
   t.FLastAnalyze := 0;         // R-15: henüz analiz edilmedi
   SetLength(t.Cols, Length(Cols));

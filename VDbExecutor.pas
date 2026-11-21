@@ -113,6 +113,9 @@ type
     V: string;
   end;
 
+  { SKILL6 04: gercek satir imleci (one cikarilmis bildirim). }
+  TVdbRowCursor = class;
+
   { TVSqlExecutor }
 
   TVSqlExecutor = class
@@ -156,6 +159,9 @@ type
     FCteTables: TDictionary<string, TCteTable>;
     { H3: tablo id -> zone map (VERI DEGISINCE (Seq/Epoch) gecersiz). }
     FZoneMaps: TDictionary<Integer, TVDbZoneMap>;
+    { SKILL6 04: ExecSelect bir imlec baglaminda calisirken buraya isaret
+      eder; nil ise normal (maddeselestiren) yol aynen isler. }
+    FCursorProbe: TVdbRowCursor;
     { v3.3: son taramada zone map'in budadigi (disk okumasindan once atlanan)
       SAYFA sayisi. Yalnizca olcum/teshis icin; sorgu sonucunu etkilemez. }
     FZonePrunedPages: Integer;
@@ -576,7 +582,19 @@ type
     { H1 (2026-10-18): Indekssiz tek-tablo LIMIT'li SELECT'te satirlari HAM
       akistan okuyup LIMIT kadar eslesen bulunca DURUR (tum tabloyu cozmez).
       Sekil/guvenlik uymazsa False -> genel yol AYNEN calisir. }
+    function TryStreamSelectChunk(Stmt: TSqlSelectStmt; const td: TTableDef;
+      Cursor: TVdbRowCursor; AResumePage, ASkipQual, AMaxRows: Integer;
+      out Res: TSqlResult): Boolean;
+    { SKILL6 04: eski imza — Cursor=nil ile parcali olmayan yola delege eder. }
     function TryStreamSelect(Stmt: TSqlSelectStmt; const td: TTableDef;
+      out Res: TSqlResult): Boolean;
+    { SKILL6 04: ExecSelect'i bir imlec baglaminda calistirir; akisli bicim
+      uyarsa sonuc parcasi uretilir, uymazsa normal maddeselestirme olur. }
+    procedure ExecSelectForCursor(Cursor: TVdbRowCursor;
+      Stmt: TSqlSelectStmt; out Res: TSqlResult);
+    { SKILL6 04: imlec baglami varsa parcali yolu, yoksa tek seferlik yolu
+      secer. Tek bir cagri yapar; iki yolun birden calismasi imkansizdir. }
+    function TryStreamProbe(Stmt: TSqlSelectStmt; const td: TTableDef;
       out Res: TSqlResult): Boolean;
     { H16: tek kolonlu SELECT DISTINCT ... [ORDER BY ayni kolon] sorgusunu
       ham akistan tek pass'te tekillestirir. Tum satir matrisi kurulmaz;
@@ -810,6 +828,45 @@ type
       const AParams: TStrArray; out Res: TSqlResult): Boolean;
   end;
 
+  { SKILL6 04: gercek satir imleci (cursor).
+
+    Sozlesme:
+      - Create: AST'nin SAHIBI olur (OpenCursor parse eder).
+      - NextChunk(AMaxRows): en fazla AMaxRows satirlik parca uretir
+        (AMaxRows = 0 -> kalan tum satirlar). Veri bittiyse False doner.
+      - Cancel: sonraki NextChunk bos doner.
+    Akisli olmayan sorgu bicimleri (ORDER BY/GROUP BY/DISTINCT/JOIN/
+    UNION/pencere/alt sorgu, HasNulls tablolar, KV deposu, toplu yazim)
+    TEK SEFERDE maddeselestirilir; bu durust bir sinirdir ve
+    FStreamed = False ile isaretlenir. }
+  TVdbRowCursor = class
+  public
+    FExec: TVSqlExecutor;
+    FStmt: TSqlStmtNode;       // sahip
+    FSelect: TSqlSelectStmt;   // FStmt'a isaret
+    FFields: TStrArray;
+    FFieldTypes: TByteArray;
+    FTable: TTableDef;         // akis icin tablo tanimi (salt okunur kopya)
+    FResumePage, FSkipQual: Integer;
+    FChunkMax: Integer;        // motorun bu parcada uretecegi ust sinir
+    FStarted, FStreamed, FScannedAll, FDone, FCancelled: Boolean;
+    FMat: TSqlResult;          // maddesel yedek sonuc
+    FMatPos: Integer;
+    FSkip, FLimit: Integer;    // cursor'un uyguladigi OFFSET / LIMIT
+    FBuf: TSqlResult;          // teslim bekleyen satirlar
+    FBufPos: Integer;
+    FBytes: Int64;             // uretilen hucre baytlari (butce icin)
+    constructor Create(AExec: TVSqlExecutor; AStmt: TSqlStmtNode);
+    destructor Destroy; override;
+    procedure FillBuf(AMinRows: Integer);
+    function NextChunk(AMaxRows: Integer; out Res: TSqlResult): Boolean;
+    function NextRow(out Row: TStrArray; out Nulls: TNulArr): Boolean;
+    procedure Cancel;
+    { SKILL6 04: su an IMLEcte canli tutulan tahmini bayt (butce icin).
+      Akisli yolda yalniz tampon parcasi, maddesel yolda tum sonuc sayilir. }
+    function LiveBytes: Int64;
+  end;
+
 implementation
 
 var
@@ -884,8 +941,210 @@ begin
 end;
 
 { ============================================================
-  TVSqlExecutor
+  SKILL6 04: TVdbRowCursor - gercek satir imleci
   ============================================================ }
+
+constructor TVdbRowCursor.Create(AExec: TVSqlExecutor; AStmt: TSqlStmtNode);
+begin
+  inherited Create;
+  FExec := AExec;
+  FStmt := AStmt;
+  FSelect := nil;
+  if AStmt is TSqlSelectStmt then FSelect := TSqlSelectStmt(AStmt);
+  FResumePage := 0;
+  FSkipQual := 0;
+  FChunkMax := -1;
+  FMatPos := 0;
+  FBufPos := 0;
+  FSkip := 0;
+  FLimit := -1;
+end;
+
+destructor TVdbRowCursor.Destroy;
+begin
+  FStmt.Free;
+  FStmt := nil;
+  FSelect := nil;
+  inherited;
+end;
+
+procedure TVdbRowCursor.Cancel;
+begin
+  FCancelled := True;
+end;
+
+{ Bir sonraki parca icin satirlari FBuf'a doldurur; OFFSET/LIMIT burada
+  uygulanir. Akisli yolda motor sayfa penceresinden devam eder; akisli
+  olmayan bicimde sonuc ilk cagrida bir kez maddeselestirilir. }
+procedure TVdbRowCursor.FillBuf(AMinRows: Integer);
+var
+  part: TSqlResult;
+  sRows: TStrMatrix;
+  sNulls: TNullMatrix;
+  sPos, n, d, take, i: Integer;
+  sDone: Boolean;
+begin
+  FBuf := Default(TSqlResult);
+  FBufPos := 0;
+  if FDone or FCancelled then Exit;
+  part := Default(TSqlResult);
+  if not FStarted then
+  begin
+    FStarted := True;
+    if AMinRows > 0 then FChunkMax := AMinRows + FSkip else FChunkMax := -1;
+    FExec.ExecSelectForCursor(Self, FSelect, part);
+    if not FStreamed then
+    begin
+      { Akisli olmayan bicim: tek seferde maddeselesti (durust sinir).
+        Genel yol OFFSET/LIMIT'i KENDISI uyguladi; imlec tekrar uygulamaz. }
+      FMat := part;
+      FMatPos := 0;
+      FSkip := 0;
+      FLimit := -1;
+      FFields := FMat.Fields;
+      FFieldTypes := FMat.FieldTypes;
+      part := Default(TSqlResult);
+    end
+    else
+    begin
+      FFields := part.Fields;
+      FFieldTypes := part.FieldTypes;
+    end;
+  end
+  else if FStreamed and (not FScannedAll) then
+  begin
+    if AMinRows > 0 then FChunkMax := AMinRows + FSkip else FChunkMax := -1;
+    if not FExec.TryStreamSelectChunk(FSelect, FTable, Self, FResumePage,
+      FSkipQual, FChunkMax, part) then
+      raise EVDbException.Create(ecUnsupported,
+        'akisli imlec devam ettirilemedi (depo durumu degisti)');
+  end;
+  if FStreamed then
+  begin
+    sRows := part.Rows;
+    sNulls := part.RowNulls;
+    sPos := 0;
+    sDone := FScannedAll;
+  end
+  else
+  begin
+    sRows := FMat.Rows;
+    sNulls := FMat.RowNulls;
+    sPos := FMatPos;
+    sDone := True;
+  end;
+  n := Length(sRows);
+  if FSkip > 0 then
+  begin
+    d := n - sPos;
+    if d > FSkip then d := FSkip;
+    Inc(sPos, d);
+    Dec(FSkip, d);
+  end;
+  take := n - sPos;
+  if take < 0 then take := 0;
+  if (FLimit >= 0) and (take > FLimit) then take := FLimit;
+  if take > 0 then
+  begin
+    SetLength(FBuf.Rows, take);
+    for i := 0 to take - 1 do
+    begin
+      FBuf.Rows[i] := sRows[sPos + i];
+      Inc(FBytes, Int64(Length(sRows[sPos + i])) + 8);
+    end;
+    if Length(sNulls) > 0 then
+    begin
+      SetLength(FBuf.RowNulls, take);
+      for i := 0 to take - 1 do FBuf.RowNulls[i] := sNulls[sPos + i];
+    end;
+  end;
+  if FLimit >= 0 then Dec(FLimit, take);
+  if not FStreamed then FMatPos := sPos + take;
+  if (FLimit = 0) or (sDone and (sPos + take >= n)) then FDone := True;
+end;
+
+function TVdbRowCursor.NextChunk(AMaxRows: Integer; out Res: TSqlResult): Boolean;
+var
+  take, i: Integer;
+begin
+  Res := Default(TSqlResult);
+  Result := False;
+  if FCancelled then Exit;
+  if AMaxRows < 0 then AMaxRows := 0;
+  while (FBufPos >= Length(FBuf.Rows)) and (not FDone) do
+  begin
+    if AMaxRows > 0 then FillBuf(AMaxRows) else FillBuf(0);
+  end;
+  if FBufPos >= Length(FBuf.Rows) then Exit;
+  take := Length(FBuf.Rows) - FBufPos;
+  if (AMaxRows > 0) and (take > AMaxRows) then take := AMaxRows;
+  Res.Fields := FFields;
+  Res.FieldTypes := FFieldTypes;
+  SetLength(Res.Rows, take);
+  for i := 0 to take - 1 do Res.Rows[i] := FBuf.Rows[FBufPos + i];
+  if Length(FBuf.RowNulls) > 0 then
+  begin
+    SetLength(Res.RowNulls, take);
+    for i := 0 to take - 1 do Res.RowNulls[i] := FBuf.RowNulls[FBufPos + i];
+  end;
+  Inc(FBufPos, take);
+  Res.Affected := take;
+  Res.Msg := 'OK';
+  Result := True;
+end;
+
+function TVdbRowCursor.NextRow(out Row: TStrArray; out Nulls: TNulArr): Boolean;
+begin
+  Row := nil;
+  Nulls := nil;
+  Result := False;
+  if FCancelled then Exit;
+  while (FBufPos >= Length(FBuf.Rows)) and (not FDone) do FillBuf(256);
+  if FBufPos >= Length(FBuf.Rows) then Exit;
+  Row := FBuf.Rows[FBufPos];
+  if Length(FBuf.RowNulls) > 0 then Nulls := FBuf.RowNulls[FBufPos];
+  Inc(FBufPos);
+  Result := True;
+end;
+
+function TVdbRowCursor.LiveBytes: Int64;
+var
+  i, c: Integer;
+begin
+  Result := Int64(Length(FFields)) * 16;
+  if not FStreamed then
+    for i := 0 to High(FMat.Rows) do
+      for c := 0 to High(FMat.Rows[i]) do
+        Inc(Result, Int64(Length(FMat.Rows[i][c])) + 8);
+  for i := 0 to High(FBuf.Rows) do
+    for c := 0 to High(FBuf.Rows[i]) do
+      Inc(Result, Int64(Length(FBuf.Rows[i][c])) + 8);
+end;
+
+{ SKILL6 04: imlec baglamini kurup normal ExecSelect hattini calistirir.
+  Akisli sekil uyarsa ExecSelect icindeki TryStreamSelectChunk tek parca
+  uretir ve imlece durum yazar; uymazsa sonuc tamamen maddesellesir. }
+procedure TVSqlExecutor.ExecSelectForCursor(Cursor: TVdbRowCursor;
+  Stmt: TSqlSelectStmt; out Res: TSqlResult);
+begin
+  FCursorProbe := Cursor;
+  try
+    ExecSelect(Stmt, Res);
+  finally
+    FCursorProbe := nil;
+  end;
+end;
+
+function TVSqlExecutor.TryStreamProbe(Stmt: TSqlSelectStmt;
+  const td: TTableDef; out Res: TSqlResult): Boolean;
+begin
+  if FCursorProbe = nil then
+    Result := TryStreamSelectChunk(Stmt, td, nil, 0, 0, -1, Res)
+  else
+    Result := TryStreamSelectChunk(Stmt, td, FCursorProbe,
+      FCursorProbe.FResumePage, FCursorProbe.FSkipQual,
+      FCursorProbe.FChunkMax, Res);
+end;
 
 constructor TVSqlExecutor.Create(ATableDb: TVTableDb);
 begin
@@ -13172,6 +13431,17 @@ type
     OutCells: TVdbCellMatrix;
     OutTypes: TByteArray;  // P-163: cikti tipleri (string'den hucreye ceviride)
     Failed: Boolean;
+    { SKILL6 04: parcali (chunked) akis durumu. ChunkMode False iken bu
+      alanlarin HICBIRI okunmaz/yazilmaz; mevcut yol bit bazi aynidir. }
+    ChunkMode: Boolean;      // sayfa-sinirli parca uretimi acik
+    ChunkResumePage: Integer; // bu parcada ilk islenecek sayfa (-1 = bastan)
+    ChunkSkipQual: Integer;   // o sayfada zaten islenmis ham cagrim sayisi
+    ChunkMax: Integer;        // bu parcada en fazla kac satir (-1 = sinirsiz)
+    ChunkStopPage: Integer;   // durulan sayfa (-1 = tarama bitti)
+    ChunkStopQual: Integer;   // durulan sayfadaki islenmis cagrim sayisi
+    ChunkEmitted: Integer;    // bu parcada uretilen satir
+    ChunkPage: Integer;       // su anki sayfa (cagrim sayaci icin)
+    ChunkQual: Integer;       // su anki sayfadaki cagrim sayisi
   end;
   PStreamSelCtx = ^TStreamSelCtx;
 
@@ -14643,6 +14913,25 @@ begin
   ctx^.Exec.TickAbort;   // P-176
   { P-119: sayfa bucket'i dogrudan burada — VdbStreamSelPageCb kaldirildi. }
   if PageNo > 0 then ctx^.CurBucket := Integer(PageNo);
+  { SKILL6 04: parcali akis sayaci. Bir sayfanin ham geri-cagrimlari
+    deterministik sirada gelir; ayni sayfa yeniden tarandiginda onceki
+    parcada islenmis ilk N cagrim sayilarak TAM olarak atlanir. Sema
+    anahtari ve diger tablo satirlari da sayilir (sira bozulmasin). }
+  if ctx^.ChunkMode and (PageNo > 0) then
+  begin
+    if Integer(PageNo) <> ctx^.ChunkPage then
+    begin
+      ctx^.ChunkPage := Integer(PageNo);
+      ctx^.ChunkQual := 0;
+    end;
+    if (ctx^.ChunkPage = ctx^.ChunkResumePage) and
+       (ctx^.ChunkQual < ctx^.ChunkSkipQual) then
+    begin
+      Inc(ctx^.ChunkQual);
+      Exit(True);
+    end;
+    Inc(ctx^.ChunkQual);
+  end;
   if Key = VDB_SCHEMA_KEY then Exit(True);
   // P-93: DirectDecode tek gecis — hash dogrulama + decode ayni dongude.
   // FType/FOff/FLen ara dizileri yazilmaz/okunmaz; Vals dogrudan cikti
@@ -14683,6 +14972,16 @@ begin
     if ctx^.Seen <= ctx^.Offset then Exit(True);
     Inc(ctx^.Emitted);
     if (ctx^.Limit >= 0) and (ctx^.Emitted >= ctx^.Limit) then Exit(False);
+    if ctx^.ChunkMode then
+    begin
+      Inc(ctx^.ChunkEmitted);
+      if (ctx^.ChunkMax >= 0) and (ctx^.ChunkEmitted >= ctx^.ChunkMax) then
+      begin
+        ctx^.ChunkStopPage := ctx^.ChunkPage;
+        ctx^.ChunkStopQual := ctx^.ChunkQual;
+        Exit(False);
+      end;
+    end;
     Exit(True);
   end;
   // P-90d: PK string'siz hash — VDbPeekRawRowP + VDbHashKey yerine
@@ -14846,6 +15145,16 @@ begin
         ctx^.OutCells[ctx^.Emitted][j]);
   Inc(ctx^.Emitted);
   if (ctx^.Limit >= 0) and (ctx^.Emitted >= ctx^.Limit) then Exit(False);
+  if ctx^.ChunkMode then
+  begin
+    Inc(ctx^.ChunkEmitted);
+    if (ctx^.ChunkMax >= 0) and (ctx^.ChunkEmitted >= ctx^.ChunkMax) then
+    begin
+      ctx^.ChunkStopPage := ctx^.ChunkPage;
+      ctx^.ChunkStopQual := ctx^.ChunkQual;
+      Exit(False);
+    end;
+  end;
   Result := True;
 end;
 
@@ -15057,6 +15366,14 @@ end;
 
 function TVSqlExecutor.TryStreamSelect(Stmt: TSqlSelectStmt; const td: TTableDef;
   out Res: TSqlResult): Boolean;
+begin
+  { SKILL6 04: eski API — parcali olmayan, tek seferde tamamlayan yol. }
+  Result := TryStreamSelectChunk(Stmt, td, nil, 0, 0, -1, Res);
+end;
+
+function TVSqlExecutor.TryStreamSelectChunk(Stmt: TSqlSelectStmt;
+  const td: TTableDef; Cursor: TVdbRowCursor; AResumePage, ASkipQual,
+  AMaxRows: Integer; out Res: TSqlResult): Boolean;
 var
   ctx: TStreamSelCtx;
   cn, outCols: TStrArray;
@@ -15258,6 +15575,7 @@ var
 
 begin
   Result := False;
+  if Cursor <> nil then Cursor.FTable := td;
   { --- Sekil korumasi: genel yol ile AYNI sonucu garantileyen dar kume --- }
   if Stmt.LimitVal = 0 then Exit;                 // LIMIT 0 -> genel (bos)
   if Stmt.OffsetVal < 0 then Exit;
@@ -15497,6 +15815,31 @@ begin
     end;
   end;
 
+  { SKILL6 04: parcali tarama yeni bir zone map INSA ETMEZ. Devam eden
+    parcada bazi ham cagrimlar atlanir; harita sayfanin yalniz bir kismini
+    gorur ve cok dar min/max uretir -> sonraki sorgularda YANLIS budama.
+    Mevcut gecerli harita (zSkip ile budama) kullanilmaya devam eder. }
+  if Cursor <> nil then
+  begin
+    if ctx.ZoneOn then
+    begin
+      ctx.ZoneMap.Free;
+      ctx.ZoneMap := nil;
+      ctx.ZoneOn := False;
+    end;
+    ctx.ZoneLastBucket := -1;
+  end;
+
+  { SKILL6 04: parcali akista bu parcadan once tuketilen sayfalar atlanir
+    (sayfa hic acilmaz). zBCount zone kosulu olmasa da zV3'te hesaplanir. }
+  if (Cursor <> nil) and (AResumePage > 0) and (zBCount > 0) then
+  begin
+    if Length(zSkip) < zBCount then SetLength(zSkip, zBCount);
+    for zB := 1 to AResumePage - 1 do
+      if (zB > 0) and (zB < Length(zSkip)) then zSkip[zB] := 1;
+    zSkipPtr := @zSkip[0];
+  end;
+
   FCurTable := Stmt.FromTable;
   FCurCollation := '';
   FExplicitColl := False;
@@ -15527,8 +15870,28 @@ begin
   ctx.OutTypes := outTypes;
   ctx.Where := Stmt.WhereClause;
   ctx.Columns := Stmt.Columns;
-  ctx.Offset := Stmt.OffsetVal;
-  ctx.Limit := Stmt.LimitVal;
+  { SKILL6 04: parcali akista OFFSET/LIMIT'i cursor uygular; sayfa atlamali
+    devam taramasi ctx.Seen'i sifirdan baslattigi icin burada uygulanirsa
+    tekrar sayilirdi. }
+  if Cursor <> nil then
+  begin
+    ctx.Offset := 0;
+    ctx.Limit := -1;
+  end
+  else
+  begin
+    ctx.Offset := Stmt.OffsetVal;
+    ctx.Limit := Stmt.LimitVal;
+  end;
+  ctx.ChunkMode := Cursor <> nil;
+  ctx.ChunkResumePage := AResumePage;
+  ctx.ChunkSkipQual := ASkipQual;
+  ctx.ChunkMax := AMaxRows;
+  ctx.ChunkStopPage := -1;
+  ctx.ChunkStopQual := 0;
+  ctx.ChunkEmitted := 0;
+  ctx.ChunkPage := -1;
+  ctx.ChunkQual := 0;
   ctx.Seen := 0;
   ctx.Emitted := 0;
   SetLength(ctx.OutRows, 0);
@@ -15613,7 +15976,16 @@ begin
   end;
 
   zScanOk := True;
-  if FT.Kv <> nil then
+  if Cursor <> nil then
+  begin
+    { SKILL6 04: parcali akis yalniz v3 sayfa yolu uzerinde calisir; toplu
+      yazim (BatchOpen) veya KV deposunda cursor maddesel yola duser. }
+    if (not zV3) or (FT.Kv <> nil) then
+      Exit(False);
+    zScanOk := FT.Backend.ScanRawIterAllPaged(td.TableId, zSkipPtr,
+      Length(zSkip), VdbStreamSelCb, @ctx);
+  end
+  else if FT.Kv <> nil then
     zScanOk := FT.Kv.ScanRawIterAllZoned(td.TableId, zSkipPtr, Length(zSkip),
       @ctx.CurBucket, VdbStreamSelCbNoPage, @ctx)
   else if zV3 then
@@ -15660,6 +16032,16 @@ begin
     ctx.ZoneMap := nil;
   end;
   if ctx.Failed then Exit(False);
+
+  { SKILL6 04: parcali akis durumunu imlece yaz. ChunkStopPage < 0 ise
+    tarama sonuna gelindi; aksi halde sayfa penceresinden devam edilir. }
+  if Cursor <> nil then
+  begin
+    Cursor.FStreamed := True;
+    Cursor.FResumePage := ctx.ChunkStopPage;
+    Cursor.FSkipQual := ctx.ChunkStopQual;
+    if ctx.ChunkStopPage < 0 then Cursor.FScannedAll := True;
+  end;
 
   // P-88: OutRows kapasitesini gercek satir sayisina kirp.
   // P-163: tipli istekte OutRows hic kullanilmaz (dogrudan hucre yolu).
@@ -16529,7 +16911,7 @@ begin
         end;
         // H1 (2026-10-18): indekssiz, LIMIT'li, ORDER BY'siz tek tablo
         // SELECT'i ham akistan okuyup LIMIT dolunca durur. Uymazsa False.
-        if (not td.HasNulls) and TryStreamSelect(Stmt, td, Res) then
+        if (not td.HasNulls) and TryStreamProbe(Stmt, td, Res) then
         begin
           SetPlanTag('stream_select');
           Exit;

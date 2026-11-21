@@ -32,6 +32,8 @@ const
 
 type
   TSqlResult = VDbAst.TSqlResult;
+  { SKILL6 04: gercek satir imleci (VDbExecutor'da tanimli). }
+  TVdbRowCursor = VDbExecutor.TVdbRowCursor;
 
   { F-21: YAVAS SORGU KAYDI.
     Sql  = cumlenin tam metni (kisitli uzunlukta)
@@ -233,6 +235,11 @@ type
       olarak baglanir ('' metni degil). Wire Bind -1 bu yolu kullanir. }
     function Exec(const Sql: string; const Params: array of string;
       const ParamNulls: TNulArr): TSqlResult; overload;
+    { SKILL6 04: gercek satir imleci. TEK cumle kabul eder; AST'nin sahibi
+      imlectir (cagiran Free eder). Akisli sekil uymazsa sonuc ilk
+      NextChunk cagrisinda bir kez maddesellesir (durust sinir). }
+    function OpenCursor(const Sql: string; const Params: TStrArray;
+      const ParamNulls: TNulArr): TVdbRowCursor;
     { P-163 (P0-10): tipli sonuc. Akisli SELECT hizli yolu hucreleri string'e
       cevirmeden Result.TypedRows'a yazar; diger yollarda Result.Rows metin
       olarak uretilir ve burada tipli kanala cevrilir. Her iki durumda
@@ -3631,6 +3638,39 @@ begin
   SetLength(FPendParamNulls, Length(ParamNulls));
   for i := 0 to High(ParamNulls) do FPendParamNulls[i] := ParamNulls[i];
   Result := Exec(Sql, Params);
+end;
+
+function TVSql.OpenCursor(const Sql: string; const Params: TStrArray;
+  const ParamNulls: TNulArr): TVdbRowCursor;
+var
+  i: Integer;
+  st: TSqlStmtNode;
+  body: string;
+begin
+  Result := nil;
+  CheckStmtSize(Sql);
+  { Imlec TEK cumle kabul eder; son noktali virgul disinda ';' varsa reddet. }
+  body := Trim(Sql);
+  while (body <> '') and (body[Length(body)] = ';') do
+    Delete(body, Length(body), 1);
+  if Pos(';', body) > 0 then
+    raise EVDbException.Create(ecUnsupported,
+      'OpenCursor tek cumle kabul eder');
+  SetLength(FParams, Length(Params));
+  for i := 0 to High(Params) do FParams[i] := Params[i];
+  SetLength(FParamNulls, Length(ParamNulls));
+  for i := 0 to High(ParamNulls) do FParamNulls[i] := ParamNulls[i];
+  SetLength(FPendParamNulls, 0);
+  st := FParser.ParseEx(body, FParams, FParamNulls);
+  if st = nil then Exit;
+  { Imlec yalniz SELECT tasir; aksi halde ExecSelect nil AST ile cagrilirdi. }
+  if not (st is TSqlSelectStmt) then
+  begin
+    st.Free;
+    raise EVDbException.Create(ecUnsupported,
+      'OpenCursor yalniz SELECT kabul eder');
+  end;
+  Result := TVdbRowCursor.Create(FExecutor, st);
 end;
 
 function TVSql.Exec(const Sql: string; const Params: array of string): TSqlResult;
