@@ -50,6 +50,10 @@ type
     FT: TVTableDb;
     FSessionId: Cardinal;   // F-41: satir kilidi sahipligi
     FParams: TStrArray;
+    // F-49 (SKILL6 03): parametre basina gercek-NULL bayragi (wire Bind -1).
+    FParamNulls: TNulArr;
+    // F-49: bir sonraki Exec cagrisinin NULL maskesi (tek atimlik).
+    FPendParamNulls: TNulArr;
     FParamIdx: Integer;
     FSetDepth: Boolean;  // ic ice UNION taramasini engeller
     FAutoTx: Boolean;    // coklu cumle = tek transaction (otomatik)
@@ -225,6 +229,10 @@ type
     // Params[i] ile doldurulur. Tirnak/escape derdi yok
     // (or. soyad O'Brien guvenli gecer).
     function Exec(const Sql: string; const Params: array of string): TSqlResult; overload;
+    { F-49 (SKILL6 03): ParamNulls[i] = True ise Params[i] GERCEK NULL
+      olarak baglanir ('' metni degil). Wire Bind -1 bu yolu kullanir. }
+    function Exec(const Sql: string; const Params: array of string;
+      const ParamNulls: TNulArr): TSqlResult; overload;
     { P-163 (P0-10): tipli sonuc. Akisli SELECT hizli yolu hucreleri string'e
       cevirmeden Result.TypedRows'a yazar; diger yollarda Result.Rows metin
       olarak uretilir ve burada tipli kanala cevrilir. Her iki durumda
@@ -3490,6 +3498,17 @@ begin
       'SQL cumlesi cok buyuk (%d > %d bayt)', [Length(Sql), VDB_MAX_SQL_STMT]);
 end;
 
+{ F-49 (2c): hizli INSERT seritleri maske tasimaz; herhangi bir parametre
+  gercek NULL ise serit atlanir ve genel yol maskeyi kurar. }
+function VDbNullsAny(const M: TNulArr): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 0 to High(M) do
+    if M[i] then Exit(True);
+end;
+
 function TVSql.Exec(const Sql: string): TSqlResult;
 var
   st: TStrArray;
@@ -3497,6 +3516,7 @@ var
   stmt: string;
   fastOk: Boolean;
 begin
+  SetLength(FParamNulls, 0);   // F-49: parametresiz cagride maske kalinti birakmaz
   CheckStmtSize(Sql);
   { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
   Result := Default(TSqlResult);
@@ -3603,6 +3623,16 @@ begin
   end;
 end;
 
+function TVSql.Exec(const Sql: string; const Params: array of string;
+  const ParamNulls: TNulArr): TSqlResult;
+var
+  i: Integer;
+begin
+  SetLength(FPendParamNulls, Length(ParamNulls));
+  for i := 0 to High(ParamNulls) do FPendParamNulls[i] := ParamNulls[i];
+  Result := Exec(Sql, Params);
+end;
+
 function TVSql.Exec(const Sql: string; const Params: array of string): TSqlResult;
 var
   i: Integer;
@@ -3610,6 +3640,9 @@ var
   prevSess: Cardinal;
   fastOk: Boolean;
 begin
+  // F-49 (SKILL6 03): bekleyen parametre NULL maskesini devral (tek atimlik).
+  FParamNulls := FPendParamNulls;
+  SetLength(FPendParamNulls, 0);
   CheckStmtSize(Sql);
   { Bkz. ExecRaw: gecici kayit sonucu sifirlanmamis olabilir. }
   Result := Default(TSqlResult);
@@ -3631,7 +3664,8 @@ begin
       v3.57: acik transaction icinde hizli yol atlanir — statement kapsami
       yalnizca ExecRaw uzerinden acilir. }
     if (Length(Sql) > 13) and ((Sql[1] = 'I') or (Sql[1] = 'i')) and
-       (not FT.Backend.InBatch) and (Pos(';', Sql) = 0) and (Length(Params) > 0) then
+       (not FT.Backend.InBatch) and (Pos(';', Sql) = 0) and (Length(Params) > 0) and
+       (not VDbNullsAny(FParamNulls)) then
     begin
       FT.Lock;
       try
@@ -4328,7 +4362,7 @@ begin
     SlowMarkStart;
     try
       // Once parametreli INSERT (FParams varsa) — '?'
-      if Length(FParams) > 0 then
+      if (Length(FParams) > 0) and (not VDbNullsAny(FParamNulls)) then
       begin
         fastOk := FExecutor.ExecFastParamInsert(Sql, FParams, Result);
         if fastOk then
@@ -4516,7 +4550,7 @@ begin
         if (UpperCase(w3) = 'TRANSACTION') or
            (UpperCase(w3) = 'SESSION') then
         begin
-          astStmt := FParser.Parse(Sql, FParams);
+          astStmt := FParser.ParseEx(Sql, FParams, FParamNulls);
           try
             Result := FExecutor.Execute(astStmt);
           finally
@@ -4647,7 +4681,19 @@ begin
         begin
           lit := astStmt.ParamLits[i];
           if (lit.ParamIdx >= 0) and (lit.ParamIdx <= High(FParams)) then
-            lit.StrVal := FParams[lit.ParamIdx];
+          begin
+            // F-49 (SKILL6 03): NULL parametresi dugumu NULL'a cevirir.
+            if (lit.ParamIdx <= High(FParamNulls)) and FParamNulls[lit.ParamIdx] then
+            begin
+              lit.LitType := sltNull;
+              lit.StrVal := '';
+            end
+            else
+            begin
+              lit.LitType := sltString;
+              lit.StrVal := FParams[lit.ParamIdx];
+            end;
+          end;
         end;
       SlowMarkStart;
       try
@@ -4680,7 +4726,7 @@ begin
   end;
   spanChild := VDbTraceBegin('sql.parse', spanRoot);
   try
-    astStmt := FParser.Parse(Sql, FParams);
+    astStmt := FParser.ParseEx(Sql, FParams, FParamNulls);
   finally
     VDbTraceEnd(spanChild);
   end;

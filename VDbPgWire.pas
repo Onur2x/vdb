@@ -397,6 +397,8 @@ type
   TPgPortal = record
     Sql: string;
     Params: TStrArray;
+    // F-49 (SKILL6 03): hangi parametreler Bind'de NULL (-1) geldi.
+    ParamsNull: TNulArr;
     Done: Boolean;
     Res: TSqlResult;
     Err: string;
@@ -812,7 +814,7 @@ begin
 end;
 
 function DataRowMsgFmt(const Row: TStrArray; const Types: TByteArray;
-  const Fmts: array of Integer): AnsiString;
+  const Fmts: array of Integer; const Nulls: TNulArr = nil): AnsiString;
 var
   sb: TStringBuilder;
   i: Integer;
@@ -825,6 +827,13 @@ begin
     sb.Append(NetI16(Length(Row)));
     for i := 0 to High(Row) do
     begin
+      { F-49 (SKILL6 03): gercek NULL PostgreSQL'de uzunluk -1'dir.
+        Maske yoksa eski davranis (bos metin) korunur. }
+      if (Nulls <> nil) and (i < Length(Nulls)) and Nulls[i] then
+      begin
+        sb.Append(NetI32(-1));
+        Continue;
+      end;
       if PgFmtAt(Fmts, i) = 1 then
       begin
         if i < Length(Types) then oid := PgOidOf(Types[i]) else oid := 25;
@@ -841,9 +850,18 @@ begin
   end;
 end;
 
-function DataRowMsg(const Row: TStrArray): AnsiString;
+function DataRowMsg(const Row: TStrArray; const Nulls: TNulArr = nil): AnsiString;
 begin
-  Result := DataRowMsgFmt(Row, nil, []);
+  Result := DataRowMsgFmt(Row, nil, [], Nulls);
+end;
+
+{ F-49 (SKILL6 03): sonuc satirinin NULL maskesi (bilinmiyorsa nil). }
+function PgRowNulls(const Res: TSqlResult; Idx: Integer): TNulArr;
+begin
+  Result := nil;
+  if Length(Res.RowNulls) <> Length(Res.Rows) then Exit;
+  if (Idx < 0) or (Idx > High(Res.RowNulls)) then Exit;
+  Result := Res.RowNulls[Idx];
 end;
 
 function ParamDescMsg(const Oids: array of LongInt): AnsiString;
@@ -2011,7 +2029,7 @@ begin
       begin
         if not SendPg(S, RowDescMsg(Res.Fields, Res.FieldTypes)) then Exit;
         for i := 0 to High(Res.Rows) do
-          if not SendPg(S, DataRowMsg(Res.Rows[i])) then Exit;
+          if not SendPg(S, DataRowMsg(Res.Rows[i], PgRowNulls(Res, i))) then Exit;
       end;
       if not SendPg(S, CommandMsg(CommandTag(stmts[k], Res))) then Exit;
     end;
@@ -2036,7 +2054,7 @@ begin
   begin
     if not SendPg(S, RowDescMsg(Res.Fields, Res.FieldTypes)) then Exit;
     for i := 0 to High(Res.Rows) do
-      if not SendPg(S, DataRowMsg(Res.Rows[i])) then Exit;
+      if not SendPg(S, DataRowMsg(Res.Rows[i], PgRowNulls(Res, i))) then Exit;
   end;
   if not SendPg(S, CommandMsg(CommandTag(Sql, Res))) then Exit;
   Result := SendPg(S, ReadyMsg);
@@ -2249,6 +2267,7 @@ var
   fmts: array of Integer;
   rfmts: array of Integer;
   params: TStrArray;
+  paramsNull: TNulArr;   // F-49 (SKILL6 03): Bind -1 -> gercek NULL
   raw: AnsiString;
   bad: Boolean;
   CopySpec: TPgCopySpec;
@@ -2335,7 +2354,11 @@ var
     P.Res := Default(TSqlResult);
     P.Sent := 0;
     try
-      P.Res := FSql.Exec(P.Sql, P.Params);
+      // F-49 (SKILL6 03): NULL parametreler gercek NULL olarak baglanir.
+      if Length(P.ParamsNull) > 0 then
+        P.Res := FSql.Exec(P.Sql, P.Params, P.ParamsNull)
+      else
+        P.Res := FSql.Exec(P.Sql, P.Params);
       Result := True;
     except
       on E: Exception do P.Err := E.Message;
@@ -2565,6 +2588,8 @@ begin
           Continue;
         end;
         SetLength(params, nParams);
+        SetLength(paramsNull, nParams);
+        for i2 := 0 to nParams - 1 do paramsNull[i2] := False;
         bad := False;
         for i2 := 0 to nParams - 1 do
         begin
@@ -2576,7 +2601,11 @@ begin
           plen := TakeI32;
           if plen = -1 then
           begin
-            params[i2] := '';               // motor NULL/bos ayrimi yapmaz
+            // F-49 (SKILL6 03): PostgreSQL NULL parametresi. Metin ''olarak
+            // baglanirsa NULL tasiyan tabloda gercek bos metne donusurdu;
+            // maske ile motorda gercek NULL olur.
+            params[i2] := '';
+            paramsNull[i2] := True;
             Continue;
           end;
           if (plen < 0) or (p + plen - 1 > Length(payload)) then
@@ -2629,6 +2658,7 @@ begin
         pt := Default(TPgPortal);
         pt.Sql := st.Sql;
         pt.Params := params;
+        pt.ParamsNull := paramsNull;
         pt.ResFmts := rfmts;
         pt.Done := False;
         pt.Sent := 0;
@@ -2758,7 +2788,7 @@ begin
                     ((maxRows = 0) or (sentThis < maxRows)) do
               begin
                 if not SendPg(FIO, DataRowMsgFmt(pt.Res.Rows[pt.Sent],
-                  pt.Res.FieldTypes, pt.ResFmts)) then Break;
+                  pt.Res.FieldTypes, pt.ResFmts, PgRowNulls(pt.Res, pt.Sent))) then Break;
                 Inc(pt.Sent);
                 Inc(sentThis);
               end;

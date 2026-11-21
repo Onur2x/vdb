@@ -40,11 +40,16 @@ type
     FPos   : Integer;
     FLen   : Integer;
     FParams: TStrArray;
+    // F-49 (SKILL6 03): parametre basina "bu deger gercek NULL" bayragi.
+    // Wire (Bind -1) bu diziyi doldurur; bos ise eski davranis korunur.
+    FParamNulls: TNulArr;
     FParamIdx: Integer;
     // P-CACHE: son okunan token'in '?' / '$N' yer tutucusu olup olmadigi
     // ve parametresi. NextToken her token'da sifirlar; ParsePrimary
     // literal olustururken ParamLits listesine isaretler.
     FLastParamIdx: Integer;
+    // F-49: son token NULL parametresi miydi? NextToken her token'da sifirlar.
+    FLastParamNull: Boolean;
     FParamLits: TList<TSqlLiteralNode>;
     // P-CACHE: Parse boyunca tuketilen yer tutucu sayisi. PeekToken/TryEat
     // geri sardiginda bu da geri sarilir. FParamLits.Count ile esit degilse
@@ -188,6 +193,10 @@ type
     destructor Destroy; override;
     function Parse(const ASql: string;
                    const AParams: array of string): TSqlStmtNode;
+    { F-49: NULL parametre maskesiyle ayristirir. Nulls[i] = True ise
+      AParams[i] degeri TRUE NULL olarak AST'ye girer (bos metin degil). }
+    function ParseEx(const ASql: string; const AParams: array of string;
+                     const AParamNulls: TNulArr): TSqlStmtNode;
     { P-CACHE: son Parse'te tum '?' / '$N' yer tutuculari ifade LITERAL'i
       olarak mi yakalandi? False ise bazi degerler AST'nin literal olmayan
       alanlarina gomulmustur (LIMIT ?, tanimlayici, -? gibi); boyle bir AST
@@ -350,6 +359,7 @@ begin
   IsStringLit := False;
   Result := False;
   FLastParamIdx := -1;   // P-CACHE: bu token yer tutucu degil
+  FLastParamNull := False;
   if FPos > FLen then Exit;
 
   // F-22: '?' iki anlamli: parametre yer tutucusu VEYA JSONB "anahtar var mi"
@@ -363,10 +373,17 @@ begin
       Inc(FPos);
       // P-CACHE: ParamIdx, Inc'den ONCE alinir (0-tabanli konum).
       FLastParamIdx := FParamIdx;
-      T := FParams[FParamIdx];
+      // F-49: NULL parametresi literali "NULL" token'i gibi davranir.
+      FLastParamNull := (FParamIdx <= High(FParamNulls)) and FParamNulls[FParamIdx];
+      if FLastParamNull then
+        T := 'NULL'
+      else
+      begin
+        T := FParams[FParamIdx];
+        IsStringLit := True;
+      end;
       Inc(FParamIdx);
       Inc(FPlaceholdersUsed);
-      IsStringLit := True;
       Result := True;
       Exit;
     end;
@@ -407,9 +424,16 @@ begin
         'parametre $%d tanimli degil (toplam %d)', [pidx, Length(FParams)]);
     FPos := i;
     FLastParamIdx := pidx - 1;
-    T := FParams[pidx - 1];
+    // F-49: NULL parametresi "NULL" token'i gibi davranir.
+    FLastParamNull := (pidx - 1 <= High(FParamNulls)) and FParamNulls[pidx - 1];
+    if FLastParamNull then
+      T := 'NULL'
+    else
+    begin
+      T := FParams[pidx - 1];
+      IsStringLit := True;
+    end;
     Inc(FPlaceholdersUsed);
-    IsStringLit := True;
     Result := True;
     Exit;
   end;
@@ -1964,6 +1988,17 @@ begin
   SavePos := FPos; SaveIdx := FParamIdx;
   ExpectToken(T, IsLit);
   U := UpperCase(T);
+
+  // F-49: NULL parametresi (Bind -1) -> gercek NULL dugumu. Plan onbellegi
+  // icin ParamIdx isaretlenir; onbellek guncellemesi LitType'i cevirir.
+  if FLastParamNull and (FLastParamIdx >= 0) then
+  begin
+    Result := TSqlLiteralNode.CreateNull;
+    TSqlLiteralNode(Result).ParamIdx := FLastParamIdx;
+    FParamLits.Add(TSqlLiteralNode(Result));
+    FLastParamIdx := -1;
+    Exit;
+  end;
 
   // String sabiti (tek tırnaklı metin veya ? parametresi)
   if IsLit then
@@ -5138,8 +5173,10 @@ begin
   inherited Create;
   FParamLits := TList<TSqlLiteralNode>.Create;
   FLastParamIdx := -1;
+  FLastParamNull := False;
   FPlaceholdersUsed := 0;
   FParamsBoundOk := True;
+  SetLength(FParamNulls, 0);
 end;
 
 destructor TVDbParser.Destroy;
@@ -5151,6 +5188,14 @@ end;
 
 function TVDbParser.Parse(const ASql: string;
                            const AParams: array of string): TSqlStmtNode;
+begin
+  SetLength(FParamNulls, 0);
+  Result := ParseEx(ASql, AParams, nil);
+end;
+
+function TVDbParser.ParseEx(const ASql: string;
+                           const AParams: array of string;
+                           const AParamNulls: TNulArr): TSqlStmtNode;
 var
   T, U, U2: string;
   i: Integer;
@@ -5168,11 +5213,15 @@ begin
   // P-CACHE: onceki Parse'ten kalan placeholder listesi temizlenir
   // (elemanlar o AST'ye aitti; burada yalniz referanslar atilir).
   FLastParamIdx := -1;
+  FLastParamNull := False;
   FPlaceholdersUsed := 0;
   FParamsBoundOk := True;
   FParamLits.Clear;
   SetLength(FParams, Length(AParams));
   for i := 0 to High(AParams) do FParams[i] := AParams[i];
+  // F-49 (SKILL6 03): gercek NULL parametreler.
+  SetLength(FParamNulls, Length(AParamNulls));
+  for i := 0 to High(AParamNulls) do FParamNulls[i] := AParamNulls[i];
 
   if AtEnd then Exit(nil);
 

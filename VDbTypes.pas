@@ -190,6 +190,8 @@ type
   TSetValuePair = record
     ColIdx: Integer;
     Value: string;
+    // F-49 (2c): SET ifadesi gercek NULL uretti mi? (EncodeRowEx maskesi)
+    IsNull: Boolean;
   end;
   TSetValuePairs = array of TSetValuePair;
 

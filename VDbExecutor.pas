@@ -141,6 +141,10 @@ type
     // Deger kanali string kaldigi icin NULL ayri bir bayrakla tasinir.
     // Cagiran her ifade once FLastNull'i okumali, sonra degeri kullanmali.
     FLastNull: Boolean;
+    // v3.71 / SKILL6 03 (F-49) asama 2b: NarrowRows'un doldurdugu satir
+    // maskeleri (Pks/Rows ile ayni indeks ve uzunluk). Bos uzunluktaki ic
+    // dizi = o satirin maskesi BILINMIYOR (orn. kapsayan indeks yolu).
+    FNarrowNulls: TNullMatrix;
     // P5-2: iliskisiz alt sorgu sonuclari (cumle basi onbellek; ayni ic
     // sorgu disaridaki her satir icin bir kez calisir). Anahtar = AST dugumu.
     FSubCache: TDictionary<Pointer, TSqlResult>;
@@ -190,6 +194,10 @@ type
     FAggSrcRows: TStrMatrix;
     FAggCNames: TStrArray;
     FAggCTypes: TByteArray;
+    // F-49 (2b): FAggSrcRows ile AYNI hizada NULL maskesi (bos = bilinmiyor).
+    // Aggregate'lar COUNT(kolon)/SUM/MIN... icin NULL'i atlar; '' ile NULL
+    // ayrimi yalnizca maske varken dogrudur.
+    FAggNulls: TNullMatrix;
     { H15: akisli GROUP BY yolunda HAVING icin aggregate degerleri.
       Akisli yol grup satirlarini TUTMAZ; aggregate'lar sayac olarak
       hesaplanir. HAVING ifadesindeki aggregate cagrilari bu eslemeden
@@ -276,7 +284,8 @@ type
     function EvalBool(Expr: TSqlExprNode; const Row: TStrArray;
       const ColNames: TStrArray; const ColTypes: TByteArray): Boolean;
     function EvalBinary(AOp: TSqlBinaryOp; const LeftVal, RightVal: string;
-      Ctype: Byte): string;
+      Ctype: Byte; LNull: Boolean = False; RNull: Boolean = False;
+      NullFlagsValid: Boolean = False): string;
     function EvalUnary(AOp: TSqlUnaryOp; const Val: string): string;
     { v3.14: ikili islemin karsilastirma/aritmetik tipini cozer. Eskiden bu
       blok EvalExpr icinde satir basina calisiyordu; tip-duyarli tam sayi
@@ -376,7 +385,8 @@ type
       AOnConflictAction: TOnConflictAction;
       const AOnConflictTarget: TStrArray;
       const ASetValues: TSetValuePairs;
-      out AOutPk: string; out AOutVals: TStrArray): Boolean;
+      out AOutPk: string; out AOutVals: TStrArray;
+      const ANulls: TNulArr = nil): Boolean;
     // F-33: view sonucunun kolon tipleri. Kolon adi taban tablonun
     // kolonuyla eslesiyorsa o kolonun tipi, aksi halde VCT_STR.
     function ViewResultTypes(const ViewName: string;
@@ -532,7 +542,8 @@ type
     procedure ExecGroupBy(Stmt: TSqlSelectStmt; const AllPks: TStrArray;
       const AllRows: TStrMatrix; const ColNames: TStrArray;
       const ColTypes: TByteArray; out Res: TSqlResult;
-      out OutTypes: TByteArray; AlreadyFiltered: Boolean = False);
+      out OutTypes: TByteArray; const AllNulls: TNullMatrix = nil;
+      AlreadyFiltered: Boolean = False);
     { P-12 (2026-10-16): WHERE/GROUP BY/HAVING/JOIN/ORDER/LIMIT OLMAYAN
       tek tablo agregalarini (COUNT(*), COUNT(k), SUM/AVG/MIN/MAX(k))
       HAM kayit uzerinde tek passede hesaplar; satirlar string matrisine
@@ -1707,7 +1718,8 @@ begin
 end;
 
 function TVSqlExecutor.EvalBinary(AOp: TSqlBinaryOp; const LeftVal, RightVal: string;
-  Ctype: Byte): string;
+  Ctype: Byte; LNull: Boolean = False; RNull: Boolean = False;
+  NullFlagsValid: Boolean = False): string;
 var
   ia, ib: Int64;
   fa, fb, fc, fd, fe, fg: Double;
@@ -1731,9 +1743,9 @@ var
   function ColCmp(const A, B: string; CT: Byte; const Op: string): Boolean;
   begin
     if (CT <> VCT_STR) or (FCurCollation = '') then
-      Exit(VDbCmpVal(A, B, Op, CT));
+      Exit(VDbCmpValEx(A, B, Op, CT, NullFlagsValid));
     if not VDbLangProfile(FCurCollation, cl) then
-      Exit(VDbCmpVal(A, B, Op, CT));
+      Exit(VDbCmpValEx(A, B, Op, CT, NullFlagsValid));
     cc := VDbCompareCol(A, B, cl);
     if Op = '=' then Result := cc = 0
     else if Op = '<>' then Result := cc <> 0
@@ -1749,10 +1761,21 @@ begin
   // -> True oluyor ve NULL satirlari WHERE filtresine giriyordu.
   // (sboEq..sboLike araligi = =, <>, <, <=, >, >=, LIKE; sboILike ayrica)
   // Aritmetik operatorler zaten kendi NULL kontrolunu yapiyor.
+  // F-49 (2c): NULL artik metinle degil BAYRAKLA bildirilir. NullFlagsValid
+  // iken (satirin NULL maskesi biliniyor) yalniz LNull/RNull NULL sayilir;
+  // boylece gercek bos metin '' NULL ile karismaz. Maske bilinmiyorken
+  // (eski yollar: JOIN/QUALIFY) eski metin kurali korunur.
   if (((AOp >= sboEq) and (AOp <= sboLike)) or (AOp = sboILike) or
      (AOp = sboJsonContains) or (AOp = sboJsonContained) or
-     (AOp = sboJsonHasKey) or (AOp >= sboRangeOverlap)) and
-     ((LeftVal = '') or (RightVal = '')) then Exit('');
+     (AOp = sboJsonHasKey) or (AOp >= sboRangeOverlap)) then
+  begin
+    if NullFlagsValid then
+    begin
+      if LNull or RNull then Exit('');
+    end
+    else if (LeftVal = '') or (RightVal = '') then
+      Exit('');
+  end;
   case AOp of
     sboAdd, sboSub, sboMul, sboDiv, sboMod:
       begin
@@ -2089,12 +2112,17 @@ var
   ovf: Boolean;
   minV, maxV, colVal: string;
   aggCt: Byte;
+  hasMinV, hasMaxV: Boolean;
+  savedNulls: TNulArr;
+  nullKnown: Boolean;
   // F-11: DISTINCT â€” tekrarli degerler bir kez sayilir. Hash kova ile
   // O(N); NULL degerler DISTINCT kumesine GIRMEZ (SQL standardi).
   seen: TDictionary<string, Byte>;
 begin
   cntI := 0; sumI := 0; sumF := 0; sumC := 0; ovf := False;
   avgCnt := 0; minV := ''; maxV := '';
+  hasMinV := False; hasMaxV := False;
+  savedNulls := FCurNulls;
   if fn.IsDistinct then
     seen := TDictionary<string, Byte>.Create
   else
@@ -2114,6 +2142,18 @@ begin
   end;
   for k := 0 to Idx.Count - 1 do
   begin
+    // F-49 (2b): satirin maskesi EvalExpr'e verilir; boylece '' ile NULL
+    // ayrimi (FLastNull) korunur.
+    if Idx[k] < Length(FAggNulls) then
+    begin
+      FCurNulls := FAggNulls[Idx[k]];
+      nullKnown := True;
+    end
+    else
+    begin
+      FCurNulls := nil;
+      nullKnown := False;
+    end;
     // F-16: FILTER (WHERE ...) â€” kosul saglamayan satir atlanir.
     if fn.Filter <> nil then
       if not EvalBool(fn.Filter, SrcRows[Idx[k]], ACNames, ACTypes) then
@@ -2135,7 +2175,14 @@ begin
     else
     begin
       colVal := EvalExpr(fn.Arg, SrcRows[Idx[k]], ACNames, ACTypes);
-      if colVal = '' then Continue;   // NULL: DISTINCT kumesine girmez
+      // F-49 (2b): NULL ancak maske tarafindan BILDIRILIYORSA atlanir.
+      // Maske yokken eski sezgisel kural ('' = NULL) korunur; aksi halde
+      // gercek bos metin sessizce yok sayilirdi.
+      if nullKnown then
+      begin
+        if FLastNull then Continue;   // gercek NULL: aggregate'e girmez
+      end
+      else if colVal = '' then Continue;
       // F-11: tekrarli degerler bir kez sayilir
       if seen <> nil then
         if seen.ContainsKey(colVal) then Continue
@@ -2165,8 +2212,12 @@ begin
           sumF := sumF + fv;
         Inc(avgCnt);
       end;
-      if (minV = '') or VDbCmpVal(colVal, minV, '<', aggCt) then minV := colVal;
-      if (maxV = '') or VDbCmpVal(colVal, maxV, '>', aggCt) then maxV := colVal;
+      // F-49 (2b): '' gercek bir deger olabildigi icin MIN/MAX "bos = yok"
+      // sezgiseline guvenemez; ayri bir "deger goruldu" bayragi tutulur.
+      if (not hasMinV) or VDbCmpVal(colVal, minV, '<', aggCt) then
+      begin minV := colVal; hasMinV := True; end;
+      if (not hasMaxV) or VDbCmpVal(colVal, maxV, '>', aggCt) then
+      begin maxV := colVal; hasMaxV := True; end;
     end;
   end;
   if fn.FuncName = 'COUNT' then Result := IntToStr(cntI)
@@ -2195,6 +2246,7 @@ begin
   else if fn.FuncName = 'MIN' then Result := minV
   else if fn.FuncName = 'MAX' then Result := maxV
   else Result := '';
+  FCurNulls := savedNulls;
   finally
     seen.Free;
   end;
@@ -2218,8 +2270,11 @@ var
   //  TStringList ayni isi yapar ve FPC'te sorunsuz).
   seen: TStringList;
   loF, hiF, frac: Double;
+  savedNulls: TNulArr;
+  nullKnown: Boolean;
 begin
   Result := '';
+  savedNulls := FCurNulls;
   if AN = nil then Exit;
   if AN.Kind = akStringAgg then
   begin
@@ -2242,8 +2297,17 @@ begin
       for k := 0 to Idx.Count - 1 do
       begin
         if AN.Arg = nil then Continue;
+        // F-49 (2b): satir maskesi yalnizca EvalExpr sirasinda verilir.
+        if Idx[k] < Length(FAggNulls) then
+        begin FCurNulls := FAggNulls[Idx[k]]; nullKnown := True; end
+        else begin FCurNulls := nil; nullKnown := False; end;
         val := EvalExpr(AN.Arg, SrcRows[Idx[k]], ACNames, ACTypes);
-        if val = '' then Continue;   // NULL atlanir
+        FCurNulls := savedNulls;
+        if nullKnown then
+        begin
+          if FLastNull then Continue;   // gercek NULL atlanir
+        end
+        else if val = '' then Continue;   // maske yok: eski sezgisel kural
         if seen <> nil then
         begin
           if seen.IndexOf(val) >= 0 then Continue;
@@ -2269,8 +2333,16 @@ begin
   for k := 0 to Idx.Count - 1 do
   begin
     if AN.Arg = nil then Continue;
+    if Idx[k] < Length(FAggNulls) then
+    begin FCurNulls := FAggNulls[Idx[k]]; nullKnown := True; end
+    else begin FCurNulls := nil; nullKnown := False; end;
     val := EvalExpr(AN.Arg, SrcRows[Idx[k]], ACNames, ACTypes);
-    if val = '' then Continue;   // NULL atlanir
+    FCurNulls := savedNulls;
+    if nullKnown then
+    begin
+      if FLastNull then Continue;   // gercek NULL atlanir
+    end
+    else if val = '' then Continue;
     vals[n] := val;
     Inc(n);
   end;
@@ -2750,7 +2822,7 @@ begin
       end;
     end
     else
-      Result := EvalBinary(bin.Op, lv, rv, ct);
+      Result := EvalBinary(bin.Op, lv, rv, ct, lnull, rnull, FCurNulls <> nil);
     if not FExplicitColl then
     begin
       FCurCollation := '';
@@ -4151,6 +4223,10 @@ var s: string;
 begin
   if Expr = nil then Exit(True);
   s := EvalExpr(Expr, Row, ColNames, ColTypes);
+  // F-49 asama 2b: WHERE/HAVING yalniz TRUE'yu kabul eder; UNKNOWN (NULL
+  // sonuc) satiri eler. Bayrak acikca denetlenir (UNKNOWN'in metin
+  // karsiligi da ''dir, ancak niyeti kodda gorunur kilmak icin).
+  if FLastNull then Exit(False);
   Result := SameText(s, 'True') or (s = '1');
 end;
 
@@ -5006,6 +5082,7 @@ var
   cr: TSqlColumnRefNode;
   opName: string;
   oneRow: TStrArray;
+  oneNulls: TNulArr;
   nParts: Integer;
   covPos: Integer;      // F-19: index-only tarama icin indeks konumu
   covAll: Boolean;
@@ -5087,8 +5164,12 @@ var
 begin
   SetLength(Pks, 0);
   SetLength(Rows, 0);
+  SetLength(FNarrowNulls, 0);
   Result := False;
   IsExact := False;
+  // F-49 (2c): indeks anahtarlari metindir; NULL ile '' ayirt edilemez.
+  // NULL tasiyan tabloda daraltma yapilmaz, cagiran genel yolu kullanir.
+  if Td.HasNulls then Exit;
   if WhereClause = nil then Exit;
 
   conj := TList<TSqlExprNode>.Create;
@@ -5102,13 +5183,18 @@ begin
          (ci = Td.PkIndex) and
          (op = sboEq) then
       begin
-        if FT.ReadRow(Td.Name, pkVal, oneRow) and
-           RowMatches(WhereClause, oneRow, ColNames, ColTypes) then
+        if FT.ReadRowEx(Td.Name, pkVal, oneRow, oneNulls) then
         begin
-          SetLength(Pks, 1);
-          SetLength(Rows, 1);
-          Pks[0] := pkVal;
-          Rows[0] := oneRow;
+          FCurNulls := oneNulls;
+          if RowMatches(WhereClause, oneRow, ColNames, ColTypes) then
+          begin
+            SetLength(Pks, 1);
+            SetLength(Rows, 1);
+            SetLength(FNarrowNulls, 1);
+            Pks[0] := pkVal;
+            Rows[0] := oneRow;
+            FNarrowNulls[0] := oneNulls;
+          end;
         end;
         // eslesme yoksa da bos sonuc DONDURULUR: tam tarama gerekmez
         IsExact := True;
@@ -5148,19 +5234,22 @@ begin
           // KR-2: on-tahsis (List.Count ust sinir), sonunda budama.
           SetLength(Pks, TSqlInNode(conj[i]).List.Count);
           SetLength(Rows, TSqlInNode(conj[i]).List.Count);
+          SetLength(FNarrowNulls, TSqlInNode(conj[i]).List.Count);
           ci := 0;  // ci'yi sayac olarak yeniden kullan (PkIndex artik gerekmez)
           for n := 0 to TSqlInNode(conj[i]).List.Count - 1 do
           begin
             if not VdbInConstText(TSqlInNode(conj[i]).List[n], pkVal) then Continue;
-            if FT.ReadRow(Td.Name, pkVal, oneRow) then
+            if FT.ReadRowEx(Td.Name, pkVal, oneRow, oneNulls) then
             begin
               Pks[ci] := pkVal;
               Rows[ci] := oneRow;
+              FNarrowNulls[ci] := oneNulls;
               Inc(ci);
             end;
           end;
           SetLength(Pks, ci);
           SetLength(Rows, ci);
+          SetLength(FNarrowNulls, ci);
           IsExact := (conj.Count = 1);
           if FCountOnly then FCountResult := Length(Pks);
           Exit(True);   // filtre RowMatches ile asagida uygulanir (IsExact degilse)
@@ -5389,6 +5478,7 @@ begin
 
     SetLength(Pks, Length(e));
     SetLength(Rows, Length(e));
+    SetLength(FNarrowNulls, Length(e));
     n := 0;
     covPos := FT.IdxPosOfCol(Td.TableId, bestCol);
     covAll := (covPos >= 0) and FT.IdxCoversAll(Td, covPos);
@@ -5397,16 +5487,23 @@ begin
       begin
         Pks[n] := e[i].Pk;
         Rows[n] := oneRow;
+        { Kapsayan indeks yolunda degerler indeks girdisinden kurulur;
+          indeks anahtari NULL ile bos metni ayirt ETMEZ -> maske
+          bilinmiyor (bos dizi). Cagiran, bilinmeyen maske varsa
+          sonucun RowNulls'unu tamamen bosaltir. }
+        SetLength(FNarrowNulls[n], 0);
         Inc(n);
       end
-      else if FT.ReadRow(Td.Name, e[i].Pk, oneRow) then
+      else if FT.ReadRowEx(Td.Name, e[i].Pk, oneRow, oneNulls) then
       begin
         Pks[n] := e[i].Pk;
         Rows[n] := oneRow;
+        FNarrowNulls[n] := oneNulls;
         Inc(n);
       end;
     SetLength(Pks, n);
     SetLength(Rows, n);
+    SetLength(FNarrowNulls, n);
     IsExact := exactRange;
     Result := True;
   finally
@@ -9539,7 +9636,8 @@ end;
 procedure TVSqlExecutor.ExecGroupBy(Stmt: TSqlSelectStmt;
   const AllPks: TStrArray; const AllRows: TStrMatrix;
   const ColNames: TStrArray; const ColTypes: TByteArray;
-  out Res: TSqlResult; out OutTypes: TByteArray; AlreadyFiltered: Boolean);
+  out Res: TSqlResult; out OutTypes: TByteArray;
+  const AllNulls: TNullMatrix; AlreadyFiltered: Boolean);
 var
   GroupKeys: TList<TStrArray>;
   GroupRowSets: TIntListList;
@@ -9561,13 +9659,19 @@ var
   savedSrc: TStrMatrix;
   savedCN: TStrArray;
   savedCT: TByteArray;
+  savedFN: TNullMatrix;
 begin
   GroupKeys := TList<TStrArray>.Create;
   GroupRowSets := TIntListList.Create;
+  savedFN := FAggNulls;
+  FAggNulls := AllNulls;
   try
     // 1. Grupla
     for i := 0 to High(AllRows) do
     begin
+      // F-49 (2b): satir maskesi WHERE ve anahtar kurma icin aktif.
+      if i < Length(AllNulls) then FCurNulls := AllNulls[i]
+      else FCurNulls := nil;
       // Indeks dilimi WHERE'in tamamini temsil ediyorsa satirlar zaten
       // filtrelenmistir; ayni AST'yi ikinci kez degerlendirmeyiz.
       if (not AlreadyFiltered) and
@@ -9590,8 +9694,16 @@ begin
         if ci < 0 then
           raise EVDbException.Create(ecColumnNotFound,
             'GROUP BY kolonu bulunamadi: ' + gb);
-        if ci < Length(AllRows[i]) then key[j] := AllRows[i][ci]
-        else key[j] := '';
+        if ci < Length(AllRows[i]) then
+        begin
+          // F-49 (2b): NULL ve '' AYRI gruplardir. Anahtara ayirici on ek
+          // konur; #0 = NULL, #1+deger = gercek deger.
+          if (FCurNulls <> nil) and (ci < Length(FCurNulls)) and FCurNulls[ci] then
+            key[j] := #0
+          else
+            key[j] := #1 + AllRows[i][ci];
+        end
+        else key[j] := #1;
       end;
       gi := -1;
       for j := 0 to GroupKeys.Count - 1 do
@@ -9604,6 +9716,7 @@ begin
       end;
       GroupRowSets[gi].Add(i);
     end;
+    FCurNulls := nil;
     // Bos tablo + GROUP BY'siz aggregate: tek bos grup olustur (COUNT(*)=0)
     if (GroupKeys.Count = 0) and (Stmt.GroupByCols.Count = 0) then
     begin
@@ -9673,6 +9786,10 @@ begin
       FAggSrcRows := AllRows;
       FAggCNames := ColNames;
       FAggCTypes := ColTypes;
+      if (rowIdx.Count > 0) and (rowIdx[0] < Length(AllNulls)) then
+        FCurNulls := AllNulls[rowIdx[0]]
+      else
+        FCurNulls := nil;
       try
       for j := 0 to Stmt.Columns.Count - 1 do
       begin
@@ -9735,6 +9852,8 @@ begin
     Res.Affected := Length(outRows);
     Res.Msg := 'OK';
   finally
+    FCurNulls := nil;
+    FAggNulls := savedFN;
     for i := 0 to GroupRowSets.Count - 1 do GroupRowSets[i].Free;
     GroupRowSets.Free;
     GroupKeys.Free;
@@ -16055,6 +16174,7 @@ var
   seenSet, rightSet: TDictionary<string, Integer>;
   distinctOut: TStrMatrix;
   rowKey: string;
+  nullKey: string;
   isDup, found, SkipOffsetLimit, HasSetOp, deferOrder, isExactNarrow: Boolean;
   preferStream: Boolean;
   // P-111: projeksiyonda basit kolon referansi icin onceden indeks
@@ -16085,6 +16205,18 @@ var
   // ve genel yolun sonunda Res'e yazilir.
   verNo: Int64;
   planTag: string;
+  // F-49 (2b): NULL maskesi tasima. maskOk yalnizca her satirin maskesi
+  // BILINIYORSA ve satirlari yeniden siralayan/eleyen bir adim maskeyi
+  // bozmadiysa True kalir; degilse Res.RowNulls bos birakilir (eski
+  // davranis: NULL bilgisi tasinmaz, deger metni degismez).
+  allNulls, filteredNulls, rlNulls, outNull, distinctNulls: TNullMatrix;
+  maskOk, hasAny: Boolean;
+
+  procedure MaskUnknown;
+  begin
+    maskOk := False;
+    SetLength(outNull, 0);
+  end;
 
   procedure SetPlanTag(const S: string);
   begin
@@ -16136,6 +16268,11 @@ begin
   try
     SkipOffsetLimit := False;
     isExactNarrow := False;
+    maskOk := False;
+    SetLength(allNulls, 0);
+    SetLength(filteredNulls, 0);
+    SetLength(outNull, 0);
+    Res.RowNulls := nil;
     // R-20: aktif tablo — kolon varsayilan collation'i (WHERE / GROUP BY / ORDER BY icin)
     FCurTable := Stmt.FromTable;
     FCurCollation := '';
@@ -16364,7 +16501,8 @@ begin
       begin
         { M5: TS_MATCH conjunct'lari varsa once inverted index ile daralt.
           WHERE yine asagida aynen uygulanir; sonuc kumesi degismez. }
-        if TryFtsNarrow(Stmt, td, colNames, colTypes, pks, allRows) then
+        if (not td.HasNulls) and
+           TryFtsNarrow(Stmt, td, colNames, colTypes, pks, allRows) then
         begin
           SkipOffsetLimit := False;
           isExactNarrow := False;
@@ -16372,7 +16510,8 @@ begin
         end
         { M4: ORDER BY VECTOR_DISTANCE(...) LIMIT k -> HNSW adaylari.
           WHERE/ORDER/LIMIT asagida aynen uygulanir. }
-        else if TryVectorNarrow(Stmt, td, colNames, colTypes, pks, allRows) then
+        else if (not td.HasNulls) and
+                TryVectorNarrow(Stmt, td, colNames, colTypes, pks, allRows) then
         begin
           SkipOffsetLimit := False;
           isExactNarrow := False;
@@ -16381,34 +16520,37 @@ begin
         else
         begin
         // H16: tek kolonlu SELECT DISTINCT -> ham akistan tek pass.
-        if TryStreamDistinct(Stmt, td, colNames, colTypes, Res) then
+        // F-49 (2c): NULL tasiyan tablo bu hizli yollari kullanmaz.
+        if (not td.HasNulls) and
+           TryStreamDistinct(Stmt, td, colNames, colTypes, Res) then
         begin
           SetPlanTag('stream_distinct');
           Exit;
         end;
         // H1 (2026-10-18): indekssiz, LIMIT'li, ORDER BY'siz tek tablo
         // SELECT'i ham akistan okuyup LIMIT dolunca durur. Uymazsa False.
-        if TryStreamSelect(Stmt, td, Res) then
+        if (not td.HasNulls) and TryStreamSelect(Stmt, td, Res) then
         begin
           SetPlanTag('stream_select');
           Exit;
         end;
         // P-12: WHERE/GROUP'suz tek tablo agregasi -> ham akistan say.
         // Sekli uymazsa False; asagidaki genel yol AYNEN calisir.
-        if TryStreamAgg(Stmt, td, Res) then
+        if (not td.HasNulls) and TryStreamAgg(Stmt, td, Res) then
         begin
           SetPlanTag('stream_agg');
           Exit;
         end;
         // H13: GROUP BY + basit aggregate -> ham akistan tek pass.
-        if TryStreamGroupBy(Stmt, td, colNames, colTypes, Res, outTypes) then
+        if (not td.HasNulls) and
+           TryStreamGroupBy(Stmt, td, colNames, colTypes, Res, outTypes) then
         begin
           SetPlanTag('stream_groupby');
           FinishGroup;
           Exit;
         end;
         // H3: WHERE'li saf COUNT(*) -> indeks dilimini satir okumadan say.
-        if TryIndexCount(td, Stmt, colNames, colTypes, cnt64) then
+        if (not td.HasNulls) and TryIndexCount(td, Stmt, colNames, colTypes, cnt64) then
         begin
           SetPlanTag('index_count');
           SetLength(Res.Fields, 1);
@@ -16425,7 +16567,8 @@ begin
         end;
         // H17: WHERE'li saf COUNT(*) -> ham akistan, yalniz WHERE'in
         // referans verdigi kolonlari cozerek tek pass.
-        if TryStreamFilteredCount(Stmt, td, colNames, colTypes, Res) then
+        if (not td.HasNulls) and
+           TryStreamFilteredCount(Stmt, td, colNames, colTypes, Res) then
         begin
           SetPlanTag('stream_count');
           Exit;
@@ -16442,6 +16585,10 @@ begin
         SkipOffsetLimit := False
       else if FT.RlsApplies(Stmt.FromTable) then
         SkipOffsetLimit := False   // R-19: asagida satir satir filtrelenir
+      else if td.HasNulls then
+        // F-49 (2c): indeks anahtarlari NULL ile '' ayirmaz; NULL tasiyan
+        // tabloda indeks sirasi/dilimi kullanilmaz, genel yol calisir.
+        SkipOffsetLimit := False
       else
       begin
         // H12b: Kucuk LIMIT'te siralama kolonu PK degilse ve WHERE PK'ya
@@ -16509,9 +16656,45 @@ begin
           KENDISI RowMatches ile filtreler, yani onceden daraltmak sonucu
           degistirmez. }
         if not NarrowRows(td, Stmt.WhereClause, colNames, colTypes, pks, allRows, isExactNarrow) then
+        begin
           // R-13 Full: tam taramaya dustuk -> bolme hedef kumesiyle
           // tara (partition pruning). Sonuc ayni, okunan satir azalir.
-          FT.ScanRowsPart(Stmt.FromTable, pks, allRows, PartTargetsOf(td, Stmt.WhereClause));
+          FT.ScanRowsPartEx(Stmt.FromTable, pks, allRows, allNulls,
+            PartTargetsOf(td, Stmt.WhereClause));
+          maskOk := True;
+        end
+        else
+        begin
+          // F-49 (2b): daraltma yolu maskeyi FNarrowNulls'a yazdi. Kapsanan
+          // indeks dali maskeyi BILMEZ (bos ic dizi) -> maskOk kalir False.
+          allNulls := FNarrowNulls;
+          maskOk := Length(allNulls) = Length(allRows);
+          if maskOk then
+            for i := 0 to High(allNulls) do
+              if Length(allNulls[i]) <> Length(colNames) then
+              begin
+                maskOk := False;
+                Break;
+              end;
+        end;
+      end;
+      // F-49 (2b): donen satirlarin HICBIRINDE NULL yoksa maske tasimanin
+      // faydasi yoktur; RowNulls bos kalir (eski davranis) ve matris
+      // bellegi ayrilmaz. Maske yalnizca gercekten NULL varken uretilir.
+      if maskOk then
+      begin
+        hasAny := False;
+        for i := 0 to High(allNulls) do
+        begin
+          for j := 0 to High(allNulls[i]) do
+            if allNulls[i][j] then begin hasAny := True; Break; end;
+          if hasAny then Break;
+        end;
+        if not hasAny then
+        begin
+          maskOk := False;
+          SetLength(allNulls, 0);
+        end;
       end;
         end;
       // R-19: satirlar okundu; simdi RLS ile GORUNMEZ olanlari ele.
@@ -16523,15 +16706,26 @@ begin
         // RLS sonucunun ust siniri allRows uzunlugudur; her gorunen
         // satirda diziyi yeniden buyutme.
         SetLength(rlRows, Length(allRows));
+        if maskOk then SetLength(rlNulls, Length(allRows));
         n := 0;
         for i := 0 to High(allRows) do
+        begin
+          if maskOk then FCurNulls := allNulls[i] else FCurNulls := nil;
           if RlsRowVisible(Stmt.FromTable, 1, allRows[i], colNames, colTypes) then
           begin
             rlRows[n] := allRows[i];
+            if maskOk then rlNulls[n] := allNulls[i];
             Inc(n);
           end;
+        end;
         SetLength(rlRows, n);
         allRows := rlRows;
+        if maskOk then
+        begin
+          SetLength(rlNulls, n);
+          allNulls := rlNulls;
+        end;
+        FCurNulls := nil;
         SetLength(pks, 0);
         SkipOffsetLimit := False;
         isExactNarrow := False;
@@ -16547,8 +16741,12 @@ begin
       if HasSetOp then
         raise EVDbException.Create(ecUnsupported,
           'UNION/EXCEPT/INTERSECT ile aggregate/GROUP BY birlestirilemiyor');
-      ExecGroupBy(Stmt, pks, allRows, colNames, colTypes, Res, outTypes,
-        isExactNarrow and (not SkipOffsetLimit));
+      if maskOk then
+        ExecGroupBy(Stmt, pks, allRows, colNames, colTypes, Res, outTypes,
+          allNulls, isExactNarrow and (not SkipOffsetLimit))
+      else
+        ExecGroupBy(Stmt, pks, allRows, colNames, colTypes, Res, outTypes,
+          nil, isExactNarrow and (not SkipOffsetLimit));
       // 4.2: kuyruk ortak FinishGroup'a tasinildi (JOIN yolu da aynisini
       // cagirir; F1-20 ORDER BY tip haritasi + OFFSET/LIMIT + Affected).
       FinishGroup;
@@ -16563,7 +16761,10 @@ begin
       // karsiliyorsa (tek BETWEEN / = / IN), satirlari tekrar tekrar
       // RowMatches ile AST evaluate etmekten kurtul (84x farkin cozumu).
       if isExactNarrow then
-        filteredRows := allRows
+      begin
+        filteredRows := allRows;
+        if maskOk then filteredNulls := allNulls;
+      end
       else
       begin
         // H1 (2026-10-18): LIMIT ERKEN-CIKIS. ORDER BY / DISTINCT / pencere /
@@ -16578,17 +16779,22 @@ begin
         // Sonuc en fazla allRows kadar olabilir; satir basina SetLength
         // dinamik diziyi tekrar tekrar kopyalayip O(N^2) maliyet yaratir.
         SetLength(filteredRows, Length(allRows));
+        if maskOk then SetLength(filteredNulls, Length(allRows));
         n := 0;
         for i := 0 to High(allRows) do
         begin
+          if maskOk then FCurNulls := allNulls[i] else FCurNulls := nil;
           if RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes) then
           begin
             filteredRows[n] := allRows[i];
+            if maskOk then filteredNulls[n] := allNulls[i];
             Inc(n);
             if (capSel >= 0) and (n >= capSel) then Break;   // H1
           end;
         end;
+        FCurNulls := nil;
         SetLength(filteredRows, n);
+        if maskOk then SetLength(filteredNulls, n);
       end;
     end;
   end;
@@ -16665,6 +16871,10 @@ begin
       end;
     if not deferOrder then
     begin
+      // F-49 (2b): DoSort satirlari yeniden siralar ve permutasyonu
+      // disari vermez; maske dizisi bu nedenle hizasiz kalirdi. Sirali
+      // sorgularda RowNulls BOS birakilir (eski davranis, sessiz yanlis yok).
+      if maskOk then MaskUnknown;
       { H12: DISTINCT/pencere/QUALIFY/set-op yoksa ve LIMIT varsa
         yalniz LIMIT+OFFSET kadar satiri sec; tum kumeyi siralama. }
       if (Stmt.LimitVal >= 0) and (not Stmt.IsDistinct) and
@@ -16682,6 +16892,7 @@ begin
     SetLength(outCols, Length(colNames));
     for i := 0 to High(colNames) do outCols[i] := colNames[i];
     outRows := filteredRows;
+    if maskOk then outNull := filteredNulls;
   end
   else
   begin
@@ -16702,7 +16913,13 @@ begin
       ComputeWindows(Stmt, filteredRows, colNames, colTypes, WinVals, WinSlot);
     // F-09: QUALIFY â€” pencere hesaplandiktan SONRA, projeksiyondan ONCE
     if Stmt.QualifyClause <> nil then
+    begin
+      // F-49 (2b): ApplyQualify satirlari SIKISTIRIR, maske hizasini
+      // koruyamaz; bu sorguda RowNulls bos birakilir.
+      if maskOk then MaskUnknown;
+      SetLength(filteredNulls, 0);
       ApplyQualify(Stmt, filteredRows, colNames, colTypes, WinVals, WinSlot);
+    end;
     // P-111: basit kolon referanslari icin EvalExpr cagrisini atla.
     // FindColIdx sonuclari dongu ONCE bir kez cozulur; her hucrede
     // 400k kez EvalExpr + FindColIdx (SameText dolasimi) yapilmaz.
@@ -16730,31 +16947,50 @@ begin
         for j := 0 to Stmt.Columns.Count - 1 do
           if preIdx[j] <> j then begin isIdentityProj := False; Break; end;
         if isIdentityProj then
+        begin
           outRows := filteredRows;
+          if maskOk then outNull := filteredNulls;
+        end;
       end;
     end;
     if not isIdentityProj then
     begin
       // outRows uzunlugu kirpilan filteredRows ile eslesmeli
       SetLength(outRows, Length(filteredRows));
+      if maskOk then SetLength(outNull, Length(filteredRows));
       for i := 0 to High(filteredRows) do
       begin
+        if maskOk then begin FCurNulls := filteredNulls[i]; SetLength(outNull[i], Stmt.Columns.Count); end
+        else FCurNulls := nil;
         SetLength(outRows[i], Stmt.Columns.Count);
         for j := 0 to Stmt.Columns.Count - 1 do
           if (j < Length(WinSlot)) and (WinSlot[j] >= 0) and
              (i < Length(WinVals)) and (WinSlot[j] < Length(WinVals[i])) then
-            outRows[i][j] := WinVals[i][WinSlot[j]]
+          begin
+            outRows[i][j] := WinVals[i][WinSlot[j]];
+            if maskOk then outNull[i][j] := False;
+          end
           else if Stmt.Columns[j].Expr is TSqlAggNode then
           begin
             // F-14/F-15: aggregate'siz SELECT'te tum tablo tek gruptur
             outRows[i][j] := '';
+            if maskOk then outNull[i][j] := False;
           end
           else if canDirectProj and (preIdx[j] >= 0) and
                   (preIdx[j] < Length(filteredRows[i])) then
-            outRows[i][j] := filteredRows[i][preIdx[j]]
+          begin
+            outRows[i][j] := filteredRows[i][preIdx[j]];
+            if maskOk then
+              outNull[i][j] := (preIdx[j] < Length(filteredNulls[i])) and
+                               filteredNulls[i][preIdx[j]];
+          end
           else
+          begin
             outRows[i][j] := EvalExpr(Stmt.Columns[j].Expr, filteredRows[i], colNames, colTypes);
+            if maskOk then outNull[i][j] := FLastNull;
+          end;
       end;
+      FCurNulls := nil;
     end;
   end;
 
@@ -16832,6 +17068,9 @@ begin
         Stmt.LimitVal + Stmt.OffsetVal)
     else
       DoSort(outRows, orderKeys, Stmt.OrderBy, outCols, outTypes);
+    // F-49 (2b): ertelenen siralama permutasyonu disari vermez; maske
+    // hizasini koruyamayacagimiz icin RowNulls bos birakilir.
+    if maskOk then MaskUnknown;
     // gecici kolonlari kirp
     if origCols < Length(outCols) then
     begin
@@ -16851,9 +17090,21 @@ begin
     seenSet := TDictionary<string, Integer>.Create;
     try
       SetLength(distinctOut, 0);
+      SetLength(distinctNulls, 0);
       for i := 0 to High(outRows) do
       begin
         rowKey := RowEncodeKey(outRows[i]);
+        // F-49 (2b): DISTINCT sirayi koruyan bir islemdir; maske paralel
+        // tasinir. NULL ile '' AYNI metin anahtarina dusmemeli diye
+        // maskenin bit deseni anahtara EKLENIR.
+        if maskOk then
+        begin
+          nullKey := '';
+          for j := 0 to High(outNull[i]) do
+            if outNull[i][j] then nullKey := nullKey + '1'
+            else nullKey := nullKey + '0';
+          rowKey := rowKey + #1 + nullKey;
+        end;
         if seenSet.ContainsKey(rowKey) then Continue;
         seenSet.Add(rowKey, 0);
         if Length(distinctOut) >= VDB_MAX_RESULT_ROWS then
@@ -16861,8 +17112,14 @@ begin
             'DISTINCT sonucu cok buyuk (>%d satir)', [VDB_MAX_RESULT_ROWS]);
         SetLength(distinctOut, Length(distinctOut) + 1);
         distinctOut[High(distinctOut)] := outRows[i];
+        if maskOk then
+        begin
+          SetLength(distinctNulls, Length(distinctOut));
+          distinctNulls[High(distinctNulls)] := outNull[i];
+        end;
       end;
       outRows := distinctOut;
+      if maskOk then outNull := distinctNulls;
     finally
       seenSet.Free;
     end;
@@ -16876,9 +17133,18 @@ begin
     begin
       n := Length(outRows) - Stmt.OffsetVal;
       for i := 0 to n - 1 do outRows[i] := outRows[i + Stmt.OffsetVal];
+      if maskOk then
+      begin
+        for i := 0 to n - 1 do outNull[i] := outNull[i + Stmt.OffsetVal];
+        SetLength(outNull, n);
+      end;
       SetLength(outRows, n);
     end
-    else SetLength(outRows, 0);
+    else
+    begin
+      SetLength(outRows, 0);
+      if maskOk then SetLength(outNull, 0);
+    end;
   end;
 
   // F1-20: projeksiyon cikti tipleri (UNION sonrasi ORDER BY icin gerekir)
@@ -16904,11 +17170,16 @@ begin
   // F1-12: set-op'ta birlestirme sonrasina birakilir.
   if (not SkipOffsetLimit) and (not HasSetOp) and (Stmt.LimitVal >= 0) and
      (Length(outRows) > Stmt.LimitVal) then
+  begin
     SetLength(outRows, Stmt.LimitVal);
+    if maskOk then SetLength(outNull, Stmt.LimitVal);
+  end;
 
   // SET OP
   if HasSetOp then
   begin
+    // F-49 (2b): birlestirme satirlari yeniden kurar; maske tasinmaz.
+    if maskOk then MaskUnknown;
     MergeSetOpRows(Stmt, outRows, outCols);
 
     // F1-12: ORDER BY / OFFSET / LIMIT birlestirme SONRASINA uygulanir.
@@ -16942,6 +17213,7 @@ begin
   Res.Fields := outCols;
   Res.FieldTypes := outTypes;   // M1: gercek sonuc tipleri
   Res.Rows := outRows;
+  if maskOk then Res.RowNulls := outNull;
   Res.Affected := Length(outRows);
   Res.Msg := 'OK';
   // P-152: hizli yollar Res'i sifirlamis olabilir; etiketi burada yaz.
@@ -17004,7 +17276,61 @@ var
   stmtTrigFired: Boolean;
   // Sprint B: BEFORE INSERT STATEMENT trigger'i tam bir kez calisir
   stmtBefFired: Boolean;
+  // F-49 (2c): VALUES satirlarinin NULL maskesi (cnames ile ayni sirada).
+  rowMask: TNulArr;
+  rowHasNull: Boolean;
+  rowMaskOk: Boolean;
 
+  { v3.71 / SKILL6 03 (2c): maske satir basina, cnames sirasinda tutulur. }
+  function MaskHasNull(const M: TNulArr): Boolean;
+  var q: Integer;
+  begin
+    Result := False;
+    for q := 0 to High(M) do
+      if M[q] then Exit(True);
+  end;
+
+  { BEFORE ROW tetikleyicisi satiri degistirdiyse maske bayatlar: o zaman
+    maske BIRAKILIR ve tablonun kendi kurali uygulanir (veri kaybi yok,
+    yalniz NULL/'' ayrimi o satir icin metin kuralina doner). }
+  function MaskStillValid(const M: TNulArr; const A, B: array of string): Boolean;
+  var q: Integer;
+  begin
+    if Length(M) = 0 then Exit(False);
+    if Length(A) <> Length(B) then Exit(False);
+    for q := 0 to High(A) do
+      if A[q] <> B[q] then Exit(False);
+    Result := True;
+  end;
+
+  { Yazma cagrisina verilecek maske: trigger satiri degistirdiyse nil. }
+  function EffMask: TNulArr;
+  begin
+    if MaskStillValid(rowMask, strVals, NewRow) then Result := rowMask
+    else Result := nil;
+  end;
+
+  { rowMask, A dizisiyle ayni genislikteyse onu verir. UPSERT yolunda
+    yazilan satir strVals'tir (NewRow degil), bu yuzden ayri yardimci. }
+  function EffMaskVals(const A: array of string): TNulArr;
+  begin
+    if (Length(rowMask) > 0) and (Length(rowMask) = Length(A)) then
+      Result := rowMask
+    else
+      Result := nil;
+  end;
+
+  { F-49 (2c): INSERT ... SELECT / MERGE kaynagindan gelen maske.
+    Yalniz satir sayisi ve genislik uyuyorsa kullanilir; aksi halde nil
+    (eski davranis) ki maske yanlis hizalanip veri bozmasin. }
+  function RowNullsOf(const RR: TSqlResult; Idx, Width: Integer): TNulArr;
+  begin
+    Result := nil;
+    if Length(RR.RowNulls) <> Length(RR.Rows) then Exit;
+    if (Idx < 0) or (Idx > High(RR.RowNulls)) then Exit;
+    if Length(RR.RowNulls[Idx]) <> Width then Exit;
+    Result := RR.RowNulls[Idx];
+  end;
   { Sprint B: BEFORE INSERT FOR EACH STATEMENT, ifadenin kendi batch'i
     ACILDIKTAN SONRA calisir. Onceden batch'ten once atesleniyordu; trigger
     govdesindeki DML otomatik commit ile kalici hale geliyor ve ana INSERT
@@ -17299,7 +17625,12 @@ begin
             FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
           if needRls then
             RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
-          FT.Insert(Stmt.Table, cnames, NewRow, @td);   // P-55
+          { F-49 (2c): BEFORE trigger satiri degistirdiyse maske guvenilmez. }
+          if hasInsTrig then
+            FT.Insert(Stmt.Table, cnames, NewRow, @td)   // P-55
+          else
+            FT.InsertEx(Stmt.Table, cnames, NewRow,
+              RowNullsOf(subRes, i, Length(cnames)), @td);   // P-55
           Inc(rCount);
           if hasInsTrig then
             FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
@@ -17356,7 +17687,7 @@ begin
           BuildUpsertSetValues(Stmt, FExcludedRow, FExcludedColNames, allColNames, td, upsertSetValues);
           if UpsertWithAuth(Stmt.Table, cnames, subRes.Rows[i],
             onConflictAction, Stmt.OnConflictTarget, upsertSetValues,
-            outPk, outVals) then
+            outPk, outVals, RowNullsOf(subRes, i, Length(cnames))) then
           begin
             Inc(rCount);
             if hasReturning then
@@ -17462,8 +17793,15 @@ begin
           else
           begin
             SetLength(strVals, Stmt.ValuesRows[i].Count);
+            SetLength(rowMask, Stmt.ValuesRows[i].Count);
             for j := 0 to Stmt.ValuesRows[i].Count - 1 do
+            begin
               strVals[j] := EvalExpr(Stmt.ValuesRows[i][j], nil, nil, nil);
+              rowMask[j] := FLastNull;
+            end;
+            if (Length(rowMask) <> Length(cnames)) or (not MaskHasNull(rowMask)) then
+              SetLength(rowMask, 0);
+            rowMaskOk := Length(rowMask) > 0;
             if onConflictAction = ocaNone then
             begin
               // DIKKAT: RETURNING varsa ONCE eklenmemeli. Once
@@ -17478,7 +17816,7 @@ begin
                   FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
                 if needRls then
                   RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
-                if FT.InsertReturning(Stmt.Table, cnames, NewRow, outPk, outVals) then
+                if FT.InsertReturning(Stmt.Table, cnames, NewRow, outPk, outVals, EffMask) then
                 begin
                   Inc(rCount);
                   // R-04: listede gercek IFADE varsa EvaluateReturning devreye girer;
@@ -17506,7 +17844,7 @@ begin
                   FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
                 if needRls then
                   RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
-                FT.Insert(Stmt.Table, cnames, NewRow, @td);   // P-55
+                FT.InsertEx(Stmt.Table, cnames, NewRow, EffMask, @td);   // P-55
                 Inc(rCount);
                 if hasInsTrig then
                   FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
@@ -17524,7 +17862,7 @@ begin
               BuildUpsertSetValues(Stmt, FExcludedRow, FExcludedColNames, allColNames, td, upsertSetValues);
               if UpsertWithAuth(Stmt.Table, cnames, strVals,
                 onConflictAction, Stmt.OnConflictTarget, upsertSetValues,
-                outPk, outVals) then
+                outPk, outVals, EffMaskVals(strVals)) then
               begin
                 Inc(rCount);
                 if hasReturning then
@@ -17620,8 +17958,15 @@ begin
         else
         begin
           SetLength(strVals, Stmt.ValuesRows[i].Count);
+          SetLength(rowMask, Stmt.ValuesRows[i].Count);
           for j := 0 to Stmt.ValuesRows[i].Count - 1 do
+          begin
             strVals[j] := EvalExpr(Stmt.ValuesRows[i][j], nil, nil, nil);
+            rowMask[j] := FLastNull;
+          end;
+          if (Length(rowMask) <> Length(cnames)) or (not MaskHasNull(rowMask)) then
+            SetLength(rowMask, 0);
+          rowMaskOk := Length(rowMask) > 0;
           if onConflictAction = ocaNone then
           begin
             // DIKKAT: RETURNING varsa ONCE eklenmemeli (bkz. bir ustteki
@@ -17635,7 +17980,7 @@ begin
                 FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
               if needRls then
                 RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
-              if FT.InsertReturning(Stmt.Table, cnames, NewRow, outPk, outVals) then
+              if FT.InsertReturning(Stmt.Table, cnames, NewRow, outPk, outVals, EffMask) then
               begin
                 Inc(rCount);
                 // R-04: listede gercek IFADE varsa EvaluateReturning devreye girer;
@@ -17661,7 +18006,7 @@ begin
                 FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teInsert), nil, NewRow, cnames, Res, True);
               if needRls then
                 RlsRequireInsert(Stmt.Table, cnames, NewRow);   // R-19
-              FT.Insert(Stmt.Table, cnames, NewRow, @td);   // P-55
+              FT.InsertEx(Stmt.Table, cnames, NewRow, EffMask, @td);   // P-55
               Inc(rCount);
               if hasInsTrig then
                 FireTriggers(Stmt.Table, Byte(ttAfter), Byte(teInsert), nil, NewRow, cnames, Res, True);
@@ -17677,7 +18022,7 @@ begin
             BuildUpsertSetValues(Stmt, FExcludedRow, FExcludedColNames, allColNames, td, upsertSetValues);
             if UpsertWithAuth(Stmt.Table, cnames, strVals,
               onConflictAction, Stmt.OnConflictTarget, upsertSetValues,
-              outPk, outVals) then
+              outPk, outVals, EffMaskVals(strVals)) then
             begin
               Inc(rCount);
               if hasReturning then
@@ -17754,6 +18099,7 @@ var
   // H13 (2026-10-18): cok-satirli VALUES icin satirlar
   rows: array of TStrArray;
   nrows, expNv, bi, bi2: Integer;
+  vIsNull: Boolean;
 
   procedure SkipWs;
   begin
@@ -17895,18 +18241,25 @@ var
     else if w = 'FALSE' then begin S := 'False'; Result := True end;
   end;
 
-  function ReadValue(out S: string): Boolean;
+  function ReadValue(out S: string; out AIsNull: Boolean): Boolean;
   var
     save: Integer;
   begin
     // ReadLiteral sayi kuyrugunda ret ile ayrilirken p'yi ilerletmis
     // olabilir ('12TRUE' tek lexer token'idir ve genel yol onu STRING
     // sayar): basarisizlikta konum GERI alinir, seri ret edilir.
+    AIsNull := False;
     save := p;
     if ReadLiteral(S) then Exit(True);
     p := save;
     Result := ReadWordLit(S);
-    if not Result then p := save;
+    if not Result then
+      p := save
+    else if S = '' then
+      { F-49 (2c): yalniz NULL kelimesi '' uretir. Hizli serit maske
+        tasimadigi icin NULL literalini genel yola birakir; aksi halde
+        NULL ile '' ayrimi bu yolda sessizce kaybolurdu. }
+      AIsNull := True;
   end;
 
 begin
@@ -17952,7 +18305,8 @@ begin
     else begin SetLength(vals, 8); cap := 8; end;
     nv := 0;
     repeat
-      if not ReadValue(s) then Exit;
+      if not ReadValue(s, vIsNull) then Exit;
+      if vIsNull then Exit;   // NULL literali: maske gerekir -> genel yol
       if nv >= cap then begin cap := cap * 2; SetLength(vals, cap); end;
       vals[nv] := s;
       Inc(nv);
@@ -17980,6 +18334,7 @@ begin
   { P-51: tek tablo araması — TableExists + IsView + GetTable yerine
     TryGetTableDef (tek VDbNorm + tek sozluk aramasi). }
   if not FT.TryGetTableDef(tbl, td) then Exit;   // genel: 'tablo bulunamadi'
+  if td.HasNulls then Exit;   // F-49 (2c): NULL tasiyan tablo genel yola
   if td.IsView then Exit;                         // view kurallari genel yolda
   // INSERT tetikleyicileri (STATEMENT + ROW, BEFORE + AFTER) genel yolun
   // FireTriggers cagri noktalaridir; biri bile varsa serit kapanir.
@@ -18157,6 +18512,7 @@ begin
     TryGetTableDef (tek VDbNorm + tek sozluk aramasi). }
   if not FT.TryGetTableDef(tbl, td) then Exit;
   if td.IsView then Exit;
+  if td.HasNulls then Exit;   // F-49 (2c): NULL tasiyan tablo genel yola
   if Length(FT.TriggersFor(tbl, Byte(ttBefore), Byte(teInsert))) > 0 then Exit;
   if Length(FT.TriggersFor(tbl, Byte(ttAfter),  Byte(teInsert))) > 0 then Exit;
   if nc = 0 then
@@ -18207,6 +18563,8 @@ var
   pbN: Integer;
   row: TStrArray;
   rowQ: TCopyBoolArr;
+  rowN: TNulArr;
+  rowAnyNull: Boolean;
   fbuf: string;
   flen: Integer;
   lineNo: Int64;
@@ -18899,6 +19257,15 @@ begin
           raise EVDbException.CreateFmt(ecInvalidArgument,
             'COPY %s:%d: %d alan bekleniyordu, %d bulundu',
             [path, lineNo, Length(cnames), Length(row)]);
+        { F-49 (2c): NULL alanlar maskeye tasinir; '' artik gercek bos
+          metin olabilir. Trigger satiri degistirdiyse maske kullanilmaz. }
+        rowAnyNull := False;
+        SetLength(rowN, Length(row));
+        for i := 0 to High(row) do
+        begin
+          rowN[i] := (not rowQ[i]) and (row[i] = nullStr);
+          if rowN[i] then rowAnyNull := True;
+        end;
         for i := 0 to High(row) do
           if (not rowQ[i]) and (row[i] = nullStr) then
             row[i] := '';
@@ -18907,7 +19274,10 @@ begin
             FireTriggers(tbl, Byte(ttBefore), Byte(teInsert),
               nil, row, cnames, Res, True);
           RlsRequireInsert(tbl, cnames, row);
-          FT.Insert(tbl, cnames, row, @td);   // P-55: GetTable derin kopyasini atla
+          if rowAnyNull and (not hasInsTrig) then
+            FT.InsertEx(tbl, cnames, row, rowN, @td)
+          else
+            FT.Insert(tbl, cnames, row, @td);   // P-55: GetTable derin kopyasini atla
           Inc(total);
           if hasInsTrig then
             FireTriggers(tbl, Byte(ttAfter), Byte(teInsert),
@@ -19210,6 +19580,7 @@ begin
   { P-51: tek tablo araması. }
   if not FT.TryGetTableDef(tbl, td) then Exit;
   if td.IsView then Exit;
+  if td.HasNulls then Exit;   // F-49 (2c): NULL tasiyan tablo genel yola
   if FT.RlsApplies(tbl) then Exit; // RLS varsa genel yol filtrelesin
   // P-CACHE: yetki kontrolu seritten once. Genel yol (ExecSelect) RequirePriv
   // yapar; serit onu atliyordu. INSERT seridi bunu zaten yapiyordu (bkz.
@@ -19359,6 +19730,7 @@ begin
   { P-51: tek tablo araması. }
   if not FT.TryGetTableDef(tbl, td) then Exit;
   if td.IsView then Exit;
+  if td.HasNulls then Exit;   // F-49 (2c): NULL tasiyan tablo genel yola
   if FT.RlsApplies(tbl) then Exit; // RLS varsa genel yol filtrelesin
   // DELETE tetikleyicileri (STATEMENT + ROW, BEFORE + AFTER) genel yolun
   // FireTriggers cagri noktalaridir; biri bile varsa serit kapanir.
@@ -19514,6 +19886,7 @@ begin
   { P-51: tek tablo araması. }
   if not FT.TryGetTableDef(tbl, td) then Exit;
   if td.IsView then Exit;
+  if td.HasNulls then Exit;   // F-49 (2c): NULL tasiyan tablo genel yola
   if FT.RlsApplies(tbl) then Exit; // RLS varsa genel yol filtrelesin
   // UPDATE tetikleyicileri (STATEMENT + ROW, BEFORE + AFTER) genel yolun
   // FireTriggers cagri noktalaridir; biri bile varsa serit kapanir.
@@ -19644,6 +20017,11 @@ var
   // P-145: otomatik commit'li tek statement'lik UPDATE kendi write-set'ini
   // on-okumadan ONCE acar (bkz. asagidaki aciklama).
   ownBatch: Boolean;
+  // F-49 (2c): satir NULL maskeleri. nullOk = satirlarin maskesi biliniyor.
+  allNulls: TNullMatrix;
+  newMask: TNulArr;
+  nullOk: Boolean;
+  updOk: Boolean;
 
   { Sprint P / SKILL6 07: UPDATE ... FROM icin hash join.
     ONCEDEN hedef x kaynak KARTEZYEN dongusuydu (O(N x M)): 100.000 satirlik
@@ -19898,11 +20276,20 @@ begin
   FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teUpdate), nil, nil, [], Res, False);
   if Assigned(VdbDmlProbe) then VdbDmlProbe(VDB_DML_PROBE_BEFORE);
   isExact := False;
+  nullOk := False;
+  SetLength(allNulls, 0);
   if not NarrowRows(td, Stmt.WhereClause, colNames, colTypes, pks, allRows, isExact) then
   begin
     isExact := False;
     // R-13 Full: partition pruning (UPDATE/DELETE taramalari da kullanir)
-    FT.ScanRowsPart(Stmt.Table, pks, allRows, PartTargetsOf(td, Stmt.WhereClause));
+    FT.ScanRowsPartEx(Stmt.Table, pks, allRows, allNulls,
+      PartTargetsOf(td, Stmt.WhereClause));
+    nullOk := True;
+  end
+  else
+  begin
+    allNulls := FNarrowNulls;
+    nullOk := Length(allNulls) = Length(allRows);
   end;
   if Assigned(VdbDmlProbe) then VdbDmlProbe(VDB_DML_PROBE_AFTER);
 
@@ -20002,6 +20389,9 @@ begin
     pks := joinedPks;
     colNames := jNames;
     colTypes := jTypes;
+    // F-49 (2c): JOIN yolu satirlari yeniden kurdu; NULL maskesi bilinmiyor.
+    nullOk := False;
+    SetLength(allNulls, 0);
     // WHERE join filtresinde zaten uygulandi (yukaridaki RowMatches);
     // döngüde RowMatches tekrar edilmez.
     isExact := True;
@@ -20033,11 +20423,25 @@ begin
       for i := 0 to High(allRows) do
       begin
 
+        if nullOk and (i < Length(allNulls)) then FCurNulls := allNulls[i] else FCurNulls := nil;
         if (not isExact) and (not RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes)) then Continue;
         // R-19: gorunmeyen satir guncellenemez (USING)
         if hasRls and not RlsRowVisible(Stmt.Table, 3, allRows[i], colNames, colTypes) then Continue;
         SetLength(newVals, Length(td.Cols));
         for j := 0 to High(td.Cols) do newVals[j] := allRows[i][j];
+        // F-49 (2c): eski satirin maskesi yeni maskeye tasinir; SET edilen
+        // kolonlar EvalExpr'in FLastNull sonucuyla guncellenir.
+        if nullOk then
+        begin
+          SetLength(newMask, Length(td.Cols));
+          for j := 0 to High(newMask) do
+            if (i < Length(allNulls)) and (j < Length(allNulls[i])) then
+              newMask[j] := allNulls[i][j]
+            else
+              newMask[j] := False;
+        end
+        else
+          SetLength(newMask, 0);
         for j := 0 to Stmt.Assignments.Count - 1 do
         begin
           ci := -1;
@@ -20045,7 +20449,10 @@ begin
             if SameText(colNames[setIdx], Stmt.Assignments[j].ColName) then
             begin ci := setIdx; Break; end;
           if ci >= 0 then
+          begin
             newVals[ci] := EvalExpr(TSqlExprNode(Stmt.Assignments[j].Expr), allRows[i], colNames, colTypes);
+            if nullOk then newMask[ci] := FLastNull;
+          end;
         end;
         // R-19: yeni satir WITH CHECK'ten gecmeli
         if hasRls and not RlsCheckRow(Stmt.Table, 3, newVals, colNames, colTypes) then
@@ -20056,7 +20463,16 @@ begin
         if hasRowTrig then
           FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teUpdate),
             allRows[i], newVals, colNames, Res, True);
-        if FT.UpdateRowInPlace(Stmt.Table, pks[i], newVals, allRows[i]) then
+        if nullOk then
+        begin
+          if i < Length(allNulls) then
+            updOk := FT.UpdateRowInPlace(Stmt.Table, pks[i], newVals, allRows[i], newMask, allNulls[i])
+          else
+            updOk := FT.UpdateRowInPlace(Stmt.Table, pks[i], newVals, allRows[i], newMask, nil);
+        end
+        else
+          updOk := FT.UpdateRowInPlace(Stmt.Table, pks[i], newVals, allRows[i]);
+        if updOk then
         begin
           Inc(rCount);
           if hasReturning then
@@ -20093,11 +20509,25 @@ begin
   begin
     for i := 0 to High(allRows) do
     begin
+      if nullOk and (i < Length(allNulls)) then FCurNulls := allNulls[i] else FCurNulls := nil;
       if (not isExact) and (not RowMatches(Stmt.WhereClause, allRows[i], colNames, colTypes)) then Continue;
       // R-19: gorunmeyen satir guncellenemez (USING)
       if hasRls and not RlsRowVisible(Stmt.Table, 3, allRows[i], colNames, colTypes) then Continue;
       SetLength(newVals, Length(td.Cols));
       for j := 0 to High(td.Cols) do newVals[j] := allRows[i][j];
+      // F-49 (2c): eski satirin maskesi yeni maskeye tasinir; SET edilen
+      // kolonlar EvalExpr'in FLastNull sonucuyla guncellenir.
+      if nullOk then
+      begin
+        SetLength(newMask, Length(td.Cols));
+        for j := 0 to High(newMask) do
+          if (i < Length(allNulls)) and (j < Length(allNulls[i])) then
+            newMask[j] := allNulls[i][j]
+          else
+            newMask[j] := False;
+      end
+      else
+        SetLength(newMask, 0);
       for j := 0 to Stmt.Assignments.Count - 1 do
       begin
         ci := -1;
@@ -20105,7 +20535,10 @@ begin
           if SameText(colNames[setIdx], Stmt.Assignments[j].ColName) then
           begin ci := setIdx; Break; end;
         if ci >= 0 then
+        begin
           newVals[ci] := EvalExpr(TSqlExprNode(Stmt.Assignments[j].Expr), allRows[i], colNames, colTypes);
+          if nullOk then newMask[ci] := FLastNull;
+        end;
       end;
       // R-19: yeni satir WITH CHECK'ten gecmeli
       if hasRls and not RlsCheckRow(Stmt.Table, 3, newVals, colNames, colTypes) then
@@ -20116,7 +20549,16 @@ begin
       if hasRowTrig then
         FireTriggers(Stmt.Table, Byte(ttBefore), Byte(teUpdate),
           allRows[i], newVals, colNames, Res, True);
-      if FT.UpdateRowInPlace(Stmt.Table, pks[i], newVals, allRows[i]) then
+      if nullOk then
+      begin
+        if i < Length(allNulls) then
+          updOk := FT.UpdateRowInPlace(Stmt.Table, pks[i], newVals, allRows[i], newMask, allNulls[i])
+        else
+          updOk := FT.UpdateRowInPlace(Stmt.Table, pks[i], newVals, allRows[i], newMask, nil);
+      end
+      else
+        updOk := FT.UpdateRowInPlace(Stmt.Table, pks[i], newVals, allRows[i]);
+      if updOk then
       begin
         Inc(rCount);
         if hasReturning then
@@ -21193,6 +21635,7 @@ begin
     SetValues[i].ColIdx := FindColIdx(Stmt.OnConflictSetExprs[i].ColName, '', AllColNames);
     SetValues[i].Value := EvalExpr(TSqlExprNode(Stmt.OnConflictSetExprs[i].Expr),
       existing, AllColNames, nil);
+    SetValues[i].IsNull := FLastNull;
   end;
 end;
 
@@ -21249,7 +21692,8 @@ function TVSqlExecutor.UpsertWithAuth(const ATable: string;
   AOnConflictAction: TOnConflictAction;
   const AOnConflictTarget: TStrArray;
   const ASetValues: TSetValuePairs;
-  out AOutPk: string; out AOutVals: TStrArray): Boolean;
+  out AOutPk: string; out AOutVals: TStrArray;
+  const ANulls: TNulArr): Boolean;
 var
   td: TTableDef;
   i: Integer;
@@ -21281,7 +21725,7 @@ begin
   try
     Result := FT.UpsertRowReturning(ATable, AColNames, AValues,
       AOnConflictAction, AOnConflictTarget, ASetValues,
-      AOutPk, AOutVals, UpsertWriteHook);
+      AOutPk, AOutVals, UpsertWriteHook, ANulls);
   finally
     FUpsertHookTable := savTable;
     FUpsertHookNames := savNames;

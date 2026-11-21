@@ -259,6 +259,11 @@ type
   PartType: string;
   PartCol: string;
   PartVals: array of string;
+  { v3.71 / SKILL6 03 (F-49, 2c): bu tabloda en az bir satir GERCEK NULL
+    tasiyor. Yalniz bu bayrak acikken okuma yollari NULL maskesini tasir;
+    NULL'suz tablolar bugunku hizli yollarda birebir ayni kalir. Semada
+    `#N|<tablo>` satiriyla kalicidir. }
+  HasNulls: Boolean;
   end;
   PTableDef = ^TTableDef;
 
@@ -616,6 +621,13 @@ type
     procedure CheckConstraints(const T: TTableDef; var Vals: TStrArray; const ExcludePk: string);
     function RefValueExists(const Rt: TTableDef; ColIdx: Integer; const V: string): Boolean;
     procedure CheckFk(const T: TTableDef; const Vals: TStrArray);
+    { v3.71 / SKILL6 03 (F-49, 2c): FK denetimi + NULL maskesi. Maske
+      verilirse NULL olan FK kolonu referans aramasina GIRMEZ; maskesiz
+      eski yol metin kuralini ('' = NULL) korur. }
+    procedure CheckFkEx(const T: TTableDef; const Vals: TStrArray; const Nulls: TNulArr);
+    { v3.71 / SKILL6 03 (F-49, 2c): tablo gercek NULL tasiyor olarak
+      isaretlenir (hizli yollar bu tabloda kullanilmaz). Sema tembel yazilir. }
+    procedure NoteTableNulls(const AName: string);
     // R2-B-3: yalniz sahibi 0 ya da cagiran oturum olan ertelenen
     // satirlari siler; baska oturumun girdileri korunur.
     procedure ClearDeferredOwn;
@@ -692,7 +704,8 @@ type
       const Mode, NewVal: string; const RefColFilter: Integer = -1);
     // FK CASCADE/SET NULL icin: satiri dogrudan yazar (kisit denetimi
     // uygulanmaz -- zaten gecerli bir deger).
-    procedure PutRow(const T: TTableDef; const Pk: string; const Vals: TStrArray);
+    procedure PutRow(const T: TTableDef; const Pk: string; const Vals: TStrArray;
+      const Nulls: TNulArr = nil);
     // F-41: baska oturumun satir kilidi bu yazmayi engelliyor mu?
     procedure CheckRowWritable(const Table, Pk: string);
     // ON DELETE/ON UPDATE degistirilebilir mi? (ALTER ile degismez)
@@ -788,9 +801,11 @@ type
     // Semayi degistirip tum satirlari yeniden kodlar. asmap: yeni sema
     // her sutunu icin kaynak kolon indeksi (-1 = yeni). Sonra index/CHK/FK
     // yeniden kurulur.
-    procedure RewriteTable(const T: TTableDef; const asmap: TIntArray);
+    procedure RewriteTable(const T: TTableDef; const asmap: TIntArray;
+      out AnyNull: Boolean);
     procedure RewriteTableRows(const T: TTableDef; const asmap: TIntArray;
-      const Pks: TStrArray; const Rows: TStrMatrix);
+      const Pks: TStrArray; const Rows: TStrMatrix;
+      const SrcNulls: TNullMatrix; out AnyNull: Boolean);
     procedure FixCheckCols(var T: TTableDef; const asmap: TIntArray);
     procedure CloneDef(const Src: TTableDef; out Dst: TTableDef);
     function SqlTypeToCtype(const S: string): Byte;
@@ -824,6 +839,11 @@ type
     // tablo tanimini cekmistir). Nil ise eski davranis.
     procedure Insert(const Table: string; const ColNames, StrVals: array of string;
       ATableDef: PTableDef = nil);
+    { v3.71 / SKILL6 03 (F-49, 2c): INSERT + NULL maskesi. Nulls[] VERILEN
+      kolonlar sirasindadir (StrVals ile ayni hiza; True = NULL). nil ise
+      eski metin kurali ('' = NULL) aynen korunur. }
+    procedure InsertEx(const Table: string; const ColNames, StrVals: array of string;
+      const Nulls: TNulArr; ATableDef: PTableDef = nil);
     // G/1: toplu eklemede duplicate check atlama. True iken Insert, PK
     // cakisma denetimi yapmaz (FKvB.Exists cagirmaz). Cagiran benzersiz
     // PK garantisi vermelidir. Varsayilan False.
@@ -838,6 +858,10 @@ type
       const Vals: TStrArray): Boolean;
     function DeleteWhere(const Table: string; const Groups: TWhereGroups): Integer;
     function ReadRow(const Table: string; const Pk: string; out Vals: TStrArray): Boolean;
+    { v3.71 / SKILL6 03 (F-49) asama 2b: ReadRow + NULL maskesi. Nulls[i] =
+      True ise Vals[i] NULL'dur. Maske her zaman kolon sayisi kadardir. }
+    function ReadRowEx(const Table: string; const Pk: string;
+      out Vals: TStrArray; out Nulls: TNulArr): Boolean;
     // DELETE/UPDATE icin WHERE'i tam tarama yapmadan daraltmayi dener:
     // PK nokta aramasi (O(1)) veya indeks dilimi. False -> tam tarama.
     function CandidatePks(const T: TTableDef; const Groups: TWhereGroups;
@@ -893,7 +917,13 @@ type
     // eskisi gibi satir okunur. UPDATE hizli yolu ve genel yol bunu
     // kullanir: satir zaten eldeyken tekrar diskten cozmek israftir.
     function UpdateRowInPlace(const Table: string; const Pk: string;
-      const SrcVals: TStrArray; PreReadVals: TStrArray = nil): Boolean;
+      const SrcVals: TStrArray; PreReadVals: TStrArray = nil;
+      const NewNulls: TNulArr = nil; const PreReadNulls: TNulArr = nil): Boolean;
+    { v3.71 / SKILL6 03 (F-49, 2c): UpdateRowInPlace + NULL maskesi.
+      NewNulls = YENI satirin TAM maskesi (dokunulmayan kolonlarin eski
+      bitleri cagiranda korunur). PreReadNulls = on-okunan satirin maskesi;
+      degisiklik karsilastirmasi maskeyi de kapsar (NULL -> '' gercek
+      degisikliktir). nil maske = eski metin kurali ('' = NULL) aynen. }
     // UPDATE SET ifadesini SATIR BASINA hesaplar.
     function EvalSetExpr(const T: TTableDef; const E: TSetExpr;
       const Old: TStrArray; const ColName: string): string;
@@ -961,13 +991,14 @@ function IdxColsOfTable(TableId: Word; ColIdx: Integer): TIntArray;
       VDbExecutor'daki INSERT/UPSERT/UPDATE/DELETE RETURNING dallarindan
       bu iki metoda iner; ayrintili durum: docs/engineering/SQL_STUB_SURFACE.md. }
     function InsertReturning(const Table: string; const ColNames, Values: TStrArray;
-      out OutPk: string; out OutVals: TStrArray): Boolean;
+      out OutPk: string; out OutVals: TStrArray;
+      const Nulls: TNulArr = nil): Boolean;
     function UpsertRowReturning(const Table: string; const ColNames, Values: TStrArray;
       const OnConflictAction: TOnConflictAction;
       const OnConflictTarget: TStrArray;
       const SetValues: TSetValuePairs;
       out OutPk: string; out OutVals: TStrArray;
-      ANotify: TUpsertNotify = nil): Boolean;
+      ANotify: TUpsertNotify = nil; const Nulls: TNulArr = nil): Boolean;
     { Sprint 2.9: ON CONFLICT(<hedef>) icin UNIQUE indeks uzerinden catisan
       satirin PK'sini bulur. PK catismasi yolundan AYRI tutulur: PK'siz
       tabloda ON CONFLICT(a) (a UNIQUE) eskiden hicbir sey yapmiyordu. }
@@ -1156,6 +1187,11 @@ function VDbUnhex(const S: string): RawByteString;
 function VDbLikeMatch(const Txt, Pat: string): Boolean;
 function VDbIsNumericCol(Ctype: Byte): Boolean;
 function VDbCmpVal(const A, B, Op: string; Ctype: Byte): Boolean;
+{ F-49 (2c): EmptyIsValue = True iken bos metin GERCEK bir degerdir (NULL
+  degil); cagiran NULL durumunu kendi maskesinden bilir. Varsayilan False
+  eski davranistir: eski metin modelinde '' NULL demekti. }
+function VDbCmpValEx(const A, B, Op: string; Ctype: Byte;
+  EmptyIsValue: Boolean): Boolean;
 // P-183: degeri kolon tipine gore kanonik metne indirger (5.00 -> 5,
 // 2.50 -> 2.5, true -> True). NULL (bos) ve cozuleyen oldugu gibi kalir.
 function VDbCanonVal(const S: string; Ctype: Byte): string;
@@ -1677,6 +1713,12 @@ end;
 
 
 function VDbCmpVal(const A, B, Op: string; Ctype: Byte): Boolean;
+begin
+  Result := VDbCmpValEx(A, B, Op, Ctype, False);
+end;
+
+function VDbCmpValEx(const A, B, Op: string; Ctype: Byte;
+  EmptyIsValue: Boolean): Boolean;
 // Tip-bilgili karsilastirma. ONEMLI: sayisalla lastirme sadece sayisal
 // kolonlarda yapilir. Aksi halde TEXT kolonda '007' = '7' olurdu.
 // NULL (bos) degerler: IS NULL disinda hicbir karsilastirmada eslesmez.
@@ -1696,7 +1738,9 @@ begin
   // NULL degeri SQL'de BILINMEZDIR (unknown): hicbir operatorde eslesmez.
   // Bu kontrol LIKE'dan ONCE gelmeli; aksi halde "NULL LIKE '%'" true
   // doner ve NULL satirlar filtreye girer.
-  if (A = '') or (B = '') then Exit(False);
+  // F-49 (2c): EmptyIsValue iken bu metin kurali UYGULANMAZ; gercek ''
+  // degerdir ve '' = '' dogrudur.
+  if (not EmptyIsValue) and ((A = '') or (B = '')) then Exit(False);
   if o = 'LIKE' then Exit(VDbLikeMatch(A, B));
   if numeric then
   begin
@@ -4219,13 +4263,26 @@ var
 
   { v3.71 / SKILL6 03: bu kolon NULL mu? Maske varsa YALNIZ maske
     belirler (sifir uzunluklu metin gercek deger olur); maske yoksa eski
-    kural: bos deger NULL'dir. }
+    kural: bos deger NULL'dir.
+
+    (2c) ISTISNA: tablo daha once gercek NULL tasidiysa (T.HasNulls) metin
+    kolonlarinda '' artik GERCEK bos metindir. Gerekce: INSERT..SELECT,
+    tetikleyici, MV, FOREIGN KEY CASCADE gibi maskesiz yollarin '' degerini
+    NULL'a cevirmesi geri donusu olmayan bir anlam kaybi olurdu. Sayisal
+    kolonlarda '' hala NULL'dir (orada bos metin diye bir deger yok). }
   function ColIsNull(AIdx: Integer): Boolean; inline;
+  var
+    isEmpty: Boolean;
   begin
     if hasNulls then
-      Result := Nulls[AIdx]
+      Exit(Nulls[AIdx]);
+    isEmpty := (AIdx >= Length(Vals)) or (Vals[AIdx] = '');
+    if not isEmpty then
+      Exit(False);
+    if T.HasNulls and (AIdx < Length(T.Cols)) then
+      Result := T.Cols[AIdx].Ctype <> VCT_STR
     else
-      Result := (AIdx >= Length(Vals)) or (Vals[AIdx] = '');
+      Result := True;
   end;
 
   procedure Grow(Need: Integer); inline;
@@ -4764,6 +4821,11 @@ begin
   cc := H.ColCount;
   SetLength(Vals, cc);
   SetLength(Nulls, cc);
+  // F-49 (2c): SetLength yonetilen OLMAYAN elemanlari sifirlamaz; maske
+  // baytlari cop kalirsa (or. -O1 derlemesinde) NULL OLMAYAN kolon NULL
+  // okunur. Maskeyi acikca temizle.
+  if cc > 0 then
+    FillChar(Nulls[0], cc * SizeOf(Boolean), 0);
   p := H.ColOff;
   for i := 0 to cc - 1 do
   begin
@@ -5999,6 +6061,21 @@ procedure ParseLines(Lines: TStrings);
               FTables.AddOrSetValue(VDbNorm(parts[1]), tq);
             end;
           end;
+        end
+        // v3.71 / SKILL6 03 (F-49, 2c): #N = tablo (gercek NULL tasiyor).
+        // Eski semalarda yoktur -> HasNulls False kalir.
+        else if (Length(s) > 2) and (CompareText(Copy(s, 1, 2), '#N') = 0) then
+        begin
+          parts.DelimitedText := s;
+          if parts.Count >= 2 then
+          begin
+            tq := Default(TTableDef);
+            if FTables.TryGetValue(VDbNorm(parts[1]), tq) then
+            begin
+              tq.HasNulls := True;
+              FTables.AddOrSetValue(VDbNorm(parts[1]), tq);
+            end;
+          end;
         end;
         Continue;
       end;
@@ -6497,6 +6574,11 @@ begin
       // zaten SelectText'i yeniden ayristirir.
       if kv.Value.IsMaterializedView then
         sl.Add('#M|' + kv.Value.Name + '|' + HexEncFld(kv.Value.SelectText));
+      // v3.71 / SKILL6 03 (F-49, 2c): gercek NULL tasiyan tablolar ayri
+      // '#N' satirinda isaretlenir. Eski semalarda bu satir yoktur: o
+      // tablolar "NULL yok" sayilir ve bugunku davranis aynen korunur.
+      if kv.Value.HasNulls then
+        sl.Add('#N|' + kv.Value.Name);
     end;
     // ---- R-18: ROLES / GRANTS (ayri satirlar, '#R' ve '#G' oneki) ----
     // Tablo satirlari 8 alanli '|' ile ayrilir; RBAC satirlari farkli
@@ -8024,14 +8106,22 @@ begin
 end;
 
 procedure TVTableDb.CheckFk(const T: TTableDef; const Vals: TStrArray);
+begin
+  CheckFkEx(T, Vals, nil);
+end;
+
+procedure TVTableDb.CheckFkEx(const T: TTableDef; const Vals: TStrArray;
+  const Nulls: TNulArr);
 var
   i, k: Integer;
   rt: TTableDef;
   rc: Integer;
   pk: string;
+  maskOn: Boolean;
 begin
   // P-32: FK yoksa hicbir sey yapma (en yaygin durum).
   if Length(T.Fks) = 0 then Exit;
+  maskOn := (Nulls <> nil) and (Length(Nulls) > 0);
   // ---- R-11: DEFERRABLE FK ertelemesi ----
   // Yalniz (a) acik bir batch icinde, (b) SET CONSTRAINTS ... DEFERRED
   // etkin ve (c) tabloda DEFERRABLE bir FK varken ertelenir. Batch disinda
@@ -8052,7 +8142,12 @@ begin
   end;
   for i := 0 to High(T.Fks) do
   begin
-    if Vals[T.Fks[i].Col] = '' then Continue; // NULL serbest
+    if maskOn then
+    begin
+      // Gercek NULL FK: referans aranmaz (SQL: NULL FK her zaman gecerlidir).
+      if (T.Fks[i].Col < Length(Nulls)) and Nulls[T.Fks[i].Col] then Continue;
+    end
+    else if Vals[T.Fks[i].Col] = '' then Continue; // NULL serbest
     { B-6: TFkDef.RefTable/RefCol semaya yazilirken VDbNorm'lanir
       (CreateTable/LoadSchema/Rename); T.Name ve Cols[].Name da normalize
       tutulur. Bu yuzden satir basina VDbNorm cagrisi ve FindCol icindeki
@@ -8077,6 +8172,37 @@ begin
   end;
 end;
 
+procedure TVTableDb.NoteTableNulls(const AName: string);
+{ v3.71 / SKILL6 03 (F-49, 2c): yazilan satir gercek NULL tasiyorsa tablo
+  isaretlenir. Isaret yalniz hizli yollarin secimi icindir: satirlarin
+  kendisi maskesini tasir, veri kaybi riski yoktur. Sema kaydina '#N'
+  satiri olarak yazilir; yeniden acilista hizli yollar yine kapanir.
+  Concurrent DDL yoksa (SoleWriter) hemen yazilir; aksi halde isaret
+  tembel yazim icin kirli birakilir. }
+var
+  key: string;
+  tq: TTableDef;
+begin
+  key := VDbNorm(AName);
+  if not FTables.TryGetValue(key, tq) then Exit;
+  if tq.HasNulls then Exit;
+  tq.HasNulls := True;
+  FTables.AddOrSetValue(key, tq);
+  // Onbellek kopyalari da isaretlenir: sonraki maskesiz yazma yollari
+  // (tetikleyici/MV/INSERT..SELECT) dogru kurali ('' = gercek bos metin)
+  // gormeli, yoksa gercek '' sessizce NULL'a donusurdu.
+  if FBatchTableCached and (FBatchTableDef.Name = tq.Name) then
+    FBatchTableDef.HasNulls := True;
+  if FOpenTDefValid and (FOpenTDef.Name = tq.Name) then
+    FOpenTDef.HasNulls := True;
+  if FKvB.InBatch then
+    FSchemaDirty := True
+  else if FKvB.SoleWriter then
+    SaveSchema
+  else
+    FSchemaDirty := True;
+end;
+
 procedure TVTableDb.ClearDeferredOwn;
 // R2-B-3: ertelenen FK listesinden yalniz sahibi 0 (ham API) ya da
 // cagiran oturum olan girdileri kaldirir. Iki liste her zaman paralel
@@ -8096,7 +8222,7 @@ begin
 end;
 
 procedure TVTableDb.PutRow(const T: TTableDef; const Pk: string;
-  const Vals: TStrArray);
+  const Vals: TStrArray; const Nulls: TNulArr = nil);
 var
   j: Integer;
   b, oldB: TBytes;
@@ -8104,7 +8230,16 @@ var
   exTid: Word;
   exPk: string;
   exVals: TStrArray;
+  hasMask, anyNull: Boolean;
+
+  function ColNull(AIdx: Integer): Boolean; inline;
+  begin
+    if hasMask then Result := (AIdx < Length(Nulls)) and Nulls[AIdx]
+    else Result := (AIdx >= Length(Vals)) or (Vals[AIdx] = '');
+  end;
 begin
+  hasMask := (Nulls <> nil) and (Length(Nulls) > 0);
+  anyNull := False;
   CheckRowWritable(T.Name, Pk);
   // R-13 Full: bolme anahtari NULL olamaz (hangi bolume dusecegi
   // hesaplanamazdi). PostgreSQL uyumlu kural; INSERT ve UPDATE yollarinin
@@ -8113,7 +8248,7 @@ begin
   begin
     j := 0;
     while (j < Length(T.Cols)) and (T.Cols[j].Name <> T.PartCol) do Inc(j);
-    if (j < Length(T.Cols)) and (j <= High(Vals)) and (Vals[j] = '') then
+    if (j < Length(T.Cols)) and ColNull(j) then
       raise EVDbException.Create(ecNotNullViolation,
         'partition anahtari NULL olamaz: ' + T.PartCol);
   end;
@@ -8142,12 +8277,17 @@ begin
       raise EVDbException.CreateFmt(ecHashCollision,
         'VDb: hash carpismasi (%s, %s)', [T.Name, Pk]);
   end;
-  b := EncodeRow(T.TableId, Pk, T, Vals);
+  if hasMask then b := EncodeRowEx(T.TableId, Pk, T, Vals, Nulls)
+  else b := EncodeRow(T.TableId, Pk, T, Vals);
+  if hasMask then
+    for j := 0 to High(Nulls) do
+      if Nulls[j] then begin anyNull := True; Break; end;
   // NOT: WriteAheadWAL cagrisi KALDIRILDI. Gerekce: mevcut WAL duzeni
   // replay yapmiyor (ReplayWAL stub) ve her cagri .wal'i bastan aciyor
   // (fmCreate) â€” yani hem ise yaramiyor hem her satirda dosya aciyordu.
   // Gercek dayaniklilik: batch basina tek fsync + BATCHEND + recovery.
   FKvB.Put(key, b);
+  if anyNull then NoteTableNulls(T.Name);
   // Indeksleri guncelle (cok kolonlu destekli).
   // B-11: Insert'teki P-65 HasIdxWork kapisi - is yoksa cagri tamamen atlanir.
   if HasIdxWork(T) then
@@ -8219,6 +8359,7 @@ var
   rows: TStrMatrix;
   act: string;
   newVals: TStrArray;
+  newNulls: TNulArr;
   cdef: string;
   hits: TStrArray;
   plan: TFkCascadeSet;
@@ -8327,9 +8468,10 @@ begin
           // cocugun FK kolonu yeni ebeveyn degerine cekilir
           for n := 0 to High(plan[i].Pks) do
           begin
-            if not ReadRow(child.Name, plan[i].Pks[n], newVals) then Continue;
+            if not ReadRowEx(child.Name, plan[i].Pks[n], newVals, newNulls) then Continue;
             newVals[plan[i].Col] := NewVal;
-            PutRow(child, plan[i].Pks[n], newVals);
+            if plan[i].Col < Length(newNulls) then newNulls[plan[i].Col] := False;
+            PutRow(child, plan[i].Pks[n], newVals, newNulls);
           end
         else
           for n := 0 to High(plan[i].Pks) do
@@ -8339,9 +8481,12 @@ begin
         // SET NULL / SET DEFAULT
         for n := 0 to High(plan[i].Pks) do
         begin
-          if not ReadRow(child.Name, plan[i].Pks[n], newVals) then Continue;
+          if not ReadRowEx(child.Name, plan[i].Pks[n], newVals, newNulls) then Continue;
           newVals[plan[i].Col] := plan[i].DefVal;   // SET NULL -> DefVal = ''
-          PutRow(child, plan[i].Pks[n], newVals);
+          // F-49 (2c): SET NULL gercek NULL yazar; SET DEFAULT bir degerdir.
+          if plan[i].Col < Length(newNulls) then
+            newNulls[plan[i].Col] := plan[i].DefVal = '';
+          PutRow(child, plan[i].Pks[n], newVals, newNulls);
         end;
     end;
     // R2-D-3: abort kolu zaten TVTableDb.AbortBatch (indeksleri veriden
@@ -9892,21 +10037,27 @@ begin
         BuildOneIndex(kv.Value, j);
 end;
 
-procedure TVTableDb.RewriteTable(const T: TTableDef; const asmap: TIntArray);
+procedure TVTableDb.RewriteTable(const T: TTableDef; const asmap: TIntArray;
+  out AnyNull: Boolean);
 // Tablonun tum satirlarini yeni semaya (T) gore yeniden kodlar.
 // asmap[i] = yeni sema sutunu i icin kaynak (eski) kolon indeksi,
 //             -1 ise o sutun yeni eklenmis -> NULL.
 // Motor append-only: eski key'ler tombstone ile dusurulur, yeniler yazilir.
 // DDL oldugu icin FKvB.BeginBatch yalnizca disaridan batch gelmediyse
 // cagrilir (ic ice batch hatasi olmaz).
+// F-49 (2c): satirlar DecodeRowEx/EncodeRowEx ile tasinir; gercek NULL ile
+// gercek '' ayrimi korunur. AnyNull = yeni tabloda en az bir NULL kaldi.
 var
   keys: TQWordArray;
   raw: TValArray;
   oldKeys: TQWordArray;
   pks: TStrArray;
   oldRows: TStrMatrix;
+  oldNulls: TNullMatrix;
   newRows: TStrMatrix;
+  newNulls: TNullMatrix;
   nv: TStrArray;
+  nm: TNulArr;
   nb: TBytes;
   tid: Word;
   pk: string;
@@ -9917,6 +10068,7 @@ var
   exPk: string;
   exVals: TStrArray;
 begin
+  AnyNull := False;
   // 1) Eski satirlari topla (dosyadan, eski semaya gore)
   // ONEMLI: once hepsini cozup KOPYALIYORUZ. Ara adimda (orn. index
   // erisimi) ScanAll tekrar cagrilirsa paylasilan dizi uzerine
@@ -9926,39 +10078,57 @@ begin
   SetLength(oldKeys, Length(keys));
   SetLength(pks, Length(keys));
   SetLength(oldRows, Length(keys));
+  SetLength(oldNulls, Length(keys));
   j := 0;
   for i := 0 to High(keys) do
   begin
     if keys[i] = VDB_SCHEMA_KEY then Continue;
-    if not DecodeRow(raw[i], tid, pk, nv) then Continue;
+    if not DecodeRowEx(raw[i], tid, pk, nv, nm) then Continue;
     if tid <> T.TableId then Continue;
     oldKeys[j] := keys[i];
     pks[j] := pk;
     // kopyala: nv yeniden kullanilacak
     oldRows[j] := Copy(nv, 0, Length(nv));
+    oldNulls[j] := Copy(nm, 0, Length(nm));
     Inc(j);
   end;
   SetLength(oldKeys, j);
   SetLength(pks, j);
   SetLength(oldRows, j);
+  SetLength(oldNulls, j);
   // cozum bittikten sonra paylasilan arabellek artik gerekmez
   SetLength(raw, 0);
   SetLength(keys, 0);
 
   // 2) Yeni satirlari uret: her satir icin yeni sema dizisini olustur
   SetLength(newRows, Length(pks));
+  SetLength(newNulls, Length(pks));
   for i := 0 to High(pks) do
   begin
     SetLength(newRows[i], Length(T.Cols));
+    SetLength(newNulls[i], Length(T.Cols));
     for j := 0 to High(T.Cols) do
     begin
       newRows[i][j] := '';
+      newNulls[i][j] := True;   // asmap[j] < 0 -> yeni sutun: NULL
       sj := asmap[j];
       if (sj >= 0) and (sj < Length(oldRows[i])) then
+      begin
         newRows[i][j] := oldRows[i][sj];
+        newNulls[i][j] := (sj < Length(oldNulls[i])) and oldNulls[i][sj];
+      end;
     end;
     // M10: ALTER TABLE ADD COLUMN GENERATED icin mevcut satiri hesapla.
     VDbApplyGenerated(T, newRows[i]);
+    for j := 0 to High(T.Cols) do
+    begin
+      if T.Cols[j].Generated or (T.Cols[j].Identity <> 0) then
+        newNulls[i][j] := False
+      // numerik/metin-disi kolonda '' gecerli deger degil: NULL kalsin
+      else if (newRows[i][j] = '') and (T.Cols[j].Ctype <> VCT_STR) then
+        newNulls[i][j] := True;
+      if newNulls[i][j] then AnyNull := True;
+    end;
   end;
 
   ownBatch := not FKvB.InBatch;
@@ -9979,7 +10149,7 @@ begin
     end;
     for i := 0 to High(pks) do
     begin
-      nb := EncodeRow(T.TableId, pks[i], T, newRows[i]);
+      nb := EncodeRowEx(T.TableId, pks[i], T, newRows[i], newNulls[i]);
       FKvB.Put(VDbHashKey(T.Name, pks[i]), nb);
     end;
     if ownBatch then FKvB.CommitBatch;
@@ -9997,11 +10167,15 @@ begin
 end;
 
 procedure TVTableDb.RewriteTableRows(const T: TTableDef; const asmap: TIntArray;
-  const Pks: TStrArray; const Rows: TStrMatrix);
+  const Pks: TStrArray; const Rows: TStrMatrix;
+  const SrcNulls: TNullMatrix; out AnyNull: Boolean);
 // RewriteTable'in satirlar ONCEDEN hazirlandigi varyant (ALTER COLUMN
 // TYPE: satirlar yeni tipe gore normallenmis gelir).
+// F-49 (2c): SrcNulls = kaynak satirlarin NULL maskesi (bilinmiyorsa nil ->
+// eski metin kurali: '' = NULL). AnyNull = yeni tabloda en az bir NULL kaldi.
 var
   newRows: TStrMatrix;
+  newNulls: TNullMatrix;
   nb: TBytes;
   i, j, sj: Integer;
   ownBatch: Boolean;
@@ -10009,20 +10183,44 @@ var
   exTid: Word;
   exPk: string;
   exVals: TStrArray;
+  maskOk: Boolean;
 begin
+  AnyNull := False;
+  maskOk := Length(SrcNulls) = Length(Pks);
+  if maskOk then
+    for i := 0 to High(SrcNulls) do
+      if Length(SrcNulls[i]) < Length(Rows[i]) then
+      begin maskOk := False; Break; end;
   SetLength(newRows, Length(Pks));
+  SetLength(newNulls, Length(Pks));
   for i := 0 to High(Pks) do
   begin
     SetLength(newRows[i], Length(T.Cols));
+    SetLength(newNulls[i], Length(T.Cols));
     for j := 0 to High(T.Cols) do
     begin
       newRows[i][j] := '';
+      newNulls[i][j] := True;   // asmap[j] < 0 -> yeni sutun: NULL
       sj := asmap[j];
       if (sj >= 0) and (sj < Length(Rows[i])) then
+      begin
         newRows[i][j] := Rows[i][sj];
+        if maskOk then
+          newNulls[i][j] := (sj < Length(SrcNulls[i])) and SrcNulls[i][sj]
+        else
+          newNulls[i][j] := Rows[i][sj] = '';
+      end;
     end;
     // M10: mevcut satirlarda GENERATED degerlerini yeniden hesapla.
     VDbApplyGenerated(T, newRows[i]);
+    for j := 0 to High(T.Cols) do
+    begin
+      if T.Cols[j].Generated or (T.Cols[j].Identity <> 0) then
+        newNulls[i][j] := False
+      else if (newRows[i][j] = '') and (T.Cols[j].Ctype <> VCT_STR) then
+        newNulls[i][j] := True;
+      if newNulls[i][j] then AnyNull := True;
+    end;
   end;
   ownBatch := not FKvB.InBatch;
   if ownBatch then FKvB.BeginBatch;
@@ -10042,7 +10240,7 @@ begin
     end;
     for i := 0 to High(Pks) do
     begin
-      nb := EncodeRow(T.TableId, Pks[i], T, newRows[i]);
+      nb := EncodeRowEx(T.TableId, Pks[i], T, newRows[i], newNulls[i]);
       FKvB.Put(VDbHashKey(T.Name, Pks[i]), nb);
     end;
     if ownBatch then FKvB.CommitBatch;
@@ -10064,6 +10262,10 @@ begin
   Dst.Name := Src.Name;
   Dst.PkIndex := Src.PkIndex;
   Dst.AutoInc := Src.AutoInc;
+  // F-49 (2c): NULL bayragi da tasinmali; aksi halde ALTER sonrasi tablo
+  // "NULL yok" sanilir ve metin-only hizli yollar gercek '' ile NULL'i
+  // karistirabilir.
+  Dst.HasNulls := Src.HasNulls;
   // DIKKAT (F-33/F-34): bu dort alan ONCEDEN kopyalanmiyordu. ALTER TABLE
   // her zaman CloneDef uzerinden yeni sema urettigi icin bir tabloya
   // "ALTER TABLE ... DROP COLUMN" uygulaninca IsView bayragi COZULMEMIS
@@ -10139,6 +10341,7 @@ var
   v: string;
   pks: TStrArray;
   rows: TStrMatrix;
+  anyNull: Boolean;
 begin
   t := GetTable(Table);
   nOld := Length(t.Cols);
@@ -10220,7 +10423,8 @@ begin
   ownDdl := not FKvB.InBatch;
   if ownDdl then BeginBatch;
   try
-    RewriteTable(nt, amap);
+    RewriteTable(nt, amap, anyNull);
+    if anyNull then nt.HasNulls := True;
     FTables.AddOrSetValue(nt.Name, nt);
     MarkSchema;
     if ownDdl then CommitBatch;
@@ -10239,6 +10443,7 @@ var
   ownDdl: Boolean;
   kv: TPair<string, TTableDef>;
   nm: string;
+  anyNull: Boolean;
 begin
   t := GetTable(Table);
   nOld := Length(t.Cols);
@@ -10346,7 +10551,8 @@ begin
   ownDdl := not FKvB.InBatch;
   if ownDdl then BeginBatch;
   try
-    RewriteTable(nt, amap);
+    RewriteTable(nt, amap, anyNull);
+    if anyNull then nt.HasNulls := True;
     FTables.AddOrSetValue(nt.Name, nt);
     MarkSchema;
     if ownDdl then CommitBatch;
@@ -10364,6 +10570,7 @@ var
   i, ci: Integer;
   ownDdl: Boolean;
   nn: string;
+  anyNull: Boolean;
 begin
   t := GetTable(Table);
   ci := FindCol(t, OldName);
@@ -10382,7 +10589,8 @@ begin
   ownDdl := not FKvB.InBatch;
   if ownDdl then BeginBatch;
   try
-    RewriteTable(nt, amap);
+    RewriteTable(nt, amap, anyNull);
+    if anyNull then nt.HasNulls := True;
     FTables.AddOrSetValue(nt.Name, nt);
     MarkSchema;
     if ownDdl then CommitBatch;
@@ -10402,6 +10610,8 @@ var
   rows: TStrMatrix;
   v: string;
   p2: TStrArray;
+  rowNulls: TNullMatrix;
+  nullOk, anyNull: Boolean;
 begin
   t := GetTable(Table);
   ci := FindCol(t, Column);
@@ -10425,7 +10635,9 @@ begin
   // NOT: tip degisince tum satirlar yeni tipe gore yeniden normallenir.
   // Donusturulemeyen deger hata verir (veri kaybi sessiz olmaz).
   SetLength(pks, 0); SetLength(rows, 0);
-  ScanRows(t.Name, pks, rows);
+  ScanRowsEx(t.Name, pks, rows, rowNulls);
+  nullOk := Length(rowNulls) = Length(rows);
+  if not nullOk then SetLength(rowNulls, 0);
   for i := 0 to High(rows) do
   begin
     v := rows[i][ci];
@@ -10483,7 +10695,8 @@ begin
   if ownDdl then BeginBatch;
   try
     // rows zaten normallestigine gore dogrudan yeniden kodla
-    RewriteTableRows(nt, amap, pks, rows);
+    RewriteTableRows(nt, amap, pks, rows, rowNulls, anyNull);
+    if anyNull then nt.HasNulls := True;
     FTables.AddOrSetValue(nt.Name, nt);
     MarkSchema;
     // index siralamasi degisebilir -> yeniden kur
@@ -11889,9 +12102,16 @@ end;
 
 procedure TVTableDb.Insert(const Table: string; const ColNames, StrVals: array of string;
   ATableDef: PTableDef);
+begin
+  InsertEx(Table, ColNames, StrVals, nil, ATableDef);
+end;
+
+procedure TVTableDb.InsertEx(const Table: string; const ColNames, StrVals: array of string;
+  const Nulls: TNulArr; ATableDef: PTableDef);
 var
   tp: PTableDef;   // P-30: sema kopyasi yerine isaretci (refcount yok)
   vals, exVals, dummyVals: TStrArray;
+  mask: TNulArr;
   provided: array of Boolean;
   i, ci: Integer;
   pk, exPk: string;
@@ -11903,10 +12123,13 @@ var
   exTid: Word;
   inBatch: Boolean;
   mapOk: Boolean;           // R2-D-YENI-1
+  hasMask, anyNull: Boolean;
 {$IFDEF APPLPROF}
   tp0, tp1, tp2: Int64;
 {$ENDIF}
 begin
+  hasMask := (Nulls <> nil) and (Length(Nulls) > 0);
+  anyNull := False;
   inBatch := FKvB.InBatch;
   { P-55: fast path zaten tablo tanimini cekmis — GetTable derin kopyasini
     atla. Batch disi ve ATableDef verilmisse dogrudan kullan. }
@@ -12004,6 +12227,14 @@ begin
     end;
   end;
 
+  if hasMask then
+  begin
+    { F-49 (2c): verilmemis kolon NULL'dur (varsayilan True). Verilen
+      kolonlar maskeden birebir kopyalanir: '' gercek bos metin olabilir. }
+    SetLength(mask, Length(tp^.Cols));
+    for i := 0 to High(mask) do mask[i] := True;
+  end;
+
   // Sutun sayisi ile deger sayisi ESIT olmali. Esit degilse sessizce
   // yutmak veri kaybina yol acar: eksik deger NULL olur, fazla deger
   // atilir. Kullanim hatasi erken bildirilir.
@@ -12047,9 +12278,17 @@ begin
       tahsisi her INSERT'te atlaniyor. }
     if Length(ColNames) < Length(tp^.Cols) then
       for i := 0 to High(tp^.Cols) do
-        if tp^.Cols[i].HasDef then vals[i] := tp^.Cols[i].Def else vals[i] := '';
+        if tp^.Cols[i].HasDef then
+        begin
+          vals[i] := tp^.Cols[i].Def;
+          if hasMask then mask[i] := False;   // DEFAULT bir degerdir
+        end
+        else vals[i] := '';
     for i := 0 to High(ColNames) do
       vals[FBatchColMap[i]] := StrVals[i];
+    if hasMask then
+      for i := 0 to High(ColNames) do
+        mask[FBatchColMap[i]] := (i < Length(Nulls)) and Nulls[i];
   end
   else
   begin
@@ -12065,6 +12304,8 @@ begin
         raise EVDbException.Create(ecColumnExists, 'kolon iki kez verildi: ' + ColNames[i]);
       vals[ci] := StrVals[i];
       provided[ci] := True;
+      if hasMask then
+        mask[ci] := (i < Length(Nulls)) and Nulls[i];
       FBatchColMap[i] := ci;
       FBatchColMapNames[i] := ColNames[i];            // R2-D-YENI-1
     end;
@@ -12073,7 +12314,10 @@ begin
     // verilmemis kolonlara DEFAULT
     for i := 0 to High(vals) do
       if not provided[i] and tp^.Cols[i].HasDef then
+      begin
         vals[i] := tp^.Cols[i].Def;
+        if hasMask then mask[i] := False;
+      end;
   end;
 {$IFDEF APPLPROF}
   tp2 := TTsc;
@@ -12088,6 +12332,10 @@ begin
   // M10: GENERATED kolonlari hesapla (tum INSERT yollari buradan gecer).
   if FBatchHasGenerated then
     VDbApplyGenerated(tp^, vals);
+  if hasMask then
+    for i := 0 to High(mask) do
+      if (tp^.Cols[i].Identity <> 0) or tp^.Cols[i].Generated then
+        mask[i] := False;
   // F2-22: PK TANIMLANMAMISSA sentetik satir anahtari uretilir.
   // ONCEDEN PkIndex 0'a zorlandigi icin ilk kolon hem anahtar hem de
   // ortuk UNIQUE idi: `CREATE TABLE t(a,b)` + ayni a ile ikinci satir
@@ -12124,10 +12372,21 @@ begin
   end;
   CheckConstraints(tp^, vals, '');
   // tarih-PK normallesmis olabilir (sentetik anahtarda dokunulmaz)
-  if tp^.PkIndex >= 0 then pk := vals[tp^.PkIndex];
+  if tp^.PkIndex >= 0 then
+  begin
+    pk := vals[tp^.PkIndex];
+    // PK asla NULL degildir: oto-sayac ya da verilen deger gercek degerdir.
+    if hasMask then mask[tp^.PkIndex] := False;
+  end;
   if not VDbCheckOK(vals, tp^.Checks) then
     raise EVDbException.Create(ecCheckViolation, 'CHECK ihlali: ' + tp^.Name);
-  CheckFk(tp^, vals);
+  if hasMask then
+    CheckFkEx(tp^, vals, mask)
+  else
+    CheckFk(tp^, vals);
+  if hasMask then
+    for i := 0 to High(mask) do
+      if mask[i] then begin anyNull := True; Break; end;
   // H10 (2026-10-18): batch tohumu bir kez hesaplandigindan pk'nin ham
   // baytlari dogrudan katilir. Saf-ASCII pk'da string baytlari =
   // UTF8Encode(pk) oldugu icin sonuc VDbHashKey ile BIREBIR (hashchk).
@@ -12157,7 +12416,9 @@ begin
 {$ENDIF}
   // P-65: EncodeRowInto + PutPtr — FEncBuf yeniden kullanilir, satir
   // basina TBytes alloc+shrink gider. PutPtr degeri cagri aninda kopyalar.
-  n := EncodeRowInto(FEncBuf, tp^.TableId, pk, tp^, vals);
+  n := EncodeRowInto(FEncBuf, tp^.TableId, pk, tp^, vals, mask);
+  if anyNull then
+    NoteTableNulls(tp^.Name);
 {$IFDEF APPLPROF}
   tp2 := TTsc;
   TPEnc := TPEnc + (tp2 - tp1);
@@ -12376,6 +12637,35 @@ begin
   // ONCEDEN burada sadece False donuluyordu; sonuc SATIR GORUNMEZ OLURDU
   // (sessiz veri kaybi). Artik net hata verilir.
   raise EVDbException.CreateFmt(ecHashCollision, 
+    'HASH CARPISMASI: tablo %s, istenen pk=%s ama kayit %s satiri iceriyor. ' +
+    'Veritabani bozulmus; yedekten geri yukleyin.', [t.Name, Pk, apk]);
+end;
+
+{ v3.71 / SKILL6 03 (F-49) asama 2b: ReadRow ile BIREBIR ayni, ancak
+  NULL maskesini de dondurur. Nulls[i] = True ise Vals[i] NULL'dur
+  (Vals[i] bos metin tutar). Maske uzunlugu her zaman kolon sayisi
+  kadardir; bos donmez. }
+function TVTableDb.ReadRowEx(const Table: string; const Pk: string;
+  out Vals: TStrArray; out Nulls: TNulArr): Boolean;
+var
+  t: TTableDef;
+  b: TBytes;
+  tid: Word;
+  apk: string;
+  hk: QWord;
+begin
+  Result := False;
+  SetLength(Nulls, 0);
+  t := GetTable(Table);
+  hk := VDbHashKey(t.Name, Pk);
+  if not FKvB.Get(hk, b) then Exit;
+  if not DecodeRowEx(b, tid, apk, Vals, Nulls) then Exit;
+  if (tid = t.TableId) and (apk = Pk) then
+  begin
+    Result := True;
+    Exit;
+  end;
+  raise EVDbException.CreateFmt(ecHashCollision,
     'HASH CARPISMASI: tablo %s, istenen pk=%s ama kayit %s satiri iceriyor. ' +
     'Veritabani bozulmus; yedekten geri yukleyin.', [t.Name, Pk, apk]);
 end;
@@ -12783,13 +13073,15 @@ begin
 end;
 
 function TVTableDb.UpdateRowInPlace(const Table: string; const Pk: string;
-  const SrcVals: TStrArray; PreReadVals: TStrArray): Boolean;
+  const SrcVals: TStrArray; PreReadVals: TStrArray;
+  const NewNulls: TNulArr; const PreReadNulls: TNulArr): Boolean;
 var
   t: TTableDef;
   i, j, k2, k3: Integer;
   setIdx, idxCols: TIntArray;
   needUpd, isRefCol: Boolean;
   oldVals, newVals: TStrArray;
+  oldMask: TNulArr;
   b, oldB: TBytes;
   key: QWord;
   exTid: Word;
@@ -12797,11 +13089,34 @@ var
   exVals: TStrArray;
   kv: TPair<string, TTableDef>;
   n: Integer;
+  hasNewMask, hasOldMask, anyNull: Boolean;
+
+  function OldIsNull(AIdx: Integer): Boolean;
+  begin
+    if hasOldMask then Result := (AIdx < Length(oldMask)) and oldMask[AIdx]
+    else Result := oldVals[AIdx] = '';
+  end;
+
+  function NewIsNull(AIdx: Integer): Boolean;
+  begin
+    if hasNewMask then Result := (AIdx < Length(NewNulls)) and NewNulls[AIdx]
+    else Result := newVals[AIdx] = '';
+  end;
+
 begin
+  hasNewMask := (NewNulls <> nil) and (Length(NewNulls) > 0);
+  hasOldMask := (PreReadNulls <> nil) and (Length(PreReadNulls) > 0);
   t := GetTable(Table);
   CheckRowWritable(t.Name, Pk);
   if PreReadVals <> nil then
-    oldVals := PreReadVals       // satir zaten okunmus — KV Get + DecodeRow atlaniyor
+  begin
+    oldVals := PreReadVals;       // satir zaten okunmus — KV Get + DecodeRow atlaniyor
+    if hasOldMask then oldMask := PreReadNulls;
+  end
+  else if hasOldMask then
+  begin
+    if not ReadRowEx(t.Name, Pk, oldVals, oldMask) then Exit(False);
+  end
   else if not ReadRow(t.Name, Pk, oldVals) then Exit(False);
   if Length(SrcVals) <> Length(t.Cols) then
     raise EVDbException.Create(ecColumnNotFound,
@@ -12820,7 +13135,7 @@ begin
   // M10: generated kolonlar da burada yakalanir.
   SetLength(setIdx, 0);
   for i := 0 to High(t.Cols) do
-    if oldVals[i] <> newVals[i] then
+    if (oldVals[i] <> newVals[i]) or (OldIsNull(i) <> NewIsNull(i)) then
     begin
       SetLength(setIdx, Length(setIdx) + 1);
       setIdx[High(setIdx)] := i;
@@ -12831,7 +13146,10 @@ begin
   if not VDbCheckOK(newVals, t.Checks) then
     raise EVDbException.Create(ecCheckViolation, 'CHECK ihlali: ' + t.Name);
   // FK kontrolu: YENI deger gecerli olmali (INSERT ile ayni kural)
-  CheckFk(t, newVals);
+  if hasNewMask then
+    CheckFkEx(t, newVals, NewNulls)
+  else
+    CheckFk(t, newVals);
 
   // Referans degeri degistiriliyorsa cocuklarin hala bu satiri
   // gostermesi lazim. Tetikleyici, kolonun UNIQUE/PK olmasi degil
@@ -12859,7 +13177,16 @@ begin
       CheckRestrict(t, oldVals, 'UPDATE', newVals[setIdx[j]], setIdx[j]);
   end;
 
-  b := EncodeRow(t.TableId, Pk, t, newVals);
+  if hasNewMask then
+    b := EncodeRowEx(t.TableId, Pk, t, newVals, NewNulls)
+  else
+    b := EncodeRow(t.TableId, Pk, t, newVals);
+  anyNull := False;
+  if hasNewMask then
+    for i := 0 to High(NewNulls) do
+      if NewNulls[i] then begin anyNull := True; Break; end;
+  if anyNull then
+    NoteTableNulls(t.Name);
   key := VDbHashKey(t.Name, Pk);
   { Hash carpisma denetimi zaten ReadRow'da yapildi (orada raise eder).
     Burada ikinci kez Get+DecodeRow yapmak her UPDATE'te satiri bir kez
@@ -12917,7 +13244,10 @@ var
   i, j: Integer;
   setIdx: TIntArray;
   oldVals, newVals: TStrArray;
+  oldMask, newMask: TNulArr;
+  nulls: TNullMatrix;
   ownBatch: Boolean;
+  maskOk, updOk: Boolean;
 begin
   Result := 0;
   t := GetTable(Table);
@@ -12936,8 +13266,13 @@ begin
     // tum tablo bellege cekiliyordu (100.000 satirda 641 ms; 5000 UPDATE
     // = ~53 DAKIKA). Simdi: WHERE daraltabiliyorsa yalniz o satirlar okunur
     // (PK nokta arama O(1), indeks dilimi O(dilim)).
+    maskOk := False;
+    SetLength(nulls, 0);
     if not CandidatePks(t, Groups, pks, rows) then
-      ScanRows(t.Name, pks, rows);
+    begin
+      ScanRowsEx(t.Name, pks, rows, nulls);
+      maskOk := Length(nulls) = Length(rows);
+    end;
     if Assigned(VdbTableDmlProbe) then
       VdbTableDmlProbe(VDB_TABLE_DML_PROBE_AFTER);
     for i := 0 to High(pks) do
@@ -12953,13 +13288,38 @@ begin
       end;
       oldVals := Copy(rows[i], 0, Length(rows[i]));
       newVals := Copy(rows[i], 0, Length(rows[i]));
+      if maskOk and (i < Length(nulls)) then
+      begin
+        oldMask := Copy(nulls[i], 0, Length(nulls[i]));
+        newMask := Copy(nulls[i], 0, Length(nulls[i]));
+      end
+      else
+      begin
+        SetLength(oldMask, 0);
+        SetLength(newMask, 0);
+      end;
       for j := 0 to High(SetCols) do
+      begin
         // SET degeri satira gore HESAPLANIR (orn. n = n + 1)
         newVals[setIdx[j]] := EvalSetExpr(t, SetExprs[j], oldVals, SetCols[j]);
+        // F-49 (2c): bu API'nin SET ifadeleri metin dondurur; NULL'i ifade
+        // edemez, bu yuzden SET edilen kolon her zaman GERCEK degerdir.
+        if Length(newMask) > 0 then
+          if setIdx[j] < Length(newMask) then newMask[setIdx[j]] := False;
+      end;
       // Satir mantigi TEK yerde: UpdateRowInPlace (kisitler + FK +
       // ON UPDATE CASCADE/RESTRICT + indeks/UNIQUE bakimi).
       // PreReadVals: rows[i] satiri zaten okunmus; ikinci ReadRow yok.
-      if UpdateRowInPlace(t.Name, pks[i], newVals, oldVals) then Inc(Result);
+      if maskOk and (Length(newMask) > 0) then
+      begin
+        if i < Length(nulls) then
+          updOk := UpdateRowInPlace(t.Name, pks[i], newVals, oldVals, newMask, nulls[i])
+        else
+          updOk := UpdateRowInPlace(t.Name, pks[i], newVals, oldVals, newMask, nil);
+      end
+      else
+        updOk := UpdateRowInPlace(t.Name, pks[i], newVals, oldVals);
+      if updOk then Inc(Result);
     end;
     if ownBatch then
     begin
@@ -13338,7 +13698,8 @@ end;
 
 // RETURNING support
 function TVTableDb.InsertReturning(const Table: string; const ColNames, Values: TStrArray;
-  out OutPk: string; out OutVals: TStrArray): Boolean;
+  out OutPk: string; out OutVals: TStrArray;
+  const Nulls: TNulArr): Boolean;
 var
   t: TTableDef;
   vals, dummyVals: TStrArray;
@@ -13351,10 +13712,15 @@ var
   exTid: Word;
   exPk: string;
   exVals: TStrArray;
+  // F-49 (2c): cnames sirasindaki maske -> tam satir maskesi
+  mask: TNulArr;
+  hasMask, anyNull: Boolean;
 begin
   Result := False;
   OutPk := '';
   OutVals := nil;
+  hasMask := (Nulls <> nil) and (Length(Nulls) > 0);
+  anyNull := False;
   
   t := GetTable(Table);
   if Length(ColNames) <> Length(Values) then
@@ -13364,6 +13730,11 @@ begin
   SetLength(vals, Length(t.Cols));
   SetLength(provided, Length(t.Cols));
   for i := 0 to High(vals) do begin vals[i] := ''; provided[i] := False; end;
+  if hasMask then
+  begin
+    SetLength(mask, Length(t.Cols));
+    for i := 0 to High(mask) do mask[i] := True;   // verilmemis = NULL
+  end;
   
   for i := 0 to High(ColNames) do
   begin
@@ -13373,15 +13744,23 @@ begin
       raise EVDbException.Create(ecColumnExists, 'kolon iki kez verildi: ' + ColNames[i]);
     vals[ci] := Values[i];
     provided[ci] := True;
+    if hasMask then mask[ci] := (i < Length(Nulls)) and Nulls[i];
   end;
   
   // verilmemis kolonlara DEFAULT
   for i := 0 to High(vals) do
     if not provided[i] and t.Cols[i].HasDef then
+    begin
       vals[i] := t.Cols[i].Def;
+      if hasMask then mask[i] := False;   // DEFAULT bir degerdir
+    end;
   // M10: IDENTITY + GENERATED kolonlari hesapla.
   ApplyIdentity(t, vals);
   VDbApplyGenerated(t, vals);
+  if hasMask then
+    for i := 0 to High(mask) do
+      if (t.Cols[i].Identity <> 0) or t.Cols[i].Generated then
+        mask[i] := False;
 
   // PK belirleme
   if t.PkIndex < 0 then
@@ -13393,6 +13772,7 @@ begin
   end
   else
   begin
+    if hasMask then mask[t.PkIndex] := False;   // PK NULL olamaz
     pk := vals[t.PkIndex];
     if t.Cols[t.PkIndex].Ctype = VCT_INT then
     begin
@@ -13415,7 +13795,14 @@ begin
   if t.PkIndex >= 0 then pk := vals[t.PkIndex];
   if not VDbCheckOK(vals, t.Checks) then
     raise EVDbException.Create(ecCheckViolation, 'CHECK ihlali: ' + t.Name);
-  CheckFk(t, vals);
+  if hasMask then
+  begin
+    CheckFkEx(t, vals, mask);
+    for i := 0 to High(mask) do
+      if mask[i] then begin anyNull := True; Break; end;
+  end
+  else
+    CheckFk(t, vals);
   
   key := VDbHashKey(t.Name, pk);
   if FKvB.Get(key, b) then
@@ -13426,9 +13813,11 @@ begin
       raise EVDbException.CreateFmt(ecHashCollision, 'VDb: hash carpismasi (%s, %s)', [t.Name, pk]);
   end;
   
-  b := EncodeRow(t.TableId, pk, t, vals);
+  if hasMask then b := EncodeRowEx(t.TableId, pk, t, vals, mask)
+  else b := EncodeRow(t.TableId, pk, t, vals);
   FKvB.Put(key, b);
   IdxAddRow(t, vals, pk, -1);
+  if anyNull then NoteTableNulls(t.Name);
   
   // RETURNING icin donus degerleri
   OutPk := pk;
@@ -13488,10 +13877,11 @@ function TVTableDb.UpsertRowReturning(const Table: string; const ColNames, Value
   const OnConflictTarget: TStrArray;
   const SetValues: TSetValuePairs;
   out OutPk: string; out OutVals: TStrArray;
-  ANotify: TUpsertNotify): Boolean;
+  ANotify: TUpsertNotify; const Nulls: TNulArr): Boolean;
 var
   t: TTableDef;
   vals, existingVals, dummyVals: TStrArray;
+  mask, exMask, dummyMask: TNulArr;
   provided: array of Boolean;
   i, ci, ciTarget: Integer;
   pk: string;
@@ -13505,6 +13895,7 @@ var
   doUpdate: Boolean;
   cfPk: string;
   excl: string;
+  hasMask, anyNull, exMaskOk: Boolean;
 begin
   Result := False;
   OutPk := '';
@@ -13518,6 +13909,15 @@ begin
   SetLength(vals, Length(t.Cols));
   SetLength(provided, Length(t.Cols));
   for i := 0 to High(vals) do begin vals[i] := ''; provided[i] := False; end;
+
+  // F-49 (2c): maske verilmemis kolonlar NULL'dur; verilen kolonlar
+  // maskeyi AYNEN devralir ('' gercek bos metin olabilir).
+  hasMask := (Nulls <> nil) and (Length(Nulls) > 0);
+  if hasMask then
+  begin
+    SetLength(mask, Length(t.Cols));
+    for i := 0 to High(mask) do mask[i] := True;
+  end;
   
   for i := 0 to High(ColNames) do
   begin
@@ -13526,16 +13926,24 @@ begin
     if provided[ci] then
       raise EVDbException.Create(ecColumnExists, 'kolon iki kez verildi: ' + ColNames[i]);
     vals[ci] := Values[i];
+    if hasMask then mask[ci] := (i < Length(Nulls)) and Nulls[i];
     provided[ci] := True;
   end;
   
   // verilmemis kolonlara DEFAULT
   for i := 0 to High(vals) do
     if not provided[i] and t.Cols[i].HasDef then
+    begin
       vals[i] := t.Cols[i].Def;
+      if hasMask then mask[i] := False;   // DEFAULT gercek degerdir
+    end;
   // M10: IDENTITY + GENERATED kolonlari hesapla.
   ApplyIdentity(t, vals);
   VDbApplyGenerated(t, vals);
+  if hasMask then
+    for i := 0 to High(mask) do
+      if (t.Cols[i].Identity <> 0) or t.Cols[i].Generated then
+        mask[i] := False;
 
   // PK belirleme
   if t.PkIndex < 0 then
@@ -13547,6 +13955,7 @@ begin
   end
   else
   begin
+    if hasMask then mask[t.PkIndex] := False;   // PK NULL olamaz
     pk := vals[t.PkIndex];
     if t.Cols[t.PkIndex].Ctype = VCT_INT then
     begin
@@ -13583,7 +13992,15 @@ begin
   if t.PkIndex >= 0 then pk := vals[t.PkIndex];
   if not VDbCheckOK(vals, t.Checks) then
     raise EVDbException.Create(ecCheckViolation, 'CHECK ihlali: ' + t.Name);
-  CheckFk(t, vals);
+  if hasMask then
+  begin
+    CheckFkEx(t, vals, mask);
+    anyNull := False;
+    for i := 0 to High(mask) do
+      if mask[i] then begin anyNull := True; Break; end;
+  end
+  else
+    CheckFk(t, vals);
   
   key := VDbHashKey(t.Name, pk);
   // P-17c: conflict YOKKEN deger ayirmaya gerek yok; Once saf arama.
@@ -13591,7 +14008,13 @@ begin
   
   if conflict then
   begin
-    if DecodeRow(b, exTid, exPk, existingVals) and (exTid = t.TableId) and (exPk = pk) then
+    exMaskOk := False;
+    SetLength(exMask, 0);
+    if not DecodeRowEx(b, exTid, exPk, existingVals, exMask) then
+      raise EVDbException.CreateFmt(ecHashCollision, 'VDb: hash carpismasi (%s, %s)', [t.Name, pk]);
+    if (exTid <> t.TableId) or (exPk <> pk) then
+      raise EVDbException.CreateFmt(ecHashCollision, 'VDb: hash carpismasi (%s, %s)', [t.Name, pk]);
+    exMaskOk := Length(exMask) = Length(t.Cols);
     begin
       // PK conflict bulundu
       case OnConflictAction of
@@ -13621,9 +14044,19 @@ begin
         // MEVCUT satir (existingVals) uzerinden kurulur. Aksi halde
         // SET'te belirtilmeyen kolonlar gelen degerlerle ezilirdi.
         SetLength(dummyVals, Length(t.Cols));
+        SetLength(dummyMask, Length(t.Cols));
         for i := 0 to High(t.Cols) do
-          if i <= High(existingVals) then dummyVals[i] := existingVals[i]
-          else dummyVals[i] := '';
+          if i <= High(existingVals) then
+          begin
+            dummyVals[i] := existingVals[i];
+            // F-49 (2c): eski satirin NULL bitleri korunur.
+            if exMaskOk then dummyMask[i] := exMask[i] else dummyMask[i] := False;
+          end
+          else
+          begin
+            dummyVals[i] := '';
+            dummyMask[i] := False;
+          end;
         for ci := 0 to High(SetValues) do
         begin
           i := SetValues[ci].ColIdx;
@@ -13631,9 +14064,14 @@ begin
             raise EVDbException.Create(ecColumnNotFound,
               'ON CONFLICT DO UPDATE: kolon yok');
           dummyVals[i] := SetValues[ci].Value;
+          dummyMask[i] := SetValues[ci].IsNull;
         end;
         // PK degistirilemez
-        if t.PkIndex >= 0 then dummyVals[t.PkIndex] := pk;
+        if t.PkIndex >= 0 then
+        begin
+          dummyVals[t.PkIndex] := pk;
+          dummyMask[t.PkIndex] := False;
+        end;
         vals := dummyVals;
         // M10: IDENTITY degeri ON CONFLICT DO UPDATE ile degistirilemez.
         VDbCheckIdentityUnchanged(t, existingVals, vals);
@@ -13655,12 +14093,16 @@ begin
         CheckConstraints(t, vals, pk);
         if not VDbCheckOK(vals, t.Checks) then
           raise EVDbException.Create(ecCheckViolation, 'CHECK ihlali: ' + t.Name);
-        CheckFk(t, vals);
+        CheckFkEx(t, vals, dummyMask);
+        anyNull := False;
+        for i := 0 to High(dummyMask) do
+          if dummyMask[i] then begin anyNull := True; Break; end;
 
         // Yeni satir yaz
-        b := EncodeRow(t.TableId, pk, t, vals);
+        b := EncodeRowEx(t.TableId, pk, t, vals, dummyMask);
         FKvB.Put(key, b);
         IdxAddRow(t, vals, pk, -1);
+        if anyNull then NoteTableNulls(t.Name);
 
         { Sprint A (3.3): yazim tamamlandi; AFTER UPDATE ROW tetikleyicileri. }
         if Assigned(ANotify) then
@@ -13671,10 +14113,6 @@ begin
         Result := True;
         Exit;
       end;
-    end
-    else
-    begin
-      raise EVDbException.CreateFmt(ecHashCollision, 'VDb: hash carpismasi (%s, %s)', [t.Name, pk]);
     end;
   end
   else
@@ -13685,7 +14123,13 @@ begin
       karisiyordu). }
     if Assigned(ANotify) then
       ANotify(uupInsertCheck, nil, vals);
-    b := EncodeRow(t.TableId, pk, t, vals);
+    if hasMask then
+    begin
+      b := EncodeRowEx(t.TableId, pk, t, vals, mask);
+      if anyNull then NoteTableNulls(t.Name);
+    end
+    else
+      b := EncodeRow(t.TableId, pk, t, vals);
     FKvB.Put(key, b);
     IdxAddRow(t, vals, pk, -1);
     

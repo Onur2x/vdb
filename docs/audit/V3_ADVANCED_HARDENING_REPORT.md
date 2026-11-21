@@ -1,7 +1,7 @@
 # VDB V3 - Ileri Sertlestirme Raporu (SKILL4)
 
 Tarih: 2026-11-18
-Surum: v3.71 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1 + H + I + J + K + L + M + N + O + P + Q; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
+Surum: v3.72 (Sprint A + B + C + D + F1 + E + B2 + C2 + D2 + E2 + G1 + H + I + J + K + L + M + N + O + P + Q; soak/F-21/F-22 = v3.50; Sprint F belgeleri v3.51)
 Dosya bicimi: **v5** (`VDB_FILE_VER = 5`, degismedi)
 Durus: **BETA CANDIDATE**
 
@@ -55,37 +55,61 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   olarak vardir, v5 motor dosya bicimine **bagli degildir**; ikincil indeksler
   hala bellektedir.
 - **macOS / ARM64 / buyuk-endian**: **not-run** (bolum H).
-- **SKILL6 03 - SQL NULL ile bos metin ayrimi**: **KISMI (asama 1 + 2a yazildi)**.
-  Disk formati bunu zaten kodlayabiliyor (v2/v3 satir govdesinde
-  `lenCode = 0` NULL, `lenCode = 1` sifir uzunluklu metin), ancak bellekteki
-  deger modeli `TStrArray` (duz metin) oldugu icin `DecodeRow` NULL'i `''`
-  yapar ve `EncodeRow` `''`i NULL yazar. `EvalExpr` de `sltNull` icin `''`
-  doner. Asama 1 (v3.71) depolama katmanina maskeyi ekledi: `TNulArr`,
-  `TNullMatrix`, `EncodeRowEx(..., const Nulls)`, `DecodeRowEx(..., out Nulls)`,
-  `ScanRowsEx` / `ScanRowsPartEx(..., out Nulls)`; maske
-  verildiginde `''` artik gercek bos metin olarak yazilir, `NULL` ise
-  `lenCode = 0` kalir. Maske `nil`/bos iken davranis BIT BAZI aynidir; bu yuzden
-  bugun hicbir cagiran maske gecmiyor ve depolanmis veri uzerindeki SQL
-  semantigi DEGISMEDI (`format_compat` 28/0, dosya bicimi degismedi).
-  Asama 2a (v3.71) ifade semantigini duzeltti: `TVSqlExecutor.FCurNulls`
-  (satir maskesi) + `EvalExpr` icin out-of-band `FLastNull`, `sltNull`
-  literal'i artik NULL'dur, NULL operandli aritmetik/karsilastirma UNKNOWN
-  dondurur, `IS NULL` / `IS NOT NULL` `FLastNull`e bakar ve AND/OR icin uc
-  degerli mantik uygulanir (UNKNOWN AND FALSE = FALSE, UNKNOWN OR TRUE =
-  TRUE). Yeni kapi `tests/null_empty` (14 kontrol, NE1-NE14) bunu olcer;
-  on-kapi `c1af8de` uzerinde **11 PASS / 3 FAIL** (NE2 `'' IS NULL` True,
-  NE4 `'' IS NOT NULL` False, NE6 `'' = ''` UNKNOWN) - yani kapi ayirt
-  edicidir. Depolanmis degerler icin kalan is (asama 2b/2c): okuma maskesinin
-  `ExecSelect`/`ExecGroupBy` hattina baglanmasi (`allNulls` -> filtre/RLS/
-  join -> projeksiyon `FLastNull` -> `TSqlResult.RowNulls`), `COUNT(kolon)`,
-  UNIQUE, GROUP BY/DISTINCT, ORDER BY NULLS FIRST/LAST, PG wire `-1`, CSV,
-  `TypedRows` icin `vckNull`; ardindan yeniden-yazan TUM yollar
-  (UPDATE/MERGE/UPSERT/INSERT..SELECT/vacuum/indeks yeniden kurma) maskeyi
-  tasimali ki maskeli yazim acilabilsin. Bu ikisi birlikte yapilmali;
-  yazma yollari maske tasimadan `''` yazimi acilirsa gercek bir bos metin
-  sonraki UPDATE'te NULL'a donusur = veri kaybi. `tests/null_empty`
-  icindeki depolama/aggregate bloklari (`NE20`-`NE44`) bu yuzden
-  `{$IFDEF NE_STORAGE}` arkasinda derlenmiyor.
+- **SKILL6 03 - SQL NULL ile bos metin ayrimi**: **TAMAM (asama 1 + 2a +
+  2b + 2c, v3.72)**. Disk formati bunu zaten kodlayabiliyordu (v2/v3 satir
+  govdesinde `lenCode = 0` NULL, `lenCode = 1` sifir uzunluklu metin), ancak
+  bellekteki deger modeli `TStrArray` (duz metin) oldugu icin `DecodeRow`
+  NULL'i `''` yapiyor ve `EncodeRow` `''`i NULL yaziyordu; `EvalExpr` de
+  `sltNull` icin `''` donuyordu. Dort asama bunu kapatti:
+  - **Asama 1 (v3.71)** depolama maskesi: `TNulArr`/`TNullMatrix`,
+    `EncodeRowEx(..., const Nulls)`, `DecodeRowEx(..., out Nulls)`,
+    `ScanRowsEx`/`ScanRowsPartEx(..., out Nulls)`. Maske verilince `''`
+    gercek bos metin (`lenCode = 1`) yazilir, NULL `lenCode = 0` kalir;
+    maske `nil` iken baytlar BIT BAZI aynidir (dosya bicimi v5 degismedi,
+    `format_compat` 28/0).
+  - **Asama 2a (v3.71)** ifade semantigi: `TVSqlExecutor.FCurNulls` +
+    out-of-band `FLastNull`, `sltNull` artik NULL, NULL operandli
+    aritmetik/karsilastirma UNKNOWN, `IS NULL`/`IS NOT NULL` bayraga bakar,
+    AND/OR uc degerli (UNKNOWN AND FALSE = FALSE, UNKNOWN OR TRUE = TRUE).
+    `EvalBinary`'ye `LNull`/`RNull`/`NullFlagsValid` eklendi ve
+    `VDbCmpValEx(..., EmptyIsValue)` ile ayrim karsilastirmaya tasindi
+    (`VDbCmpVal` bos-metin=NULL sarmalayicisi olarak kaldi).
+  - **Asama 2b (v3.72)** okuma maskesi uctan uca: `ReadRowEx`/
+    `ScanRowsEx`/`ScanRowsPartEx` -> `allNulls` -> filtre/RLS/join ->
+    projeksiyon (`FNarrowNulls`, `FAggNulls`) -> `TSqlResult.RowNulls`.
+    `COUNT(kolon)`, UNIQUE, GROUP BY/DISTINCT, `ORDER BY ... NULLS
+    FIRST/LAST` ve `IS NULL` artik depolanmis degeri maskeden okur.
+  - **Asama 2c (v3.72)** yazma maskesi: `TTableDef.HasNulls` (sema satiri
+    `#N|<tablo>`) NULL tasiyan tabloyu indeks/covered-index/stream/COPY
+    hizli yollarindan genel satir yoluna yonlendirir; `InsertEx`,
+    `InsertReturning`, `UpdateRowInPlace`, `PutRow`, `UpdateWhere`,
+    `UpsertRowReturning`, FK cascade ve `RewriteTable`/`RewriteTableRows`
+    maskeyi tasir. Hizli INSERT seritleri maske tasimadigi icin NULL
+    literal/parametre gorunce genel yola birakir (`VDbNullsAny`), aksi
+    halde NULL ile `''` ayrimi o yolda sessizce kaybolurdu. Parametre
+    maskesi SQL katmanindan gecer: `ParseEx` + `TVSql.Exec(Sql, Params,
+    ParamNulls)` (tek atimlik `FPendParamNulls`), plan onbellegi yeniden
+    baglanir. PG wire NULL'i `-1` olarak yazar (`DataRowMsgFmt(...,
+    Nulls)`, Bind `plen = -1` -> `ParamsNull`).
+  Kapi: `tests/null_empty` **41 PASS / 0 FAIL** (NE1-NE51, suite
+  bayraklari `-MObjFPC -Scghi -O1`); on-kapi `git archive HEAD`
+  (`a30676e`) uzerinde **30 PASS / 11 FAIL** (NE24, NE28, NE31, NE34 ve
+  depolama bloklari) - yani kapi ayirt edicidir. Bu is sirasinda bulunan
+  iki gercek kusur da kapandi: (i) hizli INSERT seritlerinin maskeyi
+  atlayip `T.HasNulls`i hic isaretlememesi (bundan sonra her `''` NULL
+  olarak saklaniyordu = veri kaybi), (ii) `ALTER TABLE ADD COLUMN`in
+  `RewriteTable` icinde `oldNulls` dizisini boyutlandirmamasi
+  (`EAccessViolation`, `sql_matrix` D6; `SetLength(oldNulls, ...)`
+  eklendi).
+  **Durust sinir**: (a) `COPY TO` text/Arrow/Parquet disa aktarimi NULL'i
+  hala `''` yazar (bicimde ayrim yok); (b) covered-index hizli yolu ve
+  projeksiyon oncesi `ORDER BY` siralamasi maskeyi tasimaz, o yollarda
+  NULL `''` gibi gorunur; (c) `ExecGroupBy` `Res.RowNulls`i doldurmaz;
+  (d) 2c oncesi yazilmis satirlar (maske disi) ayirt edilemez - `lenCode
+  = 1` bos metin ile `lenCode = 0` NULL diskte farklidir ama okuyan taraf
+  `HasNulls` bilgisine ancak tablo bir kez maskeli yazildiktan sonra
+  sahip olur. Bu sinirlar veri kaybi degil, gosterim/okuma kapsamidir ve
+  `CI.md`de kayitlidir.
 - **SKILL6 04 - gercek akis (streaming)**: **YAPILMADI**. `MaxPortalResultBytes`
   siniri hala `FSql.Exec` bittikten SONRA denetleniyor (VDbPgWire.pas,
   `ExecutePortal`), yani bellek siniri gercek bir ust sinir degil, sonuc
@@ -151,14 +175,16 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   O(hedef x kaynak) kartezyen dongu olmasi** kapandi (`merge_hash` U1-U9);
   eski yolda 4000 x 2500 satirlik guncelleme **13063 ms** suruyordu, yeni
   hash yolunda **16 ms**.
-  Sprint Q'da **SQL NULL ile bos metnin ayni deger olmasi** kismen kapandi:
-  depolama maskesi (asama 1: `EncodeRowEx`/`DecodeRowEx`/`ScanRowsEx`) ve
+  Sprint Q'da **SQL NULL ile bos metnin ayni deger olmasi** kapandi:
+  depolama maskesi (asama 1: `EncodeRowEx`/`DecodeRowEx`/`ScanRowsEx`),
   ifade semantigi (asama 2a: `FCurNulls`/`FLastNull`, `NULL IS NULL` = TRUE,
-  `'' IS NULL` = FALSE, `NULL = ''` UNKNOWN, `NULL AND FALSE` = FALSE)
-  hazir; yeni `tests/null_empty` kapisi (14 kontrol) on-kapi `c1af8de`
-  uzerinde **11 PASS / 3 FAIL** verirken simdi **14 PASS / 0 FAIL**.
-  Depolanmis degerler icin okuma/yazma maskesinin tum yollara baglanmasi
-  (asama 2b/2c) **hala aciktir** ve `A.2`'de durustce yazilmistir.
+  `'' IS NULL` = FALSE, `NULL = ''` UNKNOWN, `NULL AND FALSE` = FALSE),
+  okuma maskesi (2b: `Res.RowNulls`, `COUNT`/`UNIQUE`/`GROUP BY`/`ORDER BY`/
+  PG wire `-1`) ve yazma maskesi (2c: `HasNulls` + tum yeniden-yazan yollar,
+  `InsertEx`/`UpdateRowInPlace`/`UpsertRowReturning`/`RewriteTable`, parametre
+  maskesi) uctan uca baglandi; `tests/null_empty` kapisi 41 kontrole
+  buyudu ve on-kapi `a30676e` uzerinde **30 PASS / 11 FAIL** verirken simdi
+  **41 PASS / 0 FAIL**.
   Sprint A/B'de kapatilan yetki ve atomiklik kusurlari `A.4`'te.
 - Rol degistirme yetkisi ve SCRAM kullanicisi -> SQL rolu eslemesi (SKILL5
   3.1'in yetki denetimi ve 3.2) Sprint M'de **kapandi** (`sql_authorization`
@@ -195,7 +221,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | N | SKILL6 06: dosya degistirmede (VACUUM/Compact/Restore/Rekey) **dizin fsync'i hic yapilmiyordu**; rename/silme cokme sonrasi kaybolabiliyor, eski WAL geri gelebiliyordu | Tamam | `maint_lock` 19/0 (13 -> 19; ML6-ML7 yeni) |
 | O | SKILL6 05: ag zaman asimi **her recv/send cagrisi icin** ayri uygulaniyordu (damla/drip istemcisi toplam sureyi sinirsiz uzatiyordu); **CancelRequest (80877102) hic islenmiyordu** ve her baglantiya ayni `BackendKeyData(1, 0)` gonderiliyordu | Tamam | `network_limits` 41/0 (26 -> 41; NL9-NL12 yeni), `pg_cancel` 31/0 (yeni, PC0-PC9) |
 | P | SKILL6 07: `UPDATE ... FROM` esitlik birlestirmesi **kaba kuvvet O(hedef x kaynak)** kartezyen donguydu (4000 x 2500 satirda 13063 ms) | Tamam | `merge_hash` 30/0 (19 -> 30; U1-U9 yeni) |
-| Q | SKILL6 03: **SQL NULL ile bos metin ayni degerdi** (`'' IS NULL` TRUE donuyordu, `'' = ''` UNKNOWN cikiyordu); depolama maskesi ve ifade semantigi eklendi, depolanmis degerlerin okuma/yazma maskesi (2b/2c) acik | Kismi (asama 1 + 2a) | `null_empty` 14/0 (yeni, NE1-NE14); on-kapi `c1af8de` 11/3 |
+| Q | SKILL6 03: **SQL NULL ile bos metin ayni degerdi** (`'' IS NULL` TRUE donuyordu, `'' = ''` UNKNOWN cikiyordu, `COUNT(kolon)` NULL satirlari sayiyordu); depolama maskesi (asama 1), ifade semantigi (2a), okuma maskesi (2b) ve yazma maskesi (2c) uctan uca baglandi; hizli INSERT seridi ile `ALTER TABLE ADD COLUMN` kusurlari kapandi | Tamam | `null_empty` 41/0 (14 -> 41; NE20-NE51 yeni); on-kapi `a30676e` 30/11 |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -728,7 +754,7 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   Sprint P (SKILL6 07) yeni kapi dizini eklemedi; `tests/merge_hash`
   kapisini 19 -> **30** kontrole buyuttu (U1-U9), kapi sayisi 54 / 55 kaldi.
   Sprint Q (SKILL6 03) yeni kapi dizini **ekledi**: `tests/null_empty`
-  (14 kontrol, NE1-NE14); sayilar Windows 54 -> **55**, Linux 55 -> **56**.
+  (41 kontrol, NE1-NE51); sayilar Windows 54 -> **55**, Linux 55 -> **56**.
 - Windows `gatesJ` kosusunda `tls_client` **SKIP** oldu: ortamda
   `VDB_CRYPTO_DLL`/`VDB_SSL_DLL` yok. `tls_client` fikstur dizinini
   `VDB_TLS_FIXTURES` ile bulur; degisken verilmezse kapi exe'nin yanindan
@@ -1203,7 +1229,7 @@ tablosundadir. Bu sprintte kapatilanlar:
   spill-to-disk karari hala yok, `UPDATE ... FROM` icinde tek tablo/alt
   sorgu kaynagi disinda (JOIN) parser zaten hata veriyor. V2 ve bicim v5
   degismedi.
-- **F-49 (Orta/Yuksek, KISMI, v3.71; kod etiketi Sprint Q)**: **SQL NULL ile
+- **F-49 (Orta/Yuksek, TAMAM, v3.72; kod etiketi Sprint Q)**: **SQL NULL ile
   bos metin ayni degerdi**. Belirtiler olculdu: `SELECT '' IS NULL` **TRUE**
   donuyordu, `SELECT '' = ''` **UNKNOWN** cikiyordu, `COUNT(kolon)` NULL
   satirlari bos metin sandigi icin yanlis sayiyordu. SKILL6 03. Kok neden iki
@@ -1211,34 +1237,40 @@ tablosundadir. Bu sprintte kapatilanlar:
   yani ifade duzeyinde NULL diye bir sey yoktu; (b) `DecodeRow` diskte
   `lenCode = 0` (NULL) ile `lenCode = 1` + 0 bayt (bos metin) ayrimini
   **okurken atiyor**, `EncodeRow` de `''` yazarken NULL uretiyordu - yani
-  bugun diskte bos metin **hic** yazilamiyordu. Duzeltme iki asamada:
-  **asama 1** depolama maskesi (`TNulArr`/`TNullMatrix`,
-  `EncodeRowEx(..., const Nulls)`, `DecodeRowEx(..., out Nulls)`,
-  `ScanRowsEx`/`ScanRowsPartEx`); maske verilince `''` gercek bos metin
-  (`lenCode = 1`) olarak yazilir, NULL `lenCode = 0` kalir. Maske
-  `nil`/bos iken uretilen baytlar **bit bazi ayni** oldugu icin dosya bicimi
-  ve mevcut davranis degismedi (`format_compat` 28/0). **Asama 2a** ifade
-  semantigi: `TVSqlExecutor.FCurNulls` (su anki satirin NULL maskesi) +
-  `EvalExpr` icin out-of-band `FLastNull` bayragi (deger kanali `string`
-  kaldigi icin NULL ayri tasinir); `sltNull` literal'i artik NULL'dur, NULL
-  operandli aritmetik/karsilastirma UNKNOWN dondurur, `IS NULL` /
-  `IS NOT NULL` `FLastNull`e bakar, AND/OR icin **uc degerli mantik**
-  uygulanir (UNKNOWN AND FALSE = FALSE, UNKNOWN OR TRUE = TRUE), kolon
-  referansi maskeden NULL okur. Kapi: yeni **`tests/null_empty`** 14 kontrol
-  (NE1-NE14) **14 PASS / 0 FAIL**; on-kapi `c1af8de` uzerinde **11 PASS /
-  3 FAIL** (NE2 `'' IS NULL` True, NE4 `'' IS NOT NULL` False, NE6
-  `'' = ''` UNKNOWN) - yani kapi ayirt edici, eski davranisi yakaliyor.
-  **Durust sinir**: `FCurNulls` bugun `ExecSelect`/`ExecGroupBy` hattina
-  **bagli degildir**; `RowMatches`/`EvalBool` de `FLastNull` TRUE iken bunu
-  henuz FALSE'a cevirmiyor. Bu yuzden **depolanmis** NULL'lar icin
-  `COUNT(kolon)`, UNIQUE, GROUP BY/DISTINCT, ORDER BY NULLS FIRST/LAST,
-  PG wire `-1`, CSV ve `TypedRows.vckNull` hala eski (yanlis) davranista.
-  Ayrica yeniden-yazan TUM yollar (UPDATE/MERGE/UPSERT/INSERT..SELECT/
-  vacuum/indeks yeniden kurma) maskeyi tasimadan maskeli **yazim**
-  acilamaz; acilirsa gercek bir bos metin sonraki UPDATE'te NULL'a donusur =
-  veri kaybi. Bu nedenle bu raporda SKILL6 03 **KISMI** olarak isaretlidir ve
-  `tests/null_empty` icindeki `NE20`-`NE44` bloklari
-  `{$IFDEF NE_STORAGE}` arkasinda **derlenmez**. V2 ve bicim v5 degismedi.
+  bugun diskte bos metin **hic** yazilamiyordu. Dort asama bunu kapatti:
+  **asama 1** depolama maskesi (`TNulArr`/`TNullMatrix`, `EncodeRowEx`,
+  `DecodeRowEx`, `ScanRowsEx`/`ScanRowsPartEx`); maske verilince `''` gercek
+  bos metin (`lenCode = 1`) yazilir, NULL `lenCode = 0` kalir; maske `nil`
+  iken baytlar **bit bazi ayni** (`format_compat` 28/0, bicim v5 degismedi).
+  **Asama 2a** ifade semantigi: `FCurNulls` + out-of-band `FLastNull`,
+  `sltNull` NULL, NULL operandli aritmetik/karsilastirma UNKNOWN,
+  `IS NULL`/`IS NOT NULL` bayraga bakar, AND/OR uc degerli, kolon referansi
+  maskeden okur; ayrimi `EvalBinary`'nin `LNull`/`RNull`/`NullFlagsValid`
+  bayraklari ve `VDbCmpValEx(..., EmptyIsValue)` tasir. **Asama 2b** okuma
+  maskesi uctan uca: `ReadRowEx`/`ScanRowsEx` -> filtre/RLS/join ->
+  projeksiyon (`FNarrowNulls`/`FAggNulls`) -> `TSqlResult.RowNulls`; yani
+  `COUNT(kolon)`, UNIQUE, GROUP BY/DISTINCT, `ORDER BY NULLS FIRST/LAST`
+  ve PG wire `-1` depolanmis degeri maskeden okur. **Asama 2c** yazma
+  maskesi: `TTableDef.HasNulls` (sema satiri `#N|<tablo>`) NULL tasiyan
+  tabloyu indeks/covered-index/stream/COPY hizli yollarindan genel satir
+  yoluna yonlendirir; `InsertEx`, `InsertReturning`, `UpdateRowInPlace`,
+  `PutRow`, `UpdateWhere`, `UpsertRowReturning`, FK cascade ve
+  `RewriteTable`/`RewriteTableRows` maskeyi tasir; parametre maskesi
+  `ParseEx` + `TVSql.Exec(Sql, Params, ParamNulls)` ile SQL katmanindan
+  gecer. Kapi: **`tests/null_empty` 41 kontrol (NE1-NE51) 41 PASS / 0
+  FAIL**; on-kapi `git archive HEAD` (`a30676e`) uzerinde **30 PASS / 11
+  FAIL** - yani kapi ayirt edici. Bu is iki gercek kusur daha buldu ve
+  kapatti: (i) hizli INSERT seritleri maske tasimadigi icin NULL literalini
+  `''` yazip `HasNulls`i hic isaretlemiyordu (sonrasinda her `''` NULL
+  olarak saklaniyordu = veri kaybi); serit artik NULL'da genel yola birakir
+  (`VDbNullsAny`). (ii) `ALTER TABLE ADD COLUMN` `RewriteTable` icinde
+  `oldNulls`u boyutlandirmiyordu (`EAccessViolation`; `sql_matrix` D6);
+  `SetLength(oldNulls, ...)` eklendi. **Durust sinir**: `COPY TO`
+  text/Arrow/Parquet NULL'i hala `''` yazar; covered-index hizli yolu ve
+  projeksiyon oncesi `ORDER BY` siralamasi maskeyi tasimaz;
+  `ExecGroupBy` `Res.RowNulls`i doldurmaz; 2c oncesi yazilmis satirlar
+  `HasNulls` isaretlenene kadar eski kurala tabidir. Bunlar gosterim/okuma
+  kapsami olup veri kaybi degildir. V2 ve bicim v5 degismedi.
 
 
 ---

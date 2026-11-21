@@ -15,20 +15,12 @@ program null_empty;
   Bilincli tercih: her kontrol GERCEK bir sorgu sonucu karsilastirir; "kod
   var" demek yetmez. Ayrimin bir katmanda kaybolmasi kapiyi kirmizi yapar.
 
-  KAPSAM (v3.71): yalnizca (A) ifade semantigi ACIK. Bu katman bugun
-  TAM ve kapali: NULL literal, IS NULL/IS NOT NULL, NULL ile '' ayrimi ve
-  uc degerli mantik dogru sonuc veriyor.
-
-  (B) depolama ve (C) kume/siralama bloklari NE_STORAGE tanimliysa
-  derlenir. Bugun DERLENMEZLER cunku okuma maskesi yurutucuye bagli
-  degil: ScanRowsPartEx maskeyi donduruyor (VDbTable, asama 1) ama
-  ExecSelect onu tasimiyor, dolayisiyla depolanmis NULL hala '' olarak
-  gorunuyor. Bu bloklari simdi acmak, kapiciya KIRMIZI bir kapi eklemek
-  olurdu. Acma kosulu: okuma maskesinin ExecSelect/ExecGroupBy hattina
-  baglanmasi VE yeniden-yazan tum yollarin (UPDATE/MERGE/UPSERT/
-  INSERT..SELECT/vacuum/indeks yeniden kurma) maskeyi tasimasi. Ikincisi
-  yapilmadan maskeli YAZIM acilirsa gercek '' bir UPDATE'te NULL'a donusur
-  = veri kaybi. Bu yuzden iki is birlikte yapilmalidir. }
+  KAPSAM (v3.72): (A) ifade semantigi, (B) depolama ve (C) kume/siralama
+  katmanlarinin UCU DE ACIK. Okuma maskesi (ScanRowsPartEx ->
+  ExecSelect -> Res.RowNulls) ve yazma maskesi (INSERT/UPDATE/UPSERT/
+  INSERT..SELECT/COPY/ALTER yeniden yazma) birlikte bagli oldugu icin
+  NE20-NE44 artik kosulsuz derlenir; NULL ile '' arasindaki ayrim
+  yaz/oku/restart/UPDATE dongusunde korunur. }
 {$mode delphi}{$H+}
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
@@ -105,6 +97,40 @@ var
 begin
   s := CellQ(Aq, ASql);
   if not TryStrToInt64(s, Result) then Result := -1;
+end;
+
+{ Sorgunun dondurdugu SATIR sayisi (turetilmis tablo olmadan grup saymak icin). }
+function RowCountQ(Aq: TVSql; const ASql: string): Integer;
+var
+  r: TSqlResult;
+begin
+  Result := -1;
+  try
+    r := Aq.Exec(ASql);
+    Result := Length(r.Rows);
+  except
+    Result := -1;
+  end;
+end;
+
+{ Sonucun birinci kolonunda NULL maskesi True olan satir sayisi. Maske
+  dondurulmediyse (Length(RowNulls) <> Length(Rows)) -1 doner; boylece test
+  maskenin gercekten tasindigini de olcer. }
+function NullMaskQ(Aq: TVSql; const ASql: string): Integer;
+var
+  r: TSqlResult;
+  i: Integer;
+begin
+  Result := -1;
+  try
+    r := Aq.Exec(ASql);
+    if Length(r.RowNulls) <> Length(r.Rows) then Exit;
+    Result := 0;
+    for i := 0 to High(r.Rows) do
+      if (Length(r.RowNulls[i]) > 0) and r.RowNulls[i][0] then Inc(Result);
+  except
+    Result := -1;
+  end;
 end;
 
 function TryExec(Aq: TVSql; const ASql: string; out AErr: string): Boolean;
@@ -209,7 +235,6 @@ begin
 end;
 
 { ---- B) depolama: NULL ile '' yazilip aynen geri okunmali ------------- }
-{$IFDEF NE_STORAGE}
 procedure CaseStorage;
 const
   Q = #39;
@@ -263,10 +288,8 @@ begin
     CellQ(Sq, 'SELECT v IS NULL FROM t WHERE id = 3'));
   CloseAll;
 end;
-{$ENDIF}
 
 { ---- C) kume/siralama: NULL SQL kurallarina gore davranmali ---------- }
-{$IFDEF NE_STORAGE}
 procedure CaseAggregates;
 const
   Q = #39;
@@ -281,6 +304,7 @@ begin
     CloseAll;
     Exit;
   end;
+  Chk('NE40 tablo olusturuldu', True);
   TryExec(Sq, 'INSERT INTO t VALUES (1, ' + Q + 'a' + Q + ', NULL)', err);
   TryExec(Sq, 'INSERT INTO t VALUES (2, ' + Q + 'a' + Q + ', ' + bBos + ')', err);
   TryExec(Sq, 'INSERT INTO t VALUES (3, ' + Q + 'a' + Q + ', ' + Q + 'x' + Q + ')', err);
@@ -290,26 +314,38 @@ begin
   { SQL kurali: COUNT(kolon) NULL'lari saymaz -> 2 (bos metin + 'x') }
   Chk('NE42 COUNT(v) NULL saymaz', IntQ(Sq, 'SELECT COUNT(v) FROM t') = 2,
     IntToStr(IntQ(Sq, 'SELECT COUNT(v) FROM t')));
-  { GROUP BY NULL ile '' ayri gruplar olmali -> 3 grup }
-  Chk('NE43 GROUP BY NULL ile bos metni ayirir',
-    IntQ(Sq, 'SELECT COUNT(*) FROM (SELECT v FROM t GROUP BY v) q') = 3,
-    IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM (SELECT v FROM t GROUP BY v) q')));
+  { GROUP BY NULL ile '' ayri gruplar olmali -> 3 grup. Turetilmis tablo (FROM
+    (SELECT ...) q) bu SQL motorunda yok, bu yuzden grup SAYISINI dogrudan
+    sorgunun satir sayisiyla olcuyoruz. }
+  Chk('NE43 GROUP BY NULL ile bos metni ayirir', RowCountQ(Sq, 'SELECT COUNT(*) FROM t GROUP BY v') = 3,
+    IntToStr(RowCountQ(Sq, 'SELECT COUNT(*) FROM t GROUP BY v')));
   { DISTINCT ayni sekilde 3 ayri deger }
-  Chk('NE44 DISTINCT NULL ile bos metni ayirir',
-    IntQ(Sq, 'SELECT COUNT(*) FROM (SELECT DISTINCT v FROM t) q') = 3,
-    IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM (SELECT DISTINCT v FROM t) q')));
+  Chk('NE44 DISTINCT NULL ile bos metni ayirir', RowCountQ(Sq, 'SELECT DISTINCT v FROM t') = 3,
+    IntToStr(RowCountQ(Sq, 'SELECT DISTINCT v FROM t')));
+  { DISTINCT sonucu NULL maskesini de tasimali: tam olarak 1 NULL satir. }
+  Chk('NE45 DISTINCT sonucunda 1 NULL', NullMaskQ(Sq, 'SELECT DISTINCT v FROM t') = 1,
+    IntToStr(NullMaskQ(Sq, 'SELECT DISTINCT v FROM t')));
+  { Yuklemde ayrim: WHERE v IS NULL yalniz id=1, WHERE v = '' yalniz id=2. }
+  Chk('NE46 WHERE v IS NULL 1 satir', IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE v IS NULL') = 1,
+    IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE v IS NULL')));
+  Chk('NE47 WHERE v = bos metin 1 satir', IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE v = ' + bBos) = 1,
+    IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t WHERE v = ' + bBos)));
+  { INSERT..SELECT maskeyi tasimali: NULL satiri kopyalanirken '' olmamali. }
+  Chk('NE48 INSERT..SELECT icin tablo', TryExec(Sq, 'CREATE TABLE t2 (id INTEGER PRIMARY KEY, v TEXT)', err), err);
+  Chk('NE49 INSERT..SELECT calisti', TryExec(Sq, 'INSERT INTO t2 (id, v) SELECT id, v FROM t', err), err);
+  Chk('NE50 kopyada NULL korundu', IntQ(Sq, 'SELECT COUNT(*) FROM t2 WHERE v IS NULL') = 1,
+    IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t2 WHERE v IS NULL')));
+  Chk('NE51 kopyada bos metin korundu', IntQ(Sq, 'SELECT COUNT(*) FROM t2 WHERE v = ' + bBos) = 1,
+    IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t2 WHERE v = ' + bBos)));
   CloseAll;
 end;
-{$ENDIF}
 
 begin
   GPass := 0;
   GFail := 0;
   CaseLiterals;
-{$IFDEF NE_STORAGE}
   CaseStorage;
   CaseAggregates;
-{$ENDIF}
   WriteLn('SONUC: ', GPass, ' PASS, ', GFail, ' FAIL');
   if GFail > 0 then
     Halt(1);
