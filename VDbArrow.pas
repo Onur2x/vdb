@@ -976,14 +976,19 @@ begin
     8: // Date
       begin
         AF.Ctype := VCT_DATE;
-        AF.TimeUnit := FbInt16(B, FbField(B, TypeTable, 0), 0);
+        // Arrow semasinda Date.unit varsayilani MILLISECOND'dur; pyarrow bu
+        // degeri varsayilana esit oldugunda tabloya hic yazmaz (date64).
+        AF.TimeUnit := FbInt16(B, FbField(B, TypeTable, 0), 1);
         if not (AF.TimeUnit in [0, 1]) then
           raise Exception.Create('Arrow: desteklenmeyen Date birimi');
       end;
     9: // Time
       begin
         AF.Ctype := VCT_TIME;
-        AF.TimeUnit := FbInt16(B, FbField(B, TypeTable, 0), 0);
+        // Arrow semasinda Time.unit varsayilani MILLISECOND'dur (bitWidth 32).
+        // pyarrow time32[ms] icin unit alanini yazmaz; 0 varsaymak saniyeye
+        // dusurup degeri 1000 kat sisiriyordu (time32[s] ise acikca 0 yazar).
+        AF.TimeUnit := FbInt16(B, FbField(B, TypeTable, 0), 1);
         AF.TimeBits := FbInt32(B, FbField(B, TypeTable, 1), 32);
         if not (AF.TimeUnit in [0, 1, 2, 3]) then
           raise Exception.Create('Arrow: desteklenmeyen Time birimi');

@@ -129,17 +129,34 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   spill-to-disk kararlarini icermiyor; `UPDATE ... FROM` icinde esitlik
   conjunct'i yoksa (esitlik-disi WHERE) ve collation/sayisal denklik
   gerektiren durumlarda eski kartezyen yol guvenlik agi olarak duruyor.
-- **SKILL6 08 - dis sistem uyumlulugu**: **YAPILMADI**. Arrow/Parquet
-  aktarimi yalniz kendi kodumuzla gidis-donus olarak test ediliyor; NIST CAVP
-  vektorleri, gercek PostgreSQL istemci matrisi (`psql`, JDBC, psycopg) ve
-  SQLite karsilastirmali olcum yok. Bunlar dis arac/veri gerektirir; bu
-  depoda bagimlilik eklenmemesi kurali geregi ayri bir ortamda kosulmalidir.
+- **SKILL6 08 - dis sistem uyumlulugu**: **TAMAM (v3.73)**. Depoya
+  bagimlilik veya harici DLL **eklenmedi**; harici araclar yalniz depo
+  disindan, dogrulama amaciyla kullanilir ve yoksa kapi 77 (SKIP) doner.
+  (a) **Arrow/Parquet interop** iki katmanda olculur: `interop_format`
+  (saf Pascal, her zaman kosar; VDB<->VDB gidis-donus + depoda duran pyarrow
+  fiksturlerinin her hucresi) ve `interop_external` (pyarrow VDB ciktisini
+  dogrular, pyarrow'un urettigi stream/Parquet/SNAPPY dosyalarini VDB
+  birebir okur, `date64[ms]`/`time32[ms]`/`time64[us|ns]` birimlerini ayri
+  ayri sinar). (b) **Kripto** `crypto_interop` (FIPS 180-4, RFC 4231,
+  RFC 7914/6070, FIPS-197 C.3 ve GCM spesifikasyon vektorleri kaynaga
+  gomulu) ve `crypto_interop_ext` (bagimsiz Python `hashlib`/`hmac`/
+  `pbkdf2_hmac` diferansiyeli) ile dogrulanir. (c) **SQLite
+  karsilastirmasi** `bench_sqlite`: ayni is iki motorda kosar, 12 anahtar
+  uzerinden **sonuc esitligi** dogrulanir, sureler yalniz raporlanir.
+  Bu calisma bir **gercek okuyucu kusuru** buldu ve kapatti (F-51).
+  Durust sinir: iki bicimde de DECIMAL yoktur; VDB Parquet yazarken yalniz
+  UNCOMPRESSED uretir (SNAPPY yalniz okunur); `TStrMatrix` NULL maskesi
+  tasimadigi icin disa aktarimda NULL ve `''` ayni gorunur (belgelenmis
+  sinir, kapi bunu gecmez saymaz); gercek PostgreSQL istemci matrisi
+  (`psql`, JDBC, Npgsql) bu ortamda **kurulu degildir ve kosmadi** -
+  `server_version = 14.0` bir uyumluluk sertifikasi **degildir**.
 
 ### A.3 Mevcut V3 durumu
 
-- Iki platformda tam kapi seti yesil: **Windows i386 55 kapi**, **Linux
-  x86_64 56 kapi**, FAIL 0 (v3.72 kosulari: `gatesO.log` / `linO.log`;
-  Linux'ta `tls_client` gercekten kosar - 6/0, Windows'ta SKIP).
+- Iki platformda tam kapi seti yesil: **Windows i386 60 PASS**, **Linux
+  x86_64 60 PASS**, FAIL 0 (v3.73 kosulari: `gatesP.log` / `linP.log`;
+  Linux'ta `tls_client` gercekten kosar - 6/0, Windows'ta SKIP;
+  Linux'ta `interop_external` pyarrow yoklugundan SKIP).
   Windows'ta `tls_client` bu ortamda **SKIP** oldu (OpenSSL DLL'i yok);
   kostugu kosu `gatesE.log`'dur. SKIP PASS sayilmaz (ayrinti: `CI.md`).
 - Acik kritik hata yok. Kapatilan son gercek kusurlar: F-21/F-22 veri
@@ -228,6 +245,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | P | SKILL6 07: `UPDATE ... FROM` esitlik birlestirmesi **kaba kuvvet O(hedef x kaynak)** kartezyen donguydu (4000 x 2500 satirda 13063 ms) | Tamam | `merge_hash` 30/0 (19 -> 30; U1-U9 yeni) |
 | Q | SKILL6 03: **SQL NULL ile bos metin ayni degerdi** (`'' IS NULL` TRUE donuyordu, `'' = ''` UNKNOWN cikiyordu, `COUNT(kolon)` NULL satirlari sayiyordu); depolama maskesi (asama 1), ifade semantigi (2a), okuma maskesi (2b) ve yazma maskesi (2c) uctan uca baglandi; hizli INSERT seridi ile `ALTER TABLE ADD COLUMN` kusurlari kapandi | Tamam | `null_empty` 41/0 (14 -> 41; NE20-NE51 yeni); on-kapi `a30676e` 30/11 |
 | R | SKILL6 04: portal **tek seferde maddeselestiriyordu** (maxRows yalniz dilimleme; COPY OUT tam sonuc bellekte); gercek satir yineleyicisi yoktu | Tamam | `pg_portal_stream` 35/0 (22 -> 35; PS0, PS1-PS10 yeni); on-kapi `e31d186` 33/2 (dusen: PS4, PS7a) |
+| S | SKILL6 08: Arrow okuyucu `Date.unit`/`Time.unit` sema varsayilanini **SECOND/DAY** saniyordu; Arrow semasinda varsayilan MILLISECOND oldugu icin pyarrow `date64[ms]`/`time32[ms]` icin `unit` alanini **hic yazmaz** ve VDB degeri 1000 kat kaydiriyordu (`00:00:00`, `0000-00-00`). Ayrica Arrow/Parquet, bagimsiz kripto ve SQLite uyumlulugu icin kalici kapi yoktu (yalniz kendi kodumuzla gidis-donus) | Tamam | `interop_format` 21/0, `interop_external` 8/0 (on-kapi **6/2**, ayirt edici X4+X8), `crypto_interop` 33/0, `crypto_interop_ext` 25/0, `bench_sqlite` 24/0; F-51 |
 
 Sprint A gercek kusurlari kapatti: baglanti artik yetkisiz baslamaz (global
 `FSessionId` yetki kaynagi degil, yalniz LOGIN sayaci); `admin/admin123`
@@ -763,13 +781,20 @@ kripto" iddiasi yoktur. Provider secimi yetenek degistirir; operator
   kapisini 19 -> **30** kontrole buyuttu (U1-U9), kapi sayisi 54 / 55 kaldi.
   Sprint Q (SKILL6 03) yeni kapi dizini **ekledi**: `tests/null_empty`
   (41 kontrol, NE1-NE51); sayilar Windows 54 -> **55**, Linux 55 -> **56**.
+  Sprint S (SKILL6 08) **bes** yeni kapi dizini ekledi:
+  `tests/interop_format` (21 kontrol), `tests/interop_external` (8),
+  `tests/crypto_interop` (33), `tests/crypto_interop_ext` (25) ve
+  `tests/bench_sqlite` (24); kosan kapi sayisi Windows 55 -> **60**, Linux
+  56 -> **60** (Linux'ta `interop_external` pyarrow yoklugundan SKIP olur ve
+  kosan sayisina eklenmez).
 - Windows `gatesJ` kosusunda `tls_client` **SKIP** oldu: ortamda
   `VDB_CRYPTO_DLL`/`VDB_SSL_DLL` yok. `tls_client` fikstur dizinini
   `VDB_TLS_FIXTURES` ile bulur; degisken verilmezse kapi exe'nin yanindan
   arar ve bulamaz (daha once ilk denemede FAIL, degisken verilince SKIP).
   Linux'ta fikstur otomatik bulundu ve kapi **kostu**: 6/6 PASS. Windows'ta
   `tls_client`'in kostugu kosu `gatesE.log`'dur (DLL'ler o ortamda vardi).
-  Iki ortam arasindaki bu fark kapi sayisini 55/56 yapar; SKIP PASS sayilmaz.
+  Iki ortam arasindaki bu fark kosan kapi sayisini **60/60** yapar (her iki
+  platformda 3 SKIP; SKIP PASS sayilmaz).
 - **NOT-RUN** satirlari "kosmuyor" degil "olculmedi" demektir; bu raporda
   PASS sayilmaz.
 
@@ -1320,6 +1345,36 @@ tablosundadir. Bu sprintte kapatilanlar:
   adimda 25 tekil satir beklenirken 24 gelir). Diger 33 kontrol
   koruyucudur (HEAD'de de gecer). V2 ve bicim v5 degismedi.
 
+- **F-51 (ORTA, TAMAM, v3.73; kod etiketi SKILL6 08)**: **Arrow okuyucu
+  `date64[ms]` ve `time32[ms]` degerlerini 1000 kat kaydiriyordu.** Arrow
+  duz (flatbuffer) semasinda `Date.unit` ve `Time.unit` alanlarinin
+  varsayilani **MILLISECOND (1)**, `Time.bitWidth` varsayilani 32'dir. Bir
+  flatbuffer yazici varsayilana **esit** alani yazmadigi icin pyarrow
+  `date64[ms]`/`time32[ms]` icin `unit` alanini **hic yazmaz** (Time/Date
+  tablosu bos: 4 baytlik tablo + `04 00 04 00` vtable), `time32[s]` ve
+  `date32[day]` icin ise **acik** `unit=0` yazar. `VDbArrow.pas`
+  `ArrowParseType` varsayilani `0` (SECOND / DAY) aliyordu: `time32[ms]`
+  degeri 43.200.000 ms, 43.200.000 **saniye** gibi okunuyor (`00:00:00`,
+  satir basina +1000 s) ve `date64[ms]` epoch-ms degeri **gun** sayiliyordu
+  (`0000-00-00` / `1971-02-17`). `Timestamp.unit` alaninin semada varsayilani
+  **yoktur**, o yuzden her zaman yazilir ve timestamp kolu hep dogruydu;
+  Parquet yolu etkilenmiyordu. Kanit: bayt tarayicisi `t32ms.arrow` icin
+  `table@92 vt=88 len=4 tlen=4 ents=[]` (bos), `t32s.arrow` icin
+  `ents=[6] f0@102=0` (acik SECOND); enstrumante birim kopyasi
+  `DBGP typeTable=100 f0=0 f1=0` yazdi, yani `FbField` bos tabloda 0 donup
+  varsayilan kullanildi. **Duzeltme**: `ArrowParseType` icinde `8: // Date`
+  ve `9: // Time` dallari `AF.TimeUnit := FbInt16(B, FbField(B, TypeTable,
+  0), 1)` kullanir; `10: // Timestamp` varsayilanda kalir. **VDB'nin kendi
+  yazdigi dosyalar etkilenmez**: `TFbNode.AddScalar` slotu kosulsuz ekler ve
+  `MakeTypeTable` DATE/TIME icin `unit=0` alanini acikca yazar, yani
+  gidis-donus hala SECOND/DAY'dir. Kapi: `tests/interop_external` **8/0**
+  (X1-X8; X8 bes birimi tek tek sinar); on-kapi (`git archive HEAD` =
+  `16b0b09`, HEAD `VDbArrow.pas` birim yolunda one alinarak) **6 PASS /
+  2 FAIL** - **ayirt edici X4** (`at 0=00:00:00`) ve **X8** (`alan 0 satir
+  0=0000-00-00 beklenen=2026-03-01`), diger alti kontrol koruyucudur.
+  `interop_format` 21/0 ve `format_compat` 28/0 degismedi (bicim v5 bit
+  bazi ayni).
+
 
 ---
 
@@ -1330,7 +1385,7 @@ tablosundadir. Bu sprintte kapatilanlar:
 Gerekce:
 
 1. Kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici bir
-   regresyon kapisiyla kilitlendi; iki platformda **55/56** kapi yesil, FAIL 0.
+   regresyon kapisiyla kilitlendi; iki platformda **60/60** kapi yesil, FAIL 0.
 2. Tek dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari,
    bozuk ag girdisi, disk dolu, bellek tukenmesi, WAL sert tavani, B+Tree
    olcek/parcalanma, SQL 100k/1M olcegi, SQL indeks olcegi ve VACUUM geri

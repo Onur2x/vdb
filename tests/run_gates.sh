@@ -175,6 +175,11 @@ build_gate sql_scale      "$ROOT/tests/sql_scale/sql_scale.lpr"
 build_gate sql_index_scale "$ROOT/tests/sql_index_scale/sql_index_scale.lpr"
 build_gate soak          "$ROOT/tests/soak/soak.lpr"
 build_gate tls_client    "$ROOT/tests/tls_client/tls_client_gate.lpr"
+build_gate interop_format "$ROOT/tests/interop_format/interop_format.lpr"
+build_gate interop_external "$ROOT/tests/interop_external/interop_external.lpr"
+build_gate crypto_interop "$ROOT/tests/crypto_interop/crypto_interop.lpr"
+build_gate crypto_interop_ext "$ROOT/tests/crypto_interop_ext/crypto_interop_ext.lpr"
+build_gate bench_sqlite  "$ROOT/tests/bench_sqlite/bench_sqlite.lpr"
 
 # --- kosum -----------------------------------------------------------
 unset VDB_CRYPTO_PROVIDER 2>/dev/null || true
@@ -236,6 +241,20 @@ run_gate btree_disk     "$WORK/btree_disk"     btree_disk
 run_gate sql_scale      "$WORK/sql_scale"      sql_scale
 run_gate sql_index_scale "$WORK/sql_index_scale" sql_index_scale
 run_gate soak           "$WORK/soak"           soak
+
+# SKILL6 08: interop / kripto / bench kapilari.
+# Dis arac (pyarrow) gerektiren kapilar arac yoksa 77 ile SKIP verir ve
+# ASLA PASS sayilmaz. pyarrow depo disinda bir dizindeyse VDB_PY_LIBS ile
+# gosterilebilir; VDB_INTEROP_PY ile yorumlayici secilebilir.
+run_gate interop_format "$WORK/interop_format" interop_format \
+  "$(npath "$ROOT/tests/interop_format/fixtures")"
+run_gate interop_external "$WORK/interop_external" interop_external \
+  "$(npath "$WORK/interop_external")" "$(npath "$ROOT/tests/interop_external")"
+run_gate crypto_interop "$WORK/crypto_interop" crypto_interop
+run_gate crypto_interop_ext "$WORK/crypto_interop_ext" crypto_interop_ext \
+  "$(npath "$ROOT/tests/crypto_interop_ext")"
+run_gate bench_sqlite   "$WORK/bench_sqlite"   bench_sqlite \
+  "$(npath "$WORK/bench_sqlite")" "$(npath "$ROOT/tests/bench_sqlite")"
 
 run_gate selftest_builtin "$WORK/crypto_selftest" selftest_runner builtin
 

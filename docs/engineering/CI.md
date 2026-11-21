@@ -73,6 +73,11 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `sql_scale` | **SQL yurutucu olcek olcumu** (SKILL4 §4): iki kademe - 100.000 satir `t(id INTEGER PRIMARY KEY, b INTEGER, v TEXT)` ve 1.000.000 satir `m(id INTEGER PRIMARY KEY, v TEXT)` - uzerinde SS1-SS20 (34 kontrol, iki platformda ayni satir/deger, yalniz sureler farkli). Kapsam: toplu yukleme + `COUNT`, nokta okuma, `WHERE` + projeksiyon, `ORDER BY`/`LIMIT`, `OFFSET`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY` + `HAVING`, 100 satirlik boyut tablosuyla `JOIN`, 1000 satirlik `UPDATE` ve `DELETE`, 300 karisik insert/update/delete, 5000 satirlik islem `COMMIT`/`ROLLBACK` (hayalet satir yok), yeniden acilis + tam `VERIFY`, ve 1M uzerinde LIMIT'li/LIMIT'siz okuma. Olculen: 100k ekleme 656 ms (Windows i386) / 1213 ms (Linux x86_64), dosya 3.997.696 B; 1M ekleme 6547/11849 ms, dosya 37.543.936 B, yigin deltasi 43.084/43.704 KB; 1M LIMIT'siz `SELECT *` 516/900 ms (tum 1M satir doner ve ilk/orta/son deger tek tek dogrulanir), 1M `ORDER BY id LIMIT 100` 859/1212 ms. **Durust olcum siniri**: `yigin_delta_kb` `GetHeapStatus.TotalAllocated` deltasidir, RSS degildir ve blok yeniden kullanimi onu etkiler; aletin kor olmadigi SS20'de 8 MB ayirma ile kanitlanir (7812 KB olculdu). Sonuc kumesi tavani `VDB_MAX_RESULT_ROWS` = 2.000.000'dir (v3.37) ve bu kapida tavanin **altinda** olculur; tavanin ustunu maddelestirmek 32-bit kapida ~GB bellek ister, o yol `tests/limits` L4 ile kapsanir - bu, "2M satir ureten kapi" demek degildir. LIMIT'siz tam taramanin kok nedeni arastirilmadi ve akis (streaming) yoktur. Kapi yeni motor kusuru bulmadi; tek duzeltme kapinin kendi olcum aletiydi (olu `TotalCommitted` metrigi kaldirildi). Bkz. `docs/engineering/SQL_SCALE.md`. |
 | `sql_index_scale` | **SQL indeks olcegi** (SKILL4 §6): 100.000 ve 1.000.000 satirlik tablolarda IX1-IX20 (45 kontrol, iki platformda birebir ayni). Kapsam: birincil anahtar nokta okumasi ve plani (`Index Scan using t_pkey`), indekssiz plan (`Seq Scan`), `CREATE INDEX` ile ikincil indekste esitlik/aralik sorgusu (`Index Only Scan using ix_t_w`), mukerrer anahtar reddi (`ecUniqueViolation`) ve hayalet satir olmamasi, mukerrer `UPDATE` reddi, indeks uzerinden gorunen `UPDATE`/`DELETE`, 300 karisik insert/update/delete, `REINDEX`, `VACUUM`, `VACUUM` ve yeniden acilis sonrasi dogruluk, tam `VERIFY`, `SHOW INDEXES FROM t`, tablo adi olmadan `SHOW INDEXES` icin `ecSyntaxError` (F-19 duzeltmesi), `.odb.idx` yan dosyasinin bozulmasinda veri kaybi olmadan tarama ile dogru sonuc. Olculen (Windows/Linux): 1M `CREATE INDEX ix_m_v` 1016/1700 ms, 1M indeksten nokta okuma 0/1 ms, yeniden acilis sonrasi ilk indeksli sorgu 1203/1586 ms, indeks basina satir maliyeti 24/49 B, `.odb.idx` 1M icin 10.985.254 B (iki platformda ayni). **Durust sinir**: `yigin_delta_kb` `TotalAllocated` deltasidir, RSS degildir ve 100k indeks kurulumunda Windows'ta **-104 KB** cikti (ayirici bloklari yeniden kullandi), bu yuzden yalnizca 1M satir basina maliyet raporlanir. Ikincil indeksler hala bellekteki `FMemIdx`/`TVDbBTree` icindedir, `.odb.idx` yalnizca yeniden uretilebilir bir onbellektir (veri kaynagi degildir) ve `VDbBTreeDisk.pas` v5 motor dosya bicimine bagli degildir; bu kapi disk indeks olcmez. `.idx` varsayilan silme davranisi degismedi, kapi `KeepIdxOnClose` ile acik katilir. Bkz. `docs/engineering/DISK_BTREE_DESIGN.md`. |
 | `soak` | **gomulu motor soak kapisi** (SKILL4 §7, E): acik `TVDbBackendV3` uzerinde 2000 canli satirlik tablo ile tur bazli churn (her tur 100 ekle + en eski 100 sil + bir guncelleme) kosar; varsayilan sure `VDB_SOAK_SECONDS` = 25 sn (5..86400), `VDB_SOAK_CP` her N turda zorunlu `Checkpoint(True)`, `VDB_SOAK_REOPEN` her N turda kapat/ac. Her turda orneklenen metrikler: heap (`TotalAllocated` deltasi, RSS **degil**), dosya tanitici/sap, is parcacigi, WAL bayti, dizin bayti, gecikme p50/p95. SO1-SO17 (20 kontrol): isinma sayimi, son canli sayim, sifir is yuku hatasi, >= 5 ornek, heap ilk/son pencere ortalama buyumesi <= 8192 KB, FD/sap ortalama buyumesi <= 4, is parcacigi ortalamasi <= 2, sabit is yukunde dosya buyumesi <= 8 MB, p95 <= 20000 ms, WAL tavani, kapanista tam `VERIFY`, yeniden acilis sayimi, son eklenen satirin okunmasi, soak tamamlanmasi, **SO15a-d** dizin doygunlugu (F-21 regresyonu: 200 canli satir, 40 tur x 20 ekle/sil, hata yok, yeniden acilista okunur) ve **SO16/SO17** uc sayimin tutarliligi (F-22 regresyonu: `COUNT(*)` == `COUNT(*) WHERE id > 0` == `COUNT(DISTINCT id)`, checkpoint ve yeniden acilis sonrasi). **Durust sinir**: bu bir **gomulu motor** soak'idir, ag sunucusu soak'i degildir; kapi 25 sn kosar ve gercek 1 saat / 6 saat / 24 saat soak **kosulmadi**, bu yuzden uzun sureli kaynak sizintisi iddia edilemez; heap olcusu RSS degildir. Kapi iki gercek motor kusuru buldu ve duzeltti: **F-21** (dizin doygunlugunda `Insert` sessizce `False` donuyordu) ve **F-22** (serbest listedeki sayfa yeniden acilista heap sayfasi olarak dizine ekleniyor, sonra `AllocPage` tarafindan sifirlanarak canli satirlar sessizce siliniyordu) |
+| `interop_format` | **Arrow/Parquet bicim uyumlulugu, saf Pascal** (SKILL6 08): F0-F16, **21 kontrol**. Dis arac yoktur, her zaman kosar. (a) VDB kendi yazdigi Arrow IPC stream ve Parquet dosyalarini birebir geri okur (tum tipler: int/float/str/bool/date/datetime/time/blob, NULL ve bos metin dahil), yeniden acilista ayni degerler gelir. (b) Depoda **duran** pyarrow uretimi fiksturler (`tests/interop_format/fixtures/ext.arrow`, `ext.parquet`, `ext_snappy.parquet`; 50 satir x 7 kolon, 3 batch / 3 row group) VDB tarafindan okunur ve **her hucre** beklenen degere karsi dogrulanir (F15a/F15b/F15c). Fiksturler devingen veridir (uretim betigi `generate_fixtures.py` kayitta kalir). On-kapi (`git archive HEAD` = `16b0b09`) **21/0**; bu kapi **koruyucudur** (fiksturlerde TIME/date64 kolonu yok, ayirt edici kontrolu yoktur). Durust sinir: iki bicimde de DECIMAL yoktur; VDB Parquet yazarken yalniz UNCOMPRESSED uretir (SNAPPY yalniz okunur, saf Pascal ile uygulanmistir) |
+| `interop_external` | **pyarrow ile karsilikli dogrulama** (SKILL6 08): X1-X8, **8 kontrol**. (a) VDB'nin urettigi Arrow/Parquet dosyalarini **pyarrow** (harici, depo disi) acar ve hucre hucre dogrular (X1/X2). (b) pyarrow harici dosyalari uretir (`ext_vdb.arrow` 2 batch, `ext_vdb.parquet` NONE + `row_group_size=2`, `ext_vdb_snappy.parquet`) ve VDB bunlari birebir okur (X3-X6). (c) X7 NULL ile gercek `''` sinirini **belgeler**: `TStrMatrix` NULL maskesi tasimadigi icin ikisi de `''` olarak gelir. (d) X8 `date64[ms]`, `time32[s]`, `time32[ms]`, `time64[us]`, `time64[ns]` birimlerini tek tek dogrular. **Bu kapi bir gercek kusur buldu ve kapatti**: Arrow semasinda `Date.unit`/`Time.unit` varsayilani MILLISECOND oldugu icin pyarrow `date64[ms]`/`time32[ms]` icin `unit` alanini **hic yazmaz**; okuyucu varsayilani SECOND/DAY sanip degeri 1000 kat kaydiriyordu (`00:00:00`, `0000-00-00`). `VDbArrow.pas` `ArrowParseType` artik Date/Time icin varsayilan `1` (MILLISECOND) kullanir (F-51). On-kapi (`git archive HEAD`, HEAD `VDbArrow.pas` birim yolu one alinarak) **6 PASS / 2 FAIL**; **ayirt edici olan X4 ve X8**dir. Python+pyarrow yoksa kapi **77 (SKIP)** doner ve PASS sayilmaz; `VDB_INTEROP_PY` (yorumlayici) ve `VDB_PY_LIBS` (depo disi pyarrow dizini) ile yol verilebilir |
+| `crypto_interop` | **yayinlanmis kripto vektorleriyle saf Pascal dogrulama** (SKILL6 08): **33 kontrol**. Vektorler Pascal kaynagina gomuludur (harici dosya/DLL yok): FIPS 180-4 SHA-256, RFC 4231 HMAC-SHA256 (1, 2, 3, 4, 5, 6, 7 ve 64 baytlik anahtar; >64 bayt anahtar RFC 8018'den bilincli sapma olarak **reddedilir**), RFC 7914 scrypt/PBKDF2-SHA256 ve RFC 6070 PBKDF2 test vektorleri, FIPS-197 Ek C.3 AES-128, NIST GCM spesifikasyonu ornekleri (GCM15/GCM16/GCM17, 64 baytlik ek veri dahil). Beklenen etiket/deger sabitleri bagimsiz Python ile bir kez dogrulanmistir. On-kapi (`git archive HEAD` = `16b0b09`) **33/0** - bu commit kripto modulune dokunmadigi icin kapi **koruyucudur** |
+| `crypto_interop_ext` | **bagimsiz Python kripto diferansiyeli** (SKILL6 08): CE0-CE24, **25 kontrol**. `hashlib`, `hmac`, `hashlib.pbkdf2_hmac` (harici, depo disi) ile ayni girdiler uzerinde VDB'nin saf Pascal ciktisi karsilastirilir; sabit vektorun disinda rastgele olmayan ama farkli uzunluklarda girdiler de kapsanir. CE24 **64 bayttan uzun parola reddini** olcer (fail-closed; RFC 8018'den bilincli sapma, ADR 6). Python yoksa **77 (SKIP)**, PASS sayilmaz. On-kapi **25/0** - **koruyucu** |
+| `bench_sqlite` | **VDB - SQLite karsilastirmali olcum** (SKILL6 08): **24 kontrol**. Ayni is iki motorda kosar (VDB + Python standart `sqlite3`), sonuclar **is birebir esit mi** diye 12 anahtar uzerinden dogrulanir (satir sayilari, toplamlar, aralik/nokta sonuclari); hiz **yalniz raporlanir**. Olculen (Windows i386, SQLite 3.50.4, WAL): sema 4/3 ms, 20k ekleme 45/5, indeks 8/1, 1000 nokta okuma 67/4, 50 aralik 132/3, group by 2/1, join 351/0, update 5/1, tam tarama 2/0, delete 9/0; DB boyu 229376 (VDB dizin agaci) / 167936 (sqlite dosyasi) bayt. Linux x86_64 (SQLite 3.37.2): 5/2, 105/4, 9/1, 13/4, 108/3, 2/1, 57/0, 7/0, 1/0, 8/0; ayni DB boyu. Her kosu `NOT: bu sayilar tek bir kosunun olcumudur; ustunluk iddiasi yoktur.` satirini yazar. Python yoksa **77 (SKIP)**. On-kapi **24/0** - **koruyucu** (bu commit motor olcum yoluna dokunmaz) |
 | `auth_throttle` | SCRAM deneme sinirlama/kilit |
 | `selftest_builtin` | provider SelfTest (builtin) |
 | `tls_client` | istemci CA + sunucu adi dogrulamasi (OpenSSL varsa) |
@@ -82,6 +87,11 @@ Kosullu kapilar:
 - `fixtures_openssl`, `selftest_openssl`: yalniz `VDB_CRYPTO_DLL` verilmisse.
 - `tls_client`: OpenSSL yuklenemezse kapi **77** ile kendini atlar
   (`SKIP`); bu "gecti" sayilmaz, kosan kapi sayisina da eklenmez.
+- `interop_external`, `crypto_interop_ext`, `bench_sqlite`: Python (ve
+  `interop_external` icin pyarrow) bulunamazsa kapi **77** ile atlar.
+  `VDB_INTEROP_PY` yorumlayicinin yolunu, `VDB_PY_LIBS` depo disindaki
+  pyarrow dizinini gosterir. Bu kapilar da PASS sayilmaz; araclar depoya
+  **bagimlilik olarak eklenmez**.
 
 ## 3. CI matrisi
 
@@ -1671,3 +1681,44 @@ kaldirildi:
     isaretlenene kadar eski kurala (`''` = NULL) tabidir. Bunlar
     gosterim/okuma kapsamidir, veri kaybi degildir.
     `format_compat` 28/0: dosya bicimi (v5) bit bazi degismedi.
+
+- Elli altinci kosu (v3.73, SKILL6 08 - dis sistem uyumlulugu: Arrow/Parquet
+  interop, bagimsiz kripto dogrulamasi, SQLite karsilastirmasi): **Windows
+  i386 60 PASS**, **Linux x86_64 60 PASS**, FAIL 0, `SUITE_EXIT=0`
+  (`gatesP.log` / `linP.log`). Iki platformda da `fixtures_openssl`,
+  `selftest_openssl` SKIP (`VDB_CRYPTO_DLL` yok); Windows'ta `tls_client`
+  da SKIP, Linux'ta `tls_client` 6/0 kosar; Linux'ta ayrica
+  `interop_external` SKIP (pyarrow yok). SKIP PASS sayilmaz ve kosan kapi
+  sayisina eklenmez (`KOSAN KAPI: 60` her iki platformda; Linux'ta bir
+  kapi daha kayitli olup SKIP olmustur).
+  - **Yeni kapilar (5)**: `interop_format` 21/0, `interop_external` 8/0,
+    `crypto_interop` 33/0, `crypto_interop_ext` 25/0, `bench_sqlite` 24/0.
+    Kosan kapi sayisi Windows 55 -> **60**, Linux 56 -> **60** (Linux'ta
+    `interop_external` SKIP).
+  - **Bulunan ve kapatilan gercek kusur (F-51)**: Arrow semasinda
+    `Date.unit`/`Time.unit` varsayilani MILLISECOND'dir, bu yuzden pyarrow
+    `date64[ms]`/`time32[ms]` icin `unit` alanini **hic yazmaz**; okuyucu
+    varsayilani SECOND/DAY sanip degeri 1000 kat kaydiriyordu
+    (`00:00:00`, `0000-00-00`, `1971-02-17`). `VDbArrow.pas`
+    `ArrowParseType` Date/Time icin varsayilan **1** kullanir. VDB'nin
+    kendi yazdigi dosyalar etkilenmez (`MakeTypeTable` `unit=0` alanini
+    acikca yazar); `format_compat` 28/0 ve `interop_format` 21/0 degismedi.
+  - **On-kapi**: `git archive HEAD` = `16b0b09`, degisen tek uretim dosyasi
+    `VDbArrow.pas` icin HEAD kopyasi birim yolunda **one** alinarak
+    derlendi. `interop_format` 21/0, `crypto_interop` 33/0,
+    `crypto_interop_ext` 25/0, `bench_sqlite` 24/0 -> **koruyucu**;
+    `interop_external` **6 PASS / 2 FAIL** -> **ayirt edici X4 ve X8**.
+    Yani bos yesil degildir: bir ayirt edici kapi, kusurun duzeltilmedigi
+    kaynakta gercekten duser.
+  - **Durust sinir (SKILL6 08)**: (a) iki bicimde de DECIMAL yoktur ve VDB
+    Parquet yazarken yalniz UNCOMPRESSED uretir (SNAPPY yalniz okunur,
+    saf Pascal uygulamasidir); (b) `TStrMatrix` NULL maskesi tasimadigi
+    icin disa aktarimda NULL ve `''` ayni gorunur (X7 bunu **belgeler**,
+    gecmez demez); (c) pyarrow, Python `hashlib`/`hmac`/`sqlite3` yalniz
+    depo **disindan** kullanilir - depo bagimliligi veya harici DLL
+    eklenmedi; araclar yoksa ilgili kapi **77 (SKIP)** doner ve PASS
+    sayilmaz; (d) `bench_sqlite` hiz **ustunlugu iddia etmez**, yalniz ayni
+    isin ayni sonucu verdigini ve olculen sureleri yazar; (e) gercek
+    PostgreSQL istemcileri (`psql`, JDBC, Npgsql) bu ortamda **yoktur**,
+    bu yuzden istemci matrisi kosmadi - `server_version = 14.0` bir
+    **uyumluluk sertifikasi degil**, yalniz bildirilen degerdir.

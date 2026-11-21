@@ -75,6 +75,9 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 
 | F50 | **ORTA** | **PG portal ve COPY OUT gercek satir akisi yoktu** (kod etiketleri **Sprint R**; SKILL6 04). Dosyalar: `VDbExecutor.pas` (`TVdbRowCursor`; `TryStreamSelectChunk`; `TryStreamSelect`/`TryStreamProbe`; `ExecSelectForCursor`; `VdbStreamSelCb` parca/geri-basinc alanlari), `VDbSql.pas` (`TVdbRowCursor` alias, `TVSql.OpenCursor`), `VDbPgWire.pas` (`VDB_PORTAL_CHUNK`, `TPgPortal.Cur`/`BufPos`/`Bytes`, `ExecutePortal`/`PullPortalChunk`/`PortalCellBytes`, `Describe`, `COPY OUT`), `VDbTable.pas` (`CreateTable`: `HasNulls` baslatma). | Onceden portal `Execute` sonucu **tamamen** maddeselestirip yalniz `maxRows` kadarini dilimliyor, `COPY OUT` da tam sonucu bellekte kuruyordu; `maxRows` bellek siniri degildi ve F40'in "gercek streaming degildir" siniri acikti. Artik `TVdbRowCursor` **sayfa pencereli parca** uretir: `TryStreamSelectChunk(Stmt, td, Cursor, AResumePage, ASkipQual, AMaxRows, out Res)`; `ExecSelect` tek `TryStreamProbe` cagrisi yapar (tek tarama). Devam `FResumePage`/`FSkipQual` ile ayni sayfadan surer: onceki sayfalar `zSkip[]`, devam sayfasinda ilk `FSkipQual` geri cagri sayacla gecirilir. `ctx.Offset := 0; ctx.Limit := -1`; OFFSET/LIMIT'i imlec uygular. Portal parcasi 256 satir; `MaxPortalResultBytes` her parcada ve imlecte canli bayt olarak denetlenir, asimda imlec birakilir. `Describe` yalniz ilk parcayi ceker; `COPY OUT` (sorgu ve tablo) imlecten akar ve `try/finally` ile serbest birakilir. Devam ettirilemeyen imlec sessizce kesilmez (`ecUnsupported`). **Yan bulgu**: `CreateTable` yerel `TTableDef` kaydinda `HasNulls` sifirlanmiyordu; FPC managed olmayan alani sifirlamadigi icin yeni tablolar "NULL tasiyor" sayiliyor ve **tum** akis hizli yollari kapaniyordu (`t.HasNulls := False` eklendi). **Durust sinir**: ORDER BY/GROUP BY/DISTINCT/JOIN/UNION/pencere/alt sorgu, NULL tasiyan tablo, KV deposu ve `BatchOpen` tek seferlik genel yola duser; orada butce maddeselestirme **sonrasi** denetlenir. Imlec modu zone map yayinlamaz (devam eden parca geri cagri atladigi icin min/max daralirdi); var olan haritanin `zSkip` budamasi kullanilir. Bicim v5 ve V2 degismedi. | `pg_portal_stream` **35/0** (22 -> 35; PS0, PS1-PS10 yeni). PS7a ayirt edicidir: akisli 800 satir 120 KB butce icinde biter; PS7b ayni sonucu `ORDER BY` ile maddesellestirip RED alir; PS7c akisli yolda da butcenin uygulandigini gosterir; PS8/PS9 iki `COPY OUT` biciminde 800 `CopyData`; PS10 `Close` ile imleci birakir. On-kapi (ayni 35 kontrol, `git archive HEAD`, `e31d186`) **33 PASS / 2 FAIL**: ayirt edici iki kontrol PS7a (maddeselestirilen 800 satir 245043 bayt > 120000 butce) ve PS4 (`maxRows=1` ile 25 adimda 24 tekil satir); diger 33 kontrol HEAD'de de gecer. |
 
+| F51 | **ORTA** | **Arrow okuyucu `date64[ms]` ve `time32[ms]` degerlerini 1000 kat kaydiriyordu** (kod etiketi **SKILL6 08**). Dosya: `VDbArrow.pas` (`ArrowParseType`, `case TypeId of` 8/9/10 dallari). | Arrow duz (flatbuffer) semasinda `Date.unit` ve `Time.unit` alanlarinin **varsayilani MILLISECOND (1)**'dir (`Time.bitWidth` varsayilani 32). Flatbuffer yazici varsayilana esit alani yazmadigi icin pyarrow `date64[ms]`/`time32[ms]` icin `unit` alanini **hic yazmaz** (Time/Date tablosu bos: 4 baytlik tablo + `04 00 04 00` vtable), `time32[s]`/`date32[day]` icin ise acik `unit=0` yazar. Okuyucu varsayilani **SECOND / DAY** aldigi icin `time32[ms]` degeri 43.200.000 **saniye** gibi okunuyordu (`00:00:00`, satir basina +1000 s) ve `date64[ms]` epoch-ms degeri **gun** sayiliyordu (`0000-00-00` / `1971-02-17`) - yani dis sistemden gelen tarih/saat verisi sessizce yanlis okunuyordu. `Timestamp.unit` semada varsayilansiz oldugu icin her zaman yazilir ve timestamp kolu etkilenmiyordu; Parquet yolu da etkilenmiyordu. | Date ve Time dallari varsayilan **1 (MILLISECOND)** kullanir: `AF.TimeUnit := FbInt16(B, FbField(B, TypeTable, 0), 1)`; Timestamp varsayilanda kalir. VDB'nin kendi yazdigi dosyalar etkilenmez cunku `TFbNode.AddScalar` slotu kosulsuz ekler ve `MakeTypeTable` DATE/TIME icin `unit=0` alanini **acikca** yazar (gidis-donus SECOND/DAY). Bicim v5 ve V2 degismedi. | `interop_external` **8/0** (X1-X8; X8 `date64[ms]`/`time32[s]`/`time32[ms]`/`time64[us]`/`time64[ns]` birimlerini ayri ayri sinar). On-kapi (`git archive HEAD` = `16b0b09`, HEAD `VDbArrow.pas` birim yolunda **one** alinarak) **6 PASS / 2 FAIL**; ayirt edici **X4** (`at 0=00:00:00`) ve **X8** (`alan 0 satir 0=0000-00-00 beklenen=2026-03-01`), diger altisi koruyucu. `interop_format` 21/0, `format_compat` 28/0 degismedi. | KAPALI |
+| F52 | **ORTA (test boslugu)** | **Dis sistem uyumlulugu kapisizdi** (kod etiketi **SKILL6 08**): Arrow/Parquet aktarimi yalniz kendi kodumuzla gidis-donus olarak test ediliyordu, kripto yalniz kendi sabit vektorlerimizle, ve SQLite/gercek istemci karsilastirmasi yoktu. | Yeni bes kalici kapi eklendi, depoya **bagimlilik veya harici DLL eklenmeden**: `interop_format` (saf Pascal, her zaman kosar; VDB<->VDB + depoda duran pyarrow fiksturlerinin her hucresi), `interop_external` (pyarrow iki yonde), `crypto_interop` (FIPS 180-4, RFC 4231, RFC 7914/6070, FIPS-197 C.3, GCM spesifikasyon vektorleri kaynaga gomulu), `crypto_interop_ext` (bagimsiz Python `hashlib`/`hmac`/`pbkdf2_hmac` diferansiyeli) ve `bench_sqlite` (ayni is iki motorda; 12 anahtar uzerinden **sonuc esitligi**, sureler yalniz raporlanir). Harici arac yoksa kapilar **77 (SKIP)** doner ve PASS sayilmaz; SKIP kosan kapi sayisina eklenmez. | `interop_format` 21/0, `interop_external` 8/0, `crypto_interop` 33/0, `crypto_interop_ext` 25/0, `bench_sqlite` 24/0; iki platformda suite `KOSAN KAPI: 60`, `SUITE_EXIT=0` (`gatesP.log`/`linP.log`). On-kapi (`16b0b09`): diger dort kapi **koruyucu** (ayni sayilar), `interop_external` **6/2** (ayirt edici - bkz. F51). **Durust sinir**: DECIMAL iki bicimde de yok; VDB Parquet yazimi yalniz UNCOMPRESSED (SNAPPY yalniz okunur); `TStrMatrix` NULL maskesi olmadigi icin disa aktarimda NULL ve `''` ayni gorunur (X7 bunu belgeler); gercek PostgreSQL istemcileri (`psql`/JDBC/Npgsql) bu ortamda **yoktur ve kosmadi** - `server_version = 14.0` uyumluluk sertifikasi degildir. | KAPALI (istemci matrisi ayri ortam ister - `pg=not-run`) |
+
 ### Kapatilan test bosluklari (SKILL2 §22, SKILL3 §10.1)
 
 - `bench_report` (35 kontrol, 18 kategori, P50/P95/P99, CSV+meta) - yeni.
@@ -113,9 +116,9 @@ SKILL3 (VDB V3 Deep Repository Audit, Bug Fixing & Production Hardening)
 
 | Sonuc | Linux | Windows |
 |---|---|---|
-| PASS (kapi) | **49** | **48** |
+| PASS (kapi) | **60** | **60** |
 | FAIL | 0 | 0 |
-| SKIP (`VDB_CRYPTO_DLL` yok) | 2 (`fixtures_openssl`, `selftest_openssl`) | 3 (+`tls_client`) |
+| SKIP (harici DLL/arac yok) | 3 (`fixtures_openssl`, `selftest_openssl`, `interop_external`) | 3 (`fixtures_openssl`, `selftest_openssl`, `tls_client`) |
 | Calistirilmayan | canli PostgreSQL karsilastirmasi (`sql_differential` `pg=not-run`) | ayni |
 
 Canli PostgreSQL icin ayri bir CI isi vardir (`sql_differential_postgres`,
@@ -125,21 +128,26 @@ kosmadi** (makinede `psql` yok); `run_pg.sh` yalniz SKIP yolunda dogrulandi. Bu
 yuzden varsayilan kapida `pg=not-run` yazmaya devam eder ve tabloda
 "Calistirilmayan" kalir.
 
-Kapi toplamlari (ikisi de ayni): sql_stubs 25/0, sql_matrix 61/0,
-sql_fuzz 5/0, sql_differential 33/0, crypto_* PASS, wal_crash, kv_wal,
-backup_restore 25/0, page_integrity 14/0, btree_integrity 152/0,
-perf_baseline 16/0, single_file 35/0, region_stream 13/0, multiproc 17/0,
-maint_lock 19/0, crash_points 24/0, integrity_check 32/0, cache_metrics 21/0,
+Kapi toplamlari (v3.73, iki platformda 60 PASS / 0 FAIL):
+sql_stubs 25/0, sql_matrix 61/0, sql_fuzz 5/0, sql_differential 33/0
+(`pg=not-run`), crypto_core/crypto_base64/crypto_kat/fixtures_builtin/
+wal_crash/kv_wal PASS, backup_restore 25/0, page_integrity 14/0,
+btree_integrity 152/0, perf_baseline 16/0, single_file 35/0,
+region_stream 13/0, multiproc 17/0, maint_lock 19/0, pg_portal_stream 35/0,
+serializable_tx 28/0, pg_msg_nul 10/0, merge_hash 30/0, null_empty 41/0,
+crash_points 24/0, integrity_check 32/0, cache_metrics 21/0,
 format_compat 28/0, portability 29/0, multi_writer 12/0, bench_report 35/0,
 sql_features 32/0, sql_authorization 62/0, sql_atomicity 138/0,
 wal_recovery 27/0, freelist 32/0, limits 18/0, sql_memory 54/0,
 cache_pressure 8/0, page_corrupt 8/0, server_harden 36/0, server_failure 30/0,
 auth_throttle 16/0, disk_full 19/0, txn_limit 18/0, oom 9/0,
-btree_scale 15/0, wal_limit 19/0, net_fuzz 39/0, network_limits 26/0,
-btree_disk 78/0, sql_scale 34/0, sql_index_scale 45/0, soak 20/0,
+btree_scale 15/0, wal_limit 19/0, net_fuzz 39/0, network_limits 41/0,
+pg_cancel 31/0, btree_disk 78/0, sql_scale 34/0, sql_index_scale 45/0,
+soak 20/0, interop_format 21/0, interop_external 8/0 (yalniz Windows),
+crypto_interop 33/0, crypto_interop_ext 25/0, bench_sqlite 24/0,
 selftest_builtin PASS, tls_client 6/0 (yalniz Linux).
-Kanit: Windows `gatesJ.log` (`KOSAN KAPI: 48`, `SUITE_EXIT=0`), Linux
-`linJ.log` (`KOSAN KAPI: 49`, `SUITE_EXIT=0`).
+Kanit: Windows `gatesP.log` (`KOSAN KAPI: 60`, `SUITE_EXIT=0`), Linux
+`linP.log` (`KOSAN KAPI: 60`, `SUITE_EXIT=0`).
 
 ## Remaining Risks
 
@@ -194,7 +202,7 @@ karsilastirmasi kosmadi.
 **BETA CANDIDATE**
 
 Gerekce: kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici
-bir regresyon kapisiyla kilitlendi; iki platformda 48/49 kapi yesil; tek
+bir regresyon kapisiyla kilitlendi; iki platformda 60/60 kapi yesil; tek
 dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari, bozuk ag
 girdisi (genis fuzz), ag zaman asimlari ve COPY boyut tavani, disk dolu,
 islem sayisi basinci, bellek tukenmesi, WAL sert boy tavani, B+Tree
