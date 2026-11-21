@@ -340,12 +340,265 @@ begin
   CloseAll;
 end;
 
+function TQ(const E: string): Boolean;
+begin
+  Result := SameText(CellQ(Sq, 'SELECT (' + E + ')'), 'True');
+end;
+
+function FQ(const E: string): Boolean;
+begin
+  Result := SameText(CellQ(Sq, 'SELECT (' + E + ')'), 'False');
+end;
+
+function UQ(const E: string): Boolean;
+begin
+  Result := SameText(NullQ(Sq, E), 'True');
+end;
+
+{ ---- D) IN / NOT IN: '' GERCEK deger, NULL uc degerli mantik --------- }
+procedure CaseInList;
+const
+  Q = #39;
+  bBos = Q + Q;
+var
+  err: string;
+begin
+  OpenFresh('in');
+  if not TryExec(Sq, 'CREATE TABLE t3 (id INTEGER PRIMARY KEY, v TEXT)', err) then
+  begin
+    Chk('NE52-IN tablo', False, err);
+    CloseAll;
+    Exit;
+  end;
+  TryExec(Sq, 'INSERT INTO t3 VALUES (1, NULL)', err);
+  TryExec(Sq, 'INSERT INTO t3 VALUES (2, ' + bBos + ')', err);
+  TryExec(Sq, 'INSERT INTO t3 VALUES (3, ' + Q + 'x' + Q + ')', err);
+
+  Chk('NE52 bos metin IN (bos metin)', TQ(bBos + ' IN (' + bBos + ')'));
+  Chk('NE53 bos metin IN (x) = FALSE', FQ(bBos + ' IN (' + Q + 'x' + Q + ')'));
+  Chk('NE54 x IN (bos metin) = FALSE', FQ(Q + 'x' + Q + ' IN (' + bBos + ')'));
+  Chk('NE55 x NOT IN (bos metin) = TRUE', TQ(Q + 'x' + Q + ' NOT IN (' + bBos + ')'));
+  Chk('NE56 bos metin IN (NULL, bos) = TRUE', TQ(bBos + ' IN (NULL, ' + bBos + ')'));
+  Chk('NE57 bos metin NOT IN (NULL, bos) = FALSE',
+    FQ(bBos + ' NOT IN (NULL, ' + bBos + ')'));
+  Chk('NE58 bos metin IN (NULL) = UNKNOWN', UQ(bBos + ' IN (NULL)'));
+  Chk('NE59 x NOT IN (NULL, x) = FALSE', FQ(Q + 'x' + Q + ' NOT IN (NULL, ' + Q + 'x' + Q + ')'));
+  Chk('NE60 y IN (NULL, y) = TRUE', TQ(Q + 'y' + Q + ' IN (NULL, ' + Q + 'y' + Q + ')'));
+  Chk('NE61 y NOT IN (NULL, z) = UNKNOWN', UQ(Q + 'y' + Q + ' NOT IN (NULL, ' + Q + 'z' + Q + ')'));
+  Chk('NE62 5 IN (NULL, 5) = TRUE', TQ('5 IN (NULL, 5)'));
+  Chk('NE63 5 NOT IN (NULL, 5) = FALSE', FQ('5 NOT IN (NULL, 5)'));
+  { Alt sorguda da maske okunmali; '' hasNull SAYMAZ. }
+  Chk('NE64 bos metin IN (SELECT)', TQ(bBos + ' IN (SELECT v FROM t3)'));
+  Chk('NE65 q NOT IN (SELECT: NULL var) = UNKNOWN',
+    UQ(Q + 'q' + Q + ' NOT IN (SELECT v FROM t3)'));
+  CloseAll;
+end;
+
+{ ---- E) BETWEEN / NOT BETWEEN ---------------------------------------- }
+procedure CaseBetween;
+const
+  Q = #39;
+  bBos = Q + Q;
+begin
+  OpenFresh('btw');
+  Chk('NE66 bos BETWEEN bos AND z', TQ(bBos + ' BETWEEN ' + bBos + ' AND ' + Q + 'z' + Q));
+  Chk('NE67 a BETWEEN bos AND z', TQ(Q + 'a' + Q + ' BETWEEN ' + bBos + ' AND ' + Q + 'z' + Q));
+  Chk('NE68 bos NOT BETWEEN a AND z', TQ(bBos + ' NOT BETWEEN ' + Q + 'a' + Q + ' AND ' + Q + 'z' + Q));
+  Chk('NE69 NULL BETWEEN bos AND z = UNKNOWN', UQ('NULL BETWEEN ' + bBos + ' AND ' + Q + 'z' + Q));
+  Chk('NE70 bos BETWEEN NULL AND z = UNKNOWN', UQ(bBos + ' BETWEEN NULL AND ' + Q + 'z' + Q));
+  Chk('NE71 bos BETWEEN a AND NULL = UNKNOWN', UQ(bBos + ' BETWEEN ' + Q + 'a' + Q + ' AND NULL'));
+  Chk('NE72 bos BETWEEN bos AND bos', TQ(bBos + ' BETWEEN ' + bBos + ' AND ' + bBos));
+  Chk('NE73 bos NOT BETWEEN bos AND z = FALSE',
+    FQ(bBos + ' NOT BETWEEN ' + bBos + ' AND ' + Q + 'z' + Q));
+  Chk('NE74 5 BETWEEN 5 AND 10', TQ('5 BETWEEN 5 AND 10'));
+  Chk('NE75 5 BETWEEN NULL AND 10 = UNKNOWN', UQ('5 BETWEEN NULL AND 10'));
+  CloseAll;
+end;
+
+{ ---- F) ANY / ALL ----------------------------------------------------- }
+procedure CaseQuant;
+const
+  Q = #39;
+  bBos = Q + Q;
+var
+  err: string;
+begin
+  OpenFresh('qnt');
+  TryExec(Sq, 'CREATE TABLE t3 (id INTEGER PRIMARY KEY, v TEXT)', err);
+  TryExec(Sq, 'INSERT INTO t3 VALUES (1, NULL)', err);
+  TryExec(Sq, 'INSERT INTO t3 VALUES (2, ' + bBos + ')', err);
+  TryExec(Sq, 'INSERT INTO t3 VALUES (3, ' + Q + 'x' + Q + ')', err);
+
+  Chk('NE76 NULL = ANY = UNKNOWN', UQ('NULL = ANY (SELECT v FROM t3)'));
+  Chk('NE77 NULL = ALL = UNKNOWN', UQ('NULL = ALL (SELECT v FROM t3)'));
+  Chk('NE78 bos = ANY (bos var) = TRUE', TQ(bBos + ' = ANY (SELECT v FROM t3)'));
+  Chk('NE79 bos = ALL (x var) = FALSE', FQ(bBos + ' = ALL (SELECT v FROM t3)'));
+  Chk('NE80 x = ALL = FALSE', FQ(Q + 'x' + Q + ' = ALL (SELECT v FROM t3)'));
+  Chk('NE81 q = ANY (NULL var) = UNKNOWN', UQ(Q + 'q' + Q + ' = ANY (SELECT v FROM t3)'));
+  Chk('NE82 q = ALL (x var) = FALSE', FQ(Q + 'q' + Q + ' = ALL (SELECT v FROM t3)'));
+  Chk('NE83 NULL = ANY (bos kume) = FALSE',
+    FQ('NULL = ANY (SELECT v FROM t3 WHERE 1 = 0)'));
+  Chk('NE84 NULL = ALL (bos kume) = TRUE',
+    TQ('NULL = ALL (SELECT v FROM t3 WHERE 1 = 0)'));
+  Chk('NE85 bos = ANY (yalniz NULL) = UNKNOWN',
+    UQ(bBos + ' = ANY (SELECT v FROM t3 WHERE v IS NULL)'));
+  CloseAll;
+end;
+
+{ ---- G) skaler alt sorgu maske tasimasi ------------------------------- }
+procedure CaseScalarSub;
+const
+  Q = #39;
+  bBos = Q + Q;
+var
+  err: string;
+begin
+  OpenFresh('sub');
+  TryExec(Sq, 'CREATE TABLE t4 (id INTEGER PRIMARY KEY, v TEXT)', err);
+  TryExec(Sq, 'INSERT INTO t4 VALUES (1, NULL)', err);
+  TryExec(Sq, 'INSERT INTO t4 VALUES (2, ' + bBos + ')', err);
+  TryExec(Sq, 'INSERT INTO t4 VALUES (3, ' + Q + 'x' + Q + ')', err);
+
+  Chk('NE86 skaler NULL IS NULL', UQ('(SELECT v FROM t4 WHERE id = 1)'));
+  Chk('NE87 skaler NULL = bos metin UNKNOWN', UQ('(SELECT v FROM t4 WHERE id = 1) = ' + bBos));
+  Chk('NE88 skaler bos IS NULL degil', FQ('(SELECT v FROM t4 WHERE id = 2) IS NULL'));
+  Chk('NE89 skaler bos = bos metin', TQ('(SELECT v FROM t4 WHERE id = 2) = ' + bBos));
+  Chk('NE90 satirsiz skaler IS NULL', UQ('(SELECT v FROM t4 WHERE id = 99)'));
+  Chk('NE91 NULL || x IS NULL', UQ('(SELECT v FROM t4 WHERE id = 1) || ' + Q + 'x' + Q));
+  Chk('NE92 bos || x = x', TQ('(SELECT v FROM t4 WHERE id = 2) || ' + Q + 'x' + Q + ' = ' + Q + 'x' + Q));
+  Chk('NE93 korelasyonlu IN (bos)', IntQ(Sq, 'SELECT COUNT(*) FROM t4 a WHERE a.v IN (SELECT b.v FROM t4 b WHERE b.id = 2)') = 1,
+    IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t4 a WHERE a.v IN (SELECT b.v FROM t4 b WHERE b.id = 2)')));
+  Chk('NE94 korelasyonlu IN (NULL)', IntQ(Sq, 'SELECT COUNT(*) FROM t4 a WHERE a.v IN (SELECT b.v FROM t4 b WHERE b.id = 1)') = 0,
+    IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t4 a WHERE a.v IN (SELECT b.v FROM t4 b WHERE b.id = 1)')));
+  Chk('NE95 NOT (IN NULL) hic satir getirmez',
+    IntQ(Sq, 'SELECT COUNT(*) FROM t4 a WHERE NOT (a.v IN (SELECT b.v FROM t4 b WHERE b.id = 1))') = 0,
+    IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t4 a WHERE NOT (a.v IN (SELECT b.v FROM t4 b WHERE b.id = 1))')));
+  Chk('NE96 NOT IN (bos) yalniz x', IntQ(Sq, 'SELECT COUNT(*) FROM t4 a WHERE a.v NOT IN (SELECT b.v FROM t4 b WHERE b.id = 2)') = 1,
+    IntToStr(IntQ(Sq, 'SELECT COUNT(*) FROM t4 a WHERE a.v NOT IN (SELECT b.v FROM t4 b WHERE b.id = 2)')));
+  Chk('NE97 COUNT(*) alt sorgusu', IntQ(Sq, 'SELECT COUNT(*) FROM t4 WHERE v IS NULL') = 1);
+  Chk('NE98 COALESCE(skaler NULL, d) = d', TQ('COALESCE((SELECT v FROM t4 WHERE id = 1), ' + Q + 'd' + Q + ') = ' + Q + 'd' + Q));
+  Chk('NE99 COALESCE(skaler bos, d) = bos',
+    TQ('COALESCE((SELECT v FROM t4 WHERE id = 2), ' + Q + 'd' + Q + ') = ' + bBos));
+  Chk('NE100 skaler bos IS NOT NULL', TQ('(SELECT v FROM t4 WHERE id = 2) IS NOT NULL'));
+  CloseAll;
+end;
+
+{ ---- H) CASE / COALESCE / NULLIF ------------------------------------- }
+procedure CaseCaseCoalesce;
+const
+  Q = #39;
+  bBos = Q + Q;
+begin
+  OpenFresh('ccn');
+  Chk('NE101 CASE THEN NULL IS NULL', UQ('CASE WHEN 1 = 1 THEN NULL END'));
+  Chk('NE102 ELSEsiz CASE IS NULL', UQ('CASE WHEN 1 = 0 THEN ' + Q + 'x' + Q + ' END'));
+  Chk('NE103 CASE ELSE bos = bos', TQ('CASE WHEN 1 = 0 THEN ' + Q + 'x' + Q + ' ELSE ' + bBos + ' END = ' + bBos));
+  Chk('NE104 CASE ELSE bos IS NULL degil', FQ('CASE WHEN 1 = 0 THEN ' + Q + 'x' + Q + ' ELSE ' + bBos + ' END IS NULL'));
+  Chk('NE105 COALESCE(bos, y) = bos', TQ('COALESCE(' + bBos + ', ' + Q + 'y' + Q + ') = ' + bBos));
+  Chk('NE106 COALESCE(NULL, y) = y', TQ('COALESCE(NULL, ' + Q + 'y' + Q + ') = ' + Q + 'y' + Q));
+  Chk('NE107 COALESCE(NULL, NULL) IS NULL', UQ('COALESCE(NULL, NULL)'));
+  Chk('NE108 NULLIF(bos, bos) IS NULL', UQ('NULLIF(' + bBos + ', ' + bBos + ')'));
+  Chk('NE109 NULLIF(bos, x) IS NULL degil', FQ('NULLIF(' + bBos + ', ' + Q + 'x' + Q + ') IS NULL'));
+  Chk('NE110 NULLIF(bos, x) = bos', TQ('NULLIF(' + bBos + ', ' + Q + 'x' + Q + ') = ' + bBos));
+  Chk('NE111 NULLIF(NULL, bos) IS NULL', UQ('NULLIF(NULL, ' + bBos + ')'));
+  Chk('NE112 NULLIF(a, NULL) = a', TQ('NULLIF(' + Q + 'a' + Q + ', NULL) = ' + Q + 'a' + Q));
+  Chk('NE113 CASE bos WHEN bos THEN a', TQ('CASE ' + bBos + ' WHEN ' + bBos + ' THEN ' + Q + 'a' + Q + ' ELSE ' + Q + 'b' + Q + ' END = ' + Q + 'a' + Q));
+  Chk('NE114 CASE NULL WHEN NULL THEN a ELSE b', TQ('CASE NULL WHEN NULL THEN ' + Q + 'a' + Q + ' ELSE ' + Q + 'b' + Q + ' END = ' + Q + 'b' + Q));
+  Chk('NE115 CASE bos WHEN x THEN a ELSE b', TQ('CASE ' + bBos + ' WHEN ' + Q + 'x' + Q + ' THEN ' + Q + 'a' + Q + ' ELSE ' + Q + 'b' + Q + ' END = ' + Q + 'b' + Q));
+  CloseAll;
+end;
+
+{ ---- I) JOIN / toplama ve HAVING ------------------------------------- }
+procedure CaseJoinAgg;
+const
+  Q = #39;
+  bBos = Q + Q;
+var
+  err: string;
+begin
+  OpenFresh('jag');
+  TryExec(Sq, 'CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)', err);
+  TryExec(Sq, 'CREATE TABLE b (id INTEGER PRIMARY KEY, w TEXT)', err);
+  TryExec(Sq, 'CREATE TABLE c (id INTEGER PRIMARY KEY, x INTEGER)', err);
+  TryExec(Sq, 'INSERT INTO a VALUES (1, NULL)', err);
+  TryExec(Sq, 'INSERT INTO a VALUES (2, ' + bBos + ')', err);
+  TryExec(Sq, 'INSERT INTO a VALUES (3, ' + Q + 'k' + Q + ')', err);
+  TryExec(Sq, 'INSERT INTO b VALUES (1, NULL)', err);
+  TryExec(Sq, 'INSERT INTO b VALUES (2, ' + bBos + ')', err);
+  TryExec(Sq, 'INSERT INTO b VALUES (3, ' + Q + 'k' + Q + ')', err);
+  TryExec(Sq, 'INSERT INTO c VALUES (1, NULL)', err);
+  TryExec(Sq, 'INSERT INTO c VALUES (2, 0)', err);
+  TryExec(Sq, 'INSERT INTO c VALUES (3, 5)', err);
+
+  { SQL kurali: MIN/MAX NULL'i atlar ama '' gercek degerdir. }
+  Chk('NE116 MIN bos metni korur',
+    RowCountQ(Sq, 'SELECT COUNT(*) FROM a GROUP BY v HAVING MIN(v) = ' + bBos) = 1);
+  Chk('NE117 MAX dolu metni verir', TQ('(SELECT MAX(v) FROM a) = ' + Q + 'k' + Q));
+  Chk('NE118 yalniz NULL satirda MIN NULL', UQ('(SELECT MIN(v) FROM a WHERE v IS NULL)'));
+  Chk('NE119 COUNT(v) NULL saymaz', IntQ(Sq, 'SELECT COUNT(v) FROM a') = 2);
+  Chk('NE120 SUM NULL saymaz', IntQ(Sq, 'SELECT SUM(x) FROM c') = 5);
+  Chk('NE121 COUNT(x) NULL saymaz', IntQ(Sq, 'SELECT COUNT(x) FROM c') = 2);
+  { NULL anahtar JOIN'de eslesmez (eslesen yalniz 'k'). }
+  Chk('NE122 JOIN k uzerinden 1 satir',
+    IntQ(Sq, 'SELECT COUNT(*) FROM a JOIN b ON a.v = b.w WHERE a.v = ' + Q + 'k' + Q) = 1);
+  { NOT: LEFT JOIN cikisinda '' ile NULL maskesi ayni TStrArray'de
+    tasindigindan IS NULL orada guvenilir degil; bu SKILL13 (tipli hucre
+    matrisi) kapsaminda. Burada yalniz satir korunumu olculur. }
+  Chk('NE123 LEFT JOIN sol satirlari korur',
+    IntQ(Sq, 'SELECT COUNT(*) FROM a LEFT JOIN b ON a.v = b.w') = 3);
+  Chk('NE124 GROUP BY uc grup', RowCountQ(Sq, 'SELECT COUNT(*) FROM a GROUP BY v') = 3);
+  Chk('NE125 HAVING toplama', RowCountQ(Sq, 'SELECT COUNT(*) FROM a GROUP BY v HAVING COUNT(*) = 1') = 3);
+  CloseAll;
+end;
+
+{ ---- J) indeksli erisim yolu: agac karsilastirmasi '' ile NULL'i
+        karistirmamali (TreeCmp/TreeLike/BuildTree IN+BETWEEN) -------- }
+procedure CaseIndexed;
+const
+  Q = #39;
+  bBos = Q + Q;
+var
+  err: string;
+begin
+  OpenFresh('idx');
+  if not TryExec(Sq, 'CREATE TABLE t5 (id INTEGER PRIMARY KEY, v TEXT)', err) then
+  begin
+    Chk('NE126 indeks tablosu', False, err);
+    CloseAll;
+    Exit;
+  end;
+  TryExec(Sq, 'INSERT INTO t5 VALUES (1, NULL)', err);
+  TryExec(Sq, 'INSERT INTO t5 VALUES (2, ' + bBos + ')', err);
+  TryExec(Sq, 'INSERT INTO t5 VALUES (3, ' + Q + 'a' + Q + ')', err);
+  TryExec(Sq, 'INSERT INTO t5 VALUES (4, ' + Q + 'b' + Q + ')', err);
+  Chk('NE126 indeks olustu', TryExec(Sq, 'CREATE INDEX ix_t5_v ON t5 (v)', err), err);
+
+  Chk('NE127 indeksli v = bos', IntQ(Sq, 'SELECT COUNT(*) FROM t5 WHERE v = ' + bBos) = 1);
+  Chk('NE128 indeksli v = a', IntQ(Sq, 'SELECT COUNT(*) FROM t5 WHERE v = ' + Q + 'a' + Q) = 1);
+  Chk('NE129 indeksli IN (bos)', IntQ(Sq, 'SELECT COUNT(*) FROM t5 WHERE v IN (' + bBos + ')') = 1);
+  Chk('NE130 indeksli IN (bos, b)', IntQ(Sq, 'SELECT COUNT(*) FROM t5 WHERE v IN (' + bBos + ', ' + Q + 'b' + Q + ')') = 2);
+  Chk('NE131 indeksli BETWEEN bos AND a', IntQ(Sq, 'SELECT COUNT(*) FROM t5 WHERE v BETWEEN ' + bBos + ' AND ' + Q + 'a' + Q) = 2);
+  Chk('NE132 indeksli v > bos', IntQ(Sq, 'SELECT COUNT(*) FROM t5 WHERE v > ' + bBos) = 2);
+  Chk('NE133 indeksli LIKE bos', IntQ(Sq, 'SELECT COUNT(*) FROM t5 WHERE v LIKE ' + bBos) = 1);
+  Chk('NE134 indeksli IS NULL', IntQ(Sq, 'SELECT COUNT(*) FROM t5 WHERE v IS NULL') = 1);
+  Chk('NE135 indeksli BETWEEN NULL AND a = 0', IntQ(Sq, 'SELECT COUNT(*) FROM t5 WHERE v BETWEEN NULL AND ' + Q + 'a' + Q) = 0);
+  Chk('NE136 indeksli IN (NULL) = 0', IntQ(Sq, 'SELECT COUNT(*) FROM t5 WHERE v IN (NULL)') = 0);
+  CloseAll;
+end;
+
 begin
   GPass := 0;
   GFail := 0;
   CaseLiterals;
   CaseStorage;
   CaseAggregates;
+  CaseInList;
+  CaseBetween;
+  CaseQuant;
+  CaseScalarSub;
+  CaseCaseCoalesce;
+  CaseJoinAgg;
+  CaseIndexed;
   WriteLn('SONUC: ', GPass, ' PASS, ', GFail, ' FAIL');
   if GFail > 0 then
     Halt(1);

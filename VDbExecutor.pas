@@ -144,6 +144,10 @@ type
     // Deger kanali string kaldigi icin NULL ayri bir bayrakla tasinir.
     // Cagiran her ifade once FLastNull'i okumali, sonra degeri kullanmali.
     FLastNull: Boolean;
+    // SKILL09: son EvalExpr'in NULL karari GUVENILIR mi? Satir maskesi
+    // olmayan eski yollarda (JOIN satiri, TStrArray) '' sezgisel NULL'dur;
+    // orada False kalir ve eski davranis korunur.
+    FLastNullKnown: Boolean;
     // v3.71 / SKILL6 03 (F-49) asama 2b: NarrowRows'un doldurdugu satir
     // maskeleri (Pks/Rows ile ayni indeks ve uzunluk). Bos uzunluktaki ic
     // dizi = o satirin maskesi BILINMIYOR (orn. kapsayan indeks yolu).
@@ -154,6 +158,10 @@ type
     // F2-20: IN (SELECT ...) deger kumesi (alt sorgu basina TEK KEZ kurulur).
     // Once her dis satir icin alt sonucu yeniden taraniyordu (O(N*M)).
     FInSetCache: TDictionary<Pointer, TDictionary<string, Byte>>;
+    // SKILL09: IN (SELECT ...) kumesinde NULL var mi? FInSetCache'teki ''
+    // anahtari artik GERCEK bos metin degeridir; NULL ayri bayrakta tutulur.
+    // Anahtar = alt sorgu AST dugumu (FInSetCache ile ayni yasam dongusu).
+    FInSetNull: TDictionary<Pointer, Boolean>;
     // P5-CTE: WITH adlari (cumle basi kapsam; sirayla doldurulur,
     // sonrakiler oncekileri gorur).
     FCteTables: TDictionary<string, TCteTable>;
@@ -293,6 +301,12 @@ type
       Ctype: Byte; LNull: Boolean = False; RNull: Boolean = False;
       NullFlagsValid: Boolean = False): string;
     function EvalUnary(AOp: TSqlUnaryOp; const Val: string): string;
+    { SKILL09: bir sonuc hucresinin SQL NULL olup olmadigi. RowNulls
+      (Rows ile ayni hizada) varsa YALNIZCA maske konusur: '' gercek bir
+      degerdir, NULL degildir. Maske yoksa (uzunluk 0) eski davranis:
+      '' = NULL. Yalnizca maske BILINMIYORKEN kullanilir. }
+    function CellIsNull(const Res: TSqlResult; RowIdx, ColIdx: Integer;
+      const Cell: string): Boolean;
     { v3.14: ikili islemin karsilastirma/aritmetik tipini cozer. Eskiden bu
       blok EvalExpr icinde satir basina calisiyordu; tip-duyarli tam sayi
       yolunun AYNI karari vermesi icin tek yere alindi. }
@@ -635,7 +649,7 @@ type
     procedure ComputeWindows(Stmt: TSqlSelectStmt;
       const Rows: TStrMatrix; const ColNames: TStrArray;
       const ColTypes: TByteArray; out WinVals: TStrMatrix;
-      out WinSlot: TIntArray);
+      out WinSlot: TIntArray; const RowNulls: TNullMatrix);
 
     { AS OF (2026-10-06): FROM tablosunun WAL gecmisindeki satir kumesini
       kurar (N = min(AsOfValue, WalRecordCount-1)). Pencere icinde hic
@@ -2172,6 +2186,23 @@ begin
   if bRes then Result := 'True' else Result := 'False';
 end;
 
+{ SKILL09: hucresel NULL tespiti. Maske varsa tek dogru kaynak odur:
+  '' GERCEK degerdir. Maske yoksa eski '' = NULL davranisi korunur. }
+function TVSqlExecutor.CellIsNull(const Res: TSqlResult;
+  RowIdx, ColIdx: Integer; const Cell: string): Boolean;
+begin
+  if Length(Res.RowNulls) = Length(Res.Rows) then
+  begin
+    if (RowIdx >= 0) and (RowIdx <= High(Res.RowNulls))
+       and (ColIdx >= 0) and (ColIdx <= High(Res.RowNulls[RowIdx])) then
+    begin
+      Result := Res.RowNulls[RowIdx][ColIdx];
+      Exit;
+    end;
+  end;
+  Result := Cell = '';
+end;
+
 { ------------------------------------------------------------
   EvalUnary
   //---------------------------------------------------------- }
@@ -2473,9 +2504,9 @@ begin
       end;
       // F-49 (2b): '' gercek bir deger olabildigi icin MIN/MAX "bos = yok"
       // sezgiseline guvenemez; ayri bir "deger goruldu" bayragi tutulur.
-      if (not hasMinV) or VDbCmpVal(colVal, minV, '<', aggCt) then
+      if (not hasMinV) or VDbCmpValEx(colVal, minV, '<', aggCt, FCurNulls <> nil) then
       begin minV := colVal; hasMinV := True; end;
-      if (not hasMaxV) or VDbCmpVal(colVal, maxV, '>', aggCt) then
+      if (not hasMaxV) or VDbCmpValEx(colVal, maxV, '>', aggCt, FCurNulls <> nil) then
       begin maxV := colVal; hasMaxV := True; end;
     end;
   end;
@@ -2844,7 +2875,7 @@ var
   idx, i, ci, nd: Integer;
   matched: Boolean;
   { F-49 asama 2: iki tarafin NULL (UNKNOWN) durumu. }
-  lnull, rnull: Boolean;
+  lnull, rnull, lknown, rknown: Boolean;
   fa, fb, fc, fd, fe, fg: Double;
   ia: Int64;
   hasNull: Boolean;
@@ -2881,6 +2912,7 @@ begin
   { F-49 asama 2: her cagri kendi NULL durumunu bildirir. Cagiran ifade
     degeri kullanmadan once FLastNull'i okumalidir. }
   FLastNull := False;
+  FLastNullKnown := True;
   if Expr = nil then Exit('');
 
   { v3.14: TAM SAYI zinciri hizli yolu. Yalniz +,-,* ve INT kolon/tam sayi
@@ -2912,6 +2944,9 @@ begin
     // CAST ( expr AS type )
     cn := TSqlCastNode(Expr);
     v := EvalExpr(cn.Expr, Row, ColNames, ColTypes);
+    // SKILL09: CAST(NULL AS ...) NULL'dur; bayrak korunur (eskiden
+    // INTEGER hedefte bos metni ayristirmaya calisip HATA veriyordu).
+    if FLastNull then Exit('');
     // TEXT -> metin (zaten string donuyor), INTEGER -> metin
     if SameText(cn.TargetType, 'TEXT') then Exit(v);
     if SameText(cn.TargetType, 'INTEGER') then
@@ -3015,6 +3050,8 @@ begin
         FLastNull := True;
         Exit('');
       end;
+      // SKILL09: maske yoksa '' NULL olabilir -> NULL karari guvenilmez.
+      if idx >= Length(FCurNulls) then FLastNullKnown := False;
       Exit(Row[idx]);
     end;
     if (colRef.TableQualifier <> '') and (FOuterRow <> nil) and (FOuterColNames <> nil) then
@@ -3032,8 +3069,10 @@ begin
     bin := TSqlBinaryOpNode(Expr);
     lv := EvalExpr(bin.Left, Row, ColNames, ColTypes);
     lnull := FLastNull;
+    lknown := FLastNullKnown;
     rv := EvalExpr(bin.Right, Row, ColNames, ColTypes);
     rnull := FLastNull;
+    rknown := FLastNullKnown;
     ct := BinaryOpCtype(bin, ColNames, ColTypes);
     // R-20: metin kolonu ve karsilastirma tarafi bir kolon referansi ise
     // o kolonun varsayilan collation'i uygulanir. ACIK COLLATE yazilmissa
@@ -3059,11 +3098,13 @@ begin
         begin
           Result := 'False';
           FLastNull := False;
+  FLastNullKnown := True;
         end
         else if (not rnull) and (SameText(rv, 'False') or (rv = '0')) then
         begin
           Result := 'False';
           FLastNull := False;
+  FLastNullKnown := True;
         end;
       end
       else if bin.Op = sboOr then
@@ -3072,16 +3113,19 @@ begin
         begin
           Result := 'True';
           FLastNull := False;
+  FLastNullKnown := True;
         end
         else if (not rnull) and (SameText(rv, 'True') or (rv = '1')) then
         begin
           Result := 'True';
           FLastNull := False;
+  FLastNullKnown := True;
         end;
       end;
     end
     else
-      Result := EvalBinary(bin.Op, lv, rv, ct, lnull, rnull, FCurNulls <> nil);
+      Result := EvalBinary(bin.Op, lv, rv, ct, lnull, rnull,
+        (FCurNulls <> nil) or (lknown and rknown));
     if not FExplicitColl then
     begin
       FCurCollation := '';
@@ -3119,6 +3163,7 @@ begin
         if FLastNull then Result := 'False' else Result := 'True';
       end;
       FLastNull := False;
+  FLastNullKnown := True;
       Exit(Result);
     end;
     if FLastNull then Exit('');
@@ -3129,9 +3174,10 @@ begin
   begin
     inN := TSqlInNode(Expr);
     lv := EvalExpr(inN.Expr, Row, ColNames, ColTypes);
-    // NULL IN (...) / NULL NOT IN (...) -> UNKNOWN. Once 'False' donuyordu;
-    // dis NOT bunu True'ya cevirip NULL satirlarini yanlislikla seciyordu.
-    if lv = '' then Exit('');
+    // SKILL09: NULL IN (...) / NULL NOT IN (...) -> UNKNOWN. Bos metin
+    // GERCEK bir degerdir; NULL karari yalnizca FLastNull'dan gelir.
+    lnull := FLastNull;
+    if lnull then begin FLastNull := True; Exit(''); end;
     matched := False;
     // F1-13: NOT IN ... NULL handling (three-valued logic)
     hasNull := False;
@@ -3147,7 +3193,7 @@ begin
     if inN.SubSelect <> nil then
     begin
       // P5-2: IN (SELECT ...) - ic sorgu tek kolon dondurmelidir.
-      // NULL kurali liste davranisiyla aynidir: '' degerler eslesmez.
+      // SKILL09: NULL karari RowNulls maskesinden; '' gercek degerdir.
       subR := SubResult(inN.SubSelect, Row, ColNames);
       if Length(subR.Fields) <> 1 then
         raise EVDbException.Create(ecInvalidArgument,
@@ -3161,9 +3207,10 @@ begin
         for i := 0 to High(subR.Rows) do
         begin
           if Length(subR.Rows[i]) = 0 then Continue;
-          if subR.Rows[i][0] = '' then hasNull := True;
+          rnull := CellIsNull(subR, i, 0, subR.Rows[i][0]);
+          if rnull then hasNull := True
           // P-183/B-2: tip-duyarli eslesme
-          if (not matched) and VDbCmpVal(subR.Rows[i][0], lv, '=', ct) then
+          else if (not matched) and VDbCmpValEx(subR.Rows[i][0], lv, '=', ct, True) then
             matched := True;
         end;
       end
@@ -3175,44 +3222,61 @@ begin
         for i := 0 to High(subR.Rows) do
         begin
           if Length(subR.Rows[i]) = 0 then Continue;
-          if subR.Rows[i][0] = '' then begin hasNull := True; Continue; end;
-          if VDbCmpVal(subR.Rows[i][0], lv, '=', ct) then
+          rnull := CellIsNull(subR, i, 0, subR.Rows[i][0]);
+          if rnull then begin hasNull := True; Continue; end;
+          if VDbCmpValEx(subR.Rows[i][0], lv, '=', ct, True) then
           begin matched := True; Break; end;
         end;
       end
-      else if FInSetCache.TryGetValue(Pointer(inN.SubSelect), inSet) then
-      begin
-        matched := inSet.ContainsKey(lv);
-        hasNull := inSet.ContainsKey('');
-      end
       else
       begin
-        inSet := TDictionary<string, Byte>.Create;
-        for i := 0 to High(subR.Rows) do
-          if Length(subR.Rows[i]) > 0 then
-            inSet.AddOrSetValue(subR.Rows[i][0], 0);
-        FInSetCache.Add(Pointer(inN.SubSelect), inSet);
+        // SKILL09: kovada NULL ayri bayrakta tutulur; '' anahtari artik
+        // gercek bos metin degeridir (eskiden NULL ile karisiyordu).
+        inSet := nil;
+        if FInSetCache.TryGetValue(Pointer(inN.SubSelect), inSet) then
+        begin
+          hasNull := False;
+          FInSetNull.TryGetValue(Pointer(inN.SubSelect), hasNull);
+        end
+        else
+        begin
+          inSet := TDictionary<string, Byte>.Create;
+          hasNull := False;
+          for i := 0 to High(subR.Rows) do
+          begin
+            if Length(subR.Rows[i]) = 0 then Continue;
+            if CellIsNull(subR, i, 0, subR.Rows[i][0]) then
+              hasNull := True
+            else
+              inSet.AddOrSetValue(subR.Rows[i][0], 0);
+          end;
+          FInSetCache.Add(Pointer(inN.SubSelect), inSet);
+          FInSetNull.AddOrSetValue(Pointer(inN.SubSelect), hasNull);
+        end;
         matched := inSet.ContainsKey(lv);
-        hasNull := inSet.ContainsKey('');
       end;
     end
     else
       for i := 0 to inN.List.Count - 1 do
       begin
         itemVal := EvalExpr(inN.List[i], Row, ColNames, ColTypes);
-        if VDbCmpVal(itemVal, lv, '=', ct) then begin matched := True; Break; end;
-        if itemVal = '' then hasNull := True;
+        // SKILL09: NULL liste elemani eslesmez ama sonucu UNKNOWN yapar;
+        // '' eleman gercek degerdir ve hasNull'i ETKILEMEZ.
+        rnull := FLastNull;
+        if rnull then hasNull := True
+        else if VDbCmpValEx(itemVal, lv, '=', ct, True) then
+        begin matched := True; Break; end;
       end;
     if inN.IsNot then
     begin
       // SQL: x NOT IN (liste) = NOT (x IN (liste)).
       // Eslesme varsa FALSE; eslesme yok ama listede NULL varsa UNKNOWN.
       if matched then Exit('False');
-      if hasNull then Exit('');
+      if hasNull then begin FLastNull := True; Exit(''); end;
       Exit('True');
     end;
     if matched then Exit('True');
-    if hasNull then Exit('');
+    if hasNull then begin FLastNull := True; Exit(''); end;
     Exit('False');
   end;
 
@@ -3225,12 +3289,24 @@ begin
       raise EVDbException.Create(ecInvalidArgument,
         'ANY/SOME/ALL alt sorgusu tek kolon dondurmeli');
     lv := EvalExpr(quantN.Left, Row, ColNames, ColTypes);
+    // SKILL09: sol taraf NULL ise her karsilastirma UNKNOWN'dir. Bos kume
+    // kurali korunur: ANY bos = FALSE, ALL bos = TRUE.
+    lnull := FLastNull;
     ct := VCT_STR;
     if quantN.Left is TSqlColumnRefNode then
     begin
       colRef := TSqlColumnRefNode(quantN.Left);
       ci := FindColIdx(colRef.ColumnName, colRef.TableQualifier, ColNames);
       if (ci >= 0) and (ci < Length(ColTypes)) then ct := ColTypes[ci];
+    end;
+    if lnull then
+    begin
+      if Length(subR.Rows) = 0 then
+      begin
+        if quantN.Kind = qkAny then Exit('False') else Exit('True');
+      end;
+      FLastNull := True;
+      Exit('');
     end;
     matched := False;
     hasNull := False;
@@ -3241,11 +3317,13 @@ begin
       begin
         if Length(subR.Rows[i]) = 0 then Continue;
         rv := subR.Rows[i][0];
-        if rv = '' then begin hasNull := True; Continue; end;
-        if SameText(EvalBinary(quantN.CmpOp, lv, rv, ct), 'True') then
+        // SKILL09: NULL yalnizca maskeden; '' gercek deger olarak karsilasir.
+        if CellIsNull(subR, i, 0, rv) then begin hasNull := True; Continue; end;
+        if SameText(EvalBinary(quantN.CmpOp, lv, rv, ct,
+             False, False, True), 'True') then
         begin matched := True; Break; end;
       end;
-      if (not matched) and hasNull then Exit('');   // UNKNOWN
+      if (not matched) and hasNull then begin FLastNull := True; Exit(''); end;   // UNKNOWN
     end
     else
     begin
@@ -3255,13 +3333,15 @@ begin
       begin
         if Length(subR.Rows[i]) = 0 then Continue;
         rv := subR.Rows[i][0];
-        if rv = '' then begin hasNull := True; Continue; end;   // P-183/B-1
-        if not SameText(EvalBinary(quantN.CmpOp, lv, rv, ct), 'True') then
+        if CellIsNull(subR, i, 0, rv) then
+        begin hasNull := True; Continue; end;   // P-183/B-1
+        if not SameText(EvalBinary(quantN.CmpOp, lv, rv, ct,
+             False, False, True), 'True') then
         begin matched := False; Break; end;
       end;
       // P-183/B-1: ihlal varsa FALSE asagidaki ortak sondan doner (NULL
       // onemini yitirir); ihlal yok ve NULL gorulduyse UNKNOWN.
-      if hasNull and matched then Exit('');
+      if hasNull and matched then begin FLastNull := True; Exit(''); end;
     end;
     if matched then Exit('True') else Exit('False');
   end;
@@ -3281,21 +3361,26 @@ begin
       raise EVDbException.Create(ecInvalidArgument,
         'skaler alt sorgu tek kolon dondurmeli');
 
-    if Length(subR.Rows) = 0 then Exit(''); // satir yok = NULL
+    if Length(subR.Rows) = 0 then begin FLastNull := True; Exit(''); end;
     if Length(subR.Rows) > 1 then
       raise EVDbException.Create(ecInvalidArgument,
         'skaler alt sorgu birden fazla satir dondurdu');
-    if Length(subR.Rows[0]) = 0 then Exit('');
-    Exit(subR.Rows[0][0]);
+    if Length(subR.Rows[0]) = 0 then begin FLastNull := True; Exit(''); end;
+    // SKILL09: skaler alt sorgunun NULL'u da BAYRAKLA tasinir; mask varken
+    // '' gercek degerdir. Cagiran IS NULL/NOT IN vb. dogru karar verir.
+    itemVal := subR.Rows[0][0];
+    if CellIsNull(subR, 0, 0, itemVal) then begin FLastNull := True; Exit(''); end;
+    Exit(itemVal);
   end;
 
   if Expr is TSqlBetweenNode then
   begin
     bt := TSqlBetweenNode(Expr);
     lv := EvalExpr(bt.Expr, Row, ColNames, ColTypes);
-    // NULL BETWEEN ... / NULL NOT BETWEEN ... -> UNKNOWN. Once 'False'
-    // donuyordu; dis NOT bunu True'ya cevirip NULL satirlarini seciyordu.
-    if lv = '' then Exit('');
+    // SKILL09: NULL BETWEEN ... / NULL NOT BETWEEN ... -> UNKNOWN. Bos metin
+    // GERCEK degerdir; uc sinir da BAYRAKTAN denetlenir.
+    lnull := FLastNull;
+    if lnull then begin FLastNull := True; Exit(''); end;
     ct := VCT_STR;
     if bt.Expr is TSqlColumnRefNode then
     begin
@@ -3311,11 +3396,13 @@ begin
     else
       ct := ExprResultCtype(bt.Expr, ColNames, ColTypes);
     lv2 := EvalExpr(bt.LowBound, Row, ColNames, ColTypes);
-    if lv2 = '' then Exit('');
+    lnull := FLastNull;
+    if lnull then begin FLastNull := True; Exit(''); end;
     rv := EvalExpr(bt.HighBound, Row, ColNames, ColTypes);
-    if rv = '' then Exit('');
-    matched := VDbCmpVal(lv, lv2, '>=', ct) and
-               VDbCmpVal(lv, rv, '<=', ct);
+    rnull := FLastNull;
+    if rnull then begin FLastNull := True; Exit(''); end;
+    matched := VDbCmpValEx(lv, lv2, '>=', ct, True) and
+               VDbCmpValEx(lv, rv, '<=', ct, True);
     if bt.IsNot then matched := not matched;
     if matched then Exit('True') else Exit('False');
   end;
@@ -3445,7 +3532,9 @@ begin
     end
     else if fn.FuncName = 'COALESCE' then
     begin
-      if lv <> '' then Exit(lv) else Exit('');
+      // SKILL09: '' NULL DEGILDIR; secim FLastNull ile yapilir. (Parser
+      // normalde TSqlCoalesceNode uretir; bu dal eski/alternatif yollar icin.)
+      if not FLastNull then Exit(lv) else Exit('');
     end
     // ---- M10: JSONPath (JSON_EXTRACT / JSON_VALUE / JSON_EXISTS) ----
     else if (fn.FuncName = 'JSON_EXTRACT') or (fn.FuncName = 'JSON_VALUE') or
@@ -3685,10 +3774,13 @@ begin
   begin
     // P5-3: aranan (WHEN kosul) ve sade (CASE x WHEN deger) bicimler.
     // ELSE yoksa sonuc NULL'dur. Sade bicimde NULL eslesmez.
+    // SKILL09: NULL karari FLastNull'dan; '' gercek degerdir.
     csN := TSqlCaseNode(Expr);
+    lnull := False;
     if csN.Operand <> nil then
     begin
       ov := EvalExpr(csN.Operand, Row, ColNames, ColTypes);
+      lnull := FLastNull;
       ct := VCT_STR;
       if csN.Operand is TSqlColumnRefNode then
       begin
@@ -3703,7 +3795,8 @@ begin
       if csN.Operand <> nil then
       begin
         wv := EvalExpr(csN.Whens[i].Cond, Row, ColNames, ColTypes);
-        if (ov <> '') and (wv <> '') and VDbCmpVal(ov, wv, '=', ct) then
+        rnull := FLastNull;
+        if (not lnull) and (not rnull) and VDbCmpValEx(ov, wv, '=', ct, True) then
           Exit(EvalExpr(csN.Whens[i].Value, Row, ColNames, ColTypes));
       end
       else if EvalBool(csN.Whens[i].Cond, Row, ColNames, ColTypes) then
@@ -3711,44 +3804,53 @@ begin
     end;
     if csN.ElseExpr <> nil then
       Exit(EvalExpr(csN.ElseExpr, Row, ColNames, ColTypes));
+    FLastNull := True;
     Exit('');
   end;
 
-  // F-02: NULLIF(a,b) â€” a=b ise NULL, degilse a
+  // F-02: NULLIF(a,b) - a=b ise NULL, degilse a
+  // SKILL09: a NULL ise sonuc NULL; b NULL ise a dondurulur; '' degerdir.
   if Expr is TSqlNullIfNode then
   begin
     ov := EvalExpr(TSqlNullIfNode(Expr).Arg1, Row, ColNames, ColTypes);
+    lnull := FLastNull;
     wv := EvalExpr(TSqlNullIfNode(Expr).Arg2, Row, ColNames, ColTypes);
-    if (ov <> '') and (wv <> '') and VDbCmpVal(ov, wv, '=', VCT_STR) then
-      Exit('');
+    rnull := FLastNull;
+    if lnull then begin FLastNull := True; Exit(''); end;
+    if (not rnull) and VDbCmpValEx(ov, wv, '=', VCT_STR, True) then
+    begin FLastNull := True; Exit(''); end;
+    // SKILL09: Arg2 NULL ise sonuc Arg1'dir; Arg2'nin NULL bayragi sizmamali.
+    FLastNull := False;
     Exit(ov);
   end;
 
-  // F-02: COALESCE(a,b,c,...) â€” ilk non-NULL
+  // F-02: COALESCE(a,b,c,...) - ilk non-NULL
+  // SKILL09: bos metin '' NULL DEGILDIR; secilir.
   if Expr is TSqlCoalesceNode then
   begin
     for i := 0 to TSqlCoalesceNode(Expr).Args.Count - 1 do
     begin
       ov := EvalExpr(TSqlCoalesceNode(Expr).Args[i], Row, ColNames, ColTypes);
-      if ov <> '' then Exit(ov);
+      if not FLastNull then Exit(ov);
     end;
+    FLastNull := True;
     Exit('');
   end;
 
-  // F-22: JSONB ANAHTAR LISTESI â€” `col ?| ('a','b')` / `col ?& ('a','b')`
+  // F-22: JSONB ANAHTAR LISTESI - `col ?| ('a','b')` / `col ?& ('a','b')`
   if Expr is TSqlJsonKeyNode then
   begin
     jk := TSqlJsonKeyNode(Expr);
     jv := EvalExpr(jk.Left, Row, ColNames, ColTypes);
     // SQL NULL: JSON metni NULL ise sonuc UNKNOWN
-    if jv = '' then Exit('');
+    if FLastNull then Exit('');
     // NULL anahtar bir listede UNKNOWN uretir; PostgreSQL bunu yok sayar
     SetLength(jkeys, jk.Keys.Count);
     nk := 0;
     for i := 0 to jk.Keys.Count - 1 do
     begin
       jw := EvalExpr(jk.Keys[i], Row, ColNames, ColTypes);
-      if jw <> '' then
+      if not FLastNull then
       begin
         jkeys[nk] := jw;
         Inc(nk);
@@ -4590,6 +4692,7 @@ function TVSqlExecutor.EvalQualify(Expr: TSqlExprNode; const Row: TStrArray;
   RowIx: Integer): Boolean;
 var
   s: string;
+  s2: string;
   w: TSqlWindowNode;
   slot: Integer;
 
@@ -4668,6 +4771,27 @@ var
     end;
   end;
 
+  function Ev(E: TSqlExprNode): string; forward;
+
+  // SKILL09: ifadenin SQL NULL olup olmadigini belirler. Maskesi bilinen
+  // kolon ve NULL literali kesin; diger ifadelerde deger kanali '' ise NULL
+  // sayilir (QUALIFY eski davranisi). Boylece '' gercek degeri korunur.
+  function ExprIsNull(E: TSqlExprNode): Boolean;
+  var
+    tmp: string;
+  begin
+    if E = nil then Exit(True);
+    if E is TSqlLiteralNode then
+      Exit(TSqlLiteralNode(E).LitType = sltNull);
+    if E is TSqlColumnRefNode then
+    begin
+      tmp := EvalExpr(E, Row, ColNames, ColTypes);
+      Exit(FLastNull);
+    end;
+    tmp := Ev(E);
+    Result := tmp = '';
+  end;
+
   function Ev(E: TSqlExprNode): string;
   var
     b: TSqlBinaryOpNode;
@@ -4677,6 +4801,7 @@ var
     n: TSqlNullIfNode;
     co: TSqlCoalesceNode;
     t: Integer;
+    ln, rn: Boolean;
   begin
     if E = nil then Exit('');
     if E is TSqlWindowNode then
@@ -4701,6 +4826,11 @@ var
     if E is TSqlUnaryOpNode then
     begin
       u := TSqlUnaryOpNode(E);
+      // SKILL09: IS NULL/IS NOT NULL NULL'u '' ile degil maskeyle denetler.
+      if u.Op = suoIsNull then
+        Exit(BoolToStr(ExprIsNull(u.Operand), True));
+      if u.Op = suoIsNotNull then
+        Exit(BoolToStr(not ExprIsNull(u.Operand), True));
       Exit(EvalUnary(u.Op, Ev(u.Operand)));
     end;
     if E is TSqlFuncCallNode then
@@ -4709,9 +4839,12 @@ var
     begin
       btr := TSqlBetweenNode(E);
       s := Ev(btr.Expr);
-      if (s = '') or (Ev(btr.LowBound) = '') or (Ev(btr.HighBound) = '') then Exit('');
-      if SameText(EvalBinary(sboGte, s, Ev(btr.LowBound), VCT_STR), 'True') and
-         SameText(EvalBinary(sboLte, s, Ev(btr.HighBound), VCT_STR), 'True') then
+      s2 := Ev(btr.LowBound);
+      // SKILL09: NULL karari maskeden; '' degeri sinir olarak gecerlidir.
+      if ExprIsNull(btr.Expr) or ExprIsNull(btr.LowBound) or
+         ExprIsNull(btr.HighBound) then Exit('');
+      if SameText(EvalBinary(sboGte, s, s2, VCT_STR, False, False, True), 'True') and
+         SameText(EvalBinary(sboLte, s, Ev(btr.HighBound), VCT_STR, False, False, True), 'True') then
         s := 'True' else s := 'False';
       if btr.IsNot then
       begin if s = 'True' then Exit('False') else Exit('True'); end;
@@ -4730,7 +4863,10 @@ var
     begin
       n := TSqlNullIfNode(E);
       s := Ev(n.Arg1);
-      if (s <> '') and (s = Ev(n.Arg2)) then Exit('');
+      s2 := Ev(n.Arg2);
+      // SKILL09: Arg1 NULL ise sonuc NULL; Arg2 NULL ise Arg1 doner.
+      if ExprIsNull(n.Arg1) then Exit('');
+      if not ExprIsNull(n.Arg2) and (s = s2) then Exit('');
       Exit(s);
     end;
     if E is TSqlCoalesceNode then
@@ -4739,7 +4875,8 @@ var
       for t := 0 to co.Args.Count - 1 do
       begin
         s := Ev(co.Args[t]);
-        if s <> '' then Exit(s);
+        // SKILL09: '' gercek degerdir; yalnizca NULL atlanir.
+        if not ExprIsNull(co.Args[t]) then Exit(s);
       end;
       Exit('');
     end;
@@ -6036,8 +6173,8 @@ var
       begin
         for q := 1 to Length(lit.StrVal) do
           if lit.StrVal[q] >= #128 then Exit;
-        if lit.StrVal = '' then isNull := True
-        else sv := lit.StrVal;
+        // SKILL09: '' GERCEK bir degerdir; NULL ile karistirilmaz.
+        sv := lit.StrVal;
       end
       else Exit;
     end
@@ -6073,8 +6210,8 @@ var
     begin
       for q := 1 to Length(lit.StrVal) do
         if lit.StrVal[q] >= #128 then Exit;
-      if lit.StrVal = '' then isNull := True
-      else if AKind = rttILike then pat := VDbTrLower(lit.StrVal)
+      // SKILL09: '' GERCEK desendir (tam eslesme); NULL degildir.
+      if AKind = rttILike then pat := VDbTrLower(lit.StrVal)
       else pat := lit.StrVal;
     end
     else Exit;
@@ -6304,13 +6441,9 @@ var
           for n := 1 to Length(lit.StrVal) do
             if lit.StrVal[n] >= #128 then
             begin SetLength(Tree, saved); Exit; end;
-          if lit.StrVal = '' then
-            inNull := True
-          else
-          begin
-            SetLength(inStrs, inCnt + 1);
-            inStrs[inCnt] := lit.StrVal; Inc(inCnt);
-          end;
+          // SKILL09: '' GERCEK degerdir; IN listesinde NULL sayilmaz.
+          SetLength(inStrs, inCnt + 1);
+          inStrs[inCnt] := lit.StrVal; Inc(inCnt);
         end;
       end;
       if inCnt = 0 then
@@ -6359,12 +6492,10 @@ var
          not (bt.HighBound is TSqlLiteralNode) then Exit;
       // Genel yol, iki sinirdan biri NULL ise BETWEEN'in TAMAMINI UNKNOWN
       // dondurur (kisa devre). Ayni davranisi koru; desenlemek yanlis olur.
+      // SKILL09: yalnizca GERCEK NULL (sltNull) sinir UNKNOWN yapar; ''
+      // degeri desenlenebilir bir sinirodir.
       if (TSqlLiteralNode(bt.LowBound).LitType = sltNull) or
-         (TSqlLiteralNode(bt.HighBound).LitType = sltNull) or
-         ((TSqlLiteralNode(bt.LowBound).LitType = sltString) and
-          (TSqlLiteralNode(bt.LowBound).StrVal = '')) or
-         ((TSqlLiteralNode(bt.HighBound).LitType = sltString) and
-          (TSqlLiteralNode(bt.HighBound).StrVal = '')) then
+         (TSqlLiteralNode(bt.HighBound).LitType = sltNull) then
       begin
         Result := TreeAdd(rttUnknown);
         Exit;
@@ -9580,7 +9711,7 @@ end;
 procedure TVSqlExecutor.ComputeWindows(Stmt: TSqlSelectStmt;
   const Rows: TStrMatrix; const ColNames: TStrArray;
   const ColTypes: TByteArray; out WinVals: TStrMatrix;
-  out WinSlot: TIntArray);
+  out WinSlot: TIntArray; const RowNulls: TNullMatrix);
 var
   WList: TList<TSqlWindowNode>;
   j, r, s, q, k, kk, kkEnd: Integer;
@@ -9604,9 +9735,22 @@ var
   ovf: Boolean;
   navg: Integer;
   mn, mx: string;
+  mnSet, mxSet: Boolean;   // SKILL09: '' gercek deger; "atandi mi" ayri bayrak
   fv: Double;
   rk,uv: Integer;
   colRef: TSqlColumnRefNode;
+  hasMask: Boolean;   // SKILL09: RowNulls satir basina hizali mi?
+
+  { SKILL09: satirin NULL maskesini FCurNulls'a baglar. Maske yoksa
+    (eski yol) nil kalir ve '' sezgisel NULL sayilir. }
+  procedure BindMask(RowIdx: Integer);
+  begin
+    if hasMask and (RowIdx >= 0) and (RowIdx <= High(RowNulls))
+       and (Length(RowNulls[RowIdx]) = Length(ColNames)) then
+      FCurNulls := RowNulls[RowIdx]
+    else
+      FCurNulls := nil;
+  end;
 
   function PartKey(RowIdx: Integer): AnsiString;
   var
@@ -9617,6 +9761,7 @@ var
     Result := '';
     for t := 0 to WN.Partitions.Count - 1 do
     begin
+      BindMask(RowIdx);
       e := EvalExpr(WN.Partitions[t], Rows[RowIdx], ColNames, ColTypes);
       L := Length(e);
       Result := Result + AnsiString(Chr(L and $FF) + Chr((L shr 8) and $FF) +
@@ -9641,18 +9786,24 @@ var
   var
     t: Integer;
     va, vb: string;
+    lna, lnb: Boolean;
   begin
     Result := True;
     for t := 0 to WN.OrderBys.Count - 1 do
     begin
+      BindMask(Ra);
       va := EvalExpr(WN.OrderBys[t].Expr, Rows[Ra], ColNames, ColTypes);
+      lna := FLastNull;
+      BindMask(Rb);
       vb := EvalExpr(WN.OrderBys[t].Expr, Rows[Rb], ColNames, ColTypes);
-      if (va = '') or (vb = '') then
+      lnb := FLastNull;
+      // SKILL09: yalnizca NULL'lar bag sayilir; '' gercek degerdir.
+      if lna or lnb then
       begin
-        if va <> vb then Exit(False);
+        if lna <> lnb then Exit(False);
         Continue; // iki NULL = bag
       end;
-      if not VDbCmpVal(va, vb, '=', KeyCtype(WN.OrderBys[t].Expr)) then
+      if not VDbCmpValEx(va, vb, '=', KeyCtype(WN.OrderBys[t].Expr), hasMask) then
         Exit(False);
     end;
   end;
@@ -9665,6 +9816,7 @@ var
   end;
 
 begin
+  hasMask := (Length(RowNulls) = Length(Rows)) and (Length(Rows) > 0);
   SetLength(WinSlot, Stmt.Columns.Count);
   WList := TList<TSqlWindowNode>.Create;
   try
@@ -9789,9 +9941,15 @@ begin
               if WN.FuncName = 'LAG' then uv := k - WN.Offset
               else uv := k + WN.Offset;
               if (uv >= 0) and (uv <= High(ord)) then
-                WinVals[ord[k]][s] := EvalExpr(WN.Arg, Rows[ord[uv]], ColNames, ColTypes)
+              begin
+                BindMask(ord[uv]);
+                WinVals[ord[k]][s] := EvalExpr(WN.Arg, Rows[ord[uv]], ColNames, ColTypes);
+              end
               else if WN.Default <> nil then
-                WinVals[ord[k]][s] := EvalExpr(WN.Default, Rows[ord[k]], ColNames, ColTypes)
+              begin
+                BindMask(ord[k]);
+                WinVals[ord[k]][s] := EvalExpr(WN.Default, Rows[ord[k]], ColNames, ColTypes);
+              end
               else
                 WinVals[ord[k]][s] := '';
             end;
@@ -9806,7 +9964,7 @@ begin
             for k := 0 to High(ord) do
             begin
               cnt := 0; sum := 0; sumI := 0; sumC := 0; ovf := False;
-              navg := 0; mn := ''; mx := '';
+              navg := 0; mn := ''; mx := ''; mnSet := False; mxSet := False;
               if WN.FrameType = '' then
                 kkEnd := High(ord)
               else
@@ -9818,8 +9976,10 @@ begin
                   Inc(cnt);
                   Continue;
                 end;
+                BindMask(ord[kk]);
                 v := EvalExpr(WN.Arg, Rows[ord[kk]], ColNames, ColTypes);
-                if v = '' then Continue;
+                // SKILL09: '' gercek degerdir; yalnizca NULL atlanir.
+                if FLastNull then Continue;
                 Inc(cnt);
                 // D-Y1/Y2: INTEGER cercevede Int64 tam toplam.
                 if ct = VCT_INT then
@@ -9843,8 +10003,8 @@ begin
                     sum := sum + fv;
                   Inc(navg);
                 end;
-                if (mn = '') or VDbCmpVal(v, mn, '<', ct) then mn := v;
-                if (mx = '') or VDbCmpVal(v, mx, '>', ct) then mx := v;
+                if (not mnSet) or VDbCmpValEx(v, mn, '<', ct, True) then begin mn := v; mnSet := True; end;
+                if (not mxSet) or VDbCmpValEx(v, mx, '>', ct, True) then begin mx := v; mxSet := True; end;
               end;
               if WN.FuncName = 'COUNT' then wv := IntToStr(cnt)
               else if WN.FuncName = 'SUM' then
@@ -10858,6 +11018,7 @@ type
     SumI: Int64;             // VCT_INT tam toplam (D-Y1)
     Ovf: Boolean;            // Int64 tasmasi -> Double yedegi
     MinV, MaxV: string;      // EvalAggregateValue: ham deger
+    HasMinV, HasMaxV: Boolean;  // SKILL09: '' gercek deger; ayri bayrak
     AggCt: Byte;
   end;
 var
@@ -11032,7 +11193,8 @@ var
       Inc(Pl.Cnt);                 // COUNT(*)
       Exit;
     end;
-    if V = '' then Exit;           // NULL: sayilmaz
+    // SKILL09: bu hizli yol yalnizca NULL'suz tablolarda calisir (asagida
+    // HasNulls kapisi var); dolayisiyla '' GERCEK bir degerdir, atlanmaz.
     Inc(Pl.Cnt);
     // D-Y1/Y2: INTEGER kolonda Int64 tam toplam.
     if Pl.AggCt = VCT_INT then
@@ -11056,10 +11218,10 @@ var
         Pl.SumF := Pl.SumF + fv;
       Inc(Pl.AvgCnt);
     end;
-    if (Pl.MinV = '') or VDbCmpVal(V, Pl.MinV, '<', Pl.AggCt) then
-      Pl.MinV := V;
-    if (Pl.MaxV = '') or VDbCmpVal(V, Pl.MaxV, '>', Pl.AggCt) then
-      Pl.MaxV := V;
+    if (not Pl.HasMinV) or VDbCmpValEx(V, Pl.MinV, '<', Pl.AggCt, True) then
+    begin Pl.MinV := V; Pl.HasMinV := True; end;
+    if (not Pl.HasMaxV) or VDbCmpValEx(V, Pl.MaxV, '>', Pl.AggCt, True) then
+    begin Pl.MaxV := V; Pl.HasMaxV := True; end;
   end;
 
 begin
@@ -11231,6 +11393,8 @@ begin
       plans[j].Ovf := False;
       plans[j].MinV := '';
       plans[j].MaxV := '';
+      plans[j].HasMinV := False;
+      plans[j].HasMaxV := False;
       plans[j].AggCt := VCT_STR;
       if fn.IsStar then
       begin
@@ -17292,7 +17456,12 @@ begin
     // P5-WIN: pencere degerleri sorgu ORDER BY'sinden SONRA hesaplanir
     // (kendi ORDER BY'si bagimsizdir), asagida tuketilir.
     if HasWindow(Stmt) then
-      ComputeWindows(Stmt, filteredRows, colNames, colTypes, WinVals, WinSlot);
+      if maskOk then
+        ComputeWindows(Stmt, filteredRows, colNames, colTypes, WinVals, WinSlot,
+          filteredNulls)
+      else
+        ComputeWindows(Stmt, filteredRows, colNames, colTypes, WinVals, WinSlot,
+          nil);
     // F-09: QUALIFY â€” pencere hesaplandiktan SONRA, projeksiyondan ONCE
     if Stmt.QualifyClause <> nil then
     begin
@@ -25008,6 +25177,7 @@ var
   prevTypedCur: Boolean;
   prevSub: TDictionary<Pointer, TSqlResult>;
   prevInSet: TDictionary<Pointer, TDictionary<string, Byte>>;
+  prevInSetNull: TDictionary<Pointer, Boolean>;
   prevCte: TDictionary<string, TCteTable>;
 begin
 
@@ -25049,11 +25219,13 @@ begin
   // dis kapsam siziyordu.
   prevSub := FSubCache;
   prevInSet := FInSetCache;
+  prevInSetNull := FInSetNull;
   prevCte := FCteTables;
   prevTypedCur := FTypedCur;
   FTypedCur := typedHere;
   FSubCache := TDictionary<Pointer, TSqlResult>.Create;
   FInSetCache := TDictionary<Pointer, TDictionary<string, Byte>>.Create;
+  FInSetNull := TDictionary<Pointer, Boolean>.Create;
   FCteTables := TDictionary<string, TCteTable>.Create;
   // F-36: FOuterRow/FOuterColNames (trigger NEW/OLD baglami) temizligi
   // FireTriggerDef tarafindan yonetilir (kayit/geri yuikleme);
@@ -25181,6 +25353,8 @@ begin
       FInSetCache.Free;
     end;
     FInSetCache := prevInSet;
+    if FInSetNull <> nil then FInSetNull.Free;
+    FInSetNull := prevInSetNull;
     FCteTables.Free;
     FCteTables := prevCte;
   end;
