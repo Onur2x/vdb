@@ -2489,6 +2489,12 @@ var
     if not P.Cur.NextChunk(VDB_PORTAL_CHUNK, chunk) then
     begin
       P.Done := True;
+      { SKILL11 D: akis bitti. Tuketilmis imlecin satir tamponu ve dis
+        siralama kaynaklari bosaltilir; imlec nesnesi kalir cunku
+        Describe onu gorunce sorguyu YENIDEN calistirmamalidir. Aksi
+        halde bitmis portallar sunucunun sonuc bellegi butcesinde
+        gereksiz yer tutardi. }
+      P.Cur.ReleaseBuffers;
       Exit;
     end;
     P.Res := chunk;

@@ -26,7 +26,7 @@ uses
   VDbCore, VDbTable, VDbAst, VDbJson, VDbErr, VDbText, VDbXml, VDbSpatial,
   VDbRange, VDbParser, VDbTypes, VDbReplication, VDbParallel, VDbMonitor,
   VDbPlatform, VDbCost, VDbExtension, VDbVector, VDbArrow, VDbParquet,
-  VDbTrace, VDbChangeLog, VDbReplV3;
+  VDbTrace, VDbChangeLog, VDbReplV3, VDbSpill;
 
 const
   // F2-18: DISTINCT / UNION tekilleÅŸtirme sonucu ve set-op birlestirme
@@ -112,6 +112,25 @@ type
     N: TSqlExprNode;
     V: string;
   end;
+
+  { SKILL11: ORDER BY siralama kolonlari. Birim duzeyinde bildirilir cunku
+    hem DoSort hem de imlec dis-siralama yolu (BuildSortCols) kullanir;
+    karsilastirma semantigi tek kaynaktan gelir. }
+  TSortColInfo = record
+    ColIdx: Integer;
+    CType: Byte;
+    Desc: Boolean;
+    // R-20: ORDER BY ... COLLATE <ad>. Bos = motor varsayilani (bayt
+    // sirasi). TR eski davranisi verir; digerleri VDbCompareCol'a gider.
+    Collate: string;
+    UseTr: Boolean;  // acik COLLATE (yalniz metin kolonlarda)
+    // F-10: NULLS FIRST (0) / LAST (1); -1 = motor varsayilani
+    NullsPos: Integer;
+  end;
+
+  { R-14 Full: siralama kolonlari dizisi (birim duzeyinde; paralel
+    gorevlerin baglam kaydinda tasinir). }
+  TVdbSortCols = array of TSortColInfo;
 
   { SKILL6 04: gercek satir imleci (one cikarilmis bildirim). }
   TVdbRowCursor = class;
@@ -598,7 +617,7 @@ type
       Sekil/guvenlik uymazsa False -> genel yol AYNEN calisir. }
     function TryStreamSelectChunk(Stmt: TSqlSelectStmt; const td: TTableDef;
       Cursor: TVdbRowCursor; AResumePage, ASkipQual, AMaxRows: Integer;
-      out Res: TSqlResult): Boolean;
+      out Res: TSqlResult; AIgnoreOrderBy: Boolean = False): Boolean;
     { SKILL6 04: eski imza — Cursor=nil ile parcali olmayan yola delege eder. }
     function TryStreamSelect(Stmt: TSqlSelectStmt; const td: TTableDef;
       out Res: TSqlResult): Boolean;
@@ -745,6 +764,14 @@ type
     property AutoAnalyzeThreshold: Int64 read FAutoAnalyzeThr write FAutoAnalyzeThr;
     property AutoAnalyzeRuns: Int64 read FAutoAnalyzeRuns;
     property AutoAnalyzeErrors: Int64 read FAutoAnalyzeErrors;
+    { SKILL11: ORDER BY anahtarlarini siralama kolonlarina cozer. DoSort ile
+      AYNI kurallar (ad/sonek eslesmesi, COLLATE, NULLS konumu). Imlec
+      dis-siralama yolu da bunu kullanir; boylece iki yol tek kaynaktan
+      beslenir ve karsilastirma semantigi bit bit ayni kalir.
+      validCount = 0 ise False doner (genel yol da siralama yapmaz). }
+    function BuildSortCols(OrderBy: TList<TOrderItem>;
+      const Keys: TStrArray; const ColNames: TStrArray;
+      const ColTypes: TByteArray; out ASortCols: TVdbSortCols): Boolean;
     { P-176: plan onbellegi sayaclarini TVSql aktarir (SHOW STATS). }
     procedure SetPlanMetrics(AHits, AMisses: Int64; ASize: Integer);
     property PlanCacheHits: Int64 read FPlanCacheHits;
@@ -849,6 +876,13 @@ type
       - NextChunk(AMaxRows): en fazla AMaxRows satirlik parca uretir
         (AMaxRows = 0 -> kalan tum satirlar). Veri bittiyse False doner.
       - Cancel: sonraki NextChunk bos doner.
+      - ReleaseBuffers: akis TUKENDIKTEN sonra teslim tamponunu ve dis
+        siralama kaynaklarini birakir (LiveBytes kucultur, PeakBytes
+        kaniti kalir). Imlec NESNESI yasar: portal Describe onu bulur ve
+        sorguyu yeniden CALISTIRMAZ; imlec de tukenmis kalir. Cagirmak
+        zorunlu degildir (Free zaten temizler); bitmis portallarin sonuc
+        bellegi butcesinde yer tutmamasi icin sunucu cagirir. Tekrari
+        zararsizdir.
     Akisli olmayan sorgu bicimleri (ORDER BY/GROUP BY/DISTINCT/JOIN/
     UNION/pencere/alt sorgu, HasNulls tablolar, KV deposu, toplu yazim)
     TEK SEFERDE maddeselestirilir; bu durust bir sinirdir ve
@@ -870,15 +904,63 @@ type
     FBuf: TSqlResult;          // teslim bekleyen satirlar
     FBufPos: Integer;
     FBytes: Int64;             // uretilen hucre baytlari (butce icin)
+    FPeakBytes: Int64;         // SKILL11: yasam boyu en yuksek LiveBytes
+
+    { SKILL11: imlec duzeyinde DIS SIRALAMA (external merge sort).
+
+      ORDER BY bir indeksten gelmiyorsa sonuc eskiden TEK SEFERDE
+      maddeselestiriliyordu; satir sayisi buyudukce bellek dogrusal
+      buyuyordu. Bu yol, ayni filtreyi/izdusumu UYGULAYAN akisli taramayi
+      ORDER BY yokmus gibi surer, her parcayi bellek butcesi icinde
+      sirallar ve kosu dosyasina yazar; tarama bitince kosulari k-yonlu
+      birlestirir. Tepe bellek satir sayisindan BAGIMSIZ hale gelir
+      (bir parca + k kosu basi).
+
+      Sirasi bit bit ayni kalir: karsilastirma DoSort ile AYNI
+      VdbSortCompareRows ve AYNI BuildSortCols ciktisidir.
+      Kapsam siniri (durust): yalniz duz kolon adi ile yazilmis ORDER BY
+      anahtarlari (ifade anahtari, JOIN/GROUP BY/DISTINCT/UNION/pencere/
+      alt sorgu ve indeksten gelen sirali akis bu yolu KULLANMAZ). }
+    FExtSort: Boolean;         // dis siralama modu etkin
+    FSortCols: TVdbSortCols;   // BuildSortCols ciktisi (tek kaynak)
+    FSpill: TVdbSpillDir;      // bu imlecin gecici kosu dizini
+    FSpillPaths: TStrArray;    // yazilan kosu dosyalari
+    FMerge: TVdbSpillMerger;   // birlestirici (tarama bitince kurulur)
+    FRunRows: TStrMatrix;      // o an doldurulan parca
+    FRunNulls: TNullMatrix;
+    FRunBytes: Int64;          // parcanin gercek (kapasite dahil) bayti
+    FSpillRuns: Integer;       // yazilan kosu sayisi (kanit sayaci)
+    FSpillBytes: Int64;        // kosu dosyalarina yazilan bayt
+    FSortedDone: Boolean;      // tarama bitti, birlestirme asamasina gecildi
+    FProjCols: TStrArray;      // projeksiyon kolon adlari (tarama olmadan)
+    FProjTypes: TByteArray;    // projeksiyon kolon tipleri
+    procedure ExtSortStart;
+    function ExtSortDrain: Boolean;
+    procedure ExtSortAbort;
+    procedure ExtSortFlushRun;
+    procedure ExtSortEndScan;
+    procedure ExtSortFillTo(AMinRows: Integer);
+    function ExtSortNext(out Row: TStrArray; out Nulls: TNulArr): Boolean;
+    function RunCmp(A, B: Integer): Integer;     // parca ici (FRunRows)
+    function MergeCmp(A, B: Integer): Integer;   // kosular arasi (FMerge.Heads)
+
     constructor Create(AExec: TVSqlExecutor; AStmt: TSqlStmtNode);
     destructor Destroy; override;
     procedure FillBuf(AMinRows: Integer);
     function NextChunk(AMaxRows: Integer; out Res: TSqlResult): Boolean;
     function NextRow(out Row: TStrArray; out Nulls: TNulArr): Boolean;
     procedure Cancel;
+    { SKILL11 D: akis bittikten sonra teslim tamponunu ve dis siralama
+      kaynaklarini bosaltir. Imlec nesnesi kalir (portal Describe onu
+      yeniden CALISTIRMAZ) ama satir tutmaz. }
+    procedure ReleaseBuffers;
     { SKILL6 04: su an IMLEcte canli tutulan tahmini bayt (butce icin).
       Akisli yolda yalniz tampon parcasi, maddesel yolda tum sonuc sayilir. }
     function LiveBytes: Int64;
+    { SKILL11: yasam boyu en yuksek LiveBytes (tarama icinde de olculur;
+      tepe bellek kanitinin tek kaynagi). }
+    property PeakBytes: Int64 read FPeakBytes;
+    procedure NotePeak;
   end;
 
 implementation
@@ -970,12 +1052,40 @@ begin
   FChunkMax := -1;
   FMatPos := 0;
   FBufPos := 0;
+  { SKILL11: OFFSET/LIMIT imlecte TUTULUR. Akisli (parcali) yolda motor
+    bunlari uygulamaz (ctx.Offset := 0; ctx.Limit := -1), maddesel yolda
+    ise kendisi uygular ve FillBuf bunu FSkip := 0 / FLimit := -1 ile
+    notrler. Dis siralama yolunda ise birlestirme CIKISINA uygulanir. }
   FSkip := 0;
   FLimit := -1;
+  if FSelect <> nil then
+  begin
+    if FSelect.OffsetVal > 0 then FSkip := FSelect.OffsetVal;
+    FLimit := FSelect.LimitVal;
+  end;
 end;
 
 destructor TVdbRowCursor.Destroy;
 begin
+  { SKILL11: dis siralama kaynaklari once kapatilir; FSpill.Close kendi
+    kosu dosyalarini, manifesti ve dizini siler (hata/iptal sonrasi
+    gecici dosya birakmaz). }
+  if FMerge <> nil then
+  begin
+    FMerge.Free;
+    FMerge := nil;
+  end;
+  if FSpill <> nil then
+  begin
+    try
+      FSpill.Close;
+    finally
+      FSpill.Free;
+      FSpill := nil;
+    end;
+  end;
+  SetLength(FRunRows, 0);
+  FRunNulls := nil;
   FStmt.Free;
   FStmt := nil;
   FSelect := nil;
@@ -985,6 +1095,56 @@ end;
 procedure TVdbRowCursor.Cancel;
 begin
   FCancelled := True;
+  { Iptal edilen sorgu gecici dosya BIRAKMAZ: birlestirici kapanir,
+    kosu dizini silinir, sonraki cagrilar bos doner. }
+  if FMerge <> nil then
+  begin
+    FMerge.Free;
+    FMerge := nil;
+  end;
+  if FSpill <> nil then
+  begin
+    try
+      FSpill.Close;
+    finally
+      FSpill.Free;
+      FSpill := nil;
+    end;
+  end;
+  SetLength(FRunRows, 0);
+  FRunNulls := nil;
+  FSortedDone := True;
+  FDone := True;
+end;
+
+{ SKILL11 D: akis bittikten sonra teslim tamponu ve dis siralama kaynaklari
+  bosaltilir. Imlec yasamaya devam eder (portal Describe onu yeniden
+  CALISTIRMAZ) ama satir tutmaz; boylece tuketilmis portallar sunucunun
+  sonuc bellegi butcesini isgal etmez. FDone zaten True oldugu icin
+  FillBuf bir daha satir uretmez. }
+procedure TVdbRowCursor.ReleaseBuffers;
+begin
+  FBuf := Default(TSqlResult);
+  FBufPos := 0;
+  FMat := Default(TSqlResult);
+  FMatPos := 0;
+  if FMerge <> nil then
+  begin
+    FMerge.Free;
+    FMerge := nil;
+  end;
+  if FSpill <> nil then
+  begin
+    try
+      FSpill.Close;
+    finally
+      FSpill.Free;
+      FSpill := nil;
+    end;
+  end;
+  SetLength(FRunRows, 0);
+  FRunNulls := nil;
+  FSpillPaths := nil;
 end;
 
 { Bir sonraki parca icin satirlari FBuf'a doldurur; OFFSET/LIMIT burada
@@ -1006,6 +1166,27 @@ begin
   begin
     FStarted := True;
     if AMinRows > 0 then FChunkMax := AMinRows + FSkip else FChunkMax := -1;
+    ExtSortStart;
+    if FExtSort then
+    begin
+      { SKILL11: filtre+izdusum UYGULAYAN akisli tarama ORDER BY yokmus
+        gibi surulur, kosulara yazilir, sonra k-yonlu birlestirilir.
+        OFFSET/LIMIT birlestirme CIKISINA uygulanir (ExtSortFillTo). }
+      if ExtSortDrain then
+      begin
+        ExtSortEndScan;
+        FFields := FProjCols;
+        FFieldTypes := FProjTypes;
+        FBuf := Default(TSqlResult);
+        FBufPos := 0;
+        ExtSortFillTo(AMinRows);
+        Exit;
+      end;
+      { Ilk tarama cagrisi reddedildi ve HICBIR satir tuketilmedi: dis
+        siralama kapatildi, asagida maddesel yol AYNEN calisir. Iki yol
+        asla karistirilmaz. }
+      FExtSort := False;
+    end;
     FExec.ExecSelectForCursor(Self, FSelect, part);
     if not FStreamed then
     begin
@@ -1024,6 +1205,11 @@ begin
       FFields := part.Fields;
       FFieldTypes := part.FieldTypes;
     end;
+  end
+  else if FExtSort then
+  begin
+    ExtSortFillTo(AMinRows);
+    Exit;
   end
   else if FStreamed and (not FScannedAll) then
   begin
@@ -1123,16 +1309,350 @@ end;
 
 function TVdbRowCursor.LiveBytes: Int64;
 var
-  i, c: Integer;
+  i: Integer;
 begin
-  Result := Int64(Length(FFields)) * 16;
-  if not FStreamed then
-    for i := 0 to High(FMat.Rows) do
-      for c := 0 to High(FMat.Rows[i]) do
-        Inc(Result, Int64(Length(FMat.Rows[i][c])) + 8);
-  for i := 0 to High(FBuf.Rows) do
-    for c := 0 to High(FBuf.Rows[i]) do
-      Inc(Result, Int64(Length(FBuf.Rows[i][c])) + 8);
+  { SKILL11 D: butce yalnizca hucre metin uzunlugunu degil, dinamik dizi
+    kapasitesini/isaretcilerini, string heap'ini (StrRec basligi dahil),
+    sirala kayitlarini, gecici tamponlari ve imlec durumunu da sayar.
+    VdbSpillRowBytes/MatrixBytes tek kaynaktir; maddesel sonuc, teslim
+    tamponu ve dis siralama parcasi ayni olcutle olculur. }
+  Result := VdbSpillMatrixBytes(FMat.Rows);
+  Inc(Result, VdbSpillMatrixBytes(FBuf.Rows));
+  Inc(Result, VdbSpillRowBytes(FFields));
+  Inc(Result, VdbSpillRowBytes(FProjCols));
+  Inc(Result, VdbSpillRowBytes(FSpillPaths));
+  Inc(Result, Int64(Length(FFieldTypes)) + Int64(Length(FProjTypes)) + 32);
+  Inc(Result, Int64(Length(FSortCols)) * (SizeOf(TSortColInfo) + 16));
+  { Dis siralama modunda canli olan sey tek parcadir; kosular diskte
+    durur, bellekte sayilmaz. Birlestirme asamasinda ise okuyucu
+    pencereleri + kafa satirlari sayilir (bunlar kosu sayisiyla buyur). }
+  if FExtSort then
+  begin
+    Inc(Result, VdbSpillMatrixBytes(FRunRows));
+    Inc(Result, Int64(Length(FRunNulls)) * (SizeOf(Pointer) + 32));
+    for i := 0 to High(FRunNulls) do
+      Inc(Result, Int64(Length(FRunNulls[i])));
+  end;
+  if FMerge <> nil then
+    Inc(Result, FMerge.MemBytes);
+  { Imlec nesnesinin kendisi + alanlari: satir sayisindan bagimsiz taban. }
+  Inc(Result, 512);
+end;
+
+procedure TVdbRowCursor.NotePeak;
+var
+  b: Int64;
+begin
+  b := LiveBytes;
+  if b > FPeakBytes then FPeakBytes := b;
+end;
+
+{ ============================================================
+  SKILL11: imlec duzeyinde DIS SIRALAMA (external merge sort)
+
+  Sozlesme: tepe bellek satir sayisindan BAGIMSIZ olmalidir. Bu yuzden
+  sirasi bir indeksten gelmeyen ORDER BY, maddeselestirmek yerine
+  parcalara bolunur: her parca butce icinde siralanip kosu dosyasina
+  yazilir, tarama bitince kosular k-yonlu birlestirilir. Karsilastirma
+  DoSort ile AYNI VdbSortCompareRows + AYNI BuildSortCols ciktisidir;
+  bu yuzden cikti sirasi bellek-ici yolla BIT BIT aynidir.
+  ============================================================ }
+
+const
+  { Tek tarama parcasi: imlecin teslim boyutundan BAGIMSIZ sabit. Parca
+    butcesi VdbSpillExtSortBudget ile gelir (varsayilan 8 MiB). }
+  VDB_EXTSORT_SCAN_CHUNK = 4096;
+
+{ SKILL11: ileri bildirim. Tanim asagida, DoSort bolumundedir; dis
+  siralama karsilastirmasi AYNI islevi kullanir (tek kaynak). }
+function VdbSortCompareRows(const Cols: TVdbSortCols; const Rows: TStrMatrix;
+  ra, rb: Integer): Integer; forward;
+
+{ Dis siralama uygulanabilir mi? Karar TARAMADAN ONCE ve YALNIZCA
+  statik bilgiyle verilir; boylece iki yol karistirilmaz. Sirali akis
+  zaten FStreamed akisli taranabilir olmayi gerektirdigi icin, sekil
+  uygun degilse TryStreamSelectChunk ilk cagrida False doner ve
+  maddesel yol AYNEN calisir (tuketilmis parca yoktur). }
+procedure TVdbRowCursor.ExtSortStart;
+var
+  td: TTableDef;
+  cn, keys: TStrArray;
+  ct: TByteArray;
+  i: Integer;
+  dbTag: string;
+begin
+  FExtSort := False;
+  if FSelect = nil then Exit;
+  if (FSelect.OrderBy = nil) or (FSelect.OrderBy.Count = 0) then Exit;
+  if (FSelect.Columns.Count = 0) or (FSelect.FromTable = '') then Exit;
+  SetLength(keys, FSelect.OrderBy.Count);
+  for i := 0 to FSelect.OrderBy.Count - 1 do
+  begin
+    if FSelect.OrderBy[i].Expr is TSqlColumnRefNode then
+      keys[i] := TSqlColumnRefNode(FSelect.OrderBy[i].Expr).QualifiedName
+    else
+      keys[i] := '';
+  end;
+  { Ifade anahtari (or. UPPER(a)) bu yolda DESTEKLENMEZ: cikti satirlari
+    uzerinden yeniden uretilemez; maddesel yol kullanilir. }
+  for i := 0 to High(keys) do
+    if keys[i] = '' then Exit;
+  td := Default(TTableDef);
+  if not FExec.FT.TryGetTableDef(FSelect.FromTable, td) then Exit;
+  { SKILL11: NULL tasiyan tablo maddesel yolda kalir (belgelenen sinir).
+    Kosu dosyasi NULL maskesini tasimaz; birlestirme karsilastirmasi
+    maskesiz satirlari gorurdu ve NULL'larin sirasi maddesel yoldan
+    sapabilirdi. Sonucun bit bit ayni kalmasi icin bu yol kullanilmaz. }
+  if td.HasNulls then Exit;
+  { BuildSortCols, varsayilan collation'i (R-20) aktif tablo uzerinden
+    cozer; maddesel yol da ayni degeri gorur. }
+  FExec.FCurTable := FSelect.FromTable;
+  FExec.BuildColInfo(td, cn, ct);
+  SetLength(FProjCols, FSelect.Columns.Count);
+  SetLength(FProjTypes, FSelect.Columns.Count);
+  for i := 0 to FSelect.Columns.Count - 1 do
+  begin
+    if FSelect.Columns[i].Alias <> '' then
+      FProjCols[i] := FSelect.Columns[i].Alias
+    else if FSelect.Columns[i].Expr is TSqlColumnRefNode then
+      FProjCols[i] := TSqlColumnRefNode(FSelect.Columns[i].Expr).ColumnName
+    else
+      FProjCols[i] := 'col' + IntToStr(i + 1);
+    if FSelect.Columns[i].Expr <> nil then
+      FProjTypes[i] := FExec.ExprResultCtype(FSelect.Columns[i].Expr, cn, ct)
+    else
+      FProjTypes[i] := VCT_STR;
+  end;
+  FSortCols := nil;
+  { Her ORDER BY anahtari CIKTI kolonlarina cozulmelidir. Gizli kaynak
+    kolonu (SELECT listesinde olmayan ORDER BY) bu yolda cozulmez;
+    genel yol onu projeksiyon oncesi siraladigi icin maddesel yolda kalir. }
+  if not FExec.BuildSortCols(FSelect.OrderBy, keys, FProjCols,
+    FProjTypes, FSortCols) then Exit;
+  if Length(FSortCols) <> FSelect.OrderBy.Count then Exit;
+  dbTag := '';
+  if FExec.FT <> nil then
+    if FExec.FT.Backend <> nil then dbTag := FExec.FT.Backend.FilePath;
+  if dbTag = '' then dbTag := 'memdb';
+  { Gecici dizin KURULAMAZSA sorgu dusmez: hic satir tuketilmedi, eski
+    maddesel yol AYNEN calisir (durust geri donus; bellek garantisi
+    kaybolur ama sonuc degismez). }
+  try
+    FSpill := TVdbSpillDir.Create(dbTag);
+  except
+    FSpill := nil;
+    Exit;
+  end;
+  if FSpill = nil then Exit;
+  FExtSort := True;
+end;
+
+{ Dis siralama reddedildiginde (yalnizca ILK cagrida, hicbir satir
+  tuketilmeden) kaynaklari birakir; maddesel yol bundan sonra AYNEN
+  calisir. Kosu yazilmadiysa Close yalnizca manifest/dizini siler. }
+procedure TVdbRowCursor.ExtSortAbort;
+begin
+  FExtSort := False;
+  FSortCols := nil;
+  SetLength(FRunRows, 0);
+  FRunNulls := nil;
+  FRunBytes := 0;
+  SetLength(FSpillPaths, 0);
+  if FSpill <> nil then
+  begin
+    try
+      FSpill.Close;
+    except
+      { temizlik hatasi sorguyu bozmaz }
+    end;
+    FSpill.Free;
+    FSpill := nil;
+  end;
+end;
+
+{ Tum taramayi yapar ve kosulari yazar. Tepe bellek: bir parca.
+  False: ILK cagri reddedildi; hicbir satir tuketilmedi (cagiran
+  maddesel yola doner). Sonraki bir cagri reddedilirse istisna. }
+function TVdbRowCursor.ExtSortDrain: Boolean;
+var
+  td: TTableDef;
+  part: TSqlResult;
+  i, base, stall, prevPage: Integer;
+  first: Boolean;
+begin
+  Result := False;
+  td := Default(TTableDef);
+  if not FExec.FT.TryGetTableDef(FSelect.FromTable, td) then
+    raise EVDbException.Create(ecUnsupported,
+      'dis siralama: tablo tanimi bulunamadi');
+  stall := 0;
+  prevPage := -2;
+  first := True;
+  repeat
+    part := Default(TSqlResult);
+    { AIgnoreOrderBy = True: motor filtre+izdusum uygular, SIRALAMAZ. }
+    if not FExec.TryStreamSelectChunk(FSelect, td, Self, FResumePage,
+      FSkipQual, VDB_EXTSORT_SCAN_CHUNK, part, True) then
+    begin
+      if first then
+      begin
+        ExtSortAbort;
+        Exit;
+      end;
+      raise EVDbException.Create(ecUnsupported,
+        'dis siralama taramasi ilerletilemedi (akisli sekil uygun degil)');
+    end;
+    first := False;
+    if part.HasTyped then
+      raise EVDbException.Create(ecUnsupported,
+        'dis siralama tipli (ikili) sonuc yolunda kullanilmaz');
+    if not FStreamed then
+      raise EVDbException.Create(ecUnsupported,
+        'dis siralama icin akisli tarama gerekli');
+    { Parcayi TEK SetLength ile ekle: satir basina buyutme, kopyalamayi
+      parca boyuyla sinirlar (buyuk veri kumesinde O(n^2) olurdu). }
+    base := Length(FRunRows);
+    SetLength(FRunRows, base + Length(part.Rows));
+    for i := 0 to High(part.Rows) do
+    begin
+      FRunRows[base + i] := part.Rows[i];
+      Inc(FRunBytes, VdbSpillRowBytes(part.Rows[i]));
+    end;
+    NotePeak;
+    { Ilerleme denetimi: bos parca + ayni devam sayfasi = kilitlenme. }
+    if (Length(part.Rows) = 0) and (FResumePage = prevPage) then
+    begin
+      Inc(stall);
+      if stall > 3 then
+        raise EVDbException.Create(ecUnsupported,
+          'dis siralama taramasi ilerlemiyor');
+    end
+    else
+      stall := 0;
+    prevPage := FResumePage;
+    part := Default(TSqlResult);
+    if FRunBytes >= VdbSpillExtSortBudget then ExtSortFlushRun;
+  until FScannedAll;
+  ExtSortFlushRun;
+  Result := True;
+end;
+
+{ Bir parcayi kendi icinde KARARLI siralar ve kosu dosyasina yazar. }
+procedure TVdbRowCursor.ExtSortFlushRun;
+var
+  path: string;
+  w: TVdbSpillWriter;
+  i, n: Integer;
+begin
+  if Length(FRunRows) = 0 then
+  begin
+    FRunBytes := 0;
+    Exit;
+  end;
+  VdbSpillStableSortRows(FRunRows, FRunNulls, Self.RunCmp);
+  path := FSpill.NewRunPath;
+  w := TVdbSpillWriter.Create(path, Length(FProjCols));
+  try
+    for i := 0 to High(FRunRows) do
+      { Sirali cikista NULL maskesi DUSURULUR: genel ORDER BY yolu da
+        boyle yapar ("Sirali sorgularda RowNulls BOS birakilir"); NULL
+        bilgisi '' olarak tasinir ve karsilastirma onu NULL sayar. }
+      w.WriteRow(FRunRows[i], nil);
+    Inc(FSpillBytes, w.Bytes);
+  finally
+    w.Free;
+  end;
+  n := Length(FSpillPaths);
+  SetLength(FSpillPaths, n + 1);
+  FSpillPaths[n] := path;
+  Inc(FSpillRuns);
+  SetLength(FRunRows, 0);
+  FRunNulls := nil;
+  FRunBytes := 0;
+end;
+
+procedure TVdbRowCursor.ExtSortEndScan;
+begin
+  if Length(FSpillPaths) > 0 then
+  begin
+    FMerge := TVdbSpillMerger.Create(FSpillPaths);
+    FMerge.Cmp := Self.MergeCmp;
+  end;
+  FSortedDone := True;
+end;
+
+function TVdbRowCursor.ExtSortNext(out Row: TStrArray; out Nulls: TNulArr): Boolean;
+begin
+  Row := nil;
+  Nulls := nil;
+  Result := False;
+  if FCancelled or (not FSortedDone) or (FMerge = nil) then Exit;
+  Result := FMerge.Next(Row, Nulls);
+  { Dis siralama cikisinda maske yok (yukaridaki gerekce). }
+  Nulls := nil;
+end;
+
+{ OFFSET/LIMIT birlestirme CIKISINA uygulanir: sirali akistan atlanir. }
+procedure TVdbRowCursor.ExtSortFillTo(AMinRows: Integer);
+var
+  row: TStrArray;
+  gn: TNulArr;
+  n, want: Integer;
+begin
+  FBuf := Default(TSqlResult);
+  FBufPos := 0;
+  if FDone or FCancelled then Exit;
+  want := AMinRows;
+  if want <= 0 then want := 512;
+  while (FSkip > 0) and ExtSortNext(row, gn) do
+    Dec(FSkip);
+  if FSkip > 0 then
+  begin
+    FDone := True;
+    Exit;
+  end;
+  if FLimit = 0 then
+  begin
+    FDone := True;
+    Exit;
+  end;
+  n := 0;
+  while n < want do
+  begin
+    if not ExtSortNext(row, gn) then
+    begin
+      FDone := True;
+      Break;
+    end;
+    if n >= Length(FBuf.Rows) then SetLength(FBuf.Rows, n + 64);
+    FBuf.Rows[n] := row;
+    Inc(n);
+    Inc(FBytes, VdbSpillRowBytes(row));
+    if FLimit > 0 then
+    begin
+      Dec(FLimit);
+      if FLimit = 0 then
+      begin
+        FDone := True;
+        Break;
+      end;
+    end;
+  end;
+  if Length(FBuf.Rows) > n then SetLength(FBuf.Rows, n);
+  FBuf.Fields := FFields;
+  FBuf.FieldTypes := FFieldTypes;
+  NotePeak;
+end;
+
+function TVdbRowCursor.RunCmp(A, B: Integer): Integer;
+begin
+  Result := VdbSortCompareRows(FSortCols, FRunRows, A, B);
+end;
+
+function TVdbRowCursor.MergeCmp(A, B: Integer): Integer;
+begin
+  if FMerge = nil then Exit(0);
+  Result := VdbSortCompareRows(FSortCols, FMerge.Heads, A, B);
 end;
 
 { SKILL6 04: imlec baglamini kurup normal ExecSelect hattini calistirir.
@@ -7315,23 +7835,6 @@ begin
 end;
 
 type
-  TSortColInfo = record
-    ColIdx: Integer;
-    CType: Byte;
-    Desc: Boolean;
-    // R-20: ORDER BY ... COLLATE <ad>. Bos = motor varsayilani (bayt
-    // sirasi). TR eski davranisi verir; digerleri VDbCompareCol'a gider.
-    Collate: string;
-    UseTr: Boolean;  // acik COLLATE (yalniz metin kolonlarda)
-    // F-10: NULLS FIRST (0) / LAST (1); -1 = motor varsayilani
-    NullsPos: Integer;
-  end;
-
-type
-  { R-14 Full: siralama kolonlari dizisi (birim duzeyinde; paralel
-    gorevlerin baglam kaydinda tasinir). }
-  TVdbSortCols = array of TSortColInfo;
-
   { H14: tekil FLOAT kolonunda onceden cozulmus anahtar plani. Anahtarlar
     SATIR-INDEKSLI (Idx dizisi satir numarasi tutar). Genel yolda her
     kiyasta VDbParseFloat cagriliyordu; 1M satirda ~60 s suruyordu. }
@@ -7758,6 +8261,67 @@ begin
 end;
 
 { ------------------------------------------------------------
+  SKILL11: BuildSortCols - ORDER BY anahtarlarini siralama kolonlarina
+  cozer. DoSort ile AYNI kurallar; imlec dis-siralama yolu da bu tek
+  kaynagi kullanir (iki yol arasinda karsilastirma farki olusamaz).
+  //---------------------------------------------------------- }
+function TVSqlExecutor.BuildSortCols(OrderBy: TList<TOrderItem>;
+  const Keys: TStrArray; const ColNames: TStrArray;
+  const ColTypes: TByteArray; out ASortCols: TVdbSortCols): Boolean;
+var
+  k, m, kidx, validCount: Integer;
+begin
+  Result := False;
+  ASortCols := nil;
+  if (OrderBy = nil) or (OrderBy.Count = 0) then Exit;
+  SetLength(ASortCols, OrderBy.Count);
+  validCount := 0;
+  for k := 0 to OrderBy.Count - 1 do
+  begin
+    kidx := -1;
+    if k <= High(Keys) then
+      for m := 0 to High(ColNames) do
+      begin
+        if SameText(ColNames[m], Keys[k]) then
+        begin kidx := m; Break; end;
+        if (Pos('.', ColNames[m]) > 0) and
+           SameText(Copy(ColNames[m], Pos('.', ColNames[m]) + 1, MaxInt), Keys[k]) then
+        begin kidx := m; Break; end;
+        if (Pos('.', Keys[k]) > 0) and
+           SameText(Copy(Keys[k], Pos('.', Keys[k]) + 1, MaxInt), ColNames[m]) then
+        begin kidx := m; Break; end;
+      end;
+    if kidx >= 0 then
+    begin
+      ASortCols[validCount].ColIdx := kidx;
+      if kidx < Length(ColTypes) then
+        ASortCols[validCount].CType := ColTypes[kidx]
+      else
+        ASortCols[validCount].CType := VCT_STR;
+      ASortCols[validCount].Desc := OrderBy[k].Desc;
+      // P5-TR: yalniz metin kolonlarda gecerli (sayisal siralama korunur).
+      ASortCols[validCount].Collate := OrderBy[k].Collate;
+      // R-20: acik COLLATE yoksa kolonun varsayilan collation'i
+      // devreye girer (`ad TEXT COLLATE tr`).
+      if ASortCols[validCount].Collate = '' then
+        ASortCols[validCount].Collate := CurColCollation(kidx);
+      ASortCols[validCount].UseTr :=
+        (ASortCols[validCount].Collate <> '') and
+        (ASortCols[validCount].CType = VCT_STR);
+      // F-10: NULLS FIRST/LAST bayragi.
+      ASortCols[validCount].NullsPos := OrderBy[k].NullsPos;
+      Inc(validCount);
+    end
+    // F1-21: bilinmeyen kolon sessizce yok sayilmaz, hata verir.
+    else if (k <= High(Keys)) and (Keys[k] <> '') then
+      raise EVDbException.Create(ecColumnNotFound,
+        'ORDER BY bilinmeyen kolon: ' + Keys[k]);
+  end;
+  SetLength(ASortCols, validCount);
+  Result := validCount > 0;
+end;
+
+{ ------------------------------------------------------------
   DoSort - Bellek-ici ORDER BY (Iterative QuickSort, O(N log N))
   //---------------------------------------------------------- }
 procedure TVSqlExecutor.DoSort(var Rows: TStrMatrix; const Keys: TStrArray;
@@ -8069,51 +8633,9 @@ begin
     Exit;
   end;
 
-  // 1. Siralama kolonlarini onceden coz (her karsilastirmada Name arama!)
-  SetLength(sortCols, OrderBy.Count);
-  validCount := 0;
-  for k := 0 to OrderBy.Count - 1 do
-  begin
-    kidx := -1;
-    for m := 0 to High(ColNames) do
-    begin
-      if SameText(ColNames[m], Keys[k]) then
-      begin kidx := m; Break; end;
-      if (Pos('.', ColNames[m]) > 0) and
-         SameText(Copy(ColNames[m], Pos('.', ColNames[m]) + 1, MaxInt), Keys[k]) then
-      begin kidx := m; Break; end;
-      if (Pos('.', Keys[k]) > 0) and
-         SameText(Copy(Keys[k], Pos('.', Keys[k]) + 1, MaxInt), ColNames[m]) then
-      begin kidx := m; Break; end;
-    end;
-    if kidx >= 0 then
-    begin
-      sortCols[validCount].ColIdx := kidx;
-      if kidx < Length(ColTypes) then
-        sortCols[validCount].CType := ColTypes[kidx]
-      else
-        sortCols[validCount].CType := VCT_STR;
-      sortCols[validCount].Desc := OrderBy[k].Desc;
-      // P5-TR: yalniz metin kolonlarda gecerli (sayisal siralama korunur).
-      sortCols[validCount].Collate := OrderBy[k].Collate;
-      // R-20: acik COLLATE yoksa kolonun varsayilan collation'i
-      // devreye girer (`ad TEXT COLLATE tr`).
-      if sortCols[validCount].Collate = '' then
-        sortCols[validCount].Collate := CurColCollation(kidx);
-      sortCols[validCount].UseTr :=
-        (sortCols[validCount].Collate <> '') and
-        (sortCols[validCount].CType = VCT_STR);
-      // F-10: NULLS FIRST/LAST bayragi.
-      sortCols[validCount].NullsPos := OrderBy[k].NullsPos;
-      Inc(validCount);
-    end
-    // F1-21: bilinmeyen kolon sessizce yok sayilmaz, hata verir.
-    else if Keys[k] <> '' then
-      raise EVDbException.Create(ecColumnNotFound,
-        'ORDER BY bilinmeyen kolon: ' + Keys[k]);
-  end;
-  SetLength(sortCols, validCount);
-  if validCount = 0 then Exit;
+  // 1. Siralama kolonlarini onceden coz (tek kaynak: BuildSortCols).
+  if not BuildSortCols(OrderBy, Keys, ColNames, ColTypes, sortCols) then Exit;
+  validCount := Length(sortCols);
 
   { H14: tek kolonlu FLOAT siralamasi icin anahtarlar ONCEDEN cozulur.
     Genel yolda her kiyasta VDbParseFloat cagriliyordu; 1M satirlik
@@ -15537,7 +16059,8 @@ end;
 
 function TVSqlExecutor.TryStreamSelectChunk(Stmt: TSqlSelectStmt;
   const td: TTableDef; Cursor: TVdbRowCursor; AResumePage, ASkipQual,
-  AMaxRows: Integer; out Res: TSqlResult): Boolean;
+  AMaxRows: Integer; out Res: TSqlResult;
+  AIgnoreOrderBy: Boolean): Boolean;
 var
   ctx: TStreamSelCtx;
   cn, outCols: TStrArray;
@@ -15751,7 +16274,8 @@ begin
   if (Stmt.GroupByCols.Count > 0) or HasAggregate(Stmt) then Exit;
   if HasWindow(Stmt) then Exit;
   if (Stmt.QualifyClause <> nil) or (Stmt.HavingClause <> nil) then Exit;
-  if (Stmt.OrderBy <> nil) and (Stmt.OrderBy.Count > 0) then Exit;
+  if (not AIgnoreOrderBy) and (Stmt.OrderBy <> nil) and
+     (Stmt.OrderBy.Count > 0) then Exit;
   if td.IsView then Exit;
   if FT.RlsApplies(Stmt.FromTable) then Exit;
   if Stmt.Columns.Count = 0 then Exit;

@@ -193,6 +193,10 @@ build_gate disk_index_integration "$ROOT/tests/disk_index_integration/dji.lpr"
 build_gate disk_index_crash "$ROOT/tests/disk_index_crash/dixcrash.lpr"
 build_gate disk_index_scale "$ROOT/tests/disk_index_scale/dixscale.lpr"
 
+# SKILL11: dis siralama (spill) cekirdegi + davranis kapisi.
+build_gate spill_core "$ROOT/tests/spill_core/spill_core.lpr"
+build_gate stream_spill "$ROOT/tests/stream_spill/stream_spill.lpr"
+
 # --- kosum -----------------------------------------------------------
 unset VDB_CRYPTO_PROVIDER 2>/dev/null || true
 unset VDB_CRYPTO_DLL 2>/dev/null || true
@@ -260,6 +264,12 @@ run_gate soak           "$WORK/soak"           soak
 run_gate disk_index_integration "$WORK/disk_index_integration" dji
 run_gate disk_index_crash "$WORK/disk_index_crash" dixcrash
 run_gate disk_index_scale "$WORK/disk_index_scale" dixscale 200000
+
+# SKILL11: spill cekirdegi (bicim/kararlilik) ve imlec dis siralama kapisi.
+# stream_spill 1M satir ORDER BY icerir (~50 sn); butce diskte, %TEMP%
+# degil kendi calisma dizininde tutulur.
+run_gate spill_core "$WORK/spill_core" spill_core
+run_gate stream_spill "$WORK/stream_spill" stream_spill
 
 # SKILL6 08: interop / kripto / bench kapilari.
 # Dis arac (pyarrow) gerektiren kapilar arac yoksa 77 ile SKIP verir ve

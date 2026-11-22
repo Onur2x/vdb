@@ -82,6 +82,8 @@ Cikis kodu 0 = kosan tum kapilar gecti, 1 = en az biri basarisiz.
 | `disk_index_crash` | **disk indeksi cokme matrisi** (SKILL12): cocuk surec **gercekten oldurulur** (`TerminateProcess` / `SIGKILL`; `Close`, `Destroy` ve finalization calismaz), ebeveyn her asmadan sonra yeniden acar. Enjeksiyon noktalari: `precommit` (heap commit'inden once), `heap` (engine `COMMIT_POST_SYNC` - heap onaylandi, indeks dosyasina **hic** dokunulmadi), `prepage`, `midpages` (coklu sayfa yaziminin ortasi: ilk sayfa cekirdege gecti), `postpage`, `premeta`, `postmeta` (meta yazildi, fsync yok). Is yuku **tek islemdir** ve agacta cok sayida bolunme/birlestirme uretir (300 anahtar guncelleme + 201 silme + 200 ekleme). Asama basina 8 kontrol (**56 kontrol**): surec oldu mu (cikis degeri platforma baglidir - Windows'ta `TerminateProcess(9)` -> `rc=9`, Unix'te `fpKill(SIGKILL)` -> FPC `TProcess` sinyal olumunu **negatif** sinyal numarasi olarak verir, `rc=-9`; iki degeri de yalniz gercek hard-kill uretir, `Halt(9)` yedegi Unix'te kabul edilmez), heap satir sayisi beklenen durumda mi, heap kumesi is yukunden **bagimsiz** hesaplanan beklentiye uyuyor mu, **indeksli sonuc = heap'ten turetilen sonuc**, indeks kaynagi (`builds`/`hits` beklentisi asamaya gore), `vmFull` temiz, `.dix` gecerli boyutta ve kapanistan sonra yazilabilir (tanitici sizmadi). Beklenti: yalniz **tam yazilmis meta** (`postmeta`) dosyadan servis edilir (`builds=0`, `hits>0`); diger tum pencerelerde `builds>=1`. Yani "heap onaylandi ama indeks yazilmadi" penceresi gercekten olculur ve **sessiz eksik satir gorulmez**. On-kapi (`git archive HEAD` = `e911ee8`): `Fatal: (10022) Can't find unit VDbDiskIdx used by dixcrash` - birim HEAD'de **yoktur**, kapi ayirt edicidir |
 | `disk_index_scale` | **disk indeksi olcek kapisi** (SKILL12): `dixscale [satir]` (varsayilan 1.000.000; CI'da **200.000** ile kosar). 1M satirlik `t(id INTEGER PRIMARY KEY, a TEXT, n INTEGER, b TEXT)` uzerinde iki ikincil indeks (`ix_a`, `ix_n`) kurulur, kapatilip yeniden acilir. S1-S18 (**17 kontrol**): iki `.dix` dosyasi yazildi, yeniden acilista satir sayisi, esitlik ve aralik sonucu **bagimsiz hesapla** ayni, yeniden insa **YOK** (`builds=0`) ve **disk`ten servis** (`hits>0`), ikinci soguk acilista ayni sonuclar ve hala insa yok, `UPDATE`/`DELETE` sonrasi kalici sonuclar; **S15-S18 yapisal kanit**: `.dix` dogrudan acilir, `PageCount>100` ve `Height>=2` olculur, tek `Find` icin **okunan sayfa sayisi <= 8** (1M'de olculen: 3 sayfa / 5886 sayfa / yukseklik 3) - indeksin tamami RAM'e alinmiyor, salt-okunur onbellek 64 sayfa (256 KB) ile sinirlidir. Olculen 1M (Windows i386): yazim 14.516 ms, `.dix` 45.232.128 B (guncelleme sonrasi 49.139.712 B), soguk acilis + ilk sorgu 531 ms. 200k kosusunda: 2.797 ms, 8.892.416 B, 1157 sayfa, yukseklik 3, arama basina 3 sayfa. **Durust sinir**: `heap_delta` yalniz **BILGI** olarak yazilir (`TotalAllocated` deltasi RSS degildir ve SQL planlayici/onbellek ayirmalarini da icerir), bu yuzden bellek iddiasi PASS/FAIL uretmez - kanit S18'dir. **10M kosusu BASARISIZDIR**: 32-bit ikilide `CREATE INDEX` once tum indeksi bellekte `TIdxEntries` olarak maddelestirdigi icin 10M satirda `EOutOfMemory` alinir (ekleme dongusu tamamlanir, indeks kurulumu coker). Bu **olculmus bir sinirdir**, PASS degildir; 10M icin akisli/toplu indeks insasi gerekir ve bu yapilmadi. On-kapi (`git archive HEAD` = `e911ee8`): `Fatal: (10022) Can't find unit VDbDiskIdx used by dixscale` - birim HEAD'de **yoktur**, kapi ayirt edicidir |
 | `auth_throttle` | SCRAM deneme sinirlama/kilit |
+| `spill_core` | **spill cekirdegi** (SKILL11): `VDbSpill.pas` biriminin saf Pascal kendini testi (**29 kontrol**). Kosu dosyasi bicimi (magic `VDBSPL1`, alan sayisi, NULL maskesi) gidis-donus, `TVdbSpillWriter`/`Reader` bayt muhasebesi, `VdbSpillStableSortRows` kararliligi, 4 kosunun `TVdbSpillMerger` ile birlestirilmesinin **tek seferlik kararli siralama ile birebir** ayni olmasi, gecici dizin/manifest yazimi (DB/PID/VER/RUN), olu pid dizinlerinin toplanmasi, canli pid'in korunmasi, `VdbSpillRowBytes`/`MatrixBytes` muhasebesi. Harici arac/DLL yok. Iki platformda 29/0. |
+| `stream_spill` | **imlec duzeyinde dis siralama** (SKILL11): `tests/stream_spill` (**31 kontrol**, SS1-SS13). SS1 ORDER BY'in gercekten kosu dosyalarina tasdigi (`FSpillRuns>1`); SS2/SS3 imlec ciktisinin maddesel `Exec` ile **bit bit** ayni olmasi (deger + sira), `LIMIT/OFFSET` imlecte; SS4 satir 10x artinca tepe bellegin **plato** yapmasi (olculen 10k=1.097.519 B, 100k=1.376.531 B, oran 1,25); SS5 normal bitiste gecici dizin kalmamasi; SS6 `Cancel` sonrasi temizlik; SS7 **tarama sirasinda hata** (CAST bozuk deger) sonrasi temizlik; SS8 baska surecten kalan artik dizinin toplanmasi, CANLI pid dizininin korunmasi; SS9 `OpenCursor`/`NextChunk` (NextBatch)/`Free` (CloseCursor) yolu; SS10 64 MiB butce ile 100k satir; SS11 **1M satir ORDER BY** (35 kosu, tepe ~2,7 MB, Windows i386'da ~34 sn); SS12 belgelenen maddesel fallback'larin (GROUP BY, DISTINCT, JOIN, UNION ALL, pencere, **NULL tasiyan tablo**) maddesel yolda kalip ayni sonucu vermesi (iki yol karistirilmaz); SS13 tuketilmis imlecte `ReleaseBuffers` ile teslim tamponunun ve dis siralama kaynaklarinin birakilmasi (`LiveBytes` kuculur, `PeakBytes` kaniti korunur, imlec tukenmis kalir, ikinci cagri zararsiz - bitmis portallar sonuc bellegi butcesinde yer tutmaz). Butce dis siralama icin `VdbSpillBudgetOverride` ile kucultulur; spill kok dizini kendi calisma dizinidir, gercek `%TEMP%` kirlenmez. On-kapi (`git archive HEAD` = `ee5be42`): kapi **derlenmez** - 15 x `Error: (5038) identifier idents no member "FExtSort"/"FSpillRuns"/"FSpillBytes"/"PeakBytes"`; ozellik HEAD'de yoktur. |
 | `selftest_builtin` | provider SelfTest (builtin) |
 | `tls_client` | istemci CA + sunucu adi dogrulamasi (OpenSSL varsa) |
 
@@ -1806,4 +1808,69 @@ kaldirildi:
     (`TotalAllocated` deltasi RSS degildir), bellek iddiasi PASS/FAIL
     uretmez - kanit S18 yapisal olcumudur (tek `Find` icin <= 8 sayfa;
     1M'de 3 sayfa / 5886 sayfa / yukseklik 3).
+
+- Elli dokuzuncu kosu (v3.76, SKILL11 - genel akis / dis siralama):
+  **Linux x86_64 65 PASS**, **Windows i386 64 PASS**, FAIL 0,
+  `SUITE_EXIT=0`. Iki yeni kapi: `spill_core` **29/0**,
+  `stream_spill` **31/0**. Kosan kapi sayisi 62/63 -> **64/65**.
+  SKIP'ler degismedi ve PASS sayilmaz: iki platformda
+  `fixtures_openssl`, `selftest_openssl`, `interop_external` (pyarrow
+  yok), Windows'ta ayrica `tls_client`.
+  - **Yeni birim (1)**: `VDbSpill.pas` (saf Pascal, harici DLL/arac
+    yok): kosu dosyasi bicimi (`VDBSPL1`, alan sayisi + NULL maskesi,
+    uzunluk onekli kayit), `TVdbSpillWriter`/`Reader`, k-yonlu
+    `TVdbSpillMerger`, kararli siralama, gecici dizin + manifest
+    (`DB`/`PID`/`VER`/`RUN`), artik (orphan) toplama, bayt muhasebesi.
+    Kosu dosyalari `vdbspill_<hash>_<pid>_<sayac>/` altinda `.vspill`
+    uzantisiyla durur ve **kalici indekslerle (`vdbidx_*.dix`)
+    karistirilmaz**; kapanista/iptal/hata yolunda tek cagriyla silinir.
+  - **Dis siralama**: `ORDER BY` indeksten gelmiyorsa sonuc artik tek
+    seferde maddeselestirilmiyor; imlec, siralamayi **AYNI**
+    `BuildSortCols` + **AYNI** `VdbSortCompareRows` ile parca parca
+    yapip kosu dosyalarina yaziyor, tarama bitince birlestiriyor
+    (tepe bellek satir sayisindan bagimsiz; sirasi bit bit ayni).
+    `OFFSET`/`LIMIT` birlestirme ciktisina imlec duzeyinde uygulanir.
+    Ayni turda `TVdbRowCursor`'in `LIMIT`/`OFFSET`'i akisli yolda
+    **yok saydigi** eski hata da duzeltildi (SKILL6 iddiasinin aksine
+    imlec bu sinirlari uygulamiyordu); artik uygular ve maddesel dal
+    cift uygulamayi onlemek icin kendi `FSkip`/`FLimit`'ini sifirlar.
+  - **Gercek bellek muhasebesi**: `TVdbRowCursor.LiveBytes` artik
+    yalniz hucre metnini degil dizi kapasitesini/isaretcilerini,
+    string heap'ini, siralama kayitlarini, teslim tamponunu, kosu
+    parcasini, NULL maskesini ve birlestirici pencerelerini sayar
+    (`VdbSpillRowBytes`/`MatrixBytes` tek kaynak). `PeakBytes` yasam
+    boyu tepeyi verir; portal butcesi (`MaxPortalResultBytes`, 64 MiB)
+    ayni sayaci kullanir.
+  - **Tuketilmis portal tamponu (olculen Linux regresyonu)**: gercek
+    muhasebe, ayni anda acik 12 portalda (her biri son satir tamponunu
+    tutuyordu) `pg_portal_stream` PS7a'yi Linux x86_64'te kirdi:
+    `total=122635 > 120000` (Windows i386 4 bayt isaretci sayesinde
+    geciyordu). Kesin cozum butceyi gevsetmek degil **tamponu
+    birakmak** oldu: `TVdbRowCursor.ReleaseBuffers` akis bitince teslim
+    tamponunu, maddesel yedegi ve dis siralama kaynaklarini birakir;
+    imlec NESNESI yasar (portal `Describe` onu bulur, sorguyu yeniden
+    calistirmaz) ve tukenmis kalir. `PullPortalChunk` tukenme dalinda
+    bunu cagirir. Ayni kosuda `total=106441`'e indi (esik
+    degistirilmedi), PS7b/PS7c hala kontrollu RED. SS13 bunu kalici
+    olarak olcer.
+  - **On-kapi (ayirt edicilik)**: `git archive HEAD` = `ee5be42`
+    agacinda `stream_spill` **derlenmez** - 15 x
+    `Error: (5038) identifier idents no member
+    "FExtSort"/"FSpillRuns"/"FSpillBytes"/"PeakBytes"`. Ozellik
+    HEAD'de **yoktur**; kapi yalniz yeni uygulamaya karsi gecebilir.
+  - **Durust sinir (SKILL11)**: dis siralama yalnizca **duz kolon adi**
+    ile yazilmis `ORDER BY` anahtarlari icin devrededir. Ifade
+    anahtarlari, projeksiyonda olmayan (gizli) anahtarlar, `JOIN`,
+    `GROUP BY`, `DISTINCT`, `UNION`, pencere, alt sorgu ve **NULL
+    tasiyan tablolar** maddesel yolda kalir; iki yol asla karistirilmaz
+    (SS12 bunu dogrular). NULL tablolar bilincli olarak disaridadir:
+    kosu dosyasi NULL maskesi tasimadigi icin birlestirme karsilastirmasi
+    maskesiz satirlari gorur ve NULL sirasi maddesel yoldan sapabilirdi.
+    Hash partitioning / hash join / GROUP BY spill'i **yapilmadi**;
+    bu operatorler icin bellek garantisi verilmez. Gecici dizin
+    kurulamazsa sorgu dusmez, eski maddesel yol calisir (sonuc ayni,
+    bellek garantisi kaybolur).
+  - **Olcum (Windows i386)**: `stream_spill` yaklasik 50 sn; 1M satir
+    yazimi ~10 sn, 1M satir ORDER BY ~34 sn, 35 kosu, tepe ~2,7 MB.
+    `spill_core` < 1 sn.
 

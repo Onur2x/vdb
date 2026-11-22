@@ -128,6 +128,43 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   alt sorgu, NULL tasiyan tablo, KV deposu, toplu yazim) tek seferlik genel
   yola duser; bu **durust sinirdir** ve bellek siniri o yollarda hala sonuc
   uretildikten sonra denetlenir. Ayrinti: F-50.
+- **SKILL11 - genel akis / dis siralama (ORDER BY spill)**: **TAMAM
+  (v3.76, sinirli kapsam)**. `VdbSpill` birimi eklenmistir (saf Pascal;
+  bagimlilik/DLL yok): `TVdbSpillDir`, `TVdbSpillWriter`/`TVdbSpillReader`,
+  `TVdbSpillMerger`, kararli siralama ve bayt muhasebesi. `TVdbRowCursor`
+  ORDER BY'li sorgularda harici birlestirmeli siralama yapar: anahtarlar
+  `BuildSortCols` ile statik cozulur, tarama 4096'lik parcalarla yapilir,
+  her kosu kararli siralanip gecici `.vspill` dosyasina yazilir ve kosular
+  `DoSort` ile **ayni** `VdbSortCompareRows` karsilastirmasiyla birlestirilir;
+  OFFSET/LIMIT birlestirme sonrasi uygulanir. Maddesel yol ile **karistirilmaz**:
+  ilk cagri reddederse (hicbir satir tuketilmeden) eski yol aynen calisir.
+  Gecici dizin `GetTempDir` altinda veritabani basina ayrilir; manifest
+  (`DB`/`PID`/`VER`/`RUN`) ile iptal/hata/normal bitiste silinir, acilista
+  yalniz ayni veritabaninin **olu pid** dizinleri toplanir. `LiveBytes`
+  gercek muhasebe yapar (matris kapasitesi, metin yuku, siralama kaydi,
+  kosu/birlestirme tamponlari, imlec durumu) ve tepe deger `PeakBytes`te
+  raporlanir. Tuketilmis imlecte `ReleaseBuffers` teslim tamponunu ve
+  dis siralama kaynaklarini birakir; imlec nesnesi yasar (portal `Describe`
+  sorguyu yeniden calistirmaz) ve tukenmis kalir, `PullPortalChunk`
+  tukenme dalinda bunu cagirir. Bu, gercek muhasebenin Linux'ta **olctugu**
+  bir regresyonu kapatti: acik 12 portal tamponlari yuzunden
+  `pg_portal_stream` PS7a `total=122635 > 120000` ile kirmiziydi; esik
+  degistirilmeden tampon birakma ile `total=106441` oldu (iki platformda
+  35/0). **Yan bulgu ve duzeltme**: imlec modu `LIMIT`/`OFFSET`i yok
+  sayiyordu (`TVdbRowCursor.Create` `FSkip`/`FLimit`i doldurmuyordu); artik
+  ifadeden baslatilir. Kapilar: `spill_core` **29/0** (bicim/kararlilik/
+  birlestirme/dizin-manifest/yetim toplama/bayt muhasebesi, iki platformda)
+  ve `stream_spill` **31/0** (SS1-SS13; 10k -> 100k satir tepe bellek
+  **1.097.519 -> 1.376.538 bayt, oran 1,25**; **1M satir** `ORDER BY` 35
+  kosu, tepe ~2,7 MB, ~34 s; iptal/hata/olu pid temizligi; `NextChunk`
+  API'si; 64 MiB butce; SS13 tuketilmis imlecte tampon birakma ve tepe
+  bellek kanitinin korunmasi). On-kapi (`git archive HEAD` = `ee5be42`): kapi
+  **derlenmez** (15 x `(5038) ... no member "FSpillRuns"/"FExtSort"`).
+  **Durust sinir**: ifade/gizli anahtar, JOIN/GROUP BY/DISTINCT/UNION/
+  pencere/alt sorgu, KV deposu, `BatchOpen` ve NULL tasiyan tablo maddesel
+  yolda kalir (bellek garantisi o yollarda yok); hash bolumleme/hash join/
+  GROUP BY spill yoktur; gecici dizin acilamazsa sorgu sessizce maddesel
+  yola doner (sonuc ayni, bellek garantisi kaybolur).
 - **SKILL6 07 - genel hash join / maliyet modeli**: **KISMI**. `SELECT`
   tarafinda `TryStreamJoin` zaten PK arama, indeks kaynagi ve hash join
   yollarini secer (`merge_hash` kapisi M1-M13). Sprint P'de `UPDATE ... FROM`
