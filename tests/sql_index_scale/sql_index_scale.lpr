@@ -9,11 +9,13 @@ program sql_index_scale;
   - .odb.idx yan dosyasi bozulunca tam tarama ile kurtarma (veri kaybi yok),
   - indeksin RAM maliyeti (yigin deltasi) ve disk boyu.
 
-  DURUST SINIR: ikincil indeksler bugun BELLEKTE tutulur (FMemIdx: indeks
-  basina sirali tek dizi, satir basina 3 Delphi string'i). Bu kapi bir disk
-  indeksi olcmez. Ayri disk B+Tree (VDbBTreeDisk, v3.46) vardir ve
-  tests/btree_disk ile kapilidir ama v5 motor dosya bicimine BAGLI DEGILDIR.
-  Bu yuzden burada 'disk indeks' iddiasi kurulmaz.
+  DURUST SINIR (SKILL12 ile GUNCELLENDI): ikincil indeksler artik KALICI
+  disk B+Tree'sinde (VDbDiskIdx) yasar ve v5 motoruna ENTEGREDIR; ayni
+  oturumda sicak FSkipIdx, yeniden acilista disk agaci kullanilir. Bu kapi
+  yine de yalnizca SQL davranisini ve bellek/disk maliyetini olcer; disk
+  indeksinin KALICILIGI, cokme matrisi ve olcek iddialari
+  tests/disk_index_integration, tests/disk_index_crash ve
+  tests/disk_index_scale kapilarinda olculur.
 }
 {$mode delphi}{$H+}
 {$IFDEF UNIX}{$DEFINE USE_CTHREADS}{$ENDIF}
@@ -562,7 +564,8 @@ begin
   GBigDb := IncludeTrailingPathDelimiter(GDir) + 'big.odb';
 
   WriteLn('=== tests/sql_index_scale (v3.49) ===');
-  WriteLn('Ikincil indeksler BELLEKTE (FMemIdx); VDbBTreeDisk v5 motoruna bagli DEGIL.');
+  WriteLn('Ikincil indeksler artik KALICI disk B+Tree (VDbDiskIdx); disk');
+  WriteLn('entegrasyonu/cokme matrisi/olcek tests/disk_index_* kapilarindadir.');
   try
     Scenario100k;
     Scenario1M;

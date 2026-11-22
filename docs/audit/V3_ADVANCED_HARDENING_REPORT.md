@@ -37,7 +37,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
 | A | WAL yasam dongusu + kaynak sinirlari | Tamam | WAL sert tavani (v3.44), `wal_limit` 19/0, `docs/engineering/LIMITS.md` + `RESOURCE_LIMITS.md` |
 | B | SQL yurutucu olcegi | Tamam | `sql_scale` 34/0 (100k/1M), `docs/engineering/SQL_SCALE.md` |
 | C | PostgreSQL diferansiyeli | **Kismi** | `sql_differential` 33/0 `pg=not-run`; ayri CI isi `sql_differential_postgres` (canli kosmadi) |
-| D | Indeks olcegi + disk B+Tree arastirmasi | Tamam (kapsam sinirli) | `sql_index_scale` 45/0, `btree_disk` 78/0, `DISK_BTREE_DESIGN.md` |
+| D | Indeks olcegi + kalici disk B+Tree | Tamam (SKILL12 ile entegre) | `sql_index_scale` 45/0, `btree_disk` 78/0, `disk_index_integration` 49/0, `disk_index_crash` 56/0, `disk_index_scale` 17/0 (1M), `DISK_BTREE_DESIGN.md` |
 | E | Soak + bellek dayanikliligi | Tamam (gomulu motor, kisa kosu) | `soak` 20/0, F-21 ve F-22 duzeltmeleri (v3.50) |
 | F | Kripto + ag guvenligi | Tamam | `CRYPTO_PROVIDER.md`, `NETWORK_SECURITY.md`, `RESOURCE_LIMITS.md` |
 | G | Platform + CI + son rapor | Tamam (matris dar) | Bu rapor + `CI.md` bolum 3 matris kapsami |
@@ -51,9 +51,17 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   kosu **yapilmadi**.
 - **Ag sunucusu soak'i**: `soak` gomulu motordur; `TVdbPgServer` altinda uzun
   sureli, cok baglantili kosu **olculmedi**.
-- **Disk tabanli indeks**: `VDbBTreeDisk.pas` bagimsiz ve kapili bir bilesen
-  olarak vardir, v5 motor dosya bicimine **bagli degildir**; ikincil indeksler
-  hala bellektedir.
+- **Disk tabanli indeks**: SKILL12 ile **TAMAM (sinirli olcek)**. Ikincil
+  indeksler artik kalici disk B+Tree'sindedir (`VDbDiskIdx.pas`, degisken
+  uzunluklu hucre, 4096 bayt sayfa, sayfa CRC, COW yazim, cift meta) ve v5
+  motoruna entegredir: heap ile ayni islem sinirinda kalinir, damga tablo
+  basina durabil commit sayacidir, bozuk/bayat indeks daima reddedilip
+  heap'ten yeniden kurulur. Kapilar: `disk_index_integration` 49/0,
+  `disk_index_crash` 56/0 (7 gercek surec olumu), `disk_index_scale` 17/0.
+  Olcek 1M satirda olculdu; **10M satir basarilamadi** (32-bit ikilide
+  `CREATE INDEX` indeksi once bellekte kurdugu icin `EOutOfMemory`) - bu bir
+  olcum siniridir, PASS degildir. Bagimsiz `VDbBTreeDisk.pas` bileseni
+  format-bagimsiz olarak kalir ve bu kapilarda olculmez.
 - **macOS / ARM64 / buyuk-endian**: **not-run** (bolum H).
 - **SKILL6 03 - SQL NULL ile bos metin ayrimi**: **TAMAM (asama 1 + 2a +
   2b + 2c, v3.72)**. Disk formati bunu zaten kodlayabiliyordu (v2/v3 satir

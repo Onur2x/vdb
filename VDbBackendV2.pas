@@ -69,6 +69,7 @@ type
     function EngineGateHeld: Boolean;
     function SoleWriter: Boolean;
     function StoreGenStamp: Int64;
+    function StoreScopeStamp(Scope: Integer): Int64;
 
     { v3.2: v2'de R-02 savepoint'leri TVDb'de WAL tabanlidir; aynen
       devredilir. Istisna mesajlari (ecDuplicateSavepoint /
@@ -337,6 +338,13 @@ end;
 function TVDbBackendV2.StoreGenStamp: Int64;
 begin
   { v3.18: v2'de surecler arasi commit sayaci yok; damga sabittir. }
+  Result := 0;
+end;
+
+function TVDbBackendV2.StoreScopeStamp(Scope: Integer): Int64;
+begin
+  { SKILL12: v2 dondurulmustur ve disk indeksi kullanmaz; kapsam damgasi
+    kavrami yoktur. Cagrilirsa 0 doner (uyusmazlik -> yeniden insa). }
   Result := 0;
 end;
 

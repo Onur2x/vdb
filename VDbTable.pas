@@ -14,7 +14,7 @@ interface
 uses
   Classes, SysUtils, SyncObjs, Generics.Collections, VDbCore, VDbCrypt, VDbErr,
   VDbBackendApi, VDbBackendV2,
-  VDbText, VDbTypes, VDbSkipList, VDbBTree;
+  VDbText, VDbTypes, VDbSkipList, VDbBTree, VDbDiskIdx;
 
 type
   // Use Pointer for TSqlSelectStmt parameters to avoid circular dependency with VDbAst
@@ -166,15 +166,59 @@ type
     function CompareVal(const A, B: string): Integer;
   end;
 
-  { Bir indeksin okuma kaynagi: yeni yol skiplist, eski/yedek yol dizi.
+  { SKILL12: disk indeksi icin karsilastirici KOPRU.
+    Siralama BELLEKTEKI yolla BIT BIT ayni olmak zorundadir; bu yuzden
+    kural burada yeniden yazilmaz, TIdxSkipCmp'e devredilir. Aksi halde
+    disk agaci ile skiplist farkli sirada olur ve aralik taramalari
+    sessizce eksik/fazla satir dondurur. }
+  TDixCmpAdapter = class(TVDbDixCmp)
+  public
+    C: TIdxSkipCmp;
+    constructor Create(ACtype: Byte; const ACtypes: TByteArray); reintroduce;
+    destructor Destroy; override;
+    function CompareEntries(const AKey1, AVal1, AKey2, AVal2: string): Integer; override;
+    function CompareKeyBound(const AKey, ABound: string): Integer; override;
+  end;
 
-    Keep (R1): Skip'e ait yasam referansi. Alan yonetilen (managed) oldugu
-    icin kaydin her kopyasi AddRef/_Release yapar; kayit kapsamdan ciktiginda
-    referans otomatik birakilir. Cagiranlarin ek bir serbest birakma cagrisi
+  { SKILL12: disk agacinin yasam tutucusu. Sozluk (FDiskIdx) bir referans
+    tutar; okuyan her sorgu TIdxSource.Keep ile bir referans daha alir.
+    Boylece DROP INDEX / Close sirasinda hala okuyan bir sorgu varsa agac
+    nesnesi erken yok edilmez (use-after-free yok).
+
+    Lock: agac nesnesinin KENDI kilidi YOKTUR; okuma (aralik taramasi) ve
+    yazma (bekleyen islemlerin uygulanmasi / commit) ayni agaci ayni anda
+    kullanabilir. Bu kilit olmadan bir okur, yazarin yeniden ayirdigi sayfa
+    tamponunu okuyabilir (bellek bozulmasi). Kilit SIRA: FIdxCs -> Lock;
+    ters yon YOKTUR. }
+  TDixHolder = class(TInterfacedObject)
+  public
+    Tree: TVDbDiskIdx;
+    Cmp: TDixCmpAdapter;    // agacin siralama kurali (sahibi bu nesne)
+    Lock: TCriticalSection; // agac erisimlerini serilestirir
+    Mutated: Boolean;       // bu islemde degisti mi? (commit'te yazilir)
+    { Dosya acildiginda meta sayfada yazan damga. Commit'ten hemen once
+      dosyanin damgasi hala buna esit degilse BASKA bir yazar araya girmis
+      demektir; bu agac yazilmaz (yoksa digerinin satirlarini silerdi). }
+    BaseStamp: Int64;
+    constructor Create(ATree: TVDbDiskIdx; ACmp: TDixCmpAdapter);
+    destructor Destroy; override;
+  end;
+
+  { Bir indeksin okuma kaynagi: yeni yol skiplist, yedek yol dizi,
+    SKILL12 ile UCUNCU yol KALICI DISK agaci. Oncelik:
+      Skip (oturum icinde sicak) -> Disk (diskten, RAM'e yuklemeden)
+      -> FMemIdx dizisi -> veriden yeniden insa.
+
+    Keep (R1): Skip'e ya da disk agacinin yasam tutucusuna (TDixHolder)
+    ait yasam referansi. Alan yonetilen (managed) oldugu icin kaydin her
+    kopyasi AddRef/_Release yapar; kayit kapsamdan ciktiginda referans
+    otomatik birakilir. Cagiranlarin ek bir serbest birakma cagrisi
     yapmasina gerek yoktur; boylece TryGetIdxSource sozlesmesi korunur. }
   TIdxSource = record
     Keep: IInterface;
     Skip: TIdxSkip;
+    Disk: TVDbDiskIdx;      // SKILL12: disk agaci (nil ise kullanilmaz)
+    Holder: TDixHolder;     // SKILL12: Disk'in yasam tutucusu (kilit icin)
     Arr: TIdxEntries;
     Ctype: Byte;
     NParts: Integer;
@@ -377,6 +421,12 @@ type
     FSkipIdx: TDictionary<Int64, TIdxSkip>;   // H3: kanonik skiplist indeksleri
     FIdxOps: TDictionary<Int64, TList<TIdxOp>>;         // sirali bekleyen islemler
     FIdxCtype: TDictionary<Int64, Byte>;                // indeks kolon tipi
+    // SKILL12: kalici disk indeksleri. Anahtar IdxKeyPos; deger yasam
+    // tutucusu (agac + karsilastirici). RAM: yalniz acik olan indeksler;
+    // okuma diskten yapilir, tum indeksler acilista yuklenmez.
+    FDiskIdx: TDictionary<Int64, TDixHolder>;
+    FDiskIdxHits: Int64;      // SKILL12: diskten SERVIS edilen okuma sayisi
+    FDiskIdxBuilds: Int64;    // SKILL12: diske YAZILAN indeks sayisi
     FPkIdx: TDictionary<Word, TIdxEntries>;  // PK lazy index (tableId -> sorted)
     FPkIdxDirty: TDictionary<Word, Boolean>; // PK index kirli mi?
     // P-17a (2026-10-16): AutoInc sayaci SICAK yolda ayri sozlukte tutulur.
@@ -407,6 +457,11 @@ type
     // uyusmaz ve IndexOf yeniden calisir (dogruluk once gelir).
     FIdxDirtyGen: Int64;
     FLastDirtyGen: Int64;
+    { SKILL12: islem (batch) icinde kurulan indeksler. PersistDiskIdx acik
+      islemde dosya YAZMAZ; anahtar buraya alinir ve COMMIT'ten sonra
+      (FKvB.InBatch = False iken) diske yazilir. AbortBatch listeyi bosaltir:
+      geri alinan CREATE INDEX dosya birakmaz. }
+    FIdxPersistPending: array of Int64;
     { B-02: indeks onbellegi kilitleri. KILIT SIRASI:
       FLock -> FIdxBuildCs -> FEngCs -> FIdxCs (yaprak).
       FIdxCs tutulurken FKvB / GetTable / ScanRows / FIdxBuildCs / FLock
@@ -723,6 +778,31 @@ type
     procedure FreeIdxPend;
     procedure FlushIdxPending(const k: Int64);
     procedure SetIdxSkipFromEntries(const k: Int64; const E: TIdxEntries);
+    // SKILL12: kalici disk indeksi. Yol adi k'ya baglidir; dosya yoksa,
+    // damgasi guncel degilse veya imzasi tanimla uyusmuyorsa
+    // TryOpenDiskIdx False doner ve cagiran BELLEK yoluna duser.
+    function  DiskIdxPath(const k: Int64): string;
+    function  DiskIdxSig(const T: TTableDef; IdxPos: Integer): Int64;
+    // SKILL12: disk indeksinin damgasi = tablo basina DURABIL commit
+    // sayaci. `.gen` yoksa 0 doner; 0 damgasi yalnizca hic commit
+    // edilmemis (bos) tablo icin guvenilirdir (bkz. DixStampOk).
+    function  IndexStamp(ATableId: Word): Int64;
+    function  TryGetDiskIdx(const k: Int64; const T: TTableDef; IdxPos: Integer;
+      ACtype: Byte; const ACtypes: TByteArray; var Src: TIdxSource): Boolean;
+    procedure PersistDiskIdx(const k: Int64; const T: TTableDef; IdxPos: Integer;
+      const E: TIdxEntries; KeyCt: Byte; const Ctypes: TByteArray);
+    function  AttachDiskIdx(const k: Int64): Boolean;
+    procedure PrepareDiskIdxCommit;
+    procedure AddPersistPending(const k: Int64);
+    procedure PersistPendingDiskIdx;
+    procedure ApplyOpsToDisk(const k: Int64; Holder: TDixHolder;
+      lastOp: TDictionary<string, TIdxOp>;
+      oldKeys: TDictionary<string, string>);
+    procedure DropDiskIdx(const k: Int64);
+    procedure FlushDiskIdxOnCommit;
+    procedure InvalidateDiskIdx;
+    procedure FreeDiskIdx;
+    procedure PruneDiskIdxFiles;
     procedure FreeIdxSkips;
     function IdxTDefByKey(const k: Int64; out ColIdx: Integer): TTableDef;
     function IdxNPartsByKey(const k: Int64): Integer;
@@ -1057,6 +1137,13 @@ function IdxColsOfTable(TableId: Word; ColIdx: Integer): TIntArray;
       olmayan cekirdek islemleri (Verify/Backup/arsiv/replication/zone-scan
       gibi v2'ye ozgu yollar) icin duruyor. }
     property Backend: IVDbBackend read FKvB;
+    { SKILL12: disk indeksi olcum sayaclari (kapi kaniti icin). Hits: disk
+      agacindan SERVIS EDILEN okuma sayisi; Builds: diske YAZILAN (yeniden
+      insa/toplu yazim) indeks sayisi. Yeniden acilmis bir veritabaninda
+      ilk sorgudan sonra Hits > 0 ve Builds = 0 ise indeks GERCEKTEN
+      diskten okunuyor demektir (RAM'e yuklenmedi). }
+    property DiskIdxHits: Int64 read FDiskIdxHits;
+    property DiskIdxBuilds: Int64 read FDiskIdxBuilds;
   end;
 
 const
@@ -3633,12 +3720,58 @@ begin
     if a[i].Key = Key then Inc(Result);
 end;
 
-{ ================= H3: KAYNAK (SKIPLIST / DIZI) YARDIMCILARI ================= }
+{ ================= H3: KAYNAK (SKIPLIST / DISK / DIZI) YARDIMCILARI ================= }
+
+// SKILL12: disk agaci icin sinir kodlamasi, TIdxSkip.RangeBounds ile BIT BIT
+// ayni olmali. Cok parcali (bilesik) indekste sinir degerleri
+// IntToStr(Length)+':'+Val bicimine cevrilir (VDbIdxProbe1) - aksi halde
+// onek karsilastirmasi yanlis aralik verir.
+procedure IdxDiskBounds(const S: TIdxSource; const LoVal, HiVal: string;
+  var HasLo, HasHi, LoInc, HiInc: Boolean; out LoKey, HiKey: string);
+begin
+  if not HasLo then LoInc := True;
+  if not HasHi then HiInc := True;
+  if S.NParts > 1 then
+  begin
+    LoKey := VDbIdxProbe1(LoVal);
+    HiKey := VDbIdxProbe1(HiVal);
+  end
+  else
+  begin
+    LoKey := LoVal;
+    HiKey := HiVal;
+  end;
+end;
+
+// SKILL12: disk agaci okumalari TUTUCU kilidi altinda yapilir. Ayni agaca
+// buharinda bekleyen islem uygulanirken (FlushIdxPending) veya commit
+// sirasinda okuma yapilirsa sayfa tamponlari yeniden ayrilabilir; kilit
+// olmadan bu bellek bozulmasidir.
+procedure IdxDiskEnter(const S: TIdxSource);
+begin
+  if S.Holder <> nil then
+    S.Holder.Lock.Enter;
+end;
+
+procedure IdxDiskLeave(const S: TIdxSource);
+begin
+  if S.Holder <> nil then
+    S.Holder.Lock.Leave;
+end;
 
 function IdxSourceCountAll(const S: TIdxSource): Int64;
 begin
   if S.Skip <> nil then
     Result := S.Skip.List.Count
+  else if S.Disk <> nil then
+  begin
+    IdxDiskEnter(S);
+    try
+      Result := S.Disk.Count;
+    finally
+      IdxDiskLeave(S);
+    end;
+  end
   else
     Result := Length(S.Arr);
 end;
@@ -3653,10 +3786,29 @@ function IdxSourceRangeBounds(const S: TIdxSource; const LoVal, HiVal: string;
   HasLo, HasHi, LoInc, HiInc: Boolean; out Entries: TIdxEntries): Integer;
 var
   l2, h2, lo, hi: Integer;
-  op: string;
+  op, lk, hk: string;
+  de: TVDbDixEntries;
 begin
   if S.Skip <> nil then
     Exit(S.Skip.RangeBounds(LoVal, HiVal, HasLo, HasHi, LoInc, HiInc, Entries));
+  if S.Disk <> nil then
+  begin
+    IdxDiskBounds(S, LoVal, HiVal, HasLo, HasHi, LoInc, HiInc, lk, hk);
+    IdxDiskEnter(S);
+    try
+      Result := S.Disk.CollectRange(lk, hk, HasLo, HasHi, LoInc, HiInc, de);
+    finally
+      IdxDiskLeave(S);
+    end;
+    SetLength(Entries, Result);
+    for l2 := 0 to Result - 1 do
+    begin
+      Entries[l2].Key := de[l2].Key;
+      Entries[l2].Pk := de[l2].Val;
+      Entries[l2].Cov := de[l2].Cov;
+    end;
+    Exit;
+  end;
   SetLength(Entries, 0);
   Result := 0;
   if Length(S.Arr) = 0 then Exit;
@@ -3685,9 +3837,20 @@ function IdxSourceCountBounds(const S: TIdxSource; const LoVal, HiVal: string;
   HasLo, HasHi, LoInc, HiInc: Boolean): Int64;
 var
   e: TIdxEntries;
+  lk, hk: string;
 begin
   if S.Skip <> nil then
     Exit(S.Skip.CountBounds(LoVal, HiVal, HasLo, HasHi, LoInc, HiInc));
+  if S.Disk <> nil then
+  begin
+    IdxDiskBounds(S, LoVal, HiVal, HasLo, HasHi, LoInc, HiInc, lk, hk);
+    IdxDiskEnter(S);
+    try
+      Exit(S.Disk.CountRange(lk, hk, HasLo, HasHi, LoInc, HiInc));
+    finally
+      IdxDiskLeave(S);
+    end;
+  end;
   IdxSourceRangeBounds(S, LoVal, HiVal, HasLo, HasHi, LoInc, HiInc, e);
   Result := Length(e);
 end;
@@ -3738,9 +3901,34 @@ function IdxSourceRangeExact(const S: TIdxSource; const Key: string;
   ExactString: Boolean; out Entries: TIdxEntries): Integer;
 var
   l2, h2, i: Integer;
+  de: TVDbDixEntries;
 begin
   if S.Skip <> nil then
     Exit(S.Skip.RangeExact(Key, ExactString, Entries));
+  if S.Disk <> nil then
+  begin
+    // SKILL12: disk agacinda tam anahtar esitligi. Seek tam anahtarla
+    // yapildigi icin ilk kayit >= Key'tir; durma kosulu LeadCompare'dir,
+    // bu yuzden ayni anahtarin farkli pk'larini da kapsar.
+    IdxDiskEnter(S);
+    try
+      h2 := S.Disk.CollectRange(Key, Key, True, True, True, True, de);
+    finally
+      IdxDiskLeave(S);
+    end;
+    SetLength(Entries, h2);
+    Result := 0;
+    for i := 0 to h2 - 1 do
+    begin
+      if ExactString and (de[i].Key <> Key) then Continue;
+      Entries[Result].Key := de[i].Key;
+      Entries[Result].Pk := de[i].Val;
+      Entries[Result].Cov := de[i].Cov;
+      Inc(Result);
+    end;
+    SetLength(Entries, Result);
+    Exit;
+  end;
   SetLength(Entries, 0);
   Result := 0;
   if S.NParts > 1 then
@@ -3765,9 +3953,33 @@ function IdxSourceCountExact(const S: TIdxSource; const Key: string;
   ExactString: Boolean): Int64;
 var
   e: TIdxEntries;
+  de: TVDbDixEntries;
+  i, n: Integer;
 begin
   if S.Skip <> nil then
     Exit(S.Skip.CountExact(Key, ExactString));
+  if S.Disk <> nil then
+  begin
+    if not ExactString then
+    begin
+      IdxDiskEnter(S);
+      try
+        Exit(S.Disk.CountRange(Key, Key, True, True, True, True));
+      finally
+        IdxDiskLeave(S);
+      end;
+    end;
+    IdxDiskEnter(S);
+    try
+      n := S.Disk.CollectRange(Key, Key, True, True, True, True, de);
+    finally
+      IdxDiskLeave(S);
+    end;
+    Result := 0;
+    for i := 0 to n - 1 do
+      if de[i].Key = Key then Inc(Result);
+    Exit;
+  end;
   IdxSourceRangeExact(S, Key, ExactString, e);
   Result := Length(e);
 end;
@@ -5786,6 +5998,9 @@ begin
   FPolicies := TList<TPolicyDef>.Create;
   FIdxOps := TDictionary<Int64, TList<TIdxOp>>.Create;
   FIdxCtype := TDictionary<Int64, Byte>.Create;
+  FDiskIdx := TDictionary<Int64, TDixHolder>.Create;   // SKILL12
+  FDiskIdxHits := 0;      // SKILL12
+  FDiskIdxBuilds := 0;    // SKILL12
   FIdxUniq := TDictionary<Int64, TDictionary<string, string>>.Create;
   FIdxDirty := TList<Int64>.Create;
   FIdxDirtyGen := 0;                        // R2-B-4: nesil sayaci
@@ -5857,6 +6072,8 @@ begin
   FTriggers.Free;
   FreeIdxSkips;
   FSkipIdx.Free;    // B-2: sozluk nesnesi de serbest birakilir
+  FreeDiskIdx;      // SKILL12: acik disk agaclari birakilir (commit ETMEZ)
+  FDiskIdx.Free;    // SKILL12: sozluk nesnesi
   FMemIdx.Free;
   FreeIdxPend;      // TList'leri serbest birakir
   FIdxOps.Free;
@@ -7160,6 +7377,11 @@ procedure TVTableDb.Open(const Dir: string);
 begin
   FDir := IncludeTrailingPathDelimiter(Dir);
   LoadSchema;
+  // SKILL12: sema yuklendikten SONRA, artik var olmayan indekslerin disk
+  // dosyalari silinir. Aksi halde DROP TABLE/DROP INDEX sonrasi dosya
+  // kalir; ayni tablo kimligi + ayni kolon/AYNI DAMGA ile yeniden
+  // olusturulan bir indeks ESKI dosyayi acip yanlis satir dondurebilirdi.
+  PruneDiskIdxFiles;
   { R-11: COMMIT oncesi ertelenmis kisit denetimini VDb'ye bagla.
     Buraya baglanmazsa `SET CONSTRAINTS ALL DEFERRED` sonrasi FK
     ihlaleri hicbir zaman denetlenmez ve bozuk veri kalici olur. }
@@ -7167,6 +7389,60 @@ begin
   FKvB.SetBeforeCommit(FCommitHook);
   // Indeksler BURADA kurulmaz (tembel): ilk okumada TryGetMemIndex
   // veriden kurar. 95.000 satirlik tabloda dosya acilisi 4,5 sn -> ~0 ms.
+end;
+
+procedure TVTableDb.PruneDiskIdxFiles;
+// Semada KARSILIGI OLMAYAN disk indeks dosyalarini siler. Anahtar
+// (TableId shl 32) or alt-kimlik bicimindedir; bu yuzden semadan yeniden
+// uretilebilir. Yalnizca kendi urettigimiz 'vdbidx_<k>.dix' adlari ele
+// alinir; baska dosyalara dokunulmaz.
+var
+  sr: TSearchRec;
+  live: TDictionary<Int64, Boolean>;
+  kv: TPair<string, TTableDef>;
+  t: TTableDef;
+  j: Integer;
+  nm, full: string;
+  k: Int64;
+  i: Integer;
+  s: string;
+begin
+  if FDir = '' then Exit;
+  live := TDictionary<Int64, Boolean>.Create;
+  try
+    for kv in FTables do
+    begin
+      t := kv.Value;
+      for j := 0 to High(t.Idx) do
+        live.AddOrSetValue(IdxKeyPos(t, j), True);
+    end;
+    if FindFirst(FDir + 'vdbidx_*.dix', faAnyFile, sr) = 0 then
+    try
+      repeat
+        if (sr.Attr and faDirectory) <> 0 then Continue;
+        nm := sr.Name;
+        full := FDir + nm;
+        // 'vdbidx_' (7) + rakamlar + '.dix' (4)
+        s := Copy(nm, 8, Length(nm) - 11);
+        k := 0;
+        if (s = '') or not TryStrToInt64(s, k) then Continue;
+        if not live.ContainsKey(k) then
+        begin
+          // Kendi dosyamiz: sahipsiz kalmis; silinmesi guvenli (indeks
+          // veriden yeniden insa edilebilir; veri kaybi yok).
+          for i := 1 to 3 do
+          begin
+            DeleteFile(full);
+            if not FileExists(full) then Break;
+          end;
+        end;
+      until FindNext(sr) <> 0;
+    finally
+      FindClose(sr);
+    end;
+  finally
+    live.Free;
+  end;
 end;
 
 procedure TVTableDb.ReloadSchema;
@@ -7256,7 +7532,20 @@ begin
   ResetBatchTableCache;
   if FSchemaDirty then
     SaveSchema; // batch icine yazilir, tek fsync commit'te
+  // SKILL12: bekleyen indeks islemleri HEAP COMMIT'INDEN ONCE agaclara
+  // uygulanir (dosyaya yazilmaz; damga hala eski). Boylece commit sonrasi
+  // tek is kaldi: agaci yeni damgayla yazmak.
+  PrepareDiskIdxCommit;
   FKvB.CommitBatch;
+  // SKILL12: disk indeksleri HEAP COMMIT'INDEN SONRA yazilir. Sirayla:
+  //   (1) heap WAL commit + fsync  -> yeni LSN = L
+  //   (2) disk agaci Commit, damga = L
+  // Arada cokme olursa damga != L olur ve acilista indeks veriden
+  // yeniden insa edilir; yani indeks asla "eski ama gecerli" gorunmez.
+  FlushDiskIdxOnCommit;
+  // SKILL12: islem icinde kurulan indeksler (DDL batch'i) ertelenmisti;
+  // simdi diske yazilir. Sira: once heap damgasi ilerledi, sonra agac.
+  PersistPendingDiskIdx;
   ClearSavepoints;   // v3.2
   ClearSchemaSnapshot;
   // F2-7: Sema kalici olarak yazildi; "kasitli silindi" isaretleri artik
@@ -7282,6 +7571,17 @@ begin
   // baska oturumun CONCURRENTLY insasi korunur.
   StopConcBuilders('', True);
   FKvB.AbortBatch;
+  // SKILL12: geri alinan islemde disk agaclarina uygulanmis degisiklikler
+  // COMMIT EDILMEDI (dosyaya hic yazilmadi). Bellekteki kopyalar atilir;
+  // dosya son commit'lenmis haliyle kalir, yani hala tutarlidir.
+  InvalidateDiskIdx;
+  // SKILL12: geri alinan DDL'in ertelenmis indeks yazimi da iptal edilir.
+  FIdxCs.Enter;
+  try
+    SetLength(FIdxPersistPending, 0);
+  finally
+    FIdxCs.Leave;
+  end;
   ClearSavepoints;   // v3.2
   // R-11: geri alinan islemde ertelenen satirlar da gecerlidir artik;
   // COMMIT'e kadar bekleyen liste TEMIZLENMEZSE sonraki gercek
@@ -9441,6 +9741,10 @@ begin
   k := IdxKeyPos(T, IdxPos);
   // indeks sifirdan kuruluyor -> bekleyen islemler gecersizdir
   DropIdxPend(k);
+  // SKILL12: ayni sekilde eski DISK agaci da gecersizdir. Birakilmazsa
+  // asagidaki insa dosyayi guncellese bile eski tutucu yasamaya devam eder
+  // ve bir sonraki commit onun BAYAT icerigini yeni damgayla yazardi.
+  DropDiskIdx(k);
   // R-22: tarama + girdi uretimi ortak yardimcida (anlik goruntu aynisi
   // CONCURRENTLY insasinda da kullanilir).
   BuildIdxEntries(T, IdxPos, e, ctypes, keyCt);
@@ -9482,6 +9786,10 @@ begin
   finally
     FIdxCs.Leave;
   end;
+  // SKILL12: kalici disk indeksi. Yalniz islem (batch) ACIK DEGILKEN yazilir:
+  // acik islemdeki satirlar henuz onaylanmadi, damga tutmaz ve geri alma
+  // sonrasi eski agac "taze" gorunup yanlis satir dondurebilirdi.
+  PersistDiskIdx(k, T, IdxPos, e, keyCt, ctypes);
 end;
 
 function TVTableDb.FindIdxDefById(ATableId: Word; const AIndexName: string;
@@ -11006,6 +11314,7 @@ var
   p: TPair<string, TIdxOp>;
   needSkip: Boolean;
   cur: TList<TIdxOp>;   // B-02: paralel okur yarisini saptar
+  dh: TDixHolder;       // SKILL12
 
 begin
   FIdxCs.Enter;   // B-02
@@ -11059,6 +11368,11 @@ begin
       if not op.IsDel then
         sk.Add(op.Key, op.Pk, op.Cov);
     end;
+    // SKILL12: acik disk agaci varsa AYNI islem kumesi ona da uygulanir.
+    // Agac commit'te yazilir (bkz. FlushDiskIdxOnCommit); commit'ten once
+    // dosyaya hicbir sey gitmedigi icin yarim kalan islem kalici olmaz.
+    if FDiskIdx.TryGetValue(k, dh) then
+      ApplyOpsToDisk(k, dh, lastOp, oldKeys);
     FMemIdx.Remove(k);   // dizi cache'i bayat
     lastOp.Free;
     oldKeys.Free;
@@ -11070,6 +11384,11 @@ begin
 
   // Indeks henuz kurulmadiysa bekleyenler atilir; ilk okuma BuildOneIndex
   // ile TUM veriden dogru indeksi kurar.
+  // SKILL12 ISTISNASI: acik bir disk agaci varsa islemler ATILMAZ, agaca
+  // uygulanir. Aksi halde agac "damgasi guncel" gorunurken bu satirlari
+  // icermez ve aralik taramasi SESSIZCE eksik satir dondururdu.
+  if FDiskIdx.TryGetValue(k, dh) then
+    ApplyOpsToDisk(k, dh, lastOp, oldKeys);
   lastOp.Free;
   oldKeys.Free;
   ops.Free;
@@ -11077,6 +11396,580 @@ begin
   RemoveDirty(k);        // R2-B-4: tek silme noktasi
   finally
     FIdxCs.Leave;
+  end;
+end;
+
+// ===================== SKILL12: KALICI DISK INDEKSI =====================
+//
+// SORUN: ikincil indeksler bugune kadar YALNIZ bellekte (FMemIdx dizi
+// cache'i + FSkipIdx skiplist) yasiyordu. Buyuk veritabaninda acilis ya da
+// ilk sorgu indeksin TAMAMINI RAM'e yukluyordu ve surec olunce indeks
+// kayboluyordu.
+//
+// COZUM: indeksin KALICI hali diskte bir B+Agaci dosyasidir
+// (VDbDiskIdx.pas, degisken uzunluklu anahtar). Kurallar:
+//   1) HEAP DOGRUDUR, INDEKS TURETILMIS VERIDIR. Disk agaci yalnizca
+//      heap commit'i BASARILI olduktan sonra yazilir ve damgasi yeni
+//      commit sayacina esitlenir.
+//   2) Damga uyusmuyorsa (cokme, yarim yazim, eski dosya, baska tanim)
+//      dosya KULLANILMAZ; indeks veriden yeniden insa edilir. Bozuk
+//      indeksle SESSIZCE yanlis sonuc uretmek imkansizdir.
+//   3) Karsilastirma kurali yeniden yazilmaz: TIdxSkipCmp'e devredilir
+//      (TDixCmpAdapter). Boylece disk ve bellek sirasi BIT BIT aynidir.
+//   4) Hucre sayfaya sigmiyorsa (cok buyuk TEXT anahtar/deger) indeks
+//      diskte TUTULMAZ ve bellek yolunda kalir; bu sinir aciktir.
+
+function TVTableDb.DiskIdxPath(const k: Int64): string;
+begin
+  // FDir zaten sonunda ayirici ile saklanir (bkz. constructor).
+  Result := FDir + 'vdbidx_' + IntToStr(k) + '.dix';
+end;
+
+function TVTableDb.DiskIdxSig(const T: TTableDef; IdxPos: Integer): Int64;
+// Indeks TANIMININ parmak izi. Ayni k'ya (tablo+konum) farkli bir tanim
+// gelebilir (DROP + CREATE, ifade/partial degisikligi); bu durumda eski
+// dosya KULLANILMAZ. FNV1a64 - bagimlilik yok, kararli.
+var
+  s: string;
+  i: Integer;
+  h: QWord;
+begin
+  s := T.Idx[IdxPos].Name + '|' + IntToStr(T.Idx[IdxPos].Col) + '|';
+  // SKILL12: TEK KOLONLU indekste Cols semada BOS kaydedilir, yeniden
+  // yuklendiginde [Col] olur. Imza bu yuzden kanonik olmali: etkin kolon
+  // listesi (bos ise Col) hash'lenir; aksi halde her acilis "tanim degisti"
+  // sanip indeksi yeniden insa ederdi.
+  if Length(T.Idx[IdxPos].Cols) > 0 then
+  begin
+    for i := 0 to High(T.Idx[IdxPos].Cols) do
+      s := s + IntToStr(T.Idx[IdxPos].Cols[i]) + ',';
+  end
+  else
+    s := s + IntToStr(T.Idx[IdxPos].Col) + ',';
+  if T.Idx[IdxPos].Uniq then s := s + '|U';
+  s := s + '|' + T.Idx[IdxPos].Predicate + '|' + T.Idx[IdxPos].ExprText;
+  h := QWord(14695981039346656037);
+  for i := 1 to Length(s) do
+  begin
+    h := h xor QWord(Ord(s[i]));
+    h := h * QWord(1099511628211);
+  end;
+  Result := Int64(h);
+end;
+
+function TVTableDb.IndexStamp(ATableId: Word): Int64;
+// SKILL12: disk indeksi HANGI heap durumuna ait? Tablo basina durabil
+// commit sayaci bunu surecler arasi karsilastirilabilir kilar. Genel
+// `StoreGenStamp` yalniz bellekte yasar ve `.gen` kapanista silinince
+// sifirlanir; o zaman her yeni surec indeksi yeniden insa ederdi.
+begin
+  Result := FKvB.StoreScopeStamp(ATableId);
+end;
+
+function DixStampOk(tree: TVDbDiskIdx; expected: Int64): Boolean;
+// Damga esitligi TEK BASINA yetmez: `.gen` yoksa beklenen damga 0'dir ve
+// gercekten 0 damgali (hic commit edilmemis) bir agac da olabilir. Bu
+// yuzden 0 damgasina yalnizca BOS agac icin guvenilir.
+begin
+  Result := (tree.Stamp = expected) and ((expected <> 0) or (tree.Count = 0));
+end;
+
+constructor TDixCmpAdapter.Create(ACtype: Byte; const ACtypes: TByteArray);
+begin
+  inherited Create;
+  C := TIdxSkipCmp.Create;
+  C.Ctype := ACtype;
+  C.Ctypes := Copy(ACtypes, 0, Length(ACtypes));
+  C.IsMulti := Length(ACtypes) > 1;
+end;
+
+destructor TDixCmpAdapter.Destroy;
+begin
+  C.Free;
+  inherited;
+end;
+
+function TDixCmpAdapter.CompareEntries(const AKey1, AVal1, AKey2, AVal2: string): Integer;
+var
+  a, b: TVDbSkipEntry;
+begin
+  a.Key := AKey1; a.Value := AVal1; a.Cov := '';
+  b.Key := AKey2; b.Value := AVal2; b.Cov := '';
+  Result := C.FullCompare(a, b);
+end;
+
+function TDixCmpAdapter.CompareKeyBound(const AKey, ABound: string): Integer;
+begin
+  Result := C.LeadCompare(AKey, ABound);
+end;
+
+constructor TDixHolder.Create(ATree: TVDbDiskIdx; ACmp: TDixCmpAdapter);
+begin
+  inherited Create;
+  Tree := ATree;
+  Cmp := ACmp;
+  Lock := TCriticalSection.Create;
+  Mutated := False;
+  if ATree <> nil then BaseStamp := ATree.Stamp else BaseStamp := 0;
+end;
+
+destructor TDixHolder.Destroy;
+begin
+  if Lock <> nil then
+  begin
+    Lock.Enter;
+    try
+      Tree.Free;
+    finally
+      Lock.Leave;
+    end;
+    Lock.Free;
+  end
+  else
+    Tree.Free;
+  Cmp.Free;
+  inherited;
+end;
+
+function TVTableDb.TryGetDiskIdx(const k: Int64; const T: TTableDef;
+  IdxPos: Integer; ACtype: Byte; const ACtypes: TByteArray;
+  var Src: TIdxSource): Boolean;
+// Acik agac varsa onu verir. Yoksa dosyayi acar ve DAMGA + IMZA
+// dogrulamasindan gecerse sozluge kaydeder. Herhangi bir uyusmazlikta
+// False doner (cagiran bellek yoluna duser, gerekirse yeniden insa eder).
+var
+  path, reason: string;
+  cmp: TDixCmpAdapter;
+  tree: TVDbDiskIdx;
+  h, h2: TDixHolder;
+  sig, stamp: Int64;
+  orphan: Boolean;
+begin
+  Result := False;
+  FIdxCs.Enter;
+  try
+    if FDiskIdx.TryGetValue(k, h) then
+    begin
+      // R1 deseni: yasam referansi KILIT ALTINDA alinir; bu arada baska
+      // bir parcacik indeksi kaldirsa bile nesne okuma bitene kadar yasar.
+      Src.Keep := h;
+      Src.Disk := h.Tree;
+      Src.Holder := h;
+      Src.Ctype := ACtype;
+      Inc(FDiskIdxHits);   // SKILL12: diskten servis edildi
+      Exit(True);
+    end;
+  finally
+    FIdxCs.Leave;
+  end;
+
+  path := DiskIdxPath(k);
+  if not FileExists(path) then Exit;
+  cmp := TDixCmpAdapter.Create(ACtype, ACtypes);
+  tree := nil;
+  if not TVDbDiskIdx.TryOpen(path, cmp, False, tree, reason) then
+  begin
+    // Bozuk/kesik/yabanci dosya: KULLANILMAZ. Dosyayi burada silmiyoruz;
+    // yeniden insa basarili olursa uzerine yazilir.
+    cmp.Free;
+    Exit;
+  end;
+  sig := DiskIdxSig(T, IdxPos);
+  stamp := IndexStamp(Word(k shr 32));
+  if (tree.Signature <> sig) or (not DixStampOk(tree, stamp)) then
+  begin
+    tree.Free;
+    cmp.Free;
+    Exit;
+  end;
+  h := TDixHolder.Create(tree, cmp);
+  // TInterfacedObject.Create referans sayacini 0 baslatir. Nesneyi YASATAN
+  // taban referans burada alinir; sozluge devredilir (sahiplik transferi).
+  // Alinmazsa sozlukten cikarma (_Release 0 -> -1) nesneyi ASLA yok etmez:
+  // .dix dosya tanitici surec sonuna kadar acik kalir (Windows'ta kilit).
+  h._AddRef;
+  orphan := True;   // referans sozluge devredilmezse birakilir (sizinti yok)
+  FIdxCs.Enter;
+  try
+    if FDiskIdx.TryGetValue(k, h2) then
+    begin
+      // Arada baska bir parcacik ayni indeksi acmis: onunki kullanilir.
+      Src.Keep := h2;
+      Src.Disk := h2.Tree;
+      Src.Holder := h2;
+      Src.Ctype := ACtype;
+      Result := True;
+    end
+    else
+    begin
+      FDiskIdx.Add(k, h);          // sozluk 1 referans tutar
+      Src.Keep := h;               // okur 1 referans daha alir
+      Src.Disk := h.Tree;
+      Src.Holder := h;
+      Src.Ctype := ACtype;
+      Result := True;
+      orphan := False;
+    end;
+  finally
+    FIdxCs.Leave;
+  end;
+  if orphan then
+    h._Release;
+  // Soguk acilis da DISKTEN servistir: dosya okundu, RAM'e tamami
+  // yuklenmedi. Yalniz onbellekteki tutucu saymak gercek kullanimi gizler.
+  if Result then
+    Inc(FDiskIdxHits);
+end;
+
+procedure TVTableDb.PersistDiskIdx(const k: Int64; const T: TTableDef;
+  IdxPos: Integer; const E: TIdxEntries; KeyCt: Byte;
+  const Ctypes: TByteArray);
+// Sirali girisi disk agacina toplu yazar (BuildSorted) ve dosyayi
+// atomik olarak yerine koyar (.tmp + RenameFile).
+var
+  path, tmp: string;
+  cmp: TDixCmpAdapter;
+  tree: TVDbDiskIdx;
+  de: TVDbDixEntries;
+  i: Integer;
+begin
+  // Acik islemde yigin henuz onaylanmadi: disk agaci YAZILMAZ. Aksi halde
+  // geri alma sonrasi damga tutar ve eski agac yanlis satir dondurur.
+  // Anahtar ERTELENIR: commit'ten sonra (InBatch = False) yazilir.
+  if FKvB.InBatch then
+  begin
+    FIdxCs.Enter;
+    try
+      AddPersistPending(k);
+    finally
+      FIdxCs.Leave;
+    end;
+    Exit;
+  end;
+  // Bos indeks de GECERLI bir agactir (tek yaprak + meta). Yazilmazsa
+  // yeniden acilista "dosya yok" diye bosuna tam tarama yapilirdi.
+  for i := 0 to High(E) do
+  begin
+    // Hucre sayfaya sigmiyorsa disk indeksi TUTULMAZ (acik sinir).
+    if Length(E[i].Key) > DIX_MAX_KEY then Exit;
+    if DixCellSize(E[i].Key, E[i].Pk, E[i].Cov) > DIX_MAX_CELL then Exit;
+  end;
+  SetLength(de, Length(E));
+  for i := 0 to High(E) do
+  begin
+    de[i].Key := E[i].Key;
+    de[i].Val := E[i].Pk;
+    de[i].Cov := E[i].Cov;
+  end;
+  path := DiskIdxPath(k);
+  tmp := path + '.tmp';
+  cmp := TDixCmpAdapter.Create(KeyCt, Ctypes);
+  try
+    if FileExists(tmp) then DeleteFile(tmp);
+    tree := TVDbDiskIdx.CreateNew(tmp, cmp);
+    try
+      tree.BuildSorted(de, IndexStamp(Word(k shr 32)), DiskIdxSig(T, IdxPos));
+    finally
+      tree.Free;
+    end;
+    // Eski agac kapatilmali; Windows'ta acik dosya uzerine rename olmaz.
+    DropDiskIdx(k);
+    if FileExists(path) then DeleteFile(path);
+    if RenameFile(tmp, path) then
+    begin
+      Inc(FDiskIdxBuilds);   // SKILL12: diske yazildi (olcum)
+      // Yeni dosyayi HEMEN sahiplen. Aksi halde sonraki yazmalar yalniz
+      // FIdxOps'a duser, commit'te yazilacak bir agac bulunmaz ve dosya
+      // bayat damgayla kalir; her acilis indeksi bastan kurardi.
+      AttachDiskIdx(k);
+    end
+    else
+      if FileExists(tmp) then DeleteFile(tmp);
+  finally
+    cmp.Free;
+  end;
+end;
+
+function TVTableDb.AttachDiskIdx(const k: Int64): Boolean;
+// Var olan .dix dosyasini YAZILABILIR acar, imza + damga dogrular ve
+// sozluge kaydeder. DiskIdxHits ARTMAZ: bu bir okuma servisi degil, yazma
+// yolunun agaci sahiplenmesidir. Basarisizlik sessiz degildir: cagiran
+// bellek/insa yoluna duser.
+var
+  path, reason: string;
+  cmp: TDixCmpAdapter;
+  tree: TVDbDiskIdx;
+  h, h2: TDixHolder;
+  j, ci: Integer;
+  t: TTableDef;
+  ct: Byte;
+  cts: TByteArray;
+  orphan: Boolean;
+begin
+  Result := False;
+  FIdxCs.Enter;   // B-02
+  try
+    if FDiskIdx.ContainsKey(k) then Exit(True);
+  finally
+    FIdxCs.Leave;
+  end;
+  j := IdxPosOfKey(k);
+  if j < 0 then Exit;
+  t := IdxTDefByKey(k, ci);
+  if (j > High(t.Idx)) or t.Idx[j].Invalid then Exit;
+  path := DiskIdxPath(k);
+  if not FileExists(path) then Exit;
+  ct := IdxCtypeOfPos(t, j);
+  cts := IdxCtypesOf(t, j);
+  cmp := TDixCmpAdapter.Create(ct, cts);
+  tree := nil;
+  if not TVDbDiskIdx.TryOpen(path, cmp, False, tree, reason) then
+  begin
+    cmp.Free;
+    Exit;
+  end;
+  if (tree.Signature <> DiskIdxSig(t, j)) or
+     (not DixStampOk(tree, IndexStamp(Word(k shr 32)))) then
+  begin
+    tree.Free;
+    cmp.Free;
+    Exit;
+  end;
+  h := TDixHolder.Create(tree, cmp);
+  h._AddRef;   // taban referans (sozluge sahiplik transferi)
+  orphan := True;
+  FIdxCs.Enter;
+  try
+    if FDiskIdx.TryGetValue(k, h2) then
+      Result := True   // arada baska parcacik sahiplendi
+    else
+    begin
+      FDiskIdx.Add(k, h);
+      orphan := False;
+      Result := True;
+    end;
+  finally
+    FIdxCs.Leave;
+  end;
+  if orphan then
+    h._Release;   // fazla nesne: kilit DISINDA birakilir
+end;
+
+procedure TVTableDb.PrepareDiskIdxCommit;
+// COMMIT ONCESI: bekleyen indeks islemlerini (FIdxOps) tuketir. Once agac
+// sahiplenilir (dosya hala ayni tabanda ise), sonra islemler uygulanir;
+// boylece yazma yapmayan bir oturumda bile indeks dosyasi guncel kalir.
+// Dosyaya BURADA yazilmaz: heap commit'i henuz olmadi. Basarisiz
+// sahiplenmede islemler yine de tuketilir (satirlar artik heap'te olacak;
+// indeks bir sonraki okumada veriden kurulur). Tuketilmezse ayni islemler
+// hem yeni kurulan indekse hem eski tampona uygulanip MUKERRER girdi
+// uretirdi.
+var
+  keys: TList<Int64>;
+  i: Integer;
+begin
+  keys := TList<Int64>.Create;
+  try
+    FIdxCs.Enter;
+    try
+      for i := 0 to FIdxDirty.Count - 1 do
+        keys.Add(FIdxDirty[i]);
+    finally
+      FIdxCs.Leave;
+    end;
+    for i := 0 to keys.Count - 1 do
+    begin
+      AttachDiskIdx(keys[i]);
+      FlushIdxPending(keys[i]);
+    end;
+  finally
+    keys.Free;
+  end;
+end;
+
+procedure TVTableDb.AddPersistPending(const k: Int64);
+// FIdxCs TUTULURKEN cagrilir (cagiran zaten kilit altindaysa da zararsiz).
+var
+  i: Integer;
+begin
+  for i := 0 to High(FIdxPersistPending) do
+    if FIdxPersistPending[i] = k then Exit;
+  SetLength(FIdxPersistPending, Length(FIdxPersistPending) + 1);
+  FIdxPersistPending[High(FIdxPersistPending)] := k;
+end;
+
+procedure TVTableDb.PersistPendingDiskIdx;
+// COMMIT SONRASI: islem icinde kurulmus (bu yuzden ertelenmis) indeksleri
+// diske yazar. Dosya zaten guncelse dokunulmaz. Insa, COMMIT'lenmis heap'ten
+// yapilir; yani icerik kesin dogrudur.
+var
+  keys: array of Int64;
+  i, j, ci: Integer;
+  t: TTableDef;
+begin
+  FIdxCs.Enter;   // B-02
+  try
+    if Length(FIdxPersistPending) = 0 then Exit;
+    keys := Copy(FIdxPersistPending, 0, Length(FIdxPersistPending));
+    SetLength(FIdxPersistPending, 0);
+  finally
+    FIdxCs.Leave;
+  end;
+  for i := 0 to High(keys) do
+  begin
+    j := IdxPosOfKey(keys[i]);
+    if j < 0 then Continue;
+    t := IdxTDefByKey(keys[i], ci);
+    if (j > High(t.Idx)) or t.Idx[j].Invalid then Continue;
+    if AttachDiskIdx(keys[i]) then Continue;
+    BuildOneIndex(t, j);
+  end;
+end;
+
+procedure TVTableDb.ApplyOpsToDisk(const k: Int64; Holder: TDixHolder;
+  lastOp: TDictionary<string, TIdxOp>; oldKeys: TDictionary<string, string>);
+// Bellekte uygulanan AYNI son-durum kumesini disk agacina uygular.
+// Agac commit edilmez; kalici hale gelmesi CommitBatch'te olur.
+var
+  p: TPair<string, TIdxOp>;
+  op: TIdxOp;
+  oldKey: string;
+begin
+  for p in lastOp do
+  begin
+    op := p.Value;
+    Holder.Lock.Enter;
+    try
+      if oldKeys.TryGetValue(op.Pk, oldKey) then
+        Holder.Tree.Remove(oldKey, op.Pk);
+      if not op.IsDel then
+        Holder.Tree.Insert(op.Key, op.Pk, op.Cov);
+      Holder.Mutated := True;   // kilit altinda: yaris yok
+    finally
+      Holder.Lock.Leave;
+    end;
+  end;
+end;
+
+procedure TVTableDb.DropDiskIdx(const k: Int64);
+var
+  h: TDixHolder;
+begin
+  FIdxCs.Enter;
+  try
+    if FDiskIdx.TryGetValue(k, h) then
+    begin
+      FDiskIdx.Remove(k);
+      h._Release;   // sozlugun referansi birakilir (okurlar varsa yasar)
+    end;
+  finally
+    FIdxCs.Leave;
+  end;
+end;
+
+procedure TVTableDb.InvalidateDiskIdx;
+// Acik disk agaclarini BIRAKIR (dosyalara dokunmaz). Commit edilmemis
+// degisiklikler diske hic yazilmadigi icin dosya son commit'lenmis
+// haliyle tutarli kalir; sonraki okuma onu yeniden acar.
+var
+  lst: TList<TDixHolder>;
+  kv: TPair<Int64, TDixHolder>;
+  i: Integer;
+begin
+  lst := TList<TDixHolder>.Create;
+  FIdxCs.Enter;
+  try
+    for kv in FDiskIdx do
+      lst.Add(kv.Value);
+    FDiskIdx.Clear;
+  finally
+    FIdxCs.Leave;
+  end;
+  for i := 0 to lst.Count - 1 do
+    lst[i]._Release;   // okurlar varsa nesne yasamaya devam eder
+  lst.Free;
+end;
+
+procedure TVTableDb.FreeDiskIdx;
+begin
+  InvalidateDiskIdx;
+end;
+
+procedure TVTableDb.FlushDiskIdxOnCommit;
+// Heap commit'i BASARILI olduktan sonra cagrilir. Damga, commit'in
+// ARTIRDIGI tablo kapsam sayacidir (tablo basina durabil); boylece
+// "damga == heap durumu" iliskisi surecler arasi da korunur.
+var
+  lst: TList<Int64>;
+  kv: TPair<Int64, TDixHolder>;
+  h: TDixHolder;
+  i: Integer;
+  stamp, fstamp, fsig: Int64;
+  freason: string;
+  drop: Boolean;
+begin
+  lst := TList<Int64>.Create;
+  FIdxCs.Enter;
+  try
+    for kv in FDiskIdx do
+      if kv.Value.Mutated then lst.Add(kv.Key);
+  finally
+    FIdxCs.Leave;
+  end;
+  try
+    for i := 0 to lst.Count - 1 do
+    begin
+      FIdxCs.Enter;
+      try
+        drop := False;
+        if not FDiskIdx.TryGetValue(lst[i], h) then Continue;
+        // Damga HER ANAHTAR icin ayri cozulur: kapsam sayaci tablo basina.
+        stamp := IndexStamp(Word(lst[i] shr 32));
+        h.Lock.Enter;
+        try
+          // YAZMA GUARD'I: baska bir oturum/surec bu indekse araya yazdiysa
+          // bu agac onun satirlarini ICERMEZ. Uzerine yazmak o commit'i
+          // silerdi (sessiz eksik satir). Dosya dokunulmadan birakilir;
+          // sonraki okuma damga uyusmazligini gorup veriden yeniden kurar.
+          if (not VDbDixPeekMeta(h.Tree.FileName, fstamp, fsig, freason)) or
+             (fstamp <> h.BaseStamp) or (fsig <> h.Tree.Signature) then
+          begin
+            h.Mutated := False;
+            drop := True;
+          end
+          else
+          begin
+            h.Tree.Stamp := stamp;
+            try
+              h.Tree.Commit;
+              h.Mutated := False;
+              h.BaseStamp := stamp;   // dosya artik bu damgada
+            except
+              // Yazilamadi: dosya eski damgasinda kalir, yani gecersizdir;
+              // sonraki okuma indeksi veriden yeniden insa eder. Sessiz
+              // yanlis sonuc yok.
+              h.Mutated := False;
+              drop := True;
+            end;
+          end;
+        finally
+          h.Lock.Leave;
+        end;
+        // BIRAKMA kilit DISINDA yapilir: tutucunun yikicisi ayni kilidi
+        // kullanir; kilit tutarken _Release etmek use-after-free riskidir.
+        if drop then
+        begin
+          drop := False;
+          FDiskIdx.Remove(lst[i]);
+          h._Release;
+          h := nil;
+        end;
+      finally
+        FIdxCs.Leave;
+      end;
+    end;
+  finally
+    lst.Free;
   end;
 end;
 
@@ -11132,15 +12025,22 @@ end;
 function TVTableDb.IdxSourceReady(TableId: Word; ColIdx: Integer): Boolean;
 var
   k: Int64;
+  has: Boolean;
 begin
   k := IdxKey(TableId, ColIdx);
   FIdxCs.Enter;   // B-02
   try
-    Result := FMemIdx.ContainsKey(k) or FSkipIdx.ContainsKey(k) or
-              (FIdxDirty.IndexOf(k) >= 0);
+    has := FMemIdx.ContainsKey(k) or FSkipIdx.ContainsKey(k) or
+           (FIdxDirty.IndexOf(k) >= 0) or FDiskIdx.ContainsKey(k);
   finally
     FIdxCs.Leave;
   end;
+  if has then Exit(True);
+  // SKILL12: kalici indeks dosyasi varsa kaynak HAZIRDIR (ilk okuma onu
+  // diskten servis eder, RAM'e tamamini yuklemez). Dosya sistemi cagrisi
+  // kilit DISINDA yapilir; tanim da dogrulanir ki yabanci/eskimis dosya
+  // "hazir" sayilmasin.
+  Result := FileExists(DiskIdxPath(k)) and (IdxPosOfKey(k) >= 0);
 end;
 
 function TVTableDb.TryGetIdxSource(TableId: Word; ColIdx: Integer;
@@ -11153,10 +12053,14 @@ var
   e: TIdxEntries;
   sk: TIdxSkip;
   needFlush, hasSkip, hasMem, hasCt: Boolean;   // B-02
+  ctypes: TByteArray;      // SKILL12
+  ct: Byte;                // SKILL12
 begin
   Result := False;
   Src.Keep := nil;   // R1: managed alan; cagiran serbest birakmaz
   Src.Skip := nil;
+  Src.Disk := nil;   // SKILL12
+  Src.Holder := nil; // SKILL12
   SetLength(Src.Arr, 0);
   k := IdxKey(TableId, ColIdx);
   if FById.TryGetValue(TableId, nm) then
@@ -11198,6 +12102,34 @@ begin
       hasSkip := FSkipIdx.TryGetValue(k, sk);
     finally
       FIdxCs.Leave;
+    end;
+  end;
+
+  // SKILL12: DISK YOLU. Oturumda sicak skiplist yoksa (tipik olarak
+  // yeniden acilmis veritabaninin ILK sorgusunda) indeks diskten servis
+  // edilir; boylece tum indeksler RAM'e yuklenmez. Damga/imza uyusmazligi
+  // olursa TryGetDiskIdx False doner ve asagidaki insa yolu calisir.
+  if (not hasSkip) and (FDiskIdx.ContainsKey(k) or FileExists(DiskIdxPath(k))) then
+  begin
+    j := IdxPosOfKey(k);
+    if j >= 0 then
+    begin
+      ct := 0;
+      SetLength(ctypes, 0);
+      if FById.TryGetValue(TableId, nm) then
+      begin
+        t := GetTable(nm);
+        if (j <= High(t.Idx)) and (not t.Idx[j].Invalid) then
+        begin
+          ct := IdxCtypeOfPos(t, j);
+          ctypes := IdxCtypesOf(t, j);
+          if TryGetDiskIdx(k, t, j, ct, ctypes, Src) then
+          begin
+            Src.NParts := IdxNPartsByKey(k);
+            Exit(True);
+          end;
+        end;
+      end;
     end;
   end;
 
@@ -11646,6 +12578,8 @@ var
   t: TTableDef;
   j, m: Integer;
   nm: string;
+  kk: Int64;
+  ip: string;
 begin
   nm := VDbNorm(IndexName);
   // R-22 Full: bu indeks icin surmekte olan CONCURRENTLY insasi varsa
@@ -11656,20 +12590,27 @@ begin
       if kv.Value.Idx[j].Name = nm then
       begin
         t := kv.Value;
+        kk := IdxKeyPos(t, j);
+        ip := DiskIdxPath(kk);
         // indeks hem bellekten hem de tampondan KALDIRILIR
-        DropIdxPend(IdxKeyPos(t, j));   // F-17: partial indeks anahtari
+        DropIdxPend(kk);   // F-17: partial indeks anahtari
         FIdxCs.Enter;   // B-02
         try
-          FMemIdx.Remove(IdxKeyPos(t, j));
-          if FSkipIdx.ContainsKey(IdxKeyPos(t, j)) then
+          FMemIdx.Remove(kk);
+          if FSkipIdx.ContainsKey(kk) then
           begin
-            FSkipIdx[IdxKeyPos(t, j)]._Release;   // R1
-            FSkipIdx.Remove(IdxKeyPos(t, j));
+            FSkipIdx[kk]._Release;   // R1
+            FSkipIdx.Remove(kk);
           end;
-          FIdxCtype.Remove(IdxKeyPos(t, j));
+          FIdxCtype.Remove(kk);
         finally
           FIdxCs.Leave;
         end;
+        // SKILL12: kalici disk indeksi de kapatilir ve dosyasi silinir.
+        // Aksi halde ayni adla yeniden olusturulan indeks ESKI dosyayi
+        // acabilirdi (imza ayni) - dosya silinerek bu risk kapatilir.
+        DropDiskIdx(kk);
+        if FileExists(ip) then DeleteFile(ip);
         for m := j to High(t.Idx) - 1 do
           t.Idx[m] := t.Idx[m + 1];
         SetLength(t.Idx, Length(t.Idx) - 1);

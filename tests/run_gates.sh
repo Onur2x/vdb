@@ -188,6 +188,11 @@ build_gate crypto_interop "$ROOT/tests/crypto_interop/crypto_interop.lpr"
 build_gate crypto_interop_ext "$ROOT/tests/crypto_interop_ext/crypto_interop_ext.lpr"
 build_gate bench_sqlite  "$ROOT/tests/bench_sqlite/bench_sqlite.lpr"
 
+# SKILL12: kalici disk indeksi kapilari (entegrasyon, cokme matrisi, olcek).
+build_gate disk_index_integration "$ROOT/tests/disk_index_integration/dji.lpr"
+build_gate disk_index_crash "$ROOT/tests/disk_index_crash/dixcrash.lpr"
+build_gate disk_index_scale "$ROOT/tests/disk_index_scale/dixscale.lpr"
+
 # --- kosum -----------------------------------------------------------
 unset VDB_CRYPTO_PROVIDER 2>/dev/null || true
 unset VDB_CRYPTO_DLL 2>/dev/null || true
@@ -248,6 +253,13 @@ run_gate btree_disk     "$WORK/btree_disk"     btree_disk
 run_gate sql_scale      "$WORK/sql_scale"      sql_scale
 run_gate sql_index_scale "$WORK/sql_index_scale" sql_index_scale
 run_gate soak           "$WORK/soak"           soak
+
+# SKILL12: disk indeksi. Olcek kapisi CI'da 200k satir ile kosar; elle
+# daha buyuk deger verilebilir (10M 32-bit ikilide CREATE INDEX'in bellek
+# insasi yuzunden calismaz - bkz. docs/engineering/CI.md).
+run_gate disk_index_integration "$WORK/disk_index_integration" dji
+run_gate disk_index_crash "$WORK/disk_index_crash" dixcrash
+run_gate disk_index_scale "$WORK/disk_index_scale" dixscale 200000
 
 # SKILL6 08: interop / kripto / bench kapilari.
 # Dis arac (pyarrow) gerektiren kapilar arac yoksa 77 ile SKIP verir ve

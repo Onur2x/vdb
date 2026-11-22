@@ -2646,6 +2646,31 @@ begin
   Result := GenRefOthers(FPath);
 end;
 
+function HasDiskIdxSidecar(const ADbPath: string): Boolean;
+// SKILL12: bu veritabanina ait kalici disk indeksi (`vdbidx_<k>.dix`)
+// var mi? Yalniz KENDI adlandirma kalibimiz aranir; baska dosyalara
+// dokunulmaz. Amac: `.gen` kapsam damgalarini kapanista silmemek.
+var
+  sr: TSearchRec;
+  dir: string;
+begin
+  Result := False;
+  dir := ExtractFilePath(ADbPath);
+  if dir = '' then Exit;
+  if SysUtils.FindFirst(dir + 'vdbidx_*.dix', faAnyFile, sr) = 0 then
+  try
+    repeat
+      if (sr.Attr and faDirectory) = 0 then
+      begin
+        Result := True;
+        Break;
+      end;
+    until SysUtils.FindNext(sr) <> 0;
+  finally
+    SysUtils.FindClose(sr);
+  end;
+end;
+
 procedure TVDbPageStore.Close;
 var
   keepExcl: Boolean;
@@ -2661,6 +2686,14 @@ begin
     kimligi tasir, RefreshIfStaleForce hic ateslenmez ve yazarlar
     birbirinin onayli sayfalarini ezer (bkz. GenRefAdd ustundeki not). }
   if keepExcl and (GenRefOthers(FPath) > 0) then
+    keepExcl := False;
+  { SKILL12: DISK INDEKSI varsa `.gen` KORUNUR. `.gen` kapsam alani
+    disk indekslerinin damgasini tasir; silinirse her yeni surec damgayi
+    okuyamaz ve TUM indeksleri yeniden insa eder (dogru ama bosa is).
+    `.dix` yan dosyasi olan bir veritabani zaten cok dosyali oldugu icin
+    tek-dosya sozu burada ek olarak bozulmaz; `.dix` yoksa davranis
+    degismez (v3.32 aynen). }
+  if keepExcl and HasDiskIdxSidecar(FPath) then
     keepExcl := False;
   genPath := FPath + '.gen';
   try

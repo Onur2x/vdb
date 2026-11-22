@@ -807,6 +807,8 @@ type
     { v3.4: acik yazma islemi 0 veya 1 tane mi? (DDL/SAVEPOINT kosulu) }
     function SoleWriter: Boolean;
     function StoreGenStamp: Int64;
+    { SKILL12: tablo basina durabil commit sayaci (disk indeks damgasi). }
+    function StoreScopeStamp(Scope: Integer): Int64;
     { R3: cagiran is parcacigi FEngCs'i tutuyor mu (kilit ters cevrilmesi
       denetimi). Tembel indeks insasi bu durumda FIdxBuildCs ALMAZ. }
     function EngineGateHeld: Boolean;
@@ -4591,6 +4593,14 @@ function TVdbBackendV3.StoreGenStamp: Int64;
 begin
   { v3.18: yalnizca BELLEK okumasi (bkz. TVDbPageStore.GenStamp). }
   Result := Int64(FEng.Store.GenStamp);
+end;
+
+function TVdbBackendV3.StoreScopeStamp(Scope: Integer): Int64;
+begin
+  { SKILL12: tablo basina durabil commit sayaci. `.gen` kapsam alani
+    yoksa (salt-okunur acilis, dosya silinmis) 0 doner; cagiran damga
+    uyusmazligini gorup indeksi yeniden insa eder. }
+  Result := Int64(FEng.Store.ReadGenScope(Scope));
 end;
 
 function TVdbBackendV3.SoleWriter: Boolean;

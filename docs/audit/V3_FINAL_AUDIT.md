@@ -206,14 +206,15 @@ karsilastirmasi kosmadi.
 **BETA CANDIDATE**
 
 Gerekce: kritik depolama/WAL/islem hatalari kapatildi ve her biri kalici
-bir regresyon kapisiyla kilitlendi; kapi seti Linux 60/60, Windows 59/59
+bir regresyon kapisiyla kilitlendi; kapi seti Linux 63/63, Windows 62/62
 yesil (SKIP'ler PASS sayilmaz); tek
 dosya sozlesmesi, kurtarma, sayfa butunlugu, sunucu hata yollari, bozuk ag
 girdisi (genis fuzz), ag zaman asimlari ve COPY boyut tavani, disk dolu,
 islem sayisi basinci, bellek tukenmesi, WAL sert boy tavani, B+Tree
 olcek/parcalanma, SQL yurutucu olcegi (100k/1M satir), SQL indeks olcegi
 (100k/1M satir, plan dogrulamasi ve bozuk `.odb.idx` yan dosyasinda veri
-kaybi olmamasi) ve VACUUM geri
+kaybi olmamasi), kalici disk indeksi (49 entegrasyon, 56 cokme matrisi, 17
+olcek kontrolu; 1M satirda olculdu) ve VACUUM geri
 kazanimi ile tasinabilirlik olculdu. Olcum
 kapisinin kendisi iki kritik hata buldu (F17 Unix fd sizintisi, F18 sahte
 basarili dosya degistirme); ikisi de kapatildi ve ayni kapiyla kilitlendi.
@@ -229,9 +230,16 @@ okumasini (F32) kapatti; her biri kendi kapisiyla kilitlendi. Soak kapisi 25 sn
 kosar; gercek
 1 saat / 6 saat / 24 saat soak **kosulmadi**, ag sunucusu soak'i kapsam
 disidir, bu yuzden uzun sureli kaynak sizintisi iddia edilmez.
-Buna karsin ayri B+Tree disk sayfa bicimi yalnizca **bagimsiz ve kapili bir
-bilesen** olarak vardir (`VDbBTreeDisk`), v5 motor dosya bicimine bagli
-degildir; canli PostgreSQL diferansiyeli kosmadi; TLS varsayilan olarak
+SKILL12 ile ikincil indeksler artik **kalici disk B+Tree'sindedir**
+(`VDbDiskIdx.pas`) ve v5 motoruna entegredir: heap ile ayni islem sinirinda
+kalinir, damga tablo basina durabil commit sayacidir, bozuk/bayat indeks
+daima reddedilip heap'ten yeniden kurulur. Cokme matrisi (`disk_index_crash`),
+entegrasyon (`disk_index_integration`) ve olcek (`disk_index_scale`) ayri
+kapilardadir. Bu iddia 1M satirda olculmustur; **10M satir basarilamadi**
+(32-bit ikilide `CREATE INDEX` indeksi once bellekte kurdugu icin
+`EOutOfMemory`) - bu bir olcum siniridir, PASS degildir. Bagimsiz
+`VDbBTreeDisk` bileseni format-bagimsiz olarak kalir ve bu kapilarda
+olculmez. Canli PostgreSQL diferansiyeli kosmadi; TLS varsayilan olarak
 kapali. Bu nedenle "PRODUCTION CANDIDATE" degil.
 
 Bu siniflandirma bagimsiz dogrulama (harici denetim, resmi sertifika)

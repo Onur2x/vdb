@@ -158,6 +158,12 @@ type
       kullanarak FTables'i yeniden yukler (v3.18: surecler arasi DDL).
       v2: 0 (tek surec; damga yok). }
     function StoreGenStamp: Int64;
+    { SKILL12: TABLO BASINA durabil commit sayaci (disk indeks damgasi).
+      Disk indeksinin hangi heap durumuna ait oldugunu surecler arasi
+      karsilastirmak icin kullanilir. `.gen` yoksa 0 doner; bu durumda
+      damga uyusmaz ve indeks yeniden insa edilir (bayat servis YOK).
+      v2: 0 (v2'de disk indeksi yoktur). }
+    function StoreScopeStamp(Scope: Integer): Int64;
 
     { --- v3.2: SAVEPOINT / ROLLBACK TO / RELEASE SAVEPOINT ---
       Sozlesme (v2 TVDb ile AYNI, R-02):
