@@ -1268,7 +1268,12 @@ function VDbParseInt(const S: string; out V: Int64): Boolean;
 function VDbParseFloat(const S: string; out V: Double): Boolean;
 function VDbFloatToStr(V: Double): string;
 // Tip dogrula; tarih/saatleri ISO'ya normallestirir (bos = NULL gecer).
-function VDbNormValue(Ctype: Byte; const S: string): string;
+// SKILL14: DECIMAL icin APrec/AScale verilirse deger kolonun olcegine
+// yuvarlanarak KANONIK metne cevrilir (esit degerler bayt esit olur; bu
+// GROUP BY/DISTINCT metin anahtarlari icin sarttir). APrec = 0 ise deger
+// yalnizca kendi olceginde kanoniklestirilir.
+function VDbNormValue(Ctype: Byte; const S: string;
+  APrec: Byte = 0; AScale: Byte = 0): string;
 function VDbHex(const S: RawByteString): string;
 function VDbUnhex(const S: string): RawByteString;
 function VDbLikeMatch(const Txt, Pat: string): Boolean;
@@ -1320,6 +1325,9 @@ function VDbCheckOK(const Vals: TStrArray; const Groups: TWhereGroups): Boolean;
 procedure VDbSortStrs(var A: TStrArray);   // karsilastirmali (byte) siralama
 // SQL tip adi -> VCT_* (ALTER COLUMN icin; VDbSql.ColTypeOf ile ayni kural)
 function VDbTypeFromName(const S: string): Byte;
+// SKILL14: 'DECIMAL(p,s)' / 'NUMERIC(p,s)' -> hassasiyet ve olcek.
+// Tip DECIMAL/NUMERIC degilse (ya da metin gecersizse) False.
+function VDbDecSpecFromName(const S: string; out APrec, AScale: Byte): Boolean;
 // M4: 'VECTOR(n)' -> n; 'VECTOR' veya vektor olmayan ad -> 0.
 // Gecersiz n (0, 256+, sayi degil) -> 0; cagiran DDL tarafinda hata verir.
 function VDbVectorDimFromName(const S: string): Integer;
@@ -1377,7 +1385,7 @@ implementation
 
 uses
   VDbMM, // P-110: ozel bellek yoneticisi (initialization'da kurulur)
-  VDbSync, VDbParallel;
+  VDbSync, VDbParallel, VDbDecimal;
 
 {$IFDEF APPLPROF}
 { Windows birimi KASITLI cekilmez (SysUtils golgeleme riski). }
@@ -1815,6 +1823,9 @@ var
   o: string;
   numeric: Boolean;
   ab, bb: Boolean;
+  ad, bd: TVdbDec;
+  de: string;
+  dc: Integer;
 begin
   o := UpperCase(Op);
   numeric := VDbIsNumericCol(Ctype);
@@ -1829,6 +1840,20 @@ begin
   // degerdir ve '' = '' dogrudur.
   if (not EmptyIsValue) and ((A = '') or (B = '')) then Exit(False);
   if o = 'LIKE' then Exit(VDbLikeMatch(A, B));
+  { SKILL14: DECIMAL karsilastirmasi TAM ondaliktir; Double'a cevirmek
+    (numeric dali) buyuk degerlerde/0,1 gibi degerlerde yanlis sonuc verir.
+    Ayristirma basarisizsa asagidaki metin dalina dusulur. }
+  if Ctype = VCT_DECIMAL then
+    if VdbDecParse(A, ad, de) and VdbDecParse(B, bd, de) then
+    begin
+      dc := VdbDecCmp(ad, bd);
+      if o = '=' then Exit(dc = 0);
+      if (o = '<>') or (o = '!=') then Exit(dc <> 0);
+      if o = '>' then Exit(dc > 0);
+      if o = '<' then Exit(dc < 0);
+      if o = '>=' then Exit(dc >= 0);
+      if o = '<=' then Exit(dc <= 0);
+    end;
   if numeric then
   begin
     an := VDbParseFloat(A, af);
@@ -1869,6 +1894,8 @@ var
   iv: Int64;
   fv: Double;
   bv: Boolean;
+  dd: TVdbDec;
+  de: string;
 begin
   if S = '' then Exit('');
   case Ctype of
@@ -1879,6 +1906,13 @@ begin
     VCT_BOOL:
       if VDbBoolText(S, bv) then
         if bv then Exit('True') else Exit('False');
+    VCT_DECIMAL:
+      begin
+        { SKILL14: kanonik ondalik metin. Ayni kolonda degerler zaten
+          kolonun olcegine normalize edilir; burada yalnizca yazim
+          farklari (isaret, us yazimi) kanoniklestirilir. }
+        if VdbDecParse(S, dd, de) then Exit(VdbDecToStr(dd));
+      end;
   end;
   Result := S;
 end;
@@ -1921,11 +1955,16 @@ end;
 function VDbTypeFromName(const S: string): Byte;
 var
   u: string;
+  dp, ds: Byte;
 begin
   u := UpperCase(Trim(S));
   if (u = 'INTEGER') or (u = 'INT') or (u = 'BIGINT') or (u = 'SMALLINT') then Exit(VCT_INT);
-  if (u = 'FLOAT') or (u = 'DOUBLE') or (u = 'REAL') or (u = 'DECIMAL') or
-     (u = 'NUMERIC') then Exit(VCT_FLOAT);
+  if (u = 'FLOAT') or (u = 'DOUBLE') or (u = 'REAL') then Exit(VCT_FLOAT);
+  // SKILL14: DECIMAL/NUMERIC artik FLOAT'a dusmez. p/s tasimadigi icin
+  // yalniz tip kodunu dondurur; hassasiyet gereken yerlerde
+  // VDbDecSpecFromName kullanilir. Parametreli yazim ("DECIMAL(12,3)")
+  // de taninmali: ALTER COLUMN TYPE bu yardimciya TAM tip metnini verir.
+  if VDbDecSpecFromName(u, dp, ds) then Exit(VCT_DECIMAL);
   if (u = 'BOOL') or (u = 'BOOLEAN') then Exit(VCT_BOOL);
   if u = 'DATE' then Exit(VCT_DATE);
   if (u = 'DATETIME') or (u = 'TIMESTAMP') then Exit(VCT_DATETIME);
@@ -1950,6 +1989,48 @@ begin
     p := Trim(Copy(u, 8, Length(u) - 8));
     if TryStrToInt(p, n) and (n >= 1) and (n <= 255) then Exit(n);
   end;
+end;
+
+{ SKILL14: "DECIMAL(p,s)" / "NUMERIC(p,s)" metninden hassasiyet ve olcek
+  cikarir. Ad tipi DECIMAL/NUMERIC degilse Result False doner ve p/s 0
+  kalir. Ayristirma VDbParser ile ayni kurallari uygular (p 1..38,
+  0 <= s <= p); gecersiz metin de False doner (cagiran hata verir). }
+function VDbDecSpecFromName(const S: string; out APrec, AScale: Byte): Boolean;
+var
+  u, p: string;
+  n, m, c: Integer;
+begin
+  Result := False;
+  APrec := 0;
+  AScale := 0;
+  u := UpperCase(Trim(S));
+  if Copy(u, 1, 7) = 'DECIMAL' then p := Copy(u, 8, Length(u))
+  else if Copy(u, 1, 7) = 'NUMERIC' then p := Copy(u, 8, Length(u))
+  else Exit;
+  p := Trim(p);
+  if p = '' then
+  begin
+    APrec := 18;
+    AScale := 0;
+    Exit(True);
+  end;
+  if (p[1] <> '(') or (p[Length(p)] <> ')') then Exit;
+  p := Trim(Copy(p, 2, Length(p) - 2));
+  c := Pos(',', p);
+  if c > 0 then
+  begin
+    if not TryStrToInt(Trim(Copy(p, 1, c - 1)), n) then Exit;
+    if not TryStrToInt(Trim(Copy(p, c + 1, Length(p) - c)), m) then Exit;
+  end
+  else
+  begin
+    if not TryStrToInt(p, n) then Exit;
+    m := 0;
+  end;
+  if (n < 1) or (n > VDB_DEC_MAX_PREC) or (m < 0) or (m > n) then Exit;
+  APrec := Byte(n);
+  AScale := Byte(m);
+  Result := True;
 end;
 
 function VDbVectorDimOK(const S: string; Dim: Integer): Boolean;
@@ -1988,6 +2069,10 @@ function VDbColTypeName(const C: TColDef): string;
 begin
   if C.VecDim > 0 then
     Result := 'VECTOR(' + IntToStr(C.VecDim) + ')'
+  // SKILL14: DECIMAL(p,s) olcek bilgisiyle gosterilir. Prec = 0 ise
+  // (eski/tanimsiz sema) yalniz ad yazilir.
+  else if (C.Ctype = VCT_DECIMAL) and (C.Prec > 0) then
+    Result := 'DECIMAL(' + IntToStr(C.Prec) + ',' + IntToStr(C.Scale) + ')'
   else
     Result := VDbTypeName(C.Ctype);
 end;
@@ -2142,6 +2227,9 @@ var
   af, bf: Double;
   o: string;
   numeric: Boolean;
+  ad, bd: TVdbDec;
+  de: string;
+  dc: Integer;
 begin
   o := UpperCase(Op);
   numeric := VDbIsNumericCol(Ctype);
@@ -2150,6 +2238,18 @@ begin
   // NULL tarafi: deger BILINMEZ olur. (WHERE farkli davranir: eslesmez.)
   if (A = '') or (B = '') then Exit(0);
   if o = 'LIKE' then Exit(Ord(VDbLikeMatch(A, B)) * 2 - 1);
+  { SKILL14: DECIMAL icin tam ondalik uc-degerli karsilastirma. }
+  if Ctype = VCT_DECIMAL then
+    if VdbDecParse(A, ad, de) and VdbDecParse(B, bd, de) then
+    begin
+      dc := VdbDecCmp(ad, bd);
+      if o = '=' then Exit(Ord(dc = 0) * 2 - 1);
+      if (o = '<>') or (o = '!=') then Exit(Ord(dc <> 0) * 2 - 1);
+      if o = '>' then Exit(Ord(dc > 0) * 2 - 1);
+      if o = '<' then Exit(Ord(dc < 0) * 2 - 1);
+      if o = '>=' then Exit(Ord(dc >= 0) * 2 - 1);
+      if o = '<=' then Exit(Ord(dc <= 0) * 2 - 1);
+    end;
   if numeric and VDbParseFloat(A, af) and VDbParseFloat(B, bf) then
   begin
     if o = '=' then Exit(Ord(af = bf) * 2 - 1);
@@ -2256,13 +2356,16 @@ begin
   if Length(r) > 0 then Move(r[1], Result[1], Length(r));
 end;
 
-function VDbNormValue(Ctype: Byte; const S: string): string;
+function VDbNormValue(Ctype: Byte; const S: string;
+  APrec: Byte = 0; AScale: Byte = 0): string;
 var
   v: string;
   iv: Int64;
   fv: Double;
   d: TDateTime;
   fs: TFormatSettings;
+  dd, dr: TVdbDec;
+  de: string;
 begin
   if Ctype = VCT_BLOB then
   begin
@@ -2329,6 +2432,23 @@ begin
           Result := FormatDateTime('yyyy-mm-dd hh:nn:ss', d);
         end;
       end;
+    VCT_DECIMAL:
+      begin
+        { SKILL14: tam ondalik. Double'a cevirmeden ayristirilir; p/s
+          verilmisse kolonun olcegine yarim-yukari yuvarlanir ve hassasiyet
+          tasarsa HATA verilir (sessiz kirpma yok). Kanonik metin, ayni
+          degerin her zaman ayni baytlari uretmesini saglar. }
+        if not VdbDecParse(v, dd, de) then
+          raise EVDbException.Create(ecTypeMismatch, 'DECIMAL degil: ' + v);
+        if APrec > 0 then
+        begin
+          if not VdbDecFit(dd, APrec, AScale, dr, de) then
+            raise EVDbException.Create(ecNumericOutOfRange, de);
+          Result := VdbDecToStr(dr);
+        end
+        else
+          Result := VdbDecToStr(dd);
+      end;
   end;
 end;
 
@@ -2350,11 +2470,14 @@ function VDbIdxCmp(const A, B: string; Ctype: Byte): Integer;
 //
 // SIMDI: INTEGER/BOOLEAN -> Int64 (birebir dogru ve hizli),
 //       FLOAT            -> Double,
+//       DECIMAL          -> VDbDecimal ile tam ondalik karsilastirma,
 //       digerleri        -> CompareStr.
 // NULL (bos string) her zaman en basta.
 var
   ia, ib: Int64;
   fa, fb: Double;
+  da, db: TVdbDec;
+  e: string;
 begin
   if A = '' then
   begin
@@ -2379,6 +2502,16 @@ begin
       if fa > fb then Exit(1);
       Exit(0);
     end;
+  end
+  else if Ctype = VCT_DECIMAL then
+  begin
+    { SKILL14: ondalik degerler METIN olarak saklanir; siralama METIN
+      sirasi degil SAYISAL sira olmalidir ("10" > "9"). Double'a cevirmek
+      tamligi bozardi, bu yuzden tam ondalik karsilastirma kullanilir.
+      Ayristirma basarisizsa (bozuk/elle yazilmis deger) eski davranis
+      olan CompareStr'e dusulur. }
+    if VdbDecParse(A, da, e) and VdbDecParse(B, db, e) then
+      Exit(VdbDecCmp(da, db));
   end;
   Result := CompareStr(A, B);
 end;
@@ -3162,7 +3295,8 @@ begin
           'GENERATED ifadesi degerlendirilemedi (%s): %s',
           [T.Cols[i].Name, T.Cols[i].GenExpr]);
       if i < Length(Vals) then
-        Vals[i] := VDbNormValue(T.Cols[i].Ctype, v);
+        Vals[i] := VDbNormValue(T.Cols[i].Ctype, v,
+          T.Cols[i].Prec, T.Cols[i].Scale);
     end;
 end;
 
@@ -3352,6 +3486,9 @@ begin
     VCT_STR:    Result := 'TEXT';
     VCT_BOOL:   Result := 'BOOLEAN';
     VCT_BLOB:   Result := 'BLOB';
+    // SKILL14: p/s yok, yalniz ad. Sema ciktisinda (p,s) icin
+    // VDbColTypeName kullanilir.
+    VCT_DECIMAL: Result := 'DECIMAL';
   else
     Result := 'TEXT';
   end;
@@ -6394,6 +6531,10 @@ procedure ParseLines(Lines: TStrings);
             t.Cols[lj].VecDim := (fl shr 8) and $FF;
             // M6: kolon sifreleme bayragi (16. bit).
             t.Cols[lj].Encrypted := (fl and 16) <> 0;
+            // SKILL14: DECIMAL(p,s) ust baytlarda (16-23 = p, 24-31 = s).
+            // Eski semalarda bu bitler 0'dir ve DECIMAL kolonu da yoktur.
+            t.Cols[lj].Prec := (fl shr 16) and $FF;
+            t.Cols[lj].Scale := (fl shr 24) and $FF;
           end
           else
             t.Cols[lj].Ctype := Byte(StrToIntDef(rest, 2));
@@ -6678,6 +6819,13 @@ begin
           fl := fl or ((kv.Value.Cols[i].VecDim and $FF) shl 8);
         // M6: kolon sifreleme bayragi.
         if kv.Value.Cols[i].Encrypted then fl := fl or 16;
+        // SKILL14: DECIMAL(p,s) hassasiyet/olcek de ust baytlarda saklanir
+        // (16-23 = p, 24-31 = s); alan sayisi ve bicim surumu degismez.
+        if kv.Value.Cols[i].Ctype = VCT_DECIMAL then
+        begin
+          fl := fl or ((kv.Value.Cols[i].Prec and $FF) shl 16);
+          fl := fl or ((kv.Value.Cols[i].Scale and $FF) shl 24);
+        end;
         s := s + kv.Value.Cols[i].Name + ':' + IntToStr(kv.Value.Cols[i].Ctype) +
           ':' + IntToStr(fl);
         { R-20: collation 5. alan (ad:tip:bayrak:hexdef:collation).
@@ -7683,10 +7831,12 @@ begin
         if (Length(Vals[i]) = 4) and SameText(Vals[i], 'NULL') then
           Vals[i] := ''
         else if (Vals[i][1] <= ' ') or (Vals[i][Length(Vals[i])] <= ' ') then
-          Vals[i] := VDbNormValue(T.Cols[i].Ctype, Vals[i]);
+          Vals[i] := VDbNormValue(T.Cols[i].Ctype, Vals[i],
+            T.Cols[i].Prec, T.Cols[i].Scale);
       end
       else
-        Vals[i] := VDbNormValue(T.Cols[i].Ctype, Vals[i]);
+        Vals[i] := VDbNormValue(T.Cols[i].Ctype, Vals[i],
+          T.Cols[i].Prec, T.Cols[i].Scale);
     end;
     // M4: VECTOR(n) boyut/format dogrulamasi (INSERT/UPDATE/Batch/copy).
     if (T.Cols[i].VecDim > 0) and (Vals[i] <> '') and
@@ -10674,7 +10824,7 @@ begin
   v := '';
   if HasDef and (DefVal <> '') then
   begin
-    v := VDbNormValue(c2.Ctype, DefVal);
+    v := VDbNormValue(c2.Ctype, DefVal, c2.Prec, c2.Scale);
     if (c2.VecDim > 0) and (not VDbVectorDimOK(v, c2.VecDim)) then
       raise EVDbException.CreateFmt(ecTypeMismatch,
         'VECTOR(%d) varsayilani gecersiz: %s', [c2.VecDim, Col.Name]);
@@ -10913,6 +11063,7 @@ var
   t, nt: TTableDef;
   amap: TIntArray;
   i, ci, nc, ndim: Integer;
+  nprec, nscale: Byte;
   ownDdl: Boolean;
   pks: TStrArray;
   rows: TStrMatrix;
@@ -10934,7 +11085,14 @@ begin
       'PK kolonunun tipi degistirilemez: ' + t.Name + '.' + t.Cols[ci].Name);
   nc := SqlTypeToCtype(NewType);
   ndim := VDbVectorDimFromName(NewType);
-  if (nc = t.Cols[ci].Ctype) and (ndim = t.Cols[ci].VecDim) then Exit;
+  { SKILL14: DECIMAL(p,s) hedefinde yeni hassasiyet/olcek de uygulanir. }
+  nprec := 0;
+  nscale := 0;
+  if nc = VCT_DECIMAL then
+    VDbDecSpecFromName(NewType, nprec, nscale);
+  if (nc = t.Cols[ci].Ctype) and (ndim = t.Cols[ci].VecDim) and
+     ((nc <> VCT_DECIMAL) or
+      ((nprec = t.Cols[ci].Prec) and (nscale = t.Cols[ci].Scale))) then Exit;
   // R-22 Full: kolon tipi degisirken anahtar bicimi de degisebilir.
   // Surmekte olan CONCURRENTLY insalari ONCEDEN finalize et (AForce):
   // boylece tip degisikligi sonrasi kurulan indeksler guncel bicimle
@@ -10952,7 +11110,7 @@ begin
     if v <> '' then
     begin
       try
-        rows[i][ci] := VDbNormValue(nc, v);
+        rows[i][ci] := VDbNormValue(nc, v, nprec, nscale);
       except
         on E: Exception do
           raise EVDbException.CreateFmt(ecTypeMismatch, 'tip degistirilemedi (satir %s, deger "%s"): %s',
@@ -10966,9 +11124,22 @@ begin
   CloneDef(t, nt);
   nt.Cols[ci].Ctype := nc;
   nt.Cols[ci].VecDim := ndim;
+  { SKILL14: hedef DECIMAL(p,s) ise yeni p/s semaya yazilir; baska tipe
+    geciste eski p/s artik anlamsizdir. }
+  if nc = VCT_DECIMAL then
+  begin
+    nt.Cols[ci].Prec := nprec;
+    nt.Cols[ci].Scale := nscale;
+  end
+  else
+  begin
+    nt.Cols[ci].Prec := 0;
+    nt.Cols[ci].Scale := 0;
+  end;
   if nt.Cols[ci].HasDef then
   begin
-    nt.Cols[ci].Def := VDbNormValue(nc, nt.Cols[ci].Def);
+    nt.Cols[ci].Def := VDbNormValue(nc, nt.Cols[ci].Def,
+      nt.Cols[ci].Prec, nt.Cols[ci].Scale);
     if (ndim > 0) and (nt.Cols[ci].Def <> '') and
        (not VDbVectorDimOK(nt.Cols[ci].Def, ndim)) then
       raise EVDbException.CreateFmt(ecTypeMismatch,
@@ -11032,7 +11203,8 @@ begin
   t.Cols[ci].Def := '';
   if HasDef then
   begin
-    t.Cols[ci].Def := VDbNormValue(t.Cols[ci].Ctype, DefVal);
+    t.Cols[ci].Def := VDbNormValue(t.Cols[ci].Ctype, DefVal,
+      t.Cols[ci].Prec, t.Cols[ci].Scale);
     if (t.Cols[ci].VecDim > 0) and (t.Cols[ci].Def <> '') and
        (not VDbVectorDimOK(t.Cols[ci].Def, t.Cols[ci].VecDim)) then
       raise EVDbException.CreateFmt(ecTypeMismatch,
@@ -12680,6 +12852,11 @@ begin
     t.Cols[i].Identity := Cols[i].Identity;     // M10: IDENTITY
     t.Cols[i].VecDim := Cols[i].VecDim;         // M4: VECTOR(n)
     t.Cols[i].Encrypted := Cols[i].Encrypted;   // M6
+    { SKILL14: DECIMAL(p,s) hassasiyet/olcek kopyalanmali; aksi halde
+      tablo tanimi olusturulurken (p,s) kaybolur ve yazma yolunda
+      yuvarlama/tasma denetimi devre disi kalir. }
+    t.Cols[i].Prec := Cols[i].Prec;
+    t.Cols[i].Scale := Cols[i].Scale;
     t.Cols[i].ColKeyId := Cols[i].ColKeyId;
   end;
   // M10: IDENTITY dogrulamalari. Tek kolon, tamsayi tipi, DEFAULT/GENERATED

@@ -1044,6 +1044,7 @@ begin
     ecForeignKeyViolation: Result := '23503';
     ecTypeMismatch:        Result := '42804';
     ecMathError:           Result := '22012';
+    ecNumericOutOfRange:   Result := '22003';
     ecInvalidArgument:     Result := '42601';
     ecUnsupported:         Result := '0A000';
     ecTransactionState:    Result := '25000';

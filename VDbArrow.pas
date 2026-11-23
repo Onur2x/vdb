@@ -15,7 +15,7 @@ unit VDbArrow;
 interface
 
 uses
-  SysUtils, Classes, DateUtils, VDbTypes, VDbTable;
+  SysUtils, Classes, DateUtils, VDbTypes, VDbTable, VDbDecimal;
 
 function VDbArrowExport(const FileName: string;
   const Fields: TStrArray; const Types: TByteArray;
@@ -38,6 +38,20 @@ function VDbArrowImportCells(const FileName: string;
   out Fields: TStrArray; out Types: TByteArray;
   out Cells: TVdbCellMatrix; out Err: string): Boolean;
 
+{ SKILL14: DECIMAL(p,s) icin Arrow Decimal128. Tip dizisinde VCT_DECIMAL
+  olan kolonlarin hassasiyet/olcekleri Prec/Scale dizileriyle verilir
+  (nil ise hucrelerden turetilir); boylece kolon semasindaki (p,s) aynen
+  dosyaya yazilir. Okuma tarafinda ayni bilgi Prec/Scale olarak doner. }
+function VDbArrowExportCellsEx(const FileName: string;
+  const Fields: TStrArray; const Types: TByteArray;
+  const Prec, Scale: TByteArray;
+  const Cells: TVdbCellMatrix; out Err: string): Boolean;
+
+function VDbArrowImportCellsEx(const FileName: string;
+  out Fields: TStrArray; out Types: TByteArray;
+  out Prec, Scale: TByteArray;
+  out Cells: TVdbCellMatrix; out Err: string): Boolean;
+
 { SKILL13-E: toplu (batch) yazma/okuma. Dosya boyu buyuse de bellekte
   tek bir yigin tutulur; her cagri yalnizca o yigini isler. }
 type
@@ -46,11 +60,15 @@ type
     FStream: TFileStream;
     FFields: TStrArray;
     FTypes: TByteArray;
+    FPrec: TByteArray;
+    FScale: TByteArray;
     FClosed: Boolean;
     procedure WriteChunk(const Meta: TBytes; const Body: TBytes; BodyLen: Integer);
   public
     constructor Create(const FileName: string; const Fields: TStrArray;
       const Types: TByteArray);
+    constructor CreateEx(const FileName: string; const Fields: TStrArray;
+      const Types, Prec, Scale: TByteArray);
     procedure WriteBatch(const Cells: TVdbCellMatrix);
     procedure Close;
     destructor Destroy; override;
@@ -120,6 +138,8 @@ type
     TimeUnit: Integer;
     TimeBits: Integer;
     LargeOffsets: Boolean;
+    DecPrec: Integer;   // SKILL14: Arrow Decimal precision
+    DecScale: Integer;  // SKILL14: Arrow Decimal scale
   end;
   TArrowFieldArray = array of TArrowField;
 
@@ -457,6 +477,7 @@ begin
     VCT_FLOAT: Result := 3;     // FloatingPoint
     VCT_BLOB: Result := 4;      // Binary
     VCT_BOOL: Result := 6;      // Bool
+    VCT_DECIMAL: Result := 7;   // Decimal (SKILL14: Decimal128)
     VCT_DATE: Result := 8;      // Date
     VCT_TIME: Result := 9;      // Time
     VCT_DATETIME: Result := 10; // Timestamp
@@ -464,7 +485,10 @@ begin
   end;
 end;
 
-function MakeTypeTable(Doc: TFbDoc; Ctype: Byte): TFbNode;
+{ SKILL14: Arrow Decimal tablosu: precision (0), scale (1), bitWidth (2).
+  bitWidth 128 -> degerler 16 bayt ikiye tumleyen little-endian. }
+function MakeTypeTable(Doc: TFbDoc; Ctype: Byte;
+  APrec, AScale: Byte): TFbNode;
 begin
   case Ctype of
     VCT_INT:
@@ -477,6 +501,14 @@ begin
       begin
         Result := Doc.Table(0);
         Result.AddScalar(0, ffI16, 2); // DOUBLE
+      end;
+    VCT_DECIMAL:
+      begin
+        Result := Doc.Table(2);
+        if APrec = 0 then APrec := VDB_DEC_MAX_PREC;
+        Result.AddScalar(0, ffI32, APrec);
+        Result.AddScalar(1, ffI32, AScale);
+        Result.AddScalar(2, ffI32, 128);
       end;
     VCT_DATE:
       begin
@@ -499,31 +531,38 @@ begin
   end;
 end;
 
-function MakeField(Doc: TFbDoc; const Name: string; Ctype: Byte): TFbNode;
+function MakeField(Doc: TFbDoc; const Name: string; Ctype: Byte;
+  APrec, AScale: Byte): TFbNode;
 begin
   Result := Doc.Table(6);
   Result.AddOffset(0, Doc.Str(Name));
   Result.AddScalar(1, ffBool, 1);
   Result.AddScalar(2, ffI8, ArrowTypeId(Ctype));
-  Result.AddOffset(3, MakeTypeTable(Doc, Ctype));
+  Result.AddOffset(3, MakeTypeTable(Doc, Ctype, APrec, AScale));
 end;
 
 function MakeSchema(Doc: TFbDoc; const Fields: TStrArray;
-  const Types: TByteArray): TFbNode;
+  const Types: TByteArray; const Prec, Scale: TByteArray): TFbNode;
 var
   vec: TFbNode;
-  i: Integer;
+  i, p, s: Integer;
 begin
   vec := Doc.VecOff;
   for i := 0 to High(Fields) do
-    vec.AddChild(MakeField(Doc, Fields[i], Types[i]));
+  begin
+    p := 0;
+    s := 0;
+    if (i < Length(Prec)) then p := Prec[i];
+    if (i < Length(Scale)) then s := Scale[i];
+    vec.AddChild(MakeField(Doc, Fields[i], Types[i], Byte(p), Byte(s)));
+  end;
   Result := Doc.Table(3);
   Result.AddScalar(0, ffI16, 0); // Little
   Result.AddOffset(1, vec);
 end;
 
 function MakeSchemaMessage(const Fields: TStrArray;
-  const Types: TByteArray): TBytes;
+  const Types, Prec, Scale: TByteArray): TBytes;
 var
   doc: TFbDoc;
   msg: TFbNode;
@@ -533,7 +572,7 @@ begin
     msg := doc.Table(4);
     msg.AddScalar(0, ffI16, 4); // MetadataVersion V5
     msg.AddScalar(1, ffI8, 1);  // MessageHeader.Schema
-    msg.AddOffset(2, MakeSchema(doc, Fields, Types));
+    msg.AddOffset(2, MakeSchema(doc, Fields, Types, Prec, Scale));
     msg.AddScalar(3, ffI64, 0);
     Result := FinishDoc(doc, msg);
   finally
@@ -710,7 +749,118 @@ begin
   end;
 end;
 
-{ Metin hucresini eski davranisa birebir uyan tipli hucree cevirir. }
+{ SKILL14: 128-bit ondalik yardimcilari. Arrow Decimal128 degeri 16
+  bayt ikiye tumleyen little-endian tam sayidir (deger = tam / 10^olcek). }
+procedure DecMulAdd(var V: array of Byte; Mul, Add: Integer);
+var
+  i, carry, t: Integer;
+begin
+  carry := Add;
+  for i := 0 to High(V) do
+  begin
+    t := V[i] * Mul + carry;
+    V[i] := Byte(t and $FF);
+    carry := t shr 8;
+  end;
+end;
+
+function DecDigitsTo128(const Digits: string): TBytes;
+var
+  i: Integer;
+begin
+  SetLength(Result, 16);
+  FillChar(Result[0], 16, 0);
+  for i := 1 to Length(Digits) do
+    if (Digits[i] >= '0') and (Digits[i] <= '9') then
+      DecMulAdd(Result, 10, Ord(Digits[i]) - Ord('0'));
+end;
+
+procedure Dec128Negate(var V: TBytes);
+var
+  i, carry: Integer;
+begin
+  carry := 1;
+  for i := 0 to 15 do
+  begin
+    V[i] := Byte((not V[i]) and $FF);
+    if carry > 0 then
+    begin
+      V[i] := Byte(V[i] + 1);
+      if V[i] <> 0 then carry := 0;
+    end;
+  end;
+end;
+
+function Dec128ToDigits(const V: TBytes): string;
+var
+  tmp: TBytes;
+  i, r, k: Integer;
+  buf: string;
+  isZero: Boolean;
+begin
+  SetLength(tmp, 16);
+  Move(V[0], tmp[0], 16);
+  buf := '';
+  while True do
+  begin
+    r := 0;
+    for i := 15 downto 0 do
+    begin
+      r := r * 256 + tmp[i];
+      tmp[i] := Byte(r div 10);
+      r := r mod 10;
+    end;
+    buf := Chr(Ord('0') + r) + buf;
+    isZero := True;
+    for k := 0 to 15 do
+      if tmp[k] <> 0 then
+      begin isZero := False; Break; end;
+    if isZero then Break;
+  end;
+  while (Length(buf) > 1) and (buf[1] = '0') do Delete(buf, 1, 1);
+  if buf = '' then buf := '0';
+  Result := buf;
+end;
+
+{ Hucre degerini verilen olcekte Decimal128 baytlarina cevirir.
+  SKILL14: sessiz kirpma YOK. Ayristirilamayan, 128 bite sigmayan ya da
+  bildirilen hassasiyeti asan deger hata dondurur (kesme yerine hata). }
+function DecimalCellTo128(const C: TVdbCell; APrec, AScale: Integer;
+  out V: TBytes; out Err: string): Boolean;
+var
+  d, r: TVdbDec;
+  e: string;
+begin
+  Result := False;
+  Err := '';
+  SetLength(V, 16);
+  FillChar(V[0], 16, 0);
+  if not VdbDecParse(CellAsStr(C), d, e) then
+  begin
+    Err := 'Arrow: gecersiz DECIMAL: ' + CellAsStr(C);
+    Exit;
+  end;
+  if not VdbDecRound(d, AScale, r, e) then
+  begin
+    Err := 'Arrow: DECIMAL yuvarlanamadi: ' + e;
+    Exit;
+  end;
+  if Length(r.Digits) > 38 then
+  begin
+    Err := 'Arrow: DECIMAL 128 bite sigmiyor: ' + CellAsStr(C);
+    Exit;
+  end;
+  if (APrec > 0) and (VdbDecPrecision(r) > APrec) then
+  begin
+    Err := Format('Arrow: DECIMAL hassasiyet tasmasi (%d > %d): %s',
+      [VdbDecPrecision(r), APrec, CellAsStr(C)]);
+    Exit;
+  end;
+  V := DecDigitsTo128(r.Digits);
+  if r.Neg and (r.Digits <> '0') then
+    Dec128Negate(V);
+  Result := True;
+end;
 procedure LegacyCellOf(const S: string; Ctype: Byte; out C: TVdbCell);
 var
   iv: Int64;
@@ -746,7 +896,8 @@ end;
 
 function ExportBodyCells(const Fields: TStrArray; const Types: TByteArray;
   const Cells: TVdbCellMatrix; out Nodes, Buffers, Body: TBytes;
-  out BodyLen: Integer; out Err: string): Boolean;
+  out BodyLen: Integer; out Err: string;
+  const DPrec: TByteArray = nil; const DScale: TByteArray = nil): Boolean;
 var
   n, i, j, nulls, bitLen: Integer;
   validity, data, offs: TBytes;
@@ -754,7 +905,10 @@ var
   s: string;
   iv: Int64;
   fv: Double;
-  p: Integer;
+  p, dsc, dpr: Integer;
+  cdec: TVdbDec;
+  dErr: string;
+  db: TBytes;
 begin
   Result := False;
   BodyLen := 0;
@@ -874,6 +1028,43 @@ begin
             end;
           AddBuffer(Body, BodyLen, Buffers, data);
         end;
+      VCT_DECIMAL:
+        begin
+          { SKILL14: 16 bayt Decimal128. Olcek, kolon icin bildirilen
+            DScale'den gelir; bildirilmemisse hucrenin kendi olcegi
+            kullanilir. Hassasiyet DPrec'ten gelir; bildirilmemisse 38
+            (Decimal128 ust siniri) kabul edilir. Tasma hata verir. }
+          if j < Length(DScale) then
+            dsc := DScale[j]
+          else
+          begin
+            dsc := 0;
+            for i := 0 to n - 1 do
+              if (j < Length(Cells[i])) and (Cells[i][j].Kind <> vckNull) and
+                 VdbDecParse(CellAsStr(Cells[i][j]), cdec, dErr) then
+              begin
+                dsc := cdec.Scale;
+                Break;
+              end;
+          end;
+          if j < Length(DPrec) then
+            dpr := DPrec[j]
+          else
+            dpr := VDB_DEC_MAX_PREC;
+          SetLength(data, n * 16);
+          if Length(data) > 0 then FillChar(data[0], Length(data), 0);
+          for i := 0 to n - 1 do
+            if (j < Length(Cells[i])) and (Cells[i][j].Kind <> vckNull) then
+            begin
+              if not DecimalCellTo128(Cells[i][j], dpr, dsc, db, dErr) then
+              begin
+                Err := dErr;
+                Exit;
+              end;
+              Move(db[0], data[i * 16], 16);
+            end;
+          AddBuffer(Body, BodyLen, Buffers, data);
+        end;
       else
         begin
           // Utf8 / Binary: offset + veri
@@ -928,7 +1119,7 @@ begin
         LegacyCellOf('', Types[j], Cells[i][j]);
   end;
   Result := ExportBodyCells(Fields, Types, Cells, Nodes, Buffers, Body,
-    BodyLen, Err);
+    BodyLen, Err, nil, nil);
 end;
 
 function BuildBuffers(const Fields: TStrArray; const Types: TByteArray;
@@ -940,6 +1131,12 @@ end;
 
 constructor TVdbArrowWriter.Create(const FileName: string;
   const Fields: TStrArray; const Types: TByteArray);
+begin
+  CreateEx(FileName, Fields, Types, nil, nil);
+end;
+
+constructor TVdbArrowWriter.CreateEx(const FileName: string;
+  const Fields: TStrArray; const Types, Prec, Scale: TByteArray);
 var
   schemaMsg: TBytes;
   i: Integer;
@@ -950,10 +1147,34 @@ begin
   for i := 0 to High(Fields) do FFields[i] := Fields[i];
   SetLength(FTypes, Length(Types));
   for i := 0 to High(Types) do FTypes[i] := Types[i];
+  SetLength(FPrec, 0);
+  SetLength(FScale, 0);
+  if Length(Prec) > 0 then
+  begin
+    SetLength(FPrec, Length(Prec));
+    for i := 0 to High(Prec) do FPrec[i] := Prec[i];
+  end;
+  if Length(Scale) > 0 then
+  begin
+    SetLength(FScale, Length(Scale));
+    for i := 0 to High(Scale) do FScale[i] := Scale[i];
+  end;
+  { SKILL14: Arrow semasi ilk yazimda sabitlenir; bu yuzden DECIMAL
+    kolonun (p,s) bilgisi ONCEDEN verilmek zorundadir. Sessizce 0
+    hassasiyetli gecersiz sema yazmak yerine acik hata verilir. }
+  for i := 0 to High(FTypes) do
+    if FTypes[i] = VCT_DECIMAL then
+    begin
+      if (i >= Length(FPrec)) or (FPrec[i] < 1) or (FPrec[i] > VDB_DEC_MAX_PREC) then
+        raise Exception.CreateFmt(
+          'Arrow: DECIMAL hassasiyeti 1..%d olmali', [VDB_DEC_MAX_PREC]);
+      if (i >= Length(FScale)) or (FScale[i] > FPrec[i]) then
+        raise Exception.Create('Arrow: DECIMAL olcegi hassasiyetten buyuk olamaz');
+    end;
   FClosed := False;
   FStream := TFileStream.Create(FileName, fmCreate);
   try
-    schemaMsg := MakeSchemaMessage(FFields, FTypes);
+    schemaMsg := MakeSchemaMessage(FFields, FTypes, FPrec, FScale);
     WriteChunk(schemaMsg, nil, 0);
   except
     FreeAndNil(FStream);
@@ -996,7 +1217,8 @@ var
   bodyLen: Integer;
   err: string;
 begin
-  if not ExportBodyCells(FFields, FTypes, Cells, nodes, buffers, body, bodyLen, err) then
+  if not ExportBodyCells(FFields, FTypes, Cells, nodes, buffers, body, bodyLen,
+    err, FPrec, FScale) then
     raise Exception.Create(err);
   bodyLen := AlignUp(bodyLen, 8);
   if Length(body) < bodyLen then
@@ -1030,8 +1252,9 @@ begin
   inherited;
 end;
 
-function VDbArrowExportCells(const FileName: string;
+function VDbArrowExportCellsEx(const FileName: string;
   const Fields: TStrArray; const Types: TByteArray;
+  const Prec, Scale: TByteArray;
   const Cells: TVdbCellMatrix; out Err: string): Boolean;
 var
   w: TVdbArrowWriter;
@@ -1039,7 +1262,7 @@ begin
   Result := False;
   Err := '';
   try
-    w := TVdbArrowWriter.Create(FileName, Fields, Types);
+    w := TVdbArrowWriter.CreateEx(FileName, Fields, Types, Prec, Scale);
     try
       w.WriteBatch(Cells);
       w.Close;
@@ -1054,6 +1277,13 @@ begin
       Result := False;
     end;
   end;
+end;
+
+function VDbArrowExportCells(const FileName: string;
+  const Fields: TStrArray; const Types: TByteArray;
+  const Cells: TVdbCellMatrix; out Err: string): Boolean;
+begin
+  Result := VDbArrowExportCellsEx(FileName, Fields, Types, nil, nil, Cells, Err);
 end;
 
 function VDbArrowExport(const FileName: string;
@@ -1218,6 +1448,19 @@ begin
     4: AF.Ctype := VCT_BLOB;
     5: AF.Ctype := VCT_STR;
     6: AF.Ctype := VCT_BOOL;
+    7: // Decimal (SKILL14): precision (0), scale (1), bitWidth (2)
+      begin
+        AF.Ctype := VCT_DECIMAL;
+        AF.DecPrec := FbInt32(B, FbField(B, TypeTable, 0), 0);
+        AF.DecScale := FbInt32(B, FbField(B, TypeTable, 1), 0);
+        AF.BitWidth := FbInt32(B, FbField(B, TypeTable, 2), 128);
+        if AF.BitWidth <> 128 then
+          raise Exception.CreateFmt('Arrow: yalniz Decimal128 desteklenir (bitWidth=%d)',
+            [AF.BitWidth]);
+        if (AF.DecPrec < 1) or (AF.DecPrec > VDB_DEC_MAX_PREC) or
+           (AF.DecScale < 0) or (AF.DecScale > AF.DecPrec) then
+          raise Exception.Create('Arrow: gecersiz DECIMAL hassasiyet/olcek');
+      end;
     8: // Date
       begin
         AF.Ctype := VCT_DATE;
@@ -1389,6 +1632,9 @@ var
   fv: Double;
   precision: Integer;
   valid: Boolean;
+  db: TBytes;
+  dd: TVdbDec;
+  neg: Boolean;
 begin
   row64 := RI64(B, FbField(B, RBPos, 0));
   if (row64 < 0) or (row64 > MaxInt) then
@@ -1592,6 +1838,30 @@ begin
               end;
             end;
           end;
+        VCT_DECIMAL:
+          begin
+            { SKILL14: 16 bayt ikiye tumleyen little-endian Decimal128.
+              Metin olarak kanonik ondalik degere cevrilir. }
+            if dLen < Int64(rowCount) * 16 then
+              raise Exception.Create('Arrow: Decimal tamponu cok kisa');
+            for i := 0 to rowCount - 1 do
+            begin
+              valid := ValidAt(B, BodyStart, vOff, vLen, i);
+              if not valid then
+                Cells[oldRows + i][j] := CellOf(vckNull, 0, 0, '')
+              else
+              begin
+                SetLength(db, 16);
+                Move(B[BodyStart + dOff + Int64(i) * 16], db[0], 16);
+                neg := (db[15] and $80) <> 0;
+                if neg then Dec128Negate(db);
+                dd.Neg := neg;
+                dd.Digits := Dec128ToDigits(db);
+                dd.Scale := AF[j].DecScale;
+                Cells[oldRows + i][j] := CellOf(vckText, 0, 0, VdbDecToStr(dd));
+              end;
+            end;
+          end;
       end;
     end;
   end;
@@ -1616,7 +1886,8 @@ end;
 
 function ReadArrowCells(const FileName: string;
   out Fields: TStrArray; out Types: TByteArray;
-  out Cells: TVdbCellMatrix; out Err: string): Boolean;
+  out Cells: TVdbCellMatrix; out Err: string;
+  out Prec, Scale: TByteArray): Boolean;
 var
   B: TBytes;
   pos, metaLen, metaStart, bodyStart, headerType, root, hdrField, hdr, blPos: Integer;
@@ -1630,6 +1901,8 @@ begin
   Fields := nil;
   Types := nil;
   Cells := nil;
+  Prec := nil;
+  Scale := nil;
   Err := '';
   haveSchema := False;
   try
@@ -1666,10 +1939,14 @@ begin
             ArrowParseSchema(B, hdr, AF);
             SetLength(Fields, Length(AF));
             SetLength(Types, Length(AF));
+            SetLength(Prec, Length(AF));
+            SetLength(Scale, Length(AF));
             for i := 0 to High(AF) do
             begin
               Fields[i] := AF[i].Name;
               Types[i] := AF[i].Ctype;
+              Prec[i] := Byte(AF[i].DecPrec);
+              Scale[i] := Byte(AF[i].DecScale);
             end;
             haveSchema := True;
           end;
@@ -1694,17 +1971,29 @@ begin
       Fields := nil;
       Types := nil;
       Cells := nil;
+      Prec := nil;
+      Scale := nil;
       Err := E.Message;
       Result := False;
     end;
   end;
 end;
 
+function VDbArrowImportCellsEx(const FileName: string;
+  out Fields: TStrArray; out Types: TByteArray;
+  out Prec, Scale: TByteArray;
+  out Cells: TVdbCellMatrix; out Err: string): Boolean;
+begin
+  Result := ReadArrowCells(FileName, Fields, Types, Cells, Err, Prec, Scale);
+end;
+
 function VDbArrowImportCells(const FileName: string;
   out Fields: TStrArray; out Types: TByteArray;
   out Cells: TVdbCellMatrix; out Err: string): Boolean;
+var
+  pr, sc: TByteArray;
 begin
-  Result := ReadArrowCells(FileName, Fields, Types, Cells, Err);
+  Result := ReadArrowCells(FileName, Fields, Types, Cells, Err, pr, sc);
 end;
 
 function VDbArrowImport(const FileName: string;
@@ -1712,9 +2001,10 @@ function VDbArrowImport(const FileName: string;
   out Rows: TStrMatrix; out Err: string): Boolean;
 var
   Cells: TVdbCellMatrix;
+  pr, sc: TByteArray;
 begin
   Rows := nil;
-  Result := ReadArrowCells(FileName, Fields, Types, Cells, Err);
+  Result := ReadArrowCells(FileName, Fields, Types, Cells, Err, pr, sc);
   if Result then
     ArrowCellsToRows(Cells, Rows);
 end;

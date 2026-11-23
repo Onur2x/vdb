@@ -16,6 +16,7 @@ unit VDbParquet;
     DATE     -> INT32 (DATE)
     DATETIME -> INT64 (TIMESTAMP_MILLIS)
     TIME     -> INT32 (TIME_MILLIS)
+    DECIMAL  -> FIXED_LEN_BYTE_ARRAY(16) (DECIMAL)
 
   Okuyucu ayrica pyarrow'un yazdigi dictionary sayfalarini, DataPage v1/v2
   ve INT96 zaman damgalarini da cozer. Nested/repeated alanlar reddedilir. }
@@ -25,7 +26,7 @@ unit VDbParquet;
 interface
 
 uses
-  SysUtils, Classes, DateUtils, Math, VDbTypes, VDbTable;
+  SysUtils, Classes, DateUtils, Math, VDbTypes, VDbTable, VDbDecimal;
 
 function VDbParquetExport(const FileName: string;
   const Fields: TStrArray; const Types: TByteArray;
@@ -46,6 +47,20 @@ function VDbParquetImportCells(const FileName: string;
   out Fields: TStrArray; out Types: TByteArray;
   out Cells: TVdbCellMatrix; out Err: string): Boolean;
 
+{ SKILL14: DECIMAL(p,s) icin Parquet DECIMAL mantiksal tipi. Tip dizisinde
+  VCT_DECIMAL olan kolonlar FIXED_LEN_BYTE_ARRAY(16) olarak yazilir; (p,s)
+  Prec/Scale dizileriyle verilir (nil ise 38 ve hucrelerden turetilen olcek).
+  Okuma tarafinda ayni bilgi Prec/Scale olarak doner. }
+function VDbParquetExportCellsEx(const FileName: string;
+  const Fields: TStrArray; const Types: TByteArray;
+  const Prec, Scale: TByteArray;
+  const Cells: TVdbCellMatrix; out Err: string): Boolean;
+
+function VDbParquetImportCellsEx(const FileName: string;
+  out Fields: TStrArray; out Types: TByteArray;
+  out Prec, Scale: TByteArray;
+  out Cells: TVdbCellMatrix; out Err: string): Boolean;
+
 { SKILL13-E: toplu yazma. Her WriteBatch ayri bir satir grubu olur;
   veri bellekte birikmez, yalnizca satir grubu ustbilgisi tutulur.
   Kuyruk (footer) Close'ta yazilir. }
@@ -60,6 +75,9 @@ type
     DataOffset: Int64;
     TotalSize: Int64;
     NumValues: Int64;
+    TypeLength: Integer;
+    DecScale: Integer;
+    DecPrec: Integer;
   end;
 
   TParquetGroupWrite = record
@@ -74,12 +92,16 @@ type
     FStream: TFileStream;
     FFields: TStrArray;
     FTypes: TByteArray;
+    FPrec: TByteArray;
+    FScale: TByteArray;
     FGroups: array of TParquetGroupWrite;
     FNumRows: Int64;
     FClosed: Boolean;
   public
     constructor Create(const FileName: string; const Fields: TStrArray;
       const Types: TByteArray);
+    constructor CreateEx(const FileName: string; const Fields: TStrArray;
+      const Types: TByteArray; const Prec, Scale: TByteArray);
     procedure WriteBatch(const Cells: TVdbCellMatrix);
     procedure Close;
     destructor Destroy; override;
@@ -106,6 +128,7 @@ const
 
   // ConvertedType
   CT_UTF8 = 0;
+  CT_DECIMAL = 5;
   CT_DATE = 6;
   CT_TIME_MILLIS = 7;
   CT_TIME_MICROS = 8;
@@ -209,8 +232,11 @@ type
     Repetition: Integer;
     Converted: Integer;
     NumChildren: Integer;
-    LogicalKind: Integer;   // 1=STRING, 6=DATE, 7=TIME, 8=TIMESTAMP, 10=INT
+    LogicalKind: Integer;   // 1=STRING, 5=DECIMAL, 6=DATE, 7=TIME, 8=TIMESTAMP, 10=INT
     LogicalUnit: Integer;   // 1=millis, 2=micros, 3=nanos
+    TypeLength: Integer;    // FIXED_LEN_BYTE_ARRAY bayt uzunlugu
+    DecScale: Integer;      // DECIMAL olcek
+    DecPrec: Integer;       // DECIMAL hassasiyet
   end;
 
   TParquetColumnMeta = record
@@ -966,6 +992,7 @@ function LogicalFromConverted(C: Integer): Integer;
 begin
   case C of
     CT_UTF8, CT_JSON, CT_BSON: Result := 1;
+    CT_DECIMAL: Result := 5;
     CT_DATE: Result := 6;
     CT_TIME_MILLIS, CT_TIME_MICROS: Result := 7;
     CT_TIMESTAMP_MILLIS, CT_TIMESTAMP_MICROS: Result := 8;
@@ -1021,7 +1048,8 @@ begin
   R.Pop;
 end;
 
-procedure ParseLogicalType(R: TThriftReader; var Kind, UnitKind: Integer);
+procedure ParseLogicalType(R: TThriftReader; var Kind, UnitKind: Integer;
+  var DecScale, DecPrec: Integer);
 var
   id: Integer;
   t: Byte;
@@ -1040,6 +1068,22 @@ begin
     begin
       Kind := id;
       ParseTimeType(R, UnitKind);
+    end
+    else if (t = TT_STRUCT) and (id = 5) then
+    begin
+      // DecimalType: 1=scale, 2=precision
+      Kind := id;
+      R.Push;
+      while R.ReadField(id, t) do
+      begin
+        if id = 1 then
+          DecScale := R.ReadI32
+        else if id = 2 then
+          DecPrec := R.ReadI32
+        else
+          R.Skip(t);
+      end;
+      R.Pop;
     end
     else
       R.Skip(t);
@@ -1060,19 +1104,24 @@ begin
   SE.NumChildren := 0;
   SE.LogicalKind := 0;
   SE.LogicalUnit := 1;
+  SE.TypeLength := 0;
+  SE.DecScale := 0;
+  SE.DecPrec := 0;
   R.Push;
   while R.ReadField(id, t) do
   begin
     case id of
       1: SE.PType := R.ReadI32;
-      2: R.Skip(t);
+      2: SE.TypeLength := R.ReadI32;
       3: SE.Repetition := R.ReadI32;
       4: SE.Name := R.ReadBinary;
       5: SE.NumChildren := R.ReadI32;
       6: SE.Converted := R.ReadI32;
+      7: SE.DecScale := R.ReadI32;
+      8: SE.DecPrec := R.ReadI32;
       10:
         begin
-          ParseLogicalType(R, lk, lu);
+          ParseLogicalType(R, lk, lu, SE.DecScale, SE.DecPrec);
           SE.LogicalKind := lk;
           SE.LogicalUnit := lu;
         end;
@@ -1453,6 +1502,12 @@ begin
       end;
     VCT_BLOB:
       Result := PT_BYTE_ARRAY;
+    VCT_DECIMAL:
+      begin
+        Result := PT_FIXED;
+        Converted := CT_DECIMAL;
+        LogKind := 5;
+      end;
   else
     begin
       Result := PT_BYTE_ARRAY;
@@ -1462,7 +1517,8 @@ begin
   end;
 end;
 
-procedure WriteLogicalType(W: TThriftWriter; Kind, UnitKind: Integer);
+procedure WriteLogicalType(W: TThriftWriter; Kind, UnitKind: Integer;
+  DecScale, DecPrec: Integer);
 begin
   if Kind = 0 then Exit;
   W.Field(10, TT_STRUCT);
@@ -1472,6 +1528,14 @@ begin
       begin
         W.Field(Kind, TT_STRUCT);
         W.BeginStruct;
+        W.EndStruct;
+      end;
+    5:
+      begin
+        W.Field(5, TT_STRUCT);
+        W.BeginStruct;
+        W.WriteI32Field(1, DecScale);
+        W.WriteI32Field(2, DecPrec);
         W.EndStruct;
       end;
     7, 8:
@@ -1502,12 +1566,116 @@ begin
   end;
 end;
 
+{ SKILL14: Parquet DECIMAL degerleri FIXED_LEN_BYTE_ARRAY icinde buyuk-endian
+  ikiye tumleyen (two's complement) tam sayidir; deger = tam / 10^olcek.
+  Asagidaki yardimcilar 16 baytlik kanonik kanavi kullanir. }
+procedure DecMulAddBE(var V: array of Byte; Mul, Add: Integer);
+var
+  i, carry, t: Integer;
+begin
+  carry := Add;
+  for i := High(V) downto 0 do
+  begin
+    t := V[i] * Mul + carry;
+    V[i] := Byte(t and $FF);
+    carry := t shr 8;
+  end;
+  if carry <> 0 then
+    raise Exception.Create('Parquet: DECIMAL 128 bit sinirini asiyor');
+end;
+
+function DecDigitsToFixed16(const Digits: string; Neg: Boolean): TBytes;
+var
+  i, k: Integer;
+  zero: Boolean;
+begin
+  SetLength(Result, 16);
+  FillChar(Result[0], 16, 0);
+  for i := 1 to Length(Digits) do
+    if (Digits[i] >= '0') and (Digits[i] <= '9') then
+      DecMulAddBE(Result, 10, Ord(Digits[i]) - Ord('0'));
+  zero := True;
+  for k := 0 to 15 do
+    if Result[k] <> 0 then
+    begin
+      zero := False;
+      Break;
+    end;
+  if Neg and not zero then
+  begin
+    for k := 0 to 15 do
+      Result[k] := Byte((not Result[k]) and $FF);
+    for k := 15 downto 0 do
+    begin
+      Result[k] := Byte(Result[k] + 1);
+      if Result[k] <> 0 then Break;
+    end;
+  end;
+end;
+
+function DecFixedToStr(const B: TBytes; P, Width, Scale: Integer): string;
+var
+  buf: array[0..15] of Byte;
+  i, k, r: Integer;
+  neg, isZero: Boolean;
+  digs: string;
+  d: TVdbDec;
+begin
+  if (Width <= 0) or (Width > 16) then
+    raise Exception.CreateFmt('Parquet: gecersiz DECIMAL bayt uzunlugu %d', [Width]);
+  if (P < 0) or (P + Width > Length(B)) then
+    raise Exception.Create('Parquet: DECIMAL baytlari bitti');
+  if (B[P] and $80) <> 0 then
+    FillChar(buf, 16, $FF)
+  else
+    FillChar(buf, 16, 0);
+  for i := 0 to Width - 1 do
+    buf[16 - Width + i] := B[P + i];
+  neg := (buf[0] and $80) <> 0;
+  if neg then
+  begin
+    for k := 0 to 15 do
+      buf[k] := Byte((not buf[k]) and $FF);
+    for k := 15 downto 0 do
+    begin
+      buf[k] := Byte(buf[k] + 1);
+      if buf[k] <> 0 then Break;
+    end;
+  end;
+  digs := '';
+  repeat
+    r := 0;
+    for i := 0 to 15 do
+    begin
+      r := r * 256 + buf[i];
+      buf[i] := Byte(r div 10);
+      r := r mod 10;
+    end;
+    digs := Chr(Ord('0') + r) + digs;
+    isZero := True;
+    for k := 0 to 15 do
+      if buf[k] <> 0 then
+      begin
+        isZero := False;
+        Break;
+      end;
+  until isZero;
+  while (Length(digs) > 1) and (digs[1] = '0') do Delete(digs, 1, 1);
+  if digs = '' then digs := '0';
+  d.Digits := digs;
+  d.Scale := Scale;
+  if Scale < 0 then d.Scale := 0;
+  d.Neg := neg and (digs <> '0');
+  Result := VdbDecToStr(d);
+end;
+
 function BuildPageCells(ColIdx: Integer; const Fields: TStrArray;
-  const Types: TByteArray; const Cells: TVdbCellMatrix;
+  const Types: TByteArray; const DPrec, DScale: TByteArray;
+  const Cells: TVdbCellMatrix;
   out Header, Body: TBytes): Boolean;
 var
   bits, values, def: TBytes;
-  n, i, present, boolPos: Integer;
+  n, i, present, boolPos, L: Integer;
   c: TVdbCell;
   s: string;
   iv: Int64;
@@ -1515,6 +1683,10 @@ var
   byt: Byte;
   ptype: Integer;
   conv, lk, lu: Integer;
+  dsc, dpr: Integer;
+  dd, dr: TVdbDec;
+  de: string;
+  db16: TBytes;
   W: TThriftWriter;
 begin
   Result := False;
@@ -1632,6 +1804,23 @@ begin
         end;
       PT_BYTE_ARRAY:
         BufByteArray(values, ParquetCellStr(c));
+      PT_FIXED:
+        begin
+          if ColIdx < Length(DScale) then dsc := DScale[ColIdx] else dsc := 0;
+          if ColIdx < Length(DPrec) then dpr := DPrec[ColIdx] else dpr := 0;
+          if not VdbDecParse(ParquetCellStr(c), dd, de) then
+            raise Exception.Create('Parquet: gecersiz DECIMAL: ' + ParquetCellStr(c));
+          if dsc = 0 then dsc := dd.Scale;
+          if not VdbDecRound(dd, dsc, dr, de) then
+            raise Exception.Create('Parquet: DECIMAL yuvarlanamadi: ' + de);
+          if (dpr > 0) and (VdbDecPrecision(dr) > dpr) then
+            raise Exception.CreateFmt('Parquet: DECIMAL hassasiyet tasmasi (%d > %d)',
+              [VdbDecPrecision(dr), dpr]);
+          db16 := DecDigitsToFixed16(dr.Digits, dr.Neg);
+          L := Length(values);
+          SetLength(values, L + 16);
+          Move(db16[0], values[L], 16);
+        end;
     end;
   end;
   def := EncodeDefLevels(bits, n);
@@ -1713,11 +1902,22 @@ begin
     begin
       W.BeginStruct;
       W.WriteI32Field(1, SchemaCols[i].PType);
+      if SchemaCols[i].PType = PT_FIXED then
+        if SchemaCols[i].TypeLength > 0 then
+          W.WriteI32Field(2, SchemaCols[i].TypeLength)
+        else
+          W.WriteI32Field(2, 16);
       W.WriteI32Field(3, REP_OPTIONAL);
       W.WriteBinaryField(4, SchemaCols[i].Name);
       if SchemaCols[i].Converted >= 0 then
         W.WriteI32Field(6, SchemaCols[i].Converted);
-      WriteLogicalType(W, SchemaCols[i].LogicalKind, SchemaCols[i].LogicalUnit);
+      if SchemaCols[i].Converted = CT_DECIMAL then
+      begin
+        W.WriteI32Field(7, SchemaCols[i].DecScale);
+        W.WriteI32Field(8, SchemaCols[i].DecPrec);
+      end;
+      WriteLogicalType(W, SchemaCols[i].LogicalKind, SchemaCols[i].LogicalUnit,
+        SchemaCols[i].DecScale, SchemaCols[i].DecPrec);
       W.EndStruct;
     end;
 
@@ -1787,6 +1987,13 @@ end;
 
 constructor TVdbParquetWriter.Create(const FileName: string;
   const Fields: TStrArray; const Types: TByteArray);
+begin
+  CreateEx(FileName, Fields, Types, nil, nil);
+end;
+
+constructor TVdbParquetWriter.CreateEx(const FileName: string;
+  const Fields: TStrArray; const Types: TByteArray;
+  const Prec, Scale: TByteArray);
 const
   Magic: array[0..3] of Char = ('P', 'A', 'R', '1');
 var
@@ -1798,6 +2005,12 @@ begin
   for i := 0 to High(Fields) do FFields[i] := Fields[i];
   SetLength(FTypes, Length(Types));
   for i := 0 to High(Types) do FTypes[i] := Types[i];
+  SetLength(FPrec, Length(Fields));
+  SetLength(FScale, Length(Fields));
+  if Length(Prec) = Length(Fields) then
+    for i := 0 to High(Prec) do FPrec[i] := Prec[i];
+  if Length(Scale) = Length(Fields) then
+    for i := 0 to High(Scale) do FScale[i] := Scale[i];
   FNumRows := 0;
   FClosed := False;
   FStream := TFileStream.Create(FileName, fmCreate);
@@ -1807,18 +2020,40 @@ end;
 procedure TVdbParquetWriter.WriteBatch(const Cells: TVdbCellMatrix);
 var
   g: TParquetGroupWrite;
-  i: Integer;
+  i, k: Integer;
   Header, Body: TBytes;
   conv, lk, lu: Integer;
+  dd: TVdbDec;
+  de: string;
 begin
   if FClosed then
     raise Exception.Create('Parquet: yazici kapatildi');
   if Length(Cells) = 0 then Exit;
+  { SKILL14: DECIMAL icin (p,s) verilmediyse hucrelerden turet. Oncelik
+    hassasiyette: 0 = bildirilmedi. Olcek 0 ise ilk ondalik hucreden alinir. }
+  for i := 0 to High(FFields) do
+    if FTypes[i] = VCT_DECIMAL then
+    begin
+      if Length(FPrec) <= i then SetLength(FPrec, i + 1);
+      if Length(FScale) <= i then SetLength(FScale, i + 1);
+      if FPrec[i] = 0 then
+      begin
+        FPrec[i] := VDB_DEC_MAX_PREC;
+        if FScale[i] = 0 then
+          for k := 0 to High(Cells) do
+            if (i < Length(Cells[k])) and (Cells[k][i].Kind <> vckNull) and
+               VdbDecParse(ParquetCellStr(Cells[k][i]), dd, de) then
+            begin
+              FScale[i] := dd.Scale;
+              Break;
+            end;
+      end;
+    end;
   SetLength(g.Cols, Length(FFields));
   g.NumRows := Length(Cells);
   for i := 0 to High(FFields) do
   begin
-    if not BuildPageCells(i, FFields, FTypes, Cells, Header, Body) then
+    if not BuildPageCells(i, FFields, FTypes, FPrec, FScale, Cells, Header, Body) then
       raise Exception.Create('Parquet: sayfa olusturulamadi');
     g.Cols[i].Name := FFields[i];
     g.Cols[i].PType := ParquetTypeOf(FTypes[i], conv, lk, lu);
@@ -1826,6 +2061,15 @@ begin
     g.Cols[i].LogicalKind := lk;
     g.Cols[i].LogicalUnit := lu;
     g.Cols[i].VType := FTypes[i];
+    g.Cols[i].TypeLength := 0;
+    g.Cols[i].DecScale := 0;
+    g.Cols[i].DecPrec := 0;
+    if FTypes[i] = VCT_DECIMAL then
+    begin
+      g.Cols[i].TypeLength := 16;
+      if i < Length(FScale) then g.Cols[i].DecScale := FScale[i];
+      if i < Length(FPrec) then g.Cols[i].DecPrec := FPrec[i];
+    end;
     g.Cols[i].DataOffset := FStream.Position;
     if Length(Header) > 0 then FStream.WriteBuffer(Header[0], Length(Header));
     if Length(Body) > 0 then FStream.WriteBuffer(Body[0], Length(Body));
@@ -1860,6 +2104,17 @@ begin
     SchemaCols[i].LogicalKind := lk;
     SchemaCols[i].LogicalUnit := lu;
     SchemaCols[i].VType := FTypes[i];
+    SchemaCols[i].TypeLength := 0;
+    SchemaCols[i].DecScale := 0;
+    SchemaCols[i].DecPrec := 0;
+    if FTypes[i] = VCT_DECIMAL then
+    begin
+      SchemaCols[i].TypeLength := 16;
+      if i < Length(FScale) then SchemaCols[i].DecScale := FScale[i];
+      if i < Length(FPrec) then SchemaCols[i].DecPrec := FPrec[i];
+      // SKILL14: hic satir yazilmadiysa bildirilen (p,s) yine gecerli olmali.
+      if SchemaCols[i].DecPrec = 0 then SchemaCols[i].DecPrec := VDB_DEC_MAX_PREC;
+    end;
     SchemaCols[i].DataOffset := 0;
     SchemaCols[i].TotalSize := 0;
     SchemaCols[i].NumValues := 0;
@@ -1885,13 +2140,21 @@ end;
 function VDbParquetExportCells(const FileName: string;
   const Fields: TStrArray; const Types: TByteArray;
   const Cells: TVdbCellMatrix; out Err: string): Boolean;
+begin
+  Result := VDbParquetExportCellsEx(FileName, Fields, Types, nil, nil, Cells, Err);
+end;
+
+function VDbParquetExportCellsEx(const FileName: string;
+  const Fields: TStrArray; const Types: TByteArray;
+  const Prec, Scale: TByteArray;
+  const Cells: TVdbCellMatrix; out Err: string): Boolean;
 var
   w: TVdbParquetWriter;
 begin
   Result := False;
   Err := '';
   try
-    w := TVdbParquetWriter.Create(FileName, Fields, Types);
+    w := TVdbParquetWriter.CreateEx(FileName, Fields, Types, Prec, Scale);
     try
       w.WriteBatch(Cells);
       w.Close;
@@ -1937,7 +2200,8 @@ end;
 
 function LeafKind(SE: TParquetSchemaElem): Integer;
 begin
-  // 0=int, 1=date, 2=time, 3=timestamp, 4=bool, 5=float, 6=str, 7=blob
+  // 0=int, 1=date, 2=time, 3=timestamp, 4=bool, 5=float, 6=str, 7=blob, 8=decimal
+  if SE.LogicalKind = 5 then Exit(8);
   if SE.LogicalKind = 6 then Exit(1);
   if SE.LogicalKind = 7 then Exit(2);
   if SE.LogicalKind = 8 then Exit(3);
@@ -1951,6 +2215,7 @@ begin
     else
       Exit(7);
   end;
+  if SE.PType = PT_FIXED then Exit(7);
   Result := 0;
 end;
 
@@ -1964,6 +2229,7 @@ begin
     5: Result := VCT_FLOAT;
     6: Result := VCT_STR;
     7: Result := VCT_BLOB;
+    8: Result := VCT_DECIMAL;
   else
     Result := VCT_INT;
   end;
@@ -2039,6 +2305,7 @@ var
     sd: Double;
     sb: Boolean;
     ss: string;
+    fw: Integer;
   begin
     Result := nil;
     SetLength(Result, Count);
@@ -2078,6 +2345,23 @@ var
             ss := ReadPlainInt96(B, q);
             Result[k] := ss;
           end;
+        PT_FIXED:
+          begin
+            fw := SE.TypeLength;
+            if fw <= 0 then fw := 16;
+            if (q < 0) or (q + fw > Length(B)) then
+              raise Exception.Create('Parquet: fixed sozluk bitti');
+            if SE.LogicalKind = 5 then
+              Result[k] := DecFixedToStr(B, q, fw, SE.DecScale)
+            else
+            begin
+              SetLength(ss, fw);
+              Move(B[q], ss[1], fw);
+              Result[k] := ValueToStr(SE.PType, SE.LogicalKind, SE.LogicalUnit,
+                0, 0, False, ss);
+            end;
+            Inc(q, fw);
+          end;
       else
         raise Exception.CreateFmt('Parquet: desteklenmeyen fiziksel tip %d', [SE.PType]);
       end;
@@ -2099,7 +2383,7 @@ var
   procedure ReadValues(const B: TBytes; var P: Integer; N: Integer;
     Enc: Integer; const DictArr: TStrArray);
   var
-    k, bw: Integer;
+    k, bw, fw: Integer;
     ind: TInt64Arr;
     bitPos: Integer;
   begin
@@ -2133,6 +2417,24 @@ var
           for k := 0 to N - 1 do strs[k] := ReadPlainByteArray(B, P);
         PT_INT96:
           for k := 0 to N - 1 do int96[k] := ReadPlainInt96(B, P);
+        PT_FIXED:
+          begin
+            fw := SE.TypeLength;
+            if fw <= 0 then fw := 16;
+            if (N > 0) and ((P < 0) or (P + Int64(N) * fw > Length(B))) then
+              raise Exception.Create('Parquet: fixed veri bitti');
+            for k := 0 to N - 1 do
+            begin
+              if SE.LogicalKind = 5 then
+                strs[k] := DecFixedToStr(B, P, fw, SE.DecScale)
+              else
+              begin
+                SetLength(strs[k], fw);
+                Move(B[P], strs[k][1], fw);
+              end;
+              Inc(P, fw);
+            end;
+          end;
       else
         raise Exception.CreateFmt('Parquet: desteklenmeyen fiziksel tip %d', [SE.PType]);
       end;
@@ -2207,6 +2509,8 @@ var
               Values[rowPos + k] := ValueToStr(SE.PType, SE.LogicalKind, SE.LogicalUnit, 0, vals[cnt], False, '');
             PT_BYTE_ARRAY:
               Values[rowPos + k] := ValueToStr(SE.PType, SE.LogicalKind, SE.LogicalUnit, 0, 0, False, strs[cnt]);
+            PT_FIXED:
+              Values[rowPos + k] := strs[cnt];
             PT_INT96:
               Values[rowPos + k] := int96[cnt];
           end;
@@ -2391,8 +2695,9 @@ begin
   SetLength(Leaves, leafN);
 end;
 
-function VDbParquetImportCells(const FileName: string;
+function VDbParquetImportCellsEx(const FileName: string;
   out Fields: TStrArray; out Types: TByteArray;
+  out Prec, Scale: TByteArray;
   out Cells: TVdbCellMatrix; out Err: string): Boolean;
 var
   fs: TFileStream;
@@ -2408,6 +2713,8 @@ begin
   Err := '';
   Fields := nil;
   Types := nil;
+  Prec := nil;
+  Scale := nil;
   Cells := nil;
   try
     LoadParquetMeta(FileName, Meta, sz64, metaStart);
@@ -2432,10 +2739,19 @@ begin
     end;
     SetLength(Fields, leafN);
     SetLength(Types, leafN);
+    SetLength(Prec, leafN);
+    SetLength(Scale, leafN);
     for i := 0 to leafN - 1 do
     begin
       Fields[i] := leaves[i].Name;
       Types[i] := VTypeOfLeaf(leaves[i]);
+      Prec[i] := 0;
+      Scale[i] := 0;
+      if Types[i] = VCT_DECIMAL then
+      begin
+        if leaves[i].DecPrec > 0 then Prec[i] := leaves[i].DecPrec;
+        if leaves[i].DecScale > 0 then Scale[i] := leaves[i].DecScale;
+      end;
     end;
     SetLength(Cells, total);
     for i := 0 to total - 1 do
@@ -2467,9 +2783,20 @@ begin
       Err := E.Message;
       Fields := nil;
       Types := nil;
+      Prec := nil;
+      Scale := nil;
       Cells := nil;
     end;
   end;
+end;
+
+function VDbParquetImportCells(const FileName: string;
+  out Fields: TStrArray; out Types: TByteArray;
+  out Cells: TVdbCellMatrix; out Err: string): Boolean;
+var
+  pr, sc: TByteArray;
+begin
+  Result := VDbParquetImportCellsEx(FileName, Fields, Types, pr, sc, Cells, Err);
 end;
 
 function VDbParquetImport(const FileName: string;

@@ -197,6 +197,12 @@ build_gate disk_index_scale "$ROOT/tests/disk_index_scale/dixscale.lpr"
 build_gate spill_core "$ROOT/tests/spill_core/spill_core.lpr"
 build_gate stream_spill "$ROOT/tests/stream_spill/stream_spill.lpr"
 
+# SKILL14: kesin DECIMAL/NUMERIC. Cekirdek kutuphane kendi kendini dogrular;
+# decimal_numeric motorun tam yolunu (tip, aritmetik, karsilastirma, kumeleme,
+# kalicilik, Arrow/Parquet gidis-donus) kapsar.
+build_gate decimal_core "$ROOT/tests/decimal_core/decimal_core.lpr"
+build_gate decimal_numeric "$ROOT/tests/decimal_numeric/decimal_numeric.lpr"
+
 # --- kosum -----------------------------------------------------------
 unset VDB_CRYPTO_PROVIDER 2>/dev/null || true
 unset VDB_CRYPTO_DLL 2>/dev/null || true
@@ -270,6 +276,12 @@ run_gate disk_index_scale "$WORK/disk_index_scale" dixscale 200000
 # degil kendi calisma dizininde tutulur.
 run_gate spill_core "$WORK/spill_core" spill_core
 run_gate stream_spill "$WORK/stream_spill" stream_spill
+
+# SKILL14: kesin DECIMAL. decimal_core saf kutuphane testidir (hizli);
+# decimal_numeric motorun SQL, kalicilik ve Arrow/Parquet DECIMAL yolunu
+# uctan uca surer.
+run_gate decimal_core "$WORK/decimal_core" decimal_core
+run_gate decimal_numeric "$WORK/decimal_numeric" decimal_numeric
 
 # SKILL6 08: interop / kripto / bench kapilari.
 # Dis arac (pyarrow) gerektiren kapilar arac yoksa 77 ile SKIP verir ve

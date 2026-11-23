@@ -2217,6 +2217,7 @@ begin
     VCT_DATETIME: Result := 'DATETIME';
     VCT_TIME: Result := 'TIME';
     VCT_BLOB: Result := 'BLOB';
+    VCT_DECIMAL: Result := 'DECIMAL';
   else
     Result := 'TEXT';
   end;
@@ -2234,6 +2235,7 @@ begin
   if (u = 'DATETIME') or (u = 'TIMESTAMP') then Exit(VCT_DATETIME);
   if u = 'TIME' then Exit(VCT_TIME);
   if (u = 'BLOB') or (u = 'BINARY') then Exit(VCT_BLOB);
+  if (u = 'DECIMAL') or (u = 'NUMERIC') then Exit(VCT_DECIMAL);
   Result := VCT_STR;
 end;
 

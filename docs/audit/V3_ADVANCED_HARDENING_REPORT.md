@@ -211,6 +211,50 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   (sozluk dali hala metin cozer); Parquet okuyucu dosya footer'ini ve
   row group basina tek kolon parcacigini bellege alir, yani bellek tek
   bir hucre parcacigi kadardir, dosya boyuyla **dogrusal degildir**.
+- **SKILL14 - kesin DECIMAL/NUMERIC**: **TAMAM (v3.78)**. Para ve olcekli
+  degerler artik kayan nokta uzerinden tasinmiyor. Yeni saf Pascal cekirdek
+  `VDbDecimal.pas` (`TVdbDec` = isaret + rakam dizisi + olcek) toplama,
+  cikarma, carpma, bolme, yuvarlama ve karsilastirmayi tam sayi aritmetigiyle
+  yapar; cikis parametreleri **`var`**'dir (`out` degil), cunku
+  `VdbDecAdd(sum, x, sum)` gibi es adlandirmali cagrilar gecerli olmalidir
+  (`out` yonetilen alanlari sonlandirip bunu bozar). Degerler **bildirilmis
+  olcege kanoniklestirilerek metin** olarak saklanir (`DECIMAL(12,3)` icin
+  `1.5` -> `1.500`, `-0` -> `0.000`), boylece metin anahtarli `GROUP BY` /
+  `DISTINCT` dogru kalir; satir kodlamasi ve `VDB_FILE_VER` **degismedi**.
+  Hassasiyet kolon bayraklarinin 16-23, olcek 24-31 bitlerindedir (VecDim ile
+  ayni yontem): yeni sema alani ve bicim artisi yok, eski dosyalar okunur.
+  Yuvarlama **yarim yukari** (sifirdan uzak); olcek tasmasi yuvarlanir,
+  hassasiyet tasmasi `ecNumericOutOfRange` verir - sessiz kirpma yoktur.
+  Hassasiyet tavani **38** (Arrow Decimal128 ile ayni); bolme olcegi
+  `max(s1+s2, 6)`, carpma olcegi `s1+s2`. Siralama tip duyarli
+  karsilastiricilarla yapilir (`VDbIdxCmp` ve turevleri, disk
+  karsilastiricisi). Disa aktarimda Arrow tip kimligi **7 (Decimal,
+  bitWidth 128)**; Parquet'te **FIXED_LEN_BYTE_ARRAY(16)** + LogicalType
+  DECIMAL (alan 5) **ve** eski ConvertedType `CT_DECIMAL=5` +
+  `type_length`/`scale`/`precision` alanlari **birlikte** yazilir (en genis
+  uyumluluk); okuma tarafinda pyarrow'un yazdigi `fixed(n<16)` DECIMAL'i da
+  isaret genisletilerek okunur. Kapi dort **gercek** kusur bulup kapatti:
+  (1) `CreateTable` yerel tanima `Prec`/`Scale` kopyalamiyordu; (2) CAST'ta
+  belirtecin birlestirdigi `(6,2)` tek belirtec olarak geliyordu
+  (`ReadTypeParams`); (3) `ALTER ... TYPE DECIMAL(p,s)` parametreleri
+  ayristirilamiyordu; (4) `VDbTypeFromName('DECIMAL(12,3)')` tam eslesme
+  aradigi icin `VCT_STR` donuyor, ALTER tipi bozuluyordu. Kapilar:
+  `decimal_core` **44/0** (D1-D26; cekirdek aritmetik ve kanonik metin),
+  `decimal_numeric` **93/0** (DN1-DN88; tip/tanitim, aritmetik,
+  karsilastirma/siralama, `SUM`/`AVG`/`GROUP BY`, kalicilik, CAST, ALTER,
+  Arrow ve Parquet gidis-donus), `interop_external` **26/0** (yeni X9/X10
+  VDB'nin yazdigi Arrow/Parquet DECIMAL(12,3)'u pyarrow ile precision/scale
+  ve **tam** deger olarak dogrular; X11/X12 pyarrow'un yazdigi
+  DECIMAL(10,2)'yi VDB birebir okur) ve `interop_format` **27/0**
+  degismedi. On-kapi (`git archive HEAD` = `de6d249`): `decimal_core` ve
+  `decimal_numeric` **derlenmez** (`Can't find unit VDbDecimal`),
+  `interop_external` **7 x Error** (`VCT_DECIMAL` ve dort `VDb*Cells*Ex` adi
+  yok); `interop_format` baseline'da derlenir ve koruyucudur. **Durust
+  sinir**: `VDbParquetReadBatches` DECIMAL kolonunu tip olarak bildirir ama
+  (p,s) cikisi vermez; Arrow DATE/TIME/DATETIME tipli hucreler `vckText`
+  ISO metnidir; `TryJoinAgg`/`TryStreamGroupBy` DECIMAL'i reddeder (dogruluk
+  genel yolda korunur, hizlandirma yoktur); hassasiyet 38 ile sinirlidir,
+  Decimal256 yoktur; `TStrMatrix` API'si `''` ile NULL'i hala karistirir.
 - **SKILL6 07 - genel hash join / maliyet modeli**: **KISMI**. `SELECT`
   tarafinda `TryStreamJoin` zaten PK arama, indeks kaynagi ve hash join
   yollarini secer (`merge_hash` kapisi M1-M13). Sprint P'de `UPDATE ... FROM`

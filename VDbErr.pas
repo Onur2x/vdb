@@ -72,7 +72,9 @@ type
     ecQueryTimeout,         // sorgu zaman asimi (QueryTimeoutMs asildi)
     ecCancelled,            // kullanici iptali (CancelQuery)
     // --- F-42 SERIALIZABLE dogrulama ---
-    ecSerializationFailure  // SERIALIZABLE: arada baska islem commit etti (40001)
+    ecSerializationFailure, // SERIALIZABLE: arada baska islem commit etti (40001)
+    // --- SKILL14 tam ondalik ---
+    ecNumericOutOfRange     // DECIMAL hassasiyet asimi (22003)
   );
 
   EVDbException = class(Exception)
@@ -147,6 +149,7 @@ begin
     ecQueryTimeout:       Result := 'ecQueryTimeout';
     ecCancelled:          Result := 'ecCancelled';
     ecSerializationFailure: Result := 'ecSerializationFailure';
+    ecNumericOutOfRange:  Result := 'ecNumericOutOfRange';
   else
     Result := 'ecGeneral';
   end;

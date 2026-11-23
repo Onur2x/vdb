@@ -11,12 +11,17 @@ Modes
   gennulls <dir>      -> NULL/bos ayrimi tasiyan harici dosyalari uretir
   genbig <dir>        -> cok batch'li buyuk Arrow stream'i
   genbigparquet <dir> -> cok row group'lu buyuk Parquet dosyasi
+  checkdec <file> arrow|parquet
+                      -> VDB'nin yazdigi DECIMAL(12,3)'u precision/scale
+                         ve TAM deger ile dogrular (SKILL14)
+  gendec <dir>        -> pyarrow ile harici DECIMAL(10,2) dosyalari uretir
 
 Exit 0 = tum dogrulamalar gecti. Exit 2 = dogrulama basarisiz (ayrinti stdout).
 Bu betik yalniz TEST tarafidir; depoya yeni bir calisma-zamani bagimliligi
 eklemez ve VDB'nin uretim kodu bu betige bagli degildir.
 """
 import datetime
+import decimal
 import os
 import sys
 
@@ -361,6 +366,116 @@ def genbigparquet(outdir, groups=50, rows=200):
     return 0
 
 
+# SKILL14: DECIMAL(12,3) tipli kapsam. Pascal tarafi AYNI 5 satiri
+# VDbArrowExportCellsEx / VDbParquetExportCellsEx ile yazar; burada
+# pyarrow semayi (precision, scale) ve degerleri FLOAT'A CEVMEDEN dogrular.
+DEC_PREC = 12
+DEC_SCALE = 3
+DEC_ROWS = [
+    {"id": 1, "v": decimal.Decimal("123.456")},
+    {"id": 2, "v": decimal.Decimal("-0.001")},
+    {"id": 3, "v": decimal.Decimal("0.000")},
+    {"id": 4, "v": decimal.Decimal("999999999.999")},
+    {"id": 5, "v": None},
+]
+
+# pyarrow'un kendisi tarafindan yazilan harici DECIMAL(10,2). Pascal tarafi
+# bunu VDB ile okur ve AYNI kanonik metinleri bekler (None = NULL).
+GEN_DEC_PREC = 10
+GEN_DEC_SCALE = 2
+GEN_DEC_ROWS = [
+    {"id": 1, "v": decimal.Decimal("12.34")},
+    {"id": 2, "v": decimal.Decimal("-0.05")},
+    {"id": 3, "v": decimal.Decimal("0.00")},
+    {"id": 4, "v": None},
+    {"id": 5, "v": decimal.Decimal("-99999999.99")},
+]
+
+
+def checkdec(path, kind):
+    """VDB'nin yazdigi DECIMAL(12,3) kolonunu pyarrow ile dogrular."""
+    pa, pq = load_pyarrow()
+    if not os.path.exists(path):
+        print(f"FAIL dosya yok: {path}")
+        return EXIT_BAD
+    try:
+        table = read_table(path, kind, pa, pq)
+    except Exception as exc:  # noqa: BLE001
+        print(f"FAIL {kind} dec okunamadi: {exc}")
+        return EXIT_BAD
+
+    names = list(table.schema.names)
+    if names != ["id", "v"]:
+        print(f"FAIL dec alan adlari: {names} != ['id', 'v']")
+        return EXIT_BAD
+    vt = table.schema.field("v").type
+    if not pa.types.is_decimal(vt):
+        print(f"FAIL dec tipi DECIMAL degil: {vt}")
+        return EXIT_BAD
+    if vt.precision != DEC_PREC or vt.scale != DEC_SCALE:
+        print(f"FAIL dec (p,s): ({vt.precision},{vt.scale}) != "
+              f"({DEC_PREC},{DEC_SCALE})")
+        return EXIT_BAD
+    nulls = table.column("v").null_count
+    want_nulls = sum(1 for r in DEC_ROWS if r["v"] is None)
+    if nulls != want_nulls:
+        print(f"FAIL dec NULL sayisi {nulls} != {want_nulls}")
+        return EXIT_BAD
+
+    rows = table.to_pylist()
+    if len(rows) != len(DEC_ROWS):
+        print(f"FAIL dec satir sayisi {len(rows)} != {len(DEC_ROWS)}")
+        return EXIT_BAD
+    for i, (got, want) in enumerate(zip(rows, DEC_ROWS)):
+        if got["id"] != want["id"]:
+            print(f"FAIL dec satir {i} id: {got['id']!r} != {want['id']!r}")
+            return EXIT_BAD
+        g = got["v"]
+        w = want["v"]
+        if w is None:
+            good = g is None
+        else:
+            # decimal.Decimal uzerinden TAM karsilastirma (float yuvarlama yok).
+            good = g is not None and decimal.Decimal(g) == w
+        if not good:
+            print(f"FAIL dec satir {i} v: {g!r} != {w!r}")
+            return EXIT_BAD
+
+    if kind == "parquet":
+        pf = pq.ParquetFile(path)
+        col = pf.metadata.row_group(0).column(1)
+        print(f"OK dec parquet satir={len(rows)} p={vt.precision} "
+              f"s={vt.scale} fiziksel={col.physical_type} "
+              f"nulls={nulls} rg={pf.num_row_groups}")
+    else:
+        print(f"OK dec arrow satir={len(rows)} p={vt.precision} "
+              f"s={vt.scale} nulls={nulls}")
+    return 0
+
+
+def gendec(outdir):
+    """pyarrow ile harici DECIMAL(10,2) Arrow ve Parquet dosyalari uretir."""
+    pa, pq = load_pyarrow()
+    if not os.path.isdir(outdir):
+        os.makedirs(outdir)
+    typ = pa.decimal128(GEN_DEC_PREC, GEN_DEC_SCALE)
+    tbl = pa.table({
+        "id": pa.array([r["id"] for r in GEN_DEC_ROWS], pa.int32()),
+        "v": pa.array([r["v"] for r in GEN_DEC_ROWS], typ),
+    })
+    apath = os.path.join(outdir, "ext_dec.arrow")
+    with pa.ipc.new_stream(apath, tbl.schema) as wr:
+        wr.write_table(tbl)
+    ppath = os.path.join(outdir, "ext_dec.parquet")
+    pq.write_table(tbl, ppath, compression="NONE")
+    print(f"GEN ext_dec.arrow {os.path.getsize(apath)} p={GEN_DEC_PREC} "
+          f"s={GEN_DEC_SCALE}")
+    pf = pq.ParquetFile(ppath)
+    print(f"GEN ext_dec.parquet {os.path.getsize(ppath)} "
+          f"fiziksel={pf.metadata.row_group(0).column(1).physical_type}")
+    return 0
+
+
 def main(argv):
     if len(argv) < 2:
         print("FAIL kullanim: verify.py selftest|check|gen")
@@ -400,6 +515,16 @@ def main(argv):
             print("FAIL kullanim: verify.py genbigparquet <dir>")
             return EXIT_BAD
         return genbigparquet(argv[2])
+    if mode == "checkdec":
+        if len(argv) < 4:
+            print("FAIL kullanim: verify.py checkdec <file> arrow|parquet")
+            return EXIT_BAD
+        return checkdec(argv[2], argv[3])
+    if mode == "gendec":
+        if len(argv) < 3:
+            print("FAIL kullanim: verify.py gendec <dir>")
+            return EXIT_BAD
+        return gendec(argv[2])
     print(f"FAIL bilinmeyen mod: {mode}")
     return EXIT_BAD
 

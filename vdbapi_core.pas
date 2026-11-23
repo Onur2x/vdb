@@ -271,6 +271,7 @@ begin
     ecInvalidName,
     ecTypeMismatch,
     ecMathError,
+    ecNumericOutOfRange,
     ecInvalidArgument:      Result := VDB_E_SQL;
     ecTransactionState,
     ecSerializationFailure,

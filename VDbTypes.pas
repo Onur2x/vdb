@@ -40,6 +40,16 @@ const
   VCT_DATETIME = 5; // ISO yyyy-mm-dd hh:nn:ss metin
   VCT_TIME = 6;     // ISO hh:nn:ss metin
   VCT_BLOB = 7;     // ham byte
+  { SKILL14: tam hassasiyetli ondalik. Deger METIN olarak saklanir (satir
+    govdesi degismez, bicim v5 ayni kalir); tamlik hesabi VDbDecimal.pas
+    icindeki yazilim ondaligi ile yapilir, Double'a asla cevrilmez.
+    Hassasiyet/olcek kolon bayrak tamsayisinin 16-23 ve 24-31
+    bitlerinde saklanir; boylece sema satirinda yeni alan gerekmez ve
+    eski dosyalar aynen acilir (o bitler eski dosyalarda 0'dir). }
+  VCT_DECIMAL = 8;
+  { SKILL14: DECIMAL/NUMERIC icin desteklenen en buyuk hassasiyet.
+    10^38 < 2^127 oldugu icin Arrow Decimal128'e de tam sigar. }
+  VDB_DEC_MAX_PREC = 38;
   // F2-12: ON DELETE/UPDATE CASCADE zinciri ozguc doner (Delete ->
   // CheckRestrict -> Delete -> ...). CYCLE varsa (a -> b -> a) sonsuza
   // kadar doner (yigin tasmasi + sinirsiz silme). Azami derinlik.
@@ -145,6 +155,13 @@ type
     // M6: kolon seviyesi sifreleme. Yalnizca metin/BLOB kolonlarinda
     // kullanilabilir; sema bayrak alaninin 16. bitinde saklanir.
     Encrypted: Boolean;
+    // SKILL14: DECIMAL(p,s) hassasiyet ve olcek (yalniz VCT_DECIMAL icin
+    // anlamli). Sema bayrak alaninin 16-23 (p) ve 24-31 (s) bitlerinde
+    // saklanir; alan sayisi degismez. Eski dosyalarda bu bitler 0'dir ama
+    // eski dosyalarda VCT_DECIMAL kolonu da yoktur (DECIMAL eskiden FLOAT
+    // olarak eslenip kaydediliyordu), bu yuzden gecis veri kaybi dogurmaz.
+    Prec: Byte;
+    Scale: Byte;
     // Anahtar dosyasindaki anahtar kimligi (bellekte; semaya yazilmaz).
     // Sifreli degerin kendi basliginda da ayni kimlik bulunur.
     ColKeyId: QWord;
@@ -309,6 +326,11 @@ begin
       end;
     VCT_BLOB:
       begin C.Kind := vckBlob; C.S := S; end;
+    { SKILL14: DECIMAL degeri kanonik METIN olarak tasinir. Double'a
+      cevirmek tamligi bozard; tipli disa aktarimda (Arrow Decimal128 /
+      Parquet DECIMAL) bu metin VDbDecimal ile ayristirilir. }
+    VCT_DECIMAL:
+      begin C.Kind := vckText; C.S := S; end;
   else
     begin C.Kind := vckText; C.S := S; end;
   end;

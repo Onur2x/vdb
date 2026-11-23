@@ -87,7 +87,8 @@ type
     function  CurPos: string;       // hata mesaji icin "pos=N"
 
     { ---- Tür / Alan yardımcıları ---- }
-    function  ParseTypeName(out AVecDim: Integer): Byte;   // VCT_* donuyor
+    function  ParseTypeName(out AVecDim: Integer;
+      out APrec, AScale: Byte): Byte;   // VCT_* donuyor
     procedure ParseColDef(var C: TColDef; Stmt: TSqlCreateTableStmt = nil);
     function  ReadFkAction: string;
 
@@ -182,6 +183,11 @@ type
     function ParseDropTrigger: TSqlDropTriggerStmt;
     function ParseSetNew: TSqlSetNewStmt;
     function ParseCast: TSqlCastNode;
+    { SKILL14: tip parametre listesini (p,s) / (n) okur ve "..." yerine
+      dogrudan "(p,s)" metnini dondurur; parametre yoksa bos metin.
+      Tokenizer '(6,2)' gibi bir listeyi TEK token olarak uretebildigi
+      icin kapanis parantezi burada garanti edilir. }
+    function ReadTypeParams: string;
     function ParseAdmin(const Kw1, Kw2: string): TSqlAdminStmt;
     function ParseJson(const Kw: string): TSqlJsonStmt;
 
@@ -834,10 +840,13 @@ end;
   Tür / Alan yardımcıları
   ============================================================ }
 
-function TVDbParser.ParseTypeName(out AVecDim: Integer): Byte;
-var T, U: string;
+function TVDbParser.ParseTypeName(out AVecDim: Integer;
+  out APrec, AScale: Byte): Byte;
+var T, U, PT, ST: string; PrecV, ScaleV: Integer;
 begin
   AVecDim := 0;
+  APrec := 0;
+  AScale := 0;
   ExpectToken(T); U := UpperCase(T);
   // M4: VECTOR(n) -> JSON sayi dizisi (TEXT) + boyut kisiti.
   if U = 'VECTOR' then
@@ -860,10 +869,38 @@ begin
   if U = 'STRING'   then Exit(VCT_STR);
   if (U = 'INT') or (U = 'INTEGER') or (U = 'BIGINT') or (U = 'SMALLINT') or (U = 'TINYINT') then Exit(VCT_INT);
   if U = 'SERIAL'   then Exit(VCT_INT);
-  if (U = 'FLOAT') or (U = 'DOUBLE') or (U = 'REAL') or (U = 'DECIMAL') or (U = 'NUMERIC') then
+  if (U = 'FLOAT') or (U = 'DOUBLE') or (U = 'REAL') then
   begin
     if TryEat('(') then begin ExpectToken(T); TryEat(','); if TryEat(',') then ExpectToken(T); Expect(')'); end;
     Exit(VCT_FLOAT);
+  end;
+  { SKILL14: DECIMAL(p,s) / NUMERIC(p,s) artik FLOAT'a DUSMEZ. Hassasiyet
+    ve olcek kolon bayraginda saklanir. p 1..VDB_DEC_MAX_PREC, s 0..p.
+    Belirtilmezse SQL varsayilani (18,0) kullanilir. }
+  if (U = 'DECIMAL') or (U = 'NUMERIC') then
+  begin
+    PrecV := 18;
+    ScaleV := 0;
+    if TryEat('(') then
+    begin
+      ExpectToken(PT);
+      if (not TryStrToInt(Trim(PT), PrecV)) or (PrecV < 1) or
+         (PrecV > VDB_DEC_MAX_PREC) then
+        raise EVDbException.CreateFmt(ecSyntaxError,
+          'DECIMAL hassasiyeti 1..%d olmali: "%s"', [VDB_DEC_MAX_PREC, PT]);
+      if TryEat(',') then
+      begin
+        ExpectToken(ST);
+        if (not TryStrToInt(Trim(ST), ScaleV)) or (ScaleV < 0) or
+           (ScaleV > PrecV) then
+          raise EVDbException.CreateFmt(ecSyntaxError,
+            'DECIMAL olcegi 0..%d olmali: "%s"', [PrecV, ST]);
+      end;
+      Expect(')');
+    end;
+    APrec := Byte(PrecV);
+    AScale := Byte(ScaleV);
+    Exit(VCT_DECIMAL);
   end;
   if (U = 'BOOL') or (U = 'BOOLEAN') then Exit(VCT_BOOL);
   if U = 'DATE'     then Exit(VCT_DATE);
@@ -902,9 +939,11 @@ begin
   C.Identity := 0;   // M10: GENERATED ... AS IDENTITY
   C.VecDim := 0;     // M4: VECTOR(n)
   C.Encrypted := False;   // M6: kolon sifreleme
+  C.Prec := 0;            // SKILL14: DECIMAL(p,s)
+  C.Scale := 0;
   C.ColKeyId := 0;
   // Tip adını oku
-  C.Ctype := ParseTypeName(C.VecDim);
+  C.Ctype := ParseTypeName(C.VecDim, C.Prec, C.Scale);
 
   // Nitelikleri tüket (PRIMARY KEY, NOT NULL, DEFAULT, AUTOINCREMENT, UNIQUE, REFERENCES, CHECK)
   while True do
@@ -3544,6 +3583,25 @@ begin
   end;
 end;
 
+function TVDbParser.ReadTypeParams: string;
+var T: string;
+begin
+  Result := '';
+  if PeekToken <> '(' then Exit;
+  NextToken(T);            // (
+  Result := '(';
+  ExpectToken(T);          // p veya 'p,s' (tokenizer virgulu birlestirebilir)
+  Result := Result + T;
+  while PeekToken = ',' do
+  begin
+    NextToken(T);
+    ExpectToken(T);
+    Result := Result + ',' + T;
+  end;
+  Expect(')');
+  Result := Result + ')';
+end;
+
 function TVDbParser.ParseCast: TSqlCastNode;
 // Soz dizimi: CAST ( expr AS type )
 // Giriste 'CAST' yutuldu. Sadece '(' sonrasi ifade ve tip ayristirilir.
@@ -3556,14 +3614,7 @@ begin
     Expect('AS');
     // Tip: INTEGER | TEXT | VARCHAR(n) | NUMERIC(p,s) gibi
     ExpectToken(T);
-    typ := T;
-    if PeekToken = '( ' then
-    begin
-      NextToken(T);  // (
-      ExpectToken(T);  // boyut
-      typ := typ + '(' + T;
-      Expect(')');
-    end;
+    typ := T + ReadTypeParams;
     Result.TargetType := UpperCase(typ);
     Expect(')');
   except
@@ -4229,6 +4280,8 @@ begin
       if PeekToken = 'COLUMN' then NextToken(T);
       ExpectToken(Result.ColName); Result.ColName := VDbNorm(Result.ColName);
       ExpectToken(T); Result.NewTypeName := T;
+      { SKILL14: MODIFY COLUMN ... DECIMAL(p,s) gibi parametreli tipler. }
+      Result.NewTypeName := Result.NewTypeName + ReadTypeParams;
       Result.Action := ataAlterColType;
     end
     else if U = 'ALTER' then
@@ -4254,14 +4307,9 @@ begin
       else if U = 'TYPE' then
       begin
         ExpectToken(Result.NewTypeName);
-        // M4: ALTER COLUMN ... TYPE VECTOR(n) tek token degil.
-        if UpperCase(Result.NewTypeName) = 'VECTOR' then
-          if TryEat('(') then
-          begin
-            ExpectToken(T);
-            Result.NewTypeName := 'VECTOR(' + T + ')';
-            Expect(')');
-          end;
+        { M4/SKILL14: ALTER COLUMN ... TYPE VECTOR(n), DECIMAL(p,s),
+          VARCHAR(n) gibi parametreli tipler tek token degildir. }
+        Result.NewTypeName := Result.NewTypeName + ReadTypeParams;
         Result.Action := ataAlterColType;
       end
       else raise EVDbException.CreateFmt(ecSyntaxError, 'ALTER COLUMN sonrasi bilinmeyen eylem: "%s"', [T]);

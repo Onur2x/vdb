@@ -1940,3 +1940,82 @@ kaldirildi:
     pyarrow depo disidir (Windows 26.0.1, WSL 20.0.0 tekerlekten
     `PYTHONPATH` ile) ve yoksa kapi **77 (SKIP)** doner, PASS sayilmaz.
 
+- Altmis birinci kosu (v3.78, SKILL14 - kesin DECIMAL/NUMERIC):
+  **Linux x86_64 67 PASS** (varsayilan) ve **68 PASS**
+  (depo disi pyarrow ile), **Windows i386 67 PASS**, FAIL 0,
+  `SUITE_EXIT=0`. Iki yeni kapi eklendi (`decimal_core`,
+  `decimal_numeric`); `decimal_core` **44/0**, `decimal_numeric` **93/0**,
+  `interop_format` **27/0** (degismedi), `interop_external` **26/0**
+  (21 -> 26; X9-X12 yeni). SKIP'ler PASS sayilmaz: iki platformda
+  `fixtures_openssl`, `selftest_openssl`; Linux'ta (pyarrow yoksa)
+  `interop_external`, Windows'ta `tls_client`.
+  - **Sorun**: `DECIMAL(p,s)`/`NUMERIC(p,s)` tipi **yoktu**; ondalik
+    degerler ancak `DOUBLE` veya metinle tutuluyor, `0.1 + 0.2` ikili
+    kayan nokta hatasi tasiyor ve `SUM`/`AVG` kesin olmuyordu.
+    `CAST(x AS DECIMAL(p,s))` ve `ALTER ... TYPE DECIMAL(p,s)` sozdizimsel
+    olarak yoktu; Arrow/Parquet'te DECIMAL hic yazilmiyor, dis sistemden
+    gelen DECIMAL kolonlar tip kaybiyla okunuyordu (F52/F56 siniri).
+  - **Cekirdek**: yeni `VDbDecimal.pas` (saf Pascal, bagimlilik yok).
+    `TVdbDec` = isaret + rakam dizisi + olcek; toplama/cikarma/carpma/
+    bolme/yuvarlama/karsilastirma tam sayi aritmetigiyle. Cikis
+    parametreleri **`var`**'dir (`out` degil): `out` yonetilen alanlari
+    sonlandirdigi icin `VdbDecAdd(sum, x, sum)` gibi es adlandirmali
+    cagrilar bozulurdu. Metin uretimi yerel ayardan bagimsizdir; ondalik
+    ayirici her zaman `.`'dir.
+  - **Saklama**: degerler **kolonun bildirilmis olcegine
+    kanoniklestirilerek metin** olarak yazilir (`DECIMAL(12,3)` icin `1.5`
+    -> `1.500`, `-0` -> `0.000`). Sifir da olcegi korur (`0` degil
+    `0.000`); aksi halde ayni degerin iki yazimi olusur ve metin anahtarli
+    `GROUP BY`/`DISTINCT` bozulur. Satir kodlamasi ve `VDB_FILE_VER`
+    **degismedi**, eski dosyalar aynen okunur.
+  - **Sema**: hassasiyet kolon bayraklarinin 16-23, olcek 24-31
+    bitlerinde (VecDim ile ayni yontem). Yeni sema alani ve bicim artisi
+    yoktur; `TColDef.Prec`/`Scale` ve `VDbTypeName`/`VDbColTypeName`
+    `DECIMAL(p,s)` uretir. `VDbDecSpecFromName` tip adini onek eslesmesiyle
+    cozer (tam eslesme degil).
+  - **Yuvarlama ve tavan**: **yarim yukari** (sifirdan uzak); olcek
+    tasmasi yuvarlanir, hassasiyet tasmasi `ecNumericOutOfRange`
+    (`SQLSTATE 22003`) verir - sessiz kirpma yoktur. Hassasiyet tavani
+    **38** (`VDB_DEC_MAX_PREC`, Arrow Decimal128 ile ayni); bolme olcegi
+    `max(s1+s2, 6)`, carpma olcegi `s1+s2`.
+  - **Siralama**: tip duyarli karsilastiricilar (`VDbIdxCmp` ve turevleri,
+    `VDbCmpValEx`, `VDbCmpTri`, disk karsilastiricisi) sayisal deger
+    uzerinden karsilastirir; metin karsilastirmasi `'9.99' > '10.00'`
+    hatasini vermez.
+  - **Disa aktarim**: Arrow tip kimligi **7 (Decimal, bitWidth 128)**;
+    Parquet **FIXED_LEN_BYTE_ARRAY(16)**, deger buyuk-endian ikiye
+    tumleyen 128-bit tam sayi. Mantiksal tip LogicalType DECIMAL (alan 5)
+    **ve** eski ConvertedType `CT_DECIMAL=5` + `type_length`/`scale`/
+    `precision` alanlari **birlikte** yazilir. Okuma tarafinda pyarrow'un
+    yazdigi `fixed(n<16)` DECIMAL'i isaret genisletilerek okunur.
+    `VDbArrowExportCellsEx`/`VDbParquetExportCellsEx` ve
+    `VDb*ImportCellsEx` (p,s) dizilerini tasir; Arrow'da (p,s) zorunludur
+    (sema ilk yazimda sabitlenir), Parquet'te verilmezse hassasiyet 38 ve
+    olcek ilk ondalik hucreden turetilir.
+  - **Kapi kaniti**: `decimal_core` D1-D26 (kanonik metin, sifir olcegi,
+    isaret, yuvarlama, tasma); `decimal_numeric` DN1-DN88 (tanitim ve
+    yazim, aritmetik, karsilastirma/siralama, `SUM`/`AVG`/`GROUP BY`,
+    kalicilik, CAST, ALTER, Arrow ve Parquet gidis-donus);
+    `interop_external` X9/X10 VDB'nin yazdigi Arrow/Parquet
+    DECIMAL(12,3)'u pyarrow ile **precision/scale ve tam deger** olarak
+    dogrular, X11/X12 pyarrow'un yazdigi DECIMAL(10,2)'yi VDB birebir
+    okur.
+  - **Kapi dort gercek kusur buldu ve kapatti**: (1) `CreateTable` yerel
+    tablo tanimina `Prec`/`Scale` kopyalamiyordu; (2) `CAST` ifadesinde
+    belirtecin birlestirdigi `(6,2)` tek belirtec olarak geliyordu
+    (`TVDbParser.ReadTypeParams`); (3) `ALTER ... TYPE DECIMAL(p,s)`
+    parametreleri ayristirilamiyordu; (4) `VDbTypeFromName('DECIMAL(12,3)')`
+    tam eslesme aradigi icin `VCT_STR` donuyor ve ALTER tipini bozuyordu.
+  - **On-kapi** (`git archive HEAD` = `de6d249`): `decimal_core` ve
+    `decimal_numeric` **derlenmez** (`Fatal: (10022) Can't find unit
+    VDbDecimal`); `interop_external` **7 x Error** (`VCT_DECIMAL` ve dort
+    `VDb*Cells*Ex` adi yok). `interop_format` baseline'da derlenir ve
+    **koruyucudur** (SKILL13 gate'i). Yani yeni kapilar ayirt edicidir.
+  - **Durust sinir**: `VDbParquetReadBatches` DECIMAL kolonunu tip olarak
+    bildirir ama (p,s) cikisi vermez; Arrow DATE/TIME/DATETIME tipli
+    hucreler `vckText` ISO metnidir; `TryJoinAgg`/`TryStreamGroupBy`
+    DECIMAL'i reddeder (dogruluk genel yolda korunur, hizlandirma yoktur);
+    hassasiyet 38 ile sinirlidir, Decimal256 yoktur; legacy `TStrMatrix`
+    API'si `''` ile NULL'i hala karistirir. pyarrow depo disidir (Windows
+    26.0.1, WSL 20.0.0 tekerlekten `PYTHONPATH` ile) ve yoksa
+    `interop_external` **77 (SKIP)** doner, PASS sayilmaz.

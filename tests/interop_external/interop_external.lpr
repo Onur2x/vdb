@@ -19,6 +19,12 @@ program interop_external;
     X7  NULL / bos metin siniri: harici dosyada NULL olan metin ile gercek
         '' ayni sekilde ('' olarak) gelir - belgelenmis sinir, veri kaybi
         degil; satir sayisi korunur
+    X9  pyarrow, VDB'nin yazdigi Arrow DECIMAL(12,3) kolonunu precision,
+        scale ve TAM deger ile dogrular (float'a cevrilmez)
+    X10 ayni dogrulama Parquet icin
+    X11 VDB, pyarrow'un yazdigi harici Arrow DECIMAL(10,2) dosyasini tur,
+        (p,s) ve TAM deger ile birebir okur
+    X12 ayni okuma Parquet icin
 
   DIS BAGIMLILIK: python3 + pyarrow. Yoksa kapi **SKIP** (exit 77) verir ve
   gerekce yazilir; ASLA PASS sayilmaz. pyarrow depoya BAGIMLILIK DEGILDIR:
@@ -28,7 +34,7 @@ program interop_external;
 {$mode delphi}{$H+}
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
-  SysUtils, Classes, Process, VDbTypes, VDbArrow, VDbParquet;
+  SysUtils, Classes, Process, VDbTypes, VDbArrow, VDbParquet, VDbTable;
 
 const
   SKIP_CODE = 77;
@@ -463,6 +469,7 @@ var
   WArrow: TVdbArrowWriter;
   WParquet: TVdbParquetWriter;
   bigText, bigBlob: string;
+  GPrec, GScale, GOPrec, GOScale: TByteArray;
   Err, outp, reason: string;
   ok, okA, okB: Boolean;
   p, q: string;
@@ -739,6 +746,71 @@ begin
   end;
   Chk('Y13 buyuk Parquet row group bazli okunur (50 grup / 10000 satir)', ok,
     Clean(outp + ' ' + err));
+
+  { ---- 9) DECIMAL (SKILL14): pyarrow precision/scale + TAM deger ---- }
+  { verify.py DEC_ROWS ile AYNI 5 satir. Kanonik metin olcege gore
+    yazilir; NULL vckNull kalir. }
+  SetLength(CFields, 2);
+  CFields[0] := 'id'; CFields[1] := 'v';
+  SetLength(CTypes, 2);
+  CTypes[0] := VCT_INT; CTypes[1] := VCT_DECIMAL;
+  SetLength(GPrec, 2); GPrec[0] := 0; GPrec[1] := 12;
+  SetLength(GScale, 2); GScale[0] := 0; GScale[1] := 3;
+
+  SetLength(GCells2, 5, 2);
+  GCells2[0][0] := CInt(1); GCells2[0][1] := CText('123.456');
+  GCells2[1][0] := CInt(2); GCells2[1][1] := CText('-0.001');
+  GCells2[2][0] := CInt(3); GCells2[2][1] := CText('0.000');
+  GCells2[3][0] := CInt(4); GCells2[3][1] := CText('999999999.999');
+  GCells2[4][0] := CInt(5); GCells2[4][1] := CNull;
+
+  err := '';
+  ok := VDbArrowExportCellsEx(GDir + 'vdb_dec.arrow', CFields, CTypes,
+    GPrec, GScale, GCells2, err);
+  ok := ok and RunPyArgs([GScript, 'checkdec', GDir + 'vdb_dec.arrow',
+    'arrow'], outp) and (Pos('OK dec', outp) > 0);
+  Chk('X9 pyarrow DECIMAL(12,3) Arrow: precision/scale + tam deger', ok,
+    Clean(err + ' ' + outp));
+
+  err := '';
+  ok := VDbParquetExportCellsEx(GDir + 'vdb_dec.parquet', CFields, CTypes,
+    GPrec, GScale, GCells2, err);
+  ok := ok and RunPyArgs([GScript, 'checkdec', GDir + 'vdb_dec.parquet',
+    'parquet'], outp) and (Pos('OK dec', outp) > 0);
+  Chk('X10 pyarrow DECIMAL(12,3) Parquet: precision/scale + tam deger', ok,
+    Clean(err + ' ' + outp));
+
+  { pyarrow'un yazdigi harici DECIMAL(10,2): VDB birebir okumali. }
+  ok := RunPyArgs([GScript, 'gendec', ExcludeTrailingPathDelimiter(GDir)],
+    outp) and (Pos('GEN ext_dec.arrow', outp) > 0) and
+    (Pos('GEN ext_dec.parquet', outp) > 0);
+  Chk('X11a pyarrow harici DECIMAL(10,2) dosyalari uretir', ok, Clean(outp));
+
+  SetLength(GCells2, 5, 2);
+  GCells2[0][0] := CInt(1); GCells2[0][1] := CText('12.34');
+  GCells2[1][0] := CInt(2); GCells2[1][1] := CText('-0.05');
+  GCells2[2][0] := CInt(3); GCells2[2][1] := CText('0.00');
+  GCells2[3][0] := CInt(4); GCells2[3][1] := CNull;
+  GCells2[4][0] := CInt(5); GCells2[4][1] := CText('-99999999.99');
+
+  err := '';
+  ok := VDbArrowImportCellsEx(GDir + 'ext_dec.arrow', GOutFields, GOutTypes,
+    GOPrec, GOScale, GCells, err) and SameCells(GCells, GCells2, reason);
+  ok := ok and (Length(GOutTypes) = 2) and (GOutTypes[1] = VCT_DECIMAL) and
+    (Length(GOPrec) = 2) and (Length(GOScale) = 2) and
+    (GOPrec[1] = 10) and (GOScale[1] = 2);
+  Chk('X11 VDB harici Arrow DECIMAL(10,2) birebir okur (tur + p,s + deger)',
+    ok, reason + ' ' + err);
+
+  err := '';
+  ok := VDbParquetImportCellsEx(GDir + 'ext_dec.parquet', GOutFields,
+    GOutTypes, GOPrec, GOScale, GCells, err) and
+    SameCells(GCells, GCells2, reason);
+  ok := ok and (Length(GOutTypes) = 2) and (GOutTypes[1] = VCT_DECIMAL) and
+    (Length(GOPrec) = 2) and (Length(GOScale) = 2) and
+    (GOPrec[1] = 10) and (GOScale[1] = 2);
+  Chk('X12 VDB harici Parquet DECIMAL(10,2) birebir okur (tur + p,s + deger)',
+    ok, reason + ' ' + err);
 
   WriteLn('SONUC: ', GPass, ' PASS, ', GFail, ' FAIL');
   if GFail > 0 then Halt(1);

@@ -26,7 +26,7 @@ uses
   VDbCore, VDbTable, VDbAst, VDbJson, VDbErr, VDbText, VDbXml, VDbSpatial,
   VDbRange, VDbParser, VDbTypes, VDbReplication, VDbParallel, VDbMonitor,
   VDbPlatform, VDbCost, VDbExtension, VDbVector, VDbArrow, VDbParquet,
-  VDbTrace, VDbChangeLog, VDbReplV3, VDbSpill;
+  VDbTrace, VDbChangeLog, VDbReplV3, VDbSpill, VDbDecimal;
 
 const
   // F2-18: DISTINCT / UNION tekilleÅŸtirme sonucu ve set-op birlestirme
@@ -2521,6 +2521,9 @@ var
   cl: TVDbLang;
   cc: Integer;
   la, lb: Integer;
+  da, db, dr: TVdbDec;
+  de: string;
+  dok: Boolean;
 
   { SQL uc-degerli mantik: -1 = FALSE, 0 = UNKNOWN (NULL), +1 = TRUE. }
   function BoolTri(const V: string): Integer;
@@ -2573,6 +2576,39 @@ begin
     sboAdd, sboSub, sboMul, sboDiv, sboMod:
       begin
         if (LeftVal = '') or (RightVal = '') then Exit('');
+        { SKILL14: DECIMAL aritmetigi tam ondaliktir. Double'a cevirmek
+          tamligi bozardi (0.1 + 0.2 = 0.30000000000000004). Olcek kurallari:
+          +,- -> buyuk olcek; * -> s1+s2; / -> max(s1+s2, 6). Sonuc 38
+          haneyi asarsa sessiz kirpma yerine hata verilir. }
+        if Ctype = VCT_DECIMAL then
+        begin
+          if not VdbDecParse(LeftVal, da, de) or
+             not VdbDecParse(RightVal, db, de) then Exit('');
+          dok := True;
+          case AOp of
+            sboAdd: dok := VdbDecAdd(da, db, dr);
+            sboSub: dok := VdbDecSub(da, db, dr);
+            sboMul: dok := VdbDecMul(da, db, dr);
+            sboDiv:
+              begin
+                if VdbDecIsZero(db) then
+                  raise EVDbException.Create(ecMathError, 'Sifira bolme hatasi');
+                if da.Scale + db.Scale > 6 then
+                  dok := VdbDecDiv(da, db, da.Scale + db.Scale, dr, de)
+                else
+                  dok := VdbDecDiv(da, db, 6, dr, de);
+              end;
+            sboMod:
+              raise EVDbException.Create(ecMathError,
+                'DECIMAL tipte modulo kullanilamaz');
+          end;
+          if not dok then Exit('');
+          if VdbDecPrecision(dr) > VDB_DEC_MAX_PREC then
+            raise EVDbException.CreateFmt(ecNumericOutOfRange,
+              'DECIMAL sonucu %d haneyi asiyor (sinir %d)',
+              [VdbDecPrecision(dr), VDB_DEC_MAX_PREC]);
+          Exit(VdbDecToStr(dr));
+        end;
         if (Ctype = VCT_FLOAT) or (Pos('.', LeftVal) > 0) or (Pos('.', RightVal) > 0) then
         begin
           if not VDbParseFloat(LeftVal, fa) or not VDbParseFloat(RightVal, fb) then Exit('');
@@ -2925,6 +2961,10 @@ var
   hasMinV, hasMaxV: Boolean;
   savedNulls: TNulArr;
   nullKnown: Boolean;
+  // SKILL14: DECIMAL kolonda SUM/AVG tam ondalik biriktirilir.
+  sumD, dv, dres: TVdbDec;
+  hasSumD: Boolean;
+  de: string;
   // F-11: DISTINCT â€” tekrarli degerler bir kez sayilir. Hash kova ile
   // O(N); NULL degerler DISTINCT kumesine GIRMEZ (SQL standardi).
   seen: TDictionary<string, Byte>;
@@ -2932,6 +2972,7 @@ begin
   cntI := 0; sumI := 0; sumF := 0; sumC := 0; ovf := False;
   avgCnt := 0; minV := ''; maxV := '';
   hasMinV := False; hasMaxV := False;
+  sumD := VdbDecZero; hasSumD := False;
   savedNulls := FCurNulls;
   if fn.IsDistinct then
     seen := TDictionary<string, Byte>.Create
@@ -2998,8 +3039,24 @@ begin
         if seen.ContainsKey(colVal) then Continue
         else seen.Add(colVal, 0);
       Inc(cntI);
-      // D-Y1/Y2: INTEGER kolonda SUM/AVG Int64 ile tam biriktirilir.
+      // SKILL14: DECIMAL kolonda SUM/AVG TAM ondalik biriktirilir.
       if ((fn.FuncName = 'SUM') or (fn.FuncName = 'AVG')) and
+         (aggCt = VCT_DECIMAL) then
+      begin
+        if VdbDecParse(colVal, dv, de) then
+        begin
+          if not hasSumD then
+          begin
+            sumD := dv;
+            hasSumD := True;
+          end
+          else
+            VdbDecAdd(sumD, dv, sumD);
+          Inc(avgCnt);
+        end;
+      end
+      // D-Y1/Y2: INTEGER kolonda SUM/AVG Int64 ile tam biriktirilir.
+      else if ((fn.FuncName = 'SUM') or (fn.FuncName = 'AVG')) and
          (aggCt = VCT_INT) then
       begin
         if VDbParseInt(colVal, iv) then
@@ -3035,7 +3092,9 @@ begin
   begin
     if cntI > 0 then
     begin
-      if aggCt = VCT_INT then
+      if aggCt = VCT_DECIMAL then
+        Result := VdbDecToStr(sumD)
+      else if aggCt = VCT_INT then
         Result := VDbAggIntToStr(sumI, ovf, sumF)
       else
         Result := VDbFloatToStr(sumF);
@@ -3046,7 +3105,19 @@ begin
   begin
     if avgCnt > 0 then
     begin
-      if aggCt = VCT_INT then
+      if aggCt = VCT_DECIMAL then
+      begin
+        { SKILL14: AVG = SUM / n; olcek kurali max(s1+s2, 6), bolen tam
+          sayi oldugu icin s2 = 0. Sonuc yarim yukari yuvarlanir. }
+        dres := VdbDecZero;
+        dv := VdbDecFromInt64(avgCnt);
+        if sumD.Scale > 6 then
+          VdbDecDiv(sumD, dv, sumD.Scale, dres, de)
+        else
+          VdbDecDiv(sumD, dv, 6, dres, de);
+        Result := VdbDecToStr(dres);
+      end
+      else if aggCt = VCT_INT then
         Result := VDbAggAvgToStr(sumI, avgCnt, ovf, sumF)
       else
         Result := VDbFloatToStr(sumF / avgCnt);
@@ -3424,6 +3495,10 @@ var
   rr: TRangeBound;
   args: TList<TSqlExprNode>;
   argTexts: TStrArray;
+  // SKILL14: CAST(x AS DECIMAL(p,s))
+  dprec, dscl: Byte;
+  dval, dres: TVdbDec;
+  derr: string;
 begin
   { Bkz. VDbSql.ExecRaw: FPC yonetilen fonksiyon sonucunu sifirlamayabilir.
     Iade edilen gecici, onceki cagridan kalma (serbest birakilmis) bir
@@ -3474,6 +3549,18 @@ begin
       if not VDbParseInt(v, ia) then
         raise EVDbException.Create(ecTypeMismatch, 'CAST: "' + v + '" INTEGER olamiyor');
       Exit(IntToStr(ia));
+    end;
+    { SKILL14: CAST(x AS DECIMAL(p,s)) / NUMERIC(p,s). Hedef olcege
+      yarim-yukari yuvarlanir; hassasiyet tasarsa hata verilir (sessiz
+      kirpma yok, Double'a cevirme yok). }
+    if VDbDecSpecFromName(cn.TargetType, dprec, dscl) then
+    begin
+      if not VdbDecParse(v, dval, derr) then
+        raise EVDbException.Create(ecTypeMismatch,
+          'CAST: "' + v + '" DECIMAL olamiyor');
+      if not VdbDecFit(dval, dprec, dscl, dres, derr) then
+        raise EVDbException.Create(ecNumericOutOfRange, derr);
+      Exit(VdbDecToStr(dres));
     end;
     // Tip bilinmiyorsa (VARCHAR, NUMERIC vb.) metin olarak dondur.
     Exit(v);
@@ -10698,7 +10785,18 @@ begin
         if (fn.FuncName = 'COUNT') then
           OutTypes[j] := VCT_INT
         else if (fn.FuncName = 'SUM') or (fn.FuncName = 'AVG') then
-          OutTypes[j] := VCT_FLOAT
+        begin
+          { SKILL14: DECIMAL argumanda SUM/AVG sonucu da DECIMAL'dir. }
+          OutTypes[j] := VCT_FLOAT;
+          if fn.Arg is TSqlColumnRefNode then
+            for ci := 0 to High(ColNames) do
+              if SameText(ColNames[ci], TSqlColumnRefNode(fn.Arg).ColumnName) then
+              begin
+                if (ci < Length(ColTypes)) and (ColTypes[ci] = VCT_DECIMAL) then
+                  OutTypes[j] := VCT_DECIMAL;
+                Break;
+              end;
+        end
         else if ((fn.FuncName = 'MIN') or (fn.FuncName = 'MAX')) and (fn.Arg is TSqlColumnRefNode) then
         begin
           for ci := 0 to High(ColNames) do
@@ -10821,6 +10919,12 @@ type
     MinI, MaxI: Int64;       // VCT_INT icin
     MinF, MaxF: Double;      // VCT_FLOAT icin
     HasMin, HasMax: Boolean;
+    { SKILL14: DECIMAL icin TAM toplam. Double'a cevirmek tamligi bozardi;
+      bu yuzden ayri bir ondalik biriktirici tutulur (SUM ve AVG bundan
+      turer). SumDOk = False iken (hic deger yok) SUM NULL doner. }
+    SumD: TVdbDec;
+    SumDOk: Boolean;
+    MinD, MaxD: TVdbDec;
   end;
 
   TAggIterCtx = record
@@ -10846,6 +10950,9 @@ var
   iv: Int64;
   fv: Double;
   fn: TSqlFuncCallNode;
+  // SKILL14: DECIMAL yolu
+  sv, de: string;
+  dv: TVdbDec;
 begin
   ctx := User;
   if Key = VDB_SCHEMA_KEY then Exit(True);
@@ -10873,6 +10980,15 @@ begin
     end;
     // SUM/AVG/MIN/MAX: kolon tipi planda sinirlandi (INT/FLOAT/BOOL).
     case ctx.Ct[c] of
+      VCT_DECIMAL:
+        begin
+          { SKILL14: ham payload kanonik ondalik metindir; Double'a
+            cevirmeden TAM toplanir. }
+          SetLength(sv, ctx.FLen[c]);
+          if ctx.FLen[c] > 0 then
+            Move(Buf[ctx.FOff[c]], sv[1], ctx.FLen[c]);
+          if not VdbDecParse(sv, dv, de) then Exit(False);
+        end;
       VCT_INT:
         begin
           if not VDbIntFromPayload(@Buf[ctx.FOff[c]], ctx.FLen[c], iv) then
@@ -10897,7 +11013,17 @@ begin
     Inc(ctx.Plans[j].Cnt);
     Inc(ctx.Plans[j].AvgCnt);
     // D-Y1/Y2: INTEGER tam Int64, FLOAT Kahan, BOOL eski Double.
-    if ctx.Ct[c] = VCT_INT then
+    if ctx.Ct[c] = VCT_DECIMAL then
+    begin
+      if not ctx.Plans[j].SumDOk then
+      begin
+        ctx.Plans[j].SumD := dv;
+        ctx.Plans[j].SumDOk := True;
+      end
+      else
+        VdbDecAdd(ctx.Plans[j].SumD, dv, ctx.Plans[j].SumD);
+    end
+    else if ctx.Ct[c] = VCT_INT then
       VDbAggAccInt(ctx.Plans[j].SumI, ctx.Plans[j].Ovf,
         ctx.Plans[j].SumF, iv)
     else if ctx.Ct[c] = VCT_FLOAT then
@@ -10909,7 +11035,13 @@ begin
       if not ctx.Plans[j].HasMin then
       begin
         ctx.Plans[j].HasMin := True;
-        if ctx.Ct[c] = VCT_INT then ctx.Plans[j].MinI := iv else ctx.Plans[j].MinF := fv;
+        if ctx.Ct[c] = VCT_DECIMAL then ctx.Plans[j].MinD := dv
+        else if ctx.Ct[c] = VCT_INT then ctx.Plans[j].MinI := iv
+        else ctx.Plans[j].MinF := fv;
+      end
+      else if ctx.Ct[c] = VCT_DECIMAL then
+      begin
+        if VdbDecCmp(dv, ctx.Plans[j].MinD) < 0 then ctx.Plans[j].MinD := dv;
       end
       else if ctx.Ct[c] = VCT_INT then
       begin if iv < ctx.Plans[j].MinI then ctx.Plans[j].MinI := iv end
@@ -10920,7 +11052,13 @@ begin
       if not ctx.Plans[j].HasMax then
       begin
         ctx.Plans[j].HasMax := True;
-        if ctx.Ct[c] = VCT_INT then ctx.Plans[j].MaxI := iv else ctx.Plans[j].MaxF := fv;
+        if ctx.Ct[c] = VCT_DECIMAL then ctx.Plans[j].MaxD := dv
+        else if ctx.Ct[c] = VCT_INT then ctx.Plans[j].MaxI := iv
+        else ctx.Plans[j].MaxF := fv;
+      end
+      else if ctx.Ct[c] = VCT_DECIMAL then
+      begin
+        if VdbDecCmp(dv, ctx.Plans[j].MaxD) > 0 then ctx.Plans[j].MaxD := dv;
       end
       else if ctx.Ct[c] = VCT_INT then
       begin if iv > ctx.Plans[j].MaxI then ctx.Plans[j].MaxI := iv end
@@ -11144,6 +11282,9 @@ var
   // P-159: v3 satir tamponu
   useV3Par: Boolean;
   rows: TVDbRowBuf;
+  // SKILL14: DECIMAL SUM/AVG
+  dvd, dres: TVdbDec;
+  derr: string;
 begin
   Result := False;
   { --- 1) Sorgu sekli korumasi: yalnizca saf, tek tablo, tek grup --- }
@@ -11186,11 +11327,15 @@ begin
     c := FindColIdx(cr.ColumnName, cr.TableQualifier, cn);
     if c < 0 then Exit;                       // cozumsuz -> genel yol hatasi
     plans[j].Col := c;
+    { SKILL14: DECIMAL de bu hizli yola girebilir cunku VdbAggRawCb
+      degeri VdbDecParse/VdbDecCmp ile TAM ondalik isler. }
     if ((fn.FuncName = 'SUM') or (fn.FuncName = 'AVG')) and
-       not ((ct[c] = VCT_INT) or (ct[c] = VCT_FLOAT) or (ct[c] = VCT_BOOL)) then
+       not ((ct[c] = VCT_INT) or (ct[c] = VCT_FLOAT) or (ct[c] = VCT_BOOL) or
+            (ct[c] = VCT_DECIMAL)) then
       Exit;      // metin/tarih: VDbParseFloat esik davranisi birebir degil
     if ((fn.FuncName = 'MIN') or (fn.FuncName = 'MAX')) and
-       not ((ct[c] = VCT_INT) or (ct[c] = VCT_FLOAT)) then
+       not ((ct[c] = VCT_INT) or (ct[c] = VCT_FLOAT) or
+            (ct[c] = VCT_DECIMAL)) then
       Exit;      // BOOL/metin karsilastirma semantigi genel yolda farkli
   end;
 
@@ -11453,7 +11598,9 @@ begin
     begin
       if plans[j].Cnt > 0 then
       begin
-        if (plans[j].Col >= 0) and (ct[plans[j].Col] = VCT_INT) then
+        if (plans[j].Col >= 0) and (ct[plans[j].Col] = VCT_DECIMAL) then
+          Res.Rows[0][j] := VdbDecToStr(plans[j].SumD)
+        else if (plans[j].Col >= 0) and (ct[plans[j].Col] = VCT_INT) then
           Res.Rows[0][j] := VDbAggIntToStr(plans[j].SumI, plans[j].Ovf,
             plans[j].SumF)
         else
@@ -11465,7 +11612,18 @@ begin
     begin
       if plans[j].AvgCnt > 0 then
       begin
-        if (plans[j].Col >= 0) and (ct[plans[j].Col] = VCT_INT) then
+        if (plans[j].Col >= 0) and (ct[plans[j].Col] = VCT_DECIMAL) then
+        begin
+          { SKILL14: AVG = SUM / n, tam ondalik bolme. Olcek kurali
+            max(s1+s2, 6); bolen tam sayi oldugu icin s2 = 0. }
+          dvd := VdbDecFromInt64(plans[j].AvgCnt);
+          if plans[j].SumD.Scale > 6 then
+            VdbDecDiv(plans[j].SumD, dvd, plans[j].SumD.Scale, dres, derr)
+          else
+            VdbDecDiv(plans[j].SumD, dvd, 6, dres, derr);
+          Res.Rows[0][j] := VdbDecToStr(dres);
+        end
+        else if (plans[j].Col >= 0) and (ct[plans[j].Col] = VCT_INT) then
           Res.Rows[0][j] := VDbAggAvgToStr(plans[j].SumI, plans[j].AvgCnt,
             plans[j].Ovf, plans[j].SumF)
         else
@@ -11476,6 +11634,8 @@ begin
     else if fn.FuncName = 'MIN' then
     begin
       if not plans[j].HasMin then Res.Rows[0][j] := ''
+      else if ct[plans[j].Col] = VCT_DECIMAL then
+        Res.Rows[0][j] := VdbDecToStr(plans[j].MinD)
       else if ct[plans[j].Col] = VCT_INT then
         Res.Rows[0][j] := IntToStr(plans[j].MinI)
       else Res.Rows[0][j] := VDbFloatToStr(plans[j].MinF);
@@ -11483,6 +11643,8 @@ begin
     else  // MAX
     begin
       if not plans[j].HasMax then Res.Rows[0][j] := ''
+      else if ct[plans[j].Col] = VCT_DECIMAL then
+        Res.Rows[0][j] := VdbDecToStr(plans[j].MaxD)
       else if ct[plans[j].Col] = VCT_INT then
         Res.Rows[0][j] := IntToStr(plans[j].MaxI)
       else Res.Rows[0][j] := VDbFloatToStr(plans[j].MaxF);
@@ -11490,7 +11652,9 @@ begin
   end;
   { P-163: tipli sonuc kanali icin M1 cikti tipleri. COUNT -> INT,
     AVG -> FLOAT (VDbAggAvgToStr her zaman ondalik yazar), SUM int
-    kolonda INT, MIN/MAX kaynak kolon tipi. }
+    kolonda INT, MIN/MAX kaynak kolon tipi.
+    SKILL14: DECIMAL kolonda SUM/AVG/MIN/MAX sonucu da DECIMAL'dir;
+    Double'a dusurmek tamligi bozardi. }
   SetLength(Res.FieldTypes, Stmt.Columns.Count);
   for j := 0 to Stmt.Columns.Count - 1 do
   begin
@@ -11498,10 +11662,19 @@ begin
     if fn.FuncName = 'COUNT' then
       Res.FieldTypes[j] := VCT_INT
     else if fn.FuncName = 'AVG' then
-      Res.FieldTypes[j] := VCT_FLOAT
+    begin
+      if (plans[j].Col >= 0) and (plans[j].Col <= High(ct)) and
+         (ct[plans[j].Col] = VCT_DECIMAL) then
+        Res.FieldTypes[j] := VCT_DECIMAL
+      else
+        Res.FieldTypes[j] := VCT_FLOAT;
+    end
     else if fn.FuncName = 'SUM' then
     begin
       if (plans[j].Col >= 0) and (plans[j].Col <= High(ct)) and
+         (ct[plans[j].Col] = VCT_DECIMAL) then
+        Res.FieldTypes[j] := VCT_DECIMAL
+      else if (plans[j].Col >= 0) and (plans[j].Col <= High(ct)) and
          (ct[plans[j].Col] = VCT_INT) then
         Res.FieldTypes[j] := VCT_INT
       else
@@ -11929,6 +12102,10 @@ begin
       if (k < 0) or (k > High(ctM)) then Exit;
       plans[j].Col := k;
       plans[j].AggCt := ctM[k];
+      { SKILL14: bu hizli yol SUM/AVG'yi Double ile topluyor; DECIMAL'de
+        bu tamlik kaybi olurdu. Join+aggregate DECIMAL sorgulari genel
+        yoldan (ExecGroupBy + EvalAggregateValue, tam ondalik) calisir. }
+      if plans[j].AggCt = VCT_DECIMAL then Exit;
     end
     else
     begin
