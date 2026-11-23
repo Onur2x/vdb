@@ -255,6 +255,49 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   ISO metnidir; `TryJoinAgg`/`TryStreamGroupBy` DECIMAL'i reddeder (dogruluk
   genel yolda korunur, hizlandirma yoktur); hassasiyet 38 ile sinirlidir,
   Decimal256 yoktur; `TStrMatrix` API'si `''` ile NULL'i hala karistirir.
+- **SKILL16 - kriptografik rastgelelik ve bagimsiz AES-GCM KAT**: **TAMAM (v3.80)**.
+  **CSPRNG** zaten kriptografik kaynakliydi (`VDbCryptoRandom`: Windows
+  `CryptGenRandom`, Unix `/dev/urandom`; zaman tabanli yedek yol yok, kaynak
+  yoksa istisna) ve bu turda kaynak duzeyinde **kapilarak kilitlendi**:
+  `CheckRngDiscipline` alti kripto birimini (`VDbCryptoRandom`, `VDbCrypt`,
+  `VDbPageCrypto`, `VDbPgWire`, `VDbCryptoBuiltin`, `VDbNonceGuard`) tarar;
+  ciplak `Random(`/`RandSeed` yoktur ve 13 `VDbCryptRandom` cagrisinin hepsi
+  sonucu denetler. Uretim kodunda test RNG'si **yoktur** ve test RNG'si icin
+  uretim birimine hook **eklenmedi** (zayif yol bulunmamasi icin). Bu turda
+  bulunan gercek kusur: `VDbCryptEncryptLegacy` IV uretiminde
+  `VDbCryptRandom` sonucunu denetlemiyordu (RNG basarisiz olsa da zarf
+  uretmeye calisiyordu) - artik fail-closed.
+  **Bagimsiz AES-256-GCM dogrulamasi**: resmi NIST CAVP
+  `gcmEncryptExtIV256.rsp` (CAVS 14.0) alt kumesi depoya alindi
+  (`tests/crypto_kat/cavp_aes256gcm.txt`, Keylen=256/IVlen=96/Taglen=128/
+  `PTlen>0`, her (PTlen, AADlen) ailesinden Count 0 ve 1, **40 vektor**,
+  20 uzunluk ailesi); `CheckCavp` ct+tag esitligini ve `open` gidis-donusunu
+  dogrular ve alt kume Python `cryptography` AESGCM ile **40/40** yeniden
+  turetildi (`vectors=40 bad=0`). Eski "TODO: CAVP'den dogrula" notu
+  `Vectors.md`den kaldirildi.
+  **Nonce yonetimi**: yeni `VDbNonceGuard.pas` (saf Pascal, 1024 yuvali halka
+  tampon, anahtar parmak izi HMAC-SHA256 ile tutulur, anahtar saklanmaz,
+  `TRTLCriticalSection`) ayni (anahtar, nonce) ciftini reddeder;
+  `VDbPageSeal` en fazla 8 denemede taze nonce arar, bulamazsa istisna atar
+  ve **sabit nonce ile devam etmez**. Kapi surec icidir ve yeniden
+  baslatmada sifirlanir; bu yuzden nonce'lar 96-bit rastgele kalir (durust
+  sinir olarak dokumante).
+  **Negatif kume**: yanlis anahtar, yanlis nonce, bozulmus ct/tag/AAD,
+  kirpilmis etiket (0/1/8/15 bayt), bos PT, 1 MiB PT + 64 KiB AAD, ortadan
+  bozulmus ct - hepsi reddedilir; istisna da gecerli red sayilir.
+  **Bagimsiz capraz kapi**: `crypto_interop_ext` GCM icin Python
+  `cryptography` AESGCM referansiyla 5 yeni spec kosar (0/16/20/64/128 bayt
+  PT, 262144 bayt AAD dahil); referans yoksa **SKIP (77)**, PASS degil.
+  Kapilar: `crypto_kat` **155 PASS / 2 SKIP / 0 FAIL** (2 SKIP onceden
+  vardi), `crypto_interop_ext` **30/0** (25 -> 30); korunan taban cizgileri
+  `interop_external` 36/0, `interop_format` 27/0, `decimal_numeric` 93/0,
+  `decimal_core` 44/0. On-kapi (`git archive HEAD` = `df8cc07`):
+  `crypto_kat` ve `crypto_interop_ext` **derlenmez** (`VDbNonceGuard` birimi,
+  CAVP dosyasi, `GSkip`/GCM spec yok). **Durust sinir**: resmi FIPS
+  sertifikasi veya bagimsiz denetim **iddia edilmez**; CAVP dosyasi
+  pyca/cryptography deposundaki CAVP kopyasindan alinmistir ve alt kume
+  Python `cryptography` ile capraz dogrulanmistir; nonce guard kalici
+  degildir.
 - **SKILL15 - Parquet sikistirma ve bicim tamligi**: **TAMAM (v3.79)**.
   Parquet yazici artik **SNAPPY** yazabilir: `SnappyCompress` saf Pascal
   blok kodlayicidir (varint cozulmus boy, 4 baytlik hash tabanli eslesme,

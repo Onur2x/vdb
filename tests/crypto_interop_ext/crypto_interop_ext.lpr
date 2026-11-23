@@ -29,10 +29,10 @@ uses
 
 const
   SKIP_CODE = 77;
-  SPEC_COUNT = 21;
+  SPEC_COUNT = 26;
 
 var
-  GPass, GFail: Integer;
+  GPass, GFail, GSkip: Integer;
   GDir, GScript: string;
   GPy: string;
   GSpecs: array[0..SPEC_COUNT - 1] of string;
@@ -169,12 +169,19 @@ begin
   GSpecs[18] := 'PBKDF2 A 8 A 8 4096 32';
   GSpecs[19] := 'PBKDF2 A 40 A 33 1000 40';
   GSpecs[20] := 'PBKDF2 A 8 A 8 4096 64';
+  { SKILL16-B: AES-256-GCM (ct||tag) bagimsiz referansla. Deterministik
+    uretici P her iki tarafta ayni kurali uygular. }
+  GSpecs[21] := 'GCM P 32 P 12 P 0 P 0';
+  GSpecs[22] := 'GCM P 32 P 12 P 16 P 16';
+  GSpecs[23] := 'GCM P 32 P 12 P 20 P 20';
+  GSpecs[24] := 'GCM P 32 P 12 P 64 P 1000';
+  GSpecs[25] := 'GCM P 32 P 12 P 128 P 262144';
 end;
 
 function SolveSpec(const ASpec: string; out AHex: string): Boolean;
 var
   t: TStringList;
-  key, msg, pw, salt: TBytes;
+  key, msg, pw, salt, iv, ad, ct, tg: TBytes;
   it, dk: Integer;
 begin
   Result := False;
@@ -205,6 +212,24 @@ begin
         dk := StrToIntDef(t[6], 32);
         AHex := HexOf(VDbPbkdf2Sha256(pw, salt, it, dk));
         Result := True;
+      end
+      else if t[0] = 'GCM' then
+      begin
+        { SKILL16-B: VDB ciktisi ct||tag; dis referans ayni bicimi uretir. }
+        key := GenBytes(t[1], StrToIntDef(t[2], 0));
+        iv := GenBytes(t[3], StrToIntDef(t[4], 0));
+        ad := GenBytes(t[5], StrToIntDef(t[6], 0));
+        msg := GenBytes(t[7], StrToIntDef(t[8], 0));
+        if not VDbCryptGcmSeal(key, iv, msg, ad, ct, tg) then
+        begin
+          AHex := 'SEAL-FALSE';
+          Result := False;
+        end
+        else
+        begin
+          AHex := HexOf(ct) + HexOf(tg);
+          Result := True;
+        end;
       end;
     except
       on E: Exception do
@@ -227,6 +252,7 @@ var
 begin
   GPass := 0;
   GFail := 0;
+  GSkip := 0;
   AddSpecs;
   GDir := IncludeTrailingPathDelimiter(ExtractFilePath(ParamStr(0))) + 'tmp' +
     PathDelim;
@@ -283,14 +309,25 @@ begin
       if i < lines.Count then s := lines[i];
       p := LastDelimiter('|', s);
       if p > 0 then refHex := Trim(Copy(s, p + 1, MaxInt));
+      { SKILL16-B: cryptography yoksa dis referans NO-CRYPTO doner. Bu bir
+        PASS degildir: SKIP sayilir ve kapi sonda 77 ile kapanir. }
+      if Pos('NO-CRYPTO', refHex) > 0 then
+      begin
+        Inc(GSkip);
+        WriteLn('SKIP CE', i + 2, ' ', GSpecs[i],
+          ' (python cryptography yok: GCM dis referansi uretilemedi)');
+        Flush(Output);
+        Continue;
+      end;
       SolveSpec(GSpecs[i], s);
       if (refHex <> '') and (s = refHex) then Inc(okCount);
       Chk('CE' + IntToStr(i + 2) + ' ' + GSpecs[i], (refHex <> '') and
         (s = refHex),
         'vdb=' + Copy(s, 1, 32) + ' dis=' + Copy(refHex, 1, 32));
     end;
-    Chk('CE23 tum spec ler bagimsiz referansla ayni', okCount = SPEC_COUNT,
-      Format('%d/%d', [okCount, SPEC_COUNT]));
+    Chk('CE-SON tum spec ler bagimsiz referansla ayni',
+      okCount = SPEC_COUNT - GSkip,
+      Format('%d/%d, %d SKIP', [okCount, SPEC_COUNT - GSkip, GSkip]));
 
     { Durust sinir: VDB'nin HMAC anahtari 64 bayti asamaz ve PBKDF2 parolayi
       HMAC anahtari olarak kullandigi icin 64 bayttan uzun parola
@@ -306,13 +343,15 @@ begin
         if Pos('HMAC anahtari cok uzun', E.Message) > 0 then
           refHex := 'reddedildi';
     end;
-    Chk('CE24 64 bayttan uzun parola fail-closed reddedilir (sessiz kirpma yok)',
+    Chk('CE-LIM 64 bayttan uzun parola fail-closed reddedilir (sessiz kirpma yok)',
       refHex = 'reddedildi', refHex);
   finally
     lines.Free;
   end;
 
-  WriteLn('SONUC: ', GPass, ' PASS, ', GFail, ' FAIL');
+  WriteLn('SONUC: ', GPass, ' PASS, ', GFail, ' FAIL, ', GSkip, ' SKIP');
   Flush(Output);
   if GFail > 0 then Halt(1);
+  { Bagimsiz GCM referansi uretilemediyse kapi PASS sayilmaz. }
+  if GSkip > 0 then Halt(SKIP_CODE);
 end.

@@ -215,7 +215,7 @@ run_gate sql_differential "$WORK/sql_differential" sql_differential \
 run_gate crypto_core    "$WORK/crypto_core"    core_smoke
 run_gate crypto_base64  "$WORK/crypto_base64"  base64_runner
 run_gate fixtures_builtin "$FI"                gen_fixtures verify
-run_gate crypto_kat     "$WORK/crypto_kat"     kat_runner
+run_gate crypto_kat     "$WORK/crypto_kat"     kat_runner "$ROOT/tests/crypto_kat/cavp_aes256gcm.txt"
 run_gate wal_crash      "$WORK/wal_crash"      wal_crash_matrix
 run_gate kv_wal         "$WORK/kv_wal"         kv_wal_matrix
 run_gate backup_restore "$WORK/backup_restore" backup_restore

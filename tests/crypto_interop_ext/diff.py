@@ -7,11 +7,24 @@
 # disinda hesaplanir.
 #
 # Kullanim:
-#   python diff.py selftest        -> "OK hashlib"
+#   python diff.py selftest        -> "OK hashlib" / "OK hashlib gcm"
 #   python diff.py req.txt out.txt -> her satir icin "<spec> | <hex>"
+#
+# SKILL16-B: GCM spec turu eklendi. AES-256-GCM ct+tag degerleri Python
+# `cryptography` (OpenSSL tabanli, BAGIMSIZ) ile hesaplanir; VDB'nin
+# VDbCryptGcmSeal ciktisi bayt bayt karsilastirilir. cryptography yoksa
+# GCM satirlari "NO-CRYPTO" doner ve kapi bunlari SKIP olarak isaretler.
 import sys
 import hashlib
 import hmac
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    HAVE_GCM = True
+except Exception:  # noqa: BLE001 - opsiyonel dogrulama araci
+    AESGCM = None
+    HAVE_GCM = False
 
 SKIP = 77
 
@@ -40,6 +53,14 @@ def solve(spec):
         it = int(t[5])
         dk = int(t[6])
         return hashlib.pbkdf2_hmac("sha256", pw, salt, it, dk).hex()
+    if kind == "GCM":
+        if not HAVE_GCM:
+            return "NO-CRYPTO"
+        key = gen(t[1], t[2])
+        nonce = gen(t[3], t[4])
+        aad = gen(t[5], t[6])
+        pt = gen(t[7], t[8])
+        return AESGCM(key).encrypt(nonce, pt, aad).hex()
     raise ValueError("bilinmeyen tur: " + kind)
 
 
@@ -55,7 +76,7 @@ def main(argv):
         ):
             sys.stdout.write("HASHLIB BOZUK\n")
             return 2
-        sys.stdout.write("OK hashlib\n")
+        sys.stdout.write("OK hashlib" + (" gcm" if HAVE_GCM else "") + "\n")
         return 0
     out = []
     if len(argv) != 3:

@@ -35,31 +35,56 @@ ayrıca yerelde CPython `hmac` ile üretildi.
   limitasyon), (b) harness tarafında `K ← SHA-256(K)` ön-indirgemesi sonrası
   HMAC çekirdeği RFC tag'i ile doğrulanır (`HMAC(K,m)=HMAC(H(K),m)`).
 
-## 3. AES-256-GCM — `VDbCryptGcmSeal/Open` (6 vektör)
+## 3. AES-256-GCM - `VDbCryptGcmSeal/Open` (6 ornek + 40 resmi CAVP)
 
-(key, IV, AAD, PT) demetleri NIST SP 800-38D / McGrew-Viega örnekleridir.
-**NIST CAVP `gcmEncryptExtIV256.json` bu ortamdan indirilemedi** (denenen tüm
-URL'ler 404, 2026-11-13). ct/tag değerleri **bağımsız bir implementasyonla**
-(Python `cryptography` → OpenSSL) yerelde hesaplandı; üretici script:
-`%TEMP%\kat_gcm_final.py`.
+### 3.1 SP 800-38D ornek demetleri (6 vektor)
+
+(key, IV, AAD, PT) demetleri NIST SP 800-38D / McGrew-Viega ornekleridir.
+ct/tag degerleri bagimsiz bir implementasyonla (Python `cryptography` ->
+OpenSSL) yerelde hesaplandi ve asagidaki resmi CAVP kumesiyle ayni kod
+yolu uzerinden dogrulandi.
 
 | # | PT | AAD | ct | tag |
 |---|---|---|---|---|
-| V1 | boş | boş | boş | `fd2caa16a5832e76aa132c1453eeda7e` |
-| V2 | `d931…a953` (20B) | boş | `522dc1f099567d07f47f37a32a84427d643a8cdc` | `ea0c314d58d83c6c238093de1612a4de` |
-| V3 | V2 PT | `feed…dad2` (20B) | V2 ct | `10501bc85651ae8f4176d6c5a5ea9f3f` |
-| V4 | 28B | V3 AAD | `522d…d574` (28B) | `2de5dd9732afe5f27d59503701ae3bdf` |
-| V5 | 16×`0x00` (sıfır anahtar/IV) | boş | `cea7403d4d606b6e074ec5d3baf39d18` | `d0d1c8a799996bf0265b98b5d48ab919` |
-| V6 | boş (sıfır anahtar/IV) | boş | boş | `530f8afbc74536b9a963b4f1c4cb738b` |
+| V1 | bos | bos | bos | `fd2caa16a5832e76aa132c1453eeda7e` |
+| V2 | `d931...a953` (20B) | bos | `522dc1f099567d07f47f37a32a84427d643a8cdc` | `ea0c314d58d83c6c238093de1612a4de` |
+| V3 | V2 PT | `feed...dad2` (20B) | V2 ct | `10501bc85651ae8f4176d6c5a5ea9f3f` |
+| V4 | 28B | V3 AAD | `522d...d574` (28B) | `2de5dd9732afe5f27d59503701ae3bdf` |
+| V5 | 16x`0x00` (sifir anahtar/IV) | bos | `cea7403d4d606b6e074ec5d3baf39d18` | `d0d1c8a799996bf0265b98b5d48ab919` |
+| V6 | bos (sifir anahtar/IV) | bos | bos | `530f8afbc74536b9a963b4f1c4cb738b` |
 
-Anahtar `feffe992…8308` (32B), IV `cafebabefacedbaddecaf888`.
-**TODO: NIST CAVP'den doğrula** — internete erişimli bir makinede
-`gcmEncryptExtIV256.json` ile çapraz kontrol yapılmalı.
+Anahtar `feffe992...8308` (32B), IV `cafebabefacedbaddecaf888`.
 
-Ayrıca: uzunluk guard'ları, `VDBAEAD1` zarf düzeni (magic|nonce|ct|tag,
-nonce okuma, determinizm, tahrifat reddi) ve legacy CTR+HMAC zarf
-round-trip/tahrifat testleri seal'leniyor.
+### 3.2 Resmi NIST CAVP vektorleri (40 vektor, SKILL16)
 
+Kaynak: `gcmEncryptExtIV256.rsp` (CAVS 14.0, 31 Agustos 2012), NIST CAVP
+AES-GCM kumesi. Dosya pyca/cryptography deposundaki birebir kopyadan
+alindi:
+
+`https://raw.githubusercontent.com/pyca/cryptography/main/vectors/cryptography_vectors/ciphers/AES/GCM/gcmEncryptExtIV256.rsp`
+
+Secim kurali (`build/cavp_select.py`, depo disi arac): `Keylen=256`,
+`IVlen=96`, `Taglen=128`, `PTlen>0`; her `(PTlen, AADlen)` ailesinden
+`Count=0` ve `Count=1` vektorleri. Boylece 20 farkli uzunluk ailesinden
+40 vektor kapsanir (PT 128..1024 bit, AAD 0..720 bit).
+
+Alt kume depoda `tests/crypto_kat/cavp_aes256gcm.txt` olarak durur; satir
+bicimi: `PTlen AADlen Count Key IV PT AAD CT Tag` (AADlen=0 ise AAD alani
+bos string). Kapi her vektoru seal ct+tag esitligi ve open gidis-donusu ile
+dogrular (`kat_aes256gcm.pas` -> `CheckCavp`).
+
+Alt kume ayrica bagimsiz olarak Python `cryptography` AESGCM ile 40/40
+yeniden turetildi (`build/cavp_verify.py`: `vectors=40 bad=0`).
+
+### 3.3 Negatif kume ve nonce yonetimi
+
+Ek kapilar: yanlis anahtar, kirpilmis etiket (0/1/8/15 bayt), bos PT +
+bozuk etiket, 1 MiB PT + 64 KiB AAD gidis-donusu ve ortadan ct bozulmasi;
+`VDbNonceGuard` ile ayni (anahtar, nonce) ciftinin ikinci kez kabul
+edilmemesi; `VDbPageSeal` her cagride taze nonce uretmesi.
+`VDbCrypt.pas` icinde gecersiz/zayif RNG disiplini kaynak taramasindan
+gecer (kripto birimlerinde `Random(`/`RandSeed` yok, her `VDbCryptRandom`
+cagrisi sonucu denetlenir).
 ## 4. Argon2id — `VDbArgon2id` (RFC 9106 §5.3)
 
 ```

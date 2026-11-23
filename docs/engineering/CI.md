@@ -2067,3 +2067,62 @@ kaldirildi:
     bekler. pyarrow depo disidir (Windows 26.0.1, WSL 20.0.0 tekerlekten
     `PYTHONPATH` ile) ve yoksa `interop_external` **77 (SKIP)** doner,
     PASS sayilmaz.
+- Altmis ucuncu kosu (v3.80, SKILL16 - kripto rastgelelik ve bagimsiz
+  AES-GCM KAT): **Linux x86_64 67 PASS** (varsayilan) ve **68 PASS**
+  (depo disi pyarrow ile), **Windows i386 67 PASS**, FAIL 0,
+  `SUITE_EXIT=0`. Kapi sayisi degismedi (67/68). `crypto_kat`
+  **155 PASS / 2 SKIP / 0 FAIL** (onceden yalniz `RESULT: PASS` olarak
+  raporlanan iki SKIP: HMAC-SHA256 Case 5 kirpilmis etiket ve sayfa zarfi
+  resmi vektoru), `crypto_interop_ext` **30/0** (25 -> 30), korunan taban
+  cizgileri `interop_external` 36/0, `interop_format` 27/0,
+  `decimal_numeric` 93/0, `decimal_core` 44/0. SKIP'ler PASS sayilmaz:
+  iki platformda `fixtures_openssl`, `selftest_openssl`; Linux'ta
+  (pyarrow yoksa) `interop_external`, Windows'ta `tls_client`.
+  - **Sorun**: AES-256-GCM'in "bagimsiz dogrulama" iddiasi **zayifti** -
+    ct/tag degerleri `Vectors.md` icinde "TODO: NIST CAVP'den dogrula"
+    notuyla duruyordu ve ayni kod tabanindan turetilen sabitlere
+    dayaniyordu; **nonce tekrari hicbir yerde tespit edilmiyordu** (GCM'de
+    anahtar+nonce tekrari gizliligi ve butunlugu birlikte kirar); legacy
+    zarfta `VDbCryptRandom` sonucu **denetlenmiyordu** (RNG basarisiz olsa
+    da zarf uretilmeye calisiliyordu - fail-open); kripto yolunda ciplak
+    `Random(`/`RandSeed` olmadigini ve her RNG cagrisinin sonucunun
+    denetlendigini dogrulayan bir kapi yoktu.
+  - **CSPRNG**: uretim RNG'si zaten kriptografik kaynakliydi
+    (`VDbCryptoRandom`: Windows `CryptGenRandom`, Unix `/dev/urandom`,
+    zaman tabanli yedek yol yok, kaynak yoksa istisna). Bu turda kaynak
+    duzeyinde kapiya baglandi: `CheckRngDiscipline` alti kripto birimini
+    (`VDbCryptoRandom`, `VDbCrypt`, `VDbPageCrypto`, `VDbPgWire`,
+    `VDbCryptoBuiltin`, `VDbNonceGuard`) tarar - ciplak `Random(`/
+    `RandSeed` yok, 13 `VDbCryptRandom` cagrisinin hepsi sonucu denetliyor.
+    Uretim birimine test RNG'si **eklenmedi** (uretimde zayif yol
+    bulunmamasi icin). Legacy zarf IV uretimi fail-closed yapildi.
+  - **CAVP**: resmi NIST CAVP `gcmEncryptExtIV256.rsp` (CAVS 14.0) alt
+    kumesi `tests/crypto_kat/cavp_aes256gcm.txt` olarak depoya alindi
+    (Keylen=256, IVlen=96, Taglen=128, `PTlen>0`; her (PTlen, AADlen)
+    ailesinden Count 0 ve 1; **40 vektor**, 20 uzunluk ailesi). Alt kume
+    ayrica Python `cryptography` AESGCM ile **40/40** yeniden turetildi
+    (`vectors=40 bad=0`). Kaynak URL ve secim kurali `Vectors.md` bolum
+    3.2'de yazili; eski TODO notu kaldirildi.
+  - **Nonce guard**: yeni `VDbNonceGuard.pas` (saf Pascal, 1024 yuvali
+    halka tampon, anahtar parmak izi HMAC-SHA256, anahtar saklanmaz,
+    `TRTLCriticalSection`) ayni (anahtar, nonce) ciftini reddeder;
+    `VDbPageSeal` en fazla 8 denemede taze nonce arar, bulamazsa istisna
+    atar ve **sabit nonce ile devam etmez**. Guard surec icidir ve yeniden
+    baslatmada sifirlanir; nonce'lar 96-bit rastgele kalir.
+  - **Kapi kaniti**: `CheckCavp` 40 CAVP vektoru (seal ct+tag esitligi,
+    open gidis-donusu); `CheckNegatives` yanlis anahtar/nonce, bozulmus
+    ct/tag/AAD, kirpilmis etiket (0/1/8/15 bayt), bos PT, 1 MiB PT +
+    64 KiB AAD; `CheckNonceGuard` ayni ciftin reddi, farkli nonce/anahtar,
+    reset sonrasi kabul, `VDbPageSeal` iki cagride farkli zarf;
+    `crypto_interop_ext` GCM icin Python `cryptography` referansiyla 5
+    yeni spec (0/16/20/64/128 bayt PT, 262144 bayt AAD dahil) - referans
+    yoksa **77 (SKIP)**, PASS degil.
+  - **On-kapi** (`git archive HEAD` = `df8cc07`): `crypto_kat` ve
+    `crypto_interop_ext` **derlenmez** (`VDbNonceGuard` birimi,
+    `cavp_aes256gcm.txt`, `GSkip`/GCM spec yok) - kapilar ayirt edicidir.
+  - **Durust sinir**: resmi FIPS sertifikasi veya bagimsiz denetim
+    **iddia edilmez**; CAVP dosyasi pyca/cryptography deposundaki CAVP
+    kopyasindan alinmistir ve alt kume Python `cryptography` ile capraz
+    dogrulanmistir; nonce guard kalici degildir (surec ici halka tampon,
+    yeniden baslatmada sifirlanir); `/dev/urandom` ve `CryptGenRandom`
+    disinda bir CSPRNG yolu yoktur ve bulunamazsa kripto islemi reddedilir.

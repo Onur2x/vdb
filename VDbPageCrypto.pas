@@ -16,6 +16,12 @@ unit VDbPageCrypto;
   Anahtar 32 bayttir (AES-256). Parola verilirse PBKDF2-SHA256 ile tuz
   kullanilarak turetilir. Anahtar dogrulamasi icin HMAC tabanli 16 baytlik
   bir "keycheck" meta sayfada acik olarak durur (sir degil, dogrulayici).
+
+  SKILL16-D (nonce yonetimi): nonce her zarf icin OS CSPRNG'den 96 bit
+  rastgele uretilir ve VDbNonceGuard'a kaydedilir. Ayni anahtar altinda bir
+  tekrar gorulurse (pratikte ~2^-96 olasilik) zarf YENI nonce ile yeniden
+  uretilir; 8 denemede taze nonce bulunamazsa hata verilir, yani sabit bir
+  nonce ile devam EDILMEZ. Kapi surec icidir ve kalici degildir.
 }
 
 {$mode delphi}{$H+}
@@ -23,7 +29,7 @@ unit VDbPageCrypto;
 interface
 
 uses
-  SysUtils, VDbCrypt;
+  SysUtils, VDbCrypt, VDbNonceGuard;
 
 const
   VDB_ENC_NONCE_LEN = 12;
@@ -125,8 +131,12 @@ end;
 
 function VDbPageSeal(const Key, Salt: TBytes; PageNo: LongWord;
   const Plain: TBytes; out Envelope: TBytes): Boolean;
+const
+  NONCE_TRIES = 8;
 var
   nonce, cipher, tag, aad: TBytes;
+  tries: Integer;
+  marked: Boolean;
 begin
   Result := False;
   Envelope := nil;
@@ -136,8 +146,24 @@ begin
   if Length(Plain) <> 4096 then
     raise EVdbPageCrypto.Create(Format('sayfa imaji %d bayt (beklenen 4096)',
       [Length(Plain)]));
-  if not VDbCryptRandom(nonce, VDB_ENC_NONCE_LEN) then
-    raise EVdbPageCrypto.Create('nonce uretilemedi');
+  { SKILL16-D: taze nonce. Kapi tekrar gorurse yeni nonce denenir; sabit
+    nonce ile devam edilmez (fail-closed). }
+  marked := False;
+  tries := 0;
+  while tries < NONCE_TRIES do
+  begin
+    if not VDbCryptRandom(nonce, VDB_ENC_NONCE_LEN) then
+      raise EVdbPageCrypto.Create('nonce uretilemedi');
+    Inc(tries);
+    if VDbNonceMark(Key, nonce) then
+    begin
+      marked := True;
+      Break;
+    end;
+  end;
+  if not marked then
+    raise EVdbPageCrypto.Create(
+      'nonce tekrari: 8 denemede taze nonce bulunamadi');
   aad := BuildAad(Salt, PageNo);
   if not VDbCryptGcmSeal(Key, nonce, Plain, aad, cipher, tag) then
     raise EVdbPageCrypto.Create('AES-GCM sifreleme basarisiz');

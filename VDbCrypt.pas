@@ -1004,7 +1004,15 @@ begin
   DeriveKeys(Key, kEnc, kMac);
   plainLen := LongWord(Length(Plain));
   iv := nil;
-  VDbCryptRandom(iv, VDB_IV_LEN);
+  { SKILL16-E: RNG basarisizsa sabit/bos IV ile devam ETME; zarf
+    uretilmez. Eski hal sonucu yok sayiyordu ve basarisiz RNG'de
+    nil IV ile ilerliyordu. }
+  if not VDbCryptRandom(iv, VDB_IV_LEN) then
+  begin
+    OutCipher := nil;
+    Result := False;
+    Exit;
+  end;
 
   padded := ((plainLen + 15) div 16) * 16;
   if padded = 0 then padded := 16;
