@@ -165,6 +165,52 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   yolda kalir (bellek garantisi o yollarda yok); hash bolumleme/hash join/
   GROUP BY spill yoktur; gecici dizin acilamazsa sorgu sessizce maddesel
   yola doner (sonuc ayni, bellek garantisi kaybolur).
+- **SKILL13 - tipli disa aktarim ve NULL korunumu**: **TAMAM (v3.77)**.
+  Arrow ve Parquet aktariminda NULL ile **gercek bos metin/ikili** artik
+  ayridir. Mevcut `TStrMatrix` API'leri **bozulmadan** korunur (kaynak ve
+  davranis uyumlu); yeni tipli API `TVdbCellMatrix` kullanir (bu tip
+  `VDbTypes.pas` icinde **zaten vardi**, yeniden kullanildi):
+  `VDbArrowExportCells`/`VDbArrowImportCells`,
+  `VDbParquetExportCells`/`VDbParquetImportCells`, ayrica toplu yazma ve
+  parti parti okuma icin `TVdbArrowWriter` (`Create`/`WriteBatch`/`Close`),
+  `TVdbParquetWriter`, `VDbArrowReadBatches` ve `VDbParquetReadBatches`
+  (geri cagri tabanli; bellek cagriyi yapan tarafin tuttugu kadardir).
+  Yazma cekirdegi tekildir: eski yol matrisi `LegacyCellOf` ile hucreye
+  cevirip ayni cekirdegi cagirir, yani iki yol **asla** ayrisamaz; Parquet
+  tarafinda da `BuildPageCells` tek sayfa yazicisidir ve eski API
+  `RowsToParquetCells` ile ayni cekirdege gider. Okuma da tekildir
+  (`ArrowDecodeCells` / `DecodeColumn(..., out Cells)`); metin API'si
+  hucreleri metne cevirir, bu yuzden NULL hala `''` gorunur (eski
+  davranis, belgelenen sinir). Gecerlilik biti `Kind <> vckNull`'dur:
+  `vckText`/`vckBlob` ve `S=''` **gecerli bos deger** olarak yazilir,
+  Parquet'te tanim (definition) seviyesi 1 olur. Parquet yazici partiyi
+  **bir row group** olarak yazar (`BuildFileMetaGroups`), yani akisli
+  yazimda row group sayisi parti sayisidir. Kapilar: `interop_external`
+  **21/0** (X1-X8 eski + Y1-Y13 yeni; Y1/Y2 pyarrow `checkcells` NULL
+  sayilarini dogrular ve bos degerin NULL **olmadigini** acikca sinar,
+  Y3-Y5 pyarrow'un NULL + gercek `''`/`b''` karisik dosyasini VDB birebir
+  hucre olarak geri okur, Y8/Y9 3 partili yazim, Y12/Y13 pyarrow'un 40
+  batch'lik Arrow ve 50 row-groupluk Parquet dosyalarini parti parti
+  okuma) ve `interop_format` **27/0** (F0-F16 eski + F17-F22 yeni; F19
+  eski metin API'sinin `''`/NULL birlestirmesini **kasitli olarak**
+  korur). On-kapi (`git archive HEAD` = `bfb6020`): iki kapi da
+  **derlenmez** (sirasiyla 29 ve 26 x `Error: Identifier not found`, 8
+  yeni API adi) - ozellik HEAD'de yoktur. Kapi **ilk kez Linux'ta**
+  kostugunda (onceden pyarrow yoklugundan hep SKIP idi) uc test-harness
+  hatasi cikti ve duzeltildi: python argumanlari tek dizge olarak
+  geciriliyordu (`RunPyArgs` ile ayri elemanlar), basarisiz import sonrasi
+  X7 ayrintisi kosulsuz `GOut[4][2]`'ye erisip erisim ihlaliyle (exit 217)
+  dusuyordu (sinir denetimli `CellText`), ve saat beklentileri
+  `0,5 + i/86400` kayan nokta toplamindan kuruluyordu (`interop_external`
+  X4/X5/X6/X8, `interop_format` F15a/b/c; artik tam sayidan). Motor hatasi
+  degildi ve kapi zayiflatilmadan duzeltildi. **Durust sinir**: iki bicimde
+  de DECIMAL yoktur (SKILL14 sonrasi); Parquet yazimi yalniz UNCOMPRESSED
+  (SNAPPY yalniz okunur); tipli okumada Arrow DATE/TIME/DATETIME hucreleri
+  `vckText` ISO metnidir (sayisal gun/saniye degil) ve Parquet'te
+  sozluk (dictionary) kodlanmis FLOAT degerleri metin uzerinden gelir
+  (sozluk dali hala metin cozer); Parquet okuyucu dosya footer'ini ve
+  row group basina tek kolon parcacigini bellege alir, yani bellek tek
+  bir hucre parcacigi kadardir, dosya boyuyla **dogrusal degildir**.
 - **SKILL6 07 - genel hash join / maliyet modeli**: **KISMI**. `SELECT`
   tarafinda `TryStreamJoin` zaten PK arama, indeks kaynagi ve hash join
   yollarini secer (`merge_hash` kapisi M1-M13). Sprint P'de `UPDATE ... FROM`

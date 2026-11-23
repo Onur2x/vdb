@@ -25,6 +25,45 @@ function VDbArrowImport(const FileName: string;
   out Fields: TStrArray; out Types: TByteArray;
   out Rows: TStrMatrix; out Err: string): Boolean;
 
+{ SKILL13: tipli (TVdbCellMatrix) API. NULL ile bos metin/bos ikili
+  veri bu yolda birbirinden ayrilir: vckNull -> gecerlilik biti 0,
+  vckText/vckBlob (S = '') -> gecerli, sifir uzunluklu deger.
+  Eski metin API'si korunur ve ayni cekirdegi kullanir; orada '' yine
+  NULL sayilir (belgelenmis sinir). }
+function VDbArrowExportCells(const FileName: string;
+  const Fields: TStrArray; const Types: TByteArray;
+  const Cells: TVdbCellMatrix; out Err: string): Boolean;
+
+function VDbArrowImportCells(const FileName: string;
+  out Fields: TStrArray; out Types: TByteArray;
+  out Cells: TVdbCellMatrix; out Err: string): Boolean;
+
+{ SKILL13-E: toplu (batch) yazma/okuma. Dosya boyu buyuse de bellekte
+  tek bir yigin tutulur; her cagri yalnizca o yigini isler. }
+type
+  TVdbArrowWriter = class
+  private
+    FStream: TFileStream;
+    FFields: TStrArray;
+    FTypes: TByteArray;
+    FClosed: Boolean;
+    procedure WriteChunk(const Meta: TBytes; const Body: TBytes; BodyLen: Integer);
+  public
+    constructor Create(const FileName: string; const Fields: TStrArray;
+      const Types: TByteArray);
+    procedure WriteBatch(const Cells: TVdbCellMatrix);
+    procedure Close;
+    destructor Destroy; override;
+  end;
+
+  TVdbArrowBatchEvent = procedure(const Cells: TVdbCellMatrix) of object;
+
+{ SKILL13-E: akis halinde okuma. Dosya bellekte butun olarak tutulmaz;
+  her RecordBatch tek tek okunup OnBatch'e verilir. }
+function VDbArrowReadBatches(const FileName: string;
+  out Fields: TStrArray; out Types: TByteArray;
+  const OnBatch: TVdbArrowBatchEvent; out Err: string): Boolean;
+
 implementation
 
 type
@@ -617,14 +656,104 @@ end;
 
 function ExportBody(const Fields: TStrArray; const Types: TByteArray;
   const Rows: TStrMatrix; out Nodes, Buffers, Body: TBytes;
+  out BodyLen: Integer; out Err: string): Boolean; forward;
+
+{ SKILL13: tipli huceler icin deger cozumleyicileri. Hucere turu kolon
+  turuyle uyusmuyorsa metin olarak yorumlanir; boylece eski metin yolu
+  aynen korunur (or. "TRUE" yine true olur, cozulemeyen sayi 0 yazilir
+  ama gecerlilik biti 1 kalir). }
+function CellAsInt(const C: TVdbCell; out V: Int64): Boolean;
+begin
+  Result := True;
+  case C.Kind of
+    vckInt: V := C.I;
+    vckFloat: V := Trunc(C.F);
+    vckBool: if C.I <> 0 then V := 1 else V := 0;
+  else
+    if not VDbParseInt(C.S, V) then V := 0;
+  end;
+end;
+
+function CellAsFloat(const C: TVdbCell; out V: Double): Boolean;
+begin
+  Result := True;
+  case C.Kind of
+    vckFloat: V := C.F;
+    vckInt: V := C.I;
+    vckBool: if C.I <> 0 then V := 1 else V := 0;
+  else
+    if not VDbParseFloat(C.S, V) then V := 0;
+  end;
+end;
+
+function CellAsBool(const C: TVdbCell): Boolean;
+var
+  s: string;
+begin
+  case C.Kind of
+    vckBool, vckInt: Result := C.I <> 0;
+    vckFloat: Result := C.F <> 0;
+  else
+    s := LowerCase(C.S);
+    Result := (s = 'true') or (s = '1');
+  end;
+end;
+
+function CellAsStr(const C: TVdbCell): string;
+begin
+  case C.Kind of
+    vckInt: Result := IntToStr(C.I);
+    vckFloat: Result := VDbFloatToStr(C.F);
+    vckBool: if C.I <> 0 then Result := 'true' else Result := 'false';
+  else
+    Result := C.S;
+  end;
+end;
+
+{ Metin hucresini eski davranisa birebir uyan tipli hucree cevirir. }
+procedure LegacyCellOf(const S: string; Ctype: Byte; out C: TVdbCell);
+var
+  iv: Int64;
+  fv: Double;
+begin
+  C.Kind := vckNull;
+  C.I := 0;
+  C.F := 0;
+  C.S := '';
+  if S = '' then Exit;
+  case Ctype of
+    VCT_INT:
+      if VDbParseInt(S, iv) then
+      begin C.Kind := vckInt; C.I := iv; end
+      else
+      begin C.Kind := vckText; C.S := S; end;
+    VCT_FLOAT:
+      if VDbParseFloat(S, fv) then
+      begin C.Kind := vckFloat; C.F := fv; end
+      else
+      begin C.Kind := vckText; C.S := S; end;
+    VCT_BOOL:
+      begin
+        C.Kind := vckBool;
+        if (S = 'True') or (S = 'true') or (S = '1') then C.I := 1;
+      end;
+    VCT_BLOB:
+      begin C.Kind := vckBlob; C.S := S; end;
+  else
+    begin C.Kind := vckText; C.S := S; end;
+  end;
+end;
+
+function ExportBodyCells(const Fields: TStrArray; const Types: TByteArray;
+  const Cells: TVdbCellMatrix; out Nodes, Buffers, Body: TBytes;
   out BodyLen: Integer; out Err: string): Boolean;
 var
   n, i, j, nulls, bitLen: Integer;
   validity, data, offs: TBytes;
+  c: TVdbCell;
   s: string;
   iv: Int64;
   fv: Double;
-  bv: Boolean;
   p: Integer;
 begin
   Result := False;
@@ -632,29 +761,27 @@ begin
   SetLength(Body, 0);
   SetLength(Nodes, 0);
   SetLength(Buffers, 0);
-  n := Length(Rows);
+  n := Length(Cells);
   if Length(Fields) <> Length(Types) then
   begin
     Err := 'Arrow: alan/tip sayisi uyusmuyor';
     Exit;
   end;
   SetLength(Nodes, Length(Fields) * 16);
-  SetLength(Buffers, 0);
 
   for j := 0 to High(Fields) do
   begin
+    // SKILL13: NULL yalnizca vckNull'dur; '' gecerli bos degerdir.
     nulls := 0;
     for i := 0 to n - 1 do
-    begin
-      if (j >= Length(Rows[i])) or (Rows[i][j] = '') then Inc(nulls);
-    end;
+      if (j >= Length(Cells[i])) or (Cells[i][j].Kind = vckNull) then Inc(nulls);
     bitLen := (n + 7) div 8;
     SetLength(validity, bitLen);
     if bitLen > 0 then
     begin
       FillChar(validity[0], bitLen, 0);
       for i := 0 to n - 1 do
-        if (j < Length(Rows[i])) and (Rows[i][j] <> '') then
+        if (j < Length(Cells[i])) and (Cells[i][j].Kind <> vckNull) then
           validity[i shr 3] := validity[i shr 3] or (1 shl (i and 7));
     end;
 
@@ -669,10 +796,10 @@ begin
           SetLength(data, n * 8);
           if Length(data) > 0 then FillChar(data[0], Length(data), 0);
           for i := 0 to n - 1 do
-            if (j < Length(Rows[i])) and (Rows[i][j] <> '') then
+            if (j < Length(Cells[i])) and (Cells[i][j].Kind <> vckNull) then
             begin
-              if VDbParseInt(Rows[i][j], iv) then
-                WI64(data, i * 8, iv);
+              CellAsInt(Cells[i][j], iv);
+              WI64(data, i * 8, iv);
             end;
           AddBuffer(Body, BodyLen, Buffers, data);
         end;
@@ -681,9 +808,11 @@ begin
           SetLength(data, n * 8);
           if Length(data) > 0 then FillChar(data[0], Length(data), 0);
           for i := 0 to n - 1 do
-            if (j < Length(Rows[i])) and (Rows[i][j] <> '') then
-              if VDbParseFloat(Rows[i][j], fv) then
-                Move(fv, data[i * 8], 8);
+            if (j < Length(Cells[i])) and (Cells[i][j].Kind <> vckNull) then
+            begin
+              CellAsFloat(Cells[i][j], fv);
+              Move(fv, data[i * 8], 8);
+            end;
           AddBuffer(Body, BodyLen, Buffers, data);
         end;
       VCT_BOOL:
@@ -692,13 +821,9 @@ begin
           SetLength(data, bitLen);
           if Length(data) > 0 then FillChar(data[0], bitLen, 0);
           for i := 0 to n - 1 do
-            if (j < Length(Rows[i])) and (Rows[i][j] <> '') then
-            begin
-              s := LowerCase(Rows[i][j]);
-              bv := (s = 'true') or (s = '1');
-              if bv then
+            if (j < Length(Cells[i])) and (Cells[i][j].Kind <> vckNull) then
+              if CellAsBool(Cells[i][j]) then
                 data[i shr 3] := data[i shr 3] or (1 shl (i and 7));
-            end;
           AddBuffer(Body, BodyLen, Buffers, data);
         end;
       VCT_DATE:
@@ -706,9 +831,15 @@ begin
           SetLength(data, n * 4);
           if Length(data) > 0 then FillChar(data[0], Length(data), 0);
           for i := 0 to n - 1 do
-            if (j < Length(Rows[i])) and (Rows[i][j] <> '') then
-              if DateToDays(Rows[i][j], iv) then
-                WI32(data, i * 4, LongInt(iv));
+            if (j < Length(Cells[i])) and (Cells[i][j].Kind <> vckNull) then
+            begin
+              c := Cells[i][j];
+              if c.Kind = vckInt then
+                iv := c.I
+              else if not DateToDays(c.S, iv) then
+                iv := 0;
+              WI32(data, i * 4, LongInt(iv));
+            end;
           AddBuffer(Body, BodyLen, Buffers, data);
         end;
       VCT_DATETIME:
@@ -716,9 +847,15 @@ begin
           SetLength(data, n * 8);
           if Length(data) > 0 then FillChar(data[0], Length(data), 0);
           for i := 0 to n - 1 do
-            if (j < Length(Rows[i])) and (Rows[i][j] <> '') then
-              if DateTimeToSecs(Rows[i][j], iv) then
-                WI64(data, i * 8, iv);
+            if (j < Length(Cells[i])) and (Cells[i][j].Kind <> vckNull) then
+            begin
+              c := Cells[i][j];
+              if c.Kind = vckInt then
+                iv := c.I
+              else if not DateTimeToSecs(c.S, iv) then
+                iv := 0;
+              WI64(data, i * 8, iv);
+            end;
           AddBuffer(Body, BodyLen, Buffers, data);
         end;
       VCT_TIME:
@@ -726,9 +863,15 @@ begin
           SetLength(data, n * 4);
           if Length(data) > 0 then FillChar(data[0], Length(data), 0);
           for i := 0 to n - 1 do
-            if (j < Length(Rows[i])) and (Rows[i][j] <> '') then
-              if TimeToSecs(Rows[i][j], iv) then
-                WI32(data, i * 4, LongInt(iv));
+            if (j < Length(Cells[i])) and (Cells[i][j].Kind <> vckNull) then
+            begin
+              c := Cells[i][j];
+              if c.Kind = vckInt then
+                iv := c.I
+              else if not TimeToSecs(c.S, iv) then
+                iv := 0;
+              WI32(data, i * 4, LongInt(iv));
+            end;
           AddBuffer(Body, BodyLen, Buffers, data);
         end;
       else
@@ -740,12 +883,13 @@ begin
           p := 0;
           for i := 0 to n - 1 do
           begin
-            if (j < Length(Rows[i])) and (Rows[i][j] <> '') then
+            if (j < Length(Cells[i])) and (Cells[i][j].Kind <> vckNull) then
             begin
-              s := Rows[i][j];
+              s := CellAsStr(Cells[i][j]);
               if Length(data) < p + Length(s) then
                 SetLength(data, p + Length(s) + 64);
-              Move(s[1], data[p], Length(s));
+              if Length(s) > 0 then
+                Move(s[1], data[p], Length(s));
               Inc(p, Length(s));
             end;
             WI32(offs, (i + 1) * 4, LongInt(p));
@@ -759,6 +903,34 @@ begin
   Result := True;
 end;
 
+{ Eski metin API'si: '' -> NULL (belgelenmis sinir), ayni cekirdek. }
+function ExportBody(const Fields: TStrArray; const Types: TByteArray;
+  const Rows: TStrMatrix; out Nodes, Buffers, Body: TBytes;
+  out BodyLen: Integer; out Err: string): Boolean;
+var
+  i, j: Integer;
+  Cells: TVdbCellMatrix;
+begin
+  if Length(Fields) <> Length(Types) then
+  begin
+    Result := False;
+    Err := 'Arrow: alan/tip sayisi uyusmuyor';
+    Exit;
+  end;
+  SetLength(Cells, Length(Rows));
+  for i := 0 to High(Rows) do
+  begin
+    SetLength(Cells[i], Length(Fields));
+    for j := 0 to High(Fields) do
+      if j < Length(Rows[i]) then
+        LegacyCellOf(Rows[i][j], Types[j], Cells[i][j])
+      else
+        LegacyCellOf('', Types[j], Cells[i][j]);
+  end;
+  Result := ExportBodyCells(Fields, Types, Cells, Nodes, Buffers, Body,
+    BodyLen, Err);
+end;
+
 function BuildBuffers(const Fields: TStrArray; const Types: TByteArray;
   const Rows: TStrMatrix; out Nodes, Buffers, Body: TBytes;
   out BodyLen: Integer; out Err: string): Boolean;
@@ -766,70 +938,115 @@ begin
   Result := ExportBody(Fields, Types, Rows, Nodes, Buffers, Body, BodyLen, Err);
 end;
 
-function VDbArrowExport(const FileName: string;
-  const Fields: TStrArray; const Types: TByteArray;
-  const Rows: TStrMatrix; out Err: string): Boolean;
+constructor TVdbArrowWriter.Create(const FileName: string;
+  const Fields: TStrArray; const Types: TByteArray);
 var
-  schemaMsg, rbMsg: TBytes;
-  nodes, buffers, body: TBytes;
-  bodyLen, metaLen: Integer;
-  fs: TFileStream;
-  cont: LongWord;
+  schemaMsg: TBytes;
+  i: Integer;
+begin
+  if Length(Fields) <> Length(Types) then
+    raise Exception.Create('Arrow: alan/tip sayisi uyusmuyor');
+  SetLength(FFields, Length(Fields));
+  for i := 0 to High(Fields) do FFields[i] := Fields[i];
+  SetLength(FTypes, Length(Types));
+  for i := 0 to High(Types) do FTypes[i] := Types[i];
+  FClosed := False;
+  FStream := TFileStream.Create(FileName, fmCreate);
+  try
+    schemaMsg := MakeSchemaMessage(FFields, FTypes);
+    WriteChunk(schemaMsg, nil, 0);
+  except
+    FreeAndNil(FStream);
+    raise;
+  end;
+end;
+
+procedure TVdbArrowWriter.WriteChunk(const Meta: TBytes; const Body: TBytes;
+  BodyLen: Integer);
+var
+  metaLen: Integer;
   pad: TBytes;
+begin
+  if FClosed then
+    raise Exception.Create('Arrow: yazici kapatildi');
+  metaLen := AlignUp(Length(Meta), 8);
+  SetLength(pad, 8);
+  WU32(pad, 0, $FFFFFFFF);
+  WU32(pad, 4, LongWord(metaLen));
+  FStream.WriteBuffer(pad[0], 8);
+  if Length(Meta) > 0 then
+    FStream.WriteBuffer(Meta[0], Length(Meta));
+  if metaLen > Length(Meta) then
+  begin
+    SetLength(pad, metaLen - Length(Meta));
+    FillChar(pad[0], Length(pad), 0);
+    FStream.WriteBuffer(pad[0], Length(pad));
+  end;
+  if BodyLen > 0 then
+  begin
+    if BodyLen > Length(Body) then
+      raise Exception.Create('Arrow: govde tamponu kisa');
+    FStream.WriteBuffer(Body[0], BodyLen);
+  end;
+end;
+
+procedure TVdbArrowWriter.WriteBatch(const Cells: TVdbCellMatrix);
+var
+  nodes, buffers, body, rbMsg: TBytes;
+  bodyLen: Integer;
+  err: string;
+begin
+  if not ExportBodyCells(FFields, FTypes, Cells, nodes, buffers, body, bodyLen, err) then
+    raise Exception.Create(err);
+  bodyLen := AlignUp(bodyLen, 8);
+  if Length(body) < bodyLen then
+    SetLength(body, bodyLen);
+  rbMsg := MakeRecordBatchMessage(Length(Cells), nodes, buffers, bodyLen);
+  WriteChunk(rbMsg, body, bodyLen);
+end;
+
+procedure TVdbArrowWriter.Close;
+var
+  pad: TBytes;
+begin
+  if FClosed then Exit;
+  FClosed := True;
+  if FStream = nil then Exit;
+  SetLength(pad, 8);
+  WU32(pad, 0, $FFFFFFFF);
+  WU32(pad, 4, 0);
+  FStream.WriteBuffer(pad[0], 8);
+  FreeAndNil(FStream);
+end;
+
+destructor TVdbArrowWriter.Destroy;
+begin
+  try
+    Close;
+  except
+    // yikici icinde istisna yukseltilmez; kismi dosya zaten gecersizdir.
+    FreeAndNil(FStream);
+  end;
+  inherited;
+end;
+
+function VDbArrowExportCells(const FileName: string;
+  const Fields: TStrArray; const Types: TByteArray;
+  const Cells: TVdbCellMatrix; out Err: string): Boolean;
+var
+  w: TVdbArrowWriter;
 begin
   Result := False;
   Err := '';
   try
-    schemaMsg := MakeSchemaMessage(Fields, Types);
-    if not BuildBuffers(Fields, Types, Rows, nodes, buffers, body, bodyLen, Err) then
-      Exit;
-    bodyLen := AlignUp(bodyLen, 8);
-    if Length(body) < bodyLen then
-      SetLength(body, bodyLen);
-    rbMsg := MakeRecordBatchMessage(Length(Rows), nodes, buffers, bodyLen);
-    fs := TFileStream.Create(FileName, fmCreate);
+    w := TVdbArrowWriter.Create(FileName, Fields, Types);
     try
-      // Schema mesaji
-      cont := $FFFFFFFF;
-      metaLen := AlignUp(Length(schemaMsg), 8);
-      SetLength(pad, 4);
-      WU32(pad, 0, cont);
-      fs.WriteBuffer(pad[0], 4);
-      WU32(pad, 0, LongWord(metaLen));
-      fs.WriteBuffer(pad[0], 4);
-      if Length(schemaMsg) > 0 then
-        fs.WriteBuffer(schemaMsg[0], Length(schemaMsg));
-      if metaLen > Length(schemaMsg) then
-      begin
-        SetLength(pad, metaLen - Length(schemaMsg));
-        FillChar(pad[0], Length(pad), 0);
-        fs.WriteBuffer(pad[0], Length(pad));
-      end;
-      // RecordBatch mesaji
-      metaLen := AlignUp(Length(rbMsg), 8);
-      WU32(pad, 0, cont);
-      fs.WriteBuffer(pad[0], 4);
-      WU32(pad, 0, LongWord(metaLen));
-      fs.WriteBuffer(pad[0], 4);
-      if Length(rbMsg) > 0 then
-        fs.WriteBuffer(rbMsg[0], Length(rbMsg));
-      if metaLen > Length(rbMsg) then
-      begin
-        SetLength(pad, metaLen - Length(rbMsg));
-        FillChar(pad[0], Length(pad), 0);
-        fs.WriteBuffer(pad[0], Length(pad));
-      end;
-      if bodyLen > 0 then
-        fs.WriteBuffer(body[0], bodyLen);
-      // EOS
-      WU32(pad, 0, cont);
-      fs.WriteBuffer(pad[0], 4);
-      WU32(pad, 0, 0);
-      fs.WriteBuffer(pad[0], 4);
+      w.WriteBatch(Cells);
+      w.Close;
+      Result := True;
     finally
-      fs.Free;
+      w.Free;
     end;
-    Result := True;
   except
     on E: Exception do
     begin
@@ -838,6 +1055,34 @@ begin
     end;
   end;
 end;
+
+function VDbArrowExport(const FileName: string;
+  const Fields: TStrArray; const Types: TByteArray;
+  const Rows: TStrMatrix; out Err: string): Boolean;
+var
+  Cells: TVdbCellMatrix;
+  i, j: Integer;
+begin
+  Result := False;
+  Err := '';
+  if Length(Fields) <> Length(Types) then
+  begin
+    Err := 'Arrow: alan/tip sayisi uyusmuyor';
+    Exit;
+  end;
+  SetLength(Cells, Length(Rows));
+  for i := 0 to High(Rows) do
+  begin
+    SetLength(Cells[i], Length(Fields));
+    for j := 0 to High(Fields) do
+      if j < Length(Rows[i]) then
+        LegacyCellOf(Rows[i][j], Types[j], Cells[i][j])
+      else
+        LegacyCellOf('', Types[j], Cells[i][j]);
+  end;
+  Result := VDbArrowExportCells(FileName, Fields, Types, Cells, Err);
+end;
+
 
 function FbField(const B: TBytes; Table, Slot: Integer): Integer;
 var
@@ -1122,8 +1367,17 @@ begin
   Result := FormatDateTime('hh:nn:ss', UnixToDateTime(Secs));
 end;
 
-procedure ArrowDecodeBatch(const B: TBytes; const AF: TArrowFieldArray;
-  RBPos, BodyStart: Integer; BodyLen: Int64; var Rows: TStrMatrix);
+function CellOf(Kind: TVdbCellKind; I: Int64; F: Double;
+  const S: string): TVdbCell;
+begin
+  Result.Kind := Kind;
+  Result.I := I;
+  Result.F := F;
+  Result.S := S;
+end;
+
+procedure ArrowDecodeCells(const B: TBytes; const AF: TArrowFieldArray;
+  RBPos, BodyStart: Integer; BodyLen: Int64; var Cells: TVdbCellMatrix);
 var
   rowCount, oldRows, i, j, bufIdx, bufCount, nodeCount: Integer;
   row64: Int64;
@@ -1132,6 +1386,7 @@ var
   iv: Int64;
   uv: QWord;
   s: string;
+  fv: Double;
   precision: Integer;
   valid: Boolean;
 begin
@@ -1147,12 +1402,12 @@ begin
     raise Exception.CreateFmt('Arrow: dugum/alan sayisi uyusmuyor (%d/%d)',
       [nodeCount, Length(AF)]);
 
-  oldRows := Length(Rows);
+  oldRows := Length(Cells);
   if rowCount > MaxInt - oldRows then
     raise Exception.Create('Arrow: satir sayisi cok buyuk');
-  SetLength(Rows, oldRows + rowCount);
+  SetLength(Cells, oldRows + rowCount);
   for i := 0 to rowCount - 1 do
-    SetLength(Rows[oldRows + i], Length(AF));
+    SetLength(Cells[oldRows + i], Length(AF));
 
   bufIdx := 0;
   for j := 0 to High(AF) do
@@ -1184,7 +1439,7 @@ begin
         valid := ValidAt(B, BodyStart, vOff, vLen, i);
         if not valid then
         begin
-          Rows[oldRows + i][j] := '';
+          Cells[oldRows + i][j] := CellOf(vckNull, 0, 0, '');
           Continue;
         end;
         if offBytes = 4 then
@@ -1202,7 +1457,11 @@ begin
         SetLength(s, o2 - o1);
         if o2 > o1 then
           Move(B[BodyStart + dOff + o1], s[1], o2 - o1);
-        Rows[oldRows + i][j] := s;
+        // SKILL13: sifir uzunluklu metin/ikili GECERLI bir degerdir.
+        if AF[j].Ctype = VCT_BLOB then
+          Cells[oldRows + i][j] := CellOf(vckBlob, 0, 0, s)
+        else
+          Cells[oldRows + i][j] := CellOf(vckText, 0, 0, s);
       end;
     end
     else
@@ -1223,16 +1482,20 @@ begin
             begin
               valid := ValidAt(B, BodyStart, vOff, vLen, i);
               if not valid then
-                Rows[oldRows + i][j] := ''
+                Cells[oldRows + i][j] := CellOf(vckNull, 0, 0, '')
               else if AF[j].IsSigned then
               begin
                 iv := ReadSignedAt(B, BodyStart + dOff + Int64(i) * dataBytes, dataBytes);
-                Rows[oldRows + i][j] := IntToStr(iv);
+                Cells[oldRows + i][j] := CellOf(vckInt, iv, 0, '');
               end
               else
               begin
                 uv := ReadUnsignedAt(B, BodyStart + dOff + Int64(i) * dataBytes, dataBytes);
-                Rows[oldRows + i][j] := UIntToStr(uv);
+                // Int64'e sigmayan isaretsiz deger metin olarak korunur.
+                if uv <= QWord(High(Int64)) then
+                  Cells[oldRows + i][j] := CellOf(vckInt, Int64(uv), 0, '')
+                else
+                  Cells[oldRows + i][j] := CellOf(vckText, 0, 0, UIntToStr(uv));
               end;
             end;
           end;
@@ -1246,10 +1509,12 @@ begin
             begin
               valid := ValidAt(B, BodyStart, vOff, vLen, i);
               if not valid then
-                Rows[oldRows + i][j] := ''
+                Cells[oldRows + i][j] := CellOf(vckNull, 0, 0, '')
               else
-                Rows[oldRows + i][j] :=
-                  VDbFloatToStr(FbFloatAt(B, BodyStart + dOff + Int64(i) * dataBytes, precision));
+              begin
+                fv := FbFloatAt(B, BodyStart + dOff + Int64(i) * dataBytes, precision);
+                Cells[oldRows + i][j] := CellOf(vckFloat, 0, fv, '');
+              end;
             end;
           end;
         VCT_BOOL:
@@ -1258,11 +1523,11 @@ begin
             begin
               valid := ValidAt(B, BodyStart, vOff, vLen, i);
               if not valid then
-                Rows[oldRows + i][j] := ''
+                Cells[oldRows + i][j] := CellOf(vckNull, 0, 0, '')
               else if (B[BodyStart + dOff + (i shr 3)] and (1 shl (i and 7))) <> 0 then
-                Rows[oldRows + i][j] := 'true'
+                Cells[oldRows + i][j] := CellOf(vckBool, 1, 0, '')
               else
-                Rows[oldRows + i][j] := 'false';
+                Cells[oldRows + i][j] := CellOf(vckBool, 0, 0, '');
             end;
           end;
         VCT_DATE:
@@ -1274,12 +1539,13 @@ begin
             begin
               valid := ValidAt(B, BodyStart, vOff, vLen, i);
               if not valid then
-                Rows[oldRows + i][j] := ''
+                Cells[oldRows + i][j] := CellOf(vckNull, 0, 0, '')
               else
               begin
                 iv := ReadSignedAt(B, BodyStart + dOff + Int64(i) * dataBytes, dataBytes);
                 if AF[j].TimeUnit = 1 then iv := SecondsDiv(iv, 86400000);
-                Rows[oldRows + i][j] := ArrowDateStr(iv);
+                // Tarih/saat tipli hucrede de ISO metin olarak tasinir.
+                Cells[oldRows + i][j] := CellOf(vckText, 0, 0, ArrowDateStr(iv));
               end;
             end;
           end;
@@ -1292,7 +1558,7 @@ begin
             begin
               valid := ValidAt(B, BodyStart, vOff, vLen, i);
               if not valid then
-                Rows[oldRows + i][j] := ''
+                Cells[oldRows + i][j] := CellOf(vckNull, 0, 0, '')
               else
               begin
                 iv := ReadSignedAt(B, BodyStart + dOff + Int64(i) * dataBytes, dataBytes);
@@ -1301,7 +1567,7 @@ begin
                   2: iv := SecondsDiv(iv, 1000000);
                   3: iv := SecondsDiv(iv, 1000000000);
                 end;
-                Rows[oldRows + i][j] := ArrowTimeStr(iv);
+                Cells[oldRows + i][j] := CellOf(vckText, 0, 0, ArrowTimeStr(iv));
               end;
             end;
           end;
@@ -1313,7 +1579,7 @@ begin
             begin
               valid := ValidAt(B, BodyStart, vOff, vLen, i);
               if not valid then
-                Rows[oldRows + i][j] := ''
+                Cells[oldRows + i][j] := CellOf(vckNull, 0, 0, '')
               else
               begin
                 iv := RI64(B, BodyStart + dOff + Int64(i) * 8);
@@ -1322,7 +1588,7 @@ begin
                   2: iv := SecondsDiv(iv, 1000000);
                   3: iv := SecondsDiv(iv, 1000000000);
                 end;
-                Rows[oldRows + i][j] := ArrowDateTimeStr(iv);
+                Cells[oldRows + i][j] := CellOf(vckText, 0, 0, ArrowDateTimeStr(iv));
               end;
             end;
           end;
@@ -1334,9 +1600,23 @@ begin
       [bufIdx, bufCount]);
 end;
 
-function VDbArrowImport(const FileName: string;
+{ SKILL13: hucre matrisinden metin matrisi uretir; NULL '' olur. }
+procedure ArrowCellsToRows(const Cells: TVdbCellMatrix; out Rows: TStrMatrix);
+var
+  i, j: Integer;
+begin
+  SetLength(Rows, Length(Cells));
+  for i := 0 to High(Cells) do
+  begin
+    SetLength(Rows[i], Length(Cells[i]));
+    for j := 0 to High(Cells[i]) do
+      Rows[i][j] := CellAsStr(Cells[i][j]);
+  end;
+end;
+
+function ReadArrowCells(const FileName: string;
   out Fields: TStrArray; out Types: TByteArray;
-  out Rows: TStrMatrix; out Err: string): Boolean;
+  out Cells: TVdbCellMatrix; out Err: string): Boolean;
 var
   B: TBytes;
   pos, metaLen, metaStart, bodyStart, headerType, root, hdrField, hdr, blPos: Integer;
@@ -1349,7 +1629,7 @@ var
 begin
   Fields := nil;
   Types := nil;
-  Rows := nil;
+  Cells := nil;
   Err := '';
   haveSchema := False;
   try
@@ -1377,7 +1657,7 @@ begin
         raise Exception.Create('Arrow: negatif gövde uzunlugu');
       bodyStart := metaStart + metaLen;
       if (bodyStart + bodyLen > Length(B)) or (bodyLen > MaxInt) then
-        raise Exception.Create('Arrow: gövde siniri asiyor');
+        raise Exception.Create('Arrow: govde siniri asiyor');
       hdrField := FbField(B, root, 2);
       hdr := FbOffsetOf(B, hdrField);
       case headerType of
@@ -1397,7 +1677,7 @@ begin
           begin
             if not haveSchema then
               raise Exception.Create('Arrow: RecordBatch oncesi Schema yok');
-            ArrowDecodeBatch(B, AF, hdr, bodyStart, bodyLen, Rows);
+            ArrowDecodeCells(B, AF, hdr, bodyStart, bodyLen, Cells);
           end;
         else
           raise Exception.CreateFmt('Arrow: desteklenmeyen mesaj tipi %d',
@@ -1413,11 +1693,123 @@ begin
     begin
       Fields := nil;
       Types := nil;
-      Rows := nil;
+      Cells := nil;
       Err := E.Message;
       Result := False;
     end;
   end;
 end;
+
+function VDbArrowImportCells(const FileName: string;
+  out Fields: TStrArray; out Types: TByteArray;
+  out Cells: TVdbCellMatrix; out Err: string): Boolean;
+begin
+  Result := ReadArrowCells(FileName, Fields, Types, Cells, Err);
+end;
+
+function VDbArrowImport(const FileName: string;
+  out Fields: TStrArray; out Types: TByteArray;
+  out Rows: TStrMatrix; out Err: string): Boolean;
+var
+  Cells: TVdbCellMatrix;
+begin
+  Rows := nil;
+  Result := ReadArrowCells(FileName, Fields, Types, Cells, Err);
+  if Result then
+    ArrowCellsToRows(Cells, Rows);
+end;
+
+function VDbArrowReadBatches(const FileName: string;
+  out Fields: TStrArray; out Types: TByteArray;
+  const OnBatch: TVdbArrowBatchEvent; out Err: string): Boolean;
+var
+  fs: TFileStream;
+  meta: TBytes;
+  AF: TArrowFieldArray;
+  metaLen, root, typePos, headerType, hdr, blPos, i: Integer;
+  bodyLen: Int64;
+  haveSchema: Boolean;
+  cells: TVdbCellMatrix;
+begin
+  Fields := nil;
+  Types := nil;
+  Err := '';
+  haveSchema := False;
+  AF := nil;
+  fs := nil;
+  try
+    fs := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
+    while fs.Position + 8 <= fs.Size do
+    begin
+      SetLength(meta, 8);
+      fs.ReadBuffer(meta[0], 8);
+      if RU32(meta, 0) <> $FFFFFFFF then
+        raise Exception.Create('Arrow: gecersiz stream devam isareti');
+      metaLen := Integer(RU32(meta, 4));
+      if metaLen = 0 then Break;   // EOS
+      if (metaLen < 0) or (fs.Position + metaLen > fs.Size) then
+        raise Exception.Create('Arrow: metadata siniri asiyor');
+      SetLength(meta, metaLen);
+      fs.ReadBuffer(meta[0], metaLen);
+      root := Integer(RU32(meta, 0));
+      typePos := FbField(meta, root, 1);
+      if typePos = 0 then
+        raise Exception.Create('Arrow: mesaj tipi alani yok');
+      headerType := meta[typePos];
+      blPos := FbField(meta, root, 3);
+      if blPos <> 0 then bodyLen := RI64(meta, blPos) else bodyLen := 0;
+      if (bodyLen < 0) or (bodyLen > MaxInt) then
+        raise Exception.Create('Arrow: gecersiz govde uzunlugu');
+      if fs.Position + bodyLen > fs.Size then
+        raise Exception.Create('Arrow: govde siniri asiyor');
+      hdr := FbOffsetOf(meta, FbField(meta, root, 2));
+      case headerType of
+        1:
+          begin
+            ArrowParseSchema(meta, hdr, AF);
+            SetLength(Fields, Length(AF));
+            SetLength(Types, Length(AF));
+            for i := 0 to High(AF) do
+            begin
+              Fields[i] := AF[i].Name;
+              Types[i] := AF[i].Ctype;
+            end;
+            haveSchema := True;
+          end;
+        3:
+          begin
+            if not haveSchema then
+              raise Exception.Create('Arrow: RecordBatch oncesi Schema yok');
+            // Govde metadata'nin hemen ardina eklenir; tek yigin.
+            SetLength(meta, metaLen + Integer(bodyLen));
+            if bodyLen > 0 then
+              fs.ReadBuffer(meta[metaLen], bodyLen);
+            cells := nil;
+            ArrowDecodeCells(meta, AF, hdr, metaLen, bodyLen, cells);
+            if Assigned(OnBatch) then OnBatch(cells);
+          end;
+        else
+          raise Exception.CreateFmt('Arrow: desteklenmeyen mesaj tipi %d',
+            [headerType]);
+      end;
+      if (headerType <> 3) and (bodyLen > 0) then
+        fs.Seek(bodyLen, soCurrent);
+    end;
+    if not haveSchema then
+      raise Exception.Create('Arrow: Schema mesaji bulunamadi');
+    Result := True;
+  except
+    on E: Exception do
+    begin
+      Fields := nil;
+      Types := nil;
+      Err := E.Message;
+      Result := False;
+    end;
+  end;
+  FreeAndNil(fs);
+end;
+
+end.
 
 end.

@@ -35,6 +35,62 @@ function VDbParquetImport(const FileName: string;
   out Fields: TStrArray; out Types: TByteArray;
   out Rows: TStrMatrix; out Err: string): Boolean;
 
+{ SKILL13: tipli API. NULL (tanim seviyesi 0) ile bos metin/bos ikili
+  veri (tanim seviyesi 1, sifir uzunluk) ayrilir. Eski metin API'si
+  korunur ve ayni cekirdegi kullanir; orada '' yine NULL sayilir. }
+function VDbParquetExportCells(const FileName: string;
+  const Fields: TStrArray; const Types: TByteArray;
+  const Cells: TVdbCellMatrix; out Err: string): Boolean;
+
+function VDbParquetImportCells(const FileName: string;
+  out Fields: TStrArray; out Types: TByteArray;
+  out Cells: TVdbCellMatrix; out Err: string): Boolean;
+
+{ SKILL13-E: toplu yazma. Her WriteBatch ayri bir satir grubu olur;
+  veri bellekte birikmez, yalnizca satir grubu ustbilgisi tutulur.
+  Kuyruk (footer) Close'ta yazilir. }
+type
+  TColWrite = record
+    Name: string;
+    PType: Integer;
+    Converted: Integer;
+    LogicalKind: Integer;
+    LogicalUnit: Integer;
+    VType: Byte;
+    DataOffset: Int64;
+    TotalSize: Int64;
+    NumValues: Int64;
+  end;
+
+  TParquetGroupWrite = record
+    Cols: array of TColWrite;
+    NumRows: Int64;
+  end;
+
+  TVdbParquetBatchEvent = procedure(const Cells: TVdbCellMatrix) of object;
+
+  TVdbParquetWriter = class
+  private
+    FStream: TFileStream;
+    FFields: TStrArray;
+    FTypes: TByteArray;
+    FGroups: array of TParquetGroupWrite;
+    FNumRows: Int64;
+    FClosed: Boolean;
+  public
+    constructor Create(const FileName: string; const Fields: TStrArray;
+      const Types: TByteArray);
+    procedure WriteBatch(const Cells: TVdbCellMatrix);
+    procedure Close;
+    destructor Destroy; override;
+  end;
+
+{ SKILL13-E: akis halinde okuma. Dosya butun olarak bellekte tutulmaz;
+  her satir grubu (kolon dilimi) tek tek okunup OnBatch'e verilir. }
+function VDbParquetReadBatches(const FileName: string;
+  out Fields: TStrArray; out Types: TByteArray;
+  const OnBatch: TVdbParquetBatchEvent; out Err: string): Boolean;
+
 implementation
 
 const
@@ -180,17 +236,8 @@ type
     RowGroups: array of TParquetRowGroup;
   end;
 
-  TColWrite = record
-    Name: string;
-    PType: Integer;
-    Converted: Integer;
-    LogicalKind: Integer;
-    LogicalUnit: Integer;
-    VType: Byte;
-    DataOffset: Int64;
-    TotalSize: Int64;
-    NumValues: Int64;
-  end;
+  TVdbCellArray = array of TVdbCell;
+  TParquetSchemaArray = array of TParquetSchemaElem;
 
   TPageHeader = record
     PageType: Integer;
@@ -1444,12 +1491,24 @@ begin
   W.EndStruct;
 end;
 
-function BuildPage(ColIdx: Integer; const Fields: TStrArray;
-  const Types: TByteArray; const Rows: TStrMatrix;
+function ParquetCellStr(const C: TVdbCell): string;
+begin
+  case C.Kind of
+    vckInt: Result := IntToStr(C.I);
+    vckFloat: Result := VDbFloatToStr(C.F);
+    vckBool: if C.I <> 0 then Result := 'true' else Result := 'false';
+  else
+    Result := C.S;
+  end;
+end;
+
+function BuildPageCells(ColIdx: Integer; const Fields: TStrArray;
+  const Types: TByteArray; const Cells: TVdbCellMatrix;
   out Header, Body: TBytes): Boolean;
 var
   bits, values, def: TBytes;
   n, i, present, boolPos: Integer;
+  c: TVdbCell;
   s: string;
   iv: Int64;
   dv: Double;
@@ -1459,16 +1518,21 @@ var
   W: TThriftWriter;
 begin
   Result := False;
-  n := Length(Rows);
+  n := Length(Cells);
   SetLength(bits, (n + 7) div 8);
   if Length(bits) > 0 then FillChar(bits[0], Length(bits), 0);
   SetLength(values, 0);
   present := 0;
+  // SKILL13: yalnizca vckNull tanim seviyesi 0'dir; bos metin/ikili
+  // veri tanimli (seviye 1) ve sifir uzunluktadir.
   for i := 0 to n - 1 do
   begin
-    s := '';
-    if ColIdx < Length(Rows[i]) then s := Rows[i][ColIdx];
-    if s <> '' then
+    c.Kind := vckNull;
+    c.I := 0;
+    c.F := 0;
+    c.S := '';
+    if ColIdx < Length(Cells[i]) then c := Cells[i][ColIdx];
+    if c.Kind <> vckNull then
     begin
       bits[i div 8] := bits[i div 8] or (1 shl (i mod 8));
       Inc(present);
@@ -1483,15 +1547,24 @@ begin
   end;
   for i := 0 to n - 1 do
   begin
-    s := '';
-    if ColIdx < Length(Rows[i]) then s := Rows[i][ColIdx];
-    if s = '' then Continue;
+    c.Kind := vckNull;
+    c.I := 0;
+    c.F := 0;
+    c.S := '';
+    if ColIdx < Length(Cells[i]) then c := Cells[i][ColIdx];
+    if c.Kind = vckNull then Continue;
     case ptype of
       PT_BOOLEAN:
         begin
           byt := 0;
-          if s = '1' then byt := 1;
-          if SameText(s, 'true') or SameText(s, 'yes') then byt := 1;
+          case c.Kind of
+            vckBool, vckInt: if c.I <> 0 then byt := 1;
+            vckFloat: if c.F <> 0 then byt := 1;
+          else
+            s := c.S;
+            if s = '1' then byt := 1;
+            if SameText(s, 'true') or SameText(s, 'yes') then byt := 1;
+          end;
           if byt <> 0 then
             values[boolPos div 8] := values[boolPos div 8] or (1 shl (boolPos mod 8));
           Inc(boolPos);
@@ -1500,37 +1573,65 @@ begin
         begin
           if Types[ColIdx] = VCT_DATE then
           begin
-            if not TryDateDays(s, iv) then
-              raise Exception.Create('Parquet: gecersiz DATE: ' + s);
+            if c.Kind = vckInt then
+              iv := c.I
+            else if not TryDateDays(c.S, iv) then
+              raise Exception.Create('Parquet: gecersiz DATE: ' + c.S);
             BufI32(values, Integer(iv));
           end
           else if Types[ColIdx] = VCT_TIME then
           begin
-            if not TryTimeSecs(s, iv) then
-              raise Exception.Create('Parquet: gecersiz TIME: ' + s);
+            if c.Kind = vckInt then
+              iv := c.I
+            else if not TryTimeSecs(c.S, iv) then
+              raise Exception.Create('Parquet: gecersiz TIME: ' + c.S);
             BufI32(values, Integer(iv * 1000));
           end
           else
-            BufI32(values, StrToInt(s));
+          begin
+            if c.Kind = vckInt then
+              iv := c.I
+            else if c.Kind = vckFloat then
+              iv := Trunc(c.F)
+            else
+              iv := StrToInt(c.S);
+            BufI32(values, Integer(iv));
+          end;
         end;
       PT_INT64:
         begin
           if Types[ColIdx] = VCT_DATETIME then
           begin
-            if not TryDateTimeSecs(s, iv) then
-              raise Exception.Create('Parquet: gecersiz DATETIME: ' + s);
+            if c.Kind = vckInt then
+              iv := c.I
+            else if not TryDateTimeSecs(c.S, iv) then
+              raise Exception.Create('Parquet: gecersiz DATETIME: ' + c.S);
             BufI64(values, iv * 1000);
           end
           else
-            BufI64(values, StrToInt64(s));
+          begin
+            if c.Kind = vckInt then
+              iv := c.I
+            else if c.Kind = vckFloat then
+              iv := Trunc(c.F)
+            else
+              iv := StrToInt64(c.S);
+            BufI64(values, iv);
+          end;
         end;
       PT_DOUBLE:
         begin
-          dv := FloatFromStr(s);
+          case c.Kind of
+            vckFloat: dv := c.F;
+            vckInt: dv := c.I;
+            vckBool: if c.I <> 0 then dv := 1 else dv := 0;
+          else
+            dv := FloatFromStr(c.S);
+          end;
           BufDouble(values, dv);
         end;
       PT_BYTE_ARRAY:
-        BufByteArray(values, s);
+        BufByteArray(values, ParquetCellStr(c));
     end;
   end;
   def := EncodeDefLevels(bits, n);
@@ -1559,10 +1660,42 @@ begin
   Result := True;
 end;
 
-function BuildFileMeta(const Cols: array of TColWrite; NumRows: Int64): TBytes;
+{ Eski metin API'si: '' -> NULL, ayni cekirdek (belgelenmis sinir). }
+procedure RowsToParquetCells(const Fields: TStrArray; const Types: TByteArray;
+  const Rows: TStrMatrix; out Cells: TVdbCellMatrix);
+var
+  i, j: Integer;
+  s: string;
+begin
+  SetLength(Cells, Length(Rows));
+  for i := 0 to High(Rows) do
+  begin
+    SetLength(Cells[i], Length(Fields));
+    for j := 0 to High(Fields) do
+    begin
+      s := '';
+      if j < Length(Rows[i]) then s := Rows[i][j];
+      Cells[i][j].Kind := vckNull;
+      Cells[i][j].I := 0;
+      Cells[i][j].F := 0;
+      Cells[i][j].S := '';
+      if s <> '' then
+      begin
+        if Types[j] = VCT_BLOB then
+          Cells[i][j].Kind := vckBlob
+        else
+          Cells[i][j].Kind := vckText;
+        Cells[i][j].S := s;
+      end;
+    end;
+  end;
+end;
+
+function BuildFileMetaGroups(const SchemaCols: array of TColWrite;
+  const Groups: array of TParquetGroupWrite; TotalRows: Int64): TBytes;
 var
   W: TThriftWriter;
-  i: Integer;
+  i, j, nGroups: Integer;
   total: Int64;
 begin
   W := TThriftWriter.Create;
@@ -1570,62 +1703,64 @@ begin
     W.BeginStruct;
     W.WriteI32Field(1, 1); // version
     W.Field(2, TT_LIST);
-    W.ListHeader(TT_STRUCT, Length(Cols) + 1);
+    W.ListHeader(TT_STRUCT, Length(SchemaCols) + 1);
     // root
     W.BeginStruct;
     W.WriteBinaryField(4, 'schema');
-    W.WriteI32Field(5, Length(Cols));
+    W.WriteI32Field(5, Length(SchemaCols));
     W.EndStruct;
-    for i := 0 to High(Cols) do
+    for i := 0 to High(SchemaCols) do
     begin
       W.BeginStruct;
-      W.WriteI32Field(1, Cols[i].PType);
+      W.WriteI32Field(1, SchemaCols[i].PType);
       W.WriteI32Field(3, REP_OPTIONAL);
-      W.WriteBinaryField(4, Cols[i].Name);
-      if Cols[i].Converted >= 0 then
-        W.WriteI32Field(6, Cols[i].Converted);
-      WriteLogicalType(W, Cols[i].LogicalKind, Cols[i].LogicalUnit);
+      W.WriteBinaryField(4, SchemaCols[i].Name);
+      if SchemaCols[i].Converted >= 0 then
+        W.WriteI32Field(6, SchemaCols[i].Converted);
+      WriteLogicalType(W, SchemaCols[i].LogicalKind, SchemaCols[i].LogicalUnit);
       W.EndStruct;
     end;
 
-    W.WriteI64Field(3, NumRows);
+    W.WriteI64Field(3, TotalRows);
     W.Field(4, TT_LIST);
-    if NumRows > 0 then
+    nGroups := 0;
+    for i := 0 to High(Groups) do
+      if Groups[i].NumRows > 0 then Inc(nGroups);
+    W.ListHeader(TT_STRUCT, nGroups);
+    for i := 0 to High(Groups) do
     begin
-      W.ListHeader(TT_STRUCT, 1);
+      if Groups[i].NumRows <= 0 then Continue;
       W.BeginStruct;
       W.Field(1, TT_LIST);
-      W.ListHeader(TT_STRUCT, Length(Cols));
+      W.ListHeader(TT_STRUCT, Length(Groups[i].Cols));
       total := 0;
-      for i := 0 to High(Cols) do
+      for j := 0 to High(Groups[i].Cols) do
       begin
-        Inc(total, Cols[i].TotalSize);
+        Inc(total, Groups[i].Cols[j].TotalSize);
         W.BeginStruct;
-        W.WriteI64Field(2, Cols[i].DataOffset);
+        W.WriteI64Field(2, Groups[i].Cols[j].DataOffset);
         W.Field(3, TT_STRUCT);
         W.BeginStruct;
-        W.WriteI32Field(1, Cols[i].PType);
+        W.WriteI32Field(1, Groups[i].Cols[j].PType);
         W.Field(2, TT_LIST);
         W.ListHeader(TT_I32, 2);
         W.WriteI32Value(ENC_PLAIN);
         W.WriteI32Value(ENC_RLE);
         W.Field(3, TT_LIST);
         W.ListHeader(TT_BINARY, 1);
-        W.WriteBinaryValue(Cols[i].Name);
+        W.WriteBinaryValue(Groups[i].Cols[j].Name);
         W.WriteI32Field(4, CODEC_UNCOMPRESSED);
-        W.WriteI64Field(5, Cols[i].NumValues);
-        W.WriteI64Field(6, Cols[i].TotalSize);
-        W.WriteI64Field(7, Cols[i].TotalSize);
-        W.WriteI64Field(9, Cols[i].DataOffset);
+        W.WriteI64Field(5, Groups[i].Cols[j].NumValues);
+        W.WriteI64Field(6, Groups[i].Cols[j].TotalSize);
+        W.WriteI64Field(7, Groups[i].Cols[j].TotalSize);
+        W.WriteI64Field(9, Groups[i].Cols[j].DataOffset);
         W.EndStruct;
         W.EndStruct;
       end;
       W.WriteI64Field(2, total);
-      W.WriteI64Field(3, NumRows);
+      W.WriteI64Field(3, Groups[i].NumRows);
       W.EndStruct;
-    end
-    else
-      W.ListHeader(TT_STRUCT, 0);
+    end;
     W.WriteBinaryField(6, 'VDb Parquet');
     W.EndStruct;
     Result := W.Finish;
@@ -1634,69 +1769,169 @@ begin
   end;
 end;
 
-function VDbParquetExport(const FileName: string;
-  const Fields: TStrArray; const Types: TByteArray;
-  const Rows: TStrMatrix; out Err: string): Boolean;
+function BuildFileMeta(const Cols: array of TColWrite; NumRows: Int64): TBytes;
 var
-  fs: TFileStream;
-  Cols: array of TColWrite;
-  i, n: Integer;
-  Header, Body, Meta: TBytes;
+  Groups: array of TParquetGroupWrite;
+  i: Integer;
+begin
+  if NumRows > 0 then
+  begin
+    SetLength(Groups, 1);
+    Groups[0].NumRows := NumRows;
+    SetLength(Groups[0].Cols, Length(Cols));
+    for i := 0 to High(Cols) do
+      Groups[0].Cols[i] := Cols[i];
+  end;
+  Result := BuildFileMetaGroups(Cols, Groups, NumRows);
+end;
+
+constructor TVdbParquetWriter.Create(const FileName: string;
+  const Fields: TStrArray; const Types: TByteArray);
+const
   Magic: array[0..3] of Char = ('P', 'A', 'R', '1');
-  L: LongWord;
+var
+  i: Integer;
+begin
+  if Length(Fields) <> Length(Types) then
+    raise Exception.Create('Parquet: alan/tip sayisi uyusmuyor');
+  SetLength(FFields, Length(Fields));
+  for i := 0 to High(Fields) do FFields[i] := Fields[i];
+  SetLength(FTypes, Length(Types));
+  for i := 0 to High(Types) do FTypes[i] := Types[i];
+  FNumRows := 0;
+  FClosed := False;
+  FStream := TFileStream.Create(FileName, fmCreate);
+  FStream.WriteBuffer(Magic, 4);
+end;
+
+procedure TVdbParquetWriter.WriteBatch(const Cells: TVdbCellMatrix);
+var
+  g: TParquetGroupWrite;
+  i: Integer;
+  Header, Body: TBytes;
   conv, lk, lu: Integer;
+begin
+  if FClosed then
+    raise Exception.Create('Parquet: yazici kapatildi');
+  if Length(Cells) = 0 then Exit;
+  SetLength(g.Cols, Length(FFields));
+  g.NumRows := Length(Cells);
+  for i := 0 to High(FFields) do
+  begin
+    if not BuildPageCells(i, FFields, FTypes, Cells, Header, Body) then
+      raise Exception.Create('Parquet: sayfa olusturulamadi');
+    g.Cols[i].Name := FFields[i];
+    g.Cols[i].PType := ParquetTypeOf(FTypes[i], conv, lk, lu);
+    g.Cols[i].Converted := conv;
+    g.Cols[i].LogicalKind := lk;
+    g.Cols[i].LogicalUnit := lu;
+    g.Cols[i].VType := FTypes[i];
+    g.Cols[i].DataOffset := FStream.Position;
+    if Length(Header) > 0 then FStream.WriteBuffer(Header[0], Length(Header));
+    if Length(Body) > 0 then FStream.WriteBuffer(Body[0], Length(Body));
+    g.Cols[i].TotalSize := Int64(Length(Header)) + Length(Body);
+    g.Cols[i].NumValues := Length(Cells);
+  end;
+  SetLength(FGroups, Length(FGroups) + 1);
+  FGroups[High(FGroups)] := g;
+  Inc(FNumRows, Length(Cells));
+end;
+
+procedure TVdbParquetWriter.Close;
+const
+  Magic: array[0..3] of Char = ('P', 'A', 'R', '1');
+var
+  SchemaCols: array of TColWrite;
+  Meta: TBytes;
+  L: LongWord;
+  i: Integer;
+  conv, lk, lu: Integer;
+begin
+  if FClosed then Exit;
+  FClosed := True;
+  if FStream = nil then Exit;
+  // Sema her zaman alan listesinden uretilir; satir grubu olmasa da gecerli.
+  SetLength(SchemaCols, Length(FFields));
+  for i := 0 to High(FFields) do
+  begin
+    SchemaCols[i].Name := FFields[i];
+    SchemaCols[i].PType := ParquetTypeOf(FTypes[i], conv, lk, lu);
+    SchemaCols[i].Converted := conv;
+    SchemaCols[i].LogicalKind := lk;
+    SchemaCols[i].LogicalUnit := lu;
+    SchemaCols[i].VType := FTypes[i];
+    SchemaCols[i].DataOffset := 0;
+    SchemaCols[i].TotalSize := 0;
+    SchemaCols[i].NumValues := 0;
+  end;
+  Meta := BuildFileMetaGroups(SchemaCols, FGroups, FNumRows);
+  if Length(Meta) > 0 then FStream.WriteBuffer(Meta[0], Length(Meta));
+  L := LongWord(Length(Meta));
+  FStream.WriteBuffer(L, 4);
+  FStream.WriteBuffer(Magic, 4);
+  FreeAndNil(FStream);
+end;
+
+destructor TVdbParquetWriter.Destroy;
+begin
+  try
+    Close;
+  except
+    FreeAndNil(FStream);
+  end;
+  inherited;
+end;
+
+function VDbParquetExportCells(const FileName: string;
+  const Fields: TStrArray; const Types: TByteArray;
+  const Cells: TVdbCellMatrix; out Err: string): Boolean;
+var
+  w: TVdbParquetWriter;
 begin
   Result := False;
   Err := '';
   try
-    if Length(Fields) <> Length(Types) then
-      raise Exception.Create('Parquet: alan/tip sayisi uyusmuyor');
-    n := Length(Rows);
-    for i := 0 to High(Rows) do
-      if Length(Rows[i]) <> Length(Fields) then
-        raise Exception.Create('Parquet: satir alan sayisi uyusmuyor');
-
-    SetLength(Cols, Length(Fields));
-    for i := 0 to High(Fields) do
-    begin
-      Cols[i].Name := Fields[i];
-      Cols[i].PType := ParquetTypeOf(Types[i], conv, lk, lu);
-      Cols[i].Converted := conv;
-      Cols[i].LogicalKind := lk;
-      Cols[i].LogicalUnit := lu;
-      Cols[i].VType := Types[i];
-      Cols[i].DataOffset := 4;
-      Cols[i].TotalSize := 0;
-      Cols[i].NumValues := n;
-    end;
-
-    fs := TFileStream.Create(FileName, fmCreate);
+    w := TVdbParquetWriter.Create(FileName, Fields, Types);
     try
-      fs.WriteBuffer(Magic, 4);
-      if n > 0 then
-        for i := 0 to High(Cols) do
-        begin
-          if not BuildPage(i, Fields, Types, Rows, Header, Body) then
-            raise Exception.Create('Parquet: sayfa olusturulamadi');
-          Cols[i].DataOffset := fs.Position;
-          if Length(Header) > 0 then fs.WriteBuffer(Header[0], Length(Header));
-          if Length(Body) > 0 then fs.WriteBuffer(Body[0], Length(Body));
-          Cols[i].TotalSize := Int64(Length(Header)) + Length(Body);
-        end;
-      Meta := BuildFileMeta(Cols, n);
-      if Length(Meta) > 0 then fs.WriteBuffer(Meta[0], Length(Meta));
-      L := LongWord(Length(Meta));
-      fs.WriteBuffer(L, 4);
-      fs.WriteBuffer(Magic, 4);
+      w.WriteBatch(Cells);
+      w.Close;
+      Result := True;
     finally
-      fs.Free;
+      w.Free;
     end;
-    Result := True;
   except
     on E: Exception do
+    begin
       Err := E.Message;
+      Result := False;
+    end;
   end;
 end;
+
+function VDbParquetExport(const FileName: string;
+  const Fields: TStrArray; const Types: TByteArray;
+  const Rows: TStrMatrix; out Err: string): Boolean;
+var
+  Cells: TVdbCellMatrix;
+  i: Integer;
+begin
+  Result := False;
+  Err := '';
+  if Length(Fields) <> Length(Types) then
+  begin
+    Err := 'Parquet: alan/tip sayisi uyusmuyor';
+    Exit;
+  end;
+  for i := 0 to High(Rows) do
+    if Length(Rows[i]) <> Length(Fields) then
+    begin
+      Err := 'Parquet: satir alan sayisi uyusmuyor';
+      Exit;
+    end;
+  RowsToParquetCells(Fields, Types, Rows, Cells);
+  Result := VDbParquetExportCells(FileName, Fields, Types, Cells, Err);
+end;
+
 
 { --------------------------------------------------------- Parquet oku }
 
@@ -1734,8 +1969,50 @@ begin
   end;
 end;
 
-procedure DecodeColumn(const Data: TBytes; const CM: TParquetColumnMeta;
-  const SE: TParquetSchemaElem; GroupRows: Integer; out Values: TStrArray);
+function ParquetCellOf(const S: string; VType: Byte): TVdbCell;
+begin
+  Result.Kind := vckNull;
+  Result.I := 0;
+  Result.F := 0;
+  Result.S := '';
+  case VType of
+    VCT_INT:
+      begin
+        if TryStrToInt64(S, Result.I) then
+          Result.Kind := vckInt
+        else
+        begin
+          Result.Kind := vckText;
+          Result.S := S;
+        end;
+      end;
+    VCT_FLOAT:
+      begin
+        Result.Kind := vckFloat;
+        Result.F := FloatFromStr(S);
+      end;
+    VCT_BOOL:
+      begin
+        Result.Kind := vckBool;
+        if SameText(S, 'true') or (S = '1') then Result.I := 1;
+      end;
+    VCT_BLOB:
+      begin
+        Result.Kind := vckBlob;
+        Result.S := S;
+      end;
+  else
+    begin
+      Result.Kind := vckText;
+      Result.S := S;
+    end;
+  end;
+end;
+
+procedure DecodeColumn(const Data: TBytes; Base: Int64;
+  const CM: TParquetColumnMeta;
+  const SE: TParquetSchemaElem; GroupRows: Integer; out Values: TStrArray;
+  out Cells: TVdbCellArray);
 var
   off: Int64;
   H: TPageHeader;
@@ -1748,6 +2025,7 @@ var
   maxDef: Integer;
   defLen, defPos: Integer;
   encoding: Integer;
+  vtype: Byte;
   nums: array of Int64;
   vals: array of Double;
   bools: array of Boolean;
@@ -1932,6 +2210,19 @@ var
             PT_INT96:
               Values[rowPos + k] := int96[cnt];
           end;
+        // SKILL13: tipli hucre. Kayan nokta sozluk disinda ham
+        // Double'dan alinir (metin yuvarlamasina guvenilmez).
+        if isDict then
+          Cells[rowPos + k] := ParquetCellOf(strs[cnt], vtype)
+        else if (SE.PType = PT_FLOAT) or (SE.PType = PT_DOUBLE) then
+        begin
+          Cells[rowPos + k].Kind := vckFloat;
+          Cells[rowPos + k].I := 0;
+          Cells[rowPos + k].F := vals[cnt];
+          Cells[rowPos + k].S := '';
+        end
+        else
+          Cells[rowPos + k] := ParquetCellOf(Values[rowPos + k], vtype);
         Inc(cnt);
       end;
     end;
@@ -1941,6 +2232,15 @@ var
 begin
   SetLength(Values, GroupRows);
   for i := 0 to GroupRows - 1 do Values[i] := '';
+  SetLength(Cells, GroupRows);
+  for i := 0 to GroupRows - 1 do
+  begin
+    Cells[i].Kind := vckNull;
+    Cells[i].I := 0;
+    Cells[i].F := 0;
+    Cells[i].S := '';
+  end;
+  vtype := VTypeOfLeaf(SE);
   SetLength(dict, 0);
   maxDef := 0;
   if SE.Repetition = REP_OPTIONAL then maxDef := 1;
@@ -1949,8 +2249,8 @@ begin
     raise Exception.Create('Parquet: repeated (nested) alan desteklenmiyor');
   if (CM.Codec <> CODEC_UNCOMPRESSED) and (CM.Codec <> CODEC_SNAPPY) then
     raise Exception.CreateFmt('Parquet: sikistirma desteklenmiyor (codec=%d)', [CM.Codec]);
-  off := CM.DataPageOffset;
-  if CM.DictPageOffset >= 0 then off := CM.DictPageOffset;
+  off := CM.DataPageOffset - Base;
+  if CM.DictPageOffset >= 0 then off := CM.DictPageOffset - Base;
   rowPos := 0;
   seen := 0;
   while (off + 8 < Length(Data)) and (seen < CM.NumValues) do
@@ -2032,61 +2332,97 @@ begin
   end;
 end;
 
-function VDbParquetImport(const FileName: string;
+procedure LoadParquetMeta(const FileName: string; out Meta: TParquetMeta;
+  out FileSize, MetaStart: Int64);
+var
+  fs: TFileStream;
+  tail, mbuf: TBytes;
+  sz: Int64;
+  metaLen: Integer;
+begin
+  fs := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
+  try
+    sz := fs.Size;
+    if sz < 12 then
+      raise Exception.Create('Parquet: dosya cok kucuk');
+    SetLength(tail, 4);
+    fs.ReadBuffer(tail[0], 4);
+    if (Char(tail[0]) <> 'P') or (Char(tail[1]) <> 'A') or
+       (Char(tail[2]) <> 'R') or (Char(tail[3]) <> '1') then
+      raise Exception.Create('Parquet: PAR1 imzasi yok');
+    SetLength(tail, 8);
+    fs.Seek(sz - 8, soBeginning);
+    fs.ReadBuffer(tail[0], 8);
+    if (Char(tail[4]) <> 'P') or (Char(tail[5]) <> 'A') or
+       (Char(tail[6]) <> 'R') or (Char(tail[7]) <> '1') then
+      raise Exception.Create('Parquet: kuyruk PAR1 imzasi yok');
+    metaLen := Integer(LE32(tail, 0));
+    MetaStart := sz - 8 - metaLen;
+    if (MetaStart < 4) or (metaLen <= 0) then
+      raise Exception.Create('Parquet: gecersiz metadata boyu');
+    SetLength(mbuf, metaLen);
+    fs.Seek(MetaStart, soBeginning);
+    fs.ReadBuffer(mbuf[0], metaLen);
+  finally
+    fs.Free;
+  end;
+  FileSize := sz;
+  ParseFileMeta(mbuf, 0, metaLen, Meta);
+end;
+
+procedure ParquetLeaves(const Meta: TParquetMeta;
+  out Leaves: TParquetSchemaArray);
+var
+  i, leafN: Integer;
+begin
+  if Length(Meta.Schema) < 2 then
+    raise Exception.Create('Parquet: sema bos');
+  if Meta.Schema[0].NumChildren <> Length(Meta.Schema) - 1 then
+    raise Exception.Create('Parquet: nested sema desteklenmiyor');
+  leafN := 0;
+  SetLength(Leaves, Length(Meta.Schema) - 1);
+  for i := 1 to High(Meta.Schema) do
+  begin
+    if Meta.Schema[i].NumChildren > 0 then
+      raise Exception.Create('Parquet: nested sema desteklenmiyor');
+    Leaves[leafN] := Meta.Schema[i];
+    Inc(leafN);
+  end;
+  SetLength(Leaves, leafN);
+end;
+
+function VDbParquetImportCells(const FileName: string;
   out Fields: TStrArray; out Types: TByteArray;
-  out Rows: TStrMatrix; out Err: string): Boolean;
+  out Cells: TVdbCellMatrix; out Err: string): Boolean;
 var
   fs: TFileStream;
   Data: TBytes;
-  sz, metaStart, metaLen, i, j, leafN, total, base, r: Integer;
+  sz64, metaStart: Int64;
+  sz, i, j, leafN, total, base, r: Integer;
   Meta: TParquetMeta;
-  leaves: array of TParquetSchemaElem;
+  leaves: TParquetSchemaArray;
   colVals: TStrArray;
+  colCells: TVdbCellArray;
 begin
   Result := False;
   Err := '';
-  SetLength(Fields, 0);
-  SetLength(Types, 0);
-  SetLength(Rows, 0);
+  Fields := nil;
+  Types := nil;
+  Cells := nil;
   try
+    LoadParquetMeta(FileName, Meta, sz64, metaStart);
+    if sz64 > MaxInt then
+      raise Exception.Create('Parquet: dosya cok buyuk');
+    sz := Integer(sz64);
     fs := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
     try
-      sz := fs.Size;
       SetLength(Data, sz);
       if sz > 0 then fs.ReadBuffer(Data[0], sz);
     finally
       fs.Free;
     end;
-    if sz < 12 then
-      raise Exception.Create('Parquet: dosya cok kucuk');
-    if (Char(Data[0]) <> 'P') or (Char(Data[1]) <> 'A') or
-       (Char(Data[2]) <> 'R') or (Char(Data[3]) <> '1') then
-      raise Exception.Create('Parquet: PAR1 imzasi yok');
-    if (Char(Data[sz - 4]) <> 'P') or (Char(Data[sz - 3]) <> 'A') or
-       (Char(Data[sz - 2]) <> 'R') or (Char(Data[sz - 1]) <> '1') then
-      raise Exception.Create('Parquet: kuyruk PAR1 imzasi yok');
-    metaLen := Integer(LE32(Data, sz - 8));
-    metaStart := sz - 8 - metaLen;
-    if (metaStart < 4) or (metaLen <= 0) then
-      raise Exception.Create('Parquet: gecersiz metadata boyu');
-    ParseFileMeta(Data, metaStart, metaLen, Meta);
-
-    // Duz sema: kok + yapraklar. Nested reddedilir.
-    if Length(Meta.Schema) < 2 then
-      raise Exception.Create('Parquet: sema bos');
-    if Meta.Schema[0].NumChildren <> Length(Meta.Schema) - 1 then
-      raise Exception.Create('Parquet: nested sema desteklenmiyor');
-    leafN := 0;
-    SetLength(leaves, Length(Meta.Schema) - 1);
-    for i := 1 to High(Meta.Schema) do
-    begin
-      if Meta.Schema[i].NumChildren > 0 then
-        raise Exception.Create('Parquet: nested sema desteklenmiyor');
-      leaves[leafN] := Meta.Schema[i];
-      Inc(leafN);
-    end;
-    SetLength(leaves, leafN);
-
+    ParquetLeaves(Meta, leaves);
+    leafN := Length(leaves);
     total := 0;
     for i := 0 to High(Meta.RowGroups) do
     begin
@@ -2101,12 +2437,9 @@ begin
       Fields[i] := leaves[i].Name;
       Types[i] := VTypeOfLeaf(leaves[i]);
     end;
-    SetLength(Rows, total);
+    SetLength(Cells, total);
     for i := 0 to total - 1 do
-    begin
-      SetLength(Rows[i], leafN);
-      for j := 0 to leafN - 1 do Rows[i][j] := '';
-    end;
+      SetLength(Cells[i], leafN);
 
     base := 0;
     for i := 0 to High(Meta.RowGroups) do
@@ -2116,14 +2449,14 @@ begin
       for j := 0 to leafN - 1 do
       begin
         try
-          DecodeColumn(Data, Meta.RowGroups[i].Columns[j], leaves[j],
-            Integer(Meta.RowGroups[i].NumRows), colVals);
+          DecodeColumn(Data, 0, Meta.RowGroups[i].Columns[j], leaves[j],
+            Integer(Meta.RowGroups[i].NumRows), colVals, colCells);
         except
           on E: Exception do
             raise Exception.CreateFmt('Parquet: %s: %s', [leaves[j].Name, E.Message]);
         end;
         for r := 0 to Integer(Meta.RowGroups[i].NumRows) - 1 do
-          Rows[base + r][j] := colVals[r];
+          Cells[base + r][j] := colCells[r];
       end;
       Inc(base, Integer(Meta.RowGroups[i].NumRows));
     end;
@@ -2132,11 +2465,120 @@ begin
     on E: Exception do
     begin
       Err := E.Message;
-      SetLength(Fields, 0);
-      SetLength(Types, 0);
-      SetLength(Rows, 0);
+      Fields := nil;
+      Types := nil;
+      Cells := nil;
     end;
   end;
+end;
+
+function VDbParquetImport(const FileName: string;
+  out Fields: TStrArray; out Types: TByteArray;
+  out Rows: TStrMatrix; out Err: string): Boolean;
+var
+  Cells: TVdbCellMatrix;
+  i, j: Integer;
+begin
+  Rows := nil;
+  Result := VDbParquetImportCells(FileName, Fields, Types, Cells, Err);
+  if not Result then Exit;
+  SetLength(Rows, Length(Cells));
+  for i := 0 to High(Cells) do
+  begin
+    SetLength(Rows[i], Length(Cells[i]));
+    for j := 0 to High(Cells[i]) do
+      case Cells[i][j].Kind of
+        vckInt: Rows[i][j] := IntToStr(Cells[i][j].I);
+        vckFloat: Rows[i][j] := VDbFloatToStr(Cells[i][j].F);
+        vckBool: if Cells[i][j].I <> 0 then Rows[i][j] := 'true'
+                 else Rows[i][j] := 'false';
+      else
+        Rows[i][j] := Cells[i][j].S;   // vckNull -> ''
+      end;
+  end;
+end;
+
+function VDbParquetReadBatches(const FileName: string;
+  out Fields: TStrArray; out Types: TByteArray;
+  const OnBatch: TVdbParquetBatchEvent; out Err: string): Boolean;
+var
+  fs: TFileStream;
+  sz64, metaStart: Int64;
+  Meta: TParquetMeta;
+  leaves: TParquetSchemaArray;
+  i, j, leafN, rows, r: Integer;
+  CM: TParquetColumnMeta;
+  start, len: Int64;
+  buf: TBytes;
+  colVals: TStrArray;
+  colCells: TVdbCellArray;
+  cells: TVdbCellMatrix;
+begin
+  Result := False;
+  Err := '';
+  Fields := nil;
+  Types := nil;
+  fs := nil;
+  try
+    LoadParquetMeta(FileName, Meta, sz64, metaStart);
+    ParquetLeaves(Meta, leaves);
+    leafN := Length(leaves);
+    SetLength(Fields, leafN);
+    SetLength(Types, leafN);
+    for i := 0 to leafN - 1 do
+    begin
+      Fields[i] := leaves[i].Name;
+      Types[i] := VTypeOfLeaf(leaves[i]);
+    end;
+    fs := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
+    for i := 0 to High(Meta.RowGroups) do
+    begin
+      if Length(Meta.RowGroups[i].Columns) <> leafN then
+        raise Exception.Create('Parquet: satir grubu kolon sayisi uyusmuyor');
+      rows := Integer(Meta.RowGroups[i].NumRows);
+      if rows < 0 then
+        raise Exception.Create('Parquet: negatif satir sayisi');
+      if rows = 0 then Continue;
+      SetLength(cells, rows);
+      for r := 0 to rows - 1 do
+        SetLength(cells[r], leafN);
+      for j := 0 to leafN - 1 do
+      begin
+        CM := Meta.RowGroups[i].Columns[j];
+        start := CM.DataPageOffset;
+        if CM.DictPageOffset >= 0 then start := CM.DictPageOffset;
+        len := CM.TotalCompressed;
+        if (start < 4) or (len <= 0) or (start + len > metaStart) then
+          raise Exception.CreateFmt('Parquet: %s: kolon dilimi dosya disinda',
+            [leaves[j].Name]);
+        if len > MaxInt then
+          raise Exception.Create('Parquet: kolon dilimi cok buyuk');
+        SetLength(buf, Integer(len));
+        fs.Seek(start, soBeginning);
+        fs.ReadBuffer(buf[0], Integer(len));
+        try
+          DecodeColumn(buf, start, CM, leaves[j], rows, colVals, colCells);
+        except
+          on E: Exception do
+            raise Exception.CreateFmt('Parquet: %s: %s', [leaves[j].Name, E.Message]);
+        end;
+        for r := 0 to rows - 1 do
+          cells[r][j] := colCells[r];
+      end;
+      if Assigned(OnBatch) then OnBatch(cells);
+      cells := nil;
+    end;
+    Result := True;
+  except
+    on E: Exception do
+    begin
+      Err := E.Message;
+      Fields := nil;
+      Types := nil;
+      Result := False;
+    end;
+  end;
+  FreeAndNil(fs);
 end;
 
 end.

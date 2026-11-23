@@ -207,8 +207,11 @@ begin
       Reason := 'born satir ' + IntToStr(i) + '=' + M[i][4];
       Exit;
     end;
-    if Pos(FormatDateTime('yyyy-mm-dd hh:nn:ss',
-      EncodeDate(2026, 1, 1) + (i * 7) / 86400.0), M[i][5]) <> 1 then
+    { Beklenti tam sayidan kurulur: kayan nokta toplami bazi
+      platformlarda 00:00:06.999... verip saniyeyi asagi yuvarlardi. }
+    if M[i][5] <> FormatDateTime('yyyy-mm-dd', EncodeDate(2026, 1, 1)) + ' ' +
+      Format('%.2d:%.2d:%.2d', [(i * 7) div 3600, ((i * 7) div 60) mod 60,
+      (i * 7) mod 60]) then
     begin
       Reason := 'seen satir ' + IntToStr(i) + '=' + M[i][5];
       Exit;
@@ -222,12 +225,173 @@ begin
   Result := True;
 end;
 
+function CNull: TVdbCell;
+begin
+  Result.Kind := vckNull; Result.I := 0; Result.F := 0; Result.S := '';
+end;
+
+function CInt(const AValue: Int64): TVdbCell;
+begin
+  Result.Kind := vckInt; Result.I := AValue; Result.F := 0; Result.S := '';
+end;
+
+function CFlt(const AValue: Double): TVdbCell;
+begin
+  Result.Kind := vckFloat; Result.I := 0; Result.F := AValue; Result.S := '';
+end;
+
+function CBool(const AValue: Boolean): TVdbCell;
+begin
+  Result.Kind := vckBool; Result.S := ''; Result.F := 0;
+  if AValue then Result.I := 1 else Result.I := 0;
+end;
+
+function CText(const AValue: string): TVdbCell;
+begin
+  Result.Kind := vckText; Result.I := 0; Result.F := 0; Result.S := AValue;
+end;
+
+function CBlob(const AValue: string): TVdbCell;
+begin
+  Result.Kind := vckBlob; Result.I := 0; Result.F := 0; Result.S := AValue;
+end;
+
+{ SKILL13 tipli kapsam: satir 0 bos metin + bos ikili GERCEK deger,
+  satir 1 dort alan NULL, satir 3 metin NULL ama ikili bos. }
+procedure MakeCells(out C: TVdbCellMatrix);
+begin
+  SetLength(C, 4, 5);
+  C[0][0] := CInt(1); C[0][1] := CText(''); C[0][2] := CBlob('');
+  C[0][3] := CFlt(1.5); C[0][4] := CBool(True);
+  C[1][0] := CInt(2); C[1][1] := CNull; C[1][2] := CNull;
+  C[1][3] := CNull; C[1][4] := CNull;
+  C[2][0] := CInt(3); C[2][1] := CText('x'); C[2][2] := CBlob('AB');
+  C[2][3] := CFlt(2.0); C[2][4] := CBool(False);
+  C[3][0] := CInt(4); C[3][1] := CNull; C[3][2] := CBlob('');
+  C[3][3] := CFlt(0.0); C[3][4] := CBool(True);
+end;
+
+function SliceCells(const C: TVdbCellMatrix; AFrom, ACount: Integer): TVdbCellMatrix;
+var
+  i, j: Integer;
+begin
+  SetLength(Result, ACount);
+  for i := 0 to ACount - 1 do
+  begin
+    SetLength(Result[i], Length(C[AFrom + i]));
+    for j := 0 to High(C[AFrom + i]) do
+      Result[i][j] := C[AFrom + i][j];
+  end;
+end;
+
+{ Tur (Kind) ve yuk birebir; NULL'un vckNull kalmasi bu karsilastirmayla
+  olculur. Ondalikta yuvarlama YOK: ayni IEEE degeri beklenir. }
+function SameCells(const A, B: TVdbCellMatrix; out Reason: string): Boolean;
+var
+  i, j: Integer;
+begin
+  Result := False;
+  Reason := '';
+  if Length(A) <> Length(B) then
+  begin
+    Reason := 'satir ' + IntToStr(Length(A)) + '<>' + IntToStr(Length(B));
+    Exit;
+  end;
+  for i := 0 to High(A) do
+  begin
+    if Length(A[i]) <> Length(B[i]) then
+    begin
+      Reason := 'kolon ' + IntToStr(i);
+      Exit;
+    end;
+    for j := 0 to High(A[i]) do
+    begin
+      if A[i][j].Kind <> B[i][j].Kind then
+      begin
+        Reason := 'tur ' + IntToStr(i) + ',' + IntToStr(j) + ' ' +
+          IntToStr(Ord(A[i][j].Kind)) + '<>' + IntToStr(Ord(B[i][j].Kind));
+        Exit;
+      end;
+      case A[i][j].Kind of
+        vckInt, vckBool:
+          if A[i][j].I <> B[i][j].I then
+          begin
+            Reason := 'tam ' + IntToStr(i) + ',' + IntToStr(j);
+            Exit;
+          end;
+        vckFloat:
+          if A[i][j].F <> B[i][j].F then
+          begin
+            Reason := 'ondalik ' + IntToStr(i) + ',' + IntToStr(j);
+            Exit;
+          end;
+        vckText, vckBlob:
+          if A[i][j].S <> B[i][j].S then
+          begin
+            Reason := 'metin ' + IntToStr(i) + ',' + IntToStr(j) + ' uzunluk ' +
+              IntToStr(Length(A[i][j].S)) + '<>' + IntToStr(Length(B[i][j].S));
+            Exit;
+          end;
+      end;
+    end;
+  end;
+  Result := True;
+end;
+
+type
+  TCellCollector = class
+  public
+    All: TVdbCellMatrix;
+    Sizes: array of Integer;
+    procedure Add(const Cells: TVdbCellMatrix);
+    function SumRows: Integer;
+    function AllSizes(const AWant: Integer): Boolean;
+  end;
+
+procedure TCellCollector.Add(const Cells: TVdbCellMatrix);
+var
+  i, j, base: Integer;
+begin
+  SetLength(Sizes, Length(Sizes) + 1);
+  Sizes[High(Sizes)] := Length(Cells);
+  base := Length(All);
+  SetLength(All, base + Length(Cells));
+  for i := 0 to High(Cells) do
+  begin
+    SetLength(All[base + i], Length(Cells[i]));
+    for j := 0 to High(Cells[i]) do
+      All[base + i][j] := Cells[i][j];
+  end;
+end;
+
+function TCellCollector.SumRows: Integer;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 0 to High(Sizes) do
+    Result := Result + Sizes[i];
+end;
+
+function TCellCollector.AllSizes(const AWant: Integer): Boolean;
+var
+  i: Integer;
+begin
+  Result := Length(Sizes) > 0;
+  for i := 0 to High(Sizes) do
+    if Sizes[i] <> AWant then Result := False;
+end;
+
 var
   GFields: TStrArray;
   GTypes: TByteArray;
   GRows, GOut, GOut2: TStrMatrix;
   GOutFields: TStrArray;
   GOutTypes: TByteArray;
+  GCells, GWant, GBig: TVdbCellMatrix;
+  CCells: TCellCollector;
+  WArrow: TVdbArrowWriter;
+  WParquet: TVdbParquetWriter;
   Err: string;
   okA, okB, ok: Boolean;
   p, q: string;
@@ -567,6 +731,116 @@ begin
   ok := okA and okB and CmpMatrix(GRows, GOut, badI, badJ, aVal, bVal, reason) and
     CmpMatrix(GOut, GOut2, badI, badJ, aVal, bVal, reason);
   Chk('F16 Ayni veri iki bicimde ayni sonucu verir', ok, reason + ' ' + err);
+
+  { ---------------- SKILL13: tipli hucre, NULL korunumu ------------- }
+  SetLength(GFields, 5);
+  GFields[0] := 'id'; GFields[1] := 'name'; GFields[2] := 'blob';
+  GFields[3] := 'score'; GFields[4] := 'ok';
+  SetLength(GTypes, 5);
+  GTypes[0] := VCT_INT; GTypes[1] := VCT_STR; GTypes[2] := VCT_BLOB;
+  GTypes[3] := VCT_FLOAT; GTypes[4] := VCT_BOOL;
+  MakeCells(GWant);
+
+  err := '';
+  ok := VDbArrowExportCells(GDir + 'c.arrow', GFields, GTypes, GWant, err) and
+    VDbArrowImportCells(GDir + 'c.arrow', GOutFields, GOutTypes, GCells, err) and
+    SameCells(GCells, GWant, reason);
+  Chk('F17 Tipli Arrow: NULL / bos metin / bos ikili ayrilir', ok,
+    reason + ' ' + err);
+
+  err := '';
+  ok := VDbParquetExportCells(GDir + 'c.parquet', GFields, GTypes, GWant, err) and
+    VDbParquetImportCells(GDir + 'c.parquet', GOutFields, GOutTypes, GCells,
+    err) and SameCells(GCells, GWant, reason);
+  Chk('F18 Tipli Parquet: NULL / bos metin / bos ikili ayrilir', ok,
+    reason + ' ' + err);
+
+  { Eski metin API'si ayni dosyayi yazar; orada '' yine NULL sayilir
+    (belgelenmis sinir, geriye donuk uyum). Tipli okuma bunu GORUR. }
+  SetLength(GRows, 1);
+  SetLength(GRows[0], 1);
+  GRows[0][0] := '';
+  SetLength(GFields, 1);
+  GFields[0] := 't';
+  SetLength(GTypes, 1);
+  GTypes[0] := VCT_STR;
+  err := '';
+  ok := VDbArrowExport(GDir + 'legacy.arrow', GFields, GTypes, GRows, err) and
+    VDbArrowImportCells(GDir + 'legacy.arrow', GOutFields, GOutTypes, GCells,
+    err) and (Length(GCells) = 1) and (Length(GCells[0]) = 1) and
+    (GCells[0][0].Kind = vckNull);
+  Chk('F19 Eski metin API siniri korunur ('''' -> NULL)', ok, err);
+
+  { ---------------- SKILL13-E: batch yazici / okuyucu ---------------- }
+  MakeCells(GWant);
+  SetLength(GFields, 5);
+  GFields[0] := 'id'; GFields[1] := 'name'; GFields[2] := 'blob';
+  GFields[3] := 'score'; GFields[4] := 'ok';
+  SetLength(GTypes, 5);
+  GTypes[0] := VCT_INT; GTypes[1] := VCT_STR; GTypes[2] := VCT_BLOB;
+  GTypes[3] := VCT_FLOAT; GTypes[4] := VCT_BOOL;
+
+  CCells := TCellCollector.Create;
+  try
+    ok := True;
+    WArrow := TVdbArrowWriter.Create(GDir + 'b.arrow', GFields, GTypes);
+    try
+      WArrow.WriteBatch(SliceCells(GWant, 0, 2));
+      WArrow.WriteBatch(SliceCells(GWant, 2, 1));
+      WArrow.WriteBatch(SliceCells(GWant, 3, 1));
+    finally
+      WArrow.Free;
+    end;
+    err := '';
+    ok := ok and VDbArrowReadBatches(GDir + 'b.arrow', GOutFields, GOutTypes,
+      CCells.Add, err) and (Length(CCells.Sizes) = 3) and
+      (CCells.Sizes[0] = 2) and (CCells.Sizes[1] = 1) and
+      (CCells.Sizes[2] = 1) and SameCells(CCells.All, GWant, reason);
+  finally
+    CCells.Free;
+  end;
+  Chk('F20 Arrow batch yazici 3 batch''i korur, kapali dosya okunur', ok,
+    reason + ' ' + err);
+
+  CCells := TCellCollector.Create;
+  try
+    ok := True;
+    WParquet := TVdbParquetWriter.Create(GDir + 'b.parquet', GFields, GTypes);
+    try
+      WParquet.WriteBatch(SliceCells(GWant, 0, 2));
+      WParquet.WriteBatch(SliceCells(GWant, 2, 1));
+      WParquet.WriteBatch(SliceCells(GWant, 3, 1));
+    finally
+      WParquet.Free;
+    end;
+    err := '';
+    ok := ok and VDbParquetReadBatches(GDir + 'b.parquet', GOutFields, GOutTypes,
+      CCells.Add, err) and (Length(CCells.Sizes) = 3) and
+      (CCells.Sizes[0] = 2) and (CCells.Sizes[1] = 1) and
+      (CCells.Sizes[2] = 1) and SameCells(CCells.All, GWant, reason);
+  finally
+    CCells.Free;
+  end;
+  Chk('F21 Parquet batch yazici 3 row group''u korur, kapali dosya okunur',
+    ok, reason + ' ' + err);
+
+  { ---------------- SKILL13: cok buyuk deger, tipli ---------------- }
+  SetLength(GBig, 1, 2);
+  GBig[0][0] := CText(RepStr('A', 1024 * 1024));
+  GBig[0][1] := CBlob(RepStr('B', 512 * 1024));
+  SetLength(GFields, 2);
+  GFields[0] := 't'; GFields[1] := 'b';
+  SetLength(GTypes, 2);
+  GTypes[0] := VCT_STR; GTypes[1] := VCT_BLOB;
+  err := '';
+  ok := VDbArrowExportCells(GDir + 'big2.arrow', GFields, GTypes, GBig, err) and
+    VDbArrowImportCells(GDir + 'big2.arrow', GOutFields, GOutTypes, GCells,
+    err) and SameCells(GCells, GBig, reason);
+  err := '';
+  ok := ok and VDbParquetExportCells(GDir + 'big2.parquet', GFields, GTypes,
+    GBig, err) and VDbParquetImportCells(GDir + 'big2.parquet', GOutFields,
+    GOutTypes, GCells, err) and SameCells(GCells, GBig, reason);
+  Chk('F22 1 MB metin + 512 KB ikili tipli gidis-donus', ok, reason + ' ' + err);
 
   WriteLn('SONUC: ', GPass, ' PASS, ', GFail, ' FAIL');
   if GFail > 0 then Halt(1);

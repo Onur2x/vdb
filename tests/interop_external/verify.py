@@ -5,6 +5,12 @@ Modes
   check <file> arrow  -> VDB'in yazdigi Arrow IPC stream'i dogrular
   check <file> parquet-> VDB'in yazdigi Parquet'i dogrular
   gen <dir>           -> pyarrow ile harici Arrow/Parquet dosyalari uretir
+  checkcells <file> arrow|parquet
+                      -> tipli export'ta NULL ile bos metin/ikili AYRIMINI
+                         dogrular (SKILL13)
+  gennulls <dir>      -> NULL/bos ayrimi tasiyan harici dosyalari uretir
+  genbig <dir>        -> cok batch'li buyuk Arrow stream'i
+  genbigparquet <dir> -> cok row group'lu buyuk Parquet dosyasi
 
 Exit 0 = tum dogrulamalar gecti. Exit 2 = dogrulama basarisiz (ayrinti stdout).
 Bu betik yalniz TEST tarafidir; depoya yeni bir calisma-zamani bagimliligi
@@ -137,6 +143,88 @@ def check(path, kind):
     return 0
 
 
+# SKILL13: tipli hucre (TVdbCellMatrix) kapsami. Pascal tarafi
+# interop_external.lpr icinde AYNI 4 satiri YAZAR ve AYNI dosyalari OKUR.
+# row0: bos metin ve bos ikili GERCEK deger (NULL DEGIL).
+# row1: dort alan da NULL.
+# row3: metin NULL ama ikili bos (NULL'den ayri).
+CELL_ROWS = [
+    {"id": 1, "name": "", "blob": b"", "score": 1.5, "ok": True},
+    {"id": 2, "name": None, "blob": None, "score": None, "ok": None},
+    {"id": 3, "name": "x", "blob": b"AB", "score": 2.0, "ok": False},
+    {"id": 4, "name": None, "blob": b"", "score": 0.0, "ok": True},
+]
+
+CELL_FAMS = [("id", "int"), ("name", "string"), ("blob", "binary"),
+             ("score", "float"), ("ok", "bool")]
+
+# Alan basina beklenen NULL sayisi (id NULL tasimaz).
+CELL_NULLS = {"id": 0, "name": 2, "blob": 1, "score": 1, "ok": 1}
+
+
+def checkcells(path, kind):
+    """Tipli export: NULL ile bos metin/ikili AYRI olmali (SKILL13)."""
+    pa, pq = load_pyarrow()
+    if not os.path.exists(path):
+        print(f"FAIL dosya yok: {path}")
+        return EXIT_BAD
+    try:
+        table = read_table(path, kind, pa, pq)
+    except Exception as exc:  # noqa: BLE001
+        print(f"FAIL {kind} okunamadi: {exc}")
+        return EXIT_BAD
+
+    names = list(table.schema.names)
+    want_names = [n for n, _ in CELL_FAMS]
+    if names != want_names:
+        print(f"FAIL tipli alan adlari: {names} != {want_names}")
+        return EXIT_BAD
+    fams = [fam(f.type) for f in table.schema]
+    want_fams = [f for _, f in CELL_FAMS]
+    if fams != want_fams:
+        print(f"FAIL tipli alan tipleri: {list(zip(names, fams))}")
+        return EXIT_BAD
+
+    for key, want in CELL_NULLS.items():
+        got = table.column(key).null_count
+        if got != want:
+            print(f"FAIL NULL sayisi {key}: {got} != {want}")
+            return EXIT_BAD
+
+    rows = table.to_pylist()
+    if len(rows) != len(CELL_ROWS):
+        print(f"FAIL tipli satir sayisi {len(rows)} != {len(CELL_ROWS)}")
+        return EXIT_BAD
+    for i, (got, want) in enumerate(zip(rows, CELL_ROWS)):
+        for key, w in want.items():
+            g = got[key]
+            if isinstance(w, float):
+                good = g is not None and abs(float(g) - w) <= 1e-12
+            elif w is None:
+                good = g is None
+            elif isinstance(w, bytes):
+                # Bos ikili gercekten bos ikili olmali, NULL degil.
+                good = isinstance(g, (bytes, bytearray)) and bytes(g) == w
+            else:
+                good = g == w
+            if not good:
+                print(f"FAIL tipli satir {i} alan {key}: {g!r} != {w!r}")
+                return EXIT_BAD
+
+    # Acik ayrim kaniti: bos metin/bos ikili NULL SAYILMAZ.
+    if rows[0]["name"] != "" or rows[0]["blob"] != b"":
+        print("FAIL bos metin/ikili NULL olarak yazilmis")
+        return EXIT_BAD
+    if kind == "parquet":
+        pf = pq.ParquetFile(path)
+        print(f"OK cells parquet satir={len(rows)} rg={pf.num_row_groups} nulls="
+              f"{[table.column(n).null_count for n in want_names]}")
+    else:
+        print(f"OK cells arrow satir={len(rows)} nulls="
+              f"{[table.column(n).null_count for n in want_names]}")
+    return 0
+
+
 EXT_ROWS = [
     dict(id=i, name=(None if i == 4 else ("''" if i == 5 else f"n-{i}")),
          score=i / 2.0, ok=(i % 2 == 0),
@@ -207,6 +295,72 @@ def gen(outdir):
     return 0
 
 
+def gennulls(outdir):
+    """Tipli kapsam: NULL / bos metin / bos ikili ayrimi tasiyan dosyalar.
+
+    Arrow 2 batch (2+2 satir), Parquet row_group_size=2 -> 2 row group.
+    """
+    pa, pq = load_pyarrow()
+    if not os.path.isdir(outdir):
+        os.makedirs(outdir)
+    table = pa.table({
+        "id": pa.array([r["id"] for r in CELL_ROWS], pa.int32()),
+        "name": pa.array([r["name"] for r in CELL_ROWS], pa.string()),
+        "blob": pa.array([r["blob"] for r in CELL_ROWS], pa.binary()),
+        "score": pa.array([r["score"] for r in CELL_ROWS], pa.float64()),
+        "ok": pa.array([r["ok"] for r in CELL_ROWS], pa.bool_()),
+    })
+    a = os.path.join(outdir, "ext_nulls.arrow")
+    p = os.path.join(outdir, "ext_nulls.parquet")
+    with pa.OSFile(a, "wb") as sink:
+        with pa.ipc.new_stream(sink, table.schema) as writer:
+            writer.write_table(table.slice(0, 2))
+            writer.write_table(table.slice(2, 2))
+    pq.write_table(table, p, compression="NONE", row_group_size=2)
+    for f in (a, p):
+        print(f"GEN {os.path.basename(f)} {os.path.getsize(f)}")
+    return 0
+
+
+def genbig(outdir, batches=40, rows=250):
+    """Cok batch'li buyuk Arrow stream: batch bazli okuma kaniti (spec E)."""
+    pa, _ = load_pyarrow()
+    if not os.path.isdir(outdir):
+        os.makedirs(outdir)
+    schema = pa.schema([("id", pa.int32()), ("name", pa.string())])
+    path = os.path.join(outdir, "ext_big.arrow")
+    with pa.OSFile(path, "wb") as sink:
+        with pa.ipc.new_stream(sink, schema) as writer:
+            for b in range(batches):
+                base = b * rows
+                tbl = pa.table({
+                    "id": pa.array(list(range(base, base + rows)), pa.int32()),
+                    "name": pa.array([f"r{i}" for i in range(base, base + rows)],
+                                     pa.string()),
+                })
+                writer.write_table(tbl)
+    print(f"GEN {os.path.basename(path)} {os.path.getsize(path)} "
+          f"batches={batches} rows={rows}")
+    return 0
+
+
+def genbigparquet(outdir, groups=50, rows=200):
+    """Cok row group'lu buyuk Parquet: grup bazli okuma kaniti (spec E)."""
+    pa, pq = load_pyarrow()
+    if not os.path.isdir(outdir):
+        os.makedirs(outdir)
+    n = groups * rows
+    tbl = pa.table({
+        "id": pa.array(list(range(n)), pa.int32()),
+        "name": pa.array([f"r{i}" for i in range(n)], pa.string()),
+    })
+    path = os.path.join(outdir, "ext_big.parquet")
+    pq.write_table(tbl, path, compression="NONE", row_group_size=rows)
+    print(f"GEN {os.path.basename(path)} {os.path.getsize(path)} "
+          f"groups={groups} rows={rows}")
+    return 0
+
+
 def main(argv):
     if len(argv) < 2:
         print("FAIL kullanim: verify.py selftest|check|gen")
@@ -226,6 +380,26 @@ def main(argv):
             print("FAIL kullanim: verify.py gen <dir>")
             return EXIT_BAD
         return gen(argv[2])
+    if mode == "checkcells":
+        if len(argv) < 4:
+            print("FAIL kullanim: verify.py checkcells <file> arrow|parquet")
+            return EXIT_BAD
+        return checkcells(argv[2], argv[3])
+    if mode == "gennulls":
+        if len(argv) < 3:
+            print("FAIL kullanim: verify.py gennulls <dir>")
+            return EXIT_BAD
+        return gennulls(argv[2])
+    if mode == "genbig":
+        if len(argv) < 3:
+            print("FAIL kullanim: verify.py genbig <dir>")
+            return EXIT_BAD
+        return genbig(argv[2])
+    if mode == "genbigparquet":
+        if len(argv) < 3:
+            print("FAIL kullanim: verify.py genbigparquet <dir>")
+            return EXIT_BAD
+        return genbigparquet(argv[2])
     print(f"FAIL bilinmeyen mod: {mode}")
     return EXIT_BAD
 
