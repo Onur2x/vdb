@@ -25,6 +25,15 @@ program interop_external;
     X11 VDB, pyarrow'un yazdigi harici Arrow DECIMAL(10,2) dosyasini tur,
         (p,s) ve TAM deger ile birebir okur
     X12 ayni okuma Parquet icin
+    X13 VDB SNAPPY ile yazar (5 partide 250 satir, 100 satirlik gruplar):
+        pyarrow codec + 3 satir grubu + tam deger dogrular; SNAPPY dosyasi
+        UNCOMPRESSED'a gore kucuktur
+    X14 VDB pyarrow'un SNAPPY Parquet dosyasini birebir okur
+    X15 VDB pyarrow'un ZSTD dosyasini okurken ACIK hata verir (harici DLL yok)
+    X16 gecersiz codec degeri ACIK hata verir (sessiz varsayilan yok)
+    X17 MaxRowsPerGroup = 0: tek parti tek satir grubu, UNCOMPRESSED
+    X18 kesik (bozuk) dosya net hata verir, cokme veya sessiz veri yok
+    X19 akis: 110000 satir, 1000 satirlik gruplar; bellek tek grupla sinirli
 
   DIS BAGIMLILIK: python3 + pyarrow. Yoksa kapi **SKIP** (exit 77) verir ve
   gerekce yazilir; ASLA PASS sayilmaz. pyarrow depoya BAGIMLILIK DEGILDIR:
@@ -44,6 +53,65 @@ var
   GDir, GScript: string;
   GPy: string;
   GPyOK: Boolean;
+
+{ SKILL15: verify.py `codec_rows` ile AYNI kural - id/1000, olcek 3. }
+function DecById(AId: Integer): string;
+begin
+  Result := Format('%d.%.3d', [AId div 1000, AId mod 1000]);
+end;
+
+{ SKILL15: dosya boyu; yoksa -1. Akis kanitinda erken yazimi olcmek icin. }
+function FileBytes(const APath: string): Int64;
+var
+  fs: TFileStream;
+begin
+  Result := -1;
+  try
+    fs := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+    try
+      Result := fs.Size;
+    finally
+      fs.Free;
+    end;
+  except
+    Result := -1;
+  end;
+end;
+
+{ SKILL15: dosyanin ilk AKeep baytini yeni dosyaya kopyalar (kesik dosya). }
+function TruncateCopy(const ASrc, ADst: string; AKeep: Int64): Boolean;
+var
+  src, dst: TFileStream;
+  buf: TBytes;
+  n: Integer;
+begin
+  Result := False;
+  try
+    src := TFileStream.Create(ASrc, fmOpenRead or fmShareDenyNone);
+    try
+      dst := TFileStream.Create(ADst, fmCreate);
+      try
+        if AKeep > src.Size then AKeep := src.Size;
+        SetLength(buf, 65536);
+        while AKeep > 0 do
+        begin
+          n := Integer(AKeep);
+          if n > Length(buf) then n := Length(buf);
+          src.ReadBuffer(buf[0], n);
+          dst.WriteBuffer(buf[0], n);
+          Dec(AKeep, n);
+        end;
+        Result := True;
+      finally
+        dst.Free;
+      end;
+    finally
+      src.Free;
+    end;
+  except
+    Result := False;
+  end;
+end;
 
 procedure Chk(const AName: string; ACond: Boolean; const ADetail: string = '');
 begin
@@ -470,6 +538,9 @@ var
   WParquet: TVdbParquetWriter;
   bigText, bigBlob: string;
   GPrec, GScale, GOPrec, GOScale: TByteArray;
+  part, k, id: Integer;
+  midSize, szSnappy, szPlain: Int64;
+  WPlain: TVdbParquetWriter;
   Err, outp, reason: string;
   ok, okA, okB: Boolean;
   p, q: string;
@@ -811,6 +882,229 @@ begin
     (GOPrec[1] = 10) and (GOScale[1] = 2);
   Chk('X12 VDB harici Parquet DECIMAL(10,2) birebir okur (tur + p,s + deger)',
     ok, reason + ' ' + err);
+
+  { ---- 10) SKILL15: SNAPPY, satir grubu, akis, hata disiplini ---- }
+  SetLength(CFields, 3);
+  CFields[0] := 'id'; CFields[1] := 'v'; CFields[2] := 's';
+  SetLength(CTypes, 3);
+  CTypes[0] := VCT_INT; CTypes[1] := VCT_DECIMAL; CTypes[2] := VCT_STR;
+  SetLength(GPrec, 3); GPrec[0] := 0; GPrec[1] := 12; GPrec[2] := 0;
+  SetLength(GScale, 3); GScale[0] := 0; GScale[1] := 3; GScale[2] := 0;
+
+  { X13: SNAPPY, 100 satirlik gruplar, 5 partide 250 satir. Satir grubu
+    parti sinirindan bagimsiz birikmeli: 250 satir -> 3 grup (100/100/50). }
+  err := '';
+  ok := True;
+  WParquet := TVdbParquetWriter.CreateEx(GDir + 'vdb_snappy.parquet',
+    CFields, CTypes, GPrec, GScale);
+  try
+    try
+      WParquet.Codec := PQ_CODEC_SNAPPY;
+      WParquet.MaxRowsPerGroup := 100;
+      id := 0;
+      for part := 0 to 4 do
+      begin
+        SetLength(GCells2, 50, 3);
+        for k := 0 to 49 do
+        begin
+          Inc(id);
+          if id mod 50 = 0 then
+          begin
+            GCells2[k][0] := CNull;
+            GCells2[k][1] := CNull;
+            GCells2[k][2] := CNull;
+          end
+          else
+          begin
+            GCells2[k][0] := CInt(id);
+            GCells2[k][1] := CText(DecById(id));
+            GCells2[k][2] := CText('r' + IntToStr(id));
+          end;
+        end;
+        WParquet.WriteBatch(GCells2);
+      end;
+      WParquet.Close;
+    except
+      on E: Exception do
+      begin
+        ok := False;
+        err := E.Message;
+      end;
+    end;
+  finally
+    WParquet.Free;
+  end;
+  ok := ok and RunPyArgs([GScript, 'checkcodec', GDir + 'vdb_snappy.parquet',
+    'SNAPPY', '3', '250'], outp) and (Pos('OK codec', outp) > 0);
+  Chk('X13 VDB SNAPPY yazar: pyarrow codec + 3 satir grubu + tam deger', ok,
+    Clean(err + ' ' + outp));
+
+  { X14: pyarrow'un SNAPPY dosyasini birebir okur. Once pyarrow fiksturleri
+    URETILMELIDIR; aksi halde temiz is dizininde dosya bulunamaz (bu sirasi
+    bozukluk once gercek bir suite FAIL'i olarak yakalandi). }
+  err := '';
+  ok := RunPyArgs([GScript, 'gencodec', ExcludeTrailingPathDelimiter(GDir)],
+    outp) and (Pos('GEN ext_snappy.parquet', outp) > 0) and
+    (Pos('GEN ext_zstd.parquet', outp) > 0);
+  Chk('X15a pyarrow SNAPPY + ZSTD dosyalari uretir', ok, Clean(outp));
+
+  SetLength(GCells2, 3, 3);
+  GCells2[0][0] := CInt(1); GCells2[0][1] := CText('12.34');
+  GCells2[0][2] := CText('a');
+  GCells2[1][0] := CInt(2); GCells2[1][1] := CText('-0.05');
+  GCells2[1][2] := CNull;
+  GCells2[2][0] := CInt(3); GCells2[2][1] := CNull;
+  GCells2[2][2] := CText('ccc');
+  err := '';
+  ok := VDbParquetImportCells(GDir + 'ext_snappy.parquet', GOutFields,
+    GOutTypes, GCells, err) and SameCells(GCells, GCells2, reason);
+  ok := ok and (Length(GOutTypes) = 3) and (GOutTypes[1] = VCT_DECIMAL);
+  Chk('X14 VDB pyarrow SNAPPY dosyasini birebir okur', ok,
+    Clean(reason + ' ' + err));
+
+  { X15: ZSTD icin saglayici YOK - sessizce gecmemeli, ACIK hata vermeli. }
+  err := '';
+  err := '';
+  ok := not VDbParquetImportCells(GDir + 'ext_zstd.parquet', GOutFields,
+    GOutTypes, GCells, err);
+  Chk('X15 VDB ZSTD dosyasini acik hatayla reddeder (harici DLL yok)',
+    ok and (Pos('codec', err) > 0), Clean(err));
+
+  { X16: gecersiz codec degeri ACIK hata vermeli (sessiz varsayilan yok). }
+  err := '';
+  ok := False;
+  WParquet := TVdbParquetWriter.CreateEx(GDir + 'vdb_badcodec.parquet',
+    CFields, CTypes, GPrec, GScale);
+  try
+    WParquet.Codec := 6;
+    try
+      WParquet.WriteBatch(GCells2);
+    except
+      on E: Exception do
+      begin
+        ok := Pos('codec', E.Message) > 0;
+        err := E.Message;
+      end;
+    end;
+  finally
+    WParquet.Free;
+  end;
+  Chk('X16 gecersiz sayfa codec degeri acik hata verir', ok, Clean(err));
+
+  { X17: MaxRowsPerGroup = 0 -> her parti tek satir grubu; UNCOMPRESSED. }
+  err := '';
+  ok := True;
+  WParquet := TVdbParquetWriter.CreateEx(GDir + 'vdb_plain.parquet',
+    CFields, CTypes, GPrec, GScale);
+  try
+    try
+      SetLength(GCells2, 250, 3);
+      for k := 0 to 249 do
+      begin
+        id := k + 1;
+        if id mod 50 = 0 then
+        begin
+          GCells2[k][0] := CNull;
+          GCells2[k][1] := CNull;
+          GCells2[k][2] := CNull;
+        end
+        else
+        begin
+          GCells2[k][0] := CInt(id);
+          GCells2[k][1] := CText(DecById(id));
+          GCells2[k][2] := CText('r' + IntToStr(id));
+        end;
+      end;
+      WParquet.WriteBatch(GCells2);
+      WParquet.Close;
+    except
+      on E: Exception do
+      begin
+        ok := False;
+        err := E.Message;
+      end;
+    end;
+  finally
+    WParquet.Free;
+  end;
+  ok := ok and RunPyArgs([GScript, 'checkcodec', GDir + 'vdb_plain.parquet',
+    'UNCOMPRESSED', '1', '250'], outp) and (Pos('OK codec', outp) > 0);
+  Chk('X17 varsayilan yol: tek parti tek satir grubu, UNCOMPRESSED', ok,
+    Clean(err + ' ' + outp));
+
+  { X18: kesik dosya net hata vermeli; cokme veya sessiz veri olmamali. }
+  szSnappy := FileBytes(GDir + 'vdb_snappy.parquet');
+  ok := (szSnappy > 16) and TruncateCopy(GDir + 'vdb_snappy.parquet',
+    GDir + 'vdb_cut.parquet', szSnappy div 2);
+  err := '';
+  ok := ok and not VDbParquetImportCells(GDir + 'vdb_cut.parquet',
+    GOutFields, GOutTypes, GCells, err) and (err <> '');
+  Chk('X18 kesik/bozuk dosya net hata verir (cokme yok)', ok, Clean(err));
+
+  { X19: akis. 220 parti x 500 = 110000 satir, 1000 satirlik gruplar.
+    Grup dolunca diske yazilmali (Close beklemeden dosya buyur) ve SNAPPY
+    ayni verinin UNCOMPRESSED halinden kucuk olmali. }
+  err := '';
+  ok := True;
+  midSize := 0;
+  WParquet := nil;
+  WPlain := nil;
+  try
+    WParquet := TVdbParquetWriter.CreateEx(GDir + 'vdb_stream.parquet',
+      CFields, CTypes, GPrec, GScale);
+    WParquet.Codec := PQ_CODEC_SNAPPY;
+    WParquet.MaxRowsPerGroup := 1000;
+    WPlain := TVdbParquetWriter.CreateEx(GDir + 'vdb_stream_plain.parquet',
+      CFields, CTypes, GPrec, GScale);
+    id := 0;
+    for part := 0 to 219 do
+    begin
+      SetLength(GCells2, 500, 3);
+      for k := 0 to 499 do
+      begin
+        Inc(id);
+        if id mod 50 = 0 then
+        begin
+          GCells2[k][0] := CNull;
+          GCells2[k][1] := CNull;
+          GCells2[k][2] := CNull;
+        end
+        else
+        begin
+          GCells2[k][0] := CInt(id);
+          GCells2[k][1] := CText(DecById(id));
+          GCells2[k][2] := CText('r' + IntToStr(id));
+        end;
+      end;
+      WParquet.WriteBatch(GCells2);
+      WPlain.WriteBatch(GCells2);
+      if part = 1 then
+        midSize := WParquet.BytesWritten;
+    end;
+    WParquet.Close;
+    WPlain.Close;
+  except
+    on E: Exception do
+    begin
+      ok := False;
+      err := E.Message;
+    end;
+  end;
+  FreeAndNil(WParquet);
+  FreeAndNil(WPlain);
+  Chk('X19a akis: grup dolunca Close beklemeden diske yazilir',
+    ok and (midSize > 4), Clean(err + ' midSize=' + IntToStr(midSize)));
+
+  ok := ok and RunPyArgs([GScript, 'checkcodec', GDir + 'vdb_stream.parquet',
+    'SNAPPY', '110', '110000'], outp) and (Pos('OK codec', outp) > 0);
+  Chk('X19 110000 satir / 110 grup / SNAPPY + tam deger', ok,
+    Clean(err + ' ' + outp));
+
+  szSnappy := FileBytes(GDir + 'vdb_stream.parquet');
+  szPlain := FileBytes(GDir + 'vdb_stream_plain.parquet');
+  Chk('X19b SNAPPY dosyasi ayni verinin UNCOMPRESSED halinden kucuk',
+    (szSnappy > 0) and (szPlain > 0) and (szSnappy < szPlain),
+    Format('%d vs %d', [szSnappy, szPlain]));
 
   WriteLn('SONUC: ', GPass, ' PASS, ', GFail, ' FAIL');
   if GFail > 0 then Halt(1);

@@ -2019,3 +2019,51 @@ kaldirildi:
     API'si `''` ile NULL'i hala karistirir. pyarrow depo disidir (Windows
     26.0.1, WSL 20.0.0 tekerlekten `PYTHONPATH` ile) ve yoksa
     `interop_external` **77 (SKIP)** doner, PASS sayilmaz.
+- Altmis ikinci kosu (v3.79, SKILL15 - Parquet SNAPPY, satir grubu, akis):
+  **Linux x86_64 67 PASS** (varsayilan) ve **68 PASS** (depo disi
+  pyarrow ile), **Windows i386 67 PASS**, FAIL 0, `SUITE_EXIT=0`. Kapi
+  sayisi degismedi (67/68); `interop_external` **36/0** (26 -> 36; X13-X19
+  yeni), `interop_format` **27/0**, `decimal_numeric` **93/0**,
+  `decimal_core` **44/0** korundu. SKIP'ler PASS sayilmaz: iki platformda
+  `fixtures_openssl`, `selftest_openssl`; Linux'ta (pyarrow yoksa)
+  `interop_external`, Windows'ta `tls_client`.
+  - **Sorun**: Parquet yazici her sayfayi **sikistirmasiz** yaziyordu
+    (codec metadata'si sabit `0`, `CompressedSize` ve `UncompressedSize`
+    ayni deger), satir grubu boyu **ayarlanamiyordu** (her `WriteBatch`
+    cagrisi tek grup) ve yazicinin `Close` beklemeden diske ne yazdigini
+    gosteren bir **akis olcumu yoktu**. pyarrow uyumlulugu yalniz okuma
+    yonunde sinanmisti.
+  - **SNAPPY yazici**: `SnappyCompress` saf Pascal blok kodlayicidir
+    (varint cozulmus boy, 4 baytlik hash tabanli eslesme, yalniz `copy2`
+    etiketi, 64 bayta kadar parcalama); okuma tarafindaki
+    `SnappyDecompress` zaten vardi. **Yalniz sayfa govdesi** sikistirilir;
+    baslik alan 2 = sikistirilmamis, alan 3 = sikistirilmis boy;
+    `ColumnMetaData` alan 4/6/7 codec ve boylari tasir.
+  - **Satir grubu ve akis**: `MaxRowsPerGroup > 0` iken `WriteBatch`
+    satirlari `FPend` tamponunda biriktirir, tavan doldukca
+    `FlushPending` grup grup diske yazar; `Close` kalanlari bosaltir.
+    `BytesWritten` (`FStream.Size`) akis kanitidir. Desteklenmeyen codec
+    ne yazimda ne okumada gecistirilir: **acik hata**.
+  - **Kapi kaniti**: X13 VDB SNAPPY yazar, pyarrow codec + satir grubu
+    sayisi + satir sayisi + **tam deger** dogrular; X14 pyarrow SNAPPY
+    dosyasini VDB okur; X15 pyarrow ZSTD dosyasinda **acik hata**; X16
+    gecersiz codec yazimda acik hata; X17 UNCOMPRESSED tek grup; X18
+    yarim dosyada net hata (cokme yok); X19a `Close` oncesi diske yazim;
+    X19 110 grup x 1000 satir = 110000 satir; X19b SNAPPY dosyasi
+    UNCOMPRESSED'dan kucuk.
+  - **On-kapi** (`git archive HEAD` = `a5c662c`): `interop_external`
+    **derlenmez**, 8 x Error (`Codec`, `MaxRowsPerGroup`,
+    `PQ_CODEC_SNAPPY`, `BytesWritten` yok) - kapi ayirt edicidir.
+  - **Kapi bir test altyapisi kusuru yakaladi**: X14, pyarrow
+    fiksturlerini ureten `gencodec` cagrisindan **once** kosuyordu ve
+    yalnizca onceki elle kosudan kalan bayat `ext_snappy.parquet` sayesinde
+    geciyordu; temiz is dizininde dosya bulunamayip FAIL verdi. Uretim
+    X14'un onune alindi ve temiz dizinde 36/0 dogrulandi.
+  - **Durust sinir**: ZSTD/LZ4/BROTLI **ne yazilir ne okunur** (okuma
+    acik hata verir; saglayici yoklugunda sessiz yanlis sonuc
+    uretilmez); sayfa duzeyi CRC yazilmaz; Arrow tarafinda dictionary ve
+    compression metadata yazimi yoktur (coklu record batch ve kati tip
+    dogrulama korunur); tavandan kucuk son parti `Close`a kadar bellekte
+    bekler. pyarrow depo disidir (Windows 26.0.1, WSL 20.0.0 tekerlekten
+    `PYTHONPATH` ile) ve yoksa `interop_external` **77 (SKIP)** doner,
+    PASS sayilmaz.

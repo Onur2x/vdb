@@ -63,7 +63,16 @@ function VDbParquetImportCellsEx(const FileName: string;
 
 { SKILL13-E: toplu yazma. Her WriteBatch ayri bir satir grubu olur;
   veri bellekte birikmez, yalnizca satir grubu ustbilgisi tutulur.
-  Kuyruk (footer) Close'ta yazilir. }
+  Kuyruk (footer) Close'ta yazilir.
+
+  SKILL15: sayfa sikistirmasi (UNCOMPRESSED/SNAPPY, saf Pascal) ve satir
+  grubu boyu ayarlanabilir. Codec 0/1 disinda bir deger acik hata verir
+  (ZSTD/GZIP icin saglayici yoktur; sessiz geri dusme yoktur).
+  MaxRowsPerGroup > 0 ise bir WriteBatch birden fazla satir grubuna bolunur. }
+const
+  PQ_CODEC_UNCOMPRESSED = 0;
+  PQ_CODEC_SNAPPY = 1;
+
 type
   TColWrite = record
     Name: string;
@@ -78,6 +87,12 @@ type
     TypeLength: Integer;
     DecScale: Integer;
     DecPrec: Integer;
+    { SKILL15: sayfa sikistirma. TotalSize = diskteki toplam (baslik +
+      sikistirilmis govde), CompressedSize ayni deger, UncompressedSize
+      baslik + cozulmus govde. }
+    Codec: Integer;
+    CompressedSize: Int64;
+    UncompressedSize: Int64;
   end;
 
   TParquetGroupWrite = record
@@ -97,6 +112,15 @@ type
     FGroups: array of TParquetGroupWrite;
     FNumRows: Int64;
     FClosed: Boolean;
+    FCodec: Integer;
+    FMaxRowsPerGroup: Int64;
+    { SKILL15-C/D: MaxRowsPerGroup > 0 iken satirlar burada biriktirilir ve
+      grup dolunca (ya da Close'ta) diske yazilir. Bellek en fazla bir grup. }
+    FPend: TVdbCellMatrix;
+    procedure DeriveDecSpec(const Cells: TVdbCellMatrix);
+    procedure DoWriteGroup(const Cells: TVdbCellMatrix);
+    procedure FlushPending;
+    function GetBytesWritten: Int64;
   public
     constructor Create(const FileName: string; const Fields: TStrArray;
       const Types: TByteArray);
@@ -105,6 +129,12 @@ type
     procedure WriteBatch(const Cells: TVdbCellMatrix);
     procedure Close;
     destructor Destroy; override;
+    { SKILL15: sayfa sikistirma kodu (PQ_CODEC_UNCOMPRESSED/SNAPPY). }
+    property Codec: Integer read FCodec write FCodec;
+    { SKILL15: 0 = her WriteBatch tek satir grubu; > 0 ise bolunur. }
+    property MaxRowsPerGroup: Int64 read FMaxRowsPerGroup write FMaxRowsPerGroup;
+    { SKILL15-D: su ana kadar diske yazilmis bayt (akis kaniti icin). }
+    property BytesWritten: Int64 read GetBytesWritten;
   end;
 
 { SKILL13-E: akis halinde okuma. Dosya butun olarak bellekte tutulmaz;
@@ -798,6 +828,153 @@ begin
     end;
   end;
   Result := op = Length(Dst);
+end;
+
+{ SKILL15-A: saf Pascal SNAPPY **yazici** (blok bicimi). Cikti:
+  varint(cozulmus boy) + literal/copy etiketleri. Tampon buyumesi disinda
+  bellek kullanmaz; harici DLL/bagimlilik yoktur. Ayni bicim hem kendi
+  cozucumuzle (SnappyDecompress) hem pyarrow ile dogrulanir.
+  Sikistirma orani icin 4 baytlik kayan pencere + hash tablosu kullanilir;
+  eslesme bulunamazsa literal yazilir (gecerli SNAPPY, sadece daha buyuk). }
+function SnappyCompress(const Src: TBytes; out Dst: TBytes): Boolean;
+const
+  HASH_BITS = 14;
+  HASH_SIZE = 1 shl HASH_BITS;
+  MAX_COPY2 = 64;
+var
+  n, ip, nextEmit, op, cap, h, cand, matchLen, i: Integer;
+  table: array of Integer;
+  buf: TBytes;
+  U: LongWord;
+
+  procedure Grow(AExtra: Integer);
+  begin
+    if op + AExtra <= cap then Exit;
+    if cap < 128 then cap := 128;
+    while op + AExtra > cap do cap := cap * 2;
+    SetLength(buf, cap);
+  end;
+
+  procedure EmitVarint(AValue: LongWord);
+  var
+    V: LongWord;
+  begin
+    V := AValue;
+    while V >= 128 do
+    begin
+      Grow(1);
+      buf[op] := Byte((V and 127) or 128);
+      Inc(op);
+      V := V shr 7;
+    end;
+    Grow(1);
+    buf[op] := Byte(V);
+    Inc(op);
+  end;
+
+  procedure EmitLiteral(AStart, ALen: Integer);
+  var
+    L, nb, i2: Integer;
+    V: LongWord;
+  begin
+    if ALen <= 0 then Exit;
+    L := ALen - 1;
+    if L < 60 then
+    begin
+      Grow(1 + ALen);
+      buf[op] := Byte(L shl 2);
+      Inc(op);
+    end
+    else
+    begin
+      V := LongWord(L);
+      nb := 1;
+      while (nb < 4) and ((V shr (8 * nb)) <> 0) do Inc(nb);
+      Grow(1 + nb + ALen);
+      buf[op] := Byte((59 + nb) shl 2);
+      Inc(op);
+      for i2 := 0 to nb - 1 do
+      begin
+        buf[op] := Byte(V shr (8 * i2));
+        Inc(op);
+      end;
+    end;
+    Move(Src[AStart], buf[op], ALen);
+    Inc(op, ALen);
+  end;
+
+  procedure EmitCopy(AOffset, ALen: Integer);
+  var
+    L, chunk: Integer;
+  begin
+    L := ALen;
+    while L > MAX_COPY2 do
+    begin
+      if L - MAX_COPY2 < 4 then chunk := 60 else chunk := MAX_COPY2;
+      Grow(3);
+      buf[op] := Byte(((chunk - 1) shl 2) or 2);
+      Inc(op);
+      buf[op] := Byte(AOffset and 255);
+      buf[op + 1] := Byte((AOffset shr 8) and 255);
+      Inc(op, 2);
+      Dec(L, chunk);
+    end;
+    if L < 4 then Exit;
+    Grow(3);
+    buf[op] := Byte(((L - 1) shl 2) or 2);
+    Inc(op);
+    buf[op] := Byte(AOffset and 255);
+    buf[op + 1] := Byte((AOffset shr 8) and 255);
+    Inc(op, 2);
+  end;
+
+begin
+  Result := False;
+  Dst := nil;
+  n := Length(Src);
+  if n = 0 then
+  begin
+    // Gecerli bos SNAPPY blogu: yalnizca varint 0.
+    SetLength(Dst, 1);
+    Dst[0] := 0;
+    Result := True;
+    Exit;
+  end;
+  if n > 2000000000 then Exit;
+  cap := n + (n div 32) + 64;
+  SetLength(buf, cap);
+  op := 0;
+  EmitVarint(LongWord(n));
+  SetLength(table, HASH_SIZE);
+  for i := 0 to HASH_SIZE - 1 do table[i] := -1;
+  ip := 0;
+  nextEmit := 0;
+  while ip + 4 <= n do
+  begin
+    U := LongWord(Src[ip]) or (LongWord(Src[ip + 1]) shl 8) or
+         (LongWord(Src[ip + 2]) shl 16) or (LongWord(Src[ip + 3]) shl 24);
+    h := Integer((QWord(U) * 506832829) shr 32) and (HASH_SIZE - 1);
+    cand := table[h];
+    table[h] := ip;
+    if (cand >= 0) and ((ip - cand) <= 65535) and
+       (Src[cand] = Src[ip]) and (Src[cand + 1] = Src[ip + 1]) and
+       (Src[cand + 2] = Src[ip + 2]) and (Src[cand + 3] = Src[ip + 3]) then
+    begin
+      if ip > nextEmit then EmitLiteral(nextEmit, ip - nextEmit);
+      matchLen := 4;
+      while (ip + matchLen < n) and (Src[cand + matchLen] = Src[ip + matchLen]) do
+        Inc(matchLen);
+      EmitCopy(ip - cand, matchLen);
+      Inc(ip, matchLen);
+      nextEmit := ip;
+      Continue;
+    end;
+    Inc(ip);
+  end;
+  if n > nextEmit then EmitLiteral(nextEmit, n - nextEmit);
+  SetLength(buf, op);
+  Dst := buf;
+  Result := True;
 end;
 
 function DecodeRle(const B: TBytes; var P: Integer; BitWidth: Integer;
@@ -1671,8 +1848,8 @@ end;
 
 function BuildPageCells(ColIdx: Integer; const Fields: TStrArray;
   const Types: TByteArray; const DPrec, DScale: TByteArray;
-  const Cells: TVdbCellMatrix;
-  out Header, Body: TBytes): Boolean;
+  ACodec: Integer; const Cells: TVdbCellMatrix;
+  out Header, Body: TBytes; out ARawSize: Int64): Boolean;
 var
   bits, values, def: TBytes;
   n, i, present, boolPos, L: Integer;
@@ -1687,6 +1864,7 @@ var
   dd, dr: TVdbDec;
   de: string;
   db16: TBytes;
+  cbody: TBytes;
   W: TThriftWriter;
 begin
   Result := False;
@@ -1827,12 +2005,25 @@ begin
   SetLength(Body, Length(def) + Length(values));
   if Length(def) > 0 then Move(def[0], Body[0], Length(def));
   if Length(values) > 0 then Move(values[0], Body[Length(def)], Length(values));
+  { SKILL15-A: sayfa govdesi (tanim seviyeleri + degerler) tek parca
+    sikistirilir; DataPage v1'de tum govde sikistirilir. }
+  ARawSize := Length(Body);
+  if ACodec = CODEC_SNAPPY then
+  begin
+    if not SnappyCompress(Body, cbody) then
+      raise Exception.Create('Parquet: SNAPPY sikistirma hatasi');
+    Body := cbody;
+  end
+  else if ACodec <> CODEC_UNCOMPRESSED then
+    raise Exception.CreateFmt(
+      'Parquet: sikistirma desteklenmiyor (codec=%d); yalniz UNCOMPRESSED ve SNAPPY',
+      [ACodec]);
 
   W := TThriftWriter.Create;
   try
     W.BeginStruct;
     W.WriteI32Field(1, PAGE_DATA);
-    W.WriteI32Field(2, Length(Body));
+    W.WriteI32Field(2, Integer(ARawSize));
     W.WriteI32Field(3, Length(Body));
     W.Field(5, TT_STRUCT);
     W.BeginStruct;
@@ -1949,10 +2140,10 @@ begin
         W.Field(3, TT_LIST);
         W.ListHeader(TT_BINARY, 1);
         W.WriteBinaryValue(Groups[i].Cols[j].Name);
-        W.WriteI32Field(4, CODEC_UNCOMPRESSED);
+        W.WriteI32Field(4, Groups[i].Cols[j].Codec);
         W.WriteI64Field(5, Groups[i].Cols[j].NumValues);
-        W.WriteI64Field(6, Groups[i].Cols[j].TotalSize);
-        W.WriteI64Field(7, Groups[i].Cols[j].TotalSize);
+        W.WriteI64Field(6, Groups[i].Cols[j].CompressedSize);
+        W.WriteI64Field(7, Groups[i].Cols[j].UncompressedSize);
         W.WriteI64Field(9, Groups[i].Cols[j].DataOffset);
         W.EndStruct;
         W.EndStruct;
@@ -2013,24 +2204,66 @@ begin
     for i := 0 to High(Scale) do FScale[i] := Scale[i];
   FNumRows := 0;
   FClosed := False;
+  FCodec := CODEC_UNCOMPRESSED;
+  FMaxRowsPerGroup := 0;
   FStream := TFileStream.Create(FileName, fmCreate);
   FStream.WriteBuffer(Magic, 4);
 end;
 
-procedure TVdbParquetWriter.WriteBatch(const Cells: TVdbCellMatrix);
+procedure TVdbParquetWriter.DoWriteGroup(const Cells: TVdbCellMatrix);
 var
   g: TParquetGroupWrite;
-  i, k: Integer;
+  i, cnt: Integer;
   Header, Body: TBytes;
+  RawSize: Int64;
   conv, lk, lu: Integer;
+begin
+  if Length(Cells) = 0 then Exit;
+  cnt := Length(Cells);
+  SetLength(g.Cols, Length(FFields));
+  g.NumRows := cnt;
+  for i := 0 to High(FFields) do
+  begin
+    if not BuildPageCells(i, FFields, FTypes, FPrec, FScale, FCodec, Cells,
+      Header, Body, RawSize) then
+      raise Exception.Create('Parquet: sayfa olusturulamadi');
+    g.Cols[i].Name := FFields[i];
+    g.Cols[i].PType := ParquetTypeOf(FTypes[i], conv, lk, lu);
+    g.Cols[i].Converted := conv;
+    g.Cols[i].LogicalKind := lk;
+    g.Cols[i].LogicalUnit := lu;
+    g.Cols[i].VType := FTypes[i];
+    g.Cols[i].Codec := FCodec;
+    g.Cols[i].TypeLength := 0;
+    g.Cols[i].DecScale := 0;
+    g.Cols[i].DecPrec := 0;
+    if FTypes[i] = VCT_DECIMAL then
+    begin
+      g.Cols[i].TypeLength := 16;
+      if i < Length(FScale) then g.Cols[i].DecScale := FScale[i];
+      if i < Length(FPrec) then g.Cols[i].DecPrec := FPrec[i];
+    end;
+    g.Cols[i].DataOffset := FStream.Position;
+    if Length(Header) > 0 then FStream.WriteBuffer(Header[0], Length(Header));
+    if Length(Body) > 0 then FStream.WriteBuffer(Body[0], Length(Body));
+    g.Cols[i].TotalSize := Int64(Length(Header)) + Length(Body);
+    g.Cols[i].CompressedSize := g.Cols[i].TotalSize;
+    g.Cols[i].UncompressedSize := Int64(Length(Header)) + RawSize;
+    g.Cols[i].NumValues := cnt;
+  end;
+  SetLength(FGroups, Length(FGroups) + 1);
+  FGroups[High(FGroups)] := g;
+  Inc(FNumRows, cnt);
+end;
+
+{ SKILL14: DECIMAL icin (p,s) verilmediyse hucrelerden turet. Oncelik
+  hassasiyette: 0 = bildirilmedi. Olcek 0 ise ilk ondalik hucreden alinir. }
+procedure TVdbParquetWriter.DeriveDecSpec(const Cells: TVdbCellMatrix);
+var
+  i, k: Integer;
   dd: TVdbDec;
   de: string;
 begin
-  if FClosed then
-    raise Exception.Create('Parquet: yazici kapatildi');
-  if Length(Cells) = 0 then Exit;
-  { SKILL14: DECIMAL icin (p,s) verilmediyse hucrelerden turet. Oncelik
-    hassasiyette: 0 = bildirilmedi. Olcek 0 ise ilk ondalik hucreden alinir. }
   for i := 0 to High(FFields) do
     if FTypes[i] = VCT_DECIMAL then
     begin
@@ -2049,36 +2282,59 @@ begin
             end;
       end;
     end;
-  SetLength(g.Cols, Length(FFields));
-  g.NumRows := Length(Cells);
-  for i := 0 to High(FFields) do
+end;
+
+{ Birikmis satirlardan bir satir grubu yazar. MaxRowsPerGroup > 0 iken grup
+  tam olarak o kadar satirdan olusur (son grup kalan kadar). }
+procedure TVdbParquetWriter.FlushPending;
+var
+  cnt, rest, k, i: Integer;
+  sub: TVdbCellMatrix;
+begin
+  if Length(FPend) = 0 then Exit;
+  cnt := Length(FPend);
+  if (FMaxRowsPerGroup > 0) and (Int64(cnt) > FMaxRowsPerGroup) then
+    cnt := Integer(FMaxRowsPerGroup);
+  SetLength(sub, cnt);
+  for k := 0 to cnt - 1 do sub[k] := FPend[k];
+  DoWriteGroup(sub);
+  rest := Length(FPend) - cnt;
+  for i := 0 to rest - 1 do FPend[i] := FPend[cnt + i];
+  SetLength(FPend, rest);
+end;
+
+function TVdbParquetWriter.GetBytesWritten: Int64;
+begin
+  if FStream = nil then
+    Result := 0
+  else
+    Result := FStream.Size;
+end;
+
+procedure TVdbParquetWriter.WriteBatch(const Cells: TVdbCellMatrix);
+var
+  i: Integer;
+begin
+  if FClosed then
+    raise Exception.Create('Parquet: yazici kapatildi');
+  if Length(Cells) = 0 then Exit;
+  if (FCodec <> CODEC_UNCOMPRESSED) and (FCodec <> CODEC_SNAPPY) then
+    raise Exception.CreateFmt(
+      'Parquet: sikistirma desteklenmiyor (codec=%d); yalniz UNCOMPRESSED ve SNAPPY',
+      [FCodec]);
+  DeriveDecSpec(Cells);
+  if FMaxRowsPerGroup <= 0 then
   begin
-    if not BuildPageCells(i, FFields, FTypes, FPrec, FScale, Cells, Header, Body) then
-      raise Exception.Create('Parquet: sayfa olusturulamadi');
-    g.Cols[i].Name := FFields[i];
-    g.Cols[i].PType := ParquetTypeOf(FTypes[i], conv, lk, lu);
-    g.Cols[i].Converted := conv;
-    g.Cols[i].LogicalKind := lk;
-    g.Cols[i].LogicalUnit := lu;
-    g.Cols[i].VType := FTypes[i];
-    g.Cols[i].TypeLength := 0;
-    g.Cols[i].DecScale := 0;
-    g.Cols[i].DecPrec := 0;
-    if FTypes[i] = VCT_DECIMAL then
-    begin
-      g.Cols[i].TypeLength := 16;
-      if i < Length(FScale) then g.Cols[i].DecScale := FScale[i];
-      if i < Length(FPrec) then g.Cols[i].DecPrec := FPrec[i];
-    end;
-    g.Cols[i].DataOffset := FStream.Position;
-    if Length(Header) > 0 then FStream.WriteBuffer(Header[0], Length(Header));
-    if Length(Body) > 0 then FStream.WriteBuffer(Body[0], Length(Body));
-    g.Cols[i].TotalSize := Int64(Length(Header)) + Length(Body);
-    g.Cols[i].NumValues := Length(Cells);
+    DoWriteGroup(Cells);
+    Exit;
   end;
-  SetLength(FGroups, Length(FGroups) + 1);
-  FGroups[High(FGroups)] := g;
-  Inc(FNumRows, Length(Cells));
+  { SKILL15-C/D: satirlar grup tavani kadar biriktirilir; grup dolunca hemen
+    diske yazilir. Bellekte en fazla bir satir grubu tutulur. }
+  SetLength(FPend, Length(FPend) + Length(Cells));
+  for i := 0 to High(Cells) do
+    FPend[Length(FPend) - Length(Cells) + i] := Cells[i];
+  while Int64(Length(FPend)) >= FMaxRowsPerGroup do
+    FlushPending;
 end;
 
 procedure TVdbParquetWriter.Close;
@@ -2094,6 +2350,8 @@ begin
   if FClosed then Exit;
   FClosed := True;
   if FStream = nil then Exit;
+  { SKILL15-C/D: tavana ulasmamis son satirlar kapanista yazilir. }
+  FlushPending;
   // Sema her zaman alan listesinden uretilir; satir grubu olmasa da gecerli.
   SetLength(SchemaCols, Length(FFields));
   for i := 0 to High(FFields) do
@@ -2118,6 +2376,9 @@ begin
     SchemaCols[i].DataOffset := 0;
     SchemaCols[i].TotalSize := 0;
     SchemaCols[i].NumValues := 0;
+    SchemaCols[i].Codec := 0;
+    SchemaCols[i].CompressedSize := 0;
+    SchemaCols[i].UncompressedSize := 0;
   end;
   Meta := BuildFileMetaGroups(SchemaCols, FGroups, FNumRows);
   if Length(Meta) > 0 then FStream.WriteBuffer(Meta[0], Length(Meta));

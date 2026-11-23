@@ -205,7 +205,7 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   X4/X5/X6/X8, `interop_format` F15a/b/c; artik tam sayidan). Motor hatasi
   degildi ve kapi zayiflatilmadan duzeltildi. **Durust sinir**: iki bicimde
   de DECIMAL yoktur (SKILL14 sonrasi); Parquet yazimi yalniz UNCOMPRESSED
-  (SNAPPY yalniz okunur); tipli okumada Arrow DATE/TIME/DATETIME hucreleri
+  (SNAPPY yalniz okunur; SKILL15 sonrasi SNAPPY **yazilir**); tipli okumada Arrow DATE/TIME/DATETIME hucreleri
   `vckText` ISO metnidir (sayisal gun/saniye degil) ve Parquet'te
   sozluk (dictionary) kodlanmis FLOAT degerleri metin uzerinden gelir
   (sozluk dali hala metin cozer); Parquet okuyucu dosya footer'ini ve
@@ -255,6 +255,36 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   ISO metnidir; `TryJoinAgg`/`TryStreamGroupBy` DECIMAL'i reddeder (dogruluk
   genel yolda korunur, hizlandirma yoktur); hassasiyet 38 ile sinirlidir,
   Decimal256 yoktur; `TStrMatrix` API'si `''` ile NULL'i hala karistirir.
+- **SKILL15 - Parquet sikistirma ve bicim tamligi**: **TAMAM (v3.79)**.
+  Parquet yazici artik **SNAPPY** yazabilir: `SnappyCompress` saf Pascal
+  blok kodlayicidir (varint cozulmus boy, 4 baytlik hash tabanli eslesme,
+  yalniz `copy2` etiketi uretir, 64 bayta kadar parcalar); okuma tarafindaki
+  `SnappyDecompress` zaten vardi. **Yalniz sayfa govdesi** sikistirilir
+  (sayfa basligi sikistirilmaz), baslik alan 2 = sikistirilmamis, alan 3 =
+  sikistirilmis boy olur ve `ColumnMetaData` alan 4/6/7 codec ile
+  sikistirilmis/sikistirilmamis boyu tasir. **Satir grubu yonetimi**:
+  `MaxRowsPerGroup > 0` iken `WriteBatch` satirlari `FPend` tamponunda
+  biriktirir, tavan doldukca grup grup diske yazar; `Close` kalanlari
+  bosaltir. `BytesWritten` akis kanitidir. Desteklenmeyen codec ne yazimda
+  ne okumada gecistirilir: **acik hata**. Kapilar: `interop_external`
+  **36/0** (26 -> 36; X13 SNAPPY yazim + pyarrow codec/grup/satir/deger
+  dogrulamasi, X14 pyarrow SNAPPY okuma, X15 ZSTD okumada acik hata,
+  X16 gecersiz codec yazimda acik hata, X17 UNCOMPRESSED tek grup,
+  X18 yarim dosyada net hata, X19a `Close` oncesi diske yazim,
+  X19 110 grup x 1000 satir = 110000 satir, X19b SNAPPY dosyasi
+  UNCOMPRESSED'dan kucuk); korunan taban cizgileri `interop_format` 27/0,
+  `decimal_numeric` 93/0, `decimal_core` 44/0. On-kapi
+  (`git archive HEAD` = `a5c662c`): `interop_external` **derlenmez**,
+  8 x Error (`Codec`, `MaxRowsPerGroup`, `PQ_CODEC_SNAPPY`, `BytesWritten`
+  yok) - kapi ayirt edici. Kapi ayrica bir **test altyapisi kusuru**
+  yakaladi: X14, fiksturleri ureten `gencodec` cagrisindan once kosuyor ve
+  yalnizca bayat bir dosya sayesinde geciyordu; temiz is dizininde FAIL
+  verdi, uretim X14'un onune alindi. **Durust sinir**: ZSTD/LZ4/BROTLI **ne yazilir ne
+  okunur** (okuma acik hata verir; saglayici yoklugunda sessiz yanlis sonuc
+  uretilmez), sayfa duzeyi CRC yazilmaz, Arrow tarafinda dictionary ve
+  compression metadata yazimi yoktur (coklu record batch ve kati tip
+  dogrulama korunur), ve tavandan kucuk son parti `Close`a kadar bellekte
+  bekler.
 - **SKILL6 07 - genel hash join / maliyet modeli**: **KISMI**. `SELECT`
   tarafinda `TryStreamJoin` zaten PK arama, indeks kaynagi ve hash join
   yollarini secer (`merge_hash` kapisi M1-M13). Sprint P'de `UPDATE ... FROM`

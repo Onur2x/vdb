@@ -15,6 +15,10 @@ Modes
                       -> VDB'nin yazdigi DECIMAL(12,3)'u precision/scale
                          ve TAM deger ile dogrular (SKILL14)
   gendec <dir>        -> pyarrow ile harici DECIMAL(10,2) dosyalari uretir
+  checkcodec <file> <codec> <grup> <satir>
+                      -> VDB'nin yazdigi Parquet'in codec, satir grubu ve
+                         degerlerini dogrular (SKILL15)
+  gencodec <dir>      -> pyarrow ile SNAPPY ve ZSTD Parquet dosyalari uretir
 
 Exit 0 = tum dogrulamalar gecti. Exit 2 = dogrulama basarisiz (ayrinti stdout).
 Bu betik yalniz TEST tarafidir; depoya yeni bir calisma-zamani bagimliligi
@@ -476,6 +480,98 @@ def gendec(outdir):
     return 0
 
 
+def codec_rows(n):
+    """X13/X17 icin beklenen satirlar: id 1..n, v = id/1000 (olcek 3), s = 'r<id>'.
+
+    Her 50. satir tamamen NULL'dur; iki taraf da ayni kurali uygular.
+    """
+    rows = []
+    for i in range(1, n + 1):
+        if i % 50 == 0:
+            rows.append({"id": None, "v": None, "s": None})
+        else:
+            rows.append({"id": i,
+                         "v": decimal.Decimal(i) / decimal.Decimal(1000),
+                         "s": "r%d" % i})
+    return rows
+
+
+def checkcodec(path, want_codec, want_groups, want_rows):
+    """VDB'nin yazdigi Parquet dosyasini codec, satir grubu ve deger ile dogrular."""
+    pa, pq = load_pyarrow()
+    pf = pq.ParquetFile(path)
+    md = pf.metadata
+    want = want_codec.upper()
+    got_groups = md.num_row_groups
+    if got_groups != want_groups:
+        print(f"FAIL codec satir grubu {got_groups} != {want_groups}")
+        return EXIT_BAD
+    for g in range(got_groups):
+        rg = md.row_group(g)
+        for c in range(rg.num_columns):
+            comp = rg.column(c).compression
+            if comp.upper() != want:
+                print(f"FAIL codec grup {g} kolon {c}: {comp} != {want}")
+                return EXIT_BAD
+    if md.num_rows != want_rows:
+        print(f"FAIL codec satir sayisi {md.num_rows} != {want_rows}")
+        return EXIT_BAD
+    table = pf.read()
+    names = table.schema.names
+    if names != ["id", "v", "s"]:
+        print(f"FAIL codec kolonlar {names}")
+        return EXIT_BAD
+    vt = table.schema.field("v").type
+    if not pa.types.is_decimal(vt) or vt.precision != 12 or vt.scale != 3:
+        print(f"FAIL codec v tipi {vt}")
+        return EXIT_BAD
+    got = table.to_pylist()
+    wantr = codec_rows(want_rows)
+    if len(got) != len(wantr):
+        print(f"FAIL codec okunan satir {len(got)} != {len(wantr)}")
+        return EXIT_BAD
+    for i, (g, w) in enumerate(zip(got, wantr)):
+        if g["id"] != w["id"]:
+            print(f"FAIL codec satir {i} id: {g['id']!r} != {w['id']!r}")
+            return EXIT_BAD
+        if w["v"] is None:
+            if g["v"] is not None:
+                print(f"FAIL codec satir {i} v NULL beklenirdi: {g['v']!r}")
+                return EXIT_BAD
+        elif g["v"] is None or decimal.Decimal(g["v"]) != w["v"]:
+            print(f"FAIL codec satir {i} v: {g['v']!r} != {w['v']!r}")
+            return EXIT_BAD
+        if g["s"] != w["s"]:
+            print(f"FAIL codec satir {i} s: {g['s']!r} != {w['s']!r}")
+            return EXIT_BAD
+    print(f"OK codec {want} rg={got_groups} satir={want_rows} kolon=3 p=12 s=3")
+    return 0
+
+
+def gencodec(outdir):
+    """pyarrow ile SNAPPY ve ZSTD sikistirilmis Parquet dosyalari uretir."""
+    pa, pq = load_pyarrow()
+    if not os.path.isdir(outdir):
+        os.makedirs(outdir)
+    tbl = pa.table({
+        "id": pa.array([1, 2, 3], pa.int32()),
+        "v": pa.array([decimal.Decimal("12.34"), decimal.Decimal("-0.05"), None],
+                      pa.decimal128(10, 2)),
+        "s": pa.array(["a", None, "ccc"], pa.string()),
+    })
+    for name, comp in (("ext_snappy.parquet", "SNAPPY"),
+                       ("ext_zstd.parquet", "ZSTD")):
+        path = os.path.join(outdir, name)
+        pq.write_table(tbl, path, compression=comp)
+        pf = pq.ParquetFile(path)
+        got = pf.metadata.row_group(0).column(0).compression
+        if got.upper() != comp:
+            print(f"FAIL gencodec {name}: {got} != {comp}")
+            return EXIT_BAD
+        print(f"GEN {name} {os.path.getsize(path)} codec={got}")
+    return 0
+
+
 def main(argv):
     if len(argv) < 2:
         print("FAIL kullanim: verify.py selftest|check|gen")
@@ -525,6 +621,16 @@ def main(argv):
             print("FAIL kullanim: verify.py gendec <dir>")
             return EXIT_BAD
         return gendec(argv[2])
+    if mode == "checkcodec":
+        if len(argv) < 6:
+            print("FAIL kullanim: verify.py checkcodec <file> <codec> <grup> <satir>")
+            return EXIT_BAD
+        return checkcodec(argv[2], argv[3], int(argv[4]), int(argv[5]))
+    if mode == "gencodec":
+        if len(argv) < 3:
+            print("FAIL kullanim: verify.py gencodec <dir>")
+            return EXIT_BAD
+        return gencodec(argv[2])
     print(f"FAIL bilinmeyen mod: {mode}")
     return EXIT_BAD
 
