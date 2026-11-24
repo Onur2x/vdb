@@ -148,3 +148,7 @@ startup_error.txt
 # exe yaninda arar); uzantisiz Unix ciktisi izlenmez.
 /tests/crypto_fixtures/gen_fixtures
 
+
+# Python onbellekleri (SKILL17 istemci kosuculari; ASCII)
+__pycache__/
+*.pyc

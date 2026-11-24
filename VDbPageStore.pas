@@ -4748,6 +4748,8 @@ var
   env, plainBytes: TBytes;
   fileSize: Int64;
   expSize: Int64;
+  magic32, crc, selfNo, cnt: LongWord;
+  q: PLongWord;
 begin
   Result := False;
   if not VDbReadImageMeta(Path, bm, err) then
@@ -4804,16 +4806,55 @@ begin
       end
       else
         fs.ReadBuffer(buf[0], VDB_PAGE_SIZE);
-      if not PageVerify(PVdbPage(@buf), err) then
+      if PageHdr(PVdbPage(@buf))^.Magic = VDB_PAGE_MAGIC then
       begin
-        Report := Format('yedek bozuk: sayfa %d: %s', [pno, err]);
-        Exit;
-      end;
-      if PageHdr(PVdbPage(@buf))^.PageNo <> pno then
+        if not PageVerify(PVdbPage(@buf), err) then
+        begin
+          Report := Format('yedek bozuk: sayfa %d: %s', [pno, err]);
+          Exit;
+        end;
+        if PageHdr(PVdbPage(@buf))^.PageNo <> pno then
+        begin
+          Report := Format('yedek bozuk: sayfa %d basligi sayfa no %d diyor',
+            [pno, PageHdr(PVdbPage(@buf))^.PageNo]);
+          Exit;
+        end;
+      end
+      else
       begin
-        Report := Format('yedek bozuk: sayfa %d basligi sayfa no %d diyor',
-          [pno, PageHdr(PVdbPage(@buf))^.PageNo]);
-        Exit;
+        { Serbest liste (freelist) trunk sayfalari VDbPage basligi TASIMAZ;
+          kendi bicimiyle (sihirli sayi + CRC + sayac + kendi numarasi)
+          dogrulanir. Aksi halde serbest sayfa iceren SAGLAM bir yedek
+          "yedek bozuk" diye reddediliyordu (SKILL17). }
+        Move(buf[0], magic32, SizeOf(magic32));
+        if magic32 <> VDB_TRUNK_MAGIC then
+        begin
+          PageVerify(PVdbPage(@buf), err);
+          Report := Format('yedek bozuk: sayfa %d: %s', [pno, err]);
+          Exit;
+        end;
+        q := PLongWord(@buf[VDB_PAGE_BODY_END]);
+        crc := q^;
+        if VDbCrc32Of(buf[0], VDB_PAGE_BODY_END) <> crc then
+        begin
+          Report := Format('yedek bozuk: sayfa %d: freelist trunk CRC tutmadi',
+            [pno]);
+          Exit;
+        end;
+        Move(buf[8], cnt, SizeOf(cnt));
+        if cnt > LongWord(VDB_TRUNK_MAX) then
+        begin
+          Report := Format('yedek bozuk: sayfa %d: freelist trunk sayaci gecersiz: %d',
+            [pno, cnt]);
+          Exit;
+        end;
+        Move(buf[12], selfNo, SizeOf(selfNo));
+        if selfNo <> pno then
+        begin
+          Report := Format('yedek bozuk: sayfa %d basligi sayfa no %d diyor',
+            [pno, selfNo]);
+          Exit;
+        end;
       end;
     end;
     Report := Format('yedek saglam: %d sayfa, DbId=$%.16x, LSN=%d',

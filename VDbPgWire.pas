@@ -2490,6 +2490,13 @@ var
     if not P.Cur.NextChunk(VDB_PORTAL_CHUNK, chunk) then
     begin
       P.Done := True;
+      { SKILL17: NextChunk bos sonucta Res'i DOLDURMADAN False doner; ama
+        imlecte kolon meta verisi vardir. Bu veri tasinmazsa Describe
+        Portal bos sonuc icin NoData gonderir (PostgreSQL RowDescription
+        gonderir). Alan listesini buradan kopyaliyoruz. }
+      P.Res := Default(TSqlResult);
+      P.Res.Fields := P.Cur.FFields;
+      P.Res.FieldTypes := P.Cur.FFieldTypes;
       { SKILL11 D: akis bitti. Tuketilmis imlecin satir tamponu ve dis
         siralama kaynaklari bosaltilir; imlec nesnesi kalir cunku
         Describe onu gorunce sorguyu YENIDEN calistirmamalidir. Aksi

@@ -2126,3 +2126,61 @@ kaldirildi:
     dogrulanmistir; nonce guard kalici degildir (surec ici halka tampon,
     yeniden baslatmada sifirlanir); `/dev/urandom` ve `CryptGenRandom`
     disinda bir CSPRNG yolu yoktur ve bulunamazsa kripto islemi reddedilir.
+- Altmis dorduncu kosu (v3.81, SKILL17 - gercekci olcek kosusu ve gercek
+  PostgreSQL istemci matrisi): **Linux x86_64 68 PASS** (varsayilan) ve
+  **69 PASS** (depo disi pyarrow ile), **Windows i386 68 PASS**, FAIL 0,
+  `SUITE_EXIT=0`. Iki yeni kapi eklendi: `bench_scale` (olcek/benchmark,
+  PASS) ve `pg_client_matrix` (gercek istemci matrisi; bu makinede gercek
+  istemci yok, **SKIP 77** - PASS sayilmaz).
+  - **Sorun**: Depoda olcek iddiasi yalniz `tests/bench_sqlite` (24/0) ile
+    sinirliydi; 5.000 satirin uzerinde yazma/okuma/guncelleme/silme,
+    yedekleme-geri yukleme ve SQLite ile kontrol toplami karsilastirmasi
+    yapan bir kapi yoktu. PostgreSQL uyumlulugu ise yalniz depo ici saf
+    Pascal wire istemcisiyle sinaniyordu: **hicbir gercek istemci**
+    (psql, libpq, psycopg, JDBC, Npgsql) kosturulmuyordu, dolayisiyla
+    `server_version = 14.0` disinda bir uyumluluk kaniti yoktu.
+  - **Olcek kapisi** (`tests/bench_scale`): iki boyut (varsayilan 5.000 ve
+    100.000; 1M/10M yalniz `ParamStr(2)` veya `VDB_BENCH_SIZES` ile opt-in)
+    icin yazma, okuma, guncelleme, silme, yedek+geri yukleme ve es zamanli
+    yazici senaryolari; S1..S10 kontrolu, **13 kontrol toplami** VDB ile
+    SQLite arasinda birebir karsilastirilir. SQLite bacagi
+    (`sqlite_scale.py`, stdlib `sqlite3`) ayni is yukunu kosar ve
+    `journal_mode=WAL` + `synchronous=NORMAL` ayarlarini gercekten uygulayip
+    `.out` dosyasina yazar. Kapi ici olcum: **11 PASS / 0 FAIL** (5.000) ve
+    **19 PASS / 0 FAIL** (5.000 + 100.000). Kosulmayan boyutlar ve uzun
+    soak (1h/6h/24h) `SIZE ... NOT-RUN` / `SOAK ... NOT-RUN` satirlariyla
+    acikca yazilir; FAIL degildir ama PASS de degildir.
+  - **Bulunan gercek kusur (F60)**: `VDbPageStore.VerifyBackupImage`
+    freelist trunk sayfalarini (`VDB_TRUNK_MAGIC = 'VFT1'`) normal sayfa
+    gibi dogruluyordu; serbest sayfasi olan her veritabaninda yedek
+    "bozuk" gorunup `yedek bozuk: sayfa N: sihirli sayi bozuk: $4656` ile
+    **saglam yedek reddediliyordu**. Artik trunk dali ayri dogrulanir
+    (sihirli sayi, CRC32, sayac <= `VDB_TRUNK_MAX`, kendi sayfa numarasi);
+    hata metinleri `yedek bozuk:` ile baslamaya devam eder. Ayirt edici
+    kanit: on-kapi (`git archive HEAD` = `731f087`) bench_scale'i
+    **3 PASS / 1 FAIL** ile `$4656` hatasinda birakir; guncel agac
+    11/0 ve 19/0 verir.
+  - **Gercek istemci matrisi** (`tests/pg_client_matrix`): bes bacak
+    (psql, libpq, psycopg, JDBC, Npgsql) yoklanir; her bacakta 16 kontrol
+    (baglanti, SCRAM, TLS, prepared, Bind, Describe, Execute, Portal,
+    PortalSuspended, COPY IN, COPY OUT, NULL, islem, CancelRequest,
+    SQLSTATE, baglanti kapatma) kosulur. **JDBC ve Npgsql icin bu depoda
+    kosucu yoktur** (yalniz yoklanir, SKIP). **Gercek istemci
+    bulunamazsa kapi `Halt(77)` ile kapanir**, gerekce `SKIP_REASON.txt`
+    dosyasina yazilir ve SKIP **asla PASS sayilmaz**. Bu makinede Windows
+    ve WSL'de psql/libpq/psycopg yok, Java var ama JDBC surucusu yok,
+    dotnet yok: sonuc **1 PASS (sunucu acildi) / 0 FAIL / 6 SKIP**.
+  - **Wire bacagi** (saf Python, depo ici, gercek istemci sayilmaz ve
+    uyumluluk kaniti degildir): **15 OK / 0 FAIL / 1 SKIP**. Ikinci motor
+    kusuru burada bulundu ve duzeltildi: `PullPortalChunk` bos sonucta
+    `NextChunk` False donerken imlecteki kolon meta verisini tasimiyordu,
+    bu yuzden `Describe Portal` bos sonuc icin PostgreSQL'in aksine
+    NoData gonderiyordu.
+  - **Durust sinirlar** (kapi detayinda ve `.out` dosyasinda yazili):
+    `Describe Statement` RowDescription gondermez (belgeli sapma);
+    genisletilmis protokol **yalniz SELECT** kabul eder (parametreli
+    INSERT/UPDATE/DELETE desteklenmez); COPY varsayilan bicimi CSV'dir,
+    PostgreSQL'in text/tab degil (NL6'da belgelenmis, onceden var olan
+    sapma); wire bacagi TLS kurmaz (TLS ayri kapida); ORDER BY cikisi
+    NULL maskesini dusurur (onceden var olan tasarim). `server_version`
+    14.0 uyumluluk kaniti degildir.

@@ -203,6 +203,18 @@ build_gate stream_spill "$ROOT/tests/stream_spill/stream_spill.lpr"
 build_gate decimal_core "$ROOT/tests/decimal_core/decimal_core.lpr"
 build_gate decimal_numeric "$ROOT/tests/decimal_numeric/decimal_numeric.lpr"
 
+# SKILL17: gercekci olcek kosusu ve SQLite karsilastirmasi. Kapida iki boyut
+# (5.000 / 100.000) yazilir, okunur, guncellenir, silinir, yedeklenip geri
+# yuklenir; iki motorun 13 kontrol toplami karsilastirilir. Python sqlite3
+# (stdlib) yoksa kapi 77 ile SKIP verir ve PASS sayilmaz.
+build_gate bench_scale "$ROOT/tests/bench_scale/bench_scale.lpr"
+
+# SKILL17: gercek PostgreSQL istemci matrisi (psql, libpq, psycopg, JDBC,
+# Npgsql) + saf Python protokol bacagi. Makinede GERCEK istemci yoksa kapi
+# 77 ile SKIP verir (PASS sayilmaz) ve gerekceyi SKIP_REASON.txt'e yazar;
+# wire bacagi kosturulur ama uyumluluk kaniti sayilmaz.
+build_gate pg_client_matrix "$ROOT/tests/pg_client_matrix/pg_client_matrix.lpr"
+
 # --- kosum -----------------------------------------------------------
 unset VDB_CRYPTO_PROVIDER 2>/dev/null || true
 unset VDB_CRYPTO_DLL 2>/dev/null || true
@@ -282,6 +294,18 @@ run_gate stream_spill "$WORK/stream_spill" stream_spill
 # uctan uca surer.
 run_gate decimal_core "$WORK/decimal_core" decimal_core
 run_gate decimal_numeric "$WORK/decimal_numeric" decimal_numeric
+
+# SKILL17: olcek/benchmark kapisi. Uzun soak (1h/6h/24h) burada KOSMAZ;
+# kapi bunu "SOAK ... NOT-RUN" satirlariyla acikca yazar.
+run_gate bench_scale "$WORK/bench_scale" bench_scale \
+  "$(npath "$WORK/bench_scale")" "5000,100000" \
+  "$(npath "$ROOT/tests/bench_scale")"
+
+# SKILL17: gercek istemci matrisi. Ikinci arg betik dizinidir. Gercek
+# istemci yoksa cikis 77'dir: SKIP, PASS degildir.
+run_gate pg_client_matrix "$WORK/pg_client_matrix" pg_client_matrix \
+  "$(npath "$WORK/pg_client_matrix")" \
+  "$(npath "$ROOT/tests/pg_client_matrix")"
 
 # SKILL6 08: interop / kripto / bench kapilari.
 # Dis arac (pyarrow) gerektiren kapilar arac yoksa 77 ile SKIP verir ve

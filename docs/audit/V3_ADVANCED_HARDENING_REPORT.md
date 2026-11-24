@@ -255,6 +255,48 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   ISO metnidir; `TryJoinAgg`/`TryStreamGroupBy` DECIMAL'i reddeder (dogruluk
   genel yolda korunur, hizlandirma yoktur); hassasiyet 38 ile sinirlidir,
   Decimal256 yoktur; `TStrMatrix` API'si `''` ile NULL'i hala karistirir.
+- **SKILL17 - gercekci olcek kosusu ve gercek PostgreSQL istemci matrisi**:
+  **TAMAM (v3.81)**.
+  **Olcek kapisi** `tests/bench_scale` (yeni): ayni is yuku iki motorda kosar
+  (yaz, oku, `ORDER BY`, `DISTINCT`, `JOIN`, `GROUP BY`, akis, es zamanli
+  okuyucu/yazici, guncelle/sil, yedek + geri yukleme). Varsayilan boyutlar
+  5.000 ve 100.000; `ParamStr(2)` ya da `VDB_BENCH_SIZES` ile degistirilebilir.
+  1M/10M **opt-in**'dir ve kosulmayan boyutlar `SIZE <n> NOT-RUN: <gerekce>`
+  satiriyla yazilir (FAIL degil, ama PASS de degil). 1h/6h/24h soak bu kapida
+  kosmaz; `SOAK ... NOT-RUN` satirlari basilir. Iki motorun **13 kontrol
+  toplami** (S3) birebir karsilastirilir; SQLite bacagi Python stdlib
+  `sqlite3` ile kosar ve `journal_mode=WAL` + `synchronous=NORMAL` gercekten
+  uygulanir (`.out` icine yazilir). Olculen: 5.000 -> **11 PASS / 0 FAIL**;
+  5.000 + 100.000 -> **19 PASS / 0 FAIL**.
+  **Bu turda bulunan gercek kusur**: `VerifyBackupImage` freelist trunk
+  sayfalarini VDbPage sanip **saglam** yedegi reddediyordu (F60); kapinin S7
+  adimi bunu yakaladi, duzeltme `VDbPageStore.pas` icinde yapildi.
+  **Gercek istemci matrisi** `tests/pg_client_matrix` (yeni): bes gercek
+  istemci bacagi (psql, libpq, psycopg, JDBC, Npgsql) yoklanir. Kosucu betigi
+  depoda olmayan bacaklar (JDBC/Npgsql) **SKIP** yazilir; uydurma PASS
+  uretilmez. Makinede hicbir gercek istemci yoksa kapi **cikis 77** ile
+  kapanir ve gerekce `SKIP_REASON.txt` icine yazilir; SKIP **PASS sayilmaz**.
+  Protokolun kendisini dogrulamak icin saf Python wire bacagi (`pgc_wire.py`:
+  SCRAM-SHA-256, basit ve genisletilmis protokol, portal/PortalSuspended,
+  COPY IN/OUT, CancelRequest, SQLSTATE) kosar ve **uyumluluk kaniti
+  sayilmaz**. Olculen: wire **15 OK / 0 FAIL / 1 SKIP**, 1 PASS (sunucu
+  acildi), 6 SKIP -> cikis 77.
+  **Bulunan ikinci gercek kusur**: bos sonuclu portalda `PullPortalChunk`
+  imlecin alan listesini tasimiyordu; bu yuzden Describe Portal PostgreSQL'in
+  `RowDescription`'i yerine `NoData` donuyordu. Alan listesi artik sonuc
+  nesnesine kopyalanir (`VDbPgWire.pas`).
+  **Durust sinirlar** (kapi raporunda tek tek yazili): Describe Statement
+  `RowDescription` gondermez (yalniz `ParameterDescription` + `NoData`);
+  genisletilmis protokolde yalniz `SELECT` desteklenir (parametreli
+  `INSERT` `OpenCursor yalniz SELECT kabul eder` ile reddedilir); `COPY`
+  varsayilan bicimi CSV'dir (PostgreSQL'in text/tab'i degil - onceden var
+  olan, `tests/network_limits` NL6'da belgeli sapma); wire bacagi TLS
+  kurmaz (TLS ayri kapida). Sunucunun `server_version = 14.0 (VDB)` demesi
+  **PG14 uyumluluk kaniti degildir** ve oyle raporlanmaz.
+  On-kapi (`git archive HEAD` = `731f087`): `tests/bench_scale` ve
+  `tests/pg_client_matrix` **yoktur**; ayni bench kosusu temel agacta
+  `RESTORE: yedek bozuk ... $4656` ile **FAIL**, ayni matris kosusu
+  `wire.describe` **FAIL** verir. Guncel agacta 11/0 ve 15/0'dir.
 - **SKILL16 - kriptografik rastgelelik ve bagimsiz AES-GCM KAT**: **TAMAM (v3.80)**.
   **CSPRNG** zaten kriptografik kaynakliydi (`VDbCryptoRandom`: Windows
   `CryptGenRandom`, Unix `/dev/urandom`; zaman tabanli yedek yol yok, kaynak
