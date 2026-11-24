@@ -255,6 +255,48 @@ Yardimci belgeler: `docs/audit/V3_FINAL_AUDIT.md` (bulgu tablosu F1-F22),
   ISO metnidir; `TryJoinAgg`/`TryStreamGroupBy` DECIMAL'i reddeder (dogruluk
   genel yolda korunur, hizlandirma yoktur); hassasiyet 38 ile sinirlidir,
   Decimal256 yoktur; `TStrMatrix` API'si `''` ile NULL'i hala karistirir.
+- **SKILL18 - esit dayaniklilikta SQLite karsilastirmasi ve uc sonuc**:
+  **KISMEN (v3.82)**. `VDB_V3_FINAL_SKILL.md` uc somut sonuc istiyor: ani
+  kapanmada commit edilmis veri kayboluyor mu, ayni dayaniklilik seviyesinde
+  SQLite'a gore hiz, 24 saat sonunda veri/bellek/kaynak durumu. Onceki olcum
+  **adil degildi**: `VDbBackendV3.pas` (`FDurableOnFlush := True`) yuzunden
+  VDB her autocommit yaziminda fsync ederken SQLite bacagi
+  `synchronous=NORMAL` ile kosuyordu; iki taraf ayni seviyede degildi. Bu
+  turda `tests/bench_scale` icine iki anahtar eklendi
+  (`VDB_BENCH_VDB_DURABLE`, `VDB_BENCH_SQLITE_SYNC`); **varsayilanlar
+  degismedi** (VDB fsync acik, SQLite NORMAL) ve eslesmeyen cift FAIL
+  uretmez, rapora `PROFILE_MATCH=no` + gerekce yazilir. Iki esdeger profil
+  olculdu (Windows i386, 5.000 + 100.000 satir, iki motorun kontrol toplamlari
+  birebir ayni): **Test A (tam dayaniklilik)** VDB fsync/commit + SQLite
+  `synchronous=FULL`, `PROFILE_MATCH=yes`, **19 PASS / 0 FAIL**; **Test B
+  (dengeli)** VDB fsync checkpoint'e ertelenir (SQLite `NORMAL` esdegeri) +
+  SQLite `synchronous=NORMAL`, `PROFILE_MATCH=yes`, **19 PASS / 0 FAIL**.
+  **Olculen performans sonucu**: 100.000 satirda 20 karsilastirilabilir
+  fazin **18'i %50'den fazla yavas**, yani `VDB_V3_FINAL_SKILL.md` 4.5'in
+  **"ciddi performans acigi"** sinifinda: `JOIN` 604x, aralik taramasi
+  1004x, tek satir `ROLLBACK` ~3,99 s (365.439x), `DELETE` 260x, `UPDATE`
+  129x, bilesik indeks 126x, sonuc akisi 59x, `tx_commit` 21x, acilis 21x,
+  nokta sorgusu 10,7x, toplu `INSERT` 13,2x. Yakin olanlar: sema kurulumu
+  0,97x, tekli `INSERT` 1,52x **(fsync maliyeti SQLite'inkiyle
+  kiyaslanabilir)**, `GROUP BY` VDB'de **9x hizli**. Dengeli profilde oranlar
+  ayni yonde (JOIN 650x, aralik taramasi 1008x, `ROLLBACK` 290.352x, tekli
+  `INSERT` 6,1x); yani acik dayaniklilik ayarindan degil, sorgu/indeks/
+  rollback yolundan geliyor.
+  **Veri guvenligi sonucu**: `tests/crash_points` (24/0) surecu **gercekten**
+  oldurur (7 enjeksiyon noktasi, `Close()` calismaz); onaylanmis commit
+  **kaybolmaz**, fsync oncesi kesilen commit kaybolabilir ama tutarsizlik
+  yoktur. `tests/wal_crash` (13 senaryo): yarim kayit atilir, CRC/magic
+  bozulmasinda kurtarma durur, kurtarma **idempotenttir**, fsync hatasinda
+  hayalet commit kalmaz.
+  **Durust sinirlar**: 1 saat / 6 saat / **24 saat soak KOSULMADI**
+  (`bench_scale` her kosuda `SOAK ... NOT-RUN` yazar; `tests/soak` varsayilan
+  25 saniyedir ve spec 5.3'un 60 saniyelik kayit serisi yoktur); 1.000.000
+  ve 10.000.000 olcek kosulmadi (`SIZE ... NOT-RUN`); spec en az 5 tekrar
+  ister, bu kosu tek tekrardir; `SUM`, alt sorgu, `UPSERT`,
+  kapanis/checkpoint suresi ve WAL buyumesi ayri faz degildir;
+  `docs/finalization/` altindaki 12 rapor henuz yazilmamistir. Bu tabloda
+  **surum dondurma onerilmedi**: performans acigi yapisal, 24 saatlik
+  kararlilik kaniti yoktur.
 - **SKILL17 - gercekci olcek kosusu ve gercek PostgreSQL istemci matrisi**:
   **TAMAM (v3.81)**.
   **Olcek kapisi** `tests/bench_scale` (yeni): ayni is yuku iki motorda kosar

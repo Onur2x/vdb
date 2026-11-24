@@ -35,10 +35,14 @@ def pct(vals, p):
 
 def main():
     if len(sys.argv) < 3:
-        print('kullanim: sqlite_scale.py <db yolu> <N>')
+        print('kullanim: sqlite_scale.py <db yolu> <N> [FULL|NORMAL|OFF]')
         return 2
     path = sys.argv[1]
     n = int(sys.argv[2])
+    sync = (sys.argv[3] if len(sys.argv) > 3 else 'NORMAL').upper()
+    if sync not in ('FULL', 'NORMAL', 'OFF'):
+        print('gecersiz synchronous: %s (FULL/NORMAL/OFF)' % sync)
+        return 2
     if n < 1000:
         print('N cok kucuk')
         return 2
@@ -65,13 +69,16 @@ def main():
 
     con = sqlite3.connect(path)
     cur = con.cursor()
-    # Esit kosullar (SKILL17-C): SQLite tarafinin durability ayarlari acikca
-    # yazilir; VDB tarafi varsayilan durability ile kosar ve rapor bunu yazar.
+    # Esit kosullar (SKILL18): SQLite tarafinin durability ayari disaridan
+    # secilir (varsayilan NORMAL) ve raporda ADIYLA yazilir. Esdeger profiller:
+    # (VDB DurableOnFlush=1, synchronous=FULL) tam dayaniklilik;
+    # (VDB DurableOnFlush=0, synchronous=NORMAL) dengeli.
     journal = cur.execute('PRAGMA journal_mode=WAL').fetchone()[0]
-    cur.execute('PRAGMA synchronous=NORMAL')
+    cur.execute('PRAGMA synchronous=' + sync)
     syn = cur.execute('PRAGMA synchronous').fetchone()[0]
     emit('JOURNAL_MODE', journal)
     emit('SYNCHRONOUS', syn)
+    emit('SYNCHRONOUS_NAME', sync)
 
     t = time.perf_counter()
     cur.execute('CREATE TABLE bench (id INTEGER PRIMARY KEY, grp INTEGER, val INTEGER, txt TEXT)')

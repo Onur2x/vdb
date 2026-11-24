@@ -16,9 +16,12 @@ program bench_scale;
     yeniden acilis (kurtarma) ve es zamanli okuyucular / yazicilar.
   - Istatistik: P50/P95/P99 (mikrosaniye), islem basina ortalama, throughput,
     DB/WAL boyu, RSS / tepe RSS, yigin, CPU. CSV ve JSON olarak yazilir.
-  - Esit kosullar: SQLite tarafinda journal_mode=WAL + synchronous=NORMAL
-    gercekten uygulanir ve .out dosyasina GERCEK degerler yazilir; VDB
-    tarafi varsayilan durability ile kosar (asagida yazilir).
+  - Esit kosullar: SQLite tarafinda journal_mode=WAL + synchronous secilir
+    (VDB_BENCH_SQLITE_SYNC=FULL|NORMAL|OFF, varsayilan NORMAL) ve .out
+    dosyasina GERCEK degerler yazilir; VDB tarafi DurableOnFlush ile kosar
+    (VDB_BENCH_VDB_DURABLE=1|0, varsayilan 1 = her autocommit yaziminda
+    fsync). Iki ayar AYNI seviyede degilse rapora PROFILE_MATCH=no yazilir ve
+    hicbir hiz karsilastirmasi kurulmaz (bkz. DURUST SINIRLAR).
 
   DURUST SINIRLAR
   - P50/P95/P99, TEKRARLANAN olcumlerin dagilimindan gelir; tek tek islem
@@ -30,6 +33,11 @@ program bench_scale;
     urun bagimliligi degil), Linux'ta /proc/self/status ile okunur.
   - Uzun soak (1 saat / 6 saat / 24 saat) BU KAPIDA KOSULMAZ; yalniz
     "NOT-RUN" satiri yazilir. Kaynak sizintisi iddiasi bu kapiya dayanamaz.
+  - Tek kosum yapilir; 5 tekrar + ayri isinma turu YOKTUR. Bu yuzden
+    P50/P95/P99 kosular arasi degil, faz ici dagilimdan gelir.
+  - Iki motorun dayaniklilik seviyesi eslesmezse rapora PROFILE_MATCH=no ve
+    PROFILE_NOTE yazilir; bu durumda hiz karsilastirmasi KURULMAZ. Kapi FAIL
+    olmaz (olcum gecerli), yalniz "esit kosullar" iddiasi kurulamaz.
   - SQLite tarafi yoksa kapi 77 (SKIP) doner ve PASS sayilmaz.
 }
 {$mode delphi}{$H+}
@@ -111,6 +119,17 @@ var
   GPhases: array of TPhase;
   GPhaseCount: Integer;
   GChecks: TStringList;
+  { SKILL18: dayaniklilik profili. Iki motor AYNI seviyede kosmazsa
+    karsilastirma gecersizdir; bu yuzden profil disaridan secilir ve
+    rapora yazilir.
+      VDB_BENCH_VDB_DURABLE=1|0 -> DurableOnFlush (1 = her autocommit
+        yaziminda fsync = tam dayaniklilik; motor varsayilani 1).
+      VDB_BENCH_SQLITE_SYNC=FULL|NORMAL|OFF -> PRAGMA synchronous.
+    Esdeger profiller: (1,FULL) tam dayaniklilik; (0,NORMAL) dengeli. }
+  GVDbDurable: Boolean;
+  GSQLiteSync: string;
+  GProfileMatch: Boolean;
+  GProfileWhy: string;
 
 { ---------------------------------------------------------------- zaman --- }
 
@@ -228,6 +247,14 @@ begin
     Result := cand[i];
     Exit;
   end;
+end;
+
+{ SKILL18: secilen dayaniklilik profilini motora uygular. Cagri, yazma
+  baslamadan ONCE yapilmalidir. }
+procedure ApplyDurability(const ABe: IVdbBackend);
+begin
+  if ABe <> nil then
+    ABe.DurableOnFlush := GVDbDurable;
 end;
 
 function FileBytes(const APath: string): Int64;
@@ -610,6 +637,7 @@ var
 begin
   try
     VdbOpenWithBusyTimeout(FDb, Be, 5000, False);
+    ApplyDurability(Be);
     Tb := TVTableDb.CreateBackend(Be);
     try
       Tb.Open(ExtractFileDir(Be.FilePath));
@@ -695,6 +723,7 @@ begin
   GChecks.Add(Format('VDB_%d_N=%d', [AN, AN]));
 
   VdbOpen(db, Be, True, False);
+  ApplyDurability(Be);
   Tb := TVTableDb.CreateBackend(Be);
   try
     Tb.Open(dir);
@@ -955,6 +984,7 @@ begin
   { --- yeniden acilis (kurtarma), yedek, geri yukleme --- }
   t0 := NowUs;
   VdbOpen(db, Be, False, False);
+  ApplyDurability(Be);
   Tb := TVTableDb.CreateBackend(Be);
   try
     Tb.Open(dir);
@@ -984,6 +1014,7 @@ begin
 
   { Geri yukleme sonrasi satir sayisi korunmali. }
   VdbOpen(db, Be, False, False);
+  ApplyDurability(Be);
   Tb := TVTableDb.CreateBackend(Be);
   try
     Tb.Open(dir);
@@ -1037,7 +1068,8 @@ begin
   WipePath(db + '.out');
   WipePath(db + '.csv');
   WipePath(db + '.bak');
-  if not TryRun(GPy, [IncludeTrailingPathDelimiter(GScript) + 'sqlite_scale.py', db, IntToStr(AN)], o, code) then
+  if not TryRun(GPy, [IncludeTrailingPathDelimiter(GScript) + 'sqlite_scale.py',
+      db, IntToStr(AN), GSQLiteSync], o, code) then
   begin
     AReason := 'python calistirilamadi: ' + o;
     Exit;
@@ -1180,7 +1212,16 @@ begin
 
     outL.Assign(GChecks);
     outL.Add('SIZES=' + ASizes.CommaText);
-    outL.Add('DURABILITY=vdb:varsayilan (motor varsayilani)');
+    if GVDbDurable then
+      outL.Add('DURABILITY=vdb:DurableOnFlush=1 (her autocommit yaziminda fsync)')
+    else
+      outL.Add('DURABILITY=vdb:DurableOnFlush=0 (fsync checkpoint''e ertelenir)');
+    outL.Add('DURABILITY=sqlite:journal_mode=wal,synchronous=' + GSQLiteSync);
+    if GProfileMatch then
+      outL.Add('PROFILE_MATCH=yes')
+    else
+      outL.Add('PROFILE_MATCH=no');
+    outL.Add('PROFILE_NOTE=' + GProfileWhy);
     MemInfo(rss, peak);
     outL.Add(Format('PROC_RSS_BYTES=%d', [rss]));
     outL.Add(Format('PROC_PEAK_RSS_BYTES=%d', [peak]));
@@ -1253,6 +1294,50 @@ begin
     end;
     WriteLn('BILGI python=', GPy);
     WriteLn('BILGI boyutlar=', sizes.CommaText);
+
+    { SKILL18: dayaniklilik profili. Iki motor AYNI seviyede kosmali.
+      Esdeger ciftler: (DurableOnFlush=1, synchronous=FULL) tam dayaniklilik;
+      (DurableOnFlush=0, synchronous=NORMAL) dengeli. Baska her kombinasyon
+      rapora PROFILE_MATCH=no olarak yazilir; kapi bunu FAIL yapmaz ama
+      karsilastirma iddiasi bu durumda KURULAMAZ. }
+    GVDbDurable := Trim(GetEnvironmentVariable('VDB_BENCH_VDB_DURABLE')) <> '0';
+    GSQLiteSync := UpperCase(Trim(GetEnvironmentVariable('VDB_BENCH_SQLITE_SYNC')));
+    if GSQLiteSync = '' then
+      GSQLiteSync := 'NORMAL';
+    if (GSQLiteSync <> 'FULL') and (GSQLiteSync <> 'NORMAL') and
+       (GSQLiteSync <> 'OFF') then
+    begin
+      WriteLn('HATA: VDB_BENCH_SQLITE_SYNC yalniz FULL/NORMAL/OFF olabilir: ',
+        GSQLiteSync);
+      Halt(2);
+    end;
+    if GVDbDurable and (GSQLiteSync = 'FULL') then
+    begin
+      GProfileMatch := True;
+      GProfileWhy := 'tam dayaniklilik: vdb fsync/commit + sqlite synchronous=FULL';
+    end
+    else if (not GVDbDurable) and (GSQLiteSync = 'NORMAL') then
+    begin
+      GProfileMatch := True;
+      GProfileWhy := 'dengeli: vdb fsync ertelenir + sqlite synchronous=NORMAL';
+    end
+    else
+    begin
+      GProfileMatch := False;
+      if GVDbDurable then
+        GProfileWhy := 'vdb tam dayaniklilik (fsync/commit) ama sqlite synchronous='
+          + GSQLiteSync + ' -> seviyeler ESIT DEGIL'
+      else
+        GProfileWhy := 'vdb fsync ertelenir ama sqlite synchronous=' + GSQLiteSync
+          + ' -> seviyeler ESIT DEGIL';
+    end;
+    if GVDbDurable then
+      WriteLn(Format('BILGI profil: vdb DurableOnFlush=1 / sqlite synchronous=%s / esit=%s',
+        [GSQLiteSync, BoolToStr(GProfileMatch, 'yes', 'no')]))
+    else
+      WriteLn(Format('BILGI profil: vdb DurableOnFlush=0 / sqlite synchronous=%s / esit=%s',
+        [GSQLiteSync, BoolToStr(GProfileMatch, 'yes', 'no')]));
+    WriteLn('BILGI profil notu: ', GProfileWhy);
 
     sqliteOk := True;
     for i := 0 to sizes.Count - 1 do
