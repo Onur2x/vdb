@@ -647,7 +647,12 @@ type
       fsync eder (P-DUR sozlesmesi: commit fsync eder). }
     procedure Flush(DoSync: Boolean = True);
 
-    { Tum pinleri sifirlar ve onbellegi bosaltir (test/kurtarma icin). }
+    { Tum pinleri sifirlar ve onbellegi bosaltir (test/kurtarma icin).
+      NOT (SKILL8): yalniz TEMIZ cerceveleri atar. Kirli cerceveleri de atan
+      bir DropCacheAll denendi ve sema katmani tazelemeden haberdar olmadigi
+      icin DDL'i kirdigi goruldu (tests/bench_report); guvenli bir sema
+      tazeleme mimarisi eklenene kadar KULLANILMAZ. Ayrinti:
+      docs/finalization/ACCELERATED_STABILITY_REPORT.md. }
     procedure DropCache;
 
     { P1-3: durabilite (fsync) hatasindan sonra BELLEK GORUNUMUNU atar.

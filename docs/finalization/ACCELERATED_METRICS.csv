@@ -1,0 +1,31 @@
+kapi,kapsam,sonuc,pass,fail,skip,birim,kaynak,durum
+tam_kapi_seti,72 kapi,68 PASS / 4 SKIP / 0 FAIL,68,0,4,kapi,build/gates15.log,OLCULDU
+crash_stress,100 zorla sonlandirma,101 PASS / 0 FAIL,101,0,0,kapi,build/c100.log,OLCULDU
+tx_stress,1000 islem dongusu,34 PASS / 0 FAIL,34,0,0,kapi,build/tx1000.log,OLCULDU
+freelist_repro_seq1200,1200 tur iki oturum,fark=0,0,0,0,tur,build/f30.log,OLCULDU
+freelist_repro_seq1500,1500 tur iki oturum,fark=0,0,0,0,tur,build/f31.log,OLCULDU
+freelist_repro_seq1_4000,4000 tur tek oturum,fark=0,0,0,0,tur,build/f33.log,OLCULDU
+dirty_refresh,5 kontrol,5 PASS / 0 FAIL,5,0,0,kapi,build/dr_fix2.log,OLCULDU
+soak_phased_900_guncel,900 s fazli soak,FAIL,2,5,0,kapi,build/soakS.log,OLCULDU
+soak_phased_900_head,900 s fazli soak HEAD,FAIL,4,3,0,kapi,build/soakH900.log,OLCULDU
+soak_phased_7200,7200 s fazli soak,FAIL (concurrency),0,3,0,kapi,build/soak2h.log,OLCULDU
+commit_p50,islem stress,1275,1275,0,0,us,build/tx1000.log,OLCULDU
+commit_p95,islem stress,1855,1855,0,0,us,build/tx1000.log,OLCULDU
+commit_max,islem stress,3434,3434,0,0,us,build/tx1000.log,OLCULDU
+rollback_p50,islem stress,187,187,0,0,us,build/tx1000.log,OLCULDU
+rollback_p95,islem stress,275,275,0,0,us,build/tx1000.log,OLCULDU
+rollback_max,islem stress,402,402,0,0,us,build/tx1000.log,OLCULDU
+izolasyon_ihlali,islem stress,0,0,0,0,adet,build/tx1000.log,OLCULDU
+cakisma_kabul,islem stress,0,0,0,0,adet,build/tx1000.log,OLCULDU
+cakisma_red,islem stress,166,166,0,0,adet,build/tx1000.log,OLCULDU
+pk_ihlali_tetik,islem stress,167,167,0,0,adet,build/tx1000.log,OLCULDU
+performans_regresyonu_profA,guncel vs HEAD (DURABLE=1/FULL),44 faz / 1 esik-ustu,44,1,0,faz,build/perfA.txt,OLCULDU
+performans_regresyonu_profB,guncel vs HEAD (DURABLE=0/NORMAL),44 faz / 6 esik-ustu,44,6,0,faz,build/perfB.txt,OLCULDU
+performans_kod_farki,yorum disinda kod farki,0,0,0,0,satir,docs/finalization/PERFORMANCE_REGRESSION_RESULTS.md,OLCULDU
+linux_perf,Linux perf kosusu,NOT-RUN,0,0,0,faz,-,NOT-RUN
+perf_tekrar_ortalamasi,cok kosuluk ortalama/guven araligi,NOT-RUN,0,0,0,faz,-,NOT-RUN
+write_30dk,1800 s yazma stress tek yazar,3 PASS / 0 FAIL,3,0,0,kapi,build/write30.log,OLCULDU
+write_30dk_ops,1800 s yazma stress tek yazar,61196 op / 0 hata / 0 ret,61196,0,0,op,build/write30.log,OLCULDU
+linux_soak,Linux fazli soak,NOT-RUN,0,0,0,kapi,-,NOT-RUN
+os_cokmesi,guc kesintisi / OS crash,NOT-RUN,0,0,0,kapi,-,NOT-RUN
+bit_rot,disk denetim hatasi,NOT-RUN,0,0,0,kapi,-,NOT-RUN

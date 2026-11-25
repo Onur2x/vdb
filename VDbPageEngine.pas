@@ -600,6 +600,18 @@ begin
 
   if needFull then
   begin
+    { BILINEN SINIR (SKILL8): DropCache YALNIZ temiz cerceveleri atar.
+      Yerlesik kirli bir cerceve (bu oturumun daha onceki commit'inden,
+      dosyaya henuz inmemis imaj) dosyadaki daha yeni imajin uzerine
+      yazilabilir; WAL kurtarma cogu durumda daha yeni imaji InstallPage ile
+      geri kurar (tests/dirty_refresh bunu dogrular: 5/5 PASS), ancak WAL'de
+      kurtarilacak kare kalmadiginda bu koruma yoktur.
+      Kirli cerceveleri de atan bir DropCacheAll denendi: TAM tazelemede
+      calisiyor, ancak sema katmani store tazelemesinden haberdar olmadigi
+      icin "diskte 4 tablo, bellekte 3 tablo" durumunu ortaya cikardi ve
+      DDL'i reddetti (tests/bench_report, gates14 FAIL). Sema tazeleme
+      mimarisi eklenmeden bu degisiklik guvenli degildir; geri alindi.
+      Ayrintili bulgu: docs/finalization/ACCELERATED_STABILITY_REPORT.md. }
     FStore.DropCache;
     if FWal.HasContent then
     begin
